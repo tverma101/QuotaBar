@@ -731,8 +731,16 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
         // The alias itself selects Codex priority pricing: 2x the unscaled base/long-context
         // rates, not Cursor's 2.5x supplement variant and never both multipliers at once.
+        //
+        // `short` stays under the 272k long-context threshold, so it prices at the base rates:
+        // (100k/1M * 5) + (10k/1M * 30) = 0.8, doubled to 1.6.
+        //
+        // `long` is 310k total, so it takes gpt-5.6-sol's long-context tier of (8, 30, 0.8):
+        // (200k/1M * 8) + (10k/1M * 30) + (100k/1M * 0.8) = 1.98, doubled to 3.96. That 1.98 is the
+        // same figure `testCodexLongContextRatesCoverSupportedModels` asserts for this model and
+        // event, which is what pins the expectation here — the two must not drift apart.
         XCTAssertEqual(short.series.daily.first?.costUSD ?? 0, 1.6, accuracy: 0.000_001)
-        XCTAssertEqual(long.series.daily.first?.costUSD ?? 0, 5.1, accuracy: 0.000_001)
+        XCTAssertEqual(long.series.daily.first?.costUSD ?? 0, 3.96, accuracy: 0.000_001)
     }
 
     func testAggregateUnknownModelIsExcludedFromTotalsButWarns() {
