@@ -1,6 +1,6 @@
 # iCloud Sync
 
-**Sync Across Macs** is off by default. When it is on, each Mac writes one versioned OpenUsage history
+**Sync Across Macs** is off by default. When it is on, each Mac writes one versioned QuotaBar history
 file to the app's private iCloud container and reads the files written by other Macs signed into the same
 iCloud account. A random device ID is kept in the login Keychain so the same Mac continues updating its
 existing file after app preferences are reset or the app is reinstalled. There is no folder picker,
@@ -18,7 +18,7 @@ other Macs. Older single-account history without account information remains com
 Claude card is visible, and is ignored when multiple cards are visible. Codex syncing works the same way
 it did before.
 
-OpenUsage combines the valid files in memory and rebuilds Today, Yesterday, Last 30 Days, Usage Trend,
+QuotaBar combines the valid files in memory and rebuilds Today, Yesterday, Last 30 Days, Usage Trend,
 unknown-model warnings, and model breakdowns. The same combined spend rows feed the dashboard, Total
 Spend, menu-bar pins, share cards, and the local HTTP API. Both `/v1/usage` and `/v1/limits` read the
 same rendered snapshots; the former is the deprecated UI-oriented format and the latter is the
@@ -38,10 +38,10 @@ Malformed files are ignored and reported in Settings and the app log.
 ## Development and release setup
 
 Apple requires the iCloud container assignment to be present in the provisioning profile embedded in
-the app. OpenUsage uses separate resources so development builds cannot write production history:
+the app. QuotaBar uses separate resources so development builds cannot write production history:
 
-- `com.robinebers.openusage.dev` uses `iCloud.com.robinebers.openusage.dev`.
-- `com.robinebers.openusage` uses `iCloud.com.robinebers.openusage`.
+- `com.tverma101.quotabar.dev` uses `iCloud.com.tverma101.quotabar.dev`.
+- `com.tverma101.quotabar` uses `iCloud.com.tverma101.quotabar`.
 
 Create a `MAC_APP_DEVELOPMENT` profile that includes every registered development Mac and a
 `MAC_APP_DIRECT` profile for releases. Install the development profile on each included Mac. The
@@ -67,12 +67,12 @@ file exists:
 
 ```bash
 file=$(find "$HOME/Library/Mobile Documents" \
-  -type f -path '*openusage*/OpenUsage/History/v1/*.json' -print -quit)
+  -type f -path '*openusage*/QuotaBar/History/v1/*.json' -print -quit)
 
 if [[ -n "$file" ]]; then
   jq . "$file"
 else
-  echo "No OpenUsage iCloud history file found"
+  echo "No QuotaBar iCloud history file found"
 fi
 ```
 

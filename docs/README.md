@@ -1,4 +1,4 @@
-# OpenUsage Documentation
+# QuotaBar Documentation
 
 What the app does and how it behaves. These pages describe **behavior, not visuals**, and they are updated together with any change to that behavior — if the app and a page here disagree, that's a bug.
 
@@ -10,7 +10,6 @@ What the app does and how it behaves. These pages describe **behavior, not visua
 - [Refreshing & caching](refreshing.md) — when data updates and what happens when a fetch fails
 - [iCloud Sync](icloud-sync.md) — how spend history is combined across Macs
 - [Model pricing](pricing.md) — how spend tiles price tokens, and where the rates come from
-- [Updates](updates.md) — automatic updates, manual checks, and the beta channel
 - [Privacy & usage data](privacy.md) — daily activity, crash reports, and optional usage analytics
 
 ## Integrations

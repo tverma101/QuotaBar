@@ -1,5 +1,9 @@
 # Security Policy
 
+> **Fork note:** this is QuotaBar, a private fork. Report QuotaBar-specific issues to the
+> repository owner. Vulnerabilities in shared upstream code should still reach Robin Ebers at the
+> address below.
+
 ## Reporting a Vulnerability
 
 If you find a security vulnerability in OpenUsage, please report it responsibly. Do not open a public issue.

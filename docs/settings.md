@@ -10,15 +10,15 @@ Settings lives inside the popover — there is no separate window. Open it from 
 | Launch at Login | on/off | Registers the app as a login item (the system's login-item registry is the source of truth). |
 | Global Shortcut | record a shortcut | Global shortcut that toggles the popover from anywhere. Click the field and press a combo; the ⓧ clears it and disables the shortcut. |
 
-**Upgrading from the legacy (pre-0.7) edition:** the old edition managed start-on-login with its own launcher file, which an in-place update left behind. That leftover could start the app a second time at every login and showed up in System Settings → Login Items under the signing company's name ("SUNSTORY LLC") instead of OpenUsage. The app now removes it automatically on launch — only when the file verifiably points at OpenUsage itself — so login starts exactly one copy, controlled by the Launch at Login toggle above.
+**Upgrading from the legacy (pre-0.7) edition:** the old edition managed start-on-login with its own launcher file, which an in-place update left behind. That leftover could start the app a second time at every login and showed up in System Settings → Login Items under the signing company's name ("SUNSTORY LLC") instead of QuotaBar. The app now removes it automatically on launch — only when the file verifiably points at QuotaBar itself — so login starts exactly one copy, controlled by the Launch at Login toggle above.
 
 ## Codex Accounts
 
-The default Codex login is detected automatically. **Sign in to Codex…** creates an isolated `CODEX_HOME` and launches Codex's own `codex login` browser OAuth flow directly; OpenUsage registers the home only after Codex finishes and proves the account identity, then reloads the account catalog so the additional card appears in the same session. **Use Existing Codex Home…** registers a home that was authenticated outside OpenUsage. Removing a registration only stops OpenUsage from tracking that home; it does not delete Codex credentials or session history. The older `OPENUSAGE_CODEX_HOMES` environment configuration remains supported and is deduplicated with app-registered homes.
+The default Codex login is detected automatically. **Sign in to Codex…** creates an isolated `CODEX_HOME` and launches Codex's own `codex login` browser OAuth flow directly; QuotaBar registers the home only after Codex finishes and proves the account identity, then reloads the account catalog so the additional card appears in the same session. **Use Existing Codex Home…** registers a home that was authenticated outside QuotaBar. Removing a registration only stops QuotaBar from tracking that home; it does not delete Codex credentials or session history. The older `OPENUSAGE_CODEX_HOMES` environment configuration remains supported and is deduplicated with app-registered homes.
 
 ## iCloud Sync
 
-**Sync Across Macs** is off by default. Turning it on shares normalized OpenUsage history through the
+**Sync Across Macs** is off by default. Turning it on shares normalized QuotaBar history through the
 app's private iCloud container and combines machine-local tokens and spend across Macs signed into the
 same iCloud account. Settings shows the five-minute write cadence and each Mac's relative **Updated**
 time; it also reports unavailable iCloud, loading, write, and malformed-file states. See
@@ -45,7 +45,7 @@ time; it also reports unavailable iCloud, loading, write, and malformed-file sta
 
 ## Notifications
 
-OpenUsage can alert you with a macOS notification when a metric runs low or its pace gets worse, so you don't have to keep the popover open to catch a quota creeping toward its limit. Alerts work while the app runs in the menu bar, even with the popover closed.
+QuotaBar can alert you with a macOS notification when a metric runs low or its pace gets worse, so you don't have to keep the popover open to catch a quota creeping toward its limit. Alerts work while the app runs in the menu bar, even with the popover closed.
 
 | Setting | Options | What it does |
 |---|---|---|
@@ -53,23 +53,23 @@ OpenUsage can alert you with a macOS notification when a metric runs low or its 
 | Cutting It Close | On / Off | Alerts when a metric is projected to finish the period with little left — close to its limit. |
 | Will Run Out | On / Off | Alerts when a metric is projected to run out before it resets. |
 
-Alerts fire on a new crossing or pace worsening, then stay deduplicated while that condition is unchanged, so you do not get repeats on every refresh. A quota already in a bad state when OpenUsage launches establishes the baseline without alerting. If it recovers and later worsens again, the alert re-arms; a new reset period also clears the reset-based history. **Almost Out** is based only on the remaining share, so it also works for bounded balances without a reset window. **Cutting It Close** and **Will Run Out** require reset-window pace context. Metrics whose data cannot be read never alert. Turn all three triggers off to silence everything. When several alerts fire at once, they stack into a single grouped banner.
+Alerts fire on a new crossing or pace worsening, then stay deduplicated while that condition is unchanged, so you do not get repeats on every refresh. A quota already in a bad state when QuotaBar launches establishes the baseline without alerting. If it recovers and later worsens again, the alert re-arms; a new reset period also clears the reset-based history. **Almost Out** is based only on the remaining share, so it also works for bounded balances without a reset window. **Cutting It Close** and **Will Run Out** require reset-window pace context. Metrics whose data cannot be read never alert. Turn all three triggers off to silence everything. When several alerts fire at once, they stack into a single grouped banner.
 
-All three alerts default off. The first time you turn one on, OpenUsage asks for notification permission; if you decline (or turn notifications off for OpenUsage in System Settings later), a warning mark appears on the Notifications header and an "Open System Settings" button shows under the toggles so you can re-enable them. A notification's title is the alert name, its subtitle names the provider and metric, and its body is the plain-language verdict. Tapping an alert opens the popover on the dashboard.
+All three alerts default off. The first time you turn one on, QuotaBar asks for notification permission; if you decline (or turn notifications off for QuotaBar in System Settings later), a warning mark appears on the Notifications header and an "Open System Settings" button shows under the toggles so you can re-enable them. A notification's title is the alert name, its subtitle names the provider and metric, and its body is the plain-language verdict. Tapping an alert opens the popover on the dashboard.
 
 ## Privacy
 
 | Setting | Options | What it does |
 |---|---|---|
-| Hide From Screen Share | On / Off | Off (default). On replaces the menu bar strip with the OpenUsage icon and wordmark while your screen is being shared or recorded, and restores your starred metrics the moment the capture ends. See [Menu bar](menu-bar.md#hiding-usage-while-screen-sharing). |
-| Help make OpenUsage better by sharing anonymous usage analytics | On / Off | On (default) shares extra anonymous usage analytics — provider-refresh summaries and error categories. Off stops that extra sharing. Daily activity and crash reports are always sent. See [Privacy & Usage Data](privacy.md) for exactly what is and isn't sent. |
+| Hide From Screen Share | On / Off | Off (default). On replaces the menu bar strip with the QuotaBar icon and wordmark while your screen is being shared or recorded, and restores your starred metrics the moment the capture ends. See [Menu bar](menu-bar.md#hiding-usage-while-screen-sharing). |
+| Help make QuotaBar better by sharing anonymous usage analytics | On / Off | On (default) shares extra anonymous usage analytics — provider-refresh summaries and error categories. Off stops that extra sharing. Daily activity and crash reports are always sent. See [Privacy & Usage Data](privacy.md) for exactly what is and isn't sent. |
 
 ## Advanced
 
 | Setting | Options | What it does |
 |---|---|---|
 | Log Level | Error / Warning / Info / Debug | How much detail the app writes to its log file. Defaults to Info and persists across launches; raise to Debug while reproducing a problem. Applies immediately. |
-| Copy Log Path | button | Copies the log file path (`~/Library/Logs/OpenUsage/OpenUsage.log`) to the clipboard. |
+| Copy Log Path | button | Copies the log file path (`~/Library/Logs/QuotaBar/QuotaBar.log`) to the clipboard. |
 | Reveal in Finder | button | Opens a Finder window with the log file selected. |
 | Reset All Settings… | button | Restores every setting to its default, behind a confirmation alert. |
 
@@ -77,7 +77,7 @@ See [Logging](logging.md) for the full behavior: subsystem tags, the file size c
 
 **Reset All Settings…** restores every setting on this screen to its default — appearance, usage display, notifications, privacy, log level, the global shortcut (cleared), Launch at Login (turned off), iCloud sync (turned off), and the update preferences (stable channel, automatic checks on) — and also resets all customization, exactly like Customize's Reset All: default layout, order, and menu-bar stars, with providers turned back on for the tools you have installed. The reset cannot be undone.
 
-Not touched: provider logins and API keys, registered Codex home paths, cached usage data, and your extra-analytics choice. Registered Codex accounts remain available after the reset; removing one requires its explicit account action, and its Codex credentials and session history are never deleted by OpenUsage. Turning iCloud sync off as part of the reset works exactly like flipping its toggle off: this Mac's synced history is removed from the shared iCloud data, and your other Macs keep their own.
+Not touched: provider logins and API keys, registered Codex home paths, cached usage data, and your extra-analytics choice. Registered Codex accounts remain available after the reset; removing one requires its explicit account action, and its Codex credentials and session history are never deleted by QuotaBar. Turning iCloud sync off as part of the reset works exactly like flipping its toggle off: this Mac's synced history is removed from the shared iCloud data, and your other Macs keep their own.
 
 ## Updates
 
@@ -90,7 +90,6 @@ developer builds do not show it.
 | Beta Updates | On / Off | Adds pre-release builds to the updates you can receive. Stable releases remain available either way. |
 | Check for Updates… | button | Starts a manual update check and opens Sparkle's update window. |
 
-See [Updates](updates.md) for the dashboard banner, channels, and signature verification.
 
 ## Version
 

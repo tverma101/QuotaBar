@@ -1,50 +1,69 @@
-# OpenUsage upstream provenance
+# Upstream provenance
 
-Status: **external-derived / quarantined pending repository ownership decision (#41)**
+Status: **owned fork.** This resolves the question left open by issue #41 in `tverma101/Tools`,
+where this tree was vendored and tracked with no commits and no recorded provenance.
 
-## Observed upstream
-
-The subtree's existing README points to:
+## Upstream
 
 - Repository: `https://github.com/robinebers/openusage`
-- Product/release identity: OpenUsage
-- License file present in this subtree: `LICENSE`
+- Author: Robin Ebers
+- License: MIT (see `LICENSE`)
+- Brand: the OpenUsage name and logo are trademarks of Robin Ebers and are **not** used here, per
+  `TRADEMARK.md`. This project is a fork and is not the official OpenUsage.
 
 ## Imported revision
 
-**Unknown.**
+The subtree arrived in `tverma101/Tools` with its history squashed to nothing — 544 tracked files,
+zero commits — so the original revision could not be recovered from local Git history.
 
-Do not guess or synthesize a commit SHA/tag. The exact source revision must be established from Git history or a reproducible upstream comparison before this field is changed.
+It is now pinned by this repository's own history instead:
 
-## Local purpose
+| Commit | What it is |
+| ------ | ---------- |
+| `3866cd1` | `chore: establish as-is baseline of vendored OpenUsage tree` — verbatim import, before any local change |
+| `5818ab1` | `refactor: drop Sparkle auto-update pipeline` |
+| `17776c5` | `refactor: rebrand OpenUsage to QuotaBar` |
 
-This tree is currently tracked inside `tverma101/Tools` as a substantial OpenUsage-derived macOS usage-tracker codebase. Whether it should remain vendored here, become a maintained fork, or move to a separate repository is unresolved in #41.
+`3866cd1` is the exact upstream-equivalent tree, so `git diff 3866cd1..HEAD` is the complete local
+delta. The upstream version at import was `v0.7.10-beta.3`, per `CHANGELOG.md`.
 
-## Agent modification policy
+To recover the true upstream SHA, diff this tree against upstream tags rather than guessing:
 
-Unless an issue explicitly targets `OpenUsage/`:
+```sh
+git clone https://github.com/robinebers/openusage /tmp/openusage-upstream
+git --no-pager diff --stat 3866cd1 -- /tmp/openusage-upstream   # compare trees
+```
 
-- do not edit this subtree;
-- do not run repo-wide formatting/refactors/dependency updates through it;
-- do not reinterpret upstream release/CI/contribution files as policy for the whole `Tools` repository;
-- do not remove or rewrite upstream attribution, license, trademark, security or contributor notices;
-- do not claim local ownership of upstream behavior merely because the files are tracked here.
+## Local deltas from upstream
 
-When explicitly tasked here, read `OpenUsage/AGENTS.md` in addition to the repository root agent contract.
+Only two, both deliberate and both traceable to a decision:
 
-## Local patches
+1. **Sparkle auto-updates removed** (`5818ab1`). Sparkle fetches its appcast and DMGs anonymously,
+   which requires a public repository. This one is private, so the updater, its Settings section, the
+   dashboard banner, the release workflow and the GitHub Pages workflows are gone. Releases are manual.
+2. **Rebrand to QuotaBar** (`17776c5`). Required by `TRADEMARK.md`. Build identity, user-facing
+   strings, on-disk paths and the bundle id all changed. Internal symbols (`OpenUsageISO8601`,
+   `Bundle.openUsageResources`) were left alone deliberately, to keep the upstream diff small.
 
-Not yet inventoried. #41 owns identifying local deltas from upstream.
-
-Record future intentional patches here or in a linked patch manifest with:
-
-- local commit/PR;
-- upstream file/area;
-- reason for divergence;
-- whether the patch should be upstreamed, retained, or dropped during refresh.
+Pricing needed no equivalent change: `ModelPricingStore` reads the pricing supplement from upstream's
+public URL, so Cursor model rates keep updating on upstream's schedule.
 
 ## Update procedure
 
-Not yet normalized. Until #41 defines a reproducible update procedure, do **not** perform opportunistic bulk upstream refreshes.
+Refreshing from upstream is now safe and reviewable:
 
-Any future refresh must preserve licenses/notices and produce a reviewable upstream-vs-local delta.
+```sh
+git fetch upstream
+git diff HEAD..upstream/main --stat     # what upstream changed
+git merge upstream/main                 # conflicts are expected in rebranded files only
+swift build && swift test
+```
+
+Expect conflicts in anything that carries the product name. Resolve toward QuotaBar naming.
+
+## Agent modification policy
+
+QuotaBar is a maintained fork, so the old "do not edit this subtree" quarantine no longer applies.
+The engineering conventions in `AGENTS.md` govern. The upstream notices — `LICENSE`,
+`CODE_OF_CONDUCT.md`, `SECURITY.md`, `CONTRIBUTING.md`, `TRADEMARK.md` — must not be removed or
+rewritten, and upstream attribution must be preserved.
