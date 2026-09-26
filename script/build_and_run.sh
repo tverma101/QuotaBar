@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Builds OpenUsage, stages a signed .app bundle under dist/, and launches it in place — no install
+# Builds QuotaBar, stages a signed .app bundle under dist/, and launches it in place — no install
 # to /Applications. The dev build:
 #   - is signed with a stable Apple Development identity, so keychain/permission grants stick across
 #     rebuilds (macOS keys those to the signing identity + bundle id, not the install location);
-#   - uses its own bundle id (com.robinebers.openusage.dev), so it never touches the real installed
+#   - uses its own bundle id (com.tverma101.quotabar.dev), so it never touches the real installed
 #     app's settings or keychain. To run against the real app's data instead, set BUNDLE_ID to
-#     com.robinebers.openusage below;
+#     com.tverma101.quotabar below;
 #
 # Usage: script/build_and_run.sh [run|build|logs|verify]
 # Env:   CODESIGN_IDENTITY  override signing identity (exact name or hash)
@@ -18,10 +18,10 @@ set -euo pipefail
 MODE="${1:-run}"
 CONFIG="${CONFIG:-release}"
 
-TARGET_NAME="OpenUsage"                 # SwiftPM target / binary name
-APP_DISPLAY="OpenUsage"                 # user-facing app name
-BUNDLE_ID="${BUNDLE_ID:-com.robinebers.openusage.dev}"
-ICLOUD_CONTAINER_ID="iCloud.com.robinebers.openusage.dev"
+TARGET_NAME="QuotaBar"                  # SwiftPM target / binary name
+APP_DISPLAY="QuotaBar"                  # user-facing app name
+BUNDLE_ID="${BUNDLE_ID:-com.tverma101.quotabar.dev}"
+ICLOUD_CONTAINER_ID="iCloud.com.tverma101.quotabar.dev"
 MIN_SYSTEM_VERSION="15.0"
 APP_VERSION="0.7.0"
 APP_BUILD="0.7.0"
@@ -34,12 +34,12 @@ APP_MACOS="$APP_CONTENTS/MacOS"
 APP_HELPERS="$APP_CONTENTS/Helpers"
 APP_RESOURCES="$APP_CONTENTS/Resources"
 APP_BINARY="$APP_MACOS/$TARGET_NAME"
-CLI_BINARY="$APP_HELPERS/openusage"
+CLI_BINARY="$APP_HELPERS/quotabar"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 RESOURCE_BUNDLE_NAME="${TARGET_NAME}_${TARGET_NAME}.bundle"
 KAGGLE_BRIDGE_SOURCE="${KAGGLE_GLM53_CONTROL_BIN:-/Users/tejas/Documents/Codex/2026-09-10/new-chat/work/kaggle-gpu-control/bin/kaggle-glm53-control}"
-ENTITLEMENTS="$ROOT_DIR/script/OpenUsage.dev.entitlements.plist"
-SIGN_ENTITLEMENTS="$ROOT_DIR/script/OpenUsage.local.entitlements.plist"
+ENTITLEMENTS="$ROOT_DIR/script/QuotaBar.dev.entitlements.plist"
+SIGN_ENTITLEMENTS="$ROOT_DIR/script/QuotaBar.local.entitlements.plist"
 
 pkill -x "$TARGET_NAME" >/dev/null 2>&1 || true
 
@@ -47,7 +47,7 @@ echo "==> swift build ($CONFIG)"
 swift build -c "$CONFIG"
 BUILD_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 BUILD_BINARY="$BUILD_DIR/$TARGET_NAME"
-BUILD_CLI_BINARY="$BUILD_DIR/openusage-cli"
+BUILD_CLI_BINARY="$BUILD_DIR/quotabar-cli"
 
 if [ ! -x "$BUILD_BINARY" ]; then
   echo "missing built binary: $BUILD_BINARY" >&2
@@ -88,7 +88,7 @@ else
   echo "WARNING: Kaggle GLM bridge not found at $KAGGLE_BRIDGE_SOURCE; the card will report Needs attention." >&2
 fi
 # Stage every SwiftPM resource bundle produced by the build (the app's own
-# OpenUsage_OpenUsage.bundle, which carries the provider SVGs + model manifest)
+# QuotaBar_QuotaBar.bundle, which carries the provider SVGs + model manifest)
 # into Contents/Resources, the standard app layout. Bundle.openUsageResources
 # (see Support/ResourceBundle.swift) loads it from there.
 shopt -s nullglob
@@ -156,12 +156,12 @@ cat >"$INFO_PLIST" <<PLIST
   <true/>
   <key>NSUbiquitousContainers</key>
   <dict>
-    <key>iCloud.com.robinebers.openusage.dev</key>
+    <key>iCloud.com.tverma101.quotabar.dev</key>
     <dict>
       <key>NSUbiquitousContainerIsDocumentScopePublic</key>
       <false/>
       <key>NSUbiquitousContainerName</key>
-      <string>OpenUsage</string>
+      <string>QuotaBar</string>
       <key>NSUbiquitousContainerSupportedFolderLevels</key>
       <string>None</string>
     </dict>
@@ -183,7 +183,7 @@ fi
 if [ -n "${ICLOUD_PROVISIONING_PROFILE:-}" ]; then
   echo "==> using iCloud provisioning profile: $ICLOUD_PROVISIONING_PROFILE"
   cp "$ICLOUD_PROVISIONING_PROFILE" "$APP_CONTENTS/embedded.provisionprofile"
-  SIGN_ENTITLEMENTS="$DIST_DIR/OpenUsage.dev.resolved.entitlements.plist"
+  SIGN_ENTITLEMENTS="$DIST_DIR/QuotaBar.dev.resolved.entitlements.plist"
   "$ROOT_DIR/script/render_icloud_entitlements.sh" \
     "$ENTITLEMENTS" "$ICLOUD_PROVISIONING_PROFILE" "$SIGN_ENTITLEMENTS" \
     "$ICLOUD_CONTAINER_ID"
