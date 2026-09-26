@@ -2,13 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "OpenUsage",
+    name: "QuotaBar",
     platforms: [
         .macOS(.v15)
     ],
     products: [
-        .executable(name: "OpenUsage", targets: ["OpenUsageApp"]),
-        .executable(name: "openusage-cli", targets: ["OpenUsageCLI"])
+        // The CLI keeps a `-cli` suffix: a bare `quotabar` would collide with the `QuotaBar`
+        // library target's build output on case-insensitive filesystems (APFS default).
+        .executable(name: "QuotaBar", targets: ["QuotaBarApp"]),
+        .executable(name: "quotabar-cli", targets: ["QuotaBarCLI"])
     ],
     dependencies: [
         // The de-facto standard recorder + global hotkey for Mac apps (System Settings-style field).
@@ -18,12 +20,12 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "OpenUsage",
+            name: "QuotaBar",
             dependencies: [
                 .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
                 .product(name: "PostHog", package: "posthog-ios")
             ],
-            path: "Sources/OpenUsage",
+            path: "Sources/QuotaBar",
             resources: [
                 .copy("Resources/ProviderIcons"),
                 .copy("Resources/pricing_supplement.json"),
@@ -35,33 +37,33 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "OpenUsageApp",
-            dependencies: ["OpenUsage"],
-            path: "Sources/OpenUsageApp",
+            name: "QuotaBarApp",
+            dependencies: ["QuotaBar"],
+            path: "Sources/QuotaBarApp",
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]
         ),
         .executableTarget(
-            name: "OpenUsageCLI",
-            dependencies: ["OpenUsage"],
-            path: "Sources/OpenUsageCLI",
+            name: "QuotaBarCLI",
+            dependencies: ["QuotaBar"],
+            path: "Sources/QuotaBarCLI",
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]
         ),
         .testTarget(
-            name: "OpenUsageTests",
-            dependencies: ["OpenUsage"],
-            path: "Tests/OpenUsageTests",
+            name: "QuotaBarTests",
+            dependencies: ["QuotaBar"],
+            path: "Tests/QuotaBarTests",
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]
         ),
         .testTarget(
-            name: "OpenUsageCLITests",
-            dependencies: ["OpenUsageCLI"],
-            path: "Tests/OpenUsageCLITests",
+            name: "QuotaBarCLITests",
+            dependencies: ["QuotaBarCLI"],
+            path: "Tests/QuotaBarCLITests",
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]
