@@ -127,7 +127,7 @@ struct CursorAuthStore: Sendable {
     }
 
     private func readKeychainValue(_ service: String) -> String? {
-        guard let value = try? keychain.readGenericPassword(service: service) else { return nil }
+        guard let value = try? keychain.readGenericPasswordForRefresh(service: service) else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }

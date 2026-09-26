@@ -30,7 +30,7 @@ struct KeychainICloudDeviceIDStore: ICloudDeviceIDStoring {
     }
 
     func readDeviceID() throws -> String? {
-        try keychain.readGenericPasswordForCurrentUser(service: service)
+        try keychain.readGenericPasswordForRefreshForCurrentUser(service: service)
     }
 
     func writeDeviceID(_ deviceID: String) throws {

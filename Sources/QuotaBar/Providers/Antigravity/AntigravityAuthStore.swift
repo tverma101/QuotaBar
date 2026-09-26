@@ -38,7 +38,7 @@ struct AntigravityAuthStore: Sendable {
     func loadKeychainToken() throws -> AntigravityKeychainToken? {
         let raw: String?
         do {
-            raw = try keychain.readGenericPassword(
+            raw = try keychain.readGenericPasswordForRefresh(
                 service: Self.keychainService,
                 account: Self.keychainAccount
             )
