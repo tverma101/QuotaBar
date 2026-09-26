@@ -86,10 +86,10 @@ struct CopilotAuthStore: Sendable {
         // `gh` stores its Keychain item under the GitHub username as the account. Read it scoped to that
         // account when we can recover it from hosts.yml; otherwise fall back to a service-only lookup.
         if let account = ghUsername(),
-           let raw = try? keychain.readGenericPassword(service: Self.ghKeychainService, account: account) {
+           let raw = try? keychain.readGenericPasswordForRefresh(service: Self.ghKeychainService, account: account) {
             return raw
         }
-        return try? keychain.readGenericPassword(service: Self.ghKeychainService)
+        return try? keychain.readGenericPasswordForRefresh(service: Self.ghKeychainService)
     }
 
     private func ghUsername() -> String? {

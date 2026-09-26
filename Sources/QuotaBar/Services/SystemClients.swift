@@ -240,6 +240,10 @@ protocol KeychainAccessing: Sendable {
     /// item under a known account name (e.g. Antigravity's `agy` token under service `gemini`,
     /// account `antigravity`) rather than the current user.
     func readGenericPassword(service: String, account: String) throws -> String?
+    /// Account-scoped read that can suppress UI. The default (for mocks that don't model interaction)
+    /// ignores the flag; the real `SecurityKeychainAccessor` overrides it with the in-process
+    /// `LAContext` path, which is what keeps a scheduled refresh from opening a Keychain dialog.
+    func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String?
 }
 
 extension KeychainAccessing {
@@ -263,6 +267,60 @@ extension KeychainAccessing {
     /// `SecurityKeychainAccessor` overrides this to pass `-a <account>`.
     func readGenericPassword(service: String, account: String) throws -> String? {
         try readGenericPassword(service: service)
+    }
+
+    func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? {
+        _ = allowInteraction
+        return try readGenericPassword(service: service)
+    }
+
+    /// Read a generic password the way a provider refresh should: **silent first**, escalating to a
+    /// Keychain dialog only when the user explicitly asked for a refresh.
+    ///
+    /// Every provider credential read on a refresh path should use this rather than the flagless
+    /// overload. That overload shells out to `security find-generic-password`, which has no way to
+    /// suppress UI, so a scheduled refresh re-prompts for the life of the app — one dialog every five
+    /// minutes, per item, forever. The in-process path here is silent, and `allowInteraction: false`
+    /// fails fast with `KeychainError.interactionNotAllowed` instead of blocking on UI.
+    ///
+    /// Escalation mirrors `ClaudeAuthStore`: a silent read that proves interaction is *required* may
+    /// retry with UI, but only for a manual refresh, and only once per manual action across all
+    /// providers via the shared `CredentialInteractionGate` — so ⌘R opens at most one Keychain dialog
+    /// no matter how many provider cards are enabled.
+    func readGenericPasswordForRefresh(service: String, account: String? = nil) throws -> String? {
+        try escalatingRead {
+            if let account {
+                return try readGenericPassword(service: service, account: account, allowInteraction: $0)
+            }
+            return try readGenericPassword(service: service, allowInteraction: $0)
+        }
+    }
+
+    /// Current-user-scoped variant of `readGenericPasswordForRefresh`, for items this app *writes*
+    /// itself under `kSecAttrAccount` (see `writeGenericPasswordForCurrentUser`). Account scoping is
+    /// part of the query, not a detail: a service-only read is a different lookup, so this must not
+    /// collapse into the service-only helper.
+    func readGenericPasswordForRefreshForCurrentUser(service: String) throws -> String? {
+        try escalatingRead {
+            try readGenericPasswordForCurrentUser(service: service, allowInteraction: $0)
+        }
+    }
+
+    /// Shared silent-first-then-escalate body for the refresh helpers. `read` receives the
+    /// interaction flag and performs the read; a silent attempt that throws
+    /// `KeychainError.interactionNotAllowed` is retried once, and only for a manual refresh that has
+    /// not already spent the shared per-action dialog budget.
+    private func escalatingRead(_ read: (Bool) throws -> String?) throws -> String? {
+        do {
+            return try read(false)
+        } catch KeychainError.interactionNotAllowed {
+            guard ProviderRefreshContext.isManual,
+                  ProviderRefreshContext.credentialInteractionGate?.claim() ?? true
+            else {
+                throw KeychainError.interactionNotAllowed
+            }
+            return try read(true)
+        }
     }
 
     /// Whether an item exists for `service`, without reading its secret. `nil` means the probe
@@ -334,6 +392,13 @@ struct SecurityKeychainAccessor: KeychainAccessing {
 
     func readGenericPassword(service: String, account: String) throws -> String? {
         try readPassword(["find-generic-password", "-a", account, "-s", service, "-w"], service: service)
+    }
+
+    /// Account-scoped read that can suppress UI, matching the two service-scoped overloads. Without
+    /// this, the only account-scoped path was the `security` subprocess, so a provider reading another
+    /// app's item (Antigravity's `agy` token) had no way to stay silent on a scheduled refresh.
+    func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? {
+        try readPassword(service: service, account: account, allowInteraction: allowInteraction)
     }
 
     private func readPassword(_ arguments: [String], service: String) throws -> String? {

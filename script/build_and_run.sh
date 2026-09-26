@@ -191,6 +191,21 @@ else
   echo "WARNING: no matching installed iCloud provisioning profile was found; iCloud Sync will be unavailable in this build." >&2
 fi
 
+# Resolve the entitlements actually used for signing. The keychain access group must be the team
+# prefix plus THIS bundle id: a hardcoded group would put a dev build and a production build in the
+# same group, so they would read and overwrite each other's keychain items. Deriving it here keeps
+# dev/prod isolated automatically, with no drift from the committed template.
+#
+# DEVELOPMENT_TEAM must be the team of the signing identity below. Override it if you sign with a
+# different account.
+DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-LD48G22523}"
+RESOLVED_ENTITLEMENTS="$DIST_DIR/$APP_DISPLAY.signed.entitlements.plist"
+/bin/cp "$SIGN_ENTITLEMENTS" "$RESOLVED_ENTITLEMENTS"
+/usr/libexec/PlistBuddy -c "Add :keychain-access-groups array" "$RESOLVED_ENTITLEMENTS" >/dev/null
+/usr/libexec/PlistBuddy -c "Add :keychain-access-groups:0 string $DEVELOPMENT_TEAM.$BUNDLE_ID" \
+  "$RESOLVED_ENTITLEMENTS" >/dev/null
+echo "==> keychain access group: $DEVELOPMENT_TEAM.$BUNDLE_ID"
+
 # Pick a stable Apple Development identity so ad-hoc cdhash churn doesn't re-trigger
 # permission prompts on every rebuild. Fall back to ad-hoc only if none is found.
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
@@ -203,12 +218,12 @@ if [ -n "$CODESIGN_IDENTITY" ]; then
   /usr/bin/codesign --force --options runtime --sign "$CODESIGN_IDENTITY" "$CLI_BINARY" >/dev/null
   /usr/bin/codesign --force --options runtime \
     --sign "$CODESIGN_IDENTITY" \
-    --entitlements "$SIGN_ENTITLEMENTS" \
+    --entitlements "$RESOLVED_ENTITLEMENTS" \
     "$APP_BUNDLE" >/dev/null
   echo "==> signed with: $CODESIGN_IDENTITY"
 else
   /usr/bin/codesign --force --sign - "$CLI_BINARY" >/dev/null
-  /usr/bin/codesign --force --sign - --entitlements "$SIGN_ENTITLEMENTS" "$APP_BUNDLE" >/dev/null
+  /usr/bin/codesign --force --sign - --entitlements "$RESOLVED_ENTITLEMENTS" "$APP_BUNDLE" >/dev/null
   echo "WARNING: no Apple Development identity found; ad-hoc signed." >&2
 fi
 
