@@ -1,6 +1,6 @@
 import Foundation
 
-/// Burn-rate pacing for a bounded metric, ported from the original QuotaBar
+/// Burn-rate pacing for a bounded metric, ported from the original OpenUsage
 /// (`src/lib/pace-status.ts`, `src/lib/pace-tooltip.ts`). Given how much of a quota is spent and how far
 /// through the reset window we are, it projects usage at the current rate to the end of the window.
 /// This drives the meter's severity color, the amber state's spare marker + "~3% spare" copy, the

@@ -208,7 +208,7 @@ private struct MenuBarTextStrip: View {
     }
 }
 
-/// Draws up to four horizontal usage bars into a compact square — a 1:1 port of the original QuotaBar
+/// Draws up to four horizontal usage bars into a compact square — a 1:1 port of the original OpenUsage
 /// tray bars: track 0.16 / fill 1.0 / remainder 0.24 opacity (black, so the template tints them), a
 /// rounded leading edge with a small rounded moving edge, and near-full quantization so a 97% bar still
 /// shows a visible tail.
@@ -275,7 +275,7 @@ private struct MenuBarBars: View {
 }
 
 /// Pure fill geometry for the Bars glyph, factored out so the near-full quantization and minimum-visible
-/// remainder rules are unit-testable. A 1:1 port of the original QuotaBar tray math.
+/// remainder rules are unit-testable. A 1:1 port of the original OpenUsage tray math.
 enum MenuBarBarGeometry {
     struct Fill: Equatable {
         let fillW: CGFloat
