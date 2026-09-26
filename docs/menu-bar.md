@@ -1,0 +1,50 @@
+# Menu Bar
+
+Star your most important metrics straight into the menu bar strip.
+
+## Right-clicking the icon
+
+Right-click (or control-click) the OpenUsage menu bar icon for a quick menu with **Settings** and **Quit**. OpenUsage keeps one status item and one shared panel regardless of provider count, so two Codex accounts and Cursor remain together in the same dashboard instead of looking like duplicate apps.
+
+## Starring
+
+Star a metric from any row's right-click menu, or from the always-visible star beside a metric in Customize.
+
+- On first launch the app ships with a default set of stars (Antigravity Session/Weekly, Claude Session/Weekly, Codex Session/Weekly, Cursor Models/Other Models, Copilot Credits, OpenRouter Credits, Z.ai Session/Weekly) so the strip shows numbers right away. Change them anytime; a provider's Reset restores its defaults, and Reset All restores the full set. Only providers that are turned on render in the strip — and a fresh install starts with just the providers detected on your Mac (see [Dashboard § First launch](dashboard.md#first-launch)) — so the default stars don't crowd the menu bar with tools you don't use.
+- At most **2 stars per provider**.
+- When a star isn't allowed, the star button stays clickable — clicking it shakes and shows the reason in a temporary pill over the bottom of Customize (for example, "Up to 2 stars per provider").
+
+## Styles
+
+Settings → Appearance → Icon Style:
+
+- **Text** — provider icon plus values; two starred metrics from the same provider stack as a labeled pair.
+- **Bars** — a compact glyph containing the first four starred metrics that have a limit (metrics without limits only appear in Text style).
+- In each provider or account's Customize detail, **Show in menu bar** controls the whole entry: both its icon and pinned usage values. New providers and accounts default to on. Turning it off removes that provider/account from both Text and Bars styles.
+
+## Hiding usage while screen sharing
+
+Settings → Privacy → **Hide From Screen Share** (off by default). While your screen is being shared or recorded — a Zoom/Meet/Teams share, a screen recording, macOS Screen Sharing — the strip is replaced with the OpenUsage icon and wordmark, so token counts and spend never show up in front of an audience. The moment the capture ends, your starred metrics come right back. Captures you start yourself (a screen recording, for example) count too, so those get the wordmark as well.
+
+Detection rides the system's own "an app is capturing the screen" signal — the same one that lights the capture indicator in the menu bar — checked the instant it changes and re-checked every few seconds while the setting is on.
+
+## What the strip shows
+
+The strip only renders real data. A starred metric with nothing fetched yet is skipped; a provider whose stars all lack data disappears entirely (icon included). When nothing has data, the strip falls back to the app icon, but the single status item remains clickable and opens the aggregate dashboard. Stars follow your Customize order — Always Visible metrics first, then On Demand ones. A metric can be starred whether it's Always Visible or On Demand. Multiple Claude and Codex accounts remain separate provider cards inside the same panel. When an account moves from a family ID to an account-specific ID, its existing family pins carry over once, even when the old family card is no longer active; later explicit unpins are preserved.
+
+## Kaggle Compute
+
+Scroll to the bottom of the dashboard popover for the separate **Kaggle
+Compute** card. It controls only the GLM-5.3-Flash TPU bridge; it does not
+start the existing T4/Ollama or Z-Image worker. **Turn On** is the only action
+that starts a TPU notebook, and **Turn Off** deletes that notebook. The card
+polls read-only status and shows the kernel state, endpoint readiness, elapsed
+allocation time, time remaining, requests, input/output tokens, and the
+API-equivalent dollar estimate. The bridge shuts the TPU down after five
+minutes without a request, or at its allocation limit. The dollar value is a
+comparison only; Kaggle TPU time is not an API bill.
+
+The installed app bundles the bridge and uses the local `~/kaggle-tpu-lab`
+checkout plus the configured Kaggle CLI credentials. A healthy, idle setup
+shows **Off** before the first explicit Turn On; no notebook is started by
+launch or by status polling.

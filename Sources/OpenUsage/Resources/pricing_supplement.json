@@ -1,0 +1,881 @@
+{
+  "$comment": "OpenUsage pricing supplement. Prices Cursor-native models that no public catalog carries, supplies fast-variant multipliers the catalogs omit, and maps provider log/CSV model slugs to canonical pricing keys (LiteLLM keys, models.dev ids, or entries in this file). Cursor Router rows name the routed model in prose instead of a slug ('Opus 5 (Auto Balanced)'), so those labels get alias rules too. Published to gh-pages by .github/workflows/pricing-supplement.yml on every change, so installed apps pick edits up within about an hour - no release needed. Rates are USD per million tokens. Sources: https://cursor.com/docs/models-and-pricing.md for Cursor-native entries; https://developers.openai.com/api/docs/models/daybreak-blue-latest and https://developers.openai.com/api/docs/pricing for Daybreak aliases and rates.",
+  "alias_rules": [
+    {
+      "pattern": "^gpt-reserve$",
+      "canonical": "gpt-6-luna"
+    },
+    {
+      "canonical": "gpt-5.4",
+      "pattern": "^agent_review$"
+    },
+    {
+      "canonical": "auto",
+      "pattern": "^default$"
+    },
+    {
+      "canonical": "auto",
+      "pattern": "^auto$"
+    },
+    {
+      "canonical": "composer-2.5",
+      "pattern": "^composer$"
+    },
+    {
+      "canonical": "composer-1",
+      "pattern": "^composer-1$"
+    },
+    {
+      "canonical": "composer-1.5",
+      "pattern": "^composer-1\\.5$"
+    },
+    {
+      "canonical": "composer-2",
+      "pattern": "^composer-2$"
+    },
+    {
+      "canonical": "composer-2-fast",
+      "pattern": "^composer-2-fast$"
+    },
+    {
+      "canonical": "composer-2.5",
+      "pattern": "^composer-2\\.5$"
+    },
+    {
+      "canonical": "composer-2.5-fast",
+      "pattern": "^composer-2\\.5-fast$"
+    },
+    {
+      "canonical": "github_bugbot",
+      "pattern": "^github_bugbot$"
+    },
+    {
+      "canonical": "grok-4.6-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]6-fast(?:-(?:low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.6-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]6(?:-(?:low|medium|high|xhigh))?-fast$"
+    },
+    {
+      "canonical": "grok-4.6",
+      "pattern": "^(?:cursor-)?grok-4[.-]6(?:-(?:build|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.5-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]5-fast(?:-(?:low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.5-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]5(?:-(?:low|medium|high|xhigh))?-fast$"
+    },
+    {
+      "canonical": "grok-4.5",
+      "pattern": "^(?:cursor-)?grok-4[.-]5(?:-(?:build|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "kimi-k2.7-code",
+      "pattern": "^kimi-k2\\.7(?:-code)?$"
+    },
+    {
+      "canonical": "kimi-k2.7-code",
+      "pattern": "^kimi-k2p7(?:-code)?$"
+    },
+    {
+      "canonical": "kimi-k3",
+      "pattern": "^kimi-k3(?:-code)?(?:-(?:low|medium|high|xhigh|max))?$"
+    },
+    {
+      "canonical": "claude-haiku-4-5",
+      "pattern": "^claude-4\\.5-haiku(?:-thinking)?$"
+    },
+    {
+      "canonical": "claude-opus-4-5",
+      "pattern": "^claude-4\\.5-opus-(?:low|medium|high)(?:-thinking)?$"
+    },
+    {
+      "canonical": "claude-4-sonnet-1m",
+      "pattern": "^claude-4-sonnet-1m(?:-thinking)?$"
+    },
+    {
+      "canonical": "claude-sonnet-4-20250514",
+      "pattern": "^claude-4-sonnet(?:-thinking)?$"
+    },
+    {
+      "canonical": "claude-sonnet-4-5",
+      "pattern": "^claude-4\\.5-sonnet(?:-thinking)?$"
+    },
+    {
+      "canonical": "claude-sonnet-4-6",
+      "pattern": "^claude-4\\.6-sonnet(?:-(?:low|medium|high|xhigh|max))?(?:-thinking)?$"
+    },
+    {
+      "canonical": "claude-opus-4-6-fast",
+      "pattern": "^claude-4\\.6-opus-(?:low|medium|high|max)(?:-thinking)?-fast$"
+    },
+    {
+      "canonical": "claude-opus-4-6",
+      "pattern": "^claude-4\\.6-opus-(?:low|medium|high|max)(?:-thinking)?$"
+    },
+    {
+      "canonical": "claude-opus-4-7-fast",
+      "pattern": "^claude-4\\.7-opus-(?:low|medium|high|max)(?:-thinking)?-fast$"
+    },
+    {
+      "canonical": "claude-opus-4-7",
+      "pattern": "^claude-4\\.7-opus-(?:low|medium|high|max)(?:-thinking)?$"
+    },
+    {
+      "canonical": "claude-opus-4-7-fast",
+      "pattern": "^claude-opus-4-7(?:-thinking)?(?:-(?:low|medium|high|xhigh|max))?-fast$"
+    },
+    {
+      "canonical": "claude-opus-4-7",
+      "pattern": "^claude-opus-4-7(?:-thinking)?(?:-(?:low|medium|high|xhigh|max))?$"
+    },
+    {
+      "canonical": "claude-opus-4-8-fast",
+      "pattern": "^claude-opus-4-8(?:-thinking)?(?:-(?:low|medium|high|xhigh|max))?-fast$"
+    },
+    {
+      "canonical": "claude-opus-4-8",
+      "pattern": "^claude-opus-4-8(?:-thinking)?(?:-(?:low|medium|high|xhigh|max))?$"
+    },
+    {
+      "canonical": "claude-opus-5-fast",
+      "pattern": "^claude-opus-5(?:\\[1m\\])?(?:-thinking)?(?:-(?:low|medium|high|xhigh|max))?-fast$"
+    },
+    {
+      "canonical": "claude-opus-5",
+      "pattern": "^claude-opus-5(?:\\[1m\\])?(?:-thinking)?(?:-(?:low|medium|high|xhigh|max))?$"
+    },
+    {
+      "canonical": "claude-fable-5",
+      "pattern": "^claude-fable-5(?:-thinking)?(?:-(?:low|medium|high|xhigh|max))?$"
+    },
+    {
+      "canonical": "claude-sonnet-5",
+      "pattern": "^claude-sonnet-5(?:-thinking)?(?:-(?:low|medium|high|xhigh|max))?$"
+    },
+    {
+      "canonical": "gemini-2.5-flash",
+      "pattern": "^gemini-2\\.5-flash(?:-(?:none|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "gemini-3-flash-preview",
+      "pattern": "^gemini-3-flash(?:-(?:a|b|c))?(?:-preview)?(?:-(?:none|low|medium|high|xhigh))?(?:-preview)?$"
+    },
+    {
+      "canonical": "gemini-3.5-flash",
+      "pattern": "^gemini-3\\.5-flash(?:-preview)?(?:-(?:none|low|medium|high|xhigh))?(?:-preview)?$"
+    },
+    {
+      "canonical": "gemini-3.6-flash",
+      "pattern": "^gemini-3\\.6-flash(?:-preview)?(?:-(?:none|low|medium|high|xhigh))?(?:-preview)?$"
+    },
+    {
+      "canonical": "gemini-3.7-flash",
+      "pattern": "^gemini-3\\.7-flash(?:-preview)?(?:-(?:none|low|medium|high|xhigh))?(?:-preview)?$"
+    },
+    {
+      "canonical": "gemini-3-pro-preview",
+      "pattern": "^gemini-3-pro(?=-)(?:-preview)?(?:-(?:none|low|medium|high|xhigh))?(?:-preview)?$"
+    },
+    {
+      "canonical": "gemini-3.1-pro-preview",
+      "pattern": "^gemini-3\\.1-pro(?:-preview)?(?:-(?:none|low|medium|high|xhigh))?(?:-preview)?$"
+    },
+    {
+      "canonical": "gpt-5-fast",
+      "pattern": "^gpt-5(?:-(?:low|high))?-fast$"
+    },
+    {
+      "canonical": "gpt-5",
+      "pattern": "^gpt-5(?:-(?:low|high))?$"
+    },
+    {
+      "canonical": "gpt-5-fast",
+      "pattern": "^gpt-5\\.1(?:-(?:low|high))?-fast$"
+    },
+    {
+      "canonical": "gpt-5",
+      "pattern": "^gpt-5\\.1(?:-(?:low|high))?$"
+    },
+    {
+      "canonical": "gpt-5-mini",
+      "pattern": "^gpt-5-mini$"
+    },
+    {
+      "canonical": "xai/grok-4.20-0309-reasoning",
+      "pattern": "^grok-4-20(?:-thinking)?$"
+    },
+    {
+      "canonical": "xai/grok-4.3",
+      "pattern": "^grok-4\\.3(?:-thinking)?$"
+    },
+    {
+      "canonical": "grok-build-0.1",
+      "pattern": "^grok-build-0\\.1$"
+    },
+    {
+      "canonical": "grok-build-0.1",
+      "pattern": "^grok-code-fast-1$"
+    },
+    {
+      "canonical": "grok-build-0.1",
+      "pattern": "^grok-build$"
+    },
+    {
+      "canonical": "grok-build-0.1",
+      "pattern": "^grok-proxy$"
+    },
+    {
+      "canonical": "composer-2.5-fast",
+      "pattern": "^grok-composer-2\\.5-fast$"
+    },
+    {
+      "canonical": "gpt-5.1-codex-max-fast",
+      "pattern": "^gpt-5\\.1-codex-max(?:-(?:low|medium|high|xhigh))?-fast$"
+    },
+    {
+      "canonical": "gpt-5.1-codex-max",
+      "pattern": "^gpt-5\\.1-codex-max(?:-(?:low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "gpt-5.1-codex-mini",
+      "pattern": "^gpt-5\\.1-codex-mini(?:-(?:low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "gpt-5.1-codex-fast",
+      "pattern": "^gpt-5\\.1-codex(?:-(?:low|medium|high|xhigh))?-fast$"
+    },
+    {
+      "canonical": "gpt-5.1-codex",
+      "pattern": "^gpt-5\\.1-codex(?:-(?:low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "gpt-5.2-codex-fast",
+      "pattern": "^gpt-5\\.2-codex(?:-(?:low|high|xhigh))?-fast$"
+    },
+    {
+      "canonical": "gpt-5.2-codex",
+      "pattern": "^gpt-5\\.2-codex(?:-(?:low|high|xhigh))?$"
+    },
+    {
+      "canonical": "gpt-5.2-fast",
+      "pattern": "^gpt-5\\.2(?:-(?:low|high|xhigh))?-fast$"
+    },
+    {
+      "canonical": "gpt-5.2",
+      "pattern": "^gpt-5\\.2(?:-(?:low|high|xhigh))?$"
+    },
+    {
+      "canonical": "gpt-5.3-codex-spark",
+      "pattern": "^gpt-5\\.3-codex-spark-preview(?:-(?:low|high|xhigh))?$"
+    },
+    {
+      "canonical": "gpt-5.3-codex-spark",
+      "pattern": "^gpt-5\\.3-spark$"
+    },
+    {
+      "canonical": "gpt-5.3-codex-fast",
+      "pattern": "^gpt-5\\.3-codex(?:-(?:low|high|xhigh))?-fast$"
+    },
+    {
+      "canonical": "gpt-5.3-codex",
+      "pattern": "^gpt-5\\.3-codex(?:-(?:low|high|xhigh))?$"
+    },
+    {
+      "canonical": "gpt-5.4-mini",
+      "pattern": "^gpt-5\\.4-mini(?:-(?:none|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "gpt-5.4-nano",
+      "pattern": "^gpt-5\\.4-nano(?:-(?:none|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "gpt-5.4-fast",
+      "pattern": "^gpt-5\\.4-(?:low|medium|high|xhigh)-fast$"
+    },
+    {
+      "canonical": "gpt-5.4",
+      "pattern": "^gpt-5\\.4-(?:low|medium|high|xhigh)$"
+    },
+    {
+      "canonical": "gpt-5.5-fast",
+      "pattern": "^gpt-5\\.5(?:-(?:low|medium|high|xhigh|extra-high))?-fast$"
+    },
+    {
+      "canonical": "gpt-5.5",
+      "pattern": "^gpt-5\\.5(?:-(?:low|medium|high|xhigh|extra-high))?$"
+    },
+    {
+      "canonical": "gpt-5.6-sol-fast",
+      "pattern": "^gpt-5\\.6-sol(?:-(?:none|low|medium|high|xhigh|max|ultra))?-fast$"
+    },
+    {
+      "canonical": "gpt-5.6-sol",
+      "pattern": "^gpt-5\\.6-sol(?:-(?:none|low|medium|high|xhigh|max|ultra))?$"
+    },
+    {
+      "canonical": "gpt-5.6-terra-fast",
+      "pattern": "^gpt-5\\.6-terra(?:-(?:none|low|medium|high|xhigh|max))?-fast$"
+    },
+    {
+      "canonical": "gpt-5.6-terra",
+      "pattern": "^gpt-5\\.6-terra(?:-(?:none|low|medium|high|xhigh|max))?$"
+    },
+    {
+      "canonical": "gpt-5.6-luna-fast",
+      "pattern": "^gpt-5\\.6-luna(?:-(?:none|low|medium|high|xhigh|max))?-fast$"
+    },
+    {
+      "canonical": "gpt-5.6-luna",
+      "pattern": "^gpt-5\\.6-luna(?:-(?:none|low|medium|high|xhigh|max))?$"
+    },
+    {
+      "canonical": "gpt-5.6-sol",
+      "pattern": "^(?:gpt-)?daybreak-blue-latest$"
+    },
+    {
+      "canonical": "moonshot/kimi-k2.5",
+      "pattern": "^kimi-k2\\.5$"
+    },
+    {
+      "canonical": "moonshot/kimi-k2.5",
+      "pattern": "^kimi-k2p5$"
+    },
+    {
+      "canonical": "glm-5.2",
+      "pattern": "^glm-5\\.2(?:-(?:high|max))?$"
+    },
+    {
+      "canonical": "gpt-5.3-codex",
+      "pattern": "^[Pp]remium \\((?:[Gg][Pp][Tt]-5\\.3-[Cc]odex|[Cc]odex 5\\.3)\\)$"
+    },
+    {
+      "canonical": "composer-2.5-fast",
+      "pattern": "(?i)^Composer 2\\.5 Fast \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "composer-2.5",
+      "pattern": "(?i)^Composer 2\\.5 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "composer-2-fast",
+      "pattern": "(?i)^Composer 2 Fast \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "composer-2",
+      "pattern": "(?i)^Composer 2 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "grok-4.6-fast",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.6 Fast \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "grok-4.6",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.6 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "grok-4.5-fast",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.5 Fast \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "grok-4.5",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.5 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "claude-haiku-4-5",
+      "pattern": "(?i)^(?:Claude )?Haiku 4\\.5 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "claude-opus-4-8",
+      "pattern": "(?i)^(?:Claude )?Opus 4\\.8 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "claude-opus-5",
+      "pattern": "(?i)^(?:Claude )?Opus 5 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "claude-sonnet-5",
+      "pattern": "(?i)^(?:Claude )?Sonnet 5 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "claude-fable-5",
+      "pattern": "(?i)^(?:Claude )?Fable 5 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gpt-5.5",
+      "pattern": "(?i)^GPT-5\\.5 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gpt-5.6-sol",
+      "pattern": "(?i)^GPT-5\\.6 Sol \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gpt-5.6-terra",
+      "pattern": "(?i)^GPT-5\\.6 Terra \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gpt-5.6-luna",
+      "pattern": "(?i)^GPT-5\\.6 Luna \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gemini-3.1-pro-preview",
+      "pattern": "(?i)^Gemini 3\\.1 Pro \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gemini-3.6-flash",
+      "pattern": "(?i)^Gemini 3\\.6 Flash \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gemini-3.7-flash",
+      "pattern": "(?i)^Gemini 3\\.7 Flash \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "glm-5.2",
+      "pattern": "(?i)^GLM 5\\.2 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "kimi-k3",
+      "pattern": "(?i)^Kimi K3 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "tencent/Hy3-preview",
+      "pattern": "^hy3$"
+    },
+    {
+      "canonical": "gpt-6-luna-fast",
+      "pattern": "^gpt-6-luna(?:-(?:none|low|medium|high|xhigh|max))?-fast$"
+    },
+    {
+      "canonical": "gpt-6-luna",
+      "pattern": "^gpt-6-luna(?:-(?:none|low|medium|high|xhigh|max))?$"
+    },
+    {
+      "canonical": "gpt-6-terra-fast",
+      "pattern": "^gpt-6-terra(?:-(?:none|low|medium|high|xhigh|max|ultra))?-fast$"
+    },
+    {
+      "canonical": "gpt-6-terra",
+      "pattern": "^gpt-6-terra(?:-(?:none|low|medium|high|xhigh|max|ultra))?$"
+    },
+    {
+      "canonical": "gpt-6-sol-fast",
+      "pattern": "^gpt-6-sol(?:-(?:none|low|medium|high|xhigh|max|ultra))?-fast$"
+    },
+    {
+      "canonical": "gpt-6-sol",
+      "pattern": "^gpt-6-sol(?:-(?:none|low|medium|high|xhigh|max|ultra))?$"
+    },
+    {
+      "canonical": "gpt-6-astra-fast",
+      "pattern": "^gpt-6-astra(?:-(?:none|low|medium|high|xhigh|max))?-fast$"
+    },
+    {
+      "canonical": "gpt-6-astra",
+      "pattern": "^gpt-6-astra(?:-(?:none|low|medium|high|xhigh|max))?$"
+    },
+    {
+      "canonical": "gpt-6-luna",
+      "pattern": "(?i)^GPT-6 Luna \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gpt-6-terra",
+      "pattern": "(?i)^GPT-6 Terra \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gpt-6-sol",
+      "pattern": "(?i)^GPT-6 Sol \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gpt-6-astra",
+      "pattern": "(?i)^GPT-6 Astra \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gpt-6-astra",
+      "pattern": "(?i)^(unorouter/)?gpt-6-astra$"
+    },
+    {
+      "pattern": "^(?:anthropic/)?openai/gpt-5\\.6-luna(?:-(?:none|low|medium|high|xhigh|max))?$",
+      "canonical": "gpt-5.6-luna"
+    },
+    {
+      "pattern": "^(?:anthropic/)?openai/gpt-5\\.6-sol(?:-(?:none|low|medium|high|xhigh|max|ultra))?$",
+      "canonical": "gpt-5.6-sol"
+    },
+    {
+      "pattern": "^(?:anthropic/)?openai/gpt-5\\.6-terra(?:-(?:none|low|medium|high|xhigh|max))?$",
+      "canonical": "gpt-5.6-terra"
+    },
+    {
+      "pattern": "^(?:anthropic/)?openai/gpt-6-luna(?:-(?:none|low|medium|high|xhigh|max))?$",
+      "canonical": "gpt-6-luna"
+    },
+    {
+      "pattern": "^(?:anthropic/)?openai/gpt-6-sol(?:-(?:none|low|medium|high|xhigh|max|ultra))?$",
+      "canonical": "gpt-6-sol"
+    },
+    {
+      "pattern": "^(?:anthropic/)?openai/gpt-6-astra(?:-(?:none|low|medium|high|xhigh|max))?$",
+      "canonical": "gpt-6-astra"
+    },
+    {
+      "pattern": "^(?:anthropic/)?openai/gpt-5\\.4$",
+      "canonical": "gpt-5.4"
+    }
+  ],
+  "fast_multipliers": {
+    "claude-opus-5": 2.0,
+    "gpt-5": 2.0,
+    "gpt-5.1-codex": 2.0,
+    "gpt-5.1-codex-max": 2.0,
+    "gpt-5.2": 2.0,
+    "gpt-5.2-codex": 2.0,
+    "gpt-5.3-codex": 2.0,
+    "gpt-5.4": 2.0,
+    "gpt-5.5": 2.5,
+    "gpt-5.6-luna": 2.0,
+    "gpt-5.6-sol": 2.0,
+    "gpt-5.6-terra": 2.0,
+    "gpt-6-luna": 2.0,
+    "gpt-6-terra": 2.0,
+    "gpt-6-sol": 2.0,
+    "gpt-6-astra": 2.0
+  },
+  "pricing": {
+    "XiaomiMiMo/MiMo-V2.5": {
+      "$comment": "models.dev capitalised variant; same official MiMo-V2.5 card (would otherwise resolve to $0.40 provider rate).",
+      "cache_read_per_million": 0.0028,
+      "cache_write_per_million": 0.14,
+      "input_per_million": 0.14,
+      "output_per_million": 0.28
+    },
+    "XiaomiMiMo/MiMo-V2.5-Pro": {
+      "$comment": "models.dev capitalised pro variant; same official card.",
+      "cache_read_per_million": 0.0036,
+      "cache_write_per_million": 0.435,
+      "input_per_million": 0.435,
+      "output_per_million": 0.87
+    },
+    "auto": {
+      "cache_read_per_million": 0.25,
+      "cache_write_per_million": 1.25,
+      "input_per_million": 1.25,
+      "output_per_million": 6.0
+    },
+    "claude-4-sonnet-1m": {
+      "$comment": "Cursor's long-context Sonnet 4 tier: the whole request bills at the >200k rate.",
+      "cache_read_per_million": 0.6,
+      "cache_write_per_million": 7.5,
+      "input_per_million": 6.0,
+      "output_per_million": 22.5
+    },
+    "claude-opus-4-7-fast": {
+      "$comment": "Cursor bills Opus 4.7 fast mode at these rates; the models.dev entry carries higher (stale) numbers, so this override wins.",
+      "cache_read_per_million": 3.0,
+      "cache_write_per_million": 37.5,
+      "input_per_million": 30.0,
+      "output_per_million": 150.0
+    },
+    "claude-opus-4-8-fast": {
+      "$comment": "Cursor states Opus 4.8 fast mode is 3x lower per-token than Opus 4.7 fast mode (= 2x the Opus 4.8 base rate, matching LiteLLM's fast multiplier); the models.dev entry disagrees, so this override wins.",
+      "cache_read_per_million": 1.0,
+      "cache_write_per_million": 12.5,
+      "input_per_million": 10.0,
+      "output_per_million": 50.0
+    },
+    "claude-opus-5": {
+      "$comment": "Claude Opus 5 launch pricing per anthropic.com/news/claude-opus-5: $5 input / $25 output per million, plus the standard Anthropic cache multipliers (1.25x 5m cache write, 0.1x cache read). LiteLLM, models.dev, and Cursor have not listed the model yet, so it would otherwise show as an unpriced model.",
+      "cache_read_per_million": 0.5,
+      "cache_write_per_million": 6.25,
+      "input_per_million": 5.0,
+      "output_per_million": 25.0
+    },
+    "claude-opus-5-fast": {
+      "$comment": "Opus 5 fast mode: the launch announcement prices it at twice the Opus 5 base rate, matching the fast multiplier already used for Opus 4.8.",
+      "cache_read_per_million": 1.0,
+      "cache_write_per_million": 12.5,
+      "input_per_million": 10.0,
+      "output_per_million": 50.0
+    },
+    "composer-1": {
+      "cache_read_per_million": 0.125,
+      "cache_write_per_million": 1.25,
+      "input_per_million": 1.25,
+      "output_per_million": 10.0
+    },
+    "composer-1.5": {
+      "cache_read_per_million": 0.35,
+      "cache_write_per_million": 3.5,
+      "input_per_million": 3.5,
+      "output_per_million": 17.5
+    },
+    "composer-2": {
+      "cache_read_per_million": 0.2,
+      "cache_write_per_million": 0.5,
+      "input_per_million": 0.5,
+      "output_per_million": 2.5
+    },
+    "composer-2-fast": {
+      "cache_read_per_million": 0.35,
+      "cache_write_per_million": 1.5,
+      "input_per_million": 1.5,
+      "output_per_million": 7.5
+    },
+    "composer-2.5": {
+      "cache_read_per_million": 0.2,
+      "cache_write_per_million": 0.5,
+      "input_per_million": 0.5,
+      "output_per_million": 2.5
+    },
+    "composer-2.5-fast": {
+      "cache_read_per_million": 0.5,
+      "cache_write_per_million": 3.0,
+      "input_per_million": 3.0,
+      "output_per_million": 15.0
+    },
+    "deepseek-v4-flash": {
+      "$comment": "DeepSeek V4 Flash official API rates (api-docs.deepseek.com/quick_start/pricing, verified 2026-08-11 vs OpenRouter/Requesty/BenchLM). Pinned here because the LiteLLM snapshot omits the cache-write lane (resolves 0.0); DeepSeek bills cache-creation at the input rate, matching models.dev's 0.14.",
+      "cache_read_per_million": 0.0028,
+      "cache_write_per_million": 0.14,
+      "input_per_million": 0.14,
+      "output_per_million": 0.28
+    },
+    "deepseek-v4-flash-free": {
+      "$comment": "Free tier: real $0 model. Pinned because the primary catalog fuzzy-matches 'deepseek-v4-flash-free' onto the paid 'deepseek-v4-flash' entry before the models.dev exact $0 entry is reached.",
+      "cache_read_per_million": 0,
+      "cache_write_per_million": 0,
+      "input_per_million": 0,
+      "output_per_million": 0
+    },
+    "deepseek-v4-pro": {
+      "$comment": "DeepSeek V4 Pro official API rates (api-docs.deepseek.com/quick_start/pricing, verified 2026-08-12 vs OpenRouter/deepseek.ai). 31 May 2026 cut from $1.74/$3.48 to $0.435/$0.87 (75% off). Pinned because the LiteLLM snapshot omits the cache-write lane (resolves 0.0) and models.dev's capitalized deepseek-ai/DeepSeek-V4-Pro entry still carries the pre-cut rates.",
+      "cache_read_per_million": 0.003625,
+      "cache_write_per_million": 0.435,
+      "input_per_million": 0.435,
+      "output_per_million": 0.87
+    },
+    "deepseek/deepseek-v4-flash": {
+      "$comment": "Hermes records the provider-prefixed id; same official DeepSeek V4 Flash card as the bare alias.",
+      "cache_read_per_million": 0.0028,
+      "cache_write_per_million": 0.14,
+      "input_per_million": 0.14,
+      "output_per_million": 0.28
+    },
+    "deepseek/deepseek-v4-pro": {
+      "$comment": "Hermes records the provider-prefixed id; same official DeepSeek V4 Pro card as the bare alias.",
+      "cache_read_per_million": 0.003625,
+      "cache_write_per_million": 0.435,
+      "input_per_million": 0.435,
+      "output_per_million": 0.87
+    },
+    "gemini-3.6-flash": {
+      "$comment": "Google Gemini 3.6 Flash. Bundled LiteLLM/models.dev snapshots do not carry it yet; Cursor and LiteLLM agree on these API rates. Cache write is unpublished, so it defaults to input.",
+      "cache_read_per_million": 0.15,
+      "cache_write_per_million": 1.5,
+      "input_per_million": 1.5,
+      "output_per_million": 7.5
+    },
+    "gemini-3.7-flash": {
+      "$comment": "Google Gemini 3.7 Flash introductory API rate. Cursor's table lists output at $3.50; Google and LiteLLM publish $3.75, which is the API rate Cursor bills. Cache write is unpublished, so it defaults to input.",
+      "cache_read_per_million": 0.075,
+      "cache_write_per_million": 0.75,
+      "input_per_million": 0.75,
+      "output_per_million": 3.75
+    },
+    "github_bugbot": {
+      "cache_read_per_million": 0.5,
+      "cache_write_per_million": 5.0,
+      "input_per_million": 5.0,
+      "output_per_million": 30.0
+    },
+    "gpt-5.6-luna": {
+      "cache_read_per_million": 0.02,
+      "cache_write_per_million": 0.25,
+      "input_per_million": 0.2,
+      "output_per_million": 1.2
+    },
+    "gpt-5.6-sol": {
+      "$comment": "OpenAI GPT-5.6 Sol official Standard rates (developers.openai.com/api/docs/pricing).",
+      "input_per_million": 4.0,
+      "cache_write_per_million": 5.0,
+      "cache_read_per_million": 0.4,
+      "output_per_million": 20.0
+    },
+    "gpt-5.6-terra": {
+      "cache_read_per_million": 0.2,
+      "cache_write_per_million": 2.5,
+      "input_per_million": 2.0,
+      "output_per_million": 12.0
+    },
+    "grok-4.5": {
+      "$comment": "Cursor + SpaceXAI first-party model. Cache write not published separately; defaults to input.",
+      "cache_read_per_million": 0.5,
+      "cache_write_per_million": 2.0,
+      "input_per_million": 2.0,
+      "output_per_million": 6.0
+    },
+    "grok-4.5-fast": {
+      "cache_read_per_million": 1.0,
+      "cache_write_per_million": 4.0,
+      "input_per_million": 4.0,
+      "output_per_million": 12.0
+    },
+    "grok-4.6": {
+      "$comment": "Cursor + SpaceXAI first-party model. Cache write not published separately; defaults to input. Cursor lists a 50% launch discount for one week starting 2026-08-12; rates below are the numbers on the pricing table as of 2026-08-13.",
+      "cache_read_per_million": 0.5,
+      "cache_write_per_million": 2.0,
+      "input_per_million": 2.0,
+      "output_per_million": 6.0
+    },
+    "grok-4.6-fast": {
+      "cache_read_per_million": 1.0,
+      "cache_write_per_million": 4.0,
+      "input_per_million": 4.0,
+      "output_per_million": 12.0
+    },
+    "kimi-k2.7-code": {
+      "$comment": "Cursor's published Kimi K2.7 Code rates. Public catalogs disagree (some bare keys are $0), so this override wins.",
+      "cache_read_per_million": 0.19,
+      "cache_write_per_million": 0.95,
+      "input_per_million": 0.95,
+      "output_per_million": 4.0
+    },
+    "kimi-k3": {
+      "$comment": "Cursor's published Kimi K3 rates (Moonshot). Cursor lists no separate cache-write fee, so cache writes bill at the input rate, same as the Kimi K2.7 Code entry. Neither LiteLLM nor models.dev carries the model.",
+      "cache_read_per_million": 0.3,
+      "cache_write_per_million": 3.0,
+      "input_per_million": 3.0,
+      "output_per_million": 15.0
+    },
+    "meta/muse-spark-1.2": {
+      "$comment": "Provider-prefixed Muse Spark 1.2; same official $1.25/$0.15/$4.25 card as bare.",
+      "cache_read_per_million": 0.15,
+      "cache_write_per_million": 1.25,
+      "input_per_million": 1.25,
+      "output_per_million": 4.25
+    },
+    "meta/muse-spark-1.2-contributor": {
+      "$comment": "Provider-prefixed Muse Spark 1.2 Contributor; same discounted $0.10/$0.002/$0.20 card as bare contributor.",
+      "cache_read_per_million": 0.002,
+      "cache_write_per_million": 0.1,
+      "input_per_million": 0.1,
+      "output_per_million": 0.2
+    },
+    "mimo-v2.5": {
+      "$comment": "Xiaomi MiMo-V2.5 official overseas rates (mimo.mi.com/docs/price/pay-as-you-go, verified 2026-08-19 vs OpenRouter xiaomi/mimo-v2.5). Input cache hit 98% discount (0.0028 vs 0.14). Pinned because models.dev's xiaomi/MiMo entries carry $0.40 provider rate and LiteLLM has no entry \u2014 without pin the provider-prefixed id would fuzzy-match wrong.",
+      "cache_read_per_million": 0.0028,
+      "cache_write_per_million": 0.14,
+      "input_per_million": 0.14,
+      "output_per_million": 0.28
+    },
+    "mimo-v2.5-free": {
+      "$comment": "Free tier $0 \u2014 pinned to prevent fuzzy match onto paid mimo-v2.5 (same class as deepseek-v4-flash-free).",
+      "cache_read_per_million": 0,
+      "cache_write_per_million": 0,
+      "input_per_million": 0,
+      "output_per_million": 0
+    },
+    "mimo-v2.5-pro": {
+      "$comment": "Xiaomi MiMo-V2.5-Pro official overseas rates (mimo.mi.com/docs/price/pay-as-you-go, verified 2026-08-19 vs OpenRouter xiaomi/mimo-v2.5-pro). $0.435 input / $0.87 output / $0.0036 cache hit. Pinned because models.dev entry carries $0.40/$0.80/$0.003 (pre-update).",
+      "cache_read_per_million": 0.0036,
+      "cache_write_per_million": 0.435,
+      "input_per_million": 0.435,
+      "output_per_million": 0.87
+    },
+    "mimo-v2.5-pro-free": {
+      "$comment": "Free tier pro $0 \u2014 prevents fuzzy onto paid pro.",
+      "cache_read_per_million": 0,
+      "cache_write_per_million": 0,
+      "input_per_million": 0,
+      "output_per_million": 0
+    },
+    "mimo/mimo-v2.5": {
+      "$comment": "Hermes records mimo/mimo-v2.5 via alias; same official card as bare mimo-v2.5.",
+      "cache_read_per_million": 0.0028,
+      "cache_write_per_million": 0.14,
+      "input_per_million": 0.14,
+      "output_per_million": 0.28
+    },
+    "mimo/mimo-v2.5-pro": {
+      "$comment": "Hermes alias for pro; same official MiMo-V2.5-Pro card.",
+      "cache_read_per_million": 0.0036,
+      "cache_write_per_million": 0.435,
+      "input_per_million": 0.435,
+      "output_per_million": 0.87
+    },
+    "muse-spark-1.1": {
+      "$comment": "Meta Muse Spark 1.1 official API pricing (dev.meta.ai/docs/getting-started/pricing-rate-limits, verified 2026-08-20 via LiteLLM): $1.25 input / $4.25 output per M, cache read $0.15/M. Pinned because no bundled catalog carries the model at build time.",
+      "cache_read_per_million": 0.15,
+      "cache_write_per_million": 1.25,
+      "input_per_million": 1.25,
+      "output_per_million": 4.25
+    },
+    "muse-spark-1.1-contributor": {
+      "$comment": "Meta Muse Spark 1.1 Contributor \u2014 same discounted lane as 1.2-contributor ($0.10/$0.002/$0.20) per dev.meta.ai contributor SKU. Do not price at the base $1.25/$4.25 card.",
+      "cache_read_per_million": 0.002,
+      "cache_write_per_million": 0.1,
+      "input_per_million": 0.1,
+      "output_per_million": 0.2
+    },
+    "muse-spark-1.2": {
+      "$comment": "Meta Muse Spark 1.2 official API pricing (dev.meta.ai/docs/getting-started/pricing-rate-limits, verified 2026-08-20 via LiteLLM): $1.25 input / $4.25 output per M, cache read $0.15/M. Pinned because no bundled catalog carries the model at build time.",
+      "cache_read_per_million": 0.15,
+      "cache_write_per_million": 1.25,
+      "input_per_million": 1.25,
+      "output_per_million": 4.25
+    },
+    "muse-spark-1.2-contributor": {
+      "$comment": "Meta Muse Spark 1.2 Contributor discounted API pricing (dev.meta.ai/docs/getting-started/pricing-rate-limits, verified 2026-08-20 via LiteLLM: meta/muse-spark-1.2-contributor = $0.10 input / $0.002 cache read / $0.20 output per M, 12.5x cheaper than base). Contributor variant is a distinct SKU \u2014 do not price at the base $1.25/$4.25 card.",
+      "cache_read_per_million": 0.002,
+      "cache_write_per_million": 0.1,
+      "input_per_million": 0.1,
+      "output_per_million": 0.2
+    },
+    "xiaomi/mimo-v2.5": {
+      "$comment": "OpenRouter provider-prefixed id; same official MiMo-V2.5 card as bare.",
+      "cache_read_per_million": 0.0028,
+      "cache_write_per_million": 0.14,
+      "input_per_million": 0.14,
+      "output_per_million": 0.28
+    },
+    "xiaomi/mimo-v2.5-pro": {
+      "$comment": "OpenRouter provider-prefixed pro id; same official card.",
+      "cache_read_per_million": 0.0036,
+      "cache_write_per_million": 0.435,
+      "input_per_million": 0.435,
+      "output_per_million": 0.87
+    },
+    "gpt-6-luna": {
+      "$comment": "OpenAI GPT-6 Luna official Standard rates (developers.openai.com/api/docs/models/gpt-6-luna). Fast mode is 2x. Long-context (>272k) handled in CodexLogUsageScanner.",
+      "input_per_million": 0.1,
+      "cache_write_per_million": 0.125,
+      "cache_read_per_million": 0.01,
+      "output_per_million": 0.5
+    },
+    "gpt-6-terra": {
+      "$comment": "No standalone gpt-6-terra on developers.openai.com (Terra remains gpt-5.6-terra). Transitional pin matches gpt-5.6-terra so router slugs still price.",
+      "input_per_million": 2.0,
+      "cache_write_per_million": 2.5,
+      "cache_read_per_million": 0.2,
+      "output_per_million": 12.0
+    },
+    "gpt-6-sol": {
+      "$comment": "OpenAI GPT-6 Sol official Standard rates (developers.openai.com/api/docs/models/gpt-6-sol). Fast mode is 2x.",
+      "input_per_million": 2.0,
+      "cache_write_per_million": 2.5,
+      "cache_read_per_million": 0.2,
+      "output_per_million": 10.0
+    },
+    "gpt-6-astra": {
+      "$comment": "OpenAI GPT-6 Astra official Standard rates (developers.openai.com/api/docs/models/gpt-6-astra). Fast mode is 2x.",
+      "input_per_million": 10.0,
+      "cache_write_per_million": 12.5,
+      "cache_read_per_million": 1.0,
+      "output_per_million": 50.0
+    }
+  },
+  "updated_at": "2026-09-24T19:41:06Z"
+}
