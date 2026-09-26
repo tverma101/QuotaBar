@@ -25,7 +25,6 @@ import SwiftUI
 struct HeaderView: View {
     @Environment(LayoutStore.self) private var layout
     @Environment(WidgetDataStore.self) private var dataStore
-    @Environment(UpdaterController.self) private var updater
     @Environment(PopoverTransparencyStore.self) private var transparency
     @Environment(\.colorScheme) private var colorScheme
     /// The current screen. The footer is fixed chrome keyed off `layout.screen` (it no longer slides
@@ -77,9 +76,7 @@ struct HeaderView: View {
     }
 
     /// The menu's items, mirroring their in-popover entry points. Customize leads, then Settings.
-    /// `autoenablesItems` has no SwiftUI equivalent, so the Check for Updates item disables itself when
-    /// Sparkle can't currently check — e.g. dev builds with no feed, or while a check is already in
-    /// flight. Customize and Settings carry their key equivalents so the menu shows the shortcuts: when
+    /// Customize and Settings carry their key equivalents so the menu shows the shortcuts: when
     /// the menu is open the items handle them; when it's closed the `PopoverKeyReader` monitor
     /// handles (and consumes) them first, so the equivalents can't double-fire. Same split as the Quit
     /// ⌘Q item below.
@@ -98,17 +95,6 @@ struct HeaderView: View {
         Divider()
 
         shareScreenshotMenu
-
-        Button {
-            // Sparkle activates the app and presents its own window — defer until NSMenu finishes
-            // dismissing so Options' Menu host isn't torn down mid-dismiss by activation policy churn.
-            MenuHostSafeNavigation.afterMenuDismiss {
-                updater.checkForUpdates()
-            }
-        } label: {
-            Label("Check for Updates…", systemImage: "arrow.triangle.2.circlepath")
-        }
-        .disabled(!updater.canCheckForUpdates)
 
         Divider()
 

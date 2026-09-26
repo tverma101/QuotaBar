@@ -8,8 +8,6 @@ set -euo pipefail
 #   - uses its own bundle id (com.robinebers.openusage.dev), so it never touches the real installed
 #     app's settings or keychain. To run against the real app's data instead, set BUNDLE_ID to
 #     com.robinebers.openusage below;
-#   - ships no Sparkle feed, so it never checks for or installs updates (test updates with a real
-#     signed + notarized release build — that's the only honest way).
 #
 # Usage: script/build_and_run.sh [run|build|logs|verify]
 # Env:   CODESIGN_IDENTITY  override signing identity (exact name or hash)
@@ -67,8 +65,8 @@ cp "$BUILD_BINARY" "$APP_BINARY"
 cp "$BUILD_CLI_BINARY" "$CLI_BINARY"
 chmod +x "$APP_BINARY"
 chmod +x "$CLI_BINARY"
-# The shared module links Sparkle even though the one-shot CLI never initializes the updater. Helpers
-# sit one directory below Contents, so give dyld the same embedded-framework location as the app binary.
+# Helpers sit one directory below Contents, so give dyld the same embedded-framework location as the app
+# binary, matching where the app's own dependencies are embedded.
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$CLI_BINARY"
 
 # SwiftPM stamps LC_BUILD_VERSION's `sdk` field with the deployment target (macOS 15), not the real
@@ -201,14 +199,8 @@ if [ -z "$CODESIGN_IDENTITY" ]; then
     | /usr/bin/awk -F\" '/Apple Development:/ { print $2; exit }')
 fi
 
-# Embed + sign Sparkle.framework before sealing the app. The executable links Sparkle, so without the
-# embedded framework the build would fail to launch — even though the updater stays dormant here (no
-# SUFeedURL in the Info.plist above; see UpdaterController).
-"$ROOT_DIR/script/embed_sparkle.sh" "$APP_BUNDLE" "$APP_BINARY" "$CODESIGN_IDENTITY" "--options runtime"
-
 if [ -n "$CODESIGN_IDENTITY" ]; then
   /usr/bin/codesign --force --options runtime --sign "$CODESIGN_IDENTITY" "$CLI_BINARY" >/dev/null
-  # Not --deep: the Sparkle framework is already signed above and must keep that signature.
   /usr/bin/codesign --force --options runtime \
     --sign "$CODESIGN_IDENTITY" \
     --entitlements "$SIGN_ENTITLEMENTS" \

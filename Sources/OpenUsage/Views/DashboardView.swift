@@ -20,7 +20,6 @@ struct DashboardView: View {
     @Environment(LayoutStore.self) private var layout
     @Environment(WidgetDataStore.self) private var dataStore
     @Environment(PopoverTransparencyStore.self) private var transparency
-    @Environment(UpdaterController.self) private var updater
     @Environment(\.reduceAnimations) private var reduceAnimations
     @State private var reorderLift: ReorderLift?
     /// The panel height SwiftUI drives — the single animation clock. `PanelHeightModifier` follows it
@@ -504,7 +503,6 @@ struct DashboardView: View {
             DashboardContentView(
                 container: container,
                 layout: layout,
-                updater: updater,
                 reorderSpaceName: Self.reorderSpace,
                 horizontalPadding: Self.outerPadding,
                 bottomGap: Self.contentBottomGap,

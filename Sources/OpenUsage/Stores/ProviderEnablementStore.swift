@@ -29,7 +29,7 @@ final class ProviderEnablementStore {
     /// Posted when the enabled-provider set actually changes. The refresh loop listens for this to wake
     /// early and fetch a newly-enabled provider promptly, instead of waiting out the full interval —
     /// WITHOUT subscribing to the firehose `UserDefaults.didChangeNotification`, which also fires for the
-    /// app's own snapshot-cache writes, Sparkle's update bookkeeping, and unrelated global-domain changes
+    /// app's own snapshot-cache writes, and unrelated global-domain changes
     /// from other processes. Waking on that (with no minimum interval) collapsed the fixed 5-minute
     /// cadence into a refresh storm.
     ///
