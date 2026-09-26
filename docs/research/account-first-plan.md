@@ -126,9 +126,9 @@ tests land in-slice (repo policy). Estimated source LOC excludes tests.
 ## Verification
 
 - Per phase: `swift build` + full `swift test`; new suites land with their phase.
-- Live: `script/build_and_run.sh`, then `~/Library/Logs/OpenUsage/OpenUsage.log` — discovery trail,
+- Live: `script/build_and_run.sh`, then `~/Library/Logs/QuotaBar/QuotaBar.log` — discovery trail,
   identity resolution, and (Phase 1+) account-registry lines.
 - Beta release per phase via the release-swift skill; soak before the next phase merges.
-- CLI/API: `openusage claude` (alias) and `openusage claude@<hash>` (direct);
+- CLI/API: `quotabar claude` (alias) and `quotabar claude@<hash>` (direct);
   `curl 127.0.0.1:6736/v1/usage/claude` echoes the requested id.
 - iCloud: two-machine check once Phase 2 lands (migrated writer + old reader and inverse).

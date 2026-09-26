@@ -1,6 +1,6 @@
 # AGENTS.md
 
-OpenUsage is a SwiftPM-based SwiftUI menu-bar app for macOS that shows AI provider usage widgets (Claude, Codex, Cursor, Grok, Devin, and more).
+QuotaBar is a SwiftPM-based SwiftUI menu-bar app for macOS that shows AI provider usage widgets (Claude, Codex, Cursor, Grok, Devin, and more).
 
 This file documents the engineering conventions for the project. Read it before contributing.
 
@@ -8,32 +8,39 @@ This file documents the engineering conventions for the project. Read it before 
 
 AGENTS.md is the source of truth for agent instructions in this repository. CLAUDE.md files may only point to the nearest AGENTS.md file with `@AGENTS.md`; do not add guidance, duplicate instructions, or project rules to CLAUDE.md.
 
-> **Repository note:** This is the native Swift edition of OpenUsage. Active development happens on the `main` branch. (NOT the legacy Tauri version which now sits in the `tauri-legacy` branch)
+> **Repository note:** QuotaBar is a private fork of [OpenUsage](https://github.com/robinebers/openusage).
+> Do not use the OpenUsage name or logo in code, UI, or assets — see `TRADEMARK.md`. Keep `LICENSE`,
+> `CODE_OF_CONDUCT.md`, `SECURITY.md`, `CONTRIBUTING.md` and upstream attribution intact, and read
+> `UPSTREAM.md` before touching shared code so local deltas stay traceable.
 
 ## Releases
 
-`main` is the active development line; it ships via `.github/workflows/release.yml` (Sparkle appcast on `gh-pages`). Cut releases with the release-swift skill.
+There is no release automation. `main` is the development line; releases are built and installed by
+hand with `./script/build_and_run.sh build`.
 
 ### Guardrails (do not break)
-- Versions are `0.7.x` and up. Never reuse a `0.6.x` number — those are the original edition's released tags, now frozen on the `tauri-legacy` branch (final release `v0.6.28`).
-- **Never increase the version number on your own initiative — always ask for explicit approval first.** The version is a deliberate owner decision: propose the number and wait for explicit sign-off before tagging or cutting a release.
-- Beta releases use `-beta.N` tags and stay GitHub pre-releases on Sparkle's beta channel. Stable releases use plain tags and become GitHub "Latest".
-- Stable releases must carry forward the legacy `latest.json` so any remaining `0.6.x` installs can still update to `v0.6.28`. `release.yml` handles this; verify it with the release-swift skill.
-- Never leave a release in Draft, and never ship blank notes: the release-swift skill generates the changelog and verifies the published release after every cut.
+- **Never increase the version number on your own initiative — ask for explicit approval first.**
+  Versions continue upstream's `0.7.x` line so the two codebases stay comparable.
+- The app has **no auto-update path**. Sparkle needs a public repository; this one is private. Do not
+  reintroduce an updater without also solving feed hosting.
+- iCloud Sync is inert: its container must be registered in the owner's Apple Developer team first.
+  Do not treat the Settings section as a working feature.
 
 ## Architecture
 
 - SwiftPM executable target; SwiftUI content hosted in an AppKit-owned `NSStatusItem` + custom key-capable `NSPanel`.
+- The CLI product is `quotabar-cli`, not `quotabar`: a bare `quotabar` collides with the `QuotaBar`
+  library target's build output on case-insensitive filesystems and breaks the app link step.
 - Swift 6 with strict concurrency.
 - Providers implement the small `ProviderRuntime` protocol: an auth store reads credentials already on the user's machine, a usage client calls the provider's API, and a mapper normalizes the response into `MetricLine` values. The UI renders those normalized values.
 - See `docs/` for behavior docs and the developer docs (architecture overview, adding a provider).
 
 ## Providers
 
-Conventions for the per-provider modules under `Sources/OpenUsage/Providers/<Name>/`.
+Conventions for the per-provider modules under `Sources/QuotaBar/Providers/<Name>/`.
 
 - **Structure:** one folder per provider with an auth store (reads credentials already on the user's machine), a usage client (calls the provider API), and a mapper (normalizes to `MetricLine`), conforming to `ProviderRuntime` — `refresh()` plus `hasLocalCredentials()`, the local-only credential probe used by first-run detection (`FirstRunSeeder`) and by new-provider detection on the first launch after the provider ships (`NewProviderSeeder`); mirror the same local credential sources and usability filters that `refresh()` starts with, reusing the auth-store loaders instead of adding a second credential-reading path. See `docs/adding-a-provider.md` and `docs/provider-enablement.md`.
-- **Model pricing:** all spend imputation (Claude, Codex, Cursor, Grok) prices through the shared engine in `Sources/OpenUsage/Pricing/` (see `docs/pricing.md`). Cursor-native model rates and alias rules live in `Sources/OpenUsage/Resources/pricing_supplement.json` — sync new or changed models from [Cursor models & pricing](https://cursor.com/docs/models-and-pricing.md) (update `updated_at`, pricing entries, and `alias_rules` for CSV model slugs); merging to `main` publishes it to gh-pages, so installed apps pick it up without a release. The bundled LiteLLM/models.dev snapshots regenerate with `script/update_pricing_snapshots.sh` (a release-time chore).
+- **Model pricing:** all spend imputation (Claude, Codex, Cursor, Grok) prices through the shared engine in `Sources/QuotaBar/Pricing/` (see `docs/pricing.md`). Cursor-native model rates and alias rules live in `Sources/QuotaBar/Resources/pricing_supplement.json` — sync new or changed models from [Cursor models & pricing](https://cursor.com/docs/models-and-pricing.md) (update `updated_at`, pricing entries, and `alias_rules` for CSV model slugs). QuotaBar reads the supplement from **upstream's** public URL rather than publishing its own, so upstream's edits still reach installed apps. The bundled LiteLLM/models.dev snapshots regenerate with `script/update_pricing_snapshots.sh`.
 - **Default order:** Claude, Codex, Cursor first (the established providers, in that order), then every other provider alphabetically by display name (Antigravity, Devin, Grok, …). The order is the array order in `AppContainer`, which seeds `LayoutStore`'s default provider order (and `resetToDefault`). A new provider slots into the alphabetical tail.
 - **Metric placement defaults:** when adding or changing a metric, confirm its four defaults with the owner before choosing — never pick silently:
   1. enabled on/off (`DefaultLayout.metricIDs`),
@@ -75,5 +82,5 @@ Always fail loudly into error logging (log file, PostHog) and show friendly erro
 ## UI
 
 - Use title case for any hardcoded copy used as a title.
-- Match the existing design language; OpenUsage has a specific look and feel.
+- Match the existing design language; QuotaBar has a specific look and feel, inherited from OpenUsage.
 - Only add tooltips (`hoverTooltip`) when explicitly asked to. Don't add them proactively to new controls.

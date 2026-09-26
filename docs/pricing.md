@@ -1,16 +1,16 @@
 # Model Pricing
 
-How OpenUsage turns token counts into the estimated dollars on the Claude, Codex, Cursor, and Grok spend tiles. Grok uses the cost recorded in its session logs when available and only estimates older turns without one. OpenRouter and OpenCode do not use these estimates because their sources already report the cost directly.
+How QuotaBar turns token counts into the estimated dollars on the Claude, Codex, Cursor, and Grok spend tiles. Grok uses the cost recorded in its session logs when available and only estimates older turns without one. OpenRouter and OpenCode do not use these estimates because their sources already report the cost directly.
 
 ## Where prices come from
 
 Prices are layered from three sources; when the same model appears in more than one, the higher layer wins:
 
-1. **OpenUsage pricing supplement** — a small JSON file maintained in this repo and published to GitHub Pages. It covers models no public catalog carries (Cursor-native models like `auto` and `composer-*`), fast-variant multipliers, and alias rules that map provider log/CSV slugs to catalog keys.
+1. **QuotaBar pricing supplement** — a small JSON file maintained in this repo and published to GitHub Pages. It covers models no public catalog carries (Cursor-native models like `auto` and `composer-*`), fast-variant multipliers, and alias rules that map provider log/CSV slugs to catalog keys.
 2. **LiteLLM** — the community-maintained `model_prices_and_context_window.json`, covering the vast majority of API-priced models.
 3. **models.dev** — a gap-filler for models LiteLLM misses (e.g. some brand-new or niche models).
 
-The app ships with bundled snapshots of all three, so pricing works offline and on first launch. At runtime each source is refetched about once an hour (with ETag revalidation) and cached in `~/Library/Application Support/OpenUsage/pricing/`. A refresh never blocks a usage scan — scans always price against the freshest data already on hand.
+The app ships with bundled snapshots of all three, so pricing works offline and on first launch. At runtime each source is refetched about once an hour (with ETag revalidation) and cached in `~/Library/Application Support/QuotaBar/pricing/`. A refresh never blocks a usage scan — scans always price against the freshest data already on hand.
 
 Because the supplement is published to GitHub Pages on merge, a pricing correction reaches installed apps within about an hour — no app update needed.
 
@@ -26,7 +26,7 @@ A model no source can price is left out of the spend figures unless its session 
 
 ## What the estimate includes
 
-Costs are computed per usage event from four token buckets — plain input, cache writes, cache reads, and output — at the model's per-million-token rates, including 1-hour cache-write pricing, long-context tiers, and fast-variant multipliers. Most catalog tiers start above 200k prompt tokens; supported GPT-5.4, GPT-5.5, and GPT-5.6 Codex models switch above 272k input tokens. In either case, the higher rate applies to the whole request. A published cache discount is used when available; Codex cached input falls back to the full input rate when the source publishes no discount. Cursor's export combines many requests into each row, so OpenUsage uses the normal rate there rather than guessing that one request crossed the limit. When a Claude or Grok session records its own cost, that amount is used as-is. Nested Claude advisor usage has no carried cost, so it is priced separately from its tokens using the advisor model. Estimates represent API-rate value rather than a subscription bill.
+Costs are computed per usage event from four token buckets — plain input, cache writes, cache reads, and output — at the model's per-million-token rates, including 1-hour cache-write pricing, long-context tiers, and fast-variant multipliers. Most catalog tiers start above 200k prompt tokens; supported GPT-5.4, GPT-5.5, and GPT-5.6 Codex models switch above 272k input tokens. In either case, the higher rate applies to the whole request. A published cache discount is used when available; Codex cached input falls back to the full input rate when the source publishes no discount. Cursor's export combines many requests into each row, so QuotaBar uses the normal rate there rather than guessing that one request crossed the limit. When a Claude or Grok session records its own cost, that amount is used as-is. Nested Claude advisor usage has no carried cost, so it is priced separately from its tokens using the advisor model. Estimates represent API-rate value rather than a subscription bill.
 
 ## Privacy
 
@@ -34,5 +34,5 @@ The pricing refresh fetches three public price lists (from `raw.githubuserconten
 
 ## Maintainer notes
 
-- **Supplement changes** (new Cursor-native model, price correction, new alias): edit `Sources/OpenUsage/Resources/pricing_supplement.json`, sync entries from [Cursor models & pricing](https://cursor.com/docs/models-and-pricing.md), and update `updated_at` to the current UTC timestamp. On merge to `main`, `.github/workflows/pricing-supplement.yml` publishes it to gh-pages; installed apps pick it up within about an hour. The bundled copy ships with the next release for first launches. The **pricing-update skill** (`.agents/skills/pricing-update/`) walks an agent through the whole sync: pull the Cursor page, diff, edit, validate, and open a PR.
+- **Supplement changes** (new Cursor-native model, price correction, new alias): edit `Sources/QuotaBar/Resources/pricing_supplement.json`, sync entries from [Cursor models & pricing](https://cursor.com/docs/models-and-pricing.md), and update `updated_at` to the current UTC timestamp. On merge to `main`, `.github/workflows/pricing-supplement.yml` publishes it to gh-pages; installed apps pick it up within about an hour. The bundled copy ships with the next release for first launches. The **pricing-update skill** (`.agents/skills/pricing-update/`) walks an agent through the whole sync: pull the Cursor page, diff, edit, validate, and open a PR.
 - **Bundled snapshots** (`pricing_litellm_snapshot.json`, `pricing_models_dev_snapshot.json`): regenerate occasionally (e.g. before a release) with `script/update_pricing_snapshots.sh`. Staleness is harmless — runtime fetches override them.

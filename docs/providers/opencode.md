@@ -13,9 +13,9 @@ from your OpenCode account plus OpenCode's own logs already on your Mac.
 | Today / Yesterday / Last 30 Days | Cost and tokens across all your OpenCode-hosted usage (Go + Zen), including Claude Code sessions routed through the OpenCode gateway |
 | Usage Trend | A day-by-day sparkline of tokens over the last month |
 
-When you have the Go subscription, OpenUsage shows "Go" beside the provider name.
+When you have the Go subscription, QuotaBar shows "Go" beside the provider name.
 
-The Session / Weekly / Monthly meters are **account-wide**: OpenUsage reads them from OpenCode's official
+The Session / Weekly / Monthly meters are **account-wide**: QuotaBar reads them from OpenCode's official
 usage endpoint (`/zen/go/v1/usage`), so they count every client that uses your OpenCode Go account — the
 OpenCode CLI on any machine, Claude Code sessions routed through the gateway (`anthropic/opencode_go/…`
 models), and anything else billed to the account. If the endpoint is unreachable, the meters fall back
@@ -27,8 +27,8 @@ hidden and you'll just see the spend tiles.
 
 OpenCode stores separate credentials for separate products. Only the `opencode-go` API key belongs to
 the Go account-usage endpoint; the sibling `opencode` key is a Zen gateway credential and is never sent
-to the Go endpoint. OpenUsage also accepts app-saved Go keys for additional accounts. An exact duplicate
-key (for example, the same key in `auth.json` and OpenUsage settings) is fetched safely but shown once;
+to the Go endpoint. QuotaBar also accepts app-saved Go keys for additional accounts. An exact duplicate
+key (for example, the same key in `auth.json` and QuotaBar settings) is fetched safely but shown once;
 different keys remain separate even if their current percentages happen to match, because the endpoint
 does not return a stable account id that would justify merging them.
 
@@ -42,7 +42,7 @@ local to this Mac, so they do not change when you swap accounts.
 
 ## Where credentials come from
 
-Use OpenCode as usual. OpenUsage reads OpenCode's local data directory
+Use OpenCode as usual. QuotaBar reads OpenCode's local data directory
 (`~/.local/share/opencode`, or `$OPENCODE_DATA_DIR` / `$XDG_DATA_HOME` if you've set them): the
 `opencode-go` entry in `auth.json` to detect Go usage, and the local SQLite logs for the numbers. There's no login
 prompt and no token to paste. Keys saved through the app's settings are read alongside the `auth.json`
@@ -88,7 +88,7 @@ know surface as a warning instead of a guess.
 
 **Days with a still-running Hermes session are partial.** Hermes writes a session's usage ledger to
 `~/.hermes/state.db` in delayed bursts while the session runs, so the fold's view of an in-progress
-session always trails the actual consumption — and keeps rising until the session ends. OpenUsage
+session always trails the actual consumption — and keeps rising until the session ends. QuotaBar
 detects those sessions (`ended_at` not yet set) and marks the affected day's tiles with the ⓘ marker
 on BOTH the dollars and the token count, and the Usage Trend note explains it — a live session is
 never presented as a settled total. Once the session ends, the ledger finalizes and the numbers
@@ -102,7 +102,7 @@ leaves your Mac.
 
 ## Troubleshooting
 
-- **Everything shows "No data"** — OpenUsage needs OpenCode's local database at
+- **Everything shows "No data"** — QuotaBar needs OpenCode's local database at
   `~/.local/share/opencode/opencode*.db`. Run an OpenCode session, then refresh. (If you're logged into
   Go, the cap meters show at 0% even before your first local message.)
 - **No Session / Weekly / Monthly meters** — those are Go-plan caps; you'll see them when you're logged
@@ -121,7 +121,7 @@ leaves your Mac.
 
 ## Under the hood
 
-OpenUsage reads the assistant-message `cost` and token fields from every `opencode*.db` in the data
+QuotaBar reads the assistant-message `cost` and token fields from every `opencode*.db` in the data
 directory (stable is `opencode.db`, the preview line is `opencode-next.db` — all channels are unioned).
 The Go caps sum the `opencode-go` messages; the spend tiles and trend sum both `opencode-go` (Go) and
 `opencode` (Zen). Claude Code's session logs under `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR`),

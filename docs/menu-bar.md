@@ -4,7 +4,7 @@ Star your most important metrics straight into the menu bar strip.
 
 ## Right-clicking the icon
 
-Right-click (or control-click) the OpenUsage menu bar icon for a quick menu with **Settings** and **Quit**. OpenUsage keeps one status item and one shared panel regardless of provider count, so two Codex accounts and Cursor remain together in the same dashboard instead of looking like duplicate apps.
+Right-click (or control-click) the QuotaBar menu bar icon for a quick menu with **Settings** and **Quit**. QuotaBar keeps one status item and one shared panel regardless of provider count, so two Codex accounts and Cursor remain together in the same dashboard instead of looking like duplicate apps.
 
 ## Starring
 
@@ -24,7 +24,7 @@ Settings → Appearance → Icon Style:
 
 ## Hiding usage while screen sharing
 
-Settings → Privacy → **Hide From Screen Share** (off by default). While your screen is being shared or recorded — a Zoom/Meet/Teams share, a screen recording, macOS Screen Sharing — the strip is replaced with the OpenUsage icon and wordmark, so token counts and spend never show up in front of an audience. The moment the capture ends, your starred metrics come right back. Captures you start yourself (a screen recording, for example) count too, so those get the wordmark as well.
+Settings → Privacy → **Hide From Screen Share** (off by default). While your screen is being shared or recorded — a Zoom/Meet/Teams share, a screen recording, macOS Screen Sharing — the strip is replaced with the QuotaBar icon and wordmark, so token counts and spend never show up in front of an audience. The moment the capture ends, your starred metrics come right back. Captures you start yourself (a screen recording, for example) count too, so those get the wordmark as well.
 
 Detection rides the system's own "an app is capturing the screen" signal — the same one that lights the capture indicator in the menu bar — checked the instant it changes and re-checked every few seconds while the setting is on.
 

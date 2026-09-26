@@ -23,13 +23,13 @@ the ⓘ marker; tokens are always measured.
 
 ## Where the data comes from
 
-Use Hermes as usual. OpenUsage reads Hermes' session database at `~/.hermes/state.db` (or
+Use Hermes as usual. QuotaBar reads Hermes' session database at `~/.hermes/state.db` (or
 `$HERMES_HOME/state.db` if you've set it) — the same SQLite store Hermes keeps its sessions, token
-counters, and billing metadata in. Read-only: OpenUsage never writes to it, and no data leaves your Mac.
+counters, and billing metadata in. Read-only: QuotaBar never writes to it, and no data leaves your Mac.
 
 ## Troubleshooting
 
-- **"Hermes not detected"** — OpenUsage found no `~/.hermes/state.db`. Run Hermes once (CLI or desktop)
+- **"Hermes not detected"** — QuotaBar found no `~/.hermes/state.db`. Run Hermes once (CLI or desktop)
   so it creates the database, then refresh.
 - **"Couldn't read Hermes' state database"** — the database exists but couldn't be read this refresh
   (locked, corrupt, permissions). Quit Hermes and refresh, or check the permissions on `~/.hermes`.
@@ -38,6 +38,6 @@ counters, and billing metadata in. Read-only: OpenUsage never writes to it, and 
 
 ## Under the hood
 
-OpenUsage queries the `sessions` table (period totals, daily series) and `session_model_usage` (the
+QuotaBar queries the `sessions` table (period totals, daily series) and `session_model_usage` (the
 per-model breakdown) with the same read-only sqlite access every other local provider uses. Days are
 grouped in your Mac's local time zone, so they line up with your own calendar.
