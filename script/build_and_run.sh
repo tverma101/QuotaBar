@@ -191,20 +191,30 @@ else
   echo "WARNING: no matching installed iCloud provisioning profile was found; iCloud Sync will be unavailable in this build." >&2
 fi
 
-# Resolve the entitlements actually used for signing. The keychain access group must be the team
-# prefix plus THIS bundle id: a hardcoded group would put a dev build and a production build in the
-# same group, so they would read and overwrite each other's keychain items. Deriving it here keeps
-# dev/prod isolated automatically, with no drift from the committed template.
+# Resolve the entitlements actually used for signing.
 #
-# DEVELOPMENT_TEAM must be the team of the signing identity below. Override it if you sign with a
-# different account.
+# The keychain access group is only claimed when this build is backed by a provisioning profile.
+# An app signed with a bare development certificate and no profile is not authorized for any access
+# group, and declaring one anyway makes launchd refuse to spawn the app (RBSRequestErrorDomain
+# Code=5 / POSIX 163, "Launchd job spawn failed"). So the group is added only once a profile has been
+# resolved above; dev builds fall back to the implicit group derived from the bundle id.
+#
+# Deriving the group from BUNDLE_ID rather than hardcoding it also keeps a dev bundle and a production
+# bundle in different groups, so they cannot read or overwrite each other's keychain items.
+#
+# Note the code, not this entitlement, is what stops the refresh-time Keychain dialogs: provider reads
+# go through `readGenericPasswordForRefresh`, which is silent unless the user asked for a refresh.
 DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-LD48G22523}"
 RESOLVED_ENTITLEMENTS="$DIST_DIR/$APP_DISPLAY.signed.entitlements.plist"
 /bin/cp "$SIGN_ENTITLEMENTS" "$RESOLVED_ENTITLEMENTS"
-/usr/libexec/PlistBuddy -c "Add :keychain-access-groups array" "$RESOLVED_ENTITLEMENTS" >/dev/null
-/usr/libexec/PlistBuddy -c "Add :keychain-access-groups:0 string $DEVELOPMENT_TEAM.$BUNDLE_ID" \
-  "$RESOLVED_ENTITLEMENTS" >/dev/null
-echo "==> keychain access group: $DEVELOPMENT_TEAM.$BUNDLE_ID"
+if [ -n "$ICLOUD_PROVISIONING_PROFILE" ]; then
+  /usr/libexec/PlistBuddy -c "Add :keychain-access-groups array" "$RESOLVED_ENTITLEMENTS" >/dev/null
+  /usr/libexec/PlistBuddy -c "Add :keychain-access-groups:0 string $DEVELOPMENT_TEAM.$BUNDLE_ID" \
+    "$RESOLVED_ENTITLEMENTS" >/dev/null
+  echo "==> keychain access group: $DEVELOPMENT_TEAM.$BUNDLE_ID"
+else
+  echo "==> no provisioning profile: omitting keychain-access-groups (unclaimed groups block launch)"
+fi
 
 # Pick a stable Apple Development identity so ad-hoc cdhash churn doesn't re-trigger
 # permission prompts on every rebuild. Fall back to ad-hoc only if none is found.
