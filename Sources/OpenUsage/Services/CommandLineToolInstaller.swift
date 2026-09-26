@@ -3,7 +3,7 @@ import Foundation
 import Observation
 
 /// Installs the bundled one-shot CLI on the stock macOS PATH without copying it out of the app.
-/// The symlink survives in-place Sparkle updates because its destination path stays stable.
+/// The symlink points at a stable in-bundle path, so replacing the app bundle leaves it working.
 @MainActor
 @Observable
 final class CommandLineToolInstaller {

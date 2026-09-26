@@ -48,7 +48,6 @@ private final class MenuBarStatusItem {
 @MainActor
 final class StatusItemController: NSObject {
     private let container: AppContainer
-    private let updater: UpdaterController
     private let statusItems: [MenuBarStatusItem]
     private let panel: MenuBarPanel
     private let heightController: PanelHeightController
@@ -68,9 +67,8 @@ final class StatusItemController: NSObject {
     /// Corner radius of the panel surface; tuned to read like a system menu-bar popover.
     private static let cornerRadius: CGFloat = 13
 
-    init(container: AppContainer, updater: UpdaterController) {
+    init(container: AppContainer) {
         self.container = container
-        self.updater = updater
 
         self.statusItems = Self.statusItemScopes().map { _ in MenuBarStatusItem(container: container) }
 
@@ -304,7 +302,6 @@ final class StatusItemController: NSObject {
                 .environment(container.layout)
                 .environment(container.dataStore)
                 .environment(container.transparency)
-                .environment(updater)
                 .environment(\.codexResetClaim, container.codexResetClaim)
         )
     }

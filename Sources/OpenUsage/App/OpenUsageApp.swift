@@ -6,7 +6,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
     private var singleInstanceLock: SingleInstanceLock.Token?
     private var isReloadingForCodexAccount = false
-    private let updater = UpdaterController()
 
     public override init() {
         super.init()
@@ -89,9 +88,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.reloadAfterCodexAccountRegistration()
         }
         self.container = container
-        statusItemController = StatusItemController(container: container, updater: updater)
-        // Starts background update checks (release build only; dormant under preview/`swift run`).
-        updater.start()
+        statusItemController = StatusItemController(container: container)
     }
 
     /// Account discovery is normally a launch-time operation because provider runtimes own their

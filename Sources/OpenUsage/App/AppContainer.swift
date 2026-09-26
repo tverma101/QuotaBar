@@ -293,8 +293,8 @@ final class AppContainer {
     /// optional-analytics choice and install id stay independent of settings changes — see the
     /// `TelemetryStore` note above), the iCloud sync device identity, provider credentials, and
     /// cached usage snapshots.
-    /// Launch at Login and the Sparkle update preferences live outside the container; the Settings
-    /// screen resets those alongside this call.
+    /// Launch at Login lives outside the container (in the system's login-item registry); the
+    /// Settings screen resets that alongside this call.
     func resetAllSettings() {
         layout.resetToDefault()
         // The menu-bar Icon Style is a Settings preference, not part of the Customize layout reset.
@@ -339,7 +339,7 @@ final class AppContainer {
     ///
     /// The wake is deliberately scoped to `ProviderEnablementStore.didChangeNotification` — NOT the
     /// firehose `UserDefaults.didChangeNotification`, which fires for the app's own snapshot-cache writes,
-    /// Sparkle's update bookkeeping, and unrelated global-domain changes from other processes. Waking on
+    /// and unrelated global-domain changes from other processes. Waking on
     /// that, with no minimum interval before re-refreshing, collapsed the fixed 5-minute cadence into a
     /// refresh storm.
     private static func makeMemoryPressureSource(dataStore: WidgetDataStore) -> DispatchSourceMemoryPressure {

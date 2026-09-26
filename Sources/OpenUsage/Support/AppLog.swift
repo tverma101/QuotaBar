@@ -10,7 +10,6 @@ enum LogTag: String, Sendable {
     case auth
     case keychain
     case menubar
-    case updates
     case config
     case statusItem = "statusitem"
     case localAPI = "localapi"

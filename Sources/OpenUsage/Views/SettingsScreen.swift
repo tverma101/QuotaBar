@@ -13,7 +13,6 @@ import UserNotifications
 struct SettingsScreen: View {
     @Environment(AppContainer.self) private var container
     @Environment(LayoutStore.self) private var layout
-    @Environment(UpdaterController.self) private var updater
 
     @State private var launchAtLogin = LaunchAtLoginSetting()
     @State private var commandLineTool = CommandLineToolInstaller()
@@ -65,7 +64,6 @@ struct SettingsScreen: View {
             privacySection
             commandLineSection
             advancedSection
-            updatesSection
             // Mirror of the Customize cross-link — the layout controls live on the other screen.
             ScreenCrossLinkRow(
                 systemImage: "slider.horizontal.3",
@@ -240,37 +238,6 @@ struct SettingsScreen: View {
         }
     }
 
-    @ViewBuilder
-    private var updatesSection: some View {
-        @Bindable var updater = updater
-        // Visible whenever the updater is active (only the signed release build ships a feed; the
-        // dev build and a bare `swift run`, with no feed, hide this).
-        if updater.isActive {
-            section("Updates") {
-                row("Update Automatically") {
-                    Toggle("", isOn: $updater.automaticallyChecksForUpdates)
-                        .settingsSwitchStyle()
-                }
-                row("Beta Updates") {
-                    Toggle("", isOn: $updater.betaChannelEnabled)
-                        .settingsSwitchStyle()
-                        .hoverTooltip("Receive pre-release builds before they ship to everyone")
-                }
-                // No version label here — the footer already shows it. The frame goes on the label so
-                // the glass background stretches the full row width instead of hugging the text.
-                // (Glass on macOS 26+, bordered fallback on macOS 15.)
-                Button { updater.checkForUpdates() } label: {
-                    Text("Check for Updates…").frame(maxWidth: .infinity)
-                }
-                .glassButtonStyle()
-                .controlSize(.regular)
-                .disabled(!updater.canCheckForUpdates)
-                .padding(.horizontal, 12)
-                .padding(.vertical, density.controlRowPadding)
-            }
-        }
-    }
-
     // MARK: - Notifications
 
     /// Quota pace notifications: three per-trigger toggles (no master switch — turn all three off to
@@ -439,8 +406,7 @@ struct SettingsScreen: View {
             }
             // The Settings-wide destructive reset (issue #602). Red label, confirmation alert;
             // confirming restores every preference to its default — the container-owned stores plus
-            // the two view-scoped ones (Launch at Login lives in the system's login-item registry,
-            // the update preferences on the updater controller).
+            // the view-scoped one (Launch at Login, which lives in the system's login-item registry).
             Button {
                 isPresentingResetConfirm = true
             } label: {
@@ -456,7 +422,6 @@ struct SettingsScreen: View {
                 Button("Reset", role: .destructive) {
                     withAnimation(Motion.spring) { container.resetAllSettings() }
                     launchAtLogin.update(to: false)
-                    updater.resetToDefaults()
                     shortcutFieldGeneration += 1
                 }
                 Button("Cancel", role: .cancel) {}

@@ -66,7 +66,7 @@ enum SettingsSchema {
 ///   - **Legacy install (predates this key):** treated as version 0 and migrated forward from there.
 ///
 /// Crucially there is NO wipe: an app-version change never discards settings. (The old reset silently
-/// cleared `betaUpdatesEnabled`, dropping users off the Early Access channel — see `UpdaterController`.)
+/// cleared unrelated preferences that happened to live in the same domain.)
 enum SettingsMigrator {
     /// Where the applied schema version is recorded, in the same standard domain as the settings it
     /// guards. Integer; absent means "never migrated" — a fresh or legacy install, disambiguated at runtime.
