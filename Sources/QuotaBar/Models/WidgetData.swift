@@ -297,7 +297,7 @@ struct WidgetData: Hashable {
         case .percent:
             return nil
         case .dollars:
-            // Mirror the original QuotaBar panel: a bounded dollar metric's secondary line reads
+            // Mirror the original OpenUsage panel: a bounded dollar metric's secondary line reads
             // "$<limit> limit" — no "of" prefix, and cents only when the limit isn't a whole dollar.
             guard let limit else { return nil }
             let digits = limit.rounded() == limit ? 0 : 2

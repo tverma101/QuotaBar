@@ -47,7 +47,7 @@ struct MenuBarContent: Equatable {
 
 @MainActor
 enum MenuBarContentBuilder {
-    /// Max bars the compact style renders (matches the original QuotaBar tray).
+    /// Max bars the compact style renders (matches the original OpenUsage tray).
     static let maxBars = 4
 
     /// Resolve pinned provider groups into menu-bar content. `groups` is `LayoutStore.pinnedGroups`
