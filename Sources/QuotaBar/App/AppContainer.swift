@@ -400,7 +400,15 @@ final class AppContainer {
                 // corpus and the OpenCode gateway fold do not compete with each other and with remote
                 // providers for all cores; stale snapshots are already painted by the store. Return to
                 // the normal concurrent cadence after that initial burst.
-                let serializeProviders = isFirstPass || ProcessMemoryBudget.isOverHardLimit
+                //
+                // Serialize whenever we are *over the soft limit*, not just the hard one. The
+                // per-provider unload in `WidgetDataStore` only runs once a provider finishes, so
+                // concurrent folds each allocate their parse arrays unchecked and the peak is the sum
+                // of all of them. Measured on a 9.8 GB Codex corpus: five concurrent providers reached
+                // 982 MB with the soft-limit guard firing four times *after the fact*. One at a time
+                // caps the peak at a single provider's footprint. `WidgetDataStore.refreshAll` also
+                // re-checks between chunks, so this covers the first batch after a spike too.
+                let serializeProviders = isFirstPass || ProcessMemoryBudget.isOverSoftLimit
                 let panelOpen = transparency.popoverShown
                 let scope: ProviderRefreshContext.Scope = panelOpen ? .full : .menuBar
                 await ProviderRefreshContext.$scope.withValue(scope) {
