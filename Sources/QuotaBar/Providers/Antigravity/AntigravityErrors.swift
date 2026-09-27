@@ -8,6 +8,10 @@ enum AntigravityError: Error, LocalizedError, Equatable {
     case notSignedIn
     /// The Keychain credential may exist, but macOS would not let QuotaBar read it.
     case credentialStoreUnreadable
+    /// The Keychain item needs user interaction to release. Distinct from `credentialStoreUnreadable`
+    /// because the remedy is different: an explicit Refresh Now, not unlocking anything. A background
+    /// refresh can never clear this, so it must not be reported as a broken credential store.
+    case credentialPermissionRequired
     /// The Keychain item was present but did not contain usable Antigravity credential data.
     case invalidCredentialData
     /// A token was found but rejected (401/403) and a refresh couldn't recover it.
@@ -22,6 +26,8 @@ enum AntigravityError: Error, LocalizedError, Equatable {
             return "Start Antigravity or run `agy` and try again."
         case .credentialStoreUnreadable:
             return "Couldn't read Antigravity credentials from Keychain. Unlock Keychain or sign in to Antigravity again."
+        case .credentialPermissionRequired:
+            return "Antigravity needs permission to read its Keychain item. Use Refresh Now to grant it."
         case .invalidCredentialData:
             return "Antigravity credentials are invalid. Open Antigravity or run `agy` to sign in again."
         case .authExpired:

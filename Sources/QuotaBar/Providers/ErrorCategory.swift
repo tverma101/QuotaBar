@@ -238,6 +238,9 @@ extension AntigravityError: CategorizedError {
         switch self {
         case .notSignedIn: .notLoggedIn
         case .credentialStoreUnreadable: .credentialAccess
+        // Same category as an unreadable store — both are "macOS would not give us the item" — but
+        // the remedy differs, which the message now carries.
+        case .credentialPermissionRequired: .credentialAccess
         case .invalidCredentialData: .authInvalid
         case .authExpired: .authExpired
         case .unavailable: .network

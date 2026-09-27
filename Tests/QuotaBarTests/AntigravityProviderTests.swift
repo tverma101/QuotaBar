@@ -450,3 +450,83 @@ final class Counter: @unchecked Sendable {
         return value
     }
 }
+
+extension AntigravityProviderTests {
+    /// A Keychain item whose ACL does not trust QuotaBar: a silent read reports that interaction is
+    /// required, and only an interactive one succeeds.
+    private final class NeedingInteractionKeychain: KeychainAccessing, @unchecked Sendable {
+        private let lock = NSLock()
+        private var readCount = 0
+        /// Models the real ACL: once the user answers the dialog the item is trusted, and later
+        /// silent reads succeed. Before that, only an interactive read can release it.
+        private var granted = false
+
+        var reads: Int {
+            lock.lock(); defer { lock.unlock() }; return readCount
+        }
+
+        private func read(allowInteraction: Bool) throws -> String? {
+            lock.lock()
+            readCount += 1
+            let isGranted = granted
+            if allowInteraction { granted = true }
+            lock.unlock()
+            if isGranted || allowInteraction { return #"{"accessToken":"a"}"# }
+            throw KeychainError.interactionNotAllowed
+        }
+
+        func readGenericPassword(service: String) throws -> String? { try read(allowInteraction: true) }
+        func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? { try read(allowInteraction: allowInteraction) }
+        func readGenericPassword(service: String, account: String) throws -> String? { try read(allowInteraction: true) }
+        func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? { try read(allowInteraction: allowInteraction) }
+        func writeGenericPassword(service: String, value: String) throws {}
+    }
+
+    /// Regression: a background refresh can never grant Keychain access, so re-attempting the read
+    /// every five minutes only produced an error log and a failed card, forever. The old error text
+    /// ("Unlock Keychain or sign in to Antigravity again") described an action a background pass
+    /// cannot take, which is why it never recovered on its own.
+    func testBackgroundRefreshStopsRetryingAKeychainReadThatNeedsInteraction() throws {
+        let keychain = NeedingInteractionKeychain()
+        let store = AntigravityAuthStore(
+            keychain: keychain,
+            files: FakeFiles([:]),
+            now: { Date(timeIntervalSince1970: 1_700_000_000) }
+        )
+
+        func attempt(isManual: Bool) -> (any Error)? {
+            var thrown: Error?
+            ProviderRefreshContext.$isManual.withValue(isManual) {
+                do { _ = try store.loadKeychainToken() } catch { thrown = error }
+            }
+            return thrown
+        }
+
+        // First background attempt: fails, and says why in terms a user can act on.
+        let first = attempt(isManual: false)
+        guard let error = first as? AntigravityError,
+              error == .credentialPermissionRequired else {
+            return XCTFail("expected credentialPermissionRequired, got \(String(describing: first))")
+        }
+        XCTAssertEqual(keychain.reads, 1)
+
+        // Subsequent background attempts must not touch the Keychain at all.
+        for _ in 0..<4 { _ = attempt(isManual: false) }
+        XCTAssertEqual(
+            keychain.reads, 1,
+            "a background refresh must not re-attempt a read that cannot succeed without a dialog"
+        )
+
+        // A manual refresh is the one context that can show the dialog, so it retries — first
+        // silently, and only then interactively, which is two reads.
+        _ = attempt(isManual: true)
+        XCTAssertEqual(keychain.reads, 3, "Refresh Now must be able to grant access")
+
+        // Having been granted, the block is cleared and background reads work silently again.
+        XCTAssertNil(
+            attempt(isManual: false),
+            "a successful interactive read must clear the block"
+        )
+        XCTAssertEqual(keychain.reads, 4)
+    }
+}
