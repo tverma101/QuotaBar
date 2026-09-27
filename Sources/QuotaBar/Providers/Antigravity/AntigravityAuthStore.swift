@@ -24,6 +24,41 @@ struct AntigravityAuthStore: Sendable {
     var files: TextFileAccessing
     var now: @Sendable () -> Date
 
+    /// Remembers that reading Antigravity's Keychain item needs user interaction.
+    ///
+    /// Antigravity's credential is written by the Antigravity app / `agy` CLI, so its ACL does not
+    /// trust QuotaBar until the user grants it. A *background* refresh can never grant that — it has no
+    /// way to show a dialog — so every 5-minute cycle would re-attempt a read that can only fail, log
+    /// an error, and fail the provider. That is the "keychain access" spam, and it is unbounded: the
+    /// old error text ("Unlock Keychain or sign in to Antigravity again") describes an action a
+    /// background pass can never take, so it never recovered on its own.
+    ///
+    /// After the first such failure the read is skipped until `ProviderRefreshContext.isManual`, when
+    /// ⌘R can actually present the dialog and grant access. Mirrors `CredentialInteractionGate`.
+    private final class PermissionGate: @unchecked Sendable {
+        static let shared = PermissionGate()
+        private let lock = NSLock()
+        private var blocked = false
+
+        var needsInteraction: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return blocked
+        }
+
+        func block() {
+            lock.lock()
+            blocked = true
+            lock.unlock()
+        }
+
+        func reset() {
+            lock.lock()
+            blocked = false
+            lock.unlock()
+        }
+    }
+
     init(
         keychain: KeychainAccessing = SecurityKeychainAccessor(),
         files: TextFileAccessing = LocalTextFileAccessor(),
@@ -36,12 +71,30 @@ struct AntigravityAuthStore: Sendable {
 
     /// Blocking keychain read — call off the main actor.
     func loadKeychainToken() throws -> AntigravityKeychainToken? {
+        let gate = PermissionGate.shared
+        // A manual refresh is the one context that can show a Keychain dialog, so it always retries
+        // and clears the block once the user answers.
+        if gate.needsInteraction, !ProviderRefreshContext.isManual {
+            AppLog.debug(LogTag.auth("antigravity"), "keychain read deferred; needs an interactive refresh")
+            throw AntigravityError.credentialPermissionRequired
+        }
+
         let raw: String?
         do {
             raw = try keychain.readGenericPasswordForRefresh(
                 service: Self.keychainService,
                 account: Self.keychainAccount
             )
+            gate.reset()
+        } catch KeychainError.interactionNotAllowed {
+            // Expected, not exceptional: the item exists but macOS will not release it silently.
+            // Block further background attempts rather than repeating this every cycle.
+            gate.block()
+            AppLog.info(
+                LogTag.auth("antigravity"),
+                "keychain read needs user interaction; use Refresh Now to grant access"
+            )
+            throw AntigravityError.credentialPermissionRequired
         } catch {
             AppLog.error(LogTag.auth("antigravity"), "keychain credential read failed")
             throw AntigravityError.credentialStoreUnreadable
