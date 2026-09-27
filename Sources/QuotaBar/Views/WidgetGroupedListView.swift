@@ -159,7 +159,15 @@ struct WidgetGroupedListView: View {
     private func resolvedRows(_ widgets: [PlacedWidget]) -> [ResolvedRow] {
         widgets.compactMap { widget -> ResolvedRow? in
             guard let descriptor = layout.descriptor(for: widget) else { return nil }
-            return ResolvedRow(widget: widget, descriptor: descriptor, data: dataStore.data(for: descriptor))
+            let data = dataStore.data(for: descriptor)
+            // A feature/plan-dependent row with nothing to show is noise, so it hides itself — unless
+            // the user turned it on, which `showsRow` treats as intent that outranks the data.
+            //
+            // Deliberately a presentation filter rather than a layout change: Customize still lists
+            // the row, menu-bar pins still render it, and quota alerts still fire off the underlying
+            // data. Removing it from `placed` instead would quietly switch all three off.
+            guard layout.showsRow(descriptor, hasData: data.hasData) else { return nil }
+            return ResolvedRow(widget: widget, descriptor: descriptor, data: data)
         }
     }
 

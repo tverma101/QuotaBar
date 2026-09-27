@@ -31,7 +31,7 @@ final class DevinProvider: ProviderRuntime {
                 .exportingLimit("daily", unit: "percent"),
             .percent(id: "devin.weekly", provider: provider, title: "Weekly", metricLabel: "Weekly quota")
                 .exportingLimit("weekly", unit: "percent"),
-            .dollarBalance(id: "devin.extra", provider: provider, title: "Extra Balance", metricLabel: "Extra usage balance", valueWord: "left")
+            .dollarBalance(id: "devin.extra", provider: provider, title: "Extra Balance", metricLabel: "Extra usage balance", valueWord: "left").hidingWhenEmpty()
                 .exportingLimit("extraUsageBalance", kind: .balance, unit: "usd", source: .value(kind: .dollars))
         ]
     }

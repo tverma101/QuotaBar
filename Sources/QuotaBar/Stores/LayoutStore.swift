@@ -120,6 +120,16 @@ final class LayoutStore {
     private let defaultPinnedMetricIDs: [String]
     private let defaultExpandedMetricIDs: [String]
     var defaultExpandedOnEnableIDs: Set<String>
+    /// Metrics the user turned on by hand, as opposed to ones seeded from `DefaultLayout.metricIDs`.
+    ///
+    /// A conditional row (`WidgetDescriptor.hidesWhenEmpty`) hides itself while it has no data —
+    /// "Extra Usage" on a plan without extra usage is noise, not information. But hiding a row the
+    /// user deliberately switched on would silently undo their choice, so an explicit opt-in
+    /// outranks the data and the row stays visible.
+    ///
+    /// This has to be remembered separately because a seeded default and a hand-enabled metric are
+    /// indistinguishable in `placed` alone: after `setMetricEnabled(id, true)` both look the same.
+    private(set) var explicitlyEnabledMetricIDs: Set<String>
     let isProviderEnabled: @MainActor (String) -> Bool
 
     init(
@@ -158,6 +168,7 @@ final class LayoutStore {
         expandedMetricIDs = initial.expandedMetricIDs
         expandedProviderIDs = initial.expandedProviderIDs
         defaultExpandedOnEnableIDs = initial.defaultExpandedOnEnableIDs
+        explicitlyEnabledMetricIDs = persistence.loadExplicitlyEnabledMetrics()
         menuBarStyle = initial.menuBarStyle
 
         if initial.shouldPersistExpandOnEnable { persistExpandOnEnable() }
@@ -199,11 +210,27 @@ final class LayoutStore {
                     persistExpanded()
                     persistExpandOnEnable()
                 }
+                // Remember the opt-in so a `hidesWhenEmpty` row stays visible without data.
+                if explicitlyEnabledMetricIDs.insert(descriptorID).inserted {
+                    persistExplicitlyEnabledMetrics()
+                }
                 add(descriptorID)
             } else if let widget = placed.first(where: { $0.descriptorID == descriptorID }) {
+                if explicitlyEnabledMetricIDs.remove(descriptorID) != nil {
+                    persistExplicitlyEnabledMetrics()
+                }
                 remove(widget.id)
             }
         }
+    }
+
+    /// Whether a `hidesWhenEmpty` row should be drawn: always when the user asked for it, otherwise
+    /// only once it has something to show. Callers apply this as a presentation filter so Customize
+    /// still lists the row, menu-bar pins keep working, and quota alerts keep firing off the
+    /// underlying data regardless of whether the row is on screen.
+    func showsRow(_ descriptor: WidgetDescriptor, hasData: Bool) -> Bool {
+        guard descriptor.hidesWhenEmpty, !hasData else { return true }
+        return explicitlyEnabledMetricIDs.contains(descriptor.id)
     }
 
     // MARK: - Undo (#603)
@@ -389,6 +416,10 @@ final class LayoutStore {
 
     private func persistExpandedProviders() {
         persistence.saveExpandedProviders(expandedProviderIDs)
+    }
+
+    private func persistExplicitlyEnabledMetrics() {
+        persistence.saveExplicitlyEnabledMetrics(explicitlyEnabledMetricIDs)
     }
 
     // MARK: - Mutations

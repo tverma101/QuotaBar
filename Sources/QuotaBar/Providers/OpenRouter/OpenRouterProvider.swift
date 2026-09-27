@@ -43,6 +43,7 @@ final class OpenRouterProvider: ProviderRuntime {
             .boundedDollars(id: "openrouter.keyLimit", provider: provider, title: "Key Limit",
                             metricLabel: "Key Limit", limit: 100, valueWord: "spent")
                 .exportingLimit("keyLimit", unit: "usd")
+                .hidingWhenEmpty()
         ]
     }
 
