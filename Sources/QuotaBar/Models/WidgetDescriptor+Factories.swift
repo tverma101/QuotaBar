@@ -110,16 +110,10 @@ extension WidgetDescriptor {
         return descriptors.map { descriptor in
             var sample = descriptor.sample
             sample.valueTooltipNote = valueTooltipNote
-            return WidgetDescriptor(
-                id: descriptor.id,
-                providerID: descriptor.providerID,
-                metricLabel: descriptor.metricLabel,
-                sample: sample,
-                pinnable: descriptor.pinnable,
-                isSpendTile: true,
-                limitResources: descriptor.limitResources,
-                historyResource: descriptor.historyResource
-            )
+            var copy = descriptor
+            copy.sample = sample
+            copy.isSpendTile = true
+            return copy
         }
     }
 

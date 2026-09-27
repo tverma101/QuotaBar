@@ -548,3 +548,136 @@ final class IncrementalJSONLScannerTests: XCTestCase {
         return try XCTUnwrap(attributes[.modificationDate] as? Date)
     }
 }
+
+extension IncrementalJSONLScannerTests {
+    /// Regression for a real retention bug: the cache was published fully hydrated *before* the
+    /// visit loop drained it, so a cancellation between those two points returned with every
+    /// file's items still resident in the actor. Nothing released them until the next *successful*
+    /// scan, so a refresh that hit its deadline stranded the whole window — up to ~20 MB on a large
+    /// corpus, indefinitely.
+    ///
+    /// Cancellation is routine rather than exotic: `WidgetDataStore` wraps provider refreshes in a
+    /// 120 s `ProviderRefreshDeadline`, and the loop re-checks `Task.isCancelled` once per file, so
+    /// any corpus long enough to run past the deadline lands here.
+    func testCancellationDuringVisitUnloadsItemsTheVisitLoopNeverReached() async throws {
+        let base = try makeDirectory("CancelVisitStrand")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let now = Date()
+        let first = try makeFile(named: "a.jsonl", contents: "1", in: base, mtime: now)
+        let second = try makeFile(named: "b.jsonl", contents: "2", in: base, mtime: now)
+        let scanner = IncrementalJSONLScanner<Int>(
+            retainResidentItems: false,
+            persistence: makePersistence(in: base)
+        )
+
+        // The loop re-checks cancellation per *file*, so cancelling on the first visited item lets
+        // `first` drain normally and leaves `second` never reached — the shape that used to strand
+        // `second`'s items.
+        let visit = FirstVisitSignal()
+        let handle = SelfCanceller()
+        let task = Task { _ in
+            await scanner.foldItems(
+                from: [first, second],
+                since: .distantPast,
+                cacheIdentity: "home",
+                parseFile: { _ in [7] },
+                visit: { _ in visit.signal() }
+            )
+        }
+        handle.adopt(task)
+        // Race-free: fires immediately if the visit already happened, otherwise the moment it does.
+        visit.onFirstVisit { handle.cancel() }
+
+        _ = await task.value
+
+        let stranded = await scanner.residentItemCountForTesting()
+        XCTAssertEqual(
+            stranded, 0,
+            "a cancelled fold must not leave unvisited files' items resident in the scanner"
+        )
+    }
+
+    /// `retainResidentItems: true` is an explicit request to keep items, so cancellation must *not*
+    /// unload them. Guards the fix from over-reaching.
+    func testCancellationKeepsResidentItemsWhenCallerAskedForThem() async throws {
+        let base = try makeDirectory("CancelRetainIntent")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let now = Date()
+        let first = try makeFile(named: "a.jsonl", contents: "1", in: base, mtime: now)
+        let second = try makeFile(named: "b.jsonl", contents: "2", in: base, mtime: now)
+        let scanner = IncrementalJSONLScanner<Int>(
+            retainResidentItems: true,
+            persistence: makePersistence(in: base)
+        )
+
+        let visit = FirstVisitSignal()
+        let handle = SelfCanceller()
+        let task = Task { _ in
+            await scanner.foldItems(
+                from: [first, second],
+                since: .distantPast,
+                cacheIdentity: "home",
+                parseFile: { _ in [7] },
+                visit: { _ in visit.signal() }
+            )
+        }
+        handle.adopt(task)
+        visit.onFirstVisit { handle.cancel() }
+
+        _ = await task.value
+
+        let retained = await scanner.residentItemCountForTesting()
+        XCTAssertEqual(retained, 2, "retainResidentItems: true asks for items to stay")
+    }
+}
+
+/// Runs a closure the first time the visit loop is entered, whether that has already happened or
+/// happens later — so a test can react to it without racing the fold.
+private final class FirstVisitSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signalled = false
+    private var waiter: (() -> Void)?
+
+    func signal() {
+        lock.lock()
+        signalled = true
+        let pending = waiter
+        waiter = nil
+        lock.unlock()
+        pending?()
+    }
+
+    func onFirstVisit(_ block: @escaping () -> Void) {
+        lock.lock()
+        if signalled {
+            lock.unlock()
+            block()
+        } else {
+            waiter = block
+            lock.unlock()
+        }
+    }
+}
+
+/// Lets a synchronous closure cancel the task it is running inside, which needs a handle to that
+/// task. Adoption and cancellation are both idempotent and lock-guarded.
+private final class SelfCanceller: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    private var cancelled = false
+
+    func adopt(_ task: Task<Void, Never>) {
+        lock.lock()
+        self.task = task
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !cancelled else { lock.unlock(); return }
+        cancelled = true
+        let handle = task
+        lock.unlock()
+        handle?.cancel()
+    }
+}

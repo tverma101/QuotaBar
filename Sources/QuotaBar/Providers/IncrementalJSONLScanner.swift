@@ -345,6 +345,28 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         }
         trimResidentIdentities(protecting: cacheIdentity)
 
+        // Publishes the post-drain cache on *every* exit path, and unloads anything the visit loop
+        // below did not reach.
+        //
+        // This is a correctness fix, not a precaution. `caches[cacheIdentity]` was already assigned
+        // the fully-hydrated `nextCache` above, so a cancellation between that publish and the end
+        // of the visit loop used to `return false` with every file's items still resident — stranding
+        // the whole window in the actor until the next *successful* scan. Cancellation is routine
+        // here, not exotic: `WidgetDataStore` wraps provider refreshes in a 120 s
+        // `ProviderRefreshDeadline`, and the loop re-checks `Task.isCancelled` once per file, so any
+        // large corpus that runs long hit this. Unvisited items are simply re-hydrated on demand by
+        // the next scan, so dropping them costs one re-read, not correctness.
+        defer {
+            guard !retainResidentItems else { return }
+            let unvisited = nextCache.keys.filter { nextCache[$0]?.items.isEmpty == false }
+            for path in unvisited {
+                guard var cached = nextCache[path] else { continue }
+                cached.items = []
+                nextCache[path] = cached
+            }
+            caches[cacheIdentity] = nextCache
+        }
+
         for file in files {
             guard !Task.isCancelled else { return false }
             guard var cached = nextCache[file.path] else { continue }
@@ -356,7 +378,6 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
                 nextCache[file.path] = cached
             }
         }
-        caches[cacheIdentity] = nextCache
         return !Task.isCancelled
     }
 

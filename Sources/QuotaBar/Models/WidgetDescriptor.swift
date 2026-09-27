@@ -19,10 +19,38 @@ struct WidgetDescriptor: Identifiable, Hashable {
     /// Explicit aggregation semantics for this provider's normalized daily history. Exactly one
     /// descriptor carries it for every provider that exposes the shared spend tiles.
     var historyResource: UsageHistoryDescriptor? = nil
+    /// True when this row only means something if the account actually has the underlying feature, so
+    /// an empty row is noise rather than information — "Extra Usage" on a plan without extra usage, an
+    /// on-demand row for a plan that only bundles requests, a per-key rate limit for an account with no
+    /// key cap.
+    ///
+    /// Set only on feature/plan-dependent rows. Never on core quota meters: a session or weekly meter
+    /// reading empty means "we don't know yet", and hiding that would read as "you're fine" at exactly
+    /// the moment the user wants to know.
+    ///
+    /// The dashboard hides an empty conditional row unless the user explicitly turned it on, so
+    /// opting in is a statement of intent that outranks the data. See `hidesWhenEmpty` on
+    /// `WidgetData` for the live test, and `LayoutStore` for the opt-in memory.
+    var hidesWhenEmpty: Bool = false
 
     /// The metric's single display name.
     var title: String { sample.title }
 
     static func == (lhs: WidgetDescriptor, rhs: WidgetDescriptor) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+extension WidgetDescriptor {
+    /// Mark this row as feature/plan-dependent, so the dashboard hides it while it has no data unless
+    /// the user explicitly enabled it. Returns a copy so a provider can opt in inline at the
+    /// descriptor's construction site:
+    ///
+    /// ```swift
+    /// .boundedDollars(id: "\(provider.id).extra", …).hidesWhenEmpty()
+    /// ```
+    func hidesWhenEmpty() -> WidgetDescriptor {
+        var copy = self
+        copy.hidesWhenEmpty = true
+        return copy
+    }
 }
