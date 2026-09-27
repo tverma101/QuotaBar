@@ -1339,3 +1339,55 @@ final class LayoutStoreTests: XCTestCase {
         defaults.set(try! JSONEncoder().encode(value), forKey: key)
     }
 }
+
+extension LayoutStoreTests {
+    /// A conditional row's visibility depends on the opt-in, so undoing the "turn it on" action has to
+    /// undo the opt-in too. Otherwise the row returns to `placed` still pinned visible with no data —
+    /// and because the Customize switch reads `placed`, not the opt-in, the stale entry becomes
+    /// unreachable: the switch shows OFF and toggling it never clears the record.
+    func testUndoOfAnEnableAlsoUndoesTheConditionalOptIn() throws {
+        let store = makeStore("UndoConditionalOptIn")
+        let descriptor = try conditionalDescriptor()
+
+        store.setMetricEnabled(descriptor.id, true)
+        XCTAssertTrue(store.explicitlyEnabledMetricIDs.contains(descriptor.id))
+
+        store.undo()
+        XCTAssertFalse(
+            store.explicitlyEnabledMetricIDs.contains(descriptor.id),
+            "undoing the enable must not leave the row pinned visible with no data"
+        )
+        XCTAssertFalse(store.showsRow(descriptor, hasData: false))
+    }
+
+    /// A full reset means "back to defaults", so a hand-enabled opt-in must not outlive it — otherwise a
+    /// default-on conditional row renders a permanent "— / No data" row.
+    func testResetToDefaultClearsConditionalOptIns() throws {
+        let store = makeStore("ResetClearsConditionalOptIn")
+        let descriptor = try conditionalDescriptor()
+        store.setMetricEnabled(descriptor.id, true)
+        XCTAssertTrue(store.explicitlyEnabledMetricIDs.contains(descriptor.id))
+
+        store.resetToDefault()
+
+        XCTAssertEqual(store.explicitlyEnabledMetricIDs, [])
+        XCTAssertFalse(store.showsRow(descriptor, hasData: false))
+    }
+
+    /// A per-provider reset is scoped, like its sibling sets: another provider's opt-in survives.
+    func testResetProviderOnlyClearsThatProvidersOptIns() throws {
+        let store = makeStore("ResetProviderScopesOptIns")
+        let claudeRow = try conditionalDescriptor(id: "claude.extra", provider: "claude")
+        let codexRow = try conditionalDescriptor(id: "codex.rateLimitResets", provider: "codex")
+        store.setMetricEnabled(claudeRow.id, true)
+        store.setMetricEnabled(codexRow.id, true)
+
+        store.resetProvider("claude")
+
+        XCTAssertFalse(store.explicitlyEnabledMetricIDs.contains(claudeRow.id))
+        XCTAssertTrue(
+            store.explicitlyEnabledMetricIDs.contains(codexRow.id),
+            "resetting one provider must not strip another provider's opt-ins"
+        )
+    }
+}

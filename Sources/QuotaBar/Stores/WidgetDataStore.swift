@@ -685,7 +685,17 @@ final class WidgetDataStore {
     /// one, so the threshold sits at two intervals: it fires only when a refresh has actually been missed
     /// — a refresh loop that keeps failing, or a long-suspended background timer — never on the normal
     /// per-cycle aging, which would flicker a hint on healthy providers.
-    static var stalenessThreshold: TimeInterval { RefreshSetting.interval * 2 }
+    /// Derived from the *slowest* cadence the refresh loop can legally sleep at, not the panel-open one.
+    ///
+    /// The periodic loop sleeps `backgroundInterval` while the popover is closed — 15 minutes on
+    /// battery or in Low Power Mode. Sizing this off `interval` (5 min) alone put the threshold at
+    /// 600 s, so on a healthy provider the header showed a false amber "Outdated" for roughly 5 minutes
+    /// of every 15-minute cycle. The badge is read on the first render after the panel opens, which
+    /// happens *before* the forced `.full` refresh lands, so users saw it on providers that were
+    /// refreshing perfectly.
+    static var stalenessThreshold: TimeInterval {
+        max(RefreshSetting.interval, RefreshSetting.backgroundInterval) * 2
+    }
 
     /// A compact "Outdated" hint for the provider's on-screen snapshot, surfaced only once that snapshot
     /// has aged past `stalenessThreshold`; `nil` while the data is still current (the common case), so the
