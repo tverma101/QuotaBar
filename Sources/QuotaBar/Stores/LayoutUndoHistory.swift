@@ -14,6 +14,10 @@ struct LayoutSnapshot: Equatable {
     let pinnedMetricIDs: Set<String>
     let expandedMetricIDs: Set<String>
     let defaultExpandedOnEnableIDs: Set<String>
+    /// Hand-enabled metrics. Part of the snapshot because a `hidesWhenEmpty` row's visibility depends on
+    /// it: undoing the "turn it on" action has to undo the opt-in too, or the row comes back still
+    /// pinned visible with no data.
+    let explicitlyEnabledMetricIDs: Set<String>
 }
 
 /// A small, bounded undo stack of `LayoutSnapshot`s — the machinery behind `LayoutStore`'s app-wide

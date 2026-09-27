@@ -247,7 +247,8 @@ final class LayoutStore {
             metricOrderByProvider: metricOrderByProvider,
             pinnedMetricIDs: pinnedMetricIDs,
             expandedMetricIDs: expandedMetricIDs,
-            defaultExpandedOnEnableIDs: defaultExpandedOnEnableIDs
+            defaultExpandedOnEnableIDs: defaultExpandedOnEnableIDs,
+            explicitlyEnabledMetricIDs: explicitlyEnabledMetricIDs
         )
     }
 
@@ -293,7 +294,9 @@ final class LayoutStore {
         pinnedMetricIDs = snapshot.pinnedMetricIDs
         expandedMetricIDs = snapshot.expandedMetricIDs
         defaultExpandedOnEnableIDs = snapshot.defaultExpandedOnEnableIDs
+        explicitlyEnabledMetricIDs = snapshot.explicitlyEnabledMetricIDs
         persist()
+        persistExplicitlyEnabledMetrics()
         persistProviderOrder()
         persistMetricOrder()
         persistPins()
@@ -457,8 +460,13 @@ final class LayoutStore {
         persistence.saveHiddenMenuBarProviderIDs(hiddenMenuBarProviderIDs)
         expandedMetricIDs = Set(defaultExpandedMetricIDs.filter { registry.descriptor(id: $0) != nil })
         defaultExpandedOnEnableIDs = []
+        // Hand-enabled metrics are part of what "reset to default" means. Leaving them behind makes a
+        // default-on conditional row render permanently as an empty "— / No data" row, and the opt-in
+        // would be unreachable from Customize: the switch reads `placed`, which no longer holds the row.
+        explicitlyEnabledMetricIDs = []
         persistExpanded()
         persistExpandOnEnable()
+        persistExplicitlyEnabledMetrics()
         expandedProviderIDs = []
         persistExpandedProviders()
         persistSeededDefaults(Set(LayoutOrdering.knownMetricIDs(defaultMetricIDs, registry: registry)))
@@ -502,8 +510,12 @@ final class LayoutStore {
         expandedMetricIDs.subtract(owned)
         expandedMetricIDs.formUnion(defaults(defaultExpandedMetricIDs))
         defaultExpandedOnEnableIDs.subtract(owned)
+        // Same treatment: a per-provider reset returns that provider to its defaults, so a
+        // hand-enabled opt-in inside it should not outlive the reset.
+        explicitlyEnabledMetricIDs.subtract(owned)
         persistExpanded()
         persistExpandOnEnable()
+        persistExplicitlyEnabledMetrics()
 
         // Default is a collapsed card.
         if expandedProviderIDs.remove(providerID) != nil {

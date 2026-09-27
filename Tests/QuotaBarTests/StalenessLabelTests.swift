@@ -113,3 +113,23 @@ final class StalenessLabelTests: XCTestCase {
         )
     }
 }
+
+extension StalenessLabelTests {
+    /// The staleness badge must never fire on a provider that is refreshing exactly as designed.
+    ///
+    /// The periodic loop sleeps `backgroundInterval` with the popover closed — 15 minutes on battery or
+    /// in Low Power Mode. A threshold derived from the 5-minute panel-open interval therefore expired
+    /// mid-cycle and showed a false "Outdated" on healthy data.
+    func testStalenessThresholdCoversTheSlowestBackgroundCadence() {
+        XCTAssertGreaterThan(
+            WidgetDataStore.stalenessThreshold,
+            RefreshSetting.backgroundInterval,
+            "a provider refreshed exactly `backgroundInterval` ago must not read as outdated"
+        )
+        XCTAssertGreaterThanOrEqual(
+            WidgetDataStore.stalenessThreshold,
+            RefreshSetting.interval * 2,
+            "the original panel-open guarantee must still hold"
+        )
+    }
+}
