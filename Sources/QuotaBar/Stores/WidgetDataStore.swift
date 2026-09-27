@@ -232,11 +232,18 @@ final class WidgetDataStore {
         }
         let start = monotonicNow()
         AppLog.info(.refresh, "batch start (\(providerIDs.count) providers, force=\(force), scope=\(ProviderRefreshContext.scope == .menuBar ? "menuBar" : "full"))")
-        let concurrency = max(1, maxConcurrentProviders ?? providerIDs.count)
+        var concurrency = max(1, maxConcurrentProviders ?? providerIDs.count)
         var outcomes: [RefreshOutcome] = []
         outcomes.reserveCapacity(providerIDs.count)
         var nextProviderIndex = 0
         while nextProviderIndex < providerIDs.count {
+            // Re-check the budget before every chunk, not just once per pass. The per-provider unload
+            // runs *after* a provider finishes, so a chunk that started under the limit can leave the
+            // next one stacking on top of a much larger footprint. Dropping to one at a time here
+            // caps the peak at a single provider's parse arrays instead of their sum.
+            if ProcessMemoryBudget.isOverSoftLimit {
+                concurrency = 1
+            }
             let end = min(nextProviderIndex + concurrency, providerIDs.count)
             let tasks = providerIDs[nextProviderIndex..<end].map { providerID in
                 Task { await self.refresh(providerID: providerID, force: force, notifyHistoryChange: false) }
