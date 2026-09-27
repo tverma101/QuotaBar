@@ -575,8 +575,8 @@ extension IncrementalJSONLScannerTests {
         // `second`'s items.
         let visit = FirstVisitSignal()
         let handle = SelfCanceller()
-        let task = Task { _ in
-            await scanner.foldItems(
+        let task = Task {
+            _ = await scanner.foldItems(
                 from: [first, second],
                 since: .distantPast,
                 cacheIdentity: "home",
@@ -612,8 +612,8 @@ extension IncrementalJSONLScannerTests {
 
         let visit = FirstVisitSignal()
         let handle = SelfCanceller()
-        let task = Task { _ in
-            await scanner.foldItems(
+        let task = Task {
+            _ = await scanner.foldItems(
                 from: [first, second],
                 since: .distantPast,
                 cacheIdentity: "home",

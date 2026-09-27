@@ -357,14 +357,16 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         // large corpus that runs long hit this. Unvisited items are simply re-hydrated on demand by
         // the next scan, so dropping them costs one re-read, not correctness.
         defer {
-            guard !retainResidentItems else { return }
-            let unvisited = nextCache.keys.filter { nextCache[$0]?.items.isEmpty == false }
-            for path in unvisited {
-                guard var cached = nextCache[path] else { continue }
-                cached.items = []
-                nextCache[path] = cached
+            if !retainResidentItems {
+                let unvisited = nextCache.keys.filter { nextCache[$0]?.items.isEmpty == false }
+                for path in unvisited {
+                    if var cached = nextCache[path] {
+                        cached.items = []
+                        nextCache[path] = cached
+                    }
+                }
+                caches[cacheIdentity] = nextCache
             }
-            caches[cacheIdentity] = nextCache
         }
 
         for file in files {

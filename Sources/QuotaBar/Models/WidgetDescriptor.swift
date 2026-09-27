@@ -6,7 +6,10 @@ struct WidgetDescriptor: Identifiable, Hashable {
     let id: String                 // "claude.session"
     let providerID: String
     let metricLabel: String
-    let sample: WidgetData
+    /// Display template. `var` because `spendTiles` re-labels the same descriptor with a different
+    /// `valueTooltipNote`; copying the descriptor and mutating this keeps that from having to
+    /// reconstruct every field by hand (which silently dropped newly added ones).
+    var sample: WidgetData
     /// Whether this widget can be pinned to the menu-bar strip. False for tiles the tray can't render as
     /// a value — the Usage Trend chart — so the pin affordance never offers a pin that would read "0".
     var pinnable: Bool = true
@@ -46,9 +49,12 @@ extension WidgetDescriptor {
     /// descriptor's construction site:
     ///
     /// ```swift
-    /// .boundedDollars(id: "\(provider.id).extra", …).hidesWhenEmpty()
+    /// .boundedDollars(id: "\(provider.id).extra", …).hidingWhenEmpty()
     /// ```
-    func hidesWhenEmpty() -> WidgetDescriptor {
+    ///
+    /// Named `hidingWhenEmpty()` rather than `hidesWhenEmpty()` because Swift does not allow a
+    /// zero-argument method to share a name with a stored property.
+    func hidingWhenEmpty() -> WidgetDescriptor {
         var copy = self
         copy.hidesWhenEmpty = true
         return copy
