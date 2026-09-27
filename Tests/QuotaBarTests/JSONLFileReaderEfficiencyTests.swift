@@ -210,3 +210,70 @@ final class JSONLFileReaderEfficiencyTests: XCTestCase {
         return url
     }
 }
+
+extension JSONLFileReaderEfficiencyTests {
+    /// Regression guard for the cold-scan footprint (1,817 MB -> 536 MB).
+    ///
+    /// `NSFileHandle.read` autoreleases a buffer per chunk, and the read sits in the chunk loop rather
+    /// than inside `deliver`'s per-line pool. Before each chunk got its own pool, every buffer a file
+    /// allocated piled into the pool the caller opened around the whole parse and only drained at
+    /// end-of-file — so retention grew with *corpus size*, not chunk count. `leaks --autoreleasePools`
+    /// measured 1,025 MB across 13,126 `NSConcreteData` in pools on a 9.8 GB corpus.
+    ///
+    /// A 48 MB file read in 4 KB chunks is 12,288 reads. If their buffers are not released per chunk,
+    /// the test process grows by more than the file it just read; with the fix it barely moves. The
+    /// bound is deliberately loose — this asserts the shape of the fix, not a precise figure, because
+    /// a footprint delta is inherently noisy under a shared test runner.
+    func testReadBuffersAreReleasedPerChunkNotAccumulatedPerFile() throws {
+        let directory = try temporaryDirectory(named: "PerChunkRelease")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let line = String(repeating: "y", count: 512)
+        let lineCount = 96_000
+        let corpusBytes = lineCount * (line.utf8.count + 1)
+        let url = directory.appendingPathComponent("usage.jsonl")
+        try makeCorpus(at: url, line: line, count: lineCount)
+
+        // Warm the allocator and the reader's own code paths first, so the measurement below reflects
+        // steady-state retention rather than one-time first-touch page faults.
+        for _ in 0..<2 {
+            _ = JSONLFileReader.readLines(at: url, chunkSize: 4 * 1024) { _ in }
+        }
+
+        let before = ProcessMemoryBudget.physicalFootprintBytes() ?? 0
+        var delivered = 0
+        let result = JSONLFileReader.readLines(at: url, chunkSize: 4 * 1024) { _ in delivered += 1 }
+        let after = ProcessMemoryBudget.physicalFootprintBytes() ?? 0
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(delivered, lineCount, "the reader must still deliver every line")
+        XCTAssertEqual(result.statistics.bytesRead, corpusBytes)
+        XCTAssertGreaterThan(result.statistics.chunksRead, 1_000, "the corpus must span many chunks for this to mean anything")
+
+        let growth = after > before ? after - before : 0
+        XCTAssertLessThan(
+            growth,
+            UInt64(corpusBytes) / 2,
+            "reading \(corpusBytes / 1_048_576) MB must not retain a multiple of it; growth was \(growth / 1_048_576) MB"
+        )
+    }
+
+    private func makeCorpus(at url: URL, line: String, count: Int) throws {
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: url) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        defer { try? handle.close() }
+        // Write in batches so the test does not build a 48 MB string in memory itself.
+        let batch = Array(repeating: line, count: 2_000).joined(separator: "\n") + "\n"
+        let batches = count / 2_000
+        for _ in 0..<batches {
+            try handle.write(contentsOf: Data(batch.utf8))
+        }
+        let remainder = count % 2_000
+        if remainder > 0 {
+            let tail = Array(repeating: line, count: remainder).joined(separator: "\n") + "\n"
+            try handle.write(contentsOf: Data(tail.utf8))
+        }
+    }
+}
