@@ -8,7 +8,7 @@ This file documents the engineering conventions for the project. Read it before 
 
 AGENTS.md is the source of truth for agent instructions in this repository. CLAUDE.md files may only point to the nearest AGENTS.md file with `@AGENTS.md`; do not add guidance, duplicate instructions, or project rules to CLAUDE.md.
 
-> **Repository note:** QuotaBar is a private fork of [OpenUsage](https://github.com/robinebers/openusage).
+> **Repository note:** QuotaBar is a fork of [OpenUsage](https://github.com/robinebers/openusage), developed in the open. See [UPSTREAM.md](UPSTREAM.md) for what has diverged.
 > Do not use the OpenUsage name or logo in code, UI, or assets — see `TRADEMARK.md`. Keep `LICENSE`,
 > `CODE_OF_CONDUCT.md`, `SECURITY.md`, `CONTRIBUTING.md` and upstream attribution intact, and read
 > `UPSTREAM.md` before touching shared code so local deltas stay traceable.

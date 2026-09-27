@@ -216,8 +216,7 @@ final class KaggleComputeService {
         }
         if values["KAGGLE_GLM53_PYTHON"]?.isEmpty != false {
             let candidates = [
-                "\(home)/Documents/Codex/2026-09-10/new-chat/work/kaggle-gpu-control/.venv/bin/python",
-                "/Users/tejas/Documents/Codex/2026-09-10/new-chat/work/kaggle-gpu-control/.venv/bin/python",
+                "\(home)/kaggle-gpu-control/.venv/bin/python",
                 "/opt/homebrew/bin/python3",
                 "/usr/local/bin/python3",
             ]
@@ -226,7 +225,7 @@ final class KaggleComputeService {
             }
         }
         let path = values["PATH"] ?? ""
-        let prefix = "/opt/homebrew/bin:/usr/local/bin:\(home)/Documents/Codex/2026-09-10/new-chat/work/kaggle-gpu-control/.venv/bin"
+        let prefix = "/opt/homebrew/bin:/usr/local/bin:\(home)/kaggle-gpu-control/.venv/bin"
         if path.isEmpty {
             values["PATH"] = prefix
         } else if !path.split(separator: ":").contains(where: { prefix.split(separator: ":").contains($0) }) {
@@ -244,7 +243,6 @@ final class KaggleComputeService {
             bundled,
             "/usr/local/bin/kaggle-glm53-control",
             "/opt/homebrew/bin/kaggle-glm53-control",
-            "/Users/tejas/Documents/Codex/2026-09-10/new-chat/work/kaggle-gpu-control/bin/kaggle-glm53-control",
             "\(home)/kaggle-gpu-control/bin/kaggle-glm53-control",
         ].compactMap { $0 }.map { NSString(string: $0).expandingTildeInPath }
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }

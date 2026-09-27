@@ -37,7 +37,7 @@ APP_BINARY="$APP_MACOS/$TARGET_NAME"
 CLI_BINARY="$APP_HELPERS/quotabar"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 RESOURCE_BUNDLE_NAME="${TARGET_NAME}_${TARGET_NAME}.bundle"
-KAGGLE_BRIDGE_SOURCE="${KAGGLE_GLM53_CONTROL_BIN:-/Users/tejas/Documents/Codex/2026-09-10/new-chat/work/kaggle-gpu-control/bin/kaggle-glm53-control}"
+KAGGLE_BRIDGE_SOURCE="${KAGGLE_GLM53_CONTROL_BIN:-$HOME/kaggle-gpu-control/bin/kaggle-glm53-control}"
 ENTITLEMENTS="$ROOT_DIR/script/QuotaBar.dev.entitlements.plist"
 SIGN_ENTITLEMENTS="$ROOT_DIR/script/QuotaBar.local.entitlements.plist"
 

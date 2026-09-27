@@ -7,7 +7,7 @@ QuotaBar showed unexpectedly combined Codex usage, and two local Codex homes app
 ## Confirmed causes
 
 1. The user launchd environment exported `CODEX_HOME` and `ORCA_CODEX_HOME` to Orca's managed account home. A child process could therefore inherit Orca's home even when it was not launched by an Orca terminal.
-2. Orca's session backfill marker was still active with a pending scan date. Its runtime home had hard-linked 285 rollout files into `/Users/tejas/.codex/sessions`, coupling later file changes across the two roots.
+2. Orca's session backfill marker was still active with a pending scan date. Its runtime home had hard-linked 285 rollout files into `~/.codex/sessions`, coupling later file changes across the two roots.
 3. QuotaBar rejected the implicit home only when the Orca marker was also present. A stale shell snapshot or launch service could provide the path without the marker, and the marker itself was not persisted in the shell identity snapshot. Orca can also place its managed homes under a custom `ORCA_USER_DATA_PATH`.
 4. The default Codex auth file and Orca's managed auth file identify the same provider account. Different token rotations or local paths do not turn that into a second billed account.
 5. A scoped provider previously relied primarily on its provider-level identity check. A stale or malicious home override could still make the underlying auth store read the other account before the provider rejected it, and conflicting account metadata could be trusted field-by-field.
@@ -20,7 +20,7 @@ QuotaBar showed unexpectedly combined Codex usage, and two local Codex homes app
 - Every scoped `CodexAuthStore` is bound to its card identity. It drops wrong-account file/Keychain candidates, rejects an `account_id`/JWT identity conflict, and refuses to persist a mismatched refreshed state. `ProviderCatalog` pins the card's auth and log homes independently of the ambient process environment.
 - `ORCA_CODEX_HOME` and `ORCA_USER_DATA_PATH` are now included in the non-secret shell identity snapshot, so a stale snapshot cannot silently lose the evidence that the process is an Orca overlay or its custom root.
 - The stale backfill marker was saved as `backfill-complete.json.pre-isolation-20260912`, then set to `launchActive: false` with no pending scan dates.
-- The 285 shared runtime/default rollout files were copied in place and atomically replaced, then the 285 audit-proven historical copies were moved from `~/.codex/sessions` into recoverable quarantine at `/Users/tejas/.codex/archives/orca-backfilled-sessions-20260912`. No rollout or credential file was deleted. Two remaining runtime/account hardlinks are internal to Orca's own managed/runtime pair and are not linked to the default Codex root.
+- The 285 shared runtime/default rollout files were copied in place and atomically replaced, then the 285 audit-proven historical copies were moved from `~/.codex/sessions` into recoverable quarantine at `~/.codex/archives/orca-backfilled-sessions-20260912`. No rollout or credential file was deleted. Two remaining runtime/account hardlinks are internal to Orca's own managed/runtime pair and are not linked to the default Codex root.
 - The user launchd exports were unset. This affects future processes; it cannot rewrite the environment of a process that is already running.
 
 ## Validation

@@ -1,24 +1,40 @@
 import Foundation
 import PostHog
 
-/// Build-time configuration for the PostHog project. The project token is a client-side, write-only
-/// key (it ships in every distributed binary, like any analytics SDK key), so it is safe to commit;
-/// an `OPENUSAGE_POSTHOG_TOKEN` environment override is supported for local testing without editing
-/// source. The host is region-bound — a US token will not ingest against the EU host.
+/// Build-time configuration for the PostHog project.
+///
+/// ## QuotaBar ships telemetry inert
+///
+/// `bakedToken` is the placeholder, so a stock QuotaBar build resolves to `placeholderToken` and
+/// `PostHogTelemetrySink` never calls `PostHogSDK.shared.setup` — no network, no anonymous ID, no
+/// crash events. This is deliberate. The analytics mechanism is inherited from upstream, but a project
+/// token identifies a *specific* PostHog project and its owner: leaving upstream's token baked in would
+/// ship every QuotaBar user's daily-activity pings and crash reports into a third party's analytics
+/// account, which neither the user nor the QuotaBar maintainer consented to or can see.
+///
+/// To enable analytics, a maintainer supplies their own US-region `phc_…` project token (a client-side,
+/// write-only key, safe to commit) either as the `bakedToken` value or at runtime via
+/// `QUOTABAR_POSTHOG_TOKEN`. The host is region-bound — a US token will not ingest against the EU host.
 enum TelemetryConfig {
     /// Sentinel meaning "no real token configured" — the sink stays inert (no setup, no network) while
     /// the resolved token equals this. Do NOT change this value.
     static let placeholderToken = "phc_REPLACE_ME"
 
-    /// The project token baked into the build. Replace `phc_REPLACE_ME` with the real US-region
-    /// `phc_…` key (safe to commit — it's a client write-only key), or leave it and set
-    /// `OPENUSAGE_POSTHOG_TOKEN` at runtime for local testing.
-    private static let bakedToken = "phc_vGEqXEpQNwViyKnMNWvmKWpv8XxMT3yaeYi6gfidr4nf"
+    /// No real project token is committed. See the note above; `Tests/QuotaBarTests/TelemetryConfigTests.swift`
+    /// fails if a real token is ever reintroduced here by accident.
+    private static let bakedToken = placeholderToken
 
-    static var token: String {
-        let env = ProcessInfo.processInfo.environment["OPENUSAGE_POSTHOG_TOKEN"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let env, !env.isEmpty { return env }
+    static var token: String { resolvedToken(environment: ProcessInfo.processInfo.environment) }
+
+    /// Resolution split out from `token` so the "inert unless configured" guarantee is directly testable
+    /// without mutating the real process environment.
+    static func resolvedToken(environment: [String: String]) -> String {
+        for key in ["QUOTABAR_POSTHOG_TOKEN", "OPENUSAGE_POSTHOG_TOKEN"] {
+            if let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty {
+                return value
+            }
+        }
         return bakedToken
     }
 
