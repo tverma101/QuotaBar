@@ -95,7 +95,11 @@ enum JSONLFileReader {
             #endif
         }
 
-        while true {
+        // Whether the last chunk attempt hit EOF (stop cleanly) or a read error (fail the scan).
+        var readFailed = false
+        var reachedEnd = false
+
+        while !reachedEnd {
             // FileHandle reads are synchronous, so cancellation cannot interrupt one in-flight read.
             // Checking once per chunk bounds canceled work to at most one chunk plus its line parsing.
             guard !Task.isCancelled else {
@@ -107,68 +111,50 @@ enum JSONLFileReader {
                 )
             }
 
-            let chunk: Data
-            do {
-                guard let next = try handle.read(upToCount: chunkSize), !next.isEmpty else { break }
-                chunk = next
-            } catch {
-                return ReadResult(
-                    succeeded: false,
-                    statistics: statistics,
-                    finalPartial: carry,
-                    isDiscardingOversizedLine: discarding
+            // Each chunk gets its own autorelease pool so its read buffer is released every
+            // `chunkSize` bytes rather than at end-of-file.
+            //
+            // `NSFileHandle.read(upToCount:)` autoreleases an ~80 KB buffer per call (it rounds the
+            // 64 KB request up to 81,920 bytes), and it is called from the chunk loop — *outside*
+            // `deliver`'s per-line pool. So every buffer a file allocated piled into the pool the
+            // caller opened around the whole parse, which only drains when that file finishes. On a
+            // multi-GB corpus `leaks --autoreleasePools` measured **1,025 MB across 13,126
+            // NSConcreteData** sitting in pools, which is the bulk of a cold scan's footprint: the
+            // app itself holds almost nothing (live heap ~25 MB, largest owned array 1.06 MB).
+            autoreleasepool {
+                let chunk: Data
+                do {
+                    guard let next = try handle.read(upToCount: chunkSize), !next.isEmpty else {
+                        reachedEnd = true
+                        return
+                    }
+                    chunk = next
+                } catch {
+                    readFailed = true
+                    reachedEnd = true
+                    return
+                }
+
+                statistics.bytesRead += chunk.count
+                statistics.chunksRead += 1
+                Self.splitAndDeliver(
+                    chunk,
+                    carry: &carry,
+                    discarding: &discarding,
+                    statistics: &statistics,
+                    maxLineBytes: maxLineBytes,
+                    deliver: deliver
                 )
             }
+        }
 
-            statistics.bytesRead += chunk.count
-            statistics.chunksRead += 1
-
-            var segmentStart = chunk.startIndex
-            while segmentStart < chunk.endIndex,
-                  let newline = chunk[segmentStart...].firstIndex(of: UInt8(ascii: "\n"))
-            {
-                if discarding {
-                    // We already exceeded the bound in an earlier chunk. The newline ends that one
-                    // rejected logical record; later records in this same chunk remain eligible.
-                    discarding = false
-                } else if carry.isEmpty {
-                    let line = chunk[segmentStart..<newline]
-                    if line.count <= maxLineBytes {
-                        deliver(line)
-                    } else {
-                        statistics.oversizedLinesSkipped += 1
-                    }
-                } else {
-                    let continuation = chunk[segmentStart..<newline]
-                    if carry.count + continuation.count <= maxLineBytes {
-                        if !continuation.isEmpty {
-                            carry.append(contentsOf: continuation)
-                            statistics.bytesCopiedIntoCarry += continuation.count
-                            statistics.peakCarryBytes = max(statistics.peakCarryBytes, carry.count)
-                        }
-                        deliver(carry[...])
-                    } else {
-                        statistics.oversizedLinesSkipped += 1
-                    }
-                    carry.removeAll(keepingCapacity: true)
-                }
-                segmentStart = chunk.index(after: newline)
-            }
-
-            if segmentStart < chunk.endIndex, !discarding {
-                let tail = chunk[segmentStart..<chunk.endIndex]
-                if carry.count + tail.count <= maxLineBytes {
-                    carry.append(contentsOf: tail)
-                    statistics.bytesCopiedIntoCarry += tail.count
-                    statistics.peakCarryBytes = max(statistics.peakCarryBytes, carry.count)
-                } else {
-                    // Drop the accumulated bytes immediately and ignore continuation chunks until
-                    // the next newline. This is the memory safety boundary for malformed giant rows.
-                    statistics.oversizedLinesSkipped += 1
-                    carry.removeAll(keepingCapacity: true)
-                    discarding = true
-                }
-            }
+        if readFailed {
+            return ReadResult(
+                succeeded: false,
+                statistics: statistics,
+                finalPartial: carry,
+                isDiscardingOversizedLine: discarding
+            )
         }
 
         if deliverFinalPartial, !discarding, !carry.isEmpty {
@@ -182,4 +168,64 @@ enum JSONLFileReader {
             isDiscardingOversizedLine: discarding
         )
     }
+
+    /// Split one chunk into newline-delimited lines and hand each to `deliver`, carrying an
+    /// unterminated tail into the next chunk. Split out of `readLines` so the caller can wrap a whole
+    /// chunk — read plus split — in one autorelease pool.
+    private static func splitAndDeliver(
+        _ chunk: Data,
+        carry: inout Data,
+        discarding: inout Bool,
+        statistics: inout Statistics,
+        maxLineBytes: Int,
+        deliver: (Data.SubSequence) -> Void
+    ) {
+        var segmentStart = chunk.startIndex
+        while segmentStart < chunk.endIndex,
+              let newline = chunk[segmentStart...].firstIndex(of: UInt8(ascii: "\n"))
+        {
+            if discarding {
+                // We already exceeded the bound in an earlier chunk. The newline ends that one
+                // rejected logical record; later records in this same chunk remain eligible.
+                discarding = false
+            } else if carry.isEmpty {
+                let line = chunk[segmentStart..<newline]
+                if line.count <= maxLineBytes {
+                    deliver(line)
+                } else {
+                    statistics.oversizedLinesSkipped += 1
+                }
+            } else {
+                let continuation = chunk[segmentStart..<newline]
+                if carry.count + continuation.count <= maxLineBytes {
+                    if !continuation.isEmpty {
+                        carry.append(contentsOf: continuation)
+                        statistics.bytesCopiedIntoCarry += continuation.count
+                        statistics.peakCarryBytes = max(statistics.peakCarryBytes, carry.count)
+                    }
+                    deliver(carry[...])
+                } else {
+                    statistics.oversizedLinesSkipped += 1
+                }
+                carry.removeAll(keepingCapacity: true)
+            }
+            segmentStart = chunk.index(after: newline)
+        }
+
+        if segmentStart < chunk.endIndex, !discarding {
+            let tail = chunk[segmentStart..<chunk.endIndex]
+            if carry.count + tail.count <= maxLineBytes {
+                carry.append(contentsOf: tail)
+                statistics.bytesCopiedIntoCarry += tail.count
+                statistics.peakCarryBytes = max(statistics.peakCarryBytes, carry.count)
+            } else {
+                // Drop the accumulated bytes immediately and ignore continuation chunks until
+                // the next newline. This is the memory safety boundary for malformed giant rows.
+                statistics.oversizedLinesSkipped += 1
+                carry.removeAll(keepingCapacity: true)
+                discarding = true
+            }
+        }
+}
+
 }
