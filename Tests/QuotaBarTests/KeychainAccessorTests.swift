@@ -104,6 +104,64 @@ final class KeychainRefreshReadTests: XCTestCase {
     /// A background refresh must ask for exactly one silent read. This is the regression that matters
     /// most: the old flagless call shelled out to `security find-generic-password`, which cannot
     /// suppress UI, so this path produced a dialog every five minutes.
+    /// The shared gate is process-wide state; every test in this type must start from a clean slate
+    /// or ordering decides the outcome.
+    override func setUp() {
+        super.setUp()
+        KeychainPermissionGate.shared.reset()
+    }
+
+    override func tearDown() {
+        KeychainPermissionGate.shared.reset()
+        super.tearDown()
+    }
+
+    /// The gate lives in the shared helper rather than in each provider, because the condition belongs
+    /// to the item's ACL: once macOS says "this needs a dialog", every background refresh until the
+    /// user grants it gets the same answer. This asserts the general contract.
+    func testSuccessfulInteractiveReadClearsAPreviouslyBlockedItem() throws {
+        let blocked = RecordingKeychain(requiresInteraction: true)
+        XCTAssertThrowsError(try blocked.readGenericPasswordForRefresh(service: "svc"))
+        XCTAssertTrue(KeychainPermissionGate.shared.isBlocked, "a silent-read failure must block later background attempts")
+
+        // A *background* read cannot clear the block — it never reaches the Keychain, which is the
+        // whole point. Only a manual refresh can, because only it can show the dialog that grants access.
+        let stillBlocked = RecordingKeychain(requiresInteraction: false)
+        XCTAssertThrowsError(try stillBlocked.readGenericPasswordForRefresh(service: "svc"))
+        XCTAssertTrue(KeychainPermissionGate.shared.isBlocked)
+
+        // The manual read reaches the Keychain, succeeds, and clears the block for everyone.
+        let granted = RecordingKeychain(requiresInteraction: false)
+        let value = try ProviderRefreshContext.$isManual.withValue(true) {
+            try granted.readGenericPasswordForRefresh(service: "svc")
+        }
+        XCTAssertEqual(value, "secret")
+        XCTAssertFalse(
+            KeychainPermissionGate.shared.isBlocked,
+            "granting access must not leave the item blocked for every other provider"
+        )
+
+        // And background reads work silently again.
+        let afterwards = RecordingKeychain(requiresInteraction: false)
+        _ = try afterwards.readGenericPasswordForRefresh(service: "svc")
+        XCTAssertEqual(afterwards.calls, [false])
+    }
+
+    func testBackgroundRefreshAnswersFromMemoryOnceBlocked() throws {
+        let keychain = RecordingKeychain(requiresInteraction: true)
+        XCTAssertThrowsError(try keychain.readGenericPasswordForRefresh(service: "svc"))
+        XCTAssertEqual(keychain.calls, [false], "the silent probe is the only read that should happen")
+
+        // Every later background refresh must not touch the Keychain at all.
+        for _ in 0..<3 {
+            XCTAssertThrowsError(try keychain.readGenericPasswordForRefresh(service: "svc"))
+        }
+        XCTAssertEqual(
+            keychain.calls, [false],
+            "a blocked item must not be re-read on every background refresh"
+        )
+    }
+
     func testBackgroundRefreshNeverPermitsInteraction() throws {
         let keychain = RecordingKeychain(requiresInteraction: true)
         XCTAssertThrowsError(try keychain.readGenericPasswordForRefresh(service: "svc")) { error in

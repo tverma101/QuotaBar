@@ -85,9 +85,25 @@ struct CopilotAuthStore: Sendable {
     private func readGhKeychainRaw() -> String? {
         // `gh` stores its Keychain item under the GitHub username as the account. Read it scoped to that
         // account when we can recover it from hosts.yml; otherwise fall back to a service-only lookup.
-        if let account = ghUsername(),
-           let raw = try? keychain.readGenericPasswordForRefresh(service: Self.ghKeychainService, account: account) {
-            return raw
+        if let account = ghUsername() {
+            do {
+                return try keychain.readGenericPasswordForRefresh(
+                    service: Self.ghKeychainService,
+                    account: account
+                )
+            } catch KeychainError.interactionNotAllowed {
+                // A definitive answer, not a miss: the item is there but macOS will not release it
+                // silently. Falling through would repeat the entire silent-then-escalate chain for a
+                // lookup that cannot succeed, and on a manual refresh could raise a second dialog for
+                // the same item.
+                AppLog.debug(
+                    LogTag.auth("copilot"),
+                    "gh keychain read needs interaction; skipping the service-only fallback"
+                )
+                return nil
+            } catch {
+                // A real miss for this account — fall through to the service-only lookup.
+            }
         }
         return try? keychain.readGenericPasswordForRefresh(service: Self.ghKeychainService)
     }

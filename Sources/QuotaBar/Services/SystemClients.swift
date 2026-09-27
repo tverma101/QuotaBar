@@ -288,12 +288,23 @@ extension KeychainAccessing {
     /// providers via the shared `CredentialInteractionGate` — so ⌘R opens at most one Keychain dialog
     /// no matter how many provider cards are enabled.
     func readGenericPasswordForRefresh(service: String, account: String? = nil) throws -> String? {
-        try escalatingRead {
+        // A silent read already proved this item needs user interaction. Another background refresh
+        // cannot grant that — it has no way to show a dialog — so answer from memory instead of
+        // re-reading and re-failing every cycle. A manual refresh always retries, because it is the
+        // one context that can present the dialog.
+        if KeychainPermissionGate.shared.isBlocked,
+           !ProviderRefreshContext.isManual {
+            throw KeychainError.interactionNotAllowed
+        }
+        let result = try escalatingRead {
             if let account {
                 return try readGenericPassword(service: service, account: account, allowInteraction: $0)
             }
             return try readGenericPassword(service: service, allowInteraction: $0)
         }
+        // Reached without a silent-read failure, so access is granted now; stop blocking.
+        KeychainPermissionGate.shared.reset()
+        return result
     }
 
     /// Current-user-scoped variant of `readGenericPasswordForRefresh`, for items this app *writes*
@@ -314,6 +325,9 @@ extension KeychainAccessing {
         do {
             return try read(false)
         } catch KeychainError.interactionNotAllowed {
+            // Remember it: without this every five-minute cycle re-reads an item it cannot read and
+            // fails again, which is the "keychain access" spam.
+            KeychainPermissionGate.shared.block()
             guard ProviderRefreshContext.isManual,
                   ProviderRefreshContext.credentialInteractionGate?.claim() ?? true
             else {
@@ -505,4 +519,35 @@ func expandHome(_ path: String) -> String {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     if path == "~" { return home }
     return home + String(path.dropFirst())
+}
+
+/// Process-wide memory that a silent Keychain read needs user interaction.
+///
+/// Lives here rather than per provider because the condition is a property of the *item's* ACL, not
+/// of one provider: once macOS says "this needs a dialog", every background refresh until the user
+/// grants it will get the same answer. Mirrors `CredentialInteractionGate`'s lock discipline.
+final class KeychainPermissionGate: @unchecked Sendable {
+    static let shared = KeychainPermissionGate()
+
+    private init() {}
+    private let lock = NSLock()
+    private var blocked = false
+
+    var isBlocked: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return blocked
+    }
+
+    func block() {
+        lock.lock()
+        blocked = true
+        lock.unlock()
+    }
+
+    func reset() {
+        lock.lock()
+        blocked = false
+        lock.unlock()
+    }
 }
