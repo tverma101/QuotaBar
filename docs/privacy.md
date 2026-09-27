@@ -1,35 +1,38 @@
 # Privacy & Usage Data
 
-QuotaBar always sends an **anonymous daily active ping** and **anonymous crash reports** so we can
-count active users and fix app crashes. These are not optional.
+**A stock QuotaBar build sends no analytics at all.** The app inherits upstream's PostHog telemetry
+mechanism, but no project token is committed, so the analytics sink stays inert: no SDK setup, no
+network requests, no anonymous ID, no crash reports. Nothing on this page describes what a default
+install transmits, because the answer is nothing.
 
-You can also share extra anonymous usage analytics to help us understand how the app is used and catch
-problems. Extra analytics is on by default for new installs. Turn it off any time in
-**Settings → Privacy → Help make QuotaBar better by sharing anonymous usage analytics**. Existing
-installs keep the choice they already stored.
+The rest of this document describes the mechanism that *would* run if a maintainer supplies their own
+PostHog project token, so the behaviour is documented rather than hidden. To enable it, set your own
+US-region `phc_…` token via `QUOTABAR_POSTHOG_TOKEN`; see [How it works](#how-it-works) below. Nothing
+is sent until you do.
 
-## What is always shared
+## What would always be shared
 
-Once per local day, QuotaBar sends an anonymous **app use** ping: that the app was active today, the
+Once per local day, the app sends an anonymous **app use** ping: that the app was active today, the
 app and macOS version, which providers and metrics you have enabled, and which metrics you've pinned
 to the menu bar or tucked behind the "show more" caret. A random ID (not tied to you or any account)
-lets us count daily active users without identifying anyone.
+lets the project owner count daily active users without identifying anyone.
 
-- **Crash reports** — if QuotaBar crashes, it saves a report and sends it the next time you open the
+- **Crash reports** — if the app crashes, it saves a report and sends it the next time you open the
   app: the technical stack trace (which parts of *QuotaBar's own code* were running when it crashed)
   plus the app and macOS version. This contains no account details, credentials, or usage values —
   just where in the app the crash happened.
 
 ## What the toggle shares
 
-When extra analytics are on, QuotaBar also sends, for each provider refreshed that day, at most one
+When extra analytics are on, the app also sends, for each provider refreshed that day, at most one
 provider-refresh event:
 
 - **Provider refreshes** — per provider, how many refreshes succeeded or failed that day, the **kinds**
   of errors that happened (for example "not logged in", "network", or an HTTP status group), and how
   many manual refreshes you triggered.
 
-Turning the toggle off stops these extra events. Daily activity and crash reports continue.
+Turning the toggle off stops these extra events. Daily activity and crash reports continue, as long as
+a token is configured at all.
 
 ## What is never shared
 
@@ -69,12 +72,27 @@ analytics toggle controls extra PostHog events, not daily activity or crash repo
 
 ## How it works
 
-- Data is fully anonymous: QuotaBar never identifies you to the analytics service and creates no user profile.
-- Daily activity and crash reports are always enabled, regardless of the extra-analytics switch.
-- Counts are rolled up locally and sent as daily summaries, so the app's normal 5-minute refresh never turns into a flood of network calls.
-- Your analytics choice and the anonymous ID are stored separately from the rest of the app's settings, so settings migrations and updates do not re-enable extra analytics or change your ID.
+- The sink is inert unless a real `phc_…` project token resolves. `TelemetryConfig.bakedToken` is the
+  placeholder `phc_REPLACE_ME`, and `PostHogTelemetrySink` returns without calling
+  `PostHogSDK.shared.setup` when it does, so there is no transport to opt out of.
+- A maintainer enables analytics by supplying their own token, either as the `bakedToken` value in
+  `Sources/QuotaBar/Services/Telemetry.swift` or at runtime via the `QUOTABAR_POSTHOG_TOKEN`
+  environment variable. `Tests/QuotaBarTests/TelemetryConfigTests.swift` fails if a real token is
+  committed by accident, which is what keeps the default inert over time.
+- The token must be US-region for the default host. A project token is a write-only client key scoped
+  to one project; anyone reading it can only write events into that project, which is why it is safe to
+  commit but must never belong to a project owner who has not agreed to receive the data.
+- When enabled, data is fully anonymous: the app never identifies you to the analytics service and
+  creates no user profile.
+- Daily activity and crash reports are always enabled once a token exists, regardless of the
+  extra-analytics switch.
+- Counts are rolled up locally and sent as daily summaries, so the app's normal 5-minute refresh never
+  turns into a flood of network calls.
+- Your analytics choice and the anonymous ID are stored separately from the rest of the app's settings,
+  so settings migrations and updates do not re-enable extra analytics or change your ID.
 
 ## Turning extra analytics off
 
 Open **Settings → Privacy** and switch **Help make QuotaBar better by sharing anonymous usage analytics**
-off. Extra usage analytics stop. Daily activity and crash reports continue.
+off. Extra usage analytics stop. Daily activity and crash reports continue, if a token is configured
+at all. To send nothing whatsoever, build without a token — which is the default.

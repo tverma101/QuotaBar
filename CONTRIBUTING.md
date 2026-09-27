@@ -1,6 +1,6 @@
 # Contributing to OpenUsage
 
-> **Fork note:** this is QuotaBar, a private fork of OpenUsage. The workflow below describes
+> **Fork note:** this is QuotaBar, a fork of OpenUsage. The workflow below describes
 > upstream's contribution process and still governs the shared codebase; QuotaBar itself is
 > maintained privately and does not accept external pull requests.
 

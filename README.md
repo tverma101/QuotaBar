@@ -4,7 +4,7 @@ Track your AI coding subscriptions from the macOS menu bar.
 
 QuotaBar shows how much of your AI coding plans you've used: session and weekly limits, credits, and spend, all in one popover. Pin your most important metrics straight into the menu bar.
 
-> **This is a private fork, not the official OpenUsage.**
+> **This is an independent fork, not the official OpenUsage.**
 > QuotaBar is derived from [OpenUsage](https://github.com/robinebers/openusage) by Robin Ebers, which is
 > licensed under the MIT licence. It is **not** endorsed by, affiliated with, or an official part of
 > OpenUsage, and the OpenUsage name and logo are not used here — see [TRADEMARK.md](TRADEMARK.md).
@@ -105,7 +105,7 @@ profile. See [iCloud Sync](docs/icloud-sync.md) for the container identifiers.
 
 ## Contributing
 
-This is a private fork maintained for personal use, so the upstream issue-first PR workflow does not apply here. Upstream contribution guidelines still govern the shared codebase: read [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports about QuotaBar belong in this repository; anything that looks like an upstream defect should go to [robinebers/openusage](https://github.com/robinebers/openusage/issues).
+This is an independent fork, so contributions are welcome here and follow [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports about QuotaBar belong in this repository; anything that looks like an upstream defect should go to [robinebers/openusage](https://github.com/robinebers/openusage/issues).
 
 ## License
 
