@@ -48,6 +48,30 @@ Conventions for the per-provider modules under `Sources/QuotaBar/Providers/<Name
   3. pinned to the menu bar (`DefaultLayout.pinnedMetricIDs`),
   4. order (within a provider, the `widgetDescriptors` declaration order).
 
+## Building
+
+`swift build` and `swift test` are the normal commands, but the single `QuotaBar` module is large
+enough that `-emit-module` is the peak-memory step of the whole build. On a machine under memory
+pressure the kernel kills `swift-frontend` mid-`emit-module` and SwiftPM reports only
+`error: SwiftCompile ... failed with a nonzero exit code` — with no compiler diagnostic, because the
+process never got far enough to emit one. Confirm the cause before debugging the code:
+
+```sh
+ls -t /Library/Logs/DiagnosticReports/JetsamEvent-*.ips | head -1   # "reason" : "per-process-limit"
+```
+
+When that is what happened, cut the build's own memory rather than changing source:
+
+```sh
+swift build -j 2 --disable-index-store
+```
+
+`--disable-index-store` skips the module index, which is IDE-only metadata but a large consumer during
+`emit-module`. Adding `-j 1` and `-Xswiftc -gnone` also helps. None of these fix the underlying cause —
+`Sources/QuotaBar` is one 262-file module, and splitting it is the real remedy. A 1 MB `.build` lock
+left by an interrupted build, or a stale `XCBuildData/build.db`, shows up as a *hang at 0% CPU* rather
+than a crash; `rm -rf .build/out/Intermediates.noindex/XCBuildData .build/.lock` clears it.
+
 ## Running / Testing Changes
 
 - There is no hot reload. The app is a long-lived menu-bar process, so **every code change requires a full rebuild and restart of the running app** to take effect — kill the running instance, rebuild, and relaunch before testing.
