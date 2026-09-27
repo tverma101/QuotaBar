@@ -1249,6 +1249,81 @@ final class LayoutStoreTests: XCTestCase {
         )
     }
 
+    // MARK: - Conditional rows (hidesWhenEmpty)
+
+    /// Builds a descriptor that mirrors the real conditional rows: a `hidesWhenEmpty` metric,
+    /// alongside an ordinary one that is never hidden. Borrows a real mock descriptor's sample so the
+    /// fixture cannot drift from how the app actually builds a row.
+    private func conditionalDescriptor(
+        id: String = "claude.extra",
+        provider: String = "claude",
+        hidesWhenEmpty: Bool = true
+    ) throws -> WidgetDescriptor {
+        let base = try XCTUnwrap(MockData.descriptors.first { $0.id == "claude.extra" })
+        return WidgetDescriptor(
+            id: id,
+            providerID: provider,
+            metricLabel: "Extra usage",
+            sample: base.sample,
+            hidesWhenEmpty: hidesWhenEmpty
+        )
+    }
+
+    func testConditionalRowHidesItselfWhileItHasNoData() throws {
+        let store = makeStore("ConditionalHidesEmpty")
+        let descriptor = try conditionalDescriptor()
+        XCTAssertTrue(descriptor.hidesWhenEmpty)
+        XCTAssertFalse(
+            store.showsRow(descriptor, hasData: false),
+            "an empty feature/plan-dependent row is noise and should hide"
+        )
+    }
+
+    func testConditionalRowAppearsAsSoonAsItHasData() throws {
+        let store = makeStore("ConditionalShowsWithData")
+        XCTAssertTrue(store.showsRow(try conditionalDescriptor(), hasData: true))
+    }
+
+    /// The whole point of persisting the opt-in: hiding a row the user deliberately switched on would
+    /// silently undo their choice.
+    func testExplicitlyEnabledConditionalRowStaysVisibleWithoutData() throws {
+        let store = makeStore("ConditionalExplicitOptIn")
+        let descriptor = try conditionalDescriptor()
+        XCTAssertFalse(store.showsRow(descriptor, hasData: false))
+
+        store.setMetricEnabled(descriptor.id, true)
+
+        XCTAssertTrue(
+            store.showsRow(descriptor, hasData: false),
+            "turning the row on is a statement of intent that outranks the data"
+        )
+    }
+
+    func testExplicitOptInSurvivesRelaunchAndClearsOnDisable() throws {
+        let descriptor = try conditionalDescriptor()
+        // Share one defaults suite across both stores: `makeDefaults` mints a fresh UUID per call, so
+        // two `makeStore` calls would not actually model a relaunch.
+        let defaults = makeDefaults("ConditionalOptInPersists")
+        LayoutStore(registry: .mock, defaults: defaults, storageKey: "layout")
+            .setMetricEnabled(descriptor.id, true)
+
+        let relaunched = LayoutStore(registry: .mock, defaults: defaults, storageKey: "layout")
+        XCTAssertEqual(relaunched.explicitlyEnabledMetricIDs, [descriptor.id])
+        XCTAssertTrue(relaunched.showsRow(descriptor, hasData: false))
+
+        relaunched.setMetricEnabled(descriptor.id, false)
+        XCTAssertEqual(relaunched.explicitlyEnabledMetricIDs, [])
+        XCTAssertFalse(relaunched.showsRow(descriptor, hasData: false))
+    }
+
+    /// Core quota meters must never auto-hide: a session meter reading empty means "we don't know
+    /// yet", and hiding it would read as "you're fine" at the moment the user wants to know.
+    func testNonConditionalRowIsNeverHidden() throws {
+        let store = makeStore("ConditionalNeverHidesCore")
+        let core = try conditionalDescriptor(id: "claude.session", hidesWhenEmpty: false)
+        XCTAssertTrue(store.showsRow(core, hasData: false))
+    }
+
     private func makeStore(_ name: String) -> LayoutStore {
         LayoutStore(registry: .mock, defaults: makeDefaults(name), storageKey: "layout")
     }

@@ -38,6 +38,7 @@ final class ZAIProvider: ProviderRuntime {
                           metricLabel: "Web Searches", limit: 1000, suffix: "searches",
                           periodDurationMs: ZAIUsageMapper.monthlyPeriodMs)
                 .exportingLimit("webSearches", unit: "searches")
+                .hidingWhenEmpty()
         ]
     }
 

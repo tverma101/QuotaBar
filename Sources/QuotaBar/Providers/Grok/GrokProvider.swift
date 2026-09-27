@@ -35,7 +35,8 @@ final class GrokProvider: ProviderRuntime {
         [
             .percent(id: "grok.weekly", provider: provider, title: "Weekly", metricLabel: "Weekly limit")
                 .exportingLimit("weekly", unit: "percent"),
-            .badge(id: "grok.payAsYouGo", provider: provider, title: "Extra Usage", metricLabel: "Pay as you go"),
+            .badge(id: "grok.payAsYouGo", provider: provider, title: "Extra Usage", metricLabel: "Pay as you go")
+                .hidingWhenEmpty(),
             .usageTrend(provider: provider)
                 .exportingHistory(
                     scope: .machineLocal,

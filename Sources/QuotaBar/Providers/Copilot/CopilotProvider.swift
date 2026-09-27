@@ -40,7 +40,7 @@ final class CopilotProvider: ProviderRuntime {
         [
             .percent(id: "copilot.premium", provider: provider, title: "Credits")
                 .exportingLimit("premiumCredits", unit: "credits", source: .progressOrValue(kind: .count)),
-            .values(id: "copilot.extra", provider: provider, title: "Extra Usage", selection: .kind(.count))
+            .values(id: "copilot.extra", provider: provider, title: "Extra Usage", selection: .kind(.count)).hidingWhenEmpty()
                 .exportingLimit("extraUsage", unit: "count", source: .value(kind: .count)),
             .values(id: "copilot.orgCredits", provider: provider, title: "Org Credits", selection: .kind(.count))
                 .exportingLimit("orgCredits", unit: "credits", source: .value(kind: .count, label: "credits")),

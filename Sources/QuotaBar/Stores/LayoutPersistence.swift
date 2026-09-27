@@ -30,6 +30,10 @@ final class LayoutPersistence {
     func loadExpandedMetrics() -> [String]? { defaults.stringArray(forKey: keys.expandedMetrics) }
     func loadExpandOnEnable() -> [String]? { defaults.stringArray(forKey: keys.expandOnEnable) }
     func loadExpandedProviders() -> [String]? { defaults.stringArray(forKey: keys.expandedProviders) }
+    /// Metrics the user enabled by hand, as opposed to ones seeded from the default layout.
+    func loadExplicitlyEnabledMetrics() -> Set<String> {
+        Set(defaults.stringArray(forKey: keys.explicitlyEnabledMetrics) ?? [])
+    }
     func loadMenuBarStyle() -> MenuBarStyle { defaults.enumValue(forKey: keys.menuBarStyle, default: .text) }
     func loadHiddenMenuBarProviderIDs() -> Set<String> {
         if defaults.object(forKey: keys.hiddenMenuBarProviderIDs) != nil {
@@ -60,6 +64,9 @@ final class LayoutPersistence {
     }
     func saveExpandedProviders(_ value: Set<String>) {
         defaults.set(Array(value), forKey: keys.expandedProviders)
+    }
+    func saveExplicitlyEnabledMetrics(_ value: Set<String>) {
+        defaults.set(Array(value).sorted(), forKey: keys.explicitlyEnabledMetrics)
     }
     func saveMenuBarStyle(_ value: MenuBarStyle) {
         defaults.set(value.rawValue, forKey: keys.menuBarStyle)
@@ -99,6 +106,7 @@ final class LayoutPersistence {
         let expandedMetrics: String
         let expandOnEnable: String
         let expandedProviders: String
+        let explicitlyEnabledMetrics: String
         let menuBarStyle: String
         let hiddenMenuBarProviderIDs: String
         let legacyHiddenMenuBarIconProviderIDs: String
@@ -113,6 +121,7 @@ final class LayoutPersistence {
             expandedMetrics = "\(storageKey).expandedMetrics"
             expandOnEnable = "\(storageKey).expandOnEnable"
             expandedProviders = "\(storageKey).expandedProviders"
+            explicitlyEnabledMetrics = "\(storageKey).explicitlyEnabledMetrics"
             menuBarStyle = "\(storageKey).menuBarStyle"
             hiddenMenuBarProviderIDs = "\(storageKey).hiddenMenuBarProviderIDs"
             legacyHiddenMenuBarIconProviderIDs = "\(storageKey).hiddenMenuBarIconProviderIDs"

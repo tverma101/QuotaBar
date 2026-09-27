@@ -37,9 +37,9 @@ final class CursorProvider: ProviderRuntime {
                 .exportingLimit("autoUsage", unit: "percent"),
             .percent(id: "cursor.api", provider: provider, title: "Other Models")
                 .exportingLimit("apiUsage", unit: "percent"),
-            .percent(id: "cursor.grokBot", provider: provider, title: "Grok Bot", metricLabel: "Grok Bot usage")
+            .percent(id: "cursor.grokBot", provider: provider, title: "Grok Bot", metricLabel: "Grok Bot usage").hidingWhenEmpty()
                 .exportingLimit("grokBot", unit: "percent"),
-            .boundedDollars(id: "cursor.onDemand", provider: provider, title: "Extra Usage", metricLabel: "On-demand", limit: 100, valueWord: "spent")
+            .boundedDollars(id: "cursor.onDemand", provider: provider, title: "Extra Usage", metricLabel: "On-demand", limit: 100, valueWord: "spent").hidingWhenEmpty()
                 .exportingLimit("onDemand", unit: "usd", source: .progressOrValue(kind: .dollars)),
             .boundedCount(id: "cursor.requests", provider: provider, title: "Requests", limit: 500,
                           suffix: "requests", periodDurationMs: CursorUsageMapper.billingPeriodMs)
