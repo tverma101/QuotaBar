@@ -72,6 +72,20 @@ final class WidgetDataStore {
     /// deadline is already reported separately by `slowProviderRefreshThreshold`.
     static let defaultProviderRefreshTimeout: TimeInterval = 120
 
+    /// Backoff bounds for a forced caller waiting on an in-flight provider pass.
+    ///
+    /// This wait used to be `while inFlight { await Task.yield() }` — a bare re-enqueue on the
+    /// MainActor's serial executor. Every waiter spun a full core for the whole wait, and the panel
+    /// spawns one `refreshAll(force:)` per popover open, so twenty open/close cycles inside one slow
+    /// provider's window left twenty tasks doing nothing but re-enqueueing. It inflated MainActor queue
+    /// latency for every panel and menu-bar update, and nothing could cancel them. Sleeping with backoff
+    /// keeps the wait responsive to completion while costing nothing when idle.
+    private static let forceWaitInitialDelay: TimeInterval = 0.02
+    private static let forceWaitMaxDelay: TimeInterval = 0.25
+    /// Slack past the provider deadline before a forced waiter gives up. The in-flight pass is itself
+    /// cancelled at `defaultProviderRefreshTimeout`, so this only has to cover the unwind.
+    private static let forceWaitGrace: TimeInterval = 5
+
     /// Rendered snapshots consumed by every UI/API surface. Equal to `localSnapshots` when iCloud sync
     /// is off; machine-local history rows are rebuilt from the union while sync is on.
     var snapshots: [String: ProviderSnapshot] = [:]
@@ -79,6 +93,12 @@ final class WidgetDataStore {
     /// peer contribution can never echo back out and multiply on the next device.
     private(set) var localSnapshots: [String: ProviderSnapshot] = [:]
     var refreshingProviderIDs: Set<String> = []
+    /// The batch currently running, so a second caller asking for the same thing joins it instead of
+    /// starting its own set of per-provider tasks. Keyed by (force, scope) because a forced caller must
+    /// not silently receive a menu-bar-scoped pass — that is the merge-data case the per-provider force
+    /// wait exists to avoid, and it must keep running its own pass.
+    private var activeBatch: Task<Void, Never>?
+    private var activeBatchKey: String?
     /// Wall-clock time the most recent full refresh pass finished. Together with the chosen refresh
     /// cadence it drives the dashboard footer's live "Next update in …" countdown, so the footer reflects
     /// the real schedule instead of a hardcoded value. `nil` until the first pass completes.
@@ -213,7 +233,39 @@ final class WidgetDataStore {
     /// the normal overlap. Everything stays MainActor-isolated; the overlap happens at provider awaits,
     /// and the per-provider in-flight guard still prevents duplicate fetches. `force` bypasses the
     /// snapshot cache (the manual "refresh now" path); the periodic loop keeps honoring it.
+    /// Runs one refresh batch, coalescing callers that asked for exactly the same work.
+    ///
+    /// The panel fires a forced full-scope batch on every popover open and never cancels the previous
+    /// one, so a user opening and closing the panel repeatedly used to stack batches — each spawning a
+    /// task per provider, each of which then hit the forced-wait path for any provider already in
+    /// flight. A caller arriving while an identical batch runs now joins it, which yields the same
+    /// result because the batch refreshes the same provider set.
+    ///
+    /// A caller with a *different* (force, scope) is deliberately not joined: a forced caller must not
+    /// be handed a menu-bar-scoped pass, and that is the merge-data case the per-provider forced wait
+    /// exists to handle.
     func refreshAll(force: Bool = false, maxConcurrentProviders: Int? = nil) async {
+        let batchKey = "\(force)|\(ProviderRefreshContext.scope == .menuBar ? "menuBar" : "full")"
+        if let activeBatch, activeBatchKey == batchKey {
+            AppLog.debug(.refresh, "batch join (force=\(force) already in flight)")
+            await activeBatch.value
+            return
+        }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.runBatch(force: force, maxConcurrentProviders: maxConcurrentProviders)
+        }
+        activeBatch = task
+        activeBatchKey = batchKey
+        await task.value
+        // Only clear if we are still the registered batch; a nested call may have replaced it.
+        if activeBatchKey == batchKey {
+            activeBatch = nil
+            activeBatchKey = nil
+        }
+    }
+
+    private func runBatch(force: Bool, maxConcurrentProviders: Int?) async {
         // `Task {}` from MainActor context inherits the isolation (a task-group child can't capture
         // the non-Sendable store), so fire one task per provider in bounded groups, then await them all.
         let enabledIDs = registry.providers.map(\.id).filter { isProviderEnabled($0) }
@@ -406,11 +458,23 @@ final class WidgetDataStore {
                 return .skipped
             }
             AppLog.debug(.refresh, "force wait \(providerID) (already in flight)")
+            // Bounded and sleeping. `Task.yield()` here was a hot spin on the MainActor, and the loop
+            // had no deadline at all, so a waiter could outlive the pass it was waiting for.
+            let waitDeadline = monotonicNow() + Self.defaultProviderRefreshTimeout + Self.forceWaitGrace
+            var delay = Self.forceWaitInitialDelay
             while refreshingProviderIDs.contains(providerID) {
-                await Task.yield()
-                if Task.isCancelled {
+                if Task.isCancelled { return .skipped }
+                if monotonicNow() >= waitDeadline {
+                    AppLog.info(
+                        .refresh,
+                        "force wait gave up \(providerID) (still in flight past the deadline)"
+                    )
                     return .skipped
                 }
+                // `try?` because cancellation throws here; the `isCancelled` check above is what acts
+                // on it, on the next turn round the sleep.
+                try? await Task.sleep(for: .seconds(delay))
+                delay = min(delay * 2, Self.forceWaitMaxDelay)
             }
         }
         refreshingProviderIDs.insert(providerID)

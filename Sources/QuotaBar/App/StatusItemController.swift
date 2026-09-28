@@ -64,6 +64,9 @@ final class StatusItemController: NSObject {
     private let backdrop = PopoverBackdropView(cornerRadius: StatusItemController.cornerRadius)
     /// Token for the appearance-change observer; held to follow the documented removal pattern.
     private var appearanceObserver: NSObjectProtocol?
+    /// The refresh fired by the most recent popover open, so a close can cancel it and a reopen can
+    /// supersede it instead of leaving a trail of un-cancellable batches.
+    private var popoverRefreshTask: Task<Void, Never>?
     /// Corner radius of the panel surface; tuned to read like a system menu-bar popover.
     private static let cornerRadius: CGFloat = 13
 
@@ -406,7 +409,12 @@ final class StatusItemController: NSObject {
 
         // Opening the panel: pull full token/spend/history immediately so the user never waits
         // up to the background interval (or a menuBar-only pass) to see spend rows.
-        Task {
+        //
+        // Held so `hidePanel` can cancel it. It was previously fire-and-forget, so a user opening and
+        // closing the panel repeatedly left one un-cancellable batch per open behind — the tasks the
+        // per-provider forced-wait path then piled onto. Reopening supersedes the previous open anyway.
+        popoverRefreshTask?.cancel()
+        popoverRefreshTask = Task {
             await ProviderRefreshContext.$scope.withValue(.full) {
                 await container.dataStore.refreshAll(force: true)
             }
@@ -434,6 +442,10 @@ final class StatusItemController: NSObject {
     }
 
     private func hidePanel() {
+        // Stop the open's refresh: nobody is looking at the result any more, and leaving it running
+        // meant every open/close cycle added another un-cancellable batch.
+        popoverRefreshTask?.cancel()
+        popoverRefreshTask = nil
         // Dismiss hover surfaces before tearing the dashboard host down to EmptyView — a tooltip the
         // cursor was resting on otherwise gets no hover-exit and can orphan on screen. Same for the
         // Usage Trend AppKit hover popover.
