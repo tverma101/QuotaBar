@@ -1495,3 +1495,109 @@ extension LayoutStoreTests {
         XCTAssertTrue(keptRows.alwaysShown.isEmpty && keptRows.expanded.isEmpty)
     }
 }
+
+extension LayoutStoreTests {
+    /// One continuous drag is one user action and must cost one ⌘Z.
+    ///
+    /// `reorderDragGesture` fires its `reorder` action on every `onChanged` that clears the next row's
+    /// threshold, and each of those is a `recordingUndoStep`. Dragging one row past four positions
+    /// therefore recorded four entries, and the user had to press ⌘Z four times to get back. Worse, the
+    /// 40-deep stack filled after about eight such gestures, silently discarding older history — so the
+    /// symptom was "undo stopped working", not "undo needs more presses".
+    func testOneCoalescedDragRecordsOneUndoStep() throws {
+        let store = makeStore("CoalescedDrag")
+        let ids = MockData.descriptors(for: "claude").map(\.id)
+        XCTAssertGreaterThanOrEqual(ids.count, 3, "need at least three rows to drag across")
+        let dragged = ids[0]
+
+        store.beginCoalescedEdit()
+        // Four intermediate positions, as four `onChanged` crossings would produce.
+        for target in ids.dropFirst().prefix(4) {
+            XCTAssertTrue(
+                store.reorderMetric(dragged: dragged, target: target, in: "claude"),
+                "precondition: the drag actually moves at \(target)"
+            )
+        }
+        store.endCoalescedEdit()
+
+        // A single undo must return to the pre-drag order.
+        XCTAssertTrue(store.undo(), "one drag must leave something to undo")
+        XCTAssertEqual(
+            store.placed.map(\.descriptorID).prefix(3).map { $0 },
+            Array(ids.prefix(3)),
+            "one undo must restore the whole pre-drag order"
+        )
+        XCTAssertFalse(
+            store.canUndo || store.undo(),
+            "and the drag must not have left extra undo steps behind"
+        )
+    }
+
+    /// A drag that ends where it started must not consume a stack slot, or a user fiddling with a row
+    /// would silently push older history out of the 40-deep stack.
+    func testCoalescedDragWithNoNetChangeRecordsNothing() throws {
+        let store = makeStore("CoalescedNoop")
+        let ids = MockData.descriptors(for: "claude").map(\.id)
+        let before = store.undoDepthForTesting
+
+        store.beginCoalescedEdit()
+        for target in ids.dropFirst().prefix(2) {
+            _ = store.reorderMetric(dragged: ids[0], target: target, in: "claude")
+        }
+        // Walk it back to where it started.
+        for target in ids.dropFirst().prefix(2).reversed() {
+            _ = store.reorderMetric(dragged: ids[0], target: target, in: "claude")
+        }
+        store.endCoalescedEdit()
+
+        XCTAssertEqual(
+            store.undoDepthForTesting, before,
+            "a drag with no net change must not push an undo entry"
+        )
+    }
+
+    /// Undo must refuse while a scope is open: the entry for the in-flight drag has not been pushed yet,
+    /// so popping would restore a snapshot from before an unrelated earlier step and discard the work
+    /// done since.
+    func testUndoRefusesWhileACoalescedEditIsOpen() throws {
+        let store = makeStore("CoalescedUndoGuard")
+        let ids = MockData.descriptors(for: "claude").map(\.id)
+        store.reorderMetric(dragged: ids[0], target: ids[1], in: "claude")
+        XCTAssertTrue(store.canUndo, "precondition: there is an earlier step to undo")
+
+        store.beginCoalescedEdit()
+        _ = store.reorderMetric(dragged: ids[1], target: ids[2], in: "claude")
+        XCTAssertTrue(store.isCoalescedEditOpen)
+        XCTAssertFalse(
+            store.undo(),
+            "undo must refuse mid-gesture rather than restore a stale snapshot"
+        )
+        XCTAssertFalse(
+            store.canUndo,
+            "and canUndo must agree, or the Undo button would offer a no-op"
+        )
+
+        store.endCoalescedEdit()
+        XCTAssertTrue(store.canUndo, "undo works again once the gesture closes its scope")
+        XCTAssertTrue(store.undo())
+    }
+
+    /// An unmatched `end` must be harmless, and a nested `begin` must not close the outer scope early —
+    /// otherwise a nested mutation that cancels could strand the store in a scope that swallows undo.
+    func testCoalescedScopeIsReentrantAndSafeToOverClose() throws {
+        let store = makeStore("CoalescedReentrancy")
+        store.endCoalescedEdit() // unmatched close before any open
+        XCTAssertFalse(store.isCoalescedEditOpen)
+
+        let ids = MockData.descriptors(for: "claude").map(\.id)
+        store.beginCoalescedEdit()
+        store.beginCoalescedEdit() // nested: ignored
+        _ = store.reorderMetric(dragged: ids[0], target: ids[1], in: "claude")
+        store.endCoalescedEdit()
+        XCTAssertFalse(
+            store.isCoalescedEditOpen,
+            "the outer scope closes with the first end, and the inner one was never opened"
+        )
+        XCTAssertTrue(store.canUndo, "the coalesced drag recorded exactly one entry")
+    }
+}

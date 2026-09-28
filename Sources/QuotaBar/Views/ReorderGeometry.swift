@@ -167,10 +167,23 @@ func reorderDragGesture(
     lift: Binding<ReorderLift?>,
     makeLift: @escaping (DragGesture.Value) -> ReorderLift?,
     orderedIDs: @escaping () -> [String],
-    reorder: @escaping (_ target: String) -> Bool
+    reorder: @escaping (_ target: String) -> Bool,
+    /// Opens/closes a single undo entry spanning the whole drag.
+    ///
+    /// One continuous drag is one user action, but it fires `reorder` once per row the dragged row
+    /// crosses, and each of those was its own undo step — so a four-position drag needed four ⌘Z presses
+    /// and the 40-deep stack filled up after about eight gestures. `LayoutStore.beginCoalescedEdit` /
+    /// `endCoalescedEdit` collapse the intermediate positions into one entry, and only when something
+    /// actually moved.
+    onEditBegan: @escaping () -> Void = {},
+    onEditEnded: @escaping () -> Void = {}
 ) -> some Gesture {
     DragGesture(minimumDistance: 4, coordinateSpace: .named(coordinateSpaceName))
         .onChanged { value in
+            // The first update of a gesture opens the scope; later ones join the same one.
+            if active.wrappedValue != id {
+                onEditBegan()
+            }
             active.wrappedValue = id
             if lift.wrappedValue?.id != id, let newLift = makeLift(value) {
                 lift.wrappedValue = newLift
@@ -191,6 +204,9 @@ func reorderDragGesture(
         .onEnded { _ in
             active.wrappedValue = nil
             lift.wrappedValue = nil
+            // Close before clearing state, and unconditionally: a drag that returned to its origin still
+            // ends here, and leaving the scope open would swallow every later undo step.
+            onEditEnded()
         }
 }
 

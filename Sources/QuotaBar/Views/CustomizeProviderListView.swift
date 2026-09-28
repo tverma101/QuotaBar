@@ -70,7 +70,9 @@ struct CustomizeProviderListView: View {
             // Hit-test only enabled providers (the set `reorderProvider` can actually move); disabled
             // rows keep their tail position and aren't reorder targets.
             orderedIDs: { layout.customizeGroups.map(\.provider.id) },
-            reorder: { layout.reorderProvider(dragged: row.id, target: $0) }
+            reorder: { layout.reorderProvider(dragged: row.id, target: $0) },
+            onEditBegan: { layout.beginCoalescedEdit() },
+            onEditEnded: { layout.endCoalescedEdit() }
         )
     }
 
