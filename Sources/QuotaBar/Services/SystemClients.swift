@@ -292,18 +292,21 @@ extension KeychainAccessing {
         // cannot grant that — it has no way to show a dialog — so answer from memory instead of
         // re-reading and re-failing every cycle. A manual refresh always retries, because it is the
         // one context that can present the dialog.
-        if KeychainPermissionGate.shared.isBlocked,
+        let key = KeychainItemKey(service: service, account: account)
+        if KeychainPermissionGate.shared.isBlocked(key),
            !ProviderRefreshContext.isManual {
             throw KeychainError.interactionNotAllowed
         }
-        let result = try escalatingRead {
+        let result = try escalatingRead(key) {
             if let account {
                 return try readGenericPassword(service: service, account: account, allowInteraction: $0)
             }
             return try readGenericPassword(service: service, allowInteraction: $0)
         }
-        // Reached without a silent-read failure, so access is granted now; stop blocking.
-        KeychainPermissionGate.shared.reset()
+        // Reached without a silent-read failure, so access is granted for *this* item now. Scoped to
+        // this key on purpose: clearing the whole gate here would let an unrelated provider's success
+        // un-block an item that still needs a dialog, and the re-read spam would resume.
+        KeychainPermissionGate.shared.reset(key)
         return result
     }
 
@@ -312,7 +315,7 @@ extension KeychainAccessing {
     /// part of the query, not a detail: a service-only read is a different lookup, so this must not
     /// collapse into the service-only helper.
     func readGenericPasswordForRefreshForCurrentUser(service: String) throws -> String? {
-        try escalatingRead {
+        try escalatingRead(KeychainItemKey(service: service, scopedToCurrentUser: true)) {
             try readGenericPasswordForCurrentUser(service: service, allowInteraction: $0)
         }
     }
@@ -321,13 +324,17 @@ extension KeychainAccessing {
     /// interaction flag and performs the read; a silent attempt that throws
     /// `KeychainError.interactionNotAllowed` is retried once, and only for a manual refresh that has
     /// not already spent the shared per-action dialog budget.
-    private func escalatingRead(_ read: (Bool) throws -> String?) throws -> String? {
+    ///
+    /// `key` identifies the item being read, so a failure marks only that item as needing
+    /// interaction. That is the whole point: a provider that cannot be read silently must not stop
+    /// every other provider from being refreshed.
+    private func escalatingRead(_ key: KeychainItemKey, _ read: (Bool) throws -> String?) throws -> String? {
         do {
             return try read(false)
         } catch KeychainError.interactionNotAllowed {
             // Remember it: without this every five-minute cycle re-reads an item it cannot read and
             // fails again, which is the "keychain access" spam.
-            KeychainPermissionGate.shared.block()
+            KeychainPermissionGate.shared.block(key)
             guard ProviderRefreshContext.isManual,
                   ProviderRefreshContext.credentialInteractionGate?.claim() ?? true
             else {
@@ -521,33 +528,74 @@ func expandHome(_ path: String) -> String {
     return home + String(path.dropFirst())
 }
 
+/// Identity of the Keychain item a read targets, for [`KeychainPermissionGate`] bookkeeping.
+///
+/// The gate has to be per item, not per process: the "needs a dialog" condition belongs to one item's
+/// ACL, and two different items in the same app routinely differ. `account` and `scopedToCurrentUser`
+/// are part of the key because they are part of the *query* — a service-only lookup, an
+/// account-scoped lookup, and a current-user-scoped lookup are three different items, and collapsing
+/// them would let one item's block suppress the others.
+struct KeychainItemKey: Hashable {
+    let service: String
+    let account: String?
+    let scopedToCurrentUser: Bool
+
+    init(service: String, account: String? = nil, scopedToCurrentUser: Bool = false) {
+        self.service = service
+        self.account = account
+        self.scopedToCurrentUser = scopedToCurrentUser
+    }
+}
+
 /// Process-wide memory that a silent Keychain read needs user interaction.
 ///
 /// Lives here rather than per provider because the condition is a property of the *item's* ACL, not
-/// of one provider: once macOS says "this needs a dialog", every background refresh until the user
-/// grants it will get the same answer. Mirrors `CredentialInteractionGate`'s lock discipline.
+/// of one provider: once macOS says "this needs a dialog", every background refresh of *that item*
+/// until the user grants it will get the same answer. Mirrors `CredentialInteractionGate`'s lock
+/// discipline.
+///
+/// A single process-wide boolean was wrong in both directions, and the bug was user-visible:
+///
+/// - **Block leaked across items.** One provider whose item needs a dialog set the flag for
+///   *everyone*, so every other provider's background read was refused without ever reaching the
+///   Keychain — an item that was perfectly readable started reporting "not logged in" because an
+///   unrelated provider needed attention.
+/// - **Reset leaked across items.** Any successful read cleared the flag, including reads of
+///   unrelated items. So the item that genuinely needed a dialog had its block cleared every cycle by
+///   some other provider's success, and the five-minute re-read-and-fail spam came right back — the
+///   exact thing the gate exists to prevent.
+///
+/// Keyed by [`KeychainItemKey`] so block and reset both stay scoped to the item that earned them.
 final class KeychainPermissionGate: @unchecked Sendable {
     static let shared = KeychainPermissionGate()
 
     private init() {}
     private let lock = NSLock()
-    private var blocked = false
+    private var blocked: Set<KeychainItemKey> = []
 
-    var isBlocked: Bool {
+    func isBlocked(_ key: KeychainItemKey) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return blocked
+        return blocked.contains(key)
     }
 
-    func block() {
+    func block(_ key: KeychainItemKey) {
         lock.lock()
-        blocked = true
+        blocked.insert(key)
         lock.unlock()
     }
 
-    func reset() {
+    /// Clears the block for one item, leaving every other item's state untouched.
+    func reset(_ key: KeychainItemKey) {
         lock.lock()
-        blocked = false
+        blocked.remove(key)
+        lock.unlock()
+    }
+
+    /// Clears every item. Test-support only: production has no reason to forget an item's ACL.
+    func resetAll() {
+        lock.lock()
+        blocked.removeAll()
         lock.unlock()
     }
 }
