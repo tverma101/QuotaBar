@@ -10,6 +10,30 @@ struct ProviderGroup: Identifiable {
     /// doesn't matter — reorder id lists and the lifted drag preview.
     var widgets: [PlacedWidget] { alwaysShownWidgets + expandedWidgets }
     var hasExpandedMetrics: Bool { !expandedWidgets.isEmpty }
+
+    /// The rows of this group that survive a visibility filter, keeping the always-shown/expanded split.
+    ///
+    /// Exists because "does this provider have anything left to show?" cannot be answered from
+    /// `alwaysShownWidgets`/`expandedWidgets` alone. `displayGroups` drops a provider only when it has no
+    /// *placed* widgets, and that check runs before the `hidesWhenEmpty` presentation filter — so a
+    /// provider whose last non-conditional row was switched off in Customize still produced a group, and
+    /// the dashboard then rendered it as an empty rounded card, or as a lone caret above nothing when the
+    /// provider had On Demand content. This is where the post-filter emptiness becomes observable, so the
+    /// dashboard and the share-card export can both ask the same question.
+    func visibleRows(
+        keeping rowIsVisible: (PlacedWidget) -> Bool
+    ) -> (alwaysShown: [PlacedWidget], expanded: [PlacedWidget]) {
+        (
+            alwaysShownWidgets.filter(rowIsVisible),
+            expandedWidgets.filter(rowIsVisible)
+        )
+    }
+
+    /// Whether any row survives `keeping`. A group with no visible row has nothing to render, so callers
+    /// should omit it entirely rather than draw the card chrome.
+    func hasVisibleRow(keeping rowIsVisible: (PlacedWidget) -> Bool) -> Bool {
+        alwaysShownWidgets.contains(where: rowIsVisible) || expandedWidgets.contains(where: rowIsVisible)
+    }
 }
 
 /// A provider and every metric it supports, in the provider's custom order, split between Always
