@@ -18,10 +18,28 @@ final class LogFileTests: XCTestCase {
         }
     }
 
-    func testResolvedPathEndsWithExpectedSuffix() {
+    func testProductionPathEndsWithExpectedSuffix() {
         XCTAssertTrue(
-            LogFile.url.path.hasSuffix("Logs/QuotaBar/QuotaBar.log"),
-            "unexpected log path: \(LogFile.url.path)"
+            LogFile.productionDirectory().path.hasSuffix("Logs/QuotaBar"),
+            "unexpected production log dir: \(LogFile.productionDirectory().path)"
+        )
+    }
+
+    /// A test run must never resolve to the production log. The app advertises that path at startup
+    /// and in Settings, and users are told to send it with bug reports, so fixtures leaking into it
+    /// corrupt exactly the artifact a maintainer reads when triaging a real report.
+    func testTestRunsDoNotResolveToTheProductionLog() {
+        XCTAssertTrue(LogFile.isRunningUnderTest, "this guard is meaningless if the detection is wrong")
+        XCTAssertNotEqual(
+            LogFile.defaultDirectory().lastPathComponent,
+            "QuotaBar",
+            "tests must not resolve to the production Logs/QuotaBar directory"
+        )
+        XCTAssertTrue(
+            LogFile.defaultDirectory().path.hasPrefix(
+                FileManager.default.temporaryDirectory.path
+            ),
+            "tests must log under the temporary directory, got \(LogFile.defaultDirectory().path)"
         )
     }
 
