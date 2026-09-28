@@ -12,7 +12,18 @@ final class PanelHeightController {
     private let currentScreen: () -> PopoverScreen
     private let defaults: UserDefaults
 
+    /// Test seam: resolves the visible frame the panel may occupy for a given anchor rect.
+    ///
+    /// Production leaves this `nil` and the controller reads `NSScreen`. `NSScreen` is not fabricable in a
+    /// unit test, and a headless CI runner has no usable display, so `testColdOpenSettingsUsesSettingsRememberedHeight`
+    /// was really asserting against whatever screen the runner happened to have: it expected the
+    /// remembered 700 pt and got 572 pt on GitHub's runners, purely from the display clamp. Injecting the
+    /// visible frame keeps production behaviour byte-for-byte identical while making the test
+    /// deterministic.
+    private let visibleFrameProvider: ((NSRect) -> NSRect?)?
+
     private var anchorScreen: NSScreen?
+    private var anchorVisibleFrame: NSRect?
     private var anchorTopLeft: NSPoint?
     private var morphSettleTask: Task<Void, Never>?
     private(set) var isMorphing = false
@@ -20,11 +31,13 @@ final class PanelHeightController {
     init(
         panel: MenuBarPanel,
         defaults: UserDefaults = .standard,
-        currentScreen: @escaping () -> PopoverScreen
+        currentScreen: @escaping () -> PopoverScreen,
+        visibleFrameProvider: ((NSRect) -> NSRect?)? = nil
     ) {
         self.panel = panel
         self.defaults = defaults
         self.currentScreen = currentScreen
+        self.visibleFrameProvider = visibleFrameProvider
     }
 
     /// Installs the two narrow callbacks SwiftUI uses: apply one animated frame and clamp a target to
@@ -48,10 +61,12 @@ final class PanelHeightController {
 
         let screen = NSScreen.screens.first { $0.frame.intersects(buttonRect) } ?? NSScreen.main
         anchorScreen = screen
+        let visibleFrame = visibleFrameProvider?(buttonRect) ?? screen?.visibleFrame
+        anchorVisibleFrame = visibleFrame
         let topLeft = PanelGeometry.clampedTopLeft(
             below: buttonRect,
             width: Self.panelWidth,
-            visibleFrame: screen?.visibleFrame
+            visibleFrame: visibleFrame
         )
         anchorTopLeft = topLeft
 
@@ -74,6 +89,7 @@ final class PanelHeightController {
     func finishClosing() {
         anchorTopLeft = nil
         anchorScreen = nil
+        anchorVisibleFrame = nil
         morphSettleTask?.cancel()
         isMorphing = false
         PanelHeightBridge.invalidate()
@@ -113,7 +129,9 @@ final class PanelHeightController {
     }
 
     private func maximumHeight() -> CGFloat {
-        guard let anchorTopLeft, let visibleFrame = (anchorScreen ?? NSScreen.main)?.visibleFrame else {
+        guard let anchorTopLeft,
+              let visibleFrame = anchorVisibleFrame ?? (anchorScreen ?? NSScreen.main)?.visibleFrame
+        else {
             return Self.defaultHeight
         }
         return PanelGeometry.maximumHeight(topLeft: anchorTopLeft, visibleFrame: visibleFrame)
