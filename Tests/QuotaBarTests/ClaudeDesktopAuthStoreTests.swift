@@ -251,12 +251,19 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
 
         XCTAssertEqual(fixture.store.load(allowInteraction: false).status, .permissionRequired)
         XCTAssertEqual(fixture.keyReader.calls, [false])
-        XCTAssertEqual(fixture.store.load(allowInteraction: true).status, .available)
-        XCTAssertEqual(fixture.keyReader.calls, [false, true])
 
-        // The derived key is cached after approval, so later background refreshes are prompt-free.
+        // A manual read still probes silently first and only escalates when that is proven necessary.
+        // Going straight to the interactive call would open a dialog even when the item has since
+        // become accessible, and `allowInteraction` is permission to prompt — not an instruction to.
+        // So the recorded sequence is a second silent attempt, then the interactive one.
+        XCTAssertEqual(fixture.store.load(allowInteraction: true).status, .available)
+        XCTAssertEqual(fixture.keyReader.calls, [false, false, true])
+
+        // The derived key is cached after approval, so later background refreshes are prompt-free and
+        // never touch the Keychain again. This is the property that matters: without it the app would
+        // re-prompt every cycle, which is the failure the whole silent-first design exists to prevent.
         XCTAssertEqual(fixture.store.load(allowInteraction: false).status, .available)
-        XCTAssertEqual(fixture.keyReader.calls, [false, true])
+        XCTAssertEqual(fixture.keyReader.calls, [false, false, true])
     }
 
     func testExpiredDesktopTokenIsStale() throws {
