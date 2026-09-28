@@ -7,12 +7,17 @@ struct CopilotToken: Hashable, Sendable {
 
 enum CopilotAuthError: Error, LocalizedError, Equatable {
     case notLoggedIn
+    /// The Keychain item exists but macOS will not release it without a dialog. Distinct from
+    /// `notLoggedIn`: the user *is* signed in, and re-authenticating changes nothing.
+    case credentialPermissionRequired
     case tokenInvalid
 
     var errorDescription: String? {
         switch self {
         case .notLoggedIn:
             return "Sign in to GitHub Copilot in your editor, or run gh auth login, and try again."
+        case .credentialPermissionRequired:
+            return "macOS needs permission to read your Copilot Keychain item. Refresh, then choose Always Allow."
         case .tokenInvalid:
             return "GitHub token invalid or expired. Re-authenticate (gh auth login) and try again."
         }
@@ -44,8 +49,13 @@ struct CopilotAuthStore: Sendable {
     }
 
     /// First non-empty source wins. Blocking (Keychain) — call off the main actor.
-    func loadToken() -> CopilotToken? {
-        loadFromEditorConfig() ?? loadFromGhConfig() ?? loadFromGhKeychain()
+    /// Throws `credentialPermissionRequired` rather than returning `nil` when the Keychain item exists
+    /// but macOS refuses to release it, so the provider does not report a signed-in user as
+    /// "not logged in" — a remedy that cannot possibly help them.
+    func loadToken() throws -> CopilotToken? {
+        if let editor = loadFromEditorConfig() { return editor }
+        if let config = loadFromGhConfig() { return config }
+        return try loadFromGhKeychain()
     }
 
     // MARK: - Sources
@@ -73,8 +83,8 @@ struct CopilotAuthStore: Sendable {
         return CopilotToken(value: token)
     }
 
-    func loadFromGhKeychain() -> CopilotToken? {
-        guard let raw = readGhKeychainRaw(),
+    func loadFromGhKeychain() throws -> CopilotToken? {
+        guard let raw = try readGhKeychainRaw(),
               let token = ProviderParse.unwrapGoKeyring(raw)
         else {
             return nil
@@ -82,7 +92,9 @@ struct CopilotAuthStore: Sendable {
         return CopilotToken(value: token)
     }
 
-    private func readGhKeychainRaw() -> String? {
+    /// Throws `credentialPermissionRequired` when the item exists but macOS will not release it, so the
+    /// caller stops at "macOS needs permission" instead of falling through to "not logged in".
+    private func readGhKeychainRaw() throws -> String? {
         // `gh` stores its Keychain item under the GitHub username as the account. Read it scoped to that
         // account when we can recover it from hosts.yml; otherwise fall back to a service-only lookup.
         if let account = ghUsername() {
@@ -96,16 +108,26 @@ struct CopilotAuthStore: Sendable {
                 // silently. Falling through would repeat the entire silent-then-escalate chain for a
                 // lookup that cannot succeed, and on a manual refresh could raise a second dialog for
                 // the same item.
-                AppLog.debug(
+                AppLog.info(
                     LogTag.auth("copilot"),
-                    "gh keychain read needs interaction; skipping the service-only fallback"
+                    "gh keychain read needs user interaction; use Refresh to grant it"
                 )
-                return nil
+                throw CopilotAuthError.credentialPermissionRequired
             } catch {
                 // A real miss for this account — fall through to the service-only lookup.
             }
         }
-        return try? keychain.readGenericPasswordForRefresh(service: Self.ghKeychainService)
+        // A service-only lookup is a *different item* from the account-scoped one, so its refusal must
+        // not be confused with the account-scoped miss handled above.
+        do {
+            return try keychain.readGenericPasswordForRefresh(service: Self.ghKeychainService)
+        } catch KeychainError.interactionNotAllowed {
+            AppLog.info(
+                LogTag.auth("copilot"),
+                "gh keychain read needs user interaction; use Refresh to grant it"
+            )
+            throw CopilotAuthError.credentialPermissionRequired
+        }
     }
 
     private func ghUsername() -> String? {

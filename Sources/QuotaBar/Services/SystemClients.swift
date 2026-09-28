@@ -471,9 +471,20 @@ struct SecurityKeychainAccessor: KeychainAccessing {
         case errSecItemNotFound:
             return nil
         case errSecInteractionNotAllowed, errSecAuthFailed, errSecUserCanceled:
+            // Previously silent. This is the single most important Keychain diagnostic: it is what a
+            // provider needs to say "macOS needs permission" instead of "not logged in", and with no
+            // line here a misclassified provider left no trace anywhere except the in-memory gate.
+            // Not a warning: refusing to release an item the app does not own is an expected answer,
+            // and the user is the one who has to act on it.
+            AppLog.info(
+                .keychain,
+                "silent read needs user interaction; Refresh will ask (service \(service.debugDescription), OSStatus \(status))"
+            )
             throw KeychainError.interactionNotAllowed
         default:
-            AppLog.warn(.keychain, "Claude credential read failed (Security.framework OSStatus \(status))")
+            // Provider-agnostic on purpose: this accessor is shared, so naming one provider here
+            // misattributed every other provider's failure to Claude.
+            AppLog.warn(.keychain, "credential read failed (Security.framework OSStatus \(status))")
             throw KeychainError.readFailed("Security.framework OSStatus \(status)")
         }
     }

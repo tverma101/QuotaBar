@@ -63,7 +63,7 @@ final class CodexResetClaimService {
             usageClient: usageClient,
             credentialCandidates: {
                 var candidates = authStore.loadAuthCandidates()
-                if let keychain = await loadOffMainActor({ authStore.loadKeychainAuth() }) {
+                if let keychain = await loadOffMainActor({ try? authStore.loadKeychainAuth() }) {
                     candidates.append(keychain)
                 }
                 return candidates.compactMap { candidate in

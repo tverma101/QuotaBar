@@ -55,11 +55,18 @@ final class CopilotProvider: ProviderRuntime {
 
     func hasLocalCredentials() async -> Bool {
         // Same source as `refresh()`: editor config, gh config, or the gh keychain entry.
-        await loadOffMainActor { [authStore] in authStore.loadToken() } != nil
+        (try? await loadOffMainActor { [authStore] in try authStore.loadToken() }) != nil
     }
 
     func refresh() async -> ProviderSnapshot {
-        let token = await loadOffMainActor { [authStore] in authStore.loadToken() }
+        // Distinguish "no credential" from "macOS won't release the credential": the second needs one
+        // Refresh and an "Always Allow", not a re-login.
+        let token: CopilotToken?
+        do {
+            token = try await loadOffMainActor { [authStore] in try authStore.loadToken() }
+        } catch {
+            return ProviderSnapshot.error(provider: provider, error: error)
+        }
         guard let token else {
             return ProviderSnapshot.error(provider: provider, error: CopilotAuthError.notLoggedIn)
         }

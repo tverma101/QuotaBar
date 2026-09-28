@@ -45,6 +45,9 @@ struct CodexAuthState: Hashable, Sendable {
 
 enum CodexAuthError: Error, LocalizedError, Equatable {
     case notLoggedIn
+    /// The Keychain item exists but macOS will not release it without a dialog. Distinct from
+    /// `notLoggedIn`: the user *is* signed in, and re-authenticating changes nothing.
+    case credentialPermissionRequired
     case sessionExpired
     case tokenConflict
     case tokenRevoked
@@ -56,6 +59,8 @@ enum CodexAuthError: Error, LocalizedError, Equatable {
         switch self {
         case .notLoggedIn:
             return "Not logged in. Run `codex` to authenticate."
+        case .credentialPermissionRequired:
+            return "macOS needs permission to read your Codex Keychain item. Refresh, then choose Always Allow."
         case .sessionExpired:
             return "Session expired. Run `codex` to log in again."
         case .tokenConflict:
@@ -76,6 +81,10 @@ enum CodexAuthError: Error, LocalizedError, Equatable {
         case .sessionExpired, .tokenConflict, .tokenRevoked, .tokenExpired:
             return true
         case .notLoggedIn, .usageAPIKey, .invalidAuthPayload:
+            return false
+        // A Keychain ACL refusal is not an expired credential: falling back to another credential
+        // source would mask the one action (Always Allow) that actually resolves it.
+        case .credentialPermissionRequired:
             return false
         }
     }
@@ -132,8 +141,24 @@ struct CodexAuthStore: Sendable {
         return CodexAuthState(auth: auth, source: .file(path: path))
     }
 
-    func loadKeychainAuth() -> CodexAuthState? {
-        guard let value = try? keychain.readGenericPasswordForRefresh(service: Self.keychainService),
+    /// Throws rather than returning `nil` for an unreadable item: "macOS will not release this without
+    /// a dialog" and "there is no credential" are different problems with different fixes, and
+    /// collapsing the first into the second tells a signed-in user to go re-authenticate.
+    func loadKeychainAuth() throws -> CodexAuthState? {
+        let value: String?
+        do {
+            value = try keychain.readGenericPasswordForRefresh(service: Self.keychainService)
+        } catch KeychainError.interactionNotAllowed {
+            AppLog.info(
+                LogTag.auth("codex"),
+                "keychain read needs user interaction; use Refresh to grant it"
+            )
+            throw CodexAuthError.credentialPermissionRequired
+        } catch {
+            AppLog.error(LogTag.auth("codex"), "keychain credential read failed")
+            throw CodexAuthError.credentialPermissionRequired
+        }
+        guard let value,
               let auth = Self.parseAuth(value),
               Self.hasTokenLikeAuth(auth),
               matchesExpectedAccount(auth)

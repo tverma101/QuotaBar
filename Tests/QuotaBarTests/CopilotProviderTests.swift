@@ -2,7 +2,7 @@ import XCTest
 @testable import QuotaBar
 
 final class CopilotAuthStoreTests: XCTestCase {
-    func testEditorConfigWinsOverKeychain() {
+    func testEditorConfigWinsOverKeychain() throws {
         let store = CopilotAuthStore(
             files: FakeFiles([
                 CopilotAuthStore.editorAppsPath: #"{ "github.com": { "oauth_token": "gho_editor" } }"#
@@ -11,15 +11,15 @@ final class CopilotAuthStoreTests: XCTestCase {
         )
 
         // Editor config wins over the keychain: the editor token is returned, not the keychain one.
-        XCTAssertEqual(store.loadToken()?.value, "gho_editor")
+        XCTAssertEqual(try store.loadToken()?.value, "gho_editor")
     }
 
-    func testReturnsNilWhenNoCredentials() {
+    func testReturnsNilWhenNoCredentials() throws {
         let store = CopilotAuthStore(files: FakeFiles(), keychain: FakeKeychain())
-        XCTAssertNil(store.loadToken())
+        XCTAssertNil(try store.loadToken())
     }
 
-    func testEditorConfigIgnoresNonGithubDotComHost() {
+    func testEditorConfigIgnoresNonGithubDotComHost() throws {
         // An Enterprise-only editor config must not yield a token for api.github.com; the chain should
         // fall through to the gh keychain (which here holds the real github.com token).
         let store = CopilotAuthStore(
@@ -29,12 +29,12 @@ final class CopilotAuthStoreTests: XCTestCase {
             keychain: FakeKeychain("go-keyring-base64:" + Data("gho_dotcom".utf8).base64EncodedString())
         )
 
-        let token = store.loadToken()
+        let token = try store.loadToken()
 
         XCTAssertEqual(token?.value, "gho_dotcom")
     }
 
-    func testEditorConfigPicksGithubDotComAmongHosts() {
+    func testEditorConfigPicksGithubDotComAmongHosts() throws {
         let store = CopilotAuthStore(
             files: FakeFiles([
                 CopilotAuthStore.editorAppsPath: #"{ "ghe.corp.example:Iv1.x": { "oauth_token": "gho_ent" }, "github.com:Iv1.y": { "oauth_token": "gho_dotcom" } }"#
@@ -42,10 +42,10 @@ final class CopilotAuthStoreTests: XCTestCase {
             keychain: FakeKeychain()
         )
 
-        XCTAssertEqual(store.loadToken()?.value, "gho_dotcom")
+        XCTAssertEqual(try store.loadToken()?.value, "gho_dotcom")
     }
 
-    func testYamlUserIsScopedToGithubAndIgnoresNestedUsersMap() {
+    func testYamlUserIsScopedToGithubAndIgnoresNestedUsersMap() throws {
         let hosts = """
         ghe.corp.example:
             user: enterprise
@@ -57,7 +57,7 @@ final class CopilotAuthStoreTests: XCTestCase {
         XCTAssertEqual(CopilotAuthStore.yamlValue(hosts, key: "user"), "octocat")
     }
 
-    func testGhConfigPrefersGithubDotComTokenOverEnterprise() {
+    func testGhConfigPrefersGithubDotComTokenOverEnterprise() throws {
         let store = CopilotAuthStore(
             files: FakeFiles([
                 CopilotAuthStore.ghHostsPath: """
@@ -70,7 +70,7 @@ final class CopilotAuthStoreTests: XCTestCase {
             keychain: FakeKeychain()
         )
 
-        XCTAssertEqual(store.loadToken()?.value, "gho_dotcom")
+        XCTAssertEqual(try store.loadToken()?.value, "gho_dotcom")
     }
 }
 
@@ -235,7 +235,7 @@ final class CopilotUsageMapperTests: XCTestCase {
         XCTAssertTrue(mapped.isOrgManagedSeat)
     }
 
-    func testThrowsQuotaUnavailableWhenEmpty() {
+    func testThrowsQuotaUnavailableWhenEmpty() throws {
         XCTAssertThrowsError(try CopilotUsageMapper.map(body: ["copilot_plan": "pro"])) { error in
             XCTAssertEqual(error as? CopilotUsageError, .quotaUnavailable)
         }
@@ -243,14 +243,14 @@ final class CopilotUsageMapperTests: XCTestCase {
 }
 
 final class CopilotOrgBillingMapperTests: XCTestCase {
-    func testParsesOrgLogins() {
+    func testParsesOrgLogins() throws {
         let body: [[String: Any]] = [["login": "acme", "id": 1], ["login": "globex"], ["id": 3]]
         let response = HTTPResponse(statusCode: 200, headers: [:], body: try! JSONSerialization.data(withJSONObject: body))
 
         XCTAssertEqual(CopilotOrgBillingMapper.orgLogins(response), ["acme", "globex"])
     }
 
-    func testOrgLoginsEmptyForGarbledBody() {
+    func testOrgLoginsEmptyForGarbledBody() throws {
         let response = HTTPResponse(statusCode: 200, headers: [:], body: Data("<html>".utf8))
         XCTAssertEqual(CopilotOrgBillingMapper.orgLogins(response), [])
     }
@@ -277,7 +277,7 @@ final class CopilotOrgBillingMapperTests: XCTestCase {
         XCTAssertEqual(orgDollars(lines, "Org Spend") ?? -1, 1.75, accuracy: 0.0001)
     }
 
-    func testNilWhenNoCopilotCreditItems() {
+    func testNilWhenNoCopilotCreditItems() throws {
         // Actions minutes and Copilot seat fees (non-credit units) must not produce org meters.
         var body = makeOrgSummaryBody()
         body["usageItems"] = [
@@ -288,7 +288,7 @@ final class CopilotOrgBillingMapperTests: XCTestCase {
         XCTAssertNil(CopilotOrgBillingMapper.usageLines(body: body))
     }
 
-    func testNilWhenSummaryHasNoUsageItems() {
+    func testNilWhenSummaryHasNoUsageItems() throws {
         XCTAssertNil(CopilotOrgBillingMapper.usageLines(body: ["organization": "acme"]))
     }
 }
