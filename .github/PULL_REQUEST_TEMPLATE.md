@@ -1,4 +1,4 @@
-<!-- OpenUsage has a strict, issue-first PR policy. External pull requests are closed
+<!-- QuotaBar has a strict, issue-first PR policy. External pull requests are closed
 automatically unless they link an issue a maintainer has approved with the `approved`
 label and assigned to the PR author. PRs adding more than 1,000 lines receive a warning.
 Visual changes require screenshots during maintainer review.
