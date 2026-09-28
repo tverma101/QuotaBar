@@ -93,15 +93,30 @@ final class HermesUsageScannerRealDBTests: XCTestCase {
     }
 
     func testModelFallbackToSessionsColumnWithoutAttributionTable() async throws {
+        // One `now`, used for both the fixture row and the scan.
+        //
+        // This used to write `Date() - 3600` and scan at a separately-sampled `Date()`, which made the
+        // test depend on the wall clock: the scanner buckets by *local calendar day*, so a row written
+        // one hour before midnight belongs to the previous day and `.today` comes back empty. That never
+        // failed locally (this machine is UTC-4, so "one hour ago" stays in the same day except for a
+        // one-hour window around 23:00) but failed on every UTC GitHub runner whose run started just
+        // after midnight — which is exactly what happened, at 00:42 UTC. Deriving both ends from a single
+        // instant removes the dependency entirely, and the row is then always inside the day being
+        // scanned.
+        let now = Date()
         try sqlite("""
             DROP TABLE session_model_usage;
             INSERT INTO sessions (id, model, started_at, input_tokens, output_tokens) VALUES
-              ('recent', 'kimi/kimi-k2.7', \(Date().timeIntervalSince1970 - 3600), 1000, 200);
+              ('recent', 'kimi/kimi-k2.7', \(now.timeIntervalSince1970 - 60), 1000, 200);
             """)
-        let scan = try await scanner.scan(now: Date())
+        let scan = try await scanner.scan(now: now)
         let models = scan!.modelUsageByPeriod[.today] ?? []
         XCTAssertEqual(models.map(\.model), ["kimi/kimi-k2.7"])
-        XCTAssertEqual(models[0].tokens, 1200)
+        // Guarded: an unguarded `models[0]` raised `Index out of range`, which traps and takes down the
+        // whole xctest process — so a single fragile assertion discarded the result of all 1462 tests
+        // instead of reporting one failure.
+        let first = try XCTUnwrap(models.first, "expected one model row for today, got \(models)")
+        XCTAssertEqual(first.tokens, 1200)
     }
 
     func testEmptyDatabaseYieldsZeroPeriodsAndNoDaily() async throws {
