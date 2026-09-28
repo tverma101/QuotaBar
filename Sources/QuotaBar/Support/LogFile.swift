@@ -53,13 +53,58 @@ final class LogFile: @unchecked Sendable {
         self.archiveURL = directory.appendingPathComponent(archiveName)
     }
 
-    static func defaultDirectory() -> URL {
+    /// Environment override for the log directory, e.g. to capture a run's logs somewhere convenient.
+    /// Wins over every other rule below.
+    static let directoryEnvironmentKey = "QUOTABAR_LOG_DIR"
+
+    /// Where a *shipped* app writes: `~/Library/Logs/QuotaBar`. Split out from `defaultDirectory()` so
+    /// the production location stays assertable from tests without tests having to resolve to it.
+    static func productionDirectory() -> URL {
         // `.first` with a fallback rather than `[0]`: the lookup effectively always resolves on stock
         // macOS, but a force-index would crash the app at launch (this runs during `bootstrap()`) if it
         // ever returned empty in an unusual container. A non-ideal-but-valid directory keeps the app alive.
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return library.appendingPathComponent("Logs/QuotaBar", isDirectory: true)
+    }
+
+    /// True when this process is a test bundle. `swift test` resolves `.userDomainMask` to the *real*
+    /// home directory, so without this the suite appends to the user's actual production log.
+    ///
+    /// Detection has to be indirect, and each candidate was verified against a real `swift test` run:
+    /// - `Bundle.main` is the xctest **runner** binary (`.../Xcode.app/.../usr/bin`), not the test
+    ///   bundle, so `Bundle.main.bundlePath.hasSuffix(".xctest")` is always false.
+    /// - Modern XCTest does not set `XCTestConfigurationFilePath`; it is nil under `swift test`.
+    /// - `XCTestCase` being loadable is what actually holds, for both XCTest classes and swift-testing
+    ///   suites. Cheap, so it is checked before the bundle scan, which is the expensive fallback.
+    static var isRunningUnderTest: Bool {
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil { return true }
+        if NSClassFromString("XCTestCase") != nil { return true }
+        return Bundle.allBundles.contains { $0.bundlePath.hasSuffix(".xctest") }
+    }
+
+    static func defaultDirectory() -> URL {
+        if let override = ProcessInfo.processInfo.environment[directoryEnvironmentKey],
+           !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        // A test run must not write to `~/Library/Logs/QuotaBar`.
+        //
+        // `LogFile.shared` is a lazily-initialised `static let`, so the first log line a test emits
+        // would otherwise open the real production file and append to it for the rest of the run. That
+        // log is not private scratch space: the app advertises this exact path at startup and in
+        // Settings, and users are told to send it with bug reports. So `swift test` used to interleave
+        // fixtures ("migrated settings to schema v1", fake providers like `stub`/`devin`, and even a
+        // `QuotaBarTests.SettingsMigratorTests...` error description) into the file a maintainer reads
+        // when diagnosing a real report — and push it through the same 10 MB rotation budget.
+        //
+        // Per-uid subdirectory so concurrent test processes on one machine cannot collide, and so
+        // parallel runs do not write through each other's handles.
+        if isRunningUnderTest {
+            return FileManager.default.temporaryDirectory
+                .appendingPathComponent("QuotaBarTests-\(getuid())/Logs", isDirectory: true)
+        }
+        return productionDirectory()
     }
 
     /// Create the directory and file, seed the in-memory size from disk, and perform the launch-time
