@@ -1,14 +1,16 @@
 provider:
   - changed-files:
-      - any-glob-to-any-file: "Sources/OpenUsage/Providers/**"
+      - any-glob-to-any-file: "Sources/QuotaBar/Providers/**"
 
 tests:
   - changed-files:
       - any-glob-to-any-file: "Tests/**"
 
-docs:
+# Reuses the existing `documentation` label rather than introducing a duplicate `docs`.
+documentation:
   - changed-files:
       - any-glob-to-any-file: "docs/**"
+      - any-glob-to-any-file: "*.md"
 
 ci:
   - changed-files:

@@ -1,31 +1,58 @@
 ---
 name: release-swift
-description: Cut a release of OpenUsage (Swift menu-bar app): pick a version, generate a categorized changelog, tag from `main`, and publish the GitHub Release with notes. Use to ship an Early Access beta or a stable release.
+description: Cut a release of QuotaBar (Swift menu-bar app): pick a version, generate a categorized changelog, tag from `main`, build a signed and notarized DMG, and publish the GitHub Release with notes. Use to ship an Early Access beta or a stable release.
 ---
 
 # Release Swift
 
-Pushing a `v*` tag on `main` runs `.github/workflows/release.yml`, which builds, signs, notarizes, attaches `OpenUsage-<version>.dmg` to the GitHub Release, and updates the Sparkle `appcast.xml` on `gh-pages`. CI creates the release with an EMPTY body, so this skill generates the changelog, records it in `CHANGELOG.md`, and publishes the notes onto the release.
+QuotaBar has **no automated release pipeline and no auto-update mechanism.** Sparkle, the `appcast.xml`
+feed, `.github/workflows/release.yml`, and the `gh-pages` deploy were all removed — the upstream feed is
+served from a public repository this fork has no claim on, so continuing to point builds at it would
+ship users to someone else's updates.
+
+Everything below is therefore a **manual, owner-driven process**. This skill generates the changelog and
+drives the steps; the owner performs the signing and notarization with their own Apple credentials,
+because those secrets must not live in this repository.
 
 ## Channels
 
-- **Beta (Early Access):** suffixed tag like `v0.7.1-beta.1`. Marked a GitHub pre-release and added to Sparkle's `beta` channel. Only users with Early Access enabled get it; GitHub "Latest" is untouched.
-- **Stable:** plain tag like `v0.7.1`. Marked non-prerelease, becomes GitHub "Latest", and ships to everyone.
+- **Beta (Early Access):** suffixed tag like `v0.7.1-beta.1`, published as a GitHub **pre-release**.
+  GitHub "Latest" is untouched, so it does not displace the current stable for anyone who installed by
+  hand.
+- **Stable:** plain tag like `v0.7.1`, published as a normal release and becomes GitHub "Latest".
 
-The tag IS the version: `v0.7.1-beta.1` becomes `CFBundleShortVersionString = 0.7.1-beta.1`, and `CFBundleVersion` is the git commit count. There are no version files to bump.
+The tag IS the version. Do not edit version files, and **never change the version without explicit
+owner approval** — the line continues upstream's `0.7.x` so the two codebases stay comparable. Beta
+builds add a `-beta.N` suffix.
+
+## Before you start
+
+Verify the tree is releasable. A release must not ship with a known-red suite:
+
+```sh
+git switch main && git pull
+swift build -j 2 --disable-index-store --scratch-path /tmp/qb-scratch
+swift test  -j 2 --disable-index-store --scratch-path /tmp/qb-scratch
+```
+
+`--disable-index-store` is not optional on memory-constrained machines; see `AGENTS.md`.
 
 ## Cutting a release
 
 ### 1. Choose the version
 
-Next number in the current lane (default bump: patch). Beta builds add a `-beta.N` suffix. Confirm with the owner before proceeding.
+Next number in the current lane (default bump: patch). Beta builds add a `-beta.N` suffix. **Confirm
+with the owner before proceeding.**
 
 ### 2. Generate the changelog
 
 Collect commits since the **previous release in the same channel** and categorize each:
 
-- **Stable cut:** span from the **last stable tag** to this one (e.g. `v0.7.0...v0.7.1`), so the notes roll up the entire beta series plus any post-beta commits. Never start a stable changelog at the last beta — that would omit every beta in the lane.
-- **Beta cut:** span from the previous tag (the prior beta, or the last stable if it's the first beta in a lane) to this one.
+- **Stable cut:** span from the **last stable tag** to this one (e.g. `v0.7.0...v0.7.1`), so the notes
+  roll up the entire beta series plus any post-beta commits. Never start a stable changelog at the last
+  beta — that would omit every beta in the lane.
+- **Beta cut:** span from the previous tag (the prior beta, or the last stable if it's the first beta in
+  a lane) to this one.
 
 | Commit prefix | Category |
 |---|---|
@@ -38,7 +65,7 @@ Collect commits since the **previous release in the same channel** and categoriz
 Author attribution (required on every entry):
 
 - With a PR number `(#123)`: `gh pr view 123 --json author -q '.author.login'`.
-- Without a PR number: `gh api /repos/robinebers/openusage/commits/{full_hash} -q '.author.login'`.
+- Without a PR number: `gh api /repos/tverma101/QuotaBar/commits/{full_hash} -q '.author.login'`.
 - If the API returns null, fall back to the git author name.
 
 Output the changelog in a code block (template below) for review.
@@ -52,11 +79,12 @@ Wait for explicit approval of the changelog before changing any files. Accept ed
 Prepend the approved section right after the `# Changelog` header. Commit on `main`:
 
 ```sh
-git switch main && git pull
 git add CHANGELOG.md && git commit -m "docs: changelog for v{version}"
 ```
 
 ### 5. Tag and push
+
+Never tag automatically — ask the owner first.
 
 ```sh
 git tag -a v{version} -m "v{version}"
@@ -64,41 +92,54 @@ git push origin main
 git push origin v{version}
 ```
 
-### 6. Publish the notes
+### 6. Owner builds, signs, and notarizes the DMG
 
-CI creates the release with an empty body, so attach the approved notes after it finishes:
+The owner does this with their own Apple Developer credentials; they are never committed here.
+`script/build_and_run.sh` stages a bundle signed with an **Apple Development** identity, which runs
+locally but will not install on another machine. For a distributable artifact the owner needs a
+**Developer ID Application** certificate and notarization, and must set these in their own shell:
 
 ```sh
-gh run watch
-gh release view v{version} >/dev/null 2>&1   # confirm CI created the release
-gh release edit v{version} --notes-file /tmp/notes-v{version}.md
+export CODESIGN_IDENTITY="Developer ID Application: <name> (<TEAM>)"
 ```
 
-Never leave a release blank.
+Then stage, notarize, staple, and produce the DMG. Confirm the staged bundle reports the expected
+identity before packaging:
 
-### 7. Verify (never leave a draft)
+```sh
+codesign -dv --verbose=4 dist/QuotaBar.app 2>&1 | rg 'Authority|Identifier'
+```
+
+**Notarization requires a provisioning profile.** Note that the Keychain access-group entitlement is
+only emitted when a matching profile is installed — adding an unauthorized `keychain-access-groups`
+entry makes the app fail to launch with `RBSRequestErrorDomain Code=5` (POSIX 163). See `AGENTS.md`
+and `Sources/QuotaBar/Services/SystemClients.swift` before changing entitlements during a release.
+
+### 7. Publish the release and attach the notes
+
+```sh
+gh release create v{version} dist/QuotaBar-<version>.dmg \
+  --title "QuotaBar <version>" \
+  --notes-file /tmp/notes-v{version}.md \
+  --prerelease            # beta only; omit for stable
+```
+
+**Never leave a release blank.** Beta and stable are separate releases, not one release with channels:
+there is no appcast to route between them.
+
+### 8. Verify (never leave a draft)
 
 ```sh
 gh release view v{version} --json isDraft,isPrerelease,assets,body \
   --jq '{isDraft, isPrerelease, assets:[.assets[].name], bodyLen:(.body|length)}'
-git fetch origin gh-pages && git show origin/gh-pages:appcast.xml | grep -F "OpenUsage-{version}.dmg"
-curl -s "https://robinebers.github.io/openusage/appcast.xml" | grep -F "OpenUsage-{version}.dmg"
+spctl -a -vv -t install dist/QuotaBar-<version>.dmg   # must be accepted / notarized
 ```
 
-The second check matters: publishing is two hops — Release (or pricing-supplement) pushes `appcast.xml` to the **`gh-pages` branch**, then **`.github/workflows/deploy-pages.yml` on `main`** deploys that branch to the live site (Pages source is "GitHub Actions", not legacy branch deploy). Auto deploy runs on `workflow_run` after Release completes; GitHub sometimes returns **"Deployment failed, try again later"** even though `gh-pages` is already correct. If the branch has the version but the live URL does not after ~10 minutes, check `gh run list --workflow=deploy-pages.yml` and re-run **`gh workflow run deploy-pages.yml --ref main`** (must use `main` — the workflow file is not on `gh-pages`). Sparkle clients only see the live URL.
+Require `isDraft=false`, `isPrerelease=true` for beta or `false` for stable, a
+`QuotaBar-<version>.dmg` asset, `bodyLen>0`, and `spctl` accepting the DMG.
 
-Require `isDraft=false`, `isPrerelease=true` for beta or `false` for stable, an `OpenUsage-<version>.dmg` asset, `bodyLen>0`, and the version present in the appcast. If a draft was left behind, migrate its notes/assets onto the published release, then delete it — but only once a separate PUBLISHED release for the tag already exists:
-
-```sh
-tag="v{version}"
-if [ "$(gh release view "$tag" --json isDraft --jq '.isDraft')" = "false" ]; then
-  gh api repos/robinebers/openusage/releases --paginate \
-    --jq '.[] | select(.draft and .tag_name=="'"$tag"'") | .id' \
-    | xargs -I{} gh api -X DELETE repos/robinebers/openusage/releases/{}
-else
-  echo "No published release for $tag yet - publish it first; do NOT delete the draft."
-fi
-```
+Because there is no auto-update, **say so in the release notes** and tell users to replace the app
+bundle in `/Applications` by hand. An install is not self-updating.
 
 ## Changelog template
 
@@ -108,10 +149,10 @@ Only include category sections that have entries.
 ## v{version}
 
 ### New Features
-- {message} ([#{pr}](https://github.com/robinebers/openusage/pull/{pr})) by @{author}
+- {message} ([#{pr}](https://github.com/tverma101/QuotaBar/pull/{pr})) by @{author}
 
 ### Bug Fixes
-- {message} ([#{pr}](https://github.com/robinebers/openusage/pull/{pr})) by @{author}
+- {message} ([#{pr}](https://github.com/tverma101/QuotaBar/pull/{pr})) by @{author}
 
 ### Refactor
 - {message} by @{author}
@@ -122,20 +163,24 @@ Only include category sections that have entries.
 ---
 
 ### Changelog
-**Full Changelog**: [{prev_tag}...v{version}](https://github.com/robinebers/openusage/compare/{prev_tag}...v{version})
+**Full Changelog**: [{prev_tag}...v{version}](https://github.com/tverma101/QuotaBar/compare/{prev_tag}...v{version})
 
-- [{short_hash}](https://github.com/robinebers/openusage/commit/{full_hash}) {commit message} by @{author}
+- [{short_hash}](https://github.com/tverma101/QuotaBar/commit/{full_hash}) {commit message} by @{author}
 ~~~
 
-`{prev_tag}` is the previous release **in the same channel**: last stable for a stable cut, last beta (or last stable for the first beta in a lane) for a beta cut.
+`{prev_tag}` is the previous release **in the same channel**: last stable for a stable cut, last beta
+(or last stable for the first beta in a lane) for a beta cut.
 
 ## Rules
 
 - 7-char short commit hashes; tags always prefixed with `v`.
-- Stable changelogs span last-stable → this-stable (roll up the whole beta series); beta changelogs span previous-tag → this-beta.
+- Stable changelogs span last-stable → this-stable (roll up the whole beta series); beta changelogs span
+  previous-tag → this-beta.
 - Never push or tag automatically — ask the owner first.
+- Never change the version without explicit owner approval.
 - Always publish notes to the GitHub Release — never blank.
 - The version is the tag; never edit version files.
-- The appcast is append-only: older installs and the other channel's latest build must keep working, so the workflow aborts rather than shrink it.
-
-Release secrets and one-time setup live in the README under [Release setup](../../../README.md#release-setup-one-time).
+- Never commit signing, notarization, or provisioning credentials.
+- There is no appcast. If auto-update is ever reintroduced, it needs a `keychain`-safe
+  `SUFeedURL` on a QuotaBar-owned domain plus a new decision about channels — that is a design change,
+  not a release step.

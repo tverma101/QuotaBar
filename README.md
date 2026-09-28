@@ -23,9 +23,9 @@ swift test                      # run the test suite
 ./script/build_and_run.sh run   # stage a signed dev bundle in dist/ and launch it
 ```
 
-There is **no auto-update mechanism**: the repository is private, and the upstream Sparkle feed is
-served anonymously from a public repository. Reinstall by rebuilding, or replace the app bundle in
-`/Applications` by hand.
+There is **no auto-update mechanism**. Sparkle and the appcast feed were removed, and the upstream
+feed is served from a public repository this fork has no claim on, so builds must not point at it.
+Reinstall by rebuilding, or replace the app bundle in `/Applications` by hand.
 
 ## Supported Providers
 

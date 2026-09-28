@@ -100,7 +100,7 @@ jobs:
               const marker = "<!-- openusage:approved-issue-required -->";
               const body = [
                 marker,
-                "Thanks for your interest in contributing to OpenUsage!",
+                "Thanks for your interest in contributing to QuotaBar!",
                 "",
                 "External pull requests must reference an **open issue** that:",
                 "",
