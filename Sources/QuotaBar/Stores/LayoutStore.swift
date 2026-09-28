@@ -176,9 +176,20 @@ final class LayoutStore {
         expandedMetricIDs = initial.expandedMetricIDs
         expandedProviderIDs = initial.expandedProviderIDs
         defaultExpandedOnEnableIDs = initial.defaultExpandedOnEnableIDs
-        explicitlyEnabledMetricIDs = persistence.loadExplicitlyEnabledMetrics()
+        // Filtered through the registry, like every other persisted id set here (pins, expanded metrics,
+        // expanded providers). This one was loaded raw, so a descriptor id that a later version renamed or
+        // removed stayed in the blob forever: the set grew without bound across upgrades, and an id that
+        // ever reappeared would silently re-arm the opt-in for a row the user had never chosen. The stale
+        // entry is also unreachable from Customize, because that switch reads `placed` rather than the
+        // opt-in, so nothing could clear it.
+        let loadedExplicitlyEnabled = Set(persistence.loadExplicitlyEnabledMetrics())
+        explicitlyEnabledMetricIDs = loadedExplicitlyEnabled.filter { registry.descriptor(id: $0) != nil }
         menuBarStyle = initial.menuBarStyle
 
+        // Write the pruned set back so the blob cannot keep accumulating dead ids.
+        if explicitlyEnabledMetricIDs != loadedExplicitlyEnabled {
+            persistExplicitlyEnabledMetrics()
+        }
         if initial.shouldPersistExpandOnEnable { persistExpandOnEnable() }
         if initial.shouldPersistExpanded { persistExpanded() }
         if let seededDefaults = initial.seededDefaultsToPersist { persistSeededDefaults(seededDefaults) }

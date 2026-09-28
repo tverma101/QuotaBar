@@ -1601,3 +1601,60 @@ extension LayoutStoreTests {
         XCTAssertTrue(store.canUndo, "the coalesced drag recorded exactly one entry")
     }
 }
+
+extension LayoutStoreTests {
+    /// The opt-in set is persisted, so it has to be pruned on load like every other persisted id set.
+    ///
+    /// Pins, expanded metrics, and expanded providers are all filtered through the registry at load. This
+    /// one was not, so a descriptor id that a later version renamed or removed accumulated forever: the
+    /// blob grew across upgrades, and an id that ever reappeared would silently re-arm the opt-in for a row
+    /// the user had never chosen. It is also unreachable from Customize, because the switch there reads
+    /// `placed` rather than the opt-in, so nothing in the UI could clear it.
+    func testOptInsForUnknownDescriptorsAreDroppedOnLoad() throws {
+        let defaults = makeDefaults("OptInFilteredOnLoad")
+        // Seed the same garbage the audit used, alongside a real id, to show only the stale ones go.
+        defaults.set(
+            ["totally.gone.metric", "claude.extra", "also.removed"],
+            forKey: "layout.explicitlyEnabledMetrics"
+        )
+        // Garbage in the other sets too, so this is demonstrably the one that was unfiltered.
+        defaults.set(["nope.pinned"], forKey: "layout.pins")
+
+        let store = LayoutStore(registry: .mock, defaults: defaults, storageKey: "layout")
+
+        XCTAssertEqual(
+            store.explicitlyEnabledMetricIDs, ["claude.extra"],
+            "only ids the registry still knows may survive"
+        )
+        XCTAssertFalse(store.pinnedMetricIDs.contains("nope.pinned"), "sanity: pins are filtered too")
+    }
+
+    /// Pruning must be written back, or the blob keeps every dead id it ever accumulated and the
+    /// in-memory filter just hides the growth.
+    func testPrunedOptInsArePersistedBack() throws {
+        let suiteName = "OpenUsageTests.LayoutStore.OptInPrunedPersist.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let key = "layout.explicitlyEnabledMetrics"
+        defaults.set(["totally.gone.metric", "claude.extra"], forKey: key)
+
+        _ = LayoutStore(registry: .mock, defaults: defaults, storageKey: "layout")
+
+        XCTAssertEqual(
+            defaults.stringArray(forKey: key), ["claude.extra"],
+            "the dead id must be removed from storage, not just from memory"
+        )
+    }
+
+    /// A registry that legitimately knows the id must keep the opt-in — the filter must not throw away
+    /// real opt-ins for accounts whose descriptors only appear once their credentials are read.
+    func testOptInForAKnownDescriptorSurvives() throws {
+        let defaults = makeDefaults("OptInKnownSurvives")
+        defaults.set(["claude.extra"], forKey: "layout.explicitlyEnabledMetrics")
+
+        let store = LayoutStore(registry: .mock, defaults: defaults, storageKey: "layout")
+
+        XCTAssertEqual(store.explicitlyEnabledMetricIDs, ["claude.extra"])
+    }
+}
