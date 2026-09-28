@@ -108,43 +108,120 @@ final class KeychainRefreshReadTests: XCTestCase {
     /// or ordering decides the outcome.
     override func setUp() {
         super.setUp()
-        KeychainPermissionGate.shared.reset()
+        KeychainPermissionGate.shared.resetAll()
     }
 
     override func tearDown() {
-        KeychainPermissionGate.shared.reset()
+        KeychainPermissionGate.shared.resetAll()
         super.tearDown()
     }
 
     /// The gate lives in the shared helper rather than in each provider, because the condition belongs
-    /// to the item's ACL: once macOS says "this needs a dialog", every background refresh until the
-    /// user grants it gets the same answer. This asserts the general contract.
+    /// to the item's ACL: once macOS says "this needs a dialog", every background refresh *of that
+    /// item* until the user grants it gets the same answer. This asserts the general contract.
     func testSuccessfulInteractiveReadClearsAPreviouslyBlockedItem() throws {
+        let key = KeychainItemKey(service: "svc")
         let blocked = RecordingKeychain(requiresInteraction: true)
         XCTAssertThrowsError(try blocked.readGenericPasswordForRefresh(service: "svc"))
-        XCTAssertTrue(KeychainPermissionGate.shared.isBlocked, "a silent-read failure must block later background attempts")
+        XCTAssertTrue(
+            KeychainPermissionGate.shared.isBlocked(key),
+            "a silent-read failure must block later background attempts"
+        )
 
         // A *background* read cannot clear the block — it never reaches the Keychain, which is the
         // whole point. Only a manual refresh can, because only it can show the dialog that grants access.
         let stillBlocked = RecordingKeychain(requiresInteraction: false)
         XCTAssertThrowsError(try stillBlocked.readGenericPasswordForRefresh(service: "svc"))
-        XCTAssertTrue(KeychainPermissionGate.shared.isBlocked)
+        XCTAssertTrue(KeychainPermissionGate.shared.isBlocked(key))
 
-        // The manual read reaches the Keychain, succeeds, and clears the block for everyone.
+        // The manual read reaches the Keychain, succeeds, and clears the block for this item.
         let granted = RecordingKeychain(requiresInteraction: false)
         let value = try ProviderRefreshContext.$isManual.withValue(true) {
             try granted.readGenericPasswordForRefresh(service: "svc")
         }
         XCTAssertEqual(value, "secret")
         XCTAssertFalse(
-            KeychainPermissionGate.shared.isBlocked,
-            "granting access must not leave the item blocked for every other provider"
+            KeychainPermissionGate.shared.isBlocked(key),
+            "granting access must clear the item that was granted"
         )
 
         // And background reads work silently again.
         let afterwards = RecordingKeychain(requiresInteraction: false)
         _ = try afterwards.readGenericPasswordForRefresh(service: "svc")
         XCTAssertEqual(afterwards.calls, [false])
+    }
+
+    // MARK: - Per-item isolation
+    //
+    // These guard a real regression. The gate used to be one process-wide boolean, which broke
+    // provider independence in both directions and was user-visible as healthy providers reporting
+    // "not logged in" because an unrelated provider needed a Keychain dialog.
+
+    /// The central bug: a provider that needs a dialog must not stop a different, readable provider
+    /// from being refreshed in the background.
+    func testBlockedItemDoesNotSuppressAnUnrelatedService() throws {
+        let blockedKey = KeychainItemKey(service: "com.example.blocked")
+        let otherKey = KeychainItemKey(service: "com.example.healthy")
+
+        let blocked = RecordingKeychain(requiresInteraction: true)
+        XCTAssertThrowsError(try blocked.readGenericPasswordForRefresh(service: "com.example.blocked"))
+        XCTAssertTrue(KeychainPermissionGate.shared.isBlocked(blockedKey))
+
+        // A different service is a different item with a different ACL, so it must still be read.
+        let healthy = RecordingKeychain(requiresInteraction: false)
+        let value = try healthy.readGenericPasswordForRefresh(service: "com.example.healthy")
+
+        XCTAssertEqual(value, "secret")
+        XCTAssertEqual(healthy.calls, [false], "the healthy item must actually be read")
+        XCTAssertFalse(
+            KeychainPermissionGate.shared.isBlocked(otherKey),
+            "an unrelated item must not be marked as needing interaction"
+        )
+    }
+
+    /// The mirror bug: an unrelated provider's *success* must not un-block an item that still needs a
+    /// dialog, or the five-minute re-read-and-fail spam returns for that item.
+    func testUnrelatedSuccessDoesNotClearAnotherItemsBlock() throws {
+        let blockedKey = KeychainItemKey(service: "com.example.blocked")
+
+        let blocked = RecordingKeychain(requiresInteraction: true)
+        XCTAssertThrowsError(try blocked.readGenericPasswordForRefresh(service: "com.example.blocked"))
+
+        // A different provider refreshes successfully, every cycle.
+        for _ in 0..<3 {
+            let healthy = RecordingKeychain(requiresInteraction: false)
+            XCTAssertEqual(try healthy.readGenericPasswordForRefresh(service: "com.example.healthy"), "secret")
+        }
+
+        XCTAssertTrue(
+            KeychainPermissionGate.shared.isBlocked(blockedKey),
+            "another item's success must not clear this item's block"
+        )
+
+        // And the blocked item is still not re-read on every background cycle.
+        let probe = RecordingKeychain(requiresInteraction: true)
+        XCTAssertThrowsError(try probe.readGenericPasswordForRefresh(service: "com.example.blocked"))
+        XCTAssertEqual(
+            probe.calls, [],
+            "a still-blocked item must be answered from memory, not re-read"
+        )
+    }
+
+    /// Account is part of the query, so account-scoped and service-only reads are different items and
+    /// must not share a block.
+    func testAccountScopedAndServiceOnlyReadsAreIndependentItems() throws {
+        let serviceOnly = KeychainItemKey(service: "svc")
+        let accountScoped = KeychainItemKey(service: "svc", account: "user@example.com")
+
+        let blocked = RecordingKeychain(requiresInteraction: true)
+        XCTAssertThrowsError(try blocked.readGenericPasswordForRefresh(service: "svc"))
+        XCTAssertTrue(KeychainPermissionGate.shared.isBlocked(serviceOnly))
+
+        let otherAccount = RecordingKeychain(requiresInteraction: false)
+        let value = try otherAccount.readGenericPasswordForRefresh(service: "svc", account: "user@example.com")
+        XCTAssertEqual(value, "secret")
+        XCTAssertEqual(otherAccount.calls, [false])
+        XCTAssertFalse(KeychainPermissionGate.shared.isBlocked(accountScoped))
     }
 
     func testBackgroundRefreshAnswersFromMemoryOnceBlocked() throws {
