@@ -352,7 +352,9 @@ struct WidgetGroupedListView: View {
             lift: $reorderLift,
             makeLift: { makeProviderLift(for: group, value: $0) },
             orderedIDs: { layout.displayGroups.map(\.provider.id) },
-            reorder: { layout.reorderProvider(dragged: group.provider.id, target: $0) }
+            reorder: { layout.reorderProvider(dragged: group.provider.id, target: $0) },
+            onEditBegan: { layout.beginCoalescedEdit() },
+            onEditEnded: { layout.endCoalescedEdit() }
         )
     }
 
@@ -379,7 +381,9 @@ struct WidgetGroupedListView: View {
                     )
                 }
                 return layout.reorderMetric(dragged: descriptor.id, target: target, in: providerID)
-            }
+            },
+            onEditBegan: { layout.beginCoalescedEdit() },
+            onEditEnded: { layout.endCoalescedEdit() }
         )
     }
 

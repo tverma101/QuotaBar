@@ -156,6 +156,9 @@ struct CustomizeProviderDetailView: View {
                     }
                 }
                 guard let id = activeMetricID else { return }
+                // A drag is one user action; `applyMetricDividerOrder` below fires once per row crossed.
+                // Without this scope each crossing recorded its own undo step.
+                layout.beginCoalescedEdit()
                 reorderLift?.location = value.location
                 let divider = expandedDividerID(for: providerID)
                 let ordered = reorderTargetIDs(for: providerID)
@@ -173,6 +176,9 @@ struct CustomizeProviderDetailView: View {
             .onEnded { _ in
                 activeMetricID = nil
                 reorderLift = nil
+                // Close unconditionally: a drag that ended where it started still closes here, and an
+                // open scope would swallow every later undo step.
+                layout.endCoalescedEdit()
             }
     }
 

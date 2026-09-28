@@ -108,6 +108,14 @@ final class LayoutStore {
     /// True while `undo()` is replaying a snapshot, so the mutations it triggers don't push themselves
     /// back onto the stack (an undo must not be recorded as a new, separately-undoable action).
     private var isApplyingUndo = false
+    /// Snapshot taken when a coalesced edit opened, or `nil` when no such scope is open.
+    ///
+    /// A drag is not one action. `reorderDragGesture` fires its `reorder` action on every `onChanged`
+    /// that clears the next row's 20% threshold, and each of those is a `recordingUndoStep`, so dragging
+    /// a row four positions recorded four undo entries and the user had to press ⌘Z four times to get
+    /// back. The 40-deep stack also filled up ~8 gestures into a normal editing session, silently
+    /// discarding older history.
+    private var coalescedEditStart: LayoutSnapshot?
 
     /// Menu-bar display style (Text strip vs. compact Bars). Persisted; defaults to `.text`.
     var menuBarStyle: MenuBarStyle {
@@ -237,7 +245,11 @@ final class LayoutStore {
 
     /// Whether there's at least one customization step to walk back. Drives the Customize Undo button's
     /// presence and the app-wide ⌘Z handler's no-op guard.
-    var canUndo: Bool { undoHistory.canUndo }
+    var canUndo: Bool { !isCoalescedEditOpen && undoHistory.canUndo }
+
+    /// How many steps are currently on the undo stack. Exposed so tests can assert that an action
+    /// consumed exactly one slot (or none), which `canUndo` alone cannot show.
+    var undoDepthForTesting: Int { undoHistory.snapshots.count }
 
     /// A snapshot of the current undoable layout state.
     private func currentSnapshot() -> LayoutSnapshot {
@@ -261,6 +273,14 @@ final class LayoutStore {
         // Already inside an undoable scope (or replaying an undo): just run — the outer scope owns the
         // single recorded step, and undo must never record itself.
         guard !isApplyingUndo else { return body() }
+        // Inside a coalesced edit (a drag, say): the scope opened by `beginCoalescedEdit` owns the single
+        // recorded step, so intermediate positions must not each push one. The mutation still happens, and
+        // it still writes through — only the history entry is deferred to `endCoalescedEdit`.
+        if coalescedEditStart != nil {
+            isApplyingUndo = true
+            defer { isApplyingUndo = false }
+            return body()
+        }
         let before = currentSnapshot()
         isApplyingUndo = true
         defer { isApplyingUndo = false }
@@ -271,11 +291,43 @@ final class LayoutStore {
         return result
     }
 
+    /// Opens a scope in which any number of mutations record as one undo entry.
+    ///
+    /// For gestures that produce many intermediate states in one continuous user action. Pair every
+    /// `beginCoalescedEdit` with `endCoalescedEdit` — including on cancellation — or the scope stays
+    /// open and swallows later undo steps.
+    ///
+    /// Re-entrant: a nested `begin` is ignored, and `end` only closes a scope that is actually open, so a
+    /// drag that cancels a nested mutation cannot close the outer scope early.
+    func beginCoalescedEdit() {
+        guard !isApplyingUndo, coalescedEditStart == nil else { return }
+        coalescedEditStart = currentSnapshot()
+    }
+
+    /// Closes the scope opened by `beginCoalescedEdit`, recording one entry if anything actually changed.
+    /// A drag that ended where it started records nothing, so it does not consume a stack slot.
+    func endCoalescedEdit() {
+        guard let before = coalescedEditStart else { return }
+        coalescedEditStart = nil
+        if currentSnapshot() != before {
+            undoHistory.record(before)
+        }
+    }
+
+    /// Whether a coalesced scope is open. For `undo`/`redo` to refuse while a drag is mid-flight, where
+    /// the recorded history does not yet describe the current layout.
+    var isCoalescedEditOpen: Bool { coalescedEditStart != nil }
+
     /// Walk back the most recent customization step, restoring the layout to its state just before that
     /// action. A no-op (returns `false`) when there's nothing to undo. Repeated calls step further back.
     /// Available app-wide (dashboard context menus and Customize alike), not just on one screen.
     @discardableResult
     func undo() -> Bool {
+        // Refuse mid-gesture. The recorded history does not describe the current layout while a coalesced
+        // scope is open — the entry for this very drag is only pushed when it closes — so popping here
+        // would restore a snapshot from before an unrelated earlier step and silently discard the work
+        // done since. The gesture closes its own scope on `onEnded`, after which undo behaves normally.
+        guard !isCoalescedEditOpen else { return false }
         guard let snapshot = undoHistory.popLast() else { return false }
         isApplyingUndo = true
         defer { isApplyingUndo = false }
