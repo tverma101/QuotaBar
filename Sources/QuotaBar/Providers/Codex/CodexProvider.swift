@@ -84,7 +84,11 @@ final class CodexProvider: ProviderRuntime {
             return true
         }
         guard allowsKeychainFallback else { return false }
-        let keychain = await loadOffMainActor { [authStore] in authStore.loadKeychainAuth() }
+        // A Keychain refusal means the item is not usable from here, which is the same boolean answer
+        // as "no candidate" for this probe; the reason is surfaced separately by `refresh`.
+        let keychain = await loadOffMainActor { [authStore] in
+            try? authStore.loadKeychainAuth()
+        }
         return keychain.map { isExpectedAccount($0) && $0.hasUsableAccessToken } == true
     }
 
@@ -103,14 +107,23 @@ final class CodexProvider: ProviderRuntime {
             }
         }
 
-        if allowsKeychainFallback,
-           let keychainCandidate = await loadOffMainActor({ [authStore] in authStore.loadKeychainAuth() }),
-           isExpectedAccount(keychainCandidate)
-        {
+        if allowsKeychainFallback {
+            // Surface a credential-permission failure instead of letting it fall through to
+            // `notLoggedIn`, whose remedy (re-authenticate) cannot possibly help.
+            let keychainCandidate: CodexAuthState?
             do {
-                return try await probe(authState: keychainCandidate)
+                keychainCandidate = try await loadOffMainActor({ [authStore] in
+                    try authStore.loadKeychainAuth()
+                })
             } catch {
                 return await localOnlySnapshot(after: error)
+            }
+            if let keychainCandidate, isExpectedAccount(keychainCandidate) {
+                do {
+                    return try await probe(authState: keychainCandidate)
+                } catch {
+                    return await localOnlySnapshot(after: error)
+                }
             }
         }
 
@@ -348,7 +361,12 @@ final class CodexProvider: ProviderRuntime {
             candidate = authStore.loadAuth(at: path)
         case .keychain:
             guard allowsKeychainFallback else { return nil }
-            candidate = authStore.loadKeychainAuth()
+            do {
+                candidate = try authStore.loadKeychainAuth()
+            } catch {
+                AppLog.info(LogTag.auth("codex"), "keychain credential unavailable: \(error)")
+                return nil
+            }
         }
         guard let candidate, isExpectedAccount(candidate) else { return nil }
         return candidate

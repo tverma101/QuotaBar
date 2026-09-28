@@ -77,6 +77,7 @@ extension CodexAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .notLoggedIn: .notLoggedIn
+        case .credentialPermissionRequired: .credentialAccess
         case .sessionExpired, .tokenConflict, .tokenRevoked, .tokenExpired: .authExpired
         case .usageAPIKey: .notAvailable
         case .invalidAuthPayload: .authInvalid
@@ -98,6 +99,7 @@ extension CursorAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .notLoggedIn: .notLoggedIn
+        case .credentialPermissionRequired: .credentialAccess
         case .sessionExpired, .tokenExpired: .authExpired
         }
     }
@@ -156,6 +158,7 @@ extension CopilotAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .notLoggedIn: .notLoggedIn
+        case .credentialPermissionRequired: .credentialAccess
         case .tokenInvalid: .authExpired
         }
     }

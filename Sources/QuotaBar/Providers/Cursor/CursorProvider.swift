@@ -60,11 +60,19 @@ final class CursorProvider: ProviderRuntime {
 
     func hasLocalCredentials() async -> Bool {
         // Same source as `refresh()`: any auth state (state DB or keychain) counts.
-        await loadOffMainActor { [authStore] in authStore.loadAuthState() } != nil
+        (try? await loadOffMainActor { [authStore] in try authStore.loadAuthState() }) != nil
     }
 
     func refresh() async -> ProviderSnapshot {
-        guard let state = await loadOffMainActor({ [authStore] in authStore.loadAuthState() }) else {
+        // Distinguish "no credential" from "macOS won't release the credential": the second needs one
+        // Refresh and an "Always Allow", not a re-login.
+        let state: CursorAuthState?
+        do {
+            state = try await loadOffMainActor({ [authStore] in try authStore.loadAuthState() })
+        } catch {
+            return ProviderSnapshot.error(provider: provider, error: error)
+        }
+        guard let state else {
             return ProviderSnapshot.error(provider: provider, error: CursorAuthError.notLoggedIn)
         }
 

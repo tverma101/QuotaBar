@@ -2,7 +2,7 @@ import XCTest
 @testable import QuotaBar
 
 final class CursorAuthStoreTests: XCTestCase {
-    func testPrefersKeychainWhenSQLiteLooksFreeAndSubjectsDiffer() {
+    func testPrefersKeychainWhenSQLiteLooksFreeAndSubjectsDiffer() throws {
         let sqliteToken = makeCursorJWT(sub: "google-oauth2|sqlite-user")
         let keychainToken = makeCursorJWT(sub: "auth0|keychain-user")
         let sqlite = KeyValueSQLite(values: [
@@ -16,7 +16,7 @@ final class CursorAuthStoreTests: XCTestCase {
         ])
         let store = CursorAuthStore(sqlite: sqlite, keychain: keychain)
 
-        let state = store.loadAuthState()
+        let state = try store.loadAuthState()
 
         XCTAssertEqual(state?.source, .keychain)
         XCTAssertEqual(state?.accessToken, keychainToken)
@@ -58,7 +58,7 @@ final class CursorUsageMapperTests: XCTestCase {
         XCTAssertEqual(progress([overage], "Grok Bot usage")?.used, 100)
     }
 
-    func testGrokBotUsageRejectsPooledAndInvalidPersonalMeters() {
+    func testGrokBotUsageRejectsPooledAndInvalidPersonalMeters() throws {
         XCTAssertNil(CursorUsageMapper.mapGrokBotUsage([
             "usagePercent": 42,
             "usesPooledEnterpriseAllowance": true
