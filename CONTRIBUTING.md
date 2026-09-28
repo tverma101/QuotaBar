@@ -1,10 +1,11 @@
-# Contributing to OpenUsage
+# Contributing to QuotaBar
 
-> **Fork note:** this is QuotaBar, a fork of OpenUsage. The workflow below describes
-> upstream's contribution process and still governs the shared codebase; QuotaBar itself is
-> maintained privately and does not accept external pull requests.
+> **Fork note:** this is QuotaBar, a fork of [OpenUsage](https://github.com/robinebers/openusage).
+> The workflow below is upstream's, and it is enforced here too — `.github/workflows/pr-policy.yml`
+> runs against this repository. Open an issue here first; if the bug or feature belongs to upstream
+> rather than to this fork, take it to [robinebers/openusage](https://github.com/robinebers/openusage/issues).
 
-OpenUsage accepts contributions through a strict, issue-first workflow, and the quality bar is deliberately high. **By design, most external pull requests are closed** — automation closes any that don't follow the rules below. Read this entire document before opening a PR.
+QuotaBar accepts contributions through a strict, issue-first workflow, and the quality bar is deliberately high. **By design, most external pull requests are closed** — automation closes any that don't follow the rules below. Read this entire document before opening a PR.
 
 ## Philosophy
 
