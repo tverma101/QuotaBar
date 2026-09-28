@@ -9,7 +9,7 @@ import XCTest
 final class OpenCodeCodexGatewayTests: XCTestCase {
     private func d(_ iso: String) -> Date { OpenUsageISO8601.date(from: iso)! }
     private func epochMs(_ iso: String) -> Int { Int(d(iso).timeIntervalSince1970 * 1000) }
-    private let now = OpenUsageISO8601.date(from: "2026-07-12T12:00:00.000Z")!
+    private let now = TestLocalInstant.date(2026, 7, 12, 12)
 
     /// A rollout's `turn_context` line, which sets the session's model for the turns that follow.
     private func turnContext(_ iso: String, _ model: String) -> String {
@@ -43,15 +43,15 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
     func testParsePicksOnlyGatewayTurns() {
         let data = Data((
             // Cumulative totals without last_token_usage: the parser must recover the turn deltas.
-            turnContext("2026-07-12T11:00:00.000Z", "anthropic/opencode_go/deepseek-v4-flash") + "\n" +
-            totalsOnlyLine("2026-07-12T11:00:01.000Z", input: 1000, cached: 800, output: 200, reasoning: 50) + "\n" +
-            totalsOnlyLine("2026-07-12T11:00:02.000Z", input: 2000, cached: 1600, output: 400, reasoning: 100) + "\n" +
+            turnContext(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "anthropic/opencode_go/deepseek-v4-flash") + "\n" +
+            totalsOnlyLine(TestLocalInstant.iso(2026, 7, 12, 11, 0, 1), input: 1000, cached: 800, output: 200, reasoning: 50) + "\n" +
+            totalsOnlyLine(TestLocalInstant.iso(2026, 7, 12, 11, 0, 2), input: 2000, cached: 1600, output: 400, reasoning: 100) + "\n" +
             // Per-turn usage (last_token_usage) is model-independent.
-            turnContext("2026-07-12T11:00:03.000Z", "anthropic/opencode/gpt-5.5") + "\n" +
-            tokenLine("2026-07-12T11:00:04.000Z", input: 300, output: 100) + "\n" +
+            turnContext(TestLocalInstant.iso(2026, 7, 12, 11, 0, 3), "anthropic/opencode/gpt-5.5") + "\n" +
+            tokenLine(TestLocalInstant.iso(2026, 7, 12, 11, 0, 4), input: 300, output: 100) + "\n" +
             // Not through the gateway — the Codex provider owns these; must be ignored.
-            turnContext("2026-07-12T11:00:05.000Z", "gpt-5.5") + "\n" +
-            tokenLine("2026-07-12T11:00:06.000Z", input: 999, output: 999) + "\n"
+            turnContext(TestLocalInstant.iso(2026, 7, 12, 11, 0, 5), "gpt-5.5") + "\n" +
+            tokenLine(TestLocalInstant.iso(2026, 7, 12, 11, 0, 6), input: 999, output: 999) + "\n"
         ).utf8)
         let rows = OpenCodeUsageScanner.parseCodexGatewayRows(data)
         XCTAssertEqual(rows.count, 3)
@@ -69,8 +69,8 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
 
     func testParseSkipsGatewayPrefixWithNoModelSuffix() {
         let data = Data((
-            turnContext("2026-07-12T11:00:00.000Z", "anthropic/opencode_go/") + "\n" +
-            tokenLine("2026-07-12T11:00:01.000Z", input: 100, output: 50) + "\n"
+            turnContext(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "anthropic/opencode_go/") + "\n" +
+            tokenLine(TestLocalInstant.iso(2026, 7, 12, 11, 0, 1), input: 100, output: 50) + "\n"
         ).utf8)
         XCTAssertTrue(OpenCodeUsageScanner.parseCodexGatewayRows(data).isEmpty)
     }
@@ -102,10 +102,10 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
     func testCodexGatewayTurnsFoldIntoTilesWithEstimatedCost() async throws {
         let codexHome = try fixtureCodexHome(files: [
             "sessions/2026/07/12/rollout.jsonl":
-                turnContext("2026-07-12T11:00:00.000Z", "anthropic/opencode_go/deepseek-v4-flash") + "\n" +
-                tokenLine("2026-07-12T11:00:01.000Z", input: 1000, cached: 800, output: 200, reasoning: 50) + "\n"
+                turnContext(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "anthropic/opencode_go/deepseek-v4-flash") + "\n" +
+                tokenLine(TestLocalInstant.iso(2026, 7, 12, 11, 0, 1), input: 1000, cached: 800, output: 200, reasoning: 50) + "\n"
         ])
-        let ms = epochMs("2026-07-12T11:00:00.000Z")
+        let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0))
         let db = "[[\(ms),2.0,500,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
@@ -130,8 +130,8 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
     func testUnpricedCodexGatewayModelSurfacesAsUnknownAndIsExcluded() async throws {
         let codexHome = try fixtureCodexHome(files: [
             "sessions/2026/07/12/rollout.jsonl":
-                turnContext("2026-07-12T11:00:00.000Z", "anthropic/opencode_go/not-a-real-model-xyz") + "\n" +
-                tokenLine("2026-07-12T11:00:01.000Z", input: 1000, output: 200) + "\n"
+                turnContext(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "anthropic/opencode_go/not-a-real-model-xyz") + "\n" +
+                tokenLine(TestLocalInstant.iso(2026, 7, 12, 11, 0, 1), input: 1000, output: 200) + "\n"
         ])
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": "[]"]),
@@ -145,7 +145,7 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
     }
 
     func testNoCodexHomesScansNothing() async throws {
-        let ms = epochMs("2026-07-12T11:00:00.000Z")
+        let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0))
         let db = "[[\(ms),2.0,500,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),

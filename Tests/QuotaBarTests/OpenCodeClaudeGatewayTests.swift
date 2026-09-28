@@ -7,7 +7,7 @@ import XCTest
 final class OpenCodeClaudeGatewayTests: XCTestCase {
     private func d(_ iso: String) -> Date { OpenUsageISO8601.date(from: iso)! }
     private func epochMs(_ iso: String) -> Int { Int(d(iso).timeIntervalSince1970 * 1000) }
-    private let now = OpenUsageISO8601.date(from: "2026-07-12T12:00:00.000Z")!
+    private let now = TestLocalInstant.date(2026, 7, 12, 12)
 
     /// One Claude Code assistant log line in the real shape (usage block, ISO timestamp).
     private func line(
@@ -35,14 +35,14 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
 
     func testClaudeGatewayRowsFiltersByPrefix() {
         let entries = [
-            entry("2026-07-12T11:00:00.000Z", "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000),
-            entry("2026-07-12T10:00:00.000Z", "anthropic/opencode/gpt-5.5", input: 300, output: 100),
+            entry(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000),
+            entry(TestLocalInstant.iso(2026, 7, 12, 10), "anthropic/opencode/gpt-5.5", input: 300, output: 100),
             // Not through the gateway — the Claude provider owns these; must be ignored.
-            entry("2026-07-12T10:00:00.000Z", "claude-sonnet-4-5", input: 999, output: 999),
+            entry(TestLocalInstant.iso(2026, 7, 12, 10), "claude-sonnet-4-5", input: 999, output: 999),
             // No model at all (the scanner's <synthetic> placeholder) must not count.
-            entry("2026-07-12T10:00:00.000Z", nil, input: 999, output: 999),
+            entry(TestLocalInstant.iso(2026, 7, 12, 10), nil, input: 999, output: 999),
             // No model suffix after the prefix.
-            entry("2026-07-12T10:00:00.000Z", "anthropic/opencode_go/", input: 999, output: 999),
+            entry(TestLocalInstant.iso(2026, 7, 12, 10), "anthropic/opencode_go/", input: 999, output: 999),
         ]
         let rows = OpenCodeUsageScanner.claudeGatewayRows(from: entries)
         XCTAssertEqual(rows.count, 2)
@@ -85,12 +85,12 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         let claudeHome = try fixtureClaudeHome(files: [
             // Real Claude Code layout: sessions live in per-project subdirectories of `projects/`.
             ".claude/projects/-Users-tejas-Gaming/session.jsonl":
-                line("2026-07-12T11:00:00.000Z", "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000) + "\n" +
-                line("2026-07-12T10:00:00.000Z", "claude-sonnet-4-5", input: 999, output: 999) + "\n",
+                line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000) + "\n" +
+                line(TestLocalInstant.iso(2026, 7, 12, 10), "claude-sonnet-4-5", input: 999, output: 999) + "\n",
             ".claude/projects/-Users-tejas-Experiments/other.jsonl":
-                line("2026-07-12T09:00:00.000Z", "anthropic/opencode_go/deepseek-v4-flash", input: 300, output: 100) + "\n"
+                line(TestLocalInstant.iso(2026, 7, 12, 9), "anthropic/opencode_go/deepseek-v4-flash", input: 300, output: 100) + "\n"
         ])
-        let ms = epochMs("2026-07-12T11:00:00.000Z")
+        let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
         let db = "[[\(ms),2.0,500,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
@@ -126,9 +126,9 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // tokens) must price at that recorded rate, not the catalog's $0.14/M input rate.
         let claudeHome = try fixtureClaudeHome(files: [
             ".claude/projects/-Users-tejas-Gaming/session.jsonl":
-                line("2026-07-12T11:00:00.000Z", "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000) + "\n",
+                line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000) + "\n",
         ])
-        let ms = epochMs("2026-07-12T11:00:00.000Z")
+        let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
         let db = "[[\(ms),0.005,10000,\"deepseek-v4-flash\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
@@ -156,9 +156,9 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // provider's own accounting (calibrated), not the catalog's paid rates.
         let claudeHome = try fixtureClaudeHome(files: [
             ".claude/projects/-Users-tejas-Gaming/session.jsonl":
-                line("2026-07-12T11:00:00.000Z", "anthropic/opencode/deepseek-v4-flash-free", input: 400) + "\n",
+                line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode/deepseek-v4-flash-free", input: 400) + "\n",
         ])
-        let ms = epochMs("2026-07-12T11:00:00.000Z")
+        let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
         let db = "[[\(ms),0.0,5000,\"deepseek-v4-flash-free\",\"opencode\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
@@ -185,10 +185,10 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // (anthropic/opencode/…) bill separately and must not inflate the local spend.
         let claudeHome = try fixtureClaudeHome(files: [
             ".claude/projects/-Users-tejas-Gaming/session.jsonl":
-                line("2026-07-12T11:00:00.000Z", "anthropic/opencode_go/deepseek-v4-flash", input: 100_000, output: 20_000, cacheRead: 800_000) + "\n" +
-                line("2026-07-12T10:00:00.000Z", "anthropic/opencode/gpt-5.5", input: 300, output: 100) + "\n",
+                line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/deepseek-v4-flash", input: 100_000, output: 20_000, cacheRead: 800_000) + "\n" +
+                line(TestLocalInstant.iso(2026, 7, 12, 10), "anthropic/opencode/gpt-5.5", input: 300, output: 100) + "\n",
         ])
-        let ms = epochMs("2026-07-12T11:00:00.000Z")
+        let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
         let db = "[[\(ms),1.0,1000,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
@@ -210,7 +210,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // lands in the unknown-model warning, matching the Claude tiles' convention.
         let claudeHome = try fixtureClaudeHome(files: [
             ".claude/projects/-Users-tejas-Gaming/session.jsonl":
-                line("2026-07-12T11:00:00.000Z", "anthropic/opencode_go/not-a-real-model-xyz", input: 1000, output: 200) + "\n"
+                line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/not-a-real-model-xyz", input: 1000, output: 200) + "\n"
         ])
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": "[]"]),
@@ -224,7 +224,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
     }
 
     func testNoClaudeRootsScansNothing() async throws {
-        let ms = epochMs("2026-07-12T11:00:00.000Z")
+        let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
         let db = "[[\(ms),2.0,500,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),

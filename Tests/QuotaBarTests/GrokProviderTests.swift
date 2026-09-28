@@ -197,16 +197,16 @@ final class GrokProviderTests: XCTestCase {
     }
 
     func testRefreshAppendsLocalSpendTilesFromSessions() async throws {
-        let now = OpenUsageISO8601.date(from: "2026-06-18T12:00:00.000Z")!
+        let now = TestLocalInstant.date(2026, 6, 18, 12)
         let home = try GrokLogFixture.makeHome(files: [
             "project/today/updates.jsonl": GrokLogFixture.completedTurn(
-                timestamp: "2026-06-18T10:00:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 6, 18, 10),
                 model: "grok-4.6-build",
                 input: 1_000_000,
                 costUsdTicks: 10_000_000_000
             ),
             "project/yesterday/updates.jsonl": GrokLogFixture.completedTurn(
-                timestamp: "2026-06-17T10:00:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 6, 17, 10),
                 model: "grok-4.5-build",
                 input: 0,
                 output: 1_000_000,
@@ -242,10 +242,10 @@ final class GrokProviderTests: XCTestCase {
         // turn completed today. An idle today is "No data" (no backing line), never a fabricated
         // "$0.00 · 0 tokens" that contradicts a live session. "No data" is also what a missing/unreadable
         // session produces — the two cases collapse to the same honest read.
-        let now = OpenUsageISO8601.date(from: "2026-06-18T12:00:00.000Z")!
+        let now = TestLocalInstant.date(2026, 6, 18, 12)
         let home = try GrokLogFixture.makeHome(files: [
             "project/session/updates.jsonl": GrokLogFixture.completedTurn(
-                timestamp: "2026-06-17T10:00:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 6, 17, 10),
                 model: "grok-4.5-build",
                 input: 0,
                 output: 1_000_000,
@@ -285,7 +285,7 @@ final class GrokProviderTests: XCTestCase {
     private func makeProvider(
         httpClient: RecordingHTTPClient,
         scanner: GrokLogUsageScanner? = nil,
-        now: Date = OpenUsageISO8601.date(from: "2026-06-18T12:00:00.000Z")!
+        now: Date = TestLocalInstant.date(2026, 6, 18, 12)
     ) -> GrokProvider {
         let files = FakeFiles([
             GrokAuthStore.authPath: #"{"https://auth.x.ai::client":{"key":"token","refresh_token":"refresh","expires_at":"2026-07-01T00:00:00.000Z"}}"#

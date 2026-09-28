@@ -41,7 +41,7 @@ final class CodexRouterUsageScannerTests: XCTestCase {
         let fingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountID)!
         let contents = ledger([
             [
-                "at": "2026-09-02T15:00:00.000Z",
+                "at": TestLocalInstant.iso(2026, 9, 2, 15),
                 "model": "gpt-5.6-terra",
                 "provider": "openai",
                 "status": 200,
@@ -54,7 +54,7 @@ final class CodexRouterUsageScannerTests: XCTestCase {
                 "accountId": accountID
             ],
             [
-                "at": "2026-09-02T16:00:00.000Z",
+                "at": TestLocalInstant.iso(2026, 9, 2, 16),
                 "model": "gpt-5.6-terra",
                 "provider": "openai",
                 "status": 502,
@@ -68,7 +68,7 @@ final class CodexRouterUsageScannerTests: XCTestCase {
             ledgerPaths: { ["/tmp/usage-events.jsonl"] },
             readFile: { _ in contents }
         )
-        let now = OpenUsageISO8601.date(from: "2026-09-03T12:00:00.000Z")!
+        let now = TestLocalInstant.date(2026, 9, 3, 12)
 
         let optionalScan = await scanner.scan(
             accountIdentityKey: accountID,
@@ -82,7 +82,11 @@ final class CodexRouterUsageScannerTests: XCTestCase {
         // Cost: non-cached input 75 @ 1000/M + cacheRead 25 @ 100/M + output 50 @ 3000/M
         // = 0.075 + 0.0025 + 0.15 = 0.2275; tokens from totalTokens = 160
         XCTAssertEqual(scan.series.daily.count, 1)
-        XCTAssertEqual(scan.series.daily[0].date, "2026-09-02")
+        // The scanner buckets by *local* calendar day, so the expectation is derived from the same local
+        // clock rather than hardcoded to the UTC date. These fixtures used UTC instants with a UTC
+        // expectation, which is only self-consistent when the suite runs on UTC: at UTC+9 the 15:00Z event
+        // falls on the following local day and the assertion fails.
+        XCTAssertEqual(scan.series.daily[0].date, TestLocalInstant.isoDay(2026, 9, 2))
         XCTAssertEqual(scan.series.daily[0].totalTokens, 160)
         XCTAssertEqual(scan.series.daily[0].costUSD!, 0.2275, accuracy: 0.000_000_1)
     }

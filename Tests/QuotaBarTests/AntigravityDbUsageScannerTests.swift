@@ -162,7 +162,10 @@ final class AntigravityProtoDecoderTests: XCTestCase {
 }
 
 final class AntigravityDbUsageScannerTests: XCTestCase {
-    private let now = OpenUsageISO8601.date(from: "2026-07-27T12:00:00.000Z")!
+    // Local-anchored: conversation rows are written one hour before this clock and asserted into a *local*
+    // calendar day. A UTC-pinned pair only agrees when the suite runs on UTC — at Chatham (+12:45) the
+    // 11:00Z row is 23:45 on the following local day, so the provider's spend lands in Yesterday.
+    private let now = TestLocalInstant.date(2026, 7, 27, 12)
     private let pricing = ModelPricing(
         supplement: PricingSupplement(),
         primary: PricingCatalog(entries: [

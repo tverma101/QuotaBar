@@ -16,7 +16,13 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         hermesDB = dir.appendingPathComponent("state.db").path
         opencodeDB = dir.appendingPathComponent("opencode.db").path
-        now = Date(timeIntervalSince1970: 1_784_800_000) // fixed instant
+        // Local-anchored, not a hardcoded epoch. This fixture pairs the clock with sessions "hours
+        // earlier" and asserts one of them buckets to *yesterday*, which only holds for some local
+        // times of day: the fixed epoch 1_784_800_000 is 05:46 in New York (both offsets land on the
+        // previous day, test passes) but 20:16 in Lord Howe, where `now - 20h` is 00:16 the *same* day
+        // and the Yesterday tile vanishes. Late-evening local anchoring plus >= 24h offsets removes the
+        // dependency entirely.
+        now = TestLocalInstant.date(2026, 7, 23, 23)
 
         // Minimal faithful subset of Hermes' `sessions` columns the fold queries.
         try sqlite(hermesDB, """
@@ -138,7 +144,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         // live number as a settled total.
         try sqlite(hermesDB, """
             INSERT INTO sessions (id, model, started_at, billing_provider, billing_base_url, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, ended_at) VALUES
-              ('finished-yesterday', 'deepseek-v4-flash', \(now.timeIntervalSince1970 - 72000), 'opencode-go', 'https://opencode.ai/zen/go/v1', 1000, 200, 8000, 0, 0, \(now.timeIntervalSince1970 - 54000)),
+              ('finished-yesterday', 'deepseek-v4-flash', \(now.timeIntervalSince1970 - 90_000), 'opencode-go', 'https://opencode.ai/zen/go/v1', 1000, 200, 8000, 0, 0, \(now.timeIntervalSince1970 - 86_400)),
               ('live-today',         'deepseek-v4-flash', \(now.timeIntervalSince1970 - 600), 'opencode-go', 'https://opencode.ai/zen/go/v1', 500, 50, 4000, 0, 10, NULL);
             """)
         let hermesPath: String = self.hermesDB
