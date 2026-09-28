@@ -58,20 +58,22 @@ final class UsageHistoryAggregatorTests: XCTestCase {
         let peerHistory = ProviderUsageHistory(
             series: DailyUsageSeries(daily: [
                 DailyUsageEntry(date: "2026-07-13", totalTokens: 10, costUSD: 1),
-                DailyUsageEntry(date: "2026-06-13", totalTokens: 20, costUSD: 2),
-                DailyUsageEntry(date: "2026-06-12", totalTokens: 9_000, costUSD: 90)
+                // 2026-06-14 is the last day inside a 30-day window ending 2026-07-13; 2026-06-13 is
+                // the first day outside it. Pinned either side of the boundary on purpose.
+                DailyUsageEntry(date: "2026-06-14", totalTokens: 20, costUSD: 2),
+                DailyUsageEntry(date: "2026-06-13", totalTokens: 9_000, costUSD: 90)
             ]),
             modelUsage: ModelUsageSeries(daily: [
                 DailyModelUsageEntry(date: "2026-07-13", models: [
                     ModelUsageEntry(model: "Current", totalTokens: 10, costUSD: 1)
                 ]),
-                DailyModelUsageEntry(date: "2026-06-12", models: [
+                DailyModelUsageEntry(date: "2026-06-13", models: [
                     ModelUsageEntry(model: "Stale", totalTokens: 9_000, costUSD: 90)
                 ])
             ]),
             unknownModelsByDay: [
                 "2026-07-13": ["current-unknown"],
-                "2026-06-12": ["stale-unknown"]
+                "2026-06-13": ["stale-unknown"]
             ]
         )
 
@@ -85,7 +87,7 @@ final class UsageHistoryAggregatorTests: XCTestCase {
         )
 
         let claude = try XCTUnwrap(merged["claude"])
-        XCTAssertEqual(claude.series.daily.map(\.date), ["2026-07-13", "2026-06-13"])
+        XCTAssertEqual(claude.series.daily.map(\.date), ["2026-07-13", "2026-06-14"])
         XCTAssertEqual(claude.series.daily.reduce(0) { $0 + $1.totalTokens }, 30)
         XCTAssertEqual(claude.modelUsage?.daily.flatMap(\.models).map(\.model), ["Current"])
         XCTAssertEqual(claude.unknownModelsByDay, ["2026-07-13": ["current-unknown"]])

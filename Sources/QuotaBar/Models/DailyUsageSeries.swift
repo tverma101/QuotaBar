@@ -21,13 +21,28 @@ struct DailyUsageSeries: Hashable, Sendable, Codable {
 }
 
 /// The calendar window shared by local scanners, combined iCloud history, and the usage trend.
-/// `previousDays` excludes today, so 30 means today plus the previous 30 calendar days.
 enum UsageHistoryWindow {
-    static let previousDays = 30
+    /// Total calendar days in the window, **including today**.
+    ///
+    /// This is the number the user sees: the tile is labelled "Last 30 Days", and
+    /// `TotalSpendAggregator` sums each provider's tile into one cross-provider figure. So the window
+    /// has to be exactly this many days, and every provider has to agree.
+    ///
+    /// It previously was not. `previousDays` was 30 and the window was built as `0...previousDays`,
+    /// which is 31 days — so every log-scanner and iCloud-backed provider reported 31 days under a
+    /// "Last 30 Days" label, while Cursor used `-29` and genuinely reported 30. Two identically
+    /// labelled rows on the same dashboard, one week apart, summed into a single total.
+    static let totalDays = 30
+
+    /// Days strictly *before* today, i.e. `totalDays - 1`.
+    ///
+    /// Named for its only other use, the `daysBack:` scan-window argument, where an off-by-one silently
+    /// widens the scan. Derived from `totalDays` so the two cannot drift apart again.
+    static var previousDays: Int { totalDays - 1 }
 
     static func dayKeys(through now: Date, calendar: Calendar = .current) -> Set<String> {
         let today = calendar.startOfDay(for: now)
-        return Set((0...previousDays).compactMap { offset in
+        return Set((0..<totalDays).compactMap { offset in
             calendar.date(byAdding: .day, value: -offset, to: today)
                 .map { DailyUsageAccumulator.dayKey(from: $0, calendar: calendar) }
         })

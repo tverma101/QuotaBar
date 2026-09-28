@@ -108,9 +108,16 @@ final class CursorSpendRangeTests: XCTestCase {
         XCTAssertEqual(label, "Usage Trend")
         // Cursor's tokens come from its server export, so the note names that source, not local logs.
         XCTAssertEqual(note, "From your Cursor usage export")
-        XCTAssertEqual(points.count, 31, "one bar per calendar day across the 31-day window")
+        XCTAssertEqual(
+            points.count,
+            UsageHistoryWindow.totalDays,
+            "one bar per calendar day across the same 30-day window the tile reports"
+        )
         XCTAssertEqual(points.last?.value, 100, "today's tokens land on the last bar")
-        XCTAssertEqual(points[29].value, 200, "yesterday's tokens land on the second-to-last bar")
+        XCTAssertEqual(
+            points[UsageHistoryWindow.totalDays - 2].value, 200,
+            "yesterday's tokens land on the second-to-last bar"
+        )
     }
 
     func testEmptyExportLeavesSpendTilesAndUsageTrendUnbacked() {

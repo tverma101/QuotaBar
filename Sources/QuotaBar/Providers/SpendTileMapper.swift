@@ -116,7 +116,7 @@ enum SpendTileMapper {
 
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
-        return (0...UsageHistoryWindow.previousDays).reversed().compactMap { offset -> MetricChartPoint? in
+        return (0..<UsageHistoryWindow.totalDays).reversed().compactMap { offset -> MetricChartPoint? in
             guard let day = calendar.date(byAdding: .day, value: -offset, to: today) else { return nil }
             let key = dayKey(from: day)
             let tokens = tokensByDay[key] ?? 0

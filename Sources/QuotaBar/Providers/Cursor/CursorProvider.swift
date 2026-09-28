@@ -206,7 +206,14 @@ final class CursorProvider: ProviderRuntime {
         let calendar = Calendar.current
         let end = now()
         let startOfToday = calendar.startOfDay(for: end)
-        let start = calendar.date(byAdding: .day, value: -29, to: startOfToday) ?? startOfToday
+        // Same shared window as every other provider's "Last 30 Days" tile, so the cross-provider
+        // Total Spend ring sums like-for-like periods. This was the one provider already using -29
+        // (a correct 30 days) while the rest used a 31-day window, so the two were not comparable.
+        let start = calendar.date(
+            byAdding: .day,
+            value: -UsageHistoryWindow.previousDays,
+            to: startOfToday
+        ) ?? startOfToday
 
         let response: HTTPResponse?
         do {
