@@ -7,7 +7,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testUsesRecordedPerModelCostAndDoesNotCountReasoningTwice() throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-4.6-build",
             input: 1_000_000,
             cached: 700_000,
@@ -27,7 +27,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testFallsBackToSharedPricingAndSeparatesCacheBuckets() throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-4.5-build",
             input: 1_000_000,
             cached: 700_000,
@@ -44,7 +44,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testSplitsCompletedTurnAcrossModelsWithoutDuplicatingTheEvent() throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-4.5-build",
             input: 100,
             output: 20,
@@ -72,7 +72,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testSingleModelFallsBackToTurnLevelRecordedCost() throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-4.6-build",
             input: 1_000_000,
             costUsdTicks: 1_250_000_000,
@@ -85,7 +85,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testRecordedCostAllowsUnknownModelWithoutPricingWarning() throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-future-model",
             input: 500_000,
             costUsdTicks: 3_000_000_000
@@ -100,7 +100,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testUnknownModelWithoutRecordedCostIsExcludedAndWarns() {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-future-model",
             input: 500_000
         )
@@ -113,7 +113,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testZeroRecordedCostStillCountsMeasuredTokens() throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-future-model",
             input: 500,
             costUsdTicks: 0
@@ -127,7 +127,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testPrefersMillisecondAgentTimestampOverCoarseOuterTimestamp() throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-09T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 9, 10),
             model: "grok-build",
             input: 1_000,
             agentTimestampMs: 1_781_089_200_456
@@ -140,7 +140,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testParsesUnixSecondTimestamps() throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-build",
             input: 1_000,
             numericTimestamp: true
@@ -151,7 +151,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testParsesTopLevelUpdateEnvelope() throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-build",
             input: 1_000,
             nested: false
@@ -162,18 +162,18 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testSkipsIncompleteMalformedAndOutOfWindowTurns() throws {
         let incomplete = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-build",
             input: 1_000,
             sessionUpdate: "turn_started"
         )
         let stale = GrokLogFixture.completedTurn(
-            timestamp: "2026-05-30T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 5, 30, 10),
             model: "grok-build",
             input: 2_000
         )
         let completed = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-build",
             input: 3_000
         )
@@ -185,7 +185,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testCopiedEventIDsAreCountedOnce() throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-build",
             input: 1_000,
             eventID: "duplicate-event"
@@ -198,13 +198,13 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testRecursivelyScansSessionLedgersAndIgnoresOtherJSONLFiles() async throws {
         let first = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z", model: "grok-build", input: 100, eventID: "copied-turn"
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10), model: "grok-build", input: 100, eventID: "copied-turn"
         )
         let second = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-11T10:00:00.000Z", model: "grok-build", input: 200
+            timestamp: TestLocalInstant.iso(2026, 6, 11, 10), model: "grok-build", input: 200
         )
         let ignored = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-12T10:00:00.000Z", model: "grok-build", input: 300
+            timestamp: TestLocalInstant.iso(2026, 6, 12, 10), model: "grok-build", input: 300
         )
         let home = try GrokLogFixture.makeHome(files: [
             "project-a/session-a/updates.jsonl": first,
@@ -217,17 +217,17 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
         let usage = await scanner.scan(
             daysBack: 30,
-            now: OpenUsageISO8601.date(from: "2026-06-18T12:00:00.000Z")!,
+            now: TestLocalInstant.date(2026, 6, 18, 12),
             pricing: TestPricing.bundled
         )
 
-        XCTAssertEqual(usage?.series.daily.map(\.date), ["2026-06-11", "2026-06-10"])
+        XCTAssertEqual(usage?.series.daily.map(\.date), [TestLocalInstant.isoDay(2026, 6, 11), TestLocalInstant.isoDay(2026, 6, 10)])
         XCTAssertEqual(usage?.series.daily.map(\.totalTokens), [200, 100])
     }
 
     func testSkipsSubagentSessionsAlreadyIncludedInCoordinatorTotals() async throws {
         let coordinator = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-4.6-build",
             input: 300,
             costUsdTicks: 30_000_000_000,
@@ -248,7 +248,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
             eventID: "fork-turn"
         )
         let legacy = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T11:00:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 11),
             model: "grok-4.6-build",
             input: 50,
             costUsdTicks: 5_000_000_000,
@@ -267,7 +267,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
         let usage = await GrokLogFixture.scanner(home: home).scan(
             daysBack: 30,
-            now: OpenUsageISO8601.date(from: "2026-06-18T12:00:00.000Z")!,
+            now: TestLocalInstant.date(2026, 6, 18, 12),
             pricing: TestPricing.bundled
         )
         let day = try XCTUnwrap(usage?.series.daily.first)
@@ -278,7 +278,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testSkipsSessionWithMalformedSummaryInsteadOfGuessingItsKind() async throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z", model: "grok-build", input: 1_000
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10), model: "grok-build", input: 1_000
         )
         let home = try GrokLogFixture.makeHome(files: [
             "project/session/updates.jsonl": line,
@@ -293,7 +293,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
     func testReadsWhitespaceTrimmedGrokHomeOverride() async throws {
         let line = GrokLogFixture.completedTurn(
-            timestamp: "2026-06-10T10:00:00.000Z", model: "grok-build", input: 1_000
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10), model: "grok-build", input: 1_000
         )
         let home = try GrokLogFixture.makeHome(files: ["project/session/updates.jsonl": line])
         defer { try? FileManager.default.removeItem(at: home) }
@@ -305,7 +305,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
         let usage = await scanner.scan(
             daysBack: 30,
-            now: OpenUsageISO8601.date(from: "2026-06-18T12:00:00.000Z")!,
+            now: TestLocalInstant.date(2026, 6, 18, 12),
             pricing: TestPricing.bundled
         )
 

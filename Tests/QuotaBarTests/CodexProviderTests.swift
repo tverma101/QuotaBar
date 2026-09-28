@@ -522,15 +522,21 @@ final class CodexUsageMapperTests: XCTestCase {
 
 @MainActor
 final class CodexProviderTests: XCTestCase {
+    // Note on the `TestLocalInstant` fixtures below: these tests pair a clock with log events hours
+    // earlier and assert the spend lands in the "Today" tile. Anchored to UTC instants, that pairing is
+    // only self-consistent when the suite runs on UTC — at UTC+9 the 16:00Z clock is 01:00 on the *next*
+    // local day while the 14:00Z events are still on the previous one, so "Today" is empty and the tile
+    // assertion fails. The helpers make the hours local, which holds for every offset.
+
     func testNoUsageDataBadgeIsDroppedWhenLocalLogsHaveSpend() async throws {
-        let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
+        let now = TestLocalInstant.date(2026, 2, 20, 12)
         // The live usage API returns nothing mappable (empty body -> no metric lines)...
         let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data("{}".utf8)))
         let home = try CodexLogFixture.makeHome(files: [
             "sessions/rollout-1.jsonl": [
-                CodexLogFixture.turnContext(timestamp: "2026-02-20T14:00:00.000Z", model: "gpt-5.2"),
+                CodexLogFixture.turnContext(timestamp: TestLocalInstant.iso(2026, 2, 20, 10), model: "gpt-5.2"),
                 CodexLogFixture.tokenCount(
-                    timestamp: "2026-02-20T14:01:00.000Z",
+                    timestamp: TestLocalInstant.iso(2026, 2, 20, 10, 1),
                     last: CodexLogFixture.usage(input: 100, output: 50)
                 )
             ].joined(separator: "\n")
@@ -572,7 +578,7 @@ final class CodexProviderTests: XCTestCase {
     }
 
     func testLocalHistoryReplacesStaleSnapshotWhenLiveQuotaAuthFails() async throws {
-        let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
+        let now = TestLocalInstant.date(2026, 2, 20, 12)
         let httpClient = FakeHTTPClient(response: HTTPResponse(
             statusCode: 401,
             headers: [:],
@@ -580,9 +586,9 @@ final class CodexProviderTests: XCTestCase {
         ))
         let home = try CodexLogFixture.makeHome(files: [
             "sessions/rollout-1.jsonl": [
-                CodexLogFixture.turnContext(timestamp: "2026-02-20T14:00:00.000Z", model: "gpt-5.2"),
+                CodexLogFixture.turnContext(timestamp: TestLocalInstant.iso(2026, 2, 20, 10), model: "gpt-5.2"),
                 CodexLogFixture.tokenCount(
-                    timestamp: "2026-02-20T14:01:00.000Z",
+                    timestamp: TestLocalInstant.iso(2026, 2, 20, 10, 1),
                     last: CodexLogFixture.usage(input: 100, output: 50)
                 )
             ].joined(separator: "\n")

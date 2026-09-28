@@ -20,7 +20,10 @@ final class PiUsageScannerTests: XCTestCase {
     )
 
     private func line(
-        id: String = "m1", ts: String = "2026-07-12T10:00:00.000Z", provider: String = "anthropic",
+        // Local, so the day this entry buckets into is the day the assertions below name. At UTC+14 a
+        // 10:00Z entry is 00:00 the *next* local day, which is why the expectations are derived rather
+        // than hardcoded — see `TestLocalInstant`.
+        id: String = "m1", ts: String = TestLocalInstant.iso(2026, 7, 12, 10), provider: String = "anthropic",
         model: String = "claude-opus-4-8", input: Int = 100, output: Int = 50,
         cacheRead: Int = 0, cacheWrite: Int = 0, cacheWrite1h: Int = 0, total: Int = 150,
         cost: String? = "0.5"
@@ -79,7 +82,9 @@ final class PiUsageScannerTests: XCTestCase {
         let entry = PiUsageScanner.parseLine(line(provider: "cursor", model: "mystery-model", cost: "0"))!
         let scan = PiUsageScanner.aggregate(entries: [entry], cardID: "cursor", since: .distantPast, pricing: .empty)
         XCTAssertTrue(scan.series.daily.isEmpty)
-        XCTAssertEqual(scan.unknownModelsByDay["2026-07-12"], ["mystery-model"])
+        XCTAssertEqual(
+            scan.unknownModelsByDay[TestLocalInstant.isoDay(2026, 7, 12)], ["mystery-model"]
+        )
     }
 
     func testDedupDropsRepeatedIDs() {

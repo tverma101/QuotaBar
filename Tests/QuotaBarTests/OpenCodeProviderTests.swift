@@ -40,7 +40,7 @@ final class OpenCodeProviderTests: XCTestCase {
         authStore: OpenCodeAuthStore,
         usageScanner: OpenCodeUsageScanner,
         usageClient: OpenCodeGoUsageClient,
-        now: @escaping @Sendable () -> Date = { OpenUsageISO8601.date(from: "2026-07-12T12:00:00.000Z")! }
+        now: @escaping @Sendable () -> Date = { TestLocalInstant.date(2026, 7, 12, 12) }
     ) -> OpenCodeProvider {
         OpenCodeProvider(authStore: authStore, usageScanner: usageScanner, usageClient: usageClient, now: now, goKeyStore: goKeyStoreStub(), activeKeyID: { nil })
     }
@@ -56,7 +56,7 @@ final class OpenCodeProviderTests: XCTestCase {
     }
 
     func testHasLocalCredentialsViaLocalUsage() async {
-        let db = "[" + row("2026-07-12T10:00:00.000Z", "1.0", 500, "gpt-5.5", "opencode") + "]"
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode") + "]"
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(
@@ -83,10 +83,10 @@ final class OpenCodeProviderTests: XCTestCase {
     }
 
     func testRefreshProducesMetersTilesAndTrend() async {
-        let now = d("2026-07-12T12:00:00.000Z")
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let db = "[" + [
-            row("2026-07-12T11:00:00.000Z", "2.0", 1000, "glm-5.2", "opencode-go"),
-            row("2026-07-12T10:00:00.000Z", "1.0", 500, "gpt-5.5", "opencode")
+            row(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "2.0", 1000, "glm-5.2", "opencode-go"),
+            row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode")
         ].joined(separator: ",") + "]"
         let (client, _) = usageClient()
         let provider = OpenCodeProvider(
@@ -116,7 +116,7 @@ final class OpenCodeProviderTests: XCTestCase {
     }
 
     func testRefreshNotLoggedInWhenNoKeyAndNoDatabase() async {
-        let now = d("2026-07-12T12:00:00.000Z")
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
@@ -131,7 +131,7 @@ final class OpenCodeProviderTests: XCTestCase {
         // Freshly logged into Go, before the first local message: the key alone establishes the plan,
         // so the meters show instead of a bare "No usage data". The account API is down here (401), so
         // the fallback reads the published caps at 0%.
-        let now = d("2026-07-12T12:00:00.000Z")
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let (client, _) = usageClient(statusCode: 401)
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
@@ -156,8 +156,8 @@ final class OpenCodeProviderTests: XCTestCase {
     func testAccountMetersUsedWhenAPIAnswers() async {
         // Account API answers AND the local DB has rows: meters come from the account (authoritative),
         // the spend tiles + trend still come from the local scan.
-        let now = d("2026-07-12T12:00:00.000Z")
-        let db = "[" + row("2026-07-12T11:00:00.000Z", "2.0", 1000, "glm-5.2", "opencode-go") + "]"
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "2.0", 1000, "glm-5.2", "opencode-go") + "]"
         let (client, _) = usageClient()
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
@@ -186,8 +186,8 @@ final class OpenCodeProviderTests: XCTestCase {
 
     func testLocalFallbackMetersWhenAPIIsUnavailable() async {
         // Account API down (401): the meters fall back to local-observed spend against the caps.
-        let now = d("2026-07-12T12:00:00.000Z")
-        let db = "[" + row("2026-07-12T11:00:00.000Z", "2.0", 1000, "glm-5.2", "opencode-go") + "]"
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "2.0", 1000, "glm-5.2", "opencode-go") + "]"
         let (client, http) = usageClient(statusCode: 401)
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
@@ -212,9 +212,9 @@ final class OpenCodeProviderTests: XCTestCase {
 
     func testPartialAccountPayloadFallsBackToLocal() async {
         // A 200 with a missing window is not usable: the card must not mix account and local meters.
-        let now = d("2026-07-12T12:00:00.000Z")
-        let db = "[" + row("2026-07-12T11:00:00.000Z", "3.0", 1000, "glm-5.2", "opencode-go") + "]"
-        let partial = Data(#"{"usage":{"rolling":{"status":"ok","percent":4,"resetsAt":"2026-08-12T03:53:00.876Z"},"weekly":{"status":"ok","percent":25,"resetsAt":"2026-08-17T00:00:00.876Z"}}}"#.utf8)
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "3.0", 1000, "glm-5.2", "opencode-go") + "]"
+        let partial = Data(#"{"usage":{"rolling":{"status":"ok","percent":4,"resetsAt":TestLocalInstant.iso(2026, 8, 12, 3, 53, 0)},"weekly":{"status":"ok","percent":25,"resetsAt":TestLocalInstant.iso(2026, 8, 17, 0, 0, 0)}}}"#.utf8)
         let (client, _) = usageClient(body: partial)
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
@@ -235,8 +235,8 @@ final class OpenCodeProviderTests: XCTestCase {
 
     func testNoAPIWithoutGoKey() async {
         // A Zen-only user has no Go key: the account endpoint must never be called.
-        let now = d("2026-07-12T12:00:00.000Z")
-        let db = "[" + row("2026-07-12T10:00:00.000Z", "1.0", 500, "gpt-5.5", "opencode") + "]"
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode") + "]"
         let (client, http) = usageClient()
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles()),
@@ -258,7 +258,7 @@ final class OpenCodeProviderTests: XCTestCase {
     func testAccountMetersShowWithoutLocalDatabase() async {
         // Go key + working account API + no local database: account meters still render (the tiles
         // can't — there's no local data to read — but the plan and meters are account-wide facts).
-        let now = d("2026-07-12T12:00:00.000Z")
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let (client, _) = usageClient()
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
@@ -280,7 +280,7 @@ final class OpenCodeProviderTests: XCTestCase {
     func testRefreshErrorsWhenAllDatabasesUnreadable() async {
         // A valid Go key with a locked/corrupt database must surface a read error, not $0 meters.
         // The scan fails before the account API is consulted, so no request is made.
-        let now = d("2026-07-12T12:00:00.000Z")
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let (client, http) = usageClient()
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
@@ -300,7 +300,7 @@ final class OpenCodeProviderTests: XCTestCase {
 
     func testRefreshSurfacesUnreadableAuthFileInsteadOfNotLoggedIn() async {
         // auth.json exists but can't be read, and there's no database: broken storage, not logout.
-        let now = d("2026-07-12T12:00:00.000Z")
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let provider = OpenCodeProvider(
             authStore: authStore(files: UnreadableFiles(present: ["/oc/auth.json"])),
             usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
@@ -325,8 +325,8 @@ final class OpenCodeProviderTests: XCTestCase {
 
     func testSpendTilesAreNotMarkedEstimated() async {
         // OpenCode records its own per-message cost — the tiles must not carry the local-estimate ⓘ.
-        let now = d("2026-07-12T12:00:00.000Z")
-        let db = "[" + row("2026-07-12T10:00:00.000Z", "1.0", 500, "gpt-5.5", "opencode") + "]"
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode") + "]"
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(
@@ -346,8 +346,8 @@ final class OpenCodeProviderTests: XCTestCase {
     func testStaleGoHistoryDoesNotShowGoPlanOrMeters() async {
         // Zen-only recent usage + an old opencode-go anchor + no Go key: no "Go" badge, no cap meters,
         // but the Zen spend still shows in the tiles.
-        let now = d("2026-07-12T12:00:00.000Z")
-        let db = "[" + row("2026-07-12T10:00:00.000Z", "1.0", 500, "gpt-5.5", "opencode") + "]"
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode") + "]"
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(

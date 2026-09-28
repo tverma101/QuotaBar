@@ -157,11 +157,14 @@ final class CursorUsageSummaryMapperTests: XCTestCase {
 @MainActor
 final class CursorEnterpriseProviderTests: XCTestCase {
     func testRefreshCombinesEnterpriseMetersAndStillAppendsUsageHistory() async throws {
-        let now = try XCTUnwrap(OpenUsageISO8601.date(from: "2026-07-13T12:00:00.000Z"))
+        // Local-anchored clock and CSV date: the CSV row is bucketed into a *local* calendar day, so a
+        // UTC-pinned pair is only self-consistent when the suite runs on UTC. At UTC+14 the 10:00Z row is
+        // 00:00 on the next local day and the history row the test asserts goes missing.
+        let now = TestLocalInstant.date(2026, 7, 13, 12)
         let accessToken = makeCursorJWT(sub: "google-oauth2|enterprise-user")
         let csv = """
         Date,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost
-        2026-07-13T10:00:00Z,composer-1,No,0,1000,0,100,Included
+        \(TestLocalInstant.iso(2026, 7, 13, 10)),composer-1,No,0,1000,0,100,Included
         """
         let http = RoutingHTTPClient { request in
             if request.url == CursorUsageClient.usageURL {
@@ -240,7 +243,7 @@ final class CursorEnterpriseProviderTests: XCTestCase {
         XCTAssertNotNil(snapshot.lines.first { $0.label == "Usage Trend" })
         XCTAssertNotNil(snapshot.lines.first { $0.label == "Today" })
         XCTAssertEqual(snapshot.usageHistory?.series.daily.count, 1)
-        XCTAssertEqual(snapshot.usageHistory?.series.daily.first?.date, "2026-07-13")
+        XCTAssertEqual(snapshot.usageHistory?.series.daily.first?.date, TestLocalInstant.isoDay(2026, 7, 13))
         XCTAssertTrue(http.requests.contains { $0.url == CursorUsageClient.usageSummaryURL })
         XCTAssertTrue(http.requests.contains { request in
             guard request.url.path == CursorUsageClient.restUsageURL.path,

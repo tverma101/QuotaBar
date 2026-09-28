@@ -34,14 +34,14 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
     func testLastTokenUsageWinsOverTotalsDelta() {
         let lines = [
-            CodexLogFixture.turnContext(timestamp: "2026-05-12T08:00:00.000Z", model: "gpt-5.2"),
+            CodexLogFixture.turnContext(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "gpt-5.2"),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:01:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 1),
                 last: CodexLogFixture.usage(input: 1000, cached: 100, output: 200),
                 totals: CodexLogFixture.usage(input: 1000, cached: 100, output: 200)
             ),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:02:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 2),
                 last: CodexLogFixture.usage(input: 500, cached: 50, output: 100),
                 totals: CodexLogFixture.usage(input: 1500, cached: 150, output: 300)
             )
@@ -58,11 +58,11 @@ final class CodexLogUsageScannerTests: XCTestCase {
         // Older rollouts carry only the cumulative counter; each line's usage is the delta.
         let lines = [
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:01:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 1),
                 totals: CodexLogFixture.usage(input: 1000, cached: 100, output: 200)
             ),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:02:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 2),
                 totals: CodexLogFixture.usage(input: 1500, cached: 150, output: 300)
             )
         ].joined(separator: "\n")
@@ -76,16 +76,16 @@ final class CodexLogUsageScannerTests: XCTestCase {
     func testZeroUsageLinesAreSkipped() {
         let lines = [
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:01:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 1),
                 last: CodexLogFixture.usage(input: 0, output: 0)
             ),
             // Totals repeat (no growth) -> zero delta -> skipped too.
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:02:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 2),
                 totals: CodexLogFixture.usage(input: 100, output: 50)
             ),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 totals: CodexLogFixture.usage(input: 100, output: 50)
             )
         ].joined(separator: "\n")
@@ -98,13 +98,13 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
     func testModelComesFromTurnContextAndFallsBackToGpt5() {
         let noContext = CodexLogFixture.tokenCount(
-            timestamp: "2026-05-12T08:01:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 1),
             last: CodexLogFixture.usage(input: 10, output: 5)
         )
         XCTAssertEqual(CodexLogUsageScanner.parseFile(Data(noContext.utf8)).first?.model, "gpt-5")
 
         let withContext = [
-            CodexLogFixture.turnContext(timestamp: "2026-05-12T08:00:00.000Z", model: "gpt-5.3-codex"),
+            CodexLogFixture.turnContext(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "gpt-5.3-codex"),
             noContext
         ].joined(separator: "\n")
         XCTAssertEqual(CodexLogUsageScanner.parseFile(Data(withContext.utf8)).first?.model, "gpt-5.3-codex")
@@ -112,15 +112,15 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
     func testInlineModelOnTokenCountOverridesTurnContext() {
         let lines = [
-            CodexLogFixture.turnContext(timestamp: "2026-05-12T08:00:00.000Z", model: "gpt-5.2"),
+            CodexLogFixture.turnContext(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "gpt-5.2"),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:01:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 1),
                 last: CodexLogFixture.usage(input: 10, output: 5),
                 model: "gpt-5.4"
             ),
             // The inline model becomes the session's current model for later lines.
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:02:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 2),
                 last: CodexLogFixture.usage(input: 20, output: 10)
             )
         ].joined(separator: "\n")
@@ -134,24 +134,24 @@ final class CodexLogUsageScannerTests: XCTestCase {
         // The tier comes from the session's own thread_settings_applied lines, per event: turns
         // before a priority switch stay standard, turns after a switch back to default do too.
         let lines = [
-            CodexLogFixture.turnContext(timestamp: "2026-07-12T08:00:00.000Z", model: "gpt-5.2"),
+            CodexLogFixture.turnContext(timestamp: TestLocalInstant.iso(2026, 7, 12, 8, 0), model: "gpt-5.2"),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-07-12T08:01:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 7, 12, 8, 1),
                 last: CodexLogFixture.usage(input: 10, output: 5)
             ),
-            CodexLogFixture.threadSettingsApplied(timestamp: "2026-07-12T08:02:00.000Z", serviceTier: "priority"),
+            CodexLogFixture.threadSettingsApplied(timestamp: TestLocalInstant.iso(2026, 7, 12, 8, 2), serviceTier: "priority"),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-07-12T08:03:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 7, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 20, output: 10)
             ),
-            CodexLogFixture.threadSettingsApplied(timestamp: "2026-07-12T08:04:00.000Z", serviceTier: "default"),
+            CodexLogFixture.threadSettingsApplied(timestamp: TestLocalInstant.iso(2026, 7, 12, 8, 4), serviceTier: "default"),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-07-12T08:05:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 7, 12, 8, 5),
                 last: CodexLogFixture.usage(input: 30, output: 15)
             ),
-            CodexLogFixture.threadSettingsApplied(timestamp: "2026-07-12T08:06:00.000Z", serviceTier: "fast"),
+            CodexLogFixture.threadSettingsApplied(timestamp: TestLocalInstant.iso(2026, 7, 12, 8, 6), serviceTier: "fast"),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-07-12T08:07:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 7, 12, 8, 7),
                 last: CodexLogFixture.usage(input: 40, output: 20)
             )
         ].joined(separator: "\n")
@@ -163,7 +163,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
     func testCachedTokensCapAtInputTokens() {
         let line = CodexLogFixture.tokenCount(
-            timestamp: "2026-05-12T08:01:00.000Z",
+            timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 1),
             last: CodexLogFixture.usage(input: 100, cached: 250, output: 10)
         )
         XCTAssertEqual(CodexLogUsageScanner.parseFile(Data(line.utf8)).first?.cached, 100)
@@ -184,7 +184,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
     }
 
     func testAutoReviewLinesPreserveSlugAndUseDateSpecificPricing() {
-        for (date, expectedModel) in [("2026-03-10", "gpt-5.4"), ("2026-08-20", "gpt-5.6-luna")] {
+        for (date, expectedModel) in [(TestLocalInstant.isoDay(2026, 3, 10), "gpt-5.4"), (TestLocalInstant.isoDay(2026, 8, 20), "gpt-5.6-luna")] {
             let lines = [
                 CodexLogFixture.turnContext(timestamp: "\(date)T08:00:00.000Z", model: "codex-auto-review"),
                 CodexLogFixture.tokenCount(
@@ -203,28 +203,28 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
     /// Epoch seconds of the child sessions' creation instant used across the replay tests.
     private var childCreationEpoch: Int {
-        Int(OpenUsageISO8601.date(from: "2026-05-12T08:03:00.000Z")!.timeIntervalSince1970)
+        Int(TestLocalInstant.date(2026, 5, 12, 8, 3).timeIntervalSince1970)
     }
 
     func testSubagentReplayLinesAreSkippedButSeedTheDeltaBaseline() {
         // A thread_spawn subagent file replays the parent's token_counts at spawn, then a live
         // task_started opens its own turns. Only the subagent's own turns count.
         let lines = [
-            CodexLogFixture.subagentSessionMeta(timestamp: "2026-05-12T08:03:00.000Z"),
-            CodexLogFixture.taskStarted(timestamp: "2026-05-12T08:03:00.100Z", startedAt: childCreationEpoch - 900),
+            CodexLogFixture.subagentSessionMeta(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3)),
+            CodexLogFixture.taskStarted(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), startedAt: childCreationEpoch - 900),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:00.100Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 1000, cached: 100, output: 200),
                 totals: CodexLogFixture.usage(input: 1000, cached: 100, output: 200)
             ),
-            CodexLogFixture.taskStarted(timestamp: "2026-05-12T08:03:01.000Z", startedAt: childCreationEpoch + 1),
+            CodexLogFixture.taskStarted(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), startedAt: childCreationEpoch + 1),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:04:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 4),
                 last: CodexLogFixture.usage(input: 100, cached: 10, output: 20),
                 model: "gpt-5.2"
             ),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:05:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 5),
                 last: CodexLogFixture.usage(input: 50, cached: 5, output: 10)
             )
         ].joined(separator: "\n")
@@ -239,21 +239,21 @@ final class CodexLogUsageScannerTests: XCTestCase {
         // replay, so replayed lines land in many distinct timestamp seconds. All of them must be
         // skipped — only the turns after the live task_started count.
         let lines = [
-            CodexLogFixture.subagentSessionMeta(timestamp: "2026-05-12T08:03:00.000Z"),
-            CodexLogFixture.taskStarted(timestamp: "2026-05-12T08:03:00.100Z", startedAt: childCreationEpoch - 900),
+            CodexLogFixture.subagentSessionMeta(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3)),
+            CodexLogFixture.taskStarted(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), startedAt: childCreationEpoch - 900),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:00.100Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 1000, output: 200),
                 totals: CodexLogFixture.usage(input: 1000, output: 200)
             ),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:02.800Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 4000, output: 800),
                 totals: CodexLogFixture.usage(input: 7000, output: 1400)
             ),
-            CodexLogFixture.taskStarted(timestamp: "2026-05-12T08:03:03.000Z", startedAt: childCreationEpoch + 3),
+            CodexLogFixture.taskStarted(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), startedAt: childCreationEpoch + 3),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:30.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 100, output: 20)
             )
         ].joined(separator: "\n")
@@ -266,14 +266,14 @@ final class CodexLogUsageScannerTests: XCTestCase {
     func testForkSessionReplayIsSkippedToo() {
         // A fork (forked_from_id, no subagent source) replays parent history the same way.
         let lines = [
-            CodexLogFixture.forkSessionMeta(timestamp: "2026-05-12T08:03:00.000Z"),
+            CodexLogFixture.forkSessionMeta(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3)),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:00.100Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 1000, output: 200)
             ),
-            CodexLogFixture.taskStarted(timestamp: "2026-05-12T08:03:05.000Z", startedAt: childCreationEpoch + 5),
+            CodexLogFixture.taskStarted(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), startedAt: childCreationEpoch + 5),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:30.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 50, output: 10)
             )
         ].joined(separator: "\n")
@@ -286,10 +286,10 @@ final class CodexLogUsageScannerTests: XCTestCase {
     func testChildWithoutLiveTurnEmitsNothing() {
         // A child file that never reaches a live task_started is all replay — nothing counts.
         let lines = [
-            CodexLogFixture.subagentSessionMeta(timestamp: "2026-05-12T08:03:00.000Z"),
-            CodexLogFixture.taskStarted(timestamp: "2026-05-12T08:03:00.100Z", startedAt: childCreationEpoch - 900),
+            CodexLogFixture.subagentSessionMeta(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3)),
+            CodexLogFixture.taskStarted(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), startedAt: childCreationEpoch - 900),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:00.100Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 1000, output: 200)
             )
         ].joined(separator: "\n")
@@ -301,19 +301,19 @@ final class CodexLogUsageScannerTests: XCTestCase {
         // The subagent's own lines carry only totals: the replayed totals must seed the baseline
         // so the first real turn doesn't re-count the parent's cumulative sum.
         let lines = [
-            CodexLogFixture.subagentSessionMeta(timestamp: "2026-05-12T08:03:00.000Z"),
-            CodexLogFixture.taskStarted(timestamp: "2026-05-12T08:03:00.100Z", startedAt: childCreationEpoch - 900),
+            CodexLogFixture.subagentSessionMeta(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3)),
+            CodexLogFixture.taskStarted(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), startedAt: childCreationEpoch - 900),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:00.100Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 totals: CodexLogFixture.usage(input: 1000, cached: 100, output: 200)
             ),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:00.200Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 totals: CodexLogFixture.usage(input: 1500, cached: 150, output: 300)
             ),
-            CodexLogFixture.taskStarted(timestamp: "2026-05-12T08:03:01.000Z", startedAt: childCreationEpoch + 1),
+            CodexLogFixture.taskStarted(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), startedAt: childCreationEpoch + 1),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:04:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 4),
                 totals: CodexLogFixture.usage(input: 1600, cached: 160, output: 320)
             )
         ].joined(separator: "\n")
@@ -329,11 +329,11 @@ final class CodexLogUsageScannerTests: XCTestCase {
     func testRootSessionsKeepUsageWithMissingOrNullParentMetadata() {
         let cases: [(name: String, prefix: [String])] = [
             ("root metadata and unrelated spawn mention", [
-                CodexLogFixture.rootSessionMeta(timestamp: "2026-05-12T08:03:00.000Z"),
-                #"{"timestamp":"2026-05-12T08:03:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"about thread_spawn"}}"#
+                CodexLogFixture.rootSessionMeta(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3)),
+                #"{"timestamp":TestLocalInstant.iso(2026, 5, 12, 8, 3),"type":"event_msg","payload":{"type":"agent_message","message":"about thread_spawn"}}"#
             ]),
             ("null parent fields", [
-                #"{"timestamp":"2026-05-12T08:03:00.000Z","type":"session_meta","payload":{"id":"root-abc","forked_from_id":null,"parent_thread_id":null,"source":{"subagent":null}}}"#
+                #"{"timestamp":TestLocalInstant.iso(2026, 5, 12, 8, 3),"type":"session_meta","payload":{"id":"root-abc","forked_from_id":null,"parent_thread_id":null,"source":{"subagent":null}}}"#
             ]),
             ("missing session metadata", [])
         ]
@@ -341,10 +341,10 @@ final class CodexLogUsageScannerTests: XCTestCase {
         for entry in cases {
             let lines = (entry.prefix + [
                 CodexLogFixture.tokenCount(
-                    timestamp: "2026-05-12T08:03:00.100Z", last: CodexLogFixture.usage(input: 100, output: 20)
+                    timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), last: CodexLogFixture.usage(input: 100, output: 20)
                 ),
                 CodexLogFixture.tokenCount(
-                    timestamp: "2026-05-12T08:03:00.500Z", last: CodexLogFixture.usage(input: 50, output: 10)
+                    timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), last: CodexLogFixture.usage(input: 50, output: 10)
                 )
             ]).joined(separator: "\n")
 
@@ -359,14 +359,14 @@ final class CodexLogUsageScannerTests: XCTestCase {
         let sessionMeta = #"{"type":"session_meta","payload":{"id":"subagent-abc","forked_from_id":"parent-xyz"}}"#
         let lines = [
             sessionMeta,
-            CodexLogFixture.taskStarted(timestamp: "2026-05-12T08:03:00.100Z", startedAt: childCreationEpoch - 900),
+            CodexLogFixture.taskStarted(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), startedAt: childCreationEpoch - 900),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:00.100Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 1000, output: 200)
             ),
-            CodexLogFixture.taskStarted(timestamp: "2026-05-12T08:03:05.000Z", startedAt: childCreationEpoch + 5),
+            CodexLogFixture.taskStarted(timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3), startedAt: childCreationEpoch + 5),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:30.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 50, output: 10)
             )
         ].joined(separator: "\n")
@@ -379,17 +379,17 @@ final class CodexLogUsageScannerTests: XCTestCase {
         // last_token_usage, new timestamp. Only the first counts.
         let lines = [
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:01:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 1),
                 last: CodexLogFixture.usage(input: 1000, cached: 100, output: 200),
                 totals: CodexLogFixture.usage(input: 1000, cached: 100, output: 200)
             ),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:02:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 2),
                 last: CodexLogFixture.usage(input: 1000, cached: 100, output: 200),
                 totals: CodexLogFixture.usage(input: 1000, cached: 100, output: 200)
             ),
             CodexLogFixture.tokenCount(
-                timestamp: "2026-05-12T08:03:00.000Z",
+                timestamp: TestLocalInstant.iso(2026, 5, 12, 8, 3),
                 last: CodexLogFixture.usage(input: 500, cached: 50, output: 100),
                 totals: CodexLogFixture.usage(input: 1500, cached: 150, output: 300)
             )
@@ -408,19 +408,19 @@ final class CodexLogUsageScannerTests: XCTestCase {
         let scan = CodexLogUsageScanner.aggregate(
             events: [
                 makeEvent(
-                    "2026-05-12T08:00:00.000Z",
+                    TestLocalInstant.iso(2026, 5, 12, 8, 0),
                     model: "anthropic/opencode_go/deepseek-v4-flash",
                     input: 1000,
                     output: 500
                 ),
                 makeEvent(
-                    "2026-05-12T08:00:00.000Z",
+                    TestLocalInstant.iso(2026, 5, 12, 8, 0),
                     model: "anthropic/opencode/deepseek-v4-flash-free",
                     input: 800,
                     output: 200
                 ),
                 makeEvent(
-                    "2026-05-12T08:00:00.000Z",
+                    TestLocalInstant.iso(2026, 5, 12, 8, 0),
                     model: "gpt-5",
                     input: 100,
                     output: 50
@@ -458,27 +458,27 @@ final class CodexLogUsageScannerTests: XCTestCase {
     func testAggregateBucketsByLocalDayAndPrices() {
         let scan = CodexLogUsageScanner.aggregate(
             events: [
-                makeEvent("2026-05-12T08:00:00.000Z"),
-                makeEvent("2026-05-12T09:00:00.000Z"),
-                makeEvent("2026-05-13T08:00:00.000Z")
+                makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0)),
+                makeEvent(TestLocalInstant.iso(2026, 5, 12, 9, 0)),
+                makeEvent(TestLocalInstant.iso(2026, 5, 13, 8, 0))
             ],
             since: .distantPast, pricing: fixedRates()
         )
 
         XCTAssertEqual(scan.series.daily.count, 2)
         // (100 x $1000 + 50 x $3000) / 1M = $0.25 per event.
-        let may12 = scan.series.daily.first { $0.date == "2026-05-12" }
+        let may12 = scan.series.daily.first { $0.date == TestLocalInstant.isoDay(2026, 5, 12) }
         XCTAssertEqual(may12?.totalTokens, 300)
         XCTAssertEqual(may12?.costUSD ?? 0, 0.5, accuracy: 0.0001)
         XCTAssertTrue(scan.unknownModelsByDay.isEmpty)
-        let may12Models = scan.modelUsage?.daily.first { $0.date == "2026-05-12" }?.models ?? []
+        let may12Models = scan.modelUsage?.daily.first { $0.date == TestLocalInstant.isoDay(2026, 5, 12) }?.models ?? []
         XCTAssertEqual(may12Models, [ModelUsageEntry(model: "gpt-5.2", totalTokens: 300, costUSD: 0.5)])
     }
 
     func testAggregateAttributesAutoReviewUsageToSlugWhileUsingFallbackPrice() {
         let scan = CodexLogUsageScanner.aggregate(
             events: [makeEvent(
-                "2026-05-12T08:00:00.000Z", model: "codex-auto-review",
+                TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "codex-auto-review",
                 pricingModel: "gpt-5.2"
             )],
             since: .distantPast, pricing: fixedRates()
@@ -510,7 +510,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
     func testAggregateDropsIdenticalEventsAcrossFiles() {
         // The same event parsed from a copied session file counts once.
-        let event = makeEvent("2026-05-12T08:00:00.000Z")
+        let event = makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0))
         let scan = CodexLogUsageScanner.aggregate(
             events: [event, event], since: .distantPast, pricing: fixedRates()
         )
@@ -520,7 +520,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
     func testAggregateCachedTokensPriceAtCacheReadRate() {
         let scan = CodexLogUsageScanner.aggregate(
-            events: [makeEvent("2026-05-12T08:00:00.000Z", input: 1000, cached: 400, output: 0)],
+            events: [makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), input: 1000, cached: 400, output: 0)],
             since: .distantPast, pricing: fixedRates()
         )
 
@@ -538,7 +538,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
         )
         let scan = CodexLogUsageScanner.aggregate(
             events: [makeEvent(
-                "2026-05-12T08:00:00.000Z", model: "gpt-test",
+                TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "gpt-test",
                 input: 1000, cached: 400, output: 0
             )],
             since: .distantPast,
@@ -557,7 +557,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
             cacheReadIsExplicit: true
         )
         let event = makeEvent(
-            "2026-05-12T08:00:00.000Z", model: "gpt-5.5-pro",
+            TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "gpt-5.5-pro",
             input: 1000, cached: 400, output: 0
         )
 
@@ -579,7 +579,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
             cacheReadPerMillion: 0.1
         )
         let event = makeEvent(
-            "2026-05-12T08:00:00.000Z", input: 300_000, cached: 100_000, output: 10_000
+            TestLocalInstant.iso(2026, 5, 12, 8, 0), input: 300_000, cached: 100_000, output: 10_000
         )
         let expectedCosts: [(String, Double)] = [
             ("gpt-5.4", 1.275),
@@ -616,7 +616,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
             cacheReadPerMillion: 0.5
         )
         let event = makeEvent(
-            "2026-05-12T08:00:00.000Z", model: "gpt-5.5",
+            TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "gpt-5.5",
             input: 272_000, cached: 72_000, output: 1000
         )
 
@@ -632,11 +632,11 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
     func testAggregateFastEventsDoubleWhenNoExplicitMultiplier() {
         let base = CodexLogUsageScanner.aggregate(
-            events: [makeEvent("2026-05-12T08:00:00.000Z")],
+            events: [makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0))],
             since: .distantPast, pricing: fixedRates()
         )
         let fast = CodexLogUsageScanner.aggregate(
-            events: [makeEvent("2026-05-12T08:00:00.000Z", isFast: true)],
+            events: [makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), isFast: true)],
             since: .distantPast, pricing: fixedRates()
         )
 
@@ -672,12 +672,12 @@ final class CodexLogUsageScannerTests: XCTestCase {
                 supplementFastMultipliers: [entry.model: entry.supplementMultiplier]
             )
             let standard = CodexLogUsageScanner.aggregate(
-                events: [makeEvent("2026-05-12T08:00:00.000Z", model: entry.model, input: 100, output: 50)],
+                events: [makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: entry.model, input: 100, output: 50)],
                 since: .distantPast, pricing: pricing
             )
             let priority = CodexLogUsageScanner.aggregate(
                 events: [makeEvent(
-                    "2026-05-12T08:00:00.000Z", model: entry.model, input: 100, output: 50, isFast: true
+                    TestLocalInstant.iso(2026, 5, 12, 8, 0), model: entry.model, input: 100, output: 50, isFast: true
                 )],
                 since: .distantPast, pricing: pricing
             )
@@ -714,7 +714,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
         let short = CodexLogUsageScanner.aggregate(
             events: [makeEvent(
-                "2026-05-12T08:00:00.000Z", model: "gpt-5.6-sol-ultra-fast",
+                TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "gpt-5.6-sol-ultra-fast",
                 input: 100_000, output: 10_000
             )],
             since: .distantPast,
@@ -722,7 +722,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
         )
         let long = CodexLogUsageScanner.aggregate(
             events: [makeEvent(
-                "2026-05-12T09:00:00.000Z", model: "gpt-5.6-sol-ultra-fast",
+                TestLocalInstant.iso(2026, 5, 12, 9, 0), model: "gpt-5.6-sol-ultra-fast",
                 input: 300_000, cached: 100_000, output: 10_000
             )],
             since: .distantPast,
@@ -746,8 +746,8 @@ final class CodexLogUsageScannerTests: XCTestCase {
     func testAggregateUnknownModelIsExcludedFromTotalsButWarns() {
         let scan = CodexLogUsageScanner.aggregate(
             events: [
-                makeEvent("2026-05-12T08:00:00.000Z", model: "mystery-model-9"),
-                makeEvent("2026-05-12T09:00:00.000Z")
+                makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "mystery-model-9"),
+                makeEvent(TestLocalInstant.iso(2026, 5, 12, 9, 0))
             ],
             since: .distantPast, pricing: fixedRates()
         )
@@ -756,31 +756,31 @@ final class CodexLogUsageScannerTests: XCTestCase {
         // warning triangle, so the tile's tokens and dollars stay coherent.
         XCTAssertEqual(scan.series.daily.first?.totalTokens, 150)
         XCTAssertNotNil(scan.series.daily.first?.costUSD)
-        XCTAssertEqual(scan.unknownModelsByDay["2026-05-12"], ["mystery-model-9"])
+        XCTAssertEqual(scan.unknownModelsByDay[TestLocalInstant.isoDay(2026, 5, 12)], ["mystery-model-9"])
         XCTAssertEqual(scan.modelUsage?.daily.first?.models.map(\.model), ["gpt-5.2"])
     }
 
     func testAggregateUnknownModelOnlyLeavesDayUnbacked() {
         let scan = CodexLogUsageScanner.aggregate(
-            events: [makeEvent("2026-05-12T08:00:00.000Z", model: "mystery-model-9")],
+            events: [makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "mystery-model-9")],
             since: .distantPast, pricing: fixedRates()
         )
 
         // A day with nothing priceable produces no series entry at all (→ "No data"), but the
         // unknown-model warning still names what was excluded.
         XCTAssertTrue(scan.series.daily.isEmpty)
-        XCTAssertEqual(scan.unknownModelsByDay["2026-05-12"], ["mystery-model-9"])
+        XCTAssertEqual(scan.unknownModelsByDay[TestLocalInstant.isoDay(2026, 5, 12)], ["mystery-model-9"])
         XCTAssertEqual(scan.modelUsage?.daily ?? [], [])
     }
 
     func testAggregateFiltersEventsBeforeSince() {
         let scan = CodexLogUsageScanner.aggregate(
-            events: [makeEvent("2026-01-01T08:00:00.000Z"), makeEvent("2026-05-12T08:00:00.000Z")],
-            since: OpenUsageISO8601.date(from: "2026-05-01T00:00:00.000Z")!,
+            events: [makeEvent(TestLocalInstant.iso(2026, 1, 1, 8, 0)), makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0))],
+            since: TestLocalInstant.date(2026, 5, 1, 0),
             pricing: fixedRates()
         )
 
-        XCTAssertEqual(scan.series.daily.map(\.date), ["2026-05-12"])
+        XCTAssertEqual(scan.series.daily.map(\.date), [TestLocalInstant.isoDay(2026, 5, 12)])
     }
 
     // MARK: - End-to-end scan
