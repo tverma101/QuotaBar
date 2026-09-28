@@ -35,10 +35,25 @@ struct WidgetGroupedListView: View {
         .animation(Motion.spring, value: layout.displayGroups.map(\.provider.id))
     }
 
+    @ViewBuilder
     private func section(_ group: ProviderGroup) -> some View {
+        // Dropped here rather than in `displayGroups` because only now is visibility known. See
+        // `ProviderGroup.hasVisibleRow(keeping:)`.
+        if group.hasVisibleRow(keeping: isRowVisible) {
+            sectionBody(group, resolved: resolveRows(for: group))
+        }
+    }
+
+    private func sectionBody(_ group: ProviderGroup, resolved: ResolvedCard) -> some View {
         VStack(alignment: .leading, spacing: density.headerToCardSpacing) {
             header(group)
-            container(group)
+            card(
+                for: group,
+                cardRows: resolved.cardRows,
+                condensedIDs: resolved.condensedIDs,
+                providerID: group.provider.id,
+                isExpanded: layout.isProviderExpanded(group.provider.id)
+            )
         }
         .opacity(activeProviderID == group.provider.id ? 0 : 1)
         .reorderFrame(id: group.provider.id, in: .named(reorderSpaceName))
@@ -117,28 +132,58 @@ struct WidgetGroupedListView: View {
                 "provider-links"
             }
         }
+
+        /// Whether this row is a metric. A card made only of a divider/caret and links has nothing to
+        /// show, which is what an emptied provider used to render.
+        var isMetric: Bool {
+            if case .metric = self { return true }
+            return false
+        }
     }
 
-    private func container(_ group: ProviderGroup) -> some View {
+    /// Everything a card needs, resolved once per render: the filtered rows, the card-row model, and
+    /// the condensing set. `section` and `card` both read this, so the visibility decision that decides
+    /// whether a provider renders at all is made from exactly the same rows the card would show.
+    private struct ResolvedCard {
+        let cardRows: [DashboardMetricCardRow]
+        let condensedIDs: Set<String>
+    }
+
+    private func resolveRows(for group: ProviderGroup) -> ResolvedCard {
         // Resolve each row's descriptor + data exactly once per render, then reuse it for both the
         // neighbor-aware condensing rule and the row itself — `dataStore.data(for:)` used to be
         // recomputed several times per row (twice per adjacent pair plus once in `row`).
-        let providerID = group.provider.id
-        let isExpanded = layout.isProviderExpanded(providerID)
+        let isExpanded = layout.isProviderExpanded(group.provider.id)
         let alwaysRows = resolvedRows(group.alwaysShownWidgets)
         let expandedRows = resolvedRows(group.expandedWidgets)
         // The caret separates Always Visible and On Demand rows, so text-row condensing should not
         // bridge across it. Each side tightens only against rows on the same side of the separator.
-        let condensedIDs = visibleCondensedTextRowIDs(alwaysRows: alwaysRows, expandedRows: isExpanded ? expandedRows : [])
-        let cardRows = metricCardRows(
+        let condensedIDs = visibleCondensedTextRowIDs(
             alwaysRows: alwaysRows,
-            expandedRows: expandedRows,
-            hasExpandedMetrics: group.hasExpandedMetrics,
-            isExpanded: isExpanded,
-            links: group.provider.visibleLinks
+            expandedRows: isExpanded ? expandedRows : []
         )
+        return ResolvedCard(
+            cardRows: metricCardRows(
+                alwaysRows: alwaysRows,
+                expandedRows: expandedRows,
+                hasExpandedMetrics: group.hasExpandedMetrics,
+                isExpanded: isExpanded,
+                links: group.provider.visibleLinks
+            ),
+            condensedIDs: condensedIDs
+        )
+    }
+
+    /// The card body, split out so `container` can decide whether to render one at all.
+    private func card(
+        for group: ProviderGroup,
+        cardRows: [DashboardMetricCardRow],
+        condensedIDs: Set<String>,
+        providerID: String,
+        isExpanded: Bool
+    ) -> some View {
         // Same card builder the lifted preview uses, so the floating chip can't drift from the live card.
-        return DashboardMetricCard {
+        DashboardMetricCard {
             // One stable list keeps the drag-owning metric row alive when it crosses the caret boundary.
             // Separate always-shown/expanded loops can tear that source view down before `onEnded` fires,
             // leaving the lift overlay visible until another drag forces a reset.
@@ -156,18 +201,26 @@ struct WidgetGroupedListView: View {
         }
     }
 
+    /// The single visibility predicate: a feature/plan-dependent row with nothing to show is noise, so it
+    /// hides itself — unless the user turned it on, which `showsRow` treats as intent that outranks the
+    /// data.
+    ///
+    /// Deliberately a presentation filter rather than a layout change: Customize still lists the row,
+    /// menu-bar pins still render it, and quota alerts still fire off the underlying data. Removing it
+    /// from `placed` instead would quietly switch all three off.
+    private func isRowVisible(_ widget: PlacedWidget) -> Bool {
+        guard let descriptor = layout.descriptor(for: widget) else { return false }
+        return layout.showsRow(descriptor, hasData: dataStore.data(for: descriptor).hasData)
+    }
+
     private func resolvedRows(_ widgets: [PlacedWidget]) -> [ResolvedRow] {
-        widgets.compactMap { widget -> ResolvedRow? in
+        widgets.filter(isRowVisible).compactMap { widget -> ResolvedRow? in
             guard let descriptor = layout.descriptor(for: widget) else { return nil }
-            let data = dataStore.data(for: descriptor)
-            // A feature/plan-dependent row with nothing to show is noise, so it hides itself — unless
-            // the user turned it on, which `showsRow` treats as intent that outranks the data.
-            //
-            // Deliberately a presentation filter rather than a layout change: Customize still lists
-            // the row, menu-bar pins still render it, and quota alerts still fire off the underlying
-            // data. Removing it from `placed` instead would quietly switch all three off.
-            guard layout.showsRow(descriptor, hasData: data.hasData) else { return nil }
-            return ResolvedRow(widget: widget, descriptor: descriptor, data: data)
+            return ResolvedRow(
+                widget: widget,
+                descriptor: descriptor,
+                data: dataStore.data(for: descriptor)
+            )
         }
     }
 

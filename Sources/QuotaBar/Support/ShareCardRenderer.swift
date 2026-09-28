@@ -83,14 +83,21 @@ enum ShareCardRenderer {
         appearance: ColorScheme
     ) -> Bool {
         let isExpanded = layout.isProviderExpanded(group.provider.id)
-        let alwaysRows = group.alwaysShownWidgets.compactMap { widget -> WidgetData? in
+        // Apply the same `hidesWhenEmpty` filter the dashboard applies, so the export matches what the
+        // user is looking at. It did not: a conditional row hidden on screen was still exported,
+        // rendering as an "— / No data" row in the shared PNG that is not in the screenshot the user
+        // took of their own panel. The `ShareCardView` doc comment claimed it mirrored the card.
+        // Same predicate the dashboard uses, via the same `showsRow` rule.
+        let data = { (widget: PlacedWidget) -> WidgetData? in
             guard let descriptor = layout.descriptor(for: widget) else { return nil }
             return dataStore.data(for: descriptor)
         }
-        let expandedRows = group.expandedWidgets.compactMap { widget -> WidgetData? in
-            guard let descriptor = layout.descriptor(for: widget) else { return nil }
-            return dataStore.data(for: descriptor)
+        let kept = group.visibleRows {
+            guard let descriptor = layout.descriptor(for: $0) else { return false }
+            return layout.showsRow(descriptor, hasData: dataStore.data(for: descriptor).hasData)
         }
+        let alwaysRows = kept.alwaysShown.compactMap(data)
+        let expandedRows = kept.expanded.compactMap(data)
         let rows = isExpanded ? alwaysRows + expandedRows : alwaysRows
         let view = ShareCardView(
             provider: group.provider,

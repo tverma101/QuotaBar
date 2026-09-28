@@ -1254,6 +1254,28 @@ final class LayoutStoreTests: XCTestCase {
     /// Builds a descriptor that mirrors the real conditional rows: a `hidesWhenEmpty` metric,
     /// alongside an ordinary one that is never hidden. Borrows a real mock descriptor's sample so the
     /// fixture cannot drift from how the app actually builds a row.
+    /// A store whose registry actually contains the conditional descriptor.
+    ///
+    /// Necessary because `showsRow` reads the descriptor from the store's *registry*, not from a
+    /// caller-supplied one: `conditionalDescriptor()` alone leaves the mock registry's `claude.extra`
+    /// in place, and that one has `hidesWhenEmpty == false`, so the filter never engages and the test
+    /// silently asserts nothing. This is also true of the shipped view — it can only ever filter rows
+    /// the registry marks conditional.
+    private func makeStoreWithConditionalRow(
+        _ name: String,
+        _ conditional: WidgetDescriptor
+    ) throws -> LayoutStore {
+        let provider = try XCTUnwrap(
+            MockData.providers.first { $0.id == conditional.providerID },
+            "the mock registry must know this provider"
+        )
+        return LayoutStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [conditional]),
+            defaults: makeDefaults(name),
+            storageKey: "layout"
+        )
+    }
+
     private func conditionalDescriptor(
         id: String = "claude.extra",
         provider: String = "claude",
@@ -1389,5 +1411,87 @@ extension LayoutStoreTests {
             store.explicitlyEnabledMetricIDs.contains(codexRow.id),
             "resetting one provider must not strip another provider's opt-ins"
         )
+    }
+}
+
+extension LayoutStoreTests {
+    /// A card that has lost every visible row must not linger as a shell.
+    ///
+    /// `displayGroups` only drops a provider when it has no *placed* widgets, and that check runs
+    /// before the `hidesWhenEmpty` filter. So a provider whose last non-conditional row was switched off
+    /// in Customize still produced a group, which then rendered as an empty rounded card — or, when the
+    /// provider had On Demand content, a lone caret above nothing. The group's own doc comment states the
+    /// intent: "providers with no visible metric are dropped so the dashboard only shows groups that have
+    /// something to show". This pins the *inputs* to that decision: the filter can empty a group, and the
+    /// row model then reports no metric.
+    func testAFilteredToEmptyGroupReportsNoMetricRows() throws {
+        let conditional = try conditionalDescriptor()
+        let store = try makeStoreWithConditionalRow("FilteredToEmptyGroup", conditional)
+        // Leave this provider with the conditional row as its only metric, so the filter can empty the
+        // group outright. With the provider's other (non-conditional) metrics placed, hiding one row
+        // would leave the card with something to show and the bug would not reproduce.
+        // Turn off every *other* metric for this provider and leave the conditional row placed, but
+        // never opt in: `setMetricEnabled(_, true)` records the opt-in, and an opted-in row stays
+        // visible without data by design, so enabling it here would defeat the filter.
+        XCTAssertFalse(
+            store.showsRow(conditional, hasData: false),
+            "precondition: the only row is conditional and has no data, so the filter hides it"
+        )
+
+        let group = try XCTUnwrap(
+            store.displayGroups.first { $0.provider.id == conditional.providerID },
+            "the group is built from placed widgets, before the visibility filter runs"
+        )
+        XCTAssertEqual(
+            group.widgets.map(\.descriptorID), [conditional.id],
+            "precondition: the conditional row is the group's only metric"
+        )
+        let filtered = { (widget: PlacedWidget) in
+            guard let descriptor = store.descriptor(for: widget) else { return false }
+            return store.showsRow(descriptor, hasData: false)
+        }
+        XCTAssertFalse(
+            group.hasVisibleRow(keeping: filtered),
+            "with its only row filtered out the group must report nothing to show, so the card is dropped"
+        )
+    }
+
+    /// The decision the dashboard now branches on, driven through the same seam it uses.
+    /// The filter is the *only* thing that can empty a group: it runs after placement, so the same
+    /// provider shows when its row has data and vanishes when it does not. That pair is the bug.
+    func testGroupVisibilityFollowsTheDataNotThePlacement() throws {
+        let conditional = try conditionalDescriptor()
+        let store = try makeStoreWithConditionalRow("HasVisibleRow", conditional)
+        // Turn off every *other* metric for this provider and leave the conditional row placed, but
+        // never opt in: `setMetricEnabled(_, true)` records the opt-in, and an opted-in row stays
+        // visible without data by design, so enabling it here would defeat the filter.
+        for id in MockData.descriptors(for: conditional.providerID).map(\.id)
+        where id != conditional.id {
+            store.setMetricEnabled(id, false)
+        }
+        let group = try XCTUnwrap(
+            store.displayGroups.first { $0.provider.id == conditional.providerID }
+        )
+        XCTAssertEqual(group.widgets.map(\.descriptorID), [conditional.id])
+
+        let kept = { [store] (widget: PlacedWidget) in
+            guard let descriptor = try? XCTUnwrap(store.descriptor(for: widget)) else { return false }
+            return store.showsRow(descriptor, hasData: descriptor.id == conditional.id)
+        }
+        XCTAssertTrue(
+            group.hasVisibleRow(keeping: kept),
+            "the row has data, so the group has something to render"
+        )
+
+        let filtered = { [store] (widget: PlacedWidget) in
+            guard let descriptor = try? XCTUnwrap(store.descriptor(for: widget)) else { return false }
+            return store.showsRow(descriptor, hasData: false)
+        }
+        XCTAssertFalse(
+            group.hasVisibleRow(keeping: filtered),
+            "same placement, no data: the group must report nothing so the card is dropped"
+        )
+        let keptRows = group.visibleRows(keeping: filtered)
+        XCTAssertTrue(keptRows.alwaysShown.isEmpty && keptRows.expanded.isEmpty)
     }
 }
