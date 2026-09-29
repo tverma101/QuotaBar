@@ -26,8 +26,14 @@ struct DashboardContentView: View {
                         .transition(.scale(scale: 0.95).combined(with: .opacity))
                 }
                 widgetContent
-                KaggleComputeCard()
-                    .padding(.top, density.sectionSpacing)
+                // Only offered when it can work. The bridge is a separate binary QuotaBar does not ship,
+                // so an unconditional card sat at the bottom of the dashboard permanently reporting a red
+                // "Needs attention" for an optional feature the user never enabled — and suggesting a
+                // reinstall, which cannot install it.
+                if container.kaggleCompute.isBridgeAvailable {
+                    KaggleComputeCard()
+                        .padding(.top, density.sectionSpacing)
+                }
             }
             .animation(Motion.spring, value: container.onboarding.isCustomizeHintPending)
             .padding(.horizontal, horizontalPadding)
