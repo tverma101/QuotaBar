@@ -653,9 +653,23 @@ final class WidgetDataStore {
         )
     }
 
+    /// Recomputes `snapshots` from `localSnapshots` and the peer set, **assigning only when the result
+    /// actually differs**.
+    ///
+    /// Assigning unconditionally is what made the dashboard feel like it was thrashing. The cache-hit path
+    /// already compared before rebuilding, but the *success* path did not — so every successful provider
+    /// refresh replaced the whole array even when the provider returned byte-identical data. In SwiftUI that
+    /// invalidates the views holding it, which is why tapping a token-usage row opened its detail popover
+    /// and the popover immediately closed itself: opening the panel fires a forced refresh, the refresh
+    /// reassigned `snapshots`, and the popover the user had just opened was torn down and rebuilt. It
+    /// looked like constant refreshing, and it re-triggered on every retry.
+    ///
+    /// The guard makes the whole family idempotent — one place, so every caller benefits and none can
+    /// forget it. `ProviderSnapshot` is `Equatable`, so the comparison is cheap relative to the work this
+    /// function has just done.
     private func rebuildRenderedSnapshots() {
         guard !peerHistoryDocuments.isEmpty else {
-            snapshots = localSnapshots
+            if snapshots != localSnapshots { snapshots = localSnapshots }
             return
         }
         let renderDate = now()
@@ -689,7 +703,7 @@ final class WidgetDataStore {
                 now: renderDate
             )
         }
-        snapshots = rendered
+        if snapshots != rendered { snapshots = rendered }
     }
 
     /// The provider's latest refresh error, or `nil` when its last refresh succeeded.
