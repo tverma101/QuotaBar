@@ -93,12 +93,19 @@ final class WidgetDataStore {
     /// peer contribution can never echo back out and multiply on the next device.
     private(set) var localSnapshots: [String: ProviderSnapshot] = [:]
     var refreshingProviderIDs: Set<String> = []
-    /// The batch currently running, so a second caller asking for the same thing joins it instead of
-    /// starting its own set of per-provider tasks. Keyed by (force, scope) because a forced caller must
-    /// not silently receive a menu-bar-scoped pass — that is the merge-data case the per-provider force
-    /// wait exists to avoid, and it must keep running its own pass.
-    private var activeBatch: Task<Void, Never>?
-    private var activeBatchKey: String?
+    /// Running batches keyed by `<force>|<scope>`, so a second caller asking for the same thing joins it
+    /// instead of starting its own set of per-provider tasks.
+    ///
+    /// Keyed rather than a single slot: a non-forced batch (the periodic tick, a CodexRouter ledger wake)
+    /// routinely overlaps a forced one (panel open), and it finishes first because it is nearly all cache
+    /// hits. With one slot the fast batch's completion cleared the *forced* batch's registration while that
+    /// batch was still running, so the next popover open saw an empty slot and re-fetched every provider
+    /// — double API calls, double subprocesses, a second full parse of the JSONL corpus, and a spinner for
+    /// the sum of both passes. Each batch now removes only its own entry.
+    ///
+    /// A forced caller must never be handed a menu-bar-scoped pass, which is why the key includes both
+    /// parts: different settings are not joined, and the per-provider force wait handles them.
+    private var activeBatches: [String: Task<Void, Never>] = [:]
     /// Wall-clock time the most recent full refresh pass finished. Together with the chosen refresh
     /// cadence it drives the dashboard footer's live "Next update in …" countdown, so the footer reflects
     /// the real schedule instead of a hardcoded value. `nil` until the first pass completes.
@@ -246,23 +253,22 @@ final class WidgetDataStore {
     /// exists to handle.
     func refreshAll(force: Bool = false, maxConcurrentProviders: Int? = nil) async {
         let batchKey = "\(force)|\(ProviderRefreshContext.scope == .menuBar ? "menuBar" : "full")"
-        if let activeBatch, activeBatchKey == batchKey {
+        if let active = activeBatches[batchKey] {
             AppLog.debug(.refresh, "batch join (force=\(force) already in flight)")
-            await activeBatch.value
+            await active.value
             return
         }
         let task = Task { [weak self] in
             guard let self else { return }
             await self.runBatch(force: force, maxConcurrentProviders: maxConcurrentProviders)
         }
-        activeBatch = task
-        activeBatchKey = batchKey
+        activeBatches[batchKey] = task
         await task.value
-        // Only clear if we are still the registered batch; a nested call may have replaced it.
-        if activeBatchKey == batchKey {
-            activeBatch = nil
-            activeBatchKey = nil
-        }
+        // Remove only *this* batch's entry. `Task` is a value type, so there is no identity to compare;
+        // but a same-key entry cannot have been replaced while this one ran, because a same-key caller
+        // would have joined instead of starting a second. Removing a *different* key's entry here is
+        // exactly the bug this map replaced, so the key is all that is needed.
+        activeBatches[batchKey] = nil
     }
 
     private func runBatch(force: Bool, maxConcurrentProviders: Int?) async {

@@ -129,4 +129,124 @@ final class RefreshBatchCoalescingTests: XCTestCase {
             defaults: suite
         )
     }
+
+
+    /// A different-signature batch must not un-register one that is still running.
+    ///
+    /// The registration was a single slot. The periodic tick (non-forced) routinely overlaps a forced
+    /// panel-open batch and finishes first, because a non-forced caller *skips* providers already in
+    /// flight — its completion then cleared the forced batch's registration while that batch was still
+    /// fetching. The next popover open saw an empty slot, started a second batch, and re-fetched every
+    /// provider: double API calls, a second full parse of the JSONL corpus, and a spinner for the sum of
+    /// both passes.
+    ///
+    /// Ordering is the whole test: the forced batch is held open, a non-forced batch completes over it,
+    /// and only then does a second *forced* caller arrive. It must join, so the provider is entered once.
+    func testAFastBatchCompletingDoesNotUnregisterTheSlowOneStillRunning() async throws {
+        let provider = Provider(id: "devin", displayName: "Devin", icon: .providerMark("devin"))
+        let descriptor = WidgetDescriptor(
+            id: "devin.weekly", providerID: provider.id, metricLabel: "Weekly quota",
+            sample: WidgetData(title: "Weekly", icon: provider.icon, kind: .percent, used: 0, limit: 100)
+        )
+        let runtime = CountingBlockingRuntime(provider: provider, descriptors: [descriptor])
+        let store = makeStore(runtime: runtime)
+
+        // 1. A forced batch starts and blocks inside the provider.
+        async let slow: Void = store.refreshAll(force: true)
+        try await runtime.waitForEntries(1)
+
+        // 2. A non-forced batch overlaps it and completes: the provider is in flight, so this caller
+        //    skips and returns. This is what used to wipe the forced batch's registration.
+        await store.refreshAll(force: false)
+        XCTAssertEqual(runtime.refreshCount, 1, "the non-forced caller must skip, not re-fetch")
+
+        // 3. A second forced caller arrives while the first is *still* running. It must join it, which
+        //    means the provider must NOT be entered a second time. So we wait for a second entry with a
+        //    bounded timeout and require that it never arrives: waiting for it unconditionally would
+        //    deadlock, because the fixed behaviour is precisely that the count stays at 1.
+        async let third: Void = store.refreshAll(force: true)
+        try await runtime.waitForEntriesOrTimeout(2, milliseconds: 250)
+
+        XCTAssertEqual(
+            runtime.refreshCount, 1,
+            "a forced caller must join the in-flight batch, not start a second pass"
+        )
+
+        // 4. Release, then let both forced callers finish.
+        runtime.release()
+        _ = await (slow, third)
+
+        XCTAssertEqual(
+            runtime.refreshCount, 1,
+            "a completed batch of a different signature must not let a later forced caller re-fetch"
+        )
+    }
+
+    /// Counts entries into `refresh()` and holds each one until `release()`. Lets a test hold a batch in
+    /// flight deterministically rather than racing a timer.
+    private final class CountingBlockingRuntime: ProviderRuntime, @unchecked Sendable {
+        let provider: Provider
+        let widgetDescriptors: [WidgetDescriptor]
+        private let lock = NSLock()
+        private var _count = 0
+        private var released = false
+
+        init(provider: Provider, descriptors: [WidgetDescriptor]) {
+            self.provider = provider
+            self.widgetDescriptors = descriptors
+        }
+
+        var refreshCount: Int { entries }
+
+        func release() {
+            lock.lock()
+            released = true
+            lock.unlock()
+        }
+
+        /// All lock access lives in synchronous helpers: Swift 6 forbids `NSLock` in an `async` context,
+        /// and the poll below needs the flag re-read on every turn.
+        private func enter() -> Bool {
+            lock.lock()
+            _count += 1
+            let isOpen = released
+            lock.unlock()
+            return isOpen
+        }
+
+        private var isReleased: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return released
+        }
+
+        private var entries: Int {
+            lock.lock(); defer { lock.unlock() }
+            return _count
+        }
+
+        func refresh() async -> ProviderSnapshot {
+            if !enter() {
+                while !isReleased {
+                    try? await Task.sleep(for: .milliseconds(2))
+                }
+            }
+            return .error(provider: provider, message: "Not logged in")
+        }
+
+        func waitForEntries(_ n: Int) async throws {
+            while entries < n {
+                try await Task.sleep(for: .milliseconds(2))
+            }
+        }
+
+        /// Returns as soon as `n` entries are reached, or after `milliseconds` elapses. Used where the
+        /// *absence* of an entry is the assertion, so an unconditional wait would hang.
+        func waitForEntriesOrTimeout(_ n: Int, milliseconds: Int) async throws {
+            let deadline = ContinuousClock.now.advanced(by: .milliseconds(milliseconds))
+            while entries < n {
+                if ContinuousClock.now >= deadline { return }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+        }
+    }
 }

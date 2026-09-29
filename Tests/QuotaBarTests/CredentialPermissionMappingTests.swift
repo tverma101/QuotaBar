@@ -197,3 +197,44 @@ final class CredentialPermissionMappingTests: XCTestCase {
         func execute(path: String, sql: String) throws {}
     }
 }
+
+extension CredentialPermissionMappingTests {
+    /// A Keychain refusal must not take down a card that already has a working credential.
+    ///
+    /// This one was my own regression: I made `loadAuthState` throw `credentialPermissionRequired`
+    /// instead of returning nil, but left the Keychain reads *unconditional*. Cursor's Keychain items are
+    /// a fallback — the sqlite database wins — so a user signed in through `state.vscdb` whose
+    /// `cursor-access-token` item existed but was ACL-blocked got the whole store thrown from. The card
+    /// showed no usage at all, with a remedy for an item that had nothing to do with the token in use, and
+    /// because it runs on every background tick the card stayed down for the session.
+    func testKeychainRefusalDoesNotFailACardWithAWorkingDatabaseCredential() throws {
+        let store = CursorAuthStore(sqlite: StubSQLite(token: "sqlite-token"), keychain: RefusingKeychain())
+
+        let state = try XCTUnwrap(
+            try store.loadAuthState(),
+            "a working database credential must still produce a credential"
+        )
+        XCTAssertEqual(state.source, .sqlite, "the database wins; the Keychain is only a fallback")
+        XCTAssertEqual(state.accessToken, "sqlite-token")
+    }
+
+    /// The mirror: with no database credential, the Keychain *is* the only source, so a refusal is the
+    /// real answer and must still surface as the permission error rather than as "not logged in".
+    func testKeychainRefusalStillSurfacesWhenThereIsNoOtherCredential() {
+        let store = CursorAuthStore(sqlite: MissingSQLite(), keychain: RefusingKeychain())
+        XCTAssertThrowsError(try store.loadAuthState()) { error in
+            XCTAssertEqual(error as? CursorAuthError, .credentialPermissionRequired)
+        }
+    }
+}
+
+private extension CredentialPermissionMappingTests {
+    /// SQLite holding a usable access+refresh pair, so the database branch wins.
+    struct StubSQLite: SQLiteAccessing, Sendable {
+        let token: String
+        func queryValue(path: String, sql: String) throws -> String? {
+            sql.contains("accessToken") ? token : (sql.contains("refreshToken") ? token : nil)
+        }
+        func execute(path: String, sql: String) throws {}
+    }
+}
