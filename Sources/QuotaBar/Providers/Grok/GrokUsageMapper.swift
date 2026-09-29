@@ -51,7 +51,8 @@ enum GrokUsageMapper {
 
     private static func formatUnits(_ value: Double) -> String {
         if value.rounded() == value {
-            return String(Int(value))
+            // The decoder only requires `isFinite`, so `1e30` reaches here and `Int(_:)` would trap.
+            return String(ProviderParse.intFromClampedDouble(value))
         }
         return String(value)
     }
