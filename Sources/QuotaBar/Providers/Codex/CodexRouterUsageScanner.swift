@@ -157,7 +157,11 @@ actor CodexRouterUsageScanner {
                     at: atISO
                 )
             ].compactMap { $0 }
-            guard let pricingModel = candidates.first(where: { pricing.resolve(model: $0) != nil }),
+            // Prefer an exact catalog key so a gateway-tagged slug is identified as the model it routes
+            // to. `resolve` alone would match the whole prefixed string fuzzily, which prices correctly
+            // but leaves the row named `anthropic/openai/gpt-5.6-luna` — a second row for one model.
+            let exactIdentity = pricing.canonicalKey(for: candidates)
+            guard let pricingModel = exactIdentity ?? candidates.first(where: { pricing.resolve(model: $0) != nil }),
                   let rates = pricing.resolve(model: pricingModel)
             else {
                 if total > 0 {
@@ -190,7 +194,17 @@ actor CodexRouterUsageScanner {
                     rates: rates
                 )
             )
-            fold.accumulator.add(day: day, tokens: total, cost: cost, model: model)
+            // `pricingModel` is the identity: the router stamps the upstream path onto its slugs, so the
+            // same model arrives tagged and untagged. Keying the row by the raw slug split it in two and
+            // double-counted it in the period total; the observed spelling still reaches the tooltip as a
+            // variant, so nothing is lost by grouping on what pricing actually resolved.
+            fold.accumulator.add(
+                day: day,
+                tokens: total,
+                cost: cost,
+                model: model,
+                canonical: GatewaySlug.identity(of: model, resolvedPricingModel: pricingModel)
+            )
         }
 
         // Unit tests inject an in-memory ledger; keep that path allocation-light and deterministic.

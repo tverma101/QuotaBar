@@ -429,3 +429,120 @@ final class CodexRouterUsageScannerTests: XCTestCase {
         XCTAssertTrue(scan.unknownModelsByDay.isEmpty)
     }
 }
+
+extension CodexRouterUsageScannerTests {
+    /// The regression from the real dashboard: one model, two rows, counted twice.
+    ///
+    /// The Codex router stamps the upstream path onto its slugs, so `gpt-5.6-luna` also arrived as
+    /// `anthropic/openai/gpt-5.6-luna`. Both priced fine — the candidate resolver already tried every
+    /// suffix after a `/` — but the per-model row was keyed on the raw slug, so the period showed two
+    /// rows for one model, each displaying its own slug, and their costs were summed into the same
+    /// "Last 30 Days" total. The tagged row's cost was real; it was just also counted again under a
+    /// second name.
+    func testGatewayTaggedSlugCollapsesOntoTheModelItRoutes() async throws {
+        let accountID = "1118f6f1-8697-4e7b-9112-1771b3e36099"
+        let fingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountID)!
+        let contents = ledger([
+            [
+                "at": TestLocalInstant.iso(2026, 9, 2, 15),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 100, "cachedInputTokens": 0, "outputTokens": 50,
+                "reasoningTokens": 0, "totalTokens": 150,
+                "accountFingerprint": fingerprint, "accountId": accountID
+            ],
+            [
+                // Same model, routed through a stamped path.
+                "at": TestLocalInstant.iso(2026, 9, 2, 16),
+                "model": "anthropic/openai/gpt-5.6-luna",
+                "provider": "anthropic",
+                "status": 200,
+                "inputTokens": 200, "cachedInputTokens": 0, "outputTokens": 50,
+                "reasoningTokens": 0, "totalTokens": 250,
+                "accountFingerprint": fingerprint, "accountId": accountID
+            ]
+        ])
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { ["/tmp/usage-events.jsonl"] },
+            readFile: { _ in contents }
+        )
+        let scanned = await scanner.scan(
+            accountIdentityKey: accountID,
+            allowsUnscopedEvents: false,
+            daysBack: 30,
+            now: TestLocalInstant.date(2026, 9, 3, 12),
+            pricing: pricing()
+        )
+        let scan = try XCTUnwrap(scanned)
+
+        let models = try XCTUnwrap(scan.modelUsage?.daily.flatMap(\.models))
+        XCTAssertEqual(
+            models.map(\.model), ["gpt-5.6-luna"],
+            "one model, one row — the routing path is not part of the model's name"
+        )
+        XCTAssertEqual(
+            models[0].totalTokens, 400,
+            "both events belong to the same model and must sum, not split"
+        )
+        // Rates are 1000/1M in, 3000/1M out.
+        //   event 1: 100 in + 50 out = 0.10 + 0.15 = 0.25
+        //   event 2: 200 in + 50 out = 0.20 + 0.15 = 0.35
+        XCTAssertEqual(models[0].costUSD ?? 0, 0.60, accuracy: 0.000_001)
+
+        // The observed spelling is not lost — it moves to the hover breakdown, which is where a routing
+        // tag is actually informative.
+        XCTAssertEqual(
+            models[0].variants?.map(\.model).sorted(),
+            ["anthropic/openai/gpt-5.6-luna", "gpt-5.6-luna"],
+            "the tagged spelling survives as a tooltip variant"
+        )
+    }
+
+    /// The distinction that must NOT be collapsed: a bare slug that merely borrows another model's price
+    /// is its own identity. `gpt-reserve` and `codex-auto-review` are deliberate rows, so "priced like"
+    /// cannot be read as "is" — that mistake is what the narrow `GatewaySlug` rule exists to prevent.
+    func testBareSlugKeepsItsOwnIdentityEvenWhenPricedAsAnotherModel() async throws {
+        let accountID = "1118f6f1-8697-4e7b-9112-1771b3e36099"
+        let fingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountID)!
+        let contents = ledger([
+            [
+                "at": TestLocalInstant.iso(2026, 9, 2, 15),
+                "model": "gpt-5.6-luna",
+                "provider": "openai", "status": 200,
+                "inputTokens": 100, "cachedInputTokens": 0, "outputTokens": 50,
+                "reasoningTokens": 0, "totalTokens": 150,
+                "accountFingerprint": fingerprint, "accountId": accountID
+            ]
+        ])
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { ["/tmp/usage-events.jsonl"] },
+            readFile: { _ in contents }
+        )
+        let scanned = await scanner.scan(
+            accountIdentityKey: accountID,
+            allowsUnscopedEvents: false,
+            daysBack: 30,
+            now: TestLocalInstant.date(2026, 9, 3, 12),
+            pricing: pricing()
+        )
+        let scan = try XCTUnwrap(scanned)
+        let models = try XCTUnwrap(scan.modelUsage?.daily.flatMap(\.models))
+        XCTAssertEqual(models.map(\.model), ["gpt-5.6-luna"])
+        XCTAssertNil(models[0].variants, "a single untagged spelling is no breakdown")
+
+        // And the rule itself, stated directly: only a `/` marks a routing path.
+        XCTAssertTrue(GatewaySlug.hasRoutingPath("anthropic/openai/gpt-5.6-luna"))
+        XCTAssertFalse(GatewaySlug.hasRoutingPath("gpt-5.6-luna"))
+        XCTAssertFalse(GatewaySlug.hasRoutingPath("gpt-reserve"))
+        XCTAssertEqual(
+            GatewaySlug.identity(of: "anthropic/openai/gpt-5.6-luna", resolvedPricingModel: "gpt-5.6-luna"),
+            "gpt-5.6-luna"
+        )
+        // A bare slug ignores the resolved model entirely, even when pricing found one.
+        XCTAssertEqual(
+            GatewaySlug.identity(of: "gpt-reserve", resolvedPricingModel: "gpt-6-luna"),
+            "gpt-reserve"
+        )
+    }
+}
