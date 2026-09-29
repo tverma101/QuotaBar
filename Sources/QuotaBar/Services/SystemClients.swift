@@ -85,9 +85,28 @@ struct LocalTextFileAccessor: TextFileAccessing {
         let parent = URL(fileURLWithPath: expanded).deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
 
-        let destination = URL(fileURLWithPath: expanded)
-        let temporary = parent.appendingPathComponent(
-            ".\(destination.lastPathComponent).\(UUID().uuidString).tmp"
+        // A symlink at the destination is followed, not replaced.
+        //
+        // `rename(2)` replaces the *directory entry*, so writing over a path that is a symlink silently
+        // destroys the link and leaves a regular file in its place. Users keep `~/.codex/auth.json`,
+        // `~/.claude/.credentials.json` and `~/.grok/auth.json` symlinked into a dotfiles repo, and a
+        // *background* refresh — the five-minute tick, no user action — was rotating a token and
+        // atomically clobbering the link. The dotfiles copy then stopped receiving rotations, the link was
+        // gone with no undo and no log line, and the divergence only surfaced at the next `git status`.
+        //
+        // `O_NOFOLLOW` was already applied to the temporary file, which protects the write; this protects
+        // the link. Resolving first means the rotation lands on the real target, which is exactly what
+        // linking it asked for.
+        let resolvedURL = URL(
+            fileURLWithPath: Self.resolveSymlinkDestination(expanded, fallbackParent: parent)
+        )
+        let resolvedParent = resolvedURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: resolvedParent, withIntermediateDirectories: true
+        )
+        let destination = resolvedURL.path
+        let temporary = resolvedParent.appendingPathComponent(
+            ".\(resolvedURL.lastPathComponent).\(UUID().uuidString).tmp"
         )
         let descriptor = temporary.path.withCString {
             Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, Self.privateFileMode)
@@ -114,9 +133,11 @@ struct LocalTextFileAccessor: TextFileAccessing {
         descriptorIsOpen = false
         guard closeResult == 0 else { throw Self.currentPOSIXError() }
 
+        // Rename onto the *resolved* destination. Using `expanded` here is what destroyed the link: the
+        // rename replaced the symlink's directory entry with a regular file.
         let renameResult = temporary.path.withCString { source in
-            expanded.withCString { destination in
-                Darwin.rename(source, destination)
+            destination.withCString { target in
+                Darwin.rename(source, target)
             }
         }
         guard renameResult == 0 else { throw Self.currentPOSIXError() }
@@ -152,6 +173,34 @@ struct LocalTextFileAccessor: TextFileAccessing {
     private static func currentPOSIXError() -> POSIXError {
         POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
+
+    /// Follows a symlink chain at `path` and returns the path that should actually be written.
+    ///
+    /// Bounded to a handful of hops so a symlink cycle cannot hang a background refresh. A broken link
+    /// whose target's parent does not exist resolves to that target, and the write then creates the
+    /// parent — better than destroying the link and leaving the user with a regular file where their
+    /// setup used to be.
+    static func resolveSymlinkDestination(_ path: String, fallbackParent: URL) -> String {
+        var current = path
+        for _ in 0..<8 {
+            var status = stat()
+            let isLink = current.withCString { Darwin.lstat($0, &status) } == 0
+                && (status.st_mode & S_IFMT) == S_IFLNK
+            guard isLink else { return current }
+            var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+            let length = current.withCString { Darwin.readlink($0, &buffer, buffer.count - 1) }
+            guard length > 0 else { return current }
+            buffer[length] = 0
+            let target = String(cString: buffer)
+            let next = target.hasPrefix("/")
+                ? target
+                : fallbackParent.path + "/" + target
+            current = (next as NSString).expandingTildeInPath
+        }
+        // Cycle, or deeper than the hop budget: return where we started rather than somewhere arbitrary.
+        return path
+    }
+
 }
 
 protocol SQLiteAccessing: Sendable {
