@@ -121,14 +121,15 @@ actor PiUsageScanner {
               let usage = message["usage"] as? [String: Any]
         else { return nil }
 
-        let cacheWrite = Int(ProviderParse.number(usage["cacheWrite"]) ?? 0)
-        let cacheWrite1h = Int(ProviderParse.number(usage["cacheWrite1h"]) ?? 0)
+        // Saturating throughout: these are untrusted log fields and `Int(1e30)` is a fatal error, not nil.
+        let cacheWrite = ProviderParse.int(ProviderParse.number(usage["cacheWrite"]) ?? 0)
+        let cacheWrite1h = ProviderParse.int(ProviderParse.number(usage["cacheWrite1h"]) ?? 0)
         let tokens = TokenBreakdown(
-            input: Int(ProviderParse.number(usage["input"]) ?? 0),
+            input: ProviderParse.int(ProviderParse.number(usage["input"]) ?? 0),
             cacheWrite5m: max(cacheWrite - cacheWrite1h, 0),
             cacheWrite1h: cacheWrite1h,
-            cacheRead: Int(ProviderParse.number(usage["cacheRead"]) ?? 0),
-            output: Int(ProviderParse.number(usage["output"]) ?? 0)
+            cacheRead: ProviderParse.int(ProviderParse.number(usage["cacheRead"]) ?? 0),
+            output: ProviderParse.int(ProviderParse.number(usage["output"]) ?? 0)
         )
 
         let carriedCost = (usage["cost"] as? [String: Any]).flatMap { ProviderParse.number($0["total"]) }
@@ -139,7 +140,7 @@ actor PiUsageScanner {
             model: (message["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
             carriedCost: carriedCost,
             tokens: tokens,
-            reportedTotalTokens: Int(ProviderParse.number(usage["totalTokens"]) ?? 0)
+            reportedTotalTokens: ProviderParse.int(ProviderParse.number(usage["totalTokens"]) ?? 0)
         )
     }
 

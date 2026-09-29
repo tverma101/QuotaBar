@@ -48,7 +48,9 @@ actor CodexLogUsageScanner {
             reasoning = int("reasoning_output_tokens", "reasoning_tokens") ?? 0
             let reported = int("total_tokens") ?? 0
             // Reasoning tokens are a subset of output on OpenAI/Codex usage; do not add them again.
-            let recomputed = input + output
+            // Saturating: a line carrying `input_tokens` at Int.max plus any output overflowed and
+            // took the process down with it. A corrupt count must cost a wrong number, never a crash.
+            let recomputed = ProviderParse.addingSaturating(input, output)
             total = (reported > 0 || recomputed == 0) ? reported : recomputed
         }
 

@@ -137,10 +137,12 @@ actor MuseUsageScanner {
         entries.append(Entry(
             timestamp: timestamp,
             tokens: TokenBreakdown(
-                input: Int(uncachedInput),
+                // Saturating: a malformed record must cost a wrong number, never a process kill. This
+                // scanner has no dedicated test file, so the hazard was entirely unexercised.
+                input: ProviderParse.intFromClampedDouble(uncachedInput),
                 cacheWrite5m: 0,
-                cacheRead: Int(cached),
-                output: Int(output + reasoning)
+                cacheRead: ProviderParse.intFromClampedDouble(cached),
+                output: ProviderParse.intFromClampedDouble(output + reasoning)
             ),
             model: model
         ))

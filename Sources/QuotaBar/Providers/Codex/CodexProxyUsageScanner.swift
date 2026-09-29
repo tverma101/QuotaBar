@@ -181,7 +181,9 @@ actor CodexProxyUsageScanner {
     }
 
     private static func count(_ value: Any?) -> Int? {
-        guard let number = ProviderParse.number(value), number >= 0, number <= Double(Int.max) else {
+        // `Double(Int.max)` rounds up to 2^63, so `<= Double(Int.max)` admits exactly 2^63 — which then
+        // traps in the conversion below. Compare in the clamped domain instead.
+        guard let number = ProviderParse.number(value), number >= 0, number < 9_223_372_036_854_775_808 else {
             return nil
         }
         return Int(number.rounded(.down))

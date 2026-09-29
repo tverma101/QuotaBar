@@ -34,6 +34,51 @@ enum ProviderParse {
         return nil
     }
 
+    /// Bounded integer read for counts parsed out of provider payloads.
+    ///
+    /// `number` deliberately only rejects non-finite values, so it happily returns `1e30` — and every
+    /// `Int(someDouble)` on that traps with a fatal error, not a nil. A single malformed token count in
+    /// a session log therefore killed the whole menu-bar process (SIGTRAP) mid-refresh, which is the worst
+    /// possible failure for a background app: the payload is untrusted, and the cost of being wrong is
+    /// an unrecoverable crash rather than a wrong number.
+    ///
+    /// Clamps into `lower...upper` instead. A count that large is not representable, so saturating to the
+    /// bound keeps the day total finite and lets the row render; a token count is never meaningfully
+    /// negative, hence the default floor of zero.
+    static func int(
+        _ value: Any?,
+        default fallback: Int = 0,
+        lower: Int = 0,
+        upper: Int = .max
+    ) -> Int {
+        guard let double = number(value) else { return fallback }
+        return intFromClampedDouble(double, lower: lower, upper: upper)
+    }
+
+    /// `Int(exactly:)`-style conversion that saturates rather than trapping. Compares against
+    /// `Double(lowerBound)`/`Double(upperBound)`, and handles the `Double(Int.max)` rounding trap: that
+    /// value rounds *up* to 2^63, so a naive `<=` guard lets exactly 2^63 through and the conversion then
+    /// traps. Comparing in the clamped domain first is what makes the boundary safe.
+    static func intFromClampedDouble(
+        _ double: Double,
+        lower: Int = 0,
+        upper: Int = .max
+    ) -> Int {
+        if double.isNaN { return lower }
+        if double <= Double(lower) { return lower }
+        if double >= Double(upper) { return upper }
+        // Inside the representable range, so the conversion is exact. `rounded(.down)` mirrors how a
+        // count is read: 3.9 tokens is three tokens, and a negative slip cannot round away from zero.
+        return Int(double.rounded(.down))
+    }
+
+    /// Saturating addition. `Int` overflow is a trap, and token arithmetic sums attacker-controlled
+    /// counts: a line with `input_tokens` at `Int.max` plus any output overflowed and killed the process.
+    static func addingSaturating(_ lhs: Int, _ rhs: Int, cap: Int = .max) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? cap : sum
+    }
+
     /// Permissive boolean read for `JSONSerialization` output: accepts real `Bool`s, numeric `NSNumber`s
     /// (nonzero → true, via `boolValue`), and the strings "true"/"1"/"false"/"0" (case-insensitive).
     /// Returns `nil` for anything else, so an absent or unrecognized field stays distinguishable from an

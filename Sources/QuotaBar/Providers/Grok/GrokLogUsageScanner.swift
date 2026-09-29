@@ -129,10 +129,15 @@ actor GrokLogUsageScanner {
                   inputValue >= 0
             else { continue }
 
-            let input = Int(inputValue)
-            let cacheRead = min(max(Int(ProviderParse.number(values["cachedReadTokens"]) ?? 0), 0), input)
+            // Saturating: `Int(1e30)` is a fatal error, and these counts come from a log another app
+            // writes. A guard on `>= 0` bounds the wrong end.
+            let input = ProviderParse.intFromClampedDouble(inputValue)
+            let cacheRead = min(
+                max(ProviderParse.int(ProviderParse.number(values["cachedReadTokens"]) ?? 0), 0),
+                input
+            )
             let cacheWrite = min(
-                max(Int(ProviderParse.number(values["cacheCreationTokens"]) ?? 0), 0),
+                max(ProviderParse.int(ProviderParse.number(values["cacheCreationTokens"]) ?? 0), 0),
                 input - cacheRead
             )
             // Grok reports reasoning as a subset of outputTokens, so it must never be added again.
