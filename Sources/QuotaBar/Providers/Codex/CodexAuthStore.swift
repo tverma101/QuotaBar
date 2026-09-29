@@ -60,7 +60,7 @@ enum CodexAuthError: Error, LocalizedError, Equatable {
         case .notLoggedIn:
             return "Not logged in. Run `codex` to authenticate."
         case .credentialPermissionRequired:
-            return "macOS needs permission to read your Codex Keychain item. Refresh, then choose Always Allow."
+            return "macOS needs permission to read your Codex Keychain item. Refresh to be asked once, then choose Always Allow."
         case .sessionExpired:
             return "Session expired. Run `codex` to log in again."
         case .tokenConflict:
