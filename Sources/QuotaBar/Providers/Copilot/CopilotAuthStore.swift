@@ -17,7 +17,7 @@ enum CopilotAuthError: Error, LocalizedError, Equatable {
         case .notLoggedIn:
             return "Sign in to GitHub Copilot in your editor, or run gh auth login, and try again."
         case .credentialPermissionRequired:
-            return "macOS needs permission to read your Copilot Keychain item. Refresh, then choose Always Allow."
+            return "macOS needs permission to read your Copilot Keychain item. Refresh to be asked once, then choose Always Allow."
         case .tokenInvalid:
             return "GitHub token invalid or expired. Re-authenticate (gh auth login) and try again."
         }

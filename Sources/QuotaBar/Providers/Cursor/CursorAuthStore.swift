@@ -24,7 +24,7 @@ enum CursorAuthError: Error, LocalizedError, Equatable {
         case .notLoggedIn:
             return "Not logged in. Sign in via Cursor app or run `agent login`."
         case .credentialPermissionRequired:
-            return "macOS needs permission to read your Cursor Keychain item. Refresh, then choose Always Allow."
+            return "macOS needs permission to read your Cursor Keychain item. Refresh to be asked once, then choose Always Allow."
         case .sessionExpired:
             return "Session expired. Sign in via Cursor app or run `agent login`."
         case .tokenExpired:

@@ -27,7 +27,7 @@ enum AntigravityError: Error, LocalizedError, Equatable {
         case .credentialStoreUnreadable:
             return "Couldn't read Antigravity credentials from Keychain. Unlock Keychain or sign in to Antigravity again."
         case .credentialPermissionRequired:
-            return "Antigravity needs permission to read its Keychain item. Use Refresh Now to grant it."
+            return "Antigravity needs permission to read its Keychain item. Use Refresh Now to be asked once, then grant it."
         case .invalidCredentialData:
             return "Antigravity credentials are invalid. Open Antigravity or run `agy` to sign in again."
         case .authExpired:

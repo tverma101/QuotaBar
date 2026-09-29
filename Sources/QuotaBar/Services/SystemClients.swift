@@ -335,12 +335,25 @@ extension KeychainAccessing {
             // Remember it: without this every five-minute cycle re-reads an item it cannot read and
             // fails again, which is the "keychain access" spam.
             KeychainPermissionGate.shared.block(key)
+            // Already asked and refused. Escalating again would raise the identical dialog for the same
+            // item, which is the complaint this exists to answer: the app kept asking after the user had
+            // already said no. Report the same definitive answer instead.
+            guard !KeychainPermissionGate.shared.isDeclined(key) else {
+                throw KeychainError.interactionNotAllowed
+            }
             guard ProviderRefreshContext.isManual,
                   ProviderRefreshContext.credentialInteractionGate?.claim() ?? true
             else {
                 throw KeychainError.interactionNotAllowed
             }
-            return try read(true)
+            do {
+                return try read(true)
+            } catch {
+                // Cancelled, or the grant did not take. Either way the user has been asked once for this
+                // item and did not grant it, so stop asking for the rest of the session.
+                KeychainPermissionGate.shared.markDeclined(key)
+                throw error
+            }
         }
     }
 
@@ -583,6 +596,36 @@ final class KeychainPermissionGate: @unchecked Sendable {
     private init() {}
     private let lock = NSLock()
     private var blocked: Set<KeychainItemKey> = []
+    /// Items the user has already been prompted for and did not grant — cancelled the dialog, or the
+    /// interactive read came back refused.
+    ///
+    /// Without this, declining is indistinguishable from never having been asked: the item stays blocked
+    /// for background reads, but the *next* manual refresh escalates again and raises the same dialog.
+    /// That is the "it keeps asking" loop — the user's only escape was to stop pressing Refresh Now, and
+    /// the app had no way to say it would stop asking.
+    private var declined: Set<KeychainItemKey> = []
+
+    /// Whether the user has already declined this item, so a further manual refresh must not re-prompt.
+    func isDeclined(_ key: KeychainItemKey) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return declined.contains(key)
+    }
+
+    /// Records that the user declined, so the dialog is shown at most once per item per session.
+    func markDeclined(_ key: KeychainItemKey) {
+        lock.lock()
+        declined.insert(key)
+        lock.unlock()
+    }
+
+    /// Forgets a decline. Called when the user explicitly asks to try again, so the offer to grant is
+    /// reachable without restarting the app.
+    func clearDeclined(_ key: KeychainItemKey) {
+        lock.lock()
+        declined.remove(key)
+        lock.unlock()
+    }
 
     func isBlocked(_ key: KeychainItemKey) -> Bool {
         lock.lock()
@@ -607,6 +650,7 @@ final class KeychainPermissionGate: @unchecked Sendable {
     func resetAll() {
         lock.lock()
         blocked.removeAll()
+        declined.removeAll()
         lock.unlock()
     }
 }

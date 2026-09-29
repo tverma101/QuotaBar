@@ -116,7 +116,7 @@ enum ClaudeAuthError: Error, LocalizedError, Equatable {
         case .notLoggedIn:
             return "Not logged in. Run `claude` to authenticate."
         case .desktopPermissionRequired:
-            return "Claude Desktop login found. Refresh once and choose Always Allow to connect it."
+            return "Claude Desktop login found. Refresh to be asked once, then choose Always Allow to connect it."
         case .desktopTokenExpired:
             return "Claude Desktop login is stale. Open Claude Desktop, then refresh QuotaBar."
         case .desktopCredentialsUnavailable:

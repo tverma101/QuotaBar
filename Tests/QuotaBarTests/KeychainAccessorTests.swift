@@ -333,3 +333,139 @@ final class KeychainRefreshReadTests: XCTestCase {
         XCTAssertEqual(keychain.currentUserCalls, [false])
     }
 }
+
+extension KeychainRefreshReadTests {
+    /// A Keychain whose ACL needs the user *and* whose dialog the user cancels: the silent read and the
+    /// interactive read both throw. Models a user who dismisses the prompt.
+    private final class CancellingKeychain: KeychainAccessing, @unchecked Sendable {
+        private let lock = NSLock()
+        private var _interactiveReads = 0
+        var interactiveReads: Int {
+            lock.lock(); defer { lock.unlock() }
+            return _interactiveReads
+        }
+
+        private func read(_ allowInteraction: Bool) throws -> String? {
+            if allowInteraction {
+                lock.lock(); _interactiveReads += 1; lock.unlock()
+            }
+            throw KeychainError.interactionNotAllowed
+        }
+
+        func readGenericPassword(service: String) throws -> String? { try read(true) }
+        func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? { try read(allowInteraction) }
+        func readGenericPassword(service: String, account: String) throws -> String? { try read(true) }
+        func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? { try read(allowInteraction) }
+        func readGenericPasswordForCurrentUser(service: String) throws -> String? { try read(true) }
+        func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? { try read(allowInteraction) }
+        func writeGenericPassword(service: String, value: String) throws {}
+        func writeGenericPasswordForCurrentUser(service: String, value: String) throws {}
+    }
+
+    /// Refuses silently but *would* release the secret interactively — the shape that proves no second
+    /// dialog was raised.
+    private final class GrantingKeychain: KeychainAccessing, @unchecked Sendable {
+        private let lock = NSLock()
+        private var _interactiveReads = 0
+        var interactiveReads: Int {
+            lock.lock(); defer { lock.unlock() }
+            return _interactiveReads
+        }
+
+        private func read(_ allowInteraction: Bool) throws -> String? {
+            guard allowInteraction else { throw KeychainError.interactionNotAllowed }
+            lock.lock(); _interactiveReads += 1; lock.unlock()
+            return "secret"
+        }
+
+        func readGenericPassword(service: String) throws -> String? { try read(true) }
+        func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? { try read(allowInteraction) }
+        func readGenericPassword(service: String, account: String) throws -> String? { try read(true) }
+        func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? { try read(allowInteraction) }
+        func readGenericPasswordForCurrentUser(service: String) throws -> String? { try read(true) }
+        func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? { try read(allowInteraction) }
+        func writeGenericPassword(service: String, value: String) throws {}
+        func writeGenericPasswordForCurrentUser(service: String, value: String) throws {}
+    }
+
+    /// A manual refresh against an item whose prompt the user cancelled.
+    private func attemptManualRead(
+        _ keychain: KeychainAccessing,
+        service: String
+    ) throws -> String? {
+        try keychain.readGenericPasswordForRefresh(service: service)
+    }
+
+    /// The complaint this answers: the app kept asking after the user had already said no.
+    ///
+    /// A decline used to be indistinguishable from never having been asked. The item stayed blocked for
+    /// background reads — correctly silent — but the next manual refresh escalated again and raised the
+    /// identical dialog for the same item, and the user had no way to make it stop except to stop
+    /// pressing Refresh Now.
+    func testADeclinedItemIsNotPromptedForAgain() throws {
+        let service = "com.example.declined"
+        let key = KeychainItemKey(service: service)
+
+        // Asked once; the user cancels, so even the interactive read fails.
+        let cancelling = CancellingKeychain()
+        XCTAssertThrowsError(
+            try ProviderRefreshContext.$isManual.withValue(true) { try attemptManualRead(cancelling, service: service) }
+        )
+        XCTAssertEqual(cancelling.interactiveReads, 1, "precondition: the dialog was raised once")
+        XCTAssertTrue(
+            KeychainPermissionGate.shared.isDeclined(key),
+            "a cancelled prompt must be remembered, or the next refresh raises the same dialog again"
+        )
+
+        // A later manual refresh must answer from memory instead of asking again.
+        let wouldPromptAgain = GrantingKeychain()
+        XCTAssertThrowsError(
+            try ProviderRefreshContext.$isManual.withValue(true) { try attemptManualRead(wouldPromptAgain, service: service) }
+        )
+        XCTAssertEqual(
+            wouldPromptAgain.interactiveReads, 0,
+            "the app must not raise a second dialog for an item the user already declined"
+        )
+    }
+
+    /// Declining one item must not lock out another — the gate is per item, and a grant on B still works.
+    func testDecliningOneItemDoesNotAffectAnother() throws {
+        let cancelling = CancellingKeychain()
+        XCTAssertThrowsError(
+            try ProviderRefreshContext.$isManual.withValue(true) {
+                try attemptManualRead(cancelling, service: "com.example.a")
+            }
+        )
+        XCTAssertTrue(KeychainPermissionGate.shared.isDeclined(KeychainItemKey(service: "com.example.a")))
+        XCTAssertFalse(
+            KeychainPermissionGate.shared.isDeclined(KeychainItemKey(service: "com.example.b")),
+            "one declined item must not suppress a different one"
+        )
+
+        let granting = GrantingKeychain()
+        let value = try ProviderRefreshContext.$isManual.withValue(true) {
+            try attemptManualRead(granting, service: "com.example.b")
+        }
+        XCTAssertEqual(value, "secret")
+    }
+
+    /// The escape hatch. Without it, "asked once" would mean "never again this session", with no route
+    /// back for a user who decides to grant after reading the copy.
+    func testClearingADeclineAllowsAskingAgain() throws {
+        let service = "com.example.reset"
+        let cancelling = CancellingKeychain()
+        XCTAssertThrowsError(
+            try ProviderRefreshContext.$isManual.withValue(true) { try attemptManualRead(cancelling, service: service) }
+        )
+        XCTAssertTrue(KeychainPermissionGate.shared.isDeclined(KeychainItemKey(service: service)))
+
+        KeychainPermissionGate.shared.clearDeclined(KeychainItemKey(service: service))
+        XCTAssertFalse(KeychainPermissionGate.shared.isDeclined(KeychainItemKey(service: service)))
+
+        let granting = GrantingKeychain()
+        let value = try ProviderRefreshContext.$isManual.withValue(true) {
+            try attemptManualRead(granting, service: service)
+        }
+        XCTAssertEqual(value, "secret", "after clearing, the app asks again and the grant works")
+    }
+}
