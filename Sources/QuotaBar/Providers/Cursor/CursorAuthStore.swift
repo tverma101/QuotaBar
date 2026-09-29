@@ -66,10 +66,41 @@ struct CursorAuthStore: Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
 
-        let keychainAccessToken = try readKeychainValue(Self.keychainAccessTokenService)
-        let keychainRefreshToken = try readKeychainValue(Self.keychainRefreshTokenService)
-
         let hasSQLiteAuth = sqliteAccessToken != nil || sqliteRefreshToken != nil
+
+        // The Keychain is a *fallback* here, so it must not be able to fail a card that already has a
+        // working sqlite credential.
+        //
+        // Reading it unconditionally was a real regression of my own: a user signed in via Cursor's
+        // `state.vscdb`, whose `cursor-access-token` item existed but was ACL-blocked, got
+        // `credentialPermissionRequired` thrown from here — so the whole store threw and the card showed
+        // *no usage at all*, with a remedy for an item that has nothing to do with the token actually in
+        // use. Granting it changed nothing, and because this ran on every background tick the card stayed
+        // down for the whole session.
+        //
+        // So: when sqlite has a credential, a Keychain refusal degrades to "no Keychain auth" and sqlite
+        // wins. Only when there is no sqlite credential at all is a refusal the real answer, because then
+        // it means there is no credential to report.
+        var keychainAccessToken: String?
+        var keychainRefreshToken: String?
+        do {
+            keychainAccessToken = try readKeychainValue(Self.keychainAccessTokenService)
+            keychainRefreshToken = try readKeychainValue(Self.keychainRefreshTokenService)
+        } catch let error as CursorAuthError {
+            guard !hasSQLiteAuth else {
+                AppLog.info(
+                    LogTag.auth("cursor"),
+                    "keychain credential unavailable; using the Cursor database instead: \(error)"
+                )
+                return CursorAuthState(
+                    accessToken: sqliteAccessToken,
+                    refreshToken: sqliteRefreshToken,
+                    source: .sqlite
+                )
+            }
+            throw error
+        }
+
         let hasKeychainAuth = keychainAccessToken != nil || keychainRefreshToken != nil
 
         if hasSQLiteAuth {
