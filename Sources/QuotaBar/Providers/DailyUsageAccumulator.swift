@@ -25,10 +25,28 @@ struct DailyUsageAccumulator {
     }
 
     /// Add a priced row's tokens + cost, attributed to `model` on `day`.
-    mutating func add(day: String, tokens: Int, cost: Double, model: String) {
+    ///
+    /// `canonical` is the model's *identity*; `model` is the slug the provider actually emitted. They
+    /// differ when a gateway tags its slugs: the Codex router stamps the upstream path, so one model
+    /// arrives as both `gpt-5.6-luna` and `anthropic/openai/gpt-5.6-luna`. Keying rows by the raw slug
+    /// split that one model into two rows that were then summed into the same total, and the tagged one
+    /// displayed its routing prefix as if it were part of the model's name. Scanners that resolve pricing
+    /// pass the catalog key as `canonical`, so anything priced alike collapses into one row titled with
+    /// the catalog id, while the observed spellings survive as tooltip variants.
+    ///
+    /// Defaults to `model`, so a scanner with no aliasing is unaffected.
+    mutating func add(
+        day: String,
+        tokens: Int,
+        cost: Double,
+        model: String,
+        canonical: String? = nil
+    ) {
         tokensByDay[day, default: 0] += tokens
         costByDay[day, default: 0] += cost
-        modelsByDay[day, default: [:]][model, default: ModelAccumulator()].add(tokens: tokens, costUSD: cost)
+        let identity = canonical ?? model
+        modelsByDay[day, default: [:]][identity, default: ModelAccumulator()]
+            .add(tokens: tokens, costUSD: cost, spelling: model)
     }
 
     /// Merge already-built scans (a provider's native log scan plus its pi slice) into one, by replaying
@@ -144,16 +162,41 @@ struct DailyUsageAccumulator {
     private struct ModelAccumulator {
         var tokens = 0
         var costUSD: Double?
+        /// The exact slugs this row absorbed, keyed case-folded. These are what the hover panel lists, so a
+        /// gateway-tagged spelling is still visible — just no longer as a row of its own.
+        private var spellings: [String: (tokens: Int, costUSD: Double?, spelling: String)] = [:]
 
-        mutating func add(tokens: Int, costUSD: Double?) {
+        mutating func add(tokens: Int, costUSD: Double?, spelling: String) {
             self.tokens += tokens
             if let costUSD {
                 self.costUSD = (self.costUSD ?? 0) + costUSD
             }
+            let key = spelling.lowercased()
+            var existing = spellings[key] ?? (0, nil, spelling)
+            existing.tokens += tokens
+            existing.costUSD = costUSD.map { (existing.costUSD ?? 0) + $0 } ?? existing.costUSD
+            spellings[key] = existing
         }
 
         func entry(model: String) -> ModelUsageEntry {
-            ModelUsageEntry(model: model, totalTokens: tokens, costUSD: costUSD)
+            let variants = spellings.values
+                .map { value in
+                    ModelUsageVariant(
+                        model: value.spelling,
+                        totalTokens: value.tokens,
+                        costUSD: value.costUSD
+                    )
+                }
+                .sorted { $0.totalTokens > $1.totalTokens }
+            // A single spelling that is just the row's own name is no breakdown; nil keeps the tooltip on
+            // plain figures for the overwhelmingly common untagged case.
+            let isTrivial = variants.count == 1 && variants[0].model.lowercased() == model.lowercased()
+            return ModelUsageEntry(
+                model: model,
+                totalTokens: tokens,
+                costUSD: costUSD,
+                variants: isTrivial ? nil : (variants.isEmpty ? nil : variants)
+            )
         }
     }
 }

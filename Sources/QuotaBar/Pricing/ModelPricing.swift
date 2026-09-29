@@ -36,6 +36,29 @@ final class ModelPricing: Sendable {
 
     /// Rates for `model`, or nil when no source can price it (caller shows the unknown-model
     /// warning and counts tokens at $0).
+    /// The catalog key a slug should be *identified* by, preferring an exact catalog entry among
+    /// `candidates` and falling back to the first that resolves.
+    ///
+    /// Pricing *rates* do not need this — `resolve` matches fuzzily, so a gateway-tagged slug
+    /// `anthropic/openai/gpt-5.6-luna` prices correctly by containing `gpt-5.6-luna`. Identity does.
+    /// The fuzzy match happily accepts the whole prefixed string, so the slug stayed the row's name and
+    /// one model appeared as two rows. Walking the candidates longest-suffix-first for an *exact* key
+    /// picks the bare model id, which is what the row should be called.
+    func canonicalKey(for candidates: [String]) -> String? {
+        // Longest suffix first: the bare model id is the most specific identity available.
+        for candidate in candidates.sorted(by: { $0.count < $1.count }) {
+            if let key = exactKey(candidate: candidate) { return key }
+        }
+        return candidates.first { resolve(model: $0) != nil }
+    }
+
+    private func exactKey(candidate: String) -> String? {
+        if let hit = supplement.canonicalName(for: candidate) { return hit }
+        if primary.findExact(candidate) != nil { return candidate }
+        if secondary.findExact(candidate) != nil { return candidate }
+        return nil
+    }
+
     func resolve(model: String) -> ModelRates? {
         if let cached = memo.withLock({ $0[model] }) {
             return cached

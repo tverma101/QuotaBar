@@ -83,7 +83,15 @@ actor CodexProxyUsageScanner {
                     accumulator.addUnknownModel(day: day, model: model)
                     continue
                 }
-                accumulator.add(day: day, tokens: total, cost: cost, model: model)
+                // Same reason as the router scanner: the proxy stamps routing prefixes onto its slugs, so
+                // keying on the raw slug split one model across rows and counted it twice in the total.
+                accumulator.add(
+                    day: day,
+                    tokens: total,
+                    cost: cost,
+                    model: model,
+                    canonical: GatewaySlug.identity(of: model, resolvedPricingModel: pricingModel)
+                )
             }
         }
 

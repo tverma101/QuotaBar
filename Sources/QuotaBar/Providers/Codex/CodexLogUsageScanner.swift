@@ -997,7 +997,16 @@ actor CodexLogUsageScanner {
             fastTier: appliesCodexFastTier,
             fastMultiplier: codexPriorityMultiplier(for: rateModel, rates: rates)
         )
-        accumulator.add(day: day, tokens: event.total, cost: eventCost, model: model)
+        // Key the row on the resolved model, not the emitted slug. Session logs carry gateway-prefixed
+        // slugs too, so the same model can arrive both tagged and untagged; grouping on the raw slug split
+        // it across rows and into the period total twice. The spelling is kept as a tooltip variant.
+        accumulator.add(
+            day: day,
+            tokens: event.total,
+            cost: eventCost,
+            model: model,
+            canonical: GatewaySlug.identity(of: model, resolvedPricingModel: rateModel)
+        )
     }
 
     static func aggregate(events: [Event], since: Date, pricing: ModelPricing) -> LogUsageScan {
