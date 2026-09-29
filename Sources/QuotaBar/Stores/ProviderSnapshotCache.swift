@@ -19,6 +19,20 @@ struct ProviderSnapshotCache {
     /// safe to share.
     private let memo = OSAllocatedUnfairLock<Payload?>(initialState: nil)
 
+    /// The raw persisted bytes the mirror in `memo` was built from, or the bytes last written.
+    ///
+    /// The memo made this cache fast but made it *self-contained*, and the blob is shared: the app and
+    /// `quotabar-cli` are separate processes writing the same `UserDefaults` domain. `store` merged into
+    /// the memo, so a write rewrote the whole blob from a snapshot of state frozen at first read — and
+    /// silently destroyed every entry another process had added since. Reproduced: the CLI wrote
+    /// `claude = 95%`, the app's next pass stored `cursor` only, and the blob came back with `claude =
+    /// 80%`. The lost value carried a *recent* `refreshedAt`, so it was then served as TTL-fresh.
+    ///
+    /// Comparing raw bytes is the cheap half of the fix: reading the blob and memcmp-ing it costs a
+    /// buffer copy, not a full JSON decode of every provider's snapshot. A full re-decode on every
+    /// `store` — the obvious correct alternative — is the O(N) cost `memo` exists to avoid.
+    private let persistedBytes = OSAllocatedUnfairLock<Data?>(initialState: nil)
+
     /// Provider IDs whose snapshot was written by `store` *during this cache instance's lifetime* (i.e.
     /// this running session). The freshness gate (`snapshot(providerID:)`) trusts a snapshot only when
     /// its provider is in here — so a snapshot loaded from disk on launch is shown (via `loadSnapshots`)
@@ -164,12 +178,17 @@ struct ProviderSnapshotCache {
     }
 
     private func loadPayload() -> Payload {
-        if let mirror = memo.withLock({ $0 }) { return mirror }
+        let currentBytes = userDefaults.data(forKey: storageKey)
+        let knownBytes = persistedBytes.withLock { $0 }
+        // Only trust the mirror if the blob on disk is byte-identical to what produced it. Any
+        // difference means another process wrote, so the mirror is stale and must be rebuilt.
+        if currentBytes == knownBytes, let mirror = memo.withLock({ $0 }) { return mirror }
         // First access only: decode the persisted blob once, then mirror it. (Decoding outside the
         // lock keeps `self` out of the `@Sendable` closure; cache access is MainActor-serialized in
         // production, so the worst a race could do is decode twice into the same value — harmless.)
         let loaded = decodeStoredPayload()
         memo.withLock { $0 = loaded }
+        persistedBytes.withLock { $0 = currentBytes }
         return loaded
     }
 
@@ -199,6 +218,7 @@ struct ProviderSnapshotCache {
         do {
             let data = try encoder.encode(payload)
             userDefaults.set(data, forKey: storageKey)
+            persistedBytes.withLock { $0 = data }
         } catch {
             AppLog.warn(.cache, "encode failed, snapshot not persisted: \(error.localizedDescription)")
         }

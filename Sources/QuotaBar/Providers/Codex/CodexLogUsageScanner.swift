@@ -429,16 +429,34 @@ actor CodexLogUsageScanner {
     /// Avoids rebuilding large `(dev,ino)` sets on every card/fold scan within a refresh window.
     private final class SessionInodeSetCache: @unchecked Sendable {
         static let shared = SessionInodeSetCache()
+
+        /// How long a computed set is reused regardless of the directory signature.
+        ///
+        /// The signature is a top-level `sessions/` mtime, which cannot see a new rollout: Codex writes
+        /// `sessions/YYYY/MM/DD/`, so adding a file bumps only the deepest parent's mtime. The signature
+        /// was therefore constant for the process's whole life, and every rollout created after the first
+        /// scan was missing from the peer set — meaning the *same file* was skipped on neither card and
+        /// got priced on both. That put one account's usage on another account's card and double-counted
+        /// it in Total Spend. Verified against a replica: the shared rollout appeared on both cards.
+        ///
+        /// A time bound is the honest fix. The cache exists to avoid rebuilding the set for every card
+        /// *within* one refresh window, not across windows, so a minute of reuse costs nothing and caps
+        /// how long a new file can go unseen.
+        private static let maxAge: TimeInterval = 60
+
         private let lock = NSLock()
-        private var entries: [String: (signature: String, inodes: Set<FileIdentity>)] = [:]
+        private var entries: [String: (signature: String, storedAt: TimeInterval, inodes: Set<FileIdentity>)] = [:]
 
         func lookupOrCompute(
             key: String,
             signature: String,
             compute: () -> Set<FileIdentity>
         ) -> Set<FileIdentity> {
+            let now = ProcessInfo.processInfo.systemUptime
             lock.lock()
-            if let entry = entries[key], entry.signature == signature {
+            if let entry = entries[key],
+               entry.signature == signature,
+               now - entry.storedAt < Self.maxAge {
                 let hit = entry.inodes
                 lock.unlock()
                 return hit
@@ -446,9 +464,17 @@ actor CodexLogUsageScanner {
             lock.unlock()
             let inodes = compute()
             lock.lock()
-            entries[key] = (signature, inodes)
+            entries[key] = (signature, now, inodes)
             lock.unlock()
             return inodes
+        }
+
+        /// Test seam: drops every memoized set. Production has no reason to, since `maxAge` bounds
+        /// staleness on its own.
+        func reset() {
+            lock.lock()
+            entries.removeAll()
+            lock.unlock()
         }
     }
 
