@@ -246,7 +246,13 @@ final class AppContainer {
         self.kaggleCompute = KaggleComputeService()
         // Polling is read-only and starts with a bounded local status command. Starting it here keeps
         // the card accurate before the user scrolls to it; no Kaggle notebook is started automatically.
-        self.kaggleCompute.startPolling()
+        //
+        // Skipped when the bridge is absent. The loop spawns a status subprocess every 30 seconds for the
+        // life of the app, so without this guard an install that can never use the feature still paid for
+        // a poll a minute, indefinitely, in exchange for a red error card nobody asked for.
+        if self.kaggleCompute.isBridgeAvailable {
+            self.kaggleCompute.startPolling()
+        }
         self.localAPI = LocalUsageServer(state: { [layout, enablement, dataStore] in
             LocalUsageAPI.State(
                 enabledOrderedIDs: layout.orderedProviderIDs().filter { enablement.isEnabled($0) },

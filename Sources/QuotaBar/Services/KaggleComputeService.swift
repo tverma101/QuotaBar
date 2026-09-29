@@ -111,6 +111,18 @@ final class KaggleComputeService {
         self.environment = environment
     }
 
+    /// Whether the operator bridge this card drives is actually present.
+    ///
+    /// The bridge is a separate binary that QuotaBar does not ship: `build_and_run.sh` copies it in only
+    /// when it finds one at `KAGGLE_GLM53_CONTROL_BIN` (or `~/kaggle-gpu-control/bin/...`) in the developer's
+    /// own checkout. So on any normal install — and on every install of a public build, which cannot assume
+    /// that path exists — the card could never do anything. Reporting that as a red "Needs attention"
+    /// error was wrong twice over: it alarmed users about a feature they never enabled, and the remedy it
+    /// offered ("reinstall QuotaBar") could not possibly help, because no reinstall produces the binary.
+    var isBridgeAvailable: Bool {
+        Self.resolveExecutable(environment: environment) != nil
+    }
+
     func startPolling() {
         guard pollTask == nil else { return }
         refresh()
@@ -152,7 +164,7 @@ final class KaggleComputeService {
                 json: [
                     "ok": false,
                     "state": "error",
-                    "error": "The Kaggle GLM bridge is not installed. Set KAGGLE_GLM53_CONTROL_BIN or reinstall QuotaBar."
+                    "error": "The Kaggle operator bridge is not installed. Set KAGGLE_GLM53_CONTROL_BIN to its path."
                 ]
             )
             return
