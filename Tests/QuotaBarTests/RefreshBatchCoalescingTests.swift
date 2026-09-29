@@ -250,3 +250,4 @@ final class RefreshBatchCoalescingTests: XCTestCase {
         }
     }
 }
+

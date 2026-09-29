@@ -20,11 +20,28 @@ CONFIG="${CONFIG:-release}"
 
 TARGET_NAME="QuotaBar"                  # SwiftPM target / binary name
 APP_DISPLAY="QuotaBar"                  # user-facing app name
-BUNDLE_ID="${BUNDLE_ID:-com.tverma101.quotabar.dev}"
-ICLOUD_CONTAINER_ID="iCloud.com.tverma101.quotabar.dev"
+# The dev id is deliberate: it keeps local work off the installed app's UserDefaults domain and its
+# Keychain entries. But the iCloud container was *pinned* to the dev id, so even setting BUNDLE_ID by
+# hand produced a bundle declaring the wrong container. Derive it instead. RELEASE=1 is the shipping
+# configuration — and note that switching ids is not cosmetic: macOS keys Keychain grants to the app's
+# designated requirement, which embeds the bundle id, and UserDefaults are per-domain, so a different id
+# means a fresh settings store and every previously-granted Keychain item needing consent again.
+RELEASE="${RELEASE:-0}"
+if [ "$RELEASE" = "1" ]; then
+  DEFAULT_BUNDLE_ID="com.tverma101.quotabar"
+else
+  DEFAULT_BUNDLE_ID="com.tverma101.quotabar.dev"
+fi
+BUNDLE_ID="${BUNDLE_ID:-$DEFAULT_BUNDLE_ID}"
+ICLOUD_CONTAINER_ID="${ICLOUD_CONTAINER_ID:-iCloud.$BUNDLE_ID}"
 MIN_SYSTEM_VERSION="15.0"
 APP_VERSION="0.7.0"
 APP_BUILD="0.7.0"
+if [ "$RELEASE" = "1" ]; then
+  DISPLAY_VERSION="$APP_VERSION"
+else
+  DISPLAY_VERSION="$APP_VERSION-dev"
+fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
@@ -141,7 +158,13 @@ cat >"$INFO_PLIST" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>$APP_VERSION-dev</string>
+  <string>$DISPLAY_VERSION</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>MIT licensed. Derived from OpenUsage by Robin Ebers.</string>
   <key>CFBundleVersion</key>
   <string>$APP_BUILD</string>
   <key>LSMinimumSystemVersion</key>
@@ -156,7 +179,7 @@ cat >"$INFO_PLIST" <<PLIST
   <true/>
   <key>NSUbiquitousContainers</key>
   <dict>
-    <key>iCloud.com.tverma101.quotabar.dev</key>
+    <key>$ICLOUD_CONTAINER_ID</key>
     <dict>
       <key>NSUbiquitousContainerIsDocumentScopePublic</key>
       <false/>
@@ -249,6 +272,27 @@ case "$MODE" in
   build)
     : # build + stage + sign only
     ;;
+  install)
+    # Copy into /Applications so the app is somewhere macOS actually looks.
+    #
+    # Running out of `dist/` is why this app was hard to find. A menu-bar app (LSUIElement) has no Dock
+    # icon and no Launchpad entry by design, which is correct — but it means /Applications is the only
+    # place Spotlight and Finder treat it as an installed application. From a build directory it is
+    # effectively invisible: no Spotlight hit, no way to relaunch after the checkout is gone.
+    DEST="/Applications/$APP_DISPLAY.app"
+    if pgrep -x "$TARGET_NAME" >/dev/null; then
+      pkill -x "$TARGET_NAME" || true
+      sleep 1
+    fi
+    # Replace in place rather than deleting first, so a failed copy cannot leave nothing installed.
+    rsync -a --delete "$APP_BUNDLE/" "$DEST/"
+    /usr/bin/codesign --verify --deep --strict "$DEST" >/dev/null 2>&1 \
+      && echo "==> installed and signature verified: $DEST" \
+      || echo "==> installed (signature verification reported an issue): $DEST"
+    /usr/bin/mdimport -r "$DEST" >/dev/null 2>&1 || true
+    open -a "$DEST"
+    echo "==> launched from $DEST"
+    ;;
   logs)
     launch_app
     /usr/bin/log stream --info --style compact --predicate "process == \"$TARGET_NAME\""
@@ -259,7 +303,7 @@ case "$MODE" in
     pgrep -x "$TARGET_NAME" >/dev/null && echo "==> running"
     ;;
   *)
-    echo "usage: $0 [run|build|logs|verify]" >&2
+    echo "usage: $0 [run|build|install|logs|verify]" >&2
     exit 2
     ;;
 esac
