@@ -400,7 +400,11 @@ struct OpenCodeUsageScanner: Sendable {
         // free/custom Zen model can bypass the OpenCode server entirely) nor on the Codex card, which
         // now defers them here. They were previously invisible: a router configured for a free model
         // logged thousands of turns that no card counted.
-        for path in routerLedgerPaths() where FileManager.default.isReadableFile(atPath: path) {
+        // Resolve and dedupe: two entries pointing at the same file would fold every row twice.
+        var seenLedgerPaths: Set<String> = []
+        for path in routerLedgerPaths().map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
+        where FileManager.default.isReadableFile(atPath: path)
+            && seenLedgerPaths.insert(path).inserted {
             let rows = Self.routerGatewayRows(atPath: path, since: tileSince)
             guard !rows.isEmpty else { continue }
             Self.foldGatewayRows(
@@ -626,68 +630,192 @@ struct OpenCodeUsageScanner: Sendable {
         return String(model[model.index(after: lastSlash)...])
     }
 
-    /// Reads the ledger in chunks rather than as one string: it is append-only and already tens of MB.
+    /// Rows for this card's window, read from the router ledger.
     ///
-    /// Each line begins with its ISO timestamp, so the day is compared as a string before any JSON is
-    /// parsed — that turns "is this row in the window" into a prefix comparison instead of 34MB of
-    /// `JSONSerialization`.
+    /// The ledger is append-only and grows without bound (tens of MB), and the scan runs on every refresh.
+    /// Re-reading it in full cost ~13 s of CPU per refresh for a 36 MB file, because the whole file was
+    /// JSON-parsed regardless of the window. This tails instead: only bytes appended since the last call
+    /// are read and parsed, and previously parsed rows are kept for the window.
     static func routerGatewayRows(atPath path: String, since: Date) -> [ClaudeGatewayRow] {
-        let calendar = Calendar.current
-        let earliestDay = DailyUsageAccumulator.dayKey(
-            from: calendar.date(byAdding: .day, value: -35, to: calendar.startOfDay(for: Date())) ?? Date()
-        )
-        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return [] }
-        defer { try? handle.close() }
-
-        var rows: [ClaudeGatewayRow] = []
-        var buffer = Data()
-        while true {
-            let chunk = (try? handle.read(upToCount: 1 << 20)) ?? nil
-            guard let chunk, !chunk.isEmpty else { break }
-            buffer.append(chunk)
-            // Only complete lines; the tail carries over to the next chunk.
-            let lines = buffer.split(separator: 0x0A, omittingEmptySubsequences: true)
-            // A trailing element without a newline is a partial line: carry it into the next chunk.
-            // When the buffer holds only a partial line there are no complete lines at all, which the
-            // previous form mishandled by clearing the buffer and losing it.
-            if buffer.last != 0x0A, let last = lines.last {
-                buffer = Data(last)
-            } else {
-                buffer.removeAll(keepingCapacity: true)
-            }
-            for line in lines.dropLast(buffer.isEmpty ? 0 : 1) {
-                guard let row = routerGatewayRow(from: line, earliestDay: earliestDay, since: since) else { continue }
-                rows.append(row)
-            }
-        }
-        return rows
+        RouterLedgerTail.shared.rows(atPath: path, since: since)
     }
 
-    private static func routerGatewayRow(from line: Data, earliestDay: String, since: Date) -> ClaudeGatewayRow? {
-        guard line.count > 24 else { return nil }
-        let day = String(decoding: line.prefix(10), as: UTF8.self)
-        guard day >= earliestDay else { return nil }
-        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              let event = CodexRouterUsageScanner.parseEvent(object),
-              CodexRouterUsageScanner.isOpenCodeServed(event),
-              CodexRouterUsageScanner.isSuccessfulStatus(event.status),
-              event.timestamp >= since
+    /// Per-ledger tail state: how far it has been consumed, and the rows that fall inside the window.
+    private final class RouterLedgerTail: @unchecked Sendable {
+        static let shared = RouterLedgerTail()
+
+        /// Rows older than this are dropped from the cache. Comfortably wider than the 30-day display
+        /// window, so a widening window never needs a re-read.
+        private static let retentionDays = 45
+
+        private struct State {
+            var offset: UInt64 = 0
+            var rows: [ClaudeGatewayRow] = []
+            /// Bytes of a line the writer had not finished when we last read.
+            ///
+            /// This must persist across calls. Holding it in a function-local buffer meant the bytes after
+            /// the last newline were dropped when the function returned — the offset said EOF while those
+            /// bytes had never been parsed, so a line completed by the next refresh was lost forever.
+            var partial: Data = Data()
+        }
+
+        private let lock = NSLock()
+        private var states: [String: State] = [:]
+
+        func rows(atPath path: String, since: Date) -> [ClaudeGatewayRow] {
+            let cutoff = Date().addingTimeInterval(-Double(Self.retentionDays) * 86_400)
+            return lock.withLock {
+                var state = states[path] ?? State()
+
+                // Truncated or rotated: the cached offset is meaningless, so start over.
+                if let size = fileSize(path), size < state.offset {
+                    state = State()
+                }
+
+                if let size = fileSize(path), size > state.offset {
+                    consumeNewBytes(of: path, into: &state, upTo: size)
+                }
+
+                state.rows.removeAll { $0.date < cutoff }
+                states[path] = state
+                return state.rows.filter { $0.date >= since }
+            }
+        }
+
+        private func fileSize(_ path: String) -> UInt64? {
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+            return (attributes?[.size] as? NSNumber)?.uint64Value
+        }
+
+        /// Reads to EOF, then sets the offset to the start of any line the writer had not finished.
+        ///
+        /// The rewind happens **once, after the loop**. Doing it per-iteration either re-read the same
+        /// bytes (infinite) or, with a `break`, stopped after a single chunk and left the fold lagging
+        /// megabytes behind. Reading forward and rewinding at the end cannot do either.
+        private func consumeNewBytes(of path: String, into state: inout State, upTo size: UInt64) {
+            guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return }
+            defer { try? handle.close() }
+            do { try handle.seek(toOffset: state.offset) } catch { return }
+
+            var buffer = state.partial
+            defer { state.partial = buffer }
+            let chunkSize = 1 << 20
+
+            while state.offset < size {
+                // A cancelled refresh stops here; `offset` and the carry are written back by the defers, so
+                // the next call resumes exactly where this one stopped.
+                if Task.isCancelled { return }
+                let remaining = size - state.offset
+                guard let chunk = try? handle.read(upToCount: Int(min(UInt64(chunkSize), remaining))),
+                      !chunk.isEmpty else { break }
+                state.offset += UInt64(chunk.count)
+                buffer.append(chunk)
+
+                // Consume only what is complete: everything up to and including the LAST newline. Bytes after
+                // it are a line the writer has not finished, and stay in the carry.
+                guard let lastNewline = buffer.lastIndex(of: UInt8(ascii: "\n")) else { continue }
+                let completeEnd = buffer.index(after: lastNewline)
+                for line in buffer[..<completeEnd].split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true) {
+                    if let row = OpenCodeUsageScanner.routerGatewayRow(from: Data(line)) { state.rows.append(row) }
+                }
+                buffer = Data(buffer[completeEnd...])
+            }
+
+            // Rewind once, for the incomplete tail only, so the next call re-reads it whole.
+            if state.offset >= UInt64(buffer.count) {
+                state.offset -= UInt64(buffer.count)
+            }
+        }
+    }
+
+    /// Parses one ledger line. The ISO timestamp is located by scanning for `"at":"` rather than assuming it
+    /// is the first field — the ledger starts with `"meteringVersion"`, so a positional read was never a date
+    /// and the old window prefilter silently matched every line.
+    static func routerGatewayRow(from line: Data) -> ClaudeGatewayRow? {
+        // A line must be a whole JSON object. The byte scanner below defaults any missing field to 0, so a
+        // truncated line did not get skipped — it became a *wrong* row: `..."inputTokens":1000` cut short
+        // charged 1000 uncached input instead of 100 input + 900 cache-read, a ~10x overstatement on that
+        // row, with the output tokens dropped. `JSONLFileReader` gets this by construction; hand-rolling
+        // the reader means checking it here.
+        guard let first = line.first, first == UInt8(ascii: "{"),
+              let last = line.last, last == UInt8(ascii: "}")
         else { return nil }
-        let input = event.inputTokens
-        let cached = min(max(0, event.cachedInputTokens), input)
+
+        // Read the six fields this fold needs straight out of the bytes.
+        //
+        // `JSONSerialization` builds a dictionary per line, and this ledger has ~96k lines: profiling the
+        // full read showed that dominated it, and the rows it produced were then thrown away because a
+        // non-OpenCode provider was filtered out. Extracting scalars avoids allocating a container for
+        // every line, and costs nothing for the lines we discard.
+        // Trim once and reuse: the classifier trims, so an untrimmed provider here made `burnsGoQuota`
+        // disagree with inclusion and put one turn in the tiles but not in the cap meters.
+        guard let rawProvider = jsonScalar(for: "provider", in: line) else { return nil }
+        let provider = rawProvider.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard CodexRouterUsageScanner.isOpenCodeProvider(provider),
+              let status = jsonInteger(for: "status", in: line),
+              CodexRouterUsageScanner.isSuccessfulStatus(status),
+              let at = jsonScalar(for: "at", in: line),
+              let timestamp = OpenUsageISO8601.date(from: at)
+        else { return nil }
+        let input = max(0, jsonInteger(for: "inputTokens", in: line) ?? 0)
+        let cached = min(max(0, jsonInteger(for: "cachedInputTokens", in: line) ?? 0), input)
         return ClaudeGatewayRow(
-            date: event.timestamp,
+            date: timestamp,
             input: input - cached,
-            output: event.outputTokens,
+            output: max(0, jsonInteger(for: "outputTokens", in: line) ?? 0),
             cacheWrite: 0,
             cacheRead: cached,
-            model: bareRouterModelName(event.model),
-            // Only the Go subscription's cap meters are consumed by `opencode-go`; Zen and the free
-            // tier are billed outside those caps.
-            burnsGoQuota: event.provider.lowercased().hasPrefix("opencode-go"),
+            model: bareRouterModelName(jsonScalar(for: "model", in: line) ?? ""),
+            // Only the Go subscription's cap meters are consumed by `opencode-go`; Zen and the free tier
+            // are billed outside those caps.
+            burnsGoQuota: provider.lowercased().hasPrefix("opencode-go"),
             isInProgress: false
         )
     }
+
+    /// Value of a `"key":"value"` scalar, without building a dictionary.
+    private static func jsonScalar(for key: String, in data: Data) -> String? {
+        // The colon belongs in the needle: `"provider":` — matching `"provider"` alone leaves the
+        // separator next, which is not the opening quote of the value.
+        let needle = Data(("\"" + key + "\":").utf8)
+        guard let start = data.range(of: needle)?.upperBound else { return nil }
+        guard start < data.endIndex, data[start] == UInt8(ascii: "\"") else { return nil }
+        let valueStart = data.index(after: start)
+        guard let end = data[valueStart...].firstIndex(of: UInt8(ascii: "\"")), end > valueStart else { return nil }
+        return String(decoding: data[valueStart..<end], as: UTF8.self)
+    }
+
+    /// Value of a `"key":<number>` scalar, without building a dictionary.
+    private static func jsonInteger(for key: String, in data: Data) -> Int? {
+        let needle = Data(("\"" + key + "\":").utf8)
+        guard let start = data.range(of: needle)?.upperBound else { return nil }
+        var value = 0
+        var seen = false
+        var negative = false
+        var index = start
+        if index < data.endIndex, data[index] == UInt8(ascii: "-") { negative = true; index = data.index(after: index) }
+        // Saturating rather than trapping. `value * 10` overflows `Int` on a long digit run — which is a
+        // SIGTRAP, i.e. the process dies — and the ledger is untrusted, append-only input that can carry a
+        // hand-edited or absurdly large count. A saturating read costs nothing and cannot kill the app.
+        // The same 1e15 clamp every other parser in this file uses; saturating without it let a 26-digit
+        // run through at 1.15e18 tokens, i.e. an absurd figure rather than a crash.
+        let ceiling = 1_000_000_000_000_000
+        var saturated = false
+        while index < data.endIndex {
+            let byte = data[index]
+            guard byte >= UInt8(ascii: "0"), byte <= UInt8(ascii: "9") else { break }
+            seen = true
+            if !saturated {
+                value = value * 10 + Int(byte - UInt8(ascii: "0"))
+                if value > ceiling { saturated = true }   // far past any real token count
+            }
+            index = data.index(after: index)
+        }
+        guard seen else { return nil }
+        guard !saturated else { return ceiling }
+        return negative ? -value : value
+    }
+
 
     static func parseHermesGatewayRows(_ json: String) -> [ClaudeGatewayRow] {
         guard let data = json.data(using: .utf8),

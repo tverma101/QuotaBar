@@ -147,3 +147,22 @@ tier usage is billed outside them.
 A row whose model is priced at zero — including an unlisted model whose name ends in `-free`, such as a
 router-served custom model — still contributes its **tokens**. A row with no price at all is excluded from
 every total and reported by the unpriced-model warning instead, so a free tier never silently disappears.
+
+### Cost of reading the ledger
+
+The ledger is append-only and grows without bound (tens of MB). Reading it in full cost **13.1 s of CPU per
+refresh**, because every line was JSON-parsed regardless of the window — about 4% of a core continuously,
+and a visible stall whenever the popover forced a refresh.
+
+It is now read as a tail: only bytes appended since the last read are parsed, and parsed rows are cached
+for the window. Measured on a 38 MB / 96k-line ledger:
+
+| | before | after |
+|---|---|---|
+| first read | 13.1 s | 1.8 s |
+| every refresh after | 13.1 s | ~0.003 s |
+
+Fields are read straight out of the line's bytes rather than through `JSONSerialization`, which was the
+dominant cost; lines for other providers cost almost nothing because they are rejected before any field is
+parsed. A line the writer had not finished is carried to the next read rather than parsed, and a truncated
+line is skipped rather than turned into a short row.
