@@ -50,6 +50,11 @@ struct OpenCodeUsageScanner: Sendable {
     /// (`billing_provider` `opencode-go`/`opencode`) never reach `opencode*.db` and are folded from
     /// here. Nil by default — the production provider wires real discovery.
     var hermesStateDBPath: @Sendable () -> String?
+    /// CodexRouter's append-only `usage-events.jsonl` ledgers, for the turns it served against an
+    /// OpenCode-hosted account. These are Codex-CLI turns, so they live in the router's ledger rather
+    /// than `opencode*.db`, and they never reach the Codex card either (it defers them to us) — without
+    /// this fold they were simply not counted anywhere.
+    var routerLedgerPaths: @Sendable () -> [String]
     /// Muse harness roots for `muse-go` sessions (`~/.local/share/muse/sessions/**/*.jsonl`).
     /// Muse routes Muse Spark through the OpenCode Go account via the local `muse-opencode-go-bridge`
     /// (see `~/.hermes/tools/muse-opencode-go-bridge/`), so its `goal_usage_attribution`
@@ -64,6 +69,7 @@ struct OpenCodeUsageScanner: Sendable {
         claudeCacheIdentity: @escaping @Sendable () -> String = { ClaudeLogUsageScanner.parseSourceIdentity() },
         codexHomes: @escaping @Sendable () -> [URL] = { [] },
         hermesStateDBPath: @escaping @Sendable () -> String? = { nil },
+        routerLedgerPaths: @escaping @Sendable () -> [String] = { [] },
         museRoots: @escaping @Sendable () -> [URL] = { [] },
         readFailureWarning: UsageLogReadFailureReporter.Warning? = nil
     ) {
@@ -73,6 +79,7 @@ struct OpenCodeUsageScanner: Sendable {
         self.claudeCacheIdentity = claudeCacheIdentity
         self.codexHomes = codexHomes
         self.hermesStateDBPath = hermesStateDBPath
+        self.routerLedgerPaths = routerLedgerPaths
         self.museRoots = museRoots
         self.readFailureReporter = UsageLogReadFailureReporter(
             logTag: LogTag.plugin("opencode"),
@@ -388,6 +395,21 @@ struct OpenCodeUsageScanner: Sendable {
                 }
             }
         }
+        // CodexRouter turns served against an OpenCode account. The router meters every routed turn,
+        // including the ones it handed to OpenCode, and those turns never appear in `opencode*.db` (a
+        // free/custom Zen model can bypass the OpenCode server entirely) nor on the Codex card, which
+        // now defers them here. They were previously invisible: a router configured for a free model
+        // logged thousands of turns that no card counted.
+        for path in routerLedgerPaths() where FileManager.default.isReadableFile(atPath: path) {
+            let rows = Self.routerGatewayRows(atPath: path, since: tileSince)
+            guard !rows.isEmpty else { continue }
+            Self.foldGatewayRows(
+                rows, since: tileSince, pricing: pricing,
+                effectiveRates: rates,
+                accumulator: &accumulator, goWindowCosts: &goWindowCosts,
+                includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays
+            )
+        }
         // Muse harness sessions via the local `muse-opencode-go-bridge` — same Go account,
         // same `muse-spark-1.*` billed quota. Muse's `goal_usage_attribution` with
         // `reported:true` carries per-step provider tokens; without this fold the tiles +
@@ -590,6 +612,83 @@ struct OpenCodeUsageScanner: Sendable {
     /// on its start day — the same attribution the Hermes card uses — and reasoning bills at the
     /// output rate. Only `opencode-go` sessions burn the Go subscription's cap meters; sessions with
     /// `ended_at` 0/NULL (still running) are flagged `isInProgress` so their days render as partial.
+    /// OpenCode-served turns from a CodexRouter ledger, mapped onto this fold's row shape.
+    ///
+    /// Reads the same `usage-events.jsonl` the Codex card reads and selects the rows whose `provider` is
+    /// OpenCode-hosted, so the two cards partition the ledger instead of overlapping or leaving a gap.
+    /// `cached` is carved out of `input` because the router reports `inputTokens` inclusive of the cached
+    /// portion, matching the Codex session-log contract.
+    /// Router model slugs are `<provider>/<model>` (`opencode-free/space-bunny-free`). The card should
+    /// name the model, not the account that served it — the same rule the Codex card's identity resolution
+    /// follows, so a gateway path never becomes a row title.
+    static func bareRouterModelName(_ model: String) -> String {
+        guard let lastSlash = model.lastIndex(of: "/") else { return model }
+        return String(model[model.index(after: lastSlash)...])
+    }
+
+    /// Reads the ledger in chunks rather than as one string: it is append-only and already tens of MB.
+    ///
+    /// Each line begins with its ISO timestamp, so the day is compared as a string before any JSON is
+    /// parsed — that turns "is this row in the window" into a prefix comparison instead of 34MB of
+    /// `JSONSerialization`.
+    static func routerGatewayRows(atPath path: String, since: Date) -> [ClaudeGatewayRow] {
+        let calendar = Calendar.current
+        let earliestDay = DailyUsageAccumulator.dayKey(
+            from: calendar.date(byAdding: .day, value: -35, to: calendar.startOfDay(for: Date())) ?? Date()
+        )
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return [] }
+        defer { try? handle.close() }
+
+        var rows: [ClaudeGatewayRow] = []
+        var buffer = Data()
+        while true {
+            let chunk = (try? handle.read(upToCount: 1 << 20)) ?? nil
+            guard let chunk, !chunk.isEmpty else { break }
+            buffer.append(chunk)
+            // Only complete lines; the tail carries over to the next chunk.
+            let lines = buffer.split(separator: 0x0A, omittingEmptySubsequences: true)
+            // A trailing element without a newline is a partial line: carry it into the next chunk.
+            // When the buffer holds only a partial line there are no complete lines at all, which the
+            // previous form mishandled by clearing the buffer and losing it.
+            if buffer.last != 0x0A, let last = lines.last {
+                buffer = Data(last)
+            } else {
+                buffer.removeAll(keepingCapacity: true)
+            }
+            for line in lines.dropLast(buffer.isEmpty ? 0 : 1) {
+                guard let row = routerGatewayRow(from: line, earliestDay: earliestDay, since: since) else { continue }
+                rows.append(row)
+            }
+        }
+        return rows
+    }
+
+    private static func routerGatewayRow(from line: Data, earliestDay: String, since: Date) -> ClaudeGatewayRow? {
+        guard line.count > 24 else { return nil }
+        let day = String(decoding: line.prefix(10), as: UTF8.self)
+        guard day >= earliestDay else { return nil }
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              let event = CodexRouterUsageScanner.parseEvent(object),
+              CodexRouterUsageScanner.isOpenCodeServed(event),
+              CodexRouterUsageScanner.isSuccessfulStatus(event.status),
+              event.timestamp >= since
+        else { return nil }
+        let input = event.inputTokens
+        let cached = min(max(0, event.cachedInputTokens), input)
+        return ClaudeGatewayRow(
+            date: event.timestamp,
+            input: input - cached,
+            output: event.outputTokens,
+            cacheWrite: 0,
+            cacheRead: cached,
+            model: bareRouterModelName(event.model),
+            // Only the Go subscription's cap meters are consumed by `opencode-go`; Zen and the free
+            // tier are billed outside those caps.
+            burnsGoQuota: event.provider.lowercased().hasPrefix("opencode-go"),
+            isInProgress: false
+        )
+    }
+
     static func parseHermesGatewayRows(_ json: String) -> [ClaudeGatewayRow] {
         guard let data = json.data(using: .utf8),
               let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [Any]
