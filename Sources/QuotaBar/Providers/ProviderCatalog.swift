@@ -108,6 +108,16 @@ enum ProviderCatalog {
                     )
                 },
                 hermesStateDBPath: { (try? HermesUsageScanner.defaultDatabasePaths())?.first },
+                // Production builds the scanner here and hands it to the provider, so the provider's own
+                // default argument is never used — wiring the router ledger only there left it reading
+                // nothing in the real app, and Space Bunny's 2.2B tokens uncounted while the unit tests
+                // (which construct the scanner directly) all passed.
+                routerLedgerPaths: {
+                    CodexRouterUsageScanner.defaultLedgerPaths(
+                        environment: openUsageEnvironment,
+                        homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+                    )
+                },
                 museRoots: { [OpenCodeUsageScanner.museSessionsRoot()] }
             )
         )
