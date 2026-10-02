@@ -143,3 +143,7 @@ twice, and nothing falls through the gap between them.
 A row is named for the model (`space-bunny-free`), not the serving account (`opencode-free/`). Only
 `opencode-go` is charged against the Go subscription's Session / Weekly / Monthly cap meters; Zen and free
 tier usage is billed outside them.
+
+A row whose model is priced at zero — including an unlisted model whose name ends in `-free`, such as a
+router-served custom model — still contributes its **tokens**. A row with no price at all is excluded from
+every total and reported by the unpriced-model warning instead, so a free tier never silently disappears.
