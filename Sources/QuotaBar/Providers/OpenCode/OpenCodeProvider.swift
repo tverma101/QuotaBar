@@ -87,6 +87,12 @@ final class OpenCodeProvider: ProviderRuntime {
             claudeRoots: { OpenCodeUsageScanner.discoverClaudeRoots() },
             codexHomes: { CodexLogUsageScanner.discoverCodexHomes() },
             hermesStateDBPath: { (try? HermesUsageScanner.defaultDatabasePaths())?.first },
+            routerLedgerPaths: {
+                CodexRouterUsageScanner.defaultLedgerPaths(
+                    environment: QuotaBarEnvironmentReader(),
+                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+                )
+            },
             museRoots: { [OpenCodeUsageScanner.museSessionsRoot()] }
         ),
         usageClient: OpenCodeGoUsageClient = OpenCodeGoUsageClient(),

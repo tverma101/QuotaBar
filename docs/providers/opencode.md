@@ -131,3 +131,15 @@ with `anthropic/opencode_go/` or `anthropic/opencode/` for Claude/Codex, `billin
 `opencode-go`/`opencode` for Hermes — and folded into the same tiles. The account meters come from
 `GET https://opencode.ai/zen/go/v1/usage` with each Go key as the Bearer token. Read-only; nothing is sent
 except the authenticated usage request.
+
+## Codex Router turns
+
+CodexRouter meters every turn it routes, including the ones it hands to an OpenCode-hosted account
+(`opencode-go`, `opencode`, `opencode-free`). Those turns never reach `opencode*.db` — a free Zen model can
+bypass the OpenCode server entirely — so this card reads the router's `usage-events.jsonl` ledger for them,
+while the Codex card defers them here. The two cards therefore partition the ledger: nothing is counted
+twice, and nothing falls through the gap between them.
+
+A row is named for the model (`space-bunny-free`), not the serving account (`opencode-free/`). Only
+`opencode-go` is charged against the Go subscription's Session / Weekly / Monthly cap meters; Zen and free
+tier usage is billed outside them.

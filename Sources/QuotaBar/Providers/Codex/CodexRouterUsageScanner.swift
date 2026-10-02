@@ -127,7 +127,15 @@ actor CodexRouterUsageScanner {
             guard event.timestamp >= since else { return }
 
             let model = event.model
-            // Same gateway skip as session logs: OpenCode card owns these turns.
+            // Same gateway skip as session logs: the OpenCode card owns these turns.
+            //
+            // Two signals, because the router serves one traffic class under two spellings. A model slug
+            // prefixed `anthropic/opencode_go/` is the Claude/Codex log shape. The router itself stamps a
+            // `provider`, and anything OpenCode serves — `opencode-go`, `opencode`, `opencode-free` — is
+            // OpenCode traffic even when the slug carries no prefix at all (a router configured for a
+            // custom free model emits `provider=opencode-free, model=opencode-free/space-bunny-free`).
+            // Matching only the slug left those turns on the Codex card and invisible on OpenCode's.
+            if Self.isOpenCodeServed(event) { return }
             if OpenCodeUsageScanner.isHostedGatewayModel(model) { return }
 
             let input = event.inputTokens
@@ -464,6 +472,20 @@ actor CodexRouterUsageScanner {
         var accountFingerprint: String?
         /// Codex `service_tier` when the router stamped it (`priority` / `fast` / `default` / …).
         var serviceTier: String?
+    }
+
+    /// True when the router metered this turn against an OpenCode-hosted account.
+    static func isOpenCodeServed(_ event: Event) -> Bool {
+        let provider = event.provider.lowercased()
+        return provider.hasPrefix("opencode")
+    }
+
+    /// Same test for a raw ledger field, so the OpenCode fold can select its own rows.
+    static func isOpenCodeProvider(_ provider: String?) -> Bool {
+        guard let provider = provider?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty else { return false }
+        return provider.lowercased().hasPrefix("opencode")
     }
 
     static func parseEvent(_ json: [String: Any]) -> Event? {
