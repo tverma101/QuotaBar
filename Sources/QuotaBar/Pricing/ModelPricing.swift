@@ -96,7 +96,33 @@ final class ModelPricing: Sendable {
         if name.hasSuffix("-fast") { return secondary.findExact(name)?.rates }
         if let fuzzy = primary.findFuzzy(name) { return fuzzy.rates }
         if let exact = secondary.findExact(name) { return exact.rates }
+        // A model no catalog carries, whose name says it is free.
+        //
+        // The supplement's own convention is that a `-free` model is priced at $0 and *counted*
+        // (`deepseek-v4-flash-free`, `mimo-v2.5-free`, `mimo-v2.5-pro-free` all ship explicit zero rates).
+        // Without this, a genuinely free model is not mispriced — it is withheld: a fold drops every
+        // unpriced row's tokens, so a router ledger carrying 2.09B tokens of `space-bunny-free` showed
+        // ~20M on the card and the rest was silently discarded as "unknown".
+        if let free = freeVariantRates(name) { return free }
         return nil
+    }
+
+    /// Zero rates for a model whose final name segment ends in `-free`, so its tokens are counted and its
+    /// cost is an honest $0.00 rather than the row being withheld from every total.
+    ///
+    /// Narrow by design: it keys on the last segment only (`space-bunny-free` and
+    /// `opencode-free/space-bunny-free` both qualify; `free-tier-model` and `model-free-beta` do not) and
+    /// never overrides a real rate, so a paid model is untouched and an unknown *paid* model still stays
+    /// unpriced and flagged.
+    private func freeVariantRates(_ name: String) -> ModelRates? {
+        let lastSegment = name.lowercased().split(separator: "/").last.map(String.init) ?? name.lowercased()
+        guard lastSegment.hasSuffix("-free") else { return nil }
+        return ModelRates(
+            inputPerMillion: 0,
+            outputPerMillion: 0,
+            cacheWritePerMillion: 0,
+            cacheReadPerMillion: 0
+        )
     }
 
     /// Prices `<base>-fast` slugs from their base entry when a fast multiplier is known. Returns
