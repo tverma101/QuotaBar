@@ -664,6 +664,7 @@ actor CodexRouterUsageScanner {
            AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor
         {
             var collected: [Event] = []
+            var timestampCache = CodexRouterEventLineParser.TimestampCache()
             var read = JSONLFileReader.readLines(
                 at: url,
                 chunkSize: 64 * 1024,
@@ -672,7 +673,7 @@ actor CodexRouterUsageScanner {
                 discardingOversizedLine: cached.isDiscardingOversizedLine,
                 deliverFinalPartial: false
             ) { line in
-                if let event = parseLine(line), event.timestamp >= emitSince {
+                if let event = parseLine(line, timestampCache: &timestampCache), event.timestamp >= emitSince {
                     collected.append(event)
                 }
             }
@@ -684,7 +685,7 @@ actor CodexRouterUsageScanner {
             // If a final partial line is itself a complete JSON object, accept it (writers that omit
             // the trailing newline on the last record).
             if !read.finalPartial.isEmpty,
-               let event = parseLine(read.finalPartial[...]),
+               let event = parseLine(read.finalPartial[...], timestampCache: &timestampCache),
                event.timestamp >= emitSince {
                 collected.append(event)
                 read.finalPartial = Data()
@@ -764,6 +765,7 @@ actor CodexRouterUsageScanner {
         else { return nil }
 
         var collected: [Event] = []
+        var timestampCache = CodexRouterEventLineParser.TimestampCache()
         var read = JSONLFileReader.readLines(
             at: url,
             chunkSize: 64 * 1024,
@@ -772,7 +774,7 @@ actor CodexRouterUsageScanner {
             discardingOversizedLine: cached.isDiscardingOversizedLine,
             deliverFinalPartial: false
         ) { line in
-            if let event = parseLine(line), event.timestamp >= emitSince {
+            if let event = parseLine(line, timestampCache: &timestampCache), event.timestamp >= emitSince {
                 collected.append(event)
             }
         }
@@ -782,7 +784,7 @@ actor CodexRouterUsageScanner {
 
         // Match the full reader: a complete JSON object at EOF counts even without a newline.
         if !read.finalPartial.isEmpty,
-           let event = parseLine(read.finalPartial[...]),
+           let event = parseLine(read.finalPartial[...], timestampCache: &timestampCache),
            event.timestamp >= emitSince {
             collected.append(event)
             read.finalPartial = Data()
@@ -824,18 +826,19 @@ actor CodexRouterUsageScanner {
         key: String
     ) -> [Event]? {
         var collected: [Event] = []
+        var timestampCache = CodexRouterEventLineParser.TimestampCache()
         var read = JSONLFileReader.readLines(
             at: url,
             chunkSize: 64 * 1024,
             deliverFinalPartial: false
         ) { line in
-            if let event = parseLine(line), event.timestamp >= emitSince {
+            if let event = parseLine(line, timestampCache: &timestampCache), event.timestamp >= emitSince {
                 collected.append(event)
             }
         }
         guard read.succeeded else { return nil }
         if !read.finalPartial.isEmpty,
-           let event = parseLine(read.finalPartial[...]),
+           let event = parseLine(read.finalPartial[...], timestampCache: &timestampCache),
            event.timestamp >= emitSince {
             collected.append(event)
             read.finalPartial = Data()
@@ -860,8 +863,11 @@ actor CodexRouterUsageScanner {
         return collected
     }
 
-    nonisolated private static func parseLine(_ line: Data.SubSequence) -> Event? {
-        CodexRouterEventLineParser.parse(line)
+    nonisolated private static func parseLine(
+        _ line: Data.SubSequence,
+        timestampCache: inout CodexRouterEventLineParser.TimestampCache
+    ) -> Event? {
+        CodexRouterEventLineParser.parse(line, timestampCache: &timestampCache)
     }
 
     nonisolated private static func recentEvents(_ events: [Event], since: Date) -> [Event] {

@@ -10,7 +10,9 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
     static let shared = JSONLAccountingWorkPacer()
 
     static let targetCPUFraction = 0.092
-    private static let maxSleepSliceNanoseconds: UInt64 = 5_000_000
+    // A longer slice avoids thousands of timer wakeups while streaming large ledgers. Cancellation
+    // is still observed within 50 ms, and each synchronous work slice remains bounded by its caller.
+    private static let maxSleepSliceNanoseconds: UInt64 = 50_000_000
 
     private let lock = NSLock()
 

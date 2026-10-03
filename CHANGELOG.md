@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Pace automatic local accounting with a shared CPU allowance, reuse unchanged CodexRouter work, and add repeatable measurements.
+- Reduce CodexRouter cold-index CPU by reusing bounded timestamp parses and fewer throttle wakeups.
 - Name high-token free models and show folded contributors in spend details.
 - Show the OpenCode Go plan only when the account endpoint confirms active usage windows.
 
