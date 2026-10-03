@@ -54,7 +54,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         }
         let shouldThrottle = mode == "paced"
         let measurement = try await ProviderRefreshContext.$scope.withValue(.menuBar) {
-            await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(shouldThrottle) {
+            try await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(shouldThrottle) {
                 try await runMode(scratch: scratch)
             }
         }
