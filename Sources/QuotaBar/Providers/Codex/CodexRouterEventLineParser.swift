@@ -4,12 +4,11 @@ import Foundation
 /// avoids searching the whole line once per property, which is expensive for large ledgers containing
 /// optional metadata or opaque payload strings.
 enum CodexRouterEventLineParser {
-    /// Reuses parsed event times within one file read without retaining unbounded ledger history.
-    /// Router logs often repeat a timestamp across related rows; the cap keeps high-cardinality logs
-    /// from turning this optimization into another growing cache.
+    /// Reuses short repeated event times without retaining unbounded ledger history or oversized keys.
     struct TimestampCache: Sendable {
         private let capacity: Int
         private var dates: [String: Date] = [:]
+        private(set) var cacheHitCount = 0
 
         init(capacity: Int = 2_048) {
             precondition(capacity > 0)
@@ -18,15 +17,20 @@ enum CodexRouterEventLineParser {
 
         var cachedTimestampCount: Int { dates.count }
 
-        mutating func date(from value: String) -> Date? {
-            if let cached = dates[value] { return cached }
+        mutating func date(from value: String, cacheable: Bool) -> Date? {
+            if cacheable, let cached = dates[value] {
+                cacheHitCount += 1
+                return cached
+            }
             guard let parsed = OpenUsageISO8601.date(from: value) else { return nil }
-            if dates.count < capacity {
+            if cacheable, dates.count < capacity {
                 dates[value] = parsed
             }
             return parsed
         }
     }
+
+    private static let timestampCacheableByteLimit = 64
 
     private enum Field {
         case at
@@ -121,6 +125,7 @@ enum CodexRouterEventLineParser {
         objectEnd -= 1
 
         var fields = Fields()
+        var cacheableTimestamp = false
         var cursor = objectStart + 1
         while cursor < objectEnd {
             skipWhitespace(bytes, cursor: &cursor, end: objectEnd)
@@ -141,6 +146,9 @@ enum CodexRouterEventLineParser {
                 guard let token = scanString(bytes, openingQuote: cursor, end: objectEnd) else { return nil }
                 if let value = decodeString(bytes, token: token, openingQuote: cursor) {
                     fields.set(field, string: value)
+                    if case .at = field {
+                        cacheableTimestamp = token.content.count <= timestampCacheableByteLimit
+                    }
                 }
                 cursor = token.next
             } else if let field, isIntegerField(field),
@@ -164,7 +172,7 @@ enum CodexRouterEventLineParser {
         guard cursor == objectEnd else { return nil }
         let timestampString = fields.at?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let timestampString,
-              let timestamp = timestampCache.date(from: timestampString) else { return nil }
+              let timestamp = timestampCache.date(from: timestampString, cacheable: cacheableTimestamp) else { return nil }
 
         let model = fields.model?
             .trimmingCharacters(in: .whitespacesAndNewlines)

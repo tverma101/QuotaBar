@@ -239,7 +239,7 @@ final class CursorProvider: ProviderRuntime {
         do {
             // CSV parsing and the shared model fold can be sizeable on a long export. Keep both off
             // MainActor and pass the refresh budget explicitly because Task.detached drops TaskLocal.
-            let computation = try await Task.detached(priority: .utility) {
+            let computationTask = Task.detached(priority: .utility) {
                 try JSONLAccountingWorkPacer.shared.perform(enabled: paceAccountingWork) {
                     let parsed = try CursorUsageCSV.parse(csv: csv, pricing: pricing)
                     var spendLines: [MetricLine] = []
@@ -251,8 +251,14 @@ final class CursorProvider: ProviderRuntime {
                     )
                     return (parsed, history, spendLines)
                 }
-            }.value
+            }
+            let computation = try await withTaskCancellationHandler {
+                try await computationTask.value
+            } onCancel: {
+                computationTask.cancel()
+            }
 
+            guard !Task.isCancelled else { return nil }
             let (parsed, history, spendLines) = computation
             if parsed.rejectedRowCount > 0 {
                 AppLog.warn(

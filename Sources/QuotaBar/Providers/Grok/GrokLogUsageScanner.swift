@@ -58,7 +58,11 @@ actor GrokLogUsageScanner {
             cacheIdentity: identity,
             parse: Self.parseFile
         ), !Task.isCancelled else { return nil }
-        return Self.aggregate(entries: Self.dedup(entries), since: since, pricing: pricing)
+        let deduped = Self.dedup(entries)
+        guard !Task.isCancelled else { return nil }
+        let result = Self.aggregate(entries: deduped, since: since, pricing: pricing)
+        guard !Task.isCancelled else { return nil }
+        return result
     }
 
     private func grokHome() -> URL {

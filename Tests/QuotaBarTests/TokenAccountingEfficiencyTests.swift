@@ -9,8 +9,8 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
     private static let syntheticRows = 113_447
     private static let syntheticBytes = 45_219_474
 
-    func testAutomaticMenuBarPacingIncludesReapedSQLiteStyleChildCPU() async throws {
-        let measurement = try await ProviderRefreshContext.$scope.withValue(.menuBar) {
+    func testAutomaticFullRefreshPacingIncludesReapedSQLiteStyleChildCPU() async throws {
+        let measurement = try await ProviderRefreshContext.$scope.withValue(.full) {
             try await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
                 let wallStart = DispatchTime.now().uptimeNanoseconds
                 let cpuStart = Self.cpuSeconds()
@@ -53,7 +53,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             throw XCTSkip("QUOTABAR_TOKEN_ACCOUNTING_MODE must be 'raw' or 'paced'")
         }
         let shouldThrottle = mode == "paced"
-        let measurement = try await ProviderRefreshContext.$scope.withValue(.menuBar) {
+        let measurement = try await ProviderRefreshContext.$scope.withValue(.full) {
             try await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(shouldThrottle) {
                 try await runMode(scratch: scratch)
             }
@@ -138,6 +138,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             identityAliases: { [:] },
             incrementalScanner: scanner
         )
+        let pricing = TestPricing.bundled
         let now = ISO8601DateFormatter().date(from: "2026-10-02T12:00:00Z")!
         let coldWallStart = DispatchTime.now().uptimeNanoseconds
         let coldStart = Self.cpuSeconds()
@@ -146,7 +147,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             allowsUnscopedEvents: false,
             daysBack: 30,
             now: now,
-            pricing: TestPricing.bundled
+            pricing: pricing
         )
         XCTAssertNotNil(coldScan, "the representative ledger must produce an accounting result")
         let expectedFirstAccountTokens = 56_724 * 1_801
@@ -183,7 +184,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             allowsUnscopedEvents: false,
             daysBack: 30,
             now: now,
-            pricing: TestPricing.bundled
+            pricing: pricing
         )
         let cacheHydrateCPU = Self.cpuSeconds() - hydrateCPUStart
         let cacheHydrateWall = Double(DispatchTime.now().uptimeNanoseconds - hydrateWallStart) / 1_000_000_000
@@ -203,7 +204,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
                 allowsUnscopedEvents: false,
                 daysBack: 30,
                 now: now,
-                pricing: TestPricing.bundled
+                pricing: pricing
             )
             warmCPU += Self.cpuSeconds() - cpuStart
             wall += Double(DispatchTime.now().uptimeNanoseconds - slotStart) / 1_000_000_000
@@ -281,7 +282,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
     }
 
     /// Writes the same fixed number of bytes on every run. Rows resemble successful CodexRouter
-    /// events, use real bundled model pricing, and span the active 30-day accounting window.
+    /// events with unique millisecond timestamps, real bundled model pricing, and a 30-day window.
     private static func writeSyntheticLedger(to url: URL) throws {
         let models: [(name: String, provider: String)] = [
             ("gpt-5.5", "openai"),
@@ -292,8 +293,11 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let end = ISO8601DateFormatter().date(from: "2026-10-02T12:00:00Z")!
-        let timestamps = (0..<720).map { hour in
-            formatter.string(from: end.addingTimeInterval(-Double(hour % 696) * 3_600))
+        let lookbackSeconds = 30 * 24 * 60 * 60 - 1
+        let timestamps = (0..<syntheticRows).map { index in
+            formatter.string(from: end.addingTimeInterval(
+                -Double(lookbackSeconds) * Double(index) / Double(syntheticRows)
+            ))
         }
         let accountFingerprints = [
             CodexProxyUsageScanner.accountFingerprint(for: "benchmark-first-account")!,
@@ -319,7 +323,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         for index in 0..<syntheticRows {
             let model = models[index % models.count]
             let accountFingerprint = accountFingerprints[index % accountFingerprints.count]
-            let prefix = "{\"at\":\"\(timestamps[index % timestamps.count])\",\"model\":\"\(model.name)\",\"provider\":\"\(model.provider)\",\"status\":200,\"inputTokens\":1234,\"cachedInputTokens\":234,\"outputTokens\":567,\"reasoningTokens\":89,\"totalTokens\":1801,\"accountFingerprint\":\"\(accountFingerprint)\",\"serviceTier\":\"default\",\"padding\":\""
+            let prefix = "{\"at\":\"\(timestamps[index])\",\"model\":\"\(model.name)\",\"provider\":\"\(model.provider)\",\"status\":200,\"inputTokens\":1234,\"cachedInputTokens\":234,\"outputTokens\":567,\"reasoningTokens\":89,\"totalTokens\":1801,\"accountFingerprint\":\"\(accountFingerprint)\",\"serviceTier\":\"default\",\"padding\":\""
             let suffix = "\"}\n"
             let targetRowBytes = baseBytes + (index < extraBytes ? 1 : 0)
             let paddingBytes = targetRowBytes - prefix.utf8.count - suffix.utf8.count

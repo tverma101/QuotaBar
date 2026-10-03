@@ -10,6 +10,8 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
     static let shared = JSONLAccountingWorkPacer()
 
     static let targetCPUFraction = 0.092
+    // A pathological work slice must not hold the shared accounting lock past one provider deadline.
+    private static let maxPacingDebtNanoseconds: Int64 = 120_000_000_000
     // A longer slice avoids thousands of timer wakeups while streaming large ledgers. Oversleep is
     // carried forward as pacing credit, so the average stays near target without relying on precise
     // timer wakeups. Cancellation is still observed within 100 ms.
@@ -30,29 +32,19 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        let cpuStartedAt = processCPUNanoseconds()
+        var previousCPU = processCPUNanoseconds()
+        var previousWall = DispatchTime.now().uptimeNanoseconds
         defer {
-            let cpuElapsed = processCPUNanoseconds() &- cpuStartedAt
-            let waitRequired = UInt64(
-                Double(cpuElapsed) * ((1 - Self.targetCPUFraction) / Self.targetCPUFraction)
-            )
-            let (debt, overflow) = pacingDebtNanoseconds.addingReportingOverflow(Int64(clamping: waitRequired))
-            pacingDebtNanoseconds = overflow ? .max : debt
+            accountPacingInterval(previousCPU: &previousCPU, previousWall: &previousWall)
 
             if Task.isCancelled {
                 pacingDebtNanoseconds = 0
             } else {
                 while pacingDebtNanoseconds > 0 {
                     let requested = min(UInt64(pacingDebtNanoseconds), Self.maxSleepSliceNanoseconds)
-                    let sleepStartedAt = DispatchTime.now().uptimeNanoseconds
                     Thread.sleep(forTimeInterval: Double(requested) / 1_000_000_000)
-                    let actualSleep = DispatchTime.now().uptimeNanoseconds &- sleepStartedAt
-                    // A long system stall must not become an unbounded credit for the next refresh.
-                    let creditedSleep = min(actualSleep, requested + Self.maxSleepSliceNanoseconds)
-                    let (remainingDebt, sleepOverflow) = pacingDebtNanoseconds.subtractingReportingOverflow(
-                        Int64(clamping: creditedSleep)
-                    )
-                    pacingDebtNanoseconds = sleepOverflow ? .min : remainingDebt
+                    // Include limiter wakeup CPU and real scheduler delay in the same allowance.
+                    accountPacingInterval(previousCPU: &previousCPU, previousWall: &previousWall)
                     if Task.isCancelled {
                         pacingDebtNanoseconds = 0
                         break
@@ -61,6 +53,31 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
             }
         }
         return try work()
+    }
+
+    private func accountPacingInterval(previousCPU: inout UInt64, previousWall: inout UInt64) {
+        let currentCPU = processCPUNanoseconds()
+        let currentWall = DispatchTime.now().uptimeNanoseconds
+        let cpuElapsed = currentCPU &- previousCPU
+        let wallElapsed = currentWall &- previousWall
+        previousCPU = currentCPU
+        previousWall = currentWall
+
+        let targetElapsedDouble = Double(cpuElapsed) / Self.targetCPUFraction
+        let targetElapsed = targetElapsedDouble >= Double(Int64.max)
+            ? Int64.max
+            : Int64(targetElapsedDouble)
+        let wallElapsedSigned = Int64(clamping: wallElapsed)
+        let (adjustment, adjustmentOverflow) = targetElapsed.subtractingReportingOverflow(wallElapsedSigned)
+        let safeAdjustment = adjustmentOverflow
+            ? (wallElapsedSigned > 0 ? Int64.min : Int64.max)
+            : adjustment
+        let (debt, debtOverflow) = pacingDebtNanoseconds.addingReportingOverflow(safeAdjustment)
+        let saturatedDebt = debtOverflow ? (safeAdjustment > 0 ? Int64.max : Int64.min) : debt
+        pacingDebtNanoseconds = min(
+            max(saturatedDebt, -Int64(Self.maxSleepSliceNanoseconds)),
+            Self.maxPacingDebtNanoseconds
+        )
     }
 
     /// Run collection folds in bounded pieces so non-JSONL aggregation and deduplication share the

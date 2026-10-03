@@ -115,7 +115,11 @@ actor ClaudeLogUsageScanner {
             cacheIdentity: cacheIdentity,
             parseFile: { url in Self.parseFile(at: url) }
         ), !Task.isCancelled else { return nil }
-        return Self.aggregate(entries: Self.dedup(entries), since: since, pricing: pricing)
+        let deduped = Self.dedup(entries)
+        guard !Task.isCancelled else { return nil }
+        let result = Self.aggregate(entries: deduped, since: since, pricing: pricing)
+        guard !Task.isCancelled else { return nil }
+        return result
     }
 
     /// The parsed usage entries of the last `daysBack` days — the same incremental scan the card's
