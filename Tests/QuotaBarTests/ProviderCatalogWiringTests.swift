@@ -12,9 +12,17 @@ import XCTest
 /// These assert on the catalog-built object, i.e. the object the app really uses.
 @MainActor
 final class ProviderCatalogWiringTests: XCTestCase {
-    private func catalogOpenCode() throws -> OpenCodeProvider {
+    private func catalogOpenCode(
+        codexLogHomes: [String] = [],
+        openCodeClaudeRoots: @escaping @Sendable () -> [URL] = {
+            OpenCodeUsageScanner.discoverClaudeRoots()
+        }
+    ) throws -> OpenCodeProvider {
         try XCTUnwrap(
-            ProviderCatalog.make().compactMap { $0 as? OpenCodeProvider }.first
+            ProviderCatalog.make(
+                codexLogHomes: codexLogHomes,
+                openCodeClaudeRoots: openCodeClaudeRoots
+            ).compactMap { $0 as? OpenCodeProvider }.first
         )
     }
 
@@ -28,9 +36,20 @@ final class ProviderCatalogWiringTests: XCTestCase {
     }
 
     func testTheProductionScannerIsToldAboutTheOtherFoldsToo() throws {
-        let scanner = try catalogOpenCode().usageScanner
-        XCTAssertFalse(scanner.claudeRoots().isEmpty, "Claude gateway fold source")
-        XCTAssertFalse(scanner.codexHomes().isEmpty, "Codex gateway fold source")
+        let claudeRoot = URL(fileURLWithPath: "/synthetic/claude-root")
+        let codexHome = URL(fileURLWithPath: "/synthetic/codex-home")
+        let scanner = try catalogOpenCode(
+            codexLogHomes: [codexHome.path],
+            openCodeClaudeRoots: { [claudeRoot] }
+        ).usageScanner
+        XCTAssertEqual(scanner.claudeRoots(), [claudeRoot], "Claude gateway fold source")
+        XCTAssertTrue(
+            scanner.codexHomes().contains {
+                $0.resolvingSymlinksInPath().standardizedFileURL.path
+                    == codexHome.resolvingSymlinksInPath().standardizedFileURL.path
+            },
+            "Codex gateway fold source"
+        )
         // Hermes is optional — the closure is what must be wired, and nil is the correct answer on a
         // machine without a Hermes database.
         _ = scanner.hermesStateDBPath()

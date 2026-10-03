@@ -9,7 +9,10 @@ enum ProviderCatalog {
         claudeCards: [ClaudeAccountCard] = [],
         codexCards: [CodexAccountCard] = [],
         claudeIdentityKeys: [String: String] = [:],
-        codexLogHomes: [String] = []
+        codexLogHomes: [String] = [],
+        openCodeClaudeRoots: @escaping @Sendable () -> [URL] = {
+            OpenCodeUsageScanner.discoverClaudeRoots()
+        }
     ) -> [ProviderRuntime] {
         let openUsageEnvironment = QuotaBarEnvironmentReader()
         var providers: [ProviderRuntime]
@@ -100,7 +103,7 @@ enum ProviderCatalog {
         }
         let openCode = OpenCodeProvider(
             usageScanner: OpenCodeUsageScanner(
-                claudeRoots: { OpenCodeUsageScanner.discoverClaudeRoots() },
+                claudeRoots: openCodeClaudeRoots,
                 codexHomes: {
                     OpenCodeUsageScanner.uniqueCodexHomes(
                         CodexLogUsageScanner.discoverCodexHomes(environment: openUsageEnvironment)
