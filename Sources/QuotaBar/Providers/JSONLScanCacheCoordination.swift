@@ -10,11 +10,15 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
     static let shared = JSONLAccountingWorkPacer()
 
     static let targetCPUFraction = 0.092
-    // A longer slice avoids thousands of timer wakeups while streaming large ledgers. Cancellation
-    // is still observed within 50 ms, and each synchronous work slice remains bounded by its caller.
-    private static let maxSleepSliceNanoseconds: UInt64 = 50_000_000
+    // A longer slice avoids thousands of timer wakeups while streaming large ledgers. Oversleep is
+    // carried forward as pacing credit, so the average stays near target without relying on precise
+    // timer wakeups. Cancellation is still observed within 100 ms.
+    private static let maxSleepSliceNanoseconds: UInt64 = 100_000_000
 
     private let lock = NSLock()
+    /// Signed so scheduler overshoot can reduce the next slice's wait instead of accumulating delay.
+    /// Access is serialized by `lock`, and negative credit is bounded to one sleep slice.
+    private var pacingDebtNanoseconds: Int64 = 0
 
     private init() {}
 
@@ -26,17 +30,34 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        let startedAt = DispatchTime.now().uptimeNanoseconds
         let cpuStartedAt = processCPUNanoseconds()
         defer {
             let cpuElapsed = processCPUNanoseconds() &- cpuStartedAt
-            let targetElapsed = UInt64(Double(cpuElapsed) / Self.targetCPUFraction)
-            let targetEnd = startedAt &+ targetElapsed
-            while !Task.isCancelled {
-                let now = DispatchTime.now().uptimeNanoseconds
-                guard now < targetEnd else { break }
-                let remaining = targetEnd &- now
-                Thread.sleep(forTimeInterval: Double(min(remaining, Self.maxSleepSliceNanoseconds)) / 1_000_000_000)
+            let waitRequired = UInt64(
+                Double(cpuElapsed) * ((1 - Self.targetCPUFraction) / Self.targetCPUFraction)
+            )
+            let (debt, overflow) = pacingDebtNanoseconds.addingReportingOverflow(Int64(clamping: waitRequired))
+            pacingDebtNanoseconds = overflow ? .max : debt
+
+            if Task.isCancelled {
+                pacingDebtNanoseconds = 0
+            } else {
+                while pacingDebtNanoseconds > 0 {
+                    let requested = min(UInt64(pacingDebtNanoseconds), Self.maxSleepSliceNanoseconds)
+                    let sleepStartedAt = DispatchTime.now().uptimeNanoseconds
+                    Thread.sleep(forTimeInterval: Double(requested) / 1_000_000_000)
+                    let actualSleep = DispatchTime.now().uptimeNanoseconds &- sleepStartedAt
+                    // A long system stall must not become an unbounded credit for the next refresh.
+                    let creditedSleep = min(actualSleep, requested + Self.maxSleepSliceNanoseconds)
+                    let (remainingDebt, sleepOverflow) = pacingDebtNanoseconds.subtractingReportingOverflow(
+                        Int64(clamping: creditedSleep)
+                    )
+                    pacingDebtNanoseconds = sleepOverflow ? .min : remainingDebt
+                    if Task.isCancelled {
+                        pacingDebtNanoseconds = 0
+                        break
+                    }
+                }
             }
         }
         return try work()
