@@ -105,11 +105,15 @@ struct HermesUsageScanner: Sendable {
 
         // `session_model_usage` is Hermes' per-model/per-task attribution table (preferred source for
         // breakdowns); older installs may not have it, so the probe decides which query to run.
-        let hasModelTable = try? (sqlite.queryValue(path: path, sql: Self.modelTableProbeSQL) != nil)
+        let hasModelTable = try? (JSONLAccountingWorkPacer.shared.perform {
+            try sqlite.queryValue(path: path, sql: Self.modelTableProbeSQL) != nil
+        })
 
         for (period, start) in starts {
-            guard let sumJSON = try sqlite.queryValue(path: path, sql: Self.periodSQL(start: start)),
-                  let counts = Self.parsePeriod(sumJSON) else {
+            guard let sumJSON = try JSONLAccountingWorkPacer.shared.perform({
+                try sqlite.queryValue(path: path, sql: Self.periodSQL(start: start))
+            }),
+                  let counts = JSONLAccountingWorkPacer.shared.perform({ Self.parsePeriod(sumJSON) }) else {
                 continue
             }
             periods.append(HermesPeriodUsage(
@@ -118,16 +122,20 @@ struct HermesUsageScanner: Sendable {
                 costUSD: counts.costUSD,
                 apiCallCount: counts.apiCallCount
             ))
-            if let modelJSON = try? sqlite.queryValue(path: path, sql: Self.modelsSQL(start: start, detailed: hasModelTable == true)) {
-                modelUsage[period] = Self.parseModels(modelJSON)
+            if let modelJSON = try? JSONLAccountingWorkPacer.shared.perform({
+                try sqlite.queryValue(path: path, sql: Self.modelsSQL(start: start, detailed: hasModelTable == true))
+            }) {
+                modelUsage[period] = JSONLAccountingWorkPacer.shared.perform { Self.parseModels(modelJSON) }
             }
         }
 
         let dailyCutoff = calendar.date(byAdding: .day, value: -UsageHistoryWindow.previousDays, to: calendar.startOfDay(for: now))
             ?? calendar.startOfDay(for: now)
         let daily: DailyUsageSeries
-        if let dailyJSON = try sqlite.queryValue(path: path, sql: Self.dailySQL(cutoff: dailyCutoff)) {
-            daily = Self.parseDaily(dailyJSON)
+        if let dailyJSON = try JSONLAccountingWorkPacer.shared.perform({
+            try sqlite.queryValue(path: path, sql: Self.dailySQL(cutoff: dailyCutoff))
+        }) {
+            daily = JSONLAccountingWorkPacer.shared.perform { Self.parseDaily(dailyJSON) }
         } else {
             daily = DailyUsageSeries(daily: [])
         }

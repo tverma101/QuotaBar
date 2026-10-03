@@ -370,7 +370,7 @@ enum CursorUsageMapper {
     /// into the base (`gpt-5.5-extra-high-fast` → `gpt-5.5-fast` → `gpt-5.5`). Slugs no alias rule
     /// knows keep their raw name — a wrong guess would silently merge unrelated models.
     private static func familyName(for model: String, pricing: ModelPricing) -> String {
-        let canonical = pricing.supplement.canonicalName(for: model) ?? model
+        let canonical = pricing.canonicalName(for: model) ?? model
         guard canonical.hasSuffix("-fast") else { return canonical }
         let base = String(canonical.dropLast("-fast".count))
         return base.isEmpty ? canonical : base

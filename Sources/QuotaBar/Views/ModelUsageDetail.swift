@@ -1,10 +1,10 @@
 import SwiftUI
 
-/// Hover detail for a spend period: a flat ranked list of models, each two text lines (name/cost,
-/// share percent/tokens) over a proportional share bar. Rows carry no tooltips — everything shown is
-/// already on the row. The header carries only the period name — the hovered row right below already
-/// shows the period total, so repeating it here would duplicate (and wrap on) long figures. Mirrors
-/// `UsageTrendDetail`'s calm — header + flat list + source note.
+/// Hover detail for a spend period: a flat ranked list of models, each with name/cost and
+/// share-percent/token lines over a proportional bar. The Other row adds a short contributor line so
+/// folded names remain visible. The header carries only the period name — the hovered row right below
+/// already shows the period total, so repeating it here would duplicate (and wrap on) long figures.
+/// Mirrors `UsageTrendDetail`'s calm — header + flat list + source note.
 struct ModelUsageDetail: View {
     let title: String
     let breakdown: ModelUsageBreakdown
@@ -44,16 +44,23 @@ struct ModelUsageDetail: View {
             .foregroundStyle(.primary)
     }
 
-    /// Two text lines and the bar: model name / cost on top, share percent / tokens beneath. The name
-    /// only competes with the short cost figure, so it almost never truncates; the percent line answers
-    /// what the bar can't say precisely.
+    /// Model name / cost on top, share percent / tokens beneath. The Other row can add a compact
+    /// contributor line below its label; the percent line answers what the bar can't say precisely.
     private func modelRow(_ model: ModelUsageEntry, share: Double, percent: Int) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(model.model)
-                    .font(.system(size: density.supportingPointSize, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(model.model)
+                        .font(.system(size: density.supportingPointSize, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if let summary = Self.otherVariantSummary(for: model) {
+                        Text(summary)
+                            .font(.system(size: density.supportingPointSize - 1))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
                 Spacer(minLength: 8)
                 if let cost = model.costUSD {
                     Text(MetricFormatter.number(cost, kind: .dollars, style: .row))
@@ -92,6 +99,25 @@ struct ModelUsageDetail: View {
             .padding(.top, 2)
         }
         .padding(.vertical, density.textRowPadding)
+    }
+
+    /// The collapsed row must still identify the models that contributed to it. Lead with token
+    /// volume because a zero-cost model can dominate tokens while contributing no spend.
+    static func otherVariantSummary(for model: ModelUsageEntry) -> String? {
+        guard model.model.caseInsensitiveCompare(ModelUsageEntry.otherModelName) == .orderedSame,
+              let variants = model.variants?.filter({
+                  $0.model.caseInsensitiveCompare(ModelUsageEntry.unattributedModelName) != .orderedSame
+              }),
+              !variants.isEmpty
+        else { return nil }
+
+        let ranked = variants.sorted { lhs, rhs in
+            if lhs.totalTokens != rhs.totalTokens { return lhs.totalTokens > rhs.totalTokens }
+            return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
+        }
+        let leadingName = ranked[0].model
+        let additionalCount = ranked.count - 1
+        return additionalCount == 0 ? leadingName : "\(leadingName) + \(additionalCount) more"
     }
 
     /// Share against the sum of the listed models' own (display-rounded) figures, not the spend row's

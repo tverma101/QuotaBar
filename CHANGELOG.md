@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Keep active token accounting within a shared 10% one-core CPU budget and reuse unchanged CodexRouter work.
+- Pace automatic local accounting with a shared CPU allowance, reuse unchanged CodexRouter work, and add repeatable measurements.
+- Name high-token free models and show folded contributors in spend details.
 - Show the OpenCode Go plan only when the account endpoint confirms active usage windows.
 
 ## v0.7.10-beta.3

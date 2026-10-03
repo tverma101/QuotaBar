@@ -235,15 +235,33 @@ final class CursorProvider: ProviderRuntime {
             return nil
         }
         let pricing = await pricing()
+        let paceAccountingWork = ProviderRefreshContext.accountingCPUThrottleEnabled
         do {
-            let parsed = try CursorUsageCSV.parse(csv: csv, pricing: pricing)
+            // CSV parsing and the shared model fold can be sizeable on a long export. Keep both off
+            // MainActor and pass the refresh budget explicitly because Task.detached drops TaskLocal.
+            let computation = try await Task.detached(priority: .utility) {
+                try JSONLAccountingWorkPacer.shared.perform(enabled: paceAccountingWork) {
+                    let parsed = try CursorUsageCSV.parse(csv: csv, pricing: pricing)
+                    var spendLines: [MetricLine] = []
+                    let history = CursorUsageMapper.appendSpendLines(
+                        rows: parsed.rows,
+                        now: end,
+                        pricing: pricing,
+                        to: &spendLines
+                    )
+                    return (parsed, history, spendLines)
+                }
+            }.value
+
+            let (parsed, history, spendLines) = computation
             if parsed.rejectedRowCount > 0 {
                 AppLog.warn(
                     LogTag.plugin("cursor"),
                     "usage CSV ignored \(parsed.rejectedRowCount) malformed row\(parsed.rejectedRowCount == 1 ? "" : "s")"
                 )
             }
-            return CursorUsageMapper.appendSpendLines(rows: parsed.rows, now: end, pricing: pricing, to: &lines)
+            lines.append(contentsOf: spendLines)
+            return history
         } catch let error as CursorUsageCSVError {
             switch error {
             case .missingColumns(let columns):

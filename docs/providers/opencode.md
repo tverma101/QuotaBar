@@ -108,6 +108,10 @@ Each spend tile shows cost and tokens together (`$4.08 · 1.2M tokens`), the sam
 Cursor. A period with no recorded usage reads "No data" rather than a misleading `$0.00`. No log data
 leaves your Mac.
 
+The spend detail keeps a free model with a material share of tokens on its own named row even though
+its spend share is `0%`. Models grouped into `Other` are identified beneath that row's label, led by
+the model with the most tokens.
+
 ## Troubleshooting
 
 - **Everything shows "No data"** — QuotaBar needs OpenCode's local database at

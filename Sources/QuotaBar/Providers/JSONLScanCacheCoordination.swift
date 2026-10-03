@@ -3,9 +3,9 @@ import Darwin
 
 /// Shares a small CPU allowance across token-history indexing and folding. A process-wide lock keeps
 /// simultaneous provider scans from multiplying the allowance; work runs in short synchronous slices
-/// and pauses according to process CPU time, so disk wait does not consume the CPU budget. The limit
-/// applies to full history refreshes, while menu-bar quota-only passes do no history work and are left
-/// alone.
+/// and pauses according to process CPU time, so disk wait does not consume the CPU budget. Automatic
+/// refreshes use the same allowance in both menu-bar and full scopes because a startup/menu-bar pass
+/// can still cold-load provider indexes and OpenCode's local history.
 final class JSONLAccountingWorkPacer: @unchecked Sendable {
     static let shared = JSONLAccountingWorkPacer()
 
@@ -21,8 +21,6 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
         guard enabled ?? ProviderRefreshContext.accountingCPUThrottleEnabled else {
             return try work()
         }
-        if case .menuBar = ProviderRefreshContext.scope { return try work() }
-
         lock.lock()
         defer { lock.unlock() }
 
@@ -51,7 +49,6 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
     ) {
         precondition(batchSize > 0)
         let enabled = ProviderRefreshContext.accountingCPUThrottleEnabled
-            && ProviderRefreshContext.scope.isFull
         guard enabled else {
             elements.forEach(body)
             return
@@ -59,9 +56,11 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
 
         var start = 0
         while start < elements.count {
+            guard !Task.isCancelled else { break }
             let end = min(start + batchSize, elements.count)
             perform {
                 for index in start..<end {
+                    guard !Task.isCancelled else { break }
                     body(elements[index])
                 }
             }
@@ -70,8 +69,12 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
     }
 
     private func processCPUNanoseconds() -> UInt64 {
+        Self.cpuNanoseconds(for: RUSAGE_SELF) + Self.cpuNanoseconds(for: RUSAGE_CHILDREN)
+    }
+
+    private static func cpuNanoseconds(for process: Int32) -> UInt64 {
         var usage = rusage()
-        precondition(getrusage(RUSAGE_SELF, &usage) == 0, "getrusage(RUSAGE_SELF) failed")
+        precondition(getrusage(process, &usage) == 0, "getrusage(\(process)) failed")
         let user = UInt64(usage.ru_utime.tv_sec) * 1_000_000_000
             + UInt64(usage.ru_utime.tv_usec) * 1_000
         let system = UInt64(usage.ru_stime.tv_sec) * 1_000_000_000

@@ -1006,7 +1006,7 @@ actor CodexLogUsageScanner {
         // double-counts the same dollars/tokens in Total Spend.
         if OpenCodeUsageScanner.isHostedGatewayModel(model) { return }
         let pricingModel = event.pricingModel ?? model
-        let canonicalModel = pricing.supplement.canonicalName(for: pricingModel) ?? pricingModel
+        let canonicalModel = pricing.canonicalName(for: pricingModel) ?? pricingModel
         let isFastAlias = canonicalModel.hasSuffix("-fast")
         let rateModel = isFastAlias ? String(canonicalModel.dropLast("-fast".count)) : canonicalModel
         let baseRates = pricing.resolve(model: rateModel)

@@ -23,32 +23,34 @@ enum JSONLScanning {
     /// Every `*.jsonl` regular file under `dir` (recursively), path-sorted so a keep-first dedup is
     /// deterministic. Empty when `dir` can't be enumerated.
     static func jsonlFiles(under dir: URL) -> [DiscoveredFile] {
-        // `FileManager.enumerator` silently yields nothing when `dir` itself is a symlink.
-        // Resolve first so the enumeration sees the real directory.
-        let dir = dir.resolvingSymlinksInPath()
-        let keys: [URLResourceKey] = [
-            .isRegularFileKey,
-            .fileSizeKey,
-            .contentModificationDateKey,
-            .attributeModificationDateKey,
-        ]
-        guard let enumerator = FileManager.default.enumerator(
-            at: dir, includingPropertiesForKeys: keys, options: []
-        ) else { return [] }
-        var files: [DiscoveredFile] = []
-        for case let url as URL in enumerator {
-            guard url.pathExtension == "jsonl",
-                  let values = try? url.resourceValues(forKeys: Set(keys)),
-                  values.isRegularFile == true
-            else { continue }
-            files.append(DiscoveredFile(
-                path: url.path,
-                size: values.fileSize ?? 0,
-                mtime: values.contentModificationDate ?? .distantPast,
-                attributeMtime: values.attributeModificationDate
-            ))
+        JSONLAccountingWorkPacer.shared.perform {
+            // `FileManager.enumerator` silently yields nothing when `dir` itself is a symlink.
+            // Resolve first so the enumeration sees the real directory.
+            let dir = dir.resolvingSymlinksInPath()
+            let keys: [URLResourceKey] = [
+                .isRegularFileKey,
+                .fileSizeKey,
+                .contentModificationDateKey,
+                .attributeModificationDateKey,
+            ]
+            guard let enumerator = FileManager.default.enumerator(
+                at: dir, includingPropertiesForKeys: keys, options: []
+            ) else { return [] }
+            var files: [DiscoveredFile] = []
+            for case let url as URL in enumerator {
+                guard url.pathExtension == "jsonl",
+                      let values = try? url.resourceValues(forKeys: Set(keys)),
+                      values.isRegularFile == true
+                else { continue }
+                files.append(DiscoveredFile(
+                    path: url.path,
+                    size: values.fileSize ?? 0,
+                    mtime: values.contentModificationDate ?? .distantPast,
+                    attributeMtime: values.attributeModificationDate
+                ))
+            }
+            return files.sorted { $0.path < $1.path }
         }
-        return files.sorted { $0.path < $1.path }
     }
 }
 

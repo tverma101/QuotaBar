@@ -201,6 +201,12 @@ actor JSONLScanCacheWriter {
     static let shared = JSONLScanCacheWriter()
 
     func commit(_ batch: JSONLScanCacheWriteBatch) throws -> JSONLScanCacheCommitResult {
+        try JSONLAccountingWorkPacer.shared.perform {
+            try self.commitWithoutPacing(batch)
+        }
+    }
+
+    private func commitWithoutPacing(_ batch: JSONLScanCacheWriteBatch) throws -> JSONLScanCacheCommitResult {
         let persistence = batch.persistence
         let identity = batch.identity
         let manifestURL = JSONLScanCachePaths.manifestURL(

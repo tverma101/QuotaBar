@@ -27,7 +27,8 @@ enum ProviderRefreshContext {
     @TaskLocal static var credentialInteractionGate: CredentialInteractionGate? = nil
     /// Defaults to `.full` so tests, CLI, and any unscoped call site keep today's behavior.
     @TaskLocal static var scope: Scope = .full
-    /// Automatic full-history refreshes opt into the process-wide CPU allowance; focused unit tests
+    /// Automatic provider refreshes opt into the process-wide CPU allowance, including startup and
+    /// menu-bar passes whose providers can still perform local history accounting. Focused unit tests
     /// and one-shot CLI scans keep their existing timing unless they explicitly measure the budget.
     @TaskLocal static var accountingCPUThrottleEnabled = false
 }
