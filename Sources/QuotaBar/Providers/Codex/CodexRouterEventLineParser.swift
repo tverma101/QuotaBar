@@ -4,6 +4,30 @@ import Foundation
 /// avoids searching the whole line once per property, which is expensive for large ledgers containing
 /// optional metadata or opaque payload strings.
 enum CodexRouterEventLineParser {
+    /// Reuses parsed event times within one file read without retaining unbounded ledger history.
+    /// Router logs often repeat a timestamp across related rows; the cap keeps high-cardinality logs
+    /// from turning this optimization into another growing cache.
+    struct TimestampCache: Sendable {
+        private let capacity: Int
+        private var dates: [String: Date] = [:]
+
+        init(capacity: Int = 2_048) {
+            precondition(capacity > 0)
+            self.capacity = capacity
+        }
+
+        var cachedTimestampCount: Int { dates.count }
+
+        mutating func date(from value: String) -> Date? {
+            if let cached = dates[value] { return cached }
+            guard let parsed = OpenUsageISO8601.date(from: value) else { return nil }
+            if dates.count < capacity {
+                dates[value] = parsed
+            }
+            return parsed
+        }
+    }
+
     private enum Field {
         case at
         case model
@@ -67,13 +91,22 @@ enum CodexRouterEventLineParser {
     }
 
     static func parse(_ line: Data.SubSequence) -> CodexRouterUsageScanner.Event? {
+        var timestampCache = TimestampCache()
+        return parse(line, timestampCache: &timestampCache)
+    }
+
+    static func parse(
+        _ line: Data.SubSequence,
+        timestampCache: inout TimestampCache
+    ) -> CodexRouterUsageScanner.Event? {
         line.withUnsafeBytes { rawBytes in
-            parse(rawBytes.bindMemory(to: UInt8.self))
+            parse(rawBytes.bindMemory(to: UInt8.self), timestampCache: &timestampCache)
         }
     }
 
     private static func parse(
-        _ bytes: UnsafeBufferPointer<UInt8>
+        _ bytes: UnsafeBufferPointer<UInt8>,
+        timestampCache: inout TimestampCache
     ) -> CodexRouterUsageScanner.Event? {
         var objectStart = 0
         while objectStart < bytes.count, isWhitespace(bytes[objectStart]) {
@@ -131,7 +164,7 @@ enum CodexRouterEventLineParser {
         guard cursor == objectEnd else { return nil }
         let timestampString = fields.at?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let timestampString,
-              let timestamp = OpenUsageISO8601.date(from: timestampString) else { return nil }
+              let timestamp = timestampCache.date(from: timestampString) else { return nil }
 
         let model = fields.model?
             .trimmingCharacters(in: .whitespacesAndNewlines)

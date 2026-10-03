@@ -40,6 +40,20 @@ final class CodexRouterEventLineParserTests: XCTestCase {
         XCTAssertEqual(event.model, "last")
     }
 
+    func testTimestampCacheReusesDatesAndHonorsItsBound() throws {
+        var cache = CodexRouterEventLineParser.TimestampCache(capacity: 1)
+        let first = Data(#"{"at":"2026-10-02T12:00:00Z"}"#.utf8)
+        let second = Data(#"{"at":"2026-10-02T13:00:00Z"}"#.utf8)
+
+        let initial = try XCTUnwrap(CodexRouterEventLineParser.parse(first[...], timestampCache: &cache))
+        let repeated = try XCTUnwrap(CodexRouterEventLineParser.parse(first[...], timestampCache: &cache))
+        let afterCapacity = try XCTUnwrap(CodexRouterEventLineParser.parse(second[...], timestampCache: &cache))
+
+        XCTAssertEqual(initial.timestamp, repeated.timestamp)
+        XCTAssertEqual(afterCapacity.timestamp, ISO8601DateFormatter().date(from: "2026-10-02T13:00:00Z"))
+        XCTAssertEqual(cache.cachedTimestampCount, 1)
+    }
+
     func testRejectsTornFinalObject() {
         XCTAssertNil(parse(#"{"at":"2026-10-02T12:00:00Z","model":"unfinished}"#))
     }
