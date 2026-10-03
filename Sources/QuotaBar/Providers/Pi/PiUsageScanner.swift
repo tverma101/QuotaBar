@@ -76,7 +76,11 @@ actor PiUsageScanner {
             cacheIdentity: cacheIdentity,
             parseFile: { url in Self.parseFile(at: url) }
         ), !Task.isCancelled else { return nil }
-        return Self.aggregate(entries: Self.dedup(entries), cardID: cardID, since: since, pricing: pricing)
+        let deduped = Self.dedup(entries)
+        guard !Task.isCancelled else { return nil }
+        let result = Self.aggregate(entries: deduped, cardID: cardID, since: since, pricing: pricing)
+        guard !Task.isCancelled else { return nil }
+        return result
     }
 
     // MARK: - Parsing

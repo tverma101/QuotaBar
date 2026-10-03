@@ -786,10 +786,12 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         let encoded: [String: JSONLScanCacheUpsert]
         let paceAccountingWork = ProviderRefreshContext.accountingCPUThrottleEnabled
         do {
-            encoded = try await Task.detached(priority: .utility) {
+            let snapshotTask = Task.detached(priority: .utility) {
+                try Task.checkCancellation()
                 let encoder = PropertyListEncoder()
                 encoder.outputFormat = .binary
                 return try Dictionary(uniqueKeysWithValues: files.map { input in
+                    try Task.checkCancellation()
                     let metadata = JSONLScanCacheFileMetadata(
                         size: input.cached.size,
                         mtime: input.cached.mtime,
@@ -814,7 +816,14 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
                         )
                     )
                 })
-            }.value
+            }
+            encoded = try await withTaskCancellationHandler {
+                try await snapshotTask.value
+            } onCancel: {
+                snapshotTask.cancel()
+            }
+        } catch is CancellationError {
+            return
         } catch {
             AppLog.warn(
                 .cache,

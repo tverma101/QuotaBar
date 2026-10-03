@@ -52,6 +52,18 @@ final class CodexRouterEventLineParserTests: XCTestCase {
         XCTAssertEqual(initial.timestamp, repeated.timestamp)
         XCTAssertEqual(afterCapacity.timestamp, ISO8601DateFormatter().date(from: "2026-10-02T13:00:00Z"))
         XCTAssertEqual(cache.cachedTimestampCount, 1)
+        XCTAssertEqual(cache.cacheHitCount, 1)
+    }
+
+    func testTimestampCacheDoesNotRetainOversizedTimestampKeys() throws {
+        var cache = CodexRouterEventLineParser.TimestampCache(capacity: 4)
+        let oversizedTimestamp = "2026-10-02T12:00:00." + String(repeating: "1", count: 128) + "Z"
+        let data = Data(#"{"at":"\#(oversizedTimestamp)"}"#.utf8)
+
+        XCTAssertNotNil(CodexRouterEventLineParser.parse(data[...], timestampCache: &cache))
+        XCTAssertNotNil(CodexRouterEventLineParser.parse(data[...], timestampCache: &cache))
+        XCTAssertEqual(cache.cachedTimestampCount, 0)
+        XCTAssertEqual(cache.cacheHitCount, 0)
     }
 
     func testRejectsTornFinalObject() {
