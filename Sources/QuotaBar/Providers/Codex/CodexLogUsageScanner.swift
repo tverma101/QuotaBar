@@ -1122,8 +1122,38 @@ actor CodexLogUsageScanner {
     }
 
     private static func datedBaseModel(_ model: String) -> String {
-        model
-            .replacingOccurrences(of: #"-\d{4}-\d{2}-\d{2}$"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: #"-\d{8}$"#, with: "", options: .regularExpression)
+        stripDatedSuffix(model, separated: true)
+            ?? stripDatedSuffix(model, separated: false)
+            ?? model
+    }
+
+    /// These helpers run several times for every priced Codex event. The suffix grammar is fixed, so
+    /// checking its ASCII digits directly avoids compiling/running two regular expressions per event.
+    private static func stripDatedSuffix(_ model: String, separated: Bool) -> String? {
+        let bytes = model.utf8
+        let suffixLength = separated ? 11 : 9
+        guard bytes.count >= suffixLength else { return nil }
+        let start = bytes.index(bytes.endIndex, offsetBy: -suffixLength)
+        func byte(_ offset: Int) -> UInt8 {
+            bytes[bytes.index(start, offsetBy: offset)]
+        }
+        guard byte(0) == UInt8(ascii: "-") else { return nil }
+
+        if separated {
+            for offset in 1...10 {
+                if offset == 5 || offset == 8 {
+                    guard byte(offset) == UInt8(ascii: "-") else { return nil }
+                } else {
+                    guard (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte(offset)) else { return nil }
+                }
+            }
+        } else {
+            for offset in 1...8 {
+                guard (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte(offset)) else { return nil }
+            }
+        }
+
+        guard let stringStart = String.Index(start, within: model) else { return nil }
+        return String(model[..<stringStart])
     }
 }

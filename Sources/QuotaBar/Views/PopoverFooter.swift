@@ -96,7 +96,7 @@ struct PopoverFooter: View {
         Task {
             await ProviderRefreshContext.$isManual.withValue(true) {
                 await ProviderRefreshContext.$credentialInteractionGate.withValue(interactionGate) {
-                    await ProviderRefreshContext.$scope.withValue(.full) {
+                    await withThrottledFullAccounting {
                         await dataStore.refreshAll(force: true)
                     }
                 }

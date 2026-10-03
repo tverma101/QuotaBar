@@ -13,15 +13,20 @@ from your OpenCode account plus OpenCode's own logs already on your Mac.
 | Today / Yesterday / Last 30 Days | Cost and tokens across all your OpenCode-hosted usage (Go + Zen), including Claude Code sessions routed through the OpenCode gateway |
 | Usage Trend | A day-by-day sparkline of tokens over the last month |
 
-When you have the Go subscription, QuotaBar shows "Go" beside the provider name.
+QuotaBar shows "Go" beside the provider only after OpenCode's account endpoint confirms usable Go
+usage windows. Having a saved key by itself does not establish that the subscription is active.
 
 The Session / Weekly / Monthly meters are **account-wide**: QuotaBar reads them from OpenCode's official
 usage endpoint (`/zen/go/v1/usage`), so they count every client that uses your OpenCode Go account — the
 OpenCode CLI on any machine, Claude Code sessions routed through the gateway (`anthropic/opencode_go/…`
-models), and anything else billed to the account. If the endpoint is unreachable, the meters fall back
-to this Mac's observed spend against the published caps ($12 / 5h, $30 / week, $60 / month) and the card
-keeps working. If you only use the Zen pay-as-you-go gateway (no Go subscription), the cap meters are
-hidden and you'll just see the spend tiles.
+models), and anything else billed to the account. If the endpoint has a temporary network, server, or
+rate-limit failure, **Show All Accounts** can fall back to this Mac's recent Go spend against the published caps
+($12 / 5h, $30 / week, $60 / month). Local history has no account identity, so this fallback is hidden
+when a specific key is pinned. It never shows the Go badge. If OpenCode rejects a key or cannot confirm
+its Go entitlement, QuotaBar hides the cap meters and keeps the local spend tiles. The Go badge appears
+only after the endpoint returns all three usable account windows (`ok` or `rate-limited`). If you only
+use the Zen pay-as-you-go gateway (no Go subscription), the cap meters are hidden and you'll just see the
+spend tiles.
 
 ## Multiple keys
 
@@ -55,10 +60,13 @@ The account meters show ONLY the official subscription numbers: the percentages 
 account-wide accounting, and each row's dollar context is the remaining allowance derived from that
 same percent against the published caps (e.g. `80% used · $12.00 of $60`) — local estimates never mix
 into these rows. Click a meter's headline to flip the whole card between "used" and "left" readings.
-When the API is unreachable the meters fall back to this Mac's observed spend against the published
-caps — the recorded `opencode*.db` cost plus the gateway-fold estimates from this Mac's Claude Code /
-Codex / Hermes logs (Go-subscription usage only; Zen pay-as-you-go bills separately and is excluded) —
-so the percent and the dollars then come from the same local source and agree exactly.
+When the API has a temporary network, server, or rate-limit failure and no account is pinned, the meters can fall
+back to this Mac's observed spend against the published caps — the recorded `opencode*.db` cost plus
+the gateway-fold estimates from this Mac's Claude Code / Codex / Hermes logs (Go-subscription usage
+only; Zen pay-as-you-go bills separately and is excluded) — so the percent and dollars come from the
+same local source. A pinned key never uses this aggregate because the local rows cannot be assigned to
+that account. Authentication, entitlement, invalid-response, and other client errors (except HTTP 429)
+also suppress the cap fallback.
 The spend tiles combine every client that dials the OpenCode gateway on this Mac:
 
 1. Per-message cost OpenCode records in its local SQLite logs (authoritative dollars), and
@@ -103,11 +111,13 @@ leaves your Mac.
 ## Troubleshooting
 
 - **Everything shows "No data"** — QuotaBar needs OpenCode's local database at
-  `~/.local/share/opencode/opencode*.db`. Run an OpenCode session, then refresh. (If you're logged into
-  Go, the cap meters show at 0% even before your first local message.)
-- **No Session / Weekly / Monthly meters** — those are Go-plan caps; you'll see them when you're logged
-  into OpenCode Go or have used it recently on this Mac. Zen-only (or lapsed) users see the spend tiles
-  instead — old Go history alone won't bring the caps back.
+  `~/.local/share/opencode/opencode*.db`. Run an OpenCode session, then refresh. (An active Go account
+  confirmed by the account endpoint can show cap meters before your first local message.)
+- **No Session / Weekly / Monthly meters** — those are Go-plan caps. The account endpoint must confirm
+  the subscription, or a temporary network/server/rate-limit failure must leave recent local Go usage
+  for the unpinned fallback. A pinned key never uses aggregate local history. Rejected keys, an
+  unconfirmed entitlement, other client errors, or an unreadable response hide the cap meters. A saved
+  key alone is not enough; Zen-only accounts see the spend tiles instead.
 - **"Couldn't read OpenCode's local database"** — the database (or data directory) exists but couldn't be
   read this refresh. Quit OpenCode and refresh; if it persists, check the permissions on
   `~/.local/share/opencode`.

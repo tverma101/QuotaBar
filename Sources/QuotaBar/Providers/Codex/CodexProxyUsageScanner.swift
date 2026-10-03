@@ -58,17 +58,18 @@ actor CodexProxyUsageScanner {
                     throughDay: throughDay
                 )
             ) else { continue }
-            for row in Self.rows(from: payload) {
+            let rows = JSONLAccountingWorkPacer.shared.perform { Self.rows(from: payload) }
+            JSONLAccountingWorkPacer.shared.forEach(rows) { row in
                 guard let day = Self.validDay(row["local_day"] as? String),
                       let model = Self.modelName(row["model"] as? String),
                       let input = Self.count(row["input_tokens"]),
                       let output = Self.count(row["output_tokens"]),
                       let cacheRead = Self.count(row["cache_read_input_tokens"]),
                       let cacheWrite = Self.count(row["cache_creation_input_tokens"])
-                else { continue }
+                else { return }
                 guard let total = Self.total(input: input, cacheRead: cacheRead, cacheWrite: cacheWrite, output: output),
                       total > 0
-                else { continue }
+                else { return }
 
                 sawRows = true
                 let tokens = TokenBreakdown(
@@ -81,7 +82,7 @@ actor CodexProxyUsageScanner {
                       let cost = pricing.estimatedCostDollars(model: pricingModel, tokens: tokens)
                 else {
                     accumulator.addUnknownModel(day: day, model: model)
-                    continue
+                    return
                 }
                 // Same reason as the router scanner: the proxy stamps routing prefixes onto its slugs, so
                 // keying on the raw slug split one model across rows and counted it twice in the total.

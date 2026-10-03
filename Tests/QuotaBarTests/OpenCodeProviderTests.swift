@@ -127,10 +127,9 @@ final class OpenCodeProviderTests: XCTestCase {
         XCTAssertEqual(snapshot.errorCategory, .notLoggedIn)
     }
 
-    func testRefreshShowsZeroCapMetersWithGoKeyButNoDatabase() async {
-        // Freshly logged into Go, before the first local message: the key alone establishes the plan,
-        // so the meters show instead of a bare "No usage data". The account API is down here (401), so
-        // the fallback reads the published caps at 0%.
+    func testKeyAloneDoesNotShowGoPlanWhenAccountRequestIsUnauthorized() async {
+        // A saved key is only a credential candidate. It must not establish a Go plan when the account
+        // endpoint rejects it and there is no local usage to fall back to.
         let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let (client, _) = usageClient(statusCode: 401)
         let provider = OpenCodeProvider(
@@ -142,15 +141,11 @@ final class OpenCodeProviderTests: XCTestCase {
         )
         let snapshot = await provider.refresh()
         XCTAssertNil(snapshot.errorCategory)
-        XCTAssertEqual(snapshot.plan, "Go")
-        guard case .progress(_, let used, let limit, let format, _, _, _, _)? = snapshot.line(label: "Session") else {
-            return XCTFail("expected a Session meter")
-        }
-        XCTAssertEqual(used, 0)
-        XCTAssertEqual(limit, 100)
-        XCTAssertEqual(format, .percent)
-        XCTAssertNotNil(snapshot.line(label: "Weekly"))
-        XCTAssertNotNil(snapshot.line(label: "Monthly"))
+        XCTAssertNil(snapshot.plan)
+        XCTAssertNil(snapshot.line(label: "Session"))
+        XCTAssertNil(snapshot.line(label: "Weekly"))
+        XCTAssertNil(snapshot.line(label: "Monthly"))
+        XCTAssertNotNil(snapshot.warning)
     }
 
     func testAccountMetersUsedWhenAPIAnswers() async {
@@ -185,10 +180,10 @@ final class OpenCodeProviderTests: XCTestCase {
     }
 
     func testLocalFallbackMetersWhenAPIIsUnavailable() async {
-        // Account API down (401): the meters fall back to local-observed spend against the caps.
+        // A transient account API error leaves local-observed spend meters available.
         let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "2.0", 1000, "glm-5.2", "opencode-go") + "]"
-        let (client, http) = usageClient(statusCode: 401)
+        let (client, http) = usageClient(statusCode: 503)
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
@@ -200,8 +195,8 @@ final class OpenCodeProviderTests: XCTestCase {
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
         let snapshot = await provider.refresh()
-        XCTAssertEqual(snapshot.plan, "Go")
-        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertNil(snapshot.plan)
+        XCTAssertNotNil(snapshot.warning)
         XCTAssertEqual(http.requests.count, 1)
         guard case .progress(_, let sessionUsed, _, let format, _, _, _, _)? = snapshot.line(label: "Session") else {
             return XCTFail("expected a Session meter")
@@ -210,8 +205,8 @@ final class OpenCodeProviderTests: XCTestCase {
         XCTAssertEqual(format, .percent)
     }
 
-    func testPartialAccountPayloadFallsBackToLocal() async {
-        // A 200 with a missing window is not usable: the card must not mix account and local meters.
+    func testPartialAccountPayloadDoesNotPresentGoCapMetersAsVerified() async {
+        // A malformed 200 is not proof of an active Go entitlement, so only spend history remains.
         let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "3.0", 1000, "glm-5.2", "opencode-go") + "]"
         let partial = Data(#"{"usage":{"rolling":{"status":"ok","percent":4,"resetsAt":TestLocalInstant.iso(2026, 8, 12, 3, 53, 0)},"weekly":{"status":"ok","percent":25,"resetsAt":TestLocalInstant.iso(2026, 8, 17, 0, 0, 0)}}}"#.utf8)
@@ -227,10 +222,10 @@ final class OpenCodeProviderTests: XCTestCase {
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
         let snapshot = await provider.refresh()
-        guard case .progress(_, let sessionUsed, _, _, _, _, _, _)? = snapshot.line(label: "Session") else {
-            return XCTFail("expected a Session meter")
-        }
-        XCTAssertEqual(sessionUsed, 3.0 / OpenCodeUsageMapper.sessionCap * 100) // local fallback
+        XCTAssertNil(snapshot.plan)
+        XCTAssertNil(snapshot.line(label: "Session"))
+        XCTAssertNotNil(snapshot.line(label: "Today"))
+        XCTAssertNotNil(snapshot.warning)
     }
 
     func testNoAPIWithoutGoKey() async {
@@ -275,6 +270,79 @@ final class OpenCodeProviderTests: XCTestCase {
         }
         XCTAssertEqual(sessionUsed, 4)
         XCTAssertEqual(format, .percent)
+    }
+
+    func testEntitlementErrorSuppressesLocalGoCapFallback() async {
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "2.0", 1000, "glm-5.2", "opencode-go") + "]"
+        let entitlementError = Data(#"{"type":"error","error":{"type":"EntitlementError","message":"OpenCode Go subscription required."}}"#.utf8)
+        let (client, _) = usageClient(statusCode: 403, body: entitlementError)
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
+            usageScanner: OpenCodeUsageScanner(
+                sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databasePaths: { ["/oc/opencode.db"] }
+            ),
+            usageClient: client,
+            now: { now },
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.plan)
+        XCTAssertNil(snapshot.line(label: "Session"))
+        XCTAssertNil(snapshot.line(label: "Weekly"))
+        XCTAssertNil(snapshot.line(label: "Monthly"))
+        XCTAssertNotNil(snapshot.line(label: "Today"))
+        XCTAssertEqual(
+            snapshot.warning,
+            "OpenCode couldn't confirm a Go subscription for this key. Check your account or try again."
+        )
+
+        let previous = ProviderSnapshot(
+            providerID: "opencode",
+            displayName: "OpenCode",
+            plan: "Go",
+            lines: [
+                .progress(label: "Session", used: 3, limit: 100, format: .percent),
+                .progress(label: "Weekly", used: 20, limit: 100, format: .percent),
+                .progress(label: "Monthly", used: 70, limit: 100, format: .percent),
+                .values(label: "Today", values: [MetricValue(number: 42, kind: .count, label: "tokens")]),
+            ],
+            refreshedAt: now
+        )
+        let merged = snapshot.mergingMenuBarUpdate(over: previous)
+        XCTAssertNil(merged.plan)
+        XCTAssertNil(merged.line(label: "Session"))
+        XCTAssertNil(merged.line(label: "Weekly"))
+        XCTAssertNil(merged.line(label: "Monthly"))
+        XCTAssertEqual(merged.line(label: "Today"), snapshot.line(label: "Today"))
+    }
+
+    func testUnrecognizedClientErrorSuppressesLocalGoCapFallback() async {
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "2.0", 1000, "glm-5.2", "opencode-go") + "]"
+        let (client, _) = usageClient(statusCode: 402)
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
+            usageScanner: OpenCodeUsageScanner(
+                sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databasePaths: { ["/oc/opencode.db"] }
+            ),
+            usageClient: client,
+            now: { now },
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.plan)
+        XCTAssertNil(snapshot.line(label: "Session"))
+        XCTAssertNil(snapshot.line(label: "Weekly"))
+        XCTAssertNil(snapshot.line(label: "Monthly"))
+        XCTAssertNotNil(snapshot.line(label: "Today"))
+        XCTAssertNotNil(snapshot.warning)
     }
 
     func testRefreshErrorsWhenAllDatabasesUnreadable() async {

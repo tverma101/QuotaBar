@@ -79,7 +79,11 @@ struct WidgetGroupedListView: View {
             }
             Divider()
             Button("Refresh \(group.provider.displayName)") {
-                Task { await dataStore.refresh(providerID: group.provider.id, force: true) }
+                Task {
+                    await withThrottledFullAccounting {
+                        await dataStore.refresh(providerID: group.provider.id, force: true)
+                    }
+                }
             }
             Button("Customize…") {
                 openCustomize(for: group.provider.id)
@@ -323,7 +327,11 @@ struct WidgetGroupedListView: View {
         Divider()
         if let provider = layout.provider(id: providerID) {
             Button("Refresh \(provider.displayName)") {
-                Task { await dataStore.refresh(providerID: providerID, force: true) }
+                Task {
+                    await withThrottledFullAccounting {
+                        await dataStore.refresh(providerID: providerID, force: true)
+                    }
+                }
             }
         }
         Button("Customize…") {

@@ -97,7 +97,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
-        let scan = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertNotNil(scan)
         XCTAssertTrue(scan!.includesEstimatedCost)
 
@@ -135,7 +135,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
-        let scan = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertNotNil(scan)
         XCTAssertTrue(scan!.includesEstimatedCost)
 
@@ -195,7 +195,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
-        let scan = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         let windows = scan?.goWindows
         XCTAssertNotNil(windows)
         // Recorded $1.00 + the Go fold's catalog price: 100_000/20_000/800_000 at 0.14/0.28/0.0028

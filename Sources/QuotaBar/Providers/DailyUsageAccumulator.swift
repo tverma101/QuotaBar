@@ -59,21 +59,41 @@ struct DailyUsageAccumulator {
         guard !present.isEmpty else { return nil }
         var accumulator = DailyUsageAccumulator()
         for scan in present {
-            for day in scan.modelUsage?.daily ?? [] {
-                for model in day.models {
-                    // Skip cost-unknown entries rather than treating nil as $0 — their unknown-model
-                    // metadata is already carried through via unknownModelsByDay below.
-                    guard let cost = model.costUSD else { continue }
-                    accumulator.add(day: day.date, tokens: model.totalTokens, cost: cost, model: model.model)
-                }
-            }
-            for (day, models) in scan.unknownModelsByDay {
-                for model in models {
-                    accumulator.addUnknownModel(day: day, model: model)
+            accumulator.merge(scan)
+        }
+        return accumulator.build()
+    }
+
+    /// Merge a previously assembled scan without losing gateway spellings preserved as variants.
+    private mutating func merge(_ scan: LogUsageScan) {
+        for day in scan.modelUsage?.daily ?? [] {
+            for model in day.models {
+                guard let cost = model.costUSD else { continue }
+                if let variants = model.variants, !variants.isEmpty {
+                    for variant in variants {
+                        add(
+                            day: day.date,
+                            tokens: variant.totalTokens,
+                            cost: variant.costUSD ?? 0,
+                            model: variant.model,
+                            canonical: model.model
+                        )
+                    }
+                } else {
+                    add(
+                        day: day.date,
+                        tokens: model.totalTokens,
+                        cost: cost,
+                        model: model.model
+                    )
                 }
             }
         }
-        return accumulator.build()
+        for (day, models) in scan.unknownModelsByDay {
+            for model in models {
+                addUnknownModel(day: day, model: model)
+            }
+        }
     }
 
     /// Merge a primary scan with optional gap-fill supplements.

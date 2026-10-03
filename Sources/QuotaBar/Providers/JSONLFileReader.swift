@@ -121,30 +121,32 @@ enum JSONLFileReader {
             // multi-GB corpus `leaks --autoreleasePools` measured **1,025 MB across 13,126
             // NSConcreteData** sitting in pools, which is the bulk of a cold scan's footprint: the
             // app itself holds almost nothing (live heap ~25 MB, largest owned array 1.06 MB).
-            autoreleasepool {
-                let chunk: Data
-                do {
-                    guard let next = try handle.read(upToCount: chunkSize), !next.isEmpty else {
+            JSONLAccountingWorkPacer.shared.perform {
+                autoreleasepool {
+                    let chunk: Data
+                    do {
+                        guard let next = try handle.read(upToCount: chunkSize), !next.isEmpty else {
+                            reachedEnd = true
+                            return
+                        }
+                        chunk = next
+                    } catch {
+                        readFailed = true
                         reachedEnd = true
                         return
                     }
-                    chunk = next
-                } catch {
-                    readFailed = true
-                    reachedEnd = true
-                    return
-                }
 
-                statistics.bytesRead += chunk.count
-                statistics.chunksRead += 1
-                Self.splitAndDeliver(
-                    chunk,
-                    carry: &carry,
-                    discarding: &discarding,
-                    statistics: &statistics,
-                    maxLineBytes: maxLineBytes,
-                    deliver: deliver
-                )
+                    statistics.bytesRead += chunk.count
+                    statistics.chunksRead += 1
+                    Self.splitAndDeliver(
+                        chunk,
+                        carry: &carry,
+                        discarding: &discarding,
+                        statistics: &statistics,
+                        maxLineBytes: maxLineBytes,
+                        deliver: deliver
+                    )
+                }
             }
         }
 

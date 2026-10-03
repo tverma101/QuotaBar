@@ -228,7 +228,7 @@ struct OpenCodeUsageScanner: Sendable {
         }
     }
 
-    func scan(now: Date, daysBack: Int = 30, hasGoKey: Bool = false, pricing: ModelPricing = .empty) async throws -> OpenCodeUsageScan? {
+    func scan(now: Date, daysBack: Int = 30, pricing: ModelPricing = .empty) async throws -> OpenCodeUsageScan? {
         let paths: [String]
         do {
             paths = try databasePaths()
@@ -260,7 +260,8 @@ struct OpenCodeUsageScanner: Sendable {
             checked.insert(path)
             do {
                 if let json = try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs)) {
-                    rows.append(contentsOf: Self.parseRows(json))
+                    let parsedRows = JSONLAccountingWorkPacer.shared.perform { Self.parseRows(json) }
+                    rows.append(contentsOf: parsedRows)
                 }
             } catch {
                 failures[path] = error.localizedDescription
@@ -294,9 +295,9 @@ struct OpenCodeUsageScanner: Sendable {
         // authoritative, so every row is "priced": feed it straight into the shared accumulator.
         let tileSince = JSONLScanning.sinceDate(daysBack: 30, now: now)
         var accumulator = DailyUsageAccumulator()
-        for row in rows {
+        JSONLAccountingWorkPacer.shared.forEach(rows) { row in
             let date = Date(timeIntervalSince1970: row.ms / 1000)
-            guard date >= tileSince else { continue }
+            guard date >= tileSince else { return }
             accumulator.add(
                 day: DailyUsageAccumulator.dayKey(from: date),
                 tokens: row.tokens, cost: row.cost, model: row.model
@@ -319,9 +320,13 @@ struct OpenCodeUsageScanner: Sendable {
         // gateway folds below append their imputed dollars (Claude Code / Codex / Hermes burn the
         // same Go quota but never reach the DB; Zen pay-as-you-go usage is excluded — it bills
         // separately, not against the Session / Weekly / Monthly caps).
-        var goWindowCosts: [(ms: Double, cost: Double)] = rows
-            .filter { $0.providerID == Self.goProviderID }
-            .map { (ms: $0.ms, cost: $0.cost) }
+        var goWindowCosts: [(ms: Double, cost: Double)] = []
+        goWindowCosts.reserveCapacity(rows.count)
+        JSONLAccountingWorkPacer.shared.forEach(rows) { row in
+            if row.providerID == Self.goProviderID {
+                goWindowCosts.append((ms: row.ms, cost: row.cost))
+            }
+        }
         // Claude Code sessions routed through the gateway — parsed with the Claude scanner's own
         // incremental parser (a persistent cache shared with the Claude card, so unchanged session
         // logs aren't re-parsed on every 5-minute refresh). Their logs carry no per-message cost, so
@@ -432,12 +437,9 @@ struct OpenCodeUsageScanner: Sendable {
         }
         let logScan = accumulator.build()
 
-        // Go-only windows → the Session / Weekly / Monthly caps. Shown only on a CURRENT Go signal: the
-        // user is logged into Go (`hasGoKey`), or has spent on Go within the window — recorded or
-        // folded — so a stale anchor from old usage must NOT resurrect the caps or the "Go" plan for a
-        // lapsed or Zen-only user; the anchor only sets the monthly-cycle boundary once we've decided
-        // to show the meters.
-        let goWindows: OpenCodeGoWindows? = (hasGoKey || !goWindowCosts.isEmpty)
+        // Local fallback windows need current Go spend. A key's presence alone does not prove an active
+        // subscription; the provider uses the account endpoint to confirm that case.
+        let goWindows: OpenCodeGoWindows? = !goWindowCosts.isEmpty
             ? OpenCodeGoWindowMath.compute(costs: goWindowCosts, anchorMs: anchorMs, now: now)
             : nil
 
@@ -640,91 +642,164 @@ struct OpenCodeUsageScanner: Sendable {
         RouterLedgerTail.shared.rows(atPath: path, since: since)
     }
 
-    /// Per-ledger tail state: how far it has been consumed, and the rows that fall inside the window.
+    /// Read counters for the offline performance benchmark and cache regression tests.
+    static func routerLedgerReadStatisticsForTesting(path: String) -> (fullParses: Int, tailParses: Int, bytesRead: Int)? {
+        RouterLedgerTail.shared.statistics(path: path)
+    }
+
+    /// Per-ledger, bounded append cache. `JSONLFileReader` owns newline carry so a line split between
+    /// refreshes is read exactly once; `AppendOnlyFileProbe` rejects replacement and truncate/regrow.
     private final class RouterLedgerTail: @unchecked Sendable {
         static let shared = RouterLedgerTail()
 
-        /// Rows older than this are dropped from the cache. Comfortably wider than the 30-day display
-        /// window, so a widening window never needs a re-read.
+        /// Keep enough history for the current 30-day display window plus small clock/window changes.
         private static let retentionDays = 45
 
-        private struct State {
-            var offset: UInt64 = 0
-            var rows: [ClaudeGatewayRow] = []
-            /// Bytes of a line the writer had not finished when we last read.
-            ///
-            /// This must persist across calls. Holding it in a function-local buffer meant the bytes after
-            /// the last newline were dropped when the function returned — the offset said EOF while those
-            /// bytes had never been parsed, so a line completed by the next refresh was lost forever.
-            var partial: Data = Data()
-        }
+        private struct ParserCheckpoint: Sendable, Equatable {}
+
+        private static let cache = AppendOnlyFileTailCache<ClaudeGatewayRow, ParserCheckpoint>(
+            maxEntries: 8,
+            maxRetainedItems: 64_000
+        )
 
         private let lock = NSLock()
-        private var states: [String: State] = [:]
 
         func rows(atPath path: String, since: Date) -> [ClaudeGatewayRow] {
-            let cutoff = Date().addingTimeInterval(-Double(Self.retentionDays) * 86_400)
-            return lock.withLock {
-                var state = states[path] ?? State()
-
-                // Truncated or rotated: the cached offset is meaningless, so start over.
-                if let size = fileSize(path), size < state.offset {
-                    state = State()
+            lock.withLock {
+                let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+                let key = url.path
+                guard let current = AppendOnlyFileProbe.revision(at: url) else {
+                    Self.cache.remove(key)
+                    return []
                 }
 
-                if let size = fileSize(path), size > state.offset {
-                    consumeNewBytes(of: path, into: &state, upTo: size)
+                let retentionCutoff = Date().addingTimeInterval(-Double(Self.retentionDays) * 86_400)
+                if let cached = Self.cache.entry(for: key),
+                   current.device == cached.revision.device,
+                   current.inode == cached.revision.inode,
+                   current.size >= cached.offset,
+                   AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor {
+                    if current.size == cached.offset, cached.itemsAvailable {
+                        return cached.items.filter { $0.date >= since }
+                    }
+
+                    if current.size > cached.offset, cached.itemsAvailable,
+                       let rows = readAppend(at: url, key: key, current: current, cached: cached,
+                                             retentionCutoff: retentionCutoff) {
+                        return rows.filter { $0.date >= since }
+                    }
                 }
 
-                state.rows.removeAll { $0.date < cutoff }
-                states[path] = state
-                return state.rows.filter { $0.date >= since }
+                guard let rows = readWholeFile(at: url, key: key, retentionCutoff: retentionCutoff) else {
+                    return []
+                }
+                return rows.filter { $0.date >= since }
             }
         }
 
-        private func fileSize(_ path: String) -> UInt64? {
-            let attributes = try? FileManager.default.attributesOfItem(atPath: path)
-            return (attributes?[.size] as? NSNumber)?.uint64Value
+        func statistics(path: String) -> (fullParses: Int, tailParses: Int, bytesRead: Int)? {
+            let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+            guard let stats = Self.cache.statistics(for: url.path) else { return nil }
+            return (stats.fullParses, stats.tailParses, stats.bytesRead)
         }
 
-        /// Reads to EOF, then sets the offset to the start of any line the writer had not finished.
-        ///
-        /// The rewind happens **once, after the loop**. Doing it per-iteration either re-read the same
-        /// bytes (infinite) or, with a `break`, stopped after a single chunk and left the fold lagging
-        /// megabytes behind. Reading forward and rewinding at the end cannot do either.
-        private func consumeNewBytes(of path: String, into state: inout State, upTo size: UInt64) {
-            guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return }
-            defer { try? handle.close() }
-            do { try handle.seek(toOffset: state.offset) } catch { return }
-
-            var buffer = state.partial
-            defer { state.partial = buffer }
-            let chunkSize = 1 << 20
-
-            while state.offset < size {
-                // A cancelled refresh stops here; `offset` and the carry are written back by the defers, so
-                // the next call resumes exactly where this one stopped.
-                if Task.isCancelled { return }
-                let remaining = size - state.offset
-                guard let chunk = try? handle.read(upToCount: Int(min(UInt64(chunkSize), remaining))),
-                      !chunk.isEmpty else { break }
-                state.offset += UInt64(chunk.count)
-                buffer.append(chunk)
-
-                // Consume only what is complete: everything up to and including the LAST newline. Bytes after
-                // it are a line the writer has not finished, and stay in the carry.
-                guard let lastNewline = buffer.lastIndex(of: UInt8(ascii: "\n")) else { continue }
-                let completeEnd = buffer.index(after: lastNewline)
-                for line in buffer[..<completeEnd].split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true) {
-                    if let row = OpenCodeUsageScanner.routerGatewayRow(from: Data(line)) { state.rows.append(row) }
+        private func readAppend(
+            at url: URL,
+            key: String,
+            current: AppendOnlyFileRevision,
+            cached: AppendOnlyFileTailCache<ClaudeGatewayRow, ParserCheckpoint>.Entry,
+            retentionCutoff: Date
+        ) -> [ClaudeGatewayRow]? {
+            var appended: [ClaudeGatewayRow] = []
+            var read = JSONLFileReader.readLines(
+                at: url,
+                chunkSize: 64 * 1024,
+                startOffset: cached.offset,
+                initialCarry: cached.partialLine,
+                discardingOversizedLine: cached.isDiscardingOversizedLine,
+                deliverFinalPartial: false
+            ) { line in
+                if let row = OpenCodeUsageScanner.routerGatewayRow(from: Data(line)), row.date >= retentionCutoff {
+                    appended.append(row)
                 }
-                buffer = Data(buffer[completeEnd...])
+            }
+            guard read.succeeded else { return nil }
+
+            // A writer may close a complete final object without a newline. The parser validates the
+            // whole `{...}` object before accepting it; an incomplete object stays in `partialLine`.
+            if !read.finalPartial.isEmpty,
+               let row = OpenCodeUsageScanner.routerGatewayRow(from: read.finalPartial),
+               row.date >= retentionCutoff {
+                appended.append(row)
+                read.finalPartial = Data()
             }
 
-            // Rewind once, for the incomplete tail only, so the next call re-reads it whole.
-            if state.offset >= UInt64(buffer.count) {
-                state.offset -= UInt64(buffer.count)
+            let newOffset = cached.offset + UInt64(read.statistics.bytesRead)
+            guard let after = AppendOnlyFileProbe.revision(at: url),
+                  after.device == current.device,
+                  after.inode == current.inode,
+                  after.size >= newOffset,
+                  let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: newOffset)
+            else { return nil }
+
+            let retained = cached.items.filter { $0.date >= retentionCutoff } + appended
+            Self.cache.store(
+                AppendOnlyFileTailCache<ClaudeGatewayRow, ParserCheckpoint>.Entry(
+                    revision: after,
+                    offset: newOffset,
+                    anchor: anchor,
+                    partialLine: read.finalPartial,
+                    isDiscardingOversizedLine: read.isDiscardingOversizedLine,
+                    parserState: ParserCheckpoint(),
+                    items: retained
+                ),
+                for: key,
+                parseKind: .tail,
+                bytesRead: read.statistics.bytesRead
+            )
+            return retained
+        }
+
+        private func readWholeFile(at url: URL, key: String, retentionCutoff: Date) -> [ClaudeGatewayRow]? {
+            var rows: [ClaudeGatewayRow] = []
+            var read = JSONLFileReader.readLines(
+                at: url,
+                chunkSize: 64 * 1024,
+                deliverFinalPartial: false
+            ) { line in
+                if let row = OpenCodeUsageScanner.routerGatewayRow(from: Data(line)), row.date >= retentionCutoff {
+                    rows.append(row)
+                }
             }
+            guard read.succeeded else { return nil }
+            if !read.finalPartial.isEmpty,
+               let row = OpenCodeUsageScanner.routerGatewayRow(from: read.finalPartial),
+               row.date >= retentionCutoff {
+                rows.append(row)
+                read.finalPartial = Data()
+            }
+
+            let offset = UInt64(read.statistics.bytesRead)
+            guard let revision = AppendOnlyFileProbe.revision(at: url),
+                  revision.size >= offset,
+                  let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: offset)
+            else { return rows }
+
+            Self.cache.store(
+                AppendOnlyFileTailCache<ClaudeGatewayRow, ParserCheckpoint>.Entry(
+                    revision: revision,
+                    offset: offset,
+                    anchor: anchor,
+                    partialLine: read.finalPartial,
+                    isDiscardingOversizedLine: read.isDiscardingOversizedLine,
+                    parserState: ParserCheckpoint(),
+                    items: rows
+                ),
+                for: key,
+                parseKind: .full,
+                bytesRead: read.statistics.bytesRead
+            )
+            return rows
         }
     }
 
@@ -749,23 +824,23 @@ struct OpenCodeUsageScanner: Sendable {
         // every line, and costs nothing for the lines we discard.
         // Trim once and reuse: the classifier trims, so an untrimmed provider here made `burnsGoQuota`
         // disagree with inclusion and put one turn in the tiles but not in the cap meters.
-        guard let rawProvider = jsonScalar(for: "provider", in: line) else { return nil }
+        guard let rawProvider = jsonScalar(for: RouterLedgerField.provider, in: line) else { return nil }
         let provider = rawProvider.trimmingCharacters(in: .whitespacesAndNewlines)
         guard CodexRouterUsageScanner.isOpenCodeProvider(provider),
-              let status = jsonInteger(for: "status", in: line),
+              let status = jsonInteger(for: RouterLedgerField.status, in: line),
               CodexRouterUsageScanner.isSuccessfulStatus(status),
-              let at = jsonScalar(for: "at", in: line),
+              let at = jsonScalar(for: RouterLedgerField.at, in: line),
               let timestamp = OpenUsageISO8601.date(from: at)
         else { return nil }
-        let input = max(0, jsonInteger(for: "inputTokens", in: line) ?? 0)
-        let cached = min(max(0, jsonInteger(for: "cachedInputTokens", in: line) ?? 0), input)
+        let input = max(0, jsonInteger(for: RouterLedgerField.inputTokens, in: line) ?? 0)
+        let cached = min(max(0, jsonInteger(for: RouterLedgerField.cachedInputTokens, in: line) ?? 0), input)
         return ClaudeGatewayRow(
             date: timestamp,
             input: input - cached,
-            output: max(0, jsonInteger(for: "outputTokens", in: line) ?? 0),
+            output: max(0, jsonInteger(for: RouterLedgerField.outputTokens, in: line) ?? 0),
             cacheWrite: 0,
             cacheRead: cached,
-            model: bareRouterModelName(jsonScalar(for: "model", in: line) ?? ""),
+            model: bareRouterModelName(jsonScalar(for: RouterLedgerField.model, in: line) ?? ""),
             // Only the Go subscription's cap meters are consumed by `opencode-go`; Zen and the free tier
             // are billed outside those caps.
             burnsGoQuota: provider.lowercased().hasPrefix("opencode-go"),
@@ -773,11 +848,19 @@ struct OpenCodeUsageScanner: Sendable {
         )
     }
 
+    /// Field needles are reused across rows so the fast path builds no per-field `Data` values.
+    private enum RouterLedgerField {
+        static let provider = Data("\"provider\":".utf8)
+        static let status = Data("\"status\":".utf8)
+        static let at = Data("\"at\":".utf8)
+        static let inputTokens = Data("\"inputTokens\":".utf8)
+        static let cachedInputTokens = Data("\"cachedInputTokens\":".utf8)
+        static let outputTokens = Data("\"outputTokens\":".utf8)
+        static let model = Data("\"model\":".utf8)
+    }
+
     /// Value of a `"key":"value"` scalar, without building a dictionary.
-    private static func jsonScalar(for key: String, in data: Data) -> String? {
-        // The colon belongs in the needle: `"provider":` — matching `"provider"` alone leaves the
-        // separator next, which is not the opening quote of the value.
-        let needle = Data(("\"" + key + "\":").utf8)
+    private static func jsonScalar(for needle: Data, in data: Data) -> String? {
         guard let start = data.range(of: needle)?.upperBound else { return nil }
         guard start < data.endIndex, data[start] == UInt8(ascii: "\"") else { return nil }
         let valueStart = data.index(after: start)
@@ -786,8 +869,7 @@ struct OpenCodeUsageScanner: Sendable {
     }
 
     /// Value of a `"key":<number>` scalar, without building a dictionary.
-    private static func jsonInteger(for key: String, in data: Data) -> Int? {
-        let needle = Data(("\"" + key + "\":").utf8)
+    private static func jsonInteger(for needle: Data, in data: Data) -> Int? {
         guard let start = data.range(of: needle)?.upperBound else { return nil }
         var value = 0
         var seen = false
@@ -897,7 +979,8 @@ struct OpenCodeUsageScanner: Sendable {
         includesEstimatedCost: inout Bool,
         partialDays: inout Set<String>
     ) {
-        for row in rows where row.date >= since {
+        JSONLAccountingWorkPacer.shared.forEach(rows) { row in
+            guard row.date >= since else { return }
             let day = DailyUsageAccumulator.dayKey(from: row.date)
             if row.isInProgress {
                 // Still-running Hermes session: its ledger is not final (Hermes writes it in
@@ -954,7 +1037,8 @@ struct OpenCodeUsageScanner: Sendable {
     /// "Pro pricing wrong" bug the supplement pin fixed.
     private static func effectiveRates(from rows: [Row]) -> [String: Double] {
         var totals: [String: (cost: Double, tokens: Double)] = [:]
-        for row in rows where row.tokens > 0 {
+        JSONLAccountingWorkPacer.shared.forEach(rows) { row in
+            guard row.tokens > 0 else { return }
             // Muse Spark and DeepSeek Pro must use the catalog — their DB samples
             // are either tiny/uncached (Muse: 7 rows / 60k tokens → $43/M blended
             // would price the 426M-token harness at $18k vs $81 at the supplement's
@@ -965,7 +1049,7 @@ struct OpenCodeUsageScanner: Sendable {
             // blended rate is not systematically inflated and the existing
             // gateway test expects calibration.
             if row.model.hasPrefix("muse-") || row.model == "deepseek-v4-pro" || row.model == "deepseek/deepseek-v4-pro" {
-                continue
+                return
             }
             let t = totals[row.model] ?? (0, 0)
             totals[row.model] = (t.cost + row.cost, t.tokens + Double(row.tokens))

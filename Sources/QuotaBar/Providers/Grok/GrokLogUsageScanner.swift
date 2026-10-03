@@ -184,15 +184,24 @@ actor GrokLogUsageScanner {
 
     static func dedup(_ entries: [Entry]) -> [Entry] {
         var seen: Set<String> = []
-        return entries.filter { entry in
-            guard let eventID = entry.eventID else { return true }
-            return seen.insert(eventID + "\0" + entry.model).inserted
+        var output: [Entry] = []
+        output.reserveCapacity(entries.count)
+        JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
+            guard let eventID = entry.eventID else {
+                output.append(entry)
+                return
+            }
+            if seen.insert(eventID + "\0" + entry.model).inserted {
+                output.append(entry)
+            }
         }
+        return output
     }
 
     static func aggregate(entries: [Entry], since: Date, pricing: ModelPricing) -> LogUsageScan {
         var accumulator = DailyUsageAccumulator()
-        for entry in entries where entry.timestamp >= since {
+        JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
+            guard entry.timestamp >= since else { return }
             let day = DailyUsageAccumulator.dayKey(from: entry.timestamp)
             guard let cost = entry.carriedCost
                 ?? pricing.estimatedCostDollars(model: entry.model, tokens: entry.tokens)
@@ -200,7 +209,7 @@ actor GrokLogUsageScanner {
                 if entry.tokens.totalTokens > 0 {
                     accumulator.addUnknownModel(day: day, model: entry.model)
                 }
-                continue
+                return
             }
             accumulator.add(day: day, tokens: entry.tokens.totalTokens, cost: cost, model: entry.model)
         }

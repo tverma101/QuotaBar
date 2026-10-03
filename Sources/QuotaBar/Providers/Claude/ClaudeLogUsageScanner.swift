@@ -626,10 +626,10 @@ actor ClaudeLogUsageScanner {
         var exactIndex: [ExactKey: Int] = [:]
         var messageIndex: [String: [Int]] = [:]
 
-        for entry in entries {
+        JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
             guard let messageID = entry.messageID else {
                 deduped.append(entry)
-                continue
+                return
             }
             let key = ExactKey(messageID: messageID, requestID: entry.requestID)
             let collision = exactIndex[key] ?? messageIndex[messageID]?.first(where: { index in
@@ -645,7 +645,7 @@ actor ClaudeLogUsageScanner {
                     deduped[index] = entry
                     exactIndex[key] = index
                 }
-                continue
+                return
             }
 
             let index = deduped.count
@@ -683,7 +683,8 @@ actor ClaudeLogUsageScanner {
     static func aggregate(entries: [Entry], since: Date, pricing: ModelPricing) -> LogUsageScan {
         var accumulator = DailyUsageAccumulator()
 
-        for entry in entries where entry.timestamp >= since {
+        JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
+            guard entry.timestamp >= since else { return }
             let day = DailyUsageAccumulator.dayKey(from: entry.timestamp)
             // One trimmed slug for pricing, the unknown-model warning, and the breakdown key alike —
             // diverging spellings would let the warning triangle and the hover panel disagree.
@@ -691,7 +692,7 @@ actor ClaudeLogUsageScanner {
             let modelName = trimmedModel ?? ModelUsageEntry.unattributedModelName
             // OpenCode Go/Zen gateway turns are folded into the OpenCode card; counting them here
             // double-counts the same dollars/tokens in Total Spend.
-            if let trimmedModel, OpenCodeUsageScanner.isHostedGatewayModel(trimmedModel) { continue }
+            if let trimmedModel, OpenCodeUsageScanner.isHostedGatewayModel(trimmedModel) { return }
 
             let cost: Double
             if let carried = entry.costUSD {
@@ -702,7 +703,7 @@ actor ClaudeLogUsageScanner {
                 if let model = trimmedModel, entry.tokens.totalTokens > 0 {
                     accumulator.addUnknownModel(day: day, model: model)
                 }
-                continue
+                return
             }
 
             accumulator.add(day: day, tokens: entry.tokens.totalTokens, cost: cost, model: modelName)

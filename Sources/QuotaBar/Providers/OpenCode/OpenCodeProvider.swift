@@ -11,9 +11,15 @@ enum OpenCodeUsageError: Error, LocalizedError, Equatable {
     /// OpenCode databases exist on disk but none could be read this refresh. Failing loudly here beats
     /// rendering authoritative-looking $0 meters from an empty scan.
     case databaseUnreadable
-    /// The `/zen/go/v1/usage` account endpoint rejected the `opencode-go` key (401/403) — stale or
-    /// revoked. The card keeps working off local logs, but the account meters are unavailable.
+    /// The `/zen/go/v1/usage` account endpoint rejected the `opencode-go` key (401). The card keeps
+    /// working off local logs, but the account meters are unavailable.
     case accountAPIUnauthorized
+    /// The usage endpoint did not confirm a Go entitlement for this key. Keep this distinct from a
+    /// bad key; because entitlement lookups can be false negatives, the UI says "couldn't confirm"
+    /// and clears the active-plan claim rather than saying the subscription is inactive.
+    case accountAPINoEntitlement
+    /// The account endpoint returned a malformed body or an unknown window status.
+    case accountAPIInvalidResponse
     /// The account endpoint answered with an unexpected HTTP status. `statusCode` feeds telemetry; the
     /// card falls back to local logs.
     case accountAPIRequestFailed(Int)
@@ -21,6 +27,18 @@ enum OpenCodeUsageError: Error, LocalizedError, Equatable {
     /// partial JSON, non-`ok` windows). `detail` is for the log file only. The card falls back to local
     /// logs rather than rendering partial meters.
     case accountAPIUnavailable(detail: String)
+
+    var blocksLocalGoFallback: Bool {
+        switch self {
+        case .accountAPIUnauthorized, .accountAPINoEntitlement, .accountAPIInvalidResponse:
+            true
+        case .accountAPIRequestFailed(let status) where (400..<500).contains(status) && status != 429:
+            true
+        case .notLoggedIn, .credentialsUnreadable, .databaseUnreadable,
+             .accountAPIRequestFailed, .accountAPIUnavailable:
+            false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -31,11 +49,15 @@ enum OpenCodeUsageError: Error, LocalizedError, Equatable {
         case .databaseUnreadable:
             return "Couldn't read OpenCode's local database. Quit OpenCode and refresh, or check the data directory's permissions."
         case .accountAPIUnauthorized:
-            return "OpenCode Go rejected the saved key. Log into OpenCode Go again; showing local usage meanwhile."
+            return "OpenCode couldn't verify this Go key. Check the key and refresh; showing local usage meanwhile."
+        case .accountAPINoEntitlement:
+            return "OpenCode couldn't confirm a Go subscription for this key. Check your account or try again."
+        case .accountAPIInvalidResponse:
+            return "OpenCode returned Go usage data QuotaBar couldn't read. Try refreshing."
         case .accountAPIRequestFailed:
-            return "OpenCode's usage service had an error. Showing local usage meanwhile."
+            return "OpenCode's Go usage service returned an error."
         case .accountAPIUnavailable:
-            return "Couldn't reach OpenCode's usage service. Showing local usage meanwhile."
+            return "Couldn't reach OpenCode's Go usage service."
         }
     }
 }
@@ -180,8 +202,6 @@ final class OpenCodeProvider: ProviderRuntime {
             loggedStoredKeysFailure = true
             AppLog.warn(LogTag.plugin("opencode"), "app-saved OpenCode Go keys unreadable; using auth.json keys only")
         }
-        let hasGoKey = !apiKeys.isEmpty
-
         // History-skip note: OpenCode's Session/Weekly meters can fall back to `goWindows` derived
         // from the same local scan that builds spend history, so there is no clean quota-vs-history
         // split. Unpinned OpenCode cards are simply omitted from `.menuBar` passes by
@@ -189,7 +209,7 @@ final class OpenCodeProvider: ProviderRuntime {
         let modelPricing = await pricing()
         let scan: OpenCodeUsageScan?
         do {
-            scan = try await usageScanner.scan(now: refreshedAt, hasGoKey: hasGoKey, pricing: modelPricing)
+            scan = try await usageScanner.scan(now: refreshedAt, pricing: modelPricing)
         } catch {
             return ProviderSnapshot.error(provider: provider, error: error)
         }
@@ -199,6 +219,7 @@ final class OpenCodeProvider: ProviderRuntime {
         // copies of the same key (auth.json plus an app-saved copy) collapse; different keys remain
         // separate even when their current window values happen to match.
         var accountUsages: [(name: String, keyID: String, credentialID: String, usage: OpenCodeGoAccountUsage)] = []
+        var accountAPIErrors: [(name: String, keyID: String, error: OpenCodeUsageError)] = []
         if !apiKeys.isEmpty {
             for entry in apiKeys {
                 do {
@@ -210,9 +231,14 @@ final class OpenCodeProvider: ProviderRuntime {
                     ))
                     loggedAccountAPIFailure = false
                 } catch {
+                    let usageError = (error as? OpenCodeUsageError)
+                        ?? .accountAPIUnavailable(detail: error.localizedDescription)
+                    accountAPIErrors.append(
+                        (name: entry.name, keyID: entry.id, error: usageError)
+                    )
                     if !loggedAccountAPIFailure {
                         loggedAccountAPIFailure = true
-                        AppLog.warn(LogTag.plugin("opencode"), "account usage API unavailable (\(entry.name)): \(error.localizedDescription)")
+                        AppLog.warn(LogTag.plugin("opencode"), "account usage API unavailable (\(entry.name)): \(usageError.localizedDescription)")
                     }
                 }
             }
@@ -222,7 +248,7 @@ final class OpenCodeProvider: ProviderRuntime {
         var accountIndexByKeyID: [String: Int] = [:]
         var keyNameByKeyID: [String: String] = [:]
         var distinctAccounts: [(name: String, credentialID: String, usage: OpenCodeGoAccountUsage)] = []
-        for entry in accountUsages where entry.usage.isAvailable {
+        for entry in accountUsages {
             keyNameByKeyID[entry.keyID] = entry.name
             if let idx = distinctAccounts.firstIndex(where: { $0.credentialID == entry.credentialID }) {
                 accountIndexByKeyID[entry.keyID] = idx
@@ -231,33 +257,80 @@ final class OpenCodeProvider: ProviderRuntime {
                 distinctAccounts.append((entry.name, entry.credentialID, entry.usage))
             }
         }
+        let selectedKeyID = activeKeyID()
+        let selectedKeyIsKnown = selectedKeyID.map { selectedID in
+            apiKeys.contains { $0.id == selectedID }
+        } ?? false
+        let selectedKeyHasAccount = selectedKeyID.map { accountIndexByKeyID[$0] != nil } ?? false
         let accountMeters: [MetricLine]
-        if distinctAccounts.count == 1 {
+        if distinctAccounts.count == 1,
+           (!selectedKeyIsKnown || selectedKeyHasAccount) {
+            // With one distinct account, deduplicated copies and stored selections collapse to one
+            // unsuffixed set of meters as before.
             accountMeters = OpenCodeUsageMapper.accountMeterLines(distinctAccounts[0].usage)
-        } else if let selectedID = activeKeyID(),
-                  let idx = accountIndexByKeyID[selectedID],
-                  let selectedName = keyNameByKeyID[selectedID] {
+        } else if selectedKeyIsKnown,
+           let selectedKeyID,
+           let idx = accountIndexByKeyID[selectedKeyID],
+           let selectedName = keyNameByKeyID[selectedKeyID] {
             // A pinned key: swap the card to its account only, labeled so the view stays unambiguous.
             accountMeters = OpenCodeUsageMapper.accountMeterLines(distinctAccounts[idx].usage, labelSuffix: selectedName)
+        } else if selectedKeyIsKnown {
+            // The selected key is not one of the usable account responses. Never show a different
+            // key's account-wide meter as though it belonged to the pinned account.
+            accountMeters = []
         } else {
             // No selection (or it doesn't match a fetched key): every distinct account as separate rows.
             accountMeters = distinctAccounts.flatMap { entry in
                 OpenCodeUsageMapper.accountMeterLines(entry.usage, labelSuffix: entry.name)
             }
         }
-        let hasAccountUsage = !distinctAccounts.isEmpty
+        let hasAccountUsage = !accountMeters.isEmpty
+        let relevantAccountErrors = selectedKeyIsKnown ? accountAPIErrors.filter { $0.keyID == selectedKeyID } : accountAPIErrors
+        let accountErrorForDisplay = relevantAccountErrors.first { $0.error.blocksLocalGoFallback }
+            ?? relevantAccountErrors.first
+        let shouldSuppressLocalGoFallback: Bool
+        if selectedKeyIsKnown {
+            // Local windows aggregate every Go row and carry no account identity. A pinned account
+            // can only use the endpoint's result for that exact key, never the aggregate fallback.
+            shouldSuppressLocalGoFallback = !selectedKeyHasAccount
+                || relevantAccountErrors.contains { $0.error.blocksLocalGoFallback }
+        } else {
+            shouldSuppressLocalGoFallback = accountAPIErrors.contains { $0.error.blocksLocalGoFallback }
+        }
+        let clearsPriorMenuBarQuotaState = relevantAccountErrors.contains {
+            $0.error.blocksLocalGoFallback
+        }
 
         guard let scan else {
             // No OpenCode database on disk at all.
-            if hasGoKey {
-                // Freshly logged into Go, before the first local message: the key alone establishes the
-                // plan, so the meters show (account-wide values when the API answers, the published
-                // caps at 0% otherwise) rather than a bare "No usage data".
-                let windows = OpenCodeGoWindowMath.compute(costs: [], anchorMs: nil, now: refreshedAt)
-                let meters = hasAccountUsage ? accountMeters : OpenCodeUsageMapper.meterLines(windows)
+            if hasAccountUsage {
                 return ProviderSnapshot.make(
                     provider: provider, plan: "Go",
-                    lines: meters, refreshedAt: refreshedAt
+                    lines: accountMeters,
+                    refreshedAt: refreshedAt,
+                    warning: accountErrorForDisplay?.error.localizedDescription,
+                    clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
+                )
+            }
+            if let accountErrorForDisplay {
+                if accountErrorForDisplay.error.blocksLocalGoFallback {
+                    return ProviderSnapshot.make(
+                        provider: provider,
+                        plan: nil,
+                        lines: [.noUsageData],
+                        refreshedAt: refreshedAt,
+                        warning: accountErrorForDisplay.error.localizedDescription,
+                        clearsPriorMenuBarQuotaState: true
+                    )
+                }
+                return ProviderSnapshot.error(provider: provider, error: accountErrorForDisplay.error)
+            }
+            if !apiKeys.isEmpty {
+                return ProviderSnapshot.error(
+                    provider: provider,
+                    error: OpenCodeUsageError.accountAPIUnavailable(
+                        detail: "usage response did not contain three active Go windows"
+                    )
                 )
             }
             return ProviderSnapshot.error(
@@ -269,7 +342,7 @@ final class OpenCodeProvider: ProviderRuntime {
         if hasAccountUsage {
             // Authoritative account-wide percentages — the meters' primary source.
             lines.append(contentsOf: accountMeters)
-        } else if let windows = scan.goWindows {
+        } else if !shouldSuppressLocalGoFallback, let windows = scan.goWindows {
             // API unreachable or not usable: local-observed spend against the published caps.
             lines.append(contentsOf: OpenCodeUsageMapper.meterLines(windows))
         }
@@ -285,9 +358,9 @@ final class OpenCodeProvider: ProviderRuntime {
                                          partialDays: scan.partialDays)
         MetricLine.appendNoDataIfNeeded(&lines)
 
-        // `goWindows` is present only on a current Go signal (key or recent spend), never a stale anchor,
-        // so it's the honest source for the plan badge too.
-        let plan: String? = (hasAccountUsage || scan.goWindows != nil) ? "Go" : nil
+        // The Go badge represents a server-confirmed active subscription. Local Go spend can still
+        // populate fallback cap meters while offline, but it cannot prove the subscription is active.
+        let plan: String? = hasAccountUsage ? "Go" : nil
         return ProviderSnapshot.make(
             provider: provider,
             plan: plan,
@@ -297,7 +370,9 @@ final class OpenCodeProvider: ProviderRuntime {
                 series: scan.logScan.series,
                 modelUsage: scan.logScan.modelUsage,
                 unknownModelsByDay: scan.logScan.unknownModelsByDay
-            )
+            ),
+            warning: accountErrorForDisplay?.error.localizedDescription,
+            clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
         )
     }
 

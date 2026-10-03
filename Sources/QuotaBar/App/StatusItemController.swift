@@ -415,7 +415,7 @@ final class StatusItemController: NSObject {
         // per-provider forced-wait path then piled onto. Reopening supersedes the previous open anyway.
         popoverRefreshTask?.cancel()
         popoverRefreshTask = Task {
-            await ProviderRefreshContext.$scope.withValue(.full) {
+            await withThrottledFullAccounting {
                 await container.dataStore.refreshAll(force: true)
             }
         }

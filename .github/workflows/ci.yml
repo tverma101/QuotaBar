@@ -3,7 +3,7 @@ name: CI
 on:
   # The Swift edition ships from `main`. The frozen Tauri edition is preserved on `tauri-legacy`.
   push:
-    branches: [main]
+    branches: [main, codex/token-accounting-cpu-benchmark]
   pull_request:
     branches: [main]
 
@@ -20,6 +20,7 @@ jobs:
     # against the newest SDK, and a stock macos-15 runner ships Swift 6.1 without the macOS 26 SDK, so
     # it cannot build this package. Runtime verification on Sequoia is a manual smoke pass.
     runs-on: macos-26
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
@@ -30,3 +31,9 @@ jobs:
 
       - name: Run tests
         run: swift test
+
+      # This dedicated public branch runs the deterministic synthetic-ledger benchmark on GitHub's
+      # isolated macOS runner. It never copies or uploads a user's local usage ledger.
+      - name: Measure token accounting CPU
+        if: github.ref == 'refs/heads/codex/token-accounting-cpu-benchmark'
+        run: script/measure_token_accounting.sh

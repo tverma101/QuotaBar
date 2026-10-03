@@ -207,6 +207,33 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         XCTAssertEqual(used, 55)
     }
 
+    func testPinnedKeyTransientFailureDoesNotUseUnattributedLocalGoFallback() async {
+        let now = OpenUsageISO8601.date(from: "2026-07-12T12:00:00.000Z")!
+        let eventMS = Int(now.addingTimeInterval(-3_600).timeIntervalSince1970 * 1_000)
+        let db = "[[\(eventMS),2.0,1000,\"glm-5.2\",\"opencode-go\"]]"
+        let http = SequenceHTTPClient([
+            HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79)),
+            HTTPResponse(statusCode: 503, headers: [:], body: Data())
+        ])
+        let work = OpenCodeGoKey(id: UUID(), label: "Work", key: "sk-work")
+
+        let snapshot = await provider(
+            authJSON: authJSON,
+            http: http,
+            db: db,
+            storedKeys: [work],
+            activeKeyID: { work.id.uuidString }
+        ).refresh()
+
+        XCTAssertEqual(http.requests.count, 2)
+        XCTAssertNil(snapshot.plan)
+        XCTAssertNil(snapshot.line(label: "Session (Work)"))
+        XCTAssertNil(snapshot.line(label: "Session (opencode-go)"))
+        XCTAssertNil(snapshot.line(label: "Session"))
+        XCTAssertNotNil(snapshot.line(label: "Today"))
+        XCTAssertNotNil(snapshot.warning)
+    }
+
     func testSelectionByStoredKeyUUIDPinsThatAccount() async {
         let work = OpenCodeGoKey(id: UUID(), label: "Work", key: "sk-work")
         let http = SequenceHTTPClient([

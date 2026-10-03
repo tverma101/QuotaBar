@@ -152,8 +152,8 @@ actor PiUsageScanner {
         var seen: Set<String> = []
         var out: [Entry] = []
         out.reserveCapacity(entries.count)
-        for entry in entries {
-            if let id = entry.id, !seen.insert(id).inserted { continue }
+        JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
+            if let id = entry.id, !seen.insert(id).inserted { return }
             out.append(entry)
         }
         return out
@@ -165,7 +165,8 @@ actor PiUsageScanner {
     /// scanners.
     static func aggregate(entries: [Entry], cardID: String, since: Date, pricing: ModelPricing) -> LogUsageScan {
         var accumulator = DailyUsageAccumulator()
-        for entry in entries where entry.cardID == cardID && entry.timestamp >= since {
+        JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
+            guard entry.cardID == cardID, entry.timestamp >= since else { return }
             let day = DailyUsageAccumulator.dayKey(from: entry.timestamp)
             let trimmedModel = entry.model.nilIfEmpty
             let modelName = trimmedModel ?? ModelUsageEntry.unattributedModelName
@@ -179,7 +180,7 @@ actor PiUsageScanner {
                 if let model = trimmedModel, entry.reportedTotalTokens > 0 {
                     accumulator.addUnknownModel(day: day, model: model)
                 }
-                continue
+                return
             }
             accumulator.add(day: day, tokens: entry.reportedTotalTokens, cost: cost, model: modelName)
         }
