@@ -191,7 +191,10 @@ final class AppContainer {
                     var failures = 0
                     for attempt in 0..<45 {
                         guard let dataStore else { return }
-                        switch await dataStore.refresh(providerID: codex.provider.id, force: true) {
+                        let outcome = await withThrottledFullAccounting {
+                            await dataStore.refresh(providerID: codex.provider.id, force: true)
+                        }
+                        switch outcome {
                         case .refreshed, .cacheHit, .backedOff:
                             return
                         case .failed:
@@ -416,14 +419,23 @@ final class AppContainer {
                 // re-checks between chunks, so this covers the first batch after a spike too.
                 let serializeProviders = isFirstPass || ProcessMemoryBudget.isOverSoftLimit
                 let panelOpen = transparency.popoverShown
+                if panelOpen && !ProcessMemoryBudget.isOverSoftLimit {
+                    await CodexRouterUsageScanner.resumeSharedParsedItems()
+                }
                 let scope: ProviderRefreshContext.Scope = panelOpen ? .full : .menuBar
                 await ProviderRefreshContext.$scope.withValue(scope) {
-                    await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                    await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(panelOpen) {
+                        await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                    }
                 }
                 isFirstPass = false
-                // Drop parse-cache Event arrays once the cycle settles so idle hours do not keep tens of
-                // thousands of JSONL rows resident. Checkpoints stay for cheap appends on the next pass.
-                await PersistentJSONLScanCaches.unloadAfterRefreshCycle()
+                // Keep the bounded CodexRouter index warm while the panel is open so append-triggered
+                // refreshes do not decode its parsed-event cache from disk each time. Hidden cycles and
+                // memory pressure release it; the durable index remains available for the next scan.
+                let keepRouterIndexWarm = transparency.popoverShown && !ProcessMemoryBudget.isOverSoftLimit
+                await PersistentJSONLScanCaches.unloadAfterRefreshCycle(
+                    keepRouterItemsResident: keepRouterIndexWarm
+                )
                 // Re-evaluate quota pace milestones every tick — after the refresh so it sees fresh data,
                 // and on every loop (not just on a fetch) so pace worsening from elapsed time alone still
                 // alerts even with the popover closed.

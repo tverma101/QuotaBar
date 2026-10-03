@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Keep active token accounting within a shared 10% one-core CPU budget and reuse unchanged CodexRouter work.
+- Show the OpenCode Go plan only when the account endpoint confirms active usage windows.
+
 ## v0.7.10-beta.3
 
 ### New Features

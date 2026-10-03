@@ -4,6 +4,22 @@ import Foundation
 /// the various timestamp shapes providers return (space-separated, " UTC" suffix, variable fractional
 /// digits) before parsing.
 enum OpenUsageISO8601 {
+    // Timestamp normalization runs once per parsed usage row. Keep these immutable patterns compiled
+    // across refreshes instead of asking String.range(of:options:.regularExpression) to compile them
+    // again for every event.
+    private static let spaceSeparatedTimestampRegex = try! NSRegularExpression(
+        pattern: #"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#
+    )
+    private static let zonedISOTimestampRegex = try! NSRegularExpression(
+        pattern: #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$"#
+    )
+    private static let utcISOTimestampRegex = try! NSRegularExpression(
+        pattern: #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?$"#
+    )
+    private static let fractionalTimestampRegex = try! NSRegularExpression(
+        pattern: #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?$"#
+    )
+
     static func string(from date: Date) -> String {
         formatter(fractionalSeconds: true).string(from: date)
     }
@@ -20,18 +36,18 @@ enum OpenUsageISO8601 {
         guard !s.isEmpty else { return s }
 
         if s.contains(" "),
-           let range = s.range(of: #"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression) {
+           let range = regexRange(spaceSeparatedTimestampRegex, in: s) {
             s.replaceSubrange(range, with: s[range].replacingOccurrences(of: " ", with: "T"))
         }
         if s.hasSuffix(" UTC") {
             s = String(s.dropLast(4)) + "Z"
         }
 
-        if let match = s.range(of: #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$"#, options: .regularExpression) {
+        if let match = regexRange(zonedISOTimestampRegex, in: s) {
             let matched = String(s[match])
             return normalizeFractionalISO(matched, assumeUTC: false)
         }
-        if let match = s.range(of: #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?$"#, options: .regularExpression) {
+        if let match = regexRange(utcISOTimestampRegex, in: s) {
             let matched = String(s[match])
             return normalizeFractionalISO(matched, assumeUTC: true)
         }
@@ -40,9 +56,7 @@ enum OpenUsageISO8601 {
     }
 
     private static func normalizeFractionalISO(_ value: String, assumeUTC: Bool) -> String {
-        let pattern = #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
+        guard let match = fractionalTimestampRegex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
               match.numberOfRanges >= 2,
               let headRange = Range(match.range(at: 1), in: value)
         else {
@@ -70,6 +84,13 @@ enum OpenUsageISO8601 {
         }
 
         return head + frac + tz
+    }
+
+    private static func regexRange(_ regex: NSRegularExpression, in value: String) -> Range<String.Index>? {
+        guard let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) else {
+            return nil
+        }
+        return Range(match.range, in: value)
     }
 
     // ISO8601DateFormatter is expensive to construct and is hit on every snapshot decode and local-API

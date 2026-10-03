@@ -75,7 +75,7 @@ actor AntigravityDbUsageScanner {
                 let cached = try cachedDatabase(path: path, since: since)
                 guard !Task.isCancelled else { return nil }
                 guard let cached else { continue }
-                for event in cached.events {
+                JSONLAccountingWorkPacer.shared.forEach(cached.events) { event in
                     Self.accumulate(event, since: since, pricing: pricing, into: &accumulator)
                 }
                 if cached.sawOversizedBlob {
@@ -140,8 +140,10 @@ actor AntigravityDbUsageScanner {
         var refreshed = cached ?? CachedDatabase(fingerprint: fingerprint, windowStart: since)
         refreshed.fingerprint = fingerprint
         refreshed.windowStart = since
-        refreshed.events.removeAll {
-            Date(timeIntervalSince1970: TimeInterval($0.timestampSeconds)) < since
+        JSONLAccountingWorkPacer.shared.perform {
+            refreshed.events.removeAll {
+                Date(timeIntervalSince1970: TimeInterval($0.timestampSeconds)) < since
+            }
         }
         try readDatabase(path: path, since: since, into: &refreshed)
         guard !Task.isCancelled else { return nil }
@@ -152,24 +154,28 @@ actor AntigravityDbUsageScanner {
     private func readDatabase(path: String, since: Date, into cached: inout CachedDatabase) throws {
         while !Task.isCancelled {
             guard let payload = try sqlite.queryValue(path: path, sql: Self.dataSQL(after: cached.lastIndex)) else { break }
-            let rows = try JSONDecoder().decode([Row].self, from: Data(payload.utf8))
+            let rows = try JSONLAccountingWorkPacer.shared.perform {
+                try JSONDecoder().decode([Row].self, from: Data(payload.utf8))
+            }
             guard !rows.isEmpty else { break }
 
-            for row in rows {
-                guard row.index > cached.lastIndex else {
-                    throw SQLiteError.queryFailed("Antigravity generation indices are not strictly increasing")
-                }
-                cached.lastIndex = row.index
+            try JSONLAccountingWorkPacer.shared.perform {
+                for row in rows {
+                    guard row.index > cached.lastIndex else {
+                        throw SQLiteError.queryFailed("Antigravity generation indices are not strictly increasing")
+                    }
+                    cached.lastIndex = row.index
 
-                guard let hex = row.hex else {
-                    cached.sawOversizedBlob = true
-                    continue
+                    guard let hex = row.hex else {
+                        cached.sawOversizedBlob = true
+                        continue
+                    }
+                    guard let blob = Self.bytes(fromHex: hex),
+                          let event = AntigravityProtoDecoder.generationEvent(from: blob),
+                          Date(timeIntervalSince1970: TimeInterval(event.timestampSeconds)) >= since
+                    else { continue }
+                    cached.events.append(event)
                 }
-                guard let blob = Self.bytes(fromHex: hex),
-                      let event = AntigravityProtoDecoder.generationEvent(from: blob),
-                      Date(timeIntervalSince1970: TimeInterval(event.timestampSeconds)) >= since
-                else { continue }
-                cached.events.append(event)
             }
 
             if rows.count < Self.batchSize { break }

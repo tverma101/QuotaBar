@@ -11,6 +11,11 @@ enum ProviderRefreshContext {
     enum Scope: Sendable {
         case menuBar
         case full
+
+        var isFull: Bool {
+            if case .full = self { return true }
+            return false
+        }
     }
 
     /// True only for the user's explicit Refresh Now action. Opening the menu-bar panel can force a
@@ -22,6 +27,21 @@ enum ProviderRefreshContext {
     @TaskLocal static var credentialInteractionGate: CredentialInteractionGate? = nil
     /// Defaults to `.full` so tests, CLI, and any unscoped call site keep today's behavior.
     @TaskLocal static var scope: Scope = .full
+    /// Automatic full-history refreshes opt into the process-wide CPU allowance; focused unit tests
+    /// and one-shot CLI scans keep their existing timing unless they explicitly measure the budget.
+    @TaskLocal static var accountingCPUThrottleEnabled = false
+}
+
+/// Run an explicit full-history refresh under the shared CPU allowance. Keep force-refresh entry
+/// points in views/settings on the same path as panel-open and manual-refresh passes.
+func withThrottledFullAccounting<T: Sendable>(
+    _ operation: @Sendable () async throws -> T
+) async rethrows -> T {
+    try await ProviderRefreshContext.$scope.withValue(.full) {
+        try await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+            try await operation()
+        }
+    }
 }
 
 final class CredentialInteractionGate: @unchecked Sendable {

@@ -112,7 +112,7 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
             databasePaths: { ["/oc/opencode.db"] },
             codexHomes: { [codexHome] }
         )
-        let scan = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertNotNil(scan)
         XCTAssertTrue(scan!.includesEstimatedCost)
 

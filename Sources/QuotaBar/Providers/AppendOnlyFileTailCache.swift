@@ -99,6 +99,12 @@ final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unc
         var isDiscardingOversizedLine: Bool
         var parserState: ParserState
         var items: [Item]
+        /// Small append fragments can be shared by multiple account folds that observed the same
+        /// file revision. Unlike `items`, this never contains historical rows.
+        var appendedFromRevision: AppendOnlyFileRevision? = nil
+        var appendedFromAnchor: Data? = nil
+        var appendedItems: [Item] = []
+        var appendedItemsAvailable = false
         /// False after `unloadRetainedItems()` cleared `items` while keeping the append checkpoint.
         /// Distinguished from a real empty parse (`items.isEmpty && itemsAvailable`).
         var itemsAvailable: Bool = true
@@ -144,7 +150,13 @@ final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unc
         }
     }
 
-    func store(_ entry: Entry, for key: String, parseKind: ParseKind, bytesRead: Int) {
+    func store(
+        _ entry: Entry,
+        for key: String,
+        parseKind: ParseKind,
+        bytesRead: Int,
+        retainItems: Bool = true
+    ) {
         lock.withLock {
             tick &+= 1
             var stats = storage[key]?.statistics ?? Statistics()
@@ -154,7 +166,12 @@ final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unc
             }
             stats.bytesRead += max(0, bytesRead)
             var storedEntry = entry
-            storedEntry.itemsAvailable = true
+            if retainItems {
+                storedEntry.itemsAvailable = true
+            } else {
+                storedEntry.items = []
+                storedEntry.itemsAvailable = false
+            }
             storage[key] = Stored(entry: storedEntry, statistics: stats, accessTick: tick)
             evictIfNeededLocked()
         }
@@ -184,6 +201,8 @@ final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unc
             for key in Array(storage.keys) {
                 guard var stored = storage[key] else { continue }
                 stored.entry.items = []
+                stored.entry.appendedItems = []
+                stored.entry.appendedItemsAvailable = false
                 stored.entry.itemsAvailable = false
                 storage[key] = stored
             }
@@ -191,7 +210,9 @@ final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unc
     }
 
     private func retainedItemCountLocked() -> Int {
-        storage.values.reduce(into: 0) { $0 += $1.entry.items.count }
+        storage.values.reduce(into: 0) {
+            $0 += $1.entry.items.count + $1.entry.appendedItems.count
+        }
     }
 
     private func evictIfNeededLocked() {

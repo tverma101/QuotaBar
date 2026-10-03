@@ -128,6 +128,45 @@ final class MenuBarSnapshotMergeTests: XCTestCase {
         XCTAssertFalse(merged.lines.contains(MetricLine.noUsageData))
     }
 
+    func testExplicitQuotaInvalidationClearsPlanAndProgressButKeepsSpend() {
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-09-23", totalTokens: 9, costUSD: 0.02)
+            ])
+        )
+        let previous = ProviderSnapshot(
+            providerID: "opencode",
+            displayName: "OpenCode",
+            plan: "Go",
+            lines: [
+                .progress(label: "Session", used: 33, limit: 100, format: .percent),
+                .progress(label: "Weekly", used: 44, limit: 100, format: .percent),
+                .values(label: "Today", values: [
+                    MetricValue(number: 9, kind: .count, label: "tokens")
+                ]),
+            ],
+            refreshedAt: Date(timeIntervalSince1970: 1_000),
+            usageHistory: history
+        )
+        let fresh = ProviderSnapshot(
+            providerID: "opencode",
+            displayName: "OpenCode",
+            lines: [.noUsageData],
+            refreshedAt: Date(timeIntervalSince1970: 2_000),
+            warning: "OpenCode couldn't confirm a Go subscription for this key.",
+            clearsPriorMenuBarQuotaState: true
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertNil(merged.plan)
+        XCTAssertNil(merged.line(label: "Session"))
+        XCTAssertNil(merged.line(label: "Weekly"))
+        XCTAssertEqual(merged.line(label: "Today"), previous.line(label: "Today"))
+        XCTAssertEqual(merged.usageHistory, history)
+        XCTAssertNil(merged.clearsPriorMenuBarQuotaState)
+    }
+
     func testMergingDoesNotDuplicateTodayWhenFreshAlsoHasValues() {
         let previous = ProviderSnapshot(
             providerID: "cursor",

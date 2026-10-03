@@ -181,6 +181,8 @@ extension OpenCodeUsageError: CategorizedError {
         case .notLoggedIn: .notLoggedIn
         case .credentialsUnreadable, .databaseUnreadable: .credentialAccess
         case .accountAPIUnauthorized: .authExpired
+        case .accountAPINoEntitlement: .notAvailable
+        case .accountAPIInvalidResponse: .decoding
         case .accountAPIRequestFailed(let status): ErrorCategory.http(status)
         case .accountAPIUnavailable: .network
         }

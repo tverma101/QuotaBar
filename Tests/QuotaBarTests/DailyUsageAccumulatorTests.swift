@@ -38,6 +38,33 @@ final class DailyUsageAccumulatorTests: XCTestCase {
         XCTAssertEqual(models["opus"]?.totalTokens, 10)
     }
 
+    func testMergingIncrementalScansPreservesObservedModelVariants() throws {
+        var originalAccumulator = DailyUsageAccumulator()
+        originalAccumulator.add(day: "2026-10-02", tokens: 50, cost: 0.5, model: "gpt-5.6-luna")
+
+        var deltaAccumulator = DailyUsageAccumulator()
+        deltaAccumulator.add(
+            day: "2026-10-02",
+            tokens: 25,
+            cost: 0.25,
+            model: "anthropic/openai/gpt-5.6-luna",
+            canonical: "gpt-5.6-luna"
+        )
+
+        let merged = try XCTUnwrap(DailyUsageAccumulator.merged([
+            originalAccumulator.build(),
+            deltaAccumulator.build()
+        ]))
+        XCTAssertEqual(merged.series.daily.first?.totalTokens, 75)
+        XCTAssertEqual(merged.series.daily.first?.costUSD ?? -1, 0.75, accuracy: 0.0001)
+        let model = try XCTUnwrap(merged.modelUsage?.daily.first?.models.first)
+        XCTAssertEqual(model.model, "gpt-5.6-luna")
+        XCTAssertEqual(Set(model.variants?.map(\.model) ?? []), [
+            "gpt-5.6-luna",
+            "anthropic/openai/gpt-5.6-luna"
+        ])
+    }
+
     func testUnknownModelsStayOutOfTheSeries() {
         var accumulator = DailyUsageAccumulator()
         accumulator.addUnknownModel(day: "2024-06-02", model: "mystery-model")

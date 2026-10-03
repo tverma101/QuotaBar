@@ -122,7 +122,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
             databasePaths: { [dbPath] },
             hermesStateDBPath: { hermesPath }
         )
-        let scan = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertNotNil(scan)
         XCTAssertTrue(scan!.includesEstimatedCost, "imputed Hermes dollars must mark the series estimated")
 
@@ -154,7 +154,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
             databasePaths: { [opencodePath] },
             hermesStateDBPath: { hermesPath }
         )
-        let scan = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertNotNil(scan)
         let today = DailyUsageAccumulator.dayKey(from: now)
         let yesterday = DailyUsageAccumulator.dayKey(from: now.addingTimeInterval(-86400))
@@ -200,14 +200,14 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
             hermesStateDBPath: { "/hermes/state.db" },
             readFailureWarning: warning
         )
-        let scan = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertNotNil(scan, "a failed Hermes read must not fail the whole scan")
         XCTAssertTrue(scan!.partialDays.isEmpty)
         XCTAssertFalse(scan!.includesEstimatedCost)
         XCTAssertEqual(stub.warned, 1, "the Hermes read failure must warn (edge-triggered), not vanish")
 
         // Second scan: same persistent failure must NOT warn again (edge-triggered).
-        let scan2 = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan2 = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertNotNil(scan2)
         XCTAssertEqual(stub.warned, 1, "persistent failure warns once per run, not every refresh")
     }

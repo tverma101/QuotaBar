@@ -16,6 +16,10 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
     /// surfaces as the provider header's amber triangle rather than blanking the provider. Cached with the
     /// snapshot; cleared on the next refresh when the condition resolves.
     var warning: String?
+    /// An explicit successful menu-bar refresh can invalidate previously shown quota state when the
+    /// provider has definitive evidence that it no longer applies. Other providers preserve prior
+    /// progress during incomplete menu-bar passes.
+    var clearsPriorMenuBarQuotaState: Bool?
     /// Set only on error snapshots: a stable, non-PII bucket for the failure, read by telemetry on the
     /// failure path. Always `nil` on success (and error snapshots aren't cached), so it never persists.
     var errorCategory: ErrorCategory?
@@ -28,6 +32,7 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         refreshedAt: Date = Date(),
         usageHistory: ProviderUsageHistory? = nil,
         warning: String? = nil,
+        clearsPriorMenuBarQuotaState: Bool? = nil,
         errorCategory: ErrorCategory? = nil
     ) {
         self.providerID = providerID
@@ -37,6 +42,7 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         self.refreshedAt = refreshedAt
         self.usageHistory = usageHistory
         self.warning = warning
+        self.clearsPriorMenuBarQuotaState = clearsPriorMenuBarQuotaState
         self.errorCategory = errorCategory
     }
 
@@ -53,7 +59,8 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         lines: [MetricLine],
         refreshedAt: Date,
         usageHistory: ProviderUsageHistory? = nil,
-        warning: String? = nil
+        warning: String? = nil,
+        clearsPriorMenuBarQuotaState: Bool? = nil
     ) -> ProviderSnapshot {
         ProviderSnapshot(
             providerID: provider.id,
@@ -62,7 +69,8 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
             lines: lines,
             refreshedAt: refreshedAt,
             usageHistory: usageHistory,
-            warning: warning
+            warning: warning,
+            clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
         )
     }
 
@@ -99,15 +107,18 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
     func mergingMenuBarUpdate(over previous: ProviderSnapshot?) -> ProviderSnapshot {
         guard let previous else { return self }
         var merged = self
+        let clearsPriorQuota = clearsPriorMenuBarQuotaState == true
+        merged.clearsPriorMenuBarQuotaState = nil
         if merged.usageHistory == nil {
             merged.usageHistory = previous.usageHistory
         }
-        if merged.plan == nil || merged.plan?.isEmpty == true {
+        if !clearsPriorQuota && (merged.plan == nil || merged.plan?.isEmpty == true) {
             merged.plan = previous.plan
         }
         let freshLabels = Set(lines.map(\.label))
         let preserved = previous.lines.filter { line in
             !freshLabels.contains(line.label)
+                && !(clearsPriorQuota && Self.isQuotaProgress(line))
         }
         if !preserved.isEmpty {
             merged.lines.append(contentsOf: preserved)
@@ -118,5 +129,10 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
             merged.lines.removeAll { $0 == MetricLine.noUsageData }
         }
         return merged
+    }
+
+    private static func isQuotaProgress(_ line: MetricLine) -> Bool {
+        if case .progress = line { return true }
+        return false
     }
 }
