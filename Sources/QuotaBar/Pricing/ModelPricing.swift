@@ -25,6 +25,13 @@ final class ModelPricing: Sendable {
     /// Resolution walks every catalog entry on a fuzzy miss, so memoize per model name. Shared
     /// across threads; a pricing snapshot is immutable so entries never invalidate.
     private let memo = OSAllocatedUnfairLock<[String: ModelRates?]>(initialState: [:])
+    private enum CanonicalNameLookup: Sendable {
+        case found(String)
+        case missing
+    }
+    /// Alias misses matter too: local logs repeat the same model slug for thousands of events, and
+    /// testing every supplement regex for each event dominates the actual cost fold.
+    private let canonicalNameMemo = OSAllocatedUnfairLock<[String: CanonicalNameLookup]>(initialState: [:])
 
     init(supplement: PricingSupplement, primary: PricingCatalog, secondary: PricingCatalog) {
         self.supplement = supplement
@@ -53,10 +60,22 @@ final class ModelPricing: Sendable {
     }
 
     private func exactKey(candidate: String) -> String? {
-        if let hit = supplement.canonicalName(for: candidate) { return hit }
+        if let hit = canonicalName(for: candidate) { return hit }
         if primary.findExact(candidate) != nil { return candidate }
         if secondary.findExact(candidate) != nil { return candidate }
         return nil
+    }
+
+    func canonicalName(for model: String) -> String? {
+        if let cached = canonicalNameMemo.withLock({ $0[model] }) {
+            if case .found(let name) = cached { return name }
+            return nil
+        }
+        let resolved = supplement.canonicalName(for: model)
+        canonicalNameMemo.withLock {
+            $0[model] = resolved.map(CanonicalNameLookup.found) ?? .missing
+        }
+        return resolved
     }
 
     func resolve(model: String) -> ModelRates? {
@@ -80,7 +99,7 @@ final class ModelPricing: Sendable {
     }
 
     private func resolveUncached(model: String) -> ModelRates? {
-        if let canonical = supplement.canonicalName(for: model), canonical != model {
+        if let canonical = canonicalName(for: model), canonical != model {
             return lookup(canonical) ?? lookup(model)
         }
         return lookup(model)

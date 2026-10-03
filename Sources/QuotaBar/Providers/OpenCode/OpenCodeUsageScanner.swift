@@ -259,7 +259,9 @@ struct OpenCodeUsageScanner: Sendable {
         for path in paths {
             checked.insert(path)
             do {
-                if let json = try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs)) {
+                if let json = try JSONLAccountingWorkPacer.shared.perform({
+                    try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs))
+                }) {
                     let parsedRows = JSONLAccountingWorkPacer.shared.perform { Self.parseRows(json) }
                     rows.append(contentsOf: parsedRows)
                 }
@@ -271,7 +273,9 @@ struct OpenCodeUsageScanner: Sendable {
             // day-window cutoff). Best-effort per path — anchor failures are edge-warned (not silent)
             // so a persistently broken anchor query surfaces once, then falls back to calendar month.
             do {
-                if let text = try sqlite.queryValue(path: path, sql: Self.anchorSQL),
+                if let text = try JSONLAccountingWorkPacer.shared.perform({
+                    try sqlite.queryValue(path: path, sql: Self.anchorSQL)
+                }),
                    let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
                     anchorMs = Swift.min(anchorMs ?? value, value)
                 }
@@ -384,9 +388,15 @@ struct OpenCodeUsageScanner: Sendable {
         // and the day would read as ~$0 while the account meter proves otherwise.
         if let hermesPath = hermesStateDBPath() {
             do {
-                if let json = try sqlite.queryValue(path: hermesPath, sql: Self.hermesGatewaySQL(cutoffSeconds: Double(cutoffMs) / 1000)) {
+                if let json = try JSONLAccountingWorkPacer.shared.perform({
+                    try sqlite.queryValue(
+                        path: hermesPath,
+                        sql: Self.hermesGatewaySQL(cutoffSeconds: Double(cutoffMs) / 1000)
+                    )
+                }) {
                     Self.foldGatewayRows(
-                        Self.parseHermesGatewayRows(json), since: tileSince, pricing: pricing,
+                        JSONLAccountingWorkPacer.shared.perform { Self.parseHermesGatewayRows(json) },
+                        since: tileSince, pricing: pricing,
                         effectiveRates: rates,
                         accumulator: &accumulator, goWindowCosts: &goWindowCosts,
                         includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays

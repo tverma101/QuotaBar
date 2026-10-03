@@ -1,4 +1,5 @@
 import Darwin
+import Foundation
 import XCTest
 @testable import QuotaBar
 
@@ -6,7 +7,34 @@ import XCTest
 /// so it never reads or uploads a user's token history. Output contains aggregate counts and timings only.
 final class TokenAccountingEfficiencyTests: XCTestCase {
     private static let syntheticRows = 113_447
-    private static let syntheticBytes = 44_879_133
+    private static let syntheticBytes = 45_219_474
+
+    func testAutomaticMenuBarPacingIncludesReapedSQLiteStyleChildCPU() async throws {
+        let measurement = try await ProviderRefreshContext.$scope.withValue(.menuBar) {
+            try await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                let wallStart = DispatchTime.now().uptimeNanoseconds
+                let cpuStart = Self.cpuSeconds()
+                try JSONLAccountingWorkPacer.shared.perform {
+                    let child = Process()
+                    child.executableURL = URL(fileURLWithPath: "/bin/sh")
+                    child.arguments = ["-c", #"i=0; while [ "$i" -lt 50000 ]; do i=$((i + 1)); done"#]
+                    try child.run()
+                    child.waitUntilExit()
+                    guard child.terminationStatus == 0 else {
+                        throw NSError(domain: "TokenAccountingEfficiencyTests", code: 3)
+                    }
+                }
+                let cpu = Self.cpuSeconds() - cpuStart
+                let wall = Double(DispatchTime.now().uptimeNanoseconds - wallStart) / 1_000_000_000
+                return (cpu, wall)
+            }
+        }
+
+        XCTAssertGreaterThan(measurement.0, 0.010,
+                             "reaped child CPU must materially contribute to the accounting measurement")
+        XCTAssertLessThan(measurement.0 / measurement.1, 0.10,
+                          "the automatic menu-bar pass must pace child-process accounting too")
+    }
 
     func testRepeatedRouterAccountingStaysBelowTenPercentOfOneCore() async throws {
         let scratch = FileManager.default.temporaryDirectory
@@ -25,8 +53,10 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             throw XCTSkip("QUOTABAR_TOKEN_ACCOUNTING_MODE must be 'raw' or 'paced'")
         }
         let shouldThrottle = mode == "paced"
-        let measurement = try await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(shouldThrottle) {
-            try await runMode(scratch: scratch)
+        let measurement = try await ProviderRefreshContext.$scope.withValue(.menuBar) {
+            await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(shouldThrottle) {
+                try await runMode(scratch: scratch)
+            }
         }
         let coldOneCoreShare = measurement.coldCPUSeconds / measurement.coldWallSeconds
         let hydrateOneCoreShare = measurement.cacheHydrateCPUSeconds / measurement.cacheHydrateWallSeconds
@@ -108,20 +138,24 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             identityAliases: { [:] },
             incrementalScanner: scanner
         )
-        let now = Date()
+        let now = ISO8601DateFormatter().date(from: "2026-10-02T12:00:00Z")!
         let coldWallStart = DispatchTime.now().uptimeNanoseconds
         let coldStart = Self.cpuSeconds()
         let coldScan = await scannerUnderTest.scan(
-            accountIdentityKey: nil,
-            allowsUnscopedEvents: true,
+            accountIdentityKey: "benchmark-first-account",
+            allowsUnscopedEvents: false,
             daysBack: 30,
             now: now,
             pricing: TestPricing.bundled
         )
         XCTAssertNotNil(coldScan, "the representative ledger must produce an accounting result")
+        let expectedFirstAccountTokens = 56_724 * 1_801
+        XCTAssertEqual(coldScan?.series.daily.reduce(0) { $0 + $1.totalTokens }, expectedFirstAccountTokens)
+        XCTAssertTrue(coldScan?.unknownModelsByDay.isEmpty == true, "every benchmark model must be priced")
+        XCTAssertGreaterThan(coldScan?.series.daily.compactMap(\.costUSD).reduce(0, +) ?? 0, 0)
+        await scanner.flushPendingWrites()
         let coldCPU = Self.cpuSeconds() - coldStart
         let coldWall = Double(DispatchTime.now().uptimeNanoseconds - coldWallStart) / 1_000_000_000
-        await scanner.flushPendingWrites()
 
         // Simulate the next app launch: a fresh scanner instance must hydrate the durable parsed index
         // and fold a second account without reparsing the source ledger.
@@ -146,7 +180,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         let hydrateCPUStart = Self.cpuSeconds()
         let secondAccountBaseline = await secondAccountScanner.scan(
             accountIdentityKey: "benchmark-second-account",
-            allowsUnscopedEvents: true,
+            allowsUnscopedEvents: false,
             daysBack: 30,
             now: now,
             pricing: TestPricing.bundled
@@ -155,6 +189,9 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         let cacheHydrateWall = Double(DispatchTime.now().uptimeNanoseconds - hydrateWallStart) / 1_000_000_000
         let hydratedRows = await relaunchedScanner.residentItemCountForTesting()
         XCTAssertGreaterThan(hydratedRows, 0, "the new scanner must load parsed rows from the on-disk index")
+        XCTAssertEqual(secondAccountBaseline?.series.daily.reduce(0) { $0 + $1.totalTokens }, 56_723 * 1_801)
+        XCTAssertTrue(secondAccountBaseline?.unknownModelsByDay.isEmpty == true)
+        XCTAssertGreaterThan(secondAccountBaseline?.series.daily.compactMap(\.costUSD).reduce(0, +) ?? 0, 0)
 
         var warmCPU = 0.0
         var wall = 0.0
@@ -162,8 +199,8 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             let slotStart = DispatchTime.now().uptimeNanoseconds
             let cpuStart = Self.cpuSeconds()
             _ = await scannerUnderTest.scan(
-                accountIdentityKey: nil,
-                allowsUnscopedEvents: true,
+                accountIdentityKey: "benchmark-first-account",
+                allowsUnscopedEvents: false,
                 daysBack: 30,
                 now: now,
                 pricing: TestPricing.bundled
@@ -172,10 +209,14 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             wall += Double(DispatchTime.now().uptimeNanoseconds - slotStart) / 1_000_000_000
         }
 
-        // Simulate one new successful router event. This exercises append parsing and the cached
-        // account fold without exposing any ledger row contents in test output.
-        let stamp = ISO8601DateFormatter().string(from: Date())
-        let event = "\n{\"at\":\"\(stamp)\",\"model\":\"space-bunny-free\",\"provider\":\"openai\",\"status\":200,\"inputTokens\":10,\"cachedInputTokens\":2,\"outputTokens\":5,\"totalTokens\":15}\n"
+        // Simulate an append burst of successful router events. This exercises tail parsing and the
+        // cached account fold without exposing any ledger row contents in test output.
+        let stamp = ISO8601DateFormatter().string(from: now)
+        let secondAccountFingerprint = CodexProxyUsageScanner.accountFingerprint(for: "benchmark-second-account")!
+        let appendedEventCount = 64
+        let appendedTokenCount = appendedEventCount * 15
+        let eventLine = "{\"at\":\"\(stamp)\",\"model\":\"space-bunny-free\",\"provider\":\"openai\",\"status\":200,\"inputTokens\":10,\"cachedInputTokens\":2,\"outputTokens\":5,\"totalTokens\":15,\"accountFingerprint\":\"\(secondAccountFingerprint)\"}"
+        let event = "\n" + Array(repeating: eventLine, count: appendedEventCount).joined(separator: "\n") + "\n"
         let handle = try FileHandle(forWritingTo: ledger)
         try handle.seekToEnd()
         try handle.write(contentsOf: Data(event.utf8))
@@ -184,23 +225,30 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         let appendSlotStart = DispatchTime.now().uptimeNanoseconds
         let appendCPUStart = Self.cpuSeconds()
         let appendedScan = await scannerUnderTest.scan(
-            accountIdentityKey: nil,
-            allowsUnscopedEvents: true,
+            accountIdentityKey: "benchmark-first-account",
+            allowsUnscopedEvents: false,
             daysBack: 30,
             now: now,
             pricing: TestPricing.bundled
         )
         let secondAccountAppend = await secondAccountScanner.scan(
             accountIdentityKey: "benchmark-second-account",
-            allowsUnscopedEvents: true,
+            allowsUnscopedEvents: false,
             daysBack: 30,
             now: now,
             pricing: TestPricing.bundled
         )
+        await scanner.flushPendingWrites()
+        await relaunchedScanner.flushPendingWrites()
         let appendCPU = Self.cpuSeconds() - appendCPUStart
-        XCTAssertEqual(appendedScan?.series.daily.reduce(0) { $0 + $1.totalTokens }, beforeTokens + 15)
+        XCTAssertEqual(appendedScan?.series.daily.reduce(0) { $0 + $1.totalTokens }, beforeTokens)
         let secondAccountBefore = secondAccountBaseline?.series.daily.reduce(0) { $0 + $1.totalTokens } ?? 0
-        XCTAssertEqual(secondAccountAppend?.series.daily.reduce(0) { $0 + $1.totalTokens }, secondAccountBefore + 15)
+        XCTAssertEqual(
+            secondAccountAppend?.series.daily.reduce(0) { $0 + $1.totalTokens },
+            secondAccountBefore + appendedTokenCount
+        )
+        XCTAssertTrue(secondAccountAppend?.unknownModelsByDay.isEmpty == true)
+        XCTAssertGreaterThan(secondAccountAppend?.series.daily.compactMap(\.costUSD).reduce(0, +) ?? 0, 0)
         let appendWall = Double(DispatchTime.now().uptimeNanoseconds - appendSlotStart) / 1_000_000_000
 
         let residentRows = await scanner.residentItemCountForTesting()
@@ -221,8 +269,12 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
     }
 
     private static func cpuSeconds() -> Double {
+        cpuSeconds(for: RUSAGE_SELF) + cpuSeconds(for: RUSAGE_CHILDREN)
+    }
+
+    private static func cpuSeconds(for process: Int32) -> Double {
         var usage = rusage()
-        guard getrusage(RUSAGE_SELF, &usage) == 0 else { return 0 }
+        guard getrusage(process, &usage) == 0 else { return 0 }
         let user = Double(usage.ru_utime.tv_sec) + Double(usage.ru_utime.tv_usec) / 1_000_000
         let system = Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1_000_000
         return user + system
@@ -241,8 +293,12 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let end = ISO8601DateFormatter().date(from: "2026-10-02T12:00:00Z")!
         let timestamps = (0..<720).map { hour in
-            formatter.string(from: end.addingTimeInterval(-Double(hour) * 3_600))
+            formatter.string(from: end.addingTimeInterval(-Double(hour % 696) * 3_600))
         }
+        let accountFingerprints = [
+            CodexProxyUsageScanner.accountFingerprint(for: "benchmark-first-account")!,
+            CodexProxyUsageScanner.accountFingerprint(for: "benchmark-second-account")!
+        ]
 
         guard FileManager.default.createFile(
             atPath: url.path,
@@ -262,7 +318,8 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         block.reserveCapacity(1 << 20)
         for index in 0..<syntheticRows {
             let model = models[index % models.count]
-            let prefix = "{\"at\":\"\(timestamps[index % timestamps.count])\",\"model\":\"\(model.name)\",\"provider\":\"\(model.provider)\",\"status\":200,\"inputTokens\":1234,\"cachedInputTokens\":234,\"outputTokens\":567,\"reasoningTokens\":89,\"totalTokens\":1801,\"accountFingerprint\":\"acct_benchmark\",\"serviceTier\":\"default\",\"padding\":\""
+            let accountFingerprint = accountFingerprints[index % accountFingerprints.count]
+            let prefix = "{\"at\":\"\(timestamps[index % timestamps.count])\",\"model\":\"\(model.name)\",\"provider\":\"\(model.provider)\",\"status\":200,\"inputTokens\":1234,\"cachedInputTokens\":234,\"outputTokens\":567,\"reasoningTokens\":89,\"totalTokens\":1801,\"accountFingerprint\":\"\(accountFingerprint)\",\"serviceTier\":\"default\",\"padding\":\""
             let suffix = "\"}\n"
             let targetRowBytes = baseBytes + (index < extraBytes ? 1 : 0)
             let paddingBytes = targetRowBytes - prefix.utf8.count - suffix.utf8.count

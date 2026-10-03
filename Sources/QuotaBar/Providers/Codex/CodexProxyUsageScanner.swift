@@ -47,17 +47,21 @@ actor CodexProxyUsageScanner {
         var sawRows = false
         for path in databasePaths() {
             guard !Task.isCancelled else { return nil }
-            guard let schema = try? sqlite.queryValue(path: path, sql: Self.schemaSQL),
+            guard let schema = try? JSONLAccountingWorkPacer.shared.perform({
+                try sqlite.queryValue(path: path, sql: Self.schemaSQL)
+            }),
                   Self.hasRequiredSchema(schema)
             else { continue }
-            guard let payload = try? sqlite.queryValue(
-                path: path,
-                sql: Self.eventsSQL(
-                    fingerprint: fingerprint,
-                    sinceDay: sinceDay,
-                    throughDay: throughDay
+            guard let payload = try? JSONLAccountingWorkPacer.shared.perform({
+                try sqlite.queryValue(
+                    path: path,
+                    sql: Self.eventsSQL(
+                        fingerprint: fingerprint,
+                        sinceDay: sinceDay,
+                        throughDay: throughDay
+                    )
                 )
-            ) else { continue }
+            }) else { continue }
             let rows = JSONLAccountingWorkPacer.shared.perform { Self.rows(from: payload) }
             JSONLAccountingWorkPacer.shared.forEach(rows) { row in
                 guard let day = Self.validDay(row["local_day"] as? String),

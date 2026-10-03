@@ -424,7 +424,7 @@ final class AppContainer {
                 }
                 let scope: ProviderRefreshContext.Scope = panelOpen ? .full : .menuBar
                 await ProviderRefreshContext.$scope.withValue(scope) {
-                    await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(panelOpen) {
+                    await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
                         await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
                     }
                 }

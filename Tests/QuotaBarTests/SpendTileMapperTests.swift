@@ -168,6 +168,30 @@ final class SpendTileMapperTests: XCTestCase {
         XCTAssertEqual(other.variants?.map(\.model), ["tiny"])
     }
 
+    func testModelBreakdownKeepsHighTokenZeroCostModelNamed() throws {
+        let models = [
+            ModelUsageEntry(model: "muse-spark-1.3-contributor", totalTokens: 243_900_000, costUSD: 1.14),
+            ModelUsageEntry(model: "mimo-v2.5", totalTokens: 13_700_000, costUSD: 0.18),
+            ModelUsageEntry(model: "deepseek-v4.1-flash", totalTokens: 13_200_000, costUSD: 0.16),
+            ModelUsageEntry(model: "another-paid-model", totalTokens: 10_000, costUSD: 0.10),
+            ModelUsageEntry(model: "last-paid-model", totalTokens: 10_000, costUSD: 0.10),
+            ModelUsageEntry(model: "space-bunny-free", totalTokens: 10_500_000_000, costUSD: 0),
+            ModelUsageEntry(model: "tiny-paid-model", totalTokens: 1_000, costUSD: 0.01)
+        ]
+        let totalTokens = models.reduce(0) { $0 + $1.totalTokens }
+        let lines = mappedLines(
+            [DailyUsageEntry(date: "2026-06-26", totalTokens: totalTokens, costUSD: 1.69)],
+            models: [DailyModelUsageEntry(date: "2026-06-26", models: models)]
+        )
+
+        let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
+        let freeModel = try XCTUnwrap(breakdown.models.first { $0.model == "space-bunny-free" })
+        XCTAssertEqual(freeModel.totalTokens, 10_500_000_000)
+        XCTAssertEqual(freeModel.costUSD, 0)
+        let other = try XCTUnwrap(breakdown.models.first { $0.model == "Other" })
+        XCTAssertEqual(other.variants?.map(\.model), ["tiny-paid-model"])
+    }
+
     func testModelBreakdownFoldsUnattributedIntoOtherRegardlessOfSize() throws {
         let lines = mappedLines(
             [DailyUsageEntry(date: "2026-06-26", totalTokens: 1_000, costUSD: 6)],

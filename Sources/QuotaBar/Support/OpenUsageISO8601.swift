@@ -25,9 +25,42 @@ enum OpenUsageISO8601 {
     }
 
     static func date(from value: String) -> Date? {
+        if hasCanonicalUTCShape(value, fractional: true) {
+            return fractionalFormatter.date(from: value)
+        }
+        if hasCanonicalUTCShape(value, fractional: false) {
+            return plainFormatter.date(from: value)
+        }
         let normalized = normalizeTimestamp(value)
         return formatter(fractionalSeconds: true).date(from: normalized) ??
         formatter(fractionalSeconds: false).date(from: normalized)
+    }
+
+    /// CodexRouter and several local ledgers emit this exact shape for every event. Accept it without
+    /// regex normalization; malformed dates are still rejected by ISO8601DateFormatter below.
+    private static func hasCanonicalUTCShape(_ value: String, fractional: Bool) -> Bool {
+        value.utf8.withContiguousStorageIfAvailable { bytes in
+            let expectedCount = fractional ? 24 : 20
+            guard bytes.count == expectedCount,
+                  bytes[4] == 45, bytes[7] == 45, bytes[10] == 84,
+                  bytes[13] == 58, bytes[16] == 58,
+                  bytes[expectedCount - 1] == 90
+            else { return false }
+
+            for index in 0..<(expectedCount - 1) {
+                if index == 4 || index == 7 || index == 10 || index == 13 || index == 16 ||
+                    (fractional && index == 19) {
+                    continue
+                }
+                guard (48...57).contains(bytes[index]) else { return false }
+            }
+            if fractional {
+                guard bytes[19] == 46,
+                      (20...22).allSatisfy({ (48...57).contains(bytes[$0]) })
+                else { return false }
+            }
+            return true
+        } ?? false
     }
 
     /// Aligns with the JavaScript plugin `ctx.util.toIso` string normalization (Claude `resets_at`, etc.).

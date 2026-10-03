@@ -245,8 +245,8 @@ enum SpendTileMapper {
         }
 
         /// Fold a different model into this accumulator (the Other row): one variant per folded model —
-        /// its tooltip lists models, not their raw effort slugs. The Other row's own name is fixed, so
-        /// folded spellings only vote inside the variant lines.
+        /// its hover detail lists models, not their raw effort slugs. The Other row's own name is
+        /// fixed, so folded spellings only vote inside the variant lines.
         mutating func fold(_ entry: ModelUsageEntry) {
             tokens += entry.totalTokens
             if let cost = entry.costUSD {
@@ -340,13 +340,13 @@ enum SpendTileMapper {
     }
 
     /// Models below this share of the period fold into Other regardless of rank — a stack of sub-5%
-    /// slivers is noise, and Other's tooltip still names them.
+    /// slivers is noise, and the Other row lists its leading contributors.
     private static let minVisibleShare = 0.05
 
     private static func foldModelList(_ entries: [ModelUsageEntry]) -> [ModelUsageEntry] {
-        // The threshold must use the same basis the panel's percent labels use (cost shares only when
-        // every model is priced, token shares otherwise — see `ModelUsageDetail.share`), or a folded
-        // model could have displayed as 5%+.
+        // The threshold uses the same basis as the panel's percent labels (cost shares only when
+        // every model is priced, token shares otherwise — see `ModelUsageDetail.share`). A separate
+        // token-share exception below keeps a substantial free model identifiable at 0% cost share.
         let allPriced = entries.allSatisfy { $0.costUSD != nil }
         let costTotal = entries.reduce(0.0) { $0 + ($1.costUSD ?? 0) }
         let tokenTotal = entries.reduce(0) { $0 + $1.totalTokens }
@@ -354,6 +354,10 @@ enum SpendTileMapper {
             if allPriced, costTotal > 0 { return (entry.costUSD ?? 0) / costTotal }
             guard tokenTotal > 0 else { return 0 }
             return Double(entry.totalTokens) / Double(tokenTotal)
+        }
+        func zeroCostTokenLeader(_ entry: ModelUsageEntry) -> Bool {
+            guard entry.costUSD == 0, tokenTotal > 0 else { return false }
+            return Double(entry.totalTokens) / Double(tokenTotal) >= minVisibleShare
         }
 
         var visible: [ModelUsageEntry] = []
@@ -365,11 +369,17 @@ enum SpendTileMapper {
             // "Unattributed" row — the panel is an insight, not an accounting ledger, so they just
             // count into Other however large they are.
             let isUnattributed = entry.model.caseInsensitiveCompare(ModelUsageEntry.unattributedModelName) == .orderedSame
-            if isUnattributed || share(entry) < minVisibleShare {
+            if isUnattributed {
+                other.fold(entry)
+            } else if share(entry) < minVisibleShare && !zeroCostTokenLeader(entry) {
                 other.fold(entry)
             } else if entry.costUSD == nil {
                 visible.append(entry)
                 namedCount += 1
+            } else if zeroCostTokenLeader(entry) {
+                // Cost share is correctly 0%, but hiding a substantial token consumer as Other makes
+                // its usage impossible to identify. Keep it named without spending a paid-model slot.
+                visible.append(entry)
             } else if namedCount < namedModelCap {
                 visible.append(entry)
                 namedCount += 1

@@ -367,6 +367,9 @@ actor CodexRouterUsageScanner {
             }
         }
 
+        // A cancelled tail fold must not publish a partial aggregate for an unchanged source revision.
+        guard !Task.isCancelled else { return nil }
+
         let result: LogUsageScan?
         let deltaResult: LogUsageScan?
         if fold.sawRows {
@@ -643,7 +646,8 @@ actor CodexRouterUsageScanner {
            AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor
         {
             if cached.itemsAvailable {
-                return cached.items.filter { $0.timestamp >= emitSince }
+                let recent = Self.recentEvents(cached.items, since: emitSince)
+                return Task.isCancelled ? nil : recent
             }
             // Checkpoint valid but items were unloaded (memory pressure). Must full-reparse —
             // returning [] would silently drop history. Routine refresh paths no longer unload
@@ -693,7 +697,8 @@ actor CodexRouterUsageScanner {
                after.size >= newOffset,
                let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: newOffset)
             {
-                var merged = cached.items.filter { $0.timestamp >= emitSince }
+                var merged = Self.recentEvents(cached.items, since: emitSince)
+                guard !Task.isCancelled else { return nil }
                 merged.append(contentsOf: collected)
                 sharedTailCache.store(
                     AppendOnlyFileTailCache<Event, ParserCheckpoint>.Entry(
@@ -856,160 +861,16 @@ actor CodexRouterUsageScanner {
     }
 
     nonisolated private static func parseLine(_ line: Data.SubSequence) -> Event? {
-        guard let first = line.first, first == UInt8(ascii: "{"),
-              let last = line.last, last == UInt8(ascii: "}")
-        else { return nil }
-        let data = Data(line)
-        guard let atRaw = jsonString(for: RouterLedgerField.at, in: data),
-              let timestamp = OpenUsageISO8601.date(from: atRaw)
-        else { return nil }
-        let model = jsonString(for: RouterLedgerField.model, in: data)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
-            ?? ModelUsageEntry.unattributedModelName
-        let provider = jsonString(for: RouterLedgerField.provider, in: data)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
-            ?? "unknown"
-        return Event(
-            timestamp: timestamp,
-            model: model,
-            provider: provider,
-            status: jsonInteger(for: RouterLedgerField.status, in: data) ?? 0,
-            inputTokens: max(0, jsonInteger(for: RouterLedgerField.inputTokens, in: data) ?? 0),
-            cachedInputTokens: max(0, jsonInteger(for: RouterLedgerField.cachedInputTokens, in: data) ?? 0),
-            outputTokens: max(0, jsonInteger(for: RouterLedgerField.outputTokens, in: data) ?? 0),
-            reasoningTokens: max(0, jsonInteger(for: RouterLedgerField.reasoningTokens, in: data) ?? 0),
-            totalTokens: jsonInteger(for: RouterLedgerField.totalTokens, in: data).map { max(0, $0) },
-            accountId: jsonString(for: RouterLedgerField.accountId, in: data)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nilIfEmpty,
-            accountFingerprint: jsonString(for: RouterLedgerField.accountFingerprint, in: data)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nilIfEmpty,
-            serviceTier: jsonString(for: RouterLedgerField.serviceTier, in: data)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nilIfEmpty?
-                .lowercased()
-        )
+        CodexRouterEventLineParser.parse(line)
     }
 
-    private enum RouterLedgerField {
-        static let at = Data("\"at\"".utf8)
-        static let model = Data("\"model\"".utf8)
-        static let provider = Data("\"provider\"".utf8)
-        static let status = Data("\"status\"".utf8)
-        static let inputTokens = Data("\"inputTokens\"".utf8)
-        static let cachedInputTokens = Data("\"cachedInputTokens\"".utf8)
-        static let outputTokens = Data("\"outputTokens\"".utf8)
-        static let reasoningTokens = Data("\"reasoningTokens\"".utf8)
-        static let totalTokens = Data("\"totalTokens\"".utf8)
-        static let accountId = Data("\"accountId\"".utf8)
-        static let accountFingerprint = Data("\"accountFingerprint\"".utf8)
-        static let serviceTier = Data("\"serviceTier\"".utf8)
-    }
-
-    /// Common router rows are flat JSON objects with unescaped scalar strings. The fallback decodes
-    /// escaped strings correctly while keeping the normal path allocation-light.
-    private nonisolated static func jsonString(for needle: Data, in data: Data) -> String? {
-        guard let start = jsonValueStart(for: needle, in: data),
-              start < data.endIndex,
-              data[start] == UInt8(ascii: "\"")
-        else { return nil }
-        let valueStart = data.index(after: start)
-        var cursor = valueStart
-        var escaped = false
-        while cursor < data.endIndex {
-            let byte = data[cursor]
-            if escaped {
-                escaped = false
-            } else if byte == UInt8(ascii: "\\") {
-                escaped = true
-            } else if byte == UInt8(ascii: "\"") {
-                let raw = data[valueStart..<cursor]
-                if !raw.contains(UInt8(ascii: "\\")) {
-                    return String(decoding: raw, as: UTF8.self)
-                }
-                let quoted = data[data.index(before: valueStart)...cursor]
-                let wrapped = Data("[".utf8) + quoted + Data("]".utf8)
-                guard let values = (try? JSONSerialization.jsonObject(with: wrapped)) as? [String] else {
-                    return nil
-                }
-                return values.first
-            }
-            cursor = data.index(after: cursor)
+    nonisolated private static func recentEvents(_ events: [Event], since: Date) -> [Event] {
+        var recent: [Event] = []
+        recent.reserveCapacity(events.count)
+        JSONLAccountingWorkPacer.shared.forEach(events) { event in
+            if event.timestamp >= since { recent.append(event) }
         }
-        return nil
-    }
-
-    private nonisolated static func jsonInteger(for needle: Data, in data: Data) -> Int? {
-        guard var index = jsonValueStart(for: needle, in: data) else { return nil }
-        var negative = false
-        if index < data.endIndex, data[index] == UInt8(ascii: "-") {
-            negative = true
-            index = data.index(after: index)
-        }
-        let ceiling = 1_000_000_000_000_000
-        var value = 0
-        var saturated = false
-        var sawDigit = false
-        while index < data.endIndex {
-            let byte = data[index]
-            guard byte >= UInt8(ascii: "0"), byte <= UInt8(ascii: "9") else { break }
-            sawDigit = true
-            if !saturated {
-                let digit = Int(byte - UInt8(ascii: "0"))
-                if value > (ceiling - digit) / 10 {
-                    value = ceiling
-                    saturated = true
-                } else {
-                    value = value * 10 + digit
-                }
-            }
-            index = data.index(after: index)
-        }
-        guard sawDigit else { return nil }
-        return negative ? -value : value
-    }
-
-    /// Locate a scalar after its key, accepting legal JSON whitespace around the colon.
-    private nonisolated static func jsonValueStart(for key: Data, in data: Data) -> Data.Index? {
-        var searchStart = data.startIndex
-        while searchStart < data.endIndex,
-              let range = data.range(of: key, options: [], in: searchStart..<data.endIndex) {
-            var boundary = range.lowerBound
-            while boundary > data.startIndex {
-                let previous = data.index(before: boundary)
-                guard isJSONWhitespace(data[previous]) else { break }
-                boundary = previous
-            }
-            let hasFieldBoundary: Bool
-            if boundary == data.startIndex {
-                hasFieldBoundary = true
-            } else {
-                let previous = data[data.index(before: boundary)]
-                hasFieldBoundary = previous == UInt8(ascii: "{") || previous == UInt8(ascii: ",")
-            }
-            var index = range.upperBound
-            while index < data.endIndex, isJSONWhitespace(data[index]) {
-                index = data.index(after: index)
-            }
-            guard hasFieldBoundary, index < data.endIndex, data[index] == UInt8(ascii: ":") else {
-                searchStart = range.upperBound
-                continue
-            }
-            index = data.index(after: index)
-            while index < data.endIndex, isJSONWhitespace(data[index]) {
-                index = data.index(after: index)
-            }
-            return index
-        }
-        return nil
-    }
-
-    private nonisolated static func isJSONWhitespace(_ byte: UInt8) -> Bool {
-        byte == UInt8(ascii: " ") || byte == UInt8(ascii: "\t")
-            || byte == UInt8(ascii: "\n") || byte == UInt8(ascii: "\r")
+        return recent
     }
 
     // MARK: - Parsing

@@ -153,7 +153,9 @@ actor AntigravityDbUsageScanner {
 
     private func readDatabase(path: String, since: Date, into cached: inout CachedDatabase) throws {
         while !Task.isCancelled {
-            guard let payload = try sqlite.queryValue(path: path, sql: Self.dataSQL(after: cached.lastIndex)) else { break }
+            guard let payload = try JSONLAccountingWorkPacer.shared.perform({
+                try sqlite.queryValue(path: path, sql: Self.dataSQL(after: cached.lastIndex))
+            }) else { break }
             let rows = try JSONLAccountingWorkPacer.shared.perform {
                 try JSONDecoder().decode([Row].self, from: Data(payload.utf8))
             }
