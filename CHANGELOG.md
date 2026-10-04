@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reuse a gateway-only Codex cache for OpenCode refreshes and count native reasoning output once.
+
 - Open the menu from cached snapshots and reuse compact router totals so repeated taps do not restart accounting.
 - Count OpenCode's Codex Router share with append-only cache updates and retain native history without duplicate gateway usage.
 - Revalidate OpenRouter prices for unknown models with coalescing and retry backoff.

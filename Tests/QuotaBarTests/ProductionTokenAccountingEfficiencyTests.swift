@@ -5,6 +5,42 @@ import XCTest
 
 /// Measures actual production aggregate paths on a clean hosted Mac using synthetic data only.
 final class ProductionTokenAccountingEfficiencyTests: XCTestCase {
+    func testNativeGatewayProjectionAvoidsFullHistoryDecodeOnWarmRefresh() async throws {
+        guard ProcessInfo.processInfo.environment["QUOTABAR_PRODUCTION_ACCOUNTING_BENCH"] == "1" else {
+            throw XCTSkip("Enable the production accounting benchmark on an isolated Mac")
+        }
+        let fixture = try await GatewayProjectionFixture(rowCount: 8_192)
+        defer { fixture.cleanup() }
+        let file = try XCTUnwrap(CodexLogUsageScanner.sessionFiles(homes: [fixture.home]).first)
+        let projection = CodexGatewayCacheProjection.load(persistence: fixture.native,
+            identity: fixture.identity, files: [file])
+        let metadata = try XCTUnwrap(projection.metadata[file.path])
+        let nativeDecode = await measure {
+            try? JSONLScanCacheWriter.shared.loadRecord(persistence: fixture.native,
+                identity: fixture.identity, path: file.path, metadata: metadata,
+                itemType: CodexLogUsageScanner.Event.self)
+        }
+        XCTAssertEqual(nativeDecode.result?.items.count, 8_192)
+        let scanner = fixture.gatewayScanner()
+        let cold = await measure { await fixture.fold(using: scanner) }
+        XCTAssertEqual(cold.result.count, 32)
+        XCTAssertEqual(cold.result.reduce(0) { $0 + $1.total }, 4_800)
+        await scanner.flushPendingWrites()
+        let relaunched = fixture.gatewayScanner()
+        _ = await fixture.fold(using: relaunched)
+        let warm = await measure { () async -> Void in
+            for _ in 0..<20 {
+                let events = await fixture.fold(using: relaunched)
+                XCTAssertEqual(events.count, 32)
+                XCTAssertEqual(events.reduce(0) { $0 + $1.total }, 4_800)
+            }
+        }
+        XCTAssertNil(CodexLogUsageScanner.incrementalReadStatisticsForTesting(path: fixture.source.path))
+        XCTAssertLessThan(warm.cpu / 20, nativeDecode.cpu / 10,
+                          "warm gateway refresh must not repeat the native history decode")
+        print(String(format: "PRODUCTION_ACCOUNTING_BENCH provider=opencode-native-gateway rows=8192 gatewayRows=32 nativeDecodeCPU=%.6fs projectionCPU=%.6fs warm20CPU=%.6fs warm20Wall=%.6fs sourceBytes=0", nativeDecode.cpu, cold.cpu, warm.cpu, warm.wall))
+    }
+
     func testRepeatedProductionRefreshReadsOnlyNewBytes() async throws {
         guard ProcessInfo.processInfo.environment["QUOTABAR_PRODUCTION_ACCOUNTING_BENCH"] == "1" else {
             throw XCTSkip("Enable the production accounting benchmark on an isolated Mac")

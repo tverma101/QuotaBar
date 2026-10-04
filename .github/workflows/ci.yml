@@ -30,7 +30,9 @@ jobs:
         run: swift build
 
       - name: Run tests
-        run: swift test
+        run: |
+          script/test_measure_token_accounting.sh
+          swift test
 
       # This dedicated public branch runs the deterministic synthetic-ledger benchmark on GitHub's
       # isolated macOS runner. It never copies or uploads a user's local usage ledger.

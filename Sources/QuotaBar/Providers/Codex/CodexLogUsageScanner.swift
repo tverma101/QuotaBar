@@ -121,11 +121,12 @@ actor CodexLogUsageScanner {
     /// `retainResidentItems: false` unloads IncrementalJSONLScanner CachedFile.items after each
     /// return so Event arrays are not retained twice (scanner + sharedTailCache). Metadata-only
     /// disk loads keep cold identities cheap; hydrate/reparse uses disk or the tail cache.
+    static let parsedEventCachePersistence = JSONLScanCachePersistence(namespace: "codex", schemaVersion: 4)
     private static let sharedScanner = IncrementalJSONLScanner<Event>(
         maxResidentIdentities: 2,
         retainResidentItems: false,
         logTag: LogTag.plugin("codex"),
-        persistence: JSONLScanCachePersistence(namespace: "codex", schemaVersion: 4)
+        persistence: parsedEventCachePersistence
     )
 
     static func flushPersistentCacheWrites() async {
@@ -453,6 +454,40 @@ actor CodexLogUsageScanner {
         )
     }
 
+    /// OpenCode consumes only gateway events. Its own slim cache prevents decoding every native
+    /// Codex event after the ordinary cache has released its resident arrays.
+    @discardableResult
+    func foldHostedGatewayEvents(
+        daysBack: Int = 33,
+        now: Date = Date(),
+        homes: [URL],
+        gatewayScanner: IncrementalJSONLScanner<Event>? = nil,
+        nativeCachePersistence: JSONLScanCachePersistence? = nil,
+        visit: @Sendable (Event) -> Void
+    ) async -> Bool {
+        let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
+        let files = Self.sessionFiles(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory)
+        guard !files.isEmpty else { return true }
+        let projection = CodexGatewayCacheProjection.load(
+            persistence: nativeCachePersistence ?? Self.parsedEventCachePersistence,
+            identity: context.identity, files: files
+        )
+        return await (gatewayScanner ?? Self.hostedGatewayScanner).foldItems(
+            from: files, since: context.cacheSince, cacheIdentity: context.identity,
+            parseFile: { url in
+                if let projected = projection.read(at: url) { return projected }
+                return Self.parseFileIncrementally(at: url, emitSince: context.cacheSince,
+                    retentionDays: context.retentionDays)?.filter {
+                    OpenCodeUsageScanner.isHostedGatewayModel($0.model)
+                }
+            },
+            visit: { event in
+                guard event.timestamp >= context.requestedSince else { return }
+                visit(event)
+            }
+        )
+    }
+
     private struct ScanContext: Sendable {
         var requestedSince: Date
         var cacheSince: Date
@@ -494,6 +529,10 @@ actor CodexLogUsageScanner {
 
     static func tailCheckpointCountForTesting() -> Int {
         sharedTailCache.entryCountForTesting()
+    }
+
+    static func clearSharedTailCacheForTesting(path: String) {
+        sharedTailCache.remove(tailKey(for: URL(fileURLWithPath: path), retentionDays: minimumCacheRetentionDays))
     }
 
     /// Exposes the scanner's resolved CODEX_HOME list for multi-account wiring tests.

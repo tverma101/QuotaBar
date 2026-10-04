@@ -3,6 +3,16 @@ import XCTest
 @testable import QuotaBar
 
 final class OpenCodeGatewayMergeRegressionTests: XCTestCase {
+    func testNativeCodexGatewayOutputIncludesReasoningExactlyOnce() {
+        let event = CodexLogUsageScanner.Event(timestamp: Date(),
+            model: "anthropic/opencode_go/space-bunny-free", input: 100, cached: 25,
+            output: 50, reasoning: 20, total: 150)
+        let row = OpenCodeUsageScanner.codexGatewayRows(from: [event]).first
+        XCTAssertEqual(row?.tokens, event.total)
+        XCTAssertEqual(row?.output, 50)
+        XCTAssertEqual(row?.cacheRead, 25)
+    }
+
     func testCompactGoRetentionPrunesExpiredRowsWithoutDroppingCurrentQuota() {
         let now = Date()
         let aggregate = OpenCodeRouterLedgerAggregate.empty(path: "/tmp/synthetic-go-retention",
