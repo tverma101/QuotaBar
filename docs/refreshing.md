@@ -2,7 +2,7 @@
 
 ## When data updates
 
-- All enabled providers refresh together: once at launch, then every 5 minutes (a fixed cadence — there's no setting for it). Opening the popover does not start a second automatic pass. Providers fetch in parallel, so fast cards update without waiting for a slow one. The batch itself still finishes only after every provider returns; notifications, history sync, and the next five-minute wait begin after that point.
+- Enabled providers refresh once at launch. With the popover open, full-detail passes run every 5 minutes. With it closed, lightweight menu-bar passes run every 5 minutes on AC or every 15 minutes on battery / Low Power Mode. Opening the popover displays the last snapshot without starting another pass; Refresh Now can update it immediately. Providers normally fetch in parallel, so fast cards update without waiting for a slow one. The batch finishes after every provider returns; notifications, history sync, and the next wait begin after that point.
 - Local token and spend accounting uses one shared pacing target during automatic refreshes and local API reads. Instrumented parsing, cache work, and folds aim for 7.5% of one process CPU core; measurements include CPU from reaped helper processes. This is an average target across bounded work slices, not an instantaneous hard cap, and provider network work continues independently. Cold indexing can therefore take longer than a warm refresh. The repeatable benchmark covers the synthetic CodexRouter scanner/cache path; it does not establish the same measurement for every provider.
 - Turning a provider on (yourself in Customize, or automatically by first-launch/new-provider detection) fetches it promptly instead of waiting out the interval — even when the change lands in the middle of a refresh that's already running.
 - The Dashboard and Settings footer shows `Next update in Nm`. **Clicking it (or pressing ⌘R while that footer is present)** refreshes immediately, skipping the cache.
@@ -33,14 +33,12 @@ can finish within the provider deadline; the rest of instrumented automatic acco
 
 ## Idle behavior
 
-The menu-bar panel stays mounted between opens so it can reopen without rebuilding its AppKit host. That
-does not mean its clocks should keep running: the footer countdown, reset/expiry rows, and iCloud device
-age labels use a structural visibility gate. They mount their periodic `TimelineView` only while the panel
-is on-screen and render one current frame while it is hidden. Opening the panel therefore makes the
-countdowns live immediately, while a closed panel has no SwiftUI periodic timers.
+The panel window stays ready between opens. Its dashboard content mounts only while visible and is
+released when hidden. Opening it rebuilds the content from cached usage and starts its visible
+countdowns; a closed panel has no dashboard timers or animation loops running.
 
-The five-minute provider refresh remains active while the panel is closed because the menu-bar strip must
-stay current. It honors the snapshot cache and failure backoff, serializes the launch pass, and coalesces
+Lightweight provider refreshes remain active while the panel is closed so the menu-bar strip stays
+current. They honor the snapshot cache and failure backoff, serialize the launch pass, and coalesce
 menu-bar image updates when several accounts publish state together. Notification evaluation also skips
 metric resolution when all notification triggers are off, while still pruning its deduplication state.
 
