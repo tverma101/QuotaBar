@@ -185,7 +185,7 @@ The hosted production benchmark uses 8,192 synthetic rows across multiple models
 exact totals, and checks that repeated reads consume zero new ledger bytes:
 
 ```sh
-QUOTABAR_PRODUCTION_ACCOUNTING_BENCH=1 swift test -c release --filter ProductionTokenAccountingEfficiencyTests
+QUOTABAR_PRODUCTION_ACCOUNTING_BENCH=1 swift test -c release --disable-swift-testing --filter ProductionTokenAccountingEfficiencyTests
 ```
 
 Fields are read straight out of the line's bytes rather than through `JSONSerialization`, which was the

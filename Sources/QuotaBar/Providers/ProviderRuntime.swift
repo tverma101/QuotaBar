@@ -18,8 +18,8 @@ enum ProviderRefreshContext {
         }
     }
 
-    /// True only for the user's explicit Refresh Now action. Opening the menu-bar panel can force a
-    /// full refresh, but must not open another app's Keychain dialog as a side effect.
+    /// True only for the user's explicit Refresh Now action. Snapshot-only panel presentation
+    /// never opens another app's Keychain dialog.
     @TaskLocal static var isManual = false
     /// Shared by all provider refresh tasks from one explicit Refresh Now action. Claude can claim it
     /// only when a silent credential read proves that access needs user interaction, limiting that
@@ -31,8 +31,8 @@ enum ProviderRefreshContext {
     /// menu-bar, full-panel, and local-API reads whose providers can perform local accounting.
     /// Focused unit tests stay unthrottled unless they explicitly measure the budget.
     @TaskLocal static var accountingCPUThrottleEnabled = false
-    /// Menu-bar open. Catalog files that are already on disk stay as-is; a missing list may
-    /// still download. Stops a tap from kicking models.dev / OpenRouter / LiteLLM refreshes.
+    /// Lightweight background menu-bar scope keeps existing catalogues on disk; missing catalogues
+    /// may still download. Full accounting refreshes perform due catalogue discovery.
     @TaskLocal static var skipModelCatalogRefresh = false
 }
 

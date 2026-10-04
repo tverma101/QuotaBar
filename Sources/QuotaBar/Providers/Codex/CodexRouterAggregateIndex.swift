@@ -11,6 +11,7 @@ import Foundation
 final class CodexRouterAggregateIndex: @unchecked Sendable {
     static let shared = CodexRouterAggregateIndex()
     static let schema = 3
+    static let maxResidentRecords = 32
 
     struct Key: Codable, Equatable, Sendable {
         var account: String
@@ -63,6 +64,18 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
 
     private init() {}
 
+    private func remember(_ record: Record, id: String) {
+        lock.withLock {
+            memory[id] = record
+            if memory.count > Self.maxResidentRecords,
+               let victim = memory.keys.first(where: { $0 != id }) {
+                memory[victim] = nil
+            }
+        }
+    }
+
+    var residentRecordCountForTesting: Int { lock.withLock { memory.count } }
+
     func lookup(key: Key, paths: [String], now: Date) -> Lookup {
         let live = Self.stats(for: paths)
         let id = Self.fingerprint(key)
@@ -103,7 +116,7 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
 
     func save(_ record: Record) {
         let id = Self.fingerprint(record.key)
-        lock.withLock { memory[id] = record }
+        remember(record, id: id)
         let url = Self.fileURL(id: id)
         do {
             try FileManager.default.createDirectory(
@@ -159,6 +172,17 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
         }
         for id in doomed {
             try? FileManager.default.removeItem(at: Self.fileURL(id: id))
+        }
+        // Test cleanup includes records evicted from the resident bound.
+        let directory = Self.fileURL(id: "").deletingLastPathComponent()
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        for url in (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [] {
+            guard url.pathExtension == "json", let data = try? Data(contentsOf: url),
+                  let record = try? decoder.decode(Record.self, from: data),
+                  record.files.contains(where: { $0.path == resolved || $0.path == path })
+            else { continue }
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
@@ -239,7 +263,7 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
               let record = try? decoder.decode(Record.self, from: data),
               record.schema == Self.schema
         else { return nil }
-        lock.withLock { memory[id] = record }
+        remember(record, id: id)
         return record
     }
 

@@ -33,7 +33,7 @@ for ((repeat = 1; repeat <= repeat_count; repeat++)); do
     printf '\nMeasurement %s/%s: token accounting (%s) against the fixed synthetic ledger.\n' \
       "$repeat" "$repeat_count" "$mode"
     if QUOTABAR_TOKEN_ACCOUNTING_MODE="$mode" \
-      swift test -c release -j 2 --disable-index-store --filter TokenAccountingEfficiencyTests 2>&1 | tee "$measurement_log"; then
+      swift test -c release -j 2 --disable-index-store --disable-swift-testing --filter TokenAccountingEfficiencyTests 2>&1 | tee "$measurement_log"; then
       measurement_passed=1
     else
       status=$?

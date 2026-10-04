@@ -124,8 +124,7 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
         let key = bucketKey(day: day, model: row.model)
         ensureBucketIndex()
         if let index = bucketIndex[key] {
-            // Saturating: the router parser clamps a hostile line's counts to `Int.max` instead of
-            // rejecting it, so a plain `+=` across rows can overflow and trap.
+            // Saturating: bounded external counts can still overflow when accumulated across rows.
             buckets[index].input = ProviderParse.addingSaturating(buckets[index].input, row.input)
             buckets[index].output = ProviderParse.addingSaturating(buckets[index].output, row.output)
             buckets[index].cacheRead = ProviderParse.addingSaturating(buckets[index].cacheRead, row.cacheRead)

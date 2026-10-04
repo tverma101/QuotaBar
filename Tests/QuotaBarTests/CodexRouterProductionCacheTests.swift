@@ -80,6 +80,27 @@ final class CodexRouterProductionCacheTests: XCTestCase {
         }
     }
 
+    func testResidentAggregateBoundStillAllowsEvictedRecordsToReloadFromDisk() async throws {
+        try await withLedger { ledger in
+            try line(tokens: 100).write(to: ledger, atomically: true, encoding: .utf8)
+            let scanner = CodexRouterUsageScanner(ledgerPaths: { [ledger.path] }, identityAliases: { [:] })
+            for account in 0..<40 {
+                let result = await scanner.scan(accountIdentityKey: "synthetic-account-\(account)",
+                    allowsUnscopedEvents: true, daysBack: 30, now: now, pricing: pricing())
+                XCTAssertEqual(result?.series.daily.first?.totalTokens, 100)
+            }
+            XCTAssertLessThanOrEqual(CodexRouterAggregateIndex.shared.residentRecordCountForTesting,
+                                     CodexRouterAggregateIndex.maxResidentRecords)
+            let before = try XCTUnwrap(CodexRouterUsageScanner.incrementalReadStatisticsForTesting(path: ledger.path))
+            CodexRouterAggregateIndex.shared.unloadMemoryForTesting(path: ledger.path)
+            let restored = await scanner.scan(accountIdentityKey: "synthetic-account-0",
+                allowsUnscopedEvents: true, daysBack: 30, now: now, pricing: pricing())
+            XCTAssertEqual(restored?.series.daily.first?.totalTokens, 100)
+            let after = try XCTUnwrap(CodexRouterUsageScanner.incrementalReadStatisticsForTesting(path: ledger.path))
+            XCTAssertEqual(after.bytesRead, before.bytesRead)
+        }
+    }
+
     func testSameSizeRewriteBeforeUnchangedTailRebuilds() async throws {
         try await withLedger { ledger in
             // Preserve a tail larger than the checkpoint anchor to catch prefix-only mutations.
