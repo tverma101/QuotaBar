@@ -3,10 +3,29 @@
 ## When data updates
 
 - All enabled providers refresh together: once at launch, then every 5 minutes (a fixed cadence — there's no setting for it). Opening the popover does not start a second automatic pass. Providers fetch in parallel, so fast cards update without waiting for a slow one. The batch itself still finishes only after every provider returns; notifications, history sync, and the next five-minute wait begin after that point.
-- Local token and spend accounting uses one shared process CPU allowance for the work performed on each automatic pass. It applies to cold indexing when a full-history scan runs, to any local accounting during menu-bar refreshes, and to accounting SQLite helper CPU; API requests continue independently. A cold index can therefore take longer than a warm refresh.
+- Local token and spend accounting uses one shared pacing target during automatic refreshes and local API reads. Instrumented parsing, cache work, and folds aim for 7.5% of one process CPU core; measurements include CPU from reaped helper processes. This is an average target across bounded work slices, not an instantaneous hard cap, and provider network work continues independently. Cold indexing can therefore take longer than a warm refresh. The repeatable benchmark covers the synthetic CodexRouter scanner/cache path; it does not establish the same measurement for every provider.
 - Turning a provider on (yourself in Customize, or automatically by first-launch/new-provider detection) fetches it promptly instead of waiting out the interval — even when the change lands in the middle of a refresh that's already running.
 - The Dashboard and Settings footer shows `Next update in Nm`. **Clicking it (or pressing ⌘R while that footer is present)** refreshes immediately, skipping the cache.
 - The one-shot `quotabar` command reuses this same persisted cache for five minutes, refreshes missing or stale entries without starting the app, and exits. `quotabar --force` runs the same forced provider refresh as ⌘R regardless of cache age.
+
+## Background refresh without opening the menu
+
+Ask the running app to refresh local Codex and OpenCode accounting with this local notification:
+
+```sh
+swift -e 'import Foundation; DistributedNotificationCenter().postNotificationName(Notification.Name("com.quotabar.refresh"), object: nil, deliverImmediately: true)'
+```
+
+Bursts collapse into one request, and accepted requests are at least 15 seconds apart. The pass runs
+with the panel closed and keeps the normal cache and failure backoff. Codex and OpenCode snapshots
+are invalidated so their accounting actually runs; that can also call their provider APIs. Other
+providers refresh only when their normal cache is stale. `notifyutil` uses a different notification
+channel and does not trigger this path.
+
+Router accounting keeps compact daily checkpoints. An unchanged ledger reads no event bytes, and
+an append reads its new bytes. Rotation, rewriting existing data, a new accounting window, or changed
+prices can require rebuilding. The initial compact router fold runs without the pacing delay so it
+can finish within the provider deadline; the rest of instrumented automatic accounting remains paced.
 - While a provider is fetching, a small spinner appears next to its name (and one shows in the footer beside the countdown), so you can tell a refresh is in flight rather than wondering if the numbers are stale.
 - With [iCloud Sync](icloud-sync.md) on, a refresh batch writes one machine-history file after the whole
   batch finishes. Manual provider refreshes write after that provider finishes, and adjacent changes are

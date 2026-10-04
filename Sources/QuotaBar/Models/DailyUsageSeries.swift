@@ -115,7 +115,7 @@ struct ModelUsageBreakdown: Hashable, Sendable, Codable {
 /// Daily token/cost series plus the per-day models the pricing sources couldn't price — the inputs
 /// `SpendTileMapper.appendTokenUsage` needs to render the spend tiles with unknown-model warnings.
 /// Shared result shape of the native log scanners (Claude, Codex).
-struct LogUsageScan: Sendable {
+struct LogUsageScan: Sendable, Codable {
     var series: DailyUsageSeries
     var modelUsage: ModelUsageSeries?
     /// `yyyy-MM-dd` day key → models used that day whose usage was left out because no price was available.

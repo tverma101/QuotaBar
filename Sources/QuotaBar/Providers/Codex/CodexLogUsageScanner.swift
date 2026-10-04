@@ -144,6 +144,58 @@ actor CodexLogUsageScanner {
     /// `~/.codex` keeps shared inodes (see `sessionFiles`).
     private let peerHomes: [URL]
 
+    /// Priced per-inode folds. A menu-bar tap reuses these when size/mtime/inode are unchanged
+    /// instead of re-walking every retained session event. Only the files that actually grew are
+    /// folded, then merged with the cached slices.
+    private struct InodeAggregateKey: Hashable, Codable {
+        var device: UInt64
+        var inode: UInt64
+    }
+
+    private struct InodeAggregateRecord: Codable {
+        var size: Int
+        var mtime: Date
+        var attributeMtime: Date?
+        var scan: LogUsageScan
+    }
+
+    private struct PersistedInodeAggregates: Codable {
+        var pricingToken: String
+        var since: Date
+        var timeZoneIdentifier: String
+        var records: [PersistedInodeAggregate]
+    }
+
+    private struct PersistedInodeAggregate: Codable {
+        var device: UInt64
+        var inode: UInt64
+        var record: InodeAggregateRecord
+    }
+
+    private final class PerFileFoldBucket: @unchecked Sendable {
+        var fold = AggregateFoldState()
+        var scans: [String: LogUsageScan] = [:]
+
+        func begin() {
+            fold = AggregateFoldState()
+        }
+
+        func finish(_ path: String) {
+            scans[path] = fold.accumulator.build()
+        }
+    }
+
+    private var inodeAggregates: [InodeAggregateKey: InodeAggregateRecord] = [:]
+    private var aggregatePricingToken: String?
+    private var aggregateSince: Date?
+    private var aggregateTimeZone: String?
+    private var aggregateIdentity: String?
+    private var didAttemptAggregateLoad = false
+
+    private static var persistsUsageAggregates: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
+    }
+
     init(
         environment: EnvironmentReading = QuotaBarEnvironmentReader(),
         homeDirectory: @escaping @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
@@ -175,10 +227,46 @@ actor CodexLogUsageScanner {
             return nil
         }
 
-        let fold = AggregateFoldState()
+        let pricingToken = pricing.aggregateCacheToken
+        let timeZone = Calendar.current.timeZone.identifier
+        prepareInodeAggregates(
+            identity: context.identity,
+            pricingToken: pricingToken,
+            since: context.requestedSince,
+            timeZone: timeZone
+        )
+
         let requestedSince = context.requestedSince
+        var unchanged: [LogUsageScan] = []
+        var changed: [JSONLScanning.DiscoveredFile] = []
+        var liveInodes: Set<InodeAggregateKey> = []
+        unchanged.reserveCapacity(files.count)
+        for file in files {
+            guard let revision = AppendOnlyFileProbe.revision(at: URL(fileURLWithPath: file.path)) else {
+                changed.append(file)
+                continue
+            }
+            let key = InodeAggregateKey(device: revision.device, inode: revision.inode)
+            liveInodes.insert(key)
+            if let cached = inodeAggregates[key],
+               cached.size == file.size,
+               Self.timestampsMatch(cached.mtime, file.mtime),
+               Self.timestampsMatch(cached.attributeMtime, file.attributeMtime) {
+                unchanged.append(cached.scan)
+            } else {
+                changed.append(file)
+            }
+        }
+        if inodeAggregates.contains(where: { !liveInodes.contains($0.key) }) {
+            inodeAggregates = inodeAggregates.filter { liveInodes.contains($0.key) }
+        }
+        if changed.isEmpty {
+            return DailyUsageAccumulator.merged(unchanged) ?? DailyUsageAccumulator().build()
+        }
+
+        let bucket = PerFileFoldBucket()
         let ok = await scanner.foldItems(
-            from: files, since: context.cacheSince, cacheIdentity: context.identity,
+            from: changed, since: context.cacheSince, cacheIdentity: context.identity,
             parseFile: { url in
                 Self.parseFileIncrementally(
                     at: url,
@@ -191,13 +279,128 @@ actor CodexLogUsageScanner {
                     event: event,
                     since: requestedSince,
                     pricing: pricing,
-                    seen: &fold.seen,
-                    accumulator: &fold.accumulator
+                    seen: &bucket.fold.seen,
+                    accumulator: &bucket.fold.accumulator
                 )
+            },
+            fileStarted: { _ in
+                bucket.begin()
+            },
+            fileCompleted: { path, _ in
+                bucket.finish(path)
             }
         )
         guard ok, !Task.isCancelled else { return nil }
-        return fold.accumulator.build()
+
+        for file in changed {
+            guard let scan = bucket.scans[file.path],
+                  let revision = AppendOnlyFileProbe.revision(at: URL(fileURLWithPath: file.path))
+            else { continue }
+            let key = InodeAggregateKey(device: revision.device, inode: revision.inode)
+            inodeAggregates[key] = InodeAggregateRecord(
+                size: file.size,
+                mtime: file.mtime,
+                attributeMtime: file.attributeMtime,
+                scan: scan
+            )
+            unchanged.append(scan)
+        }
+        persistInodeAggregates(
+            identity: context.identity,
+            pricingToken: pricingToken,
+            since: context.requestedSince,
+            timeZone: timeZone
+        )
+        return DailyUsageAccumulator.merged(unchanged) ?? DailyUsageAccumulator().build()
+    }
+
+    private func prepareInodeAggregates(
+        identity: String,
+        pricingToken: String,
+        since: Date,
+        timeZone: String
+    ) {
+        let contextChanged = aggregateIdentity != identity
+            || aggregatePricingToken != pricingToken
+            || aggregateTimeZone != timeZone
+            || !Self.timestampsMatch(aggregateSince, since)
+        if contextChanged {
+            inodeAggregates = [:]
+            didAttemptAggregateLoad = false
+            aggregateIdentity = identity
+            aggregatePricingToken = pricingToken
+            aggregateSince = since
+            aggregateTimeZone = timeZone
+        }
+        guard !didAttemptAggregateLoad else { return }
+        didAttemptAggregateLoad = true
+        guard Self.persistsUsageAggregates,
+              let loaded = Self.readInodeAggregates(identity: identity),
+              loaded.pricingToken == pricingToken,
+              loaded.timeZoneIdentifier == timeZone,
+              Self.timestampsMatch(loaded.since, since)
+        else { return }
+        var restored: [InodeAggregateKey: InodeAggregateRecord] = [:]
+        restored.reserveCapacity(loaded.records.count)
+        for entry in loaded.records {
+            restored[InodeAggregateKey(device: entry.device, inode: entry.inode)] = entry.record
+        }
+        inodeAggregates = restored
+    }
+
+    private func persistInodeAggregates(
+        identity: String,
+        pricingToken: String,
+        since: Date,
+        timeZone: String
+    ) {
+        guard Self.persistsUsageAggregates else { return }
+        let payload = PersistedInodeAggregates(
+            pricingToken: pricingToken,
+            since: since,
+            timeZoneIdentifier: timeZone,
+            records: inodeAggregates.map { key, record in
+                PersistedInodeAggregate(device: key.device, inode: key.inode, record: record)
+            }
+        )
+        let url = Self.aggregateIndexURL(identity: identity)
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .secondsSince1970
+            let data = try encoder.encode(payload)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            AppLog.debug(LogTag.plugin("codex"), "usage aggregate index write failed")
+        }
+    }
+
+    private static func readInodeAggregates(identity: String) -> PersistedInodeAggregates? {
+        let url = aggregateIndexURL(identity: identity)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        return try? decoder.decode(PersistedInodeAggregates.self, from: data)
+    }
+
+    private static func aggregateIndexURL(identity: String) -> URL {
+        JSONLScanCachePaths.defaultDirectory
+            .appendingPathComponent("aggregates", isDirectory: true)
+            .appendingPathComponent("codex-sessions-\(JSONLScanCachePaths.stableFingerprint(identity)).json")
+    }
+
+    private static func timestampsMatch(_ lhs: Date?, _ rhs: Date?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (lhs?, rhs?):
+            return abs(lhs.timeIntervalSinceReferenceDate - rhs.timeIntervalSinceReferenceDate) < 0.001
+        default:
+            return false
+        }
     }
 
     /// The parsed turns of the last `daysBack` days. Default 30/33-day consumers share one 35-day

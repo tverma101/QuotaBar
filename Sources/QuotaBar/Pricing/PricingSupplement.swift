@@ -1,11 +1,12 @@
 import Foundation
 
-/// QuotaBar's own pricing feed: models that no public catalog carries (Cursor-native `auto`,
-/// `composer-*`, `github_bugbot`), fast-variant multipliers the catalogs omit, and the alias rules
-/// that map provider log/CSV slugs to canonical pricing keys. Ships bundled as
+/// QuotaBar's own pricing feed: curated rate/cache overrides, models that no public catalog carries
+/// (Cursor-native `auto`, `composer-*`, `github_bugbot`), fast-variant multipliers the catalogs omit,
+/// and alias rules that map provider log/CSV slugs to canonical pricing keys. Ships bundled as
 /// `pricing_supplement.json` and refreshes from gh-pages, so entries update without an app release.
 struct PricingSupplement: Sendable {
-    /// Models priced directly by the supplement (highest-precedence source).
+    /// Curated exact rates and Cursor-native entries. These override public catalogues when a
+    /// deliberate first-party price or model-specific cache rate is available.
     let pricing: [String: ModelRates]
     /// Base-model -> fast-variant multiplier, for `-fast` slugs whose catalogs carry no `fast` field.
     /// Also applied to the base model's own rates, so requests flagged fast by the scanner (rather

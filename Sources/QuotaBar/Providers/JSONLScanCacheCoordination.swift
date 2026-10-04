@@ -9,7 +9,8 @@ import Darwin
 final class JSONLAccountingWorkPacer: @unchecked Sendable {
     static let shared = JSONLAccountingWorkPacer()
 
-    static let targetCPUFraction = 0.092
+    // Leave margin below the 10% contract for work between paced slices and sampling variation.
+    static let targetCPUFraction = 0.075
     // A pathological work slice must not hold the shared accounting lock past one provider deadline.
     private static let maxPacingDebtNanoseconds: Int64 = 120_000_000_000
     // A longer slice avoids thousands of timer wakeups while streaming large ledgers. Oversleep is
@@ -29,7 +30,11 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
         guard enabled ?? ProviderRefreshContext.accountingCPUThrottleEnabled else {
             return try work()
         }
-        lock.lock()
+        guard acquireLockForWork() else {
+            // A cancelled refresh must not wait behind another accounting slice. Scanner closures
+            // observe cancellation at their next bounded loop boundary.
+            return try work()
+        }
         defer { lock.unlock() }
 
         var previousCPU = processCPUNanoseconds()
@@ -53,6 +58,18 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
             }
         }
         return try work()
+    }
+
+    private func acquireLockForWork() -> Bool {
+        while !lock.try() {
+            if Task.isCancelled { return false }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        guard !Task.isCancelled else {
+            lock.unlock()
+            return false
+        }
+        return true
     }
 
     private func accountPacingInterval(previousCPU: inout UInt64, previousWall: inout UInt64) {

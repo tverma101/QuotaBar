@@ -34,6 +34,9 @@ actor CodexRouterUsageScanner {
     /// (`acct_<base64url>`) stamped on ledger rows still match QuotaBar cards keyed by UUID.
     private let identityAliases: @Sendable () -> [String: String]
     private let scanner: IncrementalJSONLScanner<Event>
+    /// Production scans fold into the on-disk aggregate. Tests that inject a scanner keep the
+    /// event-retaining path so the benchmark can still measure that cache.
+    private let usesInjectedScanner: Bool
 
     /// Reuse the already-priced daily fold when the ledger and all attribution inputs are stable.
     /// The parsed JSONL cache alone avoids disk reads; this avoids walking and pricing every retained
@@ -63,6 +66,26 @@ actor CodexRouterUsageScanner {
         var sources: [SourceRevision]
         var itemCountsByPath: [String: Int]
         var result: LogUsageScan?
+        /// A successful, account-matched event just beyond the last scan's `now` bound. The cache
+        /// expires when that event becomes eligible, even if no ledger bytes have changed.
+        var nextFutureEventAt: Date?
+    }
+
+    private enum AggregateCacheLookup {
+        case miss
+        case hit(LogUsageScan?)
+    }
+
+    private struct ScanPreflight {
+        var sourceFiles: [JSONLScanning.DiscoveredFile]?
+        var sourceRevisions: [SourceRevision]?
+        var aggregateKey: AggregateKey?
+        var cacheLookup: AggregateCacheLookup
+        var incrementalBase: AggregateCache?
+        var skipCountsByPath: [String: Int]
+        var expectedFingerprint: String?
+        var expectedAccountId: String?
+        var expectedAliasIds: Set<String>
     }
 
     private var aggregateCache: AggregateCache?
@@ -86,8 +109,15 @@ actor CodexRouterUsageScanner {
         persistence: JSONLScanCachePersistence(namespace: "codex-router", schemaVersion: 1)
     )
 
-    /// Shared across every Codex card so two accounts do not re-parse the same ledger.
-    private static let sharedCacheIdentity = "codex-router"
+    /// Shared across every Codex card so two accounts do not re-parse the same ledger. Retention
+    /// is part of the identity because the parsed rows are filtered before entering the cache.
+    private static func sharedCacheIdentity(retentionDays: Int) -> String {
+        "codex-router-retention-\(retentionDays)"
+    }
+
+    private static func sharedTailCacheKey(for url: URL, retentionDays: Int) -> String {
+        "\(url.resolvingSymlinksInPath().path)#retention-days=\(retentionDays)"
+    }
 
     static func flushPersistentCacheWrites() async {
         await sharedScanner.flushPendingWrites()
@@ -97,9 +127,10 @@ actor CodexRouterUsageScanner {
         sharedTailCache.unloadRetainedItems()
     }
 
-    static func clearSharedTailCacheForTesting(path: String) {
+    static func clearSharedTailCacheForTesting(path: String, retentionDays: Int = 35) {
         let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
-        sharedTailCache.remove(url.path)
+        sharedTailCache.remove(sharedTailCacheKey(for: url, retentionDays: retentionDays))
+        CodexRouterAggregateIndex.shared.clear(path: url.path)
     }
 
     /// Keep the hot parsed index while the panel is active, then release it when hidden or under
@@ -109,12 +140,22 @@ actor CodexRouterUsageScanner {
     }
 
     static func resumeSharedParsedItems() async {
-        await sharedScanner.resumeResidentItems()
+        // The menu-bar path no longer keeps the parsed ledger resident. Hydrating it here put the
+        // whole event index back in RAM on every panel open.
     }
 
     /// Test hook: append-only parse counters for the shared router ledger path.
-    static func incrementalReadStatisticsForTesting(path: String) -> (fullParses: Int, tailParses: Int, bytesRead: Int)? {
-        guard let stats = sharedTailCache.statistics(for: path) else { return nil }
+    static func incrementalReadStatisticsForTesting(
+        path: String,
+        retentionDays: Int = 35
+    ) -> (fullParses: Int, tailParses: Int, bytesRead: Int)? {
+        if let stats = CodexRouterAggregateIndex.shared.statistics(path: path) {
+            return stats
+        }
+        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+        guard let stats = sharedTailCache.statistics(
+            for: sharedTailCacheKey(for: url, retentionDays: retentionDays)
+        ) else { return nil }
         return (stats.fullParses, stats.tailParses, stats.bytesRead)
     }
 
@@ -135,6 +176,7 @@ actor CodexRouterUsageScanner {
         self.identityAliases = identityAliases ?? {
             Self.loadPoolIdentityAliases(environment: environment, homeDirectory: homeDirectory())
         }
+        self.usesInjectedScanner = incrementalScanner != nil
         self.scanner = incrementalScanner ?? Self.sharedScanner
     }
 
@@ -151,54 +193,95 @@ actor CodexRouterUsageScanner {
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
         let since = calendar.date(byAdding: .day, value: -(days - 1), to: today) ?? today
-        let sourceFiles = readFile == nil ? Self.discoveredLedgers(paths: ledgerPaths()) : nil
-        let sourceRevisions = sourceFiles.flatMap(Self.sourceRevisions(for:))
+        if readFile == nil, !usesInjectedScanner {
+            // One unpaced pass seeds the on-disk aggregate inside the 120s provider deadline.
+            // Later taps hit that aggregate and do not read the ledger. Leaving the 7.5% pacer on
+            // made a 72MB cold fold exceed the deadline and start over on the next tap.
+            return await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(false) {
+                await self.scanPersistentAggregate(
+                    accountIdentityKey: accountIdentityKey,
+                    allowsUnscopedEvents: allowsUnscopedEvents,
+                    days: days,
+                    since: since,
+                    now: now,
+                    calendar: calendar,
+                    pricing: pricing
+                )
+            }
+        }
         let fold = AggregateFoldState()
-        let expectedFingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountIdentityKey)
-        let expectedAccountId = accountIdentityKey?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
-        let aliases = identityAliases()
-        // Reverse map: UUID → pool opaque ids that belong to this card.
-        let expectedAliasIds: Set<String> = {
-            guard let expectedAccountId else { return [] }
-            let needle = expectedAccountId.lowercased()
-            return Set(aliases.compactMap { (key, value) in
-                value.lowercased() == needle ? key.lowercased() : nil
-            })
-        }()
+        // Include filesystem discovery, cache revision checks, account-alias preparation, and the
+        // aggregate-cache hit in the same budget as the event fold. Otherwise a warm refresh could
+        // do its active metadata work outside the measured allowance.
+        let preflight = JSONLAccountingWorkPacer.shared.perform {
+            let sourceFiles = readFile == nil ? Self.discoveredLedgers(paths: ledgerPaths()) : nil
+            let sourceRevisions = sourceFiles.flatMap(Self.sourceRevisions(for:))
+            let expectedFingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountIdentityKey)
+            let expectedAccountId = accountIdentityKey?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfEmpty
+            let aliases = identityAliases()
+            let expectedAliasIds: Set<String> = {
+                guard let expectedAccountId else { return [] }
+                let needle = expectedAccountId.lowercased()
+                return Set(aliases.compactMap { (key, value) in
+                    value.lowercased() == needle ? key.lowercased() : nil
+                })
+            }()
+            let aggregateKey = sourceFiles.map { _ in
+                AggregateKey(
+                    accountIdentityKey: expectedAccountId,
+                    allowsUnscopedEvents: allowsUnscopedEvents,
+                    daysBack: days,
+                    since: since,
+                    timeZoneIdentifier: calendar.timeZone.identifier,
+                    aliases: aliases.map { "\($0.key.lowercased())=\($0.value.lowercased())" }.sorted(),
+                    pricingIdentity: ObjectIdentifier(pricing)
+                )
+            }
 
-        // The router ledger is local and append-only. Resource revisions are cheap to read and catch
-        // both appends and same-size replacements (attribute mtime changes on an in-place rewrite).
-        // Keep this cache per scanner/account because the folds have different account filters.
-        let aggregateKey = sourceFiles.map { _ in
-            AggregateKey(
-                accountIdentityKey: expectedAccountId,
-                allowsUnscopedEvents: allowsUnscopedEvents,
-                daysBack: days,
-                since: since,
-                timeZoneIdentifier: calendar.timeZone.identifier,
-                aliases: aliases.map { "\($0.key.lowercased())=\($0.value.lowercased())" }.sorted(),
-                pricingIdentity: ObjectIdentifier(pricing)
+            var cacheLookup = AggregateCacheLookup.miss
+            var incrementalBase: AggregateCache?
+            var skipCountsByPath: [String: Int] = [:]
+            if let aggregateKey,
+               let sourceRevisions,
+               let aggregateCache,
+               aggregateCache.key == aggregateKey {
+                let futureEventBecameEligible = aggregateCache.nextFutureEventAt.map { now >= $0 } ?? false
+                if aggregateCache.sources == sourceRevisions, !futureEventBecameEligible {
+                    cacheLookup = .hit(aggregateCache.result)
+                } else if !futureEventBecameEligible,
+                          let skipCounts = Self.appendOnlySkipCounts(
+                            previous: aggregateCache,
+                            current: sourceRevisions
+                          ) {
+                    incrementalBase = aggregateCache
+                    skipCountsByPath = skipCounts
+                }
+            }
+            return ScanPreflight(
+                sourceFiles: sourceFiles,
+                sourceRevisions: sourceRevisions,
+                aggregateKey: aggregateKey,
+                cacheLookup: cacheLookup,
+                incrementalBase: incrementalBase,
+                skipCountsByPath: skipCountsByPath,
+                expectedFingerprint: expectedFingerprint,
+                expectedAccountId: expectedAccountId,
+                expectedAliasIds: expectedAliasIds
             )
         }
-        var incrementalBase: AggregateCache?
-        var skipCountsByPath: [String: Int] = [:]
-        if let aggregateKey,
-           let sourceRevisions,
-           let aggregateCache,
-           aggregateCache.key == aggregateKey {
-            if aggregateCache.sources == sourceRevisions {
-                return Task.isCancelled ? nil : aggregateCache.result
-            }
-            if let skipCounts = Self.appendOnlySkipCounts(
-                previous: aggregateCache,
-                current: sourceRevisions
-            ) {
-                incrementalBase = aggregateCache
-                skipCountsByPath = skipCounts
-            }
+        if case .hit(let cachedResult) = preflight.cacheLookup {
+            return Task.isCancelled ? nil : cachedResult
         }
+        let sourceFiles = preflight.sourceFiles
+        let sourceRevisions = preflight.sourceRevisions
+        let aggregateKey = preflight.aggregateKey
+        let expectedFingerprint = preflight.expectedFingerprint
+        let expectedAccountId = preflight.expectedAccountId
+        let expectedAliasIds = preflight.expectedAliasIds
+        let incrementalBase = preflight.incrementalBase
+        let skipCountsByPath = preflight.skipCountsByPath
 
         let visitOne: @Sendable (Event) -> Void = { event in
             guard Self.isSuccessfulStatus(event.status) else { return }
@@ -210,6 +293,12 @@ actor CodexRouterUsageScanner {
                 allowsUnscopedEvents: allowsUnscopedEvents
             ) else { return }
             guard event.timestamp >= since else { return }
+            guard event.timestamp <= now else {
+                if fold.nextFutureEventAt.map({ event.timestamp < $0 }) ?? true {
+                    fold.nextFutureEventAt = event.timestamp
+                }
+                return
+            }
 
             let model = event.model
             // Same gateway skip as session logs: the OpenCode card owns these turns.
@@ -288,7 +377,8 @@ actor CodexRouterUsageScanner {
             )
         }
 
-        // Unit tests inject an in-memory ledger; keep that path allocation-light and deterministic.
+        // Unit tests inject an in-memory ledger, but still use the production byte parser so the
+        // assertions cover exactly the parser used by automatic indexing.
         if let readFile {
             for path in ledgerPaths() {
                 guard !Task.isCancelled else { return nil }
@@ -296,11 +386,9 @@ actor CodexRouterUsageScanner {
                 for line in contents.split(whereSeparator: \.isNewline) {
                     guard !Task.isCancelled else { return nil }
                     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !trimmed.isEmpty,
-                          let data = trimmed.data(using: .utf8),
-                          let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                          let event = Self.parseEvent(object)
-                    else { continue }
+                    guard !trimmed.isEmpty else { continue }
+                    let data = Data(trimmed.utf8)
+                    guard let event = CodexRouterEventLineParser.parse(data[...]) else { continue }
                     visitOne(event)
                 }
             }
@@ -324,7 +412,8 @@ actor CodexRouterUsageScanner {
                     guard let events = Self.parseAppendedEvents(
                         at: URL(fileURLWithPath: source.path),
                         from: previous,
-                        emitSince: emitSince
+                        emitSince: emitSince,
+                        retentionDays: retentionDays
                     ) else {
                         everyTailReadSucceeded = false
                         break
@@ -349,9 +438,13 @@ actor CodexRouterUsageScanner {
                 let ok = await scanner.foldItems(
                     from: files,
                     since: cacheSince,
-                    cacheIdentity: Self.sharedCacheIdentity,
+                    cacheIdentity: Self.sharedCacheIdentity(retentionDays: retentionDays),
                     parseFile: { url in
-                        Self.parseFileIncrementally(at: url, emitSince: emitSince)
+                        Self.parseFileIncrementally(
+                            at: url,
+                            emitSince: emitSince,
+                            retentionDays: retentionDays
+                        )
                     },
                     visit: { event in
                         if event.timestamp >= since {
@@ -370,26 +463,33 @@ actor CodexRouterUsageScanner {
         // A cancelled tail fold must not publish a partial aggregate for an unchanged source revision.
         guard !Task.isCancelled else { return nil }
 
-        let result: LogUsageScan?
-        let deltaResult: LogUsageScan?
-        if fold.sawRows {
-            let built = fold.accumulator.build()
-            deltaResult = built.series.daily.isEmpty && built.unknownModelsByDay.isEmpty ? nil : built
-        } else {
-            deltaResult = nil
+        let result = JSONLAccountingWorkPacer.shared.perform { () -> LogUsageScan? in
+            let deltaResult: LogUsageScan?
+            if fold.sawRows {
+                let built = fold.accumulator.build()
+                deltaResult = built.series.daily.isEmpty && built.unknownModelsByDay.isEmpty ? nil : built
+            } else {
+                deltaResult = nil
+            }
+            return incrementalBase == nil
+                ? deltaResult
+                : DailyUsageAccumulator.merged([incrementalBase?.result, deltaResult])
         }
-        result = incrementalBase == nil
-            ? deltaResult
-            : DailyUsageAccumulator.merged([incrementalBase?.result, deltaResult])
         if let aggregateKey, let sourceRevisions {
-            let currentFiles = Self.discoveredLedgers(paths: ledgerPaths())
-            if let current = Self.sourceRevisions(for: currentFiles), current == sourceRevisions {
-                aggregateCache = AggregateCache(
-                    key: aggregateKey,
-                    sources: sourceRevisions,
-                    itemCountsByPath: fold.itemCountsByPath,
-                    result: result
-                )
+            JSONLAccountingWorkPacer.shared.perform {
+                let currentFiles = Self.discoveredLedgers(paths: ledgerPaths())
+                if let current = Self.sourceRevisions(for: currentFiles), current == sourceRevisions {
+                    let nextFutureEventAt = [incrementalBase?.nextFutureEventAt, fold.nextFutureEventAt]
+                        .compactMap { $0 }
+                        .min()
+                    aggregateCache = AggregateCache(
+                        key: aggregateKey,
+                        sources: sourceRevisions,
+                        itemCountsByPath: fold.itemCountsByPath,
+                        result: result,
+                        nextFutureEventAt: nextFutureEventAt
+                    )
+                }
             }
         }
         return result
@@ -400,6 +500,7 @@ actor CodexRouterUsageScanner {
         var sawRows = false
         var accumulator = DailyUsageAccumulator()
         var itemCountsByPath: [String: Int] = [:]
+        var nextFutureEventAt: Date?
         let pricingCache = RouterModelPricingCache()
     }
 
@@ -631,15 +732,18 @@ actor CodexRouterUsageScanner {
     /// prefix. Otherwise stream a full parse and replace the checkpoint.
     nonisolated private static func parseFileIncrementally(
         at url: URL,
-        emitSince: Date
+        emitSince: Date,
+        retentionDays: Int
     ) -> [Event]? {
-        sharedTailCacheLock.lock()
+        guard acquireSharedTailCacheLock() else { return nil }
         defer { sharedTailCacheLock.unlock() }
-        let key = url.resolvingSymlinksInPath().path
+        let key = sharedTailCacheKey(for: url, retentionDays: retentionDays)
         let currentRevision = AppendOnlyFileProbe.revision(at: url)
 
         if let currentRevision,
            let cached = sharedTailCache.entry(for: key),
+           let cachedEmitSince = cached.parserState.emitSince,
+           cachedEmitSince <= emitSince,
            currentRevision.device == cached.revision.device,
            currentRevision.inode == cached.revision.inode,
            currentRevision.size == cached.offset,
@@ -652,12 +756,18 @@ actor CodexRouterUsageScanner {
             // Checkpoint valid but items were unloaded (memory pressure). Must full-reparse —
             // returning [] would silently drop history. Routine refresh paths no longer unload
             // this cache; pressure unload still can.
-            return fullParseAndCheckpoint(at: url, emitSince: emitSince, key: key)
+            return fullParseAndCheckpoint(
+                at: url,
+                emitSince: emitSince,
+                key: key
+            )
         }
 
         if let currentRevision,
            let cached = sharedTailCache.entry(for: key),
            cached.itemsAvailable,
+           let cachedEmitSince = cached.parserState.emitSince,
+           cachedEmitSince <= emitSince,
            currentRevision.device == cached.revision.device,
            currentRevision.inode == cached.revision.inode,
            currentRevision.size > cached.offset,
@@ -679,7 +789,11 @@ actor CodexRouterUsageScanner {
             }
             guard read.succeeded else { return nil }
             guard AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor else {
-                return fullParseAndCheckpoint(at: url, emitSince: emitSince, key: key)
+                return fullParseAndCheckpoint(
+                    at: url,
+                    emitSince: emitSince,
+                    key: key
+                )
             }
 
             // If a final partial line is itself a complete JSON object, accept it (writers that omit
@@ -708,7 +822,7 @@ actor CodexRouterUsageScanner {
                         anchor: anchor,
                         partialLine: read.finalPartial,
                         isDiscardingOversizedLine: read.isDiscardingOversizedLine,
-                        parserState: ParserCheckpoint(),
+                        parserState: ParserCheckpoint(emitSince: emitSince),
                         items: merged
                     ),
                     for: key,
@@ -717,10 +831,18 @@ actor CodexRouterUsageScanner {
                 )
                 return merged
             }
-            return fullParseAndCheckpoint(at: url, emitSince: emitSince, key: key)
+            return fullParseAndCheckpoint(
+                at: url,
+                emitSince: emitSince,
+                key: key
+            )
         }
 
-        return fullParseAndCheckpoint(at: url, emitSince: emitSince, key: key)
+        return fullParseAndCheckpoint(
+            at: url,
+            emitSince: emitSince,
+            key: key
+        )
     }
 
     /// Parse an append for the resident account-fold cache without rebuilding the full historical
@@ -729,11 +851,12 @@ actor CodexRouterUsageScanner {
     nonisolated private static func parseAppendedEvents(
         at url: URL,
         from previousSource: SourceRevision,
-        emitSince: Date
+        emitSince: Date,
+        retentionDays: Int
     ) -> [Event]? {
-        sharedTailCacheLock.lock()
+        guard acquireSharedTailCacheLock() else { return nil }
         defer { sharedTailCacheLock.unlock() }
-        let key = url.resolvingSymlinksInPath().path
+        let key = sharedTailCacheKey(for: url, retentionDays: retentionDays)
         guard let currentRevision = AppendOnlyFileProbe.revision(at: url),
               let cached = sharedTailCache.entry(for: key)
         else { return nil }
@@ -748,11 +871,13 @@ actor CodexRouterUsageScanner {
         if cached.revision.device == currentRevision.device,
            cached.revision.inode == currentRevision.inode,
            cached.revision.size == currentRevision.size,
+           cached.offset == UInt64(currentRevision.size),
            cached.appendedItemsAvailable,
            cached.appendedFromRevision == previousRevision,
            cached.appendedFromAnchor == previousSource.prefixAnchor,
            cached.parserState.emitSince == emitSince,
-           AppendOnlyFileProbe.anchor(at: url, endingAt: previousRevision.size) == previousSource.prefixAnchor {
+           AppendOnlyFileProbe.anchor(at: url, endingAt: previousRevision.size) == previousSource.prefixAnchor,
+           AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor {
             return cached.appendedItems
         }
 
@@ -820,6 +945,18 @@ actor CodexRouterUsageScanner {
         return collected
     }
 
+    nonisolated private static func acquireSharedTailCacheLock() -> Bool {
+        while !sharedTailCacheLock.try() {
+            guard !Task.isCancelled else { return false }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        guard !Task.isCancelled else {
+            sharedTailCacheLock.unlock()
+            return false
+        }
+        return true
+    }
+
     nonisolated private static func fullParseAndCheckpoint(
         at url: URL,
         emitSince: Date,
@@ -843,16 +980,18 @@ actor CodexRouterUsageScanner {
             collected.append(event)
             read.finalPartial = Data()
         }
+        let offset = UInt64(read.statistics.bytesRead)
         if let revision = AppendOnlyFileProbe.revision(at: url),
-           let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: revision.size) {
+           revision.size >= offset,
+           let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: offset) {
             sharedTailCache.store(
                 AppendOnlyFileTailCache<Event, ParserCheckpoint>.Entry(
                     revision: revision,
-                    offset: revision.size,
+                    offset: offset,
                     anchor: anchor,
                     partialLine: read.finalPartial,
                     isDiscardingOversizedLine: read.isDiscardingOversizedLine,
-                    parserState: ParserCheckpoint(),
+                    parserState: ParserCheckpoint(emitSince: emitSince),
                     items: collected
                 ),
                 for: key,
@@ -899,8 +1038,7 @@ actor CodexRouterUsageScanner {
 
     /// True when the router metered this turn against an OpenCode-hosted account.
     static func isOpenCodeServed(_ event: Event) -> Bool {
-        let provider = event.provider.lowercased()
-        return provider.hasPrefix("opencode")
+        isOpenCodeProvider(event.provider) || OpenCodeUsageScanner.isHostedGatewayModel(event.model)
     }
 
     /// Same test for a raw ledger field, so the OpenCode fold can select its own rows.
@@ -909,42 +1047,6 @@ actor CodexRouterUsageScanner {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty else { return false }
         return provider.lowercased().hasPrefix("opencode")
-    }
-
-    static func parseEvent(_ json: [String: Any]) -> Event? {
-        guard let atRaw = (json["at"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let timestamp = OpenUsageISO8601.date(from: atRaw)
-        else { return nil }
-        let model = (json["model"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
-            ?? ModelUsageEntry.unattributedModelName
-        let provider = (json["provider"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
-            ?? "unknown"
-        let status = intValue(json["status"]) ?? 0
-        return Event(
-            timestamp: timestamp,
-            model: model,
-            provider: provider,
-            status: status,
-            inputTokens: max(0, intValue(json["inputTokens"]) ?? 0),
-            cachedInputTokens: max(0, intValue(json["cachedInputTokens"]) ?? 0),
-            outputTokens: max(0, intValue(json["outputTokens"]) ?? 0),
-            reasoningTokens: max(0, intValue(json["reasoningTokens"]) ?? 0),
-            totalTokens: intValue(json["totalTokens"]).map { max(0, $0) },
-            accountId: (json["accountId"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nilIfEmpty,
-            accountFingerprint: (json["accountFingerprint"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nilIfEmpty,
-            serviceTier: (json["serviceTier"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .nilIfEmpty?
-                .lowercased()
-        )
     }
 
     static func isSuccessfulStatus(_ status: Int) -> Bool {
@@ -1050,15 +1152,6 @@ actor CodexRouterUsageScanner {
         return unique(candidates)
     }
 
-    private static func intValue(_ value: Any?) -> Int? {
-        // `Double(Int.max)` rounds up to 2^63, so `<= Double(Int.max)` admits exactly 2^63 — which then
-        // traps in the conversion below. Compare in the clamped domain instead.
-        guard let number = ProviderParse.number(value), number >= 0, number < 9_223_372_036_854_775_808 else {
-            return nil
-        }
-        return Int(number.rounded(.down))
-    }
-
     private static func splitPaths(_ raw: String?) -> [String] {
         guard let raw else { return [] }
         return raw.split { $0 == "," || $0 == "\n" || $0 == "\r" }
@@ -1070,4 +1163,184 @@ actor CodexRouterUsageScanner {
         var seen: Set<String> = []
         return paths.filter { seen.insert($0).inserted }
     }
+
+    /// Stream the ledger into a priced daily aggregate. Unchanged inode+size+mtime returns the
+    /// saved fold without opening the file. Growth reads only the appended bytes. Rotate/truncate
+    /// rebuilds once. Events are not retained.
+    private func scanPersistentAggregate(
+        accountIdentityKey: String?,
+        allowsUnscopedEvents: Bool,
+        days: Int,
+        since: Date,
+        now: Date,
+        calendar: Calendar,
+        pricing: ModelPricing
+    ) async -> LogUsageScan? {
+        let expectedFingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountIdentityKey)
+        let expectedAccountId = accountIdentityKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        let aliases = identityAliases()
+        let expectedAliasIds: Set<String> = {
+            guard let expectedAccountId else { return [] }
+            let needle = expectedAccountId.lowercased()
+            return Set(aliases.compactMap { key, value in
+                value.lowercased() == needle ? key.lowercased() : nil
+            })
+        }()
+        let index = CodexRouterAggregateIndex.shared
+        let paths = ledgerPaths()
+        let key = CodexRouterAggregateIndex.Key(
+            account: expectedAccountId ?? "",
+            allowsUnscopedEvents: allowsUnscopedEvents,
+            days: days,
+            since: since.timeIntervalSince1970,
+            timeZoneIdentifier: calendar.timeZone.identifier,
+            aliases: aliases.map { "\($0.key.lowercased())=\($0.value.lowercased())" }.sorted(),
+            pricingToken: pricing.aggregateCacheToken,
+            sourcePaths: Array(Set(paths.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })).sorted()
+        )
+        let lookup = index.lookup(key: key, paths: paths, now: now)
+        let prior: CodexRouterAggregateIndex.Record?
+        switch lookup {
+        case .hit(let cached):
+            return Task.isCancelled ? nil : cached
+        case .append(let record):
+            prior = record
+        case .rebuild:
+            prior = nil
+        }
+
+        let fold = AggregateFoldState()
+        let visit: (Event) -> Void = { event in
+            guard Self.isSuccessfulStatus(event.status) else { return }
+            guard Self.belongsToAccount(
+                event,
+                expectedFingerprint: expectedFingerprint,
+                expectedAccountId: expectedAccountId,
+                expectedAliasIds: expectedAliasIds,
+                allowsUnscopedEvents: allowsUnscopedEvents
+            ) else { return }
+            guard event.timestamp >= since else { return }
+            guard event.timestamp <= now else {
+                if fold.nextFutureEventAt.map({ event.timestamp < $0 }) ?? true {
+                    fold.nextFutureEventAt = event.timestamp
+                }
+                return
+            }
+            if Self.isOpenCodeServed(event) { return }
+            if OpenCodeUsageScanner.isHostedGatewayModel(event.model) { return }
+            let input = event.inputTokens
+            let cached = min(event.cachedInputTokens, input)
+            let output = event.outputTokens
+            let reasoning = event.reasoningTokens
+            let total = event.totalTokens ?? {
+                let result = input.addingReportingOverflow(output)
+                return result.overflow ? input : result.partialValue
+            }()
+            guard total > 0 else { return }
+            fold.sawRows = true
+            let day = DailyUsageAccumulator.dayKey(from: event.timestamp, calendar: calendar)
+            guard let resolvedPricing = fold.pricingCache.resolve(
+                model: event.model,
+                at: event.timestamp,
+                pricing: pricing
+            ) else {
+                fold.accumulator.addUnknownModel(day: day, model: event.model)
+                return
+            }
+            let isPriorityTier = event.serviceTier == "fast" || event.serviceTier == "priority"
+            let logEvent = CodexLogUsageScanner.Event(
+                timestamp: event.timestamp,
+                model: event.model,
+                pricingModel: resolvedPricing.pricingModel,
+                input: input,
+                cached: cached,
+                output: output,
+                reasoning: reasoning,
+                total: total,
+                isFast: isPriorityTier
+            )
+            let cost = CodexLogUsageScanner.cost(
+                rates: resolvedPricing.rates,
+                event: logEvent,
+                model: resolvedPricing.pricingModel,
+                fastTier: isPriorityTier,
+                fastMultiplier: resolvedPricing.priorityMultiplier
+            )
+            fold.accumulator.add(
+                day: day,
+                tokens: total,
+                cost: cost,
+                model: event.model,
+                canonical: resolvedPricing.canonicalModel
+            )
+        }
+
+        let priorByPath = Dictionary(uniqueKeysWithValues: (prior?.files ?? []).map { ($0.path, $0) })
+        var checkpoints: [CodexRouterAggregateIndex.FileCheckpoint] = []
+        let live = CodexRouterAggregateIndex.stats(for: paths)
+        for file in live {
+            guard !Task.isCancelled else { return nil }
+            let url = URL(fileURLWithPath: file.path)
+            let saved = priorByPath[file.path]
+            let tail = saved != nil && file.size > (saved?.offset ?? 0)
+            if let saved, !tail {
+                checkpoints.append(saved)
+                continue
+            }
+            let start = tail ? (saved?.offset ?? 0) : 0
+            var timestampCache = CodexRouterEventLineParser.TimestampCache()
+            var read = JSONLFileReader.readLines(
+                at: url,
+                chunkSize: 256 * 1024,
+                startOffset: start,
+                initialCarry: tail ? (saved?.partial ?? Data()) : Data(),
+                discardingOversizedLine: tail ? (saved?.discardingOversizedLine ?? false) : false,
+                deliverFinalPartial: false
+            ) { line in
+                if let event = CodexRouterEventLineParser.parse(line, timestampCache: &timestampCache) {
+                    visit(event)
+                }
+            }
+            guard read.succeeded else { return nil }
+            if !read.finalPartial.isEmpty,
+               let event = CodexRouterEventLineParser.parse(read.finalPartial[...], timestampCache: &timestampCache) {
+                visit(event)
+                read.finalPartial = Data()
+            }
+            let newOffset = start + UInt64(max(0, read.statistics.bytesRead))
+            guard let checkpoint = index.checkpoint(
+                path: file.path,
+                offset: newOffset,
+                partial: read.finalPartial,
+                discardingOversizedLine: read.isDiscardingOversizedLine
+            ), checkpoint.device == file.device, checkpoint.inode == file.inode else { return nil }
+            // A rotation during the read must never attach old events to the replacement's inode.
+
+            checkpoints.append(checkpoint)
+            index.noteParse(path: file.path, full: !tail, bytes: read.statistics.bytesRead)
+        }
+        guard !Task.isCancelled else { return nil }
+
+        let delta: LogUsageScan?
+        if fold.sawRows {
+            let built = fold.accumulator.build()
+            delta = built.series.daily.isEmpty && built.unknownModelsByDay.isEmpty ? nil : built
+        } else {
+            delta = nil
+        }
+        let result = prior == nil ? delta : DailyUsageAccumulator.merged([prior?.result, delta])
+        let nextFuture = [prior?.nextFutureEventAt, fold.nextFutureEventAt].compactMap { $0 }.min()
+        index.save(CodexRouterAggregateIndex.Record(
+            schema: CodexRouterAggregateIndex.schema,
+            key: key,
+            files: checkpoints,
+            result: result,
+            nextFutureEventAt: nextFuture,
+            complete: true
+        ))
+        return result
+    }
+
 }

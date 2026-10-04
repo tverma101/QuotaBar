@@ -63,8 +63,11 @@ struct TokenBreakdown: Codable, Sendable, Equatable {
 
     /// Input that determines whether the request crosses the long-context threshold. Output does not
     /// select the tier, but it is billed at the selected tier once the prompt crosses the threshold.
-    var promptTokens: Int { input + cacheWrite5m + cacheWrite1h + cacheRead }
-    var totalTokens: Int { input + cacheWrite5m + cacheWrite1h + cacheRead + output }
+    var promptTokens: Int {
+        let writes = ProviderParse.addingSaturating(cacheWrite5m, cacheWrite1h)
+        return ProviderParse.addingSaturating(ProviderParse.addingSaturating(input, writes), cacheRead)
+    }
+    var totalTokens: Int { ProviderParse.addingSaturating(promptTokens, output) }
 }
 
 extension ModelRates {

@@ -19,7 +19,7 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
         )
         let folded = rows(path)
         XCTAssertEqual(folded.count, 1)
-        XCTAssertEqual(folded[0].model, "space-bunny-free")
+        XCTAssertEqual(try XCTUnwrap(folded.first).model, "space-bunny-free")
     }
 
     /// Rows outside the window are excluded by the `since` filter on the cached rows — not by a fast
@@ -39,7 +39,7 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
     private func ledger(_ rows: [(String, String, Int, Int, Int)], prefix: String = "") throws -> String {
         let lines = rows.map { provider, model, input, cached, output in
             """
-            \(prefix){"at":"\(Self.recentISO)","model":"\(model)","provider":"\(provider)","status":200,"inputTokens":\(input),"cachedInputTokens":\(cached),"outputTokens":\(output),"totalTokens":\(input + output)}
+            \(prefix.isEmpty ? "{" : prefix)"at":"\(Self.recentISO)","model":"\(model)","provider":"\(provider)","status":200,"inputTokens":\(input),"cachedInputTokens":\(cached),"outputTokens":\(output),"totalTokens":\(input + output)}
             """
         }
         let dir = FileManager.default.temporaryDirectory
@@ -64,18 +64,86 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
         XCTAssertEqual(folded[0].output, 900)
     }
 
-    /// The partition has to be exact, or the same turn is on two cards or on none.
-    func testOnlyOpenCodeHostedProvidersAreFolded() throws {
+    /// The OpenCode card partitions provider-stamped router rows from legacy native gateway slugs.
+    /// `anthropic/opencode_go/...` also appears in Codex/Claude session logs, so the router fold leaves
+    /// that spelling to the native fold instead of counting the same turn twice.
+    /// The router ledger owns every OpenCode-served turn, the legacy `anthropic/opencode_go/…` slug
+    /// included. Dropping that slug here used to rely on the native session-log fold always having it,
+    /// which is false whenever the log is absent, rotated away, or lives in a home this scan does not open
+    /// — those turns then disappeared from every card. Exactly-once is now enforced one layer up: the
+    /// scanner reconciles the two sources per (day, model) and lets the router win the pairs it covers
+    /// (`OpenCodeUsageScanner.dayModelKey`).
+    func testRouterOwnsEveryOpenCodeServedRowIncludingTheLegacyHostedSlug() throws {
         let path = try ledger([
             ("opencode-go", "anthropic/opencode_go/deepseek-v4-flash", 100, 0, 10),
+            ("opencode-go", "deepseek-v4-flash", 100, 0, 10),
             ("opencode", "deepseek-v4-flash", 100, 0, 10),
             ("opencode-free", "opencode-free/space-bunny-free", 100, 0, 10),
             ("openai", "gpt-6-luna", 100, 0, 10),
             ("anthropic", "claude-opus-4-7", 100, 0, 10)
         ])
         let folded = rows(path)
-        XCTAssertEqual(folded.count, 3, "only the three OpenCode-hosted rows belong on this card")
+        XCTAssertEqual(folded.count, 4, "every OpenCode-served row belongs on the router fold")
         XCTAssertEqual(Set(folded.map(\.model)), ["deepseek-v4-flash", "space-bunny-free"])
+        XCTAssertEqual(
+            folded.filter(\.burnsGoQuota).count, 2,
+            "the legacy opencode-go slug burns the Go caps just like the bare slug does"
+        )
+    }
+
+    /// A router-only turn (no matching session log) is still counted, which is the case the old
+    /// slug exclusion lost.
+    func testLegacyHostedSlugFoldsWithoutAnyNativeSource() throws {
+        let path = try ledger([
+            ("opencode-go", "anthropic/opencode_go/deepseek-v4-flash", 5_000, 900, 300)
+        ])
+        let folded = rows(path)
+        XCTAssertEqual(folded.count, 1)
+        XCTAssertEqual(folded[0].model, "deepseek-v4-flash")
+        XCTAssertEqual(folded[0].input, 4_100)
+        XCTAssertEqual(folded[0].cacheRead, 900)
+        XCTAssertTrue(folded[0].burnsGoQuota)
+    }
+
+    /// Both sources must land on the same merge key for a given turn, otherwise the reconciliation in
+    /// `scan` treats one turn as two.
+    func testRouterAndNativeRowsShareOneDayModelMergeKey() {
+        let day = "2026-10-04"
+        let router = OpenCodeUsageScanner.ClaudeGatewayRow(
+            date: Date(), input: 10, output: 2, cacheWrite: 0, cacheRead: 0,
+            model: "deepseek-v4-flash", burnsGoQuota: true, isInProgress: false
+        )
+        let native = OpenCodeUsageScanner.ClaudeGatewayRow(
+            date: Date(), input: 10, output: 2, cacheWrite: 0, cacheRead: 0,
+            model: "deepseek-v4-flash", burnsGoQuota: true, isInProgress: false
+        )
+        XCTAssertEqual(
+            OpenCodeUsageScanner.dayModelKey(day: day, model: router.model),
+            OpenCodeUsageScanner.dayModelKey(day: day, model: native.model)
+        )
+        XCTAssertNotEqual(
+            OpenCodeUsageScanner.dayModelKey(day: day, model: router.model),
+            OpenCodeUsageScanner.dayModelKey(day: "2026-10-05", model: native.model),
+            "different days must not collapse into one key"
+        )
+    }
+
+    func testLegacyAnthropicGatewaySlugIsStillOwnedByTheNativeCodexFold() {
+        let event = CodexLogUsageScanner.Event(
+            timestamp: Date().addingTimeInterval(-600),
+            model: "anthropic/opencode_go/deepseek-v4-flash",
+            input: 100,
+            cached: 40,
+            output: 10,
+            reasoning: 0,
+            total: 110
+        )
+        let folded = OpenCodeUsageScanner.codexGatewayRows(from: [event])
+        XCTAssertEqual(folded.count, 1)
+        XCTAssertEqual(folded[0].model, "deepseek-v4-flash")
+        XCTAssertEqual(folded[0].input, 60)
+        XCTAssertEqual(folded[0].cacheRead, 40)
+        XCTAssertTrue(folded[0].burnsGoQuota)
     }
 
     /// Only the Go subscription's cap meters are consumed by `opencode-go`; Zen and free tiers are billed
@@ -101,19 +169,42 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
         XCTAssertTrue(rows(path.path).isEmpty)
     }
 
+    /// `status: 0` is how the router records a canceled/incomplete turn; 4xx/5xx are failed requests.
+    /// None is measured usage and none belongs in a spend tile.
+    func testCanceledFailedAndNonSuccessStatusesAreNotFolded() throws {
+        let stamp = OpenUsageISO8601.string(from: Date().addingTimeInterval(-600))
+        let statuses = [0, 199, 300, 400, 429, 500, 502]
+        let path = try writeLedger(statuses.map { status in
+            #"{"at":"\#(stamp)","model":"opencode-free/space-bunny-free","provider":"opencode-free","status":\#(status),"inputTokens":100,"cachedInputTokens":0,"outputTokens":10}"#
+        })
+        XCTAssertTrue(rows(path).isEmpty)
+    }
+
+    /// The router's `estimatedInputTokens` exists only when upstream reported `inputTokens: 0`. It is a
+    /// router-authored approximation for context-window bookkeeping, not a measured provider count, so
+    /// QuotaBar must not fold it into the token tiles alongside real usage.
+    func testEstimatedInputTokensAreNotCountedAsMeasuredUsage() throws {
+        let stamp = OpenUsageISO8601.string(from: Date().addingTimeInterval(-600))
+        let text = #"{"at":"\#(stamp)","model":"opencode-free/space-bunny-free","provider":"opencode-free","status":200,"inputTokens":0,"cachedInputTokens":0,"outputTokens":25,"totalTokens":25,"estimatedInputTokens":999999}"#
+        let row = try XCTUnwrap(OpenCodeUsageScanner.routerGatewayRow(from: Data(text.utf8)))
+        XCTAssertEqual(row.input, 0)
+        XCTAssertEqual(row.output, 25)
+        XCTAssertEqual(row.tokens, 25, "the estimate must not inflate the measured total")
+    }
+
     /// Chunk boundaries must not corrupt or drop rows: the ledger is read in 1MB chunks and a partial
     /// final line carries over.
     func testRowsSurviveChunkBoundaries() throws {
-        let many = (0..<20_000).map { index in
+        let many = (0..<5_000).map { index in
             ("opencode-free", "opencode-free/space-bunny-free", 100 + index, 0, 10)
         }
         let path = try ledger(many)
-        XCTAssertEqual(rows(path).count, 20_000, "every line must be read exactly once")
+        XCTAssertEqual(rows(path).count, 5_000, "every line must be read exactly once")
     }
 
     /// The Codex card defers these turns, so the helper it uses must agree with the one the fold uses.
     func testProviderClassificationIsShared() throws {
-        for provider in ["opencode-go", "opencode", "opencode-free", "OpenCode-Go"] {
+        for provider in ["opencode-go", "opencode", "opencode-free", "opencode-zen", "OpenCode-Go"] {
             XCTAssertTrue(CodexRouterUsageScanner.isOpenCodeProvider(provider), provider)
         }
         for provider in ["openai", "anthropic", "gemini", "", "not-opencode"] {
@@ -123,7 +214,26 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
 
     func testBareModelNameStripsTheServingAccount() {
         XCTAssertEqual(OpenCodeUsageScanner.bareRouterModelName("opencode-free/space-bunny-free"), "space-bunny-free")
+        XCTAssertEqual(OpenCodeUsageScanner.bareRouterModelName("opencode-zen-messages/union-alpha"), "union-alpha")
         XCTAssertEqual(OpenCodeUsageScanner.bareRouterModelName("gpt-6-luna"), "gpt-6-luna")
+    }
+
+    func testZenNamespaceSlugKeepsMeasuredTokensAndGoQuotaClassification() throws {
+        let stamp = OpenUsageISO8601.string(from: Date().addingTimeInterval(-600))
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qb-router-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("usage-events.jsonl").path
+        let text = #"{"at":"\#(stamp)","model":"opencode-zen-messages/union-alpha","provider":"opencode-go","status":200,"inputTokens":406,"cachedInputTokens":6,"outputTokens":10,"totalTokens":416}"#
+        try (text + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+
+        let folded = rows(path)
+        XCTAssertEqual(folded.count, 1)
+        XCTAssertEqual(folded[0].model, "union-alpha")
+        XCTAssertEqual(folded[0].input, 400)
+        XCTAssertEqual(folded[0].cacheRead, 6)
+        XCTAssertEqual(folded[0].tokens, 416)
+        XCTAssertTrue(folded[0].burnsGoQuota)
     }
 }
 
@@ -131,6 +241,67 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
 // MARK: - Truncated lines
 
 extension RouterLedgerProviderRoutingTests {
+    /// Large ledgers are compacted to day/model buckets. The first pass reads the file once; a warm pass
+    /// must be a no-op; an append must parse only the new bytes and add the delta exactly once.
+    func testLargeLedgerCompactsThenWarmAndAppendStayIncremental() throws {
+        let stamp = OpenUsageISO8601.string(from: Date().addingTimeInterval(-600))
+        let path = try writeLedger((0..<8_192).map { index in
+            line(
+                provider: "opencode-free",
+                model: "opencode-free/space-bunny-free",
+                input: 1_000 + index,
+                cached: 600,
+                output: 10,
+                stamp: stamp
+            )
+        })
+        defer { OpenCodeUsageScanner.routerLedgerClearCacheForTesting(path: path) }
+
+        let cold = rows(path)
+        XCTAssertEqual(cold.count, 1, "all same-day rows compact to one model bucket")
+        XCTAssertEqual(cold[0].model, "space-bunny-free")
+        XCTAssertTrue(cold[0].isAggregated, "a bucket is not a single request")
+        let coldTokens = cold.reduce(0) { $0 + $1.tokens }
+        let expected = (0..<8_192).reduce(0) { $0 + (1_000 + $1) + 10 }
+        XCTAssertEqual(coldTokens, expected)
+
+        let coldStats = try XCTUnwrap(OpenCodeUsageScanner.routerLedgerReadStatisticsForTesting(path: path))
+        XCTAssertEqual(coldStats.fullParses, 1)
+        XCTAssertEqual(coldStats.tailParses, 0)
+
+        let warm = rows(path)
+        let warmStats = try XCTUnwrap(OpenCodeUsageScanner.routerLedgerReadStatisticsForTesting(path: path))
+        XCTAssertEqual(warm.map(\.tokens), cold.map(\.tokens), "an unchanged ledger must not replay")
+        XCTAssertEqual(warmStats.fullParses, coldStats.fullParses)
+        XCTAssertEqual(warmStats.tailParses, coldStats.tailParses)
+        XCTAssertEqual(warmStats.bytesRead, coldStats.bytesRead, "an unchanged ledger must not read bytes")
+
+        let appended = line(
+            provider: "opencode-free",
+            model: "opencode-free/space-bunny-free",
+            input: 111,
+            cached: 11,
+            output: 7,
+            stamp: stamp
+        )
+        try appendBytes(appended + "\n", to: path)
+        let afterAppend = rows(path)
+        XCTAssertEqual(afterAppend.count, 1)
+        XCTAssertEqual(afterAppend[0].tokens, coldTokens + 111 + 7)
+
+        let appendStats = try XCTUnwrap(OpenCodeUsageScanner.routerLedgerReadStatisticsForTesting(path: path))
+        XCTAssertEqual(appendStats.fullParses, 1, "append must not rebuild the ledger")
+        XCTAssertEqual(appendStats.tailParses, 1)
+        XCTAssertLessThan(appendStats.bytesRead - coldStats.bytesRead, 1_024)
+
+        let unchanged = rows(path)
+        let unchangedStats = try XCTUnwrap(OpenCodeUsageScanner.routerLedgerReadStatisticsForTesting(path: path))
+        XCTAssertEqual(unchanged.map(\.tokens), afterAppend.map(\.tokens))
+        XCTAssertEqual(unchangedStats.fullParses, appendStats.fullParses)
+        XCTAssertEqual(unchangedStats.tailParses, appendStats.tailParses)
+        XCTAssertEqual(unchangedStats.bytesRead, appendStats.bytesRead)
+    }
+
     private func writeLedger(_ lines: [String]) throws -> String {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("qb-router-\(UUID().uuidString)", isDirectory: true)
@@ -174,7 +345,7 @@ extension RouterLedgerProviderRoutingTests {
         let stamp = OpenUsageISO8601.string(from: Date())
         let path = try writeLedger([line(provider: "  opencode-go  ", model: "m",
                                           input: 100, cached: 0, output: 10, stamp: stamp)])
-        let folded = rows(path)
+        let folded = self.rows(path)
         XCTAssertEqual(folded.count, 1)
         XCTAssertTrue(folded[0].burnsGoQuota, "a padded provider must still be recognised as Go")
     }
@@ -189,6 +360,74 @@ extension RouterLedgerProviderRoutingTests {
             .replacingOccurrences(of: #""inputTokens":1"#, with: #""inputTokens":\#(huge)"#)
         let row = OpenCodeUsageScanner.routerGatewayRow(from: Data(text.utf8))
         XCTAssertEqual(row?.input, 1_000_000_000_000_000, "must saturate at the codebase's clamp")
+    }
+
+    /// The parser clamps an over-long digit run to `Int.max`, so two hostile rows in one day/model bucket
+    /// ask the aggregate to add `Int.max + Int.max`. `Int` overflow is a trap, not a wrap: the process
+    /// would die inside a menu-bar refresh. Both the bucket sum and the row total must saturate.
+    func testTwoHostileRowsSaturateInsteadOfTrapping() throws {
+        let stamp = OpenUsageISO8601.string(from: Date())
+        let max = String(Int.max)
+        let rows = (0..<2).map { _ in
+            line(provider: "opencode-free", model: "opencode-free/space-bunny-free",
+                 input: 1, cached: 0, output: 1, stamp: stamp)
+                .replacingOccurrences(of: #""inputTokens":1"#, with: #""inputTokens":\#(max)"#)
+        }
+
+        // Per-row path: each row parses independently and must survive the clamp.
+        let path = try writeRaw(rows.joined(separator: "\n") + "\n")
+        let folded = self.rows(path)
+        XCTAssertEqual(folded.count, 2, "the per-row path keeps both hostile rows")
+        for row in folded {
+            XCTAssertEqual(row.input, 1_000_000_000_000_000)
+            XCTAssertEqual(row.tokens, 1_000_000_000_000_001)
+        }
+
+        // Compact path: the day/model bucket adds `Int.max + Int.max`, which traps without saturation.
+        let aggregate = OpenCodeRouterLedgerAggregate.empty(
+            path: "/tmp/qb-overflow-ledger",
+            revision: AppendOnlyFileRevision(device: 1, inode: 1, size: 1)
+        )
+        for _ in 0..<2 {
+            aggregate.addRow(OpenCodeUsageScanner.ClaudeGatewayRow(
+                date: Date(), input: .max, output: 0, cacheWrite: 0, cacheRead: 0,
+                model: "space-bunny-free", burnsGoQuota: false, isInProgress: false
+            ))
+        }
+        let bucket = try XCTUnwrap(aggregate.materialize(since: .distantPast).first)
+        XCTAssertEqual(bucket.input, .max, "Int.max + Int.max saturates instead of trapping")
+        XCTAssertTrue(bucket.isAggregated)
+
+        let single = try XCTUnwrap(OpenCodeUsageScanner.routerGatewayRow(from: Data(rows[0].utf8)))
+        XCTAssertEqual(single.input, 1_000_000_000_000_000)
+        XCTAssertEqual(
+            OpenCodeUsageScanner.ClaudeGatewayRow(
+                date: Date(), input: .max, output: .max, cacheWrite: .max, cacheRead: .max,
+                model: "m", burnsGoQuota: false, isInProgress: false
+            ).tokens,
+            .max,
+            "the four-component row total saturates too"
+        )
+    }
+
+    /// A provider spelled with a JSON unicode escape (`\u006fpencode-free`) has no literal `opencode`
+    /// substring in the raw bytes. The cheap prefilter must hand such lines to the real parser instead
+    /// of dropping them on a byte-level guess.
+    func testUnicodeEscapedProviderStillFolds() throws {
+        let stamp = OpenUsageISO8601.string(from: Date())
+        // A model with no literal marker either, so the fixture really does defeat the byte prefilter.
+        let text = line(provider: "opencode-free", model: "deepseek-v4-flash",
+                        input: 100, cached: 0, output: 10, stamp: stamp)
+            .replacingOccurrences(of: #""provider":"opencode-free""#, with: #""provider":"\u006fpencode-go""#)
+        XCTAssertFalse(
+            text.lowercased().contains("opencode"),
+            "the fixture must not contain a literal marker, or it proves nothing"
+        )
+        let row = OpenCodeUsageScanner.routerGatewayRow(from: Data(text.utf8))
+        XCTAssertEqual(row?.model, "deepseek-v4-flash", "an escaped provider is still an OpenCode row")
+        XCTAssertEqual(row?.input, 100)
+        XCTAssertEqual(row?.tokens, 110)
+        XCTAssertTrue(try XCTUnwrap(row).burnsGoQuota, "the escaped provider spelling is still Go")
     }
 }
 

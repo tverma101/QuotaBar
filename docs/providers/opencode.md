@@ -158,25 +158,39 @@ A row is named for the model (`space-bunny-free`), not the serving account (`ope
 `opencode-go` is charged against the Go subscription's Session / Weekly / Monthly cap meters; Zen and free
 tier usage is billed outside them.
 
+The router ledger includes legacy `anthropic/opencode_go/…` and `anthropic/opencode/…` rows even
+when no native session log exists. For a local day and model covered by the router, gateway session
+logs are skipped; native-only days and models fill the gaps. This avoids counting a routed turn from
+both sources. Without a shared request ID, independently used sessions of the same model on a covered
+day cannot be separated reliably; the router source takes precedence.
+
+CodexRouter sometimes records `estimatedInputTokens` when the upstream provider reported zero input tokens.
+That is a router approximation used for context-window bookkeeping, not a measured count. QuotaBar does not
+fold it into token or dollar totals; it counts the input, cached-input, and output tokens the provider
+actually reported. A provider that reports zero input can therefore still contribute its measured output
+tokens, while an invented input estimate is never presented as real usage.
+
 A row whose model is priced at zero — including an unlisted model whose name ends in `-free`, such as a
 router-served custom model — still contributes its **tokens**. A row with no price at all is excluded from
 every total and reported by the unpriced-model warning instead, so a free tier never silently disappears.
 
 ### Cost of reading the ledger
 
-The ledger is append-only and grows without bound (tens of MB). Reading it in full cost **13.1 s of CPU per
-refresh**, because every line was JSON-parsed regardless of the window — about 4% of a core continuously,
-and a visible stall whenever the popover forced a refresh.
+The ledger grows as requests complete. Only bytes appended since the last read are parsed. Small ledgers keep individual
+rows for the window. Large ledgers fold into durable local-calendar day/model buckets, so a refresh keeps a
+small aggregate plus the individual Go rows still needed by the rolling cap meters instead of keeping every
+OpenCode row resident. The compact checkpoint is persisted, so an unchanged ledger after a relaunch is a
+metadata check rather than a full parse. Rewriting or replacing existing data invalidates the checkpoint.
+The hosted production benchmark uses 8,192 synthetic rows across multiple models and days, verifies
+exact totals, and checks that repeated reads consume zero new ledger bytes:
 
-It is now read as a tail: only bytes appended since the last read are parsed, and parsed rows are cached
-for the window. Measured on a 38 MB / 96k-line ledger:
-
-| | before | after |
-|---|---|---|
-| first read | 13.1 s | 1.8 s |
-| every refresh after | 13.1 s | ~0.003 s |
+```sh
+QUOTABAR_PRODUCTION_ACCOUNTING_BENCH=1 swift test -c release --filter ProductionTokenAccountingEfficiencyTests
+```
 
 Fields are read straight out of the line's bytes rather than through `JSONSerialization`, which was the
-dominant cost; lines for other providers cost almost nothing because they are rejected before any field is
-parsed. A line the writer had not finished is carried to the next read rather than parsed, and a truncated
-line is skipped rather than turned into a short row.
+dominant cost. The shared CodexRouter single-pass parser also supplies timestamp, provider, status, input,
+cached-input, output, reasoning, and total fields in one structural walk; OpenCode converts only the
+provider-stamped, successful rows it owns. Lines for other providers cost almost nothing because they are
+rejected before token accounting. A line the writer had not finished is carried to the next read rather
+than parsed, and a truncated line is skipped rather than turned into a short row.

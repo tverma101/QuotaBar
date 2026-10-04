@@ -1,8 +1,69 @@
 import Foundation
+import CoreFoundation
 
-/// Parsers for the two public pricing feeds, plus the compact catalog format QuotaBar uses for
+/// Parsers for the three public pricing feeds, plus the compact catalog format QuotaBar uses for
 /// its bundled snapshots and on-disk caches (cost fields only — the full feeds are megabytes).
 enum PricingCatalogCodecs {
+    // MARK: - OpenRouter (/api/v1/models)
+
+    /// Builds an exact-match estimate catalog from OpenRouter's public model list. Prompt and
+    /// completion prices are USD per token in the API; QuotaBar stores per-million rates. The feed
+    /// does not expose generally applicable cache prices, so use the prompt rate without assuming
+    /// a cache discount. Bare aliases are added only when exactly one non-variant route owns them.
+    static func catalogFromOpenRouter(_ data: Data) throws -> PricingCatalog {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = root["data"] as? [[String: Any]] else {
+            throw PricingCodecError.notAnObject
+        }
+
+        guard let totalCount = integerValue(root["total_count"]),
+              totalCount == models.count,
+              let links = root["links"] as? [String: Any],
+              let next = links["next"], next is NSNull else {
+            throw PricingCodecError.incompleteModelList
+        }
+
+        var routes: [String: ModelRates] = [:]
+        var aliases: [String: [String]] = [:]
+        routes.reserveCapacity(models.count)
+        for model in models {
+            guard let id = model["id"] as? String else { continue }
+            let key = id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty, routes[key] == nil,
+                  let pricing = model["pricing"] as? [String: Any],
+                  let prompt = nonnegativeFiniteDouble(pricing["prompt"]),
+                  let completion = nonnegativeFiniteDouble(pricing["completion"]),
+                  prompt <= Double.greatestFiniteMagnitude / 1_000_000,
+                  completion <= Double.greatestFiniteMagnitude / 1_000_000 else { continue }
+
+            let input = prompt * 1_000_000
+            routes[key] = ModelRates(
+                inputPerMillion: input,
+                outputPerMillion: completion * 1_000_000,
+                cacheWritePerMillion: input,
+                cacheReadPerMillion: input,
+                cacheReadIsExplicit: false
+            )
+
+            let components = key.split(separator: "/", omittingEmptySubsequences: false)
+            guard components.count == 2,
+                  !components[1].contains(":"),
+                  !components[1].isEmpty else { continue }
+            let alias = components[1].lowercased()
+            aliases[alias, default: []].append(key)
+        }
+
+        guard !routes.isEmpty else { throw PricingCodecError.noUsableEntries }
+
+        var entries = routes
+        for (alias, routeIDs) in aliases where routeIDs.count == 1 && entries[alias] == nil {
+            if let rates = routes[routeIDs[0]] {
+                entries[alias] = rates
+            }
+        }
+        return PricingCatalog(entries: entries)
+    }
+
     // MARK: - LiteLLM (model_prices_and_context_window.json)
 
     /// Builds a catalog from LiteLLM's full JSON. Entries without both input and output costs are
@@ -75,6 +136,30 @@ enum PricingCatalogCodecs {
     private static func doubleValue(_ value: Any?) -> Double? {
         if let number = value as? NSNumber { return number.doubleValue }
         return nil
+    }
+
+    private static func nonnegativeFiniteDouble(_ value: Any?) -> Double? {
+        let result: Double
+        if let string = value as? String {
+            guard let parsed = Double(string) else { return nil }
+            result = parsed
+        } else if let number = value as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            result = number.doubleValue
+        } else {
+            return nil
+        }
+        guard result.isFinite, result >= 0 else { return nil }
+        return result
+    }
+
+    private static func integerValue(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let value = number.doubleValue
+        guard value.isFinite, value >= 0, value.rounded(.towardZero) == value,
+              value < Double(Int.max) else { return nil }
+        return Int(value)
     }
 
     // MARK: - Compact format (bundled snapshots + disk cache)
@@ -153,11 +238,13 @@ enum PricingCatalogCodecs {
 enum PricingCodecError: Error, LocalizedError, Equatable {
     case notAnObject
     case noUsableEntries
+    case incompleteModelList
 
     var errorDescription: String? {
         switch self {
         case .notAnObject: return "Pricing feed is not a JSON object."
         case .noUsableEntries: return "Pricing feed contained no usable model entries."
+        case .incompleteModelList: return "OpenRouter returned a paginated or incomplete model list."
         }
     }
 }

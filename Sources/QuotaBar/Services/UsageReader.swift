@@ -121,15 +121,18 @@ public struct UsageReader {
                 // stamp — an unstamped claude/codex entry would be discarded at the app's next launch.
                 providerIdentityKeys: accountAssembly.identityKeysByCard
             )
-            if let matchedIDs {
-                for providerID in orderedIDs.filter(matchedIDs.contains) {
-                    _ = await dataStore.refresh(providerID: providerID, force: force)
+            let shouldFlushPersistence = providersOverride == nil
+            await withThrottledFullAccounting {
+                if let matchedIDs {
+                    for providerID in orderedIDs.filter(matchedIDs.contains) {
+                        _ = await dataStore.refresh(providerID: providerID, force: force)
+                    }
+                } else {
+                    await dataStore.refreshAll(force: force)
                 }
-            } else {
-                await dataStore.refreshAll(force: force)
-            }
-            if providersOverride == nil {
-                await PersistentJSONLScanCaches.flushPendingWrites()
+                if shouldFlushPersistence {
+                    await PersistentJSONLScanCaches.flushPendingWrites()
+                }
             }
             snapshots = dataStore.snapshots
             errors = dataStore.providerErrors

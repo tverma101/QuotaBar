@@ -2,12 +2,18 @@
 
 ## Unreleased
 
-- Pace automatic local accounting with a shared CPU allowance, reuse unchanged CodexRouter work, and add repeatable measurements.
+- Open the menu from cached snapshots and reuse compact router totals so repeated taps do not restart accounting.
+- Count OpenCode's Codex Router share with append-only cache updates and retain native history without duplicate gateway usage.
+- Revalidate OpenRouter prices for unknown models with coalescing and retry backoff.
+- Add a background refresh trigger and small-to-medium adversarial accounting regressions and hosted benchmarks.
+- Pace instrumented automatic local accounting toward 7.5% of one CPU core, reuse unchanged CodexRouter work, and add repeatable scanner measurements.
 - Reduce CodexRouter cold-index CPU by reusing bounded timestamp parses and fewer throttle wakeups.
 - Measure optimized automatic refreshes with unique event timestamps and bound cached timestamp key size.
+- Decode canonical UTC usage timestamps directly and make hosted benchmark rows land within the accounting window.
 - Propagate refresh cancellation into detached accounting work and discard interrupted provider folds.
 - Name high-token free models and show folded contributors in spend details.
 - Show the OpenCode Go plan only when the account endpoint confirms active usage windows.
+- Discover shared model names and estimate public route rates from OpenRouter, retaining curated provider overrides and fallback behavior.
 
 ## v0.7.10-beta.3
 

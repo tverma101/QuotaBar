@@ -186,6 +186,9 @@ struct OpenCodeUsageScanner: Sendable {
         let tileSince: Date
         let pricing: ModelPricing
         let rates: [String: Double]
+        /// (local day, model) pairs the router ledger already accounts for. Native gateway rows for these
+        /// are skipped so one turn is never counted from both sources.
+        let routerCoverage: Set<String>
         var accumulator: DailyUsageAccumulator
         var goWindowCosts: [(ms: Double, cost: Double)]
         var includesEstimatedCost: Bool
@@ -195,6 +198,7 @@ struct OpenCodeUsageScanner: Sendable {
             tileSince: Date,
             pricing: ModelPricing,
             rates: [String: Double],
+            routerCoverage: Set<String>,
             accumulator: DailyUsageAccumulator,
             goWindowCosts: [(ms: Double, cost: Double)],
             includesEstimatedCost: Bool,
@@ -203,6 +207,7 @@ struct OpenCodeUsageScanner: Sendable {
             self.tileSince = tileSince
             self.pricing = pricing
             self.rates = rates
+            self.routerCoverage = routerCoverage
             self.accumulator = accumulator
             self.goWindowCosts = goWindowCosts
             self.includesEstimatedCost = includesEstimatedCost
@@ -214,7 +219,8 @@ struct OpenCodeUsageScanner: Sendable {
                 OpenCodeUsageScanner.claudeGatewayRows(from: [entry]),
                 since: tileSince, pricing: pricing, effectiveRates: rates,
                 accumulator: &accumulator, goWindowCosts: &goWindowCosts,
-                includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays
+                includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays,
+                skippingDayModels: routerCoverage
             )
         }
 
@@ -223,9 +229,22 @@ struct OpenCodeUsageScanner: Sendable {
                 OpenCodeUsageScanner.codexGatewayRows(from: [event]),
                 since: tileSince, pricing: pricing, effectiveRates: rates,
                 accumulator: &accumulator, goWindowCosts: &goWindowCosts,
-                includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays
+                includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays,
+                skippingDayModels: routerCoverage
             )
         }
+    }
+
+    /// Merge key for reconciling the router ledger against the native gateway folds: one local calendar
+    /// day plus the bare model name. Both sides strip the gateway prefix (`anthropic/opencode_go/…`) and
+    /// the router's serving account (`opencode-free/…`), so the same turn lands on the same key from
+    /// either source.
+    static func dayModelKey(day: String, model: String) -> String {
+        day + "\u{1f}" + model
+    }
+
+    static func dayModelKey(_ row: ClaudeGatewayRow) -> String {
+        dayModelKey(day: DailyUsageAccumulator.dayKey(from: row.date), model: row.model)
     }
 
     func scan(now: Date, daysBack: Int = 30, pricing: ModelPricing = .empty) async throws -> OpenCodeUsageScan? {
@@ -342,11 +361,24 @@ struct OpenCodeUsageScanner: Sendable {
         // (ⓘ) and unpriced models fall to the unknown-model warning, the convention the Claude
         // tiles use.
         let rates = Self.effectiveRates(from: rows)
+        // Read the router ledger FIRST: it is the complete record of OpenCode-served turns, including the
+        // `anthropic/opencode_go/…` slugs the native folds also see. Knowing which (day, model) pairs it
+        // covers lets every native fold below skip exactly those and fill only the gaps, so one turn is
+        // counted once whether it came from the router, a Claude/Codex session log, Hermes, or Muse.
+        var routerRows: [ClaudeGatewayRow] = []
+        var seenLedgerPaths: Set<String> = []
+        for path in routerLedgerPaths().map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
+        where FileManager.default.isReadableFile(atPath: path)
+            && seenLedgerPaths.insert(path).inserted {
+            routerRows += Self.routerGatewayRows(atPath: path, since: tileSince)
+        }
+        let routerCoverage = Set(routerRows.map(Self.dayModelKey))
         // Stream Claude/Codex gateway rows; unload Codex tail-cache between homes so peaks cannot stack.
         let gatewayFold = GatewayFoldState(
             tileSince: tileSince,
             pricing: pricing,
             rates: rates,
+            routerCoverage: routerCoverage,
             accumulator: accumulator,
             goWindowCosts: goWindowCosts,
             includesEstimatedCost: includesEstimatedCost,
@@ -399,7 +431,8 @@ struct OpenCodeUsageScanner: Sendable {
                         since: tileSince, pricing: pricing,
                         effectiveRates: rates,
                         accumulator: &accumulator, goWindowCosts: &goWindowCosts,
-                        includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays
+                        includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays,
+                        skippingDayModels: routerCoverage
                     )
                 }
                 await readFailureReporter.update(checkedPaths: [hermesPath], failingPaths: [])
@@ -410,20 +443,14 @@ struct OpenCodeUsageScanner: Sendable {
                 }
             }
         }
-        // CodexRouter turns served against an OpenCode account. The router meters every routed turn,
-        // including the ones it handed to OpenCode, and those turns never appear in `opencode*.db` (a
-        // free/custom Zen model can bypass the OpenCode server entirely) nor on the Codex card, which
-        // now defers them here. They were previously invisible: a router configured for a free model
-        // logged thousands of turns that no card counted.
-        // Resolve and dedupe: two entries pointing at the same file would fold every row twice.
-        var seenLedgerPaths: Set<String> = []
-        for path in routerLedgerPaths().map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
-        where FileManager.default.isReadableFile(atPath: path)
-            && seenLedgerPaths.insert(path).inserted {
-            let rows = Self.routerGatewayRows(atPath: path, since: tileSince)
-            guard !rows.isEmpty else { continue }
+        // Fold the router rows themselves. Nothing is skipped here: this source wins every (day, model)
+        // pair it covers, and the native folds above already deferred those pairs to it. Reading the
+        // ledger also means a turn whose session log is gone, moved, or outside the discovered homes is
+        // still counted — previously such `anthropic/opencode_go/…` rows were dropped on the assumption
+        // the native fold always had them, and vanished from every card.
+        if !routerRows.isEmpty {
             Self.foldGatewayRows(
-                rows, since: tileSince, pricing: pricing,
+                routerRows, since: tileSince, pricing: pricing,
                 effectiveRates: rates,
                 accumulator: &accumulator, goWindowCosts: &goWindowCosts,
                 includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays
@@ -442,7 +469,8 @@ struct OpenCodeUsageScanner: Sendable {
                 Self.museGatewayRows(from: museEntries), since: tileSince, pricing: pricing,
                 effectiveRates: rates,
                 accumulator: &accumulator, goWindowCosts: &goWindowCosts,
-                includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays
+                includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays,
+                skippingDayModels: routerCoverage
             )
         }
         let logScan = accumulator.build()
@@ -511,8 +539,17 @@ struct OpenCodeUsageScanner: Sendable {
         /// the Claude/Codex log folds — those CLIs write per-message in real time, so their rows are
         /// complete as recorded.
         var isInProgress: Bool
+        /// Summed day/model bucket, not one ledger event. Long-context rates must not treat the sum as one call.
+        var isAggregated: Bool = false
 
-        var tokens: Int { input + output + cacheWrite + cacheRead }
+        /// Saturating: every component is an externally supplied count, and the router parser clamps a
+        /// hostile line to `Int.max` rather than rejecting it, so a plain `+` can overflow and trap.
+        var tokens: Int {
+            ProviderParse.addingSaturating(
+                ProviderParse.addingSaturating(input, output),
+                ProviderParse.addingSaturating(cacheWrite, cacheRead)
+            )
+        }
     }
 
     /// Every `*.jsonl` under a root's `projects/` — including each project's per-session
@@ -628,287 +665,6 @@ struct OpenCodeUsageScanner: Sendable {
     /// on its start day — the same attribution the Hermes card uses — and reasoning bills at the
     /// output rate. Only `opencode-go` sessions burn the Go subscription's cap meters; sessions with
     /// `ended_at` 0/NULL (still running) are flagged `isInProgress` so their days render as partial.
-    /// OpenCode-served turns from a CodexRouter ledger, mapped onto this fold's row shape.
-    ///
-    /// Reads the same `usage-events.jsonl` the Codex card reads and selects the rows whose `provider` is
-    /// OpenCode-hosted, so the two cards partition the ledger instead of overlapping or leaving a gap.
-    /// `cached` is carved out of `input` because the router reports `inputTokens` inclusive of the cached
-    /// portion, matching the Codex session-log contract.
-    /// Router model slugs are `<provider>/<model>` (`opencode-free/space-bunny-free`). The card should
-    /// name the model, not the account that served it — the same rule the Codex card's identity resolution
-    /// follows, so a gateway path never becomes a row title.
-    static func bareRouterModelName(_ model: String) -> String {
-        guard let lastSlash = model.lastIndex(of: "/") else { return model }
-        return String(model[model.index(after: lastSlash)...])
-    }
-
-    /// Rows for this card's window, read from the router ledger.
-    ///
-    /// The ledger is append-only and grows without bound (tens of MB), and the scan runs on every refresh.
-    /// Re-reading it in full cost ~13 s of CPU per refresh for a 36 MB file, because the whole file was
-    /// JSON-parsed regardless of the window. This tails instead: only bytes appended since the last call
-    /// are read and parsed, and previously parsed rows are kept for the window.
-    static func routerGatewayRows(atPath path: String, since: Date) -> [ClaudeGatewayRow] {
-        RouterLedgerTail.shared.rows(atPath: path, since: since)
-    }
-
-    /// Read counters for the offline performance benchmark and cache regression tests.
-    static func routerLedgerReadStatisticsForTesting(path: String) -> (fullParses: Int, tailParses: Int, bytesRead: Int)? {
-        RouterLedgerTail.shared.statistics(path: path)
-    }
-
-    /// Per-ledger, bounded append cache. `JSONLFileReader` owns newline carry so a line split between
-    /// refreshes is read exactly once; `AppendOnlyFileProbe` rejects replacement and truncate/regrow.
-    private final class RouterLedgerTail: @unchecked Sendable {
-        static let shared = RouterLedgerTail()
-
-        /// Keep enough history for the current 30-day display window plus small clock/window changes.
-        private static let retentionDays = 45
-
-        private struct ParserCheckpoint: Sendable, Equatable {}
-
-        private static let cache = AppendOnlyFileTailCache<ClaudeGatewayRow, ParserCheckpoint>(
-            maxEntries: 8,
-            maxRetainedItems: 64_000
-        )
-
-        private let lock = NSLock()
-
-        func rows(atPath path: String, since: Date) -> [ClaudeGatewayRow] {
-            lock.withLock {
-                let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
-                let key = url.path
-                guard let current = AppendOnlyFileProbe.revision(at: url) else {
-                    Self.cache.remove(key)
-                    return []
-                }
-
-                let retentionCutoff = Date().addingTimeInterval(-Double(Self.retentionDays) * 86_400)
-                if let cached = Self.cache.entry(for: key),
-                   current.device == cached.revision.device,
-                   current.inode == cached.revision.inode,
-                   current.size >= cached.offset,
-                   AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor {
-                    if current.size == cached.offset, cached.itemsAvailable {
-                        return cached.items.filter { $0.date >= since }
-                    }
-
-                    if current.size > cached.offset, cached.itemsAvailable,
-                       let rows = readAppend(at: url, key: key, current: current, cached: cached,
-                                             retentionCutoff: retentionCutoff) {
-                        return rows.filter { $0.date >= since }
-                    }
-                }
-
-                guard let rows = readWholeFile(at: url, key: key, retentionCutoff: retentionCutoff) else {
-                    return []
-                }
-                return rows.filter { $0.date >= since }
-            }
-        }
-
-        func statistics(path: String) -> (fullParses: Int, tailParses: Int, bytesRead: Int)? {
-            let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
-            guard let stats = Self.cache.statistics(for: url.path) else { return nil }
-            return (stats.fullParses, stats.tailParses, stats.bytesRead)
-        }
-
-        private func readAppend(
-            at url: URL,
-            key: String,
-            current: AppendOnlyFileRevision,
-            cached: AppendOnlyFileTailCache<ClaudeGatewayRow, ParserCheckpoint>.Entry,
-            retentionCutoff: Date
-        ) -> [ClaudeGatewayRow]? {
-            var appended: [ClaudeGatewayRow] = []
-            var read = JSONLFileReader.readLines(
-                at: url,
-                chunkSize: 64 * 1024,
-                startOffset: cached.offset,
-                initialCarry: cached.partialLine,
-                discardingOversizedLine: cached.isDiscardingOversizedLine,
-                deliverFinalPartial: false
-            ) { line in
-                if let row = OpenCodeUsageScanner.routerGatewayRow(from: Data(line)), row.date >= retentionCutoff {
-                    appended.append(row)
-                }
-            }
-            guard read.succeeded else { return nil }
-
-            // A writer may close a complete final object without a newline. The parser validates the
-            // whole `{...}` object before accepting it; an incomplete object stays in `partialLine`.
-            if !read.finalPartial.isEmpty,
-               let row = OpenCodeUsageScanner.routerGatewayRow(from: read.finalPartial),
-               row.date >= retentionCutoff {
-                appended.append(row)
-                read.finalPartial = Data()
-            }
-
-            let newOffset = cached.offset + UInt64(read.statistics.bytesRead)
-            guard let after = AppendOnlyFileProbe.revision(at: url),
-                  after.device == current.device,
-                  after.inode == current.inode,
-                  after.size >= newOffset,
-                  let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: newOffset)
-            else { return nil }
-
-            let retained = cached.items.filter { $0.date >= retentionCutoff } + appended
-            Self.cache.store(
-                AppendOnlyFileTailCache<ClaudeGatewayRow, ParserCheckpoint>.Entry(
-                    revision: after,
-                    offset: newOffset,
-                    anchor: anchor,
-                    partialLine: read.finalPartial,
-                    isDiscardingOversizedLine: read.isDiscardingOversizedLine,
-                    parserState: ParserCheckpoint(),
-                    items: retained
-                ),
-                for: key,
-                parseKind: .tail,
-                bytesRead: read.statistics.bytesRead
-            )
-            return retained
-        }
-
-        private func readWholeFile(at url: URL, key: String, retentionCutoff: Date) -> [ClaudeGatewayRow]? {
-            var rows: [ClaudeGatewayRow] = []
-            var read = JSONLFileReader.readLines(
-                at: url,
-                chunkSize: 64 * 1024,
-                deliverFinalPartial: false
-            ) { line in
-                if let row = OpenCodeUsageScanner.routerGatewayRow(from: Data(line)), row.date >= retentionCutoff {
-                    rows.append(row)
-                }
-            }
-            guard read.succeeded else { return nil }
-            if !read.finalPartial.isEmpty,
-               let row = OpenCodeUsageScanner.routerGatewayRow(from: read.finalPartial),
-               row.date >= retentionCutoff {
-                rows.append(row)
-                read.finalPartial = Data()
-            }
-
-            let offset = UInt64(read.statistics.bytesRead)
-            guard let revision = AppendOnlyFileProbe.revision(at: url),
-                  revision.size >= offset,
-                  let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: offset)
-            else { return rows }
-
-            Self.cache.store(
-                AppendOnlyFileTailCache<ClaudeGatewayRow, ParserCheckpoint>.Entry(
-                    revision: revision,
-                    offset: offset,
-                    anchor: anchor,
-                    partialLine: read.finalPartial,
-                    isDiscardingOversizedLine: read.isDiscardingOversizedLine,
-                    parserState: ParserCheckpoint(),
-                    items: rows
-                ),
-                for: key,
-                parseKind: .full,
-                bytesRead: read.statistics.bytesRead
-            )
-            return rows
-        }
-    }
-
-    /// Parses one ledger line. The ISO timestamp is located by scanning for `"at":"` rather than assuming it
-    /// is the first field — the ledger starts with `"meteringVersion"`, so a positional read was never a date
-    /// and the old window prefilter silently matched every line.
-    static func routerGatewayRow(from line: Data) -> ClaudeGatewayRow? {
-        // A line must be a whole JSON object. The byte scanner below defaults any missing field to 0, so a
-        // truncated line did not get skipped — it became a *wrong* row: `..."inputTokens":1000` cut short
-        // charged 1000 uncached input instead of 100 input + 900 cache-read, a ~10x overstatement on that
-        // row, with the output tokens dropped. `JSONLFileReader` gets this by construction; hand-rolling
-        // the reader means checking it here.
-        guard let first = line.first, first == UInt8(ascii: "{"),
-              let last = line.last, last == UInt8(ascii: "}")
-        else { return nil }
-
-        // Read the six fields this fold needs straight out of the bytes.
-        //
-        // `JSONSerialization` builds a dictionary per line, and this ledger has ~96k lines: profiling the
-        // full read showed that dominated it, and the rows it produced were then thrown away because a
-        // non-OpenCode provider was filtered out. Extracting scalars avoids allocating a container for
-        // every line, and costs nothing for the lines we discard.
-        // Trim once and reuse: the classifier trims, so an untrimmed provider here made `burnsGoQuota`
-        // disagree with inclusion and put one turn in the tiles but not in the cap meters.
-        guard let rawProvider = jsonScalar(for: RouterLedgerField.provider, in: line) else { return nil }
-        let provider = rawProvider.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard CodexRouterUsageScanner.isOpenCodeProvider(provider),
-              let status = jsonInteger(for: RouterLedgerField.status, in: line),
-              CodexRouterUsageScanner.isSuccessfulStatus(status),
-              let at = jsonScalar(for: RouterLedgerField.at, in: line),
-              let timestamp = OpenUsageISO8601.date(from: at)
-        else { return nil }
-        let input = max(0, jsonInteger(for: RouterLedgerField.inputTokens, in: line) ?? 0)
-        let cached = min(max(0, jsonInteger(for: RouterLedgerField.cachedInputTokens, in: line) ?? 0), input)
-        return ClaudeGatewayRow(
-            date: timestamp,
-            input: input - cached,
-            output: max(0, jsonInteger(for: RouterLedgerField.outputTokens, in: line) ?? 0),
-            cacheWrite: 0,
-            cacheRead: cached,
-            model: bareRouterModelName(jsonScalar(for: RouterLedgerField.model, in: line) ?? ""),
-            // Only the Go subscription's cap meters are consumed by `opencode-go`; Zen and the free tier
-            // are billed outside those caps.
-            burnsGoQuota: provider.lowercased().hasPrefix("opencode-go"),
-            isInProgress: false
-        )
-    }
-
-    /// Field needles are reused across rows so the fast path builds no per-field `Data` values.
-    private enum RouterLedgerField {
-        static let provider = Data("\"provider\":".utf8)
-        static let status = Data("\"status\":".utf8)
-        static let at = Data("\"at\":".utf8)
-        static let inputTokens = Data("\"inputTokens\":".utf8)
-        static let cachedInputTokens = Data("\"cachedInputTokens\":".utf8)
-        static let outputTokens = Data("\"outputTokens\":".utf8)
-        static let model = Data("\"model\":".utf8)
-    }
-
-    /// Value of a `"key":"value"` scalar, without building a dictionary.
-    private static func jsonScalar(for needle: Data, in data: Data) -> String? {
-        guard let start = data.range(of: needle)?.upperBound else { return nil }
-        guard start < data.endIndex, data[start] == UInt8(ascii: "\"") else { return nil }
-        let valueStart = data.index(after: start)
-        guard let end = data[valueStart...].firstIndex(of: UInt8(ascii: "\"")), end > valueStart else { return nil }
-        return String(decoding: data[valueStart..<end], as: UTF8.self)
-    }
-
-    /// Value of a `"key":<number>` scalar, without building a dictionary.
-    private static func jsonInteger(for needle: Data, in data: Data) -> Int? {
-        guard let start = data.range(of: needle)?.upperBound else { return nil }
-        var value = 0
-        var seen = false
-        var negative = false
-        var index = start
-        if index < data.endIndex, data[index] == UInt8(ascii: "-") { negative = true; index = data.index(after: index) }
-        // Saturating rather than trapping. `value * 10` overflows `Int` on a long digit run — which is a
-        // SIGTRAP, i.e. the process dies — and the ledger is untrusted, append-only input that can carry a
-        // hand-edited or absurdly large count. A saturating read costs nothing and cannot kill the app.
-        // The same 1e15 clamp every other parser in this file uses; saturating without it let a 26-digit
-        // run through at 1.15e18 tokens, i.e. an absurd figure rather than a crash.
-        let ceiling = 1_000_000_000_000_000
-        var saturated = false
-        while index < data.endIndex {
-            let byte = data[index]
-            guard byte >= UInt8(ascii: "0"), byte <= UInt8(ascii: "9") else { break }
-            seen = true
-            if !saturated {
-                value = value * 10 + Int(byte - UInt8(ascii: "0"))
-                if value > ceiling { saturated = true }   // far past any real token count
-            }
-            index = data.index(after: index)
-        }
-        guard seen else { return nil }
-        guard !saturated else { return ceiling }
-        return negative ? -value : value
-    }
-
-
     static func parseHermesGatewayRows(_ json: String) -> [ClaudeGatewayRow] {
         guard let data = json.data(using: .utf8),
               let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [Any]
@@ -936,6 +692,48 @@ struct OpenCodeUsageScanner: Sendable {
             ))
         }
         return rows
+    }
+
+    // MARK: - Codex Router ledger
+
+    /// OpenCode-served turns from a CodexRouter ledger, mapped onto this fold's row shape.
+    ///
+    /// Reads the same `usage-events.jsonl` the Codex card reads and selects the rows whose `provider` is
+    /// OpenCode-hosted, so the two cards partition the ledger instead of overlapping or leaving a gap.
+    /// `cached` is carved out of `input` because the router reports `inputTokens` inclusive of the cached
+    /// portion, matching the Codex session-log contract.
+    /// Router model slugs are `<provider>/<model>` (`opencode-free/space-bunny-free`). The card should
+    /// name the model, not the account that served it — the same rule the Codex card's identity resolution
+    /// follows, so a gateway path never becomes a row title.
+    static func bareRouterModelName(_ model: String) -> String {
+        guard let lastSlash = model.lastIndex(of: "/") else { return model }
+        return String(model[model.index(after: lastSlash)...])
+    }
+
+    /// Rows for this card's window, read from the router ledger.
+    ///
+    /// The ledger is append-only and grows without bound (tens of MB), and the scan runs on every refresh.
+    /// Re-reading it in full cost ~13 s of CPU per refresh for a 36 MB file, because the whole file was
+    /// JSON-parsed regardless of the window. This tails instead: only bytes appended since the last call
+    /// are read and parsed. Large ledgers fold into a durable day/model aggregate so each refresh
+    /// materializes a few dozen rows instead of the whole OpenCode history.
+    static func routerGatewayRows(atPath path: String, since: Date) -> [ClaudeGatewayRow] {
+        OpenCodeRouterLedger.shared.rows(atPath: path, since: since)
+    }
+
+    /// Read counters for the offline performance benchmark and cache regression tests.
+    static func routerLedgerReadStatisticsForTesting(path: String) -> (fullParses: Int, tailParses: Int, bytesRead: Int)? {
+        OpenCodeRouterLedger.shared.statistics(path: path)
+    }
+
+    /// Remove the in-memory checkpoints and durable compact aggregate for one synthetic test ledger.
+    static func routerLedgerClearCacheForTesting(path: String) {
+        OpenCodeRouterLedger.shared.clearForTesting(path: path)
+    }
+
+    /// Parse one line through the same production router parser used by the streaming ledger reader.
+    static func routerGatewayRow(from line: Data) -> ClaudeGatewayRow? {
+        OpenCodeRouterLedger.row(from: line)
     }
 
     // MARK: - Muse gateway sessions (muse-go harness)
@@ -979,7 +777,10 @@ struct OpenCodeUsageScanner: Sendable {
     /// knows become unknown-model warnings. Priced rows that burn the Go subscription's quota are
     /// also appended to `goWindowCosts` (timestamp + imputed dollars) so the cap meters' local
     /// dollar context includes the gateway folds, exactly like the tiles do.
-    private static func foldGatewayRows(
+    /// `skippingDayModels` drops rows for (local day, model) pairs another source already owns, so the
+    /// two gateway sources never count the same turn twice. See `dayModelKey(_:)` and the router-first
+    /// reconciliation in `scan(now:daysBack:pricing:)`.
+    static func foldGatewayRows(
         _ rows: [ClaudeGatewayRow],
         since: Date,
         pricing: ModelPricing,
@@ -987,11 +788,13 @@ struct OpenCodeUsageScanner: Sendable {
         accumulator: inout DailyUsageAccumulator,
         goWindowCosts: inout [(ms: Double, cost: Double)],
         includesEstimatedCost: inout Bool,
-        partialDays: inout Set<String>
+        partialDays: inout Set<String>,
+        skippingDayModels: Set<String> = []
     ) {
         JSONLAccountingWorkPacer.shared.forEach(rows) { row in
             guard row.date >= since else { return }
             let day = DailyUsageAccumulator.dayKey(from: row.date)
+            guard !skippingDayModels.contains(Self.dayModelKey(day: day, model: row.model)) else { return }
             if row.isInProgress {
                 // Still-running Hermes session: its ledger is not final (Hermes writes it in
                 // delayed bursts), so the day's total is partial until the session ends.
@@ -1006,7 +809,8 @@ struct OpenCodeUsageScanner: Sendable {
                 model: row.model,
                 tokens: TokenBreakdown(
                     input: row.input, cacheWrite5m: row.cacheWrite, cacheRead: row.cacheRead, output: row.output
-                )
+                ),
+                applyLongContextRates: !row.isAggregated
             ) {
                 cost = estimated
             } else {
@@ -1123,7 +927,14 @@ struct OpenCodeUsageScanner: Sendable {
         SELECT json_group_array(json_array(
                  time_created,
                  json_extract(data,'$.cost'),
-                 COALESCE(json_extract(data,'$.tokens.total'),0),
+                 CASE WHEN json_type(data,'$.tokens.total') IN ('integer','real')
+                     THEN json_extract(data,'$.tokens.total')
+                     ELSE COALESCE(json_extract(data,'$.tokens.input'),0)
+                        + COALESCE(json_extract(data,'$.tokens.output'),0)
+                        + COALESCE(json_extract(data,'$.tokens.reasoning'),0)
+                        + COALESCE(json_extract(data,'$.tokens.cache.read'),0)
+                        + COALESCE(json_extract(data,'$.tokens.cache.write'),0)
+                END,
                  json_extract(data,'$.modelID'),
                  json_extract(data,'$.providerID')))
         FROM message

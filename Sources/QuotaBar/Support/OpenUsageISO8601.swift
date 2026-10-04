@@ -26,10 +26,10 @@ enum OpenUsageISO8601 {
 
     static func date(from value: String) -> Date? {
         if hasCanonicalUTCShape(value, fractional: true) {
-            return fractionalFormatter.date(from: value)
+            return parseCanonicalUTC(value, fractional: true)
         }
         if hasCanonicalUTCShape(value, fractional: false) {
-            return plainFormatter.date(from: value)
+            return parseCanonicalUTC(value, fractional: false)
         }
         let normalized = normalizeTimestamp(value)
         return formatter(fractionalSeconds: true).date(from: normalized) ??
@@ -37,7 +37,7 @@ enum OpenUsageISO8601 {
     }
 
     /// CodexRouter and several local ledgers emit this exact shape for every event. Accept it without
-    /// regex normalization; malformed dates are still rejected by ISO8601DateFormatter below.
+    /// regex normalization, then validate the Gregorian calendar fields in the direct parser below.
     private static func hasCanonicalUTCShape(_ value: String, fractional: Bool) -> Bool {
         value.utf8.withContiguousStorageIfAvailable { bytes in
             let expectedCount = fractional ? 24 : 20
@@ -61,6 +61,49 @@ enum OpenUsageISO8601 {
             }
             return true
         } ?? false
+    }
+
+    /// Avoids the ISO8601DateFormatter cost for the exact UTC shapes emitted by CodexRouter and
+    /// JavaScript's `Date.toISOString()`. Unusual but well-shaped values fall back to Foundation.
+    private static func parseCanonicalUTC(_ value: String, fractional: Bool) -> Date? {
+        value.utf8.withContiguousStorageIfAvailable { bytes -> Date? in
+            func number(_ range: Range<Int>) -> Int {
+                range.reduce(into: 0) { result, index in
+                    result = result * 10 + Int(bytes[index] - 48)
+                }
+            }
+
+            let year = number(0..<4)
+            let month = number(5..<7)
+            let day = number(8..<10)
+            let hour = number(11..<13)
+            let minute = number(14..<16)
+            let second = number(17..<19)
+            guard year > 0, (1...12).contains(month), hour < 24,
+                  minute < 60, second < 60
+            else { return nil }
+
+            let isLeapYear = year.isMultiple(of: 4) && (!year.isMultiple(of: 100) || year.isMultiple(of: 400))
+            let maximumDay: Int
+            switch month {
+            case 2: maximumDay = isLeapYear ? 29 : 28
+            case 4, 6, 9, 11: maximumDay = 30
+            default: maximumDay = 31
+            }
+            guard (1...maximumDay).contains(day) else { return nil }
+
+            // Proleptic Gregorian days since 1970-01-01 (Howard Hinnant's civil-date transform).
+            let adjustedYear = year - (month <= 2 ? 1 : 0)
+            let era = adjustedYear / 400
+            let yearOfEra = adjustedYear - era * 400
+            let adjustedMonth = month + (month > 2 ? -3 : 9)
+            let dayOfYear = (153 * adjustedMonth + 2) / 5 + day - 1
+            let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+            let daysSinceEpoch = era * 146_097 + dayOfEra - 719_468
+            let wholeSeconds = daysSinceEpoch * 86_400 + hour * 3_600 + minute * 60 + second
+            let milliseconds = fractional ? number(20..<23) : 0
+            return Date(timeIntervalSince1970: Double(wholeSeconds) + Double(milliseconds) / 1_000)
+        } ?? nil
     }
 
     /// Aligns with the JavaScript plugin `ctx.util.toIso` string normalization (Claude `resets_at`, etc.).

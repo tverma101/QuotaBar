@@ -37,10 +37,13 @@ struct WidgetGroupedListView: View {
 
     @ViewBuilder
     private func section(_ group: ProviderGroup) -> some View {
-        // Dropped here rather than in `displayGroups` because only now is visibility known. See
-        // `ProviderGroup.hasVisibleRow(keeping:)`.
-        if group.hasVisibleRow(keeping: isRowVisible) {
-            sectionBody(group, resolved: resolveRows(for: group))
+        // Resolve first, then decide. The old path asked `hasVisibleRow(keeping:)` and then resolved
+        // the same rows again, so the first visible row could build `WidgetData` three times during
+        // the panel's initial mount. One resolution now drives both the visibility decision and the
+        // rendered card.
+        let resolved = resolveRows(for: group)
+        if resolved.hasVisibleRow {
+            sectionBody(group, resolved: resolved)
         }
     }
 
@@ -151,12 +154,12 @@ struct WidgetGroupedListView: View {
     private struct ResolvedCard {
         let cardRows: [DashboardMetricCardRow]
         let condensedIDs: Set<String>
+        let hasVisibleRow: Bool
     }
 
     private func resolveRows(for group: ProviderGroup) -> ResolvedCard {
-        // Resolve each row's descriptor + data exactly once per render, then reuse it for both the
-        // neighbor-aware condensing rule and the row itself — `dataStore.data(for:)` used to be
-        // recomputed several times per row (twice per adjacent pair plus once in `row`).
+        // Resolve each row's descriptor + data exactly once per render, then reuse it for the
+        // visibility decision, the neighbor-aware condensing rule, and the row itself.
         let isExpanded = layout.isProviderExpanded(group.provider.id)
         let alwaysRows = resolvedRows(group.alwaysShownWidgets)
         let expandedRows = resolvedRows(group.expandedWidgets)
@@ -174,7 +177,8 @@ struct WidgetGroupedListView: View {
                 isExpanded: isExpanded,
                 links: group.provider.visibleLinks
             ),
-            condensedIDs: condensedIDs
+            condensedIDs: condensedIDs,
+            hasVisibleRow: !alwaysRows.isEmpty || !expandedRows.isEmpty
         )
     }
 
@@ -205,25 +209,21 @@ struct WidgetGroupedListView: View {
         }
     }
 
-    /// The single visibility predicate: a feature/plan-dependent row with nothing to show is noise, so it
-    /// hides itself — unless the user turned it on, which `showsRow` treats as intent that outranks the
-    /// data.
+    /// One resolution per row: a feature/plan-dependent row with nothing to show is noise, so it hides
+    /// itself — unless the user turned it on, which `showsRow` treats as intent that outranks the data.
     ///
     /// Deliberately a presentation filter rather than a layout change: Customize still lists the row,
     /// menu-bar pins still render it, and quota alerts still fire off the underlying data. Removing it
     /// from `placed` instead would quietly switch all three off.
-    private func isRowVisible(_ widget: PlacedWidget) -> Bool {
-        guard let descriptor = layout.descriptor(for: widget) else { return false }
-        return layout.showsRow(descriptor, hasData: dataStore.data(for: descriptor).hasData)
-    }
-
     private func resolvedRows(_ widgets: [PlacedWidget]) -> [ResolvedRow] {
-        widgets.filter(isRowVisible).compactMap { widget -> ResolvedRow? in
+        widgets.compactMap { widget -> ResolvedRow? in
             guard let descriptor = layout.descriptor(for: widget) else { return nil }
+            let data = dataStore.data(for: descriptor)
+            guard layout.showsRow(descriptor, hasData: data.hasData) else { return nil }
             return ResolvedRow(
                 widget: widget,
                 descriptor: descriptor,
-                data: dataStore.data(for: descriptor)
+                data: data
             )
         }
     }

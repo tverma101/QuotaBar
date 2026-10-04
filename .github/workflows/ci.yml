@@ -34,6 +34,10 @@ jobs:
 
       # This dedicated public branch runs the deterministic synthetic-ledger benchmark on GitHub's
       # isolated macOS runner. It never copies or uploads a user's local usage ledger.
+      - name: Measure Production Aggregate Reuse
+        if: github.ref == 'refs/heads/codex/token-accounting-cpu-benchmark'
+        run: QUOTABAR_PRODUCTION_ACCOUNTING_BENCH=1 swift test -c release -j 2 --disable-index-store --filter ProductionTokenAccountingEfficiencyTests
+
       - name: Measure token accounting CPU
         if: github.ref == 'refs/heads/codex/token-accounting-cpu-benchmark'
         run: script/measure_token_accounting.sh

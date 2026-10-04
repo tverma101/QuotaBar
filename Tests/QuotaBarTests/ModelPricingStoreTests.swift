@@ -41,6 +41,13 @@ final class ModelPricingStoreTests: XCTestCase {
     {"xai": {"models": {"fetched-dev-model": {"cost": {"input": 1, "output": 2, "cache_read": 0.2}}}}}
     """
 
+    private static let openRouterFeed = """
+    {"data": [
+      {"id": "example/fetched-openrouter-model", "pricing": {"prompt": "0.000007", "completion": "0.00002"}},
+      {"id": "example/free-model:free", "pricing": {"prompt": "0", "completion": "0"}}
+    ], "total_count": 2, "links": {"next": null}}
+    """
+
     private static let supplementFeed = """
     {"pricing": {"auto": {"input_per_million": 9.0, "output_per_million": 9.0}},
      "fast_multipliers": {}, "alias_rules": []}
@@ -64,6 +71,8 @@ final class ModelPricingStoreTests: XCTestCase {
         let body: String
         if request.url.absoluteString.contains("litellm") {
             body = litellmFeed
+        } else if request.url.host() == "openrouter.ai" {
+            body = openRouterFeed
         } else if request.url.host() == "models.dev" {
             body = modelsDevFeed
         } else {
@@ -85,11 +94,13 @@ final class ModelPricingStoreTests: XCTestCase {
     func testRefreshFetchesAllSourcesAndAppliesData() async throws {
         let (store, http) = makeStore(handler: { Self.respond(to: $0) })
         await store.refreshNow()
-        XCTAssertEqual(http.requests.count, 3)
+        XCTAssertEqual(http.requests.count, 4)
 
         let pricing = await store.current()
         XCTAssertEqual(pricing.resolve(model: "fetched-model")?.inputPerMillion, 5)
         XCTAssertEqual(pricing.resolve(model: "fetched-dev-model")?.inputPerMillion, 1)
+        XCTAssertEqual(pricing.resolve(model: "fetched-openrouter-model")?.inputPerMillion, 7)
+        XCTAssertEqual(pricing.resolve(model: "example/free-model:free")?.inputPerMillion, 0)
         XCTAssertEqual(pricing.resolve(model: "auto")?.inputPerMillion, 9, "fetched supplement replaces bundled")
         XCTAssertEqual(pricing.resolve(model: "bundled-model")?.inputPerMillion, 1, "bundled entries survive the merge")
     }
@@ -121,7 +132,7 @@ final class ModelPricingStoreTests: XCTestCase {
             now: { later }
         )
         await aged.refreshNow()
-        XCTAssertEqual(http.requests.count, 3, "all sources past TTL revalidate")
+        XCTAssertEqual(http.requests.count, 4, "all sources past TTL revalidate")
 
         let pricing = await aged.current()
         XCTAssertEqual(pricing.resolve(model: "fetched-model")?.inputPerMillion, 5, "304 keeps cached data")
@@ -203,10 +214,10 @@ final class ModelPricingStoreTests: XCTestCase {
             throw URLError(.notConnectedToInternet)
         })
         await store.refreshNow()
-        XCTAssertEqual(counter.value, 3)
+        XCTAssertEqual(counter.value, 4)
         // Immediately after a failure, nothing is due.
         await store.refreshNow()
-        XCTAssertEqual(counter.value, 3)
+        XCTAssertEqual(counter.value, 4)
     }
 }
 
