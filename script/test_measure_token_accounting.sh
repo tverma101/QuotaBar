@@ -16,12 +16,12 @@ if [[ "${QB_MEASUREMENT_TEST_MODE:-valid}" == failed ]]; then exit 1; fi
 SH
 chmod +x "$fixture_dir/bin/swift"
 
-PATH="$fixture_dir/bin:$PATH" QB_MEASUREMENT_TEST_MODE=valid \
+PATH="$fixture_dir/bin:/usr/bin:/bin:/usr/sbin:/sbin" QB_MEASUREMENT_TEST_MODE=valid \
   QUOTABAR_TOKEN_ACCOUNTING_REPEATS=3 bash "$repo_root/script/measure_token_accounting.sh" > "$fixture_dir/valid.log" 2>&1
-rg -q 'Collected 6/6 token-accounting measurements; 6 passed all assertions.' "$fixture_dir/valid.log"
+[[ "$(< "$fixture_dir/valid.log")" == *'Collected 6/6 token-accounting measurements; 6 passed all assertions.'* ]]
 
 for mode in missing failed; do
-  if PATH="$fixture_dir/bin:$PATH" QB_MEASUREMENT_TEST_MODE="$mode" \
+  if PATH="$fixture_dir/bin:/usr/bin:/bin:/usr/sbin:/sbin" QB_MEASUREMENT_TEST_MODE="$mode" \
     QUOTABAR_TOKEN_ACCOUNTING_REPEATS=1 bash "$repo_root/script/measure_token_accounting.sh" > "$fixture_dir/$mode.log" 2>&1; then
     printf 'Measurement driver incorrectly accepted %s output.\n' "$mode" >&2
     exit 1
