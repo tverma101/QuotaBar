@@ -40,7 +40,8 @@ for ((repeat = 1; repeat <= repeat_count; repeat++)); do
       printf 'Measurement %s/%s (%s) failed with exit %s; continuing to collect remaining repeats.\n' \
         "$repeat" "$repeat_count" "$mode" "$status" >&2
     fi
-    if rg -q "^TOKEN_ACCOUNTING_BENCH mode=${mode} " "$measurement_log"; then
+    # SwiftPM can prefix captured XCTest output with terminal-control bytes.
+    if rg -q "TOKEN_ACCOUNTING_BENCH mode=${mode} " "$measurement_log"; then
       collected_measurements=$((collected_measurements + 1))
       measurement_recorded=1
     else

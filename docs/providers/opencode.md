@@ -75,6 +75,8 @@ The spend tiles combine every client that dials the OpenCode gateway on this Mac
 3. The Zen gateway's per-message cost.
 4. Codex rollouts whose turns ran through the gateway (parsed with the Codex scanner's own parser,
    so cumulative-total deltas and subagent replay gating are handled exactly as the Codex card does).
+   A separate gateway-only cache reuses the native parse records and keeps unrelated Codex turns out
+   of repeated OpenCode folds. Codex output includes reasoning, which is counted once.
 5. Hermes sessions billed to the OpenCode account (`billing_provider` `opencode-go` / `opencode` in
    `~/.hermes/state.db`) — Hermes talks to the gateway directly and never writes `opencode*.db`.
 

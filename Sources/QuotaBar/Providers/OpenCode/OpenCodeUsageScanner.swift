@@ -393,7 +393,7 @@ struct OpenCodeUsageScanner: Sendable {
         let partitionedCodex = Self.partitionCodexHomes(codexHomes())
         for home in partitionedCodex.defaultHomes {
             guard !Task.isCancelled else { return nil }
-            _ = await CodexLogUsageScanner().foldParsedEvents(
+            _ = await CodexLogUsageScanner().foldHostedGatewayEvents(
                 daysBack: daysBack, now: now, homes: [home]
             ) { event in
                 gatewayFold.foldCodex(event)
@@ -402,7 +402,7 @@ struct OpenCodeUsageScanner: Sendable {
         }
         for home in partitionedCodex.managed {
             guard !Task.isCancelled else { return nil }
-            _ = await CodexLogUsageScanner(peerHomes: partitionedCodex.defaultHomes).foldParsedEvents(
+            _ = await CodexLogUsageScanner(peerHomes: partitionedCodex.defaultHomes).foldHostedGatewayEvents(
                 daysBack: daysBack, now: now, homes: [home]
             ) { event in
                 gatewayFold.foldCodex(event)
@@ -604,8 +604,8 @@ struct OpenCodeUsageScanner: Sendable {
 
     /// The gateway turns among parsed Codex events: a turn counts only when its session's model
     /// carries a gateway prefix; the prefix is stripped so the pricing catalogs see the real model
-    /// (deepseek-v4-flash, …). Reasoning tokens bill at the output rate, mirroring the Codex
-    /// scanner's cost math.
+    /// (deepseek-v4-flash, …). Codex output already includes reasoning tokens, so the gateway
+    /// keeps that same output count rather than adding its reasoning subset again.
     static func codexGatewayRows(from events: [CodexLogUsageScanner.Event]) -> [ClaudeGatewayRow] {
         events.compactMap { event in
             guard let prefix = Self.codexGatewayPrefixes.first(where: { event.model.hasPrefix($0) }) else {
@@ -616,7 +616,7 @@ struct OpenCodeUsageScanner: Sendable {
             return ClaudeGatewayRow(
                 date: event.timestamp,
                 input: max(0, event.input - event.cached),
-                output: event.output + event.reasoning,
+                output: event.output,
                 cacheWrite: 0,
                 cacheRead: event.cached,
                 model: model,

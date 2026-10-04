@@ -21,7 +21,7 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
         _ iso: String,
         input: Int, cached: Int = 0, output: Int = 0, reasoning: Int = 0
     ) -> String {
-        let total = input + output + reasoning
+        let total = input + output
         return """
         {"timestamp":"\(iso)","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":\(input),"cached_input_tokens":\(cached),"output_tokens":\(output),"reasoning_output_tokens":\(reasoning),"total_tokens":\(total)},"last_token_usage":{"input_tokens":\(input),"cached_input_tokens":\(cached),"output_tokens":\(output),"reasoning_output_tokens":\(reasoning)}}}}
         """
@@ -32,7 +32,7 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
         _ iso: String,
         input: Int, cached: Int = 0, output: Int = 0, reasoning: Int = 0
     ) -> String {
-        let total = input + output + reasoning
+        let total = input + output
         return """
         {"timestamp":"\(iso)","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":\(input),"cached_input_tokens":\(cached),"output_tokens":\(output),"reasoning_output_tokens":\(reasoning),"total_tokens":\(total)}}}}
         """
@@ -56,11 +56,11 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
         let rows = OpenCodeUsageScanner.parseCodexGatewayRows(data)
         XCTAssertEqual(rows.count, 3)
         XCTAssertEqual(rows[0].model, "deepseek-v4-flash")
-        // input 200 uncached + cacheRead 800 + output 250 (reasoning at output rate).
-        XCTAssertEqual(rows[0].tokens, 1250)
+        // input 200 uncached + cacheRead 800 + output 200, which already contains reasoning.
+        XCTAssertEqual(rows[0].tokens, 1200)
         XCTAssertTrue(rows[0].burnsGoQuota, "opencode_go prefix burns the Go subscription quota")
         XCTAssertEqual(rows[1].model, "deepseek-v4-flash")
-        XCTAssertEqual(rows[1].tokens, 1250)   // the delta, not the cumulative 2500
+        XCTAssertEqual(rows[1].tokens, 1200)   // the delta, not the cumulative 2400
         XCTAssertTrue(rows[1].burnsGoQuota)
         XCTAssertEqual(rows[2].model, "gpt-5.5")
         XCTAssertEqual(rows[2].tokens, 400)
@@ -121,9 +121,9 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
         guard case let .values(_, values, _, _, _, _)? = lines.first(where: { $0.label == "Today" }) else {
             return XCTFail("expected a Today tile")
         }
-        // DB row (500 tokens) + folded gateway turn (1250 tokens).
+        // DB row (500 tokens) + folded gateway turn (1200 tokens).
         let tokens = values.first(where: { $0.kind == .count })?.number ?? 0
-        XCTAssertEqual(tokens, 1750)
+        XCTAssertEqual(tokens, 1700)
         XCTAssertTrue(values.contains(where: \.estimated), "imputed dollars must carry the ⓘ marker")
     }
 
