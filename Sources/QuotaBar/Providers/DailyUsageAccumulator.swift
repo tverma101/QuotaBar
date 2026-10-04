@@ -42,7 +42,7 @@ struct DailyUsageAccumulator {
         model: String,
         canonical: String? = nil
     ) {
-        tokensByDay[day, default: 0] += tokens
+        tokensByDay[day] = ProviderParse.addingSaturating(tokensByDay[day, default: 0], tokens)
         costByDay[day, default: 0] += cost
         let identity = canonical ?? model
         modelsByDay[day, default: [:]][identity, default: ModelAccumulator()]
@@ -187,13 +187,13 @@ struct DailyUsageAccumulator {
         private var spellings: [String: (tokens: Int, costUSD: Double?, spelling: String)] = [:]
 
         mutating func add(tokens: Int, costUSD: Double?, spelling: String) {
-            self.tokens += tokens
+            self.tokens = ProviderParse.addingSaturating(self.tokens, tokens)
             if let costUSD {
                 self.costUSD = (self.costUSD ?? 0) + costUSD
             }
             let key = spelling.lowercased()
             var existing = spellings[key] ?? (0, nil, spelling)
-            existing.tokens += tokens
+            existing.tokens = ProviderParse.addingSaturating(existing.tokens, tokens)
             existing.costUSD = costUSD.map { (existing.costUSD ?? 0) + $0 } ?? existing.costUSD
             spellings[key] = existing
         }

@@ -225,13 +225,35 @@ final class WidgetDataStore {
     /// a full `force` (which would also re-hit Cursor/network). Last-good UI rows stay painted until
     /// the refetch completes.
     func invalidateSessionFreshnessForCodexSpend() {
-        let ids = providersByID.keys.filter { id in
-            id == "codex" || id.hasPrefix("codex@")
-        }
+        // Codex only: the ledger rows OpenCode's card would fold are the ones it skips, so an OpenCode
+        // snapshot is not made stale by a router append. `invalidateLocalAccountingFreshness` covers
+        // the trigger path, which does need both families.
+        let ids = providersByID.keys.filter { ProviderAccountID.family(of: $0) == "codex" }
         cache.invalidateSessionFreshness(providerIDs: Array(ids))
         if !ids.isEmpty {
             AppLog.debug(.refresh, "codex spend cache invalidated (\(ids.count) cards) after ledger wake")
         }
+    }
+
+    /// Same invalidation, for an external background refresh request. The router ledger is folded
+    /// into both Codex and OpenCode cards, so invalidating only Codex would leave OpenCode served
+    /// from a TTL-fresh snapshot while its own history changed.
+    ///
+    /// Drops session freshness only (no `force`), so unrelated providers keep their cache. A Codex
+    /// card's `refresh()` still re-reads its live quota API on the resulting miss.
+    func invalidateLocalAccountingFreshness() {
+        let ids = providersByID.keys.filter { Self.foldsLocalAccounting($0) }
+        cache.invalidateSessionFreshness(providerIDs: Array(ids))
+        if !ids.isEmpty {
+            AppLog.debug(.refresh, "local accounting cache invalidated (\(ids.count) cards) for background refresh")
+        }
+    }
+
+    /// Card ids whose history is a local fold over the CodexRouter ledger plus session rollouts, so a
+    /// background trigger must invalidate both families together or the cards disagree.
+    private static func foldsLocalAccounting(_ providerID: String) -> Bool {
+        let family = ProviderAccountID.family(of: providerID)
+        return family == "codex" || family == "opencode"
     }
 
     /// Refresh every enabled provider, concurrently by default — one slow provider never delays the

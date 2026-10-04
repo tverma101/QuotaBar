@@ -36,7 +36,7 @@ git --no-pager diff --stat 3866cd1 -- /tmp/openusage-upstream   # compare trees
 
 ## Local deltas from upstream
 
-Only two, both deliberate and both traceable to a decision:
+Local changes that matter when syncing shared code:
 
 1. **Sparkle auto-updates removed** (`5818ab1`). Sparkle fetches its appcast and DMGs anonymously,
    which requires a public repository. This one is private, so the updater, its Settings section, the
@@ -45,8 +45,14 @@ Only two, both deliberate and both traceable to a decision:
    strings, on-disk paths and the bundle id all changed. Internal symbols (`OpenUsageISO8601`,
    `Bundle.openUsageResources`) were left alone deliberately, to keep the upstream diff small.
 
-Pricing needed no equivalent change: `ModelPricingStore` reads the pricing supplement from upstream's
-public URL, so Cursor model rates keep updating on upstream's schedule.
+3. **Shared model pricing catalogue.** QuotaBar adds OpenRouter as a dynamic rate source and places
+   verified supplement overrides ahead of it. The supplement still reads from upstream's public URL,
+   and the LiteLLM/models.dev snapshots remain local bundled fallbacks. Review pricing precedence and
+   its cache behavior when syncing upstream changes to the shared pricing engine.
+4. **Snapshot-only menu presentation and incremental accounting.** Opening the panel uses cached
+   rows. CodexRouter and OpenCode keep compact local daily checkpoints; background refreshes read
+   appended bytes and preserve the provider ownership split. Review these caches and their regression
+   tests when syncing provider scanners or refresh behavior.
 
 ## Update procedure
 

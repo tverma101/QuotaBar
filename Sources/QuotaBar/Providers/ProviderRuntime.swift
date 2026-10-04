@@ -27,10 +27,13 @@ enum ProviderRefreshContext {
     @TaskLocal static var credentialInteractionGate: CredentialInteractionGate? = nil
     /// Defaults to `.full` so tests, CLI, and any unscoped call site keep today's behavior.
     @TaskLocal static var scope: Scope = .full
-    /// Automatic provider refreshes opt into the process-wide CPU allowance, including startup and
-    /// menu-bar passes whose providers can still perform local history accounting. Focused unit tests
-    /// and one-shot CLI scans keep their existing timing unless they explicitly measure the budget.
+    /// Provider refresh entry points opt into the process-wide CPU allowance, including startup,
+    /// menu-bar, full-panel, and local-API reads whose providers can perform local accounting.
+    /// Focused unit tests stay unthrottled unless they explicitly measure the budget.
     @TaskLocal static var accountingCPUThrottleEnabled = false
+    /// Menu-bar open. Catalog files that are already on disk stay as-is; a missing list may
+    /// still download. Stops a tap from kicking models.dev / OpenRouter / LiteLLM refreshes.
+    @TaskLocal static var skipModelCatalogRefresh = false
 }
 
 /// Run an explicit full-history refresh under the shared CPU allowance. Keep force-refresh entry

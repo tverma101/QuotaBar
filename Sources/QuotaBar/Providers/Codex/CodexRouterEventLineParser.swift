@@ -86,12 +86,30 @@ enum CodexRouterEventLineParser {
                 break
             }
         }
+
+        mutating func clear(_ field: Field) {
+            switch field {
+            case .at: at = nil
+            case .model: model = nil
+            case .provider: provider = nil
+            case .status: status = nil
+            case .inputTokens: inputTokens = nil
+            case .cachedInputTokens: cachedInputTokens = nil
+            case .outputTokens: outputTokens = nil
+            case .reasoningTokens: reasoningTokens = nil
+            case .totalTokens: totalTokens = nil
+            case .accountId: accountId = nil
+            case .accountFingerprint: accountFingerprint = nil
+            case .serviceTier: serviceTier = nil
+            }
+        }
     }
 
-    private struct StringToken {
-        var content: Range<Int>
+    private typealias StringToken = JSONLineStructure.StringToken
+
+    private struct ParsedInteger {
+        var value: Int
         var next: Int
-        var hasEscapes: Bool
     }
 
     static func parse(_ line: Data.SubSequence) -> CodexRouterUsageScanner.Event? {
@@ -133,7 +151,7 @@ enum CodexRouterEventLineParser {
             guard bytes[cursor] == ascii("\""),
                   let keyToken = scanString(bytes, openingQuote: cursor, end: objectEnd)
             else { return nil }
-            let field = field(for: bytes, key: keyToken.content, escaped: keyToken.hasEscapes)
+            let field = field(for: bytes, token: keyToken, openingQuote: cursor)
             cursor = keyToken.next
             skipWhitespace(bytes, cursor: &cursor, end: objectEnd)
             guard cursor < objectEnd, bytes[cursor] == ascii(":") else { return nil }
@@ -142,21 +160,27 @@ enum CodexRouterEventLineParser {
             guard cursor < objectEnd else { return nil }
 
             let valueStart = cursor
+            if let field {
+                fields.clear(field)
+                if case .at = field {
+                    cacheableTimestamp = false
+                }
+            }
             if let field, isStringField(field), bytes[cursor] == ascii("\"") {
                 guard let token = scanString(bytes, openingQuote: cursor, end: objectEnd) else { return nil }
-                if let value = decodeString(bytes, token: token, openingQuote: cursor) {
-                    fields.set(field, string: value)
-                    if case .at = field {
-                        cacheableTimestamp = token.content.count <= timestampCacheableByteLimit
-                    }
+                guard let value = decodeString(bytes, token: token, openingQuote: cursor) else { return nil }
+                fields.set(field, string: value)
+                if case .at = field {
+                    cacheableTimestamp = token.content.count <= timestampCacheableByteLimit
                 }
                 cursor = token.next
-            } else if let field, isIntegerField(field),
-                      let value = parseInteger(bytes, start: cursor, end: objectEnd) {
-                fields.set(field, integer: value)
-                cursor = skipValue(bytes, from: valueStart, end: objectEnd)
+            } else if let field, isIntegerField(field), isNumberStart(bytes[cursor]) {
+                guard let parsed = parseInteger(bytes, start: cursor, end: objectEnd) else { return nil }
+                fields.set(field, integer: parsed.value)
+                cursor = parsed.next
             } else {
-                cursor = skipValue(bytes, from: valueStart, end: objectEnd)
+                guard let next = skipValue(bytes, from: valueStart, end: objectEnd) else { return nil }
+                cursor = next
             }
 
             skipWhitespace(bytes, cursor: &cursor, end: objectEnd)
@@ -164,6 +188,8 @@ enum CodexRouterEventLineParser {
             guard cursor < objectEnd else { return nil }
             if bytes[cursor] == ascii(",") {
                 cursor += 1
+                skipWhitespace(bytes, cursor: &cursor, end: objectEnd)
+                guard cursor < objectEnd else { return nil }
             } else {
                 return nil
             }
@@ -207,10 +233,17 @@ enum CodexRouterEventLineParser {
 
     private static func field(
         for bytes: UnsafeBufferPointer<UInt8>,
-        key: Range<Int>,
-        escaped: Bool
+        token: StringToken,
+        openingQuote: Int
     ) -> Field? {
-        guard !escaped else { return nil }
+        if token.hasEscapes {
+            guard let key = decodeString(bytes, token: token, openingQuote: openingQuote) else { return nil }
+            return field(named: key)
+        }
+        return field(for: bytes, key: token.content)
+    }
+
+    private static func field(for bytes: UnsafeBufferPointer<UInt8>, key: Range<Int>) -> Field? {
         switch key.count {
         case 2 where matches(bytes, key, "at"): return .at
         case 5 where matches(bytes, key, "model"): return .model
@@ -228,6 +261,24 @@ enum CodexRouterEventLineParser {
         default: break
         }
         return nil
+    }
+
+    private static func field(named key: String) -> Field? {
+        switch key {
+        case "at": return .at
+        case "model": return .model
+        case "provider": return .provider
+        case "status": return .status
+        case "inputTokens": return .inputTokens
+        case "cachedInputTokens": return .cachedInputTokens
+        case "outputTokens": return .outputTokens
+        case "reasoningTokens": return .reasoningTokens
+        case "totalTokens": return .totalTokens
+        case "accountId": return .accountId
+        case "accountFingerprint": return .accountFingerprint
+        case "serviceTier": return .serviceTier
+        default: return nil
+        }
     }
 
     private static func matches(
@@ -261,22 +312,7 @@ enum CodexRouterEventLineParser {
         end: Int
     ) -> StringToken? {
         guard openingQuote < end, bytes[openingQuote] == ascii("\"") else { return nil }
-        var cursor = openingQuote + 1
-        var escaped = false
-        var hasEscapes = false
-        while cursor < end {
-            let byte = bytes[cursor]
-            if escaped {
-                escaped = false
-            } else if byte == ascii("\\") {
-                escaped = true
-                hasEscapes = true
-            } else if byte == ascii("\"") {
-                return StringToken(content: (openingQuote + 1)..<cursor, next: cursor + 1, hasEscapes: hasEscapes)
-            }
-            cursor += 1
-        }
-        return nil
+        return JSONLineStructure.scanString(bytes, openingQuote: openingQuote, end: end)
     }
 
     private static func decodeString(
@@ -285,7 +321,7 @@ enum CodexRouterEventLineParser {
         openingQuote: Int
     ) -> String? {
         guard token.hasEscapes else {
-            return String(decoding: bytes[token.content], as: UTF8.self)
+            return String(bytes: bytes[token.content], encoding: .utf8)
         }
         let quoted = Data(bytes[openingQuote..<token.next])
         let wrapped = Data([ascii("[")]) + quoted + Data([ascii("]")])
@@ -296,34 +332,83 @@ enum CodexRouterEventLineParser {
         _ bytes: UnsafeBufferPointer<UInt8>,
         start: Int,
         end: Int
-    ) -> Int? {
+    ) -> ParsedInteger? {
         var cursor = start
         var negative = false
         if cursor < end, bytes[cursor] == ascii("-") {
             negative = true
             cursor += 1
         }
+
+        guard cursor < end else { return nil }
+        if bytes[cursor] == ascii("0") {
+            cursor += 1
+        } else {
+            guard bytes[cursor] >= ascii("1"), bytes[cursor] <= ascii("9") else { return nil }
+            while cursor < end, bytes[cursor] >= ascii("0"), bytes[cursor] <= ascii("9") {
+                cursor += 1
+            }
+        }
+
+        var needsFloatingPointConversion = false
+        if cursor < end, bytes[cursor] == ascii(".") {
+            needsFloatingPointConversion = true
+            cursor += 1
+            let fractionStart = cursor
+            while cursor < end, bytes[cursor] >= ascii("0"), bytes[cursor] <= ascii("9") {
+                cursor += 1
+            }
+            guard cursor > fractionStart else { return nil }
+        }
+        if cursor < end, (bytes[cursor] == ascii("e") || bytes[cursor] == ascii("E")) {
+            needsFloatingPointConversion = true
+            cursor += 1
+            if cursor < end, (bytes[cursor] == ascii("+") || bytes[cursor] == ascii("-")) {
+                cursor += 1
+            }
+            let exponentStart = cursor
+            while cursor < end, bytes[cursor] >= ascii("0"), bytes[cursor] <= ascii("9") {
+                cursor += 1
+            }
+            guard cursor > exponentStart else { return nil }
+        }
+
+        let numberEnd = cursor
+        var next = cursor
+        skipWhitespace(bytes, cursor: &next, end: end)
+        guard next == end || bytes[next] == ascii(",") else { return nil }
+
         let ceiling = 1_000_000_000_000_000
-        var value = 0
-        var saturated = false
-        var sawDigit = false
-        while cursor < end {
-            let byte = bytes[cursor]
-            guard byte >= ascii("0"), byte <= ascii("9") else { break }
-            sawDigit = true
-            if !saturated {
-                let digit = Int(byte - ascii("0"))
-                if value > (ceiling - digit) / 10 {
-                    value = ceiling
+        let value: Int
+        if needsFloatingPointConversion {
+            guard let text = String(bytes: bytes[start..<numberEnd], encoding: .utf8),
+                  let number = Double(text), !number.isNaN else { return nil }
+            if number.isInfinite {
+                value = negative ? -ceiling : ceiling
+            } else {
+                value = Int(max(-Double(ceiling), min(Double(ceiling), number.rounded(.down))))
+            }
+        } else {
+            var digitsStart = start
+            if negative { digitsStart += 1 }
+            var magnitude = 0
+            var saturated = false
+            for index in digitsStart..<numberEnd {
+                let digit = Int(bytes[index] - ascii("0"))
+                if magnitude > (ceiling - digit) / 10 {
+                    magnitude = ceiling
                     saturated = true
-                } else {
-                    value = value * 10 + digit
+                } else if !saturated {
+                    magnitude = magnitude * 10 + digit
                 }
             }
-            cursor += 1
+            value = negative ? -magnitude : magnitude
         }
-        guard sawDigit else { return nil }
-        return negative ? -value : value
+        return ParsedInteger(value: value, next: numberEnd)
+    }
+
+    private static func isNumberStart(_ byte: UInt8) -> Bool {
+        byte == ascii("-") || (byte >= ascii("0") && byte <= ascii("9"))
     }
 
     /// Finds the next top-level delimiter while ignoring commas/braces inside strings and nested values.
@@ -331,44 +416,8 @@ enum CodexRouterEventLineParser {
         _ bytes: UnsafeBufferPointer<UInt8>,
         from start: Int,
         end: Int
-    ) -> Int {
-        var cursor = start
-        var objectDepth = 0
-        var arrayDepth = 0
-        var inString = false
-        var escaped = false
-        while cursor < end {
-            let byte = bytes[cursor]
-            if inString {
-                if escaped {
-                    escaped = false
-                } else if byte == ascii("\\") {
-                    escaped = true
-                } else if byte == ascii("\"") {
-                    inString = false
-                }
-            } else {
-                switch byte {
-                case ascii("\""):
-                    inString = true
-                case ascii("{"):
-                    objectDepth += 1
-                case ascii("}"):
-                    if objectDepth == 0 && arrayDepth == 0 { return cursor }
-                    objectDepth -= 1
-                case ascii("["):
-                    arrayDepth += 1
-                case ascii("]"):
-                    arrayDepth -= 1
-                case ascii(",") where objectDepth == 0 && arrayDepth == 0:
-                    return cursor
-                default:
-                    break
-                }
-            }
-            cursor += 1
-        }
-        return cursor
+    ) -> Int? {
+        JSONLineStructure.skipValue(bytes, from: start, end: end)
     }
 
     private static func skipWhitespace(
@@ -376,16 +425,14 @@ enum CodexRouterEventLineParser {
         cursor: inout Int,
         end: Int
     ) {
-        while cursor < end, isWhitespace(bytes[cursor]) {
-            cursor += 1
-        }
+        JSONLineStructure.skipWhitespace(bytes, cursor: &cursor, end: end)
     }
 
     private static func isWhitespace(_ byte: UInt8) -> Bool {
-        byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D
+        JSONLineStructure.isWhitespace(byte)
     }
 
     private static func ascii(_ character: Character) -> UInt8 {
-        character.asciiValue!
+        JSONLineStructure.ascii(character)
     }
 }

@@ -6,7 +6,8 @@ final class ModelPricingTests: XCTestCase {
     private func makePricing(
         supplementJSON: String? = nil,
         primary: [String: ModelRates] = [:],
-        secondary: [String: ModelRates] = [:]
+        secondary: [String: ModelRates] = [:],
+        openRouter: [String: ModelRates] = [:]
     ) throws -> ModelPricing {
         let supplement: PricingSupplement
         if let supplementJSON {
@@ -17,7 +18,8 @@ final class ModelPricingTests: XCTestCase {
         return ModelPricing(
             supplement: supplement,
             primary: PricingCatalog(entries: primary),
-            secondary: PricingCatalog(entries: secondary)
+            secondary: PricingCatalog(entries: secondary),
+            openRouter: PricingCatalog(entries: openRouter)
         )
     }
 
@@ -75,6 +77,39 @@ final class ModelPricingTests: XCTestCase {
         XCTAssertEqual(pricing.resolve(model: "grok-build-0.1")?.inputPerMillion, 1)
     }
 
+    func testOpenRouterExactRatesBeatLiteLLMAndSupplementFillsMissingModels() throws {
+        let supplement = #"{"pricing":{"gpt-5.6":{"input_per_million":1,"output_per_million":2},"auto":{"input_per_million":3,"output_per_million":4}},"alias_rules":[]}"#
+        let pricing = try makePricing(
+            supplementJSON: supplement,
+            primary: ["gpt-5.6": rates(5, 10)],
+            openRouter: ["gpt-5.6": rates(7, 14), "new-model": rates(8, 16)]
+        )
+
+        XCTAssertEqual(pricing.resolve(model: "new-model")?.inputPerMillion, 8)
+        XCTAssertEqual(pricing.resolve(model: "gpt-5.6")?.inputPerMillion, 1, "curated supplement prices must remain authoritative")
+        XCTAssertEqual(pricing.resolve(model: "auto")?.inputPerMillion, 3)
+    }
+
+    func testCuratedSupplementCacheRatesBeatOpenRouterPromptOnlyRate() throws {
+        let supplement = #"{"pricing":{"claude-opus-5":{"input_per_million":5,"output_per_million":25,"cache_write_per_million":6.25,"cache_read_per_million":0.5}},"alias_rules":[]}"#
+        let pricing = try makePricing(
+            supplementJSON: supplement,
+            openRouter: ["claude-opus-5": rates(5, 25, cacheWrite: 5, cacheRead: 5)]
+        )
+
+        let resolved = try XCTUnwrap(pricing.resolve(model: "claude-opus-5"))
+        XCTAssertEqual(resolved.inputPerMillion, 5)
+        XCTAssertEqual(resolved.cacheWritePerMillion, 6.25)
+        XCTAssertEqual(resolved.cacheReadPerMillion, 0.5)
+    }
+
+    func testOpenRouterCatalogDoesNotFuzzyMatch() throws {
+        let pricing = try makePricing(openRouter: ["vendor/gpt-5.6": rates(7, 14)])
+
+        XCTAssertNil(pricing.resolve(model: "gpt-5.6-preview"))
+        XCTAssertEqual(pricing.resolve(model: "vendor/gpt-5.6")?.inputPerMillion, 7)
+    }
+
     func testUnknownModelReturnsNil() throws {
         let pricing = try makePricing(primary: ["gpt-5.5": rates(5, 30)])
         XCTAssertNil(pricing.resolve(model: "made-up-model-9000"))
@@ -82,11 +117,15 @@ final class ModelPricingTests: XCTestCase {
 
     // MARK: - Supplement precedence, aliases, fast multipliers
 
-    func testSupplementPricingBeatsCatalogs() throws {
+    func testSupplementPricingBeatsPublicCatalogs() throws {
         let supplement = """
         {"pricing": {"auto": {"input_per_million": 1.25, "output_per_million": 6.0, "cache_read_per_million": 0.25}}, "alias_rules": []}
         """
-        let pricing = try makePricing(supplementJSON: supplement, primary: ["auto": rates(99, 99)])
+        let pricing = try makePricing(
+            supplementJSON: supplement,
+            primary: ["auto": rates(99, 99)],
+            openRouter: ["auto": rates(88, 88)]
+        )
         XCTAssertEqual(pricing.resolve(model: "auto")?.inputPerMillion, 1.25)
         XCTAssertEqual(pricing.resolve(model: "auto")?.cacheWritePerMillion, 1.25, "cache write defaults to input")
     }
@@ -172,6 +211,41 @@ final class ModelPricingTests: XCTestCase {
         )
         XCTAssertTrue(try XCTUnwrap(restored.entries["explicit"]).cacheReadIsExplicit)
         XCTAssertFalse(try XCTUnwrap(restored.entries["missing"]).cacheReadIsExplicit)
+    }
+
+    func testOpenRouterCodecAddsOnlyUniqueBaseAliasesAndKeepsVariantPricingExact() throws {
+        let source = Data(#"""
+        {
+          "data": [
+            {"id":"vendor/model-a","pricing":{"prompt":"0.000003","completion":"0.000012"}},
+            {"id":"vendor/model-a:free","pricing":{"prompt":"0","completion":"0"}},
+            {"id":"vendor/ambiguous","pricing":{"prompt":0.000004,"completion":0.000016}},
+            {"id":"other/ambiguous","pricing":{"prompt":0.000006,"completion":0.000018}},
+            {"id":"vendor/bad","pricing":{"prompt":-1,"completion":"NaN"}}
+          ],
+          "total_count": 5,
+          "links": {"next": null}
+        }
+        """#.utf8)
+
+        let catalog = try PricingCatalogCodecs.catalogFromOpenRouter(source)
+
+        XCTAssertEqual(catalog.findExact("vendor/model-a")?.rates.inputPerMillion, 3)
+        XCTAssertEqual(catalog.findExact("model-a")?.rates.inputPerMillion, 3)
+        XCTAssertEqual(catalog.findExact("vendor/model-a:free")?.rates.inputPerMillion, 0)
+        XCTAssertNil(catalog.findExact("ambiguous"), "ambiguous bare ids must not pick a route price")
+        XCTAssertNil(catalog.findExact("bad"), "invalid rates must be skipped")
+        let rates = try XCTUnwrap(catalog.findExact("model-a")?.rates)
+        XCTAssertEqual(rates.cacheReadPerMillion, 3, "unknown caching must not assume a discount")
+        XCTAssertFalse(rates.cacheReadIsExplicit)
+    }
+
+    func testOpenRouterCodecRejectsIncompletePaginatedFeed() {
+        let source = Data(#"{"data":[{"id":"vendor/model","pricing":{"prompt":"0.000001","completion":"0.000002"}}],"total_count":2,"links":{"next":"/api/v1/models?offset=1"}}"#.utf8)
+
+        XCTAssertThrowsError(try PricingCatalogCodecs.catalogFromOpenRouter(source)) { error in
+            XCTAssertEqual(error as? PricingCodecError, .incompleteModelList)
+        }
     }
 
     func testLegacyCompactCatalogTreatsUnmarkedCacheReadAsExplicit() throws {

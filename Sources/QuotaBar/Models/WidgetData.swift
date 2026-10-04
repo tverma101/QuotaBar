@@ -7,7 +7,7 @@ import Foundation
 struct WidgetData: Hashable {
     /// Hover note for locally-estimated spend tiles (Codex/Claude/Grok Today / Yesterday / Last 30
     /// Days), whose dollars are imputed from token counts rather than billed.
-    static let localEstimateNote = "Estimated locally, so it may be off"
+    static let localEstimateNote = "Public model-rate estimate, including OpenRouter rates where matched; provider billing may differ"
     /// Hover note for Cursor spend tiles, whose spend comes from Cursor's usage-history export.
     static let cursorUsageHistoryNote = "From your Cursor usage history."
     /// Headline shown on a placed tile with no real backing metric (em dash, U+2014).

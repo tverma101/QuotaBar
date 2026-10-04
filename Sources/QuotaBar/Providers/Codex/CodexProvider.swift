@@ -237,12 +237,6 @@ final class CodexProvider: ProviderRuntime {
         pricing: ModelPricing,
         accountIdentityKey: String?
     ) async -> ProviderUsageHistory? {
-        let nativeScan = await logUsageScanner.scan(now: now, pricing: pricing)
-        let proxyScan = await proxyUsageScanner.scan(
-            accountIdentityKey: accountIdentityKey,
-            now: now,
-            pricing: pricing
-        )
         // Unscoped legacy router rows (no account fingerprint) are only safe on the
         // single/default card. Multi-account cards always carry expectedIdentityKey and
         // therefore require a matching stamp — see CodexRouterUsageScanner.
@@ -253,6 +247,14 @@ final class CodexProvider: ProviderRuntime {
         let routerScan = await routerUsageScanner.scan(
             accountIdentityKey: accountIdentityKey,
             allowsUnscopedEvents: false,
+            now: now,
+            pricing: pricing
+        )
+        // Native sessions may contain days that never passed through Codex Router. Their per-file
+        // aggregates skip unchanged events, so preserving gap-fill history needs no repeated fold.
+        let nativeScan = await logUsageScanner.scan(now: now, pricing: pricing)
+        let proxyScan = await proxyUsageScanner.scan(
+            accountIdentityKey: accountIdentityKey,
             now: now,
             pricing: pricing
         )

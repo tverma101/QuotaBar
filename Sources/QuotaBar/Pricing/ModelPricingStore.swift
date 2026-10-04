@@ -1,8 +1,8 @@
 import Foundation
 
 /// Owns the app's model pricing data: bundled snapshots for offline first launch, on-disk caches in
-/// Application Support, and hourly refreshes from the live feeds (LiteLLM, models.dev, and the
-/// QuotaBar pricing supplement on gh-pages). `current()` never blocks on the network — it serves
+/// Application Support, and hourly refreshes from the live feeds (OpenRouter, LiteLLM, models.dev,
+/// and the QuotaBar pricing supplement on gh-pages). `current()` never blocks on the network — it serves
 /// the freshest data on hand and revalidates in the background (stale-while-revalidate).
 actor ModelPricingStore {
     static let shared = ModelPricingStore()
@@ -13,6 +13,7 @@ actor ModelPricingStore {
     private static let failureRetryInterval: TimeInterval = 30 * 60
 
     enum SourceID: String, CaseIterable, Codable, Sendable {
+        case openRouter = "openrouter"
         case litellm
         case modelsDev = "models_dev"
         case supplement
@@ -26,14 +27,31 @@ actor ModelPricingStore {
 
     private let http: any HTTPClient
     private let cacheDirectory: URL
-    private let now: @Sendable () -> Date
-    private let sourceURLs: [SourceID: URL]
+    // `now`, `sourceURLs`, `loaded`, `pricing`, `refreshTask`, and the `loadIfNeeded`/`rebuildPricing`/
+    // `fetch`/`cacheExists` helpers are internal rather than private because
+    // `ModelPricingStore+Discovery.swift` is a separate file and Swift `private` is file-scoped.
+    let now: @Sendable () -> Date
+    let sourceURLs: [SourceID: URL]
     private let bundledData: @Sendable (String) -> Data?
 
-    private var loaded = false
-    private var pricing: ModelPricing = .empty
+    var loaded = false
+    var pricing: ModelPricing = .empty
     private var sourceStates: [SourceID: SourceState] = [:]
-    private var refreshTask: Task<Void, Never>?
+    var refreshTask: Task<Void, Never>?
+    /// Unknown-model discovery state. The behavior lives in `ModelPricingStore+Discovery.swift`; an
+    /// extension cannot add stored properties, so the actor owns the fields.
+    let unresolvedSink = UnresolvedModelSink()
+    /// Distinct model names a recent pass could not price, awaiting one coalesced OpenRouter
+    /// revalidation. Names are only a hint that the catalogue may be stale; nothing is transmitted.
+    var pendingUnknownModels: Set<String> = []
+    /// Name -> earliest time a discovery round may attempt a fetch for it again.
+    var unresolvedBackoff: [String: Date] = [:]
+    var unresolvedDiscoveryTask: Task<Void, Never>?
+    var unresolvedFlushTask: Task<Void, Never>?
+    /// Bumped on every OpenRouter fetch attempt, so a discovery round can tell whether the hourly
+    /// refresh it waited on already revalidated that source.
+    var openRouterAttemptCount = 0
+    var lastOpenRouterAttemptAt: Date?
 
     init(
         http: any HTTPClient = URLSessionHTTPClient(),
@@ -47,9 +65,13 @@ actor ModelPricingStore {
         self.now = now
         self.sourceURLs = sourceURLs
         self.bundledData = bundledData
+        unresolvedSink.setHandler { [weak self] in
+            Task { await self?.runUnresolvedDiscoveryIfNeeded() }
+        }
     }
 
     static let defaultSourceURLs: [SourceID: URL] = [
+        .openRouter: URL(string: "https://openrouter.ai/api/v1/models")!,
         .litellm: URL(string: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json")!,
         .modelsDev: URL(string: "https://models.dev/api.json")!,
         .supplement: URL(string: "https://robinebers.github.io/openusage/pricing_supplement.json")!
@@ -71,15 +93,24 @@ actor ModelPricingStore {
     /// source is due; the refreshed data is picked up by the next call.
     func current() -> ModelPricing {
         loadIfNeeded()
-        if refreshTask == nil, SourceID.allCases.contains(where: isDue) {
-            refreshTask = Task { await self.refreshDueSources() }
+        if refreshTask == nil, unresolvedDiscoveryTask == nil,
+           SourceID.allCases.contains(where: { sourceURLs[$0] != nil && isDue($0) }) {
+            let catalogsPresent = SourceID.allCases.allSatisfy { source in
+                sourceURLs[source] == nil || cacheExists(source)
+            }
+            let skip = ProviderRefreshContext.skipModelCatalogRefresh && catalogsPresent
+            if !skip {
+                refreshTask = Task { await self.refreshDueSources() }
+            }
         }
+        scheduleUnresolvedDiscoveryIfQueued()
         return pricing
     }
 
     /// Runs any due fetches to completion — for tests and deterministic refresh points.
     func refreshNow() async {
         loadIfNeeded()
+        if let unresolvedDiscoveryTask { await unresolvedDiscoveryTask.value }
         if refreshTask == nil {
             refreshTask = Task { await self.refreshDueSources() }
         }
@@ -88,18 +119,20 @@ actor ModelPricingStore {
 
     // MARK: - Initial load (bundled + disk cache)
 
-    private func loadIfNeeded() {
+    func loadIfNeeded() {
         guard !loaded else { return }
         loaded = true
         sourceStates = readSourceStates()
         rebuildPricing()
     }
 
-    private func rebuildPricing() {
+    func rebuildPricing() {
         pricing = ModelPricing(
             supplement: loadSupplement(),
             primary: loadCatalog(.litellm, parse: PricingCatalogCodecs.catalogFromCompact),
-            secondary: loadCatalog(.modelsDev, parse: PricingCatalogCodecs.catalogFromCompact)
+            secondary: loadCatalog(.modelsDev, parse: PricingCatalogCodecs.catalogFromCompact),
+            openRouter: loadCatalog(.openRouter, parse: PricingCatalogCodecs.catalogFromCompact),
+            onUnresolvedModel: { [weak self] name in self?.unresolvedSink.record(name) }
         )
     }
 
@@ -183,21 +216,34 @@ actor ModelPricingStore {
     /// but snapshot-only models survive if the live feed ever drops them.
     private func loadCatalog(_ source: SourceID, parse: (Data) throws -> PricingCatalog) -> PricingCatalog {
         var catalog = PricingCatalog()
-        let resourceName = source == .litellm ? "pricing_litellm_snapshot" : "pricing_models_dev_snapshot"
-        if let bundled = bundledData(resourceName) {
-            do {
-                catalog = try PricingCatalogCodecs.catalogFromCompact(bundled)
-            } catch {
-                AppLog.error("pricing", "bundled \(resourceName).json unreadable: \(error.localizedDescription)")
+        let resourceName: String?
+        switch source {
+        case .openRouter:
+            resourceName = nil
+        case .litellm:
+            resourceName = "pricing_litellm_snapshot"
+        case .modelsDev:
+            resourceName = "pricing_models_dev_snapshot"
+        case .supplement:
+            resourceName = nil
+        }
+        if let resourceName {
+            if let bundled = bundledData(resourceName) {
+                do {
+                    catalog = try PricingCatalogCodecs.catalogFromCompact(bundled)
+                } catch {
+                    AppLog.error("pricing", "bundled \(resourceName).json unreadable: \(error.localizedDescription)")
+                }
+            } else {
+                AppLog.error("pricing", "bundled \(resourceName).json missing")
             }
-        } else {
-            AppLog.error("pricing", "bundled \(resourceName).json missing")
         }
         if let cached = readCache(source) {
             do {
                 catalog = catalog.merging(try parse(cached))
             } catch {
-                AppLog.warn("pricing", "cached \(source.rawValue) catalog unreadable, using bundled: \(error.localizedDescription)")
+                let fallback = source == .openRouter ? "using other pricing sources" : "using bundled snapshot"
+                AppLog.warn("pricing", "cached \(source.rawValue) catalog unreadable, \(fallback): \(error.localizedDescription)")
             }
         }
         return catalog
@@ -224,18 +270,22 @@ actor ModelPricingStore {
         }
         if changed {
             rebuildPricing()
-            AppLog.info("pricing", "pricing refreshed (\(pricing.primary.entries.count) LiteLLM, \(pricing.secondary.entries.count) models.dev, \(pricing.supplement.pricing.count) supplement models)")
+            AppLog.info("pricing", "pricing refreshed (\(pricing.openRouter.entries.count) OpenRouter, \(pricing.primary.entries.count) LiteLLM, \(pricing.secondary.entries.count) models.dev, \(pricing.supplement.pricing.count) supplement models)")
         }
         writeSourceStates()
     }
 
     /// Fetches one source and updates its cache file. Returns true when new data was stored.
-    private func fetch(_ source: SourceID) async -> Bool {
+    func fetch(_ source: SourceID) async -> Bool {
         guard let url = sourceURLs[source] else { return false }
         var state = sourceStates[source] ?? SourceState()
         var request = HTTPRequest(method: "GET", url: url, timeout: 30)
         if let etag = state.etag {
             request.headers["If-None-Match"] = etag
+        }
+        if source == .openRouter {
+            openRouterAttemptCount += 1
+            lastOpenRouterAttemptAt = now()
         }
         do {
             let response = try await http.send(request)
@@ -272,6 +322,8 @@ actor ModelPricingStore {
             return try PricingCatalogCodecs.compactData(from: try PricingCatalogCodecs.catalogFromLiteLLM(body))
         case .modelsDev:
             return try PricingCatalogCodecs.compactData(from: try PricingCatalogCodecs.catalogFromModelsDev(body))
+        case .openRouter:
+            return try PricingCatalogCodecs.compactData(from: try PricingCatalogCodecs.catalogFromOpenRouter(body))
         case .supplement:
             _ = try PricingSupplement.decode(from: body)
             return body
@@ -286,6 +338,18 @@ actor ModelPricingStore {
 
     private var stateFile: URL {
         cacheDirectory.appendingPathComponent("state.json")
+    }
+
+    func cacheExists(_ source: SourceID) -> Bool {
+        FileManager.default.fileExists(atPath: cacheFile(source).path)
+    }
+
+    /// True while `source` is inside its post-failure cool-off. Discovery honors this too, so a
+    /// source that is down backs off for the full retry interval instead of being re-attempted by
+    /// an unknown-model round.
+    func failureRetryBlocked(_ source: SourceID) -> Bool {
+        guard let failedAt = sourceStates[source]?.failedAt else { return false }
+        return now().timeIntervalSince(failedAt) < Self.failureRetryInterval
     }
 
     private func readCache(_ source: SourceID) -> Data? {
@@ -305,7 +369,7 @@ actor ModelPricingStore {
         return states
     }
 
-    private func writeSourceStates() {
+    func writeSourceStates() {
         do {
             try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
             let data = try JSONEncoder().encode(sourceStates)

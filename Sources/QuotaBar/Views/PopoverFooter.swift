@@ -92,6 +92,7 @@ struct PopoverFooter: View {
 
     private func refreshNow() {
         guard !isUpdating else { return }
+        guard PopoverRefreshPolicy.decision(for: .manualRefresh) == .forceFullRefresh else { return }
         let interactionGate = CredentialInteractionGate()
         Task {
             await ProviderRefreshContext.$isManual.withValue(true) {

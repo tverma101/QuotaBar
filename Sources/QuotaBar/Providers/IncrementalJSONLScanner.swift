@@ -317,6 +317,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         parseFile: @Sendable @escaping (URL) -> [Item]?,
         visit: @Sendable (Item) -> Void,
         skipPrefixCounts: [String: Int] = [:],
+        fileStarted: (@Sendable (String) -> Void)? = nil,
         fileCompleted: (@Sendable (String, Int) -> Void)? = nil
     ) async -> Bool {
         precondition(!cacheIdentity.isEmpty)
@@ -437,6 +438,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         for file in files {
             guard !Task.isCancelled else { return false }
             guard var cached = nextCache[file.path] else { continue }
+            fileStarted?(file.path)
             let skipped = min(skipPrefixCounts[file.path, default: 0], cached.items.count)
             var offset = skipped
             while offset < cached.items.count {

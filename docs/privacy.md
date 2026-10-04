@@ -54,7 +54,7 @@ Desktop's rotating refresh token and never modifies Desktop's config, cookies, o
 
 ## Other network requests
 
-Besides the provider API calls the vendor's own tools would make, QuotaBar fetches public [model price lists](pricing.md) about once an hour (from `raw.githubusercontent.com`, `models.dev`, and this project's GitHub Pages). These are plain downloads of public data — they carry no usage, log, or account information, and they run regardless of the analytics toggle. The spend tiles are computed from local CLI logs entirely on your Mac; no log data ever leaves it.
+Besides the provider API calls the vendor's own tools would make, QuotaBar fetches public [model price lists](pricing.md) about once an hour (from `openrouter.ai`, `raw.githubusercontent.com`, `models.dev`, and this project's GitHub Pages). An unknown model can bring forward an OpenRouter catalogue refresh, with retry limits. These are plain downloads of public data — they carry no model names, usage, log, or account information, and they run regardless of the analytics toggle. The pricing request does not include an OpenRouter API key. The spend tiles are computed from local CLI logs entirely on your Mac; no log data ever leaves it.
 
 To avoid re-reading unchanged Claude, Codex, and pi logs after every relaunch, QuotaBar keeps their
 parsed usage events in `~/Library/Application Support/QuotaBar/log-scan-cache/`. These records contain

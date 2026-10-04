@@ -127,6 +127,202 @@ final class CodexRouterUsageScannerTests: XCTestCase {
         XCTAssertEqual(allowed?.series.daily.first?.totalTokens, 15)
     }
 
+    func testIgnoresFutureDatedEvents() async throws {
+        let now = TestLocalInstant.date(2026, 9, 3, 12)
+        let accountID = "1118f6f1-8697-4e7b-9112-1771b3e36099"
+        let fingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountID)!
+        let contents = ledger([
+            [
+                "at": TestLocalInstant.iso(2026, 9, 2, 15),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "accountFingerprint": fingerprint
+            ],
+            [
+                "at": TestLocalInstant.iso(2026, 9, 6, 15),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 1_000,
+                "outputTokens": 500,
+                "totalTokens": 1_500,
+                "accountFingerprint": fingerprint
+            ]
+        ])
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { ["/tmp/usage-events.jsonl"] },
+            readFile: { _ in contents }
+        )
+
+        let optionalScan = await scanner.scan(
+            accountIdentityKey: accountID,
+            allowsUnscopedEvents: false,
+            daysBack: 30,
+            now: now,
+            pricing: pricing()
+        )
+        let scan = try XCTUnwrap(optionalScan)
+
+        XCTAssertEqual(scan.series.daily.count, 1)
+        XCTAssertEqual(scan.series.daily[0].totalTokens, 15)
+    }
+
+    func testDiskBackedAggregateCacheExpiresWhenFutureEventBecomesEligible() async throws {
+        let firstNow = TestLocalInstant.date(2026, 10, 1, 12)
+        let futureAt = firstNow.addingTimeInterval(30 * 60)
+        let laterNow = firstNow.addingTimeInterval(60 * 60)
+        let accountID = "1118f6f1-8697-4e7b-9112-1771b3e36099"
+        let fingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountID)!
+        let contents = ledger([
+            [
+                "at": TestLocalInstant.iso(2026, 10, 1, 11),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "accountFingerprint": fingerprint
+            ],
+            [
+                "at": OpenUsageISO8601.string(from: futureAt),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 1_000,
+                "outputTokens": 500,
+                "totalTokens": 1_500,
+                "accountFingerprint": fingerprint
+            ]
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("router-future-cache-\(UUID().uuidString)", isDirectory: true)
+        let ledgerURL = root.appendingPathComponent("usage-events.jsonl")
+        let cacheDirectory = root.appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data(contents.utf8).write(to: ledgerURL)
+        defer {
+            CodexRouterUsageScanner.clearSharedTailCacheForTesting(path: ledgerURL.path, retentionDays: 35)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let parseCache = IncrementalJSONLScanner<CodexRouterUsageScanner.Event>(
+            maxConcurrentParses: 1,
+            maxResidentIdentities: 1,
+            retainResidentItems: true,
+            persistence: JSONLScanCachePersistence(
+                namespace: "codex-router-future-test",
+                schemaVersion: 1,
+                directory: cacheDirectory
+            )
+        )
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { [ledgerURL.path] },
+            identityAliases: { [:] },
+            incrementalScanner: parseCache
+        )
+        let modelPricing = pricing()
+
+        let firstScan = await scanner.scan(
+            accountIdentityKey: accountID,
+            allowsUnscopedEvents: false,
+            daysBack: 30,
+            now: firstNow,
+            pricing: modelPricing
+        )
+        let first = try XCTUnwrap(firstScan)
+        XCTAssertEqual(first.series.daily.reduce(0) { $0 + $1.totalTokens }, 15)
+
+        let afterFutureScan = await scanner.scan(
+            accountIdentityKey: accountID,
+            allowsUnscopedEvents: false,
+            daysBack: 30,
+            now: laterNow,
+            pricing: modelPricing
+        )
+        let afterFuture = try XCTUnwrap(afterFutureScan)
+        XCTAssertEqual(afterFuture.series.daily.reduce(0) { $0 + $1.totalTokens }, 1_515)
+        await parseCache.flushPendingWrites()
+    }
+
+    func testParsedCacheIsSeparatedByRetentionWindow() async throws {
+        let now = TestLocalInstant.date(2026, 10, 3, 12)
+        let oldDate = Calendar.current.date(byAdding: .day, value: -50, to: now)!
+        let recentDate = Calendar.current.date(byAdding: .day, value: -2, to: now)!
+        let contents = ledger([
+            [
+                "at": OpenUsageISO8601.string(from: oldDate),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15
+            ],
+            [
+                "at": OpenUsageISO8601.string(from: recentDate),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 20,
+                "outputTokens": 10,
+                "totalTokens": 30
+            ]
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("router-retention-\(UUID().uuidString)", isDirectory: true)
+        let ledgerURL = root.appendingPathComponent("usage-events.jsonl")
+        let cacheDirectory = root.appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data(contents.utf8).write(to: ledgerURL)
+        defer {
+            CodexRouterUsageScanner.clearSharedTailCacheForTesting(path: ledgerURL.path, retentionDays: 35)
+            CodexRouterUsageScanner.clearSharedTailCacheForTesting(path: ledgerURL.path, retentionDays: 60)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let parseCache = IncrementalJSONLScanner<CodexRouterUsageScanner.Event>(
+            maxConcurrentParses: 1,
+            maxResidentIdentities: 1,
+            retainResidentItems: true,
+            persistence: JSONLScanCachePersistence(
+                namespace: "codex-router-retention-test",
+                schemaVersion: 1,
+                directory: cacheDirectory
+            )
+        )
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { [ledgerURL.path] },
+            identityAliases: { [:] },
+            incrementalScanner: parseCache
+        )
+
+        let optionalNarrow = await scanner.scan(
+            accountIdentityKey: nil,
+            allowsUnscopedEvents: true,
+            daysBack: 30,
+            now: now,
+            pricing: pricing()
+        )
+        let narrow = try XCTUnwrap(optionalNarrow)
+        XCTAssertEqual(narrow.series.daily.reduce(0) { $0 + $1.totalTokens }, 30)
+
+        let optionalWide = await scanner.scan(
+            accountIdentityKey: nil,
+            allowsUnscopedEvents: true,
+            daysBack: 60,
+            now: now,
+            pricing: pricing()
+        )
+        let wide = try XCTUnwrap(optionalWide)
+        XCTAssertEqual(wide.series.daily.reduce(0) { $0 + $1.totalTokens }, 45)
+        await parseCache.flushPendingWrites()
+    }
+
     func testRejectsOtherAccountFingerprint() async {
         let contents = ledger([
             [

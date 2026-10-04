@@ -393,42 +393,74 @@ final class AppContainer {
         Task {
             let wakeSignal = RefreshWakeSignal(names: [
                 ProviderEnablementStore.didChangeNotification,
-                CodexRouterLedgerWatcher.didChangeNotification
+                CodexRouterLedgerWatcher.didChangeNotification,
+                BackgroundRefreshTrigger.didChangeNotification
             ])
+            // Tap-free external trigger (see `BackgroundRefreshTrigger`). Armed here, outside the
+            // loop body, so a request landing mid-pass is still observed and applied to the *next*
+            // pass rather than being lost.
+            let backgroundTrigger = BackgroundRefreshTrigger()
+            backgroundTrigger.start()
             // Arm vnode watch on the CodexRouter ledger so panel-open spend updates within ~1s of a
             // routed turn (incremental tail parse). Closed-panel wakes are suppressed inside the watcher.
             let ledgerWatcher = CodexRouterLedgerWatcher(
                 isPanelOpen: { PopoverTransparencyStore.isPopoverShownUnlocked }
             )
             ledgerWatcher.start()
-            defer { ledgerWatcher.stop() }
+            defer {
+                backgroundTrigger.stop()
+                ledgerWatcher.stop()
+            }
             var isFirstPass = true
+            /// Latched by an external trigger and consumed by the next pass. Unlike the ledger wake
+            /// this one also needs `.full` scope: the panel may be closed, and `menuBar` scope skips
+            /// the local JSONL/SQLite accounting entirely, so a trigger that did not widen the scope
+            /// would do no measurable work at all.
+            var pendingFullScopePass = false
+            /// Rate limit for trigger-caused passes, and whether a pass must be dropped because the
+            /// previous one has not cleared the cooldown yet.
+            var triggerGate = BackgroundRefreshGate()
+            var dropNextRefreshPass = false
             while !Task.isCancelled {
-                // The first pass is the only refresh that can simultaneously cold-load every enabled
-                // local index after launch. Serialize provider starts once so a multi-account Codex
-                // corpus and the OpenCode gateway fold do not compete with each other and with remote
-                // providers for all cores; stale snapshots are already painted by the store. Return to
-                // the normal concurrent cadence after that initial burst.
-                //
-                // Serialize whenever we are *over the soft limit*, not just the hard one. The
-                // per-provider unload in `WidgetDataStore` only runs once a provider finishes, so
-                // concurrent folds each allocate their parse arrays unchecked and the peak is the sum
-                // of all of them. Measured on a 9.8 GB Codex corpus: five concurrent providers reached
-                // 982 MB with the soft-limit guard firing four times *after the fact*. One at a time
-                // caps the peak at a single provider's footprint. `WidgetDataStore.refreshAll` also
-                // re-checks between chunks, so this covers the first batch after a spike too.
-                let serializeProviders = isFirstPass || ProcessMemoryBudget.isOverSoftLimit
-                let panelOpen = transparency.popoverShown
-                if panelOpen && !ProcessMemoryBudget.isOverSoftLimit {
-                    await CodexRouterUsageScanner.resumeSharedParsedItems()
-                }
-                let scope: ProviderRefreshContext.Scope = panelOpen ? .full : .menuBar
-                await ProviderRefreshContext.$scope.withValue(scope) {
-                    await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
-                        await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                if dropNextRefreshPass {
+                    // A trigger arrived inside the gate's cooldown. The trigger's own debounce
+                    // already collapsed the burst; this drops the one redundant pass that would
+                    // otherwise be released the moment the prior pass ends. Notifications, telemetry,
+                    // and the timer cadence below still run.
+                    dropNextRefreshPass = false
+                    pendingFullScopePass = false
+                    AppLog.info(.refresh, "background refresh pass skipped (inside trigger cooldown)")
+                } else {
+                    // The first pass is the only refresh that can simultaneously cold-load every enabled
+                    // local index after launch. Serialize provider starts once so a multi-account Codex
+                    // corpus and the OpenCode gateway fold do not compete with each other and with remote
+                    // providers for all cores; stale snapshots are already painted by the store. Return to
+                    // the normal concurrent cadence after that initial burst.
+                    //
+                    // Serialize whenever we are *over the soft limit*, not just the hard one. The
+                    // per-provider unload in `WidgetDataStore` only runs once a provider finishes, so
+                    // concurrent folds each allocate their parse arrays unchecked and the peak is the sum
+                    // of all of them. Measured on a 9.8 GB Codex corpus: five concurrent providers reached
+                    // 982 MB with the soft-limit guard firing four times *after the fact*. One at a time
+                    // caps the peak at a single provider's footprint. `WidgetDataStore.refreshAll` also
+                    // re-checks between chunks, so this covers the first batch after a spike too.
+                    let serializeProviders = isFirstPass || ProcessMemoryBudget.isOverSoftLimit
+                    let panelOpen = transparency.popoverShown
+                    if panelOpen && !ProcessMemoryBudget.isOverSoftLimit {
+                        await CodexRouterUsageScanner.resumeSharedParsedItems()
                     }
+                    // A trigger runs the full-scope pass so local accounting actually happens even
+                    // while the panel is closed. It stays non-forced, so a provider with a fresh
+                    // snapshot still answers from cache.
+                    let scope: ProviderRefreshContext.Scope = (panelOpen || pendingFullScopePass) ? .full : .menuBar
+                    pendingFullScopePass = false
+                    await ProviderRefreshContext.$scope.withValue(scope) {
+                        await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                            await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                        }
+                    }
+                    isFirstPass = false
                 }
-                isFirstPass = false
                 // Keep the bounded CodexRouter index warm while the panel is open so append-triggered
                 // refreshes do not decode its parsed-event cache from disk each time. Hidden cycles and
                 // memory pressure release it; the durable index remains available for the next scan.
@@ -454,9 +486,20 @@ final class AppContainer {
                 // wake resumes the loop into an all-cache-hit pass and Today/charts stay stale for up
                 // to ~5 minutes despite the vnode watcher. Only Codex cards need the miss — Cursor
                 // keeps its cache.
-                if case .notification(let name) = wake,
-                   name == CodexRouterLedgerWatcher.didChangeNotification {
-                    dataStore.invalidateSessionFreshnessForCodexSpend()
+                if case .notification(let name) = wake {
+                    switch name {
+                    case CodexRouterLedgerWatcher.didChangeNotification:
+                        dataStore.invalidateSessionFreshnessForCodexSpend()
+                    case BackgroundRefreshTrigger.didChangeNotification:
+                        if triggerGate.shouldAccept(at: Date()) {
+                            pendingFullScopePass = true
+                            dataStore.invalidateLocalAccountingFreshness()
+                        } else {
+                            dropNextRefreshPass = true
+                        }
+                    default:
+                        break
+                    }
                 }
             }
         }

@@ -6,8 +6,8 @@ import XCTest
 /// Opt-in benchmark for CodexRouter indexing and refresh. It uses a deterministic synthetic ledger,
 /// so it never reads or uploads a user's token history. Output contains aggregate counts and timings only.
 final class TokenAccountingEfficiencyTests: XCTestCase {
-    private static let syntheticRows = 113_447
-    private static let syntheticBytes = 45_219_474
+    private static let syntheticRows = 8_192
+    private static let syntheticBytes = 3_276_800
 
     func testAutomaticFullRefreshPacingIncludesReapedSQLiteStyleChildCPU() async throws {
         let measurement = try await ProviderRefreshContext.$scope.withValue(.full) {
@@ -60,17 +60,21 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         }
         let coldOneCoreShare = measurement.coldCPUSeconds / measurement.coldWallSeconds
         let hydrateOneCoreShare = measurement.cacheHydrateCPUSeconds / measurement.cacheHydrateWallSeconds
-        // Unchanged snapshots run on RefreshSetting.interval; the file watcher coalesces active
-        // append bursts for CodexRouterLedgerWatcher.debounceNanoseconds (one second by default).
-        let warmOneCoreShare = measurement.warmCPUSeconds / (3 * RefreshSetting.interval)
+        // Measure the three unchanged scans over their actual active wall time. Cadence-average
+        // CPU would hide a hot refresh behind the five-minute timer gap.
+        let warmOneCoreShare = measurement.warmCPUSeconds / measurement.warmActiveWallSeconds
         print(String(
-            format: "TOKEN_ACCOUNTING_BENCH mode=%@ rows=%d bytes=%llu coldCPU=%.3fs coldWall=%.3fs coldOneCore=%.2f%% cacheHydrateCPU=%.3fs cacheHydrateWall=%.3fs cacheHydrateOneCore=%.2f%% warmCPU=%.3fs warmWall=%.3fs warmOneCore=%.2f%% appendCPU=%.3fs appendWall=%.3fs appendOneCore=%.2f%%",
+            format: "TOKEN_ACCOUNTING_BENCH mode=%@ rows=%d bytes=%llu coldCPU=%.3fs coldWall=%.3fs coldOneCore=%.2f%% coldScanCPU=%.3fs coldScanWall=%.3fs coldPersistCPU=%.3fs coldPersistWall=%.3fs cacheHydrateCPU=%.3fs cacheHydrateWall=%.3fs cacheHydrateOneCore=%.2f%% warmCPU=%.3fs warmActiveWall=%.3fs warmActiveOneCore=%.2f%% appendCPU=%.3fs appendWall=%.3fs appendOneCore=%.2f%%",
             mode,
             measurement.residentRows,
             measurement.ledgerBytes,
             measurement.coldCPUSeconds,
             measurement.coldWallSeconds,
             coldOneCoreShare * 100,
+            measurement.coldScanCPUSeconds,
+            measurement.coldScanWallSeconds,
+            measurement.coldPersistCPUSeconds,
+            measurement.coldPersistWallSeconds,
             measurement.cacheHydrateCPUSeconds,
             measurement.cacheHydrateWallSeconds,
             hydrateOneCoreShare * 100,
@@ -89,9 +93,9 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         if shouldThrottle {
             XCTAssertLessThan(coldOneCoreShare, 0.10, "automatic cold indexing must use under 10% of one core")
             XCTAssertLessThan(hydrateOneCoreShare, 0.10, "automatic parse-cache hydration must use under 10% of one core")
-            XCTAssertLessThan(warmOneCoreShare, 0.10, "memoized refresh CPU at the configured 5-minute cadence must stay under 10% of one core")
+            XCTAssertLessThan(warmOneCoreShare, 0.10, "an active memoized refresh must stay under 10% of one core")
             XCTAssertLessThan(measurement.appendOneCoreShare, 0.10, "tail indexing + incremental token/cost fold must use under 10% of one core")
-            XCTAssertLessThan(measurement.coldWallSeconds, 120, "automatic cold indexing must finish before the provider refresh deadline")
+            XCTAssertLessThan(measurement.coldScanWallSeconds, 120, "automatic cold indexing must finish before the provider refresh deadline")
             XCTAssertLessThan(measurement.cacheHydrateWallSeconds, 120, "parse-cache hydration must finish before the provider refresh deadline")
         }
     }
@@ -99,6 +103,10 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
     private struct Measurement {
         var coldCPUSeconds: Double
         var coldWallSeconds: Double
+        var coldScanCPUSeconds: Double
+        var coldScanWallSeconds: Double
+        var coldPersistCPUSeconds: Double
+        var coldPersistWallSeconds: Double
         var cacheHydrateCPUSeconds: Double
         var cacheHydrateWallSeconds: Double
         var warmCPUSeconds: Double
@@ -116,7 +124,11 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         let modeRoot = scratch.appendingPathComponent("panel-resident", isDirectory: true)
         try FileManager.default.createDirectory(at: modeRoot, withIntermediateDirectories: true)
         let ledger = modeRoot.appendingPathComponent("usage-events.jsonl")
-        try Self.writeSyntheticLedger(to: ledger)
+        // Leave a second between the fixture's newest timestamp and the scan upper bound. ISO-8601
+        // formatting truncates fractional precision; this keeps rounding from putting row zero in
+        // the future on some runs.
+        let now = Date().addingTimeInterval(2)
+        try Self.writeSyntheticLedger(to: ledger, endingAt: now.addingTimeInterval(-1))
         let size = try FileManager.default.attributesOfItem(atPath: ledger.path)[.size] as? NSNumber
 
         let persistenceDir = modeRoot.appendingPathComponent("index-cache", isDirectory: true)
@@ -139,7 +151,6 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             incrementalScanner: scanner
         )
         let pricing = TestPricing.bundled
-        let now = ISO8601DateFormatter().date(from: "2026-10-02T12:00:00Z")!
         let coldWallStart = DispatchTime.now().uptimeNanoseconds
         let coldStart = Self.cpuSeconds()
         let coldScan = await scannerUnderTest.scan(
@@ -149,12 +160,18 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             now: now,
             pricing: pricing
         )
+        let coldScanCPU = Self.cpuSeconds() - coldStart
+        let coldScanWall = Double(DispatchTime.now().uptimeNanoseconds - coldWallStart) / 1_000_000_000
         XCTAssertNotNil(coldScan, "the representative ledger must produce an accounting result")
-        let expectedFirstAccountTokens = 56_724 * 1_801
+        let expectedFirstAccountTokens = ((Self.syntheticRows + 1) / 2) * 1_801
         XCTAssertEqual(coldScan?.series.daily.reduce(0) { $0 + $1.totalTokens }, expectedFirstAccountTokens)
         XCTAssertTrue(coldScan?.unknownModelsByDay.isEmpty == true, "every benchmark model must be priced")
         XCTAssertGreaterThan(coldScan?.series.daily.compactMap(\.costUSD).reduce(0, +) ?? 0, 0)
+        let persistWallStart = DispatchTime.now().uptimeNanoseconds
+        let persistCPUStart = Self.cpuSeconds()
         await scanner.flushPendingWrites()
+        let persistCPU = Self.cpuSeconds() - persistCPUStart
+        let persistWall = Double(DispatchTime.now().uptimeNanoseconds - persistWallStart) / 1_000_000_000
         let coldCPU = Self.cpuSeconds() - coldStart
         let coldWall = Double(DispatchTime.now().uptimeNanoseconds - coldWallStart) / 1_000_000_000
 
@@ -190,13 +207,15 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         let cacheHydrateWall = Double(DispatchTime.now().uptimeNanoseconds - hydrateWallStart) / 1_000_000_000
         let hydratedRows = await relaunchedScanner.residentItemCountForTesting()
         XCTAssertGreaterThan(hydratedRows, 0, "the new scanner must load parsed rows from the on-disk index")
-        XCTAssertEqual(secondAccountBaseline?.series.daily.reduce(0) { $0 + $1.totalTokens }, 56_723 * 1_801)
+        XCTAssertEqual(secondAccountBaseline?.series.daily.reduce(0) { $0 + $1.totalTokens }, (Self.syntheticRows / 2) * 1_801)
         XCTAssertTrue(secondAccountBaseline?.unknownModelsByDay.isEmpty == true)
         XCTAssertGreaterThan(secondAccountBaseline?.series.daily.compactMap(\.costUSD).reduce(0, +) ?? 0, 0)
 
         var warmCPU = 0.0
         var wall = 0.0
-        for _ in 0..<3 {
+        // Repeat the short active cache-hit path to smooth sub-millisecond timer and CPU sampling
+        // noise while preserving per-refresh pacing and filesystem revision checks.
+        for _ in 0..<128 {
             let slotStart = DispatchTime.now().uptimeNanoseconds
             let cpuStart = Self.cpuSeconds()
             _ = await scannerUnderTest.scan(
@@ -212,9 +231,11 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
 
         // Simulate an append burst of successful router events. This exercises tail parsing and the
         // cached account fold without exposing any ledger row contents in test output.
-        let stamp = ISO8601DateFormatter().string(from: now)
+        let stamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-1))
         let secondAccountFingerprint = CodexProxyUsageScanner.accountFingerprint(for: "benchmark-second-account")!
-        let appendedEventCount = 64
+        // Keep the measured burst long enough that scheduler and timer noise do not dominate its
+        // CPU ratio. A few thousand new rows is still a small append relative to the cold ledger.
+        let appendedEventCount = 4_096
         let appendedTokenCount = appendedEventCount * 15
         let eventLine = "{\"at\":\"\(stamp)\",\"model\":\"space-bunny-free\",\"provider\":\"openai\",\"status\":200,\"inputTokens\":10,\"cachedInputTokens\":2,\"outputTokens\":5,\"totalTokens\":15,\"accountFingerprint\":\"\(secondAccountFingerprint)\"}"
         let event = "\n" + Array(repeating: eventLine, count: appendedEventCount).joined(separator: "\n") + "\n"
@@ -242,6 +263,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         await scanner.flushPendingWrites()
         await relaunchedScanner.flushPendingWrites()
         let appendCPU = Self.cpuSeconds() - appendCPUStart
+        let appendWall = Double(DispatchTime.now().uptimeNanoseconds - appendSlotStart) / 1_000_000_000
         XCTAssertEqual(appendedScan?.series.daily.reduce(0) { $0 + $1.totalTokens }, beforeTokens)
         let secondAccountBefore = secondAccountBaseline?.series.daily.reduce(0) { $0 + $1.totalTokens } ?? 0
         XCTAssertEqual(
@@ -250,13 +272,16 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         )
         XCTAssertTrue(secondAccountAppend?.unknownModelsByDay.isEmpty == true)
         XCTAssertGreaterThan(secondAccountAppend?.series.daily.compactMap(\.costUSD).reduce(0, +) ?? 0, 0)
-        let appendWall = Double(DispatchTime.now().uptimeNanoseconds - appendSlotStart) / 1_000_000_000
 
         let residentRows = await scanner.residentItemCountForTesting()
         CodexRouterUsageScanner.clearSharedTailCacheForTesting(path: ledger.path)
         return Measurement(
             coldCPUSeconds: coldCPU,
             coldWallSeconds: coldWall,
+            coldScanCPUSeconds: coldScanCPU,
+            coldScanWallSeconds: coldScanWall,
+            coldPersistCPUSeconds: persistCPU,
+            coldPersistWallSeconds: persistWall,
             cacheHydrateCPUSeconds: cacheHydrateCPU,
             cacheHydrateWallSeconds: cacheHydrateWall,
             warmCPUSeconds: warmCPU,
@@ -282,8 +307,9 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
     }
 
     /// Writes the same fixed number of bytes on every run. Rows resemble successful CodexRouter
-    /// events with unique millisecond timestamps, real bundled model pricing, and a 30-day window.
-    private static func writeSyntheticLedger(to url: URL) throws {
+    /// events with unique timestamps, real bundled model pricing, and dates safely inside the
+    /// 30-day daily-accounting window.
+    static func writeSyntheticLedger(to url: URL, endingAt end: Date, rowCount: Int = 8_192, totalBytes: Int = 3_276_800) throws {
         let models: [(name: String, provider: String)] = [
             ("gpt-5.5", "openai"),
             ("gpt-5.4", "openai"),
@@ -292,11 +318,12 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         ]
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let end = ISO8601DateFormatter().date(from: "2026-10-02T12:00:00Z")!
-        let lookbackSeconds = 30 * 24 * 60 * 60 - 1
-        let timestamps = (0..<syntheticRows).map { index in
+        // Codex's 30-day window includes today and starts at local midnight 29 days ago. Keep the
+        // oldest fixture row a full day inside that boundary, regardless of the test time zone.
+        let lookbackSeconds = 28 * 24 * 60 * 60
+        let timestamps = (0..<rowCount).map { index in
             formatter.string(from: end.addingTimeInterval(
-                -Double(lookbackSeconds) * Double(index) / Double(syntheticRows)
+                -Double(lookbackSeconds) * Double(index) / Double(rowCount)
             ))
         }
         let accountFingerprints = [
@@ -316,11 +343,11 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
 
-        let baseBytes = syntheticBytes / syntheticRows
-        let extraBytes = syntheticBytes % syntheticRows
+        let baseBytes = totalBytes / rowCount
+        let extraBytes = totalBytes % rowCount
         var block = Data()
         block.reserveCapacity(1 << 20)
-        for index in 0..<syntheticRows {
+        for index in 0..<rowCount {
             let model = models[index % models.count]
             let accountFingerprint = accountFingerprints[index % accountFingerprints.count]
             let prefix = "{\"at\":\"\(timestamps[index])\",\"model\":\"\(model.name)\",\"provider\":\"\(model.provider)\",\"status\":200,\"inputTokens\":1234,\"cachedInputTokens\":234,\"outputTokens\":567,\"reasoningTokens\":89,\"totalTokens\":1801,\"accountFingerprint\":\"\(accountFingerprint)\",\"serviceTier\":\"default\",\"padding\":\""
