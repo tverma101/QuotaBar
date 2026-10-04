@@ -40,10 +40,15 @@ for ((repeat = 1; repeat <= repeat_count; repeat++)); do
       printf 'Measurement %s/%s (%s) failed with exit %s; continuing to collect remaining repeats.\n' \
         "$repeat" "$repeat_count" "$mode" "$status" >&2
     fi
-    # SwiftPM can prefix captured XCTest output with terminal-control bytes.
-    if rg -q "TOKEN_ACCOUNTING_BENCH mode=${mode} " "$measurement_log"; then
+    # Accept formatted XCTest output without requiring tools absent on a stock hosted Mac.
+    while IFS= read -r measurement_line || [[ -n "$measurement_line" ]]; do
+      if [[ "$measurement_line" == *"TOKEN_ACCOUNTING_BENCH mode=${mode} "* ]]; then
+        measurement_recorded=1
+        break
+      fi
+    done < "$measurement_log"
+    if ((measurement_recorded == 1)); then
       collected_measurements=$((collected_measurements + 1))
-      measurement_recorded=1
     else
       printf 'Measurement %s/%s (%s) emitted no benchmark record.\n' \
         "$repeat" "$repeat_count" "$mode" >&2
