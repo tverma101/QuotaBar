@@ -27,6 +27,10 @@ swift test --filter CrossProviderAccountIsolationContractTests
 echo "==> Codex append-only efficiency contracts"
 swift test --filter CodexIncrementalEfficiencyTests
 
+echo "==> Persistent daily-aggregate + panel-open debounce contracts"
+swift test --filter LogUsageAggregateCacheTests
+swift test --filter PanelOpenDebounceTests
+
 echo "==> Codex local-log regression suite"
 swift test --filter CodexLogUsageScannerTests
 

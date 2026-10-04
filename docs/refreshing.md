@@ -2,7 +2,7 @@
 
 ## When data updates
 
-- All enabled providers refresh together: once at launch, then every 5 minutes (a fixed cadence — there's no setting for it). Opening the popover does not start a second automatic pass. Providers fetch in parallel, so fast cards update without waiting for a slow one. The batch itself still finishes only after every provider returns; notifications, history sync, and the next five-minute wait begin after that point.
+- All enabled providers refresh together: once at launch, then every 5 minutes (a fixed cadence — there's no setting for it). Opening the popover runs the same full pass, debounced: if a forced pass finished within the last 10 seconds, the reopen paints the cached values instead of re-running every provider. Providers fetch in parallel, so fast cards update without waiting for a slow one. The batch itself still finishes only after every provider returns; notifications, history sync, and the next five-minute wait begin after that point.
 - Turning a provider on (yourself in Customize, or automatically by first-launch/new-provider detection) fetches it promptly instead of waiting out the interval — even when the change lands in the middle of a refresh that's already running.
 - The Dashboard and Settings footer shows `Next update in Nm`. **Clicking it (or pressing ⌘R while that footer is present)** refreshes immediately, skipping the cache.
 - The one-shot `quotabar` command reuses this same persisted cache for five minutes, refreshes missing or stale entries without starting the app, and exits. `quotabar --force` runs the same forced provider refresh as ⌘R regardless of cache age.
@@ -46,6 +46,14 @@ are debounced until after refresh; the one-shot CLI drains pending writes before
 When macOS reports memory pressure, QuotaBar saves pending parse-cache writes and releases in-memory
 Codex event arrays in the background. This cleanup does not require the main thread and keeps the app
 running without clearing the usage values already on screen.
+
+Claude and Codex daily spend history has one more layer on top: after a scan finishes, the finished
+per-day totals are persisted under `~/Library/Application Support/QuotaBar/log-usage-aggregates/`,
+keyed by cheap file fingerprints. On the next refresh, unchanged log files are only statted — the
+day-by-day spend is read back from that aggregate instead of replaying tens of thousands of parsed
+events through pricing again. Any change (append, rewrite, truncate, or a rotated log file), a pricing
+update, or simply more than ~36 hours passing recomputes the aggregate through the normal incremental
+path.
 
 ## When a fetch fails
 
