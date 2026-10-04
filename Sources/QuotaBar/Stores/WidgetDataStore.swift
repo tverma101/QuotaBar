@@ -251,6 +251,32 @@ final class WidgetDataStore {
     /// A caller with a *different* (force, scope) is deliberately not joined: a forced caller must not
     /// be handed a menu-bar-scoped pass, and that is the merge-data case the per-provider forced wait
     /// exists to handle.
+    /// Panel-open debounce. The panel's forced refresh exists so spend rows are fresh when the
+    /// user looks; re-running a forced full pass that finished seconds ago only re-burned every
+    /// local scanner for identical output. A second open (or a rapid open/close/open burst) inside
+    /// this window paints the cached snapshots instead. Manual ⌘R / footer refreshes bypass it.
+    static let panelOpenRefreshDebounce: TimeInterval = 10
+
+    /// Wall-clock time the last completed forced full-scope pass finished (set in `runBatch`).
+    @ObservationIgnored private var lastForcedFullPassAt: Date?
+
+    /// The panel-open refresh entry point: a forced full-scope pass, debounced. Rapid taps and
+    /// immediate reopens join or skip instead of stacking full scans (see `panelOpenRefreshDebounce`).
+    func refreshAllForPanelOpen(maxConcurrentProviders: Int? = nil) async {
+        let timestamp = now()
+        if let last = lastForcedFullPassAt,
+           timestamp.timeIntervalSince(last) >= 0,
+           timestamp.timeIntervalSince(last) < Self.panelOpenRefreshDebounce
+        {
+            AppLog.debug(
+                .refresh,
+                "panel-open refresh skipped (forced full pass finished \(Int(timestamp.timeIntervalSince(last)))s ago)"
+            )
+            return
+        }
+        await refreshAll(force: true, maxConcurrentProviders: maxConcurrentProviders)
+    }
+
     func refreshAll(force: Bool = false, maxConcurrentProviders: Int? = nil) async {
         let batchKey = "\(force)|\(ProviderRefreshContext.scope == .menuBar ? "menuBar" : "full")"
         if let active = activeBatches[batchKey] {
@@ -315,6 +341,11 @@ final class WidgetDataStore {
         // (this time + one refresh interval), mirroring the periodic loop that sleeps one interval
         // after each pass.
         lastRefreshAt = Date()
+        // Record the pass for the panel-open debounce. A cancelled batch (the panel closed and
+        // superseded the task) must not suppress the next open's refresh.
+        if force, ProviderRefreshContext.scope != .menuBar, !Task.isCancelled {
+            lastForcedFullPassAt = now()
+        }
         let durationMs = durationMilliseconds(since: start)
         // Count THIS batch's actual outcomes, not the long-lived `providerErrors` map (which persists
         // across passes, so reading it would miscount cache hits and stale earlier failures).

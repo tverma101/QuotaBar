@@ -34,6 +34,10 @@ actor CodexRouterUsageScanner {
     /// (`acct_<base64url>`) stamped on ledger rows still match QuotaBar cards keyed by UUID.
     private let identityAliases: @Sendable () -> [String: String]
     private let scanner: IncrementalJSONLScanner<Event>
+    /// Production-only daily-aggregate gate (see `LogUsageAggregateCache`). Test injections
+    /// (`readFile` / `incrementalScanner`) and explicitly injected caches decide separately, so
+    /// existing parse-count tests keep running the incremental path unchanged.
+    private let aggregateCache: LogUsageAggregateCache?
 
     /// Empty checkpoint: router lines are independent (no cross-line parser state).
     private struct ParserCheckpoint: Sendable, Equatable {}
@@ -73,7 +77,8 @@ actor CodexRouterUsageScanner {
         ledgerPaths: (@Sendable () -> [String])? = nil,
         readFile: (@Sendable (String) -> String?)? = nil,
         identityAliases: (@Sendable () -> [String: String])? = nil,
-        incrementalScanner: IncrementalJSONLScanner<Event>? = nil
+        incrementalScanner: IncrementalJSONLScanner<Event>? = nil,
+        aggregateCache: LogUsageAggregateCache? = nil
     ) {
         self.environment = environment
         self.homeDirectory = homeDirectory
@@ -85,15 +90,77 @@ actor CodexRouterUsageScanner {
             Self.loadPoolIdentityAliases(environment: environment, homeDirectory: homeDirectory())
         }
         self.scanner = incrementalScanner ?? Self.sharedScanner
+        self.aggregateCache = aggregateCache ?? ((readFile == nil && incrementalScanner == nil)
+            ? LogUsageAggregateCache.shared
+            : nil)
     }
 
     /// Scan the CodexRouter ledger for one Codex card. Returns `nil` when nothing matched so the
     /// caller leaves native logs / FCC untouched.
+    ///
+    /// The daily aggregate is persisted (see `LogUsageAggregateCache`): when the ledger file and
+    /// account-pool file are stat-identical to the last computed scan, this returns the persisted
+    /// per-day rows without parsing, hydrating, or replaying any ledger event.
     func scan(
         accountIdentityKey: String?,
         allowsUnscopedEvents: Bool,
         daysBack: Int = UsageHistoryWindow.previousDays,
         now: Date = Date(),
+        pricing: ModelPricing
+    ) async -> LogUsageScan? {
+        guard let aggregateCache else {
+            return await scanUncached(
+                accountIdentityKey: accountIdentityKey,
+                allowsUnscopedEvents: allowsUnscopedEvents,
+                daysBack: daysBack,
+                now: now,
+                pricing: pricing
+            )
+        }
+        let ledgerFiles = Self.discoveredLedgers(paths: ledgerPaths())
+        let poolFiles = Self.discoveredLedgers(paths: Self.poolStatePaths(
+            environment: environment,
+            homeDirectory: homeDirectory()
+        ))
+        let fingerprints: [String: LogUsageSourceFingerprint] = [
+            "ledger": LogUsageSourceFingerprint.of(ledgerFiles),
+            "pool": LogUsageSourceFingerprint.of(poolFiles),
+        ]
+        let cacheKey = "codex-router|\(Self.aggregateScopeKey(
+            accountIdentityKey: accountIdentityKey,
+            allowsUnscopedEvents: allowsUnscopedEvents
+        ))"
+        return await aggregateCache.scan(
+            key: cacheKey,
+            pricingStamp: LogUsagePricingStamp.of(pricing),
+            daysBack: daysBack,
+            fingerprints: fingerprints,
+            now: now
+        ) { [self] in
+            await scanUncached(
+                accountIdentityKey: accountIdentityKey,
+                allowsUnscopedEvents: allowsUnscopedEvents,
+                daysBack: daysBack,
+                now: now,
+                pricing: pricing
+            )
+        }
+    }
+
+    private static func aggregateScopeKey(accountIdentityKey: String?, allowsUnscopedEvents: Bool) -> String {
+        let identity = accountIdentityKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty?
+            .lowercased() ?? "-"
+        return "\(identity)|allows-unscoped=\(allowsUnscopedEvents)"
+    }
+
+    /// The un-gated scan body: the incremental tail/parse machinery plus per-account folding.
+    private func scanUncached(
+        accountIdentityKey: String?,
+        allowsUnscopedEvents: Bool,
+        daysBack: Int,
+        now: Date,
         pricing: ModelPricing
     ) async -> LogUsageScan? {
         let days = max(1, daysBack)
@@ -538,32 +605,37 @@ actor CodexRouterUsageScanner {
 
     /// Read `chatgpt-account-pool.json` → map pool opaque id / email aliases onto the ChatGPT
     /// `identity.accountId` UUID QuotaBar cards use as `expectedIdentityKey`.
+    static func poolStatePaths(
+        environment: EnvironmentReading,
+        homeDirectory: URL
+    ) -> [String] {
+        var paths: [String] = []
+        if let override = environment.value(for: "MODEL_ROUTER_CHATGPT_ACCOUNT_POOL")?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            paths.append(override)
+        }
+        for key in ["CODEX_ROUTER_STATE_DIR", "MODEL_ROUTER_STATE_DIR"] {
+            if let state = environment.value(for: key)?
+                .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+                paths.append(
+                    URL(fileURLWithPath: state)
+                        .appendingPathComponent("chatgpt-account-pool.json").path
+                )
+            }
+        }
+        paths.append(
+            homeDirectory
+                .appendingPathComponent(".codex/codex-router/chatgpt-account-pool.json")
+                .path
+        )
+        return paths
+    }
+
     static func loadPoolIdentityAliases(
         environment: EnvironmentReading,
         homeDirectory: URL
     ) -> [String: String] {
-        let candidates: [String] = {
-            var paths: [String] = []
-            if let override = environment.value(for: "MODEL_ROUTER_CHATGPT_ACCOUNT_POOL")?
-                .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
-                paths.append(override)
-            }
-            for key in ["CODEX_ROUTER_STATE_DIR", "MODEL_ROUTER_STATE_DIR"] {
-                if let state = environment.value(for: key)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
-                    paths.append(
-                        URL(fileURLWithPath: state)
-                            .appendingPathComponent("chatgpt-account-pool.json").path
-                    )
-                }
-            }
-            paths.append(
-                homeDirectory
-                    .appendingPathComponent(".codex/codex-router/chatgpt-account-pool.json")
-                    .path
-            )
-            return paths
-        }()
+        let candidates = poolStatePaths(environment: environment, homeDirectory: homeDirectory)
 
         for path in candidates {
             guard FileManager.default.isReadableFile(atPath: path),

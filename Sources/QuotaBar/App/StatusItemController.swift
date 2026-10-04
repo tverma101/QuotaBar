@@ -416,7 +416,7 @@ final class StatusItemController: NSObject {
         popoverRefreshTask?.cancel()
         popoverRefreshTask = Task {
             await ProviderRefreshContext.$scope.withValue(.full) {
-                await container.dataStore.refreshAll(force: true)
+                await container.dataStore.refreshAllForPanelOpen()
             }
         }
 
