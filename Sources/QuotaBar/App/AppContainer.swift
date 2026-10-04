@@ -455,8 +455,10 @@ final class AppContainer {
                     let scope: ProviderRefreshContext.Scope = (panelOpen || pendingFullScopePass) ? .full : .menuBar
                     pendingFullScopePass = false
                     await ProviderRefreshContext.$scope.withValue(scope) {
-                        await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
-                            await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                        await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(scope == .menuBar) {
+                            await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                                await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                            }
                         }
                     }
                     isFirstPass = false

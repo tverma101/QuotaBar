@@ -3,6 +3,23 @@ import XCTest
 @testable import QuotaBar
 
 final class OpenCodeGatewayMergeRegressionTests: XCTestCase {
+    func testCompactGoRetentionPrunesExpiredRowsWithoutDroppingCurrentQuota() {
+        let now = Date()
+        let aggregate = OpenCodeRouterLedgerAggregate.empty(path: "/tmp/synthetic-go-retention",
+            revision: .init(device: 1, inode: 1, size: 0))
+        for days in [60, 1] {
+            aggregate.addRow(.init(date: now.addingTimeInterval(-Double(days * 86400)),
+                input: 50, output: 0, cacheWrite: 0, cacheRead: 0,
+                model: "space-bunny-free", burnsGoQuota: true, isInProgress: false))
+        }
+        XCTAssertTrue(aggregate.prune(before: now.addingTimeInterval(-45 * 86400)))
+        let retained = aggregate.materialize(since: .distantPast)
+        XCTAssertEqual(retained.count, 1)
+        XCTAssertEqual(retained.first?.tokens, 50)
+        XCTAssertEqual(retained.first?.burnsGoQuota, true)
+        XCTAssertFalse(aggregate.prune(before: now.addingTimeInterval(-45 * 86400)))
+    }
+
     func testRouterCoverageReplacesOverlapAndNativeFillsMissingDayAndModel() {
         let today = Calendar.current.startOfDay(for: Date()).addingTimeInterval(3_600)
         let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: today)!
