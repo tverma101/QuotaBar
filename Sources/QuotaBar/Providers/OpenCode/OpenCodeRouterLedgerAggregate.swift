@@ -48,6 +48,14 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
     enum Reconcile {
         case rows([OpenCodeUsageScanner.ClaudeGatewayRow])
         case stale
+        /// The ledger could not be read this pass — the refresh was cancelled at the deadline, or a
+        /// transient I/O error hit mid-read. Device, inode, size, mtime, and the prefix anchor all
+        /// verified intact before the read failed, so this is not evidence of a rewrite: the caller
+        /// must keep the aggregate (memory and persisted file) untouched and serve last-good data.
+        /// Mapping a failed read to `.stale` here deleted the durable aggregate after every timed-out
+        /// refresh, forcing the next refresh into a full cold rebuild of the whole ledger — which
+        /// timed out too, in a self-sustaining loop.
+        case aborted
     }
 
     var path: String
@@ -172,7 +180,9 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
                 appended.append(row)
             }
         }
-        guard read.succeeded else { return .stale }
+        // A cancelled read (deadline hit) or transient I/O error says nothing about the ledger's
+        // contents — every identity check above already passed. Report an abort, not staleness.
+        guard read.succeeded else { return .aborted }
         if !read.finalPartial.isEmpty,
            let row = OpenCodeRouterLedger.row(
             from: read.finalPartial[...],

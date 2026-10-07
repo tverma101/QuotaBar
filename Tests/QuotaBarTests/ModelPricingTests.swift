@@ -110,6 +110,30 @@ final class ModelPricingTests: XCTestCase {
         XCTAssertEqual(pricing.resolve(model: "vendor/gpt-5.6")?.inputPerMillion, 7)
     }
 
+    func testCodenameSpellingVariantsResolveToCatalogEntries() throws {
+        // Stealth/codename models reach the logs with spellings the public catalogues never use
+        // verbatim: spaces or underscores where the catalogue hyphenates ("space bunny" vs
+        // "space-bunny"). The normalized exact retry closes that gap, so the moment a catalogue
+        // lists the codename (OpenRouter's stealth listings carry the real rates) discovery prices
+        // it — and the checkpoint invalidation backfills older days. No manual reveal step.
+        let pricing = try makePricing(
+            openRouter: ["openrouter/space-bunny": rates(7, 14), "space-bunny": rates(7, 14)]
+        )
+        XCTAssertEqual(pricing.resolve(model: "space bunny")?.inputPerMillion, 7, "spaces normalize to the catalogue's hyphens")
+        XCTAssertEqual(pricing.resolve(model: "space_bunny")?.inputPerMillion, 7, "underscores normalize too")
+        XCTAssertEqual(pricing.resolve(model: "space-bunny")?.inputPerMillion, 7, "the plain slug keeps working")
+
+        // The hyphenated form wins via the bare OpenRouter alias, and the route-prefixed entry
+        // still prices its own exact id.
+        XCTAssertEqual(pricing.resolve(model: "openrouter/space-bunny")?.inputPerMillion, 7)
+
+        // Normalization must not invent matches: a distinct slug stays unpriced (discovery reports
+        // it instead of fabricating dollars from a look-alike entry).
+        let miss = try makePricing(openRouter: ["space-bunny": rates(7, 14)])
+        XCTAssertNil(miss.resolve(model: "space bunny 2"))
+        XCTAssertNil(miss.resolve(model: "bunny"))
+    }
+
     func testUnknownModelReturnsNil() throws {
         let pricing = try makePricing(primary: ["gpt-5.5": rates(5, 30)])
         XCTAssertNil(pricing.resolve(model: "made-up-model-9000"))

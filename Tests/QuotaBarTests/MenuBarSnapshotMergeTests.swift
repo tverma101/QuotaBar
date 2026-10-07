@@ -62,8 +62,49 @@ final class MenuBarSnapshotMergeTests: XCTestCase {
         XCTAssertEqual(merged.refreshedAt, fresh.refreshedAt)
     }
 
-    func testMergingMenuBarUpdateWithNoPreviousReturnsSelf() {
+    /// A day-labeled spend tile computed before local midnight must not ride along under the merged
+    /// snapshot's fresh timestamp: the merge re-stamps `refreshedAt`, so a preserved "Today" line
+    /// from yesterday would read as current until the next `.full` pass. The day-rollover pass
+    /// rebuilds the tile; until then the stale line is dropped rather than mislabeled as fresh.
+    func testMergingMenuBarUpdateDropsPriorDaySpendTiles() {
+        let calendar = Calendar.current
+        let yesterday = calendar.date(byAdding: .day, value: -1, to: Date())!
+        let previous = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            lines: [
+                .values(label: "Today", values: [
+                    MetricValue(number: 1_000, kind: .count, label: "tokens")
+                ]),
+                .values(label: "Yesterday", values: [
+                    MetricValue(number: 500, kind: .count, label: "tokens")
+                ]),
+                .chart(
+                    label: "Usage Trend",
+                    points: [MetricChartPoint(value: 1_000, label: "2026-09-22", valueLabel: "1k")],
+                    note: "logs"
+                ),
+            ],
+            refreshedAt: yesterday,
+            usageHistory: nil
+        )
         let fresh = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            lines: [.progress(label: "Session", used: 55, limit: 100, format: .percent)],
+            refreshedAt: Date()
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertNil(merged.line(label: "Today"), "yesterday's Today tile must not read as current")
+        XCTAssertNil(merged.line(label: "Yesterday"), "a two-day-old Yesterday tile must not survive")
+        XCTAssertEqual(merged.line(label: "Usage Trend"), previous.line(label: "Usage Trend"),
+                       "non-day-labeled lines still merge across midnight")
+        XCTAssertEqual(merged.line(label: "Session"), fresh.line(label: "Session"))
+    }
+
+    func testMergingMenuBarUpdateWithNoPreviousReturnsSelf() {        let fresh = ProviderSnapshot(
             providerID: "codex",
             displayName: "Codex",
             lines: [.progress(label: "Session", used: 1, limit: 100, format: .percent)],
@@ -246,5 +287,116 @@ final class MenuBarSnapshotMergeTests: XCTestCase {
         )
         let merged = fresh.mergingMenuBarUpdate(over: previous)
         XCTAssertEqual(merged.usageHistory, newHistory)
+    }
+
+    // MARK: - carriesPriorHistory (full passes must recompute menu-bar-carried history)
+
+    /// A menu-bar merge that preserved prior history must mark the result as carried, so the next
+    /// full pass re-runs the deferred fold instead of cache-hitting forever (menu-bar ticks re-stamp
+    /// `refreshedAt` every TTL, which would otherwise starve the recompute permanently).
+    func testMenuBarMergeMarksCarriedHistory() {
+        let previous = ProviderSnapshot(
+            providerID: "cursor",
+            displayName: "Cursor",
+            lines: [.values(label: "Today", values: [
+                MetricValue(number: 5, kind: .dollars, label: "spend")
+            ])],
+            refreshedAt: Date(timeIntervalSince1970: 1_000),
+            usageHistory: ProviderUsageHistory(
+                series: DailyUsageSeries(daily: [
+                    DailyUsageEntry(date: "2026-10-04", totalTokens: 10, costUSD: 0.02)
+                ])
+            )
+        )
+        let fresh = ProviderSnapshot(
+            providerID: "cursor",
+            displayName: "Cursor",
+            lines: [.progress(label: "Total usage", used: 5, limit: 100, format: .percent)],
+            refreshedAt: Date(timeIntervalSince1970: 2_000),
+            usageHistory: nil
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertEqual(merged.carriesPriorHistory, true)
+        XCTAssertNotNil(merged.usageHistory)
+    }
+
+    /// A merge with no prior history to preserve must not claim carried history — meter-only
+    /// providers would otherwise re-run in every full pass for nothing.
+    func testMenuBarMergeWithoutPriorHistoryLeavesCarriedFlagNil() {
+        let previous = ProviderSnapshot(
+            providerID: "cursor",
+            displayName: "Cursor",
+            lines: [.progress(label: "Total usage", used: 5, limit: 100, format: .percent)],
+            refreshedAt: Date(timeIntervalSince1970: 1_000),
+            usageHistory: nil
+        )
+        let fresh = ProviderSnapshot(
+            providerID: "cursor",
+            displayName: "Cursor",
+            lines: [.progress(label: "Total usage", used: 6, limit: 100, format: .percent)],
+            refreshedAt: Date(timeIntervalSince1970: 2_000),
+            usageHistory: nil
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertNil(merged.carriesPriorHistory)
+    }
+
+    /// History computed by this refresh (a real full fold) is not carried — the flag must clear so
+    /// subsequent full passes can honor the TTL again.
+    func testFreshHistoryClearsCarriedFlag() {
+        let previous = ProviderSnapshot(
+            providerID: "cursor",
+            displayName: "Cursor",
+            lines: [],
+            refreshedAt: Date(timeIntervalSince1970: 1_000),
+            usageHistory: ProviderUsageHistory(
+                series: DailyUsageSeries(daily: [
+                    DailyUsageEntry(date: "2026-10-04", totalTokens: 10, costUSD: 0.02)
+                ])
+            ),
+            carriesPriorHistory: true
+        )
+        let fresh = ProviderSnapshot(
+            providerID: "cursor",
+            displayName: "Cursor",
+            lines: [.progress(label: "Total usage", used: 7, limit: 100, format: .percent)],
+            refreshedAt: Date(timeIntervalSince1970: 2_000),
+            usageHistory: ProviderUsageHistory(
+                series: DailyUsageSeries(daily: [
+                    DailyUsageEntry(date: "2026-10-05", totalTokens: 99, costUSD: 0.2)
+                ])
+            )
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertEqual(merged.usageHistory?.series.daily.first?.date, "2026-10-05")
+        XCTAssertNil(merged.carriesPriorHistory)
+    }
+
+    /// The marker must survive the JSON round-trip through the persisted snapshot cache, so the
+    /// gate works across the cache's decode path (old blobs without the key decode as nil).
+    func testCarriedHistoryFlagSurvivesCacheRoundTrip() throws {
+        let snapshot = ProviderSnapshot(
+            providerID: "cursor",
+            displayName: "Cursor",
+            lines: [.progress(label: "Total usage", used: 5, limit: 100, format: .percent)],
+            refreshedAt: Date(timeIntervalSince1970: 1_000),
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: [])),
+            carriesPriorHistory: true
+        )
+        let data = try JSONEncoder().encode(snapshot)
+        let decoded = try JSONDecoder().decode(ProviderSnapshot.self, from: data)
+        XCTAssertEqual(decoded.carriesPriorHistory, true)
+
+        let legacyJSON = """
+        {"providerID":"cursor","displayName":"Cursor","lines":[],"refreshedAt":1000.0}
+        """
+        let legacy = try JSONDecoder().decode(ProviderSnapshot.self, from: Data(legacyJSON.utf8))
+        XCTAssertNil(legacy.carriesPriorHistory)
     }
 }

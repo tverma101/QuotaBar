@@ -40,7 +40,7 @@ actor GrokLogUsageScanner {
 
     /// Scan completed turns under `$GROK_HOME/sessions`, or `~/.grok/sessions` by default.
     /// Missing transcripts leave the spend tiles unbacked instead of falling back to the debug log.
-    func scan(daysBack: Int = 30, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+    func scan(daysBack: Int = UsageHistoryWindow.previousDays, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
         let directory = grokHome().appendingPathComponent("sessions", isDirectory: true)
         let identity = directory.resolvingSymlinksInPath().standardizedFileURL.path
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
@@ -207,14 +207,16 @@ actor GrokLogUsageScanner {
         JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
             guard entry.timestamp >= since else { return }
             let day = DailyUsageAccumulator.dayKey(from: entry.timestamp)
-            guard let cost = entry.carriedCost
+            let cost = entry.carriedCost
                 ?? pricing.estimatedCostDollars(model: entry.model, tokens: entry.tokens)
-            else {
-                if entry.tokens.totalTokens > 0 {
-                    accumulator.addUnknownModel(day: day, model: entry.model)
-                }
-                return
+            if let apiEstimate = pricing.estimatedCostDollars(model: entry.model, tokens: entry.tokens) {
+                accumulator.addApiEstimate(day: day, cost: apiEstimate)
             }
+            if cost == nil, entry.tokens.totalTokens > 0 {
+                accumulator.addUnknownModel(day: day, model: entry.model)
+            }
+            // Unpriced rows count their tokens with a dashed cost (owner policy), so the totals stay
+            // complete and a later reveal can price them.
             accumulator.add(day: day, tokens: entry.tokens.totalTokens, cost: cost, model: entry.model)
         }
         return accumulator.build()

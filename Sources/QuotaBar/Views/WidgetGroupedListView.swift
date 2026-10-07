@@ -25,14 +25,19 @@ struct WidgetGroupedListView: View {
     var body: some View {
         // Provider-section spacing is noticeably wider than the in-card row rhythm (so groups
         // still read as groups); the exact step comes from the density setting.
-        VStack(alignment: .leading, spacing: density.sectionSpacing) {
-            ForEach(layout.displayGroups) { group in
+        //
+        // `displayGroups` is a computed property that rebuilds dictionaries + filters per access;
+        // capture it once per body evaluation so the `.animation` identity doesn't recompute the
+        // whole thing a second time.
+        let groups = layout.displayGroups
+        return VStack(alignment: .leading, spacing: density.sectionSpacing) {
+            ForEach(groups) { group in
                 section(group)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .onPreferenceChange(ReorderFramePreferenceKey.self) { frameStore.frames = $0 }
-        .animation(Motion.spring, value: layout.displayGroups.map(\.provider.id))
+        .animation(Motion.spring, value: groups.map(\.provider.id))
     }
 
     @ViewBuilder

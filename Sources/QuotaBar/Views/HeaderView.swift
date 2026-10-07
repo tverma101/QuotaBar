@@ -87,6 +87,10 @@ struct HeaderView: View {
         }
         .keyboardShortcut(.return, modifiers: [])
 
+        Button { toggle(.history) } label: {
+            Label("Usage History", systemImage: "clock.arrow.circlepath")
+        }
+
         Button { toggle(.settings) } label: {
             Label("Settings", systemImage: "gearshape")
         }

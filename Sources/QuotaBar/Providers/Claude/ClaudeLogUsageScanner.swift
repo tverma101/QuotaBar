@@ -85,7 +85,7 @@ actor ClaudeLogUsageScanner {
     /// Scan the last `daysBack` days of Claude logs. Returns `nil` when no Claude data directory or
     /// no log files exist (the spend tiles then render "No data"); returns an empty series when logs
     /// exist but have no usage in the window.
-    func scan(daysBack: Int = 30, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+    func scan(daysBack: Int = UsageHistoryWindow.previousDays, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
         let cacheIdentity = parseCacheIdentity()
         let roots = claudeRoots()
@@ -679,11 +679,11 @@ actor ClaudeLogUsageScanner {
     /// Bucket deduplicated entries into local calendar days. Cost mode "auto": a line's `costUSD`
     /// when present, else tokens priced through `pricing`.
     ///
-    /// Entries that can't be priced (an unknown model, or unattributed tokens with no carried cost)
-    /// are excluded from every displayed total — tokens, dollars, the trend, and the model breakdown —
-    /// because mixing measured tokens with unpriceable ones makes the figures incoherent. An unknown
-    /// model's name lands in `unknownModelsByDay` (the tile's warning triangle), the only place
-    /// unpriceable usage surfaces.
+    /// Rows no pricing source can price still count their tokens (cost dashes, per the owner's
+    /// "count tokens, dash cost" policy) and land in `unknownModelsByDay` for the warning triangle
+    /// and the reveal system. Every row with a resolvable rate also contributes its tokens' public-
+    /// API-rate value to `apiEstimateByDay` — the "if it were all API" comparison — including rows
+    /// whose displayed cost is provider-reported.
     static func aggregate(entries: [Entry], since: Date, pricing: ModelPricing) -> LogUsageScan {
         var accumulator = DailyUsageAccumulator()
 
@@ -698,16 +698,20 @@ actor ClaudeLogUsageScanner {
             // double-counts the same dollars/tokens in Total Spend.
             if let trimmedModel, OpenCodeUsageScanner.isHostedGatewayModel(trimmedModel) { return }
 
-            let cost: Double
+            let cost: Double?
             if let carried = entry.costUSD {
                 cost = carried
             } else if let model = trimmedModel, let estimated = pricing.estimatedCostDollars(model: model, tokens: entry.tokens) {
                 cost = estimated
             } else {
-                if let model = trimmedModel, entry.tokens.totalTokens > 0 {
-                    accumulator.addUnknownModel(day: day, model: model)
-                }
-                return
+                cost = nil
+            }
+            if cost == nil, entry.tokens.totalTokens > 0 {
+                accumulator.addUnknownModel(day: day, model: modelName)
+            }
+            if let model = trimmedModel,
+               let apiEstimate = pricing.estimatedCostDollars(model: model, tokens: entry.tokens) {
+                accumulator.addApiEstimate(day: day, cost: apiEstimate)
             }
 
             accumulator.add(day: day, tokens: entry.tokens.totalTokens, cost: cost, model: modelName)

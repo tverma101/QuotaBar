@@ -37,7 +37,7 @@ final class CodexProvider: ProviderRuntime {
         allowsKeychainFallback: Bool = true,
         allowsUnattributedPiUsage: Bool = true,
         now: @escaping @Sendable () -> Date = Date.init,
-        pricing: @escaping @Sendable () async -> ModelPricing = { await ModelPricingStore.shared.current() }
+        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
     ) {
         self.provider = provider
         let normalizedIdentity = CodexAuthStore.normalizedIdentityKey(expectedIdentityKey)
@@ -252,7 +252,11 @@ final class CodexProvider: ProviderRuntime {
         )
         // Native sessions may contain days that never passed through Codex Router. Their per-file
         // aggregates skip unchanged events, so preserving gap-fill history needs no repeated fold.
-        let nativeScan = await logUsageScanner.scan(now: now, pricing: pricing)
+        let nativeScan = await logUsageScanner.scan(
+            daysBack: UsageHistoryWindow.lifetimeDays,
+            now: now,
+            pricing: pricing
+        )
         let proxyScan = await proxyUsageScanner.scan(
             accountIdentityKey: accountIdentityKey,
             now: now,
@@ -310,7 +314,8 @@ final class CodexProvider: ProviderRuntime {
         let usageHistory = ProviderUsageHistory(
             series: scan.series,
             modelUsage: scan.modelUsage,
-            unknownModelsByDay: scan.unknownModelsByDay
+            unknownModelsByDay: scan.unknownModelsByDay,
+            apiEstimateByDay: scan.apiEstimateByDay
         )
         SpendTileMapper.appendTokenUsage(
             scan.series,
@@ -318,7 +323,8 @@ final class CodexProvider: ProviderRuntime {
             now: now,
             unknownModelsByDay: scan.unknownModelsByDay,
             modelUsage: scan.modelUsage,
-            modelSourceNote: note
+            modelSourceNote: note,
+            apiEstimateByDay: scan.apiEstimateByDay
         )
         SpendTileMapper.appendUsageTrend(scan.series, to: &lines, now: now, note: note)
         return usageHistory

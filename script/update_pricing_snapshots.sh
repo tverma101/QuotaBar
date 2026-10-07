@@ -1,12 +1,14 @@
 #!/bin/bash
 # Regenerates the bundled pricing snapshots from the live feeds:
 #
-#   Sources/OpenUsage/Resources/pricing_litellm_snapshot.json      (LiteLLM model_prices)
-#   Sources/OpenUsage/Resources/pricing_models_dev_snapshot.json   (models.dev api.json)
+#   Sources/QuotaBar/Resources/pricing_litellm_snapshot.json      (LiteLLM model_prices)
+#   Sources/QuotaBar/Resources/pricing_models_dev_snapshot.json   (models.dev api.json)
 #
 # The snapshots are the offline fallback for first launch / no network; at runtime the app fetches
-# the same feeds daily and its disk cache overrides these. Staleness is therefore harmless, but
-# refreshing them at release time keeps first launches accurate. Run from the repo root:
+# the same feeds hourly and its disk cache overlays these. Refreshing them at release time keeps
+# first launches accurate. Each regeneration merges the live feed over the previous snapshot:
+# fresh rates win per model, and models the feed dropped stay priced so historical usage keeps
+# its dollars. Run from the repo root:
 #
 #   ./script/update_pricing_snapshots.sh
 #
@@ -18,7 +20,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-RESOURCES="Sources/OpenUsage/Resources"
+RESOURCES="Sources/QuotaBar/Resources"
 
 LITELLM_URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 MODELS_DEV_URL="https://models.dev/api.json"
@@ -38,6 +40,19 @@ from datetime import datetime, timezone
 
 tmpdir, resources = sys.argv[1], sys.argv[2]
 retrieved_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def merged_models(models, snapshot_path):
+    """Fresh rates win per key; models the feed dropped stay priced for historical usage."""
+    try:
+        with open(snapshot_path) as f:
+            previous = json.load(f)["models"]
+    except (OSError, KeyError, ValueError):
+        previous = {}
+    merged = {**previous, **models}
+    kept = len(set(previous) - set(models))
+    added = len(set(models) - set(previous))
+    print(f"  {len(models)} live + {kept} historical-only keys preserved ({added} new vs previous)")
+    return merged
 
 def compact_model(input_pm, output_pm, cache_write_pm, cache_read_pm, cache_read_explicit,
                   ia=None, oa=None, cwa=None, cra=None, fast=None):
@@ -78,6 +93,7 @@ for key, entry in litellm.items():
     )
 if not models:
     sys.exit("LiteLLM feed produced no usable entries - aborting.")
+models = merged_models(models, f"{resources}/pricing_litellm_snapshot.json")
 with open(f"{resources}/pricing_litellm_snapshot.json", "w") as f:
     json.dump({"retrieved_at": retrieved_at, "models": models}, f, sort_keys=True, separators=(",", ":"))
 print(f"pricing_litellm_snapshot.json: {len(models)} models")
@@ -106,6 +122,7 @@ for provider_name in sorted(models_dev):
         )
 if not models:
     sys.exit("models.dev feed produced no usable entries - aborting.")
+models = merged_models(models, f"{resources}/pricing_models_dev_snapshot.json")
 with open(f"{resources}/pricing_models_dev_snapshot.json", "w") as f:
     json.dump({"retrieved_at": retrieved_at, "models": models}, f, sort_keys=True, separators=(",", ":"))
 print(f"pricing_models_dev_snapshot.json: {len(models)} models")

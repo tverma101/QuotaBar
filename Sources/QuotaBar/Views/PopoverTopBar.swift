@@ -39,6 +39,12 @@ struct PopoverTopBar: View {
             } trailing: {
                 EmptyView()
             }
+        case .history:
+            navigationBar(title: "Usage History") {
+                withAnimation(Motion.modeSwitch) { layout.screen = .dashboard }
+            } trailing: {
+                EmptyView()
+            }
         }
     }
 

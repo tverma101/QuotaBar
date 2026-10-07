@@ -117,6 +117,42 @@ final class PricingDiscoveryRegressionTests: XCTestCase {
         await eventually { await store.current().isPriced("example/new-model") }
     }
 
+    func testPermanentlyUnpricedModelStopsDrivingDiscoveryFetches() async throws {
+        let clock = DiscoveryClock()
+        let http = DiscoveryHTTP()
+        let store = store(http: http, clock: clock)
+        await store.refreshNow()
+        let snapshot = await store.current()
+        XCTAssertNil(snapshot.resolve(model: "example/never-listed"))
+
+        // A name the catalogue cannot price may drive at most one revalidation per 5-minute floor,
+        // and only for a bounded streak of misses: every round below revalidates against an
+        // unchanged (304) catalogue, so the streak climbs until the name stops queuing fetches.
+        // Sink-driven rounds also run asynchronously, so drive well more than the streak's worth of
+        // floor-spaced rounds and assert the bound instead of a round-to-count mapping.
+        var maxCount = 0
+        for _ in 0..<10 {
+            clock.advance(301)
+            _ = await store.current()
+            await store.runUnresolvedDiscoveryIfNeeded()
+            let count = await http.count
+            maxCount = max(maxCount, count)
+        }
+        XCTAssertLessThanOrEqual(maxCount, 4, "refresh + at most one fetch per miss round")
+
+        // Past the cap the name is dropped, so elapsed time and current() calls fetch nothing: the
+        // only revival is a real catalogue change, which rebuilds pricing, resets the per-snapshot
+        // memo, and re-reports the name with a fresh streak. (The check stays inside the hourly
+        // refresh TTL so the legitimate hourly revalidation can't muddy the count.)
+        clock.advance(500)
+        _ = await store.current()
+        await store.runUnresolvedDiscoveryIfNeeded()
+        let final = await http.count
+        XCTAssertEqual(final, maxCount, "a permanently unpriced name must not fetch forever")
+        let pending = await store.pendingUnknownModels
+        XCTAssertTrue(pending.isEmpty, "the capped name must leave the discovery queue")
+    }
+
     private func eventually(_ condition: () async -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
         for _ in 0..<200 {
             if await condition() { return }
@@ -137,13 +173,21 @@ private actor DiscoveryHTTP: HTTPClient {
     private(set) var requests: [HTTPRequest] = []
     private var model = "old-model"
     private var fails = false
+    /// ETag of the served body, derived from the model so a changed catalogue yields a new etag and
+    /// an unchanged one revalidates as 304 — like the real feed.
+    private var etagForCurrentModel = "m-old-model"
     var count: Int { requests.count }
     func setModel(_ model: String) { self.model = model }
     func setFailure(_ fails: Bool) { self.fails = fails }
     func send(_ request: HTTPRequest) async throws -> HTTPResponse {
         requests.append(request)
         if fails { throw URLError(.notConnectedToInternet) }
-        return HTTPResponse(statusCode: 200, headers: ["etag": "v\(requests.count)"], body: Data(
+        let etag = "m-\(model)"
+        if request.headers["If-None-Match"] == etag {
+            return HTTPResponse(statusCode: 304, headers: [:], body: Data())
+        }
+        etagForCurrentModel = etag
+        return HTTPResponse(statusCode: 200, headers: ["etag": etag], body: Data(
             "{\"data\":[{\"id\":\"example/\(model)\",\"pricing\":{\"prompt\":\"0.000002\",\"completion\":\"0.000003\"}}],\"total_count\":1,\"links\":{\"next\":null}}".utf8
         ))
     }

@@ -514,6 +514,8 @@ struct DashboardView: View {
                 reorderSpaceName: Self.reorderSpace,
                 reorderLift: $reorderLift
             )
+        case .history:
+            HistoryDashboardView()
         case .settings:
             SettingsScreen()
         }

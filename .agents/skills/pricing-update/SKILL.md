@@ -1,19 +1,19 @@
 ---
 name: pricing-update
-description: Sync OpenUsage's pricing supplement with Cursor's published model pricing. Pulls https://cursor.com/docs/models-and-pricing.md, diffs it against pricing_supplement.json, updates entries/aliases/multipliers, validates, and opens a PR. Use when Cursor adds or re-prices models, a spend tile shows a warning triangle for an unpriced model, or a periodic pricing check is due.
+description: Maintain QuotaBar's pricing supplement for provider aliases, Cursor-native models, verified overrides, and public-catalog gaps. Routine model discovery and route rates come from the live OpenRouter catalogue. Use when Cursor adds a native model, a public rate needs a verified exception, or a spend tile shows a warning triangle.
 ---
 
 # Pricing Update
 
-`Sources/OpenUsage/Resources/pricing_supplement.json` prices the models no public catalog carries (Cursor-native models like `auto`, `composer-*`, `github_bugbot`), supplies fast-variant multipliers, and maps provider log/CSV slugs to canonical pricing keys. On merge to `main`, `.github/workflows/pricing-supplement.yml` validates it and publishes it to GitHub Pages; installed apps pick it up within about an hour — no release needed. Full background: `docs/pricing.md`.
+`Sources/QuotaBar/Resources/pricing_supplement.json` carries provider aliases, Cursor-native models that public catalogues do not list (such as `auto`, `composer-*`, and `github_bugbot`), verified rate/cache overrides, and known gaps. The live OpenRouter `/api/v1/models` catalogue automatically supplies exact route estimates across providers; LiteLLM and models.dev remain fallbacks. The supplement is published from upstream's GitHub Pages and is loaded by QuotaBar within about an hour. Full background: `docs/pricing.md`.
 
-Only the supplement needs manual care. Normal API models (new Claude/GPT/Gemini/Grok releases) are priced automatically by the daily LiteLLM and models.dev fetches — do not add them to the supplement unless they need an alias rule or the catalogs are wrong.
+Routine API model additions and prompt/completion rates do not need manual supplement edits: OpenRouter refreshes automatically about hourly. Edit the supplement only for aliases, Cursor-native models, verified provider-specific cache/rate overrides, or a documented public-catalog gap. OpenRouter does not provide Cursor's native subscription prices.
 
 ## Steps
 
 ### 1. Pull the source of truth into context
 
-Fetch https://cursor.com/docs/models-and-pricing.md and read the whole thing. This is the canonical source for:
+OpenRouter supplies routine API model discovery and public route rates automatically. When editing a Cursor-specific supplement entry, fetch https://cursor.com/docs/models-and-pricing.md and read the whole thing. It is the source for:
 
 - Cursor-native model prices (`auto`, `composer-*`, Bugbot) — input, cache write, cache read, output, all USD per million tokens.
 - Which models have a fast variant and what the fast pricing is.
@@ -22,7 +22,7 @@ Fetch https://cursor.com/docs/models-and-pricing.md and read the whole thing. Th
 
 ### 2. Diff against the current supplement
 
-Read `Sources/OpenUsage/Resources/pricing_supplement.json` and compare:
+Read `Sources/QuotaBar/Resources/pricing_supplement.json` and compare:
 
 - **Price changes** on existing `pricing` entries.
 - **New Cursor-native models** missing from `pricing`.
@@ -30,7 +30,7 @@ Read `Sources/OpenUsage/Resources/pricing_supplement.json` and compare:
 - **`fast_multipliers`** — for API models whose fast variant is priced as a multiplier of the base rate. Only needed when the catalogs don't carry a `-fast` key themselves.
 - **`alias_rules`** — a new model usually needs one, because Cursor CSV slugs and Codex/Claude log names rarely match catalog keys exactly (thinking suffixes, effort levels like `-low`/`-high`/`-xhigh`, dot vs dash versions). Follow the existing patterns: anchored regex, escaped dots, optional effort/thinking groups. `-fast` variants need their own rule ordered BEFORE the base rule (first match wins).
 
-Where a model exists in LiteLLM or models.dev, prefer an alias to that canonical key over duplicating prices in the supplement.
+For ordinary API models, confirm whether OpenRouter already lists an exact route before adding anything. Prefer an alias to a public catalogue key over duplicating rates in the supplement; keep a curated override only when a verified source justifies it.
 
 ### 3. Edit the supplement
 
@@ -45,7 +45,7 @@ Run the same checks CI runs, plus the pricing tests:
 ```sh
 python3 - << 'PY'
 import json, re, sys
-with open("Sources/OpenUsage/Resources/pricing_supplement.json") as f:
+with open("Sources/QuotaBar/Resources/pricing_supplement.json") as f:
     s = json.load(f)
 problems = []
 for m, e in s["pricing"].items():
@@ -65,13 +65,13 @@ PY
 swift test --filter "ModelPricing|PricingBundledResource"
 ```
 
-If a new alias rule maps a slug that appears in real usage, add a resolution test case in `Tests/OpenUsageTests/ModelPricingTests.swift`.
+If a new alias rule maps a slug that appears in real usage, add a resolution test case in `Tests/QuotaBarTests/ModelPricingTests.swift`.
 
-### 5. Open a PR
+### 5. Publish only when requested
 
-Branch from `main`, commit (`fix(pricing): ...` or `feat(pricing): ...`), and open a PR following the repo's PR description structure (TL;DR / What was happening / What this changes). Cite the Cursor doc as the source and list each price or alias change explicitly so the owner can verify numbers at a glance. Never push pricing changes directly to `main`.
+If the user requests publication, branch from `main`, commit (`fix(pricing): ...` or `feat(pricing): ...`), and open a PR following the repo's PR description structure (TL;DR / What was happening / What this changes). Cite the source for each manual price or alias so the owner can verify it. Never push pricing changes directly to `main`.
 
-### 6. Verify publication after merge
+### 6. Verify publication after an approved merge
 
 Once merged, the `Publish pricing supplement` workflow runs. Confirm it landed:
 
@@ -88,8 +88,8 @@ The bundled LiteLLM/models.dev snapshots (`pricing_*_snapshot.json`) are a separ
 
 ## Rules
 
-- USD per million tokens everywhere; exact numbers from the Cursor page, never inferred.
-- Prefer aliasing to LiteLLM/models.dev keys over duplicating prices in the supplement.
+- USD per million tokens everywhere; verified overrides need an authoritative source.
+- Prefer OpenRouter exact routes for routine API estimates, then LiteLLM/models.dev fallbacks; use aliases instead of duplicating prices where possible.
 - Never delete pricing entries that historical usage may reference.
 - `-fast` alias rules come before their base-model rules.
 - Always bump `updated_at`; always go through a PR.

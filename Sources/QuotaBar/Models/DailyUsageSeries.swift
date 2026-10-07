@@ -40,6 +40,13 @@ enum UsageHistoryWindow {
     /// widens the scan. Derived from `totalDays` so the two cannot drift apart again.
     static var previousDays: Int { totalDays - 1 }
 
+    /// The lifetime scan window for the Usage History screen's all-time card: full passes fold this
+    /// many days back — in practice everything the local logs still hold. The 30-day surfaces clip
+    /// the resulting wide series at serve time (`SpendTileMapper` filters by the window's day keys,
+    /// the trend maps exactly `totalDays` offsets, the aggregator anchors buckets on today), so one
+    /// wide fold feeds both the tiles and the history screen without a second scan.
+    static let lifetimeDays = 3650
+
     static func dayKeys(through now: Date, calendar: Calendar = .current) -> Set<String> {
         let today = calendar.startOfDay(for: now)
         return Set((0..<totalDays).compactMap { offset in
@@ -91,15 +98,20 @@ struct ProviderUsageHistory: Hashable, Sendable, Codable {
     var series: DailyUsageSeries
     var modelUsage: ModelUsageSeries?
     var unknownModelsByDay: [String: Set<String>]
+    /// Per-day public-API-rate estimate (see `LogUsageScan.apiEstimateByDay`). Additive optional so
+    /// snapshots persisted before the field decode with nil and backfill on the next full pass.
+    var apiEstimateByDay: [String: Double]? = nil
 
     init(
         series: DailyUsageSeries,
         modelUsage: ModelUsageSeries? = nil,
-        unknownModelsByDay: [String: Set<String>] = [:]
+        unknownModelsByDay: [String: Set<String>] = [:],
+        apiEstimateByDay: [String: Double]? = nil
     ) {
         self.series = series
         self.modelUsage = modelUsage
         self.unknownModelsByDay = unknownModelsByDay
+        self.apiEstimateByDay = apiEstimateByDay
     }
 }
 
@@ -120,10 +132,20 @@ struct LogUsageScan: Sendable, Codable {
     var modelUsage: ModelUsageSeries?
     /// `yyyy-MM-dd` day key → models used that day whose usage was left out because no price was available.
     var unknownModelsByDay: [String: Set<String>]
+    /// `yyyy-MM-dd` day key → what that day's usage would cost at public API rates (the "if it were all
+    /// API" comparison). Rows without any resolvable rate contribute nothing, so the estimate is honest
+    /// about coverage; nil when no row in the window could be estimated at all.
+    var apiEstimateByDay: [String: Double]?
 
-    init(series: DailyUsageSeries, modelUsage: ModelUsageSeries? = nil, unknownModelsByDay: [String: Set<String>]) {
+    init(
+        series: DailyUsageSeries,
+        modelUsage: ModelUsageSeries? = nil,
+        unknownModelsByDay: [String: Set<String>],
+        apiEstimateByDay: [String: Double]? = nil
+    ) {
         self.series = series
         self.modelUsage = modelUsage
         self.unknownModelsByDay = unknownModelsByDay
+        self.apiEstimateByDay = apiEstimateByDay
     }
 }

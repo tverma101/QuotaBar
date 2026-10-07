@@ -456,14 +456,23 @@ final class WidgetDataStore {
             currentIdentityKey: providerIdentityKeys[providerID]
         )
         if !force, !staleAccountStamp, let cached = cache.snapshot(providerID: providerID) {
-            // Skip the no-op write: `@Observable` doesn't compare values, so unconditionally
-            // re-assigning an unchanged snapshot would re-render the menu-bar label every pass.
-            AppLog.debug(.refresh, "cache hit \(providerID)")
-            if localSnapshots[providerID] != cached {
-                localSnapshots[providerID] = cached
-                rebuildRenderedSnapshots()
+            // A menu-bar merge re-stamps `refreshedAt` for the meters it computed, but its history
+            // was only carried over from the last full pass. Honoring that stamp here would let
+            // every menu-bar tick (one per TTL) keep vouching for history no pass ever recomputed —
+            // the spend tiles and unknown-model warnings would go stale forever. A full pass
+            // therefore treats carried history as stale and re-runs the provider; a menu-bar pass
+            // keeps the hit (it skips the deferred work by design).
+            if ProviderRefreshContext.scope == .menuBar || cached.carriesPriorHistory != true {
+                // Skip the no-op write: `@Observable` doesn't compare values, so unconditionally
+                // re-assigning an unchanged snapshot would re-render the menu-bar label every pass.
+                AppLog.debug(.refresh, "cache hit \(providerID)")
+                if localSnapshots[providerID] != cached {
+                    localSnapshots[providerID] = cached
+                    rebuildRenderedSnapshots()
+                }
+                return .cacheHit
             }
-            return .cacheHit
+            AppLog.info(.refresh, "\(providerID) history carried from menu-bar merge — recompute in full pass")
         }
         if !force { AppLog.debug(.refresh, "cache miss \(providerID)") }
 
@@ -565,6 +574,9 @@ final class WidgetDataStore {
            let history = localSnapshots[providerID]?.usageHistory,
            let descriptor = registry.historyDescriptorsByProvider[providerID]
         {
+            // Preserved, not computed this pass: a later full pass must re-run the scan rather than
+            // trust this snapshot's freshness stamp (see `carriesPriorHistory`).
+            snapshot.carriesPriorHistory = true
             snapshot.usageHistory = history
             snapshot = UsageHistorySnapshotRenderer.render(
                 local: snapshot,

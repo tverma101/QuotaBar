@@ -41,7 +41,7 @@ final class ClaudeProvider: ProviderRuntime {
         logUsageScanner: ClaudeLogUsageScanner = ClaudeLogUsageScanner(),
         allowsUnattributedPiUsage: Bool = true,
         now: @escaping @Sendable () -> Date = Date.init,
-        pricing: @escaping @Sendable () async -> ModelPricing = { await ModelPricingStore.shared.current() }
+        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
     ) {
         self.provider = provider
         self.authStore = authStore
@@ -304,7 +304,9 @@ final class ClaudeProvider: ProviderRuntime {
         // shared pricing store, merged with Claude usage that happened inside pi (attributed back here).
         // Both scans run on their scanner actors, off the main actor, and do not require an OAuth login.
         let pricing = await pricing()
-        let nativeScan = await logUsageScanner.scan(now: now(), pricing: pricing)
+        let nativeScan = await logUsageScanner.scan(
+            daysBack: UsageHistoryWindow.lifetimeDays, now: now(), pricing: pricing
+        )
         let piScan = allowsUnattributedPiUsage
             ? await PiUsageScanner.shared.scan(cardID: provider.id, now: now(), pricing: pricing)
             : nil
@@ -318,13 +320,15 @@ final class ClaudeProvider: ProviderRuntime {
             usageHistory = ProviderUsageHistory(
                 series: scan.series,
                 modelUsage: scan.modelUsage,
-                unknownModelsByDay: scan.unknownModelsByDay
+                unknownModelsByDay: scan.unknownModelsByDay,
+                apiEstimateByDay: scan.apiEstimateByDay
             )
             SpendTileMapper.appendTokenUsage(
                 scan.series, to: &mapped.lines, now: now(),
                 unknownModelsByDay: scan.unknownModelsByDay,
                 modelUsage: scan.modelUsage,
-                modelSourceNote: note
+                modelSourceNote: note,
+                apiEstimateByDay: scan.apiEstimateByDay
             )
             SpendTileMapper.appendUsageTrend(scan.series, to: &mapped.lines, now: now(), note: note)
         }

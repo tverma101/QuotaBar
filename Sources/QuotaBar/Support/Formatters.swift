@@ -1,24 +1,43 @@
 import Foundation
+import os
 
 /// Shared display formatters for live usage data: the mode-aware deadline/reset phrasing
 /// (`deadlineLabel`, `resetRelativeLabel`, `resetAbsoluteLabel`), compact durations, and USD currency.
 enum Formatters {
+    /// One formatter per precision, built once. ICU `NumberFormatter` construction is expensive and
+    /// this used to run per spend cell per render — measurable across a fresh dashboard mount.
+    /// `NumberFormatter` is documented thread-safe once configured (macOS 10.9+), matching the
+    /// `DateFormatter` pattern in `CursorUsageCSV`.
+    private static let currencyFormatters = OSAllocatedUnfairLock<[Int: NumberFormatter]>(initialState: [:])
+
+    private static func currencyFormatter(fractionDigits: Int) -> NumberFormatter {
+        currencyFormatters.withLock { cache in
+            if let cached = cache[fractionDigits] { return cached }
+            let f = NumberFormatter()
+            f.numberStyle = .currency
+            f.currencyCode = "USD"
+            f.locale = Locale(identifier: "en_US")
+            f.maximumFractionDigits = fractionDigits
+            f.minimumFractionDigits = fractionDigits
+            cache[fractionDigits] = f
+            return f
+        }
+    }
+
     static func currency(_ amount: Double, fractionDigits: Int = 2) -> String {
-        let f = NumberFormatter()
-        f.numberStyle = .currency
-        f.currencyCode = "USD"
-        f.locale = Locale(identifier: "en_US")
-        f.maximumFractionDigits = fractionDigits
-        f.minimumFractionDigits = fractionDigits
+        let f = currencyFormatter(fractionDigits: fractionDigits)
         // The fallback must also respect the requested precision: a raw "$\(amount)" would leak the
         // double's full decimals (e.g. "$180.168"), which is exactly the rounding glitch we're fixing.
         return f.string(from: amount as NSNumber) ?? "$\(String(format: "%.\(fractionDigits)f", amount))"
     }
 
     /// The app's compact month/day, e.g. "Jun 21" — localized, no year. Shared so every short calendar
-    /// date (reset deadlines, the Usage Trend axis) reads the same and changes in one place.
+    /// date (reset deadlines, the Usage Trend axis) reads the same and changes in one place. The style
+    /// is built once; `Date.FormatStyle` construction per call was on the row-render path.
+    private static let monthDayFormat = Date.FormatStyle.dateTime.month(.abbreviated).day()
+
     static func monthDayLabel(_ date: Date) -> String {
-        date.formatted(.dateTime.month(.abbreviated).day())
+        monthDayFormat.format(date)
     }
 
     /// The one mode-aware deadline phrase, shared by every "<verb> + when" label (reset countdowns,

@@ -340,6 +340,14 @@ actor CodexRouterUsageScanner {
                 if total > 0 {
                     fold.accumulator.addUnknownModel(day: day, model: model)
                 }
+                // Count the tokens with a dashed cost so an unrevealed codename stays visible.
+                fold.accumulator.add(
+                    day: day,
+                    tokens: total,
+                    cost: nil,
+                    model: model,
+                    canonical: model
+                )
                 return
             }
             // Match session-log rules: only priority/fast tiers apply the Codex multiplier.
@@ -357,6 +365,14 @@ actor CodexRouterUsageScanner {
                 total: total,
                 isFast: isPriorityTier
             )
+            // Public-API-rate comparison: plain catalog rates, no router priority/fast adjustments.
+            fold.accumulator.addApiEstimate(day: day, cost: resolvedPricing.rates.costDollars(
+                for: TokenBreakdown(
+                    input: max(0, input - cached),
+                    cacheRead: cached,
+                    output: output
+                )
+            ))
             let cost = CodexLogUsageScanner.cost(
                 rates: resolvedPricing.rates,
                 event: logEvent,

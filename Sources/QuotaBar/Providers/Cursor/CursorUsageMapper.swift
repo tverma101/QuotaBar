@@ -305,26 +305,39 @@ enum CursorUsageMapper {
         let calendar = Calendar.current
         var costByDay: [String: Double] = [:]
         var tokensByDay: [String: Int] = [:]
+        var apiEstimateByDay: [String: Double] = [:]
         var modelsByDay: [String: [String: ModelAccumulator]] = [:]
-        // Rows no pricing source can price (nil imputed cost) are excluded from every displayed total —
-        // tokens, dollars, the trend, and the model breakdown — because mixing measured tokens with
-        // unpriceable ones makes the figures incoherent (a huge token count next to a dollar figure that
-        // ignores it). Their model names surface only through the warning triangle: track them per day so
-        // the spend tile can warn that its figures are incomplete. Only rows that actually spent tokens
-        // count — a 0-token row of an unknown model changes nothing, so it isn't worth flagging.
+        // Rows no pricing source can price (nil imputed cost) still count their tokens with a dashed
+        // cost (owner's "count tokens, dash cost" policy) — the token total stays complete while the
+        // dollar figure only reflects priced rows. Their model names surface through the warning
+        // triangle and the reveal system. Only rows that actually spent tokens flag the day — a
+        // 0-token row of an unknown model changes nothing.
         var unknownModelsByDay: [String: Set<String>] = [:]
         for row in rows {
             let day = DailyUsageAccumulator.dayKey(from: row.date, calendar: calendar)
             let model = row.model.trimmingCharacters(in: .whitespacesAndNewlines)
+            let modelName = model.isEmpty ? ModelUsageEntry.unattributedModelName : model
+            // Public-API-rate comparison for the row's tokens (regardless of how the CSV cost was
+            // imputed — Cursor's own dollars are the displayed estimate).
+            if !model.isEmpty,
+               let apiEstimate = pricing.estimatedCostDollars(model: model, tokens: row.tokens) {
+                apiEstimateByDay[day, default: 0] += apiEstimate
+            }
             guard let cost = row.imputedCostDollars else {
                 if row.tokens.totalTokens > 0, !model.isEmpty {
                     unknownModelsByDay[day, default: []].insert(model)
                 }
+                tokensByDay[day, default: 0] += row.tokens.totalTokens
+                let family = model.isEmpty ? modelName : familyName(for: model, pricing: pricing)
+                modelsByDay[day, default: [:]][family, default: ModelAccumulator()].add(
+                    variant: modelName,
+                    tokens: row.tokens.totalTokens,
+                    costUSD: nil
+                )
                 continue
             }
             costByDay[day, default: 0] += cost
             tokensByDay[day, default: 0] += row.tokens.totalTokens
-            let modelName = model.isEmpty ? ModelUsageEntry.unattributedModelName : model
             let family = model.isEmpty ? modelName : familyName(for: model, pricing: pricing)
             modelsByDay[day, default: [:]][family, default: ModelAccumulator()].add(
                 variant: modelName,
@@ -334,12 +347,12 @@ enum CursorUsageMapper {
         }
 
         // Sum raw dollars per day, then snap to whole cents once — rounding per row would accumulate
-        // sub-cent drift across a busy day.
+        // sub-cent drift across a busy day. A day with only unpriced rows carries nil cost (dash).
         let daily = tokensByDay.keys.sorted(by: >).map { day in
             DailyUsageEntry(
                 date: day,
                 totalTokens: tokensByDay[day] ?? 0,
-                costUSD: ((costByDay[day] ?? 0) * 100).rounded() / 100
+                costUSD: costByDay[day].map { ($0 * 100).rounded() / 100 }
             )
         }
         let series = DailyUsageSeries(daily: daily)
@@ -354,7 +367,8 @@ enum CursorUsageMapper {
         SpendTileMapper.appendTokenUsage(series, to: &lines, now: now, estimated: true,
                                          unknownModelsByDay: unknownModelsByDay,
                                          modelUsage: modelUsage,
-                                         modelSourceNote: "From your Cursor usage export")
+                                         modelSourceNote: "From your Cursor usage export",
+                                         apiEstimateByDay: apiEstimateByDay.isEmpty ? nil : apiEstimateByDay)
         // Cursor's tokens come from the server-exported usage CSV, not a local CLI log, so the trend
         // note names that source rather than the "estimated from local logs" line the log-scanning
         // providers use. Tokens are measured either way.
@@ -362,7 +376,8 @@ enum CursorUsageMapper {
         return ProviderUsageHistory(
             series: series,
             modelUsage: modelUsage,
-            unknownModelsByDay: unknownModelsByDay
+            unknownModelsByDay: unknownModelsByDay,
+            apiEstimateByDay: apiEstimateByDay.isEmpty ? nil : apiEstimateByDay
         )
     }
 

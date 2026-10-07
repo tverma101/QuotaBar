@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The result of a local OpenCode scan: the combined-hosted daily series (for the spend tiles + trend,
 /// via `SpendTileMapper`) and the Go-only plan windows (for the meters). `goWindows` is `nil` when the
@@ -247,7 +248,7 @@ struct OpenCodeUsageScanner: Sendable {
         dayModelKey(day: DailyUsageAccumulator.dayKey(from: row.date), model: row.model)
     }
 
-    func scan(now: Date, daysBack: Int = 30, pricing: ModelPricing = .empty) async throws -> OpenCodeUsageScan? {
+    func scan(now: Date, daysBack: Int = UsageHistoryWindow.previousDays, pricing: ModelPricing = .empty) async throws -> OpenCodeUsageScan? {
         let paths: [String]
         do {
             paths = try databasePaths()
@@ -291,17 +292,29 @@ struct OpenCodeUsageScanner: Sendable {
             // Monthly cycle anchor: the earliest-ever local Go usage (unbounded, so it survives the
             // day-window cutoff). Best-effort per path — anchor failures are edge-warned (not silent)
             // so a persistently broken anchor query surfaces once, then falls back to calendar month.
-            do {
-                if let text = try JSONLAccountingWorkPacer.shared.perform({
-                    try sqlite.queryValue(path: path, sql: Self.anchorSQL)
-                }),
-                   let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    anchorMs = Swift.min(anchorMs ?? value, value)
+            //
+            // The anchor is memoized per database revision: it is a full-history MIN() scan that
+            // cannot change unless the database file changes (any write moves size/mtime, which the
+            // memo key catches, including a deleted oldest session), yet it re-ran on every refresh.
+            let memoKey = Self.goAnchorMemoKey(path: path)
+            if let memoKey, let anchor = Self.cachedGoAnchor(key: memoKey) {
+                anchorMs = Swift.min(anchorMs ?? anchor, anchor)
+            } else {
+                do {
+                    if let text = try JSONLAccountingWorkPacer.shared.perform({
+                        try sqlite.queryValue(path: path, sql: Self.anchorSQL)
+                    }),
+                       let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        anchorMs = Swift.min(anchorMs ?? value, value)
+                        if let memoKey {
+                            Self.storeGoAnchor(key: memoKey, anchorMs: value)
+                        }
+                    }
+                } catch {
+                    // Edge-warn via reporter path for consistency: treat anchor as a separate check;
+                    // a per-path anchor failure is rare (table missing) and should not be silent.
+                    AppLog.warn(LogTag.plugin("opencode"), "anchor query failed for \(path): \(error.localizedDescription) — monthly window falls back to calendar month")
                 }
-            } catch {
-                // Edge-warn via reporter path for consistency: treat anchor as a separate check;
-                // a per-path anchor failure is rare (table missing) and should not be silent.
-                AppLog.warn(LogTag.plugin("opencode"), "anchor query failed for \(path): \(error.localizedDescription) — monthly window falls back to calendar month")
             }
         }
         // Per-path detail is logged only for newly failing paths (the reporter edge-triggers), so a
@@ -316,7 +329,8 @@ struct OpenCodeUsageScanner: Sendable {
 
         // Combined hosted daily series (opencode-go + opencode) → the spend tiles + usage trend. Cost is
         // authoritative, so every row is "priced": feed it straight into the shared accumulator.
-        let tileSince = JSONLScanning.sinceDate(daysBack: 30, now: now)
+        // Same window the tiles label (today + the previous 29 days), so the sum matches the label.
+        let tileSince = JSONLScanning.sinceDate(daysBack: UsageHistoryWindow.previousDays, now: now)
         var accumulator = DailyUsageAccumulator()
         JSONLAccountingWorkPacer.shared.forEach(rows) { row in
             let date = Date(timeIntervalSince1970: row.ms / 1000)
@@ -816,6 +830,15 @@ struct OpenCodeUsageScanner: Sendable {
             } else {
                 cost = nil
             }
+            if let apiEstimate = pricing.estimatedCostDollars(
+                model: row.model,
+                tokens: TokenBreakdown(
+                    input: row.input, cacheWrite5m: row.cacheWrite, cacheRead: row.cacheRead, output: row.output
+                ),
+                applyLongContextRates: !row.isAggregated
+            ) {
+                accumulator.addApiEstimate(day: day, cost: apiEstimate)
+            }
             if let cost {
                 accumulator.add(day: day, tokens: row.tokens, cost: cost, model: row.model)
                 if row.burnsGoQuota {
@@ -823,7 +846,12 @@ struct OpenCodeUsageScanner: Sendable {
                 }
                 includesEstimatedCost = true
             } else {
-                accumulator.addUnknownModel(day: day, model: row.model)
+                // Unpriced rows count their tokens with a dashed cost (owner policy), so an
+                // unrevealed codename stays visible in the totals.
+                if row.tokens > 0 {
+                    accumulator.addUnknownModel(day: day, model: row.model)
+                }
+                accumulator.add(day: day, tokens: row.tokens, cost: nil, model: row.model)
             }
         }
     }
@@ -849,6 +877,11 @@ struct OpenCodeUsageScanner: Sendable {
     /// cache-read lane is authoritative; a blended $0.43/M rate from 6 DB rows (which
     /// barely exercise cache) would re-inflate Pro tiles by ~15x, re-creating the
     /// "Pro pricing wrong" bug the supplement pin fixed.
+    /// Space Bunny (`space-bunny-free`) is excluded for the inverse reason: the DB's
+    /// recorded $0/M is the free-promo artifact, not a real rate — the model is paid on
+    /// the GO plan now (opencode.ai/docs/go, verified 2026-10-06) and OpenCode kept the
+    /// legacy `-free` id, so the supplement's GO card must price the multi-billion-token
+    /// router folds instead of the poisoned $0 calibration.
     private static func effectiveRates(from rows: [Row]) -> [String: Double] {
         var totals: [String: (cost: Double, tokens: Double)] = [:]
         JSONLAccountingWorkPacer.shared.forEach(rows) { row in
@@ -862,7 +895,7 @@ struct OpenCodeUsageScanner: Sendable {
             // $0.0085/M closely matches Hermes' cache-heavy $0.007/M, so the
             // blended rate is not systematically inflated and the existing
             // gateway test expects calibration.
-            if row.model.hasPrefix("muse-") || row.model == "deepseek-v4-pro" || row.model == "deepseek/deepseek-v4-pro" {
+            if row.model.hasPrefix("muse-") || row.model == "deepseek-v4-pro" || row.model == "deepseek/deepseek-v4-pro" || row.model == "space-bunny-free" {
                 return
             }
             let t = totals[row.model] ?? (0, 0)
@@ -918,6 +951,35 @@ struct OpenCodeUsageScanner: Sendable {
     }
 
     // MARK: - SQL
+
+    // MARK: Go anchor memo
+
+    /// Process-wide memo of the monthly-cycle anchor per database revision (path + main-db stat +
+    /// WAL stat). The anchor is a full-history `MIN()` scan that ran on every refresh, but it can
+    /// only change when the database changes. The key stats both the main file and its `-wal`
+    /// companion: in WAL mode a commit touches the companion without moving the main db, so any
+    /// write — including a deleted oldest session — re-queries. Idle databases (the common
+    /// panel-open case) then skip the scan entirely.
+    private static let goAnchorMemo = OSAllocatedUnfairLock<[String: Double]>(initialState: [:])
+
+    private static func goAnchorMemoKey(path: String) -> String? {
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey]
+        func stamp(_ url: URL) -> String {
+            guard let values = try? url.resourceValues(forKeys: keys) else { return "?" }
+            return "\(values.fileSize ?? -1)|\(values.contentModificationDate?.timeIntervalSinceReferenceDate ?? -1)"
+        }
+        let main = URL(fileURLWithPath: path)
+        let wal = URL(fileURLWithPath: path + "-wal")
+        return "\(path)|\(stamp(main))|\(stamp(wal))"
+    }
+
+    private static func cachedGoAnchor(key: String) -> Double? {
+        goAnchorMemo.withLock { $0[key] }
+    }
+
+    private static func storeGoAnchor(key: String, anchorMs: Double) {
+        goAnchorMemo.withLock { $0[key] = anchorMs }
+    }
 
     /// SQL literal built from `hostedProviderIDs`, so the tracked list has one source of truth.
     private static let providerFilter = "(" + hostedProviderIDs.map { "'\($0)'" }.joined(separator: ",") + ")"

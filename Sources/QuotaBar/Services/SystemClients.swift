@@ -191,7 +191,7 @@ struct LocalTextFileAccessor: TextFileAccessing {
             let length = current.withCString { Darwin.readlink($0, &buffer, buffer.count - 1) }
             guard length > 0 else { return current }
             buffer[length] = 0
-            let target = String(cString: buffer)
+            let target = String(decoding: buffer[..<length].map { UInt8(bitPattern: $0) }, as: UTF8.self)
             let next = target.hasPrefix("/")
                 ? target
                 : fallbackParent.path + "/" + target

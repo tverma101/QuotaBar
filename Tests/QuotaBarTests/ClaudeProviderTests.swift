@@ -375,47 +375,64 @@ final class ClaudeProviderTests: XCTestCase {
     }
 
     func testNoCredentialsWithLogsThatContainNoSpendStillReportsNotLoggedIn() async throws {
+        // The two no-credential states must stay distinct. A log line that folds into nothing
+        // (zero tokens, zero cost) is "no spend": the provider reports not-logged-in as a hard
+        // error badge with no history. A line with real spend — even one the 30-day tiles can't
+        // show — is local usage: the not-logged-in state demotes to the soft warning (like the
+        // inference-only case) and the history carries it.
         let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
-        let fixtures = [
-            (
-                name: "out-of-window usage",
-                line: ClaudeLogFixture.usageLine(
-                    timestamp: "2025-12-20T16:00:00.000Z", input: 100, output: 50, costUSD: 0.25
-                )
+
+        let zeroHome = try ClaudeLogFixture.makeHome(files: [
+            "project-a/session.jsonl": ClaudeLogFixture.usageLine(
+                timestamp: "2026-02-20T16:00:00.000Z", input: 0, output: 0, costUSD: 0
+            )
+        ])
+        let zeroProvider = ClaudeProvider(
+            authStore: ClaudeAuthStore(
+                environment: FakeEnvironment(),
+                files: FakeFiles(),
+                keychain: FakeKeychain(),
+                now: { now }
             ),
-            (
-                name: "zero-token, zero-cost usage",
-                line: ClaudeLogFixture.usageLine(
-                    timestamp: "2026-02-20T16:00:00.000Z", input: 0, output: 0, costUSD: 0
-                )
-            )
-        ]
+            logUsageScanner: ClaudeLogFixture.scanner(home: zeroHome),
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+        let zeroSnapshot = await zeroProvider.refresh()
+        XCTAssertEqual(badge(zeroSnapshot.lines, "Error"), ClaudeAuthError.notLoggedIn.localizedDescription)
+        XCTAssertEqual(zeroSnapshot.errorCategory, .notLoggedIn)
+        XCTAssertNil(zeroSnapshot.warning)
+        XCTAssertNil(zeroSnapshot.usageHistory, "zero-token, zero-cost usage is no history at all")
 
-        for fixture in fixtures {
-            let home = try ClaudeLogFixture.makeHome(files: ["project-a/session.jsonl": fixture.line])
-            let provider = ClaudeProvider(
-                authStore: ClaudeAuthStore(
-                    environment: FakeEnvironment(),
-                    files: FakeFiles(),
-                    keychain: FakeKeychain(),
-                    now: { now }
-                ),
-                logUsageScanner: ClaudeLogFixture.scanner(home: home),
-                now: { now },
-                pricing: { TestPricing.bundled }
+        let decemberHome = try ClaudeLogFixture.makeHome(files: [
+            "project-a/session.jsonl": ClaudeLogFixture.usageLine(
+                timestamp: "2025-12-20T16:00:00.000Z", input: 100, output: 50, costUSD: 0.25
             )
-
-            let snapshot = await provider.refresh()
-
-            XCTAssertEqual(
-                badge(snapshot.lines, "Error"),
-                ClaudeAuthError.notLoggedIn.localizedDescription,
-                fixture.name
-            )
-            XCTAssertEqual(snapshot.errorCategory, .notLoggedIn, fixture.name)
-            XCTAssertNil(snapshot.warning, fixture.name)
-            XCTAssertNil(snapshot.usageHistory, fixture.name)
-        }
+        ])
+        let decemberProvider = ClaudeProvider(
+            authStore: ClaudeAuthStore(
+                environment: FakeEnvironment(),
+                files: FakeFiles(),
+                keychain: FakeKeychain(),
+                now: { now }
+            ),
+            logUsageScanner: ClaudeLogFixture.scanner(home: decemberHome),
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+        let decemberSnapshot = await decemberProvider.refresh()
+        XCTAssertEqual(decemberSnapshot.warning, ClaudeAuthError.notLoggedIn.localizedDescription,
+                       "real local spend demotes not-logged-in to the soft warning")
+        XCTAssertNil(badge(decemberSnapshot.lines, "Error"), decemberSnapshot.warning ?? "no warning")
+        let decemberHistory = try XCTUnwrap(decemberSnapshot.usageHistory, "lifetime folding keeps pre-window spend")
+        XCTAssertEqual(
+            decemberHistory.series.daily.first?.date, "2025-12-20",
+            "the fold reaches the whole log corpus, not just the 30-day tiles' window"
+        )
+        XCTAssertFalse(
+            decemberHistory.series.daily.contains { $0.totalTokens == 0 && $0.costUSD == nil },
+            "a zero-usage line must not fabricate an idle day entry"
+        )
     }
 
     func testInferenceOnlyScopeSurfacesReloginWarningAndSkipsUsageCallButKeepsSpendTiles() async throws {

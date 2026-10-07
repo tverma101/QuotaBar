@@ -60,6 +60,13 @@ private struct ReducedMotionPopoverPresenter<PopoverContent: View>: NSViewRepres
 
     func updateNSView(_ nsView: PopoverAnchorView, context: Context) {
         context.coordinator.isPresented = $isPresented
+        // Building the content (detail views, AnyView erasure) is only needed once actually
+        // presented — building it while hidden re-erased the subtree on every row render of a
+        // fresh dashboard mount. When not presented, just reconcile the close state.
+        guard isPresented else {
+            context.coordinator.synchronize(with: nsView)
+            return
+        }
         context.coordinator.update(
             content: AnyView(popoverContent()),
             reduceAnimations: reduceAnimations,

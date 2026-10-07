@@ -41,8 +41,8 @@ final class LocalUsageServer {
                 AppLog.info(.localAPI, "disabled: \(error.localizedDescription)")
             }
         }
-        listener.newConnectionHandler = { connection in
-            Task { @MainActor [weak self] in
+        listener.newConnectionHandler = { [weak self] connection in
+            Task { @MainActor in
                 self?.accept(connection)
             }
         }
@@ -63,8 +63,8 @@ final class LocalUsageServer {
     /// Reads until the end of the request head (`\r\n\r\n`). GET/OPTIONS bodies are irrelevant,
     /// so the head is all the router needs.
     private func receiveHead(_ connection: NWConnection, buffered: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.headLimit) { data, _, isComplete, error in
-            Task { @MainActor [weak self] in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.headLimit) { [weak self] data, _, isComplete, error in
+            Task { @MainActor in
                 guard let self else {
                     connection.cancel()
                     return

@@ -86,7 +86,18 @@ actor CodexProxyUsageScanner {
                       let cost = pricing.estimatedCostDollars(model: pricingModel, tokens: tokens)
                 else {
                     accumulator.addUnknownModel(day: day, model: model)
+                    // Unpriced rows count their tokens with a dashed cost (owner policy).
+                    accumulator.add(
+                        day: day,
+                        tokens: total,
+                        cost: nil,
+                        model: model,
+                        canonical: GatewaySlug.identity(of: model, resolvedPricingModel: model)
+                    )
                     return
+                }
+                if let apiEstimate = pricing.estimatedCostDollars(model: pricingModel, tokens: tokens) {
+                    accumulator.addApiEstimate(day: day, cost: apiEstimate)
                 }
                 // Same reason as the router scanner: the proxy stamps routing prefixes onto its slugs, so
                 // keying on the raw slug split one model across rows and counted it twice in the total.

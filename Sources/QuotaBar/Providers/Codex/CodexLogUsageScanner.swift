@@ -209,7 +209,7 @@ actor CodexLogUsageScanner {
         self.scanner = incrementalScanner ?? Self.sharedScanner
     }
 
-    func scan(daysBack: Int = 30, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+    func scan(daysBack: Int = UsageHistoryWindow.previousDays, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
         let homes = codexHomes()
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
         let files = Self.sessionFiles(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory)
@@ -233,11 +233,17 @@ actor CodexLogUsageScanner {
         prepareInodeAggregates(
             identity: context.identity,
             pricingToken: pricingToken,
-            since: context.requestedSince,
+            since: context.cacheSince,
             timeZone: timeZone
         )
 
         let requestedSince = context.requestedSince
+        // Per-inode aggregates fold the RETENTION window (cacheSince — stable within a day), not the
+        // requested one. Keying them on requestedSince made every scope change discard every
+        // aggregate: menu-bar passes (small daysBack) and full passes (30 days) alternate, so each
+        // paid a full re-fold of the whole session corpus. The narrower window is clipped at serve
+        // time instead, from the same retained aggregates.
+        let minDayKey = DailyUsageAccumulator.dayKey(from: requestedSince)
         var unchanged: [LogUsageScan] = []
         var changed: [JSONLScanning.DiscoveredFile] = []
         var liveInodes: Set<InodeAggregateKey> = []
@@ -262,8 +268,11 @@ actor CodexLogUsageScanner {
             inodeAggregates = inodeAggregates.filter { liveInodes.contains($0.key) }
         }
         if changed.isEmpty {
-            return DailyUsageAccumulator.merged(unchanged) ?? DailyUsageAccumulator().build()
+            AppLog.debug(LogTag.plugin("codex"), "aggregate split: unchanged=\(unchanged.count) changed=0")
+            return DailyUsageAccumulator.merged(unchanged, droppingDaysBefore: minDayKey)
+                ?? DailyUsageAccumulator().build()
         }
+        AppLog.debug(LogTag.plugin("codex"), "aggregate split: unchanged=\(unchanged.count) changed=\(changed.count)")
 
         let bucket = PerFileFoldBucket()
         let ok = await scanner.foldItems(
@@ -278,7 +287,7 @@ actor CodexLogUsageScanner {
             visit: { event in
                 Self.accumulate(
                     event: event,
-                    since: requestedSince,
+                    since: context.cacheSince,
                     pricing: pricing,
                     seen: &bucket.fold.seen,
                     accumulator: &bucket.fold.accumulator
@@ -309,10 +318,11 @@ actor CodexLogUsageScanner {
         persistInodeAggregates(
             identity: context.identity,
             pricingToken: pricingToken,
-            since: context.requestedSince,
+            since: context.cacheSince,
             timeZone: timeZone
         )
-        return DailyUsageAccumulator.merged(unchanged) ?? DailyUsageAccumulator().build()
+        return DailyUsageAccumulator.merged(unchanged, droppingDaysBefore: minDayKey)
+            ?? DailyUsageAccumulator().build()
     }
 
     private func prepareInodeAggregates(
@@ -335,12 +345,24 @@ actor CodexLogUsageScanner {
         }
         guard !didAttemptAggregateLoad else { return }
         didAttemptAggregateLoad = true
-        guard Self.persistsUsageAggregates,
-              let loaded = Self.readInodeAggregates(identity: identity),
+        guard Self.persistsUsageAggregates else { return }
+        let loaded = Self.readInodeAggregates(identity: identity)
+        if loaded == nil {
+            AppLog.debug(LogTag.plugin("codex"), "aggregate load: no index on disk for identity")
+        }
+        guard let loaded,
               loaded.pricingToken == pricingToken,
               loaded.timeZoneIdentifier == timeZone,
               Self.timestampsMatch(loaded.since, since)
-        else { return }
+        else {
+            if let loaded {
+                AppLog.debug(
+                    LogTag.plugin("codex"),
+                    "aggregate load rejected: tokenMatch=\(loaded.pricingToken == pricingToken) tzMatch=\(loaded.timeZoneIdentifier == timeZone) sinceMatch=\(Self.timestampsMatch(loaded.since, since))"
+                )
+            }
+            return
+        }
         var restored: [InodeAggregateKey: InodeAggregateRecord] = [:]
         restored.reserveCapacity(loaded.records.count)
         for entry in loaded.records {
@@ -1242,8 +1264,12 @@ actor CodexLogUsageScanner {
         guard seen.insert(key).inserted else { return }
 
         let day = DailyUsageAccumulator.dayKey(from: event.timestamp)
-        let trimmedModel = event.model.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-        guard let model = trimmedModel else { return }
+        // An empty model is not a reason to drop the row's tokens: count them under the shared
+        // Unattributed name (same convention as the Claude scanner). The pricing lookup then misses
+        // and the day's warning triangle carries "Unattributed", so the loss is visible instead of
+        // silently vanishing from every total.
+        let model = event.model.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            ?? ModelUsageEntry.unattributedModelName
         // OpenCode Go/Zen gateway turns are folded into the OpenCode card; counting them here
         // double-counts the same dollars/tokens in Total Spend.
         if OpenCodeUsageScanner.isHostedGatewayModel(model) { return }
@@ -1253,10 +1279,27 @@ actor CodexLogUsageScanner {
         let rateModel = isFastAlias ? String(canonicalModel.dropLast("-fast".count)) : canonicalModel
         let baseRates = pricing.resolve(model: rateModel)
         let resolvedRates = baseRates ?? pricing.resolve(model: pricingModel)
+        // Public-API-rate comparison: the same tokens at the catalog rates, without the router's
+        // priority/fast-tier adjustments. Unrevealed codenames contribute nothing.
+        let apiEstimate = resolvedRates.map { rates in
+            rates.costDollars(for: TokenBreakdown(
+                input: max(0, event.input - event.cached),
+                cacheRead: event.cached,
+                output: event.output
+            ))
+        }
         guard let rates = resolvedRates else {
             if event.total > 0 {
                 accumulator.addUnknownModel(day: day, model: model)
             }
+            // Count the tokens with a dashed cost so an unrevealed codename stays visible.
+            accumulator.add(
+                day: day,
+                tokens: event.total,
+                cost: nil,
+                model: model,
+                canonical: GatewaySlug.identity(of: model, resolvedPricingModel: rateModel)
+            )
             return
         }
         let appliesCodexFastTier = isFastAlias ? baseRates != nil : event.isFast
@@ -1267,6 +1310,9 @@ actor CodexLogUsageScanner {
             fastTier: appliesCodexFastTier,
             fastMultiplier: codexPriorityMultiplier(for: rateModel, rates: rates)
         )
+        if let apiEstimate {
+            accumulator.addApiEstimate(day: day, cost: apiEstimate)
+        }
         // Key the row on the resolved model, not the emitted slug. Session logs carry gateway-prefixed
         // slugs too, so the same model can arrive both tagged and untagged; grouping on the raw slug split
         // it across rows and into the period total twice. The spelling is kept as a tooltip variant.

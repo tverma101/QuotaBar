@@ -33,13 +33,15 @@ enum JSONLScanning {
                 .contentModificationDateKey,
                 .attributeModificationDateKey,
             ]
+            // One set for the whole enumeration: allocating per file dominated deep trees.
+            let keySet = Set(keys)
             guard let enumerator = FileManager.default.enumerator(
                 at: dir, includingPropertiesForKeys: keys, options: []
             ) else { return [] }
             var files: [DiscoveredFile] = []
             for case let url as URL in enumerator {
                 guard url.pathExtension == "jsonl",
-                      let values = try? url.resourceValues(forKeys: Set(keys)),
+                      let values = try? url.resourceValues(forKeys: keySet),
                       values.isRegularFile == true
                 else { continue }
                 files.append(DiscoveredFile(
@@ -193,42 +195,18 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         let retainItems = retainsResidentItemsNow
         await loadCacheIfNeeded(identity: cacheIdentity, retainItems: retainItems)
         guard !Task.isCancelled else { return nil }
-        let currentCache = caches[cacheIdentity] ?? [:]
         // Keep other same-parser scans' files in the shared partition until they age out of the window.
         // This lets multi-account cards with disjoint roots share one actor safely; only the current
         // call's input paths are returned below.
-        var nextCache = currentCache.filter { $0.value.mtime >= since }
-        var toParse: [JSONLScanning.DiscoveredFile] = []
-        for file in files {
-            guard file.mtime >= since else { continue }
-            if let cached = currentCache[file.path],
-               cached.size == file.size,
-               cached.mtime == file.mtime,
-               cached.attributeMtime == file.attributeMtime
-            {
-                if cached.items.isEmpty && (!retainItems || unloadedResidentPaths[cacheIdentity]?.contains(file.path) == true) {
-                    // Metadata hit after unload (or metadata-only disk load): hydrate one record or reparse.
-                    if let hydrated = await hydrateResidentItems(
-                        identity: cacheIdentity,
-                        path: file.path,
-                        expected: cached
-                    ) {
-                        nextCache[file.path] = hydrated
-                        unloadedResidentPaths[cacheIdentity]?.remove(file.path)
-                    } else {
-                        nextCache[file.path] = nil
-                        unloadedResidentPaths[cacheIdentity]?.remove(file.path)
-                        toParse.append(file)
-                    }
-                } else {
-                    nextCache[file.path] = cached
-                }
-            } else {
-                nextCache[file.path] = nil
-                unloadedResidentPaths[cacheIdentity]?.remove(file.path)
-                toParse.append(file)
-            }
-        }
+        guard let plan = await planScanCache(
+            identity: cacheIdentity,
+            files: files,
+            since: since,
+            retainItems: retainItems
+        ) else { return nil }
+        let currentCache = plan.currentCache
+        var nextCache = plan.nextCache
+        let toParse = plan.toParse
         let parseResults = await Self.parseFiles(
             toParse,
             maxConcurrentParses: maxConcurrentParses,
@@ -328,38 +306,15 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         let retainItems = retainsResidentItemsNow
         await loadCacheIfNeeded(identity: cacheIdentity, retainItems: retainItems)
         guard !Task.isCancelled else { return false }
-        let currentCache = caches[cacheIdentity] ?? [:]
-        var nextCache = currentCache.filter { $0.value.mtime >= since }
-        var toParse: [JSONLScanning.DiscoveredFile] = []
-        for file in files {
-            guard file.mtime >= since else { continue }
-            if let cached = currentCache[file.path],
-               cached.size == file.size,
-               cached.mtime == file.mtime,
-               cached.attributeMtime == file.attributeMtime
-            {
-                if cached.items.isEmpty && (!retainItems || unloadedResidentPaths[cacheIdentity]?.contains(file.path) == true) {
-                    if let hydrated = await hydrateResidentItems(
-                        identity: cacheIdentity,
-                        path: file.path,
-                        expected: cached
-                    ) {
-                        nextCache[file.path] = hydrated
-                        unloadedResidentPaths[cacheIdentity]?.remove(file.path)
-                    } else {
-                        nextCache[file.path] = nil
-                        unloadedResidentPaths[cacheIdentity]?.remove(file.path)
-                        toParse.append(file)
-                    }
-                } else {
-                    nextCache[file.path] = cached
-                }
-            } else {
-                nextCache[file.path] = nil
-                unloadedResidentPaths[cacheIdentity]?.remove(file.path)
-                toParse.append(file)
-            }
-        }
+        guard let plan = await planScanCache(
+            identity: cacheIdentity,
+            files: files,
+            since: since,
+            retainItems: retainItems
+        ) else { return false }
+        let currentCache = plan.currentCache
+        var nextCache = plan.nextCache
+        let toParse = plan.toParse
         let parseResults = await Self.parseFiles(
             toParse,
             maxConcurrentParses: maxConcurrentParses,
@@ -704,6 +659,72 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         }
     }
 
+    /// Classification for one scan pass: which cache entries carry forward, which files need parsing,
+    /// and what the previous pass had retained. Shared by `items` and `foldItems`, which used to run
+    /// two diverging copies of the same loop.
+    private struct ScanCachePlan {
+        var currentCache: [String: CachedFile]
+        var nextCache: [String: CachedFile]
+        var toParse: [JSONLScanning.DiscoveredFile]
+    }
+
+    /// Revision-classify the discovered files against the resident cache and hydrate every metadata
+    /// hit in ONE locked cross-process pass. Hydrating N records through the per-record API cost
+    /// N lock acquisitions (~8 syscalls each) on every refresh; batching keeps the identical
+    /// shared-read guarantees while paying the acquisition once.
+    private func planScanCache(
+        identity: String,
+        files: [JSONLScanning.DiscoveredFile],
+        since: Date,
+        retainItems: Bool
+    ) async -> ScanCachePlan? {
+        let currentCache = caches[identity] ?? [:]
+        var nextCache = currentCache.filter { $0.value.mtime >= since }
+        var toParse: [JSONLScanning.DiscoveredFile] = []
+        var toHydrate: [(path: String, expected: CachedFile)] = []
+        var filesByPath: [String: JSONLScanning.DiscoveredFile] = [:]
+        filesByPath.reserveCapacity(files.count)
+
+        for file in files {
+            filesByPath[file.path] = file
+            guard file.mtime >= since else { continue }
+            if let cached = currentCache[file.path],
+               cached.size == file.size,
+               cached.mtime == file.mtime,
+               cached.attributeMtime == file.attributeMtime
+            {
+                if cached.items.isEmpty && (!retainItems || unloadedResidentPaths[identity]?.contains(file.path) == true) {
+                    // Metadata hit after unload (or metadata-only disk load): hydrate or reparse.
+                    toHydrate.append((file.path, cached))
+                } else {
+                    nextCache[file.path] = cached
+                }
+            } else {
+                nextCache[file.path] = nil
+                unloadedResidentPaths[identity]?.remove(file.path)
+                toParse.append(file)
+            }
+        }
+
+        if !toHydrate.isEmpty {
+            let hydrated = await hydrateResidentItemsBatch(identity: identity, requests: toHydrate)
+            guard !Task.isCancelled else { return nil }
+            for request in toHydrate {
+                if let cached = hydrated[request.path] {
+                    nextCache[request.path] = cached
+                    unloadedResidentPaths[identity]?.remove(request.path)
+                } else {
+                    nextCache[request.path] = nil
+                    unloadedResidentPaths[identity]?.remove(request.path)
+                    if let file = filesByPath[request.path] {
+                        toParse.append(file)
+                    }
+                }
+            }
+        }
+        return ScanCachePlan(currentCache: currentCache, nextCache: nextCache, toParse: toParse)
+    }
+
     private func scheduleWrite(identity: String) {
         guard let persistence else { return }
         let generation = writeGenerations[identity, default: 0] + 1
@@ -838,13 +859,14 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         }
     }
 
-    /// Reload one persisted record whose resident items were unloaded (or never loaded).
-    private func hydrateResidentItems(
+    /// Revision-checked persisted metadata for one unloaded path. nil means the durable record's
+    /// revision cannot serve the expected cheap tuple (reparsing is the only safe path).
+    private func hydrationMetadata(
         identity: String,
         path: String,
         expected: CachedFile
-    ) async -> CachedFile? {
-        guard let persistence else { return nil }
+    ) -> JSONLScanCacheFileMetadata? {
+        guard persistence != nil else { return nil }
         let metadata = persistedMetadata[identity]?[path] ?? JSONLScanCacheFileMetadata(
             size: expected.size,
             mtime: expected.mtime,
@@ -859,6 +881,53 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         guard metadata.size == expected.size,
               metadata.mtime == expected.mtime,
               metadata.attributeMtime == expected.attributeMtime
+        else { return nil }
+        return metadata
+    }
+
+    /// One locked pass for every metadata hit in a scan. Missing bytes and revision mismatches map
+    /// to nil so the caller reparses them, matching the single-record contract.
+    private func hydrateResidentItemsBatch(
+        identity: String,
+        requests: [(path: String, expected: CachedFile)]
+    ) async -> [String: CachedFile] {
+        guard let persistence, !requests.isEmpty else { return [:] }
+        var requested: [String: JSONLScanCacheFileMetadata] = [:]
+        requested.reserveCapacity(requests.count)
+        for request in requests {
+            guard let metadata = hydrationMetadata(
+                identity: identity,
+                path: request.path,
+                expected: request.expected
+            ) else { continue }
+            requested[request.path] = metadata
+        }
+        guard !requested.isEmpty else { return [:] }
+        do {
+            let (files, invalid) = try JSONLScanCacheWriter.shared.loadRecords(
+                persistence: persistence,
+                identity: identity,
+                requested: requested,
+                itemType: Item.self
+            )
+            var result = files
+            for path in invalid.keys {
+                result[path] = nil
+            }
+            return result
+        } catch {
+            return [:]
+        }
+    }
+
+    /// Reload one persisted record whose resident items were unloaded (or never loaded).
+    private func hydrateResidentItems(
+        identity: String,
+        path: String,
+        expected: CachedFile
+    ) async -> CachedFile? {
+        guard let persistence,
+              let metadata = hydrationMetadata(identity: identity, path: path, expected: expected)
         else { return nil }
 
         do {

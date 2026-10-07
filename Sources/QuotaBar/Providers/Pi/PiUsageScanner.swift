@@ -58,7 +58,7 @@ actor PiUsageScanner {
 
     /// Scan the last `daysBack` days of pi logs for one card. Returns nil when pi's sessions directory
     /// has no log files at all, so a provider with no pi usage folds in nothing.
-    func scan(cardID: String, daysBack: Int = 30, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+    func scan(cardID: String, daysBack: Int = UsageHistoryWindow.previousDays, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
         let directory = PiPaths.sessionsDirectory(environment: environment, homeDirectory: homeDirectory())
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
         let cacheIdentity = directory.resolvingSymlinksInPath().path
@@ -164,9 +164,8 @@ actor PiUsageScanner {
     }
 
     /// Bucket the card's entries into local calendar days. Cost is pi's carried total when it recorded
-    /// one, else the tokens priced through `pricing`; a model that can't be priced and carries no cost
-    /// is excluded from the totals and surfaced as the tile's unknown-model warning, matching the log
-    /// scanners.
+    /// one, else the tokens priced through `pricing`; a row that can't be priced counts its tokens with
+    /// a dashed cost and surfaces as the tile's unknown-model warning, matching the log scanners.
     static func aggregate(entries: [Entry], cardID: String, since: Date, pricing: ModelPricing) -> LogUsageScan {
         var accumulator = DailyUsageAccumulator()
         JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
@@ -175,16 +174,20 @@ actor PiUsageScanner {
             let trimmedModel = entry.model.nilIfEmpty
             let modelName = trimmedModel ?? ModelUsageEntry.unattributedModelName
 
-            let cost: Double
+            let cost: Double?
             if let carried = entry.carriedCost, carried > 0 {
                 cost = carried
             } else if let model = trimmedModel, let estimated = pricing.estimatedCostDollars(model: model, tokens: entry.tokens) {
                 cost = estimated
             } else {
-                if let model = trimmedModel, entry.reportedTotalTokens > 0 {
-                    accumulator.addUnknownModel(day: day, model: model)
-                }
-                return
+                cost = nil
+            }
+            if cost == nil, entry.reportedTotalTokens > 0 {
+                accumulator.addUnknownModel(day: day, model: modelName)
+            }
+            if let model = trimmedModel,
+               let apiEstimate = pricing.estimatedCostDollars(model: model, tokens: entry.tokens) {
+                accumulator.addApiEstimate(day: day, cost: apiEstimate)
             }
             accumulator.add(day: day, tokens: entry.reportedTotalTokens, cost: cost, model: modelName)
         }

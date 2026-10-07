@@ -71,6 +71,7 @@ enum UsageHistoryAggregator {
         includedDays: Set<String>
     ) -> ProviderUsageHistory {
         var days: [String: (tokens: Int, cost: Double?, sawCost: Bool)] = [:]
+        var apiEstimates: [String: Double] = [:]
         var models: [String: [String: ModelAccumulator]] = [:]
         var unknown: [String: Set<String>] = [:]
 
@@ -83,6 +84,9 @@ enum UsageHistoryAggregator {
                     value.sawCost = true
                 }
                 days[day.date] = value
+            }
+            for (day, estimate) in history.apiEstimateByDay ?? [:] where includedDays.contains(day) {
+                apiEstimates[day, default: 0] += estimate
             }
             for day in history.modelUsage?.daily ?? [] where includedDays.contains(day.date) {
                 for model in day.models {
@@ -113,7 +117,8 @@ enum UsageHistoryAggregator {
         return ProviderUsageHistory(
             series: series,
             modelUsage: modelDays.isEmpty ? nil : ModelUsageSeries(daily: modelDays),
-            unknownModelsByDay: unknown
+            unknownModelsByDay: unknown,
+            apiEstimateByDay: apiEstimates.isEmpty ? nil : apiEstimates
         )
     }
 
@@ -189,7 +194,8 @@ enum UsageHistorySnapshotRenderer {
             estimated: descriptor.estimatedCost,
             unknownModelsByDay: history.unknownModelsByDay,
             modelUsage: history.modelUsage,
-            modelSourceNote: sourceNote
+            modelSourceNote: sourceNote,
+            apiEstimateByDay: history.apiEstimateByDay
         )
         SpendTileMapper.appendUsageTrend(
             history.series,

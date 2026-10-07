@@ -38,8 +38,9 @@ final class PopoverTransparencyStore {
     /// mid Space-switch while still following the user on-screen, so an occlusion gate would freeze the
     /// animation on the very panel the user is now looking at.
     /// Process-wide panel visibility for background watchers (ledger FSEvents) that cannot hop
-    /// onto the main actor synchronously. Updated only from `setPopoverShown`.
-    nonisolated(unsafe) private static let panelOpenLock = OSAllocatedUnfairLock(initialState: false)
+    /// onto the main actor synchronously. Updated only from `setPopoverShown`. `nonisolated` (not
+    /// `nonisolated(unsafe)`) is enough for a `static let` of Sendable lock type.
+    nonisolated private static let panelOpenLock = OSAllocatedUnfairLock(initialState: false)
 
     /// Nonisolated read of whether the popover is on-screen. Safe for DispatchSource callbacks.
     nonisolated static var isPopoverShownUnlocked: Bool {

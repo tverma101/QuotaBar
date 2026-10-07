@@ -743,7 +743,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
         XCTAssertEqual(long.series.daily.first?.costUSD ?? 0, 3.96, accuracy: 0.000_001)
     }
 
-    func testAggregateUnknownModelIsExcludedFromTotalsButWarns() {
+    func testAggregateUnknownModelCountsTokensButDashesCost() {
         let scan = CodexLogUsageScanner.aggregate(
             events: [
                 makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "mystery-model-9"),
@@ -752,12 +752,14 @@ final class CodexLogUsageScannerTests: XCTestCase {
             since: .distantPast, pricing: fixedRates()
         )
 
-        // Unpriceable tokens never enter the displayed totals — they surface only through the
-        // warning triangle, so the tile's tokens and dollars stay coherent.
-        XCTAssertEqual(scan.series.daily.first?.totalTokens, 150)
-        XCTAssertNotNil(scan.series.daily.first?.costUSD)
+        // Count tokens, dash cost (owner policy): unpriceable tokens stay in the token total so it
+        // matches the provider's own accounting; only priced rows contribute dollars. The unknown
+        // model keeps its warning triangle AND a visible breakdown row (cost nil).
+        XCTAssertEqual(scan.series.daily.first?.totalTokens, 300)
+        // Only the priced gpt-5.2 event contributes dollars: (100/1M·1000) + (50/1M·3000) = 0.25.
+        XCTAssertEqual(scan.series.daily.first?.costUSD, 0.25)
         XCTAssertEqual(scan.unknownModelsByDay[TestLocalInstant.isoDay(2026, 5, 12)], ["mystery-model-9"])
-        XCTAssertEqual(scan.modelUsage?.daily.first?.models.map(\.model), ["gpt-5.2"])
+        XCTAssertEqual(scan.modelUsage?.daily.first?.models.map(\.model), ["gpt-5.2", "mystery-model-9"])
     }
 
     func testAggregateUnknownModelOnlyLeavesDayUnbacked() {
@@ -766,11 +768,44 @@ final class CodexLogUsageScannerTests: XCTestCase {
             since: .distantPast, pricing: fixedRates()
         )
 
-        // A day with nothing priceable produces no series entry at all (→ "No data"), but the
-        // unknown-model warning still names what was excluded.
-        XCTAssertTrue(scan.series.daily.isEmpty)
+        // A day with nothing priceable still reports its measured tokens with a nil cost (→ "$— ·
+        // 150 tokens"), and the breakdown names the unpriced model so the reveal system can backfill it.
+        XCTAssertEqual(scan.series.daily.first?.totalTokens, 150)
+        XCTAssertNil(scan.series.daily.first?.costUSD)
         XCTAssertEqual(scan.unknownModelsByDay[TestLocalInstant.isoDay(2026, 5, 12)], ["mystery-model-9"])
-        XCTAssertEqual(scan.modelUsage?.daily ?? [], [])
+        XCTAssertEqual(scan.modelUsage?.daily.first?.models.map(\.model), ["mystery-model-9"])
+        XCTAssertNil(scan.modelUsage?.daily.first?.models.first?.costUSD)
+    }
+
+    /// The per-model rows of a fold must come out in a deterministic total order (cost desc, tokens
+    /// desc, name asc). `build()` folds a dictionary whose iteration order is randomized per run, so
+    /// without the tiebreakers the same corpus produced differently-ordered rows scan to scan — the
+    /// history screen and tests read unstable data. Repeated aggregation of one tied-token corpus
+    /// must agree every time.
+    func testModelRowOrderIsDeterministicAcrossScans() {
+        // Three unpriced models with EQUAL tokens (150 each — the pure tie that dictionary
+        // randomization reorders) plus one priced model that outranks them on cost.
+        let events = [
+            makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "mystery-b"),
+            makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "mystery-a"),
+            makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "mystery-c"),
+            makeEvent(TestLocalInstant.iso(2026, 5, 12, 9, 0), model: "gpt-5.2")
+        ]
+
+        let first = CodexLogUsageScanner.aggregate(events: events, since: .distantPast, pricing: fixedRates())
+            .modelUsage?.daily.first?.models.map(\.model)
+        XCTAssertNotNil(first)
+
+        // Dictionary iteration order is randomized per process (and per run), so 25 repeats of the
+        // same fold must all agree with the first — and with the documented total order.
+        for _ in 0..<25 {
+            let again = CodexLogUsageScanner.aggregate(events: events, since: .distantPast, pricing: fixedRates())
+                .modelUsage?.daily.first?.models.map(\.model)
+            XCTAssertEqual(again, first, "identical events must produce identically ordered model rows")
+        }
+
+        // The order itself: the priced row first (cost outranks), then the tied unpriced trio by name.
+        XCTAssertEqual(first, ["gpt-5.2", "mystery-a", "mystery-b", "mystery-c"])
     }
 
     func testAggregateFiltersEventsBeforeSince() {
@@ -897,6 +932,27 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
         let second = await scanner.scan(pricing: fixedRates())
         XCTAssertEqual(second?.series.daily.reduce(0) { $0 + $1.totalTokens }, 200)
+    }
+
+    /// A token_count event with an empty model name must not lose its tokens: the resolver falls
+    /// back to the session's current model and the row prices and counts end to end.
+    func testEmptyModelRowsKeepTheirTokensViaSessionModelFallback() async throws {
+        let day = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-3600))
+        let home = try CodexLogFixture.makeHome(files: [
+            "sessions/rollout-a.jsonl": [
+                CodexLogFixture.turnContext(timestamp: day, model: "gpt-5.2"),
+                CodexLogFixture.tokenCount(
+                    timestamp: day, last: CodexLogFixture.usage(input: 100, output: 50), model: ""
+                )
+            ].joined(separator: "\n")
+        ])
+        let scanner = CodexLogFixture.scanner(home: home)
+
+        let scan = await scanner.scan(pricing: fixedRates())
+        XCTAssertEqual(scan?.series.daily.reduce(0) { $0 + $1.totalTokens }, 150,
+                       "empty-model rows fall back to the session model and keep their tokens")
+        XCTAssertTrue(scan?.unknownModelsByDay.isEmpty == true,
+                      "the session fallback model prices, so no warning triangle")
     }
 
     /// Manual parity harness against the real logs on this machine: prints per-day totals to compare

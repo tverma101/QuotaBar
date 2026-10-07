@@ -99,8 +99,10 @@ final class CursorSpendRangeTests: XCTestCase {
         // Tokens come from Cursor; dollars are calculated locally and marked as estimated.
         XCTAssertEqual(values(lines, "Today"), [MetricValue(number: 1.00, kind: .dollars, estimated: true), MetricValue(number: 100, kind: .count, label: "tokens")])
         XCTAssertEqual(values(lines, "Yesterday"), [MetricValue(number: 2.00, kind: .dollars, estimated: true), MetricValue(number: 200, kind: .count, label: "tokens")])
-        // Last 30 Days sums every fetched day (the provider scopes the CSV to a 30-day window).
-        XCTAssertEqual(values(lines, "Last 30 Days"), [MetricValue(number: 8.50, kind: .dollars, estimated: true), MetricValue(number: 1349, kind: .count, label: "tokens")])
+        // Last 30 Days sums exactly the labeled window: a row older than the window is excluded
+        // even when the provider's export returns it, so the tile can't silently overcount if the
+        // fetch ever ignores its startDate.
+        XCTAssertEqual(values(lines, "Last 30 Days"), [MetricValue(number: 3.50, kind: .dollars, estimated: true), MetricValue(number: 350, kind: .count, label: "tokens")])
 
         guard case .chart(let label, let points, let note) = lines.first(where: { $0.label == "Usage Trend" }) else {
             return XCTFail("expected a Usage Trend chart line")
@@ -175,16 +177,18 @@ final class CursorSpendRangeTests: XCTestCase {
         var lines: [MetricLine] = []
         CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
 
-        // The unpriced row is excluded from the tile's tokens and the breakdown alike — it surfaces
-        // only through the unknown-model warning.
+        // The unpriced row keeps counting tokens (owner decision: never hide volume) and joins the
+        // breakdown with a nil cost (the tile reads its dash); it also surfaces through the
+        // unknown-model warning.
         XCTAssertEqual(values(lines, "Today"),
-                       [MetricValue(number: 3.01, kind: .dollars, estimated: true), MetricValue(number: 300, kind: .count, label: "tokens")])
+                       [MetricValue(number: 3.01, kind: .dollars, estimated: true), MetricValue(number: 600, kind: .count, label: "tokens")])
         XCTAssertEqual(unknown(lines, "Today"), ["unpriced-cursor-model"])
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
         XCTAssertEqual(breakdown.sourceNote, "From your Cursor usage export")
-        XCTAssertEqual(breakdown.models.map(\.model), ["gpt-5.5", "composer-1"])
-        XCTAssertEqual(breakdown.models.map(\.totalTokens), [200, 100])
+        XCTAssertEqual(breakdown.models.map(\.model), ["gpt-5.5", "composer-1", "unpriced-cursor-model"])
+        XCTAssertEqual(breakdown.models.map(\.totalTokens), [200, 100, 300])
         XCTAssertEqual(breakdown.models[0].costUSD, 2.01, "model cost rounds once at the displayed aggregate")
+        XCTAssertNil(breakdown.models[2].costUSD, "the unpriced row claims no cost")
     }
 
     func testModelBreakdownGroupsThinkingEffortSlugsIntoFamilies() throws {
@@ -217,10 +221,10 @@ final class CursorSpendRangeTests: XCTestCase {
                        "a -fast canonical folds into its base family")
     }
 
-    func testUnpricedOnlyDayLeavesTilesUnbacked() {
-        // A day whose every row is unpriceable has nothing coherent to display: no tiles, no trend —
-        // the excluded usage exists only in `unknownModelsByDay` (which needs a rendered tile to show
-        // its triangle; here there is none, matching "No data").
+    func testUnpricedOnlyDayCountsTokensWithoutCost() throws {
+        // A day whose every row is unpriceable still shows its tokens — on the tiles and the trend
+        // — but claims no cost (dash). The usage also lands in `unknownModelsByDay` for the warning
+        // triangle and the history screen's reveal affordance.
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let rows = [
             makeRow(date: now, cost: nil, tokens: 100, model: "totally-unknown-model-xyz")
@@ -229,9 +233,12 @@ final class CursorSpendRangeTests: XCTestCase {
         var lines: [MetricLine] = []
         CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
 
-        XCTAssertNil(values(lines, "Today"))
-        XCTAssertNil(values(lines, "Last 30 Days"))
-        XCTAssertNil(lines.first(where: { $0.label == "Usage Trend" }))
+        XCTAssertEqual(values(lines, "Today"), [MetricValue(number: 100, kind: .count, label: "tokens")])
+        XCTAssertEqual(values(lines, "Last 30 Days"), [MetricValue(number: 100, kind: .count, label: "tokens")])
+        guard case .chart(_, let points, _) = lines.first(where: { $0.label == "Usage Trend" }) else {
+            return XCTFail("the usage trend must stay present on an unpriced-only day")
+        }
+        XCTAssertEqual(points.last?.value, 100, "the trend keeps the day's token volume")
     }
 
     private func modelBreakdown(_ lines: [MetricLine], _ label: String) -> ModelUsageBreakdown? {
