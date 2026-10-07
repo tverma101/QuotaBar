@@ -22,7 +22,7 @@ final class GrokProvider: ProviderRuntime {
         usageClient: GrokUsageClient = GrokUsageClient(),
         logUsageScanner: GrokLogUsageScanner = GrokLogUsageScanner(),
         now: @escaping @Sendable () -> Date = Date.init,
-        pricing: @escaping @Sendable () async -> ModelPricing = { await ModelPricingStore.shared.current() }
+        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
     ) {
         self.authStore = authStore
         self.usageClient = usageClient
@@ -109,11 +109,12 @@ final class GrokProvider: ProviderRuntime {
         // Local spend tiles from completed session turns. Recorded Grok costs win when available;
         // older turns without a carried cost use the shared pricing store.
         var usageHistory: ProviderUsageHistory?
-        if let scan = await logUsageScanner.scan(daysBack: 30, now: now(), pricing: await pricing()) {
+        if let scan = await logUsageScanner.scan(daysBack: UsageHistoryWindow.lifetimeDays, now: now(), pricing: await pricing()) {
             usageHistory = ProviderUsageHistory(
                 series: scan.series,
                 modelUsage: scan.modelUsage,
-                unknownModelsByDay: scan.unknownModelsByDay
+                unknownModelsByDay: scan.unknownModelsByDay,
+                apiEstimateByDay: scan.apiEstimateByDay
             )
             SpendTileMapper.appendTokenUsage(
                 scan.series,
@@ -121,7 +122,8 @@ final class GrokProvider: ProviderRuntime {
                 now: now(),
                 unknownModelsByDay: scan.unknownModelsByDay,
                 modelUsage: scan.modelUsage,
-                modelSourceNote: "From your Grok logs (estimated)"
+                modelSourceNote: "From your Grok logs (estimated)",
+                apiEstimateByDay: scan.apiEstimateByDay
             )
             SpendTileMapper.appendUsageTrend(scan.series, to: &mapped.lines, now: now(),
                                              note: "From your Grok logs (estimated)")

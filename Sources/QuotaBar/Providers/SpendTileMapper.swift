@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Turns local daily token/cost data into the shared Today / Yesterday / Last 30 Days spend tiles.
 /// Every spend-tracking provider funnels through here so the tiles render identically regardless of
@@ -17,6 +18,11 @@ enum SpendTileMapper {
     /// pricing source can price. Today / Yesterday pick up their own day's set; Last 30 Days carries the
     /// union across the whole window. Empty (the default) for sources without unknown-model detection, so
     /// their tiles never carry unknown-model warnings.
+    ///
+    /// `apiEstimateByDay` carries a parallel per-day figure: what the same tokens would have cost at
+    /// each model's public API rates. It is not rendered here — the Usage History screen's
+    /// "At Public API Rates" total line consumes it. Nil (the default) for sources without an
+    /// API-rate computation.
     static func appendTokenUsage(
         _ usage: DailyUsageSeries,
         to lines: inout [MetricLine],
@@ -25,7 +31,8 @@ enum SpendTileMapper {
         unknownModelsByDay: [String: Set<String>] = [:],
         modelUsage: ModelUsageSeries? = nil,
         modelSourceNote: String? = nil,
-        partialDays: Set<String> = []
+        partialDays: Set<String> = [],
+        apiEstimateByDay: [String: Double]? = nil
     ) {
         let today = dayKey(from: now)
         let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: now).map(dayKey(from:))
@@ -55,26 +62,41 @@ enum SpendTileMapper {
                                       )))
         }
 
-        let totalTokens = usage.daily.reduce(0) { $0 + $1.totalTokens }
-        let costSamples = usage.daily.compactMap(\.costUSD)
+        // The tile is labelled "Last 30 Days" and `TotalSpendAggregator` sums it cross-provider, so the
+        // sum must cover exactly the labeled window. Filter instead of trusting the input: scan
+        // windows are day-granular and a source that sweeps one day extra (or a persisted series that
+        // outlived a window change) would otherwise be summed under the 30-day label.
+        let windowKeys = UsageHistoryWindow.dayKeys(through: now)
+        let windowed = usage.daily.filter { entry in
+            dayKey(fromUsageDate: entry.date).map { windowKeys.contains($0) } == true
+        }
+        let totalTokens = windowed.reduce(0) { $0 + $1.totalTokens }
+        let costSamples = windowed.compactMap(\.costUSD)
         let totalCost = costSamples.isEmpty ? nil : costSamples.reduce(0, +)
         if totalTokens > 0 || (totalCost ?? 0) > 0 {
             // The 30-day total is incomplete whenever ANY day in the window is partial — a running
             // Hermes session keeps growing, so the sum is real but not final.
-            let windowPartial = usage.daily.contains { dayKey(fromUsageDate: $0.date).map(partialDays.contains) == true }
-            let allUnknown = unknownModelsByDay.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+            let windowPartial = windowed.contains { dayKey(fromUsageDate: $0.date).map(partialDays.contains) == true }
+            let allUnknown = unknownModelsByDay
+                .filter { windowKeys.contains($0.key) }
+                .values
+                .reduce(into: Set<String>()) { $0.formUnion($1) }
             lines.append(.values(label: "Last 30 Days",
                                  values: spendValues(tokens: totalTokens, costUSD: totalCost, estimated: estimated,
                                                      tokensEstimated: windowPartial),
                                  unknownModels: sortedModels(allUnknown),
                                  modelBreakdown: modelBreakdown(
                                     modelUsage,
-                                    days: Set(usage.daily.compactMap { dayKey(fromUsageDate: $0.date) }),
+                                    days: Set(windowed.compactMap { dayKey(fromUsageDate: $0.date) }),
                                     totalTokens: totalTokens,
                                     totalCostUSD: totalCost,
                                     sourceNote: modelSourceNote
                                  )))
         }
+
+        // The All-At-API-Rates figure is intentionally NOT a dashboard row — the owner rejected the
+        // estimate tile; the plan-versus-API comparison lives only on the Usage History screen's
+        // total line, computed from the same `apiEstimateByDay` input.
     }
 
     /// A period with any real usage: tokens used, dollars priced, or both. A zero-token, zero-cost day
@@ -155,15 +177,19 @@ enum SpendTileMapper {
             return "\(year)-\(month)-\(day)"
         }
 
+        return fallbackDateFormatterAccess.withLock { $0.date(from: value) }.map(dayKey(from:))
+    }
+
+    /// The "MMM dd, yyyy" fallback's formatter, built once and locked for use — `DateFormatter`
+    /// construction dominates that path's cost, and folds re-derive day keys for the same rows on
+    /// every refresh (a lifetime-wide series multiplies the traffic). Folds run on provider
+    /// executors rather than one fixed thread, so the formatter itself lives behind a lock.
+    private static let fallbackDateFormatterAccess = OSAllocatedUnfairLock<DateFormatter>(initialState: {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "MMM dd, yyyy"
-        if let date = formatter.date(from: value) {
-            return dayKey(from: date)
-        }
-
-        return nil
-    }
+        return formatter
+    }())
 
     private static func dayUsageLine(
         label: String,
@@ -339,14 +365,18 @@ enum SpendTileMapper {
         return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
     }
 
-    /// Models below this share of the period fold into Other regardless of rank — a stack of sub-5%
-    /// slivers is noise, and the Other row lists its leading contributors.
+    /// Models below this share of the period fold into Other — a stack of sub-5% slivers is noise,
+    /// and the Other row lists its leading contributors.
     private static let minVisibleShare = 0.05
 
     private static func foldModelList(_ entries: [ModelUsageEntry]) -> [ModelUsageEntry] {
         // The threshold uses the same basis as the panel's percent labels (cost shares only when
-        // every model is priced, token shares otherwise — see `ModelUsageDetail.share`). A separate
-        // token-share exception below keeps a substantial free model identifiable at 0% cost share.
+        // every model is priced, token shares otherwise — see `ModelUsageDetail.share`). A model is
+        // only minor enough to fold when it is a sliver on BOTH bases: its display share and its
+        // raw token share. The token floor is what keeps a cheap-but-heavy model visible — tokens
+        // are the measured quantity and cost is the imputed one, so a model holding half the
+        // period's tokens must never disappear behind "Other" just because its cost share is small
+        // (the bug that hid 488M glm tokens under a 3% Other row).
         let allPriced = entries.allSatisfy { $0.costUSD != nil }
         let costTotal = entries.reduce(0.0) { $0 + ($1.costUSD ?? 0) }
         let tokenTotal = entries.reduce(0) { $0 + $1.totalTokens }
@@ -355,8 +385,8 @@ enum SpendTileMapper {
             guard tokenTotal > 0 else { return 0 }
             return Double(entry.totalTokens) / Double(tokenTotal)
         }
-        func zeroCostTokenLeader(_ entry: ModelUsageEntry) -> Bool {
-            guard entry.costUSD == 0, tokenTotal > 0 else { return false }
+        func tokenShareLeader(_ entry: ModelUsageEntry) -> Bool {
+            guard tokenTotal > 0 else { return false }
             return Double(entry.totalTokens) / Double(tokenTotal) >= minVisibleShare
         }
 
@@ -371,14 +401,14 @@ enum SpendTileMapper {
             let isUnattributed = entry.model.caseInsensitiveCompare(ModelUsageEntry.unattributedModelName) == .orderedSame
             if isUnattributed {
                 other.fold(entry)
-            } else if share(entry) < minVisibleShare && !zeroCostTokenLeader(entry) {
+            } else if share(entry) < minVisibleShare && !tokenShareLeader(entry) {
                 other.fold(entry)
             } else if entry.costUSD == nil {
                 visible.append(entry)
                 namedCount += 1
-            } else if zeroCostTokenLeader(entry) {
-                // Cost share is correctly 0%, but hiding a substantial token consumer as Other makes
-                // its usage impossible to identify. Keep it named without spending a paid-model slot.
+            } else if tokenShareLeader(entry) {
+                // A substantial token consumer stays named regardless of cost share, without
+                // spending a paid-model slot — its usage must stay identifiable.
                 visible.append(entry)
             } else if namedCount < namedModelCap {
                 visible.append(entry)

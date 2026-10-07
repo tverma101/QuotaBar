@@ -134,22 +134,24 @@ final class SpendTileMapperTests: XCTestCase {
         )
 
         // The unpriced "mystery" puts the whole list on token shares (the basis the panel's percent
-        // labels use), so "alpha" — top spend but only 100 of 3,700 tokens (~3%) — folds into Other
-        // along with over-the-cap "eta". The sort still ranks by cost first.
+        // labels use), so "alpha" — top spend but only 100 of 3,700 tokens (~3%), a sliver on both
+        // bases — folds into Other. "eta" clears the cap's slot count but holds 19% of measured
+        // tokens, so the token floor keeps it named anyway (the cap only ever folds slivers). The
+        // sort still ranks by cost first.
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
         XCTAssertEqual(
             breakdown.models.map(\.model),
-            ["aardvark", "beta", "delta", "epsilon", "zeta", "mystery", "Other"]
+            ["aardvark", "beta", "delta", "epsilon", "zeta", "eta", "mystery", "Other"]
         )
         let other = try XCTUnwrap(breakdown.models.first { $0.model == "Other" })
-        XCTAssertEqual(other.totalTokens, 800)
-        XCTAssertEqual(other.costUSD, 13)
-        XCTAssertEqual(other.variants?.map(\.model), ["alpha", "eta"],
+        XCTAssertEqual(other.totalTokens, 100)
+        XCTAssertEqual(other.costUSD, 10)
+        XCTAssertEqual(other.variants?.map(\.model), ["alpha"],
                        "the Other row's tooltip lists the folded models, largest spend first")
         XCTAssertNil(breakdown.models.first { $0.model == "mystery" }?.costUSD)
     }
 
-    func testModelBreakdownFoldsSubFivePercentModelsIntoOther() throws {
+    func testModelBreakdownFoldsModelsMinorOnBothSharesIntoOther() throws {
         let lines = mappedLines(
             [DailyUsageEntry(date: "2026-06-26", totalTokens: 1_000, costUSD: 100)],
             models: [DailyModelUsageEntry(date: "2026-06-26", models: [
@@ -159,13 +161,43 @@ final class SpendTileMapperTests: XCTestCase {
             ])]
         )
 
-        // All priced → cost shares: 90% / 6% / 4%. "tiny" is under the 5% floor and folds into Other
-        // even though the named-model cap has room.
+        // All priced → cost shares: 90% / 6% / 4%. "tiny" is under the 5% cost floor — but it holds
+        // 10% of the measured tokens, so the token floor keeps it named; nothing folds.
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
-        XCTAssertEqual(breakdown.models.map(\.model), ["big", "mid", "Other"])
+        XCTAssertEqual(breakdown.models.map(\.model), ["big", "mid", "tiny"])
+        XCTAssertNil(breakdown.models.first { $0.model == "Other" }, "no slivers, no Other row")
+    }
+
+    /// The reported bug: a model holding half the measured tokens vanished into Other because its
+    /// imputed-cost share was 2.9% and the old escape hatch required cost exactly zero.
+    func testModelBreakdownKeepsCheapHeavyModelNamedDespiteSmallCostShare() throws {
+        let models = [
+            ModelUsageEntry(model: "grok-4.6", totalTokens: 410_300_000, costUSD: 553.04),
+            ModelUsageEntry(model: "grok-4.7", totalTokens: 54_700_000, costUSD: 35.06),
+            ModelUsageEntry(model: "glm-5.3-flash", totalTokens: 488_000_000, costUSD: 19.61),
+            ModelUsageEntry(model: "straggler-a", totalTokens: 5_000_000, costUSD: 0.50),
+            ModelUsageEntry(model: "straggler-b", totalTokens: 3_000_000, costUSD: 0.30)
+        ]
+        let totalTokens = models.reduce(0) { $0 + $1.totalTokens }
+        let lines = mappedLines(
+            [DailyUsageEntry(date: "2026-06-26", totalTokens: totalTokens, costUSD: 608.51)],
+            models: [DailyModelUsageEntry(date: "2026-06-26", models: models)]
+        )
+
+        // Cost shares: 91% / 6% / 3% — glm's 3% cost share is under the fold floor, but its
+        // 50.8% token share is the largest measured usage in the period. It stays named; only the
+        // two genuine slivers fold.
+        let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
+        XCTAssertEqual(
+            breakdown.models.map(\.model),
+            ["grok-4.6", "grok-4.7", "glm-5.3-flash", "Other"]
+        )
+        let glm = try XCTUnwrap(breakdown.models.first { $0.model == "glm-5.3-flash" })
+        XCTAssertEqual(glm.totalTokens, 488_000_000)
         let other = try XCTUnwrap(breakdown.models.first { $0.model == "Other" })
-        XCTAssertEqual(other.costUSD, 4)
-        XCTAssertEqual(other.variants?.map(\.model), ["tiny"])
+        XCTAssertEqual(other.totalTokens, 8_000_000)
+        XCTAssertEqual(other.costUSD, 0.80)
+        XCTAssertEqual(other.variants?.map(\.model), ["straggler-a", "straggler-b"])
     }
 
     func testModelBreakdownKeepsHighTokenZeroCostModelNamed() throws {

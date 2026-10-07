@@ -302,8 +302,70 @@ extension RouterLedgerProviderRoutingTests {
         XCTAssertEqual(unchangedStats.bytesRead, appendStats.bytesRead)
     }
 
-    private func writeLedger(_ lines: [String]) throws -> String {
-        let dir = FileManager.default.temporaryDirectory
+    /// A refresh cancelled at the provider deadline (or any failed ledger read) must leave the durable
+    /// compact aggregate alone. The cancelled scan used to be misread as a stale ledger, deleting the
+    /// persisted aggregate — so the next refresh cold-rebuilt the whole 111 MB ledger, timed out too,
+    /// and the card never recovered until a pass finally outraced the deadline.
+    func testCancelledReadKeepsThePersistedAggregate() async throws {
+        // >1 MB so the ledger compacts and the aggregate persists to disk.
+        let stamp = OpenUsageISO8601.string(from: Date().addingTimeInterval(-600))
+        let path = try writeLedger((0..<8_192).map { index in
+            line(
+                provider: "opencode-free",
+                model: "opencode-free/space-bunny-free",
+                input: 1_000 + index,
+                cached: 600,
+                output: 10,
+                stamp: stamp
+            )
+        })
+        defer { OpenCodeUsageScanner.routerLedgerClearCacheForTesting(path: path) }
+        OpenCodeUsageScanner.routerLedgerClearCacheForTesting(path: path)
+
+        let cold = rows(path)
+        XCTAssertEqual(cold.count, 1)
+        let aggregateURL = OpenCodeRouterLedgerAggregate.fileURL(path: path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: aggregateURL.path),
+                      "a cold compact pass must persist its aggregate")
+
+        // The router logs other providers' traffic continuously, so a live refresh usually sees a
+        // grown ledger. Append one row, then read from inside a cancelled task — the state a 120s
+        // deadline leaves behind. The growth tail-read is what used to be misread as a stale
+        // ledger, deleting the persisted aggregate.
+        let appended = line(
+            provider: "opencode-free",
+            model: "opencode-free/space-bunny-free",
+            input: 222,
+            cached: 22,
+            output: 5,
+            stamp: stamp
+        )
+        try appendBytes(appended + "\n", to: path)
+
+        let cancelledRows: [OpenCodeUsageScanner.ClaudeGatewayRow] = await withCheckedContinuation { (continuation: CheckedContinuation<[OpenCodeUsageScanner.ClaudeGatewayRow], Never>) in
+            let read = Task<Void, Never> {
+                withUnsafeCurrentTask { $0?.cancel() }
+                let readRows = OpenCodeUsageScanner.routerGatewayRows(
+                    atPath: path, since: Date().addingTimeInterval(-86_400)
+                )
+                continuation.resume(returning: readRows)
+            }
+            _ = read
+        }
+        XCTAssertEqual(cancelledRows.count, 0, "a cancelled read yields nothing this pass")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: aggregateURL.path),
+                      "a cancelled read must NOT delete the persisted aggregate")
+
+        // The next live refresh resumes from the surviving aggregate: it tail-reads only the
+        // appended row (no cold rebuild) and the delta lands exactly once.
+        let warm = rows(path)
+        XCTAssertEqual(warm.count, 1)
+        XCTAssertEqual(warm[0].tokens, cold[0].tokens + 222 + 5)
+        let warmStats = try XCTUnwrap(OpenCodeUsageScanner.routerLedgerReadStatisticsForTesting(path: path))
+        XCTAssertEqual(warmStats.fullParses, 1, "the aggregate survived, so no second cold parse")
+    }
+
+    private func writeLedger(_ lines: [String]) throws -> String {        let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("qb-router-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("usage-events.jsonl")

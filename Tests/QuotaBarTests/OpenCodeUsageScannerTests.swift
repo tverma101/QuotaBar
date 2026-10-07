@@ -109,7 +109,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         let scanner = OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { ["/oc/opencode.db"] })
         _ = try await scanner.scan(now: now)
 
-        let tileSinceMs = Int(JSONLScanning.sinceDate(daysBack: 30, now: now).timeIntervalSince1970 * 1000)
+        let tileSinceMs = Int(JSONLScanning.sinceDate(daysBack: UsageHistoryWindow.previousDays, now: now).timeIntervalSince1970 * 1000)
         guard let sql = sqlite.lastDataSQL else { return XCTFail("expected a data query") }
         XCTAssertTrue(sql.contains("time_created >= \(tileSinceMs)"), sql)
     }

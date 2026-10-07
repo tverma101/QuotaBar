@@ -127,7 +127,7 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
         XCTAssertTrue(values.contains(where: \.estimated), "imputed dollars must carry the ⓘ marker")
     }
 
-    func testUnpricedCodexGatewayModelSurfacesAsUnknownAndIsExcluded() async throws {
+    func testUnpricedCodexGatewayModelCountsTokensAndStaysUnpriced() async throws {
         let codexHome = try fixtureCodexHome(files: [
             "sessions/2026/07/12/rollout.jsonl":
                 turnContext(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "anthropic/opencode_go/not-a-real-model-xyz") + "\n" +
@@ -140,7 +140,8 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
         )
         let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertFalse(scan!.includesEstimatedCost)
-        XCTAssertFalse(scan!.logScan.series.daily.contains { $0.totalTokens > 0 })
+        XCTAssertEqual(scan!.logScan.series.daily.map(\.totalTokens), [1200])
+        XCTAssertNil(scan!.logScan.series.daily.first?.costUSD)
         XCTAssertTrue(scan!.logScan.unknownModelsByDay.values.contains { $0.contains("not-a-real-model-xyz") })
     }
 

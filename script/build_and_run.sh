@@ -54,7 +54,6 @@ APP_BINARY="$APP_MACOS/$TARGET_NAME"
 CLI_BINARY="$APP_HELPERS/quotabar"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 RESOURCE_BUNDLE_NAME="${TARGET_NAME}_${TARGET_NAME}.bundle"
-KAGGLE_BRIDGE_SOURCE="${KAGGLE_GLM53_CONTROL_BIN:-$HOME/kaggle-gpu-control/bin/kaggle-glm53-control}"
 ENTITLEMENTS="$ROOT_DIR/script/QuotaBar.dev.entitlements.plist"
 SIGN_ENTITLEMENTS="$ROOT_DIR/script/QuotaBar.local.entitlements.plist"
 
@@ -95,15 +94,6 @@ echo "==> stamping linked SDK 26.0 for Liquid Glass controls (minos stays $MIN_S
 vtool -set-build-version macos "$MIN_SYSTEM_VERSION" 26.0 -replace -output "$APP_BINARY.tmp" "$APP_BINARY"
 mv "$APP_BINARY.tmp" "$APP_BINARY"
 chmod +x "$APP_BINARY"
-# Bundle the operator bridge so the installed app does not depend on the source checkout or a shell
-# PATH. The bridge remains a separate process and reads Kaggle credentials only from the user's CLI
-# configuration.
-if [ -x "$KAGGLE_BRIDGE_SOURCE" ]; then
-  cp "$KAGGLE_BRIDGE_SOURCE" "$APP_RESOURCES/kaggle-glm53-control"
-  chmod 700 "$APP_RESOURCES/kaggle-glm53-control"
-else
-  echo "WARNING: Kaggle GLM bridge not found at $KAGGLE_BRIDGE_SOURCE; the card will report Needs attention." >&2
-fi
 # Stage every SwiftPM resource bundle produced by the build (the app's own
 # QuotaBar_QuotaBar.bundle, which carries the provider SVGs + model manifest)
 # into Contents/Resources, the standard app layout. Bundle.openUsageResources

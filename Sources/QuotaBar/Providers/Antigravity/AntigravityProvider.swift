@@ -31,7 +31,7 @@ final class AntigravityProvider: ProviderRuntime {
         discovery: LanguageServerDiscovery = LanguageServerDiscovery(),
         dbUsageScanner: AntigravityDbUsageScanner = AntigravityDbUsageScanner(),
         now: @escaping @Sendable () -> Date = Date.init,
-        pricing: @escaping @Sendable () async -> ModelPricing = { await ModelPricingStore.shared.current() }
+        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
     ) {
         self.authStore = authStore
         self.usageClient = usageClient
@@ -96,11 +96,12 @@ final class AntigravityProvider: ProviderRuntime {
                 )
             }
 
-            if let scan = await dbUsageScanner.scan(daysBack: 30, now: refreshedAt, pricing: await pricing()) {
+            if let scan = await dbUsageScanner.scan(daysBack: UsageHistoryWindow.previousDays, now: refreshedAt, pricing: await pricing()) {
                 usageHistory = ProviderUsageHistory(
                     series: scan.series,
                     modelUsage: scan.modelUsage,
-                    unknownModelsByDay: scan.unknownModelsByDay
+                    unknownModelsByDay: scan.unknownModelsByDay,
+                    apiEstimateByDay: scan.apiEstimateByDay
                 )
                 SpendTileMapper.appendTokenUsage(
                     scan.series,
@@ -108,7 +109,8 @@ final class AntigravityProvider: ProviderRuntime {
                     now: refreshedAt,
                     unknownModelsByDay: scan.unknownModelsByDay,
                     modelUsage: scan.modelUsage,
-                    modelSourceNote: Self.usageSourceNote
+                    modelSourceNote: Self.usageSourceNote,
+                    apiEstimateByDay: scan.apiEstimateByDay
                 )
                 SpendTileMapper.appendUsageTrend(
                     scan.series,

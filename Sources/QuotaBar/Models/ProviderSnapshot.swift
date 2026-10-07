@@ -20,6 +20,14 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
     /// provider has definitive evidence that it no longer applies. Other providers preserve prior
     /// progress during incomplete menu-bar passes.
     var clearsPriorMenuBarQuotaState: Bool?
+    /// True when `usageHistory` was carried over from a previous snapshot by a menu-bar merge (or a
+    /// full-scope scan miss) rather than computed by this refresh. A menu-bar merge re-stamps
+    /// `refreshedAt` for the meters it did compute; without this marker that stamp would also vouch
+    /// for the carried history, and since menu-bar passes run every TTL, full passes could
+    /// cache-hit forever and never recompute the deferred history (stale spend tiles and
+    /// unknown-model warnings would then never clear). Cached with the snapshot; a snapshot whose
+    /// history was computed this refresh leaves it nil.
+    var carriesPriorHistory: Bool?
     /// Set only on error snapshots: a stable, non-PII bucket for the failure, read by telemetry on the
     /// failure path. Always `nil` on success (and error snapshots aren't cached), so it never persists.
     var errorCategory: ErrorCategory?
@@ -33,6 +41,7 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         usageHistory: ProviderUsageHistory? = nil,
         warning: String? = nil,
         clearsPriorMenuBarQuotaState: Bool? = nil,
+        carriesPriorHistory: Bool? = nil,
         errorCategory: ErrorCategory? = nil
     ) {
         self.providerID = providerID
@@ -43,6 +52,7 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         self.usageHistory = usageHistory
         self.warning = warning
         self.clearsPriorMenuBarQuotaState = clearsPriorMenuBarQuotaState
+        self.carriesPriorHistory = carriesPriorHistory
         self.errorCategory = errorCategory
     }
 
@@ -109,15 +119,28 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         var merged = self
         let clearsPriorQuota = clearsPriorMenuBarQuotaState == true
         merged.clearsPriorMenuBarQuotaState = nil
+        // A menu-bar merge re-stamps the result with a fresh refreshedAt. Preserved spend tiles are
+        // day-labeled ("Today" / "Yesterday") but computed at the previous scan's clock: when that
+        // was a different local day, keeping them under the new timestamp presents yesterday's spend
+        // as current until the next .full pass. Drop those two labels on a day boundary; the next
+        // full pass (the loop schedules one right after rollover) rebuilds them.
+        let sameLocalDay = Calendar.current.isDate(
+            previous.refreshedAt,
+            inSameDayAs: merged.refreshedAt
+        )
         if merged.usageHistory == nil {
             merged.usageHistory = previous.usageHistory
+            // Preserved, not computed: the full pass that re-runs the deferred history must not be
+            // satisfied by this merge's fresh `refreshedAt` (see `carriesPriorHistory`).
+            merged.carriesPriorHistory = previous.usageHistory != nil ? true : merged.carriesPriorHistory
         }
         if !clearsPriorQuota && (merged.plan == nil || merged.plan?.isEmpty == true) {
             merged.plan = previous.plan
         }
         let freshLabels = Set(lines.map(\.label))
         let preserved = previous.lines.filter { line in
-            !freshLabels.contains(line.label)
+            if !sameLocalDay, Self.isDayLabeledSpendTile(line) { return false }
+            return !freshLabels.contains(line.label)
                 && !(clearsPriorQuota && Self.isQuotaProgress(line))
         }
         if !preserved.isEmpty {
@@ -134,5 +157,12 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
     private static func isQuotaProgress(_ line: MetricLine) -> Bool {
         if case .progress = line { return true }
         return false
+    }
+
+    /// The shared Today / Yesterday spend tiles from `SpendTileMapper` — the only lines whose label
+    /// claims a relationship to "now" instead of naming a fixed metric.
+    private static func isDayLabeledSpendTile(_ line: MetricLine) -> Bool {
+        guard case .values = line else { return false }
+        return line.label == "Today" || line.label == "Yesterday"
     }
 }

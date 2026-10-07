@@ -21,7 +21,7 @@ final class CursorProvider: ProviderRuntime {
         authStore: CursorAuthStore = CursorAuthStore(),
         usageClient: CursorUsageClient = CursorUsageClient(),
         now: @escaping @Sendable () -> Date = Date.init,
-        pricing: @escaping @Sendable () async -> ModelPricing = { await ModelPricingStore.shared.current() }
+        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
     ) {
         self.authStore = authStore
         self.usageClient = usageClient
@@ -142,7 +142,10 @@ final class CursorProvider: ProviderRuntime {
                     unavailableMessage: "Cursor request-based usage data unavailable. Try again later."
                 )
                 await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
-                return snapshot(mapped)
+                // Same spend/history attachment as the other two success paths: this fallback serves
+                // accounts without the dashboard usage payload, and skipping the CSV froze their
+                // spend tiles at the last snapshot another path happened to produce.
+                return await snapshotWithOptionalSpend(mapped, accessToken: currentToken)
             } catch {
                 AppLog.warn(LogTag.plugin("cursor"), "optional request-based usage fallback failed")
             }
@@ -316,7 +319,11 @@ final class CursorProvider: ProviderRuntime {
         guard (200..<300).contains(response.statusCode),
               let body = ProviderParse.jsonObject(response.body)
         else {
-            return nil
+            // A 5xx (or any unexpected status) from the OAuth endpoint is a transient service
+            // failure, not an expired token. Returning nil here read as "refresh returned nothing"
+            // and callers raised tokenExpired, sending the user to re-login during an outage;
+            // surface a retryable request failure instead.
+            throw CursorUsageError.requestFailed(response.statusCode)
         }
         if body["shouldLogout"] as? Bool == true {
             throw CursorAuthError.sessionExpired

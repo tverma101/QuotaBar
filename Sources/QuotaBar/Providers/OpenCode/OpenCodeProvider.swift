@@ -118,7 +118,7 @@ final class OpenCodeProvider: ProviderRuntime {
             museRoots: { [OpenCodeUsageScanner.museSessionsRoot()] }
         ),
         usageClient: OpenCodeGoUsageClient = OpenCodeGoUsageClient(),
-        pricing: @escaping @Sendable () async -> ModelPricing = { await ModelPricingStore.shared.current() },
+        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() },
         now: @escaping @Sendable () -> Date = Date.init,
         goKeyStore: OpenCodeGoKeyStore = OpenCodeGoKeyStore(),
         activeKeyID: @escaping @Sendable () -> String? = {
@@ -352,7 +352,8 @@ final class OpenCodeProvider: ProviderRuntime {
             unknownModelsByDay: scan.logScan.unknownModelsByDay,
             modelUsage: scan.logScan.modelUsage,
             modelSourceNote: sourceNote,
-            partialDays: scan.partialDays
+            partialDays: scan.partialDays,
+            apiEstimateByDay: scan.logScan.apiEstimateByDay
         )
         SpendTileMapper.appendUsageTrend(scan.logScan.series, to: &lines, now: refreshedAt, note: sourceNote,
                                          partialDays: scan.partialDays)
@@ -369,7 +370,8 @@ final class OpenCodeProvider: ProviderRuntime {
             usageHistory: ProviderUsageHistory(
                 series: scan.logScan.series,
                 modelUsage: scan.logScan.modelUsage,
-                unknownModelsByDay: scan.logScan.unknownModelsByDay
+                unknownModelsByDay: scan.logScan.unknownModelsByDay,
+                apiEstimateByDay: scan.logScan.apiEstimateByDay
             ),
             warning: accountErrorForDisplay?.error.localizedDescription,
             clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState

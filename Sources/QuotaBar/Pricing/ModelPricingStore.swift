@@ -46,6 +46,8 @@ actor ModelPricingStore {
     var pendingUnknownModels: Set<String> = []
     /// Name -> earliest time a discovery round may attempt a fetch for it again.
     var unresolvedBackoff: [String: Date] = [:]
+    /// Consecutive discovery rounds that failed to price each name; drives the give-up cap in `backoff`.
+    var unresolvedMissStreaks: [String: Int] = [:]
     var unresolvedDiscoveryTask: Task<Void, Never>?
     var unresolvedFlushTask: Task<Void, Never>?
     /// Bumped on every OpenRouter fetch attempt, so a discovery round can tell whether the hourly
@@ -134,6 +136,9 @@ actor ModelPricingStore {
             openRouter: loadCatalog(.openRouter, parse: PricingCatalogCodecs.catalogFromCompact),
             onUnresolvedModel: { [weak self] name in self?.unresolvedSink.record(name) }
         )
+        // New catalogue data is a fresh discovery epoch: the rebuilt pricing's memo re-reports
+        // unpriced names, so give them a clean miss streak instead of instantly dropping them.
+        unresolvedMissStreaks.removeAll()
     }
 
     /// Merged supplement: bundled is the base (ships new pins like mimo-v2.5), cached overlays

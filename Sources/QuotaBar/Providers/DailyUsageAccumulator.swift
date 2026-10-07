@@ -7,12 +7,12 @@ import Foundation
 ///
 /// Days are keyed by the shared local-calendar `dayKey`, matching `SpendTileMapper`'s Today / Yesterday
 /// lookup — the day-key contract is one function, not five copies (drift here is the class of bug behind
-/// the ccusage false-zero fix). Only priced rows are added (every scanner skips unpriceable rows before
-/// counting), so every counted day carries a real cost; unpriceable models are tracked separately for
-/// the tile's warning triangle.
+/// the ccusage false-zero fix). Unpriced rows are added token-only (nil cost) and flagged for the
+/// reveal system, so token totals stay complete while dollars only count priced usage.
 struct DailyUsageAccumulator {
     private var tokensByDay: [String: Int] = [:]
     private var costByDay: [String: Double] = [:]
+    private var apiEstimateByDay: [String: Double] = [:]
     private var unknownModelsByDay: [String: Set<String>] = [:]
     private var modelsByDay: [String: [String: ModelAccumulator]] = [:]
 
@@ -24,7 +24,7 @@ struct DailyUsageAccumulator {
         return String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
     }
 
-    /// Add a priced row's tokens + cost, attributed to `model` on `day`.
+    /// Add a row's tokens + cost, attributed to `model` on `day`.
     ///
     /// `canonical` is the model's *identity*; `model` is the slug the provider actually emitted. They
     /// differ when a gateway tags its slugs: the Codex router stamps the upstream path, so one model
@@ -34,19 +34,33 @@ struct DailyUsageAccumulator {
     /// pass the catalog key as `canonical`, so anything priced alike collapses into one row titled with
     /// the catalog id, while the observed spellings survive as tooltip variants.
     ///
+    /// `cost` is nil for a row no pricing source can price (a stealth codename slug, an unattributed
+    /// stream). Those rows count their tokens and show a dash for cost — the owner's "count tokens,
+    /// dash cost" policy — instead of being withheld from every total. `apiEstimate` carries what the
+    /// same tokens would cost at public API rates when a rate exists for the row (the "if it were all
+    /// API" comparison); nil when the model is unidentified.
+    ///
     /// Defaults to `model`, so a scanner with no aliasing is unaffected.
     mutating func add(
         day: String,
         tokens: Int,
-        cost: Double,
+        cost: Double?,
         model: String,
         canonical: String? = nil
     ) {
         tokensByDay[day] = ProviderParse.addingSaturating(tokensByDay[day, default: 0], tokens)
-        costByDay[day, default: 0] += cost
+        if let cost {
+            costByDay[day, default: 0] += cost
+        }
         let identity = canonical ?? model
         modelsByDay[day, default: [:]][identity, default: ModelAccumulator()]
             .add(tokens: tokens, costUSD: cost, spelling: model)
+    }
+
+    /// Add the public-API-rate estimate for one row (see `add`). Sums per day; rows without any
+    /// resolvable rate contribute nothing, so the estimate is honest about coverage.
+    mutating func addApiEstimate(day: String, cost: Double) {
+        apiEstimateByDay[day, default: 0] += cost
     }
 
     /// Merge already-built scans (a provider's native log scan plus its pi slice) into one, by replaying
@@ -54,27 +68,35 @@ struct DailyUsageAccumulator {
     /// `modelUsage`, and unknown-model set stay consistent. Every input must be accumulator-built (its
     /// `series` derived from the same per-model maps), which the native and pi scanners guarantee. Nil
     /// inputs are skipped; returns nil when they are all nil (the provider then folds in nothing).
-    static func merged(_ scans: [LogUsageScan?]) -> LogUsageScan? {
+    ///
+    /// `droppingDaysBefore` clips the merged result to a narrower requested window without re-folding:
+    /// scanners that serve cache-window aggregates (`CodexLogUsageScanner`) pass the requested window's
+    /// first day key. Day keys are zero-padded `yyyy-MM-dd`, so lexicographic order is chronological.
+    static func merged(
+        _ scans: [LogUsageScan?],
+        droppingDaysBefore minDayKey: String? = nil
+    ) -> LogUsageScan? {
         let present = scans.compactMap { $0 }
         guard !present.isEmpty else { return nil }
         var accumulator = DailyUsageAccumulator()
         for scan in present {
-            accumulator.merge(scan)
+            accumulator.merge(scan, droppingDaysBefore: minDayKey)
         }
         return accumulator.build()
     }
 
     /// Merge a previously assembled scan without losing gateway spellings preserved as variants.
-    private mutating func merge(_ scan: LogUsageScan) {
-        for day in scan.modelUsage?.daily ?? [] {
+    /// Nil-cost rows (unpriced/unidentified models) replay as token-only rows so the merged scan keeps
+    /// counting their tokens; the unknown-model flags merge separately below.
+    private mutating func merge(_ scan: LogUsageScan, droppingDaysBefore minDayKey: String? = nil) {
+        for day in scan.modelUsage?.daily ?? [] where minDayKey.map({ day.date >= $0 }) ?? true {
             for model in day.models {
-                guard let cost = model.costUSD else { continue }
                 if let variants = model.variants, !variants.isEmpty {
                     for variant in variants {
                         add(
                             day: day.date,
                             tokens: variant.totalTokens,
-                            cost: variant.costUSD ?? 0,
+                            cost: variant.costUSD,
                             model: variant.model,
                             canonical: model.model
                         )
@@ -83,16 +105,21 @@ struct DailyUsageAccumulator {
                     add(
                         day: day.date,
                         tokens: model.totalTokens,
-                        cost: cost,
+                        cost: model.costUSD,
                         model: model.model
                     )
                 }
             }
         }
-        for (day, models) in scan.unknownModelsByDay {
+        for (day, models) in scan.unknownModelsByDay
+        where minDayKey.map({ day >= $0 }) ?? true {
             for model in models {
                 addUnknownModel(day: day, model: model)
             }
+        }
+        for (day, estimate) in scan.apiEstimateByDay ?? [:]
+        where minDayKey.map({ day >= $0 }) ?? true {
+            addApiEstimate(day: day, cost: estimate)
         }
     }
 
@@ -127,8 +154,7 @@ struct DailyUsageAccumulator {
             for day in scan.modelUsage?.daily ?? [] {
                 guard !daysToSkip.contains(day.date) else { continue }
                 for model in day.models {
-                    guard let cost = model.costUSD else { continue }
-                    accumulator.add(day: day.date, tokens: model.totalTokens, cost: cost, model: model.model)
+                    accumulator.add(day: day.date, tokens: model.totalTokens, cost: model.costUSD, model: model.model)
                     absorbed = true
                 }
             }
@@ -137,6 +163,10 @@ struct DailyUsageAccumulator {
                     accumulator.addUnknownModel(day: day, model: model)
                     absorbed = true
                 }
+            }
+            for (day, estimate) in scan.apiEstimateByDay ?? [:] where !daysToSkip.contains(day) {
+                accumulator.addApiEstimate(day: day, cost: estimate)
+                absorbed = true
             }
             return absorbed
         }
@@ -161,21 +191,34 @@ struct DailyUsageAccumulator {
     }
 
     /// Assemble the scan: per-day tokens/cost (days sorted newest-first), the per-day model breakdown,
-    /// and the unknown-model set. Every counted day is priced, so its `costUSD` is always the real total.
+    /// and the unknown-model set. Days with unpriced rows carry their tokens (cost shows the priced
+    /// subtotal); `apiEstimateByDay` carries the public-API-rate comparison when any row could be priced.
     func build() -> LogUsageScan {
         let days = tokensByDay.keys.sorted(by: >).map { day in
-            DailyUsageEntry(date: day, totalTokens: tokensByDay[day] ?? 0, costUSD: costByDay[day] ?? 0)
+            DailyUsageEntry(date: day, totalTokens: tokensByDay[day] ?? 0, costUSD: costByDay[day])
         }
         let modelUsage = ModelUsageSeries(daily: modelsByDay.keys.sorted(by: >).map { day in
             DailyModelUsageEntry(
                 date: day,
-                models: modelsByDay[day, default: [:]].map { model, accumulator in accumulator.entry(model: model) }
+                // Deterministic order (dictionary iteration is randomized): cost desc with nil as $0,
+                // then tokens desc, then name — the same total order the spend-tile breakdown uses,
+                // so scans and history agree row-for-row.
+                models: modelsByDay[day, default: [:]]
+                    .map { model, accumulator in accumulator.entry(model: model) }
+                    .sorted { lhs, rhs in
+                        let lhsCost = lhs.costUSD ?? 0
+                        let rhsCost = rhs.costUSD ?? 0
+                        if lhsCost != rhsCost { return lhsCost > rhsCost }
+                        if lhs.totalTokens != rhs.totalTokens { return lhs.totalTokens > rhs.totalTokens }
+                        return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
+                    }
             )
         })
         return LogUsageScan(
             series: DailyUsageSeries(daily: days),
             modelUsage: modelUsage,
-            unknownModelsByDay: unknownModelsByDay
+            unknownModelsByDay: unknownModelsByDay,
+            apiEstimateByDay: apiEstimateByDay.isEmpty ? nil : apiEstimateByDay
         )
     }
 

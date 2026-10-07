@@ -9,8 +9,36 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
     private static let syntheticRows = 8_192
     private static let syntheticBytes = 3_276_800
 
-    func testAutomaticFullRefreshPacingIncludesReapedSQLiteStyleChildCPU() async throws {
-        let measurement = try await ProviderRefreshContext.$scope.withValue(.full) {
+    /// The background menu-bar contract: background accounting stays under 10% of one core, child
+    /// processes included. Menu-bar scope paces at the 7.5% ceiling.
+    func testAutomaticMenuBarRefreshPacingIncludesReapedSQLiteStyleChildCPU() async throws {
+        let measurement = try await Self.pacedChildProcessMeasurement(scope: .menuBar)
+
+        XCTAssertGreaterThan(measurement.0, 0.010,
+                             "reaped child CPU must materially contribute to the accounting measurement")
+        XCTAssertLessThan(measurement.0 / measurement.1, 0.10,
+                          "the automatic menu-bar pass must pace child-process accounting too")
+    }
+
+    /// Unit contract for the pacer's full-scope budget: when a caller opts into pacing at full
+    /// scope, the interactive 25% ceiling applies — still paced, so a runaway child cannot burn a
+    /// core unchecked. (The app's own refresh loop now runs user-facing full passes unpaced; this
+    /// pins the pacer mechanics for callers that keep pacing on.)
+    func testFullScopePanelRefreshPacesAtTheInteractiveBudget() async throws {
+        let measurement = try await Self.pacedChildProcessMeasurement(scope: .full)
+
+        XCTAssertGreaterThan(measurement.0, 0.010,
+                             "reaped child CPU must materially contribute to the accounting measurement")
+        XCTAssertLessThan(measurement.0 / measurement.1, 0.30,
+                          "full-scope passes pace at the 25% interactive budget (with margin), not unpaced")
+        XCTAssertGreaterThan(measurement.0 / measurement.1, 0.10,
+                             "full-scope passes must actually get the wider budget, not the background ceiling")
+    }
+
+    private static func pacedChildProcessMeasurement(
+        scope: ProviderRefreshContext.Scope
+    ) async throws -> (cpu: Double, wall: Double) {
+        try await ProviderRefreshContext.$scope.withValue(scope) {
             try await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
                 let wallStart = DispatchTime.now().uptimeNanoseconds
                 let cpuStart = Self.cpuSeconds()
@@ -29,11 +57,6 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
                 return (cpu, wall)
             }
         }
-
-        XCTAssertGreaterThan(measurement.0, 0.010,
-                             "reaped child CPU must materially contribute to the accounting measurement")
-        XCTAssertLessThan(measurement.0 / measurement.1, 0.10,
-                          "the automatic menu-bar pass must pace child-process accounting too")
     }
 
     func testRepeatedRouterAccountingStaysBelowTenPercentOfOneCore() async throws {

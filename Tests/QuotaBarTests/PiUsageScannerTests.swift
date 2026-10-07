@@ -78,10 +78,12 @@ final class PiUsageScannerTests: XCTestCase {
         XCTAssertEqual(scan.series.daily.first?.costUSD ?? 0, 0.002, accuracy: 0.00001)
     }
 
-    func testUnpriceableZeroCostBecomesUnknownModel() {
+    func testUnpriceableZeroCostCountsTokensAndStaysUnpriced() {
         let entry = PiUsageScanner.parseLine(line(provider: "cursor", model: "mystery-model", cost: "0"))!
         let scan = PiUsageScanner.aggregate(entries: [entry], cardID: "cursor", since: .distantPast, pricing: .empty)
-        XCTAssertTrue(scan.series.daily.isEmpty)
+        // Unpriced usage keeps its tokens (history shows volume) but claims no cost.
+        XCTAssertEqual(scan.series.daily.map(\.totalTokens), [150])
+        XCTAssertNil(scan.series.daily.first?.costUSD)
         XCTAssertEqual(
             scan.unknownModelsByDay[TestLocalInstant.isoDay(2026, 7, 12)], ["mystery-model"]
         )

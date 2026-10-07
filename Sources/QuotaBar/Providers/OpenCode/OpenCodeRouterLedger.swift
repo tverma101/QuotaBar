@@ -191,6 +191,12 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
                 // file: a persisted aggregate that can never reconcile would otherwise be decoded on
                 // every launch and rejected again on every refresh.
                 discardAggregate(for: key)
+            case .aborted:
+                // Deadline cancellation or a transient read failure. The aggregate — in memory and on
+                // disk — is still the best known state; deleting it here turned every timed-out
+                // refresh into a full cold rebuild on the next one. Serve nothing this pass; the
+                // store keeps the last-good snapshot until the next refresh lands.
+                return []
             }
         }
 

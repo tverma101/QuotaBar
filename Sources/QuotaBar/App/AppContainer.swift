@@ -56,9 +56,6 @@ final class AppContainer {
     private let providers: [ProviderRuntime]
     /// Read-only usage API on 127.0.0.1:6736 for other local apps (silently off when the port is taken).
     private let localAPI: LocalUsageServer
-    /// Separate Kaggle TPU GLM-5.3 control plane. It is read-only until the dashboard card's explicit
-    /// Turn On action is used; it never shares the T4/Ollama or Z-Image worker lifecycle.
-    let kaggleCompute: KaggleComputeService
     // A `let` of a `Sendable` `Task` is implicitly nonisolated, so the nonisolated `deinit` can cancel it.
     private let refreshTask: Task<Void, Never>
     /// The fresh-install credential-detection pass (see `FirstRunSeeder`); `nil` on every later launch.
@@ -246,16 +243,6 @@ final class AppContainer {
         self.telemetry = telemetry
         self.transparency = PopoverTransparencyStore()
         self.privacy = MenuBarPrivacyStore()
-        self.kaggleCompute = KaggleComputeService()
-        // Polling is read-only and starts with a bounded local status command. Starting it here keeps
-        // the card accurate before the user scrolls to it; no Kaggle notebook is started automatically.
-        //
-        // Skipped when the bridge is absent. The loop spawns a status subprocess every 30 seconds for the
-        // life of the app, so without this guard an install that can never use the feature still paid for
-        // a poll a minute, indefinitely, in exchange for a red error card nobody asked for.
-        if self.kaggleCompute.isBridgeAvailable {
-            self.kaggleCompute.startPolling()
-        }
         self.localAPI = LocalUsageServer(state: { [layout, enablement, dataStore] in
             LocalUsageAPI.State(
                 enabledOrderedIDs: layout.orderedProviderIDs().filter { enablement.isEnabled($0) },
@@ -421,6 +408,11 @@ final class AppContainer {
             /// previous one has not cleared the cooldown yet.
             var triggerGate = BackgroundRefreshGate()
             var dropNextRefreshPass = false
+            // Local day the last pass ran in. Crossing midnight while the app runs must widen the
+            // next pass to full scope: menuBar passes skip local accounting and re-stamp yesterday's
+            // "Today" tile with a fresh timestamp, so without this trigger the menu bar kept showing
+            // yesterday's spend until the user opened the panel (or an external trigger landed).
+            var lastRefreshDay = DailyUsageAccumulator.dayKey(from: Date())
             while !Task.isCancelled {
                 if dropNextRefreshPass {
                     // A trigger arrived inside the gate's cooldown. The trigger's own debounce
@@ -446,6 +438,15 @@ final class AppContainer {
                     // re-checks between chunks, so this covers the first batch after a spike too.
                     let serializeProviders = isFirstPass || ProcessMemoryBudget.isOverSoftLimit
                     let panelOpen = transparency.popoverShown
+                    let currentDay = DailyUsageAccumulator.dayKey(from: Date())
+                    if currentDay != lastRefreshDay {
+                        lastRefreshDay = currentDay
+                        if !isFirstPass {
+                            pendingFullScopePass = true
+                            dataStore.invalidateLocalAccountingFreshness()
+                            AppLog.info(.refresh, "local day rolled over; scheduling full accounting pass")
+                        }
+                    }
                     if panelOpen && !ProcessMemoryBudget.isOverSoftLimit {
                         await CodexRouterUsageScanner.resumeSharedParsedItems()
                     }
@@ -456,7 +457,13 @@ final class AppContainer {
                     pendingFullScopePass = false
                     await ProviderRefreshContext.$scope.withValue(scope) {
                         await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(scope == .menuBar) {
-                            await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                            // Full-scope passes answer a user who is actively waiting (panel opened or
+                            // an explicit refresh trigger), so they run unpaced: the 25% CPU ceiling
+                            // stretched cold ledger/gateway folds into 20-30s walls for ~5-8s of real
+                            // CPU. Menu-bar ticks keep the background allowance. Memory stays bounded
+                            // by the provider serialization and soft-limit checks below, which key on
+                            // footprint rather than on pacing.
+                            await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(scope == .menuBar) {
                                 await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
                             }
                         }

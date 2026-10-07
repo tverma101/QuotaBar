@@ -6,6 +6,16 @@ Star your most important metrics straight into the menu bar strip.
 
 Right-click (or control-click) the QuotaBar menu bar icon for a quick menu with **Settings** and **Quit**. QuotaBar keeps one status item and one shared panel regardless of provider count, so two Codex accounts and Cursor remain together in the same dashboard instead of looking like duplicate apps.
 
+## Usage History
+
+The dashboard footer's **Options** menu → **Usage History** opens a read-only report built from the same local usage data the spend tiles show, so the two can never disagree:
+
+- **Lifetime** — every recorded day's tokens and plan-priced cost, dated by the earliest day your logs still hold ("Since Mar 2026"). Claude, Codex, and Grok fold their full local log history, so this approaches true lifetime; providers bounded to a provider API window contribute only what that window held.
+- **At Public API Rates (Est.)** — what all that recorded usage would have cost at each model's public API rates, shown when any fold produced an estimate. A what-if comparison, never a recorded amount.
+- **Today / 7 Days / 30 Days** summary cards: tokens always, plan-priced cost (a dash where nothing could be priced yet).
+- A **daily token trend** across the 30-day window.
+- One section per enabled provider with **per-model rows** for the window: tokens plus cost (or a dash for models no catalogue prices yet — those backfill automatically once discovery finds a rate; see [Pricing](pricing.md)).
+
 ## Starring
 
 Star a metric from any row's right-click menu, or from the always-visible star beside a metric in Customize.
@@ -31,20 +41,3 @@ Detection rides the system's own "an app is capturing the screen" signal — the
 ## What the strip shows
 
 The strip only renders real data. A starred metric with nothing fetched yet is skipped; a provider whose stars all lack data disappears entirely (icon included). When nothing has data, the strip falls back to the app icon, but the single status item remains clickable and opens the aggregate dashboard. Stars follow your Customize order — Always Visible metrics first, then On Demand ones. A metric can be starred whether it's Always Visible or On Demand. Multiple Claude and Codex accounts remain separate provider cards inside the same panel. When an account moves from a family ID to an account-specific ID, its existing family pins carry over once, even when the old family card is no longer active; later explicit unpins are preserved.
-
-## Kaggle Compute
-
-Scroll to the bottom of the dashboard popover for the separate **Kaggle
-Compute** card. It controls only the GLM-5.3-Flash TPU bridge; it does not
-start the existing T4/Ollama or Z-Image worker. **Turn On** is the only action
-that starts a TPU notebook, and **Turn Off** deletes that notebook. The card
-polls read-only status and shows the kernel state, endpoint readiness, elapsed
-allocation time, time remaining, requests, input/output tokens, and the
-API-equivalent dollar estimate. The bridge shuts the TPU down after five
-minutes without a request, or at its allocation limit. The dollar value is a
-comparison only; Kaggle TPU time is not an API bill.
-
-The installed app bundles the bridge and uses the local `~/kaggle-tpu-lab`
-checkout plus the configured Kaggle CLI credentials. A healthy, idle setup
-shows **Off** before the first explicit Turn On; no notebook is started by
-launch or by status polling.

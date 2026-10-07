@@ -16,6 +16,9 @@ extension ModelPricingStore {
     /// Floor between catalogue fetches that a newly seen unknown model triggers. The hourly TTL may be
     /// shortened for a genuinely new model, but never past one fetch per five minutes.
     static let unknownModelRetryInterval: TimeInterval = 5 * 60
+    /// Consecutive unpriced discovery rounds a name may drive before it stops queuing fetches (see
+    /// `backoff`). A real catalogue change resets the streak by rebuilding pricing.
+    static let maxDiscoveryMissStreak = 3
     /// Cap on distinct unknown names held in memory. Names never leave the machine, so this only stops
     /// a pathological log from growing the queue and the negative cache without limit.
     static let maxTrackedUnknownModels = 64
@@ -43,6 +46,15 @@ extension ModelPricingStore {
             await refreshTask.value
         } else if let inFlight = unresolvedDiscoveryTask {
             await inFlight.value
+        }
+
+        // Re-check after every await: a concurrent caller can start a discovery round while this one
+        // is suspended on the refresh/in-flight await above. Collapsing onto it instead of falling
+        // through keeps two callers from stacking duplicate `/api/v1/models` fetches; names this
+        // round added stay queued for the next one (they are only removed once priced or dropped).
+        if let inFlight = unresolvedDiscoveryTask {
+            await inFlight.value
+            return
         }
 
         // Names stay queued across the whole cooling window: a pricing snapshot can outlive the
@@ -74,6 +86,11 @@ extension ModelPricingStore {
             return
         }
 
+        // Reserve the discovery floor synchronously at spawn time: another entrant can be right
+        // behind this one on the actor between the guard checks above and the fetch actually
+        // running inside the task below — the old floor stamp inside `fetch` came too late, and two
+        // entrants would both pass `outsideDiscoveryFloor` and stack duplicate fetches.
+        lastOpenRouterAttemptAt = now()
         unresolvedDiscoveryTask = Task { await self.discover(wanted) }
         await unresolvedDiscoveryTask?.value
     }
@@ -124,6 +141,7 @@ extension ModelPricingStore {
         // A miss the catalogue cannot fix still gets the five-minute floor, so the next provider pass
         // re-arms at most one fetch rather than one fetch per event.
         backoff(names)
+        applyMissStreak(names)
     }
 
     /// Keep unpriced names queued through their cooldown so a later full refresh can retry them.
@@ -136,6 +154,26 @@ extension ModelPricingStore {
         }
         boundPendingNames()
         trimBackoff()
+    }
+
+    /// Miss accounting for one completed discovery fetch: names the fetched catalogue still cannot
+    /// price burn one miss, and after `maxDiscoveryMissStreak` consecutive fetch-misses a name stops
+    /// queuing fetches — forever-retrying a parse artifact would spend one fetch per floor interval
+    /// indefinitely, and its fetches re-arm `fetchedAt`, starving the hourly refresh. A real
+    /// catalogue change rebuilds pricing, resets the per-snapshot memo, and re-reports the name with
+    /// a fresh streak. Blocked rounds never get here: only fetch attempts count.
+    private func applyMissStreak(_ names: Set<String>) {
+        for name in names {
+            if pricing.isPriced(name) {
+                unresolvedMissStreaks[name] = nil
+                continue
+            }
+            let streak = (unresolvedMissStreaks[name] ?? 0) + 1
+            unresolvedMissStreaks[name] = streak
+            if streak >= Self.maxDiscoveryMissStreak {
+                pendingUnknownModels.remove(name)
+            }
+        }
     }
 
     /// The names eligible for a revalidation right now. A name inside its cool-off stays queued so a
@@ -162,6 +200,7 @@ extension ModelPricingStore {
     private func trimBackoff() {
         let cutoff = now().addingTimeInterval(-Self.unknownModelRetryInterval)
         unresolvedBackoff = unresolvedBackoff.filter { $0.value >= cutoff }
+        unresolvedMissStreaks = unresolvedMissStreaks.filter { pendingUnknownModels.contains($0.key) }
         guard unresolvedBackoff.count > Self.maxTrackedUnknownModels * 2 else { return }
         let newest = unresolvedBackoff.sorted { $0.value > $1.value }
             .prefix(Self.maxTrackedUnknownModels * 2)

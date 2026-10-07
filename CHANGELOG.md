@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Price OpenCode's **Space Bunny** at its published GO-plan rates ($0.15 input / $0.60 output / $0.03 cache read per 1M tokens — verified 2026-10-06 on opencode.ai/docs/go): the stealth model left its free period, the public catalogues still list only zero-rate free cards, and OpenCode kept the legacy `space-bunny-free` id — whose recorded $0 calibration from the free promo previously overrode pricing entirely. Both slugs are pinned in the supplement and skip the poisoned calibration, so multi-billion-token router folds (and history backfill) price at the GO rates on the next refresh.
+- Fix the spend detail's per-model hover panel folding cheap-but-heavy models into **Other**: a model holding 5%+ of the period's *measured tokens* now always keeps its own named row, whatever its imputed cost share says (previously only zero-cost models escaped the fold, so 488M glm tokens sat hidden in Other at a 3% cost share). The token floor also overrides the named-row cap, so over-the-cap token leaders stay identifiable.
+- Cache the spend mapper's last-resort date parser (a per-call `DateFormatter`) so lifetime-wide history folds stop paying formatter construction on every refresh.
+- Add a **Usage History** screen (Options menu): a **Lifetime** hero card (all recorded tokens and plan-priced cost, dated by the earliest day your logs hold — Claude, Codex, and Grok fold their full local history), an "At Public API Rates (Est.)" what-if line, Today/7-day/30-day token and cost totals, a daily token trend, and per-model rows per provider.
+- Unpriced models now keep counting tokens with a dashed cost instead of dropping out of the tiles, trend, and model breakdown; a session that records its own cost still shows that cost.
+- Resolve codename (stealth) models automatically: log slugs spelled with spaces or underscores normalize onto the catalogues' hyphenated ids ("space bunny" → "space-bunny"), so OpenRouter discovery prices the codename the moment it is listed, and every affected day — including older ones — backfills on the next refresh. No manual mapping step.
+- Stop a timed-out OpenCode refresh from deleting its durable router-ledger aggregate (a cancelled scan was misread as a stale ledger, forcing a full cold rebuild — and another timeout — on every retry).
+- Pace background accounting at 7.5% of one CPU core and run user-facing full passes (panel open / manual / CLI) unpaced, so a pricing-catalogue change's cold re-fold finishes inside the 120-second provider deadline instead of freezing every card; let a cancelled refresh wind down for a few seconds so its zombie work stops taxing the next pass.
+- Raise the process memory budget (soft 512 MB / hard 768 MB) so parse caches survive between providers in one batch instead of cold-reparsing after every card.
+- Filter every Last 30 Days tile to exactly its labeled 30-day window and scan 30 (not 31) local days on Claude, Codex, Grok, OpenCode, Pi, and Antigravity, so tiles, trend charts, and the cross-provider Total Spend all sum the same period.
+- Rebuild Today / Yesterday after a local-midnight rollover: the next pass widens to full scope, and a menu-bar merge no longer re-stamps a prior day's spend tiles as current.
+- Route Cursor's generic request-based fallback through the same spend/history attachment as the other paths, report a transient OAuth 5xx as a retryable request failure instead of "Token expired", and remove leftover TEMP pricing/CSV diagnostics.
+- Cap OpenRouter discovery retries for permanently unpriced models and keep concurrent discovery rounds from stacking duplicate catalogue fetches.
+
+- Remove the Kaggle Compute card, operator bridge bundling, and its polling service.
+
+- Cut menu-bar tap CPU by skipping tooltip NSView mounts for nil tooltips, caching currency/time formatters, mounting the dashboard with popover visibility already set, and skipping hidden popover content rebuilds.
+
+- Price Cursor's GLM 5.3 and Flash CSV aliases, including effort suffixes, using its published cache-read rates.
+
+- Refresh the bundled LiteLLM and models.dev catalogues to October 4 data (the snapshot script targeted a stale OpenUsage path since the rebrand), alias Cursor's Grok Bot CUA rows to Grok 4.7, and pin the Opus 4.6/4.7 fast multipliers the live feed dropped.
+
+- Track LiteLLM's corrected rates for Sonnet 5's permanent intro pricing and Grok 4.20's API rate.
+
 - Reuse a gateway-only Codex cache for OpenCode refreshes and count native reasoning output once.
 
 - Open the menu from cached snapshots and reuse compact router totals so repeated taps do not restart accounting.

@@ -307,7 +307,10 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
 
         let result = await scanner.scan(now: now, pricing: pricing)
         let scan = try XCTUnwrap(result)
-        XCTAssertTrue(scan.series.daily.isEmpty)
+        // Unpriced and missing-name usage keeps counting tokens but claims no cost; the expired
+        // generation is outside the window and contributes nothing.
+        XCTAssertEqual(scan.series.daily.map(\.totalTokens), [300])
+        XCTAssertNil(scan.series.daily.first?.costUSD)
         XCTAssertEqual(
             Set(scan.unknownModelsByDay.values.flatMap { $0 }),
             ["gemini-9-mystery", AntigravityProtoDecoder.GenerationEvent.unknownModel]

@@ -13,6 +13,11 @@ import os
 /// cancellation-aware). What the deadline guarantees is that the *store* stops waiting.
 @MainActor
 enum ProviderRefreshDeadline {
+    /// How long a cancelled refresh may keep winding down after the deadline before the store stops
+    /// caring. The scanners observe cancellation at bounded loop boundaries (~100 ms), so this is
+    /// generous; a refresh that ignores even the grace is abandoned in place.
+    static let cancellationGraceSeconds: UInt64 = 5
+
     /// The refreshed snapshot, or `nil` if `timeout` elapsed first.
     static func snapshot(
         from provider: ProviderRuntime,
@@ -38,6 +43,14 @@ enum ProviderRefreshDeadline {
                     try? await Task.sleep(for: .seconds(timeout))
                     guard !Task.isCancelled, claim.claim() else { return }
                     work.cancel()
+                    // Give cancellation-aware scanners a short grace to wind down before the store
+                    // moves on. A zombie that outlives the pass keeps burning the shared CPU-pacing
+                    // budget (its slices count toward the next refresh's pacing debt) and stacks its
+                    // parse memory on top of the next provider's. The store still resumes nil now —
+                    // the grace only bounds how long the zombie survives, never the wait.
+                    let grace = Task { await work.value }
+                    try? await Task.sleep(for: .seconds(Self.cancellationGraceSeconds))
+                    grace.cancel()
                     continuation.resume(returning: nil)
                 }
                 Task { @MainActor in

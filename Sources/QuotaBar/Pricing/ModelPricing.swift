@@ -225,12 +225,22 @@ final class ModelPricing: Sendable {
     /// model at all, and models.dev answers exact ids only (see the fuzzy note on the type).
     private func lookup(_ name: String) -> ModelRates? {
         if let entry = supplement.pricing[name] { return entry }
-        if let exact = openRouter.findExact(name) { return exact.rates }
-        if let exact = primary.findExact(name) { return exact.rates }
+        if let exact = openRouter.findExact(name) { return withSupplementFastMultiplier(name, exact.rates) }
+        if let exact = primary.findExact(name) { return withSupplementFastMultiplier(name, exact.rates) }
+        // Separator-normalized retry: a log slug spelled with spaces/underscores where the public
+        // catalogues hyphenate ("space bunny" ↔ "space-bunny", the stealth-codename case). Exact
+        // lookups on the normalized form keep every catalogue's exact-only stance — the fuzzy pass
+        // below is unchanged, so this cannot widen what a miss matches.
+        let normalized = PricingCatalog.normalizedKey(name)
+        if normalized != name {
+            if let entry = supplement.pricing[normalized] { return entry }
+            if let exact = openRouter.findExact(normalized) { return withSupplementFastMultiplier(name, exact.rates) }
+            if let exact = primary.findExact(normalized) { return withSupplementFastMultiplier(name, exact.rates) }
+        }
         if let fast = fastVariant(name) { return fast }
         if name.hasSuffix("-fast") { return secondary.findExact(name)?.rates }
-        if let fuzzy = primary.findFuzzy(name) { return fuzzy.rates }
-        if let exact = secondary.findExact(name) { return exact.rates }
+        if let fuzzy = primary.findFuzzy(name) { return withSupplementFastMultiplier(name, fuzzy.rates) }
+        if let exact = secondary.findExact(name) { return withSupplementFastMultiplier(name, exact.rates) }
         // A model no catalog carries, whose name says it is free.
         //
         // The supplement's own convention is that a `-free` model is priced at $0 and *counted*
@@ -240,6 +250,20 @@ final class ModelPricing: Sendable {
         // ~20M on the card and the rest was silently discarded as "unknown".
         if let free = freeVariantRates(name) { return free }
         return nil
+    }
+
+    /// Catalog-resolved entries carry the feed's own fast multiplier, but feeds can drop it
+    /// (LiteLLM removed Anthropic's `fast` fields in October 2026). Fall back to the supplement's
+    /// curated multiplier so a request the scanner flagged fast on the base slug still bills at the
+    /// fast rate — the same intent `PricingSupplement.decode` stamps onto supplement-priced entries.
+    /// Never touches dedicated `-fast` cards (already fast-priced) or entries whose multiplier the
+    /// feed does supply.
+    private func withSupplementFastMultiplier(_ name: String, _ rates: ModelRates) -> ModelRates {
+        guard !name.hasSuffix("-fast"), rates.fastMultiplier == 1,
+              let multiplier = supplement.fastMultiplier(for: name) else { return rates }
+        var stamped = rates
+        stamped.fastMultiplier = multiplier
+        return stamped
     }
 
     /// Zero rates for a model whose final name segment ends in `-free`, so its tokens are counted and its

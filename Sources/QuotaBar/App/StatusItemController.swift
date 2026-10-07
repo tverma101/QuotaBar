@@ -392,17 +392,18 @@ final class StatusItemController: NSObject {
         // the fixed opening guess, making large and small displays open at the same height.
         heightController.prepareForOpening(below: buttonRectOnScreen)
 
-        // Rebuild the dashboard tree only while visible. A closed panel keeps EmptyView so Observation
-        // objects cannot accumulate off-screen for hours. Attach the host *before* flipping
-        // `popoverShown` so DashboardView's onChange/onAppear observers are subscribed when the
-        // visibility signal rises (otherwise a same-runloop flip is missed and height/egg seeding
-        // depends only on later geometry).
-        hostingController.rootView = makeDashboardRootView()
-
-        // Mark the popover on-screen after the dashboard mounts, so the egg's animation loops and the
-        // height re-seed path see the rising edge. Read by the SwiftUI egg via `\.popoverIsVisible`;
-        // a closed popover keeps the loops unmounted, so a left-on egg costs no CPU.
+        // Mark the popover on-screen BEFORE mounting the dashboard: the first render then mounts
+        // the live `\.popoverIsVisible` branches (egg `TimelineView` clocks, footer countdown)
+        // directly, instead of mounting the static branch and structurally swapping every gated
+        // view one render later — a second full-tree pass on every tap. The old attach-before-flip
+        // order relied on `onChange` catching a same-runloop rising edge; `DashboardView.onAppear`
+        // covers that same edge (it seeds height and adopts slide state when it mounts with
+        // `popoverShown` already true).
         container.transparency.setPopoverShown(true)
+
+        // Rebuild the dashboard tree only while visible. A closed panel keeps EmptyView so Observation
+        // objects cannot accumulate off-screen for hours.
+        hostingController.rootView = makeDashboardRootView()
 
         // Presentation is deliberately snapshot-only. Opening used to force a full, uncached
         // provider batch, so every menu-bar tap fanned out across all provider accounting and

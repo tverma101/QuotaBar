@@ -3,25 +3,39 @@ import XCTest
 
 /// A model the pricing feeds have never heard of, whose name says it is free.
 ///
-/// This is not a hypothetical: `space-bunny-free` is served through CodexRouter, is priced in no source,
-/// and the gateway fold drops every unpriced row's tokens. A ledger carrying 2.09B tokens of it showed
-/// ~20M on the card — the other 99% silently discarded as "unknown".
+/// This is not a hypothetical: `space-bunny-free` used to be served through CodexRouter, was priced in
+/// no source, and the gateway fold dropped every unpriced row's tokens. A ledger carrying 2.09B tokens
+/// of it showed ~20M on the card — the other 99% silently discarded as "unknown". It has since left the
+/// free period (paid on the OpenCode GO plan, opencode.ai/docs/go verified 2026-10-06) and is pinned to
+/// the GO card in the supplement with its calibration excluded — so the zero-count specimens below are
+/// the still-unlisted `-free` names and the explicit $0 pins (`deepseek-v4-flash-free`, `mimo-v2.5-free`,
+/// `mimo-v2.5-pro-free`).
 ///
-/// The supplement's existing convention is that a `-free` model is priced at $0 and *counted*
-/// (`deepseek-v4-flash-free`, `mimo-v2.5-free`, `mimo-v2.5-pro-free` all ship explicit zero rates).
 /// Being absent from every catalog is not the same as being free, and withholding measured usage is the
 /// worse error.
 final class FreeModelCountingTests: XCTestCase {
     private let pricing = TestPricing.bundled
 
     func testAnUnlistedFreeModelCountsAtZeroRatherThanVanishing() throws {
-        let model = "space-bunny-free"
+        let model = "some-unlisted-model-free"
         let rates = try XCTUnwrap(pricing.resolve(model: model), "must resolve so its tokens are counted")
         XCTAssertEqual(rates.inputPerMillion, 0)
         XCTAssertEqual(rates.outputPerMillion, 0)
 
         let tokens = TokenBreakdown(input: 1_726_685_734, cacheRead: 300_000, output: 10_000)
         XCTAssertEqual(try XCTUnwrap(pricing.estimatedCostDollars(model: model, tokens: tokens)), 0)
+    }
+
+    /// The once-free codename outgrew the class: it is paid now, and the bare id must reach the GO
+    /// card rather than a $0 free-variant fallback. The provider-prefixed spelling still resolves
+    /// (counted) via the free-variant rule at $0 — inert in practice, because the scanner strips
+    /// gateway prefixes before pricing and the fold always sees the bare name.
+    func testFormerFreeCodenamePricesAtTheGOCard() throws {
+        let rates = try XCTUnwrap(pricing.resolve(model: "space-bunny-free"), "must resolve")
+        XCTAssertEqual(rates.inputPerMillion, 0.15, "GO input rate")
+        XCTAssertEqual(rates.outputPerMillion, 0.6, "GO output rate")
+        XCTAssertEqual(rates.cacheReadPerMillion, 0.03, "GO cache-read rate")
+        XCTAssertNotNil(pricing.resolve(model: "opencode-free/space-bunny-free"))
     }
 
     /// The gateway fold reads the *bare* model name, so both spellings have to resolve.
@@ -42,6 +56,7 @@ final class FreeModelCountingTests: XCTestCase {
 
     /// The whole point: the fold's token count must survive an unpriced-rate lookup. An unpriced rate is
     /// what makes `foldGatewayRows` discard a row's tokens entirely, so this asserts the rate resolves.
+    /// The legacy free slug now prices at the GO card — the poisoned $0 DB calibration is excluded.
     func testGatewayFoldWouldCountTokensForAnUnlistedFreeModel() throws {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("qb-free-\(UUID().uuidString).jsonl")
@@ -57,13 +72,14 @@ final class FreeModelCountingTests: XCTestCase {
         XCTAssertEqual(rows[0].cacheRead, 400_000)
         XCTAssertEqual(rows[0].output, 250_000)
 
-        // The figure the fold bills: zero, but present. Without a rate this is nil and the row's tokens
-        // are dropped from every total.
+        // The figure the fold bills: the GO card at these tokens — 600k×$0.15/M + 400k×$0.03/M
+        // + 250k×$0.60/M = $0.252. Without a rate this is nil and the row's tokens are dropped
+        // from every total; at the free-period $0 calibration this read $0.
         let breakdown = TokenBreakdown(
             input: rows[0].input, cacheWrite5m: rows[0].cacheWrite,
             cacheRead: rows[0].cacheRead, output: rows[0].output
         )
-        XCTAssertEqual(try XCTUnwrap(pricing.estimatedCostDollars(model: rows[0].model, tokens: breakdown)), 0)
+        XCTAssertEqual(try XCTUnwrap(pricing.estimatedCostDollars(model: rows[0].model, tokens: breakdown)), 0.252, accuracy: 1e-9)
         XCTAssertEqual(rows[0].input + rows[0].cacheRead + rows[0].output, 1_250_000)
     }
 }

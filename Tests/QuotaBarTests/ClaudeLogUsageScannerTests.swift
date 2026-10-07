@@ -290,7 +290,7 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
         XCTAssertEqual(scan.series.daily[0].costUSD ?? 0, 0.04, accuracy: 1e-9)
     }
 
-    func testAggregateUnknownModelIsExcludedFromTotalsButWarns() {
+    func testAggregateUnknownModelCountsTokensButDashesCost() {
         let day = localDay("2026-02-20T12:00:00.000Z")
         var unknown = entry(messageID: "m1", requestID: "r1", isSidechain: false, cacheRead: 0, output: 0)
         unknown.model = "mystery-model"
@@ -300,16 +300,17 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
 
         let scan = ClaudeLogUsageScanner.aggregate(entries: [unknown, priced], since: .distantPast, pricing: pricing)
 
-        // Unpriceable tokens never enter the displayed totals — they surface only through the
-        // warning triangle, so the tile's tokens and dollars stay coherent.
-        XCTAssertEqual(scan.series.daily, [DailyUsageEntry(date: day, totalTokens: 1500, costUSD: 0.02)])
+        // Unpriced usage keeps counting tokens (the history screen shows them) but contributes no
+        // cost — its day stays backed by the priced rows so the reveal can backfill dollars later.
+        XCTAssertEqual(scan.series.daily, [DailyUsageEntry(date: day, totalTokens: 1515, costUSD: 0.02)])
         XCTAssertEqual(scan.unknownModelsByDay[day], ["mystery-model"])
         XCTAssertEqual(scan.modelUsage?.daily.first?.models, [
-            ModelUsageEntry(model: "claude-test-model", totalTokens: 1500, costUSD: 0.02)
+            ModelUsageEntry(model: "claude-test-model", totalTokens: 1500, costUSD: 0.02),
+            ModelUsageEntry(model: "mystery-model", totalTokens: 15, costUSD: nil)
         ])
     }
 
-    func testUnpriceableModelsStayUnbackedAndOnlyNamedModelsWarn() {
+    func testUnpricedModelsCountTokensAndStayUnpricedWithoutCostWarning() {
         let day = localDay("2026-02-20T12:00:00.000Z")
 
         for model in ["mystery-model", nil] as [String?] {
@@ -319,9 +320,16 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
 
             let scan = ClaudeLogUsageScanner.aggregate(entries: [unpriced], since: .distantPast, pricing: pricing)
 
-            XCTAssertTrue(scan.series.daily.isEmpty)
-            XCTAssertEqual(scan.unknownModelsByDay[day], model.map { [$0] })
-            XCTAssertEqual(scan.modelUsage?.daily ?? [], [])
+            // Tokens still count (owner decision: never hide volume); cost stays unbacked so the
+            // tile reads a dash until the model is priced or revealed. A missing name folds to the
+            // synthetic "Unattributed" entry, which is also what the warning set records.
+            let foldedName = model ?? ModelUsageEntry.unattributedModelName
+            XCTAssertEqual(scan.series.daily.map(\.totalTokens), [15])
+            XCTAssertNil(scan.series.daily[0].costUSD)
+            XCTAssertEqual(scan.unknownModelsByDay[day], [foldedName])
+            XCTAssertEqual(scan.modelUsage?.daily.first?.models, [
+                ModelUsageEntry(model: foldedName, totalTokens: 15, costUSD: nil)
+            ])
         }
     }
 

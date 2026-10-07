@@ -41,7 +41,7 @@ actor AntigravityDbUsageScanner {
             .appendingPathComponent(".gemini/antigravity-cli/conversations").path
     }
 
-    func scan(daysBack: Int = 30, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+    func scan(daysBack: Int = UsageHistoryWindow.previousDays, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
         let directory = expandHome(conversationsDirectory())
         let paths: [String]
         do {
@@ -209,8 +209,14 @@ actor AntigravityDbUsageScanner {
             output: event.outputTokens
         )
 
+        // Public-API-rate comparison: the same tokens at the catalog rates.
+        if let apiEstimate = pricing.estimatedCostDollars(model: event.model, tokens: tokens) {
+            accumulator.addApiEstimate(day: day, cost: apiEstimate)
+        }
         guard let cost = pricing.estimatedCostDollars(model: event.model, tokens: tokens) else {
             accumulator.addUnknownModel(day: day, model: event.model)
+            // Unpriced rows count their tokens with a dashed cost (owner policy).
+            accumulator.add(day: day, tokens: total.partialValue, cost: nil, model: event.model)
             return
         }
         accumulator.add(day: day, tokens: total.partialValue, cost: cost, model: event.model)

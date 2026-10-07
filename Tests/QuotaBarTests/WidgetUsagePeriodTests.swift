@@ -10,9 +10,12 @@ final class WidgetUsagePeriodTests: XCTestCase {
     private let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
 
     func testSpendTilesAreUsagePeriods() {
+        // Today, Yesterday, Last 30 Days. The All-At-API-Rates estimate is deliberately NOT a tile —
+        // the owner rejected the dashboard estimate row; the comparison lives on the history screen.
         let tiles = WidgetDescriptor.spendTiles(provider: provider)
         XCTAssertEqual(tiles.count, 3)
         XCTAssertTrue(tiles.allSatisfy { $0.sample.isUsagePeriod })
+        XCTAssertFalse(tiles.contains { $0.id == "codex.apiEstimate" })
     }
 
     func testValuesAndCombinedDefaultToNotUsagePeriod() {

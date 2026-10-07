@@ -91,7 +91,11 @@ local logs carry billed rows for a model, its fold is priced at the average rate
 recorded, not the catalog sticker rate. That matters because the gateway bills DeepSeek cache hits at a
 fraction of the sticker input rate — the recorded average can sit ~15× below the catalog miss rate, so
 charging every token at the miss rate would overstate spend by the same factor. Models with no recorded
-rows fall back to catalog rates; free-tier models recorded at $0 fold at $0.
+rows fall back to catalog rates; free-tier models recorded at $0 fold at $0. A few models skip
+calibration entirely because their recorded sample misrepresents the published rate: Muse Spark (tiny
+sample) and DeepSeek V4 Pro (cache-mix mismatch) use the catalog card, and Space Bunny's legacy
+`space-bunny-free` rows recorded $0 during its free-promo period while the model is paid on the GO plan
+now, so the supplement's GO card prices its folds.
 
 Whenever imputed dollars are present the tiles carry the ⓘ estimate marker; models the catalogs don't
 know surface as a warning instead of a guess.
@@ -110,9 +114,10 @@ Each spend tile shows cost and tokens together (`$4.08 · 1.2M tokens`), the sam
 Cursor. A period with no recorded usage reads "No data" rather than a misleading `$0.00`. No log data
 leaves your Mac.
 
-The spend detail keeps a free model with a material share of tokens on its own named row even though
-its spend share is `0%`. Models grouped into `Other` are identified beneath that row's label, led by
-the model with the most tokens.
+The spend detail never hides a model that holds a material share of the period's tokens on its own
+named row — even when its cost share (or actual cost) is tiny: tokens are the measured quantity, so
+half the usage can never disappear behind "Other". Models grouped into `Other` are identified
+beneath that row's label, led by the model with the most tokens.
 
 ## Troubleshooting
 

@@ -50,6 +50,22 @@
       "pattern": "^github_bugbot$"
     },
     {
+      "canonical": "grok-4.7-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]7-fast(?:-(?:low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.7-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]7(?:-(?:low|medium|high|xhigh))?-fast$"
+    },
+    {
+      "canonical": "grok-4.7",
+      "pattern": "^(?:cursor-)?grok-4[.-]7(?:-(?:build|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.7",
+      "pattern": "^grok-bot-cua$"
+    },
+    {
       "canonical": "grok-4.6-fast",
       "pattern": "^(?:cursor-)?grok-4[.-]6-fast(?:-(?:low|medium|high|xhigh))?$"
     },
@@ -350,6 +366,14 @@
       "pattern": "^glm-5\\.2(?:-(?:high|max))?$"
     },
     {
+      "canonical": "glm-5.3-flash",
+      "pattern": "^glm-5(?:p|[.-])3-flash(?:-(?:low|high|max))?$"
+    },
+    {
+      "canonical": "glm-5.3",
+      "pattern": "^glm-5(?:p|[.-])3(?:-(?:low|high|max))?$"
+    },
+    {
       "canonical": "gpt-5.3-codex",
       "pattern": "^[Pp]remium \\((?:[Gg][Pp][Tt]-5\\.3-[Cc]odex|[Cc]odex 5\\.3)\\)$"
     },
@@ -527,6 +551,8 @@
     }
   ],
   "fast_multipliers": {
+    "claude-opus-4-6": 6.0,
+    "claude-opus-4-7": 6.0,
     "claude-opus-5": 2.0,
     "gpt-5": 2.0,
     "gpt-5.1-codex": 2.0,
@@ -736,6 +762,18 @@
       "input_per_million": 4.0,
       "output_per_million": 12.0
     },
+    "glm-5.3": {
+      "$comment": "Cursor rates verified 2026-10-04 at https://cursor.com/docs/models/glm-5-3. Cache reads differ from the OpenRouter route; cache writes have no separate fee and default to input.",
+      "cache_read_per_million": 0.26,
+      "input_per_million": 1.4,
+      "output_per_million": 4.4
+    },
+    "glm-5.3-flash": {
+      "$comment": "Cursor rates verified 2026-10-04 at https://cursor.com/docs/models/glm-5-3-flash. Cursor CSV uses glm-5p3-flash with effort suffixes. Cache reads differ from the OpenRouter route; cache writes have no separate fee and default to input.",
+      "cache_read_per_million": 0.029,
+      "input_per_million": 0.15,
+      "output_per_million": 0.5
+    },
     "kimi-k2.7-code": {
       "$comment": "Cursor's published Kimi K2.7 Code rates. Public catalogs disagree (some bare keys are $0), so this override wins.",
       "cache_read_per_million": 0.19,
@@ -875,7 +913,32 @@
       "cache_write_per_million": 12.5,
       "cache_read_per_million": 1.0,
       "output_per_million": 50.0
+    },
+    "grok-4.7": {
+      "$comment": "Cursor + SpaceXAI first-party model, Cursor Models pool as of 2026-10-04. Cache write is not published separately and defaults to the input rate. Long context (>256k) is 2x; fast long context is 3x.",
+      "cache_read_per_million": 0.5,
+      "cache_write_per_million": 2.0,
+      "input_per_million": 2.0,
+      "output_per_million": 6.0
+    },
+    "grok-4.7-fast": {
+      "cache_read_per_million": 1.0,
+      "cache_write_per_million": 4.0,
+      "input_per_million": 4.0,
+      "output_per_million": 12.0
+    },
+    "space-bunny": {
+      "$comment": "OpenCode GO published rate (opencode.ai/docs/go, verified 2026-10-06): $0.15 input / $0.60 output / $0.03 cache read per 1M, no cache-write lane. Stealth model left the free period - the bundled catalogues still carry only zero-rate space-bunny-free / stealth/space-bunny-alpha, so without this pin the slug prices at $0 or dashes. Log slugs 'space bunny' and 'space-bunny' both reach this entry via the separator-normalized retry.",
+      "cache_read_per_million": 0.03,
+      "input_per_million": 0.15,
+      "output_per_million": 0.6
+    },
+    "space-bunny-free": {
+      "$comment": "Same GO rates as space-bunny: OpenCode kept the legacy '-free' id after the model went paid on GO (verified 2026-10-06 - the router ledger still records current usage as space-bunny-free), and the pricing engine's *-free rule would otherwise force $0 on it. Priced per slug, not per date, so free-period days reprice at the GO rates too.",
+      "cache_read_per_million": 0.03,
+      "input_per_million": 0.15,
+      "output_per_million": 0.6
     }
   },
-  "updated_at": "2026-09-24T19:41:06Z"
+  "updated_at": "2026-10-06T16:10:00Z"
 }

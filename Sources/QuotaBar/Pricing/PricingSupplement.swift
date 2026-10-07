@@ -12,6 +12,11 @@ struct PricingSupplement: Sendable {
     /// Also applied to the base model's own rates, so requests flagged fast by the scanner (rather
     /// than by a `-fast` slug) bill at the fast rate.
     let fastMultipliers: [String: Double]
+    /// `fastMultipliers` keyed by `PricingCatalog.normalizedKey(base)`, precomputed once at decode
+    /// instead of re-normalizing every base key per lookup. Collision policy: the most specific raw
+    /// key (longest, then lexicographically smallest) wins — raw dictionary order is randomized, so
+    /// a collision resolved at iteration order was a latent nondeterminism.
+    let normalizedFastMultipliers: [String: Double]
     let aliasRules: [AliasRule]
     let updatedAt: String?
 
@@ -29,6 +34,24 @@ struct PricingSupplement: Sendable {
     ) {
         self.pricing = pricing
         self.fastMultipliers = fastMultipliers
+        // Collision policy when two raw base keys normalize to the same form (e.g. `gpt-5.6` and
+        // `gpt.5.6`): the most specific raw key — longest, then lexicographically smallest — wins.
+        // Raw dictionary order is randomized, so resolving collisions at iteration order was a
+        // latent nondeterminism.
+        var normalizedFast: [String: (multiplier: Double, specificity: Int, rawKey: String)] = [:]
+        for (base, multiplier) in fastMultipliers {
+            let normalized = PricingCatalog.normalizedKey(base)
+            let specificity = base.count
+            guard let existing = normalizedFast[normalized] else {
+                normalizedFast[normalized] = (multiplier, specificity, base)
+                continue
+            }
+            if specificity > existing.specificity
+                || (specificity == existing.specificity && base < existing.rawKey) {
+                normalizedFast[normalized] = (multiplier, specificity, base)
+            }
+        }
+        self.normalizedFastMultipliers = normalizedFast.mapValues(\.multiplier)
         self.aliasRules = aliasRules
         self.updatedAt = updatedAt
     }
@@ -48,8 +71,8 @@ struct PricingSupplement: Sendable {
         if let exact = fastMultipliers[model] { return exact }
         let normalized = PricingCatalog.normalizedKey(model)
         for part in normalized.split(whereSeparator: { $0 == "/" || $0 == ":" }) {
-            for (base, multiplier) in fastMultipliers {
-                if Self.matchesModelSuffix(part: String(part), base: PricingCatalog.normalizedKey(base)) {
+            for (base, multiplier) in normalizedFastMultipliers {
+                if Self.matchesModelSuffix(part: String(part), base: base) {
                     return multiplier
                 }
             }

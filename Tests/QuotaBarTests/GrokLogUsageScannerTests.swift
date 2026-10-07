@@ -98,7 +98,7 @@ final class GrokLogUsageScannerTests: XCTestCase {
         XCTAssertTrue(usage.unknownModelsByDay.isEmpty)
     }
 
-    func testUnknownModelWithoutRecordedCostIsExcludedAndWarns() {
+    func testUnknownModelWithoutRecordedCostCountsTokensAndDashesCost() {
         let line = GrokLogFixture.completedTurn(
             timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-future-model",
@@ -107,7 +107,10 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
         let usage = scan(line)
 
-        XCTAssertTrue(usage.series.daily.isEmpty)
+        // Unpriced usage keeps counting tokens (history shows volume); no cost is claimed, so the
+        // day stays cost-unbacked for a later reveal to backfill.
+        XCTAssertEqual(usage.series.daily.map(\.totalTokens), [500_000])
+        XCTAssertNil(usage.series.daily.first?.costUSD)
         XCTAssertEqual(usage.unknownModelsByDay["2026-06-10"], ["grok-future-model"])
     }
 

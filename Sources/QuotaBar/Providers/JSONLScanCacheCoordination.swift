@@ -10,7 +10,13 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
     static let shared = JSONLAccountingWorkPacer()
 
     // Leave margin below the 10% contract for work between paced slices and sampling variation.
-    static let targetCPUFraction = 0.075
+    // Full-scope passes (panel open, manual refresh, CLI) own the foreground instead: the user is
+    // actively waiting on token accounting, and 7.5% of wall cannot finish this machine's cold
+    // corpora inside the 120s provider deadline (9s of CPU vs 40-100s of real work — the gap was
+    // the OpenCode 120s-timeout loop). Background menu-bar ticks keep the original ceiling.
+    static var targetCPUFraction: Double {
+        ProviderRefreshContext.scope.isFull ? 0.25 : 0.075
+    }
     // A pathological work slice must not hold the shared accounting lock past one provider deadline.
     private static let maxPacingDebtNanoseconds: Int64 = 120_000_000_000
     // A longer slice avoids thousands of timer wakeups while streaming large ledgers. Oversleep is
