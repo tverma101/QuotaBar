@@ -59,14 +59,23 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
 
         // The report the view must show: three period cards, the estimate line, and Codex's dashed
         // codename row. Assert the model first — a silently-empty render would prove nothing.
+        // Build it through the view's own plumbing: the estimatedCost flags come from the
+        // registry's history descriptors via `dataStore.historyDescriptorsByProvider`, exactly as
+        // `HistoryDashboardView.report` does.
+        let estimatedCosts = dataStore.historyDescriptorsByProvider.mapValues(\.estimatedCost)
         let report = HistoryDashboardAggregator.report(.init(
             enabledProviderIDs: layout.orderedProviderIDs().filter { layout.isProviderEnabled($0) },
             displayNameByProviderID: [:],
             historyByProviderID: ["claude": dataStore.snapshots["claude"]!.usageHistory!,
-                                  "codex": dataStore.snapshots["codex"]!.usageHistory!]
+                                  "codex": dataStore.snapshots["codex"]!.usageHistory!],
+            estimatedCostByProviderID: estimatedCosts
         ))
         XCTAssertFalse(report.isEmpty, "fixture must produce sections")
         XCTAssertNotNil(report.apiEstimateTotal)
+        XCTAssertTrue(report.lifetimeCostIsEstimated,
+                      "Claude/Codex descriptors are fold-imputed — the hero must carry the Est. mark")
+        XCTAssertTrue(report.showsAPIEstimateCard,
+                      "fixture estimates differ from the hero total — the what-if card must show")
         XCTAssertGreaterThan(report.lifetime.tokens, report.last30.tokens,
                              "pre-window days must count toward lifetime but not the 30-day total")
         XCTAssertGreaterThan(report.lifetime.cost ?? 0, report.last30.cost ?? 0)
@@ -94,6 +103,65 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
         try png.write(to: url)
         print("history render saved to: \(url.path), size: \(hosting.bounds.size), bytes: \(png.count)")
         XCTAssertGreaterThan(png.count, 20_000, "a real history screen renders far more than a blank bitmap")
+    }
+
+    /// The user-screenshot bug: the same lifetime dollars shown twice — hero plus the
+    /// "At Public API Rates (Est.)" what-if card — when the fold is the estimate. When every
+    /// contributing provider's fold cost is the public-rate estimate, the card must disappear
+    /// and only the hero's "Est." mark remains.
+    @MainActor
+    func testEstimateCardHiddenWhenFoldCostIsTheEstimate() throws {
+        let suiteName = "HistoryDashboardViewSnapshotTests-EstimateSuppressed"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let providers: [any ProviderRuntime] = [ClaudeProvider(), CodexProvider()]
+        let registry = WidgetRegistry.from(providers)
+        let layout = LayoutStore(registry: registry, defaults: defaults, storageKey: "layout")
+        let dataStore = WidgetDataStore(registry: registry, providers: providers, defaults: defaults)
+
+        // Per-day estimate equals the fold cost exactly — the "estimate" carries no new
+        // information, so the card would duplicate the hero.
+        dataStore.snapshots = [
+            "claude": ProviderSnapshot(
+                providerID: "claude",
+                displayName: "Claude",
+                lines: [],
+                usageHistory: Self.history(
+                    daily: [(0, 96_700_000, 3.05), (-1, 578_100_000, 25.15), (-90, 3_400_000_000, 140.10)],
+                    models: [(0, "claude-sonnet-5", 96_700_000, 3.05)],
+                    estimates: [(0, 3.05), (-1, 25.15), (-90, 140.10)]
+                )
+            )
+        ]
+
+        let estimatedCosts = dataStore.historyDescriptorsByProvider.mapValues(\.estimatedCost)
+        let report = HistoryDashboardAggregator.report(.init(
+            enabledProviderIDs: layout.orderedProviderIDs().filter { layout.isProviderEnabled($0) },
+            displayNameByProviderID: [:],
+            historyByProviderID: ["claude": dataStore.snapshots["claude"]!.usageHistory!],
+            estimatedCostByProviderID: estimatedCosts
+        ))
+        XCTAssertTrue(report.lifetimeCostIsEstimated)
+        XCTAssertFalse(report.showsAPIEstimateCard,
+                       "estimate equals the hero total — the duplicate card must be suppressed")
+
+        let view = HistoryDashboardView()
+            .environment(layout)
+            .environment(dataStore)
+            .environment(\.colorScheme, .dark)
+            .background(Color(red: 0.09, green: 0.09, blue: 0.11))
+            .frame(width: 320)
+
+        let hosting = NSHostingView(rootView: view)
+        hosting.setFrameSize(hosting.fittingSize)
+        let rep = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+        hosting.cacheDisplay(in: hosting.bounds, to: rep)
+        let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quotabar_history_render_no_estimate_card.png")
+        try png.write(to: url)
+        print("suppressed render saved to: \(url.path), bytes: \(png.count)")
     }
 
     private static func history(
