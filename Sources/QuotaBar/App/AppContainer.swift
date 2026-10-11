@@ -411,6 +411,13 @@ final class AppContainer {
             /// `.localAccounting` scope: the codex/opencode local folds recompute without re-reading
             /// live quota APIs, so Today tracks routed turns even while the panel is closed.
             var pendingLocalAccountingPass = false
+            /// Latched by the panel-open edge and consumed by the next pass, which runs the
+            /// two-phase panel sequence (`.panelMeters` then `.panelAccounting`). Unlike the old
+            /// `.full` latch this one never widens to a full pass: the panel's own two phases cover
+            /// both the meters and the local accounting. Set when the panel closes again before the
+            /// pass starts, the phases still run — the meter stamps they produce stay fresh for the
+            /// next open.
+            var pendingPanelPass = false
             /// Rate limit for trigger-caused passes, and whether a pass must be dropped because the
             /// previous one has not cleared the cooldown yet.
             var triggerGate = BackgroundRefreshGate()
@@ -464,27 +471,60 @@ final class AppContainer {
                     // snapshot still answers from cache. A closed-panel ledger wake runs the narrower
                     // localAccounting pass instead: the codex/opencode folds recompute without
                     // re-reading live quota APIs (one incremental tail parse per accepted wake).
-                    let scope: ProviderRefreshContext.Scope
-                    if panelOpen || pendingFullScopePass {
-                        scope = .full
-                    } else if pendingLocalAccountingPass {
-                        scope = .localAccounting
+                    //
+                    // A panel-open pass runs in two phases so the meters the user is looking at
+                    // land in seconds rather than trailing the slowest local corpus (~19s for the
+                    // seven heavy-log providers, serialized): phase 1 (panelMeters) fetches every
+                    // enabled provider's live quota meters with no local folds at all, then phase 2
+                    // (panelAccounting) recomputes local accounting with those meters recovered by
+                    // the store's merge. `.full` remains the single-phase path for passes nobody
+                    // is watching (background trigger, midnight rollover, first launch).
+                    if panelOpen || pendingPanelPass {
+                        // The panel's two phases cover both the meters and the local accounting,
+                        // so a latched trigger/midnight pass is satisfied here too — no extra
+                        // full pass after the panel closes.
+                        pendingFullScopePass = false
+                        pendingLocalAccountingPass = false
+                        pendingPanelPass = false
+                        await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+                            await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(true) {
+                                await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(false) {
+                                    await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                                }
+                            }
+                        }
+                        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+                            await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(false) {
+                                await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(false) {
+                                    await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                                }
+                            }
+                        }
                     } else {
-                        scope = .menuBar
-                    }
-                    pendingFullScopePass = false
-                    pendingLocalAccountingPass = false
-                    await ProviderRefreshContext.$scope.withValue(scope) {
-                        await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(scope != .full) {
-                            // Full-scope passes answer a user who is actively waiting (panel opened or
-                            // an explicit refresh trigger), so they run unpaced: the 25% CPU ceiling
-                            // stretched cold ledger/gateway folds into 20-30s walls for ~5-8s of real
-                            // CPU. Menu-bar and closed-panel local-accounting ticks keep the
-                            // background allowance. Memory stays bounded by the provider
-                            // serialization and soft-limit checks below, which key on footprint
-                            // rather than on pacing.
-                            await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(scope != .full) {
-                                await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                        // Read the latches BEFORE clearing them — the wake handler sets them for
+                        // the pass that is about to run.
+                        let scope: ProviderRefreshContext.Scope
+                        if pendingFullScopePass {
+                            scope = .full
+                        } else if pendingLocalAccountingPass {
+                            scope = .localAccounting
+                        } else {
+                            scope = .menuBar
+                        }
+                        pendingFullScopePass = false
+                        pendingLocalAccountingPass = false
+                        await ProviderRefreshContext.$scope.withValue(scope) {
+                            await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(scope != .full) {
+                                // Full-scope passes answer a user who is actively waiting (panel opened or
+                                // an explicit refresh trigger), so they run unpaced: the 25% CPU ceiling
+                                // stretched cold ledger/gateway folds into 20-30s walls for ~5-8s of real
+                                // CPU. Menu-bar and closed-panel local-accounting ticks keep the
+                                // background allowance. Memory stays bounded by the provider
+                                // serialization and soft-limit checks below, which key on footprint
+                                // rather than on pacing.
+                                await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(scope != .full) {
+                                    await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                                }
                             }
                         }
                     }
@@ -527,10 +567,10 @@ final class AppContainer {
                             AppLog.info(.refresh, "closed-panel ledger wake; scheduling local accounting pass")
                         }
                     case PopoverTransparencyStore.panelVisibilityDidChangeNotification:
-                        // The store posts on the open edge only. Latch a full pass so the panel's
-                        // first paint is followed by fresh data even if the user closes it again
-                        // before the pass starts.
-                        pendingFullScopePass = true
+                        // The store posts on the open edge only. Latch the two-phase panel pass so
+                        // the panel's first paint is followed by fresh meters and folds even if the
+                        // user closes it again before the pass starts.
+                        pendingPanelPass = true
                     case BackgroundRefreshTrigger.didChangeNotification:
                         if triggerGate.shouldAccept(at: Date()) {
                             pendingFullScopePass = true

@@ -135,7 +135,16 @@ struct ProviderSnapshotCache {
         // persisted blob is shown for instant paint but never gates a refresh, so every launch refetches
         // promptly instead of waiting out the previous session's remaining interval (#697).
         let writtenThisSession = sessionWrites.withLock { $0.contains(providerID) }
-        let age = now().timeIntervalSince(snapshot.refreshedAt)
+        // Age reads the OLDER of the wall stamp and the meters' own stamp. Fold-only passes
+        // (`.localAccounting` / `.panelAccounting`) write a fresh `refreshedAt` while carrying
+        // meters recovered from the previous snapshot; gating on `refreshedAt` alone let a
+        // closed-panel ledger wake (one per routed turn) keep a snapshot whose meters the live
+        // API had not answered in hours TTL-fresh forever, so panel-open passes cache-hit and
+        // the subscription usage meters never updated. `quotaRefreshedAt` is nil on legacy
+        // payloads and falls back to `refreshedAt` (today's behavior).
+        let meterStamp = snapshot.quotaRefreshedAt ?? snapshot.refreshedAt
+        let oldestStamp = min(snapshot.refreshedAt, meterStamp)
+        let age = now().timeIntervalSince(oldestStamp)
         let trusted = allowsPersistedFreshness || writtenThisSession
         let fresh = trusted && age < ttl
         let reason = !trusted ? "stale (not written this session)"

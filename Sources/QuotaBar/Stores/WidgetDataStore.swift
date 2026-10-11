@@ -89,6 +89,12 @@ final class WidgetDataStore {
     /// Rendered snapshots consumed by every UI/API surface. Equal to `localSnapshots` when iCloud sync
     /// is off; machine-local history rows are rebuilt from the union while sync is on.
     var snapshots: [String: ProviderSnapshot] = [:]
+    /// Each provider's history descriptor, keyed by provider ID — the classifying metadata the
+    /// Usage History screen reuses (e.g. `estimatedCost`, which drives the lifetime hero's
+    /// "(Est.)" mark). Same source the spend tiles' ⓘ flag reads.
+    var historyDescriptorsByProvider: [String: UsageHistoryDescriptor] {
+        registry.historyDescriptorsByProvider
+    }
     /// Last-good snapshots produced on this Mac. These alone are cached and exported to iCloud, so a
     /// peer contribution can never echo back out and multiply on the next device.
     private(set) var localSnapshots: [String: ProviderSnapshot] = [:]
@@ -306,10 +312,14 @@ final class WidgetDataStore {
     /// Log/batch-key label per scope. Distinct keys matter: a `.localAccounting` batch in flight
     /// must not absorb a panel-open `.full` request (it refreshes only the ledger-consuming
     /// families), and vice versa a `.full` batch legitimately subsumes a concurrent wake pass.
+    /// The two panel phases get their own keys too, so a phase-1 meters batch can never join (or
+    /// be joined by) a phase-2 fold batch.
     static func batchScopeLabel(_ scope: ProviderRefreshContext.Scope) -> String {
         switch scope {
         case .menuBar: return "menuBar"
+        case .panelMeters: return "panelMeters"
         case .localAccounting: return "localAccounting"
+        case .panelAccounting: return "panelAccounting"
         case .full: return "full"
         }
     }
@@ -318,7 +328,7 @@ final class WidgetDataStore {
         // `Task {}` from MainActor context inherits the isolation (a task-group child can't capture
         // the non-Sendable store), so fire one task per provider in bounded groups, then await them all.
         let enabledIDs = registry.providers.map(\.id).filter { isProviderEnabled($0) }
-        let providerIDs = Self.selectProviderIDsForRefresh(
+        var providerIDs = Self.selectProviderIDsForRefresh(
             enabledProviderIDs: enabledIDs,
             scope: ProviderRefreshContext.scope,
             pinnedMetricIDs: pinnedMetricIDs(),
@@ -326,6 +336,13 @@ final class WidgetDataStore {
             orderedDescriptors: orderedDescriptors(),
             notificationsEnabled: notificationSettings?().anyEnabled ?? false
         )
+        // The panel fold phase only needs providers whose snapshot carries local accounting (the
+        // history exporters). Pure-API providers (Z.ai, OpenRouter, Devin, …) have no local fold;
+        // suppressing their quota fetch would just re-stamp an unchanged snapshot, and running
+        // them here would double every panel-open API call (phase 1 already fetched their meters).
+        if ProviderRefreshContext.scope == .panelAccounting {
+            providerIDs = providerIDs.filter { registry.historyDescriptorsByProvider[$0] != nil }
+        }
         if providerIDs.isEmpty {
             lastRefreshAt = Date()
             AppLog.info(.refresh, "batch skip (0 providers for scope=\(Self.batchScopeLabel(ProviderRefreshContext.scope)), force=\(force))")
@@ -433,12 +450,16 @@ final class WidgetDataStore {
         )
     }
 
-    /// Picks the provider IDs a refresh pass should hit. `.full` refreshes every enabled provider
-    /// (pinned first so panel-open paints the strip quickly). `.menuBar` only refreshes providers
-    /// that power pinned strip meters, plus providers with visible bounded metrics when quota
-    /// notifications are enabled. `.localAccounting` refreshes only the providers that fold local
-    /// usage corpora (codex + opencode families) — the wake sources for that scope are local file
-    /// appends, so remote-only providers have nothing new to read.
+    /// Picks the provider IDs a refresh pass should hit. `.full` and `.panelMeters` refresh every
+    /// enabled provider (pinned first so the panel paints the strip quickly); `.panelMeters` is
+    /// the panel-open meters phase and must not be narrowed to pinned providers, or the
+    /// dashboard's unpinned cards would wait for phase 2 to show meters. `.menuBar` only refreshes
+    /// providers that power pinned strip meters, plus providers with visible bounded metrics when
+    /// quota notifications are enabled. `.localAccounting` refreshes only the providers that fold
+    /// local usage corpora (codex + opencode families) — the wake sources for that scope are local
+    /// file appends, so remote-only providers have nothing new to read. `.panelAccounting`
+    /// selects every enabled provider; the store narrows it to history exporters, which only the
+    /// registry knows.
     static func selectProviderIDsForRefresh(
         enabledProviderIDs: [String],
         scope: ProviderRefreshContext.Scope,
@@ -453,7 +474,7 @@ final class WidgetDataStore {
         switch scope {
         case .localAccounting:
             return enabledProviderIDs.filter { foldsLocalAccounting($0) }
-        case .full:
+        case .full, .panelMeters, .panelAccounting:
             return MenuBarRefreshFilter.prioritize(
                 providerIDs: enabledProviderIDs,
                 pinnedMetricIDs: pinnedMetricIDs,
@@ -506,8 +527,18 @@ final class WidgetDataStore {
             // every menu-bar tick (one per TTL) keep vouching for history no pass ever recomputed —
             // the spend tiles and unknown-model warnings would go stale forever. A full pass
             // therefore treats carried history as stale and re-runs the provider; a menu-bar pass
-            // keeps the hit (it skips the deferred work by design).
-            if ProviderRefreshContext.scope == .menuBar || cached.carriesPriorHistory != true {
+            // keeps the hit (it skips the deferred work by design). `panelMeters` behaves like
+            // `menuBar`: meters-only work, prior history carried.
+            //
+            // The panel's accounting phase additionally falls through when the cached snapshot
+            // carries NO history at all (fresh install, newly enabled provider, a scan that has
+            // never produced rows): otherwise it would cache-hit on the meters-only phase's write
+            // and the first fold would never run. `.full` keeps its TTL contract — a fresh
+            // snapshot with no history is legitimately fresh, because a full pass is the fold.
+            let foldPhaseNeedsFirstFold = ProviderRefreshContext.scope == .panelAccounting
+                && cached.usageHistory == nil
+            if ProviderRefreshContext.scope.skipsLocalAccounting
+                || (cached.carriesPriorHistory != true && !foldPhaseNeedsFirstFold) {
                 // Skip the no-op write: `@Observable` doesn't compare values, so unconditionally
                 // re-assigning an unchanged snapshot would re-render the menu-bar label every pass.
                 AppLog.debug(.refresh, "cache hit \(providerID)")
@@ -614,15 +645,16 @@ final class WidgetDataStore {
         // produces no result. Keep only the last-good normalized history in that case; the new plan,
         // limits, warnings, and timestamp still win. A non-nil empty history remains authoritative and
         // clears the old rows, because it proves the scan completed and found no usage.
-        // Forced refreshes always replace (panel open / manual Refresh). Menu-bar and
-        // local-accounting merges are only for background ticks — applying either after a forced
+        // Forced refreshes always replace (panel open / manual Refresh). Menu-bar, panel-meter,
+        // and fold-only merges are only for partial passes — applying any of them after a forced
         // full fetch would risk keeping stale spend lines if labels ever diverge from the prior
         // snapshot.
         if !force, ProviderRefreshContext.scope != .full {
-            // Icons-only pass: keep prior spend/token/chart lines and usageHistory so the panel
+            // Meters-only pass: keep prior spend/token/chart lines and usageHistory so the panel
             // does not blank those rows between opens. Fresh meters still win on label collision;
             // omitted meters (incomplete localOnly pass) are preserved by the merge helper. A
-            // localAccounting pass is the mirror image: fresh usageHistory, no live quota meters,
+            // fold-only pass (localAccounting / panelAccounting) is the mirror image: fresh
+            // usageHistory, no live quota meters,
             // and the same helper recovers the meters from the prior snapshot.
             snapshot = snapshot.mergingMenuBarUpdate(over: localSnapshots[providerID])
         } else if snapshot.usageHistory == nil,

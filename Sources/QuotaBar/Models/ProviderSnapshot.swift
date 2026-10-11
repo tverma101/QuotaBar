@@ -28,6 +28,17 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
     /// unknown-model warnings would then never clear). Cached with the snapshot; a snapshot whose
     /// history was computed this refresh leaves it nil.
     var carriesPriorHistory: Bool?
+    /// When the live quota API last answered for the meters in this snapshot — the meters' own
+    /// freshness stamp, distinct from `refreshedAt`. A fold-only pass (`.localAccounting` /
+    /// `.panelAccounting`) produces a snapshot whose *history* is fresh but whose meters were
+    /// recovered from the previous snapshot by the store's merge; stamping that merge with a fresh
+    /// `refreshedAt` alone let closed-panel ledger wakes (one per routed turn) keep re-vouching for
+    /// meters the live API had not answered in hours, so panel-open full passes cache-hit forever
+    /// and the subscription usage meters never updated. The cache's freshness gate reads the OLDER
+    /// of this stamp and `refreshedAt`, so a recovered-meter snapshot goes stale for every scope the
+    /// moment its meter stamp ages out, while genuinely fresh work in the same snapshot still
+    /// counts. `nil` on legacy payloads (treated as `refreshedAt`, today's behavior).
+    var quotaRefreshedAt: Date?
     /// Set only on error snapshots: a stable, non-PII bucket for the failure, read by telemetry on the
     /// failure path. Always `nil` on success (and error snapshots aren't cached), so it never persists.
     var errorCategory: ErrorCategory?
@@ -54,6 +65,11 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         self.clearsPriorMenuBarQuotaState = clearsPriorMenuBarQuotaState
         self.carriesPriorHistory = carriesPriorHistory
         self.errorCategory = errorCategory
+        // A provider-produced snapshot assumes its meters are live until the data store says
+        // otherwise (fold-only scopes carry the previous snapshot's stamp instead — see
+        // `WidgetDataStore.refresh`). Legacy cached payloads decode this as nil and the cache
+        // falls back to `refreshedAt`.
+        self.quotaRefreshedAt = refreshedAt
     }
 
     func line(label: String) -> MetricLine? {
@@ -133,6 +149,27 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
             // Preserved, not computed: the full pass that re-runs the deferred history must not be
             // satisfied by this merge's fresh `refreshedAt` (see `carriesPriorHistory`).
             merged.carriesPriorHistory = previous.usageHistory != nil ? true : merged.carriesPriorHistory
+        }
+        // Meters' freshness: when this pass produced no live quota `.progress` lines (fold-only
+        // scopes), any meters on the merged snapshot were recovered from `previous` — so the
+        // meters' stamp is `previous`'s, not this merge's fresh clock. Letting the fresh
+        // `refreshedAt` vouch for recovered meters let a closed-panel ledger wake (one per routed
+        // turn) keep hours-old subscription meters TTL-fresh forever, and panel-open passes then
+        // cache-hit instead of re-reading the live quota API. Carry only when `previous` actually
+        // held meters: a provider that never produces `.progress` lines (Hermes's always-full
+        // snapshot, a meterless plan) would otherwise inherit a stamp that never refreshes and
+        // cache-miss on every pass for fold work that is genuinely fresh.
+        if !lines.contains(where: Self.isQuotaProgress),
+           previous.lines.contains(where: Self.isQuotaProgress) {
+            merged.quotaRefreshedAt = previous.quotaRefreshedAt ?? previous.refreshedAt
+            // The recovered meters keep their caveat too: a fold-only pass's fresh success says
+            // nothing about the meters' condition (e.g. "Live Codex limits unavailable" from the
+            // meters-only phase that failed while this fold succeeded). A pass that produces its
+            // own meters still clears the warning by returning nil, as before — and an explicit
+            // quota invalidation replaces the state wholesale, warning included.
+            if merged.warning == nil, !clearsPriorQuota {
+                merged.warning = previous.warning
+            }
         }
         if !clearsPriorQuota && (merged.plan == nil || merged.plan?.isEmpty == true) {
             merged.plan = previous.plan

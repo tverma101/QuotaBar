@@ -106,6 +106,16 @@ final class CursorProvider: ProviderRuntime {
             throw CursorAuthError.notLoggedIn
         }
 
+        // Fold-only pass (panel phase 2): the meters-only phase just ran this account's API chain;
+        // re-running it per fold would double every panel-open request burst. Only the token needs
+        // acquiring (the CSV download authenticates with it) — skip the meter chain, fold the CSV,
+        // and let the store's merge recover the meters onto the fresh history.
+        if ProviderRefreshContext.scope.suppressesLiveQuota {
+            var working = CursorMappedUsage(plan: nil, lines: [])
+            let history = await appendSpendLines(to: &working.lines, accessToken: accessToken)
+            return snapshot(working, usageHistory: history)
+        }
+
         let usageResponse = try await fetchUsageWithRetry(accessToken: accessToken, authState: &authState)
         try ProviderAuthRetry.requireSuccess(
             usageResponse,
@@ -163,14 +173,14 @@ final class CursorProvider: ProviderRuntime {
         return await snapshotWithOptionalSpend(mapped, accessToken: currentToken)
     }
 
-    /// Icons-only menu-bar passes keep Auto/API (and sibling) quota meters; skip the usage CSV
-    /// download that only feeds spend tiles / history. The data store merges prior spend onto this
-    /// snapshot until a `.full` pass runs.
+    /// Meters-only passes (menu-bar ticks, panel phase 1) keep Auto/API (and sibling) quota meters;
+    /// skip the usage CSV download that only feeds spend tiles / history. The data store merges
+    /// prior spend onto this snapshot until a fold pass runs.
     private func snapshotWithOptionalSpend(
         _ mapped: CursorMappedUsage,
         accessToken: String
     ) async -> ProviderSnapshot {
-        if ProviderRefreshContext.scope == .menuBar {
+        if ProviderRefreshContext.scope.skipsLocalAccounting {
             return snapshot(mapped)
         }
         var working = mapped

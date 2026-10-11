@@ -118,13 +118,64 @@ final class MenuBarRefreshFilterTests: XCTestCase {
 
     func testBatchScopeLabelsAreDistinctPerScope() {
         // Distinct labels keep a `.localAccounting` batch from joining (or being joined by) a
-        // concurrently requested `.full` batch — the two do different work.
+        // concurrently requested `.full` batch — the two do different work. The panel phases do
+        // different work from each other and from `.full`, so all five must label distinctly.
         let labels = [
             WidgetDataStore.batchScopeLabel(.menuBar),
+            WidgetDataStore.batchScopeLabel(.panelMeters),
             WidgetDataStore.batchScopeLabel(.localAccounting),
+            WidgetDataStore.batchScopeLabel(.panelAccounting),
             WidgetDataStore.batchScopeLabel(.full),
         ]
-        XCTAssertEqual(Set(labels).count, 3)
+        XCTAssertEqual(Set(labels).count, 5)
+    }
+
+    // MARK: - Panel scopes (two-phase panel-open pass)
+
+    /// Phase 1 refreshes every enabled provider (meters for the whole dashboard, not just the
+    /// pinned strip), prioritized like a full pass so the cards the user sees first update first.
+    func testSelectProviderIDsPanelMetersCoversAllEnabled() {
+        let ids = WidgetDataStore.selectProviderIDsForRefresh(
+            enabledProviderIDs: ["opencode", "claude", "codex"],
+            scope: .panelMeters,
+            pinnedMetricIDs: ["codex.session"],
+            providerIDForMetric: providerID(for:),
+            orderedDescriptors: [session, claudeSession, openSession],
+            notificationsEnabled: false
+        )
+        XCTAssertEqual(ids, ["codex", "opencode", "claude"])
+    }
+
+    /// Phase 2 also selects every enabled provider here; the history-exporter narrowing happens in
+    /// `runBatch` (pure-API providers have no fold to recompute and phase 1 already fetched their
+    /// meters).
+    func testSelectProviderIDsPanelAccountingCoversAllEnabled() {
+        let ids = WidgetDataStore.selectProviderIDsForRefresh(
+            enabledProviderIDs: ["opencode", "claude", "codex"],
+            scope: .panelAccounting,
+            pinnedMetricIDs: ["codex.session"],
+            providerIDForMetric: providerID(for:),
+            orderedDescriptors: [session, claudeSession, openSession],
+            notificationsEnabled: false
+        )
+        XCTAssertEqual(ids, ["codex", "opencode", "claude"])
+    }
+
+    /// The two panel phases read different local sources, so their scope helpers must not overlap:
+    /// meters-only phases skip the folds; fold-only phases suppress the live quota fetch.
+    func testPanelScopeHelpersPartitionTheWork() {
+        for scope in [ProviderRefreshContext.Scope.menuBar, .panelMeters] {
+            XCTAssertTrue(scope.skipsLocalAccounting, "\(scope) is meters-only")
+            XCTAssertFalse(scope.suppressesLiveQuota, "\(scope) reads the live quota API")
+        }
+        for scope in [ProviderRefreshContext.Scope.localAccounting, .panelAccounting] {
+            XCTAssertFalse(scope.skipsLocalAccounting, "\(scope) folds local corpora")
+            XCTAssertTrue(scope.suppressesLiveQuota, "\(scope) must not re-read the live quota API")
+        }
+        // `.full` does both in one pass.
+        let full = ProviderRefreshContext.Scope.full
+        XCTAssertFalse(full.skipsLocalAccounting)
+        XCTAssertFalse(full.suppressesLiveQuota)
     }
 
     func testRefreshAllMenuBarSkipsUnpinnedProviders() async {

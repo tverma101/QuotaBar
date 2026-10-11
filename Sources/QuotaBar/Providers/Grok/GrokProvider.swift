@@ -88,15 +88,23 @@ final class GrokProvider: ProviderRuntime {
     private func probe(state: inout GrokAuthState, accessToken: String) async throws -> ProviderSnapshot {
         // The weekly shared-pool meter and pay-as-you-go badge come from the billing endpoint with
         // `?format=credits` — the call the Grok CLI itself makes. This is the provider's primary
-        // remote fetch; a failure here fails the provider like any other usage call.
-        let creditsResponse = try await fetchCreditsConfigWithRetry(accessToken: accessToken, state: &state)
-        var mapped = try GrokUsageMapper.mapCreditsConfig(creditsResponse)
+        // remote fetch; a failure here fails the provider like any other usage call. Fold-only
+        // passes (panel phase 2) skip it: the meters-only phase just answered this endpoint, and
+        // the store's merge recovers the meters onto the fresh local scan.
+        var mapped = GrokMappedUsage(lines: [])
+        if !ProviderRefreshContext.scope.suppressesLiveQuota {
+            let creditsResponse = try await fetchCreditsConfigWithRetry(accessToken: accessToken, state: &state)
+            mapped = try GrokUsageMapper.mapCreditsConfig(creditsResponse)
+        }
+        // Fold-only passes recover the plan label from the prior snapshot via the merge too.
+        let plan = ProviderRefreshContext.scope.suppressesLiveQuota
+            ? nil
+            : await fetchPlanName(accessToken: state.token)
 
-        let plan = await fetchPlanName(accessToken: state.token)
-
-        // Menu-bar background ticks only need the weekly / Extra Usage meters from the credits API.
-        // Skip the local JSONL history scan; the data store merges prior spend onto this snapshot.
-        if ProviderRefreshContext.scope == .menuBar {
+        // Menu-bar and panel-meter passes only need the weekly / Extra Usage meters from the
+        // credits API. Skip the local JSONL history scan; the data store merges prior spend onto
+        // this snapshot.
+        if ProviderRefreshContext.scope.skipsLocalAccounting {
             return ProviderSnapshot.make(
                 provider: provider,
                 plan: plan,

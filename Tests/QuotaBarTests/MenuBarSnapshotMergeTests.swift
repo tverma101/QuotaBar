@@ -399,4 +399,215 @@ final class MenuBarSnapshotMergeTests: XCTestCase {
         let legacy = try JSONDecoder().decode(ProviderSnapshot.self, from: Data(legacyJSON.utf8))
         XCTAssertNil(legacy.carriesPriorHistory)
     }
+
+    // MARK: - quotaRefreshedAt (meters' freshness must not be re-vouched by fold-only passes)
+
+    /// A fold-only pass (`.localAccounting` / `.panelAccounting`) produces a snapshot whose history
+    /// is fresh but whose meters were recovered by the merge. The merged snapshot must carry the
+    /// PRIOR meters' freshness stamp — stamping the merge's own clock would let every closed-panel
+    /// ledger wake keep hours-old subscription meters TTL-fresh forever, and panel-open passes
+    /// would cache-hit instead of re-reading the live quota API (the "meter % never updates" bug).
+    func testFoldOnlyMergeCarriesMetersStampNotFreshClock() {
+        let meterStamp = Date(timeIntervalSince1970: 1_000)
+        let previous = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            plan: "Plus",
+            lines: [
+                .progress(label: "Session", used: 33, limit: 100, format: .percent),
+                .values(label: "Today", values: [
+                    MetricValue(number: 9, kind: .count, label: "tokens")
+                ]),
+            ],
+            refreshedAt: meterStamp,
+            usageHistory: nil
+        )
+        XCTAssertEqual(previous.quotaRefreshedAt, meterStamp)
+        let fresh = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            plan: nil,
+            lines: [],
+            refreshedAt: Date(timeIntervalSince1970: 2_000),
+            usageHistory: ProviderUsageHistory(
+                series: DailyUsageSeries(daily: [
+                    DailyUsageEntry(date: "2026-10-11", totalTokens: 90, costUSD: 0.3)
+                ])
+            )
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertEqual(merged.quotaRefreshedAt, meterStamp,
+                       "recovered meters keep the prior meter stamp, not the merge clock")
+        XCTAssertEqual(merged.refreshedAt, fresh.refreshedAt,
+                       "the fold's own work still stamps refreshedAt")
+    }
+
+    /// A pass that produced live quota meters (menuBar / panelMeters) owns a fresh meter stamp —
+    /// the merge must not drag an older one forward.
+    func testMeterProducingMergeKeepsFreshMeterStamp() {
+        let previous = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            lines: [.progress(label: "Session", used: 33, limit: 100, format: .percent)],
+            refreshedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let freshStamp = Date(timeIntervalSince1970: 2_000)
+        let fresh = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            lines: [.progress(label: "Session", used: 44, limit: 100, format: .percent)],
+            refreshedAt: freshStamp
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertEqual(merged.quotaRefreshedAt, freshStamp)
+    }
+
+    /// Merged snapshots preserve prior day-labeled spend tiles only within the same local day; the
+    /// recovered meters' stamp must behave the same way for a snapshot whose fresh pass wrote fresh
+    /// history but no meters — the stamp comes from `previous`, whatever era it names.
+    func testFoldOnlyMergePrefersPreviousQuotaStampOverPreviousRefreshedAt() {
+        // The prior snapshot's meters were answered by the live API at 1_000 but a later menu-bar
+        // merge re-stamped refreshedAt to 1_500. A fold-only pass at 2_000 must recover the METER
+        // stamp (1_000), not the most recent re-stamp.
+        var previous = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            plan: "Plus",
+            lines: [
+                .progress(label: "Session", used: 33, limit: 100, format: .percent),
+                .values(label: "Today", values: [
+                    MetricValue(number: 9, kind: .count, label: "tokens")
+                ]),
+            ],
+            refreshedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        previous.quotaRefreshedAt = Date(timeIntervalSince1970: 1_000)
+        previous.refreshedAt = Date(timeIntervalSince1970: 1_500)
+        let fresh = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            lines: [],
+            refreshedAt: Date(timeIntervalSince1970: 2_000),
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-11", totalTokens: 90, costUSD: 0.3)
+            ]))
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertEqual(merged.quotaRefreshedAt, Date(timeIntervalSince1970: 1_000))
+    }
+
+    /// A provider whose snapshot never carries `.progress` meters (Hermes's always-full refresh, a
+    /// meterless plan) must not inherit a carried stamp: the fold work in a fold-only pass IS fresh,
+    /// and a carried never-refreshing stamp would make it cache-miss on every pass.
+    func testMeterlessPreviousKeepsFreshStamp() {
+        let previous = ProviderSnapshot(
+            providerID: "hermes",
+            displayName: "Hermes",
+            lines: [.values(label: "Today", values: [
+                MetricValue(number: 9, kind: .count, label: "tokens")
+            ])],
+            refreshedAt: Date(timeIntervalSince1970: 1_000),
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-10", totalTokens: 5, costUSD: 0.01)
+            ]))
+        )
+        XCTAssertNil(previous.line(label: "Session"))
+        let freshStamp = Date(timeIntervalSince1970: 2_000)
+        let fresh = ProviderSnapshot(
+            providerID: "hermes",
+            displayName: "Hermes",
+            lines: [.values(label: "Today", values: [
+                MetricValue(number: 10, kind: .count, label: "tokens")
+            ])],
+            refreshedAt: freshStamp,
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-11", totalTokens: 6, costUSD: 0.02)
+            ]))
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertEqual(merged.quotaRefreshedAt, freshStamp,
+                       "no meters on either side — the fold's own stamp governs")
+    }
+
+    /// A fold-only pass's fresh success says nothing about the recovered meters' condition, so the
+    /// prior warning travels WITH the recovered meters (the user keeps the "limits unavailable"
+    /// triangle until a pass that produces its own meters succeeds). An explicit quota invalidation
+    /// replaces the state wholesale — warning included.
+    func testFoldOnlyMergeCarriesMetersWarning() {
+        let warning = "Live Codex limits unavailable: offline"
+        let previous = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            plan: "Plus",
+            lines: [.progress(label: "Session", used: 33, limit: 100, format: .percent)],
+            refreshedAt: Date(timeIntervalSince1970: 1_000),
+            warning: warning
+        )
+        let fresh = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            lines: [],
+            refreshedAt: Date(timeIntervalSince1970: 2_000),
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-11", totalTokens: 90, costUSD: 0.3)
+            ]))
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertEqual(merged.warning, warning, "recovered meters keep their caveat")
+        XCTAssertEqual(merged.line(label: "Session"), previous.line(label: "Session"))
+    }
+
+    func testInvalidationDoesNotCarryMetersWarning() {
+        let previous = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            plan: "Plus",
+            lines: [.progress(label: "Session", used: 33, limit: 100, format: .percent)],
+            refreshedAt: Date(timeIntervalSince1970: 1_000),
+            warning: "Live Codex limits unavailable: offline"
+        )
+        let fresh = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            lines: [.noUsageData],
+            refreshedAt: Date(timeIntervalSince1970: 2_000),
+            clearsPriorMenuBarQuotaState: true
+        )
+
+        let merged = fresh.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertNil(merged.warning, "explicit invalidation replaces the meters' state wholesale")
+    }
+
+    /// The meter stamp must survive the JSON round-trip through the persisted snapshot cache, and
+    /// a legacy payload without the key must decode as nil (the cache then falls back to
+    /// `refreshedAt` — today's behavior for pre-upgrade blobs).
+    func testQuotaStampSurvivesCacheRoundTrip() throws {
+        var snapshot = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            lines: [.progress(label: "Session", used: 5, limit: 100, format: .percent)],
+            refreshedAt: Date(timeIntervalSince1970: 2_000)
+        )
+        snapshot.quotaRefreshedAt = Date(timeIntervalSince1970: 1_000)
+        let data = try JSONEncoder().encode(snapshot)
+        let decoded = try JSONDecoder().decode(ProviderSnapshot.self, from: data)
+        XCTAssertEqual(decoded.quotaRefreshedAt, Date(timeIntervalSince1970: 1_000))
+
+        let legacyJSON = """
+        {"providerID":"codex","displayName":"Codex","lines":[],"refreshedAt":2000.0}
+        """
+        let legacy = try JSONDecoder().decode(ProviderSnapshot.self, from: Data(legacyJSON.utf8))
+        XCTAssertNil(legacy.quotaRefreshedAt)
+    }
 }

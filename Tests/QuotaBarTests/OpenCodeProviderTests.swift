@@ -430,6 +430,114 @@ final class OpenCodeProviderTests: XCTestCase {
         XCTAssertNil(snapshot.line(label: "Session"))
         XCTAssertNotNil(snapshot.line(label: "Today"))
     }
+
+    // MARK: - Panel scopes (two-phase panel-open pass)
+
+    /// Phase 1 (`.panelMeters`): the Go account meters only — the fast path that lands the card's
+    /// meters in seconds. No 18s local scan, so no tiles/trend and no history; the store's merge
+    /// recovers those from the prior snapshot.
+    func testPanelMetersScopeFetchesAccountMetersWithoutLocalScan() async {
+        let (client, _) = usageClient()
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageClient: client,
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await provider.refresh()
+        }
+        XCTAssertEqual(snapshot.plan, "Go")
+        XCTAssertNotNil(snapshot.line(label: "Session"))
+        XCTAssertNotNil(snapshot.line(label: "Weekly"))
+        XCTAssertNil(snapshot.line(label: "Today"), "meters-only pass skips the local scan")
+        XCTAssertNil(snapshot.line(label: "Usage Trend"))
+        XCTAssertNil(snapshot.usageHistory)
+    }
+
+    /// Phase 2 (`.panelAccounting`): the local fold runs and history/refreshes, but the account API
+    /// must NOT be re-read (phase 1 just answered it) and the local window fallback must not emit
+    /// meters — a fresh local-window meter line would clobber the meters phase 1 fetched and
+    /// re-bless recovered-meter staleness as current.
+    func testPanelAccountingScopeFoldsHistoryWithoutAccountAPIOrWindowMeters() async {
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode") + "]"
+        let (client, http) = usageClient()
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
+            usageScanner: OpenCodeUsageScanner(
+                sqlite: StubSQLite(data: ["/oc/opencode.db": db], anchor: "1700000000000"),
+                databasePaths: { ["/oc/opencode.db"] }
+            ),
+            usageClient: client,
+            now: { now },
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await provider.refresh()
+        }
+        XCTAssertTrue(http.requests.isEmpty, "fold-only scope must not re-read the account API")
+        XCTAssertNil(snapshot.line(label: "Session"), "no fresh meter lines in a fold-only pass")
+        XCTAssertNil(snapshot.line(label: "Weekly"))
+        XCTAssertNil(snapshot.line(label: "Monthly"))
+        XCTAssertNotNil(snapshot.line(label: "Today"), "the local fold still computes spend tiles")
+        XCTAssertNotNil(snapshot.usageHistory)
+        XCTAssertNil(snapshot.plan, "meters-only scope's plan is recovered by the store's merge")
+    }
+
+    /// Meters-only scope with no Go credentials falls back to local-window meters derived from the
+    /// databases alone (no corpus folds): the meters must stay current on menu-bar ticks without
+    /// paying the 15-20s multi-corpus scan the old full-scope path ran.
+    func testPanelMetersWindowFallbackWithoutGoKey() async {
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode-go") + "]"
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles()),
+            usageScanner: OpenCodeUsageScanner(
+                sqlite: StubSQLite(data: ["/oc/opencode.db": db], anchor: "1700000000000"),
+                databasePaths: { ["/oc/opencode.db"] }
+            ),
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await provider.refresh()
+        }
+        XCTAssertNotNil(snapshot.line(label: "Session"), "window fallback keeps the meters live")
+        XCTAssertNil(snapshot.plan, "no account API answer — no verified plan badge")
+        XCTAssertNil(snapshot.line(label: "Today"), "meters-only pass carries no tiles")
+    }
+
+    /// No credentials and no OpenCode data directory is the not-logged-in state — the meters-only
+    /// path must say so instead of painting a bare "No usage data" success (old full-scope parity).
+    func testPanelMetersNotLoggedInWithoutKeysOrData() async {
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles()),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await provider.refresh()
+        }
+        XCTAssertNotNil(snapshot.errorCategory, "expected the not-logged-in error snapshot")
+    }
+
+    /// Fold-only pass with Go credentials but no local database: the meters-only phase already
+    /// answered the meters; a mergeable success snapshot (not an error) keeps the card working and
+    /// avoids the failure backoff for a provider whose only problem is "no local DB".
+    func testPanelAccountingNoDatabaseReturnsMergeableSnapshot() async {
+        let (client, http) = usageClient()
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageClient: client,
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await provider.refresh()
+        }
+        XCTAssertNil(snapshot.errorCategory, "no local DB is not a fold-pass failure")
+        XCTAssertTrue(http.requests.isEmpty, "fold-only scope must not re-read the account API")
+    }
 }
 
 private final class StubSQLite: SQLiteAccessing, @unchecked Sendable {

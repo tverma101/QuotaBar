@@ -7,20 +7,50 @@ enum ProviderRefreshContext {
     ///   Antigravity, Grok). `WidgetDataStore.refreshAll` also limits the pass to pinned
     ///   providers (plus notification-relevant ones when quota alerts are on). Default for
     ///   background ticks while the popover is closed.
-    /// - `full`: complete snapshot including token/spend/history (panel open, manual refresh, CLI).
+    /// - `panelMeters`: the panel-open pass's fast first phase — the same meters-only work as
+    ///   `menuBar`, but for every enabled provider so the whole dashboard's meters land in
+    ///   seconds instead of trailing the slowest local fold. `WidgetDataStore.refreshAll` does
+    ///   not narrow the provider set.
+    /// - `full`: complete snapshot including token/spend/history (manual refresh, CLI,
+    ///   background triggers).
     /// - `localAccounting`: closed-panel wake pass after local usage files changed (CodexRouter
     ///   ledger appends). Refreshes only the providers that fold local corpora (codex + opencode
     ///   families) and folds them WITHOUT re-reading live quota APIs — re-reading those on every
     ///   routed turn is the burn the old panel-open-only watcher suppression existed to prevent.
     ///   Paced like `menuBar` and skips catalogue discovery. Remote-only providers never run.
+    /// - `panelAccounting`: the panel-open pass's second phase — the local folds every history-
+    ///   exporting provider needs, without re-reading the live quota APIs phase 1 just answered.
+    ///   The store's merge recovers the meters onto the fresh history. Same unpaced, user-waiting
+    ///   treatment as `full` for the fold itself.
     enum Scope: Sendable {
         case menuBar
+        case panelMeters
         case localAccounting
+        case panelAccounting
         case full
 
         var isFull: Bool {
             if case .full = self { return true }
             return false
+        }
+
+        /// Meters-only passes: live quota meters only, no local folds. The store's merge keeps
+        /// prior spend/history rows on the snapshot.
+        var skipsLocalAccounting: Bool {
+            switch self {
+            case .menuBar, .panelMeters: return true
+            case .localAccounting, .panelAccounting, .full: return false
+            }
+        }
+
+        /// Fold-only passes: local corpora recompute without re-reading live quota APIs; the
+        /// store's merge recovers the meters from the prior snapshot and carries their freshness
+        /// stamp (see `ProviderSnapshot.quotaRefreshedAt`).
+        var suppressesLiveQuota: Bool {
+            switch self {
+            case .localAccounting, .panelAccounting: return true
+            case .menuBar, .panelMeters, .full: return false
+            }
         }
     }
 

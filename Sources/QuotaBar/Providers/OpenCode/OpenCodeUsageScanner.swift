@@ -28,6 +28,30 @@ struct OpenCodeUsageScan: Sendable {
 /// A `Sendable` struct (like the Grok scanner), `async` and nonisolated, so the SQLite reads run off the
 /// main actor when the `@MainActor` provider `await`s it.
 struct OpenCodeUsageScanner: Sendable {
+    /// Per-stage wall-clock attribution for one scan, logged at the end so the closed-panel
+    /// accounting cadence's slow fold (~17-21s observed) can be pinned to a stage in the log
+    /// file before optimizing it. Only scans slower than the threshold are logged — a healthy
+    /// incremental pass must not add a line per 5-minute tick.
+    struct StageTimer {
+        private var stageStart = Date()
+        private var timings: [(name: String, ms: Double)] = []
+
+        mutating func end(_ name: String) {
+            let now = Date()
+            timings.append((name, now.timeIntervalSince(stageStart) * 1000))
+            stageStart = now
+        }
+
+        func logIfSlow(thresholdMs: Double = 1500) {
+            let total = timings.reduce(0.0) { $0 + $1.ms }
+            guard total >= thresholdMs else { return }
+            let parts = timings
+                .filter { $0.ms >= 5 }
+                .map { "\($0.name)=\(Int($0.ms))ms" }
+                .joined(separator: " ")
+            AppLog.info(.refresh, "opencode scan stages total=\(Int(total))ms [\(parts)]")
+        }
+    }
     /// The OpenCode-hosted providerIDs we track: the Go subscription and the Zen pay-as-you-go gateway.
     /// Both write an authoritative `cost`; other (BYO-key) providerIDs log `cost: 0` and are out of scope.
     static let hostedProviderIDs = ["opencode-go", "opencode"]
@@ -248,7 +272,12 @@ struct OpenCodeUsageScanner: Sendable {
         dayModelKey(day: DailyUsageAccumulator.dayKey(from: row.date), model: row.model)
     }
 
-    func scan(now: Date, daysBack: Int = UsageHistoryWindow.previousDays, pricing: ModelPricing = .empty) async throws -> OpenCodeUsageScan? {
+    func scan(
+        now: Date,
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        pricing: ModelPricing = .empty,
+        windowFallbackOnly: Bool = false
+    ) async throws -> OpenCodeUsageScan? {
         let paths: [String]
         do {
             paths = try databasePaths()
@@ -267,6 +296,7 @@ struct OpenCodeUsageScanner: Sendable {
             return nil
         }
 
+        var stageTimer = StageTimer()
         // Same calendar bound the tiles/trend use. A wall-clock `now - daysBack×86400` cutoff sits
         // later the same day, so morning rows on the oldest day never leave SQLite.
         let cutoffDate = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
@@ -323,6 +353,7 @@ struct OpenCodeUsageScanner: Sendable {
         for path in newlyFailing.sorted() {
             AppLog.warn(LogTag.plugin("opencode"), "usage query failed for \(path): \(failures[path] ?? "unknown error")")
         }
+        stageTimer.end("sqlite")
         if failures.count == checked.count {
             throw OpenCodeUsageError.databaseUnreadable
         }
@@ -375,6 +406,26 @@ struct OpenCodeUsageScanner: Sendable {
         // (ⓘ) and unpriced models fall to the unknown-model warning, the convention the Claude
         // tiles use.
         let rates = Self.effectiveRates(from: rows)
+        stageTimer.end("accumulate")
+        if windowFallbackOnly {
+            // Meters-only pass needs window caps but the account API didn't answer: stop after the
+            // SQLite stage. The Go-cap windows derive from the recorded `opencode-go` DB rows (plus
+            // the memoized anchor) alone — the corpus folds below would append imputed gateway
+            // dollars to the window math, but they cost 15-20s and the meters-only phase must stay
+            // fast; the fold passes (panel accounting, full) refresh the windows with the complete
+            // fold. `logScan` stays empty: tiles are not this pass's work, and the store's merge
+            // keeps the prior tiles on the card.
+            let goWindows = goWindowCosts.isEmpty
+                ? nil
+                : OpenCodeGoWindowMath.compute(costs: goWindowCosts, anchorMs: anchorMs, now: now)
+            stageTimer.logIfSlow()
+            return OpenCodeUsageScan(
+                logScan: DailyUsageAccumulator().build(),
+                goWindows: goWindows,
+                includesEstimatedCost: false,
+                partialDays: []
+            )
+        }
         // Read the router ledger FIRST: it is the complete record of OpenCode-served turns, including the
         // `anthropic/opencode_go/…` slugs the native folds also see. Knowing which (day, model) pairs it
         // covers lets every native fold below skip exactly those and fill only the gaps, so one turn is
@@ -387,6 +438,7 @@ struct OpenCodeUsageScanner: Sendable {
             routerRows += Self.routerGatewayRows(atPath: path, since: tileSince)
         }
         let routerCoverage = Set(routerRows.map(Self.dayModelKey))
+        stageTimer.end("routerLedger")
         // Stream Claude/Codex gateway rows; unload Codex tail-cache between homes so peaks cannot stack.
         let gatewayFold = GatewayFoldState(
             tileSince: tileSince,
@@ -404,6 +456,7 @@ struct OpenCodeUsageScanner: Sendable {
         ) { entry in
             gatewayFold.foldClaude(entry)
         }
+        stageTimer.end("claudeFold")
         let partitionedCodex = Self.partitionCodexHomes(codexHomes())
         for home in partitionedCodex.defaultHomes {
             guard !Task.isCancelled else { return nil }
@@ -427,6 +480,7 @@ struct OpenCodeUsageScanner: Sendable {
         goWindowCosts = gatewayFold.goWindowCosts
         includesEstimatedCost = gatewayFold.includesEstimatedCost
         partialDays = gatewayFold.partialDays
+        stageTimer.end("codexFold")
         // Hermes sessions billed to the OpenCode hosted account — they never reach `opencode*.db`.
         // A supplementary source: an unreadable Hermes database logs a warn (edge-triggered) and never
         // fails the scan (the tiles still have the OpenCode DBs + gateway logs) — but it must never
@@ -462,6 +516,7 @@ struct OpenCodeUsageScanner: Sendable {
         // ledger also means a turn whose session log is gone, moved, or outside the discovered homes is
         // still counted — previously such `anthropic/opencode_go/…` rows were dropped on the assumption
         // the native fold always had them, and vanished from every card.
+        stageTimer.end("hermes")
         if !routerRows.isEmpty {
             Self.foldGatewayRows(
                 routerRows, since: tileSince, pricing: pricing,
@@ -487,13 +542,16 @@ struct OpenCodeUsageScanner: Sendable {
                 skippingDayModels: routerCoverage
             )
         }
+        stageTimer.end("museFold")
         let logScan = accumulator.build()
+        stageTimer.end("build")
 
         // Local fallback windows need current Go spend. A key's presence alone does not prove an active
         // subscription; the provider uses the account endpoint to confirm that case.
         let goWindows: OpenCodeGoWindows? = !goWindowCosts.isEmpty
             ? OpenCodeGoWindowMath.compute(costs: goWindowCosts, anchorMs: anchorMs, now: now)
             : nil
+        stageTimer.logIfSlow()
 
         return OpenCodeUsageScan(
             logScan: logScan,

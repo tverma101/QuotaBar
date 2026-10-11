@@ -202,10 +202,82 @@ final class OpenCodeProvider: ProviderRuntime {
             loggedStoredKeysFailure = true
             AppLog.warn(LogTag.plugin("opencode"), "app-saved OpenCode Go keys unreadable; using auth.json keys only")
         }
-        // History-skip note: OpenCode's Session/Weekly meters can fall back to `goWindows` derived
-        // from the same local scan that builds spend history, so there is no clean quota-vs-history
-        // split. Unpinned OpenCode cards are simply omitted from `.menuBar` passes by
-        // `MenuBarRefreshFilter` instead.
+        // Meters-only passes (menu-bar ticks, panel phase 1) need the live Go meters, not the
+        // multi-corpus scan: the scan folds Claude/Codex session logs, the router ledger, Hermes,
+        // and Muse on every call (15-20s on a real corpus) and would hold the strip's meters
+        // hostage behind it. The data-store merge keeps prior spend tiles / history on the card
+        // until a fold pass recomputes them, and recovers the last-known meters when the API is
+        // unreachable.
+        if ProviderRefreshContext.scope.skipsLocalAccounting {
+            let goAccounts = await fetchGoAccountMeters(apiKeys: apiKeys)
+            if goAccounts.hasUsage {
+                var lines = goAccounts.meters
+                MetricLine.appendNoDataIfNeeded(&lines)
+                return ProviderSnapshot.make(
+                    provider: provider,
+                    plan: "Go",
+                    lines: lines,
+                    refreshedAt: refreshedAt,
+                    warning: goAccounts.displayError?.error.localizedDescription,
+                    clearsPriorMenuBarQuotaState: goAccounts.clearsPriorQuotaState
+                )
+            }
+            // No account answer. Mirror the scan path's not-logged-in handling: no credentials and
+            // no OpenCode data directory is the not-logged-in state, discovered without the scan.
+            if apiKeys.isEmpty {
+                do {
+                    if try usageScanner.databasePaths().isEmpty {
+                        return ProviderSnapshot.error(
+                            provider: provider,
+                            error: authReadError ?? OpenCodeUsageError.notLoggedIn
+                        )
+                    }
+                } catch {
+                    return ProviderSnapshot.error(provider: provider, error: error)
+                }
+            }
+            // A pinned key whose endpoint answer can't serve it (mismatch or a blocking error):
+            // no meters and no fallback — the merge keeps the last-known meters and their stamp.
+            if goAccounts.suppressesLocalFallback {
+                var lines: [MetricLine] = []
+                MetricLine.appendNoDataIfNeeded(&lines)
+                return ProviderSnapshot.make(
+                    provider: provider,
+                    plan: nil,
+                    lines: lines,
+                    refreshedAt: refreshedAt,
+                    warning: goAccounts.displayError?.error.localizedDescription,
+                    clearsPriorMenuBarQuotaState: goAccounts.clearsPriorQuotaState
+                )
+            }
+            // Local-window fallback from the databases alone (no corpus folds): Session / Weekly /
+            // Monthly derived from recorded `opencode-go` spend, the same source the full scan
+            // starts from. Fold passes re-derive the windows with the gateway folds' imputed
+            // dollars included; this pass keeps the meters current without the 15-20s corpus scan.
+            let fallback: OpenCodeUsageScan?
+            do {
+                fallback = try await usageScanner.scan(
+                    now: refreshedAt,
+                    pricing: ModelPricing.empty,
+                    windowFallbackOnly: true
+                )
+            } catch {
+                return ProviderSnapshot.error(provider: provider, error: error)
+            }
+            var lines: [MetricLine] = []
+            if let windows = fallback?.goWindows {
+                lines.append(contentsOf: OpenCodeUsageMapper.meterLines(windows))
+            }
+            MetricLine.appendNoDataIfNeeded(&lines)
+            return ProviderSnapshot.make(
+                provider: provider,
+                plan: nil,
+                lines: lines,
+                refreshedAt: refreshedAt,
+                warning: goAccounts.displayError?.error.localizedDescription,
+                clearsPriorMenuBarQuotaState: goAccounts.clearsPriorQuotaState
+            )
+        }
         let modelPricing = await pricing()
         let scan: OpenCodeUsageScan?
         do {
@@ -217,13 +289,137 @@ final class OpenCodeProvider: ProviderRuntime {
         // Account-wide Go meters are fetched only with Go credentials. The API does not return a
         // stable account id, so the exact credential is the only honest identity boundary. Duplicate
         // copies of the same key (auth.json plus an app-saved copy) collapse; different keys remain
-        // separate even when their current window values happen to match.
+        // separate even when their current window values happen to match. Fold-only passes skip the
+        // fetch (the meters-only phase just answered it) and recover the meters through the merge.
+        let goAccounts = await fetchGoAccountMeters(apiKeys: apiKeys)
+        let accountMeters = goAccounts.meters
+        let hasAccountUsage = goAccounts.hasUsage
+        let accountErrorForDisplay = goAccounts.displayError
+        let shouldSuppressLocalGoFallback = goAccounts.suppressesLocalFallback
+        let clearsPriorMenuBarQuotaState = goAccounts.clearsPriorQuotaState
+
+        guard let scan else {
+            // No OpenCode database on disk at all.
+            if ProviderRefreshContext.scope.suppressesLiveQuota {
+                // Fold-only pass: the meters-only phase just answered the meters and this pass has
+                // no fold work without a database. Return a mergeable success snapshot — the bogus
+                // "three active Go windows" error here would back off a provider whose only
+                // problem is "no local DB" and flip a working card to an error on every panel open.
+                var lines = accountMeters
+                MetricLine.appendNoDataIfNeeded(&lines)
+                return ProviderSnapshot.make(
+                    provider: provider,
+                    plan: hasAccountUsage ? "Go" : nil,
+                    lines: lines,
+                    refreshedAt: refreshedAt,
+                    warning: accountErrorForDisplay?.error.localizedDescription,
+                    clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
+                )
+            }
+            if hasAccountUsage {
+                return ProviderSnapshot.make(
+                    provider: provider, plan: "Go",
+                    lines: accountMeters,
+                    refreshedAt: refreshedAt,
+                    warning: accountErrorForDisplay?.error.localizedDescription,
+                    clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
+                )
+            }
+            if let accountErrorForDisplay {
+                if accountErrorForDisplay.error.blocksLocalGoFallback {
+                    return ProviderSnapshot.make(
+                        provider: provider,
+                        plan: nil,
+                        lines: [.noUsageData],
+                        refreshedAt: refreshedAt,
+                        warning: accountErrorForDisplay.error.localizedDescription,
+                        clearsPriorMenuBarQuotaState: true
+                    )
+                }
+                return ProviderSnapshot.error(provider: provider, error: accountErrorForDisplay.error)
+            }
+            if !apiKeys.isEmpty {
+                return ProviderSnapshot.error(
+                    provider: provider,
+                    error: OpenCodeUsageError.accountAPIUnavailable(
+                        detail: "usage response did not contain three active Go windows"
+                    )
+                )
+            }
+            return ProviderSnapshot.error(
+                provider: provider, error: authReadError ?? OpenCodeUsageError.notLoggedIn
+            )
+        }
+
+        var lines: [MetricLine] = []
+        if hasAccountUsage {
+            // Authoritative account-wide percentages — the meters' primary source.
+            lines.append(contentsOf: accountMeters)
+        } else if !ProviderRefreshContext.scope.suppressesLiveQuota,
+                  !shouldSuppressLocalGoFallback, let windows = scan.goWindows {
+            // API unreachable or not usable: local-observed spend against the published caps.
+            // Fold-only passes emit no window meters — the store's merge recovers the meters the
+            // meters-only phase fetched, and a fresh local-window line would clobber them (fresh
+            // label wins) while re-blessing recovered-meter staleness as current.
+            lines.append(contentsOf: OpenCodeUsageMapper.meterLines(windows))
+        }
+        SpendTileMapper.appendTokenUsage(
+            scan.logScan.series, to: &lines, now: refreshedAt,
+            estimated: scan.includesEstimatedCost,
+            unknownModelsByDay: scan.logScan.unknownModelsByDay,
+            modelUsage: scan.logScan.modelUsage,
+            modelSourceNote: sourceNote,
+            partialDays: scan.partialDays,
+            apiEstimateByDay: scan.logScan.apiEstimateByDay
+        )
+        SpendTileMapper.appendUsageTrend(scan.logScan.series, to: &lines, now: refreshedAt, note: sourceNote,
+                                         partialDays: scan.partialDays)
+        MetricLine.appendNoDataIfNeeded(&lines)
+
+        // The Go badge represents a server-confirmed active subscription. Local Go spend can still
+        // populate fallback cap meters while offline, but it cannot prove the subscription is active.
+        let plan: String? = hasAccountUsage ? "Go" : nil
+        return ProviderSnapshot.make(
+            provider: provider,
+            plan: plan,
+            lines: lines,
+            refreshedAt: refreshedAt,
+            usageHistory: ProviderUsageHistory(
+                series: scan.logScan.series,
+                modelUsage: scan.logScan.modelUsage,
+                unknownModelsByDay: scan.logScan.unknownModelsByDay,
+                apiEstimateByDay: scan.logScan.apiEstimateByDay
+            ),
+            warning: accountErrorForDisplay?.error.localizedDescription,
+            clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
+        )
+    }
+
+    private static func credentialID(for key: String) -> String {
+        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// One pass's Go-account meter answer: the display meters (deduplicated, selection-applied),
+    /// whether any account answered, and the error/fallback classification the card composes from.
+    /// Shared by the meters-only early path and the scan path so the selection rules live once.
+    private struct GoAccountMeters {
+        var meters: [MetricLine]
+        var hasUsage: Bool
+        var displayError: (name: String, keyID: String, error: OpenCodeUsageError)?
+        var suppressesLocalFallback: Bool
+        var clearsPriorQuotaState: Bool
+    }
+
+    /// Fetch every Go credential's account usage and resolve the card's meters. Fold-only passes
+    /// (`suppressesLiveQuota`) skip the network entirely and return an empty answer — the store's
+    /// merge recovers the meters and carries their freshness stamp, and the scan-path window
+    /// fallback stays suppressed so local-window meters can never clobber authoritative API ones.
+    private func fetchGoAccountMeters(
+        apiKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)]
+    ) async -> GoAccountMeters {
         var accountUsages: [(name: String, keyID: String, credentialID: String, usage: OpenCodeGoAccountUsage)] = []
         var accountAPIErrors: [(name: String, keyID: String, error: OpenCodeUsageError)] = []
-        // Closed-panel ledger wakes fold the local corpora under `.localAccounting` scope without
-        // touching the OpenCode Go usage API; the store's background merge recovers the meters and
-        // Session/Weekly can still derive from this fresh local scan.
-        if !apiKeys.isEmpty, ProviderRefreshContext.scope != .localAccounting {
+        if !apiKeys.isEmpty, !ProviderRefreshContext.scope.suppressesLiveQuota {
             for entry in apiKeys {
                 do {
                     accountUsages.append((
@@ -265,124 +461,47 @@ final class OpenCodeProvider: ProviderRuntime {
             apiKeys.contains { $0.id == selectedID }
         } ?? false
         let selectedKeyHasAccount = selectedKeyID.map { accountIndexByKeyID[$0] != nil } ?? false
-        let accountMeters: [MetricLine]
+        let meters: [MetricLine]
         if distinctAccounts.count == 1,
            (!selectedKeyIsKnown || selectedKeyHasAccount) {
             // With one distinct account, deduplicated copies and stored selections collapse to one
             // unsuffixed set of meters as before.
-            accountMeters = OpenCodeUsageMapper.accountMeterLines(distinctAccounts[0].usage)
+            meters = OpenCodeUsageMapper.accountMeterLines(distinctAccounts[0].usage)
         } else if selectedKeyIsKnown,
            let selectedKeyID,
            let idx = accountIndexByKeyID[selectedKeyID],
            let selectedName = keyNameByKeyID[selectedKeyID] {
             // A pinned key: swap the card to its account only, labeled so the view stays unambiguous.
-            accountMeters = OpenCodeUsageMapper.accountMeterLines(distinctAccounts[idx].usage, labelSuffix: selectedName)
+            meters = OpenCodeUsageMapper.accountMeterLines(distinctAccounts[idx].usage, labelSuffix: selectedName)
         } else if selectedKeyIsKnown {
             // The selected key is not one of the usable account responses. Never show a different
             // key's account-wide meter as though it belonged to the pinned account.
-            accountMeters = []
+            meters = []
         } else {
             // No selection (or it doesn't match a fetched key): every distinct account as separate rows.
-            accountMeters = distinctAccounts.flatMap { entry in
+            meters = distinctAccounts.flatMap { entry in
                 OpenCodeUsageMapper.accountMeterLines(entry.usage, labelSuffix: entry.name)
             }
         }
-        let hasAccountUsage = !accountMeters.isEmpty
         let relevantAccountErrors = selectedKeyIsKnown ? accountAPIErrors.filter { $0.keyID == selectedKeyID } : accountAPIErrors
-        let accountErrorForDisplay = relevantAccountErrors.first { $0.error.blocksLocalGoFallback }
+        let displayError = relevantAccountErrors.first { $0.error.blocksLocalGoFallback }
             ?? relevantAccountErrors.first
-        let shouldSuppressLocalGoFallback: Bool
+        let suppressesLocalFallback: Bool
         if selectedKeyIsKnown {
             // Local windows aggregate every Go row and carry no account identity. A pinned account
             // can only use the endpoint's result for that exact key, never the aggregate fallback.
-            shouldSuppressLocalGoFallback = !selectedKeyHasAccount
+            suppressesLocalFallback = !selectedKeyHasAccount
                 || relevantAccountErrors.contains { $0.error.blocksLocalGoFallback }
         } else {
-            shouldSuppressLocalGoFallback = accountAPIErrors.contains { $0.error.blocksLocalGoFallback }
+            suppressesLocalFallback = accountAPIErrors.contains { $0.error.blocksLocalGoFallback }
         }
-        let clearsPriorMenuBarQuotaState = relevantAccountErrors.contains {
-            $0.error.blocksLocalGoFallback
-        }
-
-        guard let scan else {
-            // No OpenCode database on disk at all.
-            if hasAccountUsage {
-                return ProviderSnapshot.make(
-                    provider: provider, plan: "Go",
-                    lines: accountMeters,
-                    refreshedAt: refreshedAt,
-                    warning: accountErrorForDisplay?.error.localizedDescription,
-                    clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
-                )
-            }
-            if let accountErrorForDisplay {
-                if accountErrorForDisplay.error.blocksLocalGoFallback {
-                    return ProviderSnapshot.make(
-                        provider: provider,
-                        plan: nil,
-                        lines: [.noUsageData],
-                        refreshedAt: refreshedAt,
-                        warning: accountErrorForDisplay.error.localizedDescription,
-                        clearsPriorMenuBarQuotaState: true
-                    )
-                }
-                return ProviderSnapshot.error(provider: provider, error: accountErrorForDisplay.error)
-            }
-            if !apiKeys.isEmpty {
-                return ProviderSnapshot.error(
-                    provider: provider,
-                    error: OpenCodeUsageError.accountAPIUnavailable(
-                        detail: "usage response did not contain three active Go windows"
-                    )
-                )
-            }
-            return ProviderSnapshot.error(
-                provider: provider, error: authReadError ?? OpenCodeUsageError.notLoggedIn
-            )
-        }
-
-        var lines: [MetricLine] = []
-        if hasAccountUsage {
-            // Authoritative account-wide percentages — the meters' primary source.
-            lines.append(contentsOf: accountMeters)
-        } else if !shouldSuppressLocalGoFallback, let windows = scan.goWindows {
-            // API unreachable or not usable: local-observed spend against the published caps.
-            lines.append(contentsOf: OpenCodeUsageMapper.meterLines(windows))
-        }
-        SpendTileMapper.appendTokenUsage(
-            scan.logScan.series, to: &lines, now: refreshedAt,
-            estimated: scan.includesEstimatedCost,
-            unknownModelsByDay: scan.logScan.unknownModelsByDay,
-            modelUsage: scan.logScan.modelUsage,
-            modelSourceNote: sourceNote,
-            partialDays: scan.partialDays,
-            apiEstimateByDay: scan.logScan.apiEstimateByDay
+        return GoAccountMeters(
+            meters: meters,
+            hasUsage: !meters.isEmpty,
+            displayError: displayError,
+            suppressesLocalFallback: suppressesLocalFallback,
+            clearsPriorQuotaState: relevantAccountErrors.contains { $0.error.blocksLocalGoFallback }
         )
-        SpendTileMapper.appendUsageTrend(scan.logScan.series, to: &lines, now: refreshedAt, note: sourceNote,
-                                         partialDays: scan.partialDays)
-        MetricLine.appendNoDataIfNeeded(&lines)
-
-        // The Go badge represents a server-confirmed active subscription. Local Go spend can still
-        // populate fallback cap meters while offline, but it cannot prove the subscription is active.
-        let plan: String? = hasAccountUsage ? "Go" : nil
-        return ProviderSnapshot.make(
-            provider: provider,
-            plan: plan,
-            lines: lines,
-            refreshedAt: refreshedAt,
-            usageHistory: ProviderUsageHistory(
-                series: scan.logScan.series,
-                modelUsage: scan.logScan.modelUsage,
-                unknownModelsByDay: scan.logScan.unknownModelsByDay,
-                apiEstimateByDay: scan.logScan.apiEstimateByDay
-            ),
-            warning: accountErrorForDisplay?.error.localizedDescription,
-            clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
-        )
-    }
-
-    private static func credentialID(for key: String) -> String {
-        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 }
 

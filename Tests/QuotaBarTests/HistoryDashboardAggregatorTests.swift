@@ -42,7 +42,8 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
 
     private func makeReport(
         providers: [(id: String, name: String?, history: ProviderUsageHistory?)],
-        now: Date? = nil
+        now: Date? = nil,
+        estimatedCosts: [String: Bool] = [:]
     ) -> HistoryReport {
         HistoryDashboardAggregator.report(
             .init(
@@ -54,7 +55,8 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
                 historyByProviderID: Dictionary(
                     providers.compactMap { provider in provider.history.map { (provider.id, $0) } },
                     uniquingKeysWith: { first, _ in first }
-                )
+                ),
+                estimatedCostByProviderID: estimatedCosts
             ),
             now: now ?? self.now,
             calendar: calendar
@@ -283,5 +285,109 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
         XCTAssertTrue(report.isEmpty)
         XCTAssertTrue(report.days.isEmpty)
         XCTAssertTrue(report.sections.isEmpty)
+    }
+
+    // MARK: - Lifetime hero estimate mark + redundant estimate card
+
+    /// Subscription log providers (Claude, Codex on plan) carry no per-message cost, so their
+    /// folded `costUSD` is imputed at public API rates — the hero's headline is an estimate, and
+    /// `lifetimeCostIsEstimated` must say so (the tiles' `estimatedCost` descriptor flag drives it).
+    func testLifetimeCostIsEstimatedMarksFoldImputedProviders() {
+        let report = makeReport(
+            providers: [
+                (id: "claude", name: "Claude", history: makeHistory(daily: [(0, 100, 3.09)])),
+                (id: "codex", name: "Codex", history: makeHistory(daily: [(0, 200, 2.0)])),
+            ],
+            estimatedCosts: ["claude": true, "codex": true]
+        )
+        XCTAssertTrue(report.lifetimeCostIsEstimated)
+
+        // Recorded billing (OpenCode's authoritative per-message cost) keeps the hero unmarked.
+        let recorded = makeReport(
+            providers: [
+                (id: "opencode", name: "OpenCode", history: makeHistory(daily: [(0, 100, 3.09)])),
+            ],
+            estimatedCosts: ["opencode": false]
+        )
+        XCTAssertFalse(recorded.lifetimeCostIsEstimated)
+    }
+
+    /// The "At Public API Rates (Est.)" card must disappear when it would display the same dollars
+    /// as the hero: subscription logs with no per-message cost make the hero's imputed total and
+    /// the what-if total coincide, and showing both presented one fact as two. Compared at display
+    /// precision — $3,099.61 and $3,100.02 both read "$3.1K".
+    func testEstimateCardSuppressedWhenItMatchesTheHeroAtDisplayPrecision() {
+        let report = makeReport(
+            providers: [
+                (id: "claude", name: "Claude", history: makeHistory(
+                    daily: [(0, 100, 3_099.61)],
+                    apiEstimate: [(0, 3_100.02)]
+                )),
+            ],
+            estimatedCosts: ["claude": true]
+        )
+        XCTAssertEqual(report.lifetime.cost, 3_099.61)
+        XCTAssertEqual(report.apiEstimateTotal, 3_100.02)
+        XCTAssertFalse(report.showsAPIEstimateCard,
+                       "identical display dollars — the card would duplicate the hero")
+    }
+
+    /// Genuinely different totals keep the what-if card: a provider whose logs DO record cost
+    /// (hero = recorded) alongside a what-if restatement (estimate = everything at API rates)
+    /// produces two different display figures.
+    func testEstimateCardShownWhenTotalsDifferAtDisplayPrecision() {
+        let report = makeReport(
+            providers: [
+                (id: "opencode", name: "OpenCode", history: makeHistory(
+                    daily: [(0, 100, 2_599.61)],
+                    apiEstimate: [(0, 3_100.02)]
+                )),
+            ],
+            estimatedCosts: ["opencode": false]
+        )
+        XCTAssertTrue(report.showsAPIEstimateCard)
+    }
+
+    /// Below the abbreviation threshold the row style keeps cents, so a sub-$1k match must also
+    /// suppress — and a one-cent difference must not (it displays differently).
+    func testEstimateCardSuppressionUsesRowPrecisionBelowThousand() {
+        let matching = makeReport(
+            providers: [
+                (id: "claude", name: "Claude", history: makeHistory(
+                    daily: [(0, 100, 40.76)],
+                    apiEstimate: [(0, 40.76)]
+                )),
+            ],
+            estimatedCosts: ["claude": true]
+        )
+        XCTAssertFalse(matching.showsAPIEstimateCard)
+
+        let differing = makeReport(
+            providers: [
+                (id: "claude", name: "Claude", history: makeHistory(
+                    daily: [(0, 100, 40.76)],
+                    apiEstimate: [(0, 40.77)]
+                )),
+            ],
+            estimatedCosts: ["claude": true]
+        )
+        XCTAssertTrue(differing.showsAPIEstimateCard)
+    }
+
+    /// An estimate with no hero cost at all (nothing recorded or priced into `costUSD`) still shows
+    /// the what-if card — there is nothing to duplicate.
+    func testEstimateCardShownWhenHeroHasNoCost() {
+        let report = makeReport(
+            providers: [
+                (id: "claude", name: "Claude", history: makeHistory(
+                    daily: [(0, 100, nil)],
+                    apiEstimate: [(0, 12.34)]
+                )),
+            ],
+            estimatedCosts: ["claude": true]
+        )
+        XCTAssertNil(report.lifetime.cost)
+        XCTAssertEqual(report.apiEstimateTotal, 12.34)
+        XCTAssertTrue(report.showsAPIEstimateCard)
     }
 }
