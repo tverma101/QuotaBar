@@ -105,6 +105,28 @@ struct ProviderSnapshotCache {
         return loaded
     }
 
+    /// Trim persisted usage history without treating the old provider values as freshly fetched.
+    /// Startup uses one bulk rewrite so years of stale model detail do not remain in the shared
+    /// UserDefaults blob or get re-decoded on every later launch.
+    func compactHistories(lifetimeDayKeys: Set<String>, detailDayKeys: Set<String>) {
+        var payload = loadPayload()
+        var changed = false
+        for providerID in Array(payload.snapshots.keys) {
+            guard var snapshot = payload.snapshots[providerID],
+                  let history = snapshot.usageHistory
+            else { continue }
+            let compacted = history.retainingHistory(
+                lifetimeDayKeys: lifetimeDayKeys,
+                detailDayKeys: detailDayKeys
+            )
+            guard compacted != history else { continue }
+            snapshot.usageHistory = compacted
+            payload.snapshots[providerID] = snapshot
+            changed = true
+        }
+        if changed { save(payload) }
+    }
+
     func snapshot(providerID: String) -> ProviderSnapshot? {
         let snapshot = loadPayload().snapshots[providerID]
         guard let snapshot else { return nil }

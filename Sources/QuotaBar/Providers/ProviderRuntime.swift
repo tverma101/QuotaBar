@@ -8,8 +8,14 @@ enum ProviderRefreshContext {
     ///   providers (plus notification-relevant ones when quota alerts are on). Default for
     ///   background ticks while the popover is closed.
     /// - `full`: complete snapshot including token/spend/history (panel open, manual refresh, CLI).
+    /// - `localAccounting`: closed-panel wake pass after local usage files changed (CodexRouter
+    ///   ledger appends). Refreshes only the providers that fold local corpora (codex + opencode
+    ///   families) and folds them WITHOUT re-reading live quota APIs — re-reading those on every
+    ///   routed turn is the burn the old panel-open-only watcher suppression existed to prevent.
+    ///   Paced like `menuBar` and skips catalogue discovery. Remote-only providers never run.
     enum Scope: Sendable {
         case menuBar
+        case localAccounting
         case full
 
         var isFull: Bool {
@@ -27,17 +33,19 @@ enum ProviderRefreshContext {
     @TaskLocal static var credentialInteractionGate: CredentialInteractionGate? = nil
     /// Defaults to `.full` so tests, CLI, and any unscoped call site keep today's behavior.
     @TaskLocal static var scope: Scope = .full
-    /// Provider refresh entry points opt into the process-wide CPU allowance, including startup,
-    /// menu-bar, full-panel, and local-API reads whose providers can perform local accounting.
-    /// Focused unit tests stay unthrottled unless they explicitly measure the budget.
+    /// Refresh entry points opt into the process-wide CPU allowance when appropriate: background
+    /// menu-bar ticks use the 7.5% budget, while explicit full-history reads use the 25% interactive
+    /// budget. The panel-open periodic loop can opt out to meet provider deadlines. Focused unit tests
+    /// stay unthrottled unless they explicitly measure the budget.
     @TaskLocal static var accountingCPUThrottleEnabled = false
     /// Lightweight background menu-bar scope keeps existing catalogues on disk; missing catalogues
     /// may still download. Full accounting refreshes perform due catalogue discovery.
     @TaskLocal static var skipModelCatalogRefresh = false
 }
 
-/// Run an explicit full-history refresh under the shared CPU allowance. Keep force-refresh entry
-/// points in views/settings on the same path as panel-open and manual-refresh passes.
+/// Run an explicit full-history refresh under the interactive CPU allowance. Keep forced refresh
+/// entry points in views/settings on the same path as manual-refresh reads; the panel-open periodic
+/// loop chooses its own pacing based on the provider deadline.
 func withThrottledFullAccounting<T: Sendable>(
     _ operation: @Sendable () async throws -> T
 ) async rethrows -> T {

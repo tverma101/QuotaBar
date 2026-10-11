@@ -318,10 +318,7 @@ actor CodexRouterUsageScanner {
             let reasoning = event.reasoningTokens
             // OpenAI/Codex `total_tokens` is input+output; reasoning is a subset of output. Never
             // add reasoning on top when totalTokens is absent — that double-counted tokens.
-            let total = event.totalTokens ?? {
-                let result = input.addingReportingOverflow(output)
-                return result.overflow ? input : result.partialValue
-            }()
+            let total = event.totalTokens ?? ProviderParse.addingSaturating(input, output)
             guard total > 0 else { return }
 
             fold.sawRows = true
@@ -1250,10 +1247,7 @@ actor CodexRouterUsageScanner {
             let cached = min(event.cachedInputTokens, input)
             let output = event.outputTokens
             let reasoning = event.reasoningTokens
-            let total = event.totalTokens ?? {
-                let result = input.addingReportingOverflow(output)
-                return result.overflow ? input : result.partialValue
-            }()
+            let total = event.totalTokens ?? ProviderParse.addingSaturating(input, output)
             guard total > 0 else { return }
             fold.sawRows = true
             let day = DailyUsageAccumulator.dayKey(from: event.timestamp, calendar: calendar)
@@ -1263,6 +1257,15 @@ actor CodexRouterUsageScanner {
                 pricing: pricing
             ) else {
                 fold.accumulator.addUnknownModel(day: day, model: event.model)
+                // Unknown router models still represent measured usage. Keep their tokens in the
+                // series with a nil cost, matching the event-retaining scan path.
+                fold.accumulator.add(
+                    day: day,
+                    tokens: total,
+                    cost: nil,
+                    model: event.model,
+                    canonical: event.model
+                )
                 return
             }
             let isPriorityTier = event.serviceTier == "fast" || event.serviceTier == "priority"
@@ -1277,6 +1280,13 @@ actor CodexRouterUsageScanner {
                 total: total,
                 isFast: isPriorityTier
             )
+            fold.accumulator.addApiEstimate(day: day, cost: resolvedPricing.rates.costDollars(
+                for: TokenBreakdown(
+                    input: max(0, input - cached),
+                    cacheRead: cached,
+                    output: output
+                )
+            ))
             let cost = CodexLogUsageScanner.cost(
                 rates: resolvedPricing.rates,
                 event: logEvent,

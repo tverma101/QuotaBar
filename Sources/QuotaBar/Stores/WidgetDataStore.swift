@@ -132,6 +132,12 @@ final class WidgetDataStore {
     /// Wired by `ICloudUsageSyncStore`; debounced there so a concurrent provider batch produces one file.
     @ObservationIgnored var onLocalHistoryChanged: (@MainActor () -> Void)?
     @ObservationIgnored private var peerHistoryDocuments: [UsageHistoryDocument] = []
+    /// The merged daily fold is reused across quota-only refreshes. Its value arrays are shared with
+    /// rendered snapshots through copy-on-write, while history, peer, enablement, and day changes
+    /// explicitly invalidate it.
+    @ObservationIgnored private var mergedHistoryCache: [String: ProviderUsageHistory]?
+    @ObservationIgnored private var mergedHistoryCacheDayKey: String?
+    @ObservationIgnored private var localHistoryRevision: UInt64 = 0
 
     /// Global meter style: whether every bounded tile (and the menu-bar value) renders as "used" or
     /// "left/remaining". Persisted so the choice survives relaunch; defaults to `.remaining`.
@@ -209,6 +215,10 @@ final class WidgetDataStore {
         // paint under the new account until the first successful refresh. A card whose current
         // identity is unresolved (logged out, keyring-mode Codex) can't be verified either way — it
         // keeps its cache, exactly as before the guard existed. Non-account providers are unaffected.
+        let retentionDate = now()
+        let lifetimeDayKeys = UsageHistoryWindow.lifetimeDayKeys(through: retentionDate)
+        let detailDayKeys = UsageHistoryWindow.dayKeys(through: retentionDate)
+        cache.compactHistories(lifetimeDayKeys: lifetimeDayKeys, detailDayKeys: detailDayKeys)
         let loaded = cache.loadSnapshots(providerIDs: registry.providers.map(\.id))
             .filter { cardID, _ in
                 guard cache.hasStaleAccountStamp(providerID: cardID, currentIdentityKey: providerIdentityKeys[cardID]) else {
@@ -274,7 +284,7 @@ final class WidgetDataStore {
     /// be handed a menu-bar-scoped pass, and that is the merge-data case the per-provider forced wait
     /// exists to handle.
     func refreshAll(force: Bool = false, maxConcurrentProviders: Int? = nil) async {
-        let batchKey = "\(force)|\(ProviderRefreshContext.scope == .menuBar ? "menuBar" : "full")"
+        let batchKey = "\(force)|\(Self.batchScopeLabel(ProviderRefreshContext.scope))"
         if let active = activeBatches[batchKey] {
             AppLog.debug(.refresh, "batch join (force=\(force) already in flight)")
             await active.value
@@ -293,6 +303,17 @@ final class WidgetDataStore {
         activeBatches[batchKey] = nil
     }
 
+    /// Log/batch-key label per scope. Distinct keys matter: a `.localAccounting` batch in flight
+    /// must not absorb a panel-open `.full` request (it refreshes only the ledger-consuming
+    /// families), and vice versa a `.full` batch legitimately subsumes a concurrent wake pass.
+    static func batchScopeLabel(_ scope: ProviderRefreshContext.Scope) -> String {
+        switch scope {
+        case .menuBar: return "menuBar"
+        case .localAccounting: return "localAccounting"
+        case .full: return "full"
+        }
+    }
+
     private func runBatch(force: Bool, maxConcurrentProviders: Int?) async {
         // `Task {}` from MainActor context inherits the isolation (a task-group child can't capture
         // the non-Sendable store), so fire one task per provider in bounded groups, then await them all.
@@ -307,16 +328,17 @@ final class WidgetDataStore {
         )
         if providerIDs.isEmpty {
             lastRefreshAt = Date()
-            AppLog.info(.refresh, "batch skip (0 providers for scope=\(ProviderRefreshContext.scope == .menuBar ? "menuBar" : "full"), force=\(force))")
+            AppLog.info(.refresh, "batch skip (0 providers for scope=\(Self.batchScopeLabel(ProviderRefreshContext.scope)), force=\(force))")
             return
         }
         let start = monotonicNow()
-        AppLog.info(.refresh, "batch start (\(providerIDs.count) providers, force=\(force), scope=\(ProviderRefreshContext.scope == .menuBar ? "menuBar" : "full"))")
+        AppLog.info(.refresh, "batch start (\(providerIDs.count) providers, force=\(force), scope=\(Self.batchScopeLabel(ProviderRefreshContext.scope)))")
+        let startingHistoryRevision = localHistoryRevision
         var concurrency = max(1, maxConcurrentProviders ?? providerIDs.count)
         var outcomes: [RefreshOutcome] = []
         outcomes.reserveCapacity(providerIDs.count)
-        var nextProviderIndex = 0
-        while nextProviderIndex < providerIDs.count {
+        var pendingProviderIDs = providerIDs
+        while !pendingProviderIDs.isEmpty {
             // Re-check the budget before every chunk, not just once per pass. The per-provider unload
             // runs *after* a provider finishes, so a chunk that started under the limit can leave the
             // next one stacking on top of a much larger footprint. Dropping to one at a time here
@@ -324,14 +346,25 @@ final class WidgetDataStore {
             if ProcessMemoryBudget.isOverSoftLimit {
                 concurrency = 1
             }
-            let end = min(nextProviderIndex + concurrency, providerIDs.count)
-            let tasks = providerIDs[nextProviderIndex..<end].map { providerID in
+            // Heavy local-log scans allocate their parse working set before the post-refresh unload.
+            // Keep at most one such provider in flight even when the process is currently below its
+            // soft limit; otherwise several large scans can cross the hard limit before it is sampled.
+            var chunk: [String] = []
+            var includesHeavyProvider = false
+            while chunk.count < concurrency, !pendingProviderIDs.isEmpty {
+                guard let nextIndex = pendingProviderIDs.firstIndex(where: { providerID in
+                    !Self.isHeavyLocalLogProvider(providerID) || !includesHeavyProvider
+                }) else { break }
+                let providerID = pendingProviderIDs.remove(at: nextIndex)
+                if Self.isHeavyLocalLogProvider(providerID) { includesHeavyProvider = true }
+                chunk.append(providerID)
+            }
+            let tasks = chunk.map { providerID in
                 Task { await self.refresh(providerID: providerID, force: force, notifyHistoryChange: false) }
             }
             for task in tasks {
                 outcomes.append(await task.value)
             }
-            nextProviderIndex = end
         }
         // Stamp the end of the pass so the footer countdown targets the next scheduled refresh
         // (this time + one refresh interval), mirroring the periodic loop that sleeps one interval
@@ -344,7 +377,7 @@ final class WidgetDataStore {
         let failed = outcomes.count { $0 == .failed }
         let cached = outcomes.count { $0 == .cacheHit }
         let backedOff = outcomes.count { $0 == .backedOff }
-        if refreshed > 0 { onLocalHistoryChanged?() }
+        if localHistoryRevision != startingHistoryRevision { onLocalHistoryChanged?() }
         AppLog.info(.refresh, "batch end (\(durationMs)ms, \(refreshed) ok / \(failed) failed / \(cached) cached / \(backedOff) backed off)")
     }
 
@@ -403,7 +436,9 @@ final class WidgetDataStore {
     /// Picks the provider IDs a refresh pass should hit. `.full` refreshes every enabled provider
     /// (pinned first so panel-open paints the strip quickly). `.menuBar` only refreshes providers
     /// that power pinned strip meters, plus providers with visible bounded metrics when quota
-    /// notifications are enabled.
+    /// notifications are enabled. `.localAccounting` refreshes only the providers that fold local
+    /// usage corpora (codex + opencode families) — the wake sources for that scope are local file
+    /// appends, so remote-only providers have nothing new to read.
     static func selectProviderIDsForRefresh(
         enabledProviderIDs: [String],
         scope: ProviderRefreshContext.Scope,
@@ -416,6 +451,8 @@ final class WidgetDataStore {
             descriptors: orderedDescriptors
         )
         switch scope {
+        case .localAccounting:
+            return enabledProviderIDs.filter { foldsLocalAccounting($0) }
         case .full:
             return MenuBarRefreshFilter.prioritize(
                 providerIDs: enabledProviderIDs,
@@ -455,7 +492,15 @@ final class WidgetDataStore {
             providerID: providerID,
             currentIdentityKey: providerIdentityKeys[providerID]
         )
-        if !force, !staleAccountStamp, let cached = cache.snapshot(providerID: providerID) {
+        if !force, !staleAccountStamp, let cachedSnapshot = cache.snapshot(providerID: providerID) {
+            var cached = cachedSnapshot
+            if let history = cached.usageHistory {
+                let compacted = history.retainingHistory(through: now())
+                if compacted != history {
+                    cached.usageHistory = compacted
+                    cache.store(cached, producedByIdentityKey: providerIdentityKeys[providerID])
+                }
+            }
             // A menu-bar merge re-stamps `refreshedAt` for the meters it computed, but its history
             // was only carried over from the last full pass. Honoring that stamp here would let
             // every menu-bar tick (one per TTL) keep vouching for history no pass ever recomputed —
@@ -467,6 +512,10 @@ final class WidgetDataStore {
                 // re-assigning an unchanged snapshot would re-render the menu-bar label every pass.
                 AppLog.debug(.refresh, "cache hit \(providerID)")
                 if localSnapshots[providerID] != cached {
+                    if localSnapshots[providerID]?.usageHistory != cached.usageHistory {
+                        localHistoryRevision &+= 1
+                        invalidateMergedHistoryCache()
+                    }
                     localSnapshots[providerID] = cached
                     rebuildRenderedSnapshots()
                 }
@@ -558,17 +607,23 @@ final class WidgetDataStore {
         }
         // Recovered: drop any backoff so the provider resumes the normal cadence immediately.
         failureRetryAfter[providerID] = nil
+        if let history = snapshot.usageHistory {
+            snapshot.usageHistory = history.retainingHistory(through: now())
+        }
         // A provider can refresh its live limits successfully while its optional local log/CSV scan
         // produces no result. Keep only the last-good normalized history in that case; the new plan,
         // limits, warnings, and timestamp still win. A non-nil empty history remains authoritative and
         // clears the old rows, because it proves the scan completed and found no usage.
-        // Forced refreshes always replace (panel open / manual Refresh). Menu-bar merge is only
-        // for background icons-only ticks — applying it after a forced full fetch would risk
-        // keeping stale spend lines if labels ever diverge from the prior snapshot.
-        if !force, ProviderRefreshContext.scope == .menuBar {
+        // Forced refreshes always replace (panel open / manual Refresh). Menu-bar and
+        // local-accounting merges are only for background ticks — applying either after a forced
+        // full fetch would risk keeping stale spend lines if labels ever diverge from the prior
+        // snapshot.
+        if !force, ProviderRefreshContext.scope != .full {
             // Icons-only pass: keep prior spend/token/chart lines and usageHistory so the panel
             // does not blank those rows between opens. Fresh meters still win on label collision;
-            // omitted meters (incomplete localOnly pass) are preserved by the merge helper.
+            // omitted meters (incomplete localOnly pass) are preserved by the merge helper. A
+            // localAccounting pass is the mirror image: fresh usageHistory, no live quota meters,
+            // and the same helper recovers the meters from the prior snapshot.
             snapshot = snapshot.mergingMenuBarUpdate(over: localSnapshots[providerID])
         } else if snapshot.usageHistory == nil,
            let history = localSnapshots[providerID]?.usageHistory,
@@ -587,19 +642,22 @@ final class WidgetDataStore {
             )
             AppLog.debug(.refresh, "preserved last-good history for \(providerID) after scan miss")
         }
+        let historyChanged = localSnapshots[providerID]?.usageHistory != snapshot.usageHistory
         localSnapshots[providerID] = snapshot
+        if historyChanged {
+            localHistoryRevision &+= 1
+            invalidateMergedHistoryCache()
+        }
         // Stamp the write with the card's launch-resolved account identity; nil (no stamp) for
         // non-account providers and for cards whose identity didn't resolve this launch.
         cache.store(snapshot, producedByIdentityKey: providerIdentityKeys[providerID])
         rebuildRenderedSnapshots()
-        if notifyHistoryChange { onLocalHistoryChanged?() }
+        if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
         AppLog.info(.refresh, "\(providerID) ok (\(durationMs)ms)")
         onRefreshOutcome?(providerID, .refreshed, nil, force)
         // Local-log providers can allocate large parse arrays; unload between cards so concurrent
         // Codex + OpenCode refreshes cannot stack into a multi-GB peak.
-        if Self.heavyLocalLogProviders.contains(ProviderAccountID.family(of: providerID))
-            || Self.heavyLocalLogProviders.contains(providerID)
-        {
+        if Self.isHeavyLocalLogProvider(providerID) {
             await PersistentJSONLScanCaches.unloadAfterHeavyProvider(providerID: providerID)
         } else if ProcessMemoryBudget.isOverSoftLimit {
             await PersistentJSONLScanCaches.unloadAfterHeavyProvider(providerID: providerID)
@@ -628,6 +686,7 @@ final class WidgetDataStore {
     /// Rebuild the in-memory union immediately after a provider toggle. Local cached data remains
     /// available to direct API reads, but disabled providers stop receiving peer contributions.
     func providerEnablementDidChange() {
+        invalidateMergedHistoryCache()
         rebuildRenderedSnapshots()
     }
 
@@ -636,12 +695,14 @@ final class WidgetDataStore {
     func setPeerHistoryDocuments(_ documents: [UsageHistoryDocument], ownDeviceID: String) {
         peerHistoryDocuments = UsageHistoryDocument.newestByDevice(documents)
             .filter { $0.deviceID != ownDeviceID }
+        invalidateMergedHistoryCache()
         rebuildRenderedSnapshots()
     }
 
     func clearPeerHistoryDocuments() {
         guard !peerHistoryDocuments.isEmpty else { return }
         peerHistoryDocuments = []
+        invalidateMergedHistoryCache()
         rebuildRenderedSnapshots()
     }
 
@@ -651,9 +712,15 @@ final class WidgetDataStore {
         let hasMultipleClaudeCards = registry.providers.count {
             ProviderAccountID.family(of: $0.id) == "claude"
         } > 1
+        let lifetimeDayKeys = UsageHistoryWindow.lifetimeDayKeys(through: updatedAt)
+        let detailDayKeys = UsageHistoryWindow.dayKeys(through: updatedAt)
         for (providerID, descriptor) in registry.historyDescriptorsByProvider
         where descriptor.scope == .machineLocal && isProviderEnabled(providerID) {
             if let history = localSnapshots[providerID]?.usageHistory {
+                let exportHistory = history.retainingHistory(
+                    lifetimeDayKeys: lifetimeDayKeys,
+                    detailDayKeys: detailDayKeys
+                )
                 if ProviderAccountID.family(of: providerID) == "claude" {
                     if let identity = providerIdentityKeys[providerID] {
                         identities[providerID] = identity.lowercased()
@@ -662,7 +729,7 @@ final class WidgetDataStore {
                         continue
                     }
                 }
-                providers[providerID] = history
+                providers[providerID] = exportHistory
             }
         }
         let exportedClaudeIDs = providers.keys.filter {
@@ -707,18 +774,29 @@ final class WidgetDataStore {
             return
         }
         let renderDate = now()
+        let renderDayKey = DailyUsageAccumulator.dayKey(from: renderDate)
+        if mergedHistoryCacheDayKey != renderDayKey {
+            invalidateMergedHistoryCache()
+        }
         let enabledDescriptors = registry.historyDescriptorsByProvider.reduce(
             into: [String: UsageHistoryDescriptor]()
         ) { result, entry in
             if isProviderEnabled(entry.key) { result[entry.key] = entry.value }
         }
-        let merged = UsageHistoryAggregator.merged(
-            localSnapshots: localSnapshots,
-            peerDocuments: peerHistoryDocuments,
-            descriptors: enabledDescriptors,
-            providerIdentityKeys: providerIdentityKeys,
-            now: renderDate
-        )
+        let merged: [String: ProviderUsageHistory]
+        if let mergedHistoryCache {
+            merged = mergedHistoryCache
+        } else {
+            merged = UsageHistoryAggregator.merged(
+                localSnapshots: localSnapshots,
+                peerDocuments: peerHistoryDocuments,
+                descriptors: enabledDescriptors,
+                providerIdentityKeys: providerIdentityKeys,
+                now: renderDate
+            )
+            mergedHistoryCache = merged
+            mergedHistoryCacheDayKey = renderDayKey
+        }
         var rendered = localSnapshots
         for (providerID, history) in merged {
             guard let descriptor = registry.historyDescriptorsByProvider[providerID],
@@ -738,6 +816,16 @@ final class WidgetDataStore {
             )
         }
         if snapshots != rendered { snapshots = rendered }
+    }
+
+    private func invalidateMergedHistoryCache() {
+        mergedHistoryCache = nil
+        mergedHistoryCacheDayKey = nil
+    }
+
+    private static func isHeavyLocalLogProvider(_ providerID: String) -> Bool {
+        let family = ProviderAccountID.family(of: providerID)
+        return heavyLocalLogProviders.contains(family) || heavyLocalLogProviders.contains(providerID)
     }
 
     /// The provider's latest refresh error, or `nil` when its last refresh succeeded.

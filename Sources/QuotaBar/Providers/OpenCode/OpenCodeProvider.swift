@@ -220,7 +220,10 @@ final class OpenCodeProvider: ProviderRuntime {
         // separate even when their current window values happen to match.
         var accountUsages: [(name: String, keyID: String, credentialID: String, usage: OpenCodeGoAccountUsage)] = []
         var accountAPIErrors: [(name: String, keyID: String, error: OpenCodeUsageError)] = []
-        if !apiKeys.isEmpty {
+        // Closed-panel ledger wakes fold the local corpora under `.localAccounting` scope without
+        // touching the OpenCode Go usage API; the store's background merge recovers the meters and
+        // Session/Weekly can still derive from this fresh local scan.
+        if !apiKeys.isEmpty, ProviderRefreshContext.scope != .localAccounting {
             for entry in apiKeys {
                 do {
                     accountUsages.append((

@@ -75,7 +75,7 @@ enum HermesUsageMapper {
             if named.count < namedModelCap {
                 named.append(entry)
             } else {
-                otherTokens += model.tokens
+                otherTokens = ProviderParse.addingSaturating(otherTokens, model.tokens)
                 if let cost = model.costUSD {
                     otherCost = (otherCost ?? 0) + cost
                 }

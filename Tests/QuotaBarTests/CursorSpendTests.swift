@@ -241,6 +241,22 @@ final class CursorSpendRangeTests: XCTestCase {
         XCTAssertEqual(points.last?.value, 100, "the trend keeps the day's token volume")
     }
 
+    func testExtremeSameDayTokenTotalsSaturate() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let rows = [
+            CursorUsageCSVRow(date: now, model: "unknown-a", tokens: TokenBreakdown(input: .max), imputedCostDollars: nil),
+            CursorUsageCSVRow(date: now, model: "unknown-b", tokens: TokenBreakdown(input: 1), imputedCostDollars: nil)
+        ]
+        var lines: [MetricLine] = []
+
+        let history = CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
+
+        XCTAssertEqual(history.series.daily.first?.totalTokens, .max)
+        XCTAssertEqual(history.modelUsage?.daily.first?.models.reduce(0) {
+            ProviderParse.addingSaturating($0, $1.totalTokens)
+        }, .max)
+    }
+
     private func modelBreakdown(_ lines: [MetricLine], _ label: String) -> ModelUsageBreakdown? {
         guard case .values(_, _, _, _, _, let breakdown) = lines.first(where: { $0.label == label }) else { return nil }
         return breakdown

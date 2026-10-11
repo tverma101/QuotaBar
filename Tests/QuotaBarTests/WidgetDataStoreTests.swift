@@ -23,6 +23,120 @@ final class WidgetDataStoreTests: XCTestCase {
         XCTAssertEqual(refreshCount, 3)
     }
 
+    func testHeavyLocalLogProvidersDoNotRunConcurrently() async {
+        let probe = RefreshConcurrencyProbe()
+        let providers = ["claude", "codex", "opencode"].map { id -> TestConcurrencyProviderRuntime in
+            let provider = Provider(id: id, displayName: id, icon: .providerMark("codex"))
+            return TestConcurrencyProviderRuntime(provider: provider, probe: probe)
+        }
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: providers.map(\.provider), descriptors: []),
+            providers: providers,
+            defaults: makeUserDefaults("heavy-provider-concurrency")
+        )
+
+        await store.refreshAll()
+
+        let maximumActive = await probe.maximumActive()
+        let refreshCount = await probe.refreshCount()
+        XCTAssertEqual(maximumActive, 1)
+        XCTAssertEqual(refreshCount, 3)
+    }
+
+    func testQuotaOnlyRefreshDoesNotNotifyHistorySync() async {
+        let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-07", totalTokens: 100, costUSD: 1)
+            ]),
+            unknownModelsByDay: [:]
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [],
+            snapshots: [
+                ProviderSnapshot(providerID: provider.id, displayName: provider.displayName,
+                                 lines: [.progress(label: "Session", used: 20, limit: 100, format: .percent)],
+                                 usageHistory: history),
+                ProviderSnapshot(providerID: provider.id, displayName: provider.displayName,
+                                 lines: [.progress(label: "Session", used: 21, limit: 100, format: .percent)],
+                                 usageHistory: history)
+            ]
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: []),
+            providers: [runtime],
+            defaults: makeUserDefaults("history-change-notification")
+        )
+        var notificationCount = 0
+        store.onLocalHistoryChanged = { notificationCount += 1 }
+
+        await store.refreshAll(force: true)
+        await store.refreshAll(force: true)
+
+        XCTAssertEqual(notificationCount, 1, "the quota row changes, but the history payload does not")
+    }
+
+    func testLoadedHistoryBoundsTotalsToTenYearsAndDetailsToThirtyDays() {
+        let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        var calendar = Calendar.current
+        calendar.timeZone = TimeZone(identifier: "America/New_York")!
+        let now = calendar.date(from: DateComponents(year: 2026, month: 10, day: 7, hour: 12))!
+        let ancientDay = "2000-01-01"
+        let olderDetailDay = "2026-08-01"
+        let recentDay = "2026-10-01"
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: ancientDay, totalTokens: 1, costUSD: 0.01),
+                DailyUsageEntry(date: olderDetailDay, totalTokens: 2, costUSD: 0.02),
+                DailyUsageEntry(date: recentDay, totalTokens: 3, costUSD: 0.03)
+            ]),
+            modelUsage: ModelUsageSeries(daily: [
+                DailyModelUsageEntry(date: olderDetailDay, models: [ModelUsageEntry(model: "old", totalTokens: 2)]),
+                DailyModelUsageEntry(date: recentDay, models: [ModelUsageEntry(model: "new", totalTokens: 3)])
+            ]),
+            unknownModelsByDay: [olderDetailDay: ["old"], recentDay: ["new"]],
+            apiEstimateByDay: [ancientDay: 1, olderDetailDay: 2, recentDay: 3]
+        )
+        let defaults = makeUserDefaults("history-cache-compaction")
+        let writerCache = ProviderSnapshotCache(
+            userDefaults: defaults,
+            storageKey: "snapshots",
+            ttl: 600,
+            now: { now }
+        )
+        writerCache.store(ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            refreshedAt: now,
+            usageHistory: history
+        ))
+        let cache = ProviderSnapshotCache(
+            userDefaults: defaults,
+            storageKey: "snapshots",
+            ttl: 600,
+            now: { now }
+        )
+
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: []),
+            providers: [],
+            cache: cache,
+            defaults: makeUserDefaults("history-cache-compaction-meter"),
+            now: { now }
+        )
+
+        let retained = store.localSnapshots[provider.id]?.usageHistory
+        XCTAssertEqual(retained?.series.daily.map(\.date), [olderDetailDay, recentDay])
+        XCTAssertEqual(retained?.modelUsage?.daily.map(\.date), [recentDay])
+        XCTAssertEqual(retained?.unknownModelsByDay, [recentDay: ["new"]])
+        XCTAssertEqual(retained?.apiEstimateByDay, [olderDetailDay: 2, recentDay: 3])
+        let persisted = cache.loadSnapshots(providerIDs: [provider.id])[provider.id]?.usageHistory
+        XCTAssertEqual(persisted, retained, "startup compaction also rewrites the persisted snapshot blob")
+        XCTAssertNil(cache.snapshot(providerID: provider.id), "compaction must not mark the previous-session snapshot fresh")
+    }
+
     func testResolvesProgressSnapshotIntoWidgetData() async {
         let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
         let descriptor = WidgetDescriptor(

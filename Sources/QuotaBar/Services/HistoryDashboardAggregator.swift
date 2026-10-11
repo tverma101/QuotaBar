@@ -69,7 +69,12 @@ struct HistoryReport: Equatable, Sendable {
     let generatedAt: Date
 
     /// Every section is empty (no enabled provider has local history) — the screen's empty state.
-    var isEmpty: Bool { sections.allSatisfy { $0.rows.isEmpty && $0.tokens == 0 } }
+    var isEmpty: Bool {
+        sections.isEmpty
+            && lifetime.tokens == 0
+            && lifetime.cost == nil
+            && lifetime.apiEstimate == nil
+    }
 
     /// The "if it were all API" figure — the sum of fold-time estimates across the same recorded
     /// span as `lifetime`. Distinct from the plan-priced totals: this is a what-if comparison, never
@@ -144,7 +149,7 @@ enum HistoryDashboardAggregator {
 
             for day in history.series.daily where windowKeys.contains(day.date) {
                 var bucket = daysByDate[day.date] ?? (0, nil, false, nil, false)
-                bucket.tokens += day.totalTokens
+                bucket.tokens = ProviderParse.addingSaturating(bucket.tokens, day.totalTokens)
                 if let dayCost = day.costUSD {
                     bucket.cost = (bucket.cost ?? 0) + dayCost
                     bucket.sawCost = true
@@ -157,7 +162,7 @@ enum HistoryDashboardAggregator {
 
                 // The section's totals cover the whole labeled 30-day window — not just today and
                 // the 7-day slice, or a provider whose usage sits 8-30 days back would read idle.
-                tokens += day.totalTokens
+                tokens = ProviderParse.addingSaturating(tokens, day.totalTokens)
                 if let dayCost = day.costUSD {
                     cost = (cost ?? 0) + dayCost
                     sawCost = true
@@ -172,7 +177,7 @@ enum HistoryDashboardAggregator {
                 for model in day.models {
                     let key = model.model.lowercased()
                     var row = rowsBySlug[key] ?? (0, nil, false, model.model)
-                    row.tokens += model.totalTokens
+                    row.tokens = ProviderParse.addingSaturating(row.tokens, model.totalTokens)
                     if let modelCost = model.costUSD {
                         row.cost = (row.cost ?? 0) + modelCost
                         row.sawCost = true
@@ -210,7 +215,7 @@ enum HistoryDashboardAggregator {
             ))
         }
 
-        let days = daysByDate.keys.sorted(by: >).map { date -> HistoryDayPoint in
+        let days = earliestDayKey == nil ? [] : windowKeys.sorted(by: >).map { date -> HistoryDayPoint in
             let bucket = daysByDate[date] ?? (0, nil, false, nil, false)
             let day = parseDay(date, calendar: calendar)
             return HistoryDayPoint(
@@ -245,7 +250,7 @@ enum HistoryDashboardAggregator {
         var monthEstimateSeen = false
         for (date, bucket) in daysByDate {
             if sevenDayKeys.contains(date) {
-                weekTokens += bucket.tokens
+                weekTokens = ProviderParse.addingSaturating(weekTokens, bucket.tokens)
                 if bucket.sawCost, let dayCost = bucket.cost {
                     weekCost = (weekCost ?? 0) + dayCost
                     weekCostSeen = true
@@ -255,7 +260,7 @@ enum HistoryDashboardAggregator {
                     weekEstimateSeen = true
                 }
             }
-            monthTokens += bucket.tokens
+            monthTokens = ProviderParse.addingSaturating(monthTokens, bucket.tokens)
             if bucket.sawCost, let dayCost = bucket.cost {
                 monthCost = (monthCost ?? 0) + dayCost
                 monthCostSeen = true

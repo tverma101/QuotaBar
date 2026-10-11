@@ -102,6 +102,31 @@ final class MenuBarRefreshFilterTests: XCTestCase {
         XCTAssertEqual(ids, ["codex"])
     }
 
+    func testSelectProviderIDsLocalAccountingFiltersToLocalFamilies() {
+        // A closed-panel ledger wake folds only the providers that consume local usage corpora.
+        // Multi-account codex cards (codex@<fingerprint>) share the codex family.
+        let ids = WidgetDataStore.selectProviderIDsForRefresh(
+            enabledProviderIDs: ["opencode", "claude", "codex", "codex@0577ce6e", "hermes", "cursor"],
+            scope: .localAccounting,
+            pinnedMetricIDs: ["codex.session"],
+            providerIDForMetric: providerID(for:),
+            orderedDescriptors: [session, claudeSession, openSession],
+            notificationsEnabled: false
+        )
+        XCTAssertEqual(ids, ["opencode", "codex", "codex@0577ce6e"])
+    }
+
+    func testBatchScopeLabelsAreDistinctPerScope() {
+        // Distinct labels keep a `.localAccounting` batch from joining (or being joined by) a
+        // concurrently requested `.full` batch — the two do different work.
+        let labels = [
+            WidgetDataStore.batchScopeLabel(.menuBar),
+            WidgetDataStore.batchScopeLabel(.localAccounting),
+            WidgetDataStore.batchScopeLabel(.full),
+        ]
+        XCTAssertEqual(Set(labels).count, 3)
+    }
+
     func testRefreshAllMenuBarSkipsUnpinnedProviders() async {
         let providers: [(Provider, WidgetDescriptor)] = [
             (codex, session),

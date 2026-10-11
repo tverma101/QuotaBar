@@ -154,8 +154,26 @@ struct DailyUsageAccumulator {
             for day in scan.modelUsage?.daily ?? [] {
                 guard !daysToSkip.contains(day.date) else { continue }
                 for model in day.models {
-                    accumulator.add(day: day.date, tokens: model.totalTokens, cost: model.costUSD, model: model.model)
-                    absorbed = true
+                    if let variants = model.variants, !variants.isEmpty {
+                        for variant in variants {
+                            accumulator.add(
+                                day: day.date,
+                                tokens: variant.totalTokens,
+                                cost: variant.costUSD,
+                                model: variant.model,
+                                canonical: model.model
+                            )
+                            absorbed = true
+                        }
+                    } else {
+                        accumulator.add(
+                            day: day.date,
+                            tokens: model.totalTokens,
+                            cost: model.costUSD,
+                            model: model.model
+                        )
+                        absorbed = true
+                    }
                 }
             }
             for (day, models) in scan.unknownModelsByDay where !daysToSkip.contains(day) {

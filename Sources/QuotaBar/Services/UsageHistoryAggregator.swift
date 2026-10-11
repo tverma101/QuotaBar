@@ -38,8 +38,11 @@ enum UsageHistoryAggregator {
                 }
             }
         }
-        let includedDays = UsageHistoryWindow.dayKeys(through: now)
-        return inputs.mapValues { merge($0, includedDays: includedDays) }
+        let includedDays = UsageHistoryWindow.lifetimeDayKeys(through: now)
+        let detailedDays = UsageHistoryWindow.dayKeys(through: now)
+        return inputs.mapValues {
+            merge($0, includedDays: includedDays, detailedDays: detailedDays)
+        }
     }
 
     private static func claudeHistory(
@@ -68,7 +71,8 @@ enum UsageHistoryAggregator {
 
     private static func merge(
         _ histories: [ProviderUsageHistory],
-        includedDays: Set<String>
+        includedDays: Set<String>,
+        detailedDays: Set<String>
     ) -> ProviderUsageHistory {
         var days: [String: (tokens: Int, cost: Double?, sawCost: Bool)] = [:]
         var apiEstimates: [String: Double] = [:]
@@ -78,7 +82,7 @@ enum UsageHistoryAggregator {
         for history in histories {
             for day in history.series.daily where includedDays.contains(day.date) {
                 var value = days[day.date] ?? (0, nil, false)
-                value.tokens += day.totalTokens
+                value.tokens = ProviderParse.addingSaturating(value.tokens, day.totalTokens)
                 if let cost = day.costUSD {
                     value.cost = (value.cost ?? 0) + cost
                     value.sawCost = true
@@ -88,13 +92,13 @@ enum UsageHistoryAggregator {
             for (day, estimate) in history.apiEstimateByDay ?? [:] where includedDays.contains(day) {
                 apiEstimates[day, default: 0] += estimate
             }
-            for day in history.modelUsage?.daily ?? [] where includedDays.contains(day.date) {
+            for day in history.modelUsage?.daily ?? [] where detailedDays.contains(day.date) {
                 for model in day.models {
                     models[day.date, default: [:]][model.model.lowercased(), default: ModelAccumulator()]
                         .add(model)
                 }
             }
-            for (day, names) in history.unknownModelsByDay where includedDays.contains(day) {
+            for (day, names) in history.unknownModelsByDay where detailedDays.contains(day) {
                 unknown[day, default: []].formUnion(names)
             }
         }
@@ -131,7 +135,7 @@ enum UsageHistoryAggregator {
 
         mutating func add(_ model: ModelUsageEntry) {
             if displayName.isEmpty { displayName = model.model }
-            tokens += model.totalTokens
+            tokens = ProviderParse.addingSaturating(tokens, model.totalTokens)
             if let value = model.costUSD {
                 cost = (cost ?? 0) + value
                 sawCost = true
@@ -161,7 +165,7 @@ enum UsageHistoryAggregator {
         var sawCost = false
 
         mutating func add(_ variant: ModelUsageVariant) {
-            tokens += variant.totalTokens
+            tokens = ProviderParse.addingSaturating(tokens, variant.totalTokens)
             if let value = variant.costUSD {
                 cost = (cost ?? 0) + value
                 sawCost = true
@@ -185,6 +189,7 @@ enum UsageHistorySnapshotRenderer {
         combined: Bool = true
     ) -> ProviderSnapshot {
         var result = snapshot
+        result.usageHistory = history
         result.lines.removeAll { historyLabels.contains($0.label) }
         let sourceNote = combined ? "Across your Macs · \(descriptor.sourceNote)" : descriptor.sourceNote
         SpendTileMapper.appendTokenUsage(

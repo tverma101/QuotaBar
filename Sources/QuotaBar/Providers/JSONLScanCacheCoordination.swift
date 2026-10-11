@@ -3,9 +3,9 @@ import Darwin
 
 /// Shares a small CPU allowance across token-history indexing and folding. A process-wide lock keeps
 /// simultaneous provider scans from multiplying the allowance; work runs in short synchronous slices
-/// and pauses according to process CPU time, so disk wait does not consume the CPU budget. Automatic
-/// refreshes use the same allowance in both menu-bar and full scopes because a startup/menu-bar pass
-/// can still cold-load provider indexes and OpenCode's local history.
+/// and pauses according to process CPU time, so disk wait does not consume the CPU budget. Background
+/// menu-bar ticks target 7.5% of one core; explicitly throttled full-history reads target 25% so a
+/// user waiting on a refresh does not inherit the background deadline budget.
 final class JSONLAccountingWorkPacer: @unchecked Sendable {
     static let shared = JSONLAccountingWorkPacer()
 

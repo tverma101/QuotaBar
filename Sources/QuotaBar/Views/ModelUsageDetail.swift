@@ -137,7 +137,7 @@ struct ModelUsageDetail: View {
                 }
             }
         }
-        let tokenTotal = models.reduce(0) { $0 + $1.totalTokens }
+        let tokenTotal = models.reduce(0) { ProviderParse.addingSaturating($0, $1.totalTokens) }
         guard tokenTotal > 0 else { return models.map { _ in 0 } }
         return models.map { model in
             min(max(Double(model.totalTokens) / Double(tokenTotal), 0), 1)

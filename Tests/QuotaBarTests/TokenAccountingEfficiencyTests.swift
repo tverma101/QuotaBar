@@ -39,7 +39,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
         scope: ProviderRefreshContext.Scope
     ) async throws -> (cpu: Double, wall: Double) {
         try await ProviderRefreshContext.$scope.withValue(scope) {
-            try await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+            try ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
                 let wallStart = DispatchTime.now().uptimeNanoseconds
                 let cpuStart = Self.cpuSeconds()
                 try JSONLAccountingWorkPacer.shared.perform {
@@ -76,7 +76,7 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
             throw XCTSkip("QUOTABAR_TOKEN_ACCOUNTING_MODE must be 'raw' or 'paced'")
         }
         let shouldThrottle = mode == "paced"
-        let measurement = try await ProviderRefreshContext.$scope.withValue(.full) {
+        let measurement = try await ProviderRefreshContext.$scope.withValue(.menuBar) {
             try await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(shouldThrottle) {
                 try await runMode(scratch: scratch)
             }

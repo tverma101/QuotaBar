@@ -40,16 +40,28 @@ enum UsageHistoryWindow {
     /// widens the scan. Derived from `totalDays` so the two cannot drift apart again.
     static var previousDays: Int { totalDays - 1 }
 
-    /// The lifetime scan window for the Usage History screen's all-time card: full passes fold this
-    /// many days back — in practice everything the local logs still hold. The 30-day surfaces clip
-    /// the resulting wide series at serve time (`SpendTileMapper` filters by the window's day keys,
-    /// the trend maps exactly `totalDays` offsets, the aggregator anchors buckets on today), so one
-    /// wide fold feeds both the tiles and the history screen without a second scan.
-    static let lifetimeDays = 3650
+    /// The lifetime scan window for the Usage History screen's retained-history card. Calendar year
+    /// arithmetic keeps the cutoff on the same month/day ten years ago, including leap days.
+    static func lifetimeDays(through now: Date, calendar: Calendar = .current) -> Int {
+        let today = calendar.startOfDay(for: now)
+        let firstDay = calendar.date(byAdding: .year, value: -10, to: today)
+            ?? calendar.date(byAdding: .day, value: -3650, to: today)
+            ?? today
+        return max(1, (calendar.dateComponents([.day], from: firstDay, to: today).day ?? 0) + 1)
+    }
 
     static func dayKeys(through now: Date, calendar: Calendar = .current) -> Set<String> {
+        dayKeys(through: now, count: totalDays, calendar: calendar)
+    }
+
+    /// Calendar keys retained for the Usage History lifetime report, including today.
+    static func lifetimeDayKeys(through now: Date, calendar: Calendar = .current) -> Set<String> {
+        dayKeys(through: now, count: lifetimeDays(through: now, calendar: calendar), calendar: calendar)
+    }
+
+    private static func dayKeys(through now: Date, count: Int, calendar: Calendar) -> Set<String> {
         let today = calendar.startOfDay(for: now)
-        return Set((0..<totalDays).compactMap { offset in
+        return Set((0..<max(0, count)).compactMap { offset in
             calendar.date(byAdding: .day, value: -offset, to: today)
                 .map { DailyUsageAccumulator.dayKey(from: $0, calendar: calendar) }
         })
@@ -112,6 +124,31 @@ struct ProviderUsageHistory: Hashable, Sendable, Codable {
         self.modelUsage = modelUsage
         self.unknownModelsByDay = unknownModelsByDay
         self.apiEstimateByDay = apiEstimateByDay
+    }
+}
+
+extension ProviderUsageHistory {
+    /// Model rows and unknown-model names are only consumed by the 30-day spend details. Keep daily
+    /// totals and API estimates for the ten-year lifetime report while dropping older array entries.
+    func retainingHistory(through now: Date, calendar: Calendar = .current) -> ProviderUsageHistory {
+        retainingHistory(
+            lifetimeDayKeys: UsageHistoryWindow.lifetimeDayKeys(through: now, calendar: calendar),
+            detailDayKeys: UsageHistoryWindow.dayKeys(through: now, calendar: calendar)
+        )
+    }
+
+    func retainingHistory(
+        lifetimeDayKeys: Set<String>,
+        detailDayKeys: Set<String>
+    ) -> ProviderUsageHistory {
+        let modelDays = modelUsage?.daily.filter { detailDayKeys.contains($0.date) } ?? []
+        let apiEstimates = apiEstimateByDay?.filter { lifetimeDayKeys.contains($0.key) }
+        return ProviderUsageHistory(
+            series: DailyUsageSeries(daily: series.daily.filter { lifetimeDayKeys.contains($0.date) }),
+            modelUsage: modelDays.isEmpty ? nil : ModelUsageSeries(daily: modelDays),
+            unknownModelsByDay: unknownModelsByDay.filter { detailDayKeys.contains($0.key) },
+            apiEstimateByDay: apiEstimates?.isEmpty == false ? apiEstimates : nil
+        )
     }
 }
 
