@@ -74,8 +74,12 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
         let report = makeReport(providers: [("claude", "Claude", history)])
 
         XCTAssertEqual(report.last30.tokens, 300)
-        XCTAssertEqual(report.days.map(\.date), [dayKey(offsetFromToday: 0), dayKey(offsetFromToday: -29)],
-                       "days list newest first")
+        XCTAssertEqual(report.days.count, 30, "the chart always contains one point per calendar day")
+        XCTAssertEqual(report.days.map(\.date).first, dayKey(offsetFromToday: 0), "days list newest first")
+        XCTAssertEqual(report.days.map(\.date).last, dayKey(offsetFromToday: -29))
+        XCTAssertEqual(report.days.first?.tokens, 100)
+        XCTAssertEqual(report.days[1].tokens, 0, "idle dates remain visible as zero-usage bars")
+        XCTAssertEqual(report.days.last?.tokens, 200)
         XCTAssertFalse(report.days.contains { $0.date == dayKey(offsetFromToday: -30) })
     }
 
@@ -191,6 +195,31 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
         ])
         XCTAssertEqual(report.lifetime.tokens, 5100)
         XCTAssertEqual(report.lifetime.cost, 51.0)
+    }
+
+    func testLifetimeOnlyHistoryDoesNotShowTheEmptyState() {
+        let history = makeHistory(daily: [(-90, 800, 8.0)])
+        let report = makeReport(providers: [("claude", "Claude", history)])
+
+        XCTAssertFalse(report.isEmpty)
+        XCTAssertEqual(report.lifetime.tokens, 800)
+        XCTAssertTrue(report.sections.isEmpty, "provider detail rows are limited to the 30-day window")
+        XCTAssertEqual(report.days.count, 30)
+        XCTAssertTrue(report.days.allSatisfy { $0.tokens == 0 })
+    }
+
+    func testTokenTotalsSaturateAtIntMax() {
+        let largest = makeHistory(daily: [(0, .max, nil)])
+        let additional = makeHistory(daily: [(0, 1, nil)])
+        let report = makeReport(providers: [
+            ("claude", "Claude", largest),
+            ("codex", "Codex", additional)
+        ])
+
+        XCTAssertEqual(report.today.tokens, .max)
+        XCTAssertEqual(report.last30.tokens, .max)
+        XCTAssertEqual(report.days.first?.tokens, .max)
+        XCTAssertEqual(report.lifetime.tokens, .max)
     }
 
     // MARK: - Sections

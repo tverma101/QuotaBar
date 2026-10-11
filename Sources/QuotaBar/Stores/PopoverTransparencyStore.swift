@@ -12,6 +12,15 @@ import os
 final class PopoverTransparencyStore {
     static let key = "increaseTransparency"
 
+    /// Posted on the default center when the panel becomes visible. The refresh loop sleeps up to
+    /// 15 minutes between closed-panel ticks (battery cadence) and presents the panel as a pure
+    /// snapshot, so without this wake a freshly opened panel showed whatever the last closed-panel
+    /// pass had painted — the "Today" tile could sit many minutes behind while the loop slept on.
+    /// Closing stays silent: the loop re-evaluates its cadence at its next wake regardless.
+    static let panelVisibilityDidChangeNotification = Notification.Name(
+        "QuotaBar.PanelVisibilityDidChange"
+    )
+
     /// The persisted preference (default off). Stored here rather than as a view-local `@AppStorage` so
     /// the AppKit panel honors exactly the value the Settings toggle writes. The no-op guard avoids a
     /// redundant defaults write (and the firehose `UserDefaults.didChangeNotification` it would emit).
@@ -114,6 +123,12 @@ final class PopoverTransparencyStore {
         guard shown != popoverShown else { return }
         popoverShown = shown
         Self.panelOpenLock.withLock { $0 = shown }
+        // Posted only on open (the guard above makes this the rising edge) so the sleeping refresh
+        // loop runs a full-scope pass immediately instead of finishing its battery-stretched sleep
+        // while the user stares at a stale Today tile.
+        if shown {
+            NotificationCenter.default.post(name: Self.panelVisibilityDidChangeNotification, object: nil)
+        }
     }
 
     /// The resolved level both the panel and the SwiftUI surface render.

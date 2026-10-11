@@ -10,10 +10,10 @@ Right-click (or control-click) the QuotaBar menu bar icon for a quick menu with 
 
 The dashboard footer's **Options** menu → **Usage History** opens a read-only report built from the same local usage data the spend tiles show, so the two can never disagree:
 
-- **Lifetime** — every recorded day's tokens and plan-priced cost, dated by the earliest day your logs still hold ("Since Mar 2026"). Claude, Codex, and Grok fold their full local log history, so this approaches true lifetime; providers bounded to a provider API window contribute only what that window held.
+- **Lifetime** — recorded tokens and plan-priced cost from the retained history window (up to 10 years), dated by its earliest day ("Since Mar 2026"). Claude, Codex, and Grok fold up to ten years of local logs; sources with shorter scan or retention windows contribute only the history they preserve.
 - **At Public API Rates (Est.)** — what all that recorded usage would have cost at each model's public API rates, shown when any fold produced an estimate. A what-if comparison, never a recorded amount.
 - **Today / 7 Days / 30 Days** summary cards: tokens always, plan-priced cost (a dash where nothing could be priced yet).
-- A **daily token trend** across the 30-day window.
+- A **daily token trend** across the 30-day window, with one bar for every calendar day including idle days.
 - One section per enabled provider with **per-model rows** for the window: tokens plus cost (or a dash for models no catalogue prices yet — those backfill automatically once discovery finds a rate; see [Pricing](pricing.md)).
 
 ## Starring

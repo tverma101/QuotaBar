@@ -381,7 +381,8 @@ final class AppContainer {
             let wakeSignal = RefreshWakeSignal(names: [
                 ProviderEnablementStore.didChangeNotification,
                 CodexRouterLedgerWatcher.didChangeNotification,
-                BackgroundRefreshTrigger.didChangeNotification
+                BackgroundRefreshTrigger.didChangeNotification,
+                PopoverTransparencyStore.panelVisibilityDidChangeNotification
             ])
             // Tap-free external trigger (see `BackgroundRefreshTrigger`). Armed here, outside the
             // loop body, so a request landing mid-pass is still observed and applied to the *next*
@@ -389,7 +390,9 @@ final class AppContainer {
             let backgroundTrigger = BackgroundRefreshTrigger()
             backgroundTrigger.start()
             // Arm vnode watch on the CodexRouter ledger so panel-open spend updates within ~1s of a
-            // routed turn (incremental tail parse). Closed-panel wakes are suppressed inside the watcher.
+            // routed turn (incremental tail parse). Closed-panel turns still wake the loop, but the
+            // watcher rate-limits them and the pass runs `localAccounting` scope — local folds only,
+            // no live quota API re-reads.
             let ledgerWatcher = CodexRouterLedgerWatcher(
                 isPanelOpen: { PopoverTransparencyStore.isPopoverShownUnlocked }
             )
@@ -404,6 +407,10 @@ final class AppContainer {
             /// the local JSONL/SQLite accounting entirely, so a trigger that did not widen the scope
             /// would do no measurable work at all.
             var pendingFullScopePass = false
+            /// Latched by a closed-panel ledger wake and consumed by the next pass, which then runs
+            /// `.localAccounting` scope: the codex/opencode local folds recompute without re-reading
+            /// live quota APIs, so Today tracks routed turns even while the panel is closed.
+            var pendingLocalAccountingPass = false
             /// Rate limit for trigger-caused passes, and whether a pass must be dropped because the
             /// previous one has not cleared the cooldown yet.
             var triggerGate = BackgroundRefreshGate()
@@ -418,7 +425,9 @@ final class AppContainer {
                     // A trigger arrived inside the gate's cooldown. The trigger's own debounce
                     // already collapsed the burst; this drops the one redundant pass that would
                     // otherwise be released the moment the prior pass ends. Notifications, telemetry,
-                    // and the timer cadence below still run.
+                    // and the timer cadence below still run. A latched ledger wake is preserved:
+                    // the cooldown drop is about the trigger's redundant full pass, and dropping
+                    // Today's freshness with it would stall local accounting until the next wake.
                     dropNextRefreshPass = false
                     pendingFullScopePass = false
                     AppLog.info(.refresh, "background refresh pass skipped (inside trigger cooldown)")
@@ -452,18 +461,29 @@ final class AppContainer {
                     }
                     // A trigger runs the full-scope pass so local accounting actually happens even
                     // while the panel is closed. It stays non-forced, so a provider with a fresh
-                    // snapshot still answers from cache.
-                    let scope: ProviderRefreshContext.Scope = (panelOpen || pendingFullScopePass) ? .full : .menuBar
+                    // snapshot still answers from cache. A closed-panel ledger wake runs the narrower
+                    // localAccounting pass instead: the codex/opencode folds recompute without
+                    // re-reading live quota APIs (one incremental tail parse per accepted wake).
+                    let scope: ProviderRefreshContext.Scope
+                    if panelOpen || pendingFullScopePass {
+                        scope = .full
+                    } else if pendingLocalAccountingPass {
+                        scope = .localAccounting
+                    } else {
+                        scope = .menuBar
+                    }
                     pendingFullScopePass = false
+                    pendingLocalAccountingPass = false
                     await ProviderRefreshContext.$scope.withValue(scope) {
-                        await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(scope == .menuBar) {
+                        await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(scope != .full) {
                             // Full-scope passes answer a user who is actively waiting (panel opened or
                             // an explicit refresh trigger), so they run unpaced: the 25% CPU ceiling
                             // stretched cold ledger/gateway folds into 20-30s walls for ~5-8s of real
-                            // CPU. Menu-bar ticks keep the background allowance. Memory stays bounded
-                            // by the provider serialization and soft-limit checks below, which key on
-                            // footprint rather than on pacing.
-                            await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(scope == .menuBar) {
+                            // CPU. Menu-bar and closed-panel local-accounting ticks keep the
+                            // background allowance. Memory stays bounded by the provider
+                            // serialization and soft-limit checks below, which key on footprint
+                            // rather than on pacing.
+                            await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(scope != .full) {
                                 await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
                             }
                         }
@@ -494,11 +514,23 @@ final class AppContainer {
                 // Ledger appends while the panel is open must bypass the snapshot TTL; otherwise the
                 // wake resumes the loop into an all-cache-hit pass and Today/charts stay stale for up
                 // to ~5 minutes despite the vnode watcher. Only Codex cards need the miss — Cursor
-                // keeps its cache.
+                // keeps its cache. With the panel closed, the wake instead schedules the narrower
+                // localAccounting pass (both ledger-consuming families; no live quota API re-reads).
                 if case .notification(let name) = wake {
                     switch name {
                     case CodexRouterLedgerWatcher.didChangeNotification:
-                        dataStore.invalidateSessionFreshnessForCodexSpend()
+                        if transparency.popoverShown {
+                            dataStore.invalidateSessionFreshnessForCodexSpend()
+                        } else {
+                            pendingLocalAccountingPass = true
+                            dataStore.invalidateLocalAccountingFreshness()
+                            AppLog.info(.refresh, "closed-panel ledger wake; scheduling local accounting pass")
+                        }
+                    case PopoverTransparencyStore.panelVisibilityDidChangeNotification:
+                        // The store posts on the open edge only. Latch a full pass so the panel's
+                        // first paint is followed by fresh data even if the user closes it again
+                        // before the pass starts.
+                        pendingFullScopePass = true
                     case BackgroundRefreshTrigger.didChangeNotification:
                         if triggerGate.shouldAccept(at: Date()) {
                             pendingFullScopePass = true

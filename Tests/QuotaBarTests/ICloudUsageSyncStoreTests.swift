@@ -90,7 +90,7 @@ final class ICloudUsageSyncStoreTests: XCTestCase {
         let sync = makeSync(defaults: defaults, fileStore: fileStore)
 
         sync.enabled = true
-        try await waitUntil { sync.invalidFileMessages.count == 1 }
+        try await waitUntil { sync.invalidFileMessages.count == 1 && sync.serviceError != nil }
 
         XCTAssertTrue(sync.displayedDocuments.contains { $0.deviceID == "peer" })
         XCTAssertNotNil(sync.serviceError)

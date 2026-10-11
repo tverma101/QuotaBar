@@ -327,7 +327,10 @@ enum CursorUsageMapper {
                 if row.tokens.totalTokens > 0, !model.isEmpty {
                     unknownModelsByDay[day, default: []].insert(model)
                 }
-                tokensByDay[day, default: 0] += row.tokens.totalTokens
+                tokensByDay[day] = ProviderParse.addingSaturating(
+                    tokensByDay[day, default: 0],
+                    row.tokens.totalTokens
+                )
                 let family = model.isEmpty ? modelName : familyName(for: model, pricing: pricing)
                 modelsByDay[day, default: [:]][family, default: ModelAccumulator()].add(
                     variant: modelName,
@@ -337,7 +340,10 @@ enum CursorUsageMapper {
                 continue
             }
             costByDay[day, default: 0] += cost
-            tokensByDay[day, default: 0] += row.tokens.totalTokens
+            tokensByDay[day] = ProviderParse.addingSaturating(
+                tokensByDay[day, default: 0],
+                row.tokens.totalTokens
+            )
             let family = model.isEmpty ? modelName : familyName(for: model, pricing: pricing)
             modelsByDay[day, default: [:]][family, default: ModelAccumulator()].add(
                 variant: modelName,
@@ -397,13 +403,13 @@ enum CursorUsageMapper {
         var variants: [String: (tokens: Int, costUSD: Double?)] = [:]
 
         mutating func add(variant: String, tokens: Int, costUSD: Double?) {
-            self.tokens += tokens
+            self.tokens = ProviderParse.addingSaturating(self.tokens, tokens)
             if let costUSD {
                 self.costUSD = (self.costUSD ?? 0) + costUSD
             }
             let existing = variants[variant] ?? (0, nil)
             let combinedCost: Double? = costUSD.map { (existing.costUSD ?? 0) + $0 } ?? existing.costUSD
-            variants[variant] = (existing.tokens + tokens, combinedCost)
+            variants[variant] = (ProviderParse.addingSaturating(existing.tokens, tokens), combinedCost)
         }
 
         func entry(model: String) -> ModelUsageEntry {

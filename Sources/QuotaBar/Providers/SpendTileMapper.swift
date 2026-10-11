@@ -70,7 +70,7 @@ enum SpendTileMapper {
         let windowed = usage.daily.filter { entry in
             dayKey(fromUsageDate: entry.date).map { windowKeys.contains($0) } == true
         }
-        let totalTokens = windowed.reduce(0) { $0 + $1.totalTokens }
+        let totalTokens = windowed.reduce(0) { ProviderParse.addingSaturating($0, $1.totalTokens) }
         let costSamples = windowed.compactMap(\.costUSD)
         let totalCost = costSamples.isEmpty ? nil : costSamples.reduce(0, +)
         if totalTokens > 0 || (totalCost ?? 0) > 0 {
@@ -274,7 +274,7 @@ enum SpendTileMapper {
         /// its hover detail lists models, not their raw effort slugs. The Other row's own name is
         /// fixed, so folded spellings only vote inside the variant lines.
         mutating func fold(_ entry: ModelUsageEntry) {
-            tokens += entry.totalTokens
+            tokens = ProviderParse.addingSaturating(tokens, entry.totalTokens)
             if let cost = entry.costUSD {
                 costUSD = (costUSD ?? 0) + cost
             }
@@ -282,7 +282,7 @@ enum SpendTileMapper {
         }
 
         private mutating func addTotals(of entry: ModelUsageEntry, spelledAs name: String) {
-            tokens += entry.totalTokens
+            tokens = ProviderParse.addingSaturating(tokens, entry.totalTokens)
             if let cost = entry.costUSD {
                 costUSD = (costUSD ?? 0) + cost
             }
@@ -292,7 +292,7 @@ enum SpendTileMapper {
         private mutating func mergeVariant(_ model: String, tokens: Int, costUSD: Double?) {
             let key = model.lowercased()
             var existing = variants[key] ?? (0, nil, SpellingVote())
-            existing.tokens += tokens
+            existing.tokens = ProviderParse.addingSaturating(existing.tokens, tokens)
             existing.costUSD = costUSD.map { (existing.costUSD ?? 0) + $0 } ?? existing.costUSD
             existing.vote.note(model, weight: tokens)
             variants[key] = existing
@@ -379,7 +379,7 @@ enum SpendTileMapper {
         // (the bug that hid 488M glm tokens under a 3% Other row).
         let allPriced = entries.allSatisfy { $0.costUSD != nil }
         let costTotal = entries.reduce(0.0) { $0 + ($1.costUSD ?? 0) }
-        let tokenTotal = entries.reduce(0) { $0 + $1.totalTokens }
+        let tokenTotal = entries.reduce(0) { ProviderParse.addingSaturating($0, $1.totalTokens) }
         func share(_ entry: ModelUsageEntry) -> Double {
             if allPriced, costTotal > 0 { return (entry.costUSD ?? 0) / costTotal }
             guard tokenTotal > 0 else { return 0 }

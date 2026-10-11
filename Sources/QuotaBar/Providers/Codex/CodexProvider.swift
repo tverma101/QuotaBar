@@ -93,6 +93,28 @@ final class CodexProvider: ProviderRuntime {
     }
 
     func refresh() async -> ProviderSnapshot {
+        // Closed-panel ledger wakes run `.localAccounting` scope: fold the router ledger and native
+        // sessions without re-reading the live quota APIs — per-turn re-reads are exactly the burn
+        // the watcher's closed-panel rate limit exists to prevent. The data store's background
+        // merge recovers the quota meters from the prior snapshot.
+        if ProviderRefreshContext.scope == .localAccounting {
+            var lines: [MetricLine] = []
+            let usageHistory = await appendLocalUsage(
+                to: &lines,
+                now: now(),
+                pricing: await pricing(),
+                accountIdentityKey: expectedIdentityKey
+            )
+            MetricLine.appendNoDataIfNeeded(&lines)
+            return ProviderSnapshot.make(
+                provider: provider,
+                plan: nil,
+                lines: lines,
+                refreshedAt: now(),
+                usageHistory: usageHistory
+            )
+        }
+
         let fileCandidates = authStore.loadAuthCandidates().filter(isExpectedAccount)
         var lastFallbackError: Error?
 
@@ -247,13 +269,14 @@ final class CodexProvider: ProviderRuntime {
         let routerScan = await routerUsageScanner.scan(
             accountIdentityKey: accountIdentityKey,
             allowsUnscopedEvents: false,
+            daysBack: UsageHistoryWindow.lifetimeDays(through: now),
             now: now,
             pricing: pricing
         )
         // Native sessions may contain days that never passed through Codex Router. Their per-file
         // aggregates skip unchanged events, so preserving gap-fill history needs no repeated fold.
         let nativeScan = await logUsageScanner.scan(
-            daysBack: UsageHistoryWindow.lifetimeDays,
+            daysBack: UsageHistoryWindow.lifetimeDays(through: now),
             now: now,
             pricing: pricing
         )
@@ -399,4 +422,3 @@ final class CodexProvider: ProviderRuntime {
         return response.accessToken
     }
 }
-

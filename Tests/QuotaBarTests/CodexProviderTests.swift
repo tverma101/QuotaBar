@@ -630,6 +630,53 @@ final class CodexProviderTests: XCTestCase {
         })
     }
 
+    func testLocalAccountingScopeFoldsLocallyWithoutQuotaAPICalls() async throws {
+        let now = TestLocalInstant.date(2026, 2, 20, 12)
+        // Any request at all would be the burn the closed-panel wake rate limit exists to prevent.
+        let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data("{}".utf8)))
+        let home = try CodexLogFixture.makeHome(files: [
+            "sessions/rollout-1.jsonl": [
+                CodexLogFixture.turnContext(timestamp: TestLocalInstant.iso(2026, 2, 20, 10), model: "gpt-5.2"),
+                CodexLogFixture.tokenCount(
+                    timestamp: TestLocalInstant.iso(2026, 2, 20, 10, 1),
+                    last: CodexLogFixture.usage(input: 100, output: 50)
+                )
+            ].joined(separator: "\n")
+        ])
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
+                files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
+                keychain: FakeKeychain()
+            ),
+            usageClient: CodexUsageClient(http: httpClient),
+            logUsageScanner: CodexLogFixture.scanner(home: home),
+            now: { now },
+            pricing: {
+                ModelPricing(
+                    supplement: PricingSupplement(),
+                    primary: PricingCatalog(entries: ["gpt-5.2": ModelRates(
+                        inputPerMillion: 1000, outputPerMillion: 3000,
+                        cacheWritePerMillion: 1000, cacheReadPerMillion: 100
+                    )]),
+                    secondary: PricingCatalog(entries: [:])
+                )
+            }
+        )
+
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.localAccounting) {
+            await provider.refresh()
+        }
+
+        // Fresh local accounting (spend tiles) with no live quota meters and no network.
+        XCTAssertEqual(values(snapshot.lines, "Today"),
+                       [MetricValue(number: 0.25, kind: .dollars, estimated: true),
+                        MetricValue(number: 150, kind: .count, label: "tokens")])
+        XCTAssertNil(snapshot.plan)
+        XCTAssertNil(snapshot.warning)
+        XCTAssertTrue(httpClient.requests.isEmpty, "localAccounting scope must not re-read live quota APIs")
+    }
+
     private func values(_ lines: [MetricLine], _ label: String) -> [MetricValue]? {
         guard case .values(_, let values, _, _, _, _) = lines.first(where: { $0.label == label }) else {
             return nil

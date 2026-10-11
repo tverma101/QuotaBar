@@ -6,8 +6,12 @@ import Foundation
 ///
 /// Design constraints (efficiency architecture):
 /// - Does **not** reparse the ledger itself — only signals `RefreshWakeSignal`.
-/// - Posts only while the panel is open (menuBar scope skips JSONL history; waking on every turn
-///   while closed would burn ChatGPT Session/Weekly API calls for no icon benefit).
+/// - Panel-open turns post immediately (spend tiles refresh within ~1s of a routed turn).
+///   Closed-panel turns post too, but rate-limited to one per `BackgroundRefreshTrigger.minimumPassInterval`
+///   seconds: the loop answers them with a paced `localAccounting` pass (local folds only, no live
+///   quota API re-reads), so a turn storm cannot burn ChatGPT Session/Weekly API calls for icons
+///   nobody is looking at. Events inside the cooldown are not lost — the next accepted wake's
+///   incremental tail parse catches up on every appended row.
 /// - Debounces write storms (~1s) so a multi-tool turn does not enqueue a refresh per line.
 /// - Uses `DispatchSource` vnode watches (cheap, no polling). Recreates the source after rename
 ///   rotate so a truncated/replaced ledger is not silently ignored.
@@ -23,6 +27,8 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
     private let isPanelOpen: @Sendable () -> Bool
     private let center: NotificationCenter
     private let debounceNanoseconds: UInt64
+    /// Mutated only on `queue` (the debounce/tap handlers run there).
+    private var closedPanelWakeGate: BackgroundRefreshGate
 
     private var sources: [DispatchSourceFileSystemObject] = []
     private var openDescriptors: [Int32] = []
@@ -36,7 +42,10 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
         ledgerPaths: (@Sendable () -> [String])? = nil,
         isPanelOpen: @escaping @Sendable () -> Bool,
         center: NotificationCenter = .default,
-        debounceNanoseconds: UInt64 = 1_000_000_000
+        debounceNanoseconds: UInt64 = 1_000_000_000,
+        closedPanelWakeGate: BackgroundRefreshGate = BackgroundRefreshGate(
+            minimumInterval: BackgroundRefreshTrigger.minimumPassInterval
+        )
     ) {
         self.ledgerPaths = ledgerPaths ?? {
             CodexRouterUsageScanner.defaultLedgerPaths(
@@ -47,6 +56,7 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
         self.isPanelOpen = isPanelOpen
         self.center = center
         self.debounceNanoseconds = debounceNanoseconds
+        self.closedPanelWakeGate = closedPanelWakeGate
     }
 
     func start() {
@@ -172,14 +182,18 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
     private func scheduleDebouncedWake() {
         debounceWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            self?.postIfPanelOpen()
+            self?.postIfWorthy()
         }
         debounceWorkItem = work
         queue.asyncAfter(deadline: .now() + .nanoseconds(Int(debounceNanoseconds)), execute: work)
     }
 
-    private func postIfPanelOpen() {
-        guard isPanelOpen() else { return }
+    private func postIfWorthy() {
+        // Panel-open wakes are ungated: the user is actively looking at spend tiles. Closed-panel
+        // wakes pass the background gate so a continuous turn stream wakes the loop at most once
+        // per cooldown window instead of per turn; dropped wakes only delay the wake, never the
+        // data — the tail is parsed incrementally from the last offset.
+        guard isPanelOpen() || closedPanelWakeGate.shouldAccept(at: Date()) else { return }
         center.post(name: Self.didChangeNotification, object: nil)
     }
 

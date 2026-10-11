@@ -17,8 +17,8 @@ final class CodexRouterProductionCacheTests: XCTestCase {
         )
     }
 
-    private func line(tokens: Int, hour: Int = 10) -> String {
-        "{\"at\":\"\(TestLocalInstant.iso(2026, 10, 4, hour))\",\"model\":\"test-model\",\"provider\":\"openai\",\"status\":200,\"inputTokens\":\(tokens),\"outputTokens\":0,\"totalTokens\":\(tokens)}\n"
+    private func line(tokens: Int, hour: Int = 10, model: String = "test-model") -> String {
+        "{\"at\":\"\(TestLocalInstant.iso(2026, 10, 4, hour))\",\"model\":\"\(model)\",\"provider\":\"openai\",\"status\":200,\"inputTokens\":\(tokens),\"outputTokens\":0,\"totalTokens\":\(tokens)}\n"
     }
 
     private func withLedger(_ body: (URL) async throws -> Void) async throws {
@@ -77,6 +77,22 @@ final class CodexRouterProductionCacheTests: XCTestCase {
             XCTAssertEqual(first?.series.daily.first?.totalTokens, 100)
             XCTAssertEqual(repriced?.series.daily.first?.totalTokens, 100)
             XCTAssertEqual(try XCTUnwrap(repriced?.series.daily.first?.costUSD), 0.0002, accuracy: 1e-10)
+        }
+    }
+
+    func testProductionFoldCountsUnpricedTokensAndBuildsAPIEstimates() async throws {
+        try await withLedger { ledger in
+            try (line(tokens: 100) + line(tokens: 100, hour: 11, model: "future-model"))
+                .write(to: ledger, atomically: true, encoding: .utf8)
+
+            let scanned = await scan(ledger)
+            let scan = try XCTUnwrap(scanned)
+            XCTAssertEqual(scan.series.daily.first?.totalTokens, 200)
+            XCTAssertEqual(try XCTUnwrap(scan.series.daily.first?.costUSD), 0.0001, accuracy: 1e-10)
+            XCTAssertEqual(scan.unknownModelsByDay["2026-10-04"], ["future-model"])
+            XCTAssertEqual(scan.modelUsage?.daily.first?.models.first(where: { $0.model == "future-model" })?.totalTokens, 100)
+            XCTAssertNil(scan.modelUsage?.daily.first?.models.first(where: { $0.model == "future-model" })?.costUSD)
+            XCTAssertEqual(try XCTUnwrap(scan.apiEstimateByDay?["2026-10-04"]), 0.0001, accuracy: 1e-10)
         }
     }
 
