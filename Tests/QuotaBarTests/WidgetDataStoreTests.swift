@@ -3,6 +3,164 @@ import XCTest
 
 @MainActor
 final class WidgetDataStoreTests: XCTestCase {
+    /// The cache's freshness gate reads the OLDER of `refreshedAt` and `quotaRefreshedAt`. A
+    /// fold-only pass (`.localAccounting` / `.panelAccounting`) writes a fresh `refreshedAt` while
+    /// carrying meters the live quota API answered hours ago; gating on `refreshedAt` alone let a
+    /// closed-panel ledger wake (one per routed turn) keep such a snapshot TTL-fresh forever, so
+    /// panel-open passes cache-hit and the subscription meters never updated (regression: meter %
+    /// stuck all day while routing continued).
+    func testSnapshotCacheFreshnessReadsTheOlderMeterStamp() {
+        let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
+        let defaults = makeUserDefaults("cache-meter-stamp-gate")
+        var clock = Date(timeIntervalSince1970: 10_000)
+        let cache = ProviderSnapshotCache(
+            userDefaults: defaults,
+            storageKey: "snapshots",
+            ttl: 300,
+            now: { clock }
+        )
+
+        // A meters-only pass answered the live API at T=10_000.
+        var fresh = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.progress(label: "Session", used: 5, limit: 100, format: .percent)],
+            refreshedAt: clock
+        )
+        cache.store(fresh)
+        XCTAssertNotNil(cache.snapshot(providerID: provider.id))
+
+        // A fold-only pass 200s later re-stamps refreshedAt but recovers the meters' stamp.
+        clock = Date(timeIntervalSince1970: 10_200)
+        fresh.refreshedAt = clock
+        fresh.quotaRefreshedAt = Date(timeIntervalSince1970: 10_000)
+        cache.store(fresh)
+        XCTAssertNotNil(cache.snapshot(providerID: provider.id), "meter stamp still within TTL")
+
+        // 200s further: refreshedAt is young (100s old) but the meter stamp is 400s old — past
+        // TTL. The older stamp governs, so the entry is stale and the next pass refetches meters.
+        clock = Date(timeIntervalSince1970: 10_400)
+        XCTAssertNil(cache.snapshot(providerID: provider.id),
+                     "recovered meters must age out by their own stamp, not the fold's clock")
+
+        // A fold that also produced a fresh meter fetch (panelMeters phase) is fresh by both.
+        clock = Date(timeIntervalSince1970: 10_500)
+        fresh.refreshedAt = clock
+        fresh.quotaRefreshedAt = clock
+        cache.store(fresh)
+        XCTAssertNotNil(cache.snapshot(providerID: provider.id))
+    }
+
+    /// The panel's accounting phase must fall through to the fold when the cached snapshot carries
+    /// NO history at all (fresh install / newly enabled provider): otherwise the phase would
+    /// cache-hit on the meters-only phase's write and the first fold would never run.
+    func testPanelAccountingFoldsWhenCacheHasNoHistory() async {
+        let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
+        var descriptor = WidgetDescriptor.percent(
+            id: "test.session", provider: provider, title: "Session"
+        )
+        descriptor = descriptor.exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: false,
+            sourceNote: "test"
+        )
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: "2026-10-11", totalTokens: 10, costUSD: 0.05)
+        ]))
+        let defaults = makeUserDefaults("panel-accounting-no-history")
+        let cache = ProviderSnapshotCache(
+            userDefaults: defaults,
+            storageKey: "snapshots",
+            ttl: 600,
+            now: { Date() }
+        )
+        // Phase 1's write: meters only, no history, no carry marker.
+        cache.store(ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.progress(label: "Session", used: 5, limit: 100, format: .percent)],
+            refreshedAt: Date()
+        ))
+        let runtime = CountingProviderRuntime(
+            provider: provider,
+            descriptors: [descriptor],
+            snapshot: ProviderSnapshot(
+                providerID: provider.id,
+                displayName: provider.displayName,
+                lines: [.progress(label: "Session", used: 6, limit: 100, format: .percent)],
+                refreshedAt: Date(),
+                usageHistory: history
+            )
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [runtime],
+            cache: cache,
+            defaults: makeUserDefaults("panel-accounting-no-history-store")
+        )
+
+        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await store.refreshAll()
+        }
+
+        XCTAssertEqual(runtime.refreshCount, 1, "no cached history — the fold must run")
+        XCTAssertNotNil(store.localSnapshots[provider.id]?.usageHistory)
+    }
+
+    /// And the mirror: a cached snapshot WITH history and no carry marker is the fold pass's own
+    /// fresh work — the accounting phase cache-hits within the TTL instead of refolding.
+    func testPanelAccountingCacheHitsFreshFold() async {
+        let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
+        var descriptor = WidgetDescriptor.percent(
+            id: "test.session", provider: provider, title: "Session"
+        )
+        descriptor = descriptor.exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: false,
+            sourceNote: "test"
+        )
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: "2026-10-11", totalTokens: 10, costUSD: 0.05)
+        ]))
+        let defaults = makeUserDefaults("panel-accounting-fresh-fold")
+        let cache = ProviderSnapshotCache(
+            userDefaults: defaults,
+            storageKey: "snapshots",
+            ttl: 600,
+            now: { Date() }
+        )
+        cache.store(ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.progress(label: "Session", used: 5, limit: 100, format: .percent)],
+            refreshedAt: Date(),
+            usageHistory: history
+        ))
+        let runtime = CountingProviderRuntime(
+            provider: provider,
+            descriptors: [descriptor],
+            snapshot: ProviderSnapshot(
+                providerID: provider.id,
+                displayName: provider.displayName,
+                lines: [.progress(label: "Session", used: 6, limit: 100, format: .percent)],
+                refreshedAt: Date(),
+                usageHistory: history
+            )
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [runtime],
+            cache: cache,
+            defaults: makeUserDefaults("panel-accounting-fresh-fold-store")
+        )
+
+        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await store.refreshAll()
+        }
+
+        XCTAssertEqual(runtime.refreshCount, 0, "fresh fold within TTL — cache hit")
+    }
+
     func testFirstPassConcurrencyCapSerializesProviderStarts() async {
         let probe = RefreshConcurrencyProbe()
         let providers = (0..<3).map { index -> TestConcurrencyProviderRuntime in

@@ -254,6 +254,13 @@ final class ClaudeProvider: ProviderRuntime {
         var warning: String?
         switch authStore.liveUsageAvailability(state) {
         case .available:
+            if ProviderRefreshContext.scope.suppressesLiveQuota {
+                // Fold-only pass (panel phase 2): the meters-only phase answered the usage
+                // endpoint moments ago; re-fetching per fold would double every panel-open API
+                // call and pull Anthropic's aggressive rate limits onto a routine open. The
+                // store's merge recovers the meters and carries their freshness stamp.
+                break
+            }
             mapped = try await fetchLiveUsage(
                 state: &state,
                 credentialGeneration: &credentialGeneration
@@ -286,10 +293,10 @@ final class ClaudeProvider: ProviderRuntime {
         warning: String?
     ) async -> ProviderSnapshot {
         var mapped = initialUsage
-        // Menu-bar background ticks only need Session/Weekly (and sibling) quota meters from the
-        // live usage API. Skip the expensive local JSONL / pi history scan; the data store merges
-        // prior token/history lines onto this snapshot.
-        if ProviderRefreshContext.scope == .menuBar {
+        // Meters-only passes (menu-bar ticks, panel phase 1) only need Session/Weekly (and sibling)
+        // quota meters from the live usage API. Skip the expensive local JSONL / pi history scan;
+        // the data store merges prior token/history lines onto this snapshot.
+        if ProviderRefreshContext.scope.skipsLocalAccounting {
             MetricLine.appendNoDataIfNeeded(&mapped.lines)
             return ProviderSnapshot.make(
                 provider: provider,

@@ -66,6 +66,11 @@ struct HistoryReport: Equatable, Sendable {
     /// The earliest recorded day with usage, display-formatted ("Mar 2025") — the hero's "since"
     /// caption. Nil when no provider has any usage.
     let lifetimeSinceLabel: String?
+    /// True when any contributing provider's lifetime dollars are locally imputed (public-API-rate
+    /// estimates from logs that carry no per-message cost) rather than provider-recorded. The hero
+    /// marks its total with "(Est.)" then — the tiles' ⓘ convention, applied to the screen's
+    /// headline figure.
+    let lifetimeCostIsEstimated: Bool
     let generatedAt: Date
 
     /// Every section is empty (no enabled provider has local history) — the screen's empty state.
@@ -80,6 +85,18 @@ struct HistoryReport: Equatable, Sendable {
     /// span as `lifetime`. Distinct from the plan-priced totals: this is a what-if comparison, never
     /// a recorded amount.
     var apiEstimateTotal: Double? { lifetime.apiEstimate }
+
+    /// Whether the "At Public API Rates (Est.)" card earns its row. When the what-if total displays
+    /// the same dollars as the lifetime hero, the card restates the hero as if it were a different
+    /// fact — subscription log providers carry no per-message cost, so the hero's imputed total and
+    /// this estimate coincide exactly ($3.1K and $3.1K). Compared at display precision, not raw
+    /// doubles: $3,099.61 and $3,100.02 both read "$3.1K", so the duplicate row hides either way.
+    var showsAPIEstimateCard: Bool {
+        guard let estimate = apiEstimateTotal else { return false }
+        guard let heroCost = lifetime.cost else { return true }
+        return MetricFormatter.number(estimate, kind: .dollars, style: .row)
+            != MetricFormatter.number(heroCost, kind: .dollars, style: .row)
+    }
 }
 
 /// Folds enabled providers' daily usage histories into the Usage History report. Pure and
@@ -90,6 +107,10 @@ enum HistoryDashboardAggregator {
         var enabledProviderIDs: [String]
         var displayNameByProviderID: [String: String]
         var historyByProviderID: [String: ProviderUsageHistory]
+        /// Which providers' folded `costUSD` is locally imputed (the history descriptor's
+        /// `estimatedCost`): logs that carry no per-message cost, priced at public API rates at fold
+        /// time. Drives the hero's "(Est.)" mark — the same flag the spend tiles' ⓘ uses.
+        var estimatedCostByProviderID: [String: Bool] = [:]
     }
 
     /// Folds the window's histories. `now` anchors the 30-day window and the Today/7-day buckets;
@@ -114,12 +135,14 @@ enum HistoryDashboardAggregator {
         var lifetimeTokens = 0
         var lifetimeCost: Double?
         var lifetimeCostSeen = false
+        var lifetimeCostIsEstimated = false
         var lifetimeEstimate: Double?
         var lifetimeEstimateSeen = false
         var earliestDayKey: String?
 
         for providerID in input.enabledProviderIDs {
             guard let history = input.historyByProviderID[providerID] else { continue }
+            let dollarsAreEstimated = input.estimatedCostByProviderID[providerID] == true
             var tokens = 0
             var cost: Double?
             var sawCost = false
@@ -136,6 +159,12 @@ enum HistoryDashboardAggregator {
                     if let dayCost = day.costUSD {
                         lifetimeCost = (lifetimeCost ?? 0) + dayCost
                         lifetimeCostSeen = true
+                        // A subscription-log provider's dollars are imputed at fold time (no
+                        // per-message cost in its logs), so the hero's headline is an estimate,
+                        // not recorded billing.
+                        if dollarsAreEstimated {
+                            lifetimeCostIsEstimated = true
+                        }
                     }
                     if let dayEstimate = history.apiEstimateByDay?[day.date] {
                         lifetimeEstimate = (lifetimeEstimate ?? 0) + dayEstimate
@@ -295,6 +324,7 @@ enum HistoryDashboardAggregator {
                 apiEstimate: lifetimeEstimateSeen ? lifetimeEstimate : nil
             ),
             lifetimeSinceLabel: earliestDayKey.flatMap { Self.sinceLabel(for: $0, calendar: calendar) },
+            lifetimeCostIsEstimated: lifetimeCostIsEstimated,
             generatedAt: now
         )
     }

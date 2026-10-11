@@ -93,11 +93,12 @@ final class CodexProvider: ProviderRuntime {
     }
 
     func refresh() async -> ProviderSnapshot {
-        // Closed-panel ledger wakes run `.localAccounting` scope: fold the router ledger and native
-        // sessions without re-reading the live quota APIs — per-turn re-reads are exactly the burn
-        // the watcher's closed-panel rate limit exists to prevent. The data store's background
-        // merge recovers the quota meters from the prior snapshot.
-        if ProviderRefreshContext.scope == .localAccounting {
+        // Fold-only passes (closed-panel ledger wakes, panel phase 2) fold the router ledger and
+        // native sessions without re-reading the live quota APIs — per-turn re-reads are exactly
+        // the burn the watcher's closed-panel rate limit exists to prevent, and the panel's
+        // phase 1 fetched the meters seconds ago. The data store's merge recovers the quota
+        // meters from the prior snapshot and carries their freshness stamp.
+        if ProviderRefreshContext.scope.suppressesLiveQuota {
             var lines: [MetricLine] = []
             let usageHistory = await appendLocalUsage(
                 to: &lines,
@@ -198,11 +199,11 @@ final class CodexProvider: ProviderRuntime {
         )
         var mapped = try CodexUsageMapper.mapUsageResponse(response, resetCredits: resetCredits, now: now())
 
-        // Menu-bar background ticks only need Session/Weekly (and sibling) quota meters from the
-        // rate-limit API. Skip the expensive local JSONL / FCC / CodexRouter history scan; the
-        // data store merges prior token/history lines onto this snapshot.
+        // Menu-bar and panel-meter passes only need Session/Weekly (and sibling) quota meters from
+        // the rate-limit API. Skip the expensive local JSONL / FCC / CodexRouter history scan;
+        // the data store merges prior token/history lines onto this snapshot.
         let usageHistory: ProviderUsageHistory?
-        if ProviderRefreshContext.scope == .menuBar {
+        if ProviderRefreshContext.scope.skipsLocalAccounting {
             usageHistory = nil
         } else {
             let pricing = await pricing()
@@ -230,9 +231,9 @@ final class CodexProvider: ProviderRuntime {
     private func localOnlySnapshot(after error: Error) async -> ProviderSnapshot {
         var lines: [MetricLine] = []
         let usageHistory: ProviderUsageHistory?
-        if ProviderRefreshContext.scope == .menuBar {
-            // Icons-only pass: do not scrape local history just to paint a warning card; keep prior
-            // spend/history via the data-store merge.
+        if ProviderRefreshContext.scope.skipsLocalAccounting {
+            // Meters-only pass: do not scrape local history just to paint a warning card; keep
+            // prior spend/history via the data-store merge.
             usageHistory = nil
         } else {
             usageHistory = await appendLocalUsage(

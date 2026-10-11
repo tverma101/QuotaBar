@@ -31,14 +31,17 @@ struct HistoryDashboardView: View {
         let enabledIDs = layout.orderedProviderIDs().filter { layout.isProviderEnabled($0) }
         var names: [String: String] = [:]
         var histories: [String: ProviderUsageHistory] = [:]
+        var estimatedCosts: [String: Bool] = [:]
         for id in enabledIDs {
             names[id] = layout.provider(id: id)?.displayName ?? id
             histories[id] = dataStore.snapshots[id]?.usageHistory
+            estimatedCosts[id] = dataStore.historyDescriptorsByProvider[id]?.estimatedCost
         }
         return HistoryDashboardAggregator.report(.init(
             enabledProviderIDs: enabledIDs,
             displayNameByProviderID: names,
-            historyByProviderID: histories
+            historyByProviderID: histories,
+            estimatedCostByProviderID: estimatedCosts
         ))
     }
 
@@ -50,7 +53,7 @@ struct HistoryDashboardView: View {
                 emptyState
             } else {
                 lifetimeHeroCard(report)
-                if report.apiEstimateTotal != nil {
+                if report.showsAPIEstimateCard {
                     estimateCard(report)
                 }
                 periodCard(report)
@@ -86,13 +89,21 @@ struct HistoryDashboardView: View {
 
     /// The screen's answer to "what have I used in total": every recorded day's tokens and plan-priced
     /// cost, dated by the earliest day the logs still hold. Sits above the period row so the screen
-    /// leads with the one figure the dashboard's cards can't show.
+    /// leads with the one figure the dashboard's cards can't show. When the dollars are fold-imputed
+    /// (subscription logs carry no per-message cost, so they were priced at public API rates) the
+    /// figure carries an "(Est.)" mark — the tiles' ⓘ convention, so the headline is never presented
+    /// as recorded billing.
     private func lifetimeHeroCard(_ report: HistoryReport) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text("Lifetime")
                     .font(.system(size: density.headerPointSize, weight: .semibold))
                     .foregroundStyle(.primary)
+                if report.lifetimeCostIsEstimated {
+                    Text("Est.")
+                        .font(.system(size: density.supportingPointSize - 1, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
                 Spacer(minLength: 8)
                 if let since = report.lifetimeSinceLabel {
                     Text("Since \(since)")
@@ -149,8 +160,9 @@ struct HistoryDashboardView: View {
 
     /// The "if it were all API" what-if total across the same recorded span as the lifetime hero —
     /// the reveal feature's payoff: once discovery prices a codename, this total restates with real
-    /// rates. Shown only when the fold produced any estimate at all — a dash here would just be
-    /// noise over providers with full price coverage.
+    /// rates. Shown only when it differs from the hero's displayed total (`showsAPIEstimateCard`):
+    /// when the two figures coincide — subscription logs with no per-message cost — the row would
+    /// duplicate the hero while reading as a different fact.
     private func estimateCard(_ report: HistoryReport) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "sparkles")

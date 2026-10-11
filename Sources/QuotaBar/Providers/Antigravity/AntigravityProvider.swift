@@ -80,13 +80,19 @@ final class AntigravityProvider: ProviderRuntime {
 
     func refresh() async -> ProviderSnapshot {
         do {
-            var result = try await probe()
+            // Fold-only pass (panel phase 2): the meters-only phase just ran the meter strategy;
+            // re-running it per fold would double every panel-open request. The store's merge
+            // recovers the meters and plan onto the fresh DB history.
+            var result = ProviderRefreshContext.scope.suppressesLiveQuota
+                ? StrategyResult(plan: nil, lines: [])
+                : try await probe()
             let refreshedAt = now()
             var usageHistory: ProviderUsageHistory?
 
-            // Menu-bar background ticks only need the live quota meters. Skip the local DB history
-            // scan; the data store merges prior spend/history lines onto this snapshot.
-            if ProviderRefreshContext.scope == .menuBar {
+            // Meters-only passes (menu-bar ticks, panel phase 1) only need the live quota meters.
+            // Skip the local DB history scan; the data store merges prior spend/history lines onto
+            // this snapshot.
+            if ProviderRefreshContext.scope.skipsLocalAccounting {
                 return ProviderSnapshot.make(
                     provider: provider,
                     plan: result.plan,
