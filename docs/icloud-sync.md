@@ -4,7 +4,8 @@
 file to the app's private iCloud container and reads the files written by other Macs signed into the same
 iCloud account. A random device ID is kept in the login Keychain so the same Mac continues updating its
 existing file after app preferences are reset or the app is reinstalled. There is no folder picker,
-pairing code, or separate account.
+pairing code, or separate account. QuotaBar resolves that ID only when sync is enabled, and reads it
+silently; while sync is off, it does not access the iCloud sync Keychain item.
 
 The file contains up to 10 years of daily tokens, spend, and public-rate estimates, plus 30 days of
 model totals and unknown-model names for sources that are local to one Mac: Claude, Codex, Grok, and

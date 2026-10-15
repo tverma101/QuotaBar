@@ -751,6 +751,20 @@ final class KeychainRefreshReadTests: XCTestCase {
         XCTAssertEqual(keychain.currentUserCalls, [false])
     }
 
+    func testICloudDeviceIDLookupNeverRequestsKeychainInteraction() throws {
+        let bundleID = "com.example.quotabar.\(UUID().uuidString)"
+        let service = "\(bundleID).icloud-sync-device-id.v1"
+        let key = KeychainItemKey(service: service, account: currentUserKeychainAccount())
+        KeychainPermissionGate.shared.reset(key)
+        defer { KeychainPermissionGate.shared.reset(key) }
+        let keychain = RecordingKeychain(requiresInteraction: true, usesCurrentUserChannel: true)
+        let store = KeychainICloudDeviceIDStore(keychain: keychain, bundleIdentifier: bundleID)
+
+        XCTAssertThrowsError(try store.readDeviceID())
+        XCTAssertEqual(keychain.currentUserCalls, [false])
+        XCTAssertEqual(keychain.calls, [], "the iCloud identity stays on the current-user query channel")
+    }
+
     func testCurrentUserBlockedReadIsSuppressedUntilManualRefresh() async throws {
         let keychain = RecordingKeychain(requiresInteraction: true, usesCurrentUserChannel: true)
         let key = KeychainItemKey(service: "own.item", account: currentUserKeychainAccount())

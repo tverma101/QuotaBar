@@ -1003,6 +1003,38 @@ extension AntigravityProviderTests {
         )
         XCTAssertEqual(keychain.reads, 4)
     }
+
+    @MainActor
+    func testBackgroundProviderRefreshNeverOpensGeminiKeychainPrompt() async {
+        let keychainKey = KeychainItemKey(
+            service: AntigravityAuthStore.keychainService,
+            account: AntigravityAuthStore.keychainAccount
+        )
+        KeychainPermissionGate.shared.reset(keychainKey)
+        defer { KeychainPermissionGate.shared.reset(keychainKey) }
+
+        let keychain = NeedingInteractionKeychain()
+        let routing = RoutingHTTPClient { request in
+            XCTFail("a blocked background Keychain read must stop before network work: \(request.url)")
+            return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: AntigravityAuthStore(keychain: keychain, files: FakeFiles([:])),
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let snapshots = await ProviderRefreshContext.$isManual.withValue(false) {
+            let first = await provider.refresh()
+            let second = await provider.refresh()
+            return [first, second]
+        }
+
+        XCTAssertTrue(snapshots.allSatisfy { $0.lines.contains(where: \.isError) })
+        XCTAssertEqual(keychain.reads, 1, "later background refreshes reuse the remembered silent refusal")
+        XCTAssertTrue(routing.requests.isEmpty)
+    }
 }
 
 private struct CancellationKeychain: KeychainAccessing {
