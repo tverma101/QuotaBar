@@ -60,31 +60,81 @@ final class CredentialSystemClientIntegrityTests: XCTestCase {
         XCTAssertEqual(runner.callCount, 2)
         XCTAssertFalse(runner.lastArguments.contains("-readonly"))
     }
+
+    func testSQLiteExecuteKeepsCredentialSQLOffTheProcessArgumentList() throws {
+        let database = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenUsageTests.private-sql.\(UUID().uuidString).sqlite")
+        let secret = "cursor-access-secret-value"
+        let sql = "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('cursorAuth/accessToken', '\(secret)');"
+        let runner = InputCaptureProcessRunner()
+
+        try SQLiteCLIAccessor(processRunner: runner).execute(path: database.path, sql: sql)
+
+        XCTAssertFalse(runner.arguments.contains { $0.contains(secret) })
+        XCTAssertEqual(runner.arguments.last, database.path)
+        XCTAssertEqual(runner.input, Data(sql.utf8))
+    }
+}
+
+private final class InputCaptureProcessRunner: ProcessRunning, @unchecked Sendable {
+    private(set) var arguments: [String] = []
+    private(set) var input: Data?
+
+    func run(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        timeout: TimeInterval
+    ) throws -> ProcessResult {
+        self.arguments = arguments
+        input = nil
+        return ProcessResult(exitCode: 0, stdout: "", stderr: "")
+    }
+
+    func run(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        standardInput: Data?,
+        timeout: TimeInterval
+    ) throws -> ProcessResult {
+        self.arguments = arguments
+        input = standardInput
+        return ProcessResult(exitCode: 0, stdout: "", stderr: "")
+    }
 }
 
 @MainActor
 final class AntigravityCredentialCacheIntegrityTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
-    func testCachedTokenLoadsOnlyForMatchingLogin() {
+    func testCachedTokenLoadsOnlyForMatchingLogin() throws {
         let files = FakeFiles()
-        let store = makeStore(files: files)
-        store.cacheToken("current-access", expiresIn: 7_200, sourceRefreshToken: "current-refresh")
         let current = AntigravityKeychainToken(
             accessToken: nil,
             refreshToken: "current-refresh",
             expiry: nil
         )
+        let store = makeStore(
+            files: files,
+            keychain: FakeKeychain(keychainToken(access: "expired", refresh: "current-refresh"))
+        )
+        XCTAssertTrue(try store.cacheToken("current-access", expiresIn: 7_200, matching: current))
 
         XCTAssertEqual(store.loadCachedToken(matching: current), "current-access")
         XCTAssertFalse(files.files[AntigravityAuthStore.cachePath]?.contains("current-refresh") == true)
 
-        store.cacheToken("old-access", expiresIn: 7_200, sourceRefreshToken: "old-refresh")
+        let oldSource = AntigravityKeychainToken(accessToken: nil, refreshToken: "old-refresh", expiry: nil)
+        let oldStore = makeStore(
+            files: files,
+            keychain: FakeKeychain(keychainToken(access: "expired", refresh: "old-refresh"))
+        )
+        XCTAssertTrue(try oldStore.cacheToken("old-access", expiresIn: 7_200, matching: oldSource))
         XCTAssertNil(store.loadCachedToken(matching: current))
         XCTAssertNil(files.files[AntigravityAuthStore.cachePath])
     }
 
-    func testLegacyMalformedAndExpiredCachesAreDiscarded() {
+    func testLegacyMalformedAndExpiredCachesAreDiscarded() throws {
         let source = AntigravityKeychainToken(accessToken: nil, refreshToken: "refresh", expiry: nil)
         let expiresAtMs = (now.timeIntervalSince1970 + 7_200) * 1_000
         for cache in [
@@ -97,16 +147,22 @@ final class AntigravityCredentialCacheIntegrityTests: XCTestCase {
         }
 
         let files = FakeFiles()
-        let store = makeStore(files: files)
-        store.cacheToken("expired", expiresIn: 30, sourceRefreshToken: "refresh")
+        let store = makeStore(
+            files: files,
+            keychain: FakeKeychain(keychainToken(access: "expired", refresh: "refresh"))
+        )
+        XCTAssertTrue(try store.cacheToken("expired", expiresIn: 30, matching: source))
         XCTAssertNil(store.loadCachedToken(matching: source))
         XCTAssertNil(files.files[AntigravityAuthStore.cachePath])
     }
 
-    func testLogoutRemovesCacheWithoutSendingIt() async {
+    func testLogoutRemovesCacheWithoutSendingIt() async throws {
         let files = FakeFiles()
-        makeStore(files: files)
-            .cacheToken("old-access", expiresIn: 7_200, sourceRefreshToken: "old-refresh")
+        let oldSource = AntigravityKeychainToken(accessToken: nil, refreshToken: "old-refresh", expiry: nil)
+        XCTAssertTrue(try makeStore(
+            files: files,
+            keychain: FakeKeychain(keychainToken(access: "expired", refresh: "old-refresh"))
+        ).cacheToken("old-access", expiresIn: 7_200, matching: oldSource))
         let http = RoutingHTTPClient { _ in
             XCTFail("a derived token must not be sent after logout")
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
@@ -123,10 +179,13 @@ final class AntigravityCredentialCacheIntegrityTests: XCTestCase {
         XCTAssertNil(files.files[AntigravityAuthStore.cachePath])
     }
 
-    func testKeychainReadFailureRetainsButNeverUsesCache() async {
+    func testKeychainReadFailureRetainsButNeverUsesCache() async throws {
         let files = FakeFiles()
-        makeStore(files: files)
-            .cacheToken("old-access", expiresIn: 7_200, sourceRefreshToken: "old-refresh")
+        let oldSource = AntigravityKeychainToken(accessToken: nil, refreshToken: "old-refresh", expiry: nil)
+        XCTAssertTrue(try makeStore(
+            files: files,
+            keychain: FakeKeychain(keychainToken(access: "expired", refresh: "old-refresh"))
+        ).cacheToken("old-access", expiresIn: 7_200, matching: oldSource))
         let http = RoutingHTTPClient { _ in
             XCTFail("an unverified derived token must not leave the machine")
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
@@ -142,10 +201,13 @@ final class AntigravityCredentialCacheIntegrityTests: XCTestCase {
         XCTAssertNotNil(files.files[AntigravityAuthStore.cachePath])
     }
 
-    func testAccountSwitchNeverSendsPreviousCachedToken() async {
+    func testAccountSwitchNeverSendsPreviousCachedToken() async throws {
         let files = FakeFiles()
-        makeStore(files: files)
-            .cacheToken("old-access", expiresIn: 7_200, sourceRefreshToken: "old-refresh")
+        let oldSource = AntigravityKeychainToken(accessToken: nil, refreshToken: "old-refresh", expiry: nil)
+        XCTAssertTrue(try makeStore(
+            files: files,
+            keychain: FakeKeychain(keychainToken(access: "expired", refresh: "old-refresh"))
+        ).cacheToken("old-access", expiresIn: 7_200, matching: oldSource))
         let http = RoutingHTTPClient { request in
             if request.url.host == "oauth2.googleapis.com" {
                 return HTTPResponse(
@@ -173,10 +235,13 @@ final class AntigravityCredentialCacheIntegrityTests: XCTestCase {
         XCTAssertFalse(authorizations.contains("Bearer old-access"))
     }
 
-    func testMatchingCacheAvoidsAnotherOAuthRefresh() async {
+    func testMatchingCacheAvoidsAnotherOAuthRefresh() async throws {
         let files = FakeFiles()
-        makeStore(files: files)
-            .cacheToken("cached-access", expiresIn: 7_200, sourceRefreshToken: "current-refresh")
+        let currentSource = AntigravityKeychainToken(accessToken: nil, refreshToken: "current-refresh", expiry: nil)
+        XCTAssertTrue(try makeStore(
+            files: files,
+            keychain: FakeKeychain(keychainToken(access: "expired-access", refresh: "current-refresh"))
+        ).cacheToken("cached-access", expiresIn: 7_200, matching: currentSource))
         let http = RoutingHTTPClient { request in
             if request.url.host == "oauth2.googleapis.com" {
                 XCTFail("a cache bound to the current login should avoid another OAuth refresh")
@@ -216,9 +281,9 @@ final class AntigravityCredentialCacheIntegrityTests: XCTestCase {
         }
     }
 
-    private func makeStore(files: TextFileAccessing) -> AntigravityAuthStore {
+    private func makeStore(files: TextFileAccessing, keychain: KeychainAccessing = FakeKeychain()) -> AntigravityAuthStore {
         let fixedNow = now
-        return AntigravityAuthStore(keychain: FakeKeychain(), files: files, now: { fixedNow })
+        return AntigravityAuthStore(keychain: keychain, files: files, now: { fixedNow })
     }
 
     private func makeProvider(
