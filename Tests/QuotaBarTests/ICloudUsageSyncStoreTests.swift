@@ -123,10 +123,12 @@ final class ICloudUsageSyncStoreTests: XCTestCase {
         let expectedID = UUID().uuidString.lowercased()
         let firstDefaults = makeDefaults("identity-first")
         firstDefaults.set(expectedID, forKey: "openusage.icloudSync.deviceID.v1")
+        firstDefaults.set(true, forKey: "openusage.icloudSync.enabled.v1")
         let deviceIDStore = MemoryDeviceIDStore(expectedID)
 
         let first = makeSync(defaults: firstDefaults, fileStore: RecordingHistoryFileStore(), deviceIDStore: deviceIDStore)
         let resetDefaults = makeDefaults("identity-after-reset")
+        resetDefaults.set(true, forKey: "openusage.icloudSync.enabled.v1")
         let afterReset = makeSync(defaults: resetDefaults, fileStore: RecordingHistoryFileStore(), deviceIDStore: deviceIDStore)
 
         XCTAssertEqual(first.deviceID, expectedID)
@@ -143,6 +145,7 @@ final class ICloudUsageSyncStoreTests: XCTestCase {
         let fileStore = RecordingHistoryFileStore()
         let defaults = makeDefaults("device-id-off-main")
         defaults.set(provisionalID, forKey: "openusage.icloudSync.deviceID.v1")
+        defaults.set(true, forKey: "openusage.icloudSync.enabled.v1")
         let sync = makeSync(
             defaults: defaults,
             fileStore: fileStore,
@@ -155,10 +158,33 @@ final class ICloudUsageSyncStoreTests: XCTestCase {
         XCTAssertEqual(sync.deviceID, provisionalID, "the provisional identity must not race the pending Keychain read")
 
         deviceIDStore.releaseRead()
-        try await waitUntil { sync.deviceID == expectedID }
-        XCTAssertFalse(sync.enabled, "identity lookup alone must not enable iCloud sync")
+        try await waitUntil {
+            let writeCount = await fileStore.writeCount
+            return sync.deviceID == expectedID && writeCount == 1 && !sync.isSyncing
+        }
+        XCTAssertTrue(sync.enabled)
         let writeCount = await fileStore.writeCount
-        XCTAssertEqual(writeCount, 0, "device identity lookup must not activate iCloud history sync")
+        XCTAssertEqual(writeCount, 1, "enabling sync writes one initial history document")
+    }
+
+    func testDisabledSyncDoesNotReadOrWriteDeviceIdentityUntilEnabled() async throws {
+        let deviceIDStore = MemoryDeviceIDStore()
+        let fileStore = RecordingHistoryFileStore()
+        let sync = makeSync(
+            defaults: makeDefaults("identity-is-lazy"),
+            fileStore: fileStore,
+            deviceIDStore: deviceIDStore
+        )
+
+        XCTAssertFalse(sync.enabled)
+        XCTAssertEqual(deviceIDStore.readCount, 0)
+        XCTAssertEqual(deviceIDStore.writeCount, 0)
+
+        sync.enabled = true
+        try await waitUntil { await fileStore.writeCount == 1 && !sync.isSyncing }
+
+        XCTAssertEqual(deviceIDStore.readCount, 1)
+        XCTAssertEqual(deviceIDStore.writeCount, 1)
     }
 
     func testEnableDuringDeviceIDLookupReconcilesOnlyOnce() async throws {
@@ -166,14 +192,17 @@ final class ICloudUsageSyncStoreTests: XCTestCase {
         let deviceIDStore = BlockingDeviceIDStore(deviceID: expectedID)
         defer { deviceIDStore.releaseRead() }
         let fileStore = RecordingHistoryFileStore()
+        let defaults = makeDefaults("enable-during-device-id-read")
+        defaults.set(true, forKey: "openusage.icloudSync.enabled.v1")
         let sync = makeSync(
-            defaults: makeDefaults("enable-during-device-id-read"),
+            defaults: defaults,
             fileStore: fileStore,
             deviceIDStore: deviceIDStore,
             writeDebounce: .milliseconds(10)
         )
 
         try await waitUntil { deviceIDStore.didStartRead }
+        sync.enabled = false
         sync.enabled = true
         deviceIDStore.releaseRead()
 
@@ -248,18 +277,32 @@ final class ICloudUsageSyncStoreTests: XCTestCase {
 private final class MemoryDeviceIDStore: ICloudDeviceIDStoring, @unchecked Sendable {
     private let lock = NSLock()
     private var deviceID: String?
+    private var reads = 0
+    private var writes = 0
 
     init(_ deviceID: String? = nil) {
         self.deviceID = deviceID
     }
 
+    var readCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return reads
+    }
+
+    var writeCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return writes
+    }
+
     func readDeviceID() throws -> String? {
         lock.lock(); defer { lock.unlock() }
+        reads += 1
         return deviceID
     }
 
     func writeDeviceID(_ deviceID: String) throws {
         lock.lock(); defer { lock.unlock() }
+        writes += 1
         self.deviceID = deviceID
     }
 }
