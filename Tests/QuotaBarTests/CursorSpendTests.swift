@@ -75,12 +75,101 @@ final class CursorCSVParserTests: XCTestCase {
         // A CSV row combines many requests, so its total cannot prove that any one request crossed 200k.
         XCTAssertEqual(row.imputedCostDollars!, 2.4, accuracy: 0.0001)
     }
+
+    func testUsageCSVAggregatesGrokAtCursorRateWithoutChangingPublicTier() throws {
+        let pricing = TestPricing.bundled
+        let tokens = TokenBreakdown(input: 220_000)
+        let csv = """
+        Date,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost
+        2026-01-01T00:00:00Z,grok-4.7,No,0,220000,0,0,Included
+        """
+
+        let row = try XCTUnwrap(CursorUsageCSV.parse(csv: csv, pricing: pricing).rows.first)
+
+        XCTAssertEqual(row.imputedCostDollars!, 0.44, accuracy: 0.000_001,
+                       "Cursor's aggregate CSV uses the Cursor base rate")
+        XCTAssertEqual(try XCTUnwrap(pricing.estimatedCostDollars(model: "grok-4.7", tokens: tokens)), 0.88,
+                       "the generic xAI model uses its public long-context tier above 200K")
+    }
+
+    /// Cursor names Grok Bot work by product, never by the model that served it. Those rows cannot be
+    /// priced, but their token counts are measured usage — dropping them silently under-counted a
+    /// real product. They land in the unattributed nil-cost bucket instead.
+    func testOpaqueGrokBotCSVRowsKeepTokensWithoutModelAttribution() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let date = ISO8601DateFormatter().string(from: now)
+        let csv = """
+        Date,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost
+        \(date),grok-bot-cua,No,0,100,0,0,Included
+        \(date),grok-bot-default,No,0,200,0,0,Included
+        \(date),sand-automation,No,0,300,0,0,Included
+        \(date),grok-4.7,No,0,50,0,0,Included
+        """
+
+        let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
+        XCTAssertEqual(parsed.unpricedGrokBotRowCount, 3)
+        XCTAssertEqual(parsed.rejectedRowCount, 0)
+        XCTAssertEqual(parsed.rows.map(\.model), ["grok-bot-cua", "grok-bot-default", "sand-automation", "grok-4.7"])
+        XCTAssertTrue(parsed.rows.prefix(3).allSatisfy { $0.imputedCostDollars == nil },
+                      "an opaque product label must never be priced")
+
+        var lines: [MetricLine] = []
+        let history = try CursorUsageMapper.appendSpendLines(
+            rows: parsed.rows,
+            now: now,
+            pricing: TestPricing.bundled,
+            to: &lines
+        )
+        XCTAssertEqual(history.series.daily.filter { $0.totalTokens > 0 }.first?.totalTokens, 650,
+                       "priced and unpriced rows both contribute their measured tokens")
+        // The unpriced product rows keep the day's cost incomplete and surface as unattributed, so the
+        // tile warns instead of presenting a partial dollar figure as the whole truth.
+        XCTAssertEqual(history.series.daily.first?.costIsComplete, false,
+                       "a day with unpriced rows must not report its dollars as complete")
+        XCTAssertEqual(history.unknownModelsByDay[DailyUsageAccumulator.dayKey(from: now)]?.count, 3)
+    }
+
+    func testUsageCSVKeepsRowsWhenCombinedExportTokensExceedIntMax() throws {
+        let csv = """
+        Date,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost
+        2026-01-01T00:00:00Z,unknown-a,No,0,\(Int.max),0,0,Included
+        2026-01-02T00:00:00Z,unknown-b,No,0,1,0,0,Included
+        """
+
+        let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
+
+        XCTAssertEqual(parsed.rows.count, 2)
+        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [.max, 1])
+        XCTAssertEqual(parsed.rejectedRowCount, 0)
+    }
+
+    func testUsageCSVOmitsZeroTokenRowsFromUsageHistory() throws {
+        let csv = """
+        Date,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost
+        2026-01-01T00:00:00Z,composer-1,No,0,0,0,0,Included
+        """
+
+        let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
+        XCTAssertTrue(parsed.rows.isEmpty)
+        XCTAssertEqual(parsed.rejectedRowCount, 0)
+
+        var lines: [MetricLine] = []
+        let history = try CursorUsageMapper.appendSpendLines(
+            rows: parsed.rows,
+            now: Date(timeIntervalSince1970: 1_800_000_000),
+            pricing: TestPricing.bundled,
+            to: &lines
+        )
+        XCTAssertTrue(history.series.daily.isEmpty)
+        XCTAssertTrue(history.modelUsage?.daily.isEmpty == true)
+        XCTAssertTrue(lines.isEmpty)
+    }
 }
 
 // MARK: - Range aggregation
 
 final class CursorSpendRangeTests: XCTestCase {
-    func testAppendSpendLinesBucketsRowsByLocalDay() {
+    func testAppendSpendLinesBucketsRowsByLocalDay() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let cal = Calendar.current
         let startOfToday = cal.startOfDay(for: now)
@@ -94,7 +183,7 @@ final class CursorSpendRangeTests: XCTestCase {
         ]
 
         var lines: [MetricLine] = []
-        CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
+        try CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
 
         // Tokens come from Cursor; dollars are calculated locally and marked as estimated.
         XCTAssertEqual(values(lines, "Today"), [MetricValue(number: 1.00, kind: .dollars, estimated: true), MetricValue(number: 100, kind: .count, label: "tokens")])
@@ -122,13 +211,13 @@ final class CursorSpendRangeTests: XCTestCase {
         )
     }
 
-    func testEmptyExportLeavesSpendTilesAndUsageTrendUnbacked() {
+    func testEmptyExportLeavesSpendTilesAndUsageTrendUnbacked() throws {
         var lines: [MetricLine] = []
-        CursorUsageMapper.appendSpendLines(rows: [], now: Date(), pricing: TestPricing.bundled, to: &lines)
+        try CursorUsageMapper.appendSpendLines(rows: [], now: Date(), pricing: TestPricing.bundled, to: &lines)
         XCTAssertTrue(lines.isEmpty)
     }
 
-    func testUnknownModelsAttachToTheRightPeriods() {
+    func testUnknownModelsAttachToTheRightPeriods() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let cal = Calendar.current
         let rows = [
@@ -139,16 +228,24 @@ final class CursorSpendRangeTests: XCTestCase {
         ]
 
         var lines: [MetricLine] = []
-        CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
+        try CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
 
         // Today carries its own unknown model; a fully-priced Yesterday stays clean; Last 30 Days carries
         // the de-duplicated, sorted union across the whole window.
         XCTAssertEqual(unknown(lines, "Today"), ["totally-unknown-model-xyz"])
         XCTAssertEqual(unknown(lines, "Yesterday"), [])
         XCTAssertEqual(unknown(lines, "Last 30 Days"), ["another-unknown-abc", "totally-unknown-model-xyz"])
+        XCTAssertEqual(values(lines, "Today"), [MetricValue(number: 150, kind: .count, label: "tokens")],
+                       "the same-day priced subtotal must stay hidden when another model is unpriced")
+        XCTAssertEqual(values(lines, "Yesterday"), [
+            MetricValue(number: 2.00, kind: .dollars, estimated: true),
+            MetricValue(number: 200, kind: .count, label: "tokens")
+        ])
+        XCTAssertEqual(values(lines, "Last 30 Days"), [MetricValue(number: 430, kind: .count, label: "tokens")],
+                       "the 30-day subtotal must stay hidden if any day has unknown cost")
     }
 
-    func testUnknownModelWithZeroTokensIsNotFlagged() {
+    func testUnknownModelWithZeroTokensIsNotFlagged() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         // A zero-token row of an unknown model changes no cost, so it never raises the warning. The day
         // also has real priced usage, so the tile exists (an all-idle day gets no tile at all) — proving
@@ -159,7 +256,7 @@ final class CursorSpendRangeTests: XCTestCase {
         ]
 
         var lines: [MetricLine] = []
-        CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
+        try CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
 
         XCTAssertNotNil(values(lines, "Today"), "the priced row keeps the tile present")
         XCTAssertEqual(unknown(lines, "Today"), [])
@@ -175,16 +272,17 @@ final class CursorSpendRangeTests: XCTestCase {
         ]
 
         var lines: [MetricLine] = []
-        CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
+        try CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
 
         // The unpriced row keeps counting tokens (owner decision: never hide volume) and joins the
         // breakdown with a nil cost (the tile reads its dash); it also surfaces through the
         // unknown-model warning.
-        XCTAssertEqual(values(lines, "Today"),
-                       [MetricValue(number: 3.01, kind: .dollars, estimated: true), MetricValue(number: 600, kind: .count, label: "tokens")])
+        XCTAssertEqual(values(lines, "Today"), [MetricValue(number: 600, kind: .count, label: "tokens")],
+                       "partial dollar subtotals must not be presented as full cost")
         XCTAssertEqual(unknown(lines, "Today"), ["unpriced-cursor-model"])
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
         XCTAssertEqual(breakdown.sourceNote, "From your Cursor usage export")
+        XCTAssertNil(breakdown.totalCostUSD, "the breakdown header cannot claim a partial dollar subtotal")
         XCTAssertEqual(breakdown.models.map(\.model), ["gpt-5.5", "composer-1", "unpriced-cursor-model"])
         XCTAssertEqual(breakdown.models.map(\.totalTokens), [200, 100, 300])
         XCTAssertEqual(breakdown.models[0].costUSD, 2.01, "model cost rounds once at the displayed aggregate")
@@ -204,7 +302,7 @@ final class CursorSpendRangeTests: XCTestCase {
         ]
 
         var lines: [MetricLine] = []
-        CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
+        try CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
 
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
         XCTAssertEqual(breakdown.models.map(\.model), ["claude-opus-4-8", "gpt-5.5"])
@@ -231,7 +329,7 @@ final class CursorSpendRangeTests: XCTestCase {
         ]
 
         var lines: [MetricLine] = []
-        CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
+        try CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
 
         XCTAssertEqual(values(lines, "Today"), [MetricValue(number: 100, kind: .count, label: "tokens")])
         XCTAssertEqual(values(lines, "Last 30 Days"), [MetricValue(number: 100, kind: .count, label: "tokens")])
@@ -249,7 +347,7 @@ final class CursorSpendRangeTests: XCTestCase {
         ]
         var lines: [MetricLine] = []
 
-        let history = CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
+        let history = try CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
 
         XCTAssertEqual(history.series.daily.first?.totalTokens, .max)
         XCTAssertEqual(history.modelUsage?.daily.first?.models.reduce(0) {
@@ -355,6 +453,57 @@ final class CursorSpendProviderTests: XCTestCase {
         XCTAssertEqual(unknownModels(snapshot.lines, "Today"), ["totally-unknown-model-xyz"])
         XCTAssertEqual(unknownModels(snapshot.lines, "Yesterday"), [])
         XCTAssertEqual(unknownModels(snapshot.lines, "Last 30 Days"), ["totally-unknown-model-xyz"])
+    }
+
+    func testMalformedRowWithholdsPartialSpendExportButKeepsQuotaMeters() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let todayStr = ISO8601DateFormatter().string(from: now)
+        let csv = """
+        Date,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost
+        \(todayStr),composer-1,No,0,1000000,0,0,Included
+        \(todayStr),composer-1,No,0,500000,0,not-a-number,Included
+        """
+        let accessToken = makeCursorJWT(sub: "google-oauth2|user_abc123")
+        let http = RoutingHTTPClient { request in
+            let url = request.url.absoluteString
+            if url.contains("export-usage-events-csv") {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(csv.utf8))
+            }
+            if url.contains("GetCurrentPeriodUsage") {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data("""
+                {
+                  "enabled": true,
+                  "billingCycleEnd": 1772592000000,
+                  "planUsage": { "limit": 40000, "remaining": 32000, "totalPercentUsed": 20 }
+                }
+                """.utf8))
+            }
+            if url.contains("GetPlanInfo") {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"planInfo":{"planName":"pro plan"}}"#.utf8))
+            }
+            if url.contains("GetCreditGrantsBalance") {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"hasCreditGrants":false}"#.utf8))
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+        let provider = CursorProvider(
+            authStore: CursorAuthStore(
+                sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]),
+                keychain: FakeKeychain()
+            ),
+            usageClient: CursorUsageClient(http: http),
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertTrue(http.requests.contains { $0.url.absoluteString.contains("export-usage-events-csv") })
+        XCTAssertTrue(snapshot.lines.contains { $0.label == "Total usage" })
+        XCTAssertNil(snapshot.usageHistory)
+        for label in ["Today", "Yesterday", "Last 30 Days", "Usage Trend"] {
+            XCTAssertNil(snapshot.lines.first { $0.label == label }, "partial CSV must not publish \(label)")
+        }
     }
 
     private func unknownModels(_ lines: [MetricLine], _ label: String) -> [String]? {

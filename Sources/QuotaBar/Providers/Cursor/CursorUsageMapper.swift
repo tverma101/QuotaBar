@@ -301,31 +301,43 @@ enum CursorUsageMapper {
         now: Date,
         pricing: ModelPricing,
         to lines: inout [MetricLine]
-    ) -> ProviderUsageHistory {
+    ) throws -> ProviderUsageHistory {
         let calendar = Calendar.current
         var costByDay: [String: Double] = [:]
         var tokensByDay: [String: Int] = [:]
         var apiEstimateByDay: [String: Double] = [:]
+        var apiEstimateIncompleteDays: Set<String> = []
         var modelsByDay: [String: [String: ModelAccumulator]] = [:]
+        var incompleteCostDays: Set<String> = []
         // Rows no pricing source can price (nil imputed cost) still count their tokens with a dashed
         // cost (owner's "count tokens, dash cost" policy) — the token total stays complete while the
         // dollar figure only reflects priced rows. Their model names surface through the warning
         // triangle and the reveal system. Only rows that actually spent tokens flag the day — a
         // 0-token row of an unknown model changes nothing.
         var unknownModelsByDay: [String: Set<String>] = [:]
-        for row in rows {
+        for (index, row) in rows.enumerated() {
+            if index & 0x7F == 0, Task<Never, Never>.isCancelled { throw CancellationError() }
             let day = DailyUsageAccumulator.dayKey(from: row.date, calendar: calendar)
             let model = row.model.trimmingCharacters(in: .whitespacesAndNewlines)
             let modelName = model.isEmpty ? ModelUsageEntry.unattributedModelName : model
             // Public-API-rate comparison for the row's tokens (regardless of how the CSV cost was
             // imputed — Cursor's own dollars are the displayed estimate).
-            if !model.isEmpty,
-               let apiEstimate = pricing.estimatedCostDollars(model: model, tokens: row.tokens) {
+            let apiEstimate = model.isEmpty ? nil : pricing.estimatedCostDollars(
+                model: model,
+                tokens: row.tokens,
+                applyLongContextRates: false
+            )
+            if let apiEstimate {
                 apiEstimateByDay[day, default: 0] += apiEstimate
+            } else if row.tokens.totalTokens > 0 {
+                apiEstimateIncompleteDays.insert(day)
             }
             guard let cost = row.imputedCostDollars else {
-                if row.tokens.totalTokens > 0, !model.isEmpty {
-                    unknownModelsByDay[day, default: []].insert(model)
+                if row.tokens.totalTokens > 0 {
+                    incompleteCostDays.insert(day)
+                    if !model.isEmpty {
+                        unknownModelsByDay[day, default: []].insert(model)
+                    }
                 }
                 tokensByDay[day] = ProviderParse.addingSaturating(
                     tokensByDay[day, default: 0],
@@ -358,7 +370,8 @@ enum CursorUsageMapper {
             DailyUsageEntry(
                 date: day,
                 totalTokens: tokensByDay[day] ?? 0,
-                costUSD: costByDay[day].map { ($0 * 100).rounded() / 100 }
+                costUSD: costByDay[day].map { ($0 * 100).rounded() / 100 },
+                costIsComplete: !incompleteCostDays.contains(day)
             )
         }
         let series = DailyUsageSeries(daily: daily)
@@ -383,7 +396,8 @@ enum CursorUsageMapper {
             series: series,
             modelUsage: modelUsage,
             unknownModelsByDay: unknownModelsByDay,
-            apiEstimateByDay: apiEstimateByDay.isEmpty ? nil : apiEstimateByDay
+            apiEstimateByDay: apiEstimateByDay.isEmpty ? nil : apiEstimateByDay,
+            apiEstimateIncompleteDays: apiEstimateIncompleteDays
         )
     }
 
@@ -391,7 +405,7 @@ enum CursorUsageMapper {
     /// into the base (`gpt-5.5-extra-high-fast` → `gpt-5.5-fast` → `gpt-5.5`). Slugs no alias rule
     /// knows keep their raw name — a wrong guess would silently merge unrelated models.
     private static func familyName(for model: String, pricing: ModelPricing) -> String {
-        let canonical = pricing.canonicalName(for: model) ?? model
+        let canonical = pricing.cursorCanonicalName(for: model) ?? pricing.canonicalName(for: model) ?? model
         guard canonical.hasSuffix("-fast") else { return canonical }
         let base = String(canonical.dropLast("-fast".count))
         return base.isEmpty ? canonical : base
@@ -400,24 +414,38 @@ enum CursorUsageMapper {
     private struct ModelAccumulator {
         var tokens = 0
         var costUSD: Double?
-        var variants: [String: (tokens: Int, costUSD: Double?)] = [:]
+        var costIsComplete = true
+        var variants: [String: (tokens: Int, costUSD: Double?, costIsComplete: Bool)] = [:]
 
         mutating func add(variant: String, tokens: Int, costUSD: Double?) {
             self.tokens = ProviderParse.addingSaturating(self.tokens, tokens)
             if let costUSD {
                 self.costUSD = (self.costUSD ?? 0) + costUSD
+            } else if tokens > 0 {
+                self.costIsComplete = false
             }
-            let existing = variants[variant] ?? (0, nil)
-            let combinedCost: Double? = costUSD.map { (existing.costUSD ?? 0) + $0 } ?? existing.costUSD
-            variants[variant] = (ProviderParse.addingSaturating(existing.tokens, tokens), combinedCost)
+            var existing = variants[variant] ?? (tokens: 0, costUSD: nil, costIsComplete: true)
+            existing.tokens = ProviderParse.addingSaturating(existing.tokens, tokens)
+            if let costUSD {
+                existing.costUSD = (existing.costUSD ?? 0) + costUSD
+            } else if tokens > 0 {
+                existing.costIsComplete = false
+            }
+            variants[variant] = existing
         }
 
         func entry(model: String) -> ModelUsageEntry {
             // A single variant with the family's own name is not a breakdown — leave `variants` nil so
             // the hover tooltip falls back to plain figures.
-            let list = variants.map { ModelUsageVariant(model: $0.key, totalTokens: $0.value.tokens, costUSD: $0.value.costUSD) }
+            let list = variants.map {
+                ModelUsageVariant(
+                    model: $0.key,
+                    totalTokens: $0.value.tokens,
+                    costUSD: $0.value.costIsComplete ? $0.value.costUSD : nil
+                )
+            }
             let isTrivial = list.count == 1 && list[0].model == model
-            return ModelUsageEntry(model: model, totalTokens: tokens, costUSD: costUSD,
+            return ModelUsageEntry(model: model, totalTokens: tokens, costUSD: costIsComplete ? costUSD : nil,
                                    variants: isTrivial ? nil : list)
         }
     }

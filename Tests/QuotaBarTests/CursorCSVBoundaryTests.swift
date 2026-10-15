@@ -35,7 +35,7 @@ final class CursorCSVBoundaryTests: XCTestCase {
 
         let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
 
-        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [0, 1_234])
+        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [1_234])
         XCTAssertEqual(parsed.rejectedRowCount, 8)
     }
 
@@ -52,7 +52,7 @@ final class CursorCSVBoundaryTests: XCTestCase {
         XCTAssertEqual(parsed.rejectedRowCount, 1)
     }
 
-    func testUsageCSVRejectsAggregateOverflowWithoutDiscardingSafeRows() throws {
+    func testUsageCSVKeepsRowsWhenCombinedExportTokensExceedIntMax() throws {
         let firstRowTokens = Int.max - 1
         let csv = """
         \(header)
@@ -62,8 +62,8 @@ final class CursorCSVBoundaryTests: XCTestCase {
 
         let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
 
-        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [firstRowTokens])
-        XCTAssertEqual(parsed.rejectedRowCount, 1)
+        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [firstRowTokens, 2])
+        XCTAssertEqual(parsed.rejectedRowCount, 0)
     }
 
     func testUsageCSVAcceptsLargeNonOverflowingValues() throws {
@@ -101,7 +101,7 @@ final class CursorCSVBoundaryTests: XCTestCase {
 
         let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
 
-        XCTAssertEqual(parsed.rows.first?.tokens.totalTokens, 0)
+        XCTAssertTrue(parsed.rows.isEmpty)
         XCTAssertEqual(parsed.rejectedRowCount, 0)
     }
 

@@ -60,7 +60,17 @@ final class CursorProvider: ProviderRuntime {
 
     func hasLocalCredentials() async -> Bool {
         // Same source as `refresh()`: any auth state (state DB or keychain) counts.
-        (try? await loadOffMainActor { [authStore] in try authStore.loadAuthState() }) != nil
+        do {
+            return try await loadOffMainActor { [authStore] in try authStore.loadAuthState() } != nil
+        } catch CursorAuthError.credentialPermissionRequired {
+            // Preserve an inaccessible but present Keychain login so the card exposes its repair path.
+            return true
+        } catch CursorAuthError.credentialsUnreadable {
+            // An indeterminate Keychain read must not make one-shot seeding hide the provider.
+            return true
+        } catch {
+            return false
+        }
     }
 
     func refresh() async -> ProviderSnapshot {
@@ -70,8 +80,12 @@ final class CursorProvider: ProviderRuntime {
         do {
             state = try await loadOffMainActor({ [authStore] in try authStore.loadAuthState() })
         } catch {
+            if ProviderCancellation.isCancellation(error) {
+                return cancelledRefreshSnapshot(provider: provider)
+            }
             return ProviderSnapshot.error(provider: provider, error: error)
         }
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         guard let state else {
             return ProviderSnapshot.error(provider: provider, error: CursorAuthError.notLoggedIn)
         }
@@ -79,6 +93,9 @@ final class CursorProvider: ProviderRuntime {
         do {
             return try await probe(authState: state)
         } catch {
+            if ProviderCancellation.isCancellation(error) {
+                return cancelledRefreshSnapshot(provider: provider)
+            }
             return ProviderSnapshot.error(provider: provider, error: error)
         }
     }
@@ -95,12 +112,19 @@ final class CursorProvider: ProviderRuntime {
                 } else if accessToken == nil {
                     throw CursorAuthError.notLoggedIn
                 }
+            } catch let error as CursorAuthError where error == .sessionExpired
+                || error == .credentialPermissionRequired || error == .credentialsUnreadable {
+                // A live-source mismatch or failed source recheck is not a transient OAuth outage:
+                // never continue requests with the pre-switch account's token.
+                throw error
             } catch {
-                if accessToken == nil {
+                try ProviderCancellation.rethrowIfCancellation(error)
+                if accessToken == nil || authStore.isExpired(accessToken) {
                     throw error
                 }
             }
         }
+        try Task.checkCancellation()
 
         guard let accessToken else {
             throw CursorAuthError.notLoggedIn
@@ -112,7 +136,7 @@ final class CursorProvider: ProviderRuntime {
         // and let the store's merge recover the meters onto the fresh history.
         if ProviderRefreshContext.scope.suppressesLiveQuota {
             var working = CursorMappedUsage(plan: nil, lines: [])
-            let history = await appendSpendLines(to: &working.lines, accessToken: accessToken)
+            let history = try await appendSpendLines(to: &working.lines, accessToken: accessToken)
             return snapshot(working, usageHistory: history)
         }
 
@@ -128,7 +152,7 @@ final class CursorProvider: ProviderRuntime {
         // The access token may have rotated during the usage fetch's refresh-and-retry; read the live one.
         let currentToken = authState.accessToken ?? accessToken
 
-        let (planName, planInfoUnavailable) = await fetchPlanName(accessToken: currentToken)
+        let (planName, planInfoUnavailable) = try await fetchPlanName(accessToken: currentToken)
         let fallback = CursorUsageMapper.shouldUseRequestBasedFallback(
             usage: usage,
             planName: planName,
@@ -140,8 +164,8 @@ final class CursorProvider: ProviderRuntime {
                 planName: planName,
                 unavailableMessage: fallback.message
             )
-            await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
-            return await snapshotWithOptionalSpend(mapped, accessToken: currentToken)
+            try await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
+            return try await snapshotWithOptionalSpend(mapped, accessToken: currentToken)
         }
 
         if shouldTryGenericRequestFallback(usage: usage) {
@@ -151,26 +175,27 @@ final class CursorProvider: ProviderRuntime {
                     planName: planName,
                     unavailableMessage: "Cursor request-based usage data unavailable. Try again later."
                 )
-                await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
+                try await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
                 // Same spend/history attachment as the other two success paths: this fallback serves
                 // accounts without the dashboard usage payload, and skipping the CSV froze their
                 // spend tiles at the last snapshot another path happened to produce.
-                return await snapshotWithOptionalSpend(mapped, accessToken: currentToken)
+                return try await snapshotWithOptionalSpend(mapped, accessToken: currentToken)
             } catch {
+                try ProviderCancellation.rethrowIfCancellation(error)
                 AppLog.warn(LogTag.plugin("cursor"), "optional request-based usage fallback failed")
             }
         }
 
-        let creditGrants = await fetchCreditGrants(accessToken: currentToken)
-        let stripeBalanceCents = await fetchStripeBalanceCents(accessToken: currentToken)
+        let creditGrants = try await fetchCreditGrants(accessToken: currentToken)
+        let stripeBalanceCents = try await fetchStripeBalanceCents(accessToken: currentToken)
         var mapped = try CursorUsageMapper.mapUsage(
             usage: usage,
             planName: planName,
             creditGrants: creditGrants,
             stripeBalanceCents: stripeBalanceCents
         )
-        await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
-        return await snapshotWithOptionalSpend(mapped, accessToken: currentToken)
+        try await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
+        return try await snapshotWithOptionalSpend(mapped, accessToken: currentToken)
     }
 
     /// Meters-only passes (menu-bar ticks, panel phase 1) keep Auto/API (and sibling) quota meters;
@@ -179,19 +204,19 @@ final class CursorProvider: ProviderRuntime {
     private func snapshotWithOptionalSpend(
         _ mapped: CursorMappedUsage,
         accessToken: String
-    ) async -> ProviderSnapshot {
+    ) async throws -> ProviderSnapshot {
         if ProviderRefreshContext.scope.skipsLocalAccounting {
             return snapshot(mapped)
         }
         var working = mapped
-        let history = await appendSpendLines(to: &working.lines, accessToken: accessToken)
+        let history = try await appendSpendLines(to: &working.lines, accessToken: accessToken)
         return snapshot(working, usageHistory: history)
     }
 
     /// Grok Bot uses the same Cursor account but keeps a separate weekly allowance. Missing access is
     /// normal for ineligible accounts; malformed data and request failures remain visible in diagnostics.
-    private func appendGrokBotUsage(to lines: inout [MetricLine], accessToken: String) async {
-        guard let usage = await fetchOptionalJSONObject(label: "Grok Bot usage", request: {
+    private func appendGrokBotUsage(to lines: inout [MetricLine], accessToken: String) async throws {
+        guard let usage = try await fetchOptionalJSONObject(label: "Grok Bot usage", request: {
             try await self.usageClient.fetchGrokBotUsage(accessToken: accessToken)
         }) else {
             return
@@ -215,7 +240,8 @@ final class CursorProvider: ProviderRuntime {
     /// Strictly additive: fetch the usage CSV and append the three per-day spend tiles. Any failure
     /// (no session, non-2xx, or undecodable body) appends nothing, so the live Cursor mapping is never
     /// affected and the spend tiles fall back to "No data".
-    private func appendSpendLines(to lines: inout [MetricLine], accessToken: String) async -> ProviderUsageHistory? {
+    private func appendSpendLines(to lines: inout [MetricLine], accessToken: String) async throws -> ProviderUsageHistory? {
+        try Task.checkCancellation()
         let calendar = Calendar.current
         let end = now()
         let startOfToday = calendar.startOfDay(for: end)
@@ -230,11 +256,14 @@ final class CursorProvider: ProviderRuntime {
 
         let response: HTTPResponse?
         do {
+            try Task.checkCancellation()
             response = try await usageClient.fetchUsageCSV(accessToken: accessToken, start: start, end: end)
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             AppLog.warn(LogTag.plugin("cursor"), "usage CSV request failed")
             return nil
         }
+        try Task.checkCancellation()
         guard let response else {
             AppLog.warn(LogTag.plugin("cursor"), "usage CSV request could not be prepared from the current session")
             return nil
@@ -248,6 +277,7 @@ final class CursorProvider: ProviderRuntime {
             return nil
         }
         let pricing = await pricing()
+        try Task.checkCancellation()
         let paceAccountingWork = ProviderRefreshContext.accountingCPUThrottleEnabled
         do {
             // CSV parsing and the shared model fold can be sizeable on a long export. Keep both off
@@ -256,7 +286,7 @@ final class CursorProvider: ProviderRuntime {
                 try JSONLAccountingWorkPacer.shared.perform(enabled: paceAccountingWork) {
                     let parsed = try CursorUsageCSV.parse(csv: csv, pricing: pricing)
                     var spendLines: [MetricLine] = []
-                    let history = CursorUsageMapper.appendSpendLines(
+                    let history = try CursorUsageMapper.appendSpendLines(
                         rows: parsed.rows,
                         now: end,
                         pricing: pricing,
@@ -271,12 +301,21 @@ final class CursorProvider: ProviderRuntime {
                 computationTask.cancel()
             }
 
-            guard !Task.isCancelled else { return nil }
+            try Task.checkCancellation()
             let (parsed, history, spendLines) = computation
             if parsed.rejectedRowCount > 0 {
                 AppLog.warn(
                     LogTag.plugin("cursor"),
-                    "usage CSV ignored \(parsed.rejectedRowCount) malformed row\(parsed.rejectedRowCount == 1 ? "" : "s")"
+                    "usage CSV rejected \(parsed.rejectedRowCount) malformed row\(parsed.rejectedRowCount == 1 ? "" : "s"); withholding partial spend history"
+                )
+                // The parser keeps valid rows for diagnostics and boundary tests, but the provider
+                // must not publish their subtotal as if the full export had been accounted for.
+                return nil
+            }
+            if parsed.unpricedGrokBotRowCount > 0 {
+                AppLog.info(
+                    LogTag.plugin("cursor"),
+                    "usage CSV kept \(parsed.unpricedGrokBotRowCount) Grok Bot row\(parsed.unpricedGrokBotRowCount == 1 ? "" : "s") as unpriced tokens (no reported serving model)"
                 )
             }
             lines.append(contentsOf: spendLines)
@@ -289,6 +328,7 @@ final class CursorProvider: ProviderRuntime {
                 AppLog.warn(LogTag.plugin("cursor"), "usage CSV is structurally malformed")
             }
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             AppLog.warn(LogTag.plugin("cursor"), "usage CSV could not be parsed")
         }
         return nil
@@ -341,20 +381,33 @@ final class CursorProvider: ProviderRuntime {
         guard let accessToken = (body["access_token"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty else {
             return nil
         }
-        // Fail loudly, but do NOT interpolate the error: the Cursor token is persisted via a SQL
-        // statement that embeds the token, and a sqlite3 failure surfaces as stderr that could echo a
-        // fragment of that statement (JWTs aren't covered by log redaction). A generic error line keeps
-        // it loud without risking a token leak. The refreshed token still works for this session.
+        // Keychain and SQLite persistence are synchronous; keep their process waits off MainActor.
+        // Keep the error log generic because SQLite stderr can echo sensitive write/error-path details.
+        // The refreshed token still works for this session if persistence fails.
         do {
-            try authStore.saveAccessToken(accessToken, source: authState.source)
+            let authStore = self.authStore
+            let refreshContext = ProviderRefreshContext.detachedValues
+            // A successful OAuth response must save even if this provider task is canceled while the
+            // response is returning. The store revalidates the live source immediately before writing.
+            try await Task.detached(priority: .utility) {
+                try refreshContext.withValue {
+                    try authStore.saveAccessToken(accessToken, replacing: authState)
+                }
+            }.value
+        } catch let error as CursorAuthError where error == .sessionExpired
+            || error == .credentialPermissionRequired || error == .credentialsUnreadable {
+            throw error
+        } catch let error as CancellationError {
+            throw error
         } catch {
-            AppLog.error(LogTag.auth("cursor"), "failed to persist rotated access token to the Cursor state DB; using it for this session only")
+            try ProviderCancellation.rethrowIfCancellation(error)
+            AppLog.error(LogTag.auth("cursor"), "failed to persist rotated access token; using it for this session only")
         }
         return accessToken
     }
 
-    private func fetchPlanName(accessToken: String) async -> (String?, Bool) {
-        guard let body = await fetchOptionalJSONObject(label: "plan", request: {
+    private func fetchPlanName(accessToken: String) async throws -> (String?, Bool) {
+        guard let body = try await fetchOptionalJSONObject(label: "plan", request: {
             try await self.usageClient.fetchPlan(accessToken: accessToken)
         }) else {
             return (nil, true)
@@ -370,8 +423,8 @@ final class CursorProvider: ProviderRuntime {
         return (planName, false)
     }
 
-    private func fetchCreditGrants(accessToken: String) async -> [String: Any]? {
-        guard let body = await fetchOptionalJSONObject(label: "credit-grants", request: {
+    private func fetchCreditGrants(accessToken: String) async throws -> [String: Any]? {
+        guard let body = try await fetchOptionalJSONObject(label: "credit-grants", request: {
             try await self.usageClient.fetchCredits(accessToken: accessToken)
         }) else {
             return nil
@@ -394,8 +447,8 @@ final class CursorProvider: ProviderRuntime {
         return body
     }
 
-    private func fetchStripeBalanceCents(accessToken: String) async -> Double {
-        guard let body = await fetchOptionalJSONObject(label: "prepaid-balance", request: {
+    private func fetchStripeBalanceCents(accessToken: String) async throws -> Double {
+        guard let body = try await fetchOptionalJSONObject(label: "prepaid-balance", request: {
             try await self.usageClient.fetchStripeBalance(accessToken: accessToken)
         }) else {
             return 0
@@ -413,14 +466,17 @@ final class CursorProvider: ProviderRuntime {
     private func fetchOptionalJSONObject(
         label: String,
         request: () async throws -> HTTPResponse?
-    ) async -> [String: Any]? {
+    ) async throws -> [String: Any]? {
+        try Task.checkCancellation()
         let response: HTTPResponse?
         do {
             response = try await request()
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             AppLog.warn(LogTag.plugin("cursor"), "optional \(label) request failed")
             return nil
         }
+        try Task.checkCancellation()
         guard let response else {
             AppLog.warn(LogTag.plugin("cursor"), "optional \(label) request could not be prepared from the current session")
             return nil
@@ -448,6 +504,7 @@ final class CursorProvider: ProviderRuntime {
         } catch let error as CursorUsageError {
             throw error
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             throw CursorUsageError.requestBasedUnavailable(unavailableMessage)
         }
     }
@@ -457,13 +514,13 @@ final class CursorProvider: ProviderRuntime {
         planName: String?,
         unavailableMessage: String
     ) async throws -> CursorMappedUsage {
-        let summary = await fetchOptionalJSONObject(label: "usage-summary", request: {
+        let summary = try await fetchOptionalJSONObject(label: "usage-summary", request: {
             try await self.usageClient.fetchUsageSummary(accessToken: accessToken)
         })
         if let summary, !CursorUsageSummaryMapper.hasUsableSummaryPayload(summary) {
             AppLog.warn(LogTag.plugin("cursor"), "optional usage-summary response contained no usable usage fields")
         }
-        let requestUsage = await fetchOptionalJSONObject(label: "request-based usage", request: {
+        let requestUsage = try await fetchOptionalJSONObject(label: "request-based usage", request: {
             try await self.usageClient.fetchRequestBasedUsage(accessToken: accessToken)
         })
         if let requestUsage, !CursorUsageSummaryMapper.hasUsableRequestPayload(requestUsage) {

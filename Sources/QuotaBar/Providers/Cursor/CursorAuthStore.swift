@@ -16,6 +16,7 @@ enum CursorAuthError: Error, LocalizedError, Equatable {
     /// The Keychain item exists but macOS will not release it without a dialog. Distinct from
     /// `notLoggedIn`: the user *is* signed in, and re-authenticating changes nothing.
     case credentialPermissionRequired
+    case credentialsUnreadable
     case sessionExpired
     case tokenExpired
 
@@ -25,6 +26,8 @@ enum CursorAuthError: Error, LocalizedError, Equatable {
             return "Not logged in. Sign in via Cursor app or run `agent login`."
         case .credentialPermissionRequired:
             return "macOS needs permission to read your Cursor Keychain item. Refresh to be asked once, then choose Always Allow."
+        case .credentialsUnreadable:
+            return "QuotaBar couldn't read Cursor's local credential data. Check access to Cursor's state database and login Keychain, then refresh again."
         case .sessionExpired:
             return "Session expired. Sign in via Cursor app or run `agent login`."
         case .tokenExpired:
@@ -58,15 +61,30 @@ struct CursorAuthStore: Sendable {
 
     /// Throws `credentialPermissionRequired` when a Keychain item exists but macOS refuses to release
     /// it, so the provider stops at "macOS needs permission" instead of reporting a signed-in user as
-    /// "not logged in" — a remedy that cannot possibly help.
-    func loadAuthState() throws -> CursorAuthState? {
-        let sqliteAccessToken = readStateValue(Self.accessTokenKey)
-        let sqliteRefreshToken = readStateValue(Self.refreshTokenKey)
-        let sqliteMembershipType = readStateValue(Self.membershipTypeKey)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
+    /// "not logged in" — a remedy that cannot possibly help. A present state database that cannot be
+    /// queried is likewise distinct from a missing database or a database with no auth rows.
+    func loadAuthState(requireDeterminateKeychainSelection: Bool = false) throws -> CursorAuthState? {
+        var sqliteAccessToken: String?
+        var sqliteRefreshToken: String?
+        var sqliteMembershipType: String?
+        var sqliteReadFailed = false
+        do {
+            sqliteAccessToken = try readStateValue(Self.accessTokenKey)
+            sqliteRefreshToken = try readStateValue(Self.refreshTokenKey)
+            sqliteMembershipType = try readStateValue(Self.membershipTypeKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            // A readable database with no auth rows returns nil. A query/open failure means the
+            // configured source is indeterminate, so preserve it for detection and try Keychain.
+            sqliteReadFailed = true
+            AppLog.error(LogTag.auth("cursor"), "state database credential read failed")
+        }
 
         let hasSQLiteAuth = sqliteAccessToken != nil || sqliteRefreshToken != nil
+        let sqliteCanAuthenticate = sqliteRefreshToken != nil
+            || (sqliteAccessToken != nil && !isExpired(sqliteAccessToken))
 
         // The Keychain is a *fallback* here, so it must not be able to fail a card that already has a
         // working sqlite credential.
@@ -78,30 +96,36 @@ struct CursorAuthStore: Sendable {
         // use. Granting it changed nothing, and because this ran on every background tick the card stayed
         // down for the whole session.
         //
-        // So: when sqlite has a credential, a Keychain refusal degrades to "no Keychain auth" and sqlite
-        // wins. Only when there is no sqlite credential at all is a refusal the real answer, because then
-        // it means there is no credential to report.
+        // So: when SQLite has a credential it can still use or refresh, a Keychain refusal degrades to
+        // "no Keychain auth" and SQLite wins. If SQLite is expired and has no refresh token, the Keychain
+        // permission is the only actionable credential path and must remain visible.
         var keychainAccessToken: String?
         var keychainRefreshToken: String?
         do {
             keychainAccessToken = try readKeychainValue(Self.keychainAccessTokenService)
             keychainRefreshToken = try readKeychainValue(Self.keychainRefreshTokenService)
         } catch let error as CursorAuthError {
-            guard !hasSQLiteAuth else {
-                AppLog.info(
-                    LogTag.auth("cursor"),
-                    "keychain credential unavailable; using the Cursor database instead: \(error)"
-                )
-                return CursorAuthState(
-                    accessToken: sqliteAccessToken,
-                    refreshToken: sqliteRefreshToken,
-                    source: .sqlite
-                )
+            guard hasSQLiteAuth, sqliteCanAuthenticate else { throw error }
+            if requireDeterminateKeychainSelection,
+               sqliteMembershipType == "free",
+               Self.tokenSubject(sqliteAccessToken) != nil {
+                throw error
             }
-            throw error
+            return CursorAuthState(
+                accessToken: sqliteAccessToken,
+                refreshToken: sqliteRefreshToken,
+                source: .sqlite
+            )
         }
 
         let hasKeychainAuth = keychainAccessToken != nil || keychainRefreshToken != nil
+
+        // Cursor's Keychain copy is a fallback for users whose database cannot supply a token. If both
+        // sources are genuinely empty, keep a database read error visible instead of calling it logged
+        // out. A usable Keychain credential still allows the card to refresh normally.
+        if sqliteReadFailed, !hasSQLiteAuth, !hasKeychainAuth {
+            throw CursorAuthError.credentialsUnreadable
+        }
 
         if hasSQLiteAuth {
             let sqliteSubject = Self.tokenSubject(sqliteAccessToken)
@@ -142,18 +166,35 @@ struct CursorAuthStore: Sendable {
         return expiresAt.timeIntervalSince(now()) <= Self.refreshBufferSeconds
     }
 
-    func saveAccessToken(_ accessToken: String, source: CursorAuthState.Source) throws {
-        switch source {
+    func isExpired(_ accessToken: String?) -> Bool {
+        guard let accessToken, let expiresAt = Self.tokenExpiration(accessToken) else { return false }
+        return expiresAt <= now()
+    }
+
+    /// Store a rotated access token only if the exact credential generation used for the refresh is
+    /// still present. This makes logout/account replacement win when a refresh response arrives late.
+    func saveAccessToken(_ accessToken: String, replacing expected: CursorAuthState) throws {
+        let live = try ProviderRefreshContext.withCredentialSourceRevalidation {
+            try loadAuthState(requireDeterminateKeychainSelection: true)
+        }
+        guard let live,
+              live.source == expected.source,
+              live.accessToken == expected.accessToken,
+              live.refreshToken == expected.refreshToken else {
+            throw CursorAuthError.sessionExpired
+        }
+
+        switch expected.source {
         case .sqlite:
             try writeStateValue(Self.accessTokenKey, accessToken)
         case .keychain:
-            try keychain.writeGenericPassword(service: Self.keychainAccessTokenService, value: accessToken)
+            try keychain.writeGenericPasswordForCurrentUser(service: Self.keychainAccessTokenService, value: accessToken)
         }
     }
 
-    private func readStateValue(_ key: String) -> String? {
+    private func readStateValue(_ key: String) throws -> String? {
         let sql = "SELECT value FROM ItemTable WHERE key = '\(Self.sqlEscaped(key))' LIMIT 1;"
-        guard let value = try? sqlite.queryValue(path: Self.stateDBPath, sql: sql) else { return nil }
+        guard let value = try sqlite.queryValue(path: Self.stateDBPath, sql: sql) else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
@@ -168,16 +209,22 @@ struct CursorAuthStore: Sendable {
     private func readKeychainValue(_ service: String) throws -> String? {
         let value: String?
         do {
-            value = try keychain.readGenericPasswordForRefresh(service: service)
+            // QuotaBar writes rotated tokens under the current-user account. Check that exact item
+            // first, then retain compatibility with Cursor's older account-agnostic service entries.
+            if let currentUserValue = try keychain.readGenericPasswordForRefreshForCurrentUser(service: service) {
+                value = currentUserValue
+            } else {
+                value = try keychain.readGenericPasswordForRefresh(service: service)
+            }
+        } catch let error as CancellationError {
+            throw error
         } catch KeychainError.interactionNotAllowed {
-            AppLog.info(
-                LogTag.auth("cursor"),
-                "keychain read needs user interaction; use Refresh to grant it"
-            )
+            // The shared Keychain gate logs the first silent refusal; a remembered block must not
+            // emit another auth line on each automatic retry.
             throw CursorAuthError.credentialPermissionRequired
         } catch {
             AppLog.error(LogTag.auth("cursor"), "keychain credential read failed")
-            throw CursorAuthError.credentialPermissionRequired
+            throw CursorAuthError.credentialsUnreadable
         }
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (trimmed?.isEmpty ?? true) ? nil : trimmed
