@@ -7,6 +7,12 @@ enum CursorCSVParser {
     struct Summary: Equatable {
         var isStructurallyComplete: Bool
         var rejectedRecordCount: Int
+        var wasCancelled: Bool = false
+    }
+
+    private struct RowScanResult {
+        var isStructurallyComplete: Bool
+        var wasCancelled: Bool
     }
 
     /// Streams records and reports structural failures plus rows whose width differs from the header.
@@ -20,7 +26,7 @@ enum CursorCSVParser {
     ) -> Summary {
         var header: [String]?
         var rejectedRecordCount = 0
-        let isStructurallyComplete = forEachRow(in: text) { row in
+        let rowScan = forEachRow(in: text) { row in
             guard let keys = header else {
                 let normalized = row.map {
                     $0.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{FEFF}")))
@@ -41,12 +47,13 @@ enum CursorCSVParser {
             body(dict)
         }
         return Summary(
-            isStructurallyComplete: isStructurallyComplete,
-            rejectedRecordCount: rejectedRecordCount
+            isStructurallyComplete: rowScan.isStructurallyComplete,
+            rejectedRecordCount: rejectedRecordCount,
+            wasCancelled: rowScan.wasCancelled
         )
     }
 
-    private static func forEachRow(in text: String, _ body: ([String]) -> Void) -> Bool {
+    private static func forEachRow(in text: String, _ body: ([String]) -> Void) -> RowScanResult {
         enum FieldState: Equatable {
             case start
             case unquoted
@@ -58,8 +65,13 @@ enum CursorCSVParser {
         var row: [String] = []
         var state = FieldState.start
         var i = text.startIndex
+        var scannedCharacters = 0
 
         while i < text.endIndex {
+            if scannedCharacters & 0x7FF == 0, Task<Never, Never>.isCancelled {
+                return RowScanResult(isStructurallyComplete: false, wasCancelled: true)
+            }
+            scannedCharacters += 1
             let c = text[i]
 
             if state == .quoted {
@@ -101,7 +113,7 @@ enum CursorCSVParser {
             case .unquoted:
                 switch c {
                 case "\"":
-                    return false
+                    return RowScanResult(isStructurallyComplete: false, wasCancelled: false)
                 case ",":
                     row.append(field)
                     field = ""
@@ -128,7 +140,7 @@ enum CursorCSVParser {
                     field = ""
                     state = .start
                 default:
-                    return false
+                    return RowScanResult(isStructurallyComplete: false, wasCancelled: false)
                 }
             case .quoted:
                 preconditionFailure("quoted fields are handled before the state switch")
@@ -136,13 +148,15 @@ enum CursorCSVParser {
             i = text.index(after: i)
         }
 
-        guard state != .quoted else { return false }
+        guard state != .quoted else {
+            return RowScanResult(isStructurallyComplete: false, wasCancelled: false)
+        }
         // Trailing partial row.
         if !field.isEmpty || !row.isEmpty || state == .quoteClosed {
             row.append(field)
             emit(row, body)
         }
-        return true
+        return RowScanResult(isStructurallyComplete: true, wasCancelled: false)
     }
 
     private static func emit(_ row: [String], _ body: ([String]) -> Void) {

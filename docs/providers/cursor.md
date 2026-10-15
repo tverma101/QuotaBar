@@ -22,15 +22,19 @@ into the Grok CLI is not required.
 
 ## Where credentials come from
 
-Just be signed into the Cursor app. QuotaBar reads Cursor's local state database (and its keychain entries) for the session tokens; refreshed tokens are persisted back. Nothing extra to install or configure.
+Just be signed into the Cursor app. QuotaBar reads Cursor's local state database (and its keychain entries) for the session tokens; rotated Keychain tokens are saved under the current-user account and read back before legacy service-only entries. Nothing extra to install or configure.
+
+A newer **Refresh Now** supersedes credential reads still queued by an older refresh, so they cannot
+raise a late Keychain dialog or undo the newer action's grant.
 
 ## Spend history
 
-Today, Yesterday, Last 30 Days, and Usage Trend come from Cursor's usage export. QuotaBar uses the exported token counts and shared model pricing to estimate the cost locally. Cursor's export may occasionally arrive late, so the newest figures can lag behind current activity. QuotaBar leaves isolated malformed rows out instead of silently counting broken values as zero. A failed download, invalid export schema, or broken CSV structure leaves spend history unavailable for that refresh. Each failure is recorded in the diagnostic log without including the exported usage data.
+Today, Yesterday, Last 30 Days, and Usage Trend come from Cursor's usage export. QuotaBar requests its current 30-day CSV window, so Usage History can include only the rows Cursor returns in that export. QuotaBar uses exported token counts and shared model pricing to estimate cost locally. Grok Bot is different: Cursor chooses its serving model and reports product-level usage without naming that model. QuotaBar keeps rows labeled `grok-bot-*` (and legacy `sand-*`) in the token totals but cannot price them: Cursor chooses the serving model and never names it, so those tokens count toward a day while its dollar figure stays incomplete (a dashed cost and the unknown-model warning) rather than being guessed at or dropped. The separate Grok Bot quota meter is unaffected. Genuine model rows such as `grok-4.7` continue to count and price normally. Cursor's export may occasionally arrive late, so the newest figures can lag behind current activity. If any row is malformed, QuotaBar withholds that refresh's spend export rather than publishing a partial subtotal. A failed download, invalid export schema, or broken CSV structure likewise leaves spend history unavailable for that refresh. Each failure is recorded in the diagnostic log without including the exported usage data.
 
 ## Troubleshooting
 
 - **"Not logged in" / token errors** — open Cursor and make sure you're signed in, then refresh.
+- **"Couldn't read Cursor's local credential data"** — check that Cursor's state database and the login Keychain are readable, then refresh. A source that exists but cannot be read is reported separately from a missing login.
 - **Some metrics missing** — Cursor omits fields depending on plan type; missing metrics simply show "No data".
 - **Optional lookup failed** — Grok Bot, plan, credit-grant, prepaid-balance, and request-fallback failures stay nonfatal when primary usage is available. QuotaBar records fixed, credential-free reasons in the diagnostic log.
 
