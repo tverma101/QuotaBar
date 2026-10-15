@@ -7,8 +7,14 @@ import Foundation
 /// (`claude-sonnet-4` never matches `claude-sonnet-4-5`).
 struct PricingCatalog: Sendable, Equatable {
     var entries: [String: ModelRates]
-    /// When the source published its data (informational, for logs).
+    /// When this snapshot was retrieved or generated; used to resolve bundle/cache conflicts.
     var retrievedAt: String?
+    /// Exact model IDs that the source deliberately omits because its providers publish conflicting
+    /// rates. These tombstones stop older bundled or cached snapshots from restoring an arbitrary rate.
+    var retiredKeys: Set<String>
+    /// Whether `retiredKeys` is a complete source snapshot, including when the set is empty.
+    /// Legacy compact caches omit the field and may contain arbitrary rates for conflicted IDs.
+    var retiredKeysAreAuthoritative: Bool
     /// Per-entry match corpus precomputed at build: raw key bytes plus separator-normalized key
     /// bytes. The fuzzy scan used to materialize both arrays per entry per miss (~20k allocations
     /// for one miss over the LiteLLM snapshot), and misses repeat across distinct gateway-tagged
@@ -24,16 +30,26 @@ struct PricingCatalog: Sendable, Equatable {
         var rates: ModelRates
     }
 
-    init(entries: [String: ModelRates] = [:], retrievedAt: String? = nil) {
+    init(
+        entries: [String: ModelRates] = [:],
+        retrievedAt: String? = nil,
+        retiredKeys: Set<String> = [],
+        retiredKeysAreAuthoritative: Bool = false
+    ) {
         self.entries = entries
         self.retrievedAt = retrievedAt
+        self.retiredKeys = retiredKeys
+        self.retiredKeysAreAuthoritative = retiredKeysAreAuthoritative
         self.fuzzyIndex = Self.buildFuzzyIndex(entries: entries)
     }
 
     /// Derived from `entries` alone, so equality ignores it (two catalogs that price identically
     /// stay equal regardless of the byte-array duplication).
     static func == (lhs: PricingCatalog, rhs: PricingCatalog) -> Bool {
-        lhs.entries == rhs.entries && lhs.retrievedAt == rhs.retrievedAt
+        lhs.entries == rhs.entries
+            && lhs.retrievedAt == rhs.retrievedAt
+            && lhs.retiredKeys == rhs.retiredKeys
+            && lhs.retiredKeysAreAuthoritative == rhs.retiredKeysAreAuthoritative
     }
 
     private static func buildFuzzyIndex(entries: [String: ModelRates]) -> [FuzzyIndexEntry] {
@@ -78,7 +94,21 @@ struct PricingCatalog: Sendable, Equatable {
     func merging(_ other: PricingCatalog) -> PricingCatalog {
         var merged = entries
         merged.merge(other.entries) { _, new in new }
-        return PricingCatalog(entries: merged, retrievedAt: other.retrievedAt ?? retrievedAt)
+        var retired = retiredKeys.union(other.retiredKeys)
+        if other.retiredKeysAreAuthoritative {
+            for key in other.entries.keys where !other.retiredKeys.contains(key) {
+                retired.remove(key)
+            }
+        }
+        for key in retired {
+            merged.removeValue(forKey: key)
+        }
+        return PricingCatalog(
+            entries: merged,
+            retrievedAt: other.retrievedAt ?? retrievedAt,
+            retiredKeys: retired,
+            retiredKeysAreAuthoritative: retiredKeysAreAuthoritative || other.retiredKeysAreAuthoritative
+        )
     }
 }
 

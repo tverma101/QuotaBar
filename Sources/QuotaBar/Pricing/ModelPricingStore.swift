@@ -163,7 +163,17 @@ actor ModelPricingStore {
                 // and let bundled win on conflicts.
                 return cached.merging(bundled)
             }
-            return merged
+            if Self.isNewer(cached.updatedAt, than: bundled.updatedAt),
+               cached.retiredAliasPatternsAreAuthoritative {
+                // A complete newer feed may intentionally restore an alias alongside an empty
+                // retirement set. Keep bundled pricing-key tombstones, but let that complete alias
+                // catalogue supersede the bundle's alias retirements.
+                return merged.preservingRetirements(from: bundled, preserveAliasPatterns: false)
+            }
+            // A newer cache can still predate an explicit retirement in the bundle. Keep those
+            // tombstones authoritative so stale shared keys cannot leak Cursor-only prices back
+            // into provider-wide resolution.
+            return merged.preservingRetirements(from: bundled)
         case (let cached?, nil):
             return cached
         case (nil, let bundled?):
@@ -217,8 +227,8 @@ actor ModelPricingStore {
         }
     }
 
-    /// A catalog is the bundled snapshot with the fetched cache merged on top — cached entries win,
-    /// but snapshot-only models survive if the live feed ever drops them.
+    /// Keep entries found in either source, but let the newer snapshot/cache win on conflicts. Old
+    /// cache-only entries remain available if the live feed drops a model.
     private func loadCatalog(_ source: SourceID, parse: (Data) throws -> PricingCatalog) -> PricingCatalog {
         var catalog = PricingCatalog()
         let resourceName: String?
@@ -245,13 +255,25 @@ actor ModelPricingStore {
         }
         if let cached = readCache(source) {
             do {
-                catalog = catalog.merging(try parse(cached))
+                catalog = Self.mergeCatalog(catalog, try parse(cached))
             } catch {
                 let fallback = source == .openRouter ? "using other pricing sources" : "using bundled snapshot"
                 AppLog.warn("pricing", "cached \(source.rawValue) catalog unreadable, \(fallback): \(error.localizedDescription)")
             }
         }
         return catalog
+    }
+
+    /// Older app versions wrote compact cache catalogs without `retrieved_at`; a dated bundle is
+    /// therefore newer than those caches. When both timestamps are absent, preserve cached priority.
+    private static func mergeCatalog(_ bundled: PricingCatalog, _ cached: PricingCatalog) -> PricingCatalog {
+        if bundled.retrievedAt == nil && cached.retrievedAt == nil {
+            return bundled.merging(cached)
+        }
+        if isNewer(cached.retrievedAt, than: bundled.retrievedAt) {
+            return bundled.merging(cached)
+        }
+        return cached.merging(bundled)
     }
 
     // MARK: - Refresh
@@ -296,10 +318,15 @@ actor ModelPricingStore {
             let response = try await http.send(request)
             switch response.statusCode {
             case 200:
-                let cacheData = try validatedCacheData(source, body: response.body)
+                let fetchedAt = now()
+                let cacheData = try validatedCacheData(
+                    source,
+                    body: response.body,
+                    retrievedAt: OpenUsageISO8601.string(from: fetchedAt)
+                )
                 try writeCache(source, data: cacheData)
                 state.etag = response.header("etag")
-                state.fetchedAt = now()
+                state.fetchedAt = fetchedAt
                 state.failedAt = nil
                 sourceStates[source] = state
                 return true
@@ -321,14 +348,20 @@ actor ModelPricingStore {
 
     /// Parses the fetched body (throwing on garbage so it never replaces a good cache) and returns
     /// the bytes to persist — compacted for the big catalogs, verbatim for the supplement.
-    private func validatedCacheData(_ source: SourceID, body: Data) throws -> Data {
+    private func validatedCacheData(_ source: SourceID, body: Data, retrievedAt: String) throws -> Data {
         switch source {
         case .litellm:
-            return try PricingCatalogCodecs.compactData(from: try PricingCatalogCodecs.catalogFromLiteLLM(body))
+            var catalog = try PricingCatalogCodecs.catalogFromLiteLLM(body)
+            catalog.retrievedAt = retrievedAt
+            return try PricingCatalogCodecs.compactData(from: catalog)
         case .modelsDev:
-            return try PricingCatalogCodecs.compactData(from: try PricingCatalogCodecs.catalogFromModelsDev(body))
+            var catalog = try PricingCatalogCodecs.catalogFromModelsDev(body)
+            catalog.retrievedAt = retrievedAt
+            return try PricingCatalogCodecs.compactData(from: catalog)
         case .openRouter:
-            return try PricingCatalogCodecs.compactData(from: try PricingCatalogCodecs.catalogFromOpenRouter(body))
+            var catalog = try PricingCatalogCodecs.catalogFromOpenRouter(body)
+            catalog.retrievedAt = retrievedAt
+            return try PricingCatalogCodecs.compactData(from: catalog)
         case .supplement:
             _ = try PricingSupplement.decode(from: body)
             return body
