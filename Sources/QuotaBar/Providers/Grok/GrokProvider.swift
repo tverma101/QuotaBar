@@ -50,7 +50,18 @@ final class GrokProvider: ProviderRuntime {
     func hasLocalCredentials() async -> Bool {
         // Same source as `refresh()`: ~/.grok/auth.json with at least one keyed entry.
         await loadOffMainActor { [authStore] in
-            ((try? authStore.loadAuthCandidates()) ?? []).isEmpty == false
+            do {
+                let candidates = try authStore.loadAuthCandidates()
+                return !candidates.isEmpty
+            } catch is GrokCredentialsUnreadableError {
+                // Keep an unreadable configured auth file visible so refresh can explain how to repair it.
+                return true
+            } catch GrokAuthError.invalidAuth {
+                // A present but malformed or unusable auth file is a configured source, not a logout.
+                return true
+            } catch {
+                return false
+            }
         }
     }
 
@@ -63,13 +74,28 @@ final class GrokProvider: ProviderRuntime {
     }
 
     private func loadAndProbe() async throws -> ProviderSnapshot {
-        let candidates = try authStore.loadAuthCandidates()
+        let candidates = try await loadOffMainActor { [authStore] in
+            try authStore.loadAuthCandidates()
+        }
+        try Task.checkCancellation()
         var sawExpiredCandidate = false
+        var refreshFailure: GrokUsageError?
 
         for var state in candidates {
             if authStore.needsRefresh(entry: state.entry, token: state.token) {
-                if let refreshed = await refreshAccessToken(state: &state) {
-                    return try await probe(state: &state, accessToken: refreshed)
+                do {
+                    if let refreshed = try await refreshAccessToken(state: &state) {
+                        try Task.checkCancellation()
+                        return try await probe(state: &state, accessToken: refreshed)
+                    }
+                } catch let error as GrokUsageError {
+                    if authStore.isExpired(entry: state.entry, token: state.token) {
+                        // Try other configured accounts before returning a transient refresh error.
+                        refreshFailure = error
+                        continue
+                    }
+                    // A still-valid access token can continue to serve this refresh if the proactive
+                    // token rotation hit a transient network or server error.
                 }
                 if authStore.isExpired(entry: state.entry, token: state.token) {
                     sawExpiredCandidate = true
@@ -79,6 +105,9 @@ final class GrokProvider: ProviderRuntime {
             return try await probe(state: &state, accessToken: state.token)
         }
 
+        if let refreshFailure {
+            throw refreshFailure
+        }
         if sawExpiredCandidate {
             throw GrokAuthError.expired
         }
@@ -86,6 +115,7 @@ final class GrokProvider: ProviderRuntime {
     }
 
     private func probe(state: inout GrokAuthState, accessToken: String) async throws -> ProviderSnapshot {
+        try Task.checkCancellation()
         // The weekly shared-pool meter and pay-as-you-go badge come from the billing endpoint with
         // `?format=credits` — the call the Grok CLI itself makes. This is the provider's primary
         // remote fetch; a failure here fails the provider like any other usage call. Fold-only
@@ -97,9 +127,12 @@ final class GrokProvider: ProviderRuntime {
             mapped = try GrokUsageMapper.mapCreditsConfig(creditsResponse)
         }
         // Fold-only passes recover the plan label from the prior snapshot via the merge too.
-        let plan = ProviderRefreshContext.scope.suppressesLiveQuota
-            ? nil
-            : await fetchPlanName(accessToken: state.token)
+        let plan: String?
+        if ProviderRefreshContext.scope.suppressesLiveQuota {
+            plan = nil
+        } else {
+            plan = try await fetchPlanName(accessToken: state.token)
+        }
 
         // Menu-bar and panel-meter passes only need the weekly / Extra Usage meters from the
         // credits API. Skip the local JSONL history scan; the data store merges prior spend onto
@@ -127,7 +160,8 @@ final class GrokProvider: ProviderRuntime {
                 series: scan.series,
                 modelUsage: scan.modelUsage,
                 unknownModelsByDay: scan.unknownModelsByDay,
-                apiEstimateByDay: scan.apiEstimateByDay
+                apiEstimateByDay: scan.apiEstimateByDay,
+                apiEstimateIncompleteDays: scan.apiEstimateIncompleteDays
             )
             SpendTileMapper.appendTokenUsage(
                 scan.series,
@@ -158,7 +192,7 @@ final class GrokProvider: ProviderRuntime {
             token: accessToken,
             attempt: { try await self.usageClient.fetchCreditsConfig(accessToken: $0) },
             refreshAccessToken: {
-                guard let refreshed = await self.refreshAccessToken(state: &working) else {
+                guard let refreshed = try await self.refreshAccessToken(state: &working) else {
                     throw GrokAuthError.expired
                 }
                 return refreshed
@@ -168,7 +202,8 @@ final class GrokProvider: ProviderRuntime {
         )
     }
 
-    private func refreshAccessToken(state: inout GrokAuthState) async -> String? {
+    private func refreshAccessToken(state: inout GrokAuthState) async throws -> String? {
+        let originalState = state
         guard let refreshToken = authStore.refreshToken(for: state.entry) else {
             return nil
         }
@@ -180,18 +215,17 @@ final class GrokProvider: ProviderRuntime {
                 clientID: authStore.clientID(entryKey: state.entryKey, entry: state.entry)
             )
         } catch {
-            // Log the real cause: a transport failure here is currently surfaced to the user as
-            // "auth expired" (loadAndProbe / the retry closure both map a nil refresh to .expired), so
-            // without this line the actual reason (network/DNS/timeout) is lost. (Refining the
-            // user-facing message to a request-failure is deferred — it needs a careful rework of the
-            // candidate-loop + retry-closure semantics.)
-            AppLog.warn(LogTag.auth("grok"), "token refresh request failed (transport): \(error.localizedDescription)")
-            return nil
+            try ProviderCancellation.rethrowIfCancellation(error)
+            AppLog.warn(LogTag.auth("grok"), "token refresh request failed (transport)")
+            throw GrokUsageError.connectionFailed
         }
-
         guard (200..<300).contains(response.statusCode) else {
             AppLog.warn(LogTag.auth("grok"), "token refresh failed (HTTP \(response.statusCode))")
-            return nil
+            // OAuth's 400/401 rejection means the refresh grant is no longer usable. Other statuses
+            // (notably 429 and 5xx) are retryable service/HTTP failures, not evidence that the user
+            // needs to sign in again.
+            if response.statusCode == 400 || response.statusCode == 401 { return nil }
+            throw GrokUsageError.requestFailed(response.statusCode)
         }
         guard let decoded = usageClient.decodeRefreshResponse(response),
               !decoded.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -216,10 +250,29 @@ final class GrokProvider: ProviderRuntime {
         // can surface a false "auth expired"). The refreshed token works for this session, so log and
         // continue rather than fail the live fetch.
         do {
-            try authStore.save(state)
+            let persistedState = state
+            let authStore = self.authStore
+            let refreshContext = ProviderRefreshContext.detachedValues
+            // A successful OAuth response may rotate and revoke its refresh token. Persist it even
+            // when the provider task is canceled before usage requests resume.
+            try await Task.detached(priority: .utility) {
+                try refreshContext.withValue {
+                    try authStore.save(persistedState, replacing: originalState)
+                }
+            }.value
+        } catch is GrokAuthConflictError {
+            // The login was removed/replaced while OAuth was in flight. Do not use the old
+            // account's late response for this refresh either.
+            throw GrokAuthConflictError()
+        } catch let error as GrokCredentialsUnreadableError {
+            throw error
+        } catch let error as GrokAuthError where error == .invalidAuth {
+            throw error
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             AppLog.error(LogTag.auth("grok"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
         }
+        try Task.checkCancellation()
         return accessToken
     }
 
@@ -233,10 +286,14 @@ final class GrokProvider: ProviderRuntime {
         return now().addingTimeInterval(60 * 60)
     }
 
-    private func fetchPlanName(accessToken: String) async -> String? {
+    private func fetchPlanName(accessToken: String) async throws -> String? {
+        try Task.checkCancellation()
         do {
-            return GrokUsageMapper.planName(from: try await usageClient.fetchSettings(accessToken: accessToken))
+            let response = try await usageClient.fetchSettings(accessToken: accessToken)
+            try Task.checkCancellation()
+            return GrokUsageMapper.planName(from: response)
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             return nil
         }
     }

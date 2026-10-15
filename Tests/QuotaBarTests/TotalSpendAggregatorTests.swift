@@ -21,7 +21,8 @@ final class TotalSpendAggregatorTests: XCTestCase {
         _ label: String,
         dollars: Double? = nil,
         tokens: Double? = 1_000_000,
-        estimated: Bool = false
+        estimated: Bool = false,
+        unknownModels: [String] = []
     ) -> MetricLine {
         var values: [MetricValue] = []
         if let dollars {
@@ -30,7 +31,7 @@ final class TotalSpendAggregatorTests: XCTestCase {
         if let tokens {
             values.append(MetricValue(number: tokens, kind: .count, label: "tokens"))
         }
-        return .values(label: label, values: values)
+        return .values(label: label, values: values, unknownModels: unknownModels)
     }
 
     func testSumsDollarsAndTokensAcrossProviders() {
@@ -135,6 +136,41 @@ final class TotalSpendAggregatorTests: XCTestCase {
 
         XCTAssertEqual(rates.slices.map(\.provider.id), ["claude"])
         XCTAssertEqual(rates.centerValue, 10, accuracy: 0.0001)
+    }
+
+    func testMixedPricedAndUnpricedUsageIsOmittedFromDollarRatesAndMarkedPartial() {
+        let snapshots = [
+            "claude": snapshot(claude, lines: [spendLine(
+                "Today", dollars: 1, tokens: 1_000, unknownModels: ["opaque-model"]
+            )]),
+            "codex": snapshot(codex, lines: [spendLine("Today", dollars: 2, tokens: 1_000)])
+        ]
+        let total = TotalSpendAggregator.total(for: .today, providers: [claude, codex], snapshots: snapshots)
+
+        let cost = total.projection(for: .cost)
+        XCTAssertEqual(cost.centerValue, 2, accuracy: 0.0001)
+        XCTAssertEqual(cost.slices.map(\.provider.id), ["codex"])
+        XCTAssertTrue(cost.hasIncompleteCost)
+
+        let rate = total.projection(for: .costPerMtok)
+        XCTAssertEqual(rate.centerValue, 2_000, accuracy: 0.0001)
+        XCTAssertEqual(rate.slices.map(\.provider.id), ["codex"])
+        XCTAssertTrue(rate.hasIncompleteCost)
+
+        let tokens = total.projection(for: .tokens)
+        XCTAssertEqual(tokens.centerValue, 2_000, accuracy: 0.0001)
+        XCTAssertFalse(tokens.hasIncompleteCost)
+    }
+
+    func testVerifiedZeroCostUsageContributesTokensToBlendedCostRate() {
+        let snapshots = [
+            "claude": snapshot(claude, lines: [spendLine("Today", dollars: 10, tokens: 1_000_000)]),
+            "cursor": snapshot(cursor, lines: [spendLine("Today", dollars: 0, tokens: 1_000_000)])
+        ]
+        let total = TotalSpendAggregator.total(for: .today, providers: [claude, cursor], snapshots: snapshots)
+
+        XCTAssertEqual(total.projection(for: .costPerMtok).centerValue, 5, accuracy: 0.0001)
+        XCTAssertEqual(Set(total.projection(for: .costPerMtok).slices.map(\.provider.id)), Set(["claude", "cursor"]))
     }
 
     func testTokensProjectionRanksByTokenCount() {

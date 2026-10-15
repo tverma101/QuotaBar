@@ -305,6 +305,24 @@ final class ClaudeUsageMapperTests: XCTestCase {
 
 @MainActor
 final class ClaudeProviderTests: XCTestCase {
+    func testProfileVerificationPreservesCancellation() async throws {
+        let config = try configuredAuthStore(files: FakeFiles(), now: { Date() }).oauthConfig()
+        let client = ClaudeUsageClient(httpClient: ClaudeCancellationHTTPClient())
+
+        do {
+            _ = try await client.verifyAccount(
+                accessToken: "test-token",
+                expectedIdentityKey: "user-id|organization-id",
+                config: config
+            )
+            XCTFail("expected profile request cancellation")
+        } catch is CancellationError {
+            // A canceled profile check is not a connection failure.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+    }
+
     func testRefreshFetchesLiveUsageAndScansConfigDirLogs() async throws {
         let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
         let httpClient = FakeHTTPClient(response: HTTPResponse(
@@ -372,6 +390,77 @@ final class ClaudeProviderTests: XCTestCase {
             MetricValue(number: 150, kind: .count, label: "tokens")
         ])
         XCTAssertTrue(httpClient.requests.isEmpty)
+    }
+
+    func testIncompletePiDiscoveryDoesNotPublishNativeOnlyHistory() async throws {
+        let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
+        let home = try ClaudeLogFixture.makeHome(files: [
+            "project-a/today.jsonl": ClaudeLogFixture.usageLine(
+                timestamp: "2026-02-20T16:00:00.000Z", input: 100, output: 50, costUSD: 0.25
+            )
+        ])
+        defer { try? FileManager.default.removeItem(at: home) }
+        let piSessionsPath = home.appendingPathComponent("pi-sessions")
+        try Data("not a directory".utf8).write(to: piSessionsPath)
+        let piScanner = PiUsageScanner(
+            environment: FakeEnvironment(["PI_CODING_AGENT_SESSION_DIR": piSessionsPath.path]),
+            homeDirectory: { home },
+            incrementalScanner: IncrementalJSONLScanner<PiUsageScanner.Entry>()
+        )
+        let provider = ClaudeProvider(
+            authStore: ClaudeAuthStore(
+                environment: FakeEnvironment(), files: FakeFiles(), keychain: FakeKeychain(), now: { now }
+            ),
+            logUsageScanner: ClaudeLogFixture.scanner(home: home),
+            piUsageScanner: piScanner,
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .notLoggedIn)
+        XCTAssertNil(snapshot.usageHistory, "a failed Pi walk must not publish the native-only subtotal")
+        XCTAssertNil(values(snapshot.lines, "Today"))
+    }
+
+    func testUnreadableClaudeOwnershipPreambleDoesNotPublishOtherAccountFiles() async throws {
+        let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
+        let timestamp = OpenUsageISO8601.string(from: now)
+        let usage = ClaudeLogFixture.usageLine(
+            timestamp: timestamp, input: 100, output: 50, costUSD: 0.25
+        )
+        let home = try ClaudeLogFixture.makeUserHome(claudeFiles: [
+            "workspace/a-owned.jsonl": #"{"ownerOrganizationUuid":"org-a","ownerAccountUuid":"user-a"}"# + "\n" + usage,
+            "workspace/z-unreadable.jsonl": #"{"ownerOrganizationUuid":"org-a","ownerAccountUuid":"user-a"}"# + "\n" + usage
+        ])
+        defer { try? FileManager.default.removeItem(at: home) }
+        let scanner = ClaudeLogUsageScanner(
+            environment: FakeEnvironment([:]),
+            homeDirectory: { home },
+            incrementalScanner: IncrementalJSONLScanner<ClaudeLogUsageScanner.Entry>(),
+            accountUUID: "user-a",
+            organizationUUID: "org-a",
+            ownershipLookup: { file in
+                if file.path.hasSuffix("z-unreadable.jsonl") { return .unreadable }
+                return .readable(organizationID: "org-a", accountID: "user-a", isAmbiguous: false)
+            }
+        )
+        let provider = ClaudeProvider(
+            authStore: ClaudeAuthStore(
+                environment: FakeEnvironment(), files: FakeFiles(), keychain: FakeKeychain(), now: { now }
+            ),
+            logUsageScanner: scanner,
+            allowsUnattributedPiUsage: false,
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .notLoggedIn)
+        XCTAssertNil(snapshot.usageHistory, "the readable subset cannot replace the last-good account history")
+        XCTAssertNil(values(snapshot.lines, "Today"))
     }
 
     func testNoCredentialsWithLogsThatContainNoSpendStillReportsNotLoggedIn() async throws {
@@ -474,6 +563,372 @@ final class ClaudeProviderTests: XCTestCase {
         // Local spend tiles are unaffected and still load.
         XCTAssertNotNil(values(snapshot.lines, "Today"))
         XCTAssertEqual(snapshot.plan, "Max 5x")
+    }
+
+    func testUnknownScopesWithExplicitProfileScope403WarnsWithoutCallingTokenExpired() async {
+        // Older credential files can omit `scopes`. Keep allowing those tokens through, then classify
+        // Anthropic's documented 403 body before the generic 401/403 token-refresh path can call it expired.
+        let files = FakeFiles([
+            "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","subscriptionType":"max"}}"#
+        ])
+        let httpClient = FakeHTTPClient(response: HTTPResponse(
+            statusCode: 403,
+            headers: [:],
+            body: Data("OAuth token does not meet scope requirement user:profile".utf8)
+        ))
+        let provider = ClaudeProvider(
+            authStore: configuredAuthStore(files: files, now: { Date() }),
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.warning, ClaudeUsageMapper.missingProfileScopeWarning)
+        XCTAssertNil(badge(snapshot.lines, "Error"))
+        XCTAssertNil(snapshot.line(label: "Session"))
+        XCTAssertEqual(httpClient.requests.filter { $0.url.path == "/api/oauth/usage" }.count, 1)
+        XCTAssertFalse(httpClient.requests.contains { $0.url.path == "/v1/oauth/token" })
+    }
+
+    func testGeneric403WithoutMissingProfileScopeRemainsAuthFailure() async {
+        let files = FakeFiles([
+            "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","subscriptionType":"max"}}"#
+        ])
+        let httpClient = FakeHTTPClient(response: HTTPResponse(
+            statusCode: 403,
+            headers: [:],
+            body: Data("Forbidden".utf8)
+        ))
+        let provider = ClaudeProvider(
+            authStore: configuredAuthStore(files: files, now: { Date() }),
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(badge(snapshot.lines, "Error"), ClaudeAuthError.tokenExpired.localizedDescription)
+        XCTAssertNil(snapshot.warning)
+        XCTAssertEqual(httpClient.requests.filter { $0.url.path == "/api/oauth/usage" }.count, 1)
+    }
+
+    func testPermissionRequiredClaudeCodeKeychainRemainsDetectedWithoutPrompt() async {
+        let keychain = PermissionRequiredClaudeCodeKeychain()
+        let authStore = configuredAuthStore(files: FakeFiles(), keychain: keychain, now: { Date() })
+        resetKeychainPermissionState(for: authStore)
+        defer { resetKeychainPermissionState(for: authStore) }
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
+                statusCode: 200, headers: [:], body: Data()
+            ))),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let hasLocalCredentials = await provider.hasLocalCredentials()
+
+        XCTAssertTrue(hasLocalCredentials)
+        assertClaudeKeychainProbesStayedSilent(keychain, authStore: authStore)
+        XCTAssertFalse(keychain.existenceProbes.isEmpty, "detection should use the attributes-only presence probe")
+    }
+
+    func testPermissionRequiredClaudeCodeKeychainShowsActionableErrorWithoutAlternate() async {
+        let keychain = PermissionRequiredClaudeCodeKeychain()
+        let authStore = configuredAuthStore(files: FakeFiles(), keychain: keychain, now: { Date() })
+        resetKeychainPermissionState(for: authStore)
+        defer { resetKeychainPermissionState(for: authStore) }
+        let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data()))
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(badge(snapshot.lines, "Error"), ClaudeAuthError.credentialPermissionRequired.localizedDescription)
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+        assertClaudeKeychainProbesStayedSilent(keychain, authStore: authStore)
+        XCTAssertTrue(httpClient.requests.isEmpty, "no unreadable credential should be sent to the API")
+    }
+
+    func testClaudeCodeKeychainReadFailureStaysDetectedAndShowsCredentialAccessError() async {
+        let keychain = ReadFailedClaudeCodeKeychain()
+        let authStore = configuredAuthStore(files: FakeFiles(), keychain: keychain, now: { Date() })
+        resetKeychainPermissionState(for: authStore)
+        defer { resetKeychainPermissionState(for: authStore) }
+        let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data()))
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let hasLocalCredentials = await provider.hasLocalCredentials()
+        let snapshot = await provider.refresh()
+
+        XCTAssertTrue(hasLocalCredentials, "an unavailable Keychain must remain detectable")
+        XCTAssertEqual(badge(snapshot.lines, "Error"), ClaudeAuthError.credentialKeychainReadFailed.localizedDescription)
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+        XCTAssertTrue(httpClient.requests.isEmpty, "there is no usable credential to send to the API")
+        XCTAssertFalse(keychain.interactionFlags.contains(true), "detection and background refresh stay prompt-free")
+    }
+
+    func testIndeterminateClaudeKeychainPresenceProbeKeepsProviderDetected() async {
+        let keychain = IndeterminateClaudeCodeKeychain()
+        let authStore = configuredAuthStore(files: FakeFiles(), keychain: keychain, now: { Date() })
+        resetKeychainPermissionState(for: authStore)
+        defer { resetKeychainPermissionState(for: authStore) }
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
+                statusCode: 200, headers: [:], body: Data()
+            ))),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let hasLocalCredentials = await provider.hasLocalCredentials()
+
+        XCTAssertTrue(hasLocalCredentials, "a failed attributes probe means unknown, not absent")
+        XCTAssertFalse(keychain.interactionFlags.contains(true))
+    }
+
+    func testClaudeCodeKeychainReadFailureDoesNotShadowValidFileCredential() async {
+        let keychain = ReadFailedClaudeCodeKeychain()
+        let files = FakeFiles([
+            "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"file-token","subscriptionType":"pro","scopes":["user:profile"]}}"#
+        ])
+        let authStore = configuredAuthStore(files: files, keychain: keychain, now: { Date() })
+        resetKeychainPermissionState(for: authStore)
+        defer { resetKeychainPermissionState(for: authStore) }
+        let httpClient = FakeHTTPClient(response: HTTPResponse(
+            statusCode: 200,
+            headers: [:],
+            body: Data(#"{"five_hour":{"utilization":41,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
+        ))
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(Self.progress(snapshot.lines, "Session")?.used, 41)
+        XCTAssertNil(badge(snapshot.lines, "Error"))
+        XCTAssertFalse(httpClient.requests.isEmpty)
+    }
+
+    func testPermissionRequiredKeychainDoesNotShadowValidFileCredential() async {
+        let keychain = PermissionRequiredClaudeCodeKeychain()
+        let files = FakeFiles([
+            "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"file-token","subscriptionType":"pro","scopes":["user:profile"]}}"#
+        ])
+        let authStore = configuredAuthStore(files: files, keychain: keychain, now: { Date() })
+        resetKeychainPermissionState(for: authStore)
+        defer { resetKeychainPermissionState(for: authStore) }
+        let httpClient = FakeHTTPClient(response: HTTPResponse(
+            statusCode: 200,
+            headers: [:],
+            body: Data(#"{"five_hour":{"utilization":27,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
+        ))
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(Self.progress(snapshot.lines, "Session")?.used, 27)
+        XCTAssertNil(badge(snapshot.lines, "Error"))
+        assertClaudeKeychainProbesStayedSilent(keychain, authStore: authStore)
+    }
+
+    func testPermissionRequiredKeychainSurvivesRejectedFileTokenAndMissingDesktop() async {
+        let keychain = PermissionRequiredClaudeCodeKeychain()
+        let files = FakeFiles([
+            "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"file-token","subscriptionType":"pro","scopes":["user:profile"]}}"#
+        ])
+        let authStore = configuredAuthStore(files: files, keychain: keychain, now: { Date() })
+        resetKeychainPermissionState(for: authStore)
+        defer { resetKeychainPermissionState(for: authStore) }
+        let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 401, headers: [:], body: Data()))
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(badge(snapshot.lines, "Error"), ClaudeAuthError.credentialPermissionRequired.localizedDescription)
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+        XCTAssertEqual(httpClient.requests.filter { $0.url.path == "/api/oauth/usage" }.count, 1)
+        XCTAssertFalse(httpClient.requests.contains { $0.url.path == "/v1/oauth/token" })
+        assertClaudeKeychainProbesStayedSilent(keychain, authStore: authStore)
+    }
+
+    func testSupersededManualRefreshStopsBeforeFileFallbackAndUsageRequest() async throws {
+        let files = FakeFiles([
+            "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"file-token","subscriptionType":"pro","scopes":["user:profile"]}}"#
+        ])
+        let authStore = configuredAuthStore(files: files, now: { Date() })
+        let keychain = BlockingClaudeCodeKeychain(service: try XCTUnwrap(authStore.keychainServiceCandidates().first))
+        let store = configuredAuthStore(files: files, keychain: keychain, now: { Date() })
+        resetKeychainPermissionState(for: store)
+        defer { resetKeychainPermissionState(for: store) }
+        defer { keychain.releaseFirstRead.signal() }
+        let httpClient = FakeHTTPClient(response: HTTPResponse(
+            statusCode: 200,
+            headers: [:],
+            body: Data(#"{"five_hour":{"utilization":27,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
+        ))
+        let provider = ClaudeProvider(
+            authStore: store,
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let olderRefresh = Task {
+            await withManualRefresh { await provider.refresh() }
+        }
+        let firstReadStarted = await withCheckedContinuation {
+            (continuation: CheckedContinuation<DispatchTimeoutResult, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: keychain.firstReadStarted.wait(timeout: .now() + 5))
+            }
+        }
+        XCTAssertEqual(firstReadStarted, .success)
+
+        _ = await withManualRefresh { ProviderRefreshContext.manualActionID }
+        keychain.releaseFirstRead.signal()
+        _ = await olderRefresh.value
+
+        XCTAssertEqual(keychain.reads.map(\.interactionAllowed), [false])
+        XCTAssertTrue(httpClient.requests.isEmpty, "a superseded refresh must not try the valid file fallback")
+    }
+
+    func testMalformedPresentCredentialsFileStaysDetectedAndRefreshShowsRepairError() async {
+        let malformedFiles = [
+            "not-json",
+            #"{"claudeAiOauth":{"accessToken":"   "}}"#
+        ]
+        for fileContents in malformedFiles {
+            let files = FakeFiles(["/tmp/claude/.credentials.json": fileContents])
+            let authStore = configuredAuthStore(files: files, keychain: FakeKeychain(), now: { Date() })
+            resetKeychainPermissionState(for: authStore)
+            let provider = ClaudeProvider(
+                authStore: authStore,
+                usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
+                    statusCode: 200, headers: [:], body: Data()
+                ))),
+                logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+                pricing: { TestPricing.bundled }
+            )
+
+            let hasLocalCredentials = await provider.hasLocalCredentials()
+            XCTAssertTrue(hasLocalCredentials, "present invalid credentials must remain detected")
+            let snapshot = await provider.refresh()
+            XCTAssertEqual(badge(snapshot.lines, "Error"), ClaudeCredentialsInvalidError().localizedDescription)
+            XCTAssertEqual(snapshot.errorCategory, .authInvalid)
+        }
+    }
+
+    func testMalformedCredentialsFileDoesNotShadowValidKeychainCredential() async {
+        let files = FakeFiles(["/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":" "}}"#])
+        let keychain = ServiceKeychain()
+        let authStore = configuredAuthStore(files: files, keychain: keychain, now: { Date() })
+        resetKeychainPermissionState(for: authStore)
+        keychain.currentUserValues[authStore.keychainServiceCandidates().first!] =
+            #"{"claudeAiOauth":{"accessToken":"keychain-token","subscriptionType":"max","scopes":["user:profile"]}}"#
+        let httpClient = FakeHTTPClient(response: HTTPResponse(
+            statusCode: 200,
+            headers: [:],
+            body: Data(#"{"five_hour":{"utilization":35,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
+        ))
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: httpClient),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(Self.progress(snapshot.lines, "Session")?.used, 35)
+        XCTAssertNil(badge(snapshot.lines, "Error"))
+    }
+
+    func testUnreadableCredentialsFileCountsAsConfiguredAndRefreshShowsRepairError() async {
+        let authStore = ClaudeAuthStore(
+            environment: FakeEnvironment(["CLAUDE_CONFIG_DIR": "/tmp/claude"]),
+            files: ClaudeUnreadableCredentialFiles(),
+            keychain: FakeKeychain()
+        )
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
+                statusCode: 200, headers: [:], body: Data()
+            ))),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let hasLocalCredentials = await provider.hasLocalCredentials()
+        XCTAssertTrue(hasLocalCredentials)
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(badge(snapshot.lines, "Error"), ClaudeCredentialsUnreadableError().localizedDescription)
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+        XCTAssertFalse(snapshot.lines.contains { $0.label == "Not logged in" })
+    }
+
+    func testUnreadableDesktopConfigCountsAsConfiguredAndRefreshShowsRepairErrorWithoutPrompt() async {
+        let keyReader = NoPromptClaudeDesktopKeyReader()
+        let desktop = ClaudeDesktopAuthStore(
+            files: ClaudeUnreadableDesktopConfigFiles(
+                path: "/fixture-home/Library/Application Support/Claude/config.json"
+            ),
+            keyReader: keyReader,
+            homeDirectory: { URL(fileURLWithPath: "/fixture-home", isDirectory: true) }
+        )
+        let authStore = ClaudeAuthStore(
+            environment: FakeEnvironment(["CLAUDE_CONFIG_DIR": "/tmp/claude"]),
+            files: FakeFiles(),
+            keychain: FakeKeychain(),
+            desktop: desktop,
+            desktopOnly: true
+        )
+        let provider = ClaudeProvider(
+            authStore: authStore,
+            usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
+                statusCode: 200, headers: [:], body: Data()
+            ))),
+            logUsageScanner: ClaudeLogFixture.scanner(home: nil),
+            pricing: { TestPricing.bundled }
+        )
+
+        let hasLocalCredentials = await provider.hasLocalCredentials()
+        XCTAssertTrue(hasLocalCredentials)
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(badge(snapshot.lines, "Error"), ClaudeDesktopCredentialsUnreadableError().localizedDescription)
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+        XCTAssertTrue(keyReader.calls.isEmpty, "first-run detection and the failed config probe must not prompt")
     }
 
     func testLiveClaudeUsageReportsResetFields() async throws {
@@ -691,14 +1146,8 @@ final class ClaudeProviderTests: XCTestCase {
             )
         }
 
-        let cases = [
-            FakeFiles(),
-            FakeFiles(["~/.claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"   "}}"#])
-        ]
-        for files in cases {
-            let snapshot = await makeProvider(files: files).refresh()
-            XCTAssertEqual(badge(snapshot.lines, "Error"), ClaudeAuthError.notLoggedIn.localizedDescription)
-        }
+        let snapshot = await makeProvider(files: FakeFiles()).refresh()
+        XCTAssertEqual(badge(snapshot.lines, "Error"), ClaudeAuthError.notLoggedIn.localizedDescription)
     }
 
     func testRateLimitedResponseMapsToRetryBadgeNotError() async {
@@ -822,6 +1271,45 @@ final class ClaudeProviderTests: XCTestCase {
         )
     }
 
+    private func resetKeychainPermissionState(for authStore: ClaudeAuthStore) {
+        for service in authStore.keychainServiceCandidates() {
+            KeychainPermissionGate.shared.reset(KeychainItemKey(
+                service: service,
+                account: currentUserKeychainAccount()
+            ))
+            KeychainPermissionGate.shared.reset(KeychainItemKey(service: service))
+        }
+    }
+
+    private func assertClaudeKeychainProbesStayedSilent(
+        _ keychain: PermissionRequiredClaudeCodeKeychain,
+        authStore: ClaudeAuthStore,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let services = authStore.keychainServiceCandidates()
+        XCTAssertEqual(
+            keychain.readInteractionFlags,
+            Array(repeating: false, count: services.count),
+            "every current-user candidate must stay prompt-free",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            keychain.readServices,
+            services,
+            "each distinct service candidate is tried once",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            keychain.readScopes,
+            Array(repeating: "current-user", count: services.count),
+            file: file,
+            line: line
+        )
+    }
+
     private func badge(_ lines: [MetricLine], _ label: String) -> String? {
         guard case .badge(_, let value, _, _) = lines.first(where: { $0.label == label }) else {
             return nil
@@ -851,6 +1339,12 @@ final class ClaudeProviderTests: XCTestCase {
     }
 }
 
+private struct ClaudeCancellationHTTPClient: HTTPClient {
+    func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        throw CancellationError()
+    }
+}
+
 /// A monotonic call counter for stateful `RoutingHTTPClient` handlers (e.g. "succeed once, then 429").
 private final class CallCounter: @unchecked Sendable {
     private let lock = NSLock()
@@ -874,5 +1368,251 @@ private final class TestClock: @unchecked Sendable {
     func set(_ value: Date) {
         lock.lock(); defer { lock.unlock() }
         self.value = value
+    }
+}
+
+/// Models a credentials file that exists but whose contents cannot be read.
+private struct ClaudeUnreadableCredentialFiles: TextFileAccessing {
+    private let credentialsPath = "/tmp/claude/.credentials.json"
+
+    func exists(_ path: String) -> Bool {
+        path == credentialsPath
+    }
+
+    func readTextIfPresent(_ path: String) throws -> String? {
+        guard exists(path) else { return nil }
+        throw CocoaError(.fileReadNoPermission)
+    }
+
+    func readText(_ path: String) throws -> String {
+        throw CocoaError(.fileReadNoPermission)
+    }
+
+    func writeText(_ path: String, _ text: String) throws {
+        throw CocoaError(.fileWriteNoPermission)
+    }
+
+    func remove(_ path: String) throws {
+        throw CocoaError(.fileWriteNoPermission)
+    }
+}
+
+private final class PermissionRequiredClaudeCodeKeychain: KeychainAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedReadFlags: [Bool] = []
+    private var recordedReadServices: [String] = []
+    private var recordedReadScopes: [String] = []
+    private var recordedExistenceProbes: [String] = []
+
+    var readInteractionFlags: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedReadFlags
+    }
+
+    var existenceProbes: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedExistenceProbes
+    }
+
+    var readServices: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedReadServices
+    }
+
+    var readScopes: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedReadScopes
+    }
+
+    func readGenericPassword(service: String) throws -> String? { nil }
+
+    func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? {
+        recordRead(service: service, scope: "legacy", allowInteraction: allowInteraction)
+        throw KeychainError.interactionNotAllowed
+    }
+
+    func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? {
+        recordRead(service: service, scope: "current-user", allowInteraction: allowInteraction)
+        throw KeychainError.interactionNotAllowed
+    }
+
+    private func recordRead(service: String, scope: String, allowInteraction: Bool) {
+        lock.lock()
+        recordedReadFlags.append(allowInteraction)
+        recordedReadServices.append(service)
+        recordedReadScopes.append(scope)
+        lock.unlock()
+    }
+
+    func genericPasswordExists(service: String) -> Bool? {
+        lock.lock(); recordedExistenceProbes.append(service); lock.unlock()
+        return true
+    }
+
+    func writeGenericPassword(service: String, value: String) throws {}
+}
+
+private final class BlockingClaudeCodeKeychain: KeychainAccessing, @unchecked Sendable {
+    struct Read: Sendable {
+        let service: String
+        let interactionAllowed: Bool
+    }
+
+    private let serviceToBlock: String
+    private let lock = NSLock()
+    private var recordedReads: [Read] = []
+    private var didBlockFirstRead = false
+    let firstReadStarted = DispatchSemaphore(value: 0)
+    let releaseFirstRead = DispatchSemaphore(value: 0)
+
+    var reads: [Read] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedReads
+    }
+
+    init(service: String) {
+        serviceToBlock = service
+    }
+
+    func readGenericPassword(service: String) throws -> String? { nil }
+
+    func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? {
+        try recordAndRead(service: service, allowInteraction: allowInteraction)
+    }
+
+    func readGenericPasswordForCurrentUser(service: String) throws -> String? { nil }
+
+    func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? {
+        try recordAndRead(service: service, allowInteraction: allowInteraction)
+    }
+
+    func genericPasswordExists(service: String) -> Bool? { true }
+
+    func writeGenericPassword(service: String, value: String) throws {}
+
+    private func recordAndRead(service: String, allowInteraction: Bool) throws -> String? {
+        lock.lock()
+        recordedReads.append(Read(service: service, interactionAllowed: allowInteraction))
+        let shouldBlock = service == serviceToBlock && !allowInteraction && !didBlockFirstRead
+        if shouldBlock { didBlockFirstRead = true }
+        lock.unlock()
+
+        if shouldBlock {
+            firstReadStarted.signal()
+            guard releaseFirstRead.wait(timeout: .now() + 5) == .success else {
+                throw KeychainError.readFailed("Timed out waiting for the test to release the Keychain read.")
+            }
+        }
+        if allowInteraction {
+            throw KeychainError.interactionNotAllowed
+        }
+        throw KeychainError.interactionNotAllowed
+    }
+}
+
+private final class ReadFailedClaudeCodeKeychain: KeychainAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedInteractionFlags: [Bool] = []
+
+    var interactionFlags: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedInteractionFlags
+    }
+
+    func readGenericPassword(service: String) throws -> String? {
+        throw KeychainError.readFailed("test Keychain read failure")
+    }
+
+    func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? {
+        record(allowInteraction)
+        throw KeychainError.readFailed("test Keychain read failure")
+    }
+
+    func readGenericPasswordForCurrentUser(service: String) throws -> String? {
+        throw KeychainError.readFailed("test Keychain read failure")
+    }
+
+    func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? {
+        record(allowInteraction)
+        throw KeychainError.readFailed("test Keychain read failure")
+    }
+
+    func genericPasswordExists(service: String) -> Bool? { nil }
+
+    func writeGenericPassword(service: String, value: String) throws {}
+
+    private func record(_ allowInteraction: Bool) {
+        lock.lock(); recordedInteractionFlags.append(allowInteraction); lock.unlock()
+    }
+}
+
+private final class IndeterminateClaudeCodeKeychain: KeychainAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedInteractionFlags: [Bool] = []
+
+    var interactionFlags: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedInteractionFlags
+    }
+
+    func readGenericPassword(service: String) throws -> String? { nil }
+
+    func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? {
+        record(allowInteraction)
+        return nil
+    }
+
+    func readGenericPasswordForCurrentUser(service: String) throws -> String? { nil }
+
+    func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? {
+        record(allowInteraction)
+        return nil
+    }
+
+    func genericPasswordExists(service: String) -> Bool? { nil }
+
+    func writeGenericPassword(service: String, value: String) throws {}
+
+    private func record(_ allowInteraction: Bool) {
+        lock.lock(); recordedInteractionFlags.append(allowInteraction); lock.unlock()
+    }
+}
+
+private struct ClaudeUnreadableDesktopConfigFiles: TextFileAccessing {
+    let path: String
+
+    func exists(_ candidate: String) -> Bool { candidate == path }
+
+    func readTextIfPresent(_ candidate: String) throws -> String? {
+        guard exists(candidate) else { return nil }
+        throw CocoaError(.fileReadNoPermission)
+    }
+
+    func readText(_ candidate: String) throws -> String {
+        throw CocoaError(.fileReadNoPermission)
+    }
+
+    func writeText(_ candidate: String, _ text: String) throws {
+        throw CocoaError(.fileWriteNoPermission)
+    }
+
+    func remove(_ candidate: String) throws {
+        throw CocoaError(.fileWriteNoPermission)
+    }
+}
+
+private final class NoPromptClaudeDesktopKeyReader: ClaudeDesktopSafeStorageKeyReading, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedCalls: [Bool] = []
+
+    var calls: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedCalls
+    }
+
+    func readPassword(allowInteraction: Bool) throws -> String? {
+        lock.lock(); recordedCalls.append(allowInteraction); lock.unlock()
+        return nil
     }
 }

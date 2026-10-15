@@ -72,6 +72,30 @@ final class OpenRouterAuthStoreTests: XCTestCase {
                        .overrideActive)
     }
 
+    func testUnreadableSavedKeyStatusShowsRepairAndPreservesEnvironmentFallback() throws {
+        let path = OpenRouterAuthStore.configPaths[0]
+        let unreadableStore = OpenRouterAuthStore(
+            files: UnreadableFiles(present: [path]),
+            environment: FakeEnvironment()
+        )
+        let unreadableStatus = unreadableStore.keyStatus()
+
+        XCTAssertEqual(unreadableStatus, .savedUnreadable)
+        XCTAssertEqual(unreadableStatus.indicator, .needsAttention)
+        XCTAssertEqual(unreadableStatus.editorMode, .savedUnreadable)
+
+        let environmentStore = OpenRouterAuthStore(
+            files: UnreadableFiles(present: [path]),
+            environment: FakeEnvironment(["OPENROUTER_API_KEY": "sk-or-env"])
+        )
+        let environmentStatus = environmentStore.keyStatus()
+
+        XCTAssertEqual(environmentStatus, .environmentFallback)
+        XCTAssertEqual(environmentStatus.indicator, .needsAttention)
+        XCTAssertEqual(environmentStatus.editorMode, .environmentFallback)
+        XCTAssertEqual(try environmentStore.loadAPIKeyForRefresh()?.apiKey, "sk-or-env")
+    }
+
     func testCurrentAPIKeyReturnsEffectiveKey() {
         let store = OpenRouterAuthStore(
             files: FakeFiles([OpenRouterAuthStore.configPaths[0]: #"{"apiKey":"sk-or-file"}"#]),
@@ -193,6 +217,20 @@ final class OpenRouterUsageMapperTests: XCTestCase {
 
 @MainActor
 final class OpenRouterProviderTests: XCTestCase {
+    func testCreditsCancellationStopsBeforeKeyEndpoint() async {
+        let http = RoutingHTTPClient { _ in throw CancellationError() }
+        let provider = OpenRouterProvider(
+            authStore: makeAuthStore(key: "sk-or-test"),
+            usageClient: OpenRouterUsageClient(http: http)
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertEqual(http.requests.count, 1)
+        XCTAssertEqual(http.requests[0].url.absoluteString, OpenRouterUsageClient.creditsURL)
+    }
+
     func testRefreshMapsBothEndpoints() async throws {
         let provider = OpenRouterProvider(
             authStore: makeAuthStore(key: "sk-or-test"),
@@ -267,6 +305,26 @@ final class OpenRouterProviderTests: XCTestCase {
         XCTAssertEqual(snapshot.errorCategory, .notLoggedIn)
     }
 
+    func testUnreadableSavedKeyRemainsDetectedAndSurfacesCredentialAccess() async {
+        let path = OpenRouterAuthStore.configPaths[0]
+        let provider = OpenRouterProvider(
+            authStore: OpenRouterAuthStore(
+                files: UnreadableFiles(present: [path]),
+                environment: FakeEnvironment()
+            ),
+            usageClient: OpenRouterUsageClient(http: RoutingHTTPClient { _ in
+                XCTFail("should not hit the network without a readable key")
+                return jsonResponse([:])
+            })
+        )
+
+        let detected = await provider.hasLocalCredentials()
+        let snapshot = await provider.refresh()
+
+        XCTAssertTrue(detected)
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+    }
+
     func testRefreshOnAuthFailureReportsInvalidKey() async {
         // Both endpoints reject the key — nothing usable comes back, so it's a hard auth failure.
         let provider = OpenRouterProvider(
@@ -316,6 +374,15 @@ final class OpenRouterProviderTests: XCTestCase {
 
         try provider.deleteAPIKey()
         XCTAssertEqual(provider.apiKeyStatus, .fromEnvironment)
+    }
+
+    func testUnreadableSavedKeyFallsBackToEnvironmentForRefresh() throws {
+        let store = OpenRouterAuthStore(
+            files: UnreadableFiles(present: [OpenRouterAuthStore.configPaths[0]]),
+            environment: FakeEnvironment(["OPENROUTER_API_KEY": "sk-or-env"])
+        )
+
+        XCTAssertEqual(try store.loadAPIKeyForRefresh()?.apiKey, "sk-or-env")
     }
 
     private func makeAuthStore(key: String) -> OpenRouterAuthStore {

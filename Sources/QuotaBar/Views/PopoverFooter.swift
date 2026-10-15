@@ -93,13 +93,10 @@ struct PopoverFooter: View {
     private func refreshNow() {
         guard !isUpdating else { return }
         guard PopoverRefreshPolicy.decision(for: .manualRefresh) == .forceFullRefresh else { return }
-        let interactionGate = CredentialInteractionGate()
         Task {
-            await ProviderRefreshContext.$isManual.withValue(true) {
-                await ProviderRefreshContext.$credentialInteractionGate.withValue(interactionGate) {
-                    await withThrottledFullAccounting {
-                        await dataStore.refreshAll(force: true)
-                    }
+            await withManualRefresh {
+                await withThrottledFullAccounting {
+                    await dataStore.refreshAll(force: true)
                 }
             }
         }
@@ -107,8 +104,8 @@ struct PopoverFooter: View {
 
     private func updateStatusText(now: Date) -> String {
         if isUpdating { return "Updating…" }
-        let base = dataStore.lastRefreshAt ?? now
-        let remaining = max(0, base.addingTimeInterval(RefreshSetting.interval).timeIntervalSince(now))
+        let base = dataStore.lastQuotaRefreshAt ?? now
+        let remaining = max(0, base.addingTimeInterval(RefreshSetting.quotaInterval).timeIntervalSince(now))
         let totalSeconds = Int(remaining.rounded(.up))
         if totalSeconds >= 60 {
             let minutes = Int((Double(totalSeconds) / 60).rounded(.up))

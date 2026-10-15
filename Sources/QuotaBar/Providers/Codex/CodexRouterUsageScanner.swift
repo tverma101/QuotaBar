@@ -316,6 +316,7 @@ actor CodexRouterUsageScanner {
             let cached = min(event.cachedInputTokens, input)
             let output = event.outputTokens
             let reasoning = event.reasoningTokens
+            let hasCompleteCostBreakdown = event.hasCompleteMeasuredCostBreakdown
             // OpenAI/Codex `total_tokens` is input+output; reasoning is a subset of output. Never
             // add reasoning on top when totalTokens is absent — that double-counted tokens.
             let total = event.totalTokens ?? ProviderParse.addingSaturating(input, output)
@@ -351,6 +352,11 @@ actor CodexRouterUsageScanner {
             // Router rows omit serviceTier today (and Codex config often uses `default`), so
             // standard API rates apply unless the ledger stamps priority/fast.
             let isPriorityTier = event.serviceTier == "fast" || event.serviceTier == "priority"
+            let serviceTierMultiplier = CodexLogUsageScanner.codexServiceTierMultiplier(
+                for: resolvedPricing.pricingModel,
+                serviceTier: event.serviceTier
+            )
+            let appliesServiceTier = serviceTierMultiplier != nil
             let logEvent = CodexLogUsageScanner.Event(
                 timestamp: event.timestamp,
                 model: model,
@@ -360,22 +366,28 @@ actor CodexRouterUsageScanner {
                 output: output,
                 reasoning: reasoning,
                 total: total,
-                isFast: isPriorityTier
+                isFast: isPriorityTier || appliesServiceTier,
+                serviceTier: event.serviceTier
             )
             // Public-API-rate comparison: plain catalog rates, no router priority/fast adjustments.
-            fold.accumulator.addApiEstimate(day: day, cost: resolvedPricing.rates.costDollars(
+            let apiEstimate = resolvedPricing.rates.costDollars(
                 for: TokenBreakdown(
                     input: max(0, input - cached),
                     cacheRead: cached,
                     output: output
                 )
-            ))
+            )
+            fold.accumulator.recordApiEstimate(
+                day: day,
+                cost: hasCompleteCostBreakdown ? apiEstimate : nil,
+                tokens: total
+            )
             let cost = CodexLogUsageScanner.cost(
                 rates: resolvedPricing.rates,
                 event: logEvent,
                 model: resolvedPricing.pricingModel,
-                fastTier: isPriorityTier,
-                fastMultiplier: resolvedPricing.priorityMultiplier
+                fastTier: isPriorityTier || appliesServiceTier,
+                fastMultiplier: serviceTierMultiplier ?? resolvedPricing.priorityMultiplier
             )
             // `pricingModel` is the identity: the router stamps the upstream path onto its slugs, so the
             // same model arrives tagged and untagged. Keying the row by the raw slug split it in two and
@@ -388,6 +400,13 @@ actor CodexRouterUsageScanner {
                 model: model,
                 canonical: resolvedPricing.canonicalModel
             )
+            if !hasCompleteCostBreakdown {
+                fold.accumulator.markCostIncomplete(
+                    day: day,
+                    model: model,
+                    canonical: resolvedPricing.canonicalModel
+                )
+            }
         }
 
         // Unit tests inject an in-memory ledger, but still use the production byte parser so the
@@ -1043,10 +1062,23 @@ actor CodexRouterUsageScanner {
         var outputTokens: Int
         var reasoningTokens: Int
         var totalTokens: Int?
+        /// This estimate is never added to usage. It only tells reconciliation that the router's
+        /// input count is incomplete when it reports zero measured input alongside an estimate.
+        var hasEstimatedInputTokens: Bool? = nil
         var accountId: String?
         var accountFingerprint: String?
         /// Codex `service_tier` when the router stamped it (`priority` / `fast` / `default` / …).
         var serviceTier: String?
+
+        /// The estimate is deliberately excluded from measured usage. A reported total that cannot be
+        /// reconciled to measured input + output likewise lacks a complete priceable breakdown.
+        var hasCompleteMeasuredCostBreakdown: Bool {
+            guard hasEstimatedInputTokens != true else { return false }
+            guard let totalTokens else { return true }
+            let measuredTotal = inputTokens.addingReportingOverflow(outputTokens)
+            guard !measuredTotal.overflow else { return false }
+            return totalTokens == measuredTotal.partialValue
+        }
     }
 
     /// True when the router metered this turn against an OpenCode-hosted account.
@@ -1247,6 +1279,7 @@ actor CodexRouterUsageScanner {
             let cached = min(event.cachedInputTokens, input)
             let output = event.outputTokens
             let reasoning = event.reasoningTokens
+            let hasCompleteCostBreakdown = event.hasCompleteMeasuredCostBreakdown
             let total = event.totalTokens ?? ProviderParse.addingSaturating(input, output)
             guard total > 0 else { return }
             fold.sawRows = true
@@ -1269,6 +1302,11 @@ actor CodexRouterUsageScanner {
                 return
             }
             let isPriorityTier = event.serviceTier == "fast" || event.serviceTier == "priority"
+            let serviceTierMultiplier = CodexLogUsageScanner.codexServiceTierMultiplier(
+                for: resolvedPricing.pricingModel,
+                serviceTier: event.serviceTier
+            )
+            let appliesServiceTier = serviceTierMultiplier != nil
             let logEvent = CodexLogUsageScanner.Event(
                 timestamp: event.timestamp,
                 model: event.model,
@@ -1278,21 +1316,27 @@ actor CodexRouterUsageScanner {
                 output: output,
                 reasoning: reasoning,
                 total: total,
-                isFast: isPriorityTier
+                isFast: isPriorityTier || appliesServiceTier,
+                serviceTier: event.serviceTier
             )
-            fold.accumulator.addApiEstimate(day: day, cost: resolvedPricing.rates.costDollars(
+            let apiEstimate = resolvedPricing.rates.costDollars(
                 for: TokenBreakdown(
                     input: max(0, input - cached),
                     cacheRead: cached,
                     output: output
                 )
-            ))
+            )
+            fold.accumulator.recordApiEstimate(
+                day: day,
+                cost: hasCompleteCostBreakdown ? apiEstimate : nil,
+                tokens: total
+            )
             let cost = CodexLogUsageScanner.cost(
                 rates: resolvedPricing.rates,
                 event: logEvent,
                 model: resolvedPricing.pricingModel,
-                fastTier: isPriorityTier,
-                fastMultiplier: resolvedPricing.priorityMultiplier
+                fastTier: isPriorityTier || appliesServiceTier,
+                fastMultiplier: serviceTierMultiplier ?? resolvedPricing.priorityMultiplier
             )
             fold.accumulator.add(
                 day: day,
@@ -1301,6 +1345,13 @@ actor CodexRouterUsageScanner {
                 model: event.model,
                 canonical: resolvedPricing.canonicalModel
             )
+            if !hasCompleteCostBreakdown {
+                fold.accumulator.markCostIncomplete(
+                    day: day,
+                    model: event.model,
+                    canonical: resolvedPricing.canonicalModel
+                )
+            }
         }
 
         let priorByPath = Dictionary(uniqueKeysWithValues: (prior?.files ?? []).map { ($0.path, $0) })

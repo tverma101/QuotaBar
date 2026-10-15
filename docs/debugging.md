@@ -74,6 +74,8 @@ short trail in the log file:
   "Refresh" in the row's context menu to force one.
 - **Permissions / keychain prompts on every rebuild.** The script signs with a stable Apple Development
   identity so the permission ACLs stick. If you see repeated prompts, make sure such an identity exists in
-  your keychain (the script warns when it falls back to ad-hoc signing).
+  your keychain (the script warns when it falls back to ad-hoc signing). Background refreshes must never
+  open Keychain UI; an explicit Refresh gets one dialog budget, and a cancelled item is retried only by a
+  later explicit Refresh. Repeated dialogs within one action indicate a regression in the shared gate.
 - **Inspect the local API.** With the app running, `curl 127.0.0.1:6736/v1/usage` shows the same usage
   snapshots the UI uses — handy to confirm whether a problem is in fetching/mapping or in the UI.

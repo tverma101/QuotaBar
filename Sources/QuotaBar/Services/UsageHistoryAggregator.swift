@@ -74,15 +74,19 @@ enum UsageHistoryAggregator {
         includedDays: Set<String>,
         detailedDays: Set<String>
     ) -> ProviderUsageHistory {
-        var days: [String: (tokens: Int, cost: Double?, sawCost: Bool)] = [:]
+        var days: [String: (tokens: Int, cost: Double?, sawCost: Bool, costIsComplete: Bool)] = [:]
         var apiEstimates: [String: Double] = [:]
+        var apiEstimateIncompleteDays: Set<String> = []
         var models: [String: [String: ModelAccumulator]] = [:]
         var unknown: [String: Set<String>] = [:]
 
         for history in histories {
             for day in history.series.daily where includedDays.contains(day.date) {
-                var value = days[day.date] ?? (0, nil, false)
+                var value = days[day.date] ?? (0, nil, false, true)
                 value.tokens = ProviderParse.addingSaturating(value.tokens, day.totalTokens)
+                if day.totalTokens > 0 && (!day.costIsComplete || day.costUSD == nil) {
+                    value.costIsComplete = false
+                }
                 if let cost = day.costUSD {
                     value.cost = (value.cost ?? 0) + cost
                     value.sawCost = true
@@ -92,6 +96,10 @@ enum UsageHistoryAggregator {
             for (day, estimate) in history.apiEstimateByDay ?? [:] where includedDays.contains(day) {
                 apiEstimates[day, default: 0] += estimate
             }
+            apiEstimateIncompleteDays.formUnion(
+                (history.apiEstimateIncompleteDays ?? Set(history.unknownModelsByDay.keys))
+                    .filter(includedDays.contains)
+            )
             for day in history.modelUsage?.daily ?? [] where detailedDays.contains(day.date) {
                 for model in day.models {
                     models[day.date, default: [:]][model.model.lowercased(), default: ModelAccumulator()]
@@ -103,11 +111,18 @@ enum UsageHistoryAggregator {
             }
         }
 
+        for (day, names) in unknown where !names.isEmpty {
+            guard var value = days[day] else { continue }
+            value.costIsComplete = false
+            days[day] = value
+        }
+
         let series = DailyUsageSeries(daily: days.map { date, value in
             DailyUsageEntry(
                 date: date,
                 totalTokens: value.tokens,
-                costUSD: value.sawCost ? value.cost : nil
+                costUSD: value.sawCost && value.costIsComplete ? value.cost : nil,
+                costIsComplete: value.costIsComplete
             )
         }.sorted { $0.date > $1.date })
 
@@ -122,7 +137,8 @@ enum UsageHistoryAggregator {
             series: series,
             modelUsage: modelDays.isEmpty ? nil : ModelUsageSeries(daily: modelDays),
             unknownModelsByDay: unknown,
-            apiEstimateByDay: apiEstimates.isEmpty ? nil : apiEstimates
+            apiEstimateByDay: apiEstimates.isEmpty ? nil : apiEstimates,
+            apiEstimateIncompleteDays: apiEstimateIncompleteDays
         )
     }
 
@@ -131,6 +147,7 @@ enum UsageHistoryAggregator {
         var tokens = 0
         var cost: Double?
         var sawCost = false
+        var costIsComplete = true
         var variants: [String: VariantAccumulator] = [:]
 
         mutating func add(_ model: ModelUsageEntry) {
@@ -139,6 +156,8 @@ enum UsageHistoryAggregator {
             if let value = model.costUSD {
                 cost = (cost ?? 0) + value
                 sawCost = true
+            } else if model.totalTokens > 0 {
+                costIsComplete = false
             }
             for variant in model.variants ?? [] {
                 variants[variant.model.lowercased(), default: VariantAccumulator(name: variant.model)]
@@ -152,7 +171,7 @@ enum UsageHistoryAggregator {
             return ModelUsageEntry(
                 model: displayName,
                 totalTokens: tokens,
-                costUSD: sawCost ? cost : nil,
+                costUSD: sawCost && costIsComplete ? cost : nil,
                 variants: mergedVariants.isEmpty ? nil : mergedVariants
             )
         }
@@ -163,17 +182,20 @@ enum UsageHistoryAggregator {
         var tokens = 0
         var cost: Double?
         var sawCost = false
+        var costIsComplete = true
 
         mutating func add(_ variant: ModelUsageVariant) {
             tokens = ProviderParse.addingSaturating(tokens, variant.totalTokens)
             if let value = variant.costUSD {
                 cost = (cost ?? 0) + value
                 sawCost = true
+            } else if variant.totalTokens > 0 {
+                costIsComplete = false
             }
         }
 
         var entry: ModelUsageVariant {
-            ModelUsageVariant(model: name, totalTokens: tokens, costUSD: sawCost ? cost : nil)
+            ModelUsageVariant(model: name, totalTokens: tokens, costUSD: sawCost && costIsComplete ? cost : nil)
         }
     }
 }

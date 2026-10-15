@@ -23,7 +23,7 @@ final class AntigravityProviderTests: XCTestCase {
         ))
         let client = AntigravityUsageClient(lsHTTP: http, http: http)
 
-        _ = await client.refreshGoogleToken("refresh token&=+/?%")
+        _ = try await client.refreshGoogleToken("refresh token&=+/?%")
 
         let request = try XCTUnwrap(http.requests.first)
         XCTAssertEqual(request.method, "POST")
@@ -262,21 +262,61 @@ final class AntigravityProviderTests: XCTestCase {
         XCTAssertEqual(AntigravityAuthStore.extractToken(fromKeychainRaw: "rawtoken")?.accessToken, "rawtoken")
     }
 
-    func testLoadCachedTokenAppliesRefreshBuffer() {
+    func testLoadCachedTokenAppliesRefreshBuffer() throws {
         let now = Date(timeIntervalSince1970: 1_000_000)
-        func store(expiresInSeconds: Double) -> AntigravityAuthStore {
-            let store = AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles(), now: { now })
-            store.cacheToken(
+        let raw = "go-keyring-base64:" + Data(#"{"token":{"refresh_token":"refresh"}}"#.utf8).base64EncodedString()
+        let source = AntigravityKeychainToken(accessToken: nil, refreshToken: "refresh", expiry: nil)
+        func store() -> AntigravityAuthStore {
+            AntigravityAuthStore(keychain: FakeKeychain(raw), files: FakeFiles(), now: { now })
+        }
+        func write(_ store: AntigravityAuthStore, expiresInSeconds: Double) throws {
+            XCTAssertTrue(try store.cacheToken(
                 "ya29.cached",
                 expiresIn: expiresInSeconds,
-                sourceRefreshToken: "refresh"
-            )
-            return store
+                matching: source
+            ))
         }
-        let source = AntigravityKeychainToken(accessToken: nil, refreshToken: "refresh", expiry: nil)
+        let nearExpiry = store()
+        try write(nearExpiry, expiresInSeconds: 30)
         // Within the 60s refresh buffer -> treated as expired (avoids a near-certain 401 + extra refresh).
-        XCTAssertNil(store(expiresInSeconds: 30).loadCachedToken(matching: source))
-        XCTAssertEqual(store(expiresInSeconds: 7200).loadCachedToken(matching: source), "ya29.cached")
+        XCTAssertNil(nearExpiry.loadCachedToken(matching: source))
+        let fresh = store()
+        try write(fresh, expiresInSeconds: 7200)
+        XCTAssertEqual(fresh.loadCachedToken(matching: source), "ya29.cached")
+    }
+
+    func testSuccessfulTokenCacheSurvivesNewManualActionWhenKeychainSourceMatches() async throws {
+        let permissionKey = KeychainItemKey(
+            service: AntigravityAuthStore.keychainService,
+            account: AntigravityAuthStore.keychainAccount
+        )
+        KeychainPermissionGate.shared.reset(permissionKey)
+        defer { KeychainPermissionGate.shared.reset(permissionKey) }
+        let raw = "go-keyring-base64:" + Data(#"{"token":{"access_token":"old-access","refresh_token":"old-refresh"}}"#.utf8).base64EncodedString()
+        let source = AntigravityKeychainToken(accessToken: "old-access", refreshToken: "old-refresh", expiry: nil)
+        let files = FakeFiles()
+        let store = AntigravityAuthStore(keychain: FakeKeychain(raw), files: files)
+        let olderActionID = KeychainPermissionGate.shared.beginManualAction()
+        let saveStarted = DispatchSemaphore(value: 0)
+        let releaseSave = DispatchSemaphore(value: 0)
+        defer { releaseSave.signal() }
+        let save = Task.detached {
+            try await ProviderRefreshContext.$isManual.withValue(true) {
+                try await ProviderRefreshContext.$manualActionID.withValue(olderActionID) {
+                    saveStarted.signal()
+                    _ = releaseSave.wait(timeout: .now() + 5)
+                    return try store.cacheToken("ya29.rotated", expiresIn: 3_600, matching: source)
+                }
+            }
+        }
+
+        XCTAssertEqual(saveStarted.wait(timeout: .now() + 2), .success)
+        _ = KeychainPermissionGate.shared.beginManualAction()
+        releaseSave.signal()
+
+        let didSave = try await save.value
+        XCTAssertTrue(didSave)
+        XCTAssertEqual(store.loadCachedToken(matching: source), "ya29.rotated")
     }
 
     func testLoadKeychainTokenThroughStore() throws {
@@ -288,6 +328,86 @@ final class AntigravityProviderTests: XCTestCase {
         XCTAssertEqual(token?.refreshToken, "1//r")
     }
 
+    func testKeychainCancellationStaysCancellationAndDoesNotLogCredentialFailure() throws {
+        let key = KeychainItemKey(
+            service: AntigravityAuthStore.keychainService,
+            account: AntigravityAuthStore.keychainAccount
+        )
+        KeychainPermissionGate.shared.reset(key)
+        defer { KeychainPermissionGate.shared.reset(key) }
+        let store = AntigravityAuthStore(keychain: CancellationKeychain(), files: FakeFiles())
+
+        let (error, logs) = try captureAntigravityAuthStoreLogs {
+            _ = try store.loadKeychainToken()
+        }
+
+        XCTAssertTrue(error is CancellationError)
+        XCTAssertFalse(logs.contains("keychain credential read failed"), logs)
+        XCTAssertFalse(logs.contains("[ERROR] [auth:antigravity]"), logs)
+    }
+
+    func testRememberedKeychainPermissionDoesNotRepeatAuthInfoLog() throws {
+        let key = KeychainItemKey(
+            service: AntigravityAuthStore.keychainService,
+            account: AntigravityAuthStore.keychainAccount
+        )
+        KeychainPermissionGate.shared.reset(key)
+        defer { KeychainPermissionGate.shared.reset(key) }
+        let keychain = InteractionRequiredKeychain()
+        let store = AntigravityAuthStore(keychain: keychain, files: FakeFiles())
+
+        let (_, logs) = try captureAntigravityAuthStoreLogs {
+            for _ in 0..<3 { _ = try? store.loadKeychainToken() }
+        }
+
+        XCTAssertEqual(keychain.readCount, 1, "the blocked item must be answered from the shared gate")
+        XCTAssertFalse(logs.contains("keychain read needs user interaction"), logs)
+        XCTAssertFalse(logs.contains("use Refresh Now to grant it"), logs)
+    }
+
+    @MainActor
+    func testHasLocalCredentialsDetectsRunningLanguageServerOrAgyWithoutCloudCalls() async {
+        let commands = [
+            "/Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone --override_ide_name antigravity --csrf_token tok --app_data_dir antigravity",
+            "/Users/tester/.local/bin/agy --serve"
+        ]
+
+        for command in commands {
+            let http = FakeHTTPClient(response: HTTPResponse(statusCode: 503, headers: [:], body: Data()))
+            let provider = AntigravityProvider(
+                authStore: AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles()),
+                usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
+                discovery: LanguageServerDiscovery(processRunner: LocalCredentialProcessRunner(command: command)),
+                dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+            )
+
+            let detected = await provider.hasLocalCredentials()
+
+            XCTAssertTrue(detected, "a discovered local server should count: \(command)")
+            XCTAssertTrue(http.requests.isEmpty, "local detection must not call loopback or Google endpoints")
+        }
+    }
+
+    @MainActor
+    func testCancelledKeychainProbeDoesNotCountAsCredentials() async {
+        let key = KeychainItemKey(
+            service: AntigravityAuthStore.keychainService,
+            account: AntigravityAuthStore.keychainAccount
+        )
+        KeychainPermissionGate.shared.reset(key)
+        defer { KeychainPermissionGate.shared.reset(key) }
+        let http = FakeHTTPClient(response: HTTPResponse(statusCode: 503, headers: [:], body: Data()))
+        let provider = AntigravityProvider(
+            authStore: AntigravityAuthStore(keychain: CancellationKeychain(), files: FakeFiles()),
+            usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let detected = await provider.hasLocalCredentials()
+        XCTAssertFalse(detected)
+    }
+
     // MARK: - Provider integration (Cloud Code path, no language server)
 
     /// A provider on the Cloud Code path (no language server), signed in via a wrapped keychain
@@ -295,11 +415,14 @@ final class AntigravityProviderTests: XCTestCase {
     @MainActor
     private func makeCloudCodeProvider(
         routing: RoutingHTTPClient,
-        keychainExpiry: String? = "2099-01-01T00:00:00Z"
+        keychainExpiry: String? = "2099-01-01T00:00:00Z",
+        refreshToken: String? = "1//r"
     ) -> AntigravityProvider {
         let wrapped = keychainExpiry.map { expiry in
-            let inner = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"\#(expiry)"}}"#
-            return "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
+            var token: [String: Any] = ["access_token": "ya29.kc", "expiry": expiry]
+            if let refreshToken { token["refresh_token"] = refreshToken }
+            let json = (try? JSONSerialization.data(withJSONObject: ["token": token], options: [.sortedKeys])) ?? Data()
+            return "go-keyring-base64:" + json.base64EncodedString()
         }
         return AntigravityProvider(
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
@@ -319,6 +442,7 @@ final class AntigravityProviderTests: XCTestCase {
         }}
         """
         let planJSON = #"{"paidTier":{"name":"Google AI Pro"}}"#
+        let codeAssistCalls = Counter()
 
         let routing = RoutingHTTPClient { request in
             let path = request.url.path
@@ -330,6 +454,7 @@ final class AntigravityProviderTests: XCTestCase {
                 return HTTPResponse(statusCode: 200, headers: [:], body: Data(modelsJSON.utf8))
             }
             if path.contains("loadCodeAssist") {
+                _ = codeAssistCalls.next()
                 return HTTPResponse(statusCode: 200, headers: [:], body: Data(planJSON.utf8))
             }
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
@@ -343,6 +468,31 @@ final class AntigravityProviderTests: XCTestCase {
         XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Claude"])
         XCTAssertEqual(used(snapshot.lines[0]), 60)
         XCTAssertEqual(used(snapshot.lines[1]), 30)
+        XCTAssertEqual(
+            codeAssistCalls.next(),
+            1,
+            "summary fallback should reuse the concurrently started plan/project request"
+        )
+    }
+
+    @MainActor
+    func testQuotaSummaryAndPlanLookupRunConcurrently() async {
+        let http = AntigravityPlanConcurrencyHTTPClient()
+        let wrapped = #"{"token":{"access_token":"ya29.kc","expiry":"2099-01-01T00:00:00Z","refresh_token":"1//r"}}"#
+        let provider = AntigravityProvider(
+            authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
+            usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let refresh = Task { await provider.refresh() }
+        let planStartedBeforeSummaryFinished = await http.waitForPlanStart(timeout: .seconds(2))
+        await http.releaseSummary()
+        let snapshot = await refresh.value
+
+        XCTAssertTrue(planStartedBeforeSummaryFinished, "plan lookup should overlap the quota summary request")
+        XCTAssertEqual(snapshot.plan, "Pro")
     }
 
     @MainActor
@@ -366,6 +516,267 @@ final class AntigravityProviderTests: XCTestCase {
     }
 
     @MainActor
+    func testCloudCodeCancellationDoesNotTryAnotherBaseOrFallbackEndpoint() async {
+        let routing = RoutingHTTPClient { _ in throw URLError(.cancelled) }
+        let provider = makeCloudCodeProvider(routing: routing)
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        let quotaRequests = routing.requests.filter { $0.url.path == AntigravityUsageClient.quotaSummaryPath }
+        let planRequests = routing.requests.filter { $0.url.path == AntigravityUsageClient.loadCodeAssistPath }
+        XCTAssertEqual(quotaRequests.count, 1, "cancellation must not retry the quota request: \(routing.requests.map { $0.url.absoluteString })")
+        XCTAssertLessThanOrEqual(planRequests.count, 1, "the independent plan lookup must not retry")
+        XCTAssertEqual(routing.requests.count, quotaRequests.count + planRequests.count,
+                       "cancellation must stop before alternate hosts and legacy endpoints")
+        XCTAssertTrue(routing.requests.allSatisfy { $0.url.host == "daily-cloudcode-pa.googleapis.com" })
+    }
+
+    @MainActor
+    func testCancellationDuringSuccessfulKeychainReadStopsCloudCodeRequests() async {
+        let keychainKey = KeychainItemKey(
+            service: AntigravityAuthStore.keychainService,
+            account: AntigravityAuthStore.keychainAccount
+        )
+        KeychainPermissionGate.shared.reset(keychainKey)
+        defer { KeychainPermissionGate.shared.reset(keychainKey) }
+
+        let rawToken = "go-keyring-base64:" + Data(
+            #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2099-01-01T00:00:00Z"}}"#.utf8
+        ).base64EncodedString()
+        let keychain = BlockingSuccessfulKeychain(value: rawToken)
+        let routing = RoutingHTTPClient { request in
+            XCTFail("Cloud Code must not run after cancellation: \(request.url)")
+            return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: AntigravityAuthStore(keychain: keychain, files: FakeFiles()),
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let refresh = Task { @MainActor in await provider.refresh() }
+        defer { keychain.releaseRead.signal() }
+        let keychainReadStarted = await Task.detached {
+            waitForAntigravityTestSignal(keychain.readStarted)
+        }.value
+        XCTAssertEqual(keychainReadStarted, .success)
+        refresh.cancel()
+        keychain.releaseRead.signal()
+
+        let snapshot = await refresh.value
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertTrue(routing.requests.isEmpty)
+    }
+
+    @MainActor
+    func testCancellationAfterSuccessfulCachedTokenReadStopsCloudCodeRequests() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let keychainKey = KeychainItemKey(
+            service: AntigravityAuthStore.keychainService,
+            account: AntigravityAuthStore.keychainAccount
+        )
+        KeychainPermissionGate.shared.reset(keychainKey)
+        defer { KeychainPermissionGate.shared.reset(keychainKey) }
+
+        let rawToken = "go-keyring-base64:" + Data(
+            #"{"token":{"access_token":"ya29.expired","refresh_token":"1//r","expiry":"2000-01-01T00:00:00Z"}}"#.utf8
+        ).base64EncodedString()
+        let files = BlockingAntigravityFiles()
+        let authStore = AntigravityAuthStore(
+            keychain: FakeKeychain(rawToken),
+            files: files,
+            now: { now }
+        )
+        XCTAssertTrue(try authStore.cacheToken(
+            "ya29.cached",
+            expiresIn: 3600,
+            matching: AntigravityKeychainToken(accessToken: "ya29.expired", refreshToken: "1//r", expiry: Date(timeIntervalSince1970: 0))
+        ))
+        files.blockNextRead()
+
+        let routing = RoutingHTTPClient { request in
+            XCTFail("Cloud Code must not run after cancellation: \(request.url)")
+            return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: authStore,
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            now: { now }
+        )
+
+        let refresh = Task { @MainActor in await provider.refresh() }
+        defer { files.releaseRead.signal() }
+        let cachedReadStarted = await Task.detached {
+            waitForAntigravityTestSignal(files.readStarted)
+        }.value
+        XCTAssertEqual(cachedReadStarted, .success)
+        refresh.cancel()
+        files.releaseRead.signal()
+
+        let snapshot = await refresh.value
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertTrue(routing.requests.isEmpty)
+    }
+
+    @MainActor
+    func testCancellationAfterDuplicateCachedTokenReadStopsCloudCodeRequests() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let keychainKey = KeychainItemKey(
+            service: AntigravityAuthStore.keychainService,
+            account: AntigravityAuthStore.keychainAccount
+        )
+        KeychainPermissionGate.shared.reset(keychainKey)
+        defer { KeychainPermissionGate.shared.reset(keychainKey) }
+
+        let rawToken = "go-keyring-base64:" + Data(
+            #"{"token":{"access_token":"ya29.cached","refresh_token":"1//r","expiry":"2099-01-01T00:00:00Z"}}"#.utf8
+        ).base64EncodedString()
+        let files = BlockingAntigravityFiles()
+        let authStore = AntigravityAuthStore(
+            keychain: FakeKeychain(rawToken),
+            files: files,
+            now: { now }
+        )
+        XCTAssertTrue(try authStore.cacheToken(
+            "ya29.cached",
+            expiresIn: 3600,
+            matching: AntigravityKeychainToken(accessToken: "ya29.cached", refreshToken: "1//r", expiry: Date(timeIntervalSince1970: 4_102_444_800))
+        ))
+        files.blockNextRead()
+
+        let routing = RoutingHTTPClient { request in
+            XCTFail("Cloud Code must not run after cancellation: \(request.url)")
+            return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: authStore,
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+            now: { now }
+        )
+
+        let refresh = Task { @MainActor in await provider.refresh() }
+        defer { files.releaseRead.signal() }
+        let cachedReadStarted = await Task.detached {
+            waitForAntigravityTestSignal(files.readStarted)
+        }.value
+        XCTAssertEqual(cachedReadStarted, .success)
+        refresh.cancel()
+        files.releaseRead.signal()
+
+        let snapshot = await refresh.value
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertTrue(routing.requests.isEmpty)
+    }
+
+    @MainActor
+    func testOAuthRefreshCancellationDoesNotBecomeTransientFailureOrRetry() async {
+        let routing = RoutingHTTPClient { request in
+            if request.url.host == "oauth2.googleapis.com" {
+                throw URLError(.cancelled)
+            }
+            return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+        }
+        let provider = makeCloudCodeProvider(routing: routing)
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        // The plan lookup starts in parallel with the first quota request. Cancellation must stop
+        // after that pair and the single OAuth exchange; it must not retry the quota request.
+        XCTAssertEqual(routing.requests.count, 3, "parallel plan + quota lookup, then one canceled OAuth exchange; no quota retry")
+        XCTAssertEqual(routing.requests.last?.url.host, "oauth2.googleapis.com")
+        XCTAssertEqual(routing.requests.filter { $0.url.path.contains("retrieveUserQuotaSummary") }.count, 1)
+    }
+
+    @MainActor
+    func testLateOAuthRefreshDoesNotCacheAfterKeychainLogoutOrAccountSwitch() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let keychainKey = KeychainItemKey(
+            service: AntigravityAuthStore.keychainService,
+            account: AntigravityAuthStore.keychainAccount
+        )
+        KeychainPermissionGate.shared.reset(keychainKey)
+        defer { KeychainPermissionGate.shared.reset(keychainKey) }
+
+        func wrappedToken(access: String, refresh: String, expiry: String) -> String {
+            let json = #"{"token":{"access_token":"\#(access)","refresh_token":"\#(refresh)","expiry":"\#(expiry)"}}"#
+            return "go-keyring-base64:" + Data(json.utf8).base64EncodedString()
+        }
+        for replacementRefreshToken in [Optional<String>.none, Optional("2//new")] {
+            let keychain = FakeKeychain(wrappedToken(access: "ya29.old", refresh: "1//old", expiry: "2000-01-01T00:00:00Z"))
+            let files = FakeFiles()
+            let gate = AntigravityOAuthResponseGate()
+            let routing = RoutingHTTPClient { request in
+                if request.url.host == "oauth2.googleapis.com" {
+                    await gate.pause()
+                    return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"late-access","expires_in":3600}"#.utf8))
+                }
+                return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+            }
+            let authStore = AntigravityAuthStore(keychain: keychain, files: files, now: { now })
+            let provider = AntigravityProvider(
+                authStore: authStore,
+                usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+                discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+                dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" }),
+                now: { now }
+            )
+            let refresh = Task { @MainActor in await provider.refresh() }
+
+            await gate.waitUntilPaused()
+            keychain.value = replacementRefreshToken.map {
+                wrappedToken(access: "ya29.new-account", refresh: $0, expiry: "2099-01-01T00:00:00Z")
+            }
+            await gate.open()
+
+            let snapshot = await refresh.value
+            XCTAssertEqual(snapshot.errorCategory, .authExpired)
+            XCTAssertNil(files.files[AntigravityAuthStore.cachePath], "the derived token cache must stay empty after logout/account switch")
+            XCTAssertEqual(routing.requests.last?.url.host, "oauth2.googleapis.com", "no request may use the late token after the source changes")
+        }
+    }
+
+    @MainActor
+    func testCloudCode403IsPermissionDeniedAndDoesNotRefreshOAuth() async {
+        let routing = RoutingHTTPClient { request in
+            if request.url.host == "oauth2.googleapis.com" {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"refreshed","expires_in":3600}"#.utf8))
+            }
+            return HTTPResponse(statusCode: 403, headers: [:], body: Data())
+        }
+        let provider = makeCloudCodeProvider(routing: routing)
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .http4xx)
+        XCTAssertFalse(
+            routing.requests.contains { $0.url.host == "oauth2.googleapis.com" },
+            "permission denial must not start a token refresh"
+        )
+    }
+
+    @MainActor
+    func testExpiredAccessTokenWithoutRefreshTokenReportsExpiredAuth() async {
+        let routing = RoutingHTTPClient { _ in HTTPResponse(statusCode: 503, headers: [:], body: Data()) }
+        let provider = makeCloudCodeProvider(
+            routing: routing,
+            keychainExpiry: "2000-01-01T00:00:00Z",
+            refreshToken: nil
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .authExpired)
+        XCTAssertTrue(routing.requests.isEmpty, "an already-expired access token must not be sent")
+    }
+
+    @MainActor
     func testDeadRefreshTokenReportsAuthExpired() async {
         // Access token already expired (skipped); refresh returns 400 invalid_grant. A dead refresh
         // token is expired auth (.authExpired), not a transient outage.
@@ -378,6 +789,57 @@ final class AntigravityProviderTests: XCTestCase {
         let provider = makeCloudCodeProvider(routing: routing, keychainExpiry: "2000-01-01T00:00:00Z")
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.errorCategory, .authExpired)
+    }
+
+    @MainActor
+    func testInvalidOAuthClientIsConfigurationErrorNotExpiredSignIn() async {
+        let routing = RoutingHTTPClient { request in
+            if request.url.host == "oauth2.googleapis.com" {
+                return HTTPResponse(
+                    statusCode: 401,
+                    headers: [:],
+                    body: Data(#"{"error":"invalid_client"}"#.utf8)
+                )
+            }
+            return HTTPResponse(statusCode: 503, headers: [:], body: Data())
+        }
+        let provider = makeCloudCodeProvider(routing: routing, keychainExpiry: "2000-01-01T00:00:00Z")
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .authInvalid)
+        guard case .badge(_, let message, _, _) = snapshot.lines.first else {
+            return XCTFail("expected the OAuth client configuration error badge")
+        }
+        XCTAssertTrue(message.contains("OAuth client configuration"))
+        XCTAssertFalse(message.contains("sign-in expired"))
+    }
+
+    @MainActor
+    func testDeletedClientAndInvalidOAuthRequestAreNotExpiredSignIn() async {
+        for oauthError in ["deleted_client", "invalid_request"] {
+            let routing = RoutingHTTPClient { request in
+                if request.url.host == "oauth2.googleapis.com" {
+                    return HTTPResponse(
+                        statusCode: 400,
+                        headers: [:],
+                        body: Data("{\"error\":\"\(oauthError)\"}".utf8)
+                    )
+                }
+                return HTTPResponse(statusCode: 503, headers: [:], body: Data())
+            }
+            let provider = makeCloudCodeProvider(routing: routing, keychainExpiry: "2000-01-01T00:00:00Z")
+
+            let snapshot = await provider.refresh()
+
+            XCTAssertEqual(snapshot.errorCategory, .authInvalid, oauthError)
+            guard case .badge(_, let message, _, _) = snapshot.lines.first else {
+                XCTFail("expected an OAuth request configuration error for \(oauthError)")
+                continue
+            }
+            XCTAssertTrue(message.contains("OAuth client configuration"), oauthError)
+            XCTAssertFalse(message.contains("sign-in expired"), oauthError)
+        }
     }
 
     @MainActor
@@ -437,6 +899,18 @@ final class AntigravityProviderTests: XCTestCase {
 struct EmptyProcessRunner: ProcessRunning {
     func run(executable: String, arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> ProcessResult {
         ProcessResult(exitCode: 0, stdout: "", stderr: "")
+    }
+}
+
+private struct LocalCredentialProcessRunner: ProcessRunning {
+    var command: String
+
+    func run(executable: String, arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> ProcessResult {
+        if executable.hasSuffix("/ps") {
+            return ProcessResult(exitCode: 0, stdout: "4276 \(command)\n", stderr: "")
+        }
+        let lsof = "language_ 4276 user 6u IPv4 0x0 0t0 TCP 127.0.0.1:52168 (LISTEN)\n"
+        return ProcessResult(exitCode: 0, stdout: lsof, stderr: "")
     }
 }
 
@@ -529,4 +1003,195 @@ extension AntigravityProviderTests {
         )
         XCTAssertEqual(keychain.reads, 4)
     }
+}
+
+private struct CancellationKeychain: KeychainAccessing {
+    func readGenericPassword(service: String) throws -> String? { throw CancellationError() }
+    func writeGenericPassword(service: String, value: String) throws {}
+}
+
+private final class BlockingSuccessfulKeychain: KeychainAccessing, @unchecked Sendable {
+    let value: String
+    let readStarted = DispatchSemaphore(value: 0)
+    let releaseRead = DispatchSemaphore(value: 0)
+
+    init(value: String) {
+        self.value = value
+    }
+
+    func readGenericPassword(service: String) throws -> String? {
+        readStarted.signal()
+        _ = releaseRead.wait(timeout: .now() + 5)
+        return value
+    }
+
+    func writeGenericPassword(service: String, value: String) throws {}
+}
+
+private final class BlockingAntigravityFiles: TextFileAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var contents: [String: String] = [:]
+    private var shouldBlockNextRead = false
+    let readStarted = DispatchSemaphore(value: 0)
+    let releaseRead = DispatchSemaphore(value: 0)
+
+    func blockNextRead() {
+        lock.lock()
+        shouldBlockNextRead = true
+        lock.unlock()
+    }
+
+    func exists(_ path: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return contents[path] != nil
+    }
+
+    func readTextIfPresent(_ path: String) throws -> String? {
+        lock.lock()
+        let content = contents[path]
+        let shouldBlock = shouldBlockNextRead
+        shouldBlockNextRead = false
+        lock.unlock()
+        if shouldBlock {
+            readStarted.signal()
+            _ = releaseRead.wait(timeout: .now() + 5)
+        }
+        return content
+    }
+
+    func readText(_ path: String) throws -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return contents[path] ?? ""
+    }
+
+    func writeText(_ path: String, _ text: String) throws {
+        lock.lock()
+        contents[path] = text
+        lock.unlock()
+    }
+
+    func remove(_ path: String) throws {
+        lock.lock()
+        contents.removeValue(forKey: path)
+        lock.unlock()
+    }
+}
+
+private actor AntigravityPlanConcurrencyHTTPClient: HTTPClient {
+    private var summaryReleased = false
+    private var summaryContinuation: CheckedContinuation<HTTPResponse, Never>?
+    private var planStarted = false
+    private var planStartContinuation: CheckedContinuation<Bool, Never>?
+
+    private let summaryResponse = HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"groups":[]}"#.utf8))
+    private let planResponse = HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"paidTier":{"name":"Google AI Pro"}}"#.utf8))
+
+    func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        switch request.url.path {
+        case AntigravityUsageClient.quotaSummaryPath:
+            guard !summaryReleased else { return summaryResponse }
+            return await withCheckedContinuation { summaryContinuation = $0 }
+        case AntigravityUsageClient.loadCodeAssistPath:
+            planStarted = true
+            planStartContinuation?.resume(returning: true)
+            planStartContinuation = nil
+            return planResponse
+        default:
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+    }
+
+    func waitForPlanStart(timeout: Duration) async -> Bool {
+        guard !planStarted else { return true }
+        return await withCheckedContinuation { continuation in
+            planStartContinuation = continuation
+            Task {
+                try? await Task.sleep(for: timeout)
+                self.finishPlanWaitAsTimedOut()
+            }
+        }
+    }
+
+    func releaseSummary() {
+        summaryReleased = true
+        summaryContinuation?.resume(returning: summaryResponse)
+        summaryContinuation = nil
+    }
+
+    private func finishPlanWaitAsTimedOut() {
+        planStartContinuation?.resume(returning: planStarted)
+        planStartContinuation = nil
+    }
+}
+
+private func waitForAntigravityTestSignal(_ semaphore: DispatchSemaphore) -> DispatchTimeoutResult {
+    semaphore.wait(timeout: .now() + 2)
+}
+
+private actor AntigravityOAuthResponseGate {
+    private var paused = false
+    private var released = false
+    private var pauseContinuation: CheckedContinuation<Void, Never>?
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        paused = true
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        guard !released else { return }
+        await withCheckedContinuation { pauseContinuation = $0 }
+    }
+
+    func waitUntilPaused() async {
+        guard !paused else { return }
+        await withCheckedContinuation { enteredContinuation = $0 }
+    }
+
+    func open() {
+        released = true
+        pauseContinuation?.resume()
+        pauseContinuation = nil
+    }
+}
+
+private func captureAntigravityAuthStoreLogs(
+    _ operation: () throws -> Void
+) throws -> (error: Error?, logs: String) {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("OpenUsageTests.AntigravityCancellation.\(UUID().uuidString)", isDirectory: true)
+    let sink = LogFile(directory: directory, fileName: "OpenUsage.log")
+    sink.open()
+    let originalSink = AppLog.sink
+    AppLog.sink = sink
+    AppLog.reloadLevel(.info)
+    defer {
+        AppLog.sink = originalSink
+        AppLog.reloadLevel()
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    var caught: Error?
+    do { try operation() } catch { caught = error }
+    return (caught, try String(contentsOf: sink.fileURL, encoding: .utf8))
+}
+
+private final class InteractionRequiredKeychain: KeychainAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _readCount = 0
+
+    var readCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _readCount
+    }
+
+    func readGenericPassword(service: String) throws -> String? {
+        lock.lock()
+        _readCount += 1
+        lock.unlock()
+        throw KeychainError.interactionNotAllowed
+    }
+
+    func writeGenericPassword(service: String, value: String) throws {}
 }

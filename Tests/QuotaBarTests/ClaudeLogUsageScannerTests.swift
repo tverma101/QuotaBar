@@ -302,7 +302,7 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
 
         // Unpriced usage keeps counting tokens (the history screen shows them) but contributes no
         // cost — its day stays backed by the priced rows so the reveal can backfill dollars later.
-        XCTAssertEqual(scan.series.daily, [DailyUsageEntry(date: day, totalTokens: 1515, costUSD: 0.02)])
+        XCTAssertEqual(scan.series.daily, [DailyUsageEntry(date: day, totalTokens: 1515, costUSD: 0.02, costIsComplete: false)])
         XCTAssertEqual(scan.unknownModelsByDay[day], ["mystery-model"])
         XCTAssertEqual(scan.modelUsage?.daily.first?.models, [
             ModelUsageEntry(model: "claude-test-model", totalTokens: 1500, costUSD: 0.02),
@@ -570,6 +570,41 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
         XCTAssertEqual(second.series.daily.first?.costUSD ?? 0, 0.25, accuracy: 1e-9)
     }
 
+    func testOrganizationScanFailsWhenAnySessionOwnershipPreambleCannotBeRead() async throws {
+        let now = Date()
+        let timestamp = OpenUsageISO8601.string(from: now)
+        let usage = ClaudeLogFixture.usageLine(
+            timestamp: timestamp, input: 100, output: 50, costUSD: 0.25
+        )
+        let home = try ClaudeLogFixture.makeUserHome(claudeFiles: [
+            "workspace/a-owned.jsonl": #"{"ownerOrganizationUuid":"org-a","ownerAccountUuid":"user-a"}"# + "\n" + usage,
+            "workspace/z-unreadable.jsonl": #"{"ownerOrganizationUuid":"org-a","ownerAccountUuid":"user-a"}"# + "\n" + usage
+        ])
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let scanner = ClaudeLogUsageScanner(
+            environment: FakeEnvironment([:]),
+            homeDirectory: { home },
+            incrementalScanner: IncrementalJSONLScanner<Entry>(),
+            accountUUID: "user-a",
+            organizationUUID: "org-a",
+            ownershipLookup: { file in
+                if file.path.hasSuffix("z-unreadable.jsonl") { return .unreadable }
+                return .readable(organizationID: "org-a", accountID: "user-a", isAmbiguous: false)
+            }
+        )
+        let result = await scanner.scanResult(now: now, pricing: pricing)
+        guard case .incomplete = result else {
+            return XCTFail("one unreadable owner preamble must invalidate the account-scoped fold")
+        }
+
+        let folded = await scanner.foldParsedEntries(
+            now: now,
+            roots: [home.appendingPathComponent(".claude")]
+        ) { _ in }
+        XCTAssertFalse(folded, "OpenCode must also reject the incomplete Claude source")
+    }
+
     func testOrganizationScanRecoversOnlyMatchingIndexedDesktopSessionsAndSubagents() async throws {
         let now = Date()
         let timestamp = OpenUsageISO8601.string(from: now)
@@ -636,6 +671,39 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
 
         XCTAssertEqual(scan.series.daily.first?.totalTokens, 165)
         XCTAssertEqual(scan.series.daily.first?.costUSD ?? 0, 0.30, accuracy: 1e-9)
+    }
+
+    func testOrganizationScanFailsClosedWhenDesktopSessionIndexCannotBeParsed() async throws {
+        let now = Date()
+        let sessionID = "88888888-8888-4888-8888-888888888888"
+        let home = try ClaudeLogFixture.makeUserHome(claudeFiles: [
+            "workspace/\(sessionID).jsonl": ClaudeLogFixture.usageLine(
+                timestamp: OpenUsageISO8601.string(from: now), input: 100, output: 50
+            )
+        ])
+        defer { try? FileManager.default.removeItem(at: home) }
+        let indexDirectory = home.appendingPathComponent(
+            "Library/Application Support/Claude/claude-code-sessions/user-a/org-a"
+        )
+        try FileManager.default.createDirectory(at: indexDirectory, withIntermediateDirectories: true)
+        try "{ malformed index".write(
+            to: indexDirectory.appendingPathComponent("local_session.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let scanner = ClaudeLogUsageScanner(
+            environment: FakeEnvironment([:]),
+            homeDirectory: { home },
+            incrementalScanner: IncrementalJSONLScanner<Entry>(),
+            accountUUID: "user-a",
+            organizationUUID: "org-a",
+            ownershipLookup: { _ in .readable(organizationID: nil, accountID: nil, isAmbiguous: false) }
+        )
+
+        guard case .incomplete = await scanner.scanResult(now: now, pricing: pricing) else {
+            return XCTFail("malformed account-scoped session index must not turn into an empty ownership set")
+        }
     }
 
     func testOrganizationScanDoesNotRecoverIndexedDesktopSessionsWithoutAccount() async throws {

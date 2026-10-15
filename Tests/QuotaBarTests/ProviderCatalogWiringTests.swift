@@ -52,7 +52,39 @@ final class ProviderCatalogWiringTests: XCTestCase {
         )
         // Hermes is optional — the closure is what must be wired, and nil is the correct answer on a
         // machine without a Hermes database.
-        _ = scanner.hermesStateDBPath()
+        _ = try scanner.hermesStateDBPath()
+    }
+
+    func testMuseGatewayFoldFollowsOpenCodeEnablement() {
+        let enabledSources = ProviderCatalog.enabledGatewaySources(
+            claudeProviderIDs: [],
+            codexProviderIDs: [],
+            isProviderEnabled: { $0 == "opencode" }
+        )
+        XCTAssertTrue(enabledSources.contains(.muse))
+
+        let disabledSources = ProviderCatalog.enabledGatewaySources(
+            claudeProviderIDs: [],
+            codexProviderIDs: [],
+            isProviderEnabled: { $0 == "muse" }
+        )
+        XCTAssertFalse(disabledSources.contains(.muse))
+    }
+
+    func testFreebuffIsRegisteredAlphabeticallyWithOwnerConfirmedDefaults() throws {
+        let providers = ProviderCatalog.make()
+        let ids = providers.map { $0.provider.id }
+        let freebuff = try XCTUnwrap(providers.compactMap { $0 as? FreebuffProvider }.first)
+        let metrics = Set(freebuff.widgetDescriptors.map(\.id))
+
+        XCTAssertEqual(Array(ids.prefix(3)), ["claude", "codex", "cursor"])
+        XCTAssertEqual(ids[ids.firstIndex(of: "freebuff")! - 1], "devin")
+        XCTAssertEqual(ids[ids.firstIndex(of: "freebuff")! + 1], "grok")
+        XCTAssertTrue(metrics.isSubset(of: Set(DefaultLayout.metricIDs)))
+        XCTAssertTrue(metrics.isDisjoint(with: Set(DefaultLayout.pinnedMetricIDs)))
+        XCTAssertTrue(metrics.isDisjoint(with: Set(DefaultLayout.expandedMetricIDs)))
+        let metricOrder = freebuff.widgetDescriptors.map(\.id)
+        XCTAssertEqual(metricOrder[metricOrder.firstIndex(of: "freebuff.premiumSessions")! + 1], "freebuff.freePremiumSessions")
     }
 
     /// End-to-end: whatever the fold's sources resolve to must actually produce rows on this machine.
@@ -61,7 +93,7 @@ final class ProviderCatalogWiringTests: XCTestCase {
     /// router simply hadn't been used since yesterday.
     func testAtLeastOneConfiguredSourceYieldsRows() throws {
         let scanner = try catalogOpenCode().usageScanner
-        let ledgerPaths = scanner.routerLedgerPaths()
+        let ledgerPaths = try scanner.routerLedgerPaths()
         guard let first = ledgerPaths.first(where: { FileManager.default.isReadableFile(atPath: $0) }) else {
             throw XCTSkip("no router ledger on this machine")
         }

@@ -414,14 +414,31 @@ final class SequenceProviderRuntime: ProviderRuntime {
     let widgetDescriptors: [WidgetDescriptor]
     private let snapshots: [ProviderSnapshot]
     private(set) var refreshCount = 0
+    private(set) var observedScopes: [ProviderRefreshContext.Scope] = []
+    private(set) var observedManualValues: [Bool] = []
+    private(set) var observedThrottleValues: [Bool] = []
+    private(set) var observedInteractiveBudgetValues: [Bool] = []
+    private(set) var observedCPUFractions: [Double] = []
+    let panelMetersRefreshIncludesHistory: Bool
 
-    init(provider: Provider, descriptors: [WidgetDescriptor], snapshots: [ProviderSnapshot]) {
+    init(
+        provider: Provider,
+        descriptors: [WidgetDescriptor],
+        snapshots: [ProviderSnapshot],
+        panelMetersRefreshIncludesHistory: Bool = false
+    ) {
         self.provider = provider
         self.widgetDescriptors = descriptors
         self.snapshots = snapshots
+        self.panelMetersRefreshIncludesHistory = panelMetersRefreshIncludesHistory
     }
 
     func refresh() async -> ProviderSnapshot {
+        observedScopes.append(ProviderRefreshContext.scope)
+        observedManualValues.append(ProviderRefreshContext.isManual)
+        observedThrottleValues.append(ProviderRefreshContext.accountingCPUThrottleEnabled)
+        observedInteractiveBudgetValues.append(ProviderRefreshContext.accountingCPUInteractiveBudgetEnabled)
+        observedCPUFractions.append(JSONLAccountingWorkPacer.targetCPUFraction)
         let snapshot = snapshots[min(refreshCount, snapshots.count - 1)]
         refreshCount += 1
         return snapshot
@@ -479,7 +496,11 @@ final class KeyValueSQLite: SQLiteAccessing, @unchecked Sendable {
 /// Routes each request through a handler and records every request — for multi-request flows like
 /// the 401 → token refresh → retry sequence, where a single canned response can't express the flow.
 final class RoutingHTTPClient: HTTPClient, @unchecked Sendable {
-    var requests: [HTTPRequest] = []
+    private let requestLock = NSLock()
+    private var recordedRequests: [HTTPRequest] = []
+    var requests: [HTTPRequest] {
+        requestLock.withLock { recordedRequests }
+    }
     private let handler: @Sendable (HTTPRequest) async throws -> HTTPResponse
 
     init(handler: @escaping @Sendable (HTTPRequest) async throws -> HTTPResponse) {
@@ -487,7 +508,7 @@ final class RoutingHTTPClient: HTTPClient, @unchecked Sendable {
     }
 
     func send(_ request: HTTPRequest) async throws -> HTTPResponse {
-        requests.append(request)
+        requestLock.withLock { recordedRequests.append(request) }
         return try await handler(request)
     }
 }

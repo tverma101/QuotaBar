@@ -13,7 +13,7 @@ final class PopoverTransparencyStore {
     static let key = "increaseTransparency"
 
     /// Posted on the default center when the panel becomes visible. The refresh loop sleeps up to
-    /// 15 minutes between closed-panel ticks (battery cadence) and presents the panel as a pure
+    /// 2 minutes between closed-panel ticks on battery and presents the panel as a pure
     /// snapshot, so without this wake a freshly opened panel showed whatever the last closed-panel
     /// pass had painted — the "Today" tile could sit many minutes behind while the loop slept on.
     /// Closing stays silent: the loop re-evaluates its cadence at its next wake regardless.

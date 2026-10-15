@@ -7,6 +7,9 @@ import Observation
 @MainActor
 @Observable
 final class CommandLineToolInstaller {
+    static let bundledHelperRelativePath = "Contents/Helpers/quotabar"
+    static let defaultCommandPath = "/usr/local/bin/quotabar"
+
     enum Status: Equatable {
         case notInstalled
         case installed
@@ -26,8 +29,8 @@ final class CommandLineToolInstaller {
 
     init(
         sourcePath: String = Bundle.main.bundleURL
-            .appendingPathComponent("Contents/Helpers/openusage").path,
-        destinationPath: String = "/usr/local/bin/openusage",
+            .appendingPathComponent(CommandLineToolInstaller.bundledHelperRelativePath).path,
+        destinationPath: String = CommandLineToolInstaller.defaultCommandPath,
         fileManager: FileManager = .default,
         performPrivileged: (@MainActor (Operation, String, String) -> OperationResult)? = nil
     ) {

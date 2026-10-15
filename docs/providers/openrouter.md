@@ -44,6 +44,7 @@ the saved key falls back to the environment key, or to none.
 ## Troubleshooting
 
 - **"No OpenRouter API key"** — add the key in Settings → API Keys (or the config file / env var), then refresh.
+- **"Couldn't read the saved OpenRouter API key"** — a saved config file exists but QuotaBar can't read it. The API Keys card shows an orange repair state; a valid environment key remains active and is labeled as a fallback. Check file permissions, enter a replacement, or remove the saved file, then refresh.
 - **"API key invalid"** — the key was rejected (401/403). Check or recreate it at openrouter.ai/keys.
 
 ## Under the hood

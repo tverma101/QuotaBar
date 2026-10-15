@@ -1,6 +1,11 @@
 import CryptoKit
 import Foundation
 
+enum CodexProxyUsageScanResult: Sendable {
+    case complete(LogUsageScan?)
+    case incomplete
+}
+
 /// Reads only the metadata needed to fold FCC-routed Codex requests into the matching Codex card.
 ///
 /// FCC stores a privacy-preserving account fingerprint on new proxy events. The account id is not
@@ -12,6 +17,9 @@ actor CodexProxyUsageScanner {
     private let environment: EnvironmentReading
     private let homeDirectory: @Sendable () -> URL
     private let databasePaths: @Sendable () -> [String]
+    /// The default FCC database is optional when it has never been created. Explicitly configured
+    /// paths (including injected test paths) are expected sources and must fail closed if unavailable.
+    private let optionalDefaultDatabasePath: String?
 
     init(
         sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
@@ -25,6 +33,11 @@ actor CodexProxyUsageScanner {
         self.databasePaths = databasePaths ?? {
             Self.defaultDatabasePaths(environment: environment, homeDirectory: homeDirectory())
         }
+        if databasePaths == nil, Self.configuredDatabasePaths(environment: environment).isEmpty {
+            self.optionalDefaultDatabasePath = homeDirectory().appendingPathComponent(".fcc/usage.db").path
+        } else {
+            self.optionalDefaultDatabasePath = nil
+        }
     }
 
     /// Scan FCC's local ledger for one exact Codex account. A missing account identity, missing
@@ -35,7 +48,27 @@ actor CodexProxyUsageScanner {
         now: Date = Date(),
         pricing: ModelPricing
     ) async -> LogUsageScan? {
-        guard let fingerprint = Self.accountFingerprint(for: accountIdentityKey) else { return nil }
+        switch await scanResult(
+            accountIdentityKey: accountIdentityKey,
+            daysBack: daysBack,
+            now: now,
+            pricing: pricing
+        ) {
+        case .complete(let scan): return scan
+        case .incomplete: return nil
+        }
+    }
+
+    /// Completeness-aware scan for providers that merge FCC rows with other local histories.
+    /// A configured DB or row that cannot be validated invalidates the combined fold; callers must
+    /// keep the previous snapshot rather than publish a smaller sum.
+    func scanResult(
+        accountIdentityKey: String?,
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing
+    ) async -> CodexProxyUsageScanResult {
+        guard let fingerprint = Self.accountFingerprint(for: accountIdentityKey) else { return .complete(nil) }
         let days = max(1, daysBack)
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
@@ -45,24 +78,47 @@ actor CodexProxyUsageScanner {
 
         var accumulator = DailyUsageAccumulator()
         var sawRows = false
+        var sawSource = false
         for path in databasePaths() {
-            guard !Task.isCancelled else { return nil }
-            guard let schema = try? JSONLAccountingWorkPacer.shared.perform({
-                try sqlite.queryValue(path: path, sql: Self.schemaSQL)
-            }),
-                  Self.hasRequiredSchema(schema)
-            else { continue }
-            guard let payload = try? JSONLAccountingWorkPacer.shared.perform({
-                try sqlite.queryValue(
-                    path: path,
-                    sql: Self.eventsSQL(
-                        fingerprint: fingerprint,
-                        sinceDay: sinceDay,
-                        throughDay: throughDay
+            guard !Task.isCancelled else { return .incomplete }
+            if path == optionalDefaultDatabasePath, !FileManager.default.fileExists(atPath: path) {
+                continue
+            }
+            sawSource = true
+            let schema: String?
+            do {
+                schema = try JSONLAccountingWorkPacer.shared.perform {
+                    try sqlite.queryValue(path: path, sql: Self.schemaSQL)
+                }
+            } catch {
+                AppLog.warn(LogTag.plugin("codex"), "FCC usage database could not be read; preserving last-good history")
+                return .incomplete
+            }
+            guard Self.hasRequiredSchema(schema) else {
+                AppLog.warn(LogTag.plugin("codex"), "FCC usage database schema is incomplete; preserving last-good history")
+                return .incomplete
+            }
+            let payload: String?
+            do {
+                payload = try JSONLAccountingWorkPacer.shared.perform {
+                    try sqlite.queryValue(
+                        path: path,
+                        sql: Self.eventsSQL(
+                            fingerprint: fingerprint,
+                            sinceDay: sinceDay,
+                            throughDay: throughDay
+                        )
                     )
-                )
-            }) else { continue }
-            let rows = JSONLAccountingWorkPacer.shared.perform { Self.rows(from: payload) }
+                }
+            } catch {
+                AppLog.warn(LogTag.plugin("codex"), "FCC usage query failed; preserving last-good history")
+                return .incomplete
+            }
+            guard let payload, let rows = JSONLAccountingWorkPacer.shared.perform({ Self.rows(from: payload) }) else {
+                AppLog.warn(LogTag.plugin("codex"), "FCC usage rows could not be decoded; preserving last-good history")
+                return .incomplete
+            }
+            var malformedRow = false
             JSONLAccountingWorkPacer.shared.forEach(rows) { row in
                 guard let day = Self.validDay(row["local_day"] as? String),
                       let model = Self.modelName(row["model"] as? String),
@@ -70,10 +126,12 @@ actor CodexProxyUsageScanner {
                       let output = Self.count(row["output_tokens"]),
                       let cacheRead = Self.count(row["cache_read_input_tokens"]),
                       let cacheWrite = Self.count(row["cache_creation_input_tokens"])
-                else { return }
-                guard let total = Self.total(input: input, cacheRead: cacheRead, cacheWrite: cacheWrite, output: output),
-                      total > 0
-                else { return }
+                else { malformedRow = true; return }
+                guard let total = Self.total(input: input, cacheRead: cacheRead, cacheWrite: cacheWrite, output: output) else {
+                    malformedRow = true
+                    return
+                }
+                guard total > 0 else { return }
 
                 sawRows = true
                 let tokens = TokenBreakdown(
@@ -96,9 +154,11 @@ actor CodexProxyUsageScanner {
                     )
                     return
                 }
-                if let apiEstimate = pricing.estimatedCostDollars(model: pricingModel, tokens: tokens) {
-                    accumulator.addApiEstimate(day: day, cost: apiEstimate)
-                }
+                accumulator.recordApiEstimate(
+                    day: day,
+                    cost: pricing.estimatedCostDollars(model: pricingModel, tokens: tokens),
+                    tokens: total
+                )
                 // Same reason as the router scanner: the proxy stamps routing prefixes onto its slugs, so
                 // keying on the raw slug split one model across rows and counted it twice in the total.
                 accumulator.add(
@@ -109,11 +169,16 @@ actor CodexProxyUsageScanner {
                     canonical: GatewaySlug.identity(of: model, resolvedPricingModel: pricingModel)
                 )
             }
+            guard !malformedRow else {
+                AppLog.warn(LogTag.plugin("codex"), "FCC usage database contains malformed rows; preserving last-good history")
+                return .incomplete
+            }
         }
 
-        guard sawRows else { return nil }
+        guard !Task.isCancelled else { return .incomplete }
+        guard sawSource, sawRows else { return .complete(nil) }
         let result = accumulator.build()
-        return result.series.daily.isEmpty && result.unknownModelsByDay.isEmpty ? nil : result
+        return .complete(result.series.daily.isEmpty && result.unknownModelsByDay.isEmpty ? nil : result)
     }
 
     /// The exact compatibility contract with FCC's `account_fingerprint("openai", account_id)`.
@@ -131,12 +196,16 @@ actor CodexProxyUsageScanner {
         environment: EnvironmentReading,
         homeDirectory: URL
     ) -> [String] {
-        let configured = [
+        let configured = configuredDatabasePaths(environment: environment)
+        guard configured.isEmpty else { return unique(configured) }
+        return [homeDirectory.appendingPathComponent(".fcc/usage.db").path]
+    }
+
+    private static func configuredDatabasePaths(environment: EnvironmentReading) -> [String] {
+        [
             environment.value(for: "OPENUSAGE_CODEX_PROXY_USAGE_DB"),
             environment.value(for: "FCC_USAGE_DB")
         ].flatMap(splitPaths)
-        guard configured.isEmpty else { return unique(configured) }
-        return [homeDirectory.appendingPathComponent(".fcc/usage.db").path]
     }
 
     private static let schemaSQL = "PRAGMA table_info(usage_events);"
@@ -176,11 +245,11 @@ actor CodexProxyUsageScanner {
         ].allSatisfy(columns.contains)
     }
 
-    private static func rows(from payload: String) -> [[String: Any]] {
+    private static func rows(from payload: String) -> [[String: Any]]? {
         guard let data = payload.data(using: .utf8),
               let value = try? JSONSerialization.jsonObject(with: data),
               let rows = value as? [[String: Any]]
-        else { return [] }
+        else { return nil }
         return rows
     }
 

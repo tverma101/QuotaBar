@@ -21,19 +21,14 @@ enum ProviderRefreshDeadline {
     /// The refreshed snapshot, or `nil` if `timeout` elapsed first.
     static func snapshot(
         from provider: ProviderRuntime,
-        force: Bool,
         timeout: TimeInterval
     ) async -> ProviderSnapshot? {
         let work = Task { @MainActor in
-            // `force` controls cache bypass and scope only. User-interaction permission is a separate
-            // TaskLocal set by the explicit Refresh Now button, so opening the panel stays silent.
-            if force {
-                await ProviderRefreshContext.$scope.withValue(.full) {
-                    await provider.refresh()
-                }
-            } else {
-                await provider.refresh()
-            }
+            // `force` is handled by the store's cache and in-flight policy. Preserve the caller's
+            // TaskLocal scope: a forced `.panelMeters` retry must stay meters-only so a slow local
+            // history scan cannot hold the visible quota retry open or be repeated in phase two.
+            // User-interaction permission is a separate TaskLocal, so panel opens stay silent.
+            await provider.refresh()
         }
         let claim = ContinuationClaim()
         return await withTaskCancellationHandler {
@@ -41,24 +36,27 @@ enum ProviderRefreshDeadline {
                 // Detached, so a busy MainActor can't delay the one thing that bounds the wait.
                 let deadline = Task.detached {
                     try? await Task.sleep(for: .seconds(timeout))
-                    guard !Task.isCancelled, claim.claim() else { return }
+                    guard !Task.isCancelled, claim.beginTimeout() else { return }
                     work.cancel()
-                    // Give cancellation-aware scanners a short grace to wind down before the store
-                    // moves on. A zombie that outlives the pass keeps burning the shared CPU-pacing
-                    // budget (its slices count toward the next refresh's pacing debt) and stacks its
-                    // parse memory on top of the next provider's. The store still resumes nil now —
-                    // the grace only bounds how long the zombie survives, never the wait.
-                    let grace = Task { await work.value }
-                    try? await Task.sleep(for: .seconds(Self.cancellationGraceSeconds))
-                    grace.cancel()
-                    continuation.resume(returning: nil)
+                    // Return as soon as cooperative work stops. Only a provider that ignores
+                    // cancellation keeps the store waiting through the bounded grace period.
+                    Task.detached {
+                        await work.value
+                        guard claim.finishTimeout() else { return }
+                        continuation.resume(returning: nil)
+                    }
+                    Task.detached {
+                        try? await Task.sleep(for: .seconds(Self.cancellationGraceSeconds))
+                        guard claim.finishTimeout() else { return }
+                        continuation.resume(returning: nil)
+                    }
                 }
                 Task { @MainActor in
                     let snapshot = await work.value
                     // Cancel the deadline the moment the snapshot lands, so a fast refresh doesn't leave
                     // a timer sleeping per provider until it expires.
                     deadline.cancel()
-                    guard claim.claim() else { return }
+                    guard claim.claimSnapshot() else { return }
                     continuation.resume(returning: snapshot)
                 }
             }
@@ -75,12 +73,34 @@ enum ProviderRefreshDeadline {
 /// check-and-set has to be atomic — with a plain `Bool` both can read it as unclaimed and resume, and a
 /// second resume is a fatal error, not a caught one.
 private struct ContinuationClaim: Sendable {
-    private let claimed = OSAllocatedUnfairLock(initialState: false)
+    private enum State: Sendable, Equatable {
+        case pending
+        case timedOut
+        case finished
+    }
 
-    func claim() -> Bool {
-        claimed.withLock { claimed in
-            if claimed { return false }
-            claimed = true
+    private let state = OSAllocatedUnfairLock(initialState: State.pending)
+
+    func claimSnapshot() -> Bool {
+        state.withLock { state in
+            guard state == .pending else { return false }
+            state = .finished
+            return true
+        }
+    }
+
+    func beginTimeout() -> Bool {
+        state.withLock { state in
+            guard state == .pending else { return false }
+            state = .timedOut
+            return true
+        }
+    }
+
+    func finishTimeout() -> Bool {
+        state.withLock { state in
+            guard state == .timedOut else { return false }
+            state = .finished
             return true
         }
     }

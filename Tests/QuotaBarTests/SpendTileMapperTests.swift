@@ -118,6 +118,38 @@ final class SpendTileMapperTests: XCTestCase {
         ])
     }
 
+    func testModelAndOtherCostsStayBlankWhenAnyContributingUsageIsUnpriced() throws {
+        let models = [
+            DailyModelUsageEntry(date: "2026-06-26", models: [
+                ModelUsageEntry(model: "heavy", totalTokens: 890, costUSD: 89),
+                ModelUsageEntry(model: "shared", totalTokens: 100, costUSD: 10),
+                ModelUsageEntry(model: "tiny-priced", totalTokens: 10, costUSD: 1)
+            ]),
+            DailyModelUsageEntry(date: "2026-06-25", models: [
+                ModelUsageEntry(model: "heavy", totalTokens: 890, costUSD: 89),
+                ModelUsageEntry(model: "shared", totalTokens: 100, costUSD: nil),
+                ModelUsageEntry(model: "tiny-unpriced", totalTokens: 10, costUSD: nil)
+            ])
+        ]
+        let lines = mappedLines(
+            [
+                DailyUsageEntry(date: "2026-06-26", totalTokens: 1_000, costUSD: nil, costIsComplete: false),
+                DailyUsageEntry(date: "2026-06-25", totalTokens: 1_000, costUSD: nil, costIsComplete: false)
+            ],
+            models: models
+        )
+
+        let breakdown = try XCTUnwrap(modelBreakdown(lines, "Last 30 Days"))
+        XCTAssertEqual(breakdown.models.map(\.model), ["heavy", "shared", "Other"])
+        XCTAssertEqual(breakdown.models.first { $0.model == "heavy" }?.costUSD, 178)
+        XCTAssertNil(breakdown.models.first { $0.model == "shared" }?.costUSD,
+                     "a same-model partial subtotal must not look like its full period cost")
+        let other = try XCTUnwrap(breakdown.models.first { $0.model == "Other" })
+        XCTAssertNil(other.costUSD, "folded Other rows also hide partial dollar subtotals")
+        XCTAssertEqual(other.variants?.first { $0.model == "tiny-priced" }?.costUSD, 1)
+        XCTAssertNil(other.variants?.first { $0.model == "tiny-unpriced" }?.costUSD)
+    }
+
     func testModelBreakdownSortsFoldsOtherAndKeepsUnpricedNamed() throws {
         let lines = mappedLines(
             [DailyUsageEntry(date: "2026-06-26", totalTokens: 3_700, costUSD: 49)],

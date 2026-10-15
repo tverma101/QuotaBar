@@ -91,6 +91,30 @@ final class ZAIAuthStoreTests: XCTestCase {
         XCTAssertEqual(ZAIAuthStore(files: FakeFiles(file), environment: FakeEnvironment(envKey)).keyStatus(), .overrideActive)
     }
 
+    func testUnreadableSavedKeyStatusShowsRepairAndPreservesEnvironmentFallback() throws {
+        let path = ZAIAuthStore.configPaths[0]
+        let unreadableStore = ZAIAuthStore(
+            files: UnreadableFiles(present: [path]),
+            environment: FakeEnvironment()
+        )
+        let unreadableStatus = unreadableStore.keyStatus()
+
+        XCTAssertEqual(unreadableStatus, .savedUnreadable)
+        XCTAssertEqual(unreadableStatus.indicator, .needsAttention)
+        XCTAssertEqual(unreadableStatus.editorMode, .savedUnreadable)
+
+        let environmentStore = ZAIAuthStore(
+            files: UnreadableFiles(present: [path]),
+            environment: FakeEnvironment(["ZAI_API_KEY": "zai-env"])
+        )
+        let environmentStatus = environmentStore.keyStatus()
+
+        XCTAssertEqual(environmentStatus, .environmentFallback)
+        XCTAssertEqual(environmentStatus.indicator, .needsAttention)
+        XCTAssertEqual(environmentStatus.editorMode, .environmentFallback)
+        XCTAssertEqual(try environmentStore.loadAPIKeyForRefresh()?.apiKey, "zai-env")
+    }
+
     func testCurrentAPIKeyReturnsEffectiveKey() {
         let store = ZAIAuthStore(
             files: FakeFiles([ZAIAuthStore.configPaths[0]: #"{"apiKey":"zai-file"}"#]),
@@ -236,6 +260,20 @@ final class ZAIUsageMapperTests: XCTestCase {
 
 @MainActor
 final class ZAIProviderTests: XCTestCase {
+    func testQuotaCancellationStopsBeforeSubscriptionEndpoint() async {
+        let http = RoutingHTTPClient { _ in throw URLError(.cancelled) }
+        let provider = ZAIProvider(
+            authStore: makeAuthStore(key: "zai-test"),
+            usageClient: ZAIUsageClient(http: http)
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertEqual(http.requests.count, 1)
+        XCTAssertEqual(http.requests[0].url, ZAIUsageClient.quotaURL)
+    }
+
     func testRefreshMapsBothEndpoints() async throws {
         let provider = ZAIProvider(
             authStore: makeAuthStore(key: "zai-test"),
@@ -291,6 +329,26 @@ final class ZAIProviderTests: XCTestCase {
 
         XCTAssertEqual(snapshot.lines.first?.label, "Error")
         XCTAssertEqual(snapshot.errorCategory, .notLoggedIn)
+    }
+
+    func testUnreadableSavedKeyRemainsDetectedAndSurfacesCredentialAccess() async {
+        let path = ZAIAuthStore.configPaths[0]
+        let provider = ZAIProvider(
+            authStore: ZAIAuthStore(
+                files: UnreadableFiles(present: [path]),
+                environment: FakeEnvironment()
+            ),
+            usageClient: ZAIUsageClient(http: RoutingHTTPClient { _ in
+                XCTFail("should not hit the network without a readable key")
+                return jsonResponse("{}")
+            })
+        )
+
+        let detected = await provider.hasLocalCredentials()
+        let snapshot = await provider.refresh()
+
+        XCTAssertTrue(detected)
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
     }
 
     func testRefreshClassifiesAuthenticationAndServerFailures() async {
@@ -364,6 +422,15 @@ final class ZAIProviderTests: XCTestCase {
 
         try provider.deleteAPIKey()
         XCTAssertEqual(provider.apiKeyStatus, .fromEnvironment)
+    }
+
+    func testUnreadableSavedKeyFallsBackToEnvironmentForRefresh() throws {
+        let store = ZAIAuthStore(
+            files: UnreadableFiles(present: [ZAIAuthStore.configPaths[0]]),
+            environment: FakeEnvironment(["ZAI_API_KEY": "zai-env"])
+        )
+
+        XCTAssertEqual(try store.loadAPIKeyForRefresh()?.apiKey, "zai-env")
     }
 
     func testProviderIdentityAndLinks() {

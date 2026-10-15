@@ -16,6 +16,36 @@ protocol ProcessRunning: Sendable {
         environment: [String: String],
         timeout: TimeInterval
     ) throws -> ProcessResult
+
+    /// Runs a child with a private stdin payload. Implementations that do not support stdin may
+    /// continue to handle nil input through the default implementation.
+    func run(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        standardInput: Data?,
+        timeout: TimeInterval
+    ) throws -> ProcessResult
+}
+
+extension ProcessRunning {
+    func run(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        standardInput: Data?,
+        timeout: TimeInterval
+    ) throws -> ProcessResult {
+        guard standardInput == nil else {
+            throw ProcessRunnerError.standardInputUnsupported
+        }
+        return try run(
+            executable: executable,
+            arguments: arguments,
+            environment: environment,
+            timeout: timeout
+        )
+    }
 }
 
 struct SystemProcessRunner: ProcessRunning {
@@ -23,6 +53,22 @@ struct SystemProcessRunner: ProcessRunning {
         executable: String,
         arguments: [String],
         environment: [String: String],
+        timeout: TimeInterval
+    ) throws -> ProcessResult {
+        try run(
+            executable: executable,
+            arguments: arguments,
+            environment: environment,
+            standardInput: nil,
+            timeout: timeout
+        )
+    }
+
+    func run(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        standardInput: Data?,
         timeout: TimeInterval
     ) throws -> ProcessResult {
         let process = Process()
@@ -43,8 +89,10 @@ struct SystemProcessRunner: ProcessRunning {
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
+        let inputPipe = standardInput.map { _ in Pipe() }
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        process.standardInput = inputPipe
 
         // Drain both pipes on background queues, started BEFORE the child runs. A child that writes
         // more than the OS pipe buffer (~64KB) would otherwise block on write, never exit, and trip the
@@ -62,6 +110,18 @@ struct SystemProcessRunner: ProcessRunning {
         process.terminationHandler = { _ in exited.leave() }
 
         try process.run()
+
+        if let standardInput, let inputPipe {
+            do {
+                try inputPipe.fileHandleForWriting.write(contentsOf: standardInput)
+                try inputPipe.fileHandleForWriting.close()
+            } catch {
+                if process.isRunning { process.terminate() }
+                process.waitUntilExit()
+                drained.wait()
+                throw error
+            }
+        }
 
         if exited.wait(timeout: .now() + timeout) == .timedOut {
             terminateProcessTree(rootPID: process.processIdentifier)
@@ -128,11 +188,14 @@ struct SystemProcessRunner: ProcessRunning {
 
 enum ProcessRunnerError: Error, LocalizedError, Equatable {
     case timedOut(executable: String, timeout: TimeInterval)
+    case standardInputUnsupported
 
     var errorDescription: String? {
         switch self {
         case .timedOut(let executable, let timeout):
             return "\(executable) timed out after \(Int(timeout))s."
+        case .standardInputUnsupported:
+            return "This process runner does not support standard input."
         }
     }
 }

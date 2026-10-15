@@ -19,6 +19,7 @@ final class ClaudeProvider: ProviderRuntime {
     let authStore: ClaudeAuthStore
     let usageClient: ClaudeUsageClient
     let logUsageScanner: ClaudeLogUsageScanner
+    let piUsageScanner: PiUsageScanner
     let allowsUnattributedPiUsage: Bool
     let now: @Sendable () -> Date
     let pricing: @Sendable () async -> ModelPricing
@@ -39,6 +40,7 @@ final class ClaudeProvider: ProviderRuntime {
         authStore: ClaudeAuthStore = ClaudeAuthStore(),
         usageClient: ClaudeUsageClient = ClaudeUsageClient(),
         logUsageScanner: ClaudeLogUsageScanner = ClaudeLogUsageScanner(),
+        piUsageScanner: PiUsageScanner = .shared,
         allowsUnattributedPiUsage: Bool = true,
         now: @escaping @Sendable () -> Date = Date.init,
         pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
@@ -47,6 +49,7 @@ final class ClaudeProvider: ProviderRuntime {
         self.authStore = authStore
         self.usageClient = usageClient
         self.logUsageScanner = logUsageScanner
+        self.piUsageScanner = piUsageScanner
         self.allowsUnattributedPiUsage = allowsUnattributedPiUsage
         self.now = now
         self.pricing = pricing
@@ -78,19 +81,31 @@ final class ClaudeProvider: ProviderRuntime {
     func hasLocalCredentials() async -> Bool {
         // Never trigger another app's Keychain prompt during first-run detection. Encrypted Desktop
         // material still counts as a local login; only the explicit Refresh Now action may request access.
-        let (load, hasKeychainMaterial) = await loadOffMainActor { [authStore] in
-            (authStore.loadCredentialSet(), authStore.hasKeychainCredentialMaterial())
+        let probe: (load: ClaudeCredentialLoad, hasKeychainMaterial: Bool?) = await loadOffMainActor { [authStore] in
+            let load = authStore.loadCredentialSet()
+            guard !load.keychainReadCancelled else { return (load, nil as Bool?) }
+            return (load, authStore.hasKeychainCredentialMaterial())
         }
+        let load = probe.load
+        if load.keychainReadCancelled { return true }
         if load.candidates.contains(where: \.hasUsableAccessToken) { return true }
-        if hasKeychainMaterial { return true }
-        return load.desktopStatus == .permissionRequired || load.desktopStatus == .stale
+        if load.keychainPermissionRequired || load.keychainReadFailed { return true }
+        if load.credentialsFileUnreadable { return true }
+        if load.credentialsFileInvalid { return true }
+        // `nil` means the silent attributes probe could not determine whether an item exists.
+        // Keep the provider detectable rather than turning an unavailable Keychain into “not logged in.”
+        if probe.hasKeychainMaterial != false { return true }
+        return load.desktopStatus == .permissionRequired
+            || load.desktopStatus == .unreadable
+            || load.desktopStatus == .stale
     }
 
     func refresh() async -> ProviderSnapshot {
         await refresh(
             credentialReloadsRemaining: 1,
             forceDesktopFallback: false,
-            previousFallbackError: nil
+            previousFallbackError: nil,
+            previousKeychainAccessError: nil
         )
     }
 
@@ -99,8 +114,11 @@ final class ClaudeProvider: ProviderRuntime {
     private func refresh(
         credentialReloadsRemaining: Int,
         forceDesktopFallback: Bool,
-        previousFallbackError: ClaudeAuthError?
+        previousFallbackError: ClaudeAuthError?,
+        previousKeychainAccessError: ClaudeAuthError?
     ) async -> ProviderSnapshot {
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        let manualActionID = ProviderRefreshContext.manualActionID
         let allowCredentialInteraction = ProviderRefreshContext.isManual
         let interactionGate = ProviderRefreshContext.credentialInteractionGate
         let credentialLoad = await loadOffMainActor { [authStore] in
@@ -111,21 +129,65 @@ final class ClaudeProvider: ProviderRuntime {
                 forceDesktopFallback: forceDesktopFallback
             )
         }
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        guard KeychainPermissionGate.shared.isCurrentManualAction(manualActionID),
+              !credentialLoad.keychainReadCancelled
+        else { return cancelledRefreshSnapshot(provider: provider) }
+        let keychainAccessError: ClaudeAuthError? = if credentialLoad.keychainPermissionRequired {
+            .credentialPermissionRequired
+        } else if credentialLoad.keychainReadFailed {
+            .credentialKeychainReadFailed
+        } else {
+            previousKeychainAccessError
+        }
         let storedCandidates = credentialLoad.candidates
         let candidates = storedCandidates.filter {
             $0.hasUsableAccessToken && (!forceDesktopFallback || $0.source == .desktop)
+        }
+        if credentialLoad.keychainPermissionRequired, candidates.isEmpty {
+            return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.credentialPermissionRequired)
         }
         if forceDesktopFallback {
             switch credentialLoad.desktopStatus {
             case .permissionRequired:
                 return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.desktopPermissionRequired)
+            case .unreadable:
+                return ProviderSnapshot.error(provider: provider, error: ClaudeDesktopCredentialsUnreadableError())
             case .stale, .invalid, .notFound:
+                if credentialLoad.credentialsFileUnreadable {
+                    return ProviderSnapshot.error(provider: provider, error: ClaudeCredentialsUnreadableError())
+                }
+                if credentialLoad.credentialsFileInvalid {
+                    return ProviderSnapshot.error(provider: provider, error: ClaudeCredentialsInvalidError())
+                }
+                if let keychainAccessError {
+                    return ProviderSnapshot.error(provider: provider, error: keychainAccessError)
+                }
                 if let previousFallbackError {
                     return ProviderSnapshot.error(provider: provider, error: previousFallbackError)
                 }
             case .notChecked, .available:
                 break
             }
+        }
+        if credentialLoad.desktopStatus == .unreadable {
+            return ProviderSnapshot.error(provider: provider, error: ClaudeDesktopCredentialsUnreadableError())
+        }
+        let hasReadableStoredCredential = candidates.contains {
+            if case .environment = $0.source { return false }
+            return $0.hasUsableAccessToken
+        }
+        if credentialLoad.credentialsFileUnreadable, !hasReadableStoredCredential {
+            if credentialLoad.desktopStatus == .permissionRequired {
+                return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.desktopPermissionRequired)
+            }
+            return ProviderSnapshot.error(provider: provider, error: ClaudeCredentialsUnreadableError())
+        }
+        if credentialLoad.credentialsFileInvalid,
+           candidates.isEmpty,
+           credentialLoad.desktopStatus != .permissionRequired
+        {
+            return ProviderSnapshot.error(provider: provider, error: ClaudeCredentialsInvalidError())
         }
         let hasLiveUsageCandidate = candidates.contains {
             authStore.liveUsageAvailability($0) == .available
@@ -134,6 +196,8 @@ final class ClaudeProvider: ProviderRuntime {
             switch credentialLoad.desktopStatus {
             case .permissionRequired:
                 ClaudeAuthError.desktopPermissionRequired.localizedDescription
+            case .unreadable:
+                ClaudeDesktopCredentialsUnreadableError().localizedDescription
             case .stale:
                 ClaudeAuthError.desktopTokenExpired.localizedDescription
             case .invalid:
@@ -148,12 +212,17 @@ final class ClaudeProvider: ProviderRuntime {
             switch credentialLoad.desktopStatus {
             case .permissionRequired:
                 return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.desktopPermissionRequired)
+            case .unreadable:
+                return ProviderSnapshot.error(provider: provider, error: ClaudeDesktopCredentialsUnreadableError())
             case .stale:
                 return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.desktopTokenExpired)
             case .invalid:
                 return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.desktopCredentialsUnavailable)
             case .notChecked, .notFound, .available:
                 break
+            }
+            if credentialLoad.keychainReadFailed {
+                return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.credentialKeychainReadFailed)
             }
             AppLog.info(LogTag.auth("claude"), "no access token, not logged in")
             let error = ClaudeAuthError.notLoggedIn
@@ -184,6 +253,9 @@ final class ClaudeProvider: ProviderRuntime {
         var lastFallbackError: ClaudeAuthError?
         var credentialGeneration = ClaudeCredentialGeneration(storedCandidates)
         for state in candidates {
+            guard !Task.isCancelled,
+                  KeychainPermissionGate.shared.isCurrentManualAction(manualActionID)
+            else { return cancelledRefreshSnapshot(provider: provider) }
             // The environment token cannot read subscription usage. If a CLI login was rejected, try
             // Desktop before this spend-only fallback can turn the refresh into a false success.
             if !forceDesktopFallback,
@@ -194,7 +266,8 @@ final class ClaudeProvider: ProviderRuntime {
                 return await refresh(
                     credentialReloadsRemaining: credentialReloadsRemaining,
                     forceDesktopFallback: true,
-                    previousFallbackError: lastFallbackError
+                    previousFallbackError: lastFallbackError,
+                    previousKeychainAccessError: keychainAccessError
                 )
             }
             do {
@@ -203,6 +276,9 @@ final class ClaudeProvider: ProviderRuntime {
                     credentialGeneration: &credentialGeneration,
                     fallbackWarning: desktopFallbackWarning
                 )
+                guard !Task.isCancelled,
+                      KeychainPermissionGate.shared.isCurrentManualAction(manualActionID)
+                else { return cancelledRefreshSnapshot(provider: provider) }
                 AppLog.info(LogTag.plugin("claude"), "refresh end (\(Int(Date().timeIntervalSince(start) * 1000))ms)")
                 return snapshot
             } catch ClaudeAuthError.credentialsChanged where credentialReloadsRemaining > 0 {
@@ -210,13 +286,18 @@ final class ClaudeProvider: ProviderRuntime {
                 return await refresh(
                     credentialReloadsRemaining: credentialReloadsRemaining - 1,
                     forceDesktopFallback: forceDesktopFallback,
-                    previousFallbackError: previousFallbackError
+                    previousFallbackError: previousFallbackError,
+                    previousKeychainAccessError: keychainAccessError
                 )
             } catch let error as ClaudeAuthError where error.allowsAuthFallback {
+                guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
                 AppLog.warn(LogTag.auth("claude"), "\(state.source.label) failed (\(error)); falling back to next source if any")
                 lastFallbackError = error
                 continue
             } catch {
+                if ProviderCancellation.isCancellation(error) {
+                    return cancelledRefreshSnapshot(provider: provider)
+                }
                 return ProviderSnapshot.error(provider: provider, error: error)
             }
         }
@@ -224,12 +305,26 @@ final class ClaudeProvider: ProviderRuntime {
            lastFallbackError != nil,
            credentialLoad.desktopStatus == .notChecked
         {
+            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
             AppLog.info(LogTag.auth("claude"), "stored Claude login failed; trying Claude Desktop")
             return await refresh(
                 credentialReloadsRemaining: credentialReloadsRemaining,
                 forceDesktopFallback: true,
-                previousFallbackError: lastFallbackError
+                previousFallbackError: lastFallbackError,
+                previousKeychainAccessError: keychainAccessError
             )
+        }
+        if credentialLoad.credentialsFileUnreadable {
+            return ProviderSnapshot.error(provider: provider, error: ClaudeCredentialsUnreadableError())
+        }
+        if credentialLoad.keychainPermissionRequired {
+            return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.credentialPermissionRequired)
+        }
+        if credentialLoad.credentialsFileInvalid {
+            return ProviderSnapshot.error(provider: provider, error: ClaudeCredentialsInvalidError())
+        }
+        if credentialLoad.keychainReadFailed {
+            return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.credentialKeychainReadFailed)
         }
         return ProviderSnapshot.error(
             provider: provider,
@@ -242,6 +337,7 @@ final class ClaudeProvider: ProviderRuntime {
         credentialGeneration: inout ClaudeCredentialGeneration,
         fallbackWarning: String?
     ) async throws -> ProviderSnapshot {
+        try Task.checkCancellation()
         var state = initialState
         var mapped = ClaudeMappedUsage(
             plan: ClaudeUsageMapper.formatPlan(
@@ -265,6 +361,7 @@ final class ClaudeProvider: ProviderRuntime {
                 state: &state,
                 credentialGeneration: &credentialGeneration
             )
+            try Task.checkCancellation()
             // A rate-limited fetch rides its "Updates blocked by Anthropic" notice on the mapped usage so
             // it reaches the header triangle even when the badge/note lines aren't in the user's layout.
             warning = mapped.warning
@@ -292,6 +389,7 @@ final class ClaudeProvider: ProviderRuntime {
         mapped initialUsage: ClaudeMappedUsage,
         warning: String?
     ) async -> ProviderSnapshot {
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         var mapped = initialUsage
         // Meters-only passes (menu-bar ticks, panel phase 1) only need Session/Weekly (and sibling)
         // quota meters from the live usage API. Skip the expensive local JSONL / pi history scan;
@@ -311,13 +409,27 @@ final class ClaudeProvider: ProviderRuntime {
         // shared pricing store, merged with Claude usage that happened inside pi (attributed back here).
         // Both scans run on their scanner actors, off the main actor, and do not require an OAuth login.
         let pricing = await pricing()
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         let scanNow = now()
-        let nativeScan = await logUsageScanner.scan(
+        let nativeResult = await logUsageScanner.scanResult(
             daysBack: UsageHistoryWindow.lifetimeDays(through: scanNow), now: scanNow, pricing: pricing
         )
-        let piScan = allowsUnattributedPiUsage
-            ? await PiUsageScanner.shared.scan(cardID: provider.id, now: scanNow, pricing: pricing)
-            : nil
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        guard case .complete(let nativeScan) = nativeResult else {
+            return localHistoryIncompleteSnapshot(mapped: mapped, warning: warning)
+        }
+        let piResult: PiUsageScanResult = allowsUnattributedPiUsage
+            ? await piUsageScanner.scanResult(
+                cardID: provider.id,
+                daysBack: UsageHistoryWindow.lifetimeDays(through: scanNow),
+                now: scanNow,
+                pricing: pricing
+            )
+            : .complete(nil)
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        guard case .complete(let piScan) = piResult else {
+            return localHistoryIncompleteSnapshot(mapped: mapped, warning: warning)
+        }
         var usageHistory: ProviderUsageHistory?
         // Cancellation can land between the native and pi scans. Treat the pair as one unit so a
         // partial result cannot replace the last-good combined history in WidgetDataStore.
@@ -329,7 +441,8 @@ final class ClaudeProvider: ProviderRuntime {
                 series: scan.series,
                 modelUsage: scan.modelUsage,
                 unknownModelsByDay: scan.unknownModelsByDay,
-                apiEstimateByDay: scan.apiEstimateByDay
+                apiEstimateByDay: scan.apiEstimateByDay,
+                apiEstimateIncompleteDays: scan.apiEstimateIncompleteDays
             )
             SpendTileMapper.appendTokenUsage(
                 scan.series, to: &mapped.lines, now: now(),
@@ -352,6 +465,24 @@ final class ClaudeProvider: ProviderRuntime {
         )
     }
 
+    /// A failed local source must not publish a partial native+Pi replacement. The store keeps the
+    /// prior normalized history when this successful live snapshot carries `usageHistory == nil`.
+    private func localHistoryIncompleteSnapshot(
+        mapped initialUsage: ClaudeMappedUsage,
+        warning: String?
+    ) -> ProviderSnapshot {
+        var mapped = initialUsage
+        MetricLine.appendNoDataIfNeeded(&mapped.lines)
+        return ProviderSnapshot.make(
+            provider: provider,
+            plan: mapped.plan,
+            lines: mapped.lines,
+            refreshedAt: now(),
+            usageHistory: nil,
+            warning: warning
+        )
+    }
+
     private func fetchLiveUsage(
         state: inout ClaudeCredentialState,
         credentialGeneration: inout ClaudeCredentialGeneration
@@ -370,6 +501,7 @@ final class ClaudeProvider: ProviderRuntime {
         if authStore.needsRefresh(state.oauth),
            let refreshToken = state.oauth.refreshToken,
            !refreshToken.isEmpty {
+            try Task.checkCancellation()
             let refreshed = try await refreshAccessToken(
                 state: &state,
                 refreshToken: refreshToken,
@@ -381,49 +513,94 @@ final class ClaudeProvider: ProviderRuntime {
 
         var working = state
         defer { state = working }
+        try Task.checkCancellation()
         var verificationResponse = try await verifyAccountIfNeeded(
             accessToken: working.oauth.accessToken ?? ""
         )
-        let response = try await ProviderAuthRetry.fetch(
-            token: working.oauth.accessToken ?? "",
-            attempt: { accessToken in
-                if let response = verificationResponse {
-                    verificationResponse = nil
-                    return response
-                }
-                return try await self.usageClient.fetchUsage(
-                    accessToken: accessToken, config: self.authStore.oauthConfig()
-                )
-            },
-            refreshAccessToken: {
-                if working.source == .desktop {
-                    throw ClaudeAuthError.desktopTokenExpired
-                }
-                guard let refreshToken = working.oauth.refreshToken, !refreshToken.isEmpty else {
-                    throw ClaudeAuthError.tokenExpired
-                }
-                let refreshed = try await self.refreshAccessToken(
-                    state: &working,
-                    refreshToken: refreshToken,
-                    expectedGeneration: expectedGeneration
-                )
-                if refreshed.persisted {
-                    expectedGeneration = expectedGeneration.replacing(working)
-                }
-                verificationResponse = try await self.verifyAccountIfNeeded(
-                    accessToken: refreshed.accessToken
-                )
-                return refreshed.accessToken
-            },
-            connectionFailed: ClaudeUsageError.connectionFailed,
-            authExpired: ClaudeAuthError.tokenExpired
-        )
+        let attempt: (String) async throws -> HTTPResponse = { accessToken in
+            try Task.checkCancellation()
+            if let response = verificationResponse {
+                verificationResponse = nil
+                return response
+            }
+            return try await self.usageClient.fetchUsage(
+                accessToken: accessToken, config: self.authStore.oauthConfig()
+            )
+        }
+        let firstResponse: HTTPResponse
+        do {
+            firstResponse = try await attempt(working.oauth.accessToken ?? "")
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            throw ClaudeUsageError.connectionFailed
+        }
+
+        let response: HTTPResponse
+        if ClaudeUsageClient.isMissingProfileScopeFailure(firstResponse) {
+            // An explicit scope denial is definitive. Refreshing an unknown-scope token cannot grant
+            // the missing permission and, without a refresh token, used to mislabel this as expired.
+            response = firstResponse
+        } else if ProviderAuthRetry.isAuthFailure(firstResponse) {
+            AppLog.debug(.auth, "\(firstResponse.statusCode) -> refreshing token, retrying once")
+            if working.source == .desktop {
+                throw ClaudeAuthError.desktopTokenExpired
+            }
+            guard let refreshToken = working.oauth.refreshToken, !refreshToken.isEmpty else {
+                throw ClaudeAuthError.tokenExpired
+            }
+            let refreshed = try await refreshAccessToken(
+                state: &working,
+                refreshToken: refreshToken,
+                expectedGeneration: expectedGeneration
+            )
+            if refreshed.persisted {
+                expectedGeneration = expectedGeneration.replacing(working)
+            }
+            verificationResponse = try await verifyAccountIfNeeded(accessToken: refreshed.accessToken)
+            try Task.checkCancellation()
+
+            let retried: HTTPResponse
+            do {
+                retried = try await attempt(refreshed.accessToken)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                try ProviderCancellation.rethrowIfCancellation(error)
+                throw ClaudeUsageError.connectionFailed
+            }
+            if ClaudeUsageClient.isMissingProfileScopeFailure(retried) {
+                response = retried
+            } else if ProviderAuthRetry.isAuthFailure(retried) {
+                AppLog.warn(.auth, "retry still unauthorized -> auth expired")
+                throw ClaudeAuthError.tokenExpired
+            } else {
+                response = retried
+            }
+        } else {
+            response = firstResponse
+        }
 
         let forceDesktopGeneration = working.source == .desktop
+        try Task.checkCancellation()
         let currentGeneration = await loadOffMainActor { [authStore] in
             authStore.credentialGeneration(forceDesktopFallback: forceDesktopGeneration)
         }
+        try Task.checkCancellation()
         guard currentGeneration == expectedGeneration else { throw ClaudeAuthError.credentialsChanged }
+
+        if ClaudeUsageClient.isMissingProfileScopeFailure(response) {
+            AppLog.warn(LogTag.plugin("claude"), "live usage unavailable: OAuth response says the credential lacks the user:profile scope; re-login with `claude` to restore session/weekly limits")
+            return ClaudeMappedUsage(
+                plan: ClaudeUsageMapper.formatPlan(
+                    subscriptionType: working.oauth.subscriptionType,
+                    rateLimitTier: working.oauth.rateLimitTier
+                ),
+                lines: [],
+                warning: ClaudeUsageMapper.missingProfileScopeWarning
+            )
+        }
 
         // 429 can come back from either attempt; the helper hands both through unchanged. Start a cooldown
         // (respecting Retry-After) and serve the last-good usage rather than a bare badge.
@@ -441,6 +618,7 @@ final class ClaudeProvider: ProviderRuntime {
     }
 
     private func verifyAccountIfNeeded(accessToken: String) async throws -> HTTPResponse? {
+        try Task.checkCancellation()
         guard let identity = authStore.expectedIdentityKey,
               identity.split(separator: "|").count == 2
         else { return nil }
@@ -497,7 +675,13 @@ final class ClaudeProvider: ProviderRuntime {
         expectedGeneration: ClaudeCredentialGeneration
     ) async throws -> RefreshedAccess {
         AppLog.info(LogTag.auth("claude"), "token refresh attempt")
-        let response = try await usageClient.refreshToken(refreshToken, config: authStore.oauthConfig())
+        let response: HTTPResponse
+        do {
+            response = try await usageClient.refreshToken(refreshToken, config: authStore.oauthConfig())
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            throw error
+        }
         if response.statusCode == 400 || response.statusCode == 401 {
             let body = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any]
             let errorCode = body?["error"] as? String ?? body?["error_description"] as? String
@@ -529,9 +713,9 @@ final class ClaudeProvider: ProviderRuntime {
         // rather than fail the live fetch.
         let persisted: Bool
         do {
-            guard try await Task.detached(priority: .utility, operation: { [authStore, state] in
+            guard try await loadOffMainActor({ [authStore, state] in
                 try authStore.save(state, ifUnchanged: expectedGeneration)
-            }).value else {
+            }) else {
                 throw ClaudeAuthError.credentialsChanged
             }
             persisted = true
@@ -545,6 +729,9 @@ final class ClaudeProvider: ProviderRuntime {
             cachedCredentialFingerprint = Self.credentialFingerprint(state.oauth)
         }
         AppLog.info(LogTag.auth("claude"), "token refresh ok (rotated)")
+        // A successful response may already have invalidated the previous refresh token. Persist its
+        // rotation even if cancellation arrived while the request was in flight, then honor cancel.
+        try Task.checkCancellation()
         return RefreshedAccess(accessToken: decoded.accessToken, persisted: persisted)
     }
 

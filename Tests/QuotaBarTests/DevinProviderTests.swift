@@ -2,9 +2,9 @@ import XCTest
 @testable import QuotaBar
 
 final class DevinAuthStoreTests: XCTestCase {
-    func testParsesCredentialsTomlAndAcceptsOnlyHTTPSServerURL() {
-        func load(serverURL: String) -> DevinAuth? {
-            DevinAuthStore(
+    func testParsesCredentialsTomlAndAcceptsOnlyHTTPSServerURL() throws {
+        func load(serverURL: String) throws -> DevinAuth? {
+            try DevinAuthStore(
                 files: FakeFiles([
                     DevinAuthStore.credentialsPath: """
                     windsurf_api_key = "devin-session-token$cli"
@@ -15,25 +15,48 @@ final class DevinAuthStoreTests: XCTestCase {
             ).loadCredentialsFile()
         }
 
-        let https = load(serverURL: "https://server.codeium.test/")
+        let https = try load(serverURL: "https://server.codeium.test/")
         XCTAssertEqual(https?.apiKey, "devin-session-token$cli")
         XCTAssertEqual(https?.apiServerUrl, "https://server.codeium.test", "trailing slash cleaned")
 
         // A plaintext URL is dropped; the key still parses (proving the file parsed at all).
-        let http = load(serverURL: "http://server.codeium.test")
+        let http = try load(serverURL: "http://server.codeium.test")
         XCTAssertEqual(http?.apiKey, "devin-session-token$cli")
         XCTAssertNil(http?.apiServerUrl)
     }
 
-    func testReadsAppAuthFromSQLiteState() {
+    func testReadsAppAuthFromSQLiteState() throws {
         let sqlite = FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)
         let store = DevinAuthStore(files: FakeFiles(), sqlite: sqlite)
 
-        let auth = store.loadAppAuth()
+        let auth = try store.loadAppAuth()
 
         XCTAssertEqual(auth?.apiKey, "devin-session-token$app")
         XCTAssertEqual(sqlite.lastPath, DevinAuthStore.stateDBPath)
         XCTAssertEqual(sqlite.lastSQL?.contains("windsurfAuthStatus"), true)
+    }
+
+    func testUnreadableCredentialsFileThrowsButMissingFileRemainsNil() throws {
+        let unreadable = DevinAuthStore(
+            files: UnreadableDevinFiles(path: DevinAuthStore.credentialsPath),
+            sqlite: FakeSQLite()
+        )
+        XCTAssertThrowsError(try unreadable.loadCredentialsFile()) { error in
+            XCTAssertEqual(error as? DevinAuthError, .credentialsUnreadable)
+        }
+
+        let missing = DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite())
+        XCTAssertNil(try missing.loadCredentialsFile())
+    }
+
+    func testUnreadableAppDatabaseThrowsButMissingRowRemainsNil() throws {
+        let unreadable = DevinAuthStore(files: FakeFiles(), sqlite: UnreadableDevinSQLite())
+        XCTAssertThrowsError(try unreadable.loadAppAuth()) { error in
+            XCTAssertEqual(error as? DevinAuthError, .credentialsUnreadable)
+        }
+
+        let missing = DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite())
+        XCTAssertNil(try missing.loadAppAuth())
     }
 }
 
@@ -169,12 +192,33 @@ final class DevinProviderTests: XCTestCase {
         ])
     }
 
+    func testCancellationOfFirstCredentialSourceStopsBeforeAppAuthFallback() async {
+        let httpClient = RoutingHTTPClient { _ in throw CancellationError() }
+        let provider = DevinProvider(
+            authStore: DevinAuthStore(
+                files: FakeFiles([
+                    DevinAuthStore.credentialsPath: "windsurf_api_key = \"devin-session-token$cli\"\napi_server_url = \"https://server.codeium.test\""
+                ]),
+                sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)
+            ),
+            usageClient: DevinUsageClient(http: httpClient)
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertEqual(httpClient.requests.count, 1)
+        XCTAssertTrue(httpClient.requests[0].url.absoluteString.contains("server.codeium.test"))
+    }
+
     func testRefreshReturnsLoginHintWithoutAuth() async {
         let provider = DevinProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite()),
             usageClient: DevinUsageClient(http: QueueHTTPClient())
         )
 
+        let detected = await provider.hasLocalCredentials()
+        XCTAssertFalse(detected)
         let snapshot = await provider.refresh()
 
         XCTAssertEqual(snapshot.lines.first?.label, "Error")
@@ -182,6 +226,41 @@ final class DevinProviderTests: XCTestCase {
         // The final fallback must carry a real telemetry category (regression: it once used the
         // message-only factory, leaving errorCategory nil so failures bucketed as `other`).
         XCTAssertEqual(snapshot.errorCategory, .notLoggedIn)
+    }
+
+    func testUnreadableCredentialsFileKeepsProviderVisibleAndReportsCredentialAccess() async {
+        let http = QueueHTTPClient()
+        let provider = DevinProvider(
+            authStore: DevinAuthStore(
+                files: UnreadableDevinFiles(path: DevinAuthStore.credentialsPath),
+                sqlite: FakeSQLite()
+            ),
+            usageClient: DevinUsageClient(http: http)
+        )
+
+        let detected = await provider.hasLocalCredentials()
+        XCTAssertTrue(detected)
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+        XCTAssertEqual(errorText(snapshot.lines), DevinAuthError.credentialsUnreadable.localizedDescription)
+        XCTAssertTrue(http.requests.isEmpty)
+    }
+
+    func testUnreadableAppDatabaseKeepsProviderVisibleAndReportsCredentialAccess() async {
+        let http = QueueHTTPClient()
+        let provider = DevinProvider(
+            authStore: DevinAuthStore(files: FakeFiles(), sqlite: UnreadableDevinSQLite()),
+            usageClient: DevinUsageClient(http: http)
+        )
+
+        let detected = await provider.hasLocalCredentials()
+        XCTAssertTrue(detected)
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+        XCTAssertEqual(errorText(snapshot.lines), DevinAuthError.credentialsUnreadable.localizedDescription)
+        XCTAssertTrue(http.requests.isEmpty)
     }
 
     private func errorText(_ lines: [MetricLine]) -> String? {
@@ -233,6 +312,34 @@ private final class FakeSQLite: SQLiteAccessing, @unchecked Sendable {
     }
 
     func execute(path: String, sql: String) throws {}
+}
+
+private struct UnreadableDevinSQLite: SQLiteAccessing {
+    func queryValue(path: String, sql: String) throws -> String? {
+        throw SQLiteError.queryFailed("injected Devin state database read failure")
+    }
+
+    func execute(path: String, sql: String) throws {}
+}
+
+private struct UnreadableDevinFiles: TextFileAccessing {
+    let path: String
+
+    func exists(_ path: String) -> Bool {
+        path == self.path
+    }
+
+    func readTextIfPresent(_ path: String) throws -> String? {
+        guard path == self.path else { return nil }
+        throw CocoaError(.fileReadNoPermission)
+    }
+
+    func readText(_ path: String) throws -> String {
+        throw CocoaError(.fileReadNoPermission)
+    }
+
+    func writeText(_ path: String, _ text: String) throws {}
+    func remove(_ path: String) throws {}
 }
 
 private final class QueueHTTPClient: HTTPClient, @unchecked Sendable {

@@ -124,4 +124,42 @@ final class PiUsageScannerTests: XCTestCase {
     func testMergedReturnsNilWhenAllNil() {
         XCTAssertNil(DailyUsageAccumulator.merged([nil, nil]))
     }
+
+    func testScanResultDistinguishesFailedDiscoveryFromAnEmptySource() async {
+        let failingHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pi-scan-failure-\(UUID().uuidString)", isDirectory: true)
+        let failingSessions = failingHome.appendingPathComponent(".pi/agent/sessions")
+        do {
+            try FileManager.default.createDirectory(
+                at: failingSessions.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            try Data("not a directory".utf8).write(to: failingSessions)
+        } catch {
+            return XCTFail("could not create failed-discovery fixture: \(error)")
+        }
+        defer { try? FileManager.default.removeItem(at: failingHome) }
+        let failingScanner = PiUsageScanner(
+            environment: FakeEnvironment([:]),
+            homeDirectory: { failingHome },
+            incrementalScanner: IncrementalJSONLScanner<PiUsageScanner.Entry>()
+        )
+        let failed = await failingScanner.scanResult(cardID: "claude", now: Date(), pricing: .empty)
+        guard case .incomplete = failed else {
+            return XCTFail("failed traversal must not be reported as an empty Pi source")
+        }
+
+        let emptyHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pi-scan-empty-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: emptyHome) }
+        let emptyScanner = PiUsageScanner(
+            environment: FakeEnvironment([:]),
+            homeDirectory: { emptyHome },
+            incrementalScanner: IncrementalJSONLScanner<PiUsageScanner.Entry>()
+        )
+        let empty = await emptyScanner.scanResult(cardID: "claude", now: Date(), pricing: .empty)
+        guard case .complete(let scan) = empty else {
+            return XCTFail("a completed empty traversal is a valid empty source")
+        }
+        XCTAssertNil(scan)
+    }
 }

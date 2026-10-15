@@ -173,11 +173,16 @@ final class SettingsMigratorTests: XCTestCase {
 
         XCTAssertEqual(result, SettingsSchema.current)
         let enabled = Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? [])
-        XCTAssertEqual(enabled, Set(SettingsSchema.v2ProviderIDs).subtracting(["devin", "grok"]))
+        XCTAssertEqual(
+            enabled,
+            Set(SettingsSchema.v2ProviderIDs)
+                .union(SettingsSchema.v3PreviouslyShippedProviderIDs)
+                .subtracting(["devin", "grok"])
+        )
         XCTAssertNil(defaults.stringArray(forKey: "openusage.disabledProviders.v1"), "legacy key removed")
         XCTAssertEqual(
             Set(defaults.stringArray(forKey: "openusage.knownProviders.v1") ?? []),
-            Set(SettingsSchema.v2ProviderIDs)
+            Set(SettingsSchema.v2ProviderIDs).union(SettingsSchema.v3PreviouslyShippedProviderIDs)
         )
 
         // The store loads the migrated shape: same effective on/off set, now in enabled-list mode.
@@ -188,7 +193,8 @@ final class SettingsMigratorTests: XCTestCase {
         XCTAssertFalse(store.isEnabled("grok"))
     }
 
-    /// A legacy install with no disabled providers (the all-on default) converts to all-on.
+    /// A legacy install with no disabled providers (the all-on default) keeps all previously shipped
+    /// providers enabled, including OpenCode and Hermes omitted from v2's original frozen list.
     func testV2ConvertsAllOnLegacyInstall() {
         let (defaults, domain) = makeDefaults("V2AllOn")
         defer { defaults.removePersistentDomain(forName: domain) }
@@ -199,17 +205,18 @@ final class SettingsMigratorTests: XCTestCase {
 
         XCTAssertEqual(
             Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []),
-            Set(SettingsSchema.v2ProviderIDs)
+            Set(SettingsSchema.v2ProviderIDs).union(SettingsSchema.v3PreviouslyShippedProviderIDs)
         )
     }
 
-    /// An install already in enabled-list mode (fresh-installed after first-run detection shipped)
-    /// keeps its enabled set untouched and only gains the known set.
-    func testV2LeavesExistingEnabledListAloneAndSeedsKnownSet() {
+    /// An install with an existing nonempty known set preserves its enabled choices and adds the
+    /// providers that were already shipped when the migration first went live.
+    func testV2LeavesExistingEnabledListAloneAndExtendsKnownSet() {
         let (defaults, domain) = makeDefaults("V2EnabledList")
         defer { defaults.removePersistentDomain(forName: domain) }
         defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
         defaults.set(["claude", "cursor"], forKey: "openusage.enabledProviders.v1")
+        defaults.set(["claude", "cursor"], forKey: "openusage.knownProviders.v1")
 
         SettingsMigrator.migrate(defaults: defaults, domainName: domain)
 
@@ -219,8 +226,100 @@ final class SettingsMigratorTests: XCTestCase {
         )
         XCTAssertEqual(
             Set(defaults.stringArray(forKey: "openusage.knownProviders.v1") ?? []),
-            Set(SettingsSchema.v2ProviderIDs)
+            Set(["claude", "cursor"])
+                .union(SettingsSchema.v2ProviderIDs)
+                .union(SettingsSchema.v3PreviouslyShippedProviderIDs)
         )
+    }
+
+    /// The legacy disabled list can contain provider IDs missing from v2's frozen set, including
+    /// OpenCode/Hermes and account-specific cards. Those explicit choices must not look like newcomers
+    /// to `NewProviderSeeder` after the migration drops the old key.
+    @MainActor
+    func testMigrationKeepsPreviouslyDisabledProviderChoicesOff() async {
+        let (defaults, domain) = makeDefaults("preserve-disabled")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
+        let disabled = ["opencode", "hermes", "codex@account-a"]
+        defaults.set(disabled, forKey: "openusage.disabledProviders.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        let enablement = ProviderEnablementStore(defaults: defaults)
+        let probes = disabled.map(MigrationCredentialProvider.init)
+        let task = NewProviderSeeder.reconcileIfNeeded(providers: probes, enablement: enablement)
+        await task?.value
+
+        for providerID in disabled {
+            XCTAssertFalse(enablement.isEnabled(providerID), "\(providerID) was explicitly disabled")
+        }
+        XCTAssertTrue(probes.allSatisfy { $0.probeCount == 0 }, "old choices must not be re-probed")
+        XCTAssertEqual(enablement.knownIDs, Set(SettingsSchema.v2ProviderIDs)
+            .union(SettingsSchema.v3PreviouslyShippedProviderIDs)
+            .union(disabled))
+    }
+
+    /// The old disabled-list format meant every omitted provider was enabled. OpenCode and Hermes were
+    /// already shipped but absent from v2's frozen list, so migrating an install that disabled another
+    /// provider must preserve those two enabled choices.
+    @MainActor
+    func testLegacyDisabledListKeepsPreviouslyShippedOmittedProvidersEnabled() {
+        let (defaults, domain) = makeDefaults("preserve-omitted-enabled")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(["devin"], forKey: "openusage.disabledProviders.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        let enablement = ProviderEnablementStore(defaults: defaults)
+
+        XCTAssertTrue(enablement.isEnabled("opencode"))
+        XCTAssertTrue(enablement.isEnabled("hermes"))
+        XCTAssertFalse(enablement.isEnabled("devin"))
+    }
+
+    /// Some schema-v2 standalone installs already had an enabled list but never acquired a known set.
+    /// The empty set is the seeder's signal to baseline every current provider without probing; v3 must
+    /// not replace that sentinel with only Hermes/OpenCode and cause every other omitted ID to be probed.
+    @MainActor
+    func testV3PreservesEmptyKnownSetSentinelWithoutReenablingDisabledChoices() async {
+        let (defaults, domain) = makeDefaults("v2-empty-known")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(2, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(["cursor"], forKey: "openusage.enabledProviders.v1")
+        defaults.set([String](), forKey: "openusage.knownProviders.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        let enablement = ProviderEnablementStore(defaults: defaults)
+        let omitted = ["claude", "opencode", "hermes", "grok"]
+        let currentRegistryIDs = omitted + ["cursor"]
+        let probes = currentRegistryIDs.map(MigrationCredentialProvider.init)
+        let task = NewProviderSeeder.reconcileIfNeeded(providers: probes, enablement: enablement)
+        await task?.value
+
+        XCTAssertEqual(enablement.enabledIDs, ["cursor"])
+        XCTAssertTrue(probes.allSatisfy { $0.probeCount == 0 })
+        XCTAssertEqual(enablement.knownIDs, Set(currentRegistryIDs))
+    }
+
+    /// A schema-v1 enabled-list install passes through v2 and v3 in one launch. The v2 migration must
+    /// keep its empty-known sentinel intact so omitted credentials do not re-enable disabled choices.
+    @MainActor
+    func testV1MigrationPreservesEmptyKnownSentinelWithoutCredentialProbes() async {
+        let (defaults, domain) = makeDefaults("v1-empty-known")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(["cursor"], forKey: "openusage.enabledProviders.v1")
+        defaults.set([String](), forKey: "openusage.knownProviders.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        let enablement = ProviderEnablementStore(defaults: defaults)
+        let registryIDs = ["claude", "cursor", "codex", "codex@account-a", "hermes", "opencode"]
+        let probes = registryIDs.map(MigrationCredentialProvider.init)
+        let task = NewProviderSeeder.reconcileIfNeeded(providers: probes, enablement: enablement)
+        await task?.value
+
+        XCTAssertEqual(enablement.enabledIDs, ["cursor"])
+        XCTAssertTrue(probes.allSatisfy { $0.probeCount == 0 })
+        XCTAssertEqual(enablement.knownIDs, Set(registryIDs))
     }
 
     /// Re-running the v2 step (an interrupted upgrade replays it) changes nothing.
@@ -237,6 +336,26 @@ final class SettingsMigratorTests: XCTestCase {
 
         XCTAssertEqual(defaults.stringArray(forKey: "openusage.enabledProviders.v1"), enabledAfterFirst)
     }
+
+@MainActor
+private final class MigrationCredentialProvider: ProviderRuntime {
+    let provider: Provider
+    let widgetDescriptors: [WidgetDescriptor] = []
+    private(set) var probeCount = 0
+
+    init(_ id: String) {
+        provider = Provider(id: id, displayName: id, icon: .providerMark(id))
+    }
+
+    func refresh() async -> ProviderSnapshot {
+        ProviderSnapshot.make(provider: provider, plan: nil, lines: [], refreshedAt: Date())
+    }
+
+    func hasLocalCredentials() async -> Bool {
+        probeCount += 1
+        return true
+    }
+}
 
     // MARK: - Schema integrity
 

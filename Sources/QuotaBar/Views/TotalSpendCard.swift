@@ -105,7 +105,7 @@ struct TotalSpendCard: View {
     /// tooltip lie about what the total reflects.
     private var infoTooltip: String {
         let names = providers.map(\.displayName)
-        return "Only includes \(names.formatted(.list(type: .and)))."
+        return "Only includes \(names.formatted(.list(type: .and))). Unpriced usage is omitted from dollar totals and marked Partial."
     }
 
     private var shareButton: some View {
@@ -191,7 +191,9 @@ struct TotalSpendCard: View {
     /// A metric/period combination with nothing to show mirrors the spend tiles' "No data" rule —
     /// never a fabricated zero ring.
     private var emptyState: some View {
-        Text(metric.emptyMessage)
+        Text(projection.hasIncompleteCost && metric.usesDollarEstimateNote
+             ? "No fully priced usage for this period"
+             : metric.emptyMessage)
             .font(.system(size: density.supportingPointSize))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity)
@@ -250,13 +252,14 @@ struct TotalSpendRingContent: View {
 
     private var accessibilityLabel: String {
         let center = formatValue(projection.centerValue, style: .full)
+        let partial = projection.hasIncompleteCost ? ", partial because unpriced usage is omitted" : ""
         switch projection.metric {
         case .cost:
-            return "Total cost \(center) across \(projection.slices.count) providers"
+            return "Total cost \(center) across \(projection.slices.count) providers\(partial)"
         case .tokens:
             return "Total tokens \(center) across \(projection.slices.count) providers"
         case .costPerMtok:
-            return "Blended cost per megatoken \(center) across \(projection.slices.count) providers"
+            return "Blended cost per megatoken \(center) across \(projection.slices.count) providers\(partial)"
         }
     }
 
@@ -301,6 +304,12 @@ struct TotalSpendRingContent: View {
                 .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
+            if projection.hasIncompleteCost {
+                Text("Partial")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
         .padding(.horizontal, 10)
         .hoverTooltip(centerTooltip)
@@ -308,10 +317,14 @@ struct TotalSpendRingContent: View {
 
     private var centerTooltip: String {
         let exact = formatValue(projection.centerValue, style: .full)
+        var notes: [String] = []
         if projection.isEstimated, projection.metric.usesDollarEstimateNote {
-            return "\(exact) · \(WidgetData.localEstimateNote)"
+            notes.append(WidgetData.localEstimateNote)
         }
-        return exact
+        if projection.hasIncompleteCost {
+            notes.append("Partial: unpriced usage is omitted")
+        }
+        return notes.isEmpty ? exact : "\(exact) · \(notes.joined(separator: " · "))"
     }
 
     // MARK: - Legend

@@ -74,7 +74,10 @@ struct WidgetGroupedListView: View {
             warning: dataStore.headerNotice(for: group.provider.id),
             refreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
             staleness: dataStore.stalenessHint(for: group.provider.id),
-            onCopyScreenshot: { shareCard(group) }
+            onCopyScreenshot: { shareCard(group) },
+            onRefresh: dataStore.errorMessage(for: group.provider.id) == nil
+                ? nil
+                : { retryProvider(group.provider.id) }
         )
         // Keep the provider mark and hover-revealed copy control aligned with the card's content edges.
         .padding(.horizontal, 8)
@@ -87,11 +90,7 @@ struct WidgetGroupedListView: View {
             }
             Divider()
             Button("Refresh \(group.provider.displayName)") {
-                Task {
-                    await withThrottledFullAccounting {
-                        await dataStore.refresh(providerID: group.provider.id, force: true)
-                    }
-                }
+                refreshProvider(group.provider.id)
             }
             Button("Customize…") {
                 openCustomize(for: group.provider.id)
@@ -332,11 +331,7 @@ struct WidgetGroupedListView: View {
         Divider()
         if let provider = layout.provider(id: providerID) {
             Button("Refresh \(provider.displayName)") {
-                Task {
-                    await withThrottledFullAccounting {
-                        await dataStore.refresh(providerID: providerID, force: true)
-                    }
-                }
+                refreshProvider(providerID)
             }
         }
         Button("Customize…") {
@@ -352,6 +347,41 @@ struct WidgetGroupedListView: View {
             withAnimation(Motion.modeSwitch) {
                 layout.customizeProviderID = providerID
                 layout.isEditing = true
+            }
+        }
+    }
+
+    private func refreshProvider(_ providerID: String) {
+        Task {
+            await withManualRefresh {
+                await withThrottledFullAccounting {
+                    await dataStore.refresh(providerID: providerID, force: true)
+                }
+            }
+        }
+    }
+
+    /// A visible error-button retry is aimed at restoring the provider's live status. Publish that
+    /// result as soon as auth/API work finishes, then fold local token history in a separate task so
+    /// the error action isn't held open by accounting work.
+    private func retryProvider(_ providerID: String) {
+        Task {
+            let attempt = await withManualRefresh {
+                let manualActionID = ProviderRefreshContext.manualActionID
+                let interactionGate = ProviderRefreshContext.credentialInteractionGate
+                let outcome = await withThrottledPanelMeters {
+                    await dataStore.refresh(providerID: providerID, force: true)
+                }
+                return (outcome, manualActionID, interactionGate)
+            }
+            guard attempt.0 == .refreshed || attempt.0 == .failed else { return }
+
+            Task { @MainActor in
+                _ = await dataStore.refreshProviderHistoryAfterRetry(
+                    providerID: providerID,
+                    manualActionID: attempt.1,
+                    credentialInteractionGate: attempt.2
+                )
             }
         }
     }

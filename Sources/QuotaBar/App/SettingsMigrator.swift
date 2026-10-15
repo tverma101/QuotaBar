@@ -18,7 +18,7 @@ struct SettingsMigration: Sendable {
 enum SettingsSchema {
     /// Current schema version. Keep equal to the highest migration `version` below (or the baseline when
     /// there are none). This is NOT the app version — bump it only alongside a migration you add.
-    static let current = 2
+    static let current = 3
 
     /// The provider IDs that existed when the v2 migration shipped, frozen forever. A migration is a
     /// point-in-time transform: any future build with more providers also contains this migration, so a
@@ -27,6 +27,12 @@ enum SettingsSchema {
     static let v2ProviderIDs = [
         "antigravity", "claude", "codex", "copilot", "cursor", "devin", "grok", "openrouter", "zai"
     ]
+
+    /// Providers that were already in the registry when v2 shipped but were accidentally omitted from
+    /// its frozen provider list. The legacy disabled-list conversion must still treat them as enabled
+    /// unless explicitly disabled; v3 also marks them known so credential detection cannot override an
+    /// explicit off choice.
+    static let v3PreviouslyShippedProviderIDs = ["hermes", "opencode"]
 
     /// Ordered migrations, each taking the domain one version higher. v1 is the baseline — the settings
     /// shape at the moment this system replaced the beta-era "wipe on every update" behavior — so it
@@ -38,16 +44,43 @@ enum SettingsSchema {
         // - legacy disabled-list installs convert to the equivalent enabled list (behavior-preserving:
         //   the effective on/off set is identical before and after),
         // - every install gets the known-provider set seeded with the providers of this era, so nothing
-        //   already shipped is retroactively treated as "new" and re-enabled against the user's choice.
+        //   already shipped is retroactively treated as "new" and re-enabled against the user's choice;
+        //   explicit legacy disabled IDs are recorded too, including account-specific IDs.
         SettingsMigration(version: 2) { defaults in
-            if defaults.stringArray(forKey: "openusage.enabledProviders.v1") == nil {
-                let disabled = Set(defaults.stringArray(forKey: "openusage.disabledProviders.v1") ?? [])
-                let enabled = v2ProviderIDs.filter { !disabled.contains($0) }
+            let legacyDisabled = Set(defaults.stringArray(forKey: "openusage.disabledProviders.v1") ?? [])
+            let existingEnabledList = defaults.stringArray(forKey: "openusage.enabledProviders.v1")
+            let existingKnownList = defaults.stringArray(forKey: "openusage.knownProviders.v1")
+            if existingEnabledList == nil {
+                let legacyShippedIDs = Set(v2ProviderIDs).union(v3PreviouslyShippedProviderIDs)
+                let enabled = legacyShippedIDs.filter { !legacyDisabled.contains($0) }.sorted()
                 defaults.set(enabled, forKey: "openusage.enabledProviders.v1")
                 defaults.removeObject(forKey: "openusage.disabledProviders.v1")
             }
-            if defaults.stringArray(forKey: "openusage.knownProviders.v1") == nil {
-                defaults.set(v2ProviderIDs, forKey: "openusage.knownProviders.v1")
+            // Enabled-list installs predate provider tracking. Their empty or missing known-list is
+            // an intentional ambiguity sentinel: NewProviderSeeder baselines the live registry
+            // without probing so credentials cannot override a provider the user turned off.
+            // Only legacy disabled-list installs have enough information to safely seed v2's set.
+            if existingEnabledList == nil || !(existingKnownList ?? []).isEmpty {
+                var known = Set(existingKnownList ?? [])
+                known.formUnion(v2ProviderIDs)
+                known.formUnion(legacyDisabled)
+                defaults.set(known.sorted(), forKey: "openusage.knownProviders.v1")
+            } else {
+                defaults.set([String](), forKey: "openusage.knownProviders.v1")
+            }
+        },
+        // v2's frozen list omitted OpenCode and Hermes even though both were already shipped. Their
+        // legacy disabled-list choices migrated to OFF but were not marked known; NewProviderSeeder
+        // could then probe and re-enable them. Preserve the enabled set and repair only that knowledge.
+        SettingsMigration(version: 3) { defaults in
+            var known = Set(defaults.stringArray(forKey: "openusage.knownProviders.v1") ?? [])
+            // An empty/missing known set is a deliberate legacy sentinel: NewProviderSeeder then
+            // baselines the current registry without credential probes because old enabled-list
+            // installs cannot distinguish "user turned it off" from "not tracked yet". Do not make
+            // that ambiguous state look partially known by inserting only these two IDs.
+            if !known.isEmpty {
+                known.formUnion(v3PreviouslyShippedProviderIDs)
+                defaults.set(known.sorted(), forKey: "openusage.knownProviders.v1")
             }
         }
     ]

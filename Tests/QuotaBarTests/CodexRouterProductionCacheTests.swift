@@ -96,6 +96,32 @@ final class CodexRouterProductionCacheTests: XCTestCase {
         }
     }
 
+    func testProductionFoldMarksIncompleteRouterCostCoverage() async throws {
+        try await withLedger { ledger in
+            let estimatedInput = #"{"at":"\#(TestLocalInstant.iso(2026, 10, 4, 10))","model":"test-model","provider":"openai","status":200,"inputTokens":0,"cachedInputTokens":0,"outputTokens":25,"totalTokens":25,"estimatedInputTokens":900}"# + "\n"
+            let mismatchedTotal = #"{"at":"\#(TestLocalInstant.iso(2026, 10, 4, 11))","model":"test-model","provider":"openai","status":200,"inputTokens":100,"cachedInputTokens":25,"outputTokens":50,"totalTokens":160}"# + "\n"
+            try (estimatedInput + mismatchedTotal).write(to: ledger, atomically: true, encoding: .utf8)
+
+            let maybeScan = await self.scan(ledger)
+            let scan = try XCTUnwrap(maybeScan)
+            let day = try XCTUnwrap(scan.series.daily.first)
+
+            XCTAssertEqual(day.totalTokens, 185)
+            XCTAssertFalse(day.costIsComplete)
+            XCTAssertNil(scan.apiEstimateByDay?[day.date])
+            XCTAssertTrue(scan.apiEstimateIncompleteDays?.contains(day.date) == true)
+            XCTAssertNil(scan.modelUsage?.daily.first?.models.first?.costUSD)
+
+            CodexRouterAggregateIndex.shared.unloadMemoryForTesting(path: ledger.path)
+            let maybeRestoredScan = await self.scan(ledger)
+            let restoredScan = try XCTUnwrap(maybeRestoredScan)
+            let restoredDay = try XCTUnwrap(restoredScan.series.daily.first)
+            XCTAssertEqual(restoredDay.totalTokens, 185)
+            XCTAssertFalse(restoredDay.costIsComplete)
+            XCTAssertTrue(restoredScan.apiEstimateIncompleteDays?.contains(restoredDay.date) == true)
+        }
+    }
+
     func testResidentAggregateBoundStillAllowsEvictedRecordsToReloadFromDisk() async throws {
         try await withLedger { ledger in
             try line(tokens: 100).write(to: ledger, atomically: true, encoding: .utf8)

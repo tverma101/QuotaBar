@@ -25,24 +25,31 @@ While a pool's rolling 5-hour window has no usage yet, that meter reads **Not st
 
 QuotaBar never asks for a token — it reads what Antigravity already has:
 
-- **Antigravity running** — QuotaBar talks to the app's local language server (the richest source, and where the plan name comes from).
+- **Antigravity running** — QuotaBar talks to the app's local language server (the richest source, and where the plan name comes from). Provider detection also recognizes a discovered Antigravity or `agy` listener; it does not need a separate Cloud Code Keychain token while that local source is available.
 - **App closed** — it falls back to the OAuth token Antigravity / `agy` store in your macOS Keychain and queries Google's Cloud Code API. An expired token is refreshed automatically (QuotaBar never writes back to Antigravity's own keychain item). Its short-lived cache is reused only while the same Keychain login is present and readable.
 
-If neither is available you'll see *Start Antigravity or run `agy` and try again.*
+If neither is available you'll see *Start Antigravity or run `agy` and try again.* An expired access token with no refresh token is reported as expired sign-in. A Cloud Code 403 is shown as an access denial and does not trigger an OAuth refresh.
 
 ## Spend and usage history
 
-QuotaBar reads generation token counts, including the fixed system prompt, from `~/.gemini/antigravity-cli/conversations/*.db` and estimates their API-equivalent cost using the shared [model pricing](../pricing.md). Today, Yesterday, and Last 30 Days contribute to the Total Spend card alongside the other providers. These are estimates, not charges from your Antigravity subscription, and conversation data never leaves your Mac. Previously scanned conversations are reused on refresh, so only new generation records need to be read.
+QuotaBar reads generation token counts, including the fixed system prompt, from every `~/.gemini/antigravity*/conversations/*.db` store. That covers the Antigravity app, IDE, CLI, and compatible clients that keep separate conversation roots. QuotaBar estimates their API-equivalent cost using the shared [model pricing](../pricing.md). Today, Yesterday, Last 30 Days, and Usage Trend combine recent usage across the discovered stores; Usage History retains up to ten years. The quota meters come from Google's API, while token counts come only from generation records stored on this Mac, so quota usage can be present while these local token rows have no recent data. If Google's quota request fails, QuotaBar still scans local history and shows the error alongside any available spend rows. These are estimates, not charges from your Antigravity subscription, and conversation data never leaves your Mac. Unchanged databases reuse their cached history; when a database changes, QuotaBar verifies cached rows with one compact SQLite digest query before reading appended generations. SQLite CLI builds without the digest functions use the bounded batch verifier. Edits to older records trigger a full rescan so totals don't stay stale.
 
-The transcript logs don't include token accounting, so they aren't used. Missing or unpriced models aren't assigned an invented price, and unusually large generation records are skipped with a warning to keep memory usage bounded.
+The transcript logs don't include token accounting, so they aren't used. When a client root or database
+disappears from discovery, its last-good rows remain in the aggregate while readable stores continue
+updating. A root-discovery or database-read failure keeps the last complete aggregate instead of
+publishing partial history. Missing or unpriced models aren't assigned an invented price, and unusually
+large generation records are skipped with a warning to keep memory usage bounded.
 
 ## Troubleshooting
 
 - **"Start Antigravity or run `agy`…"** — sign in to the Antigravity app (or run `agy`) so a usable token exists, then refresh.
 - **"Couldn't read Antigravity credentials…"** — unlock Keychain or sign in to Antigravity again. QuotaBar will not use its cached access token until the current login can be verified.
+- **"Google denied access to Antigravity usage"** — Cloud Code returned 403. Check that the signed-in account and project have access; QuotaBar does not treat this as an expired token.
+- **"Google rejected QuotaBar's Antigravity OAuth client configuration"** — Google returned `invalid_client` while exchanging the refresh token. This is an app-side client configuration issue, not an expired Antigravity sign-in; update QuotaBar and try again.
 - **The weekly meters show "No data"** — your Antigravity build doesn't expose the quota-summary endpoint yet (only newer builds do). The 5-hour meters still work from the older endpoints; updating Antigravity brings the weekly meters back.
 - **A meter shows "No data"** — that pool/window wasn't in the latest response (some tiers only report certain windows). The other meters still update.
-- **Spend or usage history shows "No data"** — Antigravity hasn't written usable conversation databases yet. Run an Antigravity or `agy` session, then refresh.
+- **Spend or usage history shows "No data"** — none of the discovered Antigravity stores has usable generation records in the current 30-day window. The quota meters can still show usage because they come from Google's API; token counts need local generation records. Open Usage History to see older retained records, or run an Antigravity app, IDE, or `agy` session on this Mac and refresh.
+- **Some usage is missing** — QuotaBar keeps last-good rows from a cached database or client root that disappears from discovery while readable stores continue updating. A root-discovery or unreadable-database failure preserves the last complete history. Check Settings → Copy Log Path for a read warning, restore access, and refresh.
 - **Where did the Gemini Pro and Flash meters go?** — merged: both models draw from the one shared Gemini pool, which is now the single Session meter.
 - **Quotas look full after heavy use** — the 5-hour windows reset on a rolling basis and the weekly windows once a week; the reset time is shown on each meter.
 

@@ -25,12 +25,17 @@ final class ProviderEnablementStore {
     private static let disabledStorageKey = "openusage.disabledProviders.v1"
     private static let enabledStorageKey = "openusage.enabledProviders.v1"
     private static let knownStorageKey = "openusage.knownProviders.v1"
+    private static let userChoiceRevisionKey = "openusage.providerUserChoiceRevision.v1"
+    private static let userChoiceProviderIDsKey = "openusage.providerUserChoiceIDs.v1"
+    private static let firstRunProbePendingKey = "openusage.firstRunCredentialProbePending.v1"
+    private static let firstRunProbeRevisionKey = "openusage.firstRunCredentialProbeRevision.v1"
+    private static let pendingProviderProbeIDsKey = "openusage.pendingProviderCredentialProbeIDs.v1"
 
     /// Posted when the enabled-provider set actually changes. The refresh loop listens for this to wake
     /// early and fetch a newly-enabled provider promptly, instead of waiting out the full interval —
     /// WITHOUT subscribing to the firehose `UserDefaults.didChangeNotification`, which also fires for the
     /// app's own snapshot-cache writes, and unrelated global-domain changes
-    /// from other processes. Waking on that (with no minimum interval) collapsed the fixed 5-minute
+    /// from other processes. Waking on that (with no minimum interval) collapsed the bounded periodic
     /// cadence into a refresh storm.
     ///
     /// `nonisolated` so the refresh loop's background task can name it without hopping to the main actor
@@ -44,7 +49,7 @@ final class ProviderEnablementStore {
     var onProviderEnabled: (@MainActor (String) -> Void)?
     /// Called after any real enablement-set change. iCloud history rewrites its one machine document so
     /// disabling a provider removes its stale contribution as promptly as enabling adds it.
-    var onChange: (@MainActor () -> Void)?
+    var onChange: (@MainActor (Set<String>) -> Void)?
 
     /// Legacy-mode state: the providers the user turned off. Unused (empty) in enabled-list mode.
     private(set) var disabledIDs: Set<String>
@@ -53,7 +58,19 @@ final class ProviderEnablementStore {
     /// Every provider ID this install has ever seen (see the type comment). Seeded by the v2 settings
     /// migration or `FirstRunSeeder`, then grown by `registerKnownProviders`.
     private(set) var knownIDs: Set<String>
+    /// Provider IDs the user has explicitly toggled. Persisted so an interrupted first-launch probe
+    /// cannot auto-enable a provider the user intentionally left off before quitting.
+    private(set) var userChoiceProviderIDs: Set<String>
+    /// Persisted revision lets a first-launch probe detect user changes even across an app restart.
+    private(set) var persistentUserChoiceRevision: UInt64
+    /// Durable probe state: first-run detection has a single revision fence; update-time detection
+    /// retains the individual provider IDs until each local credential probe completes.
+    private(set) var firstRunCredentialProbeRevision: UInt64?
+    private(set) var pendingProviderCredentialProbeIDs: Set<String>
     private let defaults: UserDefaults
+    /// In-memory revisions distinguish a final user choice from the store merely returning to the
+    /// same enabled set while an asynchronous credential probe is running.
+    private var userChoiceRevisions: [String: UInt64] = [:]
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -65,6 +82,12 @@ final class ProviderEnablementStore {
             self.disabledIDs = Set(defaults.stringArray(forKey: Self.disabledStorageKey) ?? [])
         }
         self.knownIDs = Set(defaults.stringArray(forKey: Self.knownStorageKey) ?? [])
+        self.userChoiceProviderIDs = Set(defaults.stringArray(forKey: Self.userChoiceProviderIDsKey) ?? [])
+        self.persistentUserChoiceRevision = (defaults.object(forKey: Self.userChoiceRevisionKey) as? NSNumber)?.uint64Value ?? 0
+        self.firstRunCredentialProbeRevision = (defaults.object(forKey: Self.firstRunProbeRevisionKey) as? NSNumber)?.uint64Value
+        self.pendingProviderCredentialProbeIDs = Set(
+            defaults.stringArray(forKey: Self.pendingProviderProbeIDsKey) ?? []
+        )
     }
 
     func isEnabled(_ id: String) -> Bool {
@@ -73,6 +96,24 @@ final class ProviderEnablementStore {
     }
 
     func setEnabled(_ enabled: Bool, for id: String) {
+        updateEnabled(enabled, for: id, recordsUserChoice: true)
+    }
+
+    /// Revisions captured before an async seed probe. No-op toggles do not advance the revision.
+    func userChoiceRevisionsSnapshot(for ids: Set<String>) -> [String: UInt64] {
+        Dictionary(uniqueKeysWithValues: ids.map { ($0, userChoiceRevisions[$0, default: 0]) })
+    }
+
+    func userChangedChoices(since revisions: [String: UInt64]) -> Bool {
+        revisions.contains { userChoiceRevisions[$0.key, default: 0] != $0.value }
+    }
+
+    /// Apply a detected new-provider default without treating it as a manual user toggle.
+    func enableDetectedProvider(_ id: String) {
+        updateEnabled(true, for: id, recordsUserChoice: false)
+    }
+
+    private func updateEnabled(_ enabled: Bool, for id: String, recordsUserChoice: Bool) {
         if var ids = enabledIDs {
             if enabled { ids.insert(id) } else { ids.remove(id) }
             // A no-op toggle (re-setting the same value) shouldn't persist or wake the refresh loop.
@@ -89,10 +130,17 @@ final class ProviderEnablementStore {
             guard disabledIDs != before else { return }
             defaults.set(Array(disabledIDs), forKey: Self.disabledStorageKey)
         }
+        if recordsUserChoice {
+            userChoiceRevisions[id, default: 0] &+= 1
+            persistentUserChoiceRevision &+= 1
+            userChoiceProviderIDs.insert(id)
+            defaults.set(persistentUserChoiceRevision, forKey: Self.userChoiceRevisionKey)
+            defaults.set(Array(userChoiceProviderIDs), forKey: Self.userChoiceProviderIDsKey)
+        }
         // Clear the backoff BEFORE the wake notification, so the refresh it triggers actually probes the
         // just-enabled provider instead of skipping it as recently-failed.
         if enabled { onProviderEnabled?(id) }
-        onChange?()
+        onChange?([id])
         NotificationCenter.default.post(name: Self.didChangeNotification, object: nil)
     }
 
@@ -111,7 +159,47 @@ final class ProviderEnablementStore {
         return new
     }
 
+    /// Begins the durable first-run credential probe before fallback state is written. A later launch
+    /// can resume it and compare the saved user-choice revision before applying detection results.
+    func beginFirstRunCredentialProbe() {
+        firstRunCredentialProbeRevision = persistentUserChoiceRevision
+        defaults.set(true, forKey: Self.firstRunProbePendingKey)
+        defaults.set(persistentUserChoiceRevision, forKey: Self.firstRunProbeRevisionKey)
+    }
+
+    var hasPendingFirstRunCredentialProbe: Bool {
+        defaults.bool(forKey: Self.firstRunProbePendingKey)
+    }
+
+    func completeFirstRunCredentialProbe() {
+        firstRunCredentialProbeRevision = nil
+        defaults.removeObject(forKey: Self.firstRunProbePendingKey)
+        defaults.removeObject(forKey: Self.firstRunProbeRevisionKey)
+    }
+
+    /// Marks newly-seen providers as pending before starting their asynchronous local credential
+    /// probes. Pending IDs are intentionally distinct from `knownIDs`: a relaunch resumes unfinished
+    /// detection, while completed misses remain one-shot and preserve the user's ability to enable them.
+    @discardableResult
+    func registerProvidersForCredentialProbe(_ ids: Set<String>) -> Set<String> {
+        let newlyKnown = ids.subtracting(knownIDs)
+        if !newlyKnown.isEmpty {
+            knownIDs.formUnion(newlyKnown)
+            defaults.set(Array(knownIDs), forKey: Self.knownStorageKey)
+            pendingProviderCredentialProbeIDs.formUnion(newlyKnown)
+            defaults.set(Array(pendingProviderCredentialProbeIDs), forKey: Self.pendingProviderProbeIDsKey)
+        }
+        return newlyKnown
+    }
+
+    func completeProviderCredentialProbes(for ids: Set<String>) {
+        pendingProviderCredentialProbeIDs.subtract(ids)
+        defaults.set(Array(pendingProviderCredentialProbeIDs), forKey: Self.pendingProviderProbeIDsKey)
+    }
+
     func seedEnabledProviders(_ ids: Set<String>) {
+        let previouslyEnabled = enabledIDs ?? knownIDs.subtracting(disabledIDs)
+        let changedIDs = previouslyEnabled.symmetricDifference(ids)
         let newlyEnabled = ids.filter { !isEnabled($0) }
         let changed = enabledIDs != ids
         enabledIDs = ids
@@ -119,7 +207,7 @@ final class ProviderEnablementStore {
         defaults.set(Array(ids), forKey: Self.enabledStorageKey)
         guard changed else { return }
         for id in newlyEnabled.sorted() { onProviderEnabled?(id) }
-        onChange?()
+        onChange?(changedIDs)
         NotificationCenter.default.post(name: Self.didChangeNotification, object: nil)
     }
 }

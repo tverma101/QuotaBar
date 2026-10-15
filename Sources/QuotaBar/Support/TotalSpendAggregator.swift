@@ -66,14 +66,16 @@ enum TotalSpendMetric: String, CaseIterable, Identifiable, Sendable {
 struct TotalSpendSlice: Identifiable, Equatable {
     let provider: Provider
     let amountUSD: Double
+    let hasDollarAmount: Bool
     let tokenCount: Double
     let estimated: Bool
+    let hasIncompleteCost: Bool
 
     var id: String { provider.id }
 
     /// Dollars per million tokens for this provider alone. `nil` when either side is missing.
     var costPerMtok: Double? {
-        guard amountUSD > 0, tokenCount > 0 else { return nil }
+        guard hasDollarAmount, tokenCount > 0 else { return nil }
         return (amountUSD / tokenCount) * 1_000_000
     }
 }
@@ -94,6 +96,7 @@ struct TotalSpendProjection: Equatable {
     let slices: [TotalSpendProjectedSlice]
     let centerValue: Double
     let isEstimated: Bool
+    let hasIncompleteCost: Bool
 
     var isEmpty: Bool { slices.isEmpty }
 }
@@ -116,12 +119,13 @@ struct TotalSpend: Equatable {
         let included: [(slice: TotalSpendSlice, display: Double)] = slices.compactMap { slice in
             switch metric {
             case .cost:
-                guard slice.amountUSD > 0 else { return nil }
+                guard slice.hasDollarAmount, !slice.hasIncompleteCost else { return nil }
                 return (slice, slice.amountUSD)
             case .tokens:
                 guard slice.tokenCount > 0 else { return nil }
                 return (slice, slice.tokenCount)
             case .costPerMtok:
+                guard !slice.hasIncompleteCost else { return nil }
                 guard let rate = slice.costPerMtok else { return nil }
                 return (slice, rate)
             }
@@ -152,7 +156,15 @@ struct TotalSpend: Equatable {
             estimated = ranked.contains { $0.slice.estimated }
         }
 
-        return TotalSpendProjection(metric: metric, slices: projected, centerValue: center, isEstimated: estimated)
+        let hasIncompleteCost = metric.usesDollarEstimateNote
+            && slices.contains(where: \.hasIncompleteCost)
+        return TotalSpendProjection(
+            metric: metric,
+            slices: projected,
+            centerValue: center,
+            isEstimated: estimated,
+            hasIncompleteCost: hasIncompleteCost
+        )
     }
 }
 
@@ -171,7 +183,7 @@ enum TotalSpendAggregator {
         let slices = providers.compactMap { provider -> TotalSpendSlice? in
             guard let snapshot = snapshots[provider.id],
                   let line = snapshot.line(label: period.lineLabel),
-                  case .values(_, let values, _, _, _, _) = line else { return nil }
+                  case .values(_, let values, _, _, let unknownModels, _) = line else { return nil }
 
             let dollars = values.filter { $0.kind == .dollars }
             let amount = dollars.reduce(0) { $0 + $1.number }
@@ -183,8 +195,10 @@ enum TotalSpendAggregator {
             return TotalSpendSlice(
                 provider: provider,
                 amountUSD: max(amount, 0),
+                hasDollarAmount: !dollars.isEmpty,
                 tokenCount: max(tokens, 0),
-                estimated: dollars.contains(where: \.estimated)
+                estimated: dollars.contains(where: \.estimated),
+                hasIncompleteCost: !unknownModels.isEmpty || (tokens > 0 && dollars.isEmpty)
             )
         }
         return TotalSpend(period: period, slices: slices)

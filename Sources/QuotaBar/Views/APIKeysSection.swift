@@ -60,7 +60,7 @@ struct APIKeysSection: View {
             Text(provider.provider.displayName)
             Spacer(minLength: 8)
             statusDot
-            Button(isOpen ? "Done" : (status == .notSet ? "Add" : "Edit")) {
+            Button(isOpen ? "Done" : (status.editorMode == .add ? "Add" : "Edit")) {
                 toggleExpand()
             }
             .buttonStyle(.bordered)
@@ -70,10 +70,15 @@ struct APIKeysSection: View {
         .padding(.vertical, density.controlRowPadding)
     }
 
-    /// The dot is binary, never a palette: red when no key is set, green when a key is usable (from
-    /// the environment, saved, or overriding the env). It's the row's only status signal.
+    /// Red means missing, orange means a saved source needs repair, and green means a usable key is
+    /// available from the environment or a readable saved file.
     private var statusDot: some View {
-        let color = status == .notSet ? Color(nsColor: .systemRed) : Color(nsColor: .systemGreen)
+        let color: Color
+        switch status.indicator {
+        case .missing: color = Color(nsColor: .systemRed)
+        case .needsAttention: color = Color(nsColor: .systemOrange)
+        case .ready: color = Color(nsColor: .systemGreen)
+        }
         return Circle().fill(color).frame(width: 6, height: 6)
     }
 
@@ -82,12 +87,26 @@ struct APIKeysSection: View {
     @ViewBuilder
     private var editorBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if status == .notSet {
+            if status.editorMode == .add {
                 // No key anywhere: the field is editable from the start.
                 keyField(editable: true)
                 primaryButton("Save", disabled: !hasInput) { save() }
-            } else if status == .fromEnvironment {
+            } else if status.editorMode == .savedUnreadable {
+                Text("QuotaBar can't read the saved key file. Check its permissions or enter a replacement.")
+                    .font(.caption)
+                    .foregroundStyle(Theme.notice)
+                keyField(editable: true)
+                HStack(spacing: 8) {
+                    primaryButton("Save", disabled: !hasInput) { save() }
+                    ghostButton("Remove Saved File") { remove() }
+                }
+            } else if status.editorMode == .environment || status.editorMode == .environmentFallback {
                 // Env key, no custom key yet: read-only until "Override" is checked, then editable.
+                if status.editorMode == .environmentFallback {
+                    Text("The saved key file can't be read. The environment key is active; check file permissions or remove the saved file.")
+                        .font(.caption)
+                        .foregroundStyle(Theme.notice)
+                }
                 keyField(editable: overrideChecked)
                 if overrideChecked {
                     HStack(spacing: 8) {
@@ -98,6 +117,9 @@ struct APIKeysSection: View {
                     Toggle("Override With a Custom Key", isOn: $overrideChecked)
                         .toggleStyle(.checkbox)
                         .font(.caption)
+                    if status.editorMode == .environmentFallback {
+                        ghostButton("Remove Saved File") { remove() }
+                    }
                 }
             } else {
                 // saved / overrideActive: a custom key is already set, so the override checkbox is
@@ -160,9 +182,11 @@ struct APIKeysSection: View {
     private var sourceHint: String {
         switch status {
         case .fromEnvironment: "From Your Environment"
+        case .environmentFallback: "Environment Fallback"
         case .saved: "Saved in App"
         case .overrideActive: "Custom Key"
         case .notSet: ""
+        case .savedUnreadable: "Saved File Unreadable"
         }
     }
 

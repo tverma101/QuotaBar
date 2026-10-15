@@ -9,6 +9,8 @@ enum ResetClaimOutcome: Equatable, Sendable {
     case success
     case nothingToReset
     case noCredit
+    case credentialAccess
+    case cancelled
     case failed
 }
 
@@ -27,8 +29,24 @@ enum ResetClaimOutcome: Equatable, Sendable {
 final class CodexResetClaimService {
     typealias Credentials = (accessToken: String, accountID: String?)
 
+    private struct CredentialCandidateLoad {
+        let candidates: [Credentials]
+        let credentialAccessFailed: Bool
+        let wasCancelled: Bool
+
+        init(
+            candidates: [Credentials],
+            credentialAccessFailed: Bool,
+            wasCancelled: Bool = false
+        ) {
+            self.candidates = candidates
+            self.credentialAccessFailed = credentialAccessFailed
+            self.wasCancelled = wasCancelled
+        }
+    }
+
     private let usageClient: CodexUsageClient
-    private let credentialCandidates: () async -> [Credentials]
+    private let credentialCandidates: () async -> CredentialCandidateLoad
     private let refreshAfterClaim: () async -> Void
     /// The credit id each idempotency key was matched to, kept for the key's retries: if a consume
     /// succeeded but its response was lost, the credit is gone from a re-fetched list — a fresh match
@@ -44,7 +62,22 @@ final class CodexResetClaimService {
         refreshAfterClaim: @escaping () async -> Void = {}
     ) {
         self.usageClient = usageClient
-        self.credentialCandidates = credentialCandidates
+        self.credentialCandidates = {
+            CredentialCandidateLoad(
+                candidates: await credentialCandidates(),
+                credentialAccessFailed: false
+            )
+        }
+        self.refreshAfterClaim = refreshAfterClaim
+    }
+
+    private init(
+        usageClient: CodexUsageClient,
+        credentialCandidateLoader: @escaping () async -> CredentialCandidateLoad,
+        refreshAfterClaim: @escaping () async -> Void
+    ) {
+        self.usageClient = usageClient
+        self.credentialCandidates = credentialCandidateLoader
         self.refreshAfterClaim = refreshAfterClaim
     }
 
@@ -61,17 +94,61 @@ final class CodexResetClaimService {
     ) {
         self.init(
             usageClient: usageClient,
-            credentialCandidates: {
-                var candidates = authStore.loadAuthCandidates()
-                if let keychain = await loadOffMainActor({ try? authStore.loadKeychainAuth() }) {
-                    candidates.append(keychain)
+            credentialCandidateLoader: {
+                var candidates: [CodexAuthState] = []
+                var credentialAccessFailed = false
+                do {
+                    candidates = try await loadOffMainActor { [authStore] in
+                        try authStore.loadAuthCandidates()
+                    }
+                } catch is CancellationError {
+                    return CredentialCandidateLoad(
+                        candidates: [], credentialAccessFailed: false, wasCancelled: true
+                    )
+                } catch {
+                    credentialAccessFailed = true
+                    AppLog.error(
+                        LogTag.auth("codex"),
+                        "reset claim could not read auth files: \(error.localizedDescription)"
+                    )
                 }
-                return candidates.compactMap { candidate in
+                if Task.isCancelled {
+                    return CredentialCandidateLoad(
+                        candidates: [], credentialAccessFailed: false, wasCancelled: true
+                    )
+                }
+                do {
+                    if let keychain = try await loadOffMainActor({ [authStore] in
+                        try authStore.loadKeychainAuth()
+                    }) {
+                        candidates.append(keychain)
+                    }
+                } catch is CancellationError {
+                    return CredentialCandidateLoad(
+                        candidates: [], credentialAccessFailed: false, wasCancelled: true
+                    )
+                } catch {
+                    credentialAccessFailed = true
+                    AppLog.error(
+                        LogTag.auth("codex"),
+                        "reset claim could not read Keychain credentials: \(error.localizedDescription)"
+                    )
+                }
+                if Task.isCancelled {
+                    return CredentialCandidateLoad(
+                        candidates: [], credentialAccessFailed: false, wasCancelled: true
+                    )
+                }
+                let usableCandidates: [Credentials] = candidates.compactMap { candidate in
                     guard candidate.hasUsableAccessToken, let token = candidate.auth.tokens?.accessToken else {
                         return nil
                     }
-                    return (token, candidate.auth.tokens?.accountID)
+                    return (accessToken: token, accountID: candidate.auth.tokens?.accountID)
                 }
+                return CredentialCandidateLoad(
+                    candidates: usableCandidates,
+                    credentialAccessFailed: credentialAccessFailed
+                )
             },
             refreshAfterClaim: refreshAfterClaim
         )
@@ -80,8 +157,17 @@ final class CodexResetClaimService {
     /// Claims the credit expiring at `expiry`. Never throws — every failure mode is logged loudly and
     /// collapsed to an outcome the popover can render.
     func claim(creditExpiringAt expiry: Date, redeemRequestID: String) async -> ResetClaimOutcome {
-        let candidates = await credentialCandidates()
+        let credentialLoad = await credentialCandidates()
+        guard !credentialLoad.wasCancelled, !Task.isCancelled else { return .cancelled }
+        let candidates = credentialLoad.candidates
         guard !candidates.isEmpty else {
+            if credentialLoad.credentialAccessFailed {
+                AppLog.error(
+                    LogTag.plugin("codex"),
+                    "reset claim: no usable Codex credentials because credential access failed"
+                )
+                return .credentialAccess
+            }
             AppLog.error(LogTag.plugin("codex"), "reset claim: no usable Codex credentials")
             return .failed
         }
@@ -112,12 +198,17 @@ final class CodexResetClaimService {
                 return .noCredit
             case .failed:
                 return .failed
+            case .cancelled:
+                return .cancelled
             }
         }
 
+        // A late list response must never authorize a new consume POST after the user canceled.
+        guard !Task.isCancelled else { return .cancelled }
         let outcome = await consume(
             creditID: creditID, redeemRequestID: redeemRequestID, candidates: preferredCandidates
         )
+        guard outcome != .cancelled else { return .cancelled }
         if outcome != .failed {
             // The world changed (or turned out different from the snapshot): refresh before returning,
             // so the result banner appears over already-reconciled meters and credit count.
@@ -134,6 +225,7 @@ final class CodexResetClaimService {
     ) async -> ResetClaimOutcome {
         var lastRejection: Int?
         for credentials in candidates {
+            guard !Task.isCancelled else { return .cancelled }
             let response: HTTPResponse
             do {
                 response = try await usageClient.consumeResetCredit(
@@ -143,9 +235,11 @@ final class CodexResetClaimService {
                     redeemRequestID: redeemRequestID
                 )
             } catch {
+                if ProviderCancellation.isCancellation(error) { return .cancelled }
                 AppLog.error(LogTag.plugin("codex"), "reset claim: consume request failed: \(error.localizedDescription)")
                 return .failed
             }
+            guard !Task.isCancelled else { return .cancelled }
             if response.statusCode == 401 || response.statusCode == 403 {
                 lastRejection = response.statusCode
                 continue
@@ -167,6 +261,7 @@ final class CodexResetClaimService {
     private enum MatchResult {
         case matched(creditID: String, credentials: Credentials)
         case noCredit
+        case cancelled
         case failed
     }
 
@@ -177,15 +272,20 @@ final class CodexResetClaimService {
     private func matchCredit(expiringAt expiry: Date, candidates: [Credentials]) async -> MatchResult {
         var lastFailure = "no credential candidate authenticated"
         for credentials in candidates {
+            guard !Task.isCancelled else { return .cancelled }
             let list: HTTPResponse
             do {
                 list = try await usageClient.fetchResetCredits(
                     accessToken: credentials.accessToken, accountID: credentials.accountID
                 )
             } catch {
+                if ProviderCancellation.isCancellation(error) { return .cancelled }
                 AppLog.error(LogTag.plugin("codex"), "reset claim: credit list fetch failed: \(error.localizedDescription)")
                 return .failed
             }
+            // URLSession fakes and real transports may deliver a successful response after the task
+            // was canceled. Do not turn that late GET into a consume POST.
+            guard !Task.isCancelled else { return .cancelled }
             if list.statusCode == 401 || list.statusCode == 403 {
                 lastFailure = "credit list fetch rejected (\(list.statusCode))"
                 continue

@@ -104,6 +104,11 @@ struct HistoryDashboardView: View {
                         .font(.system(size: density.supportingPointSize - 1, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
+                if report.lifetimeHasIncompleteCost {
+                    Text("Partial")
+                        .font(.system(size: density.supportingPointSize - 1, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
                 Spacer(minLength: 8)
                 if let since = report.lifetimeSinceLabel {
                     Text("Since \(since)")
@@ -149,6 +154,11 @@ struct HistoryDashboardView: View {
             Text(total.cost.map { MetricFormatter.number($0, kind: .dollars, style: .row) } ?? "\u{2014}")
                 .font(.system(size: density.headerPointSize, weight: .semibold))
                 .monospacedDigit()
+            if total.hasIncompleteCost {
+                Text("Partial cost")
+                    .font(.system(size: density.supportingPointSize - 2))
+                    .foregroundStyle(.tertiary)
+            }
             Text(MetricFormatter.number(Double(total.tokens), kind: .count, style: .row) + " tokens")
                 .font(.system(size: density.supportingPointSize - 1))
                 .foregroundStyle(.secondary)
@@ -242,6 +252,14 @@ struct HistoryDashboardView: View {
             .padding(.horizontal, 12)
             .padding(.top, 12)
             .padding(.bottom, 6)
+
+            if section.hasIncompleteCost {
+                Text("Some usage has no model price; cost is incomplete.")
+                    .font(.system(size: density.supportingPointSize - 1))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 4)
+            }
 
             ForEach(section.rows) { row in
                 modelRow(row)

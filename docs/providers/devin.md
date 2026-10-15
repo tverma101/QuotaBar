@@ -24,6 +24,7 @@ If the CLI credentials fail but the app is signed in with a different account, t
 ## Troubleshooting
 
 - **"Not logged in"** — run `devin auth login`, or sign into the Devin app, then refresh.
+- **"Couldn't read Devin's local credentials"** — check read access to `credentials.toml` and Devin's state database, then refresh. An existing but unreadable source is reported separately from a missing login.
 - **Weekly shows the daily figure** — when Devin reports no separate weekly quota, the daily quota is shown in the Weekly row so it stays meaningful.
 
 ## Under the hood

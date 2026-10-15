@@ -127,7 +127,7 @@ struct ProviderSnapshotCache {
         if changed { save(payload) }
     }
 
-    func snapshot(providerID: String) -> ProviderSnapshot? {
+    func snapshot(providerID: String, freshnessInterval: TimeInterval? = nil) -> ProviderSnapshot? {
         let snapshot = loadPayload().snapshots[providerID]
         guard let snapshot else { return nil }
         // Freshness has two requirements, and disk age alone is not enough: the snapshot must have been
@@ -146,10 +146,11 @@ struct ProviderSnapshotCache {
         let oldestStamp = min(snapshot.refreshedAt, meterStamp)
         let age = now().timeIntervalSince(oldestStamp)
         let trusted = allowsPersistedFreshness || writtenThisSession
-        let fresh = trusted && age < ttl
+        let effectiveTTL = freshnessInterval ?? ttl
+        let fresh = trusted && age < effectiveTTL
         let reason = !trusted ? "stale (not written this session)"
             : fresh ? "fresh" : "stale"
-        AppLog.debug(.cache, "\(providerID) staleness \(Int(age))s vs ttl \(Int(ttl))s -> \(reason)")
+        AppLog.debug(.cache, "\(providerID) staleness \(Int(age))s vs ttl \(Int(effectiveTTL))s -> \(reason)")
         return fresh ? snapshot : nil
     }
 

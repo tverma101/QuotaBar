@@ -47,11 +47,11 @@ struct AntigravityAuthStore: Sendable {
                 account: Self.keychainAccount
             )
         } catch KeychainError.interactionNotAllowed {
-            AppLog.info(
-                LogTag.auth("antigravity"),
-                "keychain read needs user interaction; use Refresh Now to grant it"
-            )
+            // The shared Keychain gate logs the first silent refusal. Later blocked refreshes must
+            // stay quiet instead of repeating a provider-level line on every scheduler tick.
             throw AntigravityError.credentialPermissionRequired
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             AppLog.error(LogTag.auth("antigravity"), "keychain credential read failed")
             throw AntigravityError.credentialStoreUnreadable
@@ -111,10 +111,26 @@ struct AntigravityAuthStore: Sendable {
         return token
     }
 
-    func cacheToken(_ accessToken: String, expiresIn: Double, sourceRefreshToken: String) {
-        guard let credentialFingerprint = Self.credentialFingerprint(for: sourceRefreshToken),
+    @discardableResult
+    func cacheToken(
+        _ accessToken: String,
+        expiresIn: Double,
+        matching source: AntigravityKeychainToken
+    ) throws -> Bool {
+        guard let credentialFingerprint = Self.credentialFingerprint(for: source.refreshToken),
               accessToken.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty != nil else {
-            return
+            return false
+        }
+
+        // OAuth runs off-thread and can outlive a logout/account switch. Re-read the source in the
+        // same synchronous operation immediately before writing the derived token cache.
+        let live = try ProviderRefreshContext.withCredentialSourceRevalidation {
+            try loadKeychainToken()
+        }
+        guard let live,
+              Self.credentialFingerprint(for: live.refreshToken) == credentialFingerprint else {
+            AppLog.warn(LogTag.auth("antigravity"), "discarding refreshed token because the Keychain login changed during OAuth")
+            return false
         }
         let expiresAtMs = (now().timeIntervalSince1970 + expiresIn) * 1000
         let cached = CachedToken(
@@ -130,6 +146,7 @@ struct AntigravityAuthStore: Sendable {
             // again next cycle. Log loudly rather than fail the live fetch.
             AppLog.warn(LogTag.auth("antigravity"), "failed to cache refreshed token: \(error.localizedDescription)")
         }
+        return true
     }
 
     /// Remove only QuotaBar's derived token; Antigravity's Keychain entry is never modified.

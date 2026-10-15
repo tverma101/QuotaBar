@@ -8,7 +8,7 @@ import Foundation
 /// cap meters. Non-Go rows materialize as a few dozen aggregated rows; long-context pricing is disabled
 /// for those sums because one bucket is not one request.
 final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
-    private static let schema = 3
+    private static let schema = 6
 
     struct Bucket: Codable, Sendable {
         var day: String
@@ -16,6 +16,11 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
         var input: Int
         var output: Int
         var cacheRead: Int
+        var accountId: String? = nil
+        var accountFingerprint: String? = nil
+        var burnsGoQuota: Bool? = nil
+        var routerInputWasEstimated: Bool? = nil
+        var routerCostBreakdownIsComplete: Bool? = nil
     }
 
     struct GoRow: Codable, Sendable {
@@ -24,6 +29,10 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
         var output: Int
         var cacheRead: Int
         var model: String
+        var accountId: String? = nil
+        var accountFingerprint: String? = nil
+        var routerInputWasEstimated: Bool? = nil
+        var routerCostBreakdownIsComplete: Bool? = nil
     }
 
     private struct File: Codable {
@@ -117,38 +126,103 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
         mtimeMillis = Self.mtimeMillis(URL(fileURLWithPath: path))
     }
 
-    func addRow(_ row: OpenCodeUsageScanner.ClaudeGatewayRow) {
+    func addRow(
+        _ row: OpenCodeUsageScanner.ClaudeGatewayRow,
+        compactGoBefore detailedGoCutoff: Date? = nil
+    ) {
         if row.burnsGoQuota {
+            if let detailedGoCutoff, row.date < detailedGoCutoff {
+                addBucket(
+                    day: DailyUsageAccumulator.dayKey(from: row.date),
+                    model: row.model,
+                    input: row.input,
+                    output: row.output,
+                    cacheRead: row.cacheRead,
+                    accountId: row.accountId,
+                    accountFingerprint: row.accountFingerprint,
+                    burnsGoQuota: true,
+                    routerInputWasEstimated: row.routerInputWasEstimated,
+                    routerCostBreakdownIsComplete: row.routerCostBreakdownIsComplete
+                )
+                return
+            }
             goRows.append(GoRow(
                 date: row.date.timeIntervalSince1970,
                 input: row.input,
                 output: row.output,
                 cacheRead: row.cacheRead,
-                model: row.model
+                model: row.model,
+                accountId: row.accountId,
+                accountFingerprint: row.accountFingerprint,
+                routerInputWasEstimated: row.routerInputWasEstimated,
+                routerCostBreakdownIsComplete: row.routerCostBreakdownIsComplete
             ))
             return
         }
-        let day = DailyUsageAccumulator.dayKey(from: row.date)
-        let key = bucketKey(day: day, model: row.model)
+        addBucket(
+            day: DailyUsageAccumulator.dayKey(from: row.date),
+            model: row.model,
+            input: row.input,
+            output: row.output,
+            cacheRead: row.cacheRead,
+            accountId: row.accountId,
+            accountFingerprint: row.accountFingerprint,
+            burnsGoQuota: false,
+            routerInputWasEstimated: row.routerInputWasEstimated,
+            routerCostBreakdownIsComplete: row.routerCostBreakdownIsComplete
+        )
+    }
+
+    private func addBucket(
+        day: String,
+        model: String,
+        input: Int,
+        output: Int,
+        cacheRead: Int,
+        accountId: String?,
+        accountFingerprint: String?,
+        burnsGoQuota: Bool?,
+        routerInputWasEstimated: Bool?,
+        routerCostBreakdownIsComplete: Bool?
+    ) {
+        let key = bucketKey(
+            day: day,
+            model: model,
+            accountId: accountId,
+            accountFingerprint: accountFingerprint,
+            burnsGoQuota: burnsGoQuota,
+            routerInputWasEstimated: routerInputWasEstimated,
+            routerCostBreakdownIsComplete: routerCostBreakdownIsComplete
+        )
         ensureBucketIndex()
         if let index = bucketIndex[key] {
             // Saturating: bounded external counts can still overflow when accumulated across rows.
-            buckets[index].input = ProviderParse.addingSaturating(buckets[index].input, row.input)
-            buckets[index].output = ProviderParse.addingSaturating(buckets[index].output, row.output)
-            buckets[index].cacheRead = ProviderParse.addingSaturating(buckets[index].cacheRead, row.cacheRead)
+            buckets[index].input = ProviderParse.addingSaturating(buckets[index].input, input)
+            buckets[index].output = ProviderParse.addingSaturating(buckets[index].output, output)
+            buckets[index].cacheRead = ProviderParse.addingSaturating(buckets[index].cacheRead, cacheRead)
         } else {
             bucketIndex[key] = buckets.count
             buckets.append(Bucket(
                 day: day,
-                model: row.model,
-                input: row.input,
-                output: row.output,
-                cacheRead: row.cacheRead
+                model: model,
+                input: input,
+                output: output,
+                cacheRead: cacheRead,
+                accountId: accountId,
+                accountFingerprint: accountFingerprint,
+                burnsGoQuota: burnsGoQuota,
+                routerInputWasEstimated: routerInputWasEstimated,
+                routerCostBreakdownIsComplete: routerCostBreakdownIsComplete
             ))
         }
     }
 
-    func reconcile(url: URL, current: AppendOnlyFileRevision, since: Date) -> Reconcile {
+    func reconcile(
+        url: URL,
+        current: AppendOnlyFileRevision,
+        since: Date,
+        detailedGoCutoff: Date
+    ) -> Reconcile {
         guard current.device == device, current.inode == inode else { return .stale }
         let freshMtime = Self.mtimeMillis(url)
         if current.size == offset, current.size == size {
@@ -200,7 +274,7 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
               let newAnchor = AppendOnlyFileProbe.anchor(at: url, endingAt: newOffset)
         else { return .stale }
 
-        absorb(appended)
+        absorb(appended, compactGoBefore: detailedGoCutoff)
         OpenCodeRouterLedger.noteCompactTail(path: path, bytesRead: read.statistics.bytesRead)
         offset = newOffset
         size = after.size
@@ -236,9 +310,13 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
                 cacheWrite: 0,
                 cacheRead: bucket.cacheRead,
                 model: bucket.model,
-                burnsGoQuota: false,
+                burnsGoQuota: bucket.burnsGoQuota == true,
                 isInProgress: false,
-                isAggregated: true
+                isAggregated: true,
+                accountId: bucket.accountId,
+                accountFingerprint: bucket.accountFingerprint,
+                routerInputWasEstimated: bucket.routerInputWasEstimated,
+                routerCostBreakdownIsComplete: bucket.routerCostBreakdownIsComplete
             ))
         }
         for row in goRows.sorted(by: { $0.date < $1.date }) {
@@ -252,21 +330,46 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
                 cacheRead: row.cacheRead,
                 model: row.model,
                 burnsGoQuota: true,
-                isInProgress: false
+                isInProgress: false,
+                accountId: row.accountId,
+                accountFingerprint: row.accountFingerprint,
+                routerInputWasEstimated: row.routerInputWasEstimated,
+                routerCostBreakdownIsComplete: row.routerCostBreakdownIsComplete
             ))
         }
         return rows
     }
 
-    /// Drop data that can no longer appear in the 45-day retention or cap-meter windows.
-    /// Returns whether persisted state changed and should be written back.
+    /// Keep exact timestamps for recent Go cap meters, while folding older Go turns to day/model
+    /// buckets for lifetime history. Drop rows older than the retained history window.
     @discardableResult
-    func prune(before cutoff: Date) -> Bool {
+    func prune(before cutoff: Date, detailedGoCutoff: Date) -> Bool {
         let cutoffDay = DailyUsageAccumulator.dayKey(from: cutoff)
         let oldBucketCount = buckets.count
         buckets.removeAll { $0.day < cutoffDay }
+        if buckets.count != oldBucketCount {
+            hasBucketIndex = false
+        }
         let oldGoCount = goRows.count
-        goRows.removeAll { Date(timeIntervalSince1970: $0.date) < cutoff }
+        let oldGoRows = goRows.filter {
+            let date = Date(timeIntervalSince1970: $0.date)
+            return date >= cutoff && date < detailedGoCutoff
+        }
+        goRows.removeAll { Date(timeIntervalSince1970: $0.date) < detailedGoCutoff }
+        for row in oldGoRows {
+            addBucket(
+                day: DailyUsageAccumulator.dayKey(from: Date(timeIntervalSince1970: row.date)),
+                model: row.model,
+                input: row.input,
+                output: row.output,
+                cacheRead: row.cacheRead,
+                accountId: row.accountId,
+                accountFingerprint: row.accountFingerprint,
+                burnsGoQuota: true,
+                routerInputWasEstimated: row.routerInputWasEstimated,
+                routerCostBreakdownIsComplete: row.routerCostBreakdownIsComplete
+            )
+        }
         if buckets.count != oldBucketCount || goRows.count != oldGoCount {
             hasBucketIndex = false
             return true
@@ -325,10 +428,10 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
 
     private var timeZoneIdentifier: String { Calendar.current.timeZone.identifier }
 
-    private func absorb(_ rows: [OpenCodeUsageScanner.ClaudeGatewayRow]) {
+    private func absorb(_ rows: [OpenCodeUsageScanner.ClaudeGatewayRow], compactGoBefore: Date) {
         ensureBucketIndex()
         for row in rows {
-            addRow(row)
+            addRow(row, compactGoBefore: compactGoBefore)
         }
     }
 
@@ -337,13 +440,32 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
         bucketIndex.removeAll(keepingCapacity: true)
         bucketIndex.reserveCapacity(buckets.count)
         for (index, bucket) in buckets.enumerated() {
-            bucketIndex[bucketKey(day: bucket.day, model: bucket.model)] = index
+            bucketIndex[bucketKey(
+                day: bucket.day,
+                model: bucket.model,
+                accountId: bucket.accountId,
+                accountFingerprint: bucket.accountFingerprint,
+                burnsGoQuota: bucket.burnsGoQuota,
+                routerInputWasEstimated: bucket.routerInputWasEstimated,
+                routerCostBreakdownIsComplete: bucket.routerCostBreakdownIsComplete
+            )] = index
         }
         hasBucketIndex = true
     }
 
-    private func bucketKey(day: String, model: String) -> String {
-        day + "\u{1f}" + model
+    private func bucketKey(
+        day: String,
+        model: String,
+        accountId: String?,
+        accountFingerprint: String?,
+        burnsGoQuota: Bool?,
+        routerInputWasEstimated: Bool?,
+        routerCostBreakdownIsComplete: Bool?
+    ) -> String {
+        [day, model, accountId ?? "", accountFingerprint ?? "",
+         burnsGoQuota.map { $0 ? "1" : "0" } ?? "?",
+         routerInputWasEstimated.map { $0 ? "1" : "0" } ?? "?",
+         routerCostBreakdownIsComplete.map { $0 ? "1" : "0" } ?? "?"].joined(separator: "\u{1f}")
     }
 
     private static func noon(_ day: String, timeZoneIdentifier: String) -> Date? {

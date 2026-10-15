@@ -174,6 +174,13 @@ struct BackgroundRefreshGate {
         return true
     }
 
+    /// Seconds until a rejected event can be accepted. Used by file watchers that must coalesce
+    /// bursts without losing the final change when no later event arrives.
+    func delayUntilNextAcceptance(at now: Date) -> TimeInterval {
+        guard let lastAcceptedAt else { return 0 }
+        return max(0, minimumInterval - now.timeIntervalSince(lastAcceptedAt))
+    }
+
     /// Drop the recorded acceptance (used when the accepted trigger's pass never actually ran, e.g.
     /// the loop shut down first, so the next trigger is not penalised for a pass that never happened).
     mutating func reset() {

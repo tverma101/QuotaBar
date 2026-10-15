@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct CodexTokens: Codable, Hashable, Sendable {
@@ -29,7 +30,7 @@ struct CodexAuth: Codable, Hashable, Sendable {
 struct CodexAuthState: Hashable, Sendable {
     enum Source: Hashable, Sendable {
         case file(path: String)
-        case keychain
+        case keychain(account: String)
     }
 
     var auth: CodexAuth
@@ -48,6 +49,7 @@ enum CodexAuthError: Error, LocalizedError, Equatable {
     /// The Keychain item exists but macOS will not release it without a dialog. Distinct from
     /// `notLoggedIn`: the user *is* signed in, and re-authenticating changes nothing.
     case credentialPermissionRequired
+    case credentialsUnreadable
     case sessionExpired
     case tokenConflict
     case tokenRevoked
@@ -61,6 +63,8 @@ enum CodexAuthError: Error, LocalizedError, Equatable {
             return "Not logged in. Run `codex` to authenticate."
         case .credentialPermissionRequired:
             return "macOS needs permission to read your Codex Keychain item. Refresh to be asked once, then choose Always Allow."
+        case .credentialsUnreadable:
+            return "QuotaBar found Codex credential data but couldn't read it. Check file permissions and that your login Keychain is unlocked, then refresh again."
         case .sessionExpired:
             return "Session expired. Run `codex` to log in again."
         case .tokenConflict:
@@ -80,7 +84,7 @@ enum CodexAuthError: Error, LocalizedError, Equatable {
         switch self {
         case .sessionExpired, .tokenConflict, .tokenRevoked, .tokenExpired:
             return true
-        case .notLoggedIn, .usageAPIKey, .invalidAuthPayload:
+        case .notLoggedIn, .usageAPIKey, .invalidAuthPayload, .credentialsUnreadable:
             return false
         // A Keychain ACL refusal is not an expired credential: falling back to another credential
         // source would mask the one action (Always Allow) that actually resolves it.
@@ -121,23 +125,46 @@ struct CodexAuthStore: Sendable {
         self.expectedIdentityKey = Self.normalizedIdentityKey(expectedIdentityKey)
     }
 
-    func loadAuthCandidates() -> [CodexAuthState] {
-        authPaths().compactMap { loadAuth(at: $0) }
+    func loadAuthCandidates() throws -> [CodexAuthState] {
+        var candidates: [CodexAuthState] = []
+        var firstError: CodexAuthError?
+        for path in authPaths() {
+            do {
+                if let candidate = try loadAuth(at: path) {
+                    candidates.append(candidate)
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as CodexAuthError {
+                if firstError == nil { firstError = error }
+            } catch {
+                if firstError == nil { firstError = .credentialsUnreadable }
+            }
+        }
+        // Keep using any readable, usable profile file. If none could be loaded, preserve the
+        // distinction between absent credentials and an existing file that could not be read.
+        if candidates.isEmpty, let firstError {
+            throw firstError
+        }
+        return candidates
     }
 
     /// Reads the credential from a single on-disk auth file — the targeted counterpart to
     /// `loadKeychainAuth()`, used when reloading the exact source we already loaded from so we don't
-    /// re-scan every candidate path. Returns `nil` when the file is missing, unreadable, or doesn't
-    /// carry token-like auth.
-    func loadAuth(at path: String) -> CodexAuthState? {
-        guard files.exists(path),
-              let text = try? files.readText(path),
-              let auth = Self.parseAuth(text),
-              Self.hasTokenLikeAuth(auth),
-              matchesExpectedAccount(auth)
-        else {
-            return nil
+    /// re-scan every candidate path. Returns `nil` when the file is missing or doesn't carry
+    /// token-like auth; read/parse failures remain actionable instead of becoming a false miss.
+    func loadAuth(at path: String) throws -> CodexAuthState? {
+        let text: String?
+        do {
+            text = try files.readTextIfPresent(path)
+        } catch let error as CancellationError {
+            throw error
+        } catch {
+            throw CodexAuthError.credentialsUnreadable
         }
+        guard let text else { return nil }
+        guard let auth = Self.parseAuth(text) else { throw CodexAuthError.invalidAuthPayload }
+        guard Self.hasTokenLikeAuth(auth), matchesExpectedAccount(auth) else { return nil }
         return CodexAuthState(auth: auth, source: .file(path: path))
     }
 
@@ -145,18 +172,49 @@ struct CodexAuthStore: Sendable {
     /// a dialog" and "there is no credential" are different problems with different fixes, and
     /// collapsing the first into the second tells a signed-in user to go re-authenticate.
     func loadKeychainAuth() throws -> CodexAuthState? {
+        var permissionRequired = false
+        var unreadable = false
+        for account in keychainAccountCandidates() {
+            do {
+                if let state = try loadKeychainAuth(account: account) {
+                    return state
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch CodexAuthError.credentialPermissionRequired {
+                permissionRequired = true
+            } catch {
+                unreadable = true
+            }
+        }
+
+        if permissionRequired {
+            // The shared Keychain gate logs the first silent refusal; later reads use its blocked
+            // state and must not repeat this line on every scheduler pass.
+            throw CodexAuthError.credentialPermissionRequired
+        }
+        if unreadable {
+            AppLog.error(LogTag.auth("codex"), "keychain credential read failed")
+            throw CodexAuthError.credentialsUnreadable
+        }
+        return nil
+    }
+
+    /// Reload one exact Codex CLI Keychain item. Codex scopes its `Codex Auth` item to a stable key
+    /// derived from CODEX_HOME, so a service-only query can select another profile's credential.
+    func loadKeychainAuth(account: String) throws -> CodexAuthState? {
         let value: String?
         do {
-            value = try keychain.readGenericPasswordForRefresh(service: Self.keychainService)
-        } catch KeychainError.interactionNotAllowed {
-            AppLog.info(
-                LogTag.auth("codex"),
-                "keychain read needs user interaction; use Refresh to grant it"
+            value = try keychain.readGenericPasswordForRefresh(
+                service: Self.keychainService,
+                account: account
             )
+        } catch let error as CancellationError {
+            throw error
+        } catch KeychainError.interactionNotAllowed {
             throw CodexAuthError.credentialPermissionRequired
         } catch {
-            AppLog.error(LogTag.auth("codex"), "keychain credential read failed")
-            throw CodexAuthError.credentialPermissionRequired
+            throw CodexAuthError.credentialsUnreadable
         }
         guard let value,
               let auth = Self.parseAuth(value),
@@ -165,7 +223,7 @@ struct CodexAuthStore: Sendable {
         else {
             return nil
         }
-        return CodexAuthState(auth: auth, source: .keychain)
+        return CodexAuthState(auth: auth, source: .keychain(account: account))
     }
 
     func save(_ state: CodexAuthState) throws {
@@ -182,9 +240,37 @@ struct CodexAuthStore: Sendable {
         switch state.source {
         case .file(let path):
             try files.writeText(path, text)
-        case .keychain:
-            try keychain.writeGenericPassword(service: Self.keychainService, value: text)
+        case .keychain(let account):
+            try keychain.writeGenericPassword(service: Self.keychainService, account: account, value: text)
         }
+    }
+
+    /// Persist a refresh only while the exact credential generation that produced it is still live.
+    /// Logout removes the source and a CLI/account switch replaces its token bundle; either must win
+    /// over a refresh response that was already in flight. Non-token metadata is merged from the
+    /// live file/Keychain value so a refresh does not roll back concurrent CLI metadata updates.
+    func save(_ state: CodexAuthState, replacing original: CodexAuthState) throws {
+        guard state.source == original.source else { throw CodexAuthError.tokenConflict }
+
+        let live = try ProviderRefreshContext.withCredentialSourceRevalidation {
+            switch original.source {
+            case .file(let path):
+                return try loadAuth(at: path)
+            case .keychain(let account):
+                return try loadKeychainAuth(account: account)
+            }
+        }
+
+        guard let live,
+              live.auth.tokens == original.auth.tokens,
+              matchesExpectedAccount(live.auth) else {
+            throw CodexAuthError.tokenConflict
+        }
+
+        var merged = live
+        merged.auth.tokens = state.auth.tokens
+        merged.auth.lastRefresh = state.auth.lastRefresh
+        try save(merged)
     }
 
     /// Whether the access token should be proactively refreshed.
@@ -230,6 +316,31 @@ struct CodexAuthStore: Sendable {
             return nil
         }
         return codexHome
+    }
+
+    /// Codex stores direct-keyring credentials at `Codex Auth` / `cli|<16 hex chars>`, where the
+    /// suffix is the first 16 lowercase SHA-256 hex characters of the canonical CODEX_HOME path.
+    /// The CLI falls back to the original path when canonicalization fails; mirror that for homes
+    /// that have not been created yet.
+    static func keychainAccount(forCodexHome home: String) -> String {
+        let expandedHome = expandHome(home)
+        let canonicalHome: String
+        if FileManager.default.fileExists(atPath: expandedHome) {
+            canonicalHome = URL(fileURLWithPath: expandedHome)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+                .path
+        } else {
+            canonicalHome = expandedHome
+        }
+        let digest = SHA256.hash(data: Data(canonicalHome.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return "cli|\(hex.prefix(16))"
+    }
+
+    func keychainAccountCandidates() -> [String] {
+        let homes = codexHome().map { [$0] } ?? Self.defaultAuthHomes
+        return homes.map(Self.keychainAccount(forCodexHome:))
     }
 
     /// Returns a copy bound to one account identity. Provider construction uses this even when a

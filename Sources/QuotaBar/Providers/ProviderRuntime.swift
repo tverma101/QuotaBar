@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 
 enum ProviderRefreshContext {
     /// How much work a refresh pass should do.
@@ -13,16 +14,18 @@ enum ProviderRefreshContext {
     ///   not narrow the provider set.
     /// - `full`: complete snapshot including token/spend/history (manual refresh, CLI,
     ///   background triggers).
-    /// - `localAccounting`: closed-panel wake pass after local usage files changed (CodexRouter
-    ///   ledger appends). Refreshes only the providers that fold local corpora (codex + opencode
-    ///   families) and folds them WITHOUT re-reading live quota APIs — re-reading those on every
-    ///   routed turn is the burn the old panel-open-only watcher suppression existed to prevent.
+    /// - `localAccounting`: local usage files changed (CodexRouter ledger appends), with the panel
+    ///   either open or closed. Refreshes enabled Codex cards and the enabled OpenCode card when a
+    ///   Codex source is enabled, folding them WITHOUT re-reading live quota APIs — re-reading those
+    ///   on every routed turn is the burn the old panel-open-only watcher suppression existed to prevent.
     ///   Paced like `menuBar` and skips catalogue discovery. Remote-only providers never run.
-    /// - `panelAccounting`: the panel-open pass's second phase — the local folds every history-
-    ///   exporting provider needs, without re-reading the live quota APIs phase 1 just answered.
-    ///   The store's merge recovers the meters onto the fresh history. Same unpaced, user-waiting
-    ///   treatment as `full` for the fold itself.
-    enum Scope: Sendable {
+    /// - `panelAccounting`: the panel-open full-history phase — local folds every enabled
+    ///   history-exporting provider needs, without re-reading live quota APIs. Runs on panel open,
+    ///   full refresh requests, visible retry follow-up, and the separate five-minute history deadline,
+    ///   not on every meter tick.
+    ///   The store's merge recovers the meters onto the fresh history. Scheduler-owned panel accounting
+    ///   runs unpaced; a visible manual retry opts into the interactive CPU pacer.
+    enum Scope: Sendable, Equatable, Hashable {
         case menuBar
         case panelMeters
         case localAccounting
@@ -57,20 +60,152 @@ enum ProviderRefreshContext {
     /// True only for the user's explicit Refresh Now action. Snapshot-only panel presentation
     /// never opens another app's Keychain dialog.
     @TaskLocal static var isManual = false
-    /// Shared by all provider refresh tasks from one explicit Refresh Now action. Claude can claim it
-    /// only when a silent credential read proves that access needs user interaction, limiting that
-    /// action to one Keychain dialog even when several Claude account cards are enabled.
+    /// Shared by all provider refresh tasks from one explicit refresh action. A provider can claim it
+    /// only after a silent credential read proves interaction is required, limiting each action to one
+    /// Keychain dialog across all enabled providers and account cards.
     @TaskLocal static var credentialInteractionGate: CredentialInteractionGate? = nil
+    /// Monotonic identity for the newest explicit refresh. Detached credential reads retain this so
+    /// work queued by an older action cannot open a Keychain dialog after a newer action has started.
+    @TaskLocal static var manualActionID: UInt64? = nil
+    /// Per-load cancellation handle for synchronous Security.framework reads. Each `loadOffMainActor`
+    /// creates its own token so canceling one provider or a Safe Storage cache waiter cannot cancel a
+    /// sibling load's authentication context.
+    @TaskLocal static var keychainReadCancellationToken: KeychainReadCancellationToken? = nil
     /// Defaults to `.full` so tests, CLI, and any unscoped call site keep today's behavior.
     @TaskLocal static var scope: Scope = .full
     /// Refresh entry points opt into the process-wide CPU allowance when appropriate: background
-    /// menu-bar ticks use the 7.5% budget, while explicit full-history reads use the 25% interactive
-    /// budget. The panel-open periodic loop can opt out to meet provider deadlines. Focused unit tests
-    /// stay unthrottled unless they explicitly measure the budget.
+    /// menu-bar ticks use the 7.5% budget, while explicit full-history reads and visible-retry recovery
+    /// use the 25% interactive budget. The panel-open periodic loop can opt out to meet provider deadlines.
+    /// Focused unit tests stay unthrottled unless they explicitly measure the budget.
     @TaskLocal static var accountingCPUThrottleEnabled = false
+    /// Silent recovery for an interrupted user retry has no Keychain permission, but its local work
+    /// still needs the same interactive pacing allowance so a cold fold can finish inside the deadline.
+    @TaskLocal static var accountingCPUInteractiveBudgetEnabled = false
     /// Lightweight background menu-bar scope keeps existing catalogues on disk; missing catalogues
     /// may still download. Full accounting refreshes perform due catalogue discovery.
     @TaskLocal static var skipModelCatalogRefresh = false
+
+    /// Re-read the live credential before persisting a successful token rotation. A newer manual
+    /// refresh must fence stale prompts, but it must not make a silent source check fail merely
+    /// because this already-successful OAuth response came from the older action.
+    static func withCredentialSourceRevalidation<T>(_ operation: () throws -> T) rethrows -> T {
+        try $isManual.withValue(false) {
+            try $credentialInteractionGate.withValue(nil) {
+                try $manualActionID.withValue(nil) {
+                    try operation()
+                }
+            }
+        }
+    }
+
+    /// Capture the refresh context before moving synchronous work into `Task.detached`, which does
+    /// not inherit task-local values. Keep every value together so off-actor provider loads preserve
+    /// manual-interaction permissions, scope, and accounting policy as one context.
+    struct DetachedValues: Sendable {
+        let isManual: Bool
+        let credentialInteractionGate: CredentialInteractionGate?
+        let manualActionID: UInt64?
+        let scope: Scope
+        let accountingCPUThrottleEnabled: Bool
+        let accountingCPUInteractiveBudgetEnabled: Bool
+        let skipModelCatalogRefresh: Bool
+
+        func withValue<T>(_ operation: () throws -> T) rethrows -> T {
+            try ProviderRefreshContext.$scope.withValue(scope) {
+                try ProviderRefreshContext.$isManual.withValue(isManual) {
+                    try ProviderRefreshContext.$credentialInteractionGate.withValue(credentialInteractionGate) {
+                        try ProviderRefreshContext.$manualActionID.withValue(manualActionID) {
+                            try ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(accountingCPUThrottleEnabled) {
+                                try ProviderRefreshContext.$accountingCPUInteractiveBudgetEnabled.withValue(
+                                    accountingCPUInteractiveBudgetEnabled
+                                ) {
+                                    try ProviderRefreshContext.$skipModelCatalogRefresh.withValue(skipModelCatalogRefresh) {
+                                        try operation()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    static var detachedValues: DetachedValues {
+        DetachedValues(
+            isManual: isManual,
+            credentialInteractionGate: credentialInteractionGate,
+            manualActionID: manualActionID,
+            scope: scope,
+            accountingCPUThrottleEnabled: accountingCPUThrottleEnabled,
+            accountingCPUInteractiveBudgetEnabled: accountingCPUInteractiveBudgetEnabled,
+            skipModelCatalogRefresh: skipModelCatalogRefresh
+        )
+    }
+
+    /// Cancellation includes the detached load's token because Security.framework calls are synchronous
+    /// and cannot observe task cancellation until they return. The token invalidates a context currently
+    /// being used for Keychain authentication.
+    static var credentialReadIsCancelled: Bool {
+        keychainReadCancellationToken?.isCancelled == true || Task<Never, Never>.isCancelled
+    }
+}
+
+/// A single detached credential load's cancellation target for in-flight Keychain authentication.
+/// `LAContext.invalidate()` stops pending policy evaluations, so keep each context registered only while
+/// its `SecItemCopyMatching` call is active and never reuse it after cancellation.
+final class KeychainReadCancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private let invalidateContext: @Sendable (LAContext) -> Void
+    private var cancelled = false
+    private var activeContexts: [ObjectIdentifier: LAContext] = [:]
+
+    init(invalidateContext: @escaping @Sendable (LAContext) -> Void = { $0.invalidate() }) {
+        self.invalidateContext = invalidateContext
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    /// Returns false after cancellation and invalidates a context that arrived too late for Security to
+    /// use. Registration and cancellation share one lock so neither ordering can leave an unowned prompt.
+    func register(_ context: LAContext) -> Bool {
+        lock.lock()
+        guard !cancelled else {
+            lock.unlock()
+            invalidateContext(context)
+            return false
+        }
+        activeContexts[ObjectIdentifier(context)] = context
+        lock.unlock()
+        return true
+    }
+
+    /// Removes a completed query and reports whether cancellation won the race with its completion.
+    func finish(_ context: LAContext) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        activeContexts.removeValue(forKey: ObjectIdentifier(context))
+        return !cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !cancelled else {
+            lock.unlock()
+            return
+        }
+        cancelled = true
+        let contexts = Array(activeContexts.values)
+        activeContexts.removeAll()
+        lock.unlock()
+
+        // Do not hold the bookkeeping lock while LocalAuthentication stops pending evaluations.
+        contexts.forEach(invalidateContext)
+    }
 }
 
 /// Run an explicit full-history refresh under the interactive CPU allowance. Keep forced refresh
@@ -86,6 +221,36 @@ func withThrottledFullAccounting<T: Sendable>(
     }
 }
 
+/// Run a visible quota retry's meter phase with the interactive CPU allowance. Most providers skip
+/// local accounting in the panelMeters scope, but Hermes includes its local SQLite history scan in this pass.
+func withThrottledPanelMeters<T: Sendable>(
+    _ operation: @Sendable () async throws -> T
+) async rethrows -> T {
+    try await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+        try await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+            try await operation()
+        }
+    }
+}
+
+/// Run a user-requested refresh with one shared Keychain-dialog budget. Background scheduler passes
+/// and local credential probes must not use this wrapper.
+func withManualRefresh<T: Sendable>(
+    _ operation: @Sendable () async throws -> T
+) async rethrows -> T {
+    // A new explicit request is the user retry action. Advance the action identity as well as
+    // clearing per-item declines, so detached reads queued by an older action cannot prompt later.
+    let manualActionID = KeychainPermissionGate.shared.beginManualAction()
+    let interactionGate = CredentialInteractionGate()
+    return try await ProviderRefreshContext.$isManual.withValue(true) {
+        try await ProviderRefreshContext.$credentialInteractionGate.withValue(interactionGate) {
+            try await ProviderRefreshContext.$manualActionID.withValue(manualActionID) {
+                try await operation()
+            }
+        }
+    }
+}
+
 final class CredentialInteractionGate: @unchecked Sendable {
     private let lock = NSLock()
     private var claimed = false
@@ -96,6 +261,14 @@ final class CredentialInteractionGate: @unchecked Sendable {
         guard !claimed else { return false }
         claimed = true
         return true
+    }
+
+    /// Returns the per-action dialog budget if the process-wide query lease was released before an
+    /// interactive Keychain call began. Once Security.framework is entered, the budget stays spent.
+    func releaseClaim() {
+        lock.lock()
+        claimed = false
+        lock.unlock()
     }
 }
 
@@ -124,6 +297,11 @@ protocol ProviderRuntime: AnyObject {
     var provider: Provider { get }
     var widgetDescriptors: [WidgetDescriptor] { get }
 
+    /// True when `.panelMeters` must also compute this provider's local history because there is no
+    /// separate remote quota surface. A visible retry can then avoid immediately scanning that source
+    /// a second time in the follow-up accounting phase.
+    var panelMetersRefreshIncludesHistory: Bool { get }
+
     func refresh() async -> ProviderSnapshot
 
     /// Whether credentials for this provider already exist on this machine — a cheap, local-only probe
@@ -131,6 +309,10 @@ protocol ProviderRuntime: AnyObject {
     /// `FirstRunSeeder` to enable exactly the providers the user actually has. Mirror the credential
     /// sources `refresh()` reads, and run blocking loads via `loadOffMainActor`.
     func hasLocalCredentials() async -> Bool
+}
+
+extension ProviderRuntime {
+    var panelMetersRefreshIncludesHistory: Bool { false }
 }
 
 /// Run a blocking, `Sendable` credential load off the MainActor.
@@ -142,10 +324,46 @@ protocol ProviderRuntime: AnyObject {
 /// detached task moves the wait onto a background executor; the `Sendable` result crosses back cleanly.
 /// It is awaited immediately, so it reads like a normal call while no longer blocking the actor.
 func loadOffMainActor<T: Sendable>(_ load: @escaping @Sendable () -> T) async -> T {
-    await Task.detached(priority: .utility, operation: load).value
+    let context = ProviderRefreshContext.detachedValues
+    let cancellationToken = KeychainReadCancellationToken()
+    let work = Task.detached(priority: .utility) {
+        context.withValue {
+            ProviderRefreshContext.$keychainReadCancellationToken.withValue(
+                cancellationToken,
+                operation: load
+            )
+        }
+    }
+    return await withTaskCancellationHandler {
+        await work.value
+    } onCancel: {
+        cancellationToken.cancel()
+        work.cancel()
+    }
 }
 
 /// Throwing counterpart for blocking credential reads that distinguish absence from access failure.
 func loadOffMainActor<T: Sendable>(_ load: @escaping @Sendable () throws -> T) async throws -> T {
-    try await Task.detached(priority: .utility, operation: load).value
+    let context = ProviderRefreshContext.detachedValues
+    let cancellationToken = KeychainReadCancellationToken()
+    let work = Task.detached(priority: .utility) {
+        try context.withValue {
+            try ProviderRefreshContext.$keychainReadCancellationToken.withValue(
+                cancellationToken,
+                operation: load
+            )
+        }
+    }
+    return try await withTaskCancellationHandler {
+        try await work.value
+    } onCancel: {
+        cancellationToken.cancel()
+        work.cancel()
+    }
+}
+
+/// Provider refresh methods are nonthrowing, so return a discardable marker when their owner is
+/// cancelled. WidgetDataStore checks the task state and will not publish this snapshot or its error.
+func cancelledRefreshSnapshot(provider: Provider) -> ProviderSnapshot {
+    ProviderSnapshot.error(provider: provider, error: CancellationError())
 }

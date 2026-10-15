@@ -44,6 +44,7 @@ struct OpenCodeAuthStore: Sendable {
         do {
             text = try files.readTextIfPresent(authFilePath)
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             throw OpenCodeUsageError.credentialsUnreadable(detail: error.localizedDescription)
         }
         guard let text else { return [] }

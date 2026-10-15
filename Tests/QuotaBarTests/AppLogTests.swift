@@ -117,4 +117,43 @@ final class AppLogTests: XCTestCase {
             contents
         )
     }
+
+    @MainActor
+    func testRepeatedScheduledProviderFailureLogIsDeduplicatedUntilForcedRetry() async throws {
+        AppLog.reloadLevel(.info)
+        let provider = Provider(id: "keychain-spam-test", displayName: "Keychain Spam Test", icon: .providerMark("codex"))
+        let message = "macOS needs permission to read this Keychain item."
+        let runtime = TestProviderRuntime(
+            provider: provider,
+            descriptors: [],
+            snapshot: ProviderSnapshot.error(
+                provider: provider,
+                message: message,
+                category: .credentialAccess
+            )
+        )
+        let suiteName = "OpenUsageTests.AppLog.keychainSpam.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        var now = Date(timeIntervalSince1970: 1_800_000_000)
+        let registry = WidgetRegistry(providers: [provider], descriptors: [])
+        let store = WidgetDataStore(
+            registry: registry,
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots"),
+            defaults: defaults,
+            now: { now },
+            monotonicNow: { 0 }
+        )
+
+        _ = await store.refresh(providerID: provider.id, force: true)
+        now.addTimeInterval(61)
+        _ = await store.refresh(providerID: provider.id, force: false)
+        _ = await store.refresh(providerID: provider.id, force: true)
+
+        let failureLines = try fileContents().components(separatedBy: .newlines).filter {
+            $0.contains("[WARN] [refresh] keychain-spam-test failed: \(message)")
+        }
+        XCTAssertEqual(failureLines.count, 2, "scheduled retries dedupe; an explicit force retry is logged")
+    }
 }
