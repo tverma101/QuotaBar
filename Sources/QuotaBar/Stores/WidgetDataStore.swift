@@ -55,9 +55,9 @@ final class WidgetDataStore {
     /// refresh isn't cached, so — unlike a success, which the snapshot cache gates for an interval —
     /// nothing else stops the loop from re-probing a broken provider (logged-out Devin/Grok especially)
     /// on every wake, spawning subprocesses and network calls in a tight loop. This negative-cache caps a
-    /// failing provider to one probe per window. Shorter than the refresh interval, so the normal
-    /// 5-minute heartbeat always retries; it only suppresses the sub-interval re-probes a wake burst
-    /// would cause. The manual `force` refresh (⌘R) always bypasses it.
+    /// failing provider to one probe per window. It bounds wake bursts while remaining no longer
+    /// than the AC meter cadence; on battery, the next two-minute quota tick retries it. The manual
+    /// `force` refresh (⌘R) always bypasses it.
     private static let failureRetryBackoff: TimeInterval = 60
     static let defaultSlowProviderRefreshThreshold: TimeInterval = 10
     /// Hard deadline for a single provider's `refresh()` call. If the provider hasn't returned by then
@@ -99,8 +99,9 @@ final class WidgetDataStore {
     /// peer contribution can never echo back out and multiply on the next device.
     private(set) var localSnapshots: [String: ProviderSnapshot] = [:]
     var refreshingProviderIDs: Set<String> = []
-    /// Running batches keyed by `<force>|<scope>`, so a second caller asking for the same thing joins it
-    /// instead of starting its own set of per-provider tasks.
+    /// Running batches keyed by their complete execution policy, so a second caller asking for the same
+    /// thing joins it instead of starting its own set of per-provider tasks. Manual action identity is
+    /// part of the key: a new Refresh Now must not join work whose Keychain prompt budget it superseded.
     ///
     /// Keyed rather than a single slot: a non-forced batch (the periodic tick, a CodexRouter ledger wake)
     /// routinely overlaps a forced one (panel open), and it finishes first because it is nearly all cache
@@ -109,32 +110,101 @@ final class WidgetDataStore {
     /// — double API calls, double subprocesses, a second full parse of the JSONL corpus, and a spinner for
     /// the sum of both passes. Each batch now removes only its own entry.
     ///
-    /// A forced caller must never be handed a menu-bar-scoped pass, which is why the key includes both
-    /// parts: different settings are not joined, and the per-provider force wait handles them.
-    private var activeBatches: [String: Task<Void, Never>] = [:]
-    /// Wall-clock time the most recent full refresh pass finished. Together with the chosen refresh
-    /// cadence it drives the dashboard footer's live "Next update in …" countdown, so the footer reflects
-    /// the real schedule instead of a hardcoded value. `nil` until the first pass completes.
-    var lastRefreshAt: Date?
-    /// Latest refresh error per provider (e.g. "Not logged in. Run `codex` to authenticate."). Set when
-    /// a refresh comes back as an error snapshot, cleared on the next successful one. The dashboard
-    /// renders it as a warning indicator beside the provider name; the last good snapshot keeps
-    /// displaying (stale-while-revalidate) instead of being replaced by dead "No data" rows.
+    /// A forced caller must never be handed a menu-bar-scoped pass, and a memory-capped pass must not
+    /// join an uncapped one. Different settings are not joined; per-provider waits serialize overlap.
+    private struct RefreshBatchKey: Hashable {
+        let force: Bool
+        let bypassSnapshotCache: Bool
+        let bypassFailureBackoff: Bool
+        let scope: ProviderRefreshContext.Scope
+        let manualActionID: UInt64?
+        let maxConcurrentProviders: Int?
+    }
+
+    /// Quota requests and local history folds are independent work. A failure in one must not
+    /// throttle the other, while the same work still gets a short negative-cache window.
+    private enum FailureDomain: Hashable {
+        case liveQuota
+        case accounting
+        case full
+
+    }
+
+    private struct FailureBackoffKey: Hashable {
+        let providerID: String
+        let domain: FailureDomain
+    }
+
+    private struct ProviderFailureState {
+        let message: String
+        let order: UInt64
+    }
+
+    private var activeBatches: [RefreshBatchKey: Task<Void, Never>] = [:]
+    /// Publication ownership is per provider. The Keychain gate retains a global action identity for
+    /// prompt safety, but a targeted refresh must not invalidate unrelated cards in an older full pass.
+    @ObservationIgnored private var providerRequestGenerations: [String: UInt64] = [:]
+    @ObservationIgnored private var latestManualActionByProvider: [String: UInt64] = [:]
+    /// Manual actions issued before a provider was disabled must not become valid again if that card is
+    /// re-enabled while a delayed phase-two request is still queued.
+    @ObservationIgnored private var invalidatedManualActionsThrough: [String: UInt64] = [:]
+    /// Handles for provider work currently awaited by any batch or direct card refresh. Disabling a
+    /// card cancels its task so cancellation-aware scanners can stop instead of finishing work the user
+    /// has just turned off.
+    @ObservationIgnored private var activeProviderRefreshTasks: [String: [UUID: Task<RefreshOutcome, Never>]] = [:]
+    @ObservationIgnored private var activeProviderRefreshTaskScopes: [String: [UUID: ProviderRefreshContext.Scope]] = [:]
+    @ObservationIgnored private var activeProviderRefreshTaskBatchIDs: [String: [UUID: UUID]] = [:]
+    /// Scopes currently inside `ProviderRuntime.refresh`, keyed by task ID. Meter refreshes may overlap
+    /// a fold-only pass for the same enabled card so a slow local scan cannot hold subscription meters
+    /// past their deadline. Other combinations remain serialized, except an explicit forced panel-meter
+    /// retry uses the same safe overlap rule to keep the visible Retry action responsive.
+    @ObservationIgnored private var runningProviderRefreshScopes: [String: [UUID: ProviderRefreshContext.Scope]] = [:]
+    /// Refresh requests skipped behind an incompatible in-flight scope. They are emitted to the
+    /// scheduler as soon as the provider can accept them, so a consumed timer/ledger/panel intent is
+    /// retried promptly without repeatedly polling the provider.
+    @ObservationIgnored private var deferredRefreshRequests: [String: Set<DeferredRefreshRequest>] = [:]
+    /// Wall-clock time of the most recent live quota attempt or due scheduler check. The footer uses
+    /// it for its live "Next update in …" countdown. Fold-only and early cache-hit passes do not
+    /// advance it, so they cannot make the meter countdown appear fresh while the quota schedule is due.
+    var lastQuotaRefreshAt: Date?
+    /// Monotonic time a provider actually attempted a live quota refresh. Early panel/trigger passes
+    /// that only hit cache must not move the scheduler's deadline or claim the meters were refreshed.
+    @ObservationIgnored private(set) var lastLiveQuotaRefreshUptime: TimeInterval?
+
+    /// Keeps the footer aligned with a due scheduler check when no provider was eligible or every
+    /// selected provider was skipped/backed off. Early cache-hit passes must not call this.
+    func markQuotaRefreshCheckCompleted(at date: Date = Date()) {
+        lastQuotaRefreshAt = date
+    }
+    /// Latest refresh error per provider (e.g. "Not logged in. Run `codex` to authenticate."). It is
+    /// cleared when the work that failed succeeds again. The dashboard renders it as a warning
+    /// indicator beside the provider name; the last good snapshot keeps displaying
+    /// (stale-while-revalidate) instead of being replaced by dead "No data" rows.
     var providerErrors: [String: String] = [:]
+
+    @ObservationIgnored private var providerFailureStates: [String: [FailureDomain: ProviderFailureState]] = [:]
+    @ObservationIgnored private var nextProviderFailureOrder: UInt64 = 0
+
+    /// The same persistent provider failure is reported once until recovery, a changed error, or an
+    /// explicit forced refresh. Scheduled retries after a blocked Keychain read must not write the
+    /// identical warning to the log on every backoff interval.
+    @ObservationIgnored private var lastLoggedProviderError: [String: String] = [:]
 
     /// Per-provider earliest next-probe time after a failure (see `failureRetryBackoff`). Not part of
     /// observable UI state, so it's excluded from `@Observable` tracking.
-    @ObservationIgnored private var failureRetryAfter: [String: Date] = [:]
+    @ObservationIgnored private var failureRetryAfter: [FailureBackoffKey: Date] = [:]
 
     /// Owns the quota pace-notification subsystem (dedup state, fire/deliver decision, trace). This store
     /// just gathers each pass's enabled bounded metrics and delegates.
     @ObservationIgnored private let notificationEvaluator = QuotaNotificationEvaluator()
 
     /// Telemetry hook wired by `AppContainer`. Invoked once per *real* provider fetch — `.refreshed` or
-    /// `.failed` only, never the cache-hit/skip/backoff outcomes that the 5-minute timer produces in
+    /// `.failed` only, never the cache-hit/skip/backoff outcomes that the one-minute meter timer produces in
     /// bulk — so the recorder can roll daily usage and error counts up into one event per provider per
     /// day. `nil` (and so a no-op) in tests and previews. Not observable UI state.
     @ObservationIgnored var onRefreshOutcome: (@MainActor (String, RefreshOutcome, ErrorCategory?, Bool) -> Void)?
+    @ObservationIgnored var onDeferredRefreshReady: (@MainActor (DeferredRefreshRequest) -> Void)?
+    @ObservationIgnored var onDeferredRefreshesInvalidated: (@MainActor (Set<String>) -> Void)?
     /// Wired by `ICloudUsageSyncStore`; debounced there so a concurrent provider batch produces one file.
     @ObservationIgnored var onLocalHistoryChanged: (@MainActor () -> Void)?
     @ObservationIgnored private var peerHistoryDocuments: [UsageHistoryDocument] = []
@@ -258,10 +328,18 @@ final class WidgetDataStore {
     /// Drops session freshness only (no `force`), so unrelated providers keep their cache. A Codex
     /// card's `refresh()` still re-reads its live quota API on the resulting miss.
     func invalidateLocalAccountingFreshness() {
-        let ids = providersByID.keys.filter { Self.foldsLocalAccounting($0) }
+        let ids = providersByID.keys.filter {
+            isProviderEnabled($0) && Self.foldsLocalAccounting($0)
+        }
         cache.invalidateSessionFreshness(providerIDs: Array(ids))
         if !ids.isEmpty {
             AppLog.debug(.refresh, "local accounting cache invalidated (\(ids.count) cards) for background refresh")
+        }
+    }
+
+    func hasEnabledProviderFamily(_ family: String) -> Bool {
+        providersByID.keys.contains {
+            ProviderAccountID.family(of: $0) == family && isProviderEnabled($0)
         }
     }
 
@@ -286,22 +364,51 @@ final class WidgetDataStore {
     /// flight. A caller arriving while an identical batch runs now joins it, which yields the same
     /// result because the batch refreshes the same provider set.
     ///
-    /// A caller with a *different* (force, scope) is deliberately not joined: a forced caller must not
-    /// be handed a menu-bar-scoped pass, and that is the merge-data case the per-provider forced wait
-    /// exists to handle.
-    func refreshAll(force: Bool = false, maxConcurrentProviders: Int? = nil) async {
-        let batchKey = "\(force)|\(Self.batchScopeLabel(ProviderRefreshContext.scope))"
+    /// A caller with a *different* force/cache/scope tuple is deliberately not joined: a forced caller
+    /// must not be handed a menu-bar-scoped pass, and a scheduled history fold must not join a batch
+    /// that is allowed to reuse its cached snapshot.
+    func refreshAll(
+        force: Bool = false,
+        bypassSnapshotCache: Bool = false,
+        bypassFailureBackoff: Bool = false,
+        maxConcurrentProviders: Int? = nil
+    ) async {
+        let scope = ProviderRefreshContext.scope
+        let batchKey = RefreshBatchKey(
+            force: force,
+            bypassSnapshotCache: bypassSnapshotCache,
+            bypassFailureBackoff: bypassFailureBackoff,
+            scope: scope,
+            manualActionID: ProviderRefreshContext.manualActionID,
+            maxConcurrentProviders: maxConcurrentProviders.map { max(1, $0) }
+        )
         if let active = activeBatches[batchKey] {
-            AppLog.debug(.refresh, "batch join (force=\(force) already in flight)")
+            AppLog.debug(.refresh, "batch join (force=\(force), bypassCache=\(bypassSnapshotCache) already in flight)")
+            // A joiner owns only its wait. Canceling it must not cancel the shared batch that the
+            // original caller and other joiners still rely on.
             await active.value
             return
         }
+        let batchID = UUID()
         let task = Task { [weak self] in
             guard let self else { return }
-            await self.runBatch(force: force, maxConcurrentProviders: maxConcurrentProviders)
+            await self.runBatch(
+                batchID: batchID,
+                force: force,
+                bypassSnapshotCache: bypassSnapshotCache,
+                bypassFailureBackoff: bypassFailureBackoff,
+                maxConcurrentProviders: maxConcurrentProviders
+            )
         }
         activeBatches[batchKey] = task
-        await task.value
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: { [weak self] in
+            task.cancel()
+            Task { @MainActor [weak self] in
+                self?.cancelProviderRefreshes(batchID: batchID)
+            }
+        }
         // Remove only *this* batch's entry. `Task` is a value type, so there is no identity to compare;
         // but a same-key entry cannot have been replaced while this one ran, because a same-key caller
         // would have joined instead of starting a second. Removing a *different* key's entry here is
@@ -324,7 +431,13 @@ final class WidgetDataStore {
         }
     }
 
-    private func runBatch(force: Bool, maxConcurrentProviders: Int?) async {
+    private func runBatch(
+        batchID: UUID,
+        force: Bool,
+        bypassSnapshotCache: Bool,
+        bypassFailureBackoff: Bool,
+        maxConcurrentProviders: Int?
+    ) async {
         // `Task {}` from MainActor context inherits the isolation (a task-group child can't capture
         // the non-Sendable store), so fire one task per provider in bounded groups, then await them all.
         let enabledIDs = registry.providers.map(\.id).filter { isProviderEnabled($0) }
@@ -341,12 +454,23 @@ final class WidgetDataStore {
         // suppressing their quota fetch would just re-stamp an unchanged snapshot, and running
         // them here would double every panel-open API call (phase 1 already fetched their meters).
         if ProviderRefreshContext.scope == .panelAccounting {
-            providerIDs = providerIDs.filter { registry.historyDescriptorsByProvider[$0] != nil }
+            providerIDs = providerIDs.filter {
+                registry.historyDescriptorsByProvider[$0] != nil
+                    && providersByID[$0]?.panelMetersRefreshIncludesHistory != true
+            }
         }
         if providerIDs.isEmpty {
-            lastRefreshAt = Date()
             AppLog.info(.refresh, "batch skip (0 providers for scope=\(Self.batchScopeLabel(ProviderRefreshContext.scope)), force=\(force))")
             return
+        }
+        // Capture request ownership before starting any provider task. A newer manual request can then
+        // invalidate only the cards it actually covers, even while it waits for their current pass.
+        var requestGenerations: [String: UInt64] = [:]
+        for providerID in providerIDs {
+            requestGenerations[providerID] = beginProviderRequest(
+                providerID: providerID,
+                manualActionID: ProviderRefreshContext.manualActionID
+            )
         }
         let start = monotonicNow()
         AppLog.info(.refresh, "batch start (\(providerIDs.count) providers, force=\(force), scope=\(Self.batchScopeLabel(ProviderRefreshContext.scope)))")
@@ -354,8 +478,10 @@ final class WidgetDataStore {
         var concurrency = max(1, maxConcurrentProviders ?? providerIDs.count)
         var outcomes: [RefreshOutcome] = []
         outcomes.reserveCapacity(providerIDs.count)
+        var attemptedLiveQuota = false
         var pendingProviderIDs = providerIDs
         while !pendingProviderIDs.isEmpty {
+            guard !Task.isCancelled else { break }
             // Re-check the budget before every chunk, not just once per pass. The per-provider unload
             // runs *after* a provider finishes, so a chunk that started under the limit can leave the
             // next one stacking on top of a much larger footprint. Dropping to one at a time here
@@ -366,27 +492,58 @@ final class WidgetDataStore {
             // Heavy local-log scans allocate their parse working set before the post-refresh unload.
             // Keep at most one such provider in flight even when the process is currently below its
             // soft limit; otherwise several large scans can cross the hard limit before it is sampled.
+            // Most menu-bar meters skip those scans, but Hermes still reads its local database in a
+            // meters-only scope, so serialize that provider while allowing scan-light quota APIs together.
+            let serializedHeavyProviders = Self.heavyProvidersToSerialize(in: ProviderRefreshContext.scope)
             var chunk: [String] = []
             var includesHeavyProvider = false
             while chunk.count < concurrency, !pendingProviderIDs.isEmpty {
+                guard !Task.isCancelled else { break }
                 guard let nextIndex = pendingProviderIDs.firstIndex(where: { providerID in
-                    !Self.isHeavyLocalLogProvider(providerID) || !includesHeavyProvider
+                    !serializedHeavyProviders.contains(providerID) || !includesHeavyProvider
                 }) else { break }
                 let providerID = pendingProviderIDs.remove(at: nextIndex)
-                if Self.isHeavyLocalLogProvider(providerID) { includesHeavyProvider = true }
+                if serializedHeavyProviders.contains(providerID) {
+                    includesHeavyProvider = true
+                }
                 chunk.append(providerID)
             }
             let tasks = chunk.map { providerID in
-                Task { await self.refresh(providerID: providerID, force: force, notifyHistoryChange: false) }
+                let taskID = UUID()
+                let requestGeneration = requestGenerations[providerID, default: 0]
+                let task = Task { @MainActor [weak self] in
+                    guard let self else { return RefreshOutcome.skipped }
+                    return await self.performRefresh(
+                        providerID: providerID,
+                        taskID: taskID,
+                        requestGeneration: requestGeneration,
+                        force: force,
+                        bypassSnapshotCache: bypassSnapshotCache,
+                        notifyHistoryChange: false,
+                        bypassFailureBackoff: bypassFailureBackoff
+                    )
+                }
+                registerProviderRefreshTask(
+                    task,
+                    id: taskID,
+                    providerID: providerID,
+                    scope: ProviderRefreshContext.scope,
+                    batchID: batchID
+                )
+                return (providerID, taskID, task)
             }
-            for task in tasks {
-                outcomes.append(await task.value)
+            for (providerID, taskID, task) in tasks {
+                let outcome = await task.value
+                outcomes.append(outcome)
+                if !ProviderRefreshContext.scope.suppressesLiveQuota,
+                   providersByID[providerID]?.panelMetersRefreshIncludesHistory != true,
+                   outcome == .refreshed || outcome == .failed
+                {
+                    attemptedLiveQuota = true
+                }
+                unregisterProviderRefreshTask(taskID, providerID: providerID)
             }
         }
-        // Stamp the end of the pass so the footer countdown targets the next scheduled refresh
-        // (this time + one refresh interval), mirroring the periodic loop that sleeps one interval
-        // after each pass.
-        lastRefreshAt = Date()
         let durationMs = durationMilliseconds(since: start)
         // Count THIS batch's actual outcomes, not the long-lived `providerErrors` map (which persists
         // across passes, so reading it would miscount cache hits and stale earlier failures).
@@ -394,8 +551,16 @@ final class WidgetDataStore {
         let failed = outcomes.count { $0 == .failed }
         let cached = outcomes.count { $0 == .cacheHit }
         let backedOff = outcomes.count { $0 == .backedOff }
+        let inFlight = outcomes.count { $0 == .inFlight }
+        // Fold-only and cache-hit batches do not advance the quota timer or the popover countdown.
+        // In particular, a panel-open or accepted-trigger meter pass just before TTL expiry must
+        // not buy another full interval without making a live quota attempt.
+        if !ProviderRefreshContext.scope.suppressesLiveQuota, attemptedLiveQuota {
+            lastQuotaRefreshAt = Date()
+            lastLiveQuotaRefreshUptime = ProcessInfo.processInfo.systemUptime
+        }
         if localHistoryRevision != startingHistoryRevision { onLocalHistoryChanged?() }
-        AppLog.info(.refresh, "batch end (\(durationMs)ms, \(refreshed) ok / \(failed) failed / \(cached) cached / \(backedOff) backed off)")
+        AppLog.info(.refresh, "batch end (\(durationMs)ms, \(refreshed) ok / \(failed) failed / \(cached) cached / \(backedOff) backed off / \(inFlight) deferred)")
     }
 
     /// Evaluate every visible, enabled metric for a quota pace milestone and post a notification for any
@@ -414,7 +579,7 @@ final class WidgetDataStore {
         let toggles = settings.toggles
         if !settings.anyEnabled {
             // Preserve the evaluator's pruning semantics while avoiding descriptor/data resolution on
-            // every five-minute background tick when notifications are completely disabled.
+            // every one-minute background tick when notifications are completely disabled.
             await notificationEvaluator.evaluate(
                 metrics: [],
                 toggles: toggles,
@@ -456,8 +621,9 @@ final class WidgetDataStore {
     /// dashboard's unpinned cards would wait for phase 2 to show meters. `.menuBar` only refreshes
     /// providers that power pinned strip meters, plus providers with visible bounded metrics when
     /// quota notifications are enabled. `.localAccounting` refreshes only the providers that fold
-    /// local usage corpora (codex + opencode families) — the wake sources for that scope are local
-    /// file appends, so remote-only providers have nothing new to read. `.panelAccounting`
+    /// local usage corpora (enabled Codex cards, plus OpenCode only while Codex is an enabled source)
+    /// — the wake sources for that scope are CodexRouter ledger appends, so unrelated providers have
+    /// nothing new to read. `.panelAccounting`
     /// selects every enabled provider; the store narrows it to history exporters, which only the
     /// registry knows.
     static func selectProviderIDsForRefresh(
@@ -473,7 +639,16 @@ final class WidgetDataStore {
         )
         switch scope {
         case .localAccounting:
-            return enabledProviderIDs.filter { foldsLocalAccounting($0) }
+            // This scope is driven by CodexRouter ledger appends. OpenCode only needs that wake while
+            // at least one Codex card is enabled as a ledger source; otherwise an off Codex card's
+            // writes would unnecessarily start OpenCode's unrelated local database fold.
+            guard enabledProviderIDs.contains(where: { ProviderAccountID.family(of: $0) == "codex" }) else {
+                return []
+            }
+            return enabledProviderIDs.filter {
+                let family = ProviderAccountID.family(of: $0)
+                return family == "codex" || family == "opencode"
+            }
         case .full, .panelMeters, .panelAccounting:
             return MenuBarRefreshFilter.prioritize(
                 providerIDs: enabledProviderIDs,
@@ -497,15 +672,312 @@ final class WidgetDataStore {
     /// from real outcomes rather than cumulative error state. `.backedOff` is a probe deliberately skipped
     /// because the provider failed within the last `failureRetryBackoff` — distinct from `.skipped`
     /// (disabled / unknown / already in flight) so a wake-burst's suppression is visible in the logs.
-    enum RefreshOutcome: Sendable { case refreshed, failed, cacheHit, skipped, backedOff }
+    struct DeferredRefreshRequest: Hashable, Sendable {
+        let providerID: String
+        let scope: ProviderRefreshContext.Scope
+        let bypassSnapshotCache: Bool
+        let bypassFailureBackoff: Bool
+        let requestGeneration: UInt64
+        let manualActionID: UInt64?
+        let credentialInteractionGate: CredentialInteractionGate?
+
+        init(
+            providerID: String,
+            scope: ProviderRefreshContext.Scope,
+            bypassSnapshotCache: Bool,
+            bypassFailureBackoff: Bool,
+            requestGeneration: UInt64,
+            manualActionID: UInt64? = nil,
+            credentialInteractionGate: CredentialInteractionGate? = nil
+        ) {
+            self.providerID = providerID
+            self.scope = scope
+            self.bypassSnapshotCache = bypassSnapshotCache
+            self.bypassFailureBackoff = bypassFailureBackoff
+            self.requestGeneration = requestGeneration
+            self.manualActionID = manualActionID
+            self.credentialInteractionGate = credentialInteractionGate
+        }
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.providerID == rhs.providerID
+                && lhs.scope == rhs.scope
+                && lhs.bypassSnapshotCache == rhs.bypassSnapshotCache
+                && lhs.bypassFailureBackoff == rhs.bypassFailureBackoff
+                && lhs.requestGeneration == rhs.requestGeneration
+                && lhs.manualActionID == rhs.manualActionID
+                && lhs.credentialInteractionGate === rhs.credentialInteractionGate
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(providerID)
+            hasher.combine(scope)
+            hasher.combine(bypassSnapshotCache)
+            hasher.combine(bypassFailureBackoff)
+            hasher.combine(requestGeneration)
+            hasher.combine(manualActionID)
+            hasher.combine(credentialInteractionGate.map { ObjectIdentifier($0) })
+        }
+    }
+
+    enum RefreshOutcome: Sendable, Equatable { case refreshed, failed, cacheHit, skipped, inFlight, backedOff }
 
     @discardableResult
     func refresh(
         providerID: String,
         force: Bool = false,
-        notifyHistoryChange: Bool = true
+        notifyHistoryChange: Bool = true,
+        bypassSnapshotCache: Bool = false,
+        bypassFailureBackoff: Bool = false
     ) async -> RefreshOutcome {
         guard isProviderEnabled(providerID) else { return .skipped }
+        let requestGeneration = beginProviderRequest(
+            providerID: providerID,
+            manualActionID: ProviderRefreshContext.manualActionID
+        )
+        let taskID = UUID()
+        let task: Task<RefreshOutcome, Never> = Task { @MainActor [weak self] in
+            guard let self else { return RefreshOutcome.skipped }
+            return await self.performRefresh(
+                providerID: providerID,
+                taskID: taskID,
+                requestGeneration: requestGeneration,
+                force: force,
+                bypassSnapshotCache: bypassSnapshotCache,
+                notifyHistoryChange: notifyHistoryChange,
+                bypassFailureBackoff: bypassFailureBackoff
+            )
+        }
+        registerProviderRefreshTask(
+            task, id: taskID, providerID: providerID, scope: ProviderRefreshContext.scope
+        )
+        defer { unregisterProviderRefreshTask(taskID, providerID: providerID) }
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    /// Refresh just the provider's local usage history after a visible quota retry.
+    /// The panel accounting phase is only meaningful for history exporters; running it against a
+    /// pure API provider would repeat its live requests. Keep the retry's action identity so a newer
+    /// manual refresh makes this delayed fold stale, and leave `force` off so conflicting work can
+    /// defer this provider-local fold. The store still merges its partial result with any quota meters
+    /// phase one recovered. Bypass the just-written failure backoff so a failed quota attempt can
+    /// still leave useful local history.
+    func refreshProviderHistoryAfterRetry(
+        providerID: String,
+        manualActionID: UInt64?,
+        credentialInteractionGate: CredentialInteractionGate? = nil
+    ) async -> RefreshOutcome {
+        guard registry.historyDescriptorsByProvider[providerID] != nil,
+              providersByID[providerID]?.panelMetersRefreshIncludesHistory != true
+        else { return .skipped }
+        return await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await ProviderRefreshContext.$isManual.withValue(manualActionID != nil) {
+                await ProviderRefreshContext.$credentialInteractionGate.withValue(
+                    credentialInteractionGate
+                ) {
+                    await ProviderRefreshContext.$manualActionID.withValue(manualActionID) {
+                        await ProviderRefreshContext.$accountingCPUInteractiveBudgetEnabled.withValue(true) {
+                            await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                                await refresh(
+                                    providerID: providerID,
+                                    force: false,
+                                    bypassSnapshotCache: true,
+                                    bypassFailureBackoff: true
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resume a visible retry's history fold after conflicting provider work has ended.
+    /// Carry its original Keychain action through the scheduler wake so the delayed pass does not
+    /// become a silent global accounting refresh.
+    func resumeDeferredManualHistoryRetry(_ request: DeferredRefreshRequest) async -> RefreshOutcome {
+        guard request.scope == .panelAccounting,
+              let manualActionID = request.manualActionID,
+              isProviderEnabled(request.providerID),
+              isCurrentProviderRequest(
+                  providerID: request.providerID,
+                  generation: request.requestGeneration
+              )
+        else { return .skipped }
+        return await refreshProviderHistoryAfterRetry(
+            providerID: request.providerID,
+            manualActionID: manualActionID,
+            credentialInteractionGate: request.credentialInteractionGate
+        )
+    }
+
+    private func registerProviderRefreshTask(
+        _ task: Task<RefreshOutcome, Never>,
+        id: UUID,
+        providerID: String,
+        scope: ProviderRefreshContext.Scope,
+        batchID: UUID? = nil
+    ) {
+        activeProviderRefreshTasks[providerID, default: [:]][id] = task
+        activeProviderRefreshTaskScopes[providerID, default: [:]][id] = scope
+        if let batchID {
+            activeProviderRefreshTaskBatchIDs[providerID, default: [:]][id] = batchID
+        }
+    }
+
+    private func unregisterProviderRefreshTask(_ id: UUID, providerID: String) {
+        activeProviderRefreshTasks[providerID]?[id] = nil
+        activeProviderRefreshTaskScopes[providerID]?[id] = nil
+        activeProviderRefreshTaskBatchIDs[providerID]?[id] = nil
+        if activeProviderRefreshTasks[providerID]?.isEmpty == true {
+            activeProviderRefreshTasks[providerID] = nil
+            activeProviderRefreshTaskScopes[providerID] = nil
+            activeProviderRefreshTaskBatchIDs[providerID] = nil
+        }
+        emitReadyDeferredRefreshes(for: providerID)
+    }
+
+    private func emitReadyDeferredRefreshes(for providerID: String) {
+        guard let requests = deferredRefreshRequests[providerID], !requests.isEmpty else { return }
+        let activeScopes = Array(runningProviderRefreshScopes[providerID, default: [:]].values)
+        let ready = requests.filter { request in
+            activeScopes.isEmpty || Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
+        }
+        guard !ready.isEmpty else { return }
+        deferredRefreshRequests[providerID] = requests.subtracting(ready)
+        if deferredRefreshRequests[providerID]?.isEmpty == true {
+            deferredRefreshRequests[providerID] = nil
+        }
+        for request in ready {
+            AppLog.debug(.refresh, "deferred refresh ready \(providerID) (scope=\(Self.batchScopeLabel(request.scope)))")
+            onDeferredRefreshReady?(request)
+        }
+    }
+
+    /// Cancels scheduler-owned accounting work when its loop shuts down. Meter tasks keep running so
+    /// app teardown does not accidentally cancel an unrelated manual or visible-panel request.
+    func cancelProviderRefreshes(scopes: [ProviderRefreshContext.Scope]) {
+        for (providerID, tasks) in activeProviderRefreshTasks {
+            for (id, task) in tasks where scopes.contains(activeProviderRefreshTaskScopes[providerID]?[id] ?? .full) {
+                task.cancel()
+            }
+        }
+    }
+
+    private func cancelProviderRefreshes(batchID: UUID) {
+        for (providerID, tasks) in activeProviderRefreshTasks {
+            for (id, task) in tasks where activeProviderRefreshTaskBatchIDs[providerID]?[id] == batchID {
+                task.cancel()
+            }
+        }
+    }
+
+    /// Returns a stable per-provider request generation. Two refreshes in one manual action share one
+    /// generation; a later action advances it once for each provider it covers. A superseded action
+    /// that reaches this store late receives a sentinel that cannot publish.
+    private func beginProviderRequest(providerID: String, manualActionID: UInt64?) -> UInt64 {
+        let current = providerRequestGenerations[providerID, default: 0]
+        guard let manualActionID else { return current }
+        if let invalidatedThrough = invalidatedManualActionsThrough[providerID],
+           manualActionID <= invalidatedThrough
+        {
+            return UInt64.max
+        }
+        if let latestAction = latestManualActionByProvider[providerID] {
+            if manualActionID == latestAction { return current }
+            if manualActionID < latestAction { return UInt64.max }
+        }
+        latestManualActionByProvider[providerID] = manualActionID
+        let next = current &+ 1
+        providerRequestGenerations[providerID] = next
+        return next
+    }
+
+    private func isCurrentProviderRequest(providerID: String, generation: UInt64) -> Bool {
+        generation != UInt64.max && providerRequestGenerations[providerID, default: 0] == generation
+    }
+
+    /// A global manual action may supersede an unrelated provider's Keychain read. Retry that card
+    /// once in a silent task if no newer request owns it; the old action cannot spend another prompt.
+    private func scheduleSilentSupersessionRetry(
+        providerID: String,
+        requestGeneration: UInt64,
+        scope: ProviderRefreshContext.Scope
+    ) {
+        guard isCurrentProviderRequest(providerID: providerID, generation: requestGeneration),
+              isProviderEnabled(providerID)
+        else { return }
+        AppLog.debug(.refresh, "superseded manual action; scheduling silent retry for \(providerID)")
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self,
+                  self.isCurrentProviderRequest(providerID: providerID, generation: requestGeneration),
+                  self.isProviderEnabled(providerID)
+            else { return }
+            await ProviderRefreshContext.$scope.withValue(scope) {
+                await ProviderRefreshContext.$isManual.withValue(false) {
+                    await ProviderRefreshContext.$credentialInteractionGate.withValue(nil) {
+                        await ProviderRefreshContext.$manualActionID.withValue(nil) {
+                            await ProviderRefreshContext.$accountingCPUInteractiveBudgetEnabled.withValue(true) {
+                                let foldOnly = scope.suppressesLiveQuota
+                                let outcome = await self.refresh(
+                                    providerID: providerID,
+                                    force: !foldOnly,
+                                    bypassSnapshotCache: foldOnly,
+                                    bypassFailureBackoff: foldOnly
+                                )
+                                // A visible retry's first (meters) phase may have been cancelled when a
+                                // newer manual action arrived for another card. Once its silent meters
+                                // retry recovers this provider, perform the missing local fold too.
+                                // A newer request for this same provider owns the generation and must win.
+                                if scope == .panelMeters,
+                                   outcome == .refreshed || outcome == .failed,
+                                   self.isCurrentProviderRequest(
+                                       providerID: providerID,
+                                       generation: requestGeneration
+                                   )
+                                {
+                                    _ = await self.refreshProviderHistoryAfterRetry(
+                                        providerID: providerID,
+                                        manualActionID: nil
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func performRefresh(
+        providerID: String,
+        taskID: UUID,
+        requestGeneration: UInt64,
+        force: Bool,
+        bypassSnapshotCache: Bool,
+        notifyHistoryChange: Bool,
+        bypassFailureBackoff: Bool = false
+    ) async -> RefreshOutcome {
+        guard isProviderEnabled(providerID) else { return .skipped }
+        let manualActionID = ProviderRefreshContext.manualActionID
+        guard isCurrentProviderRequest(providerID: providerID, generation: requestGeneration) else {
+            return .skipped
+        }
+        if let manualActionID,
+           !KeychainPermissionGate.shared.isCurrentManualAction(manualActionID)
+        {
+            scheduleSilentSupersessionRetry(
+                providerID: providerID,
+                requestGeneration: requestGeneration,
+                scope: ProviderRefreshContext.scope
+            )
+            return .skipped
+        }
         // A TTL-fresh entry that provably belongs to another account (swap since it was written) must
         // not short-circuit the refresh — under persisted freshness (the one-shot CLI) it would copy
         // the previous account's snapshot back in. Treat it as a miss so the fetch overwrites it.
@@ -513,7 +985,11 @@ final class WidgetDataStore {
             providerID: providerID,
             currentIdentityKey: providerIdentityKeys[providerID]
         )
-        if !force, !staleAccountStamp, let cachedSnapshot = cache.snapshot(providerID: providerID) {
+        let freshnessInterval = ProviderRefreshContext.scope.skipsLocalAccounting
+            ? RefreshSetting.quotaCacheInterval
+            : nil
+        if !force, !bypassSnapshotCache, !staleAccountStamp,
+           let cachedSnapshot = cache.snapshot(providerID: providerID, freshnessInterval: freshnessInterval) {
             var cached = cachedSnapshot
             if let history = cached.usageHistory {
                 let compacted = history.retainingHistory(through: now())
@@ -554,11 +1030,26 @@ final class WidgetDataStore {
             }
             AppLog.info(.refresh, "\(providerID) history carried from menu-bar merge — recompute in full pass")
         }
-        if !force { AppLog.debug(.refresh, "cache miss \(providerID)") }
+        if !force {
+            let reason = bypassSnapshotCache ? "scheduled cache bypass" : "cache miss"
+            AppLog.debug(.refresh, "\(reason) \(providerID)")
+        }
 
         // A provider that just failed isn't cached, so nothing else stops the loop from re-probing it on
-        // every wake. Hold off until its backoff expires; the manual `force` refresh ignores the backoff.
-        if !force, let retryAfter = failureRetryAfter[providerID], now() < retryAfter {
+        // every wake. Map the requested scope to the work it actually performs: full failures share
+        // backoff with their quota/accounting phases, and local-only providers such as Hermes use the
+        // accounting domain even during `.panelMeters`.
+        let scope = ProviderRefreshContext.scope
+        let failureDomains = failureDomains(for: providerID, scope: scope)
+        let failureBackoffKeys = failureDomains.map {
+            FailureBackoffKey(providerID: providerID, domain: $0)
+        }
+        let checkTime = now()
+        if !force, !bypassFailureBackoff,
+           failureBackoffKeys.contains(where: { key in
+               guard let retryAfter = failureRetryAfter[key] else { return false }
+               return checkTime < retryAfter
+           }) {
             AppLog.debug(.refresh, "backoff skip \(providerID) (failed <\(Int(Self.failureRetryBackoff))s ago)")
             return .backedOff
         }
@@ -566,54 +1057,137 @@ final class WidgetDataStore {
         guard let provider = providersByID[providerID] else { return .skipped }
         // Skip if an in-flight refresh already owns this provider (e.g. the background timer racing the
         // first popover open), so we never fire duplicate network calls for the same provider.
-        // Forced refreshes (panel open / manual Refresh) must not bail: wait for the in-flight pass
-        // to finish, then run full detail. Otherwise a menuBar tick in flight at open time would leave
-        // the panel on quota-only merge data and the cache TTL could block the next full pass.
+        // Forced refreshes (panel open / manual Refresh) must not bail: wait for incompatible in-flight
+        // work, then run the caller's requested scope. A forced panel-meter retry is the exception when
+        // only fold-only work is active: meters skip local accounting and folds skip live quota, so this
+        // uses the same safe overlap as an ordinary due meter pass. Otherwise a menuBar tick in flight at
+        // open time would leave the panel on quota-only merge data and the cache TTL could block the next
+        // full pass.
         if refreshingProviderIDs.contains(providerID) {
-            if !force {
+            let activeScopes = Array(runningProviderRefreshScopes[providerID, default: [:]].values)
+            let requestedScope = ProviderRefreshContext.scope
+            let canOverlapFold = Self.mayOverlapMeterRefresh(requestedScope, with: activeScopes)
+            if canOverlapFold && (!force || requestedScope == .panelMeters) {
+                AppLog.debug(.refresh, "meter refresh overlaps fold-only work for \(providerID)")
+            } else if !force {
                 AppLog.debug(.refresh, "cache skip \(providerID) (already in flight)")
-                return .skipped
-            }
-            AppLog.debug(.refresh, "force wait \(providerID) (already in flight)")
-            // Bounded and sleeping. `Task.yield()` here was a hot spin on the MainActor, and the loop
-            // had no deadline at all, so a waiter could outlive the pass it was waiting for.
-            let waitDeadline = monotonicNow() + Self.defaultProviderRefreshTimeout + Self.forceWaitGrace
-            var delay = Self.forceWaitInitialDelay
-            while refreshingProviderIDs.contains(providerID) {
-                if Task.isCancelled { return .skipped }
-                if monotonicNow() >= waitDeadline {
-                    AppLog.info(
-                        .refresh,
-                        "force wait gave up \(providerID) (still in flight past the deadline)"
-                    )
-                    return .skipped
+                deferredRefreshRequests[providerID, default: []].insert(DeferredRefreshRequest(
+                    providerID: providerID,
+                    scope: ProviderRefreshContext.scope,
+                    bypassSnapshotCache: bypassSnapshotCache,
+                    bypassFailureBackoff: bypassFailureBackoff,
+                    requestGeneration: requestGeneration,
+                    manualActionID: ProviderRefreshContext.manualActionID,
+                    credentialInteractionGate: ProviderRefreshContext.credentialInteractionGate
+                ))
+                return .inFlight
+            } else {
+                AppLog.debug(.refresh, "force wait \(providerID) (already in flight)")
+                // Bounded and sleeping. `Task.yield()` here was a hot spin on the MainActor, and the loop
+                // had no deadline at all, so a waiter could outlive the pass it was waiting for.
+                let waitDeadline = monotonicNow() + Self.defaultProviderRefreshTimeout + Self.forceWaitGrace
+                var delay = Self.forceWaitInitialDelay
+                while !runningProviderRefreshScopes[providerID, default: [:]].isEmpty {
+                    guard !Task.isCancelled,
+                          isProviderEnabled(providerID),
+                          isCurrentProviderRequest(providerID: providerID, generation: requestGeneration)
+                    else { return .skipped }
+                    guard KeychainPermissionGate.shared.isCurrentManualAction(manualActionID) else {
+                        scheduleSilentSupersessionRetry(
+                            providerID: providerID,
+                            requestGeneration: requestGeneration,
+                            scope: ProviderRefreshContext.scope
+                        )
+                        return .skipped
+                    }
+                    if monotonicNow() >= waitDeadline {
+                        AppLog.info(
+                            .refresh,
+                            "force wait gave up \(providerID) (still in flight past the deadline)"
+                        )
+                        return .skipped
+                    }
+                    // `try?` because cancellation throws here; the `isCancelled` check above acts on it.
+                    try? await Task.sleep(for: .seconds(delay))
+                    delay = min(delay * 2, Self.forceWaitMaxDelay)
                 }
-                // `try?` because cancellation throws here; the `isCancelled` check above is what acts
-                // on it, on the next turn round the sleep.
-                try? await Task.sleep(for: .seconds(delay))
-                delay = min(delay * 2, Self.forceWaitMaxDelay)
             }
         }
+        guard !Task.isCancelled,
+              isProviderEnabled(providerID),
+              isCurrentProviderRequest(providerID: providerID, generation: requestGeneration)
+        else { return .skipped }
+        guard KeychainPermissionGate.shared.isCurrentManualAction(manualActionID) else {
+            scheduleSilentSupersessionRetry(
+                providerID: providerID,
+                requestGeneration: requestGeneration,
+                scope: ProviderRefreshContext.scope
+            )
+            return .skipped
+        }
+        runningProviderRefreshScopes[providerID, default: [:]][taskID] = ProviderRefreshContext.scope
         refreshingProviderIDs.insert(providerID)
-        defer { refreshingProviderIDs.remove(providerID) }
+        defer {
+            runningProviderRefreshScopes[providerID]?[taskID] = nil
+            if runningProviderRefreshScopes[providerID]?.isEmpty == true {
+                runningProviderRefreshScopes[providerID] = nil
+                refreshingProviderIDs.remove(providerID)
+            }
+        }
         let start = monotonicNow()
         // A provider that never returns would otherwise hold the in-flight entry — and the spinner —
         // forever. Past the deadline, stop waiting and treat it as any other failed refresh.
-        guard var snapshot = await ProviderRefreshDeadline.snapshot(
+        let fetchedSnapshot = await ProviderRefreshDeadline.snapshot(
             from: provider,
-            force: force,
             timeout: providerRefreshTimeout
-        ) else {
-            providerErrors[providerID] = "Refresh timed out after \(Int(providerRefreshTimeout))s"
-            failureRetryAfter[providerID] = now().addingTimeInterval(Self.failureRetryBackoff)
+        )
+        guard isCurrentProviderRequest(providerID: providerID, generation: requestGeneration) else {
+            AppLog.debug(.refresh, "superseded provider request (\(providerID)); discarding stale result")
+            return .skipped
+        }
+        guard var snapshot = fetchedSnapshot else {
+            // A disabled provider's non-cooperative work can outlive the deadline after its task was
+            // cancelled. Do not turn that cancellation into a timeout failure: the provider may have
+            // been re-enabled in the meantime, and the stale task must not restore failure backoff.
+            guard !Task.isCancelled, isProviderEnabled(providerID) else {
+                AppLog.debug(.refresh, "cancelled or disabled \(providerID) refresh reached deadline; skipping")
+                return .skipped
+            }
+            if let manualActionID,
+               !KeychainPermissionGate.shared.isCurrentManualAction(manualActionID)
+            {
+                scheduleSilentSupersessionRetry(
+                    providerID: providerID,
+                    requestGeneration: requestGeneration,
+                    scope: ProviderRefreshContext.scope
+                )
+                return .skipped
+            }
+            let message = "Refresh timed out after \(Int(providerRefreshTimeout))s"
+            recordProviderFailure(message, for: providerID, domains: failureDomains)
+            let retryAfter = now().addingTimeInterval(Self.failureRetryBackoff)
+            for key in failureBackoffKeys { failureRetryAfter[key] = retryAfter }
             AppLog.warn(.refresh, "\(providerID) timed out after \(Int(providerRefreshTimeout))s")
             onRefreshOutcome?(providerID, .failed, .network, force)
             return .failed
         }
         // A canceled refresh may still return if a provider's underlying work is non-throwing. Never
         // publish that potentially partial snapshot; keep the last-good state exactly as it was.
-        guard !Task.isCancelled else {
-            AppLog.debug(.refresh, "cancelled \(providerID) refresh; keeping last-good snapshot")
+        guard !Task.isCancelled, isProviderEnabled(providerID) else {
+            AppLog.debug(.refresh, "cancelled or disabled \(providerID) refresh; keeping last-good snapshot")
+            return .skipped
+        }
+        if snapshot.errorCategory == .cancelled {
+            if let manualActionID,
+               !KeychainPermissionGate.shared.isCurrentManualAction(manualActionID)
+            {
+                scheduleSilentSupersessionRetry(
+                    providerID: providerID,
+                    requestGeneration: requestGeneration,
+                    scope: ProviderRefreshContext.scope
+                )
+            }
+            AppLog.debug(.refresh, "provider refresh cancelled (\(providerID)); keeping last-good snapshot")
             return .skipped
         }
         let durationMs = durationMilliseconds(since: start)
@@ -625,19 +1199,37 @@ final class WidgetDataStore {
         }
         if let message = Self.errorMessage(in: snapshot) {
             // Failed refresh: surface the error but keep the last good snapshot on screen rather than
-            // collapsing every row to "No data". The provider error string is already user-safe.
-            providerErrors[providerID] = message
+            // collapsing every row to "No data". A provider may explicitly invalidate quota state
+            // when the failure proves that a prior subscription/credential no longer applies; keep
+            // its spend history while dropping the stale plan and progress rows.
+            if snapshot.clearsPriorMenuBarQuotaState == true,
+               !ProviderRefreshContext.scope.suppressesLiveQuota
+            {
+                clearPriorQuotaState(for: providerID)
+            }
+            mergeHistoryFromFailedRefresh(
+                snapshot,
+                providerID: providerID,
+                notifyHistoryChange: notifyHistoryChange
+            )
+            recordProviderFailure(message, for: providerID, domains: failureDomains)
             // Negative-cache the failure so a wake burst can't re-probe this provider in a tight loop.
-            failureRetryAfter[providerID] = now().addingTimeInterval(Self.failureRetryBackoff)
-            AppLog.warn(.refresh, "\(providerID) failed: \(message)")
+            let retryAfter = now().addingTimeInterval(Self.failureRetryBackoff)
+            for key in failureBackoffKeys { failureRetryAfter[key] = retryAfter }
+            if force || lastLoggedProviderError[providerID] != message {
+                AppLog.warn(.refresh, "\(providerID) failed: \(message)")
+                lastLoggedProviderError[providerID] = message
+            }
             onRefreshOutcome?(providerID, .failed, snapshot.errorCategory, force)
             return .failed
         }
-        if providerErrors[providerID] != nil {
-            providerErrors[providerID] = nil
+        clearProviderFailure(for: providerID, domains: failureDomains, clearAll: scope == .full)
+        // Recovered: drop the matching backoff so that work resumes its normal cadence immediately.
+        if scope == .full {
+            clearFailureBackoff(for: providerID)
+        } else {
+            for key in failureBackoffKeys { failureRetryAfter[key] = nil }
         }
-        // Recovered: drop any backoff so the provider resumes the normal cadence immediately.
-        failureRetryAfter[providerID] = nil
         if let history = snapshot.usageHistory {
             snapshot.usageHistory = history.retainingHistory(through: now())
         }
@@ -645,11 +1237,10 @@ final class WidgetDataStore {
         // produces no result. Keep only the last-good normalized history in that case; the new plan,
         // limits, warnings, and timestamp still win. A non-nil empty history remains authoritative and
         // clears the old rows, because it proves the scan completed and found no usage.
-        // Forced refreshes always replace (panel open / manual Refresh). Menu-bar, panel-meter,
-        // and fold-only merges are only for partial passes — applying any of them after a forced
-        // full fetch would risk keeping stale spend lines if labels ever diverge from the prior
-        // snapshot.
-        if !force, ProviderRefreshContext.scope != .full {
+        // Full-scope refreshes replace the snapshot. Menu-bar, panel-meter, and fold-only scopes
+        // merge their partial result even when forced: `force` bypasses cache/in-flight policy, while
+        // the scope still controls which parts of this snapshot were actually recomputed.
+        if ProviderRefreshContext.scope != .full {
             // Meters-only pass: keep prior spend/token/chart lines and usageHistory so the panel
             // does not blank those rows between opens. Fresh meters still win on label collision;
             // omitted meters (incomplete localOnly pass) are preserved by the merge helper. A
@@ -657,6 +1248,15 @@ final class WidgetDataStore {
             // usageHistory, no live quota meters,
             // and the same helper recovers the meters from the prior snapshot.
             snapshot = snapshot.mergingMenuBarUpdate(over: localSnapshots[providerID])
+            if ProviderRefreshContext.scope.suppressesLiveQuota,
+               providerHasQuotaMetrics(providerID),
+               !Self.hasQuotaProgress(snapshot.lines),
+               !Self.hasQuotaProgress(localSnapshots[providerID]?.lines ?? [])
+            {
+                // A first-run fold has no prior meter stamp to carry. It must not make the failed
+                // or skipped quota request look fresh just because local history completed.
+                snapshot.quotaRefreshedAt = .distantPast
+            }
         } else if snapshot.usageHistory == nil,
            let history = localSnapshots[providerID]?.usageHistory,
            let descriptor = registry.historyDescriptorsByProvider[providerID]
@@ -697,10 +1297,152 @@ final class WidgetDataStore {
         return .refreshed
     }
 
+    /// A provider can still produce useful local usage history while its quota API is unavailable.
+    /// Merge that history into the last-good display without clearing the provider error or making
+    /// preserved quota meters look freshly checked. A first-run history-only snapshot gets an old
+    /// quota stamp so the next normal refresh still probes the live API.
+    private func mergeHistoryFromFailedRefresh(
+        _ failedSnapshot: ProviderSnapshot,
+        providerID: String,
+        notifyHistoryChange: Bool
+    ) {
+        guard let incomingHistory = failedSnapshot.usageHistory,
+              let descriptor = registry.historyDescriptorsByProvider[providerID]
+        else { return }
+
+        let previous = localSnapshots[providerID]
+        let history = incomingHistory.retainingHistory(through: now())
+        var updated = previous ?? ProviderSnapshot(
+            providerID: failedSnapshot.providerID,
+            displayName: failedSnapshot.displayName,
+            lines: [],
+            refreshedAt: failedSnapshot.refreshedAt
+        )
+        let hasPreviousQuota = Self.hasQuotaProgress(previous?.lines ?? [])
+        let previousQuotaStamp = previous.map { $0.quotaRefreshedAt ?? $0.refreshedAt }
+        updated.refreshedAt = failedSnapshot.refreshedAt
+        updated.quotaRefreshedAt = hasPreviousQuota ? previousQuotaStamp : .distantPast
+        updated = UsageHistorySnapshotRenderer.render(
+            local: updated,
+            history: history,
+            descriptor: descriptor,
+            now: now(),
+            combined: false
+        )
+
+        let historyChanged = previous?.usageHistory != updated.usageHistory
+        localSnapshots[providerID] = updated
+        cache.store(updated, producedByIdentityKey: providerIdentityKeys[providerID])
+        if historyChanged {
+            localHistoryRevision &+= 1
+            invalidateMergedHistoryCache()
+        }
+        rebuildRenderedSnapshots()
+        if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
+    }
+
     /// Provider IDs / families whose refresh parses large on-disk JSONL corpora.
     private static let heavyLocalLogProviders: Set<String> = [
         "claude", "codex", "opencode", "grok", "muse", "pi", "hermes",
     ]
+
+    private static func heavyProvidersToSerialize(in scope: ProviderRefreshContext.Scope) -> Set<String> {
+        guard scope.skipsLocalAccounting else { return heavyLocalLogProviders }
+        // HermesProvider always reads SQLite, and OpenCode may do a small SQLite window fallback when
+        // its account API has no answer. Keep those local reads out of the same heavy-provider chunk.
+        return ["hermes", "opencode"]
+    }
+
+    /// A due meter batch may run while local files are being folded for the same card. Providers already
+    /// separate these scopes: meter passes skip local accounting, and fold-only passes skip quota APIs.
+    /// Never overlap two meter passes or a full pass, which could duplicate API calls or publish stale
+    /// quota data over a newer result.
+    private static func mayOverlapMeterRefresh(
+        _ requested: ProviderRefreshContext.Scope,
+        with active: [ProviderRefreshContext.Scope]
+    ) -> Bool {
+        guard requested.skipsLocalAccounting, !active.isEmpty else { return false }
+        switch requested {
+        case .menuBar, .panelMeters:
+            return active.allSatisfy(\.suppressesLiveQuota)
+        case .localAccounting, .panelAccounting, .full:
+            return false
+        }
+    }
+
+    private func providerHasQuotaMetrics(_ providerID: String) -> Bool {
+        registry.descriptors(for: providerID).contains { descriptor in
+            descriptor.sample.limit != nil || !descriptor.limitResources.isEmpty
+        }
+    }
+
+    private func failureDomains(
+        for providerID: String,
+        scope: ProviderRefreshContext.Scope
+    ) -> [FailureDomain] {
+        let includesHistoryInMeters = providersByID[providerID]?.panelMetersRefreshIncludesHistory == true
+        let hasQuota = providerHasQuotaMetrics(providerID)
+        let hasHistory = registry.historyDescriptorsByProvider[providerID] != nil
+        switch scope {
+        case .full:
+            var domains: [FailureDomain] = []
+            if hasQuota { domains.append(.liveQuota) }
+            if hasHistory || includesHistoryInMeters { domains.append(.accounting) }
+            return domains.isEmpty ? [.full] : domains
+        case .menuBar, .panelMeters:
+            var domains: [FailureDomain] = []
+            if hasQuota { domains.append(.liveQuota) }
+            if includesHistoryInMeters && (hasHistory || !hasQuota) { domains.append(.accounting) }
+            return domains.isEmpty ? [.liveQuota] : domains
+        case .localAccounting, .panelAccounting:
+            return [.accounting]
+        }
+    }
+
+    private func recordProviderFailure(
+        _ message: String,
+        for providerID: String,
+        domains: [FailureDomain]
+    ) {
+        for affectedDomain in domains {
+            nextProviderFailureOrder &+= 1
+            providerFailureStates[providerID, default: [:]][affectedDomain] = ProviderFailureState(
+                message: message,
+                order: nextProviderFailureOrder
+            )
+        }
+        updateDisplayedProviderError(for: providerID)
+    }
+
+    private func clearProviderFailure(
+        for providerID: String,
+        domains: [FailureDomain],
+        clearAll: Bool
+    ) {
+        if clearAll {
+            providerFailureStates[providerID] = nil
+        } else {
+            // `.full` is the unattributable fallback bucket, not a distinct kind of failure: it is
+            // only recorded for a provider whose scopes all resolve to nothing narrower. Any
+            // successful pass proves at least part of such a provider works, so the catch-all error
+            // must not outlive it — otherwise its error row and Retry affordance stay forever.
+            for domain in domains + [.full] {
+                providerFailureStates[providerID]?[domain] = nil
+            }
+            if providerFailureStates[providerID]?.isEmpty == true {
+                providerFailureStates[providerID] = nil
+            }
+        }
+        updateDisplayedProviderError(for: providerID)
+        if providerErrors[providerID] == nil {
+            lastLoggedProviderError[providerID] = nil
+        }
+    }
+
+    private func updateDisplayedProviderError(for providerID: String) {
+        let latest = providerFailureStates[providerID]?.values.max { $0.order < $1.order }
+        providerErrors[providerID] = latest?.message
+    }
 
 
     private func durationMilliseconds(since start: TimeInterval) -> Int {
@@ -712,14 +1454,61 @@ final class WidgetDataStore {
     /// failure just before it was turned off must not suppress that fetch (the loop wouldn't otherwise
     /// retry until the 5-minute heartbeat). The periodic loop never calls this — only the user action does.
     func clearFailureBackoff(for providerID: String) {
-        failureRetryAfter[providerID] = nil
+        failureRetryAfter = failureRetryAfter.filter { $0.key.providerID != providerID }
     }
 
     /// Rebuild the in-memory union immediately after a provider toggle. Local cached data remains
     /// available to direct API reads, but disabled providers stop receiving peer contributions.
-    func providerEnablementDidChange() {
+    func providerEnablementDidChange(changedProviderIDs: Set<String> = []) {
         invalidateMergedHistoryCache()
         rebuildRenderedSnapshots()
+        let disabledProviderIDs = changedProviderIDs.filter { !isProviderEnabled($0) }
+        let enabledProviderIDs = changedProviderIDs.filter { isProviderEnabled($0) }
+        for providerID in disabledProviderIDs {
+            if let latestAction = latestManualActionByProvider[providerID] {
+                invalidatedManualActionsThrough[providerID] = max(
+                    invalidatedManualActionsThrough[providerID] ?? latestAction,
+                    latestAction
+                )
+            }
+            providerRequestGenerations[providerID, default: 0] &+= 1
+            deferredRefreshRequests[providerID] = nil
+            activeProviderRefreshTasks[providerID]?.values.forEach { $0.cancel() }
+        }
+        if !disabledProviderIDs.isEmpty {
+            onDeferredRefreshesInvalidated?(Set(disabledProviderIDs))
+        }
+        // A re-enable wake is meters-only. Drop the cache freshness stamp so a recent pre-disable
+        // snapshot cannot short-circuit the prompt fetch and leave the provider blank or stale.
+        cache.invalidateSessionFreshness(providerIDs: enabledProviderIDs.sorted())
+
+        let codexPeerSetChanged = changedProviderIDs.contains {
+            ProviderAccountID.family(of: $0) == "codex"
+        }
+        if codexPeerSetChanged {
+            // An enabled Codex card may have captured a peer-home list before this toggle. Cancel
+            // every active Codex scan so no task keeps walking a card that was just switched off;
+            // the next pass rebuilds peer homes from current enablement and refreshes enabled cards.
+            let codexProviderIDs = providersByID.keys.filter {
+                ProviderAccountID.family(of: $0) == "codex"
+            }
+            for providerID in codexProviderIDs {
+                activeProviderRefreshTasks[providerID]?.values.forEach { $0.cancel() }
+            }
+        }
+
+        // Muse shares OpenCode's provider card and enablement ID, while keeping its own source-family
+        // identity in usage rows. Toggling the card must invalidate OpenCode's cached fold too.
+        let sourceFamilies: Set<String> = ["claude", "codex", "hermes", "muse", "opencode"]
+        let changedSourceFamily = changedProviderIDs.contains {
+            sourceFamilies.contains(ProviderAccountID.family(of: $0))
+        }
+        if changedSourceFamily {
+            // OpenCode's spend fold consumes these source families. Cancel an in-flight fold so the
+            // next pass uses the new source plan instead of finishing work for the old card selection.
+            activeProviderRefreshTasks["opencode"]?.values.forEach { $0.cancel() }
+            cache.invalidateSessionFreshness(providerIDs: ["opencode"])
+        }
     }
 
     /// Replaces the downloaded peer set. A conflicted duplicate device file resolves to the newest
@@ -890,6 +1679,28 @@ final class WidgetDataStore {
         return "Refresh failed"
     }
 
+    private static func hasQuotaProgress(_ lines: [MetricLine]) -> Bool {
+        lines.contains { line in
+            if case .progress = line { return true }
+            return false
+        }
+    }
+
+    private func clearPriorQuotaState(for providerID: String) {
+        guard var previous = localSnapshots[providerID] else { return }
+        previous.plan = nil
+        previous.lines.removeAll { line in
+            if case .progress = line { return true }
+            return false
+        }
+        previous.warning = nil
+        previous.clearsPriorMenuBarQuotaState = nil
+        previous.quotaRefreshedAt = nil
+        localSnapshots[providerID] = previous
+        cache.store(previous, producedByIdentityKey: providerIdentityKeys[providerID])
+        rebuildRenderedSnapshots()
+    }
+
     func data(for descriptor: WidgetDescriptor) -> WidgetData {
         var result: WidgetData
         if let snapshot = snapshots[descriptor.providerID],
@@ -925,12 +1736,9 @@ final class WidgetDataStore {
     /// per-cycle aging, which would flicker a hint on healthy providers.
     /// Derived from the *slowest* cadence the refresh loop can legally sleep at, not the panel-open one.
     ///
-    /// The periodic loop sleeps `backgroundInterval` while the popover is closed — 15 minutes on
-    /// battery or in Low Power Mode. Sizing this off `interval` (5 min) alone put the threshold at
-    /// 600 s, so on a healthy provider the header showed a false amber "Outdated" for roughly 5 minutes
-    /// of every 15-minute cycle. The badge is read on the first render after the panel opens, which
-    /// happens *before* the forced `.full` refresh lands, so users saw it on providers that were
-    /// refreshing perfectly.
+    /// Live quota meters update every minute on AC and every two minutes on battery / Low Power Mode;
+    /// full-detail snapshots still use the five-minute cadence. The threshold follows the slower of
+    /// those schedules so a healthy provider does not show a false amber "Outdated" on panel open.
     static var stalenessThreshold: TimeInterval {
         max(RefreshSetting.interval, RefreshSetting.backgroundInterval) * 2
     }

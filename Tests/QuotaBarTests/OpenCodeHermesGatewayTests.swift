@@ -178,10 +178,23 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
                        "finished day's token count must stay measured (no ⓘ)")
     }
 
-    func testHermesReadFailureWarnsInsteadOfSilentlyDroppingTheFold() async throws {
-        // A WAL-locked Hermes database during a busy write burst must not silently zero the day:
-        // the fold is skipped (supplementary source), but the failure is reported loudly through
-        // the edge-triggered reporter instead of vanishing into `try?`.
+    /// A failed sub-source must fail the whole fold closed. Returning nil would read as "no
+    /// sources", which the provider folds as a successful empty pass — the exact partial publish
+    /// this regression guards against.
+    private func assertFailsClosed(_ body: () async throws -> Void?) async {
+        do {
+            _ = try await body()
+            XCTFail("a failed Hermes read must not publish a partial combined total")
+        } catch let error as OpenCodeUsageError {
+            XCTAssertEqual(String(describing: error), String(describing: OpenCodeUsageError.usageSourcesIncomplete))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    func testHermesReadFailureWarnsAndRejectsThePartialFold() async throws {
+        // A WAL-locked Hermes database during a busy write burst must not publish only the readable
+        // OpenCode subset: Hermes is an independent usage source, so the combined fold is incomplete.
         final class ThrowingSQLite: SQLiteAccessing, @unchecked Sendable {
             var warned: Int = 0
             func queryValue(path: String, sql: String) throws -> String? {
@@ -200,15 +213,13 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
             hermesStateDBPath: { "/hermes/state.db" },
             readFailureWarning: warning
         )
-        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
-        XCTAssertNotNil(scan, "a failed Hermes read must not fail the whole scan")
-        XCTAssertTrue(scan!.partialDays.isEmpty)
-        XCTAssertFalse(scan!.includesEstimatedCost)
+        // Returning nil would read as "no sources", which the provider folds as a successful empty
+        // pass — so a partial fold must fail closed instead, like the Claude and Musk sources do.
+        await assertFailsClosed { try await scanner.scan(now: now, pricing: TestPricing.bundled) }
         XCTAssertEqual(stub.warned, 1, "the Hermes read failure must warn (edge-triggered), not vanish")
 
         // Second scan: same persistent failure must NOT warn again (edge-triggered).
-        let scan2 = try await scanner.scan(now: now, pricing: TestPricing.bundled)
-        XCTAssertNotNil(scan2)
+        await assertFailsClosed { try await scanner.scan(now: now, pricing: TestPricing.bundled) }
         XCTAssertEqual(stub.warned, 1, "persistent failure warns once per run, not every refresh")
     }
 
