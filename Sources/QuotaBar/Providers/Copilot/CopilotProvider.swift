@@ -183,10 +183,12 @@ final class CopilotProvider: ProviderRuntime {
         }
 
         let orgs: [String]
+        var orgListWasPartial = false
         do {
             let response = try await orgBillingClient.fetchUserOrgs(token: token)
             try Task.checkCancellation()
             if let partialStatus = response.header("x-quotabar-partial-status") {
+                orgListWasPartial = true
                 if let statusCode = Int(partialStatus) {
                     let rateLimited = response.header("x-quotabar-partial-rate-limit") == "true"
                         || CopilotOrgBillingClient.isRateLimitResponse(
@@ -201,8 +203,6 @@ final class CopilotProvider: ProviderRuntime {
                         )
                         AppLog.info(LogTag.plugin("copilot"), "org list rate limited; pausing org discovery")
                         return []
-                    } else if statusCode == 403 {
-                        recordOrgProbeCooldown()
                     }
                     AppLog.warn(LogTag.plugin("copilot"), "org list pagination stopped at HTTP \(statusCode); using completed pages")
                 } else {
@@ -233,7 +233,9 @@ final class CopilotProvider: ProviderRuntime {
             return []
         }
 
-        var sawTransientFailure = false
+        // A partial organization list is not evidence that the user has no readable billing org.
+        // Keep completed pages useful, but don't cache a no-result outcome from an incomplete scan.
+        var sawTransientFailure = orgListWasPartial
         for org in orgs where !attemptedOrgs.contains(org.lowercased()) {
             try Task.checkCancellation()
             do {

@@ -790,6 +790,48 @@ final class CopilotProviderTests: XCTestCase {
         XCTAssertEqual(http.requests.filter { $0.url.path == "/orgs/acme/settings/billing/usage/summary" }.count, 1)
     }
 
+    func testLaterPageTransportFailureDoesNotCacheCompletedPagesAsNoResult() async {
+        let clock = Date(timeIntervalSince1970: 1_800_000_000)
+        let http = RoutingHTTPClient { request in
+            if request.url.absoluteString.contains("/copilot_internal/user") {
+                return ok(makeBusinessPlaceholderBody())
+            }
+            if request.url.path == "/user/orgs" {
+                if URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems?.contains(where: {
+                    $0.name == "page" && $0.value == "2"
+                }) == true {
+                    throw URLError(.timedOut)
+                }
+                return HTTPResponse(
+                    statusCode: 200,
+                    headers: ["Link": "<https://api.github.com/user/orgs?per_page=100&page=2>; rel=\"next\""],
+                    body: try! JSONSerialization.data(withJSONObject: [["login": "acme"]])
+                )
+            }
+            if request.url.path == "/orgs/acme/settings/billing/usage/summary" {
+                return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+            }
+            XCTFail("unexpected request: \(request.url)")
+            return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+        }
+        let defaults = freshDefaults()
+        let provider = CopilotProvider(
+            authStore: editorTokenStore(),
+            usageClient: CopilotUsageClient(http: http),
+            orgBillingClient: CopilotOrgBillingClient(http: http),
+            defaults: defaults,
+            now: { clock }
+        )
+
+        _ = await provider.refresh()
+
+        XCTAssertNil(defaults.object(forKey: CopilotProvider.billingOrgProbeRetryAfterKey),
+                     "an incomplete membership scan must not be cached as a complete no-result scan")
+        _ = await provider.refresh()
+        XCTAssertEqual(http.requests.filter { $0.url.path == "/user/orgs" }.count, 4,
+                       "a later refresh retries the incomplete membership scan")
+    }
+
     func testOrgBillingRateLimitHonorsRetryAfterAndManualRefreshKeepsServerDeadline() async {
         let clock = Date(timeIntervalSince1970: 1_800_000_000)
         let http = RoutingHTTPClient { request in
