@@ -24,6 +24,7 @@
 - Add the locally authenticated Freebuff usage card with daily, weekly, monthly, Freebucks, free and plan premium-session pools, reset, and provider-reported dollar metrics.
 - Stop provider API and fallback work promptly after cancellation, while persisting a successful Codex refresh-token rotation before discarding its canceled usage refresh.
 - Follow GitHub Copilot org pagination, preserve completed pages after later-page failures, and stop the org scan on rate limits while honoring server cooldowns.
+- Do not cache incomplete Copilot organization discovery as a complete no-result scan.
 - Keep cancelled Keychain prompts quiet within one refresh, allow a deliberate retry on the next explicit Refresh, and preserve manual consent through detached loads.
 - Let sibling Keychain reads wait through cancellable preflight and use the shared prompt budget if Security never starts the first read.
 - Discard a superseded Claude Keychain load before trying fallback credentials or sending a usage request.
