@@ -11,8 +11,10 @@ enum OpenCodeUsageError: Error, LocalizedError, Equatable {
     /// OpenCode databases exist on disk but none could be read this refresh. Failing loudly here beats
     /// rendering authoritative-looking $0 meters from an empty scan.
     case databaseUnreadable
-    /// The `/zen/go/v1/usage` account endpoint rejected the `opencode-go` key (401). The card keeps
-    /// working off local logs, but the account meters are unavailable.
+    /// A discovered local usage source failed mid-read. Do not publish a partial replacement for the
+    /// prior history; let the store keep the last-good snapshot and retry next refresh.
+    case usageSourcesIncomplete
+    /// The `/zen/go/v1/usage` account endpoint rejected the `opencode-go` key (401).
     case accountAPIUnauthorized
     /// The usage endpoint did not confirm a Go entitlement for this key. Keep this distinct from a
     /// bad key; because entitlement lookups can be false negatives, the UI says "couldn't confirm"
@@ -20,36 +22,24 @@ enum OpenCodeUsageError: Error, LocalizedError, Equatable {
     case accountAPINoEntitlement
     /// The account endpoint returned a malformed body or an unknown window status.
     case accountAPIInvalidResponse
-    /// The account endpoint answered with an unexpected HTTP status. `statusCode` feeds telemetry; the
-    /// card falls back to local logs.
+    /// The account endpoint answered with an unexpected HTTP status. `statusCode` feeds telemetry.
     case accountAPIRequestFailed(Int)
     /// The account endpoint answered but its payload couldn't be used (network failure, malformed or
-    /// partial JSON, non-`ok` windows). `detail` is for the log file only. The card falls back to local
-    /// logs rather than rendering partial meters.
+    /// partial JSON, non-`ok` windows). `detail` is for the log file only.
     case accountAPIUnavailable(detail: String)
-
-    var blocksLocalGoFallback: Bool {
-        switch self {
-        case .accountAPIUnauthorized, .accountAPINoEntitlement, .accountAPIInvalidResponse:
-            true
-        case .accountAPIRequestFailed(let status) where (400..<500).contains(status) && status != 429:
-            true
-        case .notLoggedIn, .credentialsUnreadable, .databaseUnreadable,
-             .accountAPIRequestFailed, .accountAPIUnavailable:
-            false
-        }
-    }
 
     var errorDescription: String? {
         switch self {
         case .notLoggedIn:
             return "OpenCode not detected. Log in with OpenCode Go or use OpenCode locally first."
         case .credentialsUnreadable:
-            return "Couldn't read OpenCode's auth.json. Check its file permissions or log into OpenCode Go again."
+            return "Couldn't read OpenCode credentials. Check auth.json and QuotaBar's saved Go keys, then refresh again."
         case .databaseUnreadable:
             return "Couldn't read OpenCode's local database. Quit OpenCode and refresh, or check the data directory's permissions."
+        case .usageSourcesIncomplete:
+            return "Couldn't read all of OpenCode's local usage history. Check its files and refresh again."
         case .accountAPIUnauthorized:
-            return "OpenCode couldn't verify this Go key. Check the key and refresh; showing local usage meanwhile."
+            return "OpenCode couldn't verify this Go key. Check the key and refresh."
         case .accountAPINoEntitlement:
             return "OpenCode couldn't confirm a Go subscription for this key. Check your account or try again."
         case .accountAPIInvalidResponse:
@@ -62,10 +52,9 @@ enum OpenCodeUsageError: Error, LocalizedError, Equatable {
     }
 }
 
-/// Tracks OpenCode-hosted usage (the Go subscription + the Zen pay-as-you-go gateway). The Go plan caps
-/// come from OpenCode's account-wide `/zen/go/v1/usage` API (authoritative — every machine and client)
-/// and fall back to the local SQLite logs when the API is unreachable; the spend tiles + usage trend are
-/// always read from the local logs. See `OpenCodeUsageScanner` and `OpenCodeGoUsageClient`.
+/// Tracks OpenCode-hosted usage (the Go subscription + the Zen pay-as-you-go gateway). Go plan caps
+/// come only from a successful `/zen/go/v1/usage` response; local SQLite logs provide spend tiles and
+/// history, never subscription caps. See `OpenCodeUsageScanner` and `OpenCodeGoUsageClient`.
 @MainActor
 final class OpenCodeProvider: ProviderRuntime {
     let provider = Provider(
@@ -86,6 +75,10 @@ final class OpenCodeProvider: ProviderRuntime {
     let activeKeyID: @Sendable () -> String?
     let pricing: @Sendable () async -> ModelPricing
     let now: @Sendable () -> Date
+    private let enabledGatewaySources: @MainActor () -> Set<OpenCodeUsageScanner.GatewaySource>
+    private let enabledCodexHomes: @MainActor () -> [URL]?
+    private let enabledClaudeScanners: @MainActor () -> [ClaudeLogUsageScanner]?
+    private let enabledCodexAccountKeys: @MainActor () -> Set<String>?
 
     /// Names the local source on hover (the dollars can only undercount true account usage — this
     /// machine only). No "(estimated)": OpenCode records its own per-message cost, so the values are
@@ -108,9 +101,14 @@ final class OpenCodeProvider: ProviderRuntime {
         usageScanner: OpenCodeUsageScanner = OpenCodeUsageScanner(
             claudeRoots: { OpenCodeUsageScanner.discoverClaudeRoots() },
             codexHomes: { CodexLogUsageScanner.discoverCodexHomes() },
-            hermesStateDBPath: { (try? HermesUsageScanner.defaultDatabasePaths())?.first },
+            hermesStateDBPath: {
+                try OpenCodeUsageScanner.configuredHermesStateDBPath(
+                    environment: QuotaBarEnvironmentReader(),
+                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+                )
+            },
             routerLedgerPaths: {
-                CodexRouterUsageScanner.defaultLedgerPaths(
+                OpenCodeUsageScanner.configuredRouterLedgerPaths(
                     environment: QuotaBarEnvironmentReader(),
                     homeDirectory: FileManager.default.homeDirectoryForCurrentUser
                 )
@@ -121,6 +119,12 @@ final class OpenCodeProvider: ProviderRuntime {
         pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() },
         now: @escaping @Sendable () -> Date = Date.init,
         goKeyStore: OpenCodeGoKeyStore = OpenCodeGoKeyStore(),
+        enabledGatewaySources: @escaping @MainActor () -> Set<OpenCodeUsageScanner.GatewaySource> = {
+            Set(OpenCodeUsageScanner.GatewaySource.allCases)
+        },
+        enabledCodexHomes: @escaping @MainActor () -> [URL]? = { nil },
+        enabledClaudeScanners: @escaping @MainActor () -> [ClaudeLogUsageScanner]? = { nil },
+        enabledCodexAccountKeys: @escaping @MainActor () -> Set<String>? = { nil },
         activeKeyID: @escaping @Sendable () -> String? = {
             UserDefaults.standard.string(forKey: OpenCodeGoKeyStore.selectionKey)
         }
@@ -132,12 +136,15 @@ final class OpenCodeProvider: ProviderRuntime {
         self.now = now
         self.goKeyStore = goKeyStore
         self.activeKeyID = activeKeyID
+        self.enabledGatewaySources = enabledGatewaySources
+        self.enabledCodexHomes = enabledCodexHomes
+        self.enabledClaudeScanners = enabledClaudeScanners
+        self.enabledCodexAccountKeys = enabledCodexAccountKeys
     }
 
     var widgetDescriptors: [WidgetDescriptor] {
-        // Go plan caps as percent meters (Session/Weekly above the fold, Monthly on demand) — fed by
-        // the account-wide API when it answers, by local `opencode-go` spend otherwise; the spend tiles
-        // + trend below sum combined OpenCode-hosted (Go + Zen) spend.
+        // Go plan caps as percent meters (Session/Weekly above the fold, Monthly on demand) — only
+        // from a current account-wide API response; local spend tiles + trend sum Go + Zen history.
         [
             .percent(id: "opencode.session", provider: provider, title: "Session", sessionStartSignal: .zeroUsage)
                 .exportingLimit("session", unit: "percent", estimated: true),
@@ -165,12 +172,20 @@ final class OpenCodeProvider: ProviderRuntime {
             } catch {
                 return true
             }
-            if (try? goKeyStore.loadKeys())?.isEmpty == false { return true }
+            do {
+                let keys = try goKeyStore.loadKeys()
+                if !keys.isEmpty { return true }
+            } catch {
+                // The app-saved key file is itself an OpenCode footprint. Keep the provider enabled
+                // so refresh can report the read failure instead of recording a one-shot miss.
+                return true
+            }
             return usageScanner.hasHostedUsage()
         }
     }
 
     func refresh() async -> ProviderSnapshot {
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         // One clock for the whole refresh, so the scan cutoff, tiles, trend, and snapshot timestamp
         // can't straddle a midnight boundary.
         let refreshedAt = now()
@@ -181,20 +196,35 @@ final class OpenCodeProvider: ProviderRuntime {
         var authReadError: OpenCodeUsageError?
         do {
             let fileKeys = try await loadOffMainActor { [authStore] in try authStore.apiKeys() }
+            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
             loggedAuthReadFailure = false
             apiKeys = fileKeys.map { (name: $0.name, key: $0.key, id: $0.name, source: .authFile) }
         } catch let error as OpenCodeUsageError {
+            if Task.isCancelled { return cancelledRefreshSnapshot(provider: provider) }
             authReadError = error
             if case .credentialsUnreadable(let detail) = error, !loggedAuthReadFailure {
                 loggedAuthReadFailure = true
                 AppLog.warn(LogTag.plugin("opencode"), "auth.json unreadable: \(detail)")
             }
         } catch {
+            if Task.isCancelled { return cancelledRefreshSnapshot(provider: provider) }
             authReadError = .credentialsUnreadable(detail: error.localizedDescription)
         }
         // App-saved keys are independent of auth.json's health: a broken auth.json must not hide
         // keys the user stored in settings.
-        if let storedKeys = try? await loadOffMainActor({ [goKeyStore] in try goKeyStore.loadKeys() }) {
+        let storedKeys: [OpenCodeGoKey]?
+        var storedKeysReadError: OpenCodeUsageError?
+        do {
+            storedKeys = try await loadOffMainActor({ [goKeyStore] in try goKeyStore.loadKeys() })
+        } catch let error as OpenCodeUsageError {
+            storedKeys = nil
+            storedKeysReadError = error
+        } catch {
+            storedKeys = nil
+            storedKeysReadError = .credentialsUnreadable(detail: error.localizedDescription)
+        }
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        if let storedKeys {
             apiKeys += storedKeys.map {
                 (name: $0.label, key: $0.key, id: $0.id.uuidString, source: .appSaved)
             }
@@ -206,10 +236,11 @@ final class OpenCodeProvider: ProviderRuntime {
         // multi-corpus scan: the scan folds Claude/Codex session logs, the router ledger, Hermes,
         // and Muse on every call (15-20s on a real corpus) and would hold the strip's meters
         // hostage behind it. The data-store merge keeps prior spend tiles / history on the card
-        // until a fold pass recomputes them, and recovers the last-known meters when the API is
-        // unreachable.
+        // until a fold pass recomputes them. Quota rows are cleared whenever no current account
+        // response confirms them.
         if ProviderRefreshContext.scope.skipsLocalAccounting {
             let goAccounts = await fetchGoAccountMeters(apiKeys: apiKeys)
+            guard !Task.isCancelled, !goAccounts.cancelled else { return cancelledRefreshSnapshot(provider: provider) }
             if goAccounts.hasUsage {
                 var lines = goAccounts.meters
                 MetricLine.appendNoDataIfNeeded(&lines)
@@ -226,65 +257,63 @@ final class OpenCodeProvider: ProviderRuntime {
             // no OpenCode data directory is the not-logged-in state, discovered without the scan.
             if apiKeys.isEmpty {
                 do {
+                    guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
                     if try usageScanner.databasePaths().isEmpty {
                         return ProviderSnapshot.error(
                             provider: provider,
-                            error: authReadError ?? OpenCodeUsageError.notLoggedIn
+                            error: authReadError ?? storedKeysReadError ?? OpenCodeUsageError.notLoggedIn,
+                            clearsPriorMenuBarQuotaState: true
                         )
                     }
                 } catch {
-                    return ProviderSnapshot.error(provider: provider, error: error)
+                    return ProviderSnapshot.error(
+                        provider: provider,
+                        error: error,
+                        clearsPriorMenuBarQuotaState: goAccounts.clearsPriorQuotaState
+                    )
                 }
             }
-            // A pinned key whose endpoint answer can't serve it (mismatch or a blocking error):
-            // no meters and no fallback — the merge keeps the last-known meters and their stamp.
-            if goAccounts.suppressesLocalFallback {
-                var lines: [MetricLine] = []
-                MetricLine.appendNoDataIfNeeded(&lines)
-                return ProviderSnapshot.make(
-                    provider: provider,
-                    plan: nil,
-                    lines: lines,
-                    refreshedAt: refreshedAt,
-                    warning: goAccounts.displayError?.error.localizedDescription,
-                    clearsPriorMenuBarQuotaState: goAccounts.clearsPriorQuotaState
-                )
-            }
-            // Local-window fallback from the databases alone (no corpus folds): Session / Weekly /
-            // Monthly derived from recorded `opencode-go` spend, the same source the full scan
-            // starts from. Fold passes re-derive the windows with the gateway folds' imputed
-            // dollars included; this pass keeps the meters current without the 15-20s corpus scan.
-            let fallback: OpenCodeUsageScan?
-            do {
-                fallback = try await usageScanner.scan(
-                    now: refreshedAt,
-                    pricing: ModelPricing.empty,
-                    windowFallbackOnly: true
-                )
-            } catch {
-                return ProviderSnapshot.error(provider: provider, error: error)
-            }
             var lines: [MetricLine] = []
-            if let windows = fallback?.goWindows {
-                lines.append(contentsOf: OpenCodeUsageMapper.meterLines(windows))
-            }
             MetricLine.appendNoDataIfNeeded(&lines)
             return ProviderSnapshot.make(
                 provider: provider,
                 plan: nil,
                 lines: lines,
                 refreshedAt: refreshedAt,
-                warning: goAccounts.displayError?.error.localizedDescription,
+                warning: goAccounts.displayError?.error.localizedDescription
+                    ?? (apiKeys.isEmpty ? (authReadError ?? storedKeysReadError)?.localizedDescription : nil),
                 clearsPriorMenuBarQuotaState: goAccounts.clearsPriorQuotaState
             )
         }
         let modelPricing = await pricing()
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         let scan: OpenCodeUsageScan?
         do {
-            scan = try await usageScanner.scan(now: refreshedAt, pricing: modelPricing)
+            let enabledSources = enabledGatewaySources()
+            scan = try await usageScanner.scan(
+                now: refreshedAt,
+                daysBack: UsageHistoryWindow.lifetimeDays(through: refreshedAt),
+                pricing: modelPricing,
+                gatewaySources: enabledSources,
+                enabledCodexHomes: enabledSources.contains(.codex)
+                    ? (enabledCodexHomes() ?? usageScanner.codexHomes())
+                    : [],
+                enabledClaudeScanners: enabledSources.contains(.claude) ? enabledClaudeScanners() : [],
+                enabledCodexAccountKeys: enabledSources.contains(.codex) ? enabledCodexAccountKeys() : []
+            )
         } catch {
-            return ProviderSnapshot.error(provider: provider, error: error)
+            if Task.isCancelled { return cancelledRefreshSnapshot(provider: provider) }
+            // A fold-only pass never asked the account endpoint, so it has no evidence that the
+            // meters the meters-only phase just fetched are stale. Clearing them here would wipe
+            // freshly recovered quota rows because a local scan failed; the meters phase owns them.
+            let clearsPriorQuotaState = !ProviderRefreshContext.scope.suppressesLiveQuota
+            return ProviderSnapshot.error(
+                provider: provider,
+                error: error,
+                clearsPriorMenuBarQuotaState: clearsPriorQuotaState
+            )
         }
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
 
         // Account-wide Go meters are fetched only with Go credentials. The API does not return a
         // stable account id, so the exact credential is the only honest identity boundary. Duplicate
@@ -292,10 +321,10 @@ final class OpenCodeProvider: ProviderRuntime {
         // separate even when their current window values happen to match. Fold-only passes skip the
         // fetch (the meters-only phase just answered it) and recover the meters through the merge.
         let goAccounts = await fetchGoAccountMeters(apiKeys: apiKeys)
+        guard !Task.isCancelled, !goAccounts.cancelled else { return cancelledRefreshSnapshot(provider: provider) }
         let accountMeters = goAccounts.meters
         let hasAccountUsage = goAccounts.hasUsage
         let accountErrorForDisplay = goAccounts.displayError
-        let shouldSuppressLocalGoFallback = goAccounts.suppressesLocalFallback
         let clearsPriorMenuBarQuotaState = goAccounts.clearsPriorQuotaState
 
         guard let scan else {
@@ -312,7 +341,8 @@ final class OpenCodeProvider: ProviderRuntime {
                     plan: hasAccountUsage ? "Go" : nil,
                     lines: lines,
                     refreshedAt: refreshedAt,
-                    warning: accountErrorForDisplay?.error.localizedDescription,
+                    warning: accountErrorForDisplay?.error.localizedDescription
+                        ?? (apiKeys.isEmpty ? (authReadError ?? storedKeysReadError)?.localizedDescription : nil),
                     clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
                 )
             }
@@ -326,17 +356,11 @@ final class OpenCodeProvider: ProviderRuntime {
                 )
             }
             if let accountErrorForDisplay {
-                if accountErrorForDisplay.error.blocksLocalGoFallback {
-                    return ProviderSnapshot.make(
-                        provider: provider,
-                        plan: nil,
-                        lines: [.noUsageData],
-                        refreshedAt: refreshedAt,
-                        warning: accountErrorForDisplay.error.localizedDescription,
-                        clearsPriorMenuBarQuotaState: true
-                    )
-                }
-                return ProviderSnapshot.error(provider: provider, error: accountErrorForDisplay.error)
+                return ProviderSnapshot.error(
+                    provider: provider,
+                    error: accountErrorForDisplay.error,
+                    clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
+                )
             }
             if !apiKeys.isEmpty {
                 return ProviderSnapshot.error(
@@ -347,7 +371,9 @@ final class OpenCodeProvider: ProviderRuntime {
                 )
             }
             return ProviderSnapshot.error(
-                provider: provider, error: authReadError ?? OpenCodeUsageError.notLoggedIn
+                provider: provider,
+                error: authReadError ?? storedKeysReadError ?? OpenCodeUsageError.notLoggedIn,
+                clearsPriorMenuBarQuotaState: true
             )
         }
 
@@ -355,13 +381,6 @@ final class OpenCodeProvider: ProviderRuntime {
         if hasAccountUsage {
             // Authoritative account-wide percentages — the meters' primary source.
             lines.append(contentsOf: accountMeters)
-        } else if !ProviderRefreshContext.scope.suppressesLiveQuota,
-                  !shouldSuppressLocalGoFallback, let windows = scan.goWindows {
-            // API unreachable or not usable: local-observed spend against the published caps.
-            // Fold-only passes emit no window meters — the store's merge recovers the meters the
-            // meters-only phase fetched, and a fresh local-window line would clobber them (fresh
-            // label wins) while re-blessing recovered-meter staleness as current.
-            lines.append(contentsOf: OpenCodeUsageMapper.meterLines(windows))
         }
         SpendTileMapper.appendTokenUsage(
             scan.logScan.series, to: &lines, now: refreshedAt,
@@ -376,8 +395,8 @@ final class OpenCodeProvider: ProviderRuntime {
                                          partialDays: scan.partialDays)
         MetricLine.appendNoDataIfNeeded(&lines)
 
-        // The Go badge represents a server-confirmed active subscription. Local Go spend can still
-        // populate fallback cap meters while offline, but it cannot prove the subscription is active.
+        // Both the Go badge and cap meters require a successful current account response. Historical
+        // local Go spend stays in spend tiles but never proves an active subscription.
         let plan: String? = hasAccountUsage ? "Go" : nil
         return ProviderSnapshot.make(
             provider: provider,
@@ -388,9 +407,11 @@ final class OpenCodeProvider: ProviderRuntime {
                 series: scan.logScan.series,
                 modelUsage: scan.logScan.modelUsage,
                 unknownModelsByDay: scan.logScan.unknownModelsByDay,
-                apiEstimateByDay: scan.logScan.apiEstimateByDay
+                apiEstimateByDay: scan.logScan.apiEstimateByDay,
+                apiEstimateIncompleteDays: scan.logScan.apiEstimateIncompleteDays
             ),
-            warning: accountErrorForDisplay?.error.localizedDescription,
+            warning: accountErrorForDisplay?.error.localizedDescription
+                ?? (apiKeys.isEmpty ? (authReadError ?? storedKeysReadError)?.localizedDescription : nil),
             clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
         )
     }
@@ -406,30 +427,43 @@ final class OpenCodeProvider: ProviderRuntime {
         var meters: [MetricLine]
         var hasUsage: Bool
         var displayError: (name: String, keyID: String, error: OpenCodeUsageError)?
-        var suppressesLocalFallback: Bool
         var clearsPriorQuotaState: Bool
+        var cancelled: Bool
     }
 
     /// Fetch every Go credential's account usage and resolve the card's meters. Fold-only passes
     /// (`suppressesLiveQuota`) skip the network entirely and return an empty answer — the store's
-    /// merge recovers the meters and carries their freshness stamp, and the scan-path window
-    /// fallback stays suppressed so local-window meters can never clobber authoritative API ones.
+    /// merge recovers the meters and carries their freshness stamp.
     private func fetchGoAccountMeters(
         apiKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)]
     ) async -> GoAccountMeters {
         var accountUsages: [(name: String, keyID: String, credentialID: String, usage: OpenCodeGoAccountUsage)] = []
         var accountAPIErrors: [(name: String, keyID: String, error: OpenCodeUsageError)] = []
+        var wasCancelled = false
         if !apiKeys.isEmpty, !ProviderRefreshContext.scope.suppressesLiveQuota {
             for entry in apiKeys {
+                guard !Task.isCancelled else {
+                    wasCancelled = true
+                    break
+                }
                 do {
+                    let usage = try await usageClient.fetchUsage(key: entry.key)
+                    guard !Task.isCancelled else {
+                        wasCancelled = true
+                        break
+                    }
                     accountUsages.append((
                         entry.name,
                         entry.id,
                         Self.credentialID(for: entry.key),
-                        try await usageClient.fetchUsage(key: entry.key)
+                        usage
                     ))
                     loggedAccountAPIFailure = false
                 } catch {
+                    if ProviderCancellation.isCancellation(error) {
+                        wasCancelled = true
+                        break
+                    }
                     let usageError = (error as? OpenCodeUsageError)
                         ?? .accountAPIUnavailable(detail: error.localizedDescription)
                     accountAPIErrors.append(
@@ -484,23 +518,17 @@ final class OpenCodeProvider: ProviderRuntime {
             }
         }
         let relevantAccountErrors = selectedKeyIsKnown ? accountAPIErrors.filter { $0.keyID == selectedKeyID } : accountAPIErrors
-        let displayError = relevantAccountErrors.first { $0.error.blocksLocalGoFallback }
-            ?? relevantAccountErrors.first
-        let suppressesLocalFallback: Bool
-        if selectedKeyIsKnown {
-            // Local windows aggregate every Go row and carry no account identity. A pinned account
-            // can only use the endpoint's result for that exact key, never the aggregate fallback.
-            suppressesLocalFallback = !selectedKeyHasAccount
-                || relevantAccountErrors.contains { $0.error.blocksLocalGoFallback }
-        } else {
-            suppressesLocalFallback = accountAPIErrors.contains { $0.error.blocksLocalGoFallback }
-        }
+        let displayError = relevantAccountErrors.first
+        let hasUsage = !meters.isEmpty
         return GoAccountMeters(
             meters: meters,
-            hasUsage: !meters.isEmpty,
+            hasUsage: hasUsage,
             displayError: displayError,
-            suppressesLocalFallback: suppressesLocalFallback,
-            clearsPriorQuotaState: relevantAccountErrors.contains { $0.error.blocksLocalGoFallback }
+            // Only a fresh, successful account response authorizes quota rows. Clear cached caps on
+            // outages, missing entitlements, partial account sets, and absent credentials.
+            clearsPriorQuotaState: !ProviderRefreshContext.scope.suppressesLiveQuota
+                && (!hasUsage || !relevantAccountErrors.isEmpty),
+            cancelled: wasCancelled
         )
     }
 }
@@ -510,22 +538,29 @@ final class OpenCodeProvider: ProviderRuntime {
 extension OpenCodeProvider: GoKeyManaging {
     /// Every key the card can use, in fetch order. The settings section renders this list and
     /// drives `selectGoKey` — the same merge `refresh()` performs, in one readable helper.
-    private func allGoKeys() throws -> [(name: String, key: String, id: String, source: OpenCodeGoKeySource)] {
-        let fileKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)] = try authStore.apiKeys().map {
-            (name: $0.name, key: $0.key, id: $0.name, source: .authFile)
-        }
-        let storedKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)] = try goKeyStore.loadKeys().map {
-            (name: $0.label, key: $0.key, id: $0.id.uuidString, source: .appSaved)
-        }
-        return fileKeys + storedKeys
+    private func allGoKeys() async throws -> [(name: String, key: String, id: String, source: OpenCodeGoKeySource)] {
+        async let fileKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)] =
+            loadOffMainActor { [authStore] in
+                try authStore.apiKeys().map {
+                    (name: $0.name, key: $0.key, id: $0.name, source: .authFile)
+                }
+            }
+        async let storedKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)] =
+            loadOffMainActor { [goKeyStore] in
+                try goKeyStore.loadKeys().map {
+                    (name: $0.label, key: $0.key, id: $0.id.uuidString, source: .appSaved)
+                }
+            }
+        let (fileValues, storedValues) = try await (fileKeys, storedKeys)
+        return fileValues + storedValues
     }
 
-    func goKeyEntries() -> [OpenCodeGoKeyEntry] {
-        let selection = activeKeyID()
-        guard let keys = try? allGoKeys() else {
+    func goKeyEntries() async -> [OpenCodeGoKeyEntry] {
+        guard let keys = try? await allGoKeys() else {
             AppLog.warn(LogTag.plugin("opencode"), "Go keys unreadable; settings list empty")
             return []
         }
+        let selection = activeKeyID()
         return keys.map { entry in
             OpenCodeGoKeyEntry(
                 id: entry.id,
@@ -538,12 +573,16 @@ extension OpenCodeProvider: GoKeyManaging {
     }
 
     @discardableResult
-    func saveGoKey(label: String, key: String) throws -> OpenCodeGoKey {
-        try goKeyStore.addKey(label: label, key: key)
+    func saveGoKey(label: String, key: String) async throws -> OpenCodeGoKey {
+        try await loadOffMainActor { [goKeyStore, label, key] in
+            try goKeyStore.addKey(label: label, key: key)
+        }
     }
 
-    func removeGoKey(id: UUID) throws {
-        try goKeyStore.removeKey(id: id)
+    func removeGoKey(id: UUID) async throws {
+        try await loadOffMainActor { [goKeyStore, id] in
+            try goKeyStore.removeKey(id: id)
+        }
         // Dropping the pinned key must not leave a stale selection behind — refresh would fall
         // back to "all accounts", but the settings list should reflect reality immediately.
         if OpenCodeGoKeyStore.activeSelection() == id.uuidString {

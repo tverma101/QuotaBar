@@ -3,6 +3,457 @@ import XCTest
 
 @MainActor
 final class WidgetDataStoreTests: XCTestCase {
+    func testInFlightProviderRefreshIsDeferredAndSignaledWhenConflictCompletes() async {
+        let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
+        let descriptor = WidgetDescriptor.percent(id: "test.session", provider: provider, title: "Session")
+        let runtime = SuspendedProviderRuntime(provider: provider, descriptors: [descriptor])
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(
+                userDefaults: makeUserDefaults("deferred-refresh-cache"),
+                storageKey: "snapshots",
+                ttl: 300
+            ),
+            defaults: makeUserDefaults("deferred-refresh-store")
+        )
+        var ready: [WidgetDataStore.DeferredRefreshRequest] = []
+        store.onDeferredRefreshReady = { ready.append($0) }
+
+        let fullRefresh = Task {
+            await ProviderRefreshContext.$scope.withValue(.full) {
+                await store.refresh(providerID: provider.id, force: true)
+            }
+        }
+        while !runtime.didStart { await Task.yield() }
+
+        let outcome = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id)
+        }
+        XCTAssertEqual(outcome, .inFlight)
+        XCTAssertTrue(ready.isEmpty, "the request remains queued while a full refresh owns the provider")
+
+        runtime.resume()
+        let fullOutcome = await fullRefresh.value
+        XCTAssertEqual(fullOutcome, .refreshed)
+        XCTAssertEqual(ready, [WidgetDataStore.DeferredRefreshRequest(
+            providerID: provider.id,
+            scope: .panelMeters,
+            bypassSnapshotCache: false,
+            bypassFailureBackoff: false,
+            requestGeneration: 0
+        )])
+    }
+
+    func testForcedPanelMeterRetryOverlapsHeldAccountingFoldAndPreservesNewMeters() async throws {
+        for foldScope in [ProviderRefreshContext.Scope.localAccounting, .panelAccounting] {
+            let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+            let now = Date(timeIntervalSince1970: 1_800_000_000)
+            let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+            let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+                scope: .machineLocal,
+                estimatedCost: true,
+                sourceNote: "local"
+            )
+            let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-13", totalTokens: 18, costUSD: 0.08)
+            ]))
+            let freshMeters = ProviderSnapshot(
+                providerID: provider.id,
+                displayName: provider.displayName,
+                plan: "Fresh plan",
+                lines: [.progress(label: "Session", used: 44, limit: 100, format: .percent)],
+                refreshedAt: now
+            )
+            // This fold began before the meter retry and carries no quota work. Its completion must
+            // merge against the newer local snapshot instead of replacing the retry's live meters.
+            let staleFold = ProviderSnapshot(
+                providerID: provider.id,
+                displayName: provider.displayName,
+                lines: [],
+                refreshedAt: now.addingTimeInterval(-60),
+                usageHistory: history
+            )
+            let runtime = PanelMeterOverlapProviderRuntime(
+                provider: provider,
+                descriptors: [meter, historyDescriptor],
+                freshMeters: freshMeters,
+                staleFold: staleFold
+            )
+            let store = WidgetDataStore(
+                registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+                providers: [runtime],
+                cache: ProviderSnapshotCache(
+                    userDefaults: makeUserDefaults("forced-panel-meter-overlap-\(foldScope)"),
+                    storageKey: "snapshots",
+                    ttl: 600,
+                    now: { now }
+                ),
+                defaults: makeUserDefaults("forced-panel-meter-overlap-store-\(foldScope)"),
+                now: { now }
+            )
+            let foldStarted = expectation(description: "\(foldScope) fold started")
+            let metersStarted = expectation(description: "forced panel meters started during \(foldScope) fold")
+            runtime.onFoldStart = { foldStarted.fulfill() }
+            runtime.onPanelMetersStart = { metersStarted.fulfill() }
+
+            let foldTask = Task {
+                await ProviderRefreshContext.$scope.withValue(foldScope) {
+                    await store.refresh(providerID: provider.id, force: true, bypassSnapshotCache: true)
+                }
+            }
+            await fulfillment(of: [foldStarted], timeout: 1)
+
+            let retryTask = Task {
+                await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+                    await store.refresh(providerID: provider.id, force: true, bypassSnapshotCache: true)
+                }
+            }
+            await fulfillment(of: [metersStarted], timeout: 1)
+            let metersStartedBeforeFoldFinished = runtime.didStartPanelMeters && !runtime.didFinishFold
+
+            var retryOutcome: WidgetDataStore.RefreshOutcome
+            if metersStartedBeforeFoldFinished {
+                // The quota retry must finish while local history is still held, which proves it is
+                // not waiting for the fold's provider deadline or completion.
+                retryOutcome = await retryTask.value
+                XCTAssertFalse(runtime.didFinishFold)
+                let interim = try XCTUnwrap(store.localSnapshots[provider.id])
+                XCTAssertEqual(interim.line(label: "Session"), freshMeters.line(label: "Session"))
+                runtime.resumeFold()
+            } else {
+                // Release the fold on the old serialized path as well, so a regression reports as an
+                // assertion failure instead of leaving a suspended provider task behind.
+                runtime.resumeFold()
+                retryOutcome = await retryTask.value
+            }
+            let foldOutcome = await foldTask.value
+
+            XCTAssertTrue(
+                metersStartedBeforeFoldFinished,
+                "an explicit panel-meter retry must overlap the fold-only \(foldScope) scope"
+            )
+            XCTAssertEqual(retryOutcome, .refreshed)
+            XCTAssertEqual(foldOutcome, .refreshed)
+            let final = try XCTUnwrap(store.localSnapshots[provider.id])
+            XCTAssertEqual(final.plan, "Fresh plan")
+            XCTAssertEqual(final.line(label: "Session"), freshMeters.line(label: "Session"))
+            XCTAssertEqual(final.usageHistory, history)
+            XCTAssertEqual(final.quotaRefreshedAt, freshMeters.refreshedAt)
+        }
+    }
+
+    func testDeferredVisibleRetryPreservesFailureBackoffBypass() async throws {
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let history = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let runtime = SuspendedProviderRuntime(provider: provider, descriptors: [meter, history])
+        let defaults = makeUserDefaults("deferred-history-retry-bypass")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, history]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600),
+            defaults: defaults
+        )
+        var ready: [WidgetDataStore.DeferredRefreshRequest] = []
+        store.onDeferredRefreshReady = { ready.append($0) }
+
+        let meterRefresh = Task {
+            await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+                await store.refresh(providerID: provider.id, force: true)
+            }
+        }
+        while !runtime.didStart { await Task.yield() }
+
+        let foldRetry = try await withManualRefresh {
+            let manualActionID = try XCTUnwrap(ProviderRefreshContext.manualActionID)
+            let interactionGate = try XCTUnwrap(ProviderRefreshContext.credentialInteractionGate)
+            let outcome = await store.refreshProviderHistoryAfterRetry(
+                providerID: provider.id,
+                manualActionID: manualActionID,
+                credentialInteractionGate: interactionGate
+            )
+            return (outcome, manualActionID, interactionGate)
+        }
+        XCTAssertEqual(foldRetry.0, .inFlight)
+        runtime.resume()
+        _ = await meterRefresh.value
+
+        XCTAssertEqual(ready, [WidgetDataStore.DeferredRefreshRequest(
+            providerID: provider.id,
+            scope: .panelAccounting,
+            bypassSnapshotCache: true,
+            bypassFailureBackoff: true,
+            requestGeneration: 1,
+            manualActionID: foldRetry.1,
+            credentialInteractionGate: foldRetry.2
+        )])
+
+        let resumed = await store.resumeDeferredManualHistoryRetry(try XCTUnwrap(ready.first))
+        XCTAssertEqual(resumed, .refreshed)
+        XCTAssertEqual(runtime.observedScopes.last, .panelAccounting)
+        XCTAssertEqual(runtime.observedManualValues.last, true)
+        XCTAssertEqual(runtime.observedManualActionIDs.compactMap { $0 }.last, foldRetry.1)
+        let observedGate = try XCTUnwrap(runtime.observedInteractionGates.last ?? nil)
+        XCTAssertTrue(observedGate === foldRetry.2)
+        XCTAssertEqual(runtime.observedThrottleValues.last, true)
+    }
+
+    func testDisablingProviderInvalidatesReadyManualHistoryRetryAfterReenable() async throws {
+        let enablement = ProviderEnablementStore(defaults: makeUserDefaults("disable-deferred-retry-enablement"))
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        enablement.setEnabled(true, for: provider.id)
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let history = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let runtime = SuspendedProviderRuntime(provider: provider, descriptors: [meter, history])
+        let defaults = makeUserDefaults("disable-deferred-retry-store")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, history]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600),
+            defaults: defaults,
+            isProviderEnabled: { enablement.isEnabled($0) }
+        )
+        let wakeSignal = RefreshWakeSignal(
+            name: Notification.Name("QuotaBarTests.deferredHistoryRetry"),
+            center: NotificationCenter()
+        )
+        var readyRequest: WidgetDataStore.DeferredRefreshRequest?
+        store.onDeferredRefreshReady = { request in
+            readyRequest = request
+            wakeSignal.signalDeferredRefreshReady(request)
+        }
+        store.onDeferredRefreshesInvalidated = { providerIDs in
+            wakeSignal.cancelDeferredRefreshes(forProviderIDs: providerIDs)
+        }
+        enablement.onChange = { changedProviderIDs in
+            store.providerEnablementDidChange(changedProviderIDs: changedProviderIDs)
+        }
+
+        let meterRefresh = Task {
+            await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+                await store.refresh(providerID: provider.id, force: true)
+            }
+        }
+        while !runtime.didStart { await Task.yield() }
+
+        let deferred = try await withManualRefresh {
+            let manualActionID = try XCTUnwrap(ProviderRefreshContext.manualActionID)
+            let interactionGate = try XCTUnwrap(ProviderRefreshContext.credentialInteractionGate)
+            let outcome = await store.refreshProviderHistoryAfterRetry(
+                providerID: provider.id,
+                manualActionID: manualActionID,
+                credentialInteractionGate: interactionGate
+            )
+            return (outcome, manualActionID, interactionGate)
+        }
+        XCTAssertEqual(deferred.0, .inFlight)
+
+        runtime.resume()
+        _ = await meterRefresh.value
+        let request = try XCTUnwrap(readyRequest)
+        XCTAssertEqual(request.manualActionID, deferred.1)
+        let requestGate = try XCTUnwrap(request.credentialInteractionGate)
+        XCTAssertTrue(requestGate === deferred.2)
+
+        // Disable and re-enable before the scheduler consumes the ready request. The old action's
+        // prompt allowance and provider generation must not become valid again on re-enable.
+        enablement.setEnabled(false, for: provider.id)
+        enablement.setEnabled(true, for: provider.id)
+        XCTAssertEqual(wakeSignal.takePendingDeferredRefreshes().count, 0)
+        let resumed = await store.resumeDeferredManualHistoryRetry(request)
+        XCTAssertEqual(resumed, .skipped)
+        let latePhase = await store.refreshProviderHistoryAfterRetry(
+            providerID: provider.id,
+            manualActionID: deferred.1,
+            credentialInteractionGate: deferred.2
+        )
+        XCTAssertEqual(latePhase, .skipped, "a disabled provider's original manual action stays revoked after re-enable")
+        XCTAssertEqual(runtime.observedScopes, [.panelMeters])
+    }
+
+    func testDisablingProviderDropsQueuedManualHistoryRetryBeforeItBecomesReady() async throws {
+        let enablement = ProviderEnablementStore(defaults: makeUserDefaults("disable-queued-retry-enablement"))
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        enablement.setEnabled(true, for: provider.id)
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let history = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let runtime = SuspendedProviderRuntime(provider: provider, descriptors: [meter, history])
+        let defaults = makeUserDefaults("disable-queued-retry-store")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, history]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600),
+            defaults: defaults,
+            isProviderEnabled: { enablement.isEnabled($0) }
+        )
+        var ready: [WidgetDataStore.DeferredRefreshRequest] = []
+        store.onDeferredRefreshReady = { ready.append($0) }
+        enablement.onChange = { changedProviderIDs in
+            store.providerEnablementDidChange(changedProviderIDs: changedProviderIDs)
+        }
+
+        let meterRefresh = Task {
+            await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+                await store.refresh(providerID: provider.id, force: true)
+            }
+        }
+        while !runtime.didStart { await Task.yield() }
+
+        let deferred = try await withManualRefresh {
+            let manualActionID = try XCTUnwrap(ProviderRefreshContext.manualActionID)
+            let interactionGate = try XCTUnwrap(ProviderRefreshContext.credentialInteractionGate)
+            return await store.refreshProviderHistoryAfterRetry(
+                providerID: provider.id,
+                manualActionID: manualActionID,
+                credentialInteractionGate: interactionGate
+            )
+        }
+        XCTAssertEqual(deferred, .inFlight)
+
+        enablement.setEnabled(false, for: provider.id)
+        enablement.setEnabled(true, for: provider.id)
+        runtime.resume()
+        _ = await meterRefresh.value
+
+        XCTAssertTrue(ready.isEmpty, "disabling the provider removes its queued manual history retry")
+        XCTAssertEqual(runtime.observedScopes, [.panelMeters])
+    }
+
+    func testSupersededVisibleMeterRetrySilentlyCompletesItsHistoryFold() async throws {
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 42, costUSD: 0.02)
+        ]))
+        let meters = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Pro",
+            lines: [.progress(label: "Session", used: 30, limit: 100, format: .percent)],
+            refreshedAt: now
+        )
+        let folded = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [meters, folded]
+        )
+        let defaults = makeUserDefaults("superseded-visible-meter-retry-fold")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now }),
+            defaults: defaults,
+            now: { now }
+        )
+        let gate = KeychainPermissionGate.shared
+        let supersededAction = gate.beginManualAction()
+        _ = gate.beginManualAction()
+
+        let firstAttempt = await withThrottledPanelMeters {
+            await ProviderRefreshContext.$manualActionID.withValue(supersededAction) {
+                await store.refresh(providerID: provider.id, force: true)
+            }
+        }
+
+        XCTAssertEqual(firstAttempt, .skipped)
+        for _ in 0..<2_000 where store.localSnapshots[provider.id]?.usageHistory != history {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+
+        XCTAssertEqual(runtime.refreshCount, 2, "the silent retry should fetch meters and then fold local history")
+        XCTAssertEqual(runtime.observedScopes, [.panelMeters, .panelAccounting])
+        XCTAssertEqual(runtime.observedManualValues, [false, false])
+        XCTAssertEqual(runtime.observedThrottleValues, [true, true])
+        XCTAssertEqual(runtime.observedInteractiveBudgetValues, [true, true])
+        XCTAssertEqual(runtime.observedCPUFractions, [0.25, 0.25])
+        let snapshot = try XCTUnwrap(store.localSnapshots[provider.id])
+        XCTAssertEqual(snapshot.plan, "Pro")
+        XCTAssertEqual(snapshot.line(label: "Session"), meters.line(label: "Session"))
+        XCTAssertEqual(snapshot.usageHistory, history)
+    }
+
+    func testSupersededHermesMeterRetryUsesInteractiveBudgetWithoutDuplicateFold() async throws {
+        let provider = Provider(id: "hermes", displayName: "Hermes", icon: .providerMark("hermes"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let meter = WidgetDescriptor.percent(id: "hermes.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 42, costUSD: 0.02)
+        ]))
+        let snapshot = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.progress(label: "Session", used: 30, limit: 100, format: .percent)],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [snapshot],
+            panelMetersRefreshIncludesHistory: true
+        )
+        let defaults = makeUserDefaults("superseded-hermes-retry-pacing")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now }),
+            defaults: defaults,
+            now: { now }
+        )
+        let gate = KeychainPermissionGate.shared
+        let supersededAction = gate.beginManualAction()
+        _ = gate.beginManualAction()
+
+        let firstAttempt = await withThrottledPanelMeters {
+            await ProviderRefreshContext.$manualActionID.withValue(supersededAction) {
+                await store.refresh(providerID: provider.id, force: true)
+            }
+        }
+
+        XCTAssertEqual(firstAttempt, .skipped)
+        for _ in 0..<2_000 where runtime.refreshCount == 0 {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertEqual(runtime.refreshCount, 1, "Hermes' meter pass already includes its SQLite history scan")
+        XCTAssertEqual(runtime.observedScopes, [.panelMeters])
+        XCTAssertEqual(runtime.observedManualValues, [false])
+        XCTAssertEqual(runtime.observedThrottleValues, [true])
+        XCTAssertEqual(runtime.observedInteractiveBudgetValues, [true])
+        XCTAssertEqual(runtime.observedCPUFractions, [0.25])
+        XCTAssertEqual(store.localSnapshots[provider.id]?.usageHistory, history)
+    }
+
     /// The cache's freshness gate reads the OLDER of `refreshedAt` and `quotaRefreshedAt`. A
     /// fold-only pass (`.localAccounting` / `.panelAccounting`) writes a fresh `refreshedAt` while
     /// carrying meters the live quota API answered hours ago; gating on `refreshedAt` alone let a
@@ -159,6 +610,210 @@ final class WidgetDataStoreTests: XCTestCase {
         }
 
         XCTAssertEqual(runtime.refreshCount, 0, "fresh fold within TTL — cache hit")
+    }
+
+    func testRetryHistoryPassSkipsProvidersWithoutHistoryExporters() async {
+        let provider = Provider(id: "zai", displayName: "Z.AI", icon: .providerMark("zai"))
+        let descriptor = WidgetDescriptor.percent(id: "zai.usage", provider: provider, title: "Usage")
+        let runtime = CountingProviderRuntime(
+            provider: provider,
+            descriptors: [descriptor],
+            snapshot: ProviderSnapshot(
+                providerID: provider.id,
+                displayName: provider.displayName,
+                lines: [.progress(label: "Usage", used: 20, limit: 100, format: .percent)],
+                refreshedAt: Date()
+            )
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [runtime],
+            defaults: makeUserDefaults("retry-history-pure-api")
+        )
+
+        let outcome = await store.refreshProviderHistoryAfterRetry(providerID: provider.id, manualActionID: nil)
+
+        XCTAssertEqual(outcome, .skipped)
+        XCTAssertEqual(runtime.refreshCount, 0, "a retry must not repeat live API work for a provider with no local history")
+    }
+
+    func testRetryHistoryPassMergesFreshHistoryWithoutDroppingRecoveredQuota() async {
+        let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        var descriptor = WidgetDescriptor.percent(id: "claude.session", provider: provider, title: "Session")
+        descriptor = descriptor.exportingHistory(scope: .machineLocal, estimatedCost: true, sourceNote: "local")
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: "2026-10-14", totalTokens: 12, costUSD: 0.03)
+        ]))
+        let previous = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Pro",
+            lines: [.progress(label: "Session", used: 15, limit: 100, format: .percent)],
+            refreshedAt: Date()
+        )
+        let cache = ProviderSnapshotCache(
+            userDefaults: makeUserDefaults("retry-history-merge-cache"),
+            storageKey: "snapshots",
+            ttl: 600
+        )
+        cache.store(previous)
+        let runtime = CountingProviderRuntime(
+            provider: provider,
+            descriptors: [descriptor],
+            snapshot: ProviderSnapshot(
+                providerID: provider.id,
+                displayName: provider.displayName,
+                lines: [],
+                refreshedAt: Date(),
+                usageHistory: history
+            )
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [runtime],
+            cache: cache,
+            defaults: makeUserDefaults("retry-history-merge-store")
+        )
+
+        let outcome = await store.refreshProviderHistoryAfterRetry(providerID: provider.id, manualActionID: nil)
+
+        XCTAssertEqual(outcome, .refreshed)
+        XCTAssertEqual(runtime.refreshCount, 1)
+        XCTAssertEqual(store.localSnapshots[provider.id]?.plan, "Pro")
+        XCTAssertTrue(store.localSnapshots[provider.id]?.lines.contains(
+            .progress(label: "Session", used: 15, limit: 100, format: .percent)
+        ) == true)
+        XCTAssertEqual(store.localSnapshots[provider.id]?.usageHistory, history)
+    }
+
+    /// A scheduled five-minute history pass must actually refold a fresh cached snapshot. This cache
+    /// bypass stays separate from `force`, so a fold-only result still recovers quota meters.
+    func testSupersededPanelFoldRetriesSilentlyWithoutDroppingQuotaMeters() async throws {
+        let provider = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 42, costUSD: 0.01)
+        ]))
+        let meter = WidgetDescriptor.percent(id: "opencode.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let previous = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Go",
+            lines: [.progress(label: "Session", used: 27, limit: 100, format: .percent)],
+            refreshedAt: now
+        )
+        let folded = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [previous, folded]
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            defaults: makeUserDefaults("superseded-panel-fold"),
+            now: { now }
+        )
+        let first = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id, force: true)
+        }
+        XCTAssertEqual(first, .refreshed)
+
+        let gate = KeychainPermissionGate.shared
+        let oldAction = gate.beginManualAction()
+        _ = gate.beginManualAction() // a newer refresh for a different provider supersedes oldAction
+        let staleFold = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await ProviderRefreshContext.$manualActionID.withValue(oldAction) {
+                await store.refresh(
+                    providerID: provider.id,
+                    force: false,
+                    bypassSnapshotCache: true
+                )
+            }
+        }
+        XCTAssertEqual(staleFold, .skipped)
+
+        for _ in 0..<500 where store.localSnapshots[provider.id]?.usageHistory != history {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(runtime.refreshCount, 2, "the stale fold is replaced by one silent local fold")
+        XCTAssertEqual(store.localSnapshots[provider.id]?.plan, "Go")
+        XCTAssertEqual(store.localSnapshots[provider.id]?.line(label: "Session"), previous.line(label: "Session"))
+        XCTAssertEqual(store.localSnapshots[provider.id]?.usageHistory, history)
+    }
+
+    func testScheduledPanelAccountingBypassesFreshFoldCacheAndKeepsMeters() async throws {
+        let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
+        var descriptor = WidgetDescriptor.percent(
+            id: "test.session", provider: provider, title: "Session"
+        )
+        descriptor = descriptor.exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: false,
+            sourceNote: "test"
+        )
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: "2026-10-11", totalTokens: 10, costUSD: 0.05)
+        ]))
+        let defaults = makeUserDefaults("panel-accounting-scheduled-bypass")
+        let cache = ProviderSnapshotCache(
+            userDefaults: defaults,
+            storageKey: "snapshots",
+            ttl: 600,
+            now: { Date() }
+        )
+        cache.store(ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.progress(label: "Session", used: 5, limit: 100, format: .percent)],
+            refreshedAt: Date(),
+            usageHistory: history
+        ))
+        let runtime = CountingProviderRuntime(
+            provider: provider,
+            descriptors: [descriptor],
+            snapshot: ProviderSnapshot(
+                providerID: provider.id,
+                displayName: provider.displayName,
+                lines: [.values(label: "Today", values: [
+                    MetricValue(number: 20, kind: .count, label: "tokens")
+                ])],
+                refreshedAt: Date(),
+                usageHistory: history
+            )
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [runtime],
+            cache: cache,
+            defaults: makeUserDefaults("panel-accounting-scheduled-bypass-store")
+        )
+
+        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await store.refreshAll(bypassSnapshotCache: true)
+        }
+
+        XCTAssertEqual(runtime.refreshCount, 1, "a due history pass must not reuse the prior fold")
+        let refreshed = try XCTUnwrap(store.localSnapshots[provider.id])
+        XCTAssertTrue(refreshed.lines.contains { line in
+            if case .progress(label: "Session", used: 5, limit: 100, format: .percent, resetsAt: nil, periodDurationMs: nil, colorHex: nil, detail: nil) = line {
+                return true
+            }
+            return false
+        }, "fold-only work must keep the cached live meter")
+        XCTAssertTrue(refreshed.lines.contains { $0.label == "Today" })
     }
 
     func testFirstPassConcurrencyCapSerializesProviderStarts() async {
@@ -408,6 +1063,774 @@ final class WidgetDataStoreTests: XCTestCase {
         XCTAssertEqual(store.errorMessage(for: provider.id), "Token expired. Run `claude` to log in again.")
         XCTAssertEqual(store.warningMessage(for: provider.id), "Re-login for live usage.")  // stale, still present
         XCTAssertEqual(store.headerNotice(for: provider.id), "Token expired. Run `claude` to log in again.")  // error wins
+    }
+
+    func testFailedRefreshMergesNewHistoryWithoutRefreshingOrDroppingQuota() async throws {
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let quotaTime = now.addingTimeInterval(-900)
+        let day = DailyUsageAccumulator.dayKey(from: now)
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: day, totalTokens: 1_500, costUSD: 0.02)
+        ]))
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        var failed = ProviderSnapshot.error(provider: provider, message: "Usage is temporarily unavailable.")
+        failed.usageHistory = history
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [
+                ProviderSnapshot(
+                    providerID: provider.id,
+                    displayName: provider.displayName,
+                    plan: "Pro",
+                    lines: [.progress(label: "Session", used: 25, limit: 100, format: .percent)],
+                    refreshedAt: quotaTime
+                ),
+                failed
+            ]
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            defaults: makeUserDefaults("failed-refresh-history-merge"),
+            now: { now }
+        )
+
+        await store.refreshAll(force: true)
+        await store.refreshAll(force: true)
+
+        let snapshot = try XCTUnwrap(store.localSnapshots[provider.id])
+        XCTAssertEqual(store.errorMessage(for: provider.id), "Usage is temporarily unavailable.")
+        XCTAssertEqual(snapshot.plan, "Pro")
+        XCTAssertEqual(snapshot.line(label: "Session"), .progress(label: "Session", used: 25, limit: 100, format: .percent))
+        XCTAssertEqual(snapshot.quotaRefreshedAt, quotaTime)
+        XCTAssertEqual(snapshot.usageHistory, history)
+        XCTAssertNotNil(snapshot.line(label: "Last 30 Days"))
+    }
+
+    func testFirstRunFailedRefreshCanPublishHistoryWithoutFreshQuota() async throws {
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let day = DailyUsageAccumulator.dayKey(from: now)
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: day, totalTokens: 1_500, costUSD: 0.02)
+        ]))
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        var failed = ProviderSnapshot.error(provider: provider, message: "Usage is temporarily unavailable.")
+        failed.usageHistory = history
+        let runtime = SequenceProviderRuntime(provider: provider, descriptors: [meter, historyDescriptor], snapshots: [failed])
+        let defaults = makeUserDefaults("first-run-failed-history")
+        let cache = ProviderSnapshotCache(
+            userDefaults: defaults,
+            storageKey: "snapshots",
+            ttl: 600,
+            now: { now }
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            cache: cache,
+            defaults: defaults,
+            now: { now }
+        )
+
+        await store.refreshAll(force: true)
+
+        let snapshot = try XCTUnwrap(store.localSnapshots[provider.id])
+        XCTAssertEqual(store.errorMessage(for: provider.id), "Usage is temporarily unavailable.")
+        XCTAssertEqual(snapshot.usageHistory, history)
+        XCTAssertNil(snapshot.plan)
+        XCTAssertNil(snapshot.line(label: "Session"))
+        XCTAssertEqual(snapshot.quotaRefreshedAt, .distantPast)
+        XCTAssertNotNil(snapshot.line(label: "Last 30 Days"))
+    }
+
+    func testFailedQuotaRetryCanFoldHistoryWithoutClearingQuotaError() async throws {
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let quotaTime = now.addingTimeInterval(-300)
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 1_500, costUSD: 0.02)
+        ]))
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let quota = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Pro",
+            lines: [.progress(label: "Session", used: 25, limit: 100, format: .percent)],
+            refreshedAt: quotaTime
+        )
+        let failed = ProviderSnapshot.error(provider: provider, message: "Usage is temporarily unavailable.")
+        let folded = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [quota, failed, folded]
+        )
+        let defaults = makeUserDefaults("failed-quota-history-retry")
+        let cache = ProviderSnapshotCache(
+            userDefaults: defaults,
+            storageKey: "snapshots",
+            ttl: 600,
+            now: { now }
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            cache: cache,
+            defaults: defaults,
+            now: { now }
+        )
+
+        let initial = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id, force: true)
+        }
+        let failure = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id, force: true)
+        }
+        let historyRetry = await store.refreshProviderHistoryAfterRetry(providerID: provider.id, manualActionID: nil)
+
+        XCTAssertEqual(initial, .refreshed)
+        XCTAssertEqual(failure, .failed)
+        XCTAssertEqual(historyRetry, .refreshed)
+        XCTAssertEqual(runtime.refreshCount, 3)
+        XCTAssertEqual(store.errorMessage(for: provider.id), "Usage is temporarily unavailable.")
+        let snapshot = try XCTUnwrap(store.localSnapshots[provider.id])
+        XCTAssertEqual(snapshot.plan, "Pro")
+        XCTAssertEqual(snapshot.line(label: "Session"), quota.line(label: "Session"))
+        XCTAssertEqual(snapshot.quotaRefreshedAt, quotaTime)
+        XCTAssertEqual(snapshot.usageHistory, history)
+    }
+
+    func testVisibleTwoPhaseRetryClearsRecoveredFullRefreshError() async throws {
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 8, costUSD: 0.01)
+        ]))
+        let fullFailure = ProviderSnapshot.error(provider: provider, message: "Usage is temporarily unavailable.")
+        let meters = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Pro",
+            lines: [.progress(label: "Session", used: 20, limit: 100, format: .percent)],
+            refreshedAt: now
+        )
+        let folded = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [fullFailure, meters, folded]
+        )
+        let defaults = makeUserDefaults("visible-retry-clears-full-error")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now }),
+            defaults: defaults,
+            now: { now }
+        )
+
+        let initial = await store.refresh(providerID: provider.id, force: true)
+        let quotaRetry = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id, force: true)
+        }
+        XCTAssertEqual(initial, .failed)
+        XCTAssertEqual(quotaRetry, .refreshed)
+        XCTAssertEqual(store.errorMessage(for: provider.id), "Usage is temporarily unavailable.",
+                        "the local history portion of the full error remains until its fold succeeds")
+
+        let historyRetry = await store.refreshProviderHistoryAfterRetry(providerID: provider.id, manualActionID: nil)
+
+        XCTAssertEqual(historyRetry, .refreshed)
+        XCTAssertNil(store.errorMessage(for: provider.id))
+        let snapshot = try XCTUnwrap(store.localSnapshots[provider.id])
+        XCTAssertEqual(snapshot.plan, "Pro")
+        XCTAssertEqual(snapshot.usageHistory, history)
+    }
+
+    /// A provider whose every scope resolves to no narrower domain records its failure under the
+    /// catch-all `.full` bucket. A later successful pass clears only its own (narrower) domains, so
+    /// without clearing the catch-all too the error — and its Retry affordance — would stay forever.
+    func testFallbackFullFailureIsClearedByALaterSuccessfulPass() async throws {
+        let provider = Provider(id: "freebuff", displayName: "Freebuff", icon: .providerMark("freebuff"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let failure = ProviderSnapshot.error(provider: provider, message: "Usage is temporarily unavailable.")
+        let recovered = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            refreshedAt: now
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [],
+            snapshots: [failure, recovered]
+        )
+        let defaults = makeUserDefaults("fallback-full-failure-recovery")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: []),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now }),
+            defaults: defaults,
+            now: { now }
+        )
+
+        let failedOutcome = await store.refresh(providerID: provider.id, force: true)
+        XCTAssertEqual(failedOutcome, .failed)
+        XCTAssertEqual(store.errorMessage(for: provider.id), "Usage is temporarily unavailable.")
+
+        // A user-initiated retry bypasses the negative cache, exactly like the visible retry path.
+        let recoveredOutcome = await store.refresh(providerID: provider.id, bypassFailureBackoff: true)
+        XCTAssertEqual(recoveredOutcome, .refreshed)
+        XCTAssertNil(store.errorMessage(for: provider.id),
+                     "the catch-all failure must not outlive a pass that proved the provider works")
+    }
+
+    func testForcedPanelMetersRetryKeepsItsScopeInsideProviderDeadline() async throws {
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 42, costUSD: 0.02)
+        ]))
+        let initial = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Pro",
+            lines: [.progress(label: "Session", used: 20, limit: 100, format: .percent)],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        let meters = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Pro",
+            lines: [.progress(label: "Session", used: 25, limit: 100, format: .percent)],
+            refreshedAt: now.addingTimeInterval(1)
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [initial, meters]
+        )
+        let defaults = makeUserDefaults("forced-panel-meter-keeps-scope")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now }),
+            defaults: defaults,
+            now: { now }
+        )
+
+        _ = await store.refresh(providerID: provider.id, force: true)
+        let retry = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id, force: true)
+        }
+
+        XCTAssertEqual(retry, .refreshed)
+        XCTAssertEqual(runtime.observedScopes, [.full, .panelMeters])
+        let snapshot = try XCTUnwrap(store.localSnapshots[provider.id])
+        XCTAssertEqual(snapshot.line(label: "Session"), meters.line(label: "Session"))
+        XCTAssertEqual(snapshot.usageHistory, history)
+    }
+
+    func testHermesPanelMeterRecoveryClearsItsAccountingError() async {
+        let provider = Provider(id: "hermes", displayName: "Hermes", icon: .providerMark("hermes"))
+        let today = WidgetDescriptor.values(id: "hermes.today", provider: provider, title: "Today")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let failed = ProviderSnapshot.error(provider: provider, message: "Local database unavailable")
+        let recovered = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.values(label: "Today", values: [MetricValue(number: 42, kind: .count, label: "tokens")])],
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: []))
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [today, historyDescriptor],
+            snapshots: [failed, recovered],
+            panelMetersRefreshIncludesHistory: true
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [today, historyDescriptor]),
+            providers: [runtime],
+            defaults: makeUserDefaults("hermes-recovery-clears-accounting-error")
+        )
+
+        let initial = await store.refresh(providerID: provider.id, force: true)
+        let retry = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id, force: true)
+        }
+
+        XCTAssertEqual(initial, .failed)
+        XCTAssertEqual(retry, .refreshed)
+        XCTAssertNil(store.errorMessage(for: provider.id))
+    }
+
+    func testFullRefreshFailureBacksOffQuotaAndAccountingPhases() async {
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let failure = ProviderSnapshot.error(provider: provider, message: "Usage unavailable")
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [failure]
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            defaults: makeUserDefaults("full-refresh-failure-shares-component-backoff"),
+            now: { Date(timeIntervalSince1970: 1_800_000_000) }
+        )
+
+        let full = await store.refresh(providerID: provider.id, force: true)
+        let quota = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id)
+        }
+        let accounting = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await store.refresh(providerID: provider.id)
+        }
+
+        XCTAssertEqual(full, .failed)
+        XCTAssertEqual(quota, .backedOff)
+        XCTAssertEqual(accounting, .backedOff)
+        XCTAssertEqual(runtime.refreshCount, 1)
+    }
+
+    func testAccountingFailureDoesNotBlockMetersOrGetClearedByMeterSuccess() async throws {
+        let provider = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let meter = WidgetDescriptor.percent(id: "opencode.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let foldFailure = ProviderSnapshot.error(provider: provider, message: "Local history unavailable")
+        let quota = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Go",
+            lines: [.progress(label: "Session", used: 27, limit: 100, format: .percent)],
+            refreshedAt: now
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [foldFailure, quota]
+        )
+        let defaults = makeUserDefaults("accounting-failure-does-not-block-meters")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now }),
+            defaults: defaults,
+            now: { now }
+        )
+
+        let fold = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await store.refresh(providerID: provider.id, force: true)
+        }
+        let meters = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id, bypassSnapshotCache: true)
+        }
+
+        XCTAssertEqual(fold, .failed)
+        XCTAssertEqual(meters, .refreshed, "an accounting scan failure must not back off the independent quota request")
+        XCTAssertEqual(runtime.refreshCount, 2)
+        XCTAssertEqual(store.errorMessage(for: provider.id), "Local history unavailable")
+        let snapshot = try XCTUnwrap(store.localSnapshots[provider.id])
+        XCTAssertEqual(snapshot.plan, "Go")
+        XCTAssertEqual(snapshot.line(label: "Session"), quota.line(label: "Session"))
+    }
+
+    func testQuotaFailureDoesNotBlockAccountingFold() async throws {
+        let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 12, costUSD: 0.01)
+        ]))
+        let meter = WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let quotaFailure = ProviderSnapshot.error(provider: provider, message: "Quota unavailable")
+        let fold = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [quotaFailure, fold]
+        )
+        let defaults = makeUserDefaults("quota-failure-does-not-block-accounting")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now }),
+            defaults: defaults,
+            now: { now }
+        )
+
+        let quota = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id, force: true)
+        }
+        let accounting = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await store.refresh(providerID: provider.id, bypassSnapshotCache: true)
+        }
+
+        XCTAssertEqual(quota, .failed)
+        XCTAssertEqual(accounting, .refreshed, "a quota API failure must not suppress local history")
+        XCTAssertEqual(runtime.refreshCount, 2)
+        XCTAssertEqual(store.errorMessage(for: provider.id), "Quota unavailable")
+        XCTAssertEqual(store.localSnapshots[provider.id]?.usageHistory, history)
+    }
+
+    func testFoldFailureCannotClearNewlyFetchedQuotaMeters() async throws {
+        let provider = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let meter = WidgetDescriptor.percent(id: "opencode.session", provider: provider, title: "Session")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let quota = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Go",
+            lines: [.progress(label: "Session", used: 27, limit: 100, format: .percent)],
+            refreshedAt: now
+        )
+        let foldFailure = ProviderSnapshot.error(
+            provider: provider,
+            message: "Local history unavailable",
+            category: .network,
+            clearsPriorMenuBarQuotaState: true
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, historyDescriptor],
+            snapshots: [quota, foldFailure]
+        )
+        let defaults = makeUserDefaults("fold-failure-keeps-fresh-quota")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, historyDescriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now }),
+            defaults: defaults,
+            now: { now }
+        )
+
+        _ = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refresh(providerID: provider.id, force: true)
+        }
+        let retry = await store.refreshProviderHistoryAfterRetry(providerID: provider.id, manualActionID: nil)
+
+        XCTAssertEqual(retry, .failed)
+        XCTAssertEqual(store.errorMessage(for: provider.id), "Local history unavailable")
+        let snapshot = try XCTUnwrap(store.localSnapshots[provider.id])
+        XCTAssertEqual(snapshot.plan, "Go")
+        XCTAssertEqual(snapshot.line(label: "Session"), quota.line(label: "Session"))
+    }
+
+    func testMeterlessLocalProviderKeepsItsHistoryCacheFreshAfterFold() async throws {
+        let provider = Provider(id: "hermes", displayName: "Hermes", icon: .providerMark("hermes"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let today = WidgetDescriptor.values(id: "hermes.today", provider: provider, title: "Today")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 42, costUSD: 0.02)
+        ]))
+        let snapshot = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.values(label: "Today", values: [MetricValue(number: 42, kind: .count, label: "tokens")])],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        let runtime = SequenceProviderRuntime(provider: provider, descriptors: [today, historyDescriptor], snapshots: [snapshot])
+        let defaults = makeUserDefaults("meterless-local-history-cache")
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now })
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [today, historyDescriptor]),
+            providers: [runtime],
+            cache: cache,
+            defaults: defaults,
+            now: { now }
+        )
+
+        let outcome = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await store.refresh(providerID: provider.id, bypassSnapshotCache: true)
+        }
+
+        XCTAssertEqual(outcome, .refreshed)
+        XCTAssertNotNil(cache.snapshot(providerID: provider.id), "history-only providers must not get an expired quota stamp")
+    }
+
+    func testPanelMeterRetryDoesNotImmediatelyRepeatProvidersWhoseMeterPassScansHistory() async {
+        let provider = Provider(id: "hermes", displayName: "Hermes", icon: .providerMark("hermes"))
+        let today = WidgetDescriptor.values(id: "hermes.today", provider: provider, title: "Today")
+        let history = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [today, history],
+            snapshots: [],
+            panelMetersRefreshIncludesHistory: true
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [today, history]),
+            providers: [runtime],
+            defaults: makeUserDefaults("hermes-retry-no-double-scan")
+        )
+
+        let outcome = await store.refreshProviderHistoryAfterRetry(providerID: provider.id, manualActionID: nil)
+
+        XCTAssertEqual(outcome, .skipped)
+        XCTAssertEqual(runtime.refreshCount, 0)
+    }
+
+    func testPanelAccountingSkipsProviderWhoseMeterPassAlreadyScansHistory() async {
+        let provider = Provider(id: "hermes", displayName: "Hermes", icon: .providerMark("hermes"))
+        let today = WidgetDescriptor.values(id: "hermes.today", provider: provider, title: "Today")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [today, historyDescriptor],
+            snapshots: [],
+            panelMetersRefreshIncludesHistory: true
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [today, historyDescriptor]),
+            providers: [runtime],
+            defaults: makeUserDefaults("hermes-panel-accounting-is-not-repeated")
+        )
+
+        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await store.refreshAll()
+        }
+
+        XCTAssertEqual(runtime.refreshCount, 0)
+    }
+
+    func testVisibleHistoryRetryPreservesManualCredentialContextAndCPUThrottle() async throws {
+        let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: []))
+        let snapshot = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            refreshedAt: Date(),
+            usageHistory: history
+        )
+        let runtime = RefreshContextRecordingProviderRuntime(
+            provider: provider,
+            descriptors: [historyDescriptor],
+            snapshot: snapshot
+        )
+        let defaults = makeUserDefaults("manual-history-retry-context")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [historyDescriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600),
+            defaults: defaults
+        )
+
+        let attempt = try await withManualRefresh {
+            let manualActionID = try XCTUnwrap(ProviderRefreshContext.manualActionID)
+            let interactionGate = try XCTUnwrap(ProviderRefreshContext.credentialInteractionGate)
+            let outcome = await store.refreshProviderHistoryAfterRetry(
+                providerID: provider.id,
+                manualActionID: manualActionID,
+                credentialInteractionGate: interactionGate
+            )
+            return (outcome, manualActionID, interactionGate)
+        }
+
+        XCTAssertEqual(attempt.0, .refreshed)
+        XCTAssertEqual(runtime.observedScope, .panelAccounting)
+        XCTAssertTrue(runtime.observedIsManual)
+        XCTAssertEqual(runtime.observedManualActionID, attempt.1)
+        XCTAssertTrue(runtime.observedInteractionGate === attempt.2)
+        XCTAssertTrue(runtime.observedAccountingCPUThrottleEnabled)
+    }
+
+    func testPanelMeterHistoryOnlyProviderDoesNotAdvanceQuotaDeadline() async {
+        let provider = Provider(id: "hermes", displayName: "Hermes", icon: .providerMark("hermes"))
+        let today = WidgetDescriptor.values(id: "hermes.today", provider: provider, title: "Today")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 42, costUSD: 0.02)
+        ]))
+        let snapshot = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.values(label: "Today", values: [MetricValue(number: 42, kind: .count, label: "tokens")])],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [today, historyDescriptor],
+            snapshots: [snapshot],
+            panelMetersRefreshIncludesHistory: true
+        )
+        let defaults = makeUserDefaults("hermes-does-not-advance-quota-deadline")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [today, historyDescriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now }),
+            defaults: defaults,
+            now: { now }
+        )
+
+        await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await store.refreshAll(force: true)
+        }
+
+        XCTAssertEqual(runtime.refreshCount, 1)
+        XCTAssertNil(store.lastLiveQuotaRefreshUptime,
+                     "a local-only Hermes scan must not postpone the next remote quota request")
+    }
+
+    func testDefinitiveAuthenticationErrorClearsCachedQuotaButKeepsHistory() async throws {
+        let provider = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: "2026-10-13", totalTokens: 135_900_000, costUSD: 1.47)
+        ]))
+        let previous = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Go",
+            lines: [
+                .progress(label: "Session", used: 0, limit: 100, format: .percent),
+                .progress(label: "Weekly", used: 0, limit: 100, format: .percent),
+                .progress(label: "Monthly", used: 0, limit: 100, format: .percent),
+                .values(label: "Today", values: [MetricValue(number: 1.47, kind: .dollars, label: "cost")])
+            ],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        let logout = ProviderSnapshot.error(
+            provider: provider,
+            message: "Not signed in",
+            category: .notLoggedIn,
+            clearsPriorMenuBarQuotaState: true
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [],
+            snapshots: [previous, logout]
+        )
+        let defaults = makeUserDefaults("clear-quota-on-logout")
+        let cache = ProviderSnapshotCache(
+            userDefaults: defaults,
+            storageKey: "snapshots",
+            ttl: 600,
+            now: { now }
+        )
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: []),
+            providers: [runtime],
+            cache: cache,
+            defaults: defaults,
+            now: { now }
+        )
+
+        await store.refreshAll(force: true)
+        await store.refreshAll(force: true)
+
+        let retained = try XCTUnwrap(store.localSnapshots[provider.id])
+        XCTAssertNil(retained.plan)
+        XCTAssertNil(retained.line(label: "Session"))
+        XCTAssertNil(retained.line(label: "Weekly"))
+        XCTAssertNil(retained.line(label: "Monthly"))
+        XCTAssertNotNil(retained.line(label: "Today"))
+        XCTAssertEqual(retained.usageHistory, history)
+        XCTAssertEqual(store.errorMessage(for: provider.id), "Not signed in")
+
+        let persisted = cache.loadSnapshots(providerIDs: [provider.id])[provider.id]
+        XCTAssertNil(persisted?.plan)
+        XCTAssertNil(persisted?.line(label: "Session"))
+        XCTAssertEqual(persisted?.usageHistory, history)
     }
 
     func testRemainingProgressWithoutResetUsesPeriodDurationLabel() {
@@ -934,6 +2357,56 @@ final class WidgetDataStoreTests: XCTestCase {
     }
 }
 
+@MainActor
+private final class SuspendedProviderRuntime: ProviderRuntime {
+    let provider: Provider
+    let widgetDescriptors: [WidgetDescriptor]
+    private var continuation: CheckedContinuation<ProviderSnapshot, Never>?
+    private(set) var didStart = false
+    private(set) var observedScopes: [ProviderRefreshContext.Scope] = []
+    private(set) var observedManualValues: [Bool] = []
+    private(set) var observedManualActionIDs: [UInt64?] = []
+    private(set) var observedInteractionGates: [CredentialInteractionGate?] = []
+    private(set) var observedThrottleValues: [Bool] = []
+    private var refreshCount = 0
+
+    init(provider: Provider, descriptors: [WidgetDescriptor]) {
+        self.provider = provider
+        self.widgetDescriptors = descriptors
+    }
+
+    func refresh() async -> ProviderSnapshot {
+        observedScopes.append(ProviderRefreshContext.scope)
+        observedManualValues.append(ProviderRefreshContext.isManual)
+        observedManualActionIDs.append(ProviderRefreshContext.manualActionID)
+        observedInteractionGates.append(ProviderRefreshContext.credentialInteractionGate)
+        observedThrottleValues.append(ProviderRefreshContext.accountingCPUThrottleEnabled)
+        refreshCount += 1
+        if refreshCount > 1 {
+            return ProviderSnapshot.make(
+                provider: provider,
+                plan: nil,
+                lines: [],
+                refreshedAt: Date()
+            )
+        }
+        didStart = true
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func resume() {
+        continuation?.resume(returning: ProviderSnapshot.make(
+            provider: provider,
+            plan: nil,
+            lines: [],
+            refreshedAt: Date()
+        ))
+        continuation = nil
+    }
+}
+
 private actor RefreshConcurrencyProbe {
     private var active = 0
     private var maximum = 0
@@ -954,6 +2427,56 @@ private actor RefreshConcurrencyProbe {
 }
 
 @MainActor
+private final class PanelMeterOverlapProviderRuntime: ProviderRuntime {
+    let provider: Provider
+    let widgetDescriptors: [WidgetDescriptor]
+    private let freshMeters: ProviderSnapshot
+    private let staleFold: ProviderSnapshot
+    private var foldContinuation: CheckedContinuation<ProviderSnapshot, Never>?
+    private(set) var didStartFold = false
+    private(set) var didStartPanelMeters = false
+    private(set) var didFinishFold = false
+    var onFoldStart: (() -> Void)?
+    var onPanelMetersStart: (() -> Void)?
+
+    init(
+        provider: Provider,
+        descriptors: [WidgetDescriptor],
+        freshMeters: ProviderSnapshot,
+        staleFold: ProviderSnapshot
+    ) {
+        self.provider = provider
+        self.widgetDescriptors = descriptors
+        self.freshMeters = freshMeters
+        self.staleFold = staleFold
+    }
+
+    func refresh() async -> ProviderSnapshot {
+        switch ProviderRefreshContext.scope {
+        case .localAccounting, .panelAccounting:
+            didStartFold = true
+            onFoldStart?()
+            let result = await withCheckedContinuation { (continuation: CheckedContinuation<ProviderSnapshot, Never>) in
+                foldContinuation = continuation
+            }
+            didFinishFold = true
+            return result
+        case .panelMeters:
+            didStartPanelMeters = true
+            onPanelMetersStart?()
+            return freshMeters
+        case .menuBar, .full:
+            return freshMeters
+        }
+    }
+
+    func resumeFold() {
+        foldContinuation?.resume(returning: staleFold)
+        foldContinuation = nil
+    }
+}
+
+@MainActor
 private final class TestConcurrencyProviderRuntime: ProviderRuntime {
     let provider: Provider
     let widgetDescriptors: [WidgetDescriptor] = []
@@ -970,4 +2493,34 @@ private final class TestConcurrencyProviderRuntime: ProviderRuntime {
         await probe.end()
         return ProviderSnapshot(providerID: provider.id, displayName: provider.displayName, lines: [])
     }
+}
+
+@MainActor
+private final class RefreshContextRecordingProviderRuntime: ProviderRuntime {
+    let provider: Provider
+    let widgetDescriptors: [WidgetDescriptor]
+    private let snapshot: ProviderSnapshot
+
+    private(set) var observedScope: ProviderRefreshContext.Scope?
+    private(set) var observedIsManual = false
+    private(set) var observedManualActionID: UInt64?
+    private(set) var observedInteractionGate: CredentialInteractionGate?
+    private(set) var observedAccountingCPUThrottleEnabled = false
+
+    init(provider: Provider, descriptors: [WidgetDescriptor], snapshot: ProviderSnapshot) {
+        self.provider = provider
+        self.widgetDescriptors = descriptors
+        self.snapshot = snapshot
+    }
+
+    func refresh() async -> ProviderSnapshot {
+        observedScope = ProviderRefreshContext.scope
+        observedIsManual = ProviderRefreshContext.isManual
+        observedManualActionID = ProviderRefreshContext.manualActionID
+        observedInteractionGate = ProviderRefreshContext.credentialInteractionGate
+        observedAccountingCPUThrottleEnabled = ProviderRefreshContext.accountingCPUThrottleEnabled
+        return snapshot
+    }
+
+    func hasLocalCredentials() async -> Bool { true }
 }

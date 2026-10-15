@@ -55,6 +55,31 @@ final class OpenCodeProviderTests: XCTestCase {
         XCTAssertTrue(has)
     }
 
+    func testGoKeySettingsFileAccessRunsOffMainActor() async throws {
+        let files = ThreadRecordingOpenCodeFiles([
+            "/oc/auth.json": authJSON,
+            "/oc/go-keys.json": "[]"
+        ])
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: files),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            goKeyStore: OpenCodeGoKeyStore(files: files, filePath: { "/oc/go-keys.json" }),
+            activeKeyID: { nil }
+        )
+
+        let entries = await provider.goKeyEntries()
+        let saved = try await provider.saveGoKey(label: "Work", key: "sk-local")
+        try await provider.removeGoKey(id: saved.id)
+
+        XCTAssertEqual(entries.map(\.label), ["opencode-go"])
+        XCTAssertTrue(
+            files.accesses.allSatisfy { !$0.wasOnMainThread },
+            "settings reads and saved-key file mutations should run outside the UI actor"
+        )
+        XCTAssertTrue(files.accesses.contains { $0.path == "/oc/auth.json" })
+        XCTAssertTrue(files.accesses.contains { $0.path == "/oc/go-keys.json" })
+    }
+
     func testHasLocalCredentialsViaLocalUsage() async {
         let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode") + "]"
         let provider = OpenCodeProvider(
@@ -140,12 +165,12 @@ final class OpenCodeProviderTests: XCTestCase {
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
         let snapshot = await provider.refresh()
-        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertEqual(snapshot.errorCategory, .authExpired)
         XCTAssertNil(snapshot.plan)
         XCTAssertNil(snapshot.line(label: "Session"))
         XCTAssertNil(snapshot.line(label: "Weekly"))
         XCTAssertNil(snapshot.line(label: "Monthly"))
-        XCTAssertNotNil(snapshot.warning)
+        XCTAssertNil(snapshot.warning)
     }
 
     func testAccountMetersUsedWhenAPIAnswers() async {
@@ -179,8 +204,8 @@ final class OpenCodeProviderTests: XCTestCase {
         XCTAssertNotNil(snapshot.line(label: "Today")) // local spend tile still present
     }
 
-    func testLocalFallbackMetersWhenAPIIsUnavailable() async {
-        // A transient account API error leaves local-observed spend meters available.
+    func testAPIUnavailableHidesGoCapsButKeepsLocalSpend() async {
+        // Local history is not proof of an active Go entitlement, even during an API outage.
         let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "2.0", 1000, "glm-5.2", "opencode-go") + "]"
         let (client, http) = usageClient(statusCode: 503)
@@ -197,12 +222,12 @@ final class OpenCodeProviderTests: XCTestCase {
         let snapshot = await provider.refresh()
         XCTAssertNil(snapshot.plan)
         XCTAssertNotNil(snapshot.warning)
+        XCTAssertEqual(snapshot.clearsPriorMenuBarQuotaState, true)
         XCTAssertEqual(http.requests.count, 1)
-        guard case .progress(_, let sessionUsed, _, let format, _, _, _, _)? = snapshot.line(label: "Session") else {
-            return XCTFail("expected a Session meter")
-        }
-        XCTAssertEqual(sessionUsed, 2.0 / OpenCodeUsageMapper.sessionCap * 100) // 2.0 of $12 local spend
-        XCTAssertEqual(format, .percent)
+        XCTAssertNil(snapshot.line(label: "Session"))
+        XCTAssertNil(snapshot.line(label: "Weekly"))
+        XCTAssertNil(snapshot.line(label: "Monthly"))
+        XCTAssertNotNil(snapshot.line(label: "Today"), "local spend remains visible during an API outage")
     }
 
     func testPartialAccountPayloadDoesNotPresentGoCapMetersAsVerified() async {
@@ -229,9 +254,13 @@ final class OpenCodeProviderTests: XCTestCase {
     }
 
     func testNoAPIWithoutGoKey() async {
-        // A Zen-only user has no Go key: the account endpoint must never be called.
+        // A Zen-only account with old local opencode-go rows still has no current Go account to meter.
+        // The account endpoint must not be called, and history must not fabricate plan caps.
         let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
-        let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode") + "]"
+        let db = "[" + [
+            row(TestLocalInstant.iso(2026, 7, 12, 11, 0, 0), "2.0", 1_000, "glm-5.2", "opencode-go"),
+            row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode")
+        ].joined(separator: ",") + "]"
         let (client, http) = usageClient()
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles()),
@@ -247,7 +276,10 @@ final class OpenCodeProviderTests: XCTestCase {
         XCTAssertNil(snapshot.plan)
         XCTAssertTrue(http.requests.isEmpty)
         XCTAssertNil(snapshot.line(label: "Session"))
+        XCTAssertNil(snapshot.line(label: "Weekly"))
+        XCTAssertNil(snapshot.line(label: "Monthly"))
         XCTAssertNotNil(snapshot.line(label: "Today"))
+        XCTAssertEqual(snapshot.clearsPriorMenuBarQuotaState, true)
     }
 
     func testAccountMetersShowWithoutLocalDatabase() async {
@@ -270,6 +302,28 @@ final class OpenCodeProviderTests: XCTestCase {
         }
         XCTAssertEqual(sessionUsed, 4)
         XCTAssertEqual(format, .percent)
+    }
+
+    func testCancelledGoAccountRequestStopsBeforeTryingAnotherKey() async {
+        let files = FakeFiles([
+            "/oc/auth.json": authJSON,
+            "/oc/go-keys.json": #"[{"id":"00000000-0000-0000-0000-000000000001","label":"Second","key":"sk-second"}]"#
+        ])
+        let http = RoutingHTTPClient { _ in
+            throw URLError(.cancelled)
+        }
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: files),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageClient: OpenCodeGoUsageClient(http: http),
+            goKeyStore: OpenCodeGoKeyStore(files: files, filePath: { "/oc/go-keys.json" }),
+            activeKeyID: { nil }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertEqual(http.requests.count, 1, "cancellation must stop before trying the saved second key")
     }
 
     func testEntitlementErrorSuppressesLocalGoCapFallback() async {
@@ -391,6 +445,26 @@ final class OpenCodeProviderTests: XCTestCase {
         XCTAssertTrue(has)
     }
 
+    func testUnreadableSavedGoKeysRemainDetectedAndSurfaceCredentialAccess() async {
+        // An app-saved Go-key file is a provider footprint even when its permissions prevent reading it.
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles()),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageClient: usageClient().client,
+            goKeyStore: OpenCodeGoKeyStore(
+                files: UnreadableFiles(present: ["/oc/go-keys.json"]),
+                filePath: { "/oc/go-keys.json" }
+            ),
+            activeKeyID: { nil }
+        )
+
+        let detected = await provider.hasLocalCredentials()
+        let snapshot = await provider.refresh()
+
+        XCTAssertTrue(detected)
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+    }
+
     func testSpendTilesAreNotMarkedEstimated() async {
         // OpenCode records its own per-message cost — the tiles must not carry the local-estimate ⓘ.
         let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
@@ -485,10 +559,37 @@ final class OpenCodeProviderTests: XCTestCase {
         XCTAssertNil(snapshot.plan, "meters-only scope's plan is recovered by the store's merge")
     }
 
-    /// Meters-only scope with no Go credentials falls back to local-window meters derived from the
-    /// databases alone (no corpus folds): the meters must stay current on menu-bar ticks without
-    /// paying the 15-20s multi-corpus scan the old full-scope path ran.
-    func testPanelMetersWindowFallbackWithoutGoKey() async {
+    /// Phase 2's local scan can fail even though phase 1 just recovered the live Go meters. A
+    /// fold-only pass never calls the account endpoint, so a scan failure is no evidence that those
+    /// meters are stale — claiming otherwise deleted freshly recovered quota rows.
+    func testPanelAccountingScanFailureKeepsTheMetersPhaseFetched() async {
+        let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
+        let (client, http) = usageClient()
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
+            usageScanner: OpenCodeUsageScanner(
+                sqlite: StubSQLite(failing: ["/oc/opencode.db"]),
+                databasePaths: { ["/oc/opencode.db"] }
+            ),
+            usageClient: client,
+            now: { now },
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await provider.refresh()
+        }
+        XCTAssertTrue(http.requests.isEmpty, "fold-only scope must not re-read the account API")
+        XCTAssertNotNil(snapshot.errorCategory, "the local history failure still surfaces")
+        XCTAssertNotEqual(
+            snapshot.clearsPriorMenuBarQuotaState, true,
+            "a fold-only scan failure must not invalidate the meters the meters phase just fetched"
+        )
+    }
+
+    /// Local `opencode-go` rows show historical use but do not prove a current Go subscription.
+    /// With no Go credential, even the quota-only path must hide the published caps and clear a
+    /// previously cached plan/meter set while preserving spend history.
+    func testPanelMetersHideGoCapsWithoutCredentialAndClearCachedPlan() async {
         let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let db = "[" + row(TestLocalInstant.iso(2026, 7, 12, 10, 0, 0), "1.0", 500, "gpt-5.5", "opencode-go") + "]"
         let provider = OpenCodeProvider(
@@ -497,14 +598,37 @@ final class OpenCodeProviderTests: XCTestCase {
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db], anchor: "1700000000000"),
                 databasePaths: { ["/oc/opencode.db"] }
             ),
+            now: { now },
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
         let snapshot = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
             await provider.refresh()
         }
-        XCTAssertNotNil(snapshot.line(label: "Session"), "window fallback keeps the meters live")
-        XCTAssertNil(snapshot.plan, "no account API answer — no verified plan badge")
+        XCTAssertNil(snapshot.line(label: "Session"), "local logs cannot establish an active Go cap")
+        XCTAssertNil(snapshot.line(label: "Weekly"))
+        XCTAssertNil(snapshot.line(label: "Monthly"))
+        XCTAssertNil(snapshot.plan)
+        XCTAssertEqual(snapshot.clearsPriorMenuBarQuotaState, true)
         XCTAssertNil(snapshot.line(label: "Today"), "meters-only pass carries no tiles")
+
+        let previous = ProviderSnapshot(
+            providerID: "opencode",
+            displayName: "OpenCode",
+            plan: "Go",
+            lines: [
+                .progress(label: "Session", used: 0, limit: 100, format: .percent),
+                .progress(label: "Weekly", used: 0, limit: 100, format: .percent),
+                .progress(label: "Monthly", used: 0, limit: 100, format: .percent),
+                .values(label: "Today", values: [MetricValue(number: 1, kind: .dollars, label: "cost")])
+            ],
+            refreshedAt: now
+        )
+        let merged = snapshot.mergingMenuBarUpdate(over: previous)
+        XCTAssertNil(merged.plan, "a stale plan badge must not survive removal of all Go credentials")
+        XCTAssertNil(merged.line(label: "Session"))
+        XCTAssertNil(merged.line(label: "Weekly"))
+        XCTAssertNil(merged.line(label: "Monthly"))
+        XCTAssertNotNil(merged.line(label: "Today"), "meter clearing must keep historical spend tiles")
     }
 
     /// No credentials and no OpenCode data directory is the not-logged-in state — the meters-only
@@ -519,6 +643,64 @@ final class OpenCodeProviderTests: XCTestCase {
             await provider.refresh()
         }
         XCTAssertNotNil(snapshot.errorCategory, "expected the not-logged-in error snapshot")
+        XCTAssertEqual(snapshot.clearsPriorMenuBarQuotaState, true)
+    }
+
+    func testFullRefreshWithoutGoKeyOrDataClearsPreviousQuotaState() async {
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles()),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .notLoggedIn)
+        XCTAssertEqual(snapshot.clearsPriorMenuBarQuotaState, true)
+    }
+
+    func testUnreadableLocalDatabaseClearsPreviouslyCachedGoQuota() async {
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles()),
+            usageScanner: OpenCodeUsageScanner(
+                sqlite: StubSQLite(),
+                databasePaths: { throw OpenCodeUsageError.databaseUnreadable }
+            ),
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+        XCTAssertEqual(snapshot.clearsPriorMenuBarQuotaState, true)
+        let previous = ProviderSnapshot(
+            providerID: "opencode", displayName: "OpenCode", plan: "Go",
+            lines: [
+                .progress(label: "Session", used: 5, limit: 100, format: .percent),
+                .values(label: "Today", values: [MetricValue(number: 2, kind: .dollars, label: "cost")])
+            ],
+            refreshedAt: Date()
+        )
+        let merged = snapshot.mergingMenuBarUpdate(over: previous)
+        XCTAssertNil(merged.plan)
+        XCTAssertNil(merged.line(label: "Session"))
+        XCTAssertNotNil(merged.line(label: "Today"))
+    }
+
+    func testPanelMetersDatabaseErrorClearsPreviouslyCachedGoQuota() async {
+        let provider = OpenCodeProvider(
+            authStore: authStore(files: FakeFiles()),
+            usageScanner: OpenCodeUsageScanner(
+                sqlite: StubSQLite(),
+                databasePaths: { throw OpenCodeUsageError.databaseUnreadable }
+            ),
+            goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
+        )
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await provider.refresh()
+        }
+
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+        XCTAssertEqual(snapshot.clearsPriorMenuBarQuotaState, true)
     }
 
     /// Fold-only pass with Go credentials but no local database: the meters-only phase already
@@ -562,4 +744,59 @@ private final class StubSQLite: SQLiteAccessing, @unchecked Sendable {
     }
 
     func execute(path: String, sql: String) throws {}
+}
+
+private final class ThreadRecordingOpenCodeFiles: TextFileAccessing, @unchecked Sendable {
+    struct Access {
+        let path: String
+        let wasOnMainThread: Bool
+    }
+
+    private let lock = NSLock()
+    private var contents: [String: String]
+    private var recordedAccesses: [Access] = []
+
+    var accesses: [Access] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedAccesses
+    }
+
+    init(_ contents: [String: String]) {
+        self.contents = contents
+    }
+
+    func exists(_ path: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return contents[path] != nil
+    }
+
+    func readTextIfPresent(_ path: String) throws -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedAccesses.append(Access(path: path, wasOnMainThread: Thread.isMainThread))
+        return contents[path]
+    }
+
+    func readText(_ path: String) throws -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedAccesses.append(Access(path: path, wasOnMainThread: Thread.isMainThread))
+        return contents[path] ?? ""
+    }
+
+    func writeText(_ path: String, _ text: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedAccesses.append(Access(path: path, wasOnMainThread: Thread.isMainThread))
+        contents[path] = text
+    }
+
+    func remove(_ path: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedAccesses.append(Access(path: path, wasOnMainThread: Thread.isMainThread))
+        contents.removeValue(forKey: path)
+    }
 }

@@ -37,9 +37,11 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
         let day = try XCTUnwrap(scan(line).series.daily.first)
 
-        // 200k input + 100k cache write at $2/M, 700k cache read at $0.5/M, 250k output at $6/M.
+        // The turn's 1M prompt tokens cross xAI's published 200K long-context threshold, so the whole
+        // row prices in that tier: 200k input + 100k cache write at $4/M, 700k cache read at $0.60/M,
+        // 250k output at $12/M.
         XCTAssertEqual(day.totalTokens, 1_250_000)
-        XCTAssertEqual(try XCTUnwrap(day.costUSD), 2.45, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(day.costUSD), 4.62, accuracy: 0.0001)
     }
 
     func testSplitsCompletedTurnAcrossModelsWithoutDuplicatingTheEvent() throws {
@@ -96,6 +98,25 @@ final class GrokLogUsageScannerTests: XCTestCase {
         let day = try XCTUnwrap(usage.series.daily.first)
         XCTAssertEqual(try XCTUnwrap(day.costUSD), 0.3, accuracy: 0.0001)
         XCTAssertTrue(usage.unknownModelsByDay.isEmpty)
+    }
+
+    func testPublicRateTotalIsIncompleteWhenRecordedCostHasNoPublicRate() throws {
+        let recordedOnly = GrokLogFixture.completedTurn(
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
+            model: "grok-future-model",
+            input: 500_000,
+            costUsdTicks: 3_000_000_000
+        )
+        let publiclyPriced = GrokLogFixture.completedTurn(
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 11),
+            model: "grok-4.6-build",
+            input: 100_000
+        )
+
+        let usage = scan(recordedOnly + "\n" + publiclyPriced)
+
+        XCTAssertNotNil(usage.apiEstimateByDay?["2026-06-10"])
+        XCTAssertEqual(usage.apiEstimateIncompleteDays, ["2026-06-10"])
     }
 
     func testUnknownModelWithoutRecordedCostCountsTokensAndDashesCost() {
