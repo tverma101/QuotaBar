@@ -54,6 +54,7 @@ an invalid response instead of being shown as zero.
 ## Troubleshooting
 
 - **"No Z.ai API key"** — add a key in Settings → API Keys, or export `ZAI_API_KEY`.
+- **"Couldn't read the saved Z.ai API key"** — a saved config file exists but QuotaBar can't read it. The API Keys card shows an orange repair state; a valid environment key remains active and is labeled as a fallback. Check file permissions, enter a replacement, or remove the saved file, then refresh.
 - **"Z.ai API key invalid"** — the key was rejected (401/403). Regenerate it in the
   [Z.ai console](https://z.ai/manage-apikey/apikey-list).
 - **"No active GLM Coding Plan"** (amber notice by the name) — the key is valid, but the account has no

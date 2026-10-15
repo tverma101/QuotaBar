@@ -1,5 +1,131 @@
 import Foundation
 
+/// Readable ownership metadata can legitimately be ambiguous or absent. Only a failure to read the
+/// preamble makes an account-scoped scan incomplete.
+enum ClaudeSessionOwnershipLookupResult: Sendable {
+    case readable(organizationID: String?, accountID: String?, isAmbiguous: Bool)
+    case unreadable
+}
+
+/// Lets a provider distinguish a complete empty log scan from a source read that was incomplete.
+enum ClaudeLogUsageScanResult: Sendable {
+    case complete(LogUsageScan?)
+    case incomplete
+}
+
+/// Account-scoped Claude cards share physical logs. Cache ownership metadata across those cards so
+/// each candidate session is classified once; nonmatching usage rows never enter the parse/fold cache.
+private actor ClaudeSessionOwnershipIndex {
+    static let shared = ClaudeSessionOwnershipIndex()
+
+    private struct CachedIdentity {
+        var size: Int
+        var mtime: Date
+        var attributeMtime: Date?
+        var organizationID: String?
+        var accountID: String?
+        var isAmbiguous: Bool
+    }
+
+    private var entries: [String: CachedIdentity] = [:]
+
+    func identity(for file: JSONLScanning.DiscoveredFile) -> ClaudeSessionOwnershipLookupResult {
+        if let cached = entries[file.path], cached.size == file.size,
+           cached.mtime == file.mtime, cached.attributeMtime == file.attributeMtime {
+            return .readable(
+                organizationID: cached.organizationID,
+                accountID: cached.accountID,
+                isAmbiguous: cached.isAmbiguous
+            )
+        }
+        guard !Task.isCancelled else { return .unreadable }
+        guard let identity = Self.readOwnershipPrefix(at: URL(fileURLWithPath: file.path)) else {
+            AppLog.warn(LogTag.plugin("claude"), "Failed to read Claude session ownership from \(file.path)")
+            return .unreadable
+        }
+        entries[file.path] = CachedIdentity(
+            size: file.size, mtime: file.mtime, attributeMtime: file.attributeMtime,
+            organizationID: identity.organizationID, accountID: identity.accountID,
+            isAmbiguous: identity.isAmbiguous
+        )
+        return .readable(
+            organizationID: identity.organizationID,
+            accountID: identity.accountID,
+            isAmbiguous: identity.isAmbiguous
+        )
+    }
+
+    /// Ownership is written in the session preamble, before the first usage row. Read only that
+    /// prefix: a disabled account's shared-root file needs attribution metadata, not a full-file
+    /// scan just to decide that its usage rows do not belong to this enabled card.
+    private static func readOwnershipPrefix(at url: URL) -> (
+        organizationID: String?, accountID: String?, isAmbiguous: Bool
+    )? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        let ownerMarker = Data(#""ownerOrganizationUuid""#.utf8)
+        let usageMarker = Data(#""usage":{"#.utf8)
+        var owner: String?
+        var account: String?
+        var isAmbiguous = false
+        var carry = Data()
+        let readLimit = 1024 * 1024
+        var bytesRead = 0
+        var reachedUsage = false
+
+        func inspect(_ line: Data.SubSequence) {
+            guard !isAmbiguous, line.range(of: ownerMarker) != nil,
+                  let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  let value = object["ownerOrganizationUuid"] as? String, !value.isEmpty
+            else { return }
+            let candidate = value.lowercased()
+            if let owner, owner != candidate {
+                isAmbiguous = true
+                return
+            }
+            owner = candidate
+            if let candidateAccount = object["ownerAccountUuid"] as? String, !candidateAccount.isEmpty {
+                let normalizedAccount = candidateAccount.lowercased()
+                if let account, account != normalizedAccount {
+                    isAmbiguous = true
+                    return
+                }
+                account = normalizedAccount
+            }
+        }
+
+        do {
+            while bytesRead < readLimit, !reachedUsage {
+                guard !Task.isCancelled else { return nil }
+                let amount = min(64 * 1024, readLimit - bytesRead)
+                guard let chunk = try handle.read(upToCount: amount), !chunk.isEmpty else {
+                    if !carry.isEmpty { inspect(carry[...]) }
+                    break
+                }
+                bytesRead += chunk.count
+                carry.append(chunk)
+                var lineStart = carry.startIndex
+                while let newline = carry[lineStart...].firstIndex(of: UInt8(ascii: "\n")) {
+                    let line = carry[lineStart..<newline]
+                    inspect(line)
+                    lineStart = carry.index(after: newline)
+                    if line.range(of: usageMarker) != nil {
+                        reachedUsage = true
+                        break
+                    }
+                }
+                if lineStart > carry.startIndex {
+                    carry.removeSubrange(carry.startIndex..<lineStart)
+                }
+            }
+        } catch {
+            return nil
+        }
+        return (owner, account, isAmbiguous)
+    }
+}
+
 /// Builds daily token/cost estimates for Claude by scanning Claude Code's local session logs
 /// natively (`<config dir>/projects/**/*.jsonl`), replacing the external `ccusage` CLI.
 ///
@@ -30,9 +156,7 @@ actor ClaudeLogUsageScanner {
     private let organizationID: String?
     private let accountID: String?
     private let allowsUnattributedSessions: Bool
-    private var sessionOwnership: [String: (
-        size: Int, mtime: Date, attributeMtime: Date?, organizationID: String?, accountID: String?
-    )] = [:]
+    private let ownershipLookup: @Sendable (JSONLScanning.DiscoveredFile) async -> ClaudeSessionOwnershipLookupResult
 
     /// One parsed usage line. Token buckets are pre-normalized into `TokenBreakdown`; dedup fields
     /// ride along so the global dedup pass can run over cached entries.
@@ -70,7 +194,8 @@ actor ClaudeLogUsageScanner {
         cacheIdentityOverride: String? = nil,
         accountUUID: String? = nil,
         organizationUUID: String? = nil,
-        allowsUnattributedSessions: Bool = false
+        allowsUnattributedSessions: Bool = false,
+        ownershipLookup: (@Sendable (JSONLScanning.DiscoveredFile) async -> ClaudeSessionOwnershipLookupResult)? = nil
     ) {
         precondition(cacheIdentityOverride?.isEmpty != true)
         self.environment = environment
@@ -80,12 +205,30 @@ actor ClaudeLogUsageScanner {
         self.organizationID = organizationUUID?.lowercased()
         self.accountID = accountUUID?.lowercased()
         self.allowsUnattributedSessions = allowsUnattributedSessions
+        self.ownershipLookup = ownershipLookup ?? { file in
+            await ClaudeSessionOwnershipIndex.shared.identity(for: file)
+        }
     }
 
     /// Scan the last `daysBack` days of Claude logs. Returns `nil` when no Claude data directory or
     /// no log files exist (the spend tiles then render "No data"); returns an empty series when logs
     /// exist but have no usage in the window.
     func scan(daysBack: Int = UsageHistoryWindow.previousDays, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+        switch await scanResult(daysBack: daysBack, now: now, pricing: pricing) {
+        case .complete(let scan):
+            return scan
+        case .incomplete:
+            return nil
+        }
+    }
+
+    /// Completeness-aware form used by the Claude provider so an ownership/read failure cannot be
+    /// mistaken for a clean scan that simply found no Claude rows.
+    func scanResult(
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing
+    ) async -> ClaudeLogUsageScanResult {
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
         let cacheIdentity = parseCacheIdentity()
         let roots = claudeRoots()
@@ -93,19 +236,22 @@ actor ClaudeLogUsageScanner {
             _ = await scanner.items(
                 from: [], since: since, cacheIdentity: cacheIdentity, parseFile: { url in Self.parseFile(at: url) }
             )
-            return nil
+            return .complete(nil)
         }
 
-        var files = Self.usageFiles(under: roots)
+        guard var files = Self.usageFilesIfComplete(under: roots) else { return .incomplete }
         if let organizationID {
-            files = ownedUsageFiles(files, organizationID: organizationID)
+            guard let owned = await ownedUsageFiles(files, organizationID: organizationID) else {
+                return .incomplete
+            }
+            files = owned
         }
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled else { return .incomplete }
         guard !files.isEmpty else {
             _ = await scanner.items(
                 from: [], since: since, cacheIdentity: cacheIdentity, parseFile: { url in Self.parseFile(at: url) }
             )
-            return nil
+            return .complete(nil)
         }
 
         // Entries come back concatenated in path-sorted file order, so dedup's keep-first is deterministic.
@@ -114,12 +260,12 @@ actor ClaudeLogUsageScanner {
             since: since,
             cacheIdentity: cacheIdentity,
             parseFile: { url in Self.parseFile(at: url) }
-        ), !Task.isCancelled else { return nil }
+        ), !Task.isCancelled else { return .incomplete }
         let deduped = Self.dedup(entries)
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled else { return .incomplete }
         let result = Self.aggregate(entries: deduped, since: since, pricing: pricing)
-        guard !Task.isCancelled else { return nil }
-        return result
+        guard !Task.isCancelled else { return .incomplete }
+        return .complete(result)
     }
 
     /// The parsed usage entries of the last `daysBack` days — the same incremental scan the card's
@@ -159,13 +305,25 @@ actor ClaudeLogUsageScanner {
             .sorted()
         let cacheIdentity = cacheIdentityOverride
             ?? (identityPaths.isEmpty ? "no-claude-root" : identityPaths.joined(separator: "\n"))
-        let files = Self.usageFiles(under: roots)
+        guard var files = Self.usageFilesIfComplete(under: roots) else { return false }
+        if let organizationID {
+            guard let owned = await ownedUsageFiles(files, organizationID: organizationID) else { return false }
+            files = owned
+        }
+        guard !Task.isCancelled else { return false }
         guard !files.isEmpty else { return true }
-        return await scanner.foldItems(
+        let deduplication = ClaudeEntryDeduplication()
+        let complete = await scanner.foldItems(
             from: files, since: since, cacheIdentity: cacheIdentity,
             parseFile: { url in Self.parseFile(at: url) },
-            visit: visit
+            visit: { entry in deduplication.append(entry) }
         )
+        guard complete, !Task.isCancelled else { return false }
+        for entry in deduplication.entries {
+            guard !Task.isCancelled else { return false }
+            visit(entry)
+        }
+        return !Task.isCancelled
     }
 
     /// Stable source configuration identity rather than the discovered root list: Cowork adds session
@@ -301,10 +459,21 @@ actor ClaudeLogUsageScanner {
     /// Every `*.jsonl` under each root's `projects/`, path-sorted so the dedup pass (keep-first wins)
     /// is deterministic — the same order ccusage scans in.
     static func usageFiles(under roots: [URL]) -> [JSONLScanning.DiscoveredFile] {
+        usageFilesIfComplete(under: roots) ?? []
+    }
+
+    static func usageFilesIfComplete(under roots: [URL]) -> [JSONLScanning.DiscoveredFile]? {
         var seenPaths: Set<String> = []
-        return roots
-            .flatMap { JSONLScanning.jsonlFiles(under: $0.appendingPathComponent("projects")) }
-            .sorted { $0.path < $1.path }
+        var files: [JSONLScanning.DiscoveredFile] = []
+        for root in roots {
+            guard !Task.isCancelled,
+                  let rootFiles = JSONLScanning.jsonlFilesIfComplete(
+                    under: root.appendingPathComponent("projects")
+                  )
+            else { return nil }
+            files.append(contentsOf: rootFiles)
+        }
+        return files.sorted { $0.path < $1.path }
             .filter { seenPaths.insert($0.path).inserted }
     }
 
@@ -314,7 +483,7 @@ actor ClaudeLogUsageScanner {
     private func ownedUsageFiles(
         _ files: [JSONLScanning.DiscoveredFile],
         organizationID: String
-    ) -> [JSONLScanning.DiscoveredFile] {
+    ) async -> [JSONLScanning.DiscoveredFile]? {
         let coworkPrefix = homeDirectory()
             .appendingPathComponent("Library/Application Support/Claude/local-agent-mode-sessions")
             .resolvingSymlinksInPath().path + "/"
@@ -324,7 +493,7 @@ actor ClaudeLogUsageScanner {
         var desktopSessionIDs: Set<String>?
 
         for file in files {
-            guard !Task.isCancelled else { return [] }
+            guard !Task.isCancelled else { return nil }
             guard seenPaths.insert(file.path).inserted else { continue }
             let canonicalPath = URL(fileURLWithPath: file.path).resolvingSymlinksInPath().path
             if canonicalPath.hasPrefix(coworkPrefix) {
@@ -346,93 +515,85 @@ actor ClaudeLogUsageScanner {
             } else {
                 sessionFile = file
             }
-            guard let sessionFile, let ownership = sessionIdentity(sessionFile) else { continue }
-            if let owner = ownership.organizationID {
-                if owner == organizationID, accountID == nil || ownership.accountID == accountID {
+            guard let sessionFile else { continue }
+            let lookup = await ownershipLookup(sessionFile)
+            guard !Task.isCancelled else { return nil }
+            switch lookup {
+            case .unreadable:
+                // It may belong to this account; omitting it would publish a successful partial sum.
+                return nil
+            case .readable(let owner, let ownerAccount, let isAmbiguous):
+                guard !isAmbiguous else { continue }
+                if let owner {
+                    if owner == organizationID, accountID == nil || ownerAccount == accountID {
+                        ownedFiles.append(file)
+                    }
+                } else if allowsUnattributedSessions {
                     ownedFiles.append(file)
-                }
-            } else if allowsUnattributedSessions {
-                ownedFiles.append(file)
-            } else if let accountID {
-                if desktopSessionIDs == nil {
-                    desktopSessionIDs = indexedDesktopSessionIDs(accountID: accountID, organizationID: organizationID)
-                }
-                let sessionID = URL(fileURLWithPath: sessionFile.path)
-                    .deletingPathExtension().lastPathComponent.lowercased()
-                if desktopSessionIDs?.contains(sessionID) == true {
-                    ownedFiles.append(file)
+                } else if let accountID {
+                    if desktopSessionIDs == nil {
+                        guard let indexed = indexedDesktopSessionIDs(
+                            accountID: accountID,
+                            organizationID: organizationID
+                        ) else {
+                            AppLog.warn(
+                                LogTag.plugin("claude"),
+                                "account-scoped desktop session index could not be completely read; preserving last-good history"
+                            )
+                            return nil
+                        }
+                        desktopSessionIDs = indexed
+                    }
+                    let sessionID = URL(fileURLWithPath: sessionFile.path)
+                        .deletingPathExtension().lastPathComponent.lowercased()
+                    if desktopSessionIDs?.contains(sessionID) == true {
+                        ownedFiles.append(file)
+                    }
                 }
             }
         }
         return ownedFiles
     }
 
-    private func indexedDesktopSessionIDs(accountID: String, organizationID: String) -> Set<String> {
+    private func indexedDesktopSessionIDs(accountID: String, organizationID: String) -> Set<String>? {
         let directory = homeDirectory()
             .appendingPathComponent("Library/Application Support/Claude/claude-code-sessions")
             .appendingPathComponent(accountID)
             .appendingPathComponent(organizationID)
-        let files = (try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-
-        return Set(files.compactMap { file in
-            guard file.lastPathComponent.hasPrefix("local_"), file.pathExtension == "json",
-                  let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
-                  values.isRegularFile == true, values.isSymbolicLink != true,
-                  let handle = try? FileHandle(forReadingFrom: file)
-            else { return nil }
-            defer { try? handle.close() }
-            guard let prefix = try? handle.read(upToCount: 512),
-                  let header = String(data: prefix, encoding: .utf8),
-                  let field = header.range(of: #""cliSessionId"\s*:\s*""#, options: .regularExpression),
-                  let end = header[field.upperBound...].firstIndex(of: "\""),
-                  let sessionID = UUID(uuidString: String(header[field.upperBound..<end]))
-            else { return nil }
-            return sessionID.uuidString.lowercased()
-        })
-    }
-
-    private func sessionIdentity(
-        _ file: JSONLScanning.DiscoveredFile
-    ) -> (organizationID: String?, accountID: String?)? {
-        if let cached = sessionOwnership[file.path],
-           cached.size == file.size,
-           cached.mtime == file.mtime,
-           cached.attributeMtime == file.attributeMtime
-        {
-            return (cached.organizationID, cached.accountID)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory) else {
+            // A missing index is a valid empty source. A present index that cannot be read below is
+            // different: account ownership is unresolved and the combined history must not publish.
+            return []
         }
+        guard isDirectory.boolValue, FileManager.default.isReadableFile(atPath: directory.path),
+              let files = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+              )
+        else { return nil }
 
-        let data: Data
-        do {
-            data = try Data(contentsOf: URL(fileURLWithPath: file.path), options: .mappedIfSafe)
-        } catch {
-            AppLog.warn(LogTag.plugin("claude"), "Failed to read Claude session ownership from \(file.path): \(error)")
-            return nil
-        }
-
-        let marker = Data(#""ownerOrganizationUuid""#.utf8)
-        var owner: String?
-        var account: String?
-        for line in data.split(separator: UInt8(ascii: "\n")) where line.range(of: marker) != nil {
-            guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-                  let value = object["ownerOrganizationUuid"] as? String,
-                  !value.isEmpty
-            else { continue }
-            let candidate = value.lowercased()
-            if let owner, owner != candidate { return nil }
-            owner = candidate
-            if let candidateAccount = object["ownerAccountUuid"] as? String, !candidateAccount.isEmpty {
-                let normalizedAccount = candidateAccount.lowercased()
-                if let account, account != normalizedAccount { return nil }
-                account = normalizedAccount
+        var sessionIDs: Set<String> = []
+        for file in files where file.lastPathComponent.hasPrefix("local_") && file.pathExtension == "json" {
+            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else {
+                return nil
+            }
+            // Do not follow index symlinks into another account's directory. They do not establish
+            // ownership for this account's sessions.
+            guard values.isSymbolicLink != true else { continue }
+            guard values.isRegularFile == true,
+                  let data = try? Data(contentsOf: file),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rawSessionID = object["cliSessionId"] as? String
+            else { return nil }
+            // Non-UUID values cannot match Claude's UUID-named session logs; keep ignoring those
+            // well-formed but unrelated index entries.
+            if let sessionID = UUID(uuidString: rawSessionID) {
+                sessionIDs.insert(sessionID.uuidString.lowercased())
             }
         }
-
-        sessionOwnership[file.path] = (file.size, file.mtime, file.attributeMtime, owner, account)
-        return (owner, account)
+        return sessionIDs
     }
 
     // MARK: - Line parsing
@@ -621,43 +782,53 @@ actor ClaudeLogUsageScanner {
         var requestID: String?
     }
 
-    /// Drop replayed usage lines, keeping ccusage's preferences. Entries are keyed by
-    /// `(message.id, requestId)`; a second index on `message.id` alone catches sidechain logs that
-    /// replay a parent message under a new request id. On a collision the existing entry is replaced
-    /// only when the candidate wins `shouldReplace`. Entries without a message id are always kept.
-    static func dedup(_ entries: [Entry]) -> [Entry] {
-        var deduped: [Entry] = []
-        var exactIndex: [ExactKey: Int] = [:]
-        var messageIndex: [String: [Int]] = [:]
+    /// Stateful counterpart to `dedup` for the gateway fold. `foldItems` calls its visitor serially;
+    /// the unchecked Sendable conformance lets that callback build only the compact deduplicated set,
+    /// which is emitted after the source scan completes so a failed read cannot publish half a fold.
+    private final class ClaudeEntryDeduplication: @unchecked Sendable {
+        private(set) var entries: [Entry] = []
+        private var exactIndex: [ExactKey: Int] = [:]
+        private var messageIndex: [String: [Int]] = [:]
 
-        JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
+        func append(_ entry: Entry) {
             guard let messageID = entry.messageID else {
-                deduped.append(entry)
+                entries.append(entry)
                 return
             }
             let key = ExactKey(messageID: messageID, requestID: entry.requestID)
             let collision = exactIndex[key] ?? messageIndex[messageID]?.first(where: { index in
-                entry.isSidechain || deduped[index].isSidechain
+                entry.isSidechain || entries[index].isSidechain
             })
 
             if let index = collision {
-                if shouldReplace(candidate: entry, existing: deduped[index]) {
-                    let old = deduped[index]
+                if ClaudeLogUsageScanner.shouldReplace(candidate: entry, existing: entries[index]) {
+                    let old = entries[index]
                     if let oldID = old.messageID {
                         exactIndex.removeValue(forKey: ExactKey(messageID: oldID, requestID: old.requestID))
                     }
-                    deduped[index] = entry
+                    entries[index] = entry
                     exactIndex[key] = index
                 }
                 return
             }
 
-            let index = deduped.count
-            deduped.append(entry)
+            let index = entries.count
+            entries.append(entry)
             exactIndex[key] = index
             messageIndex[messageID, default: []].append(index)
         }
-        return deduped
+    }
+
+    /// Drop replayed usage lines, keeping ccusage's preferences. Entries are keyed by
+    /// `(message.id, requestId)`; a second index on `message.id` alone catches sidechain logs that
+    /// replay a parent message under a new request id. On a collision the existing entry is replaced
+    /// only when the candidate wins `shouldReplace`. Entries without a message id are always kept.
+    static func dedup(_ entries: [Entry]) -> [Entry] {
+        let deduplication = ClaudeEntryDeduplication()
+        JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
+            deduplication.append(entry)
+        }
+        return deduplication.entries
     }
 
     /// Preference order on a duplicate: the non-sidechain (parent) entry, then the larger token
@@ -709,10 +880,11 @@ actor ClaudeLogUsageScanner {
             if cost == nil, entry.tokens.totalTokens > 0 {
                 accumulator.addUnknownModel(day: day, model: modelName)
             }
-            if let model = trimmedModel,
-               let apiEstimate = pricing.estimatedCostDollars(model: model, tokens: entry.tokens) {
-                accumulator.addApiEstimate(day: day, cost: apiEstimate)
-            }
+            accumulator.recordApiEstimate(
+                day: day,
+                cost: trimmedModel.flatMap { pricing.estimatedCostDollars(model: $0, tokens: entry.tokens) },
+                tokens: entry.tokens.totalTokens
+            )
 
             accumulator.add(day: day, tokens: entry.tokens.totalTokens, cost: cost, model: modelName)
         }

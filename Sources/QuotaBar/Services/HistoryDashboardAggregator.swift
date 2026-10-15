@@ -10,6 +10,7 @@ struct HistoryDayPoint: Identifiable, Equatable, Sendable {
     let label: String
     let tokens: Int
     let cost: Double?
+    let hasIncompleteCost: Bool
     let apiEstimate: Double?
     var id: String { date }
 }
@@ -35,6 +36,7 @@ struct HistoryProviderSection: Identifiable, Equatable, Sendable {
     let displayName: String
     let tokens: Int
     let cost: Double?
+    let hasIncompleteCost: Bool
     let apiEstimate: Double?
     let rows: [HistoryModelRow]
     var id: String { providerID }
@@ -47,6 +49,7 @@ struct HistoryPeriodTotal: Equatable, Sendable {
     let tokens: Int
     let cost: Double?
     let apiEstimate: Double?
+    let hasIncompleteCost: Bool
 }
 
 /// The full Usage History screen model: the daily trend across the 30-day window, period totals, and
@@ -71,6 +74,9 @@ struct HistoryReport: Equatable, Sendable {
     /// marks its total with "(Est.)" then — the tiles' ⓘ convention, applied to the screen's
     /// headline figure.
     let lifetimeCostIsEstimated: Bool
+    /// True when lifetime history includes tokens that could not be priced completely. In that case
+    /// the partial dollar subtotal is hidden while measured tokens remain visible.
+    let lifetimeHasIncompleteCost: Bool
     let generatedAt: Date
 
     /// Every section is empty (no enabled provider has local history) — the screen's empty state.
@@ -127,7 +133,7 @@ enum HistoryDashboardAggregator {
             }
         )
 
-        var daysByDate: [String: (tokens: Int, cost: Double?, sawCost: Bool, estimate: Double?, sawEstimate: Bool)] = [:]
+        var daysByDate: [String: (tokens: Int, cost: Double?, sawCost: Bool, estimate: Double?, sawEstimate: Bool, incompleteCost: Bool, incompleteEstimate: Bool)] = [:]
         var sections: [HistoryProviderSection] = []
 
         // Lifetime: every recorded day of every provider's history, unclipped by the 30-day window.
@@ -136,8 +142,10 @@ enum HistoryDashboardAggregator {
         var lifetimeCost: Double?
         var lifetimeCostSeen = false
         var lifetimeCostIsEstimated = false
+        var lifetimeCostIncomplete = false
         var lifetimeEstimate: Double?
         var lifetimeEstimateSeen = false
+        var lifetimeEstimateIncomplete = false
         var earliestDayKey: String?
 
         for providerID in input.enabledProviderIDs {
@@ -146,9 +154,11 @@ enum HistoryDashboardAggregator {
             var tokens = 0
             var cost: Double?
             var sawCost = false
+            var sectionCostIncomplete = false
             var estimate: Double?
             var sawEstimate = false
-            var rowsBySlug: [String: (tokens: Int, cost: Double?, sawCost: Bool, spelling: String)] = [:]
+            var sectionEstimateIncomplete = false
+            var rowsBySlug: [String: (tokens: Int, cost: Double?, sawCost: Bool, spelling: String, incompleteCost: Bool)] = [:]
 
             for day in history.series.daily {
                 // The lifetime fold runs over every recorded day; the windowed fold below re-enters
@@ -156,7 +166,9 @@ enum HistoryDashboardAggregator {
                 // idle zero-filled day is not evidence of when recording began.
                 if day.totalTokens > 0 || day.costUSD != nil {
                     lifetimeTokens = ProviderParse.addingSaturating(lifetimeTokens, day.totalTokens)
-                    if let dayCost = day.costUSD {
+                    let dayIncomplete = hasIncompleteCost(day, history: history)
+                    if dayIncomplete { lifetimeCostIncomplete = true }
+                    if !dayIncomplete, let dayCost = day.costUSD {
                         lifetimeCost = (lifetimeCost ?? 0) + dayCost
                         lifetimeCostSeen = true
                         // A subscription-log provider's dollars are imputed at fold time (no
@@ -166,7 +178,10 @@ enum HistoryDashboardAggregator {
                             lifetimeCostIsEstimated = true
                         }
                     }
-                    if let dayEstimate = history.apiEstimateByDay?[day.date] {
+                    let estimateIncomplete = history.apiEstimateIncompleteDays?.contains(day.date) == true
+                        || history.unknownModelsByDay[day.date]?.isEmpty == false
+                    if estimateIncomplete { lifetimeEstimateIncomplete = true }
+                    if !estimateIncomplete, let dayEstimate = history.apiEstimateByDay?[day.date] {
                         lifetimeEstimate = (lifetimeEstimate ?? 0) + dayEstimate
                         lifetimeEstimateSeen = true
                     }
@@ -177,13 +192,24 @@ enum HistoryDashboardAggregator {
             }
 
             for day in history.series.daily where windowKeys.contains(day.date) {
-                var bucket = daysByDate[day.date] ?? (0, nil, false, nil, false)
+                var bucket = daysByDate[day.date] ?? (0, nil, false, nil, false, false, false)
                 bucket.tokens = ProviderParse.addingSaturating(bucket.tokens, day.totalTokens)
-                if let dayCost = day.costUSD {
+                let dayIncomplete = hasIncompleteCost(day, history: history)
+                if dayIncomplete {
+                    bucket.incompleteCost = true
+                    sectionCostIncomplete = true
+                }
+                if !dayIncomplete, let dayCost = day.costUSD {
                     bucket.cost = (bucket.cost ?? 0) + dayCost
                     bucket.sawCost = true
                 }
-                if let dayEstimate = history.apiEstimateByDay?[day.date] {
+                let estimateIncomplete = history.apiEstimateIncompleteDays?.contains(day.date) == true
+                    || history.unknownModelsByDay[day.date]?.isEmpty == false
+                if estimateIncomplete {
+                    bucket.incompleteEstimate = true
+                    sectionEstimateIncomplete = true
+                }
+                if !estimateIncomplete, let dayEstimate = history.apiEstimateByDay?[day.date] {
                     bucket.estimate = (bucket.estimate ?? 0) + dayEstimate
                     bucket.sawEstimate = true
                 }
@@ -192,11 +218,12 @@ enum HistoryDashboardAggregator {
                 // The section's totals cover the whole labeled 30-day window — not just today and
                 // the 7-day slice, or a provider whose usage sits 8-30 days back would read idle.
                 tokens = ProviderParse.addingSaturating(tokens, day.totalTokens)
-                if let dayCost = day.costUSD {
+                if !dayIncomplete, let dayCost = day.costUSD {
                     cost = (cost ?? 0) + dayCost
                     sawCost = true
                 }
-                if let dayEstimate = history.apiEstimateByDay?[day.date] {
+                if !estimateIncomplete,
+                   let dayEstimate = history.apiEstimateByDay?[day.date] {
                     estimate = (estimate ?? 0) + dayEstimate
                     sawEstimate = true
                 }
@@ -205,11 +232,13 @@ enum HistoryDashboardAggregator {
             for day in history.modelUsage?.daily ?? [] where windowKeys.contains(day.date) {
                 for model in day.models {
                     let key = model.model.lowercased()
-                    var row = rowsBySlug[key] ?? (0, nil, false, model.model)
+                    var row = rowsBySlug[key] ?? (0, nil, false, model.model, false)
                     row.tokens = ProviderParse.addingSaturating(row.tokens, model.totalTokens)
                     if let modelCost = model.costUSD {
                         row.cost = (row.cost ?? 0) + modelCost
                         row.sawCost = true
+                    } else if model.totalTokens > 0 {
+                        row.incompleteCost = true
                     }
                     rowsBySlug[key] = row
                 }
@@ -225,7 +254,7 @@ enum HistoryDashboardAggregator {
                         providerID: providerID,
                         slug: value.spelling,
                         tokens: value.tokens,
-                        cost: value.sawCost ? value.cost : nil
+                        cost: value.sawCost && !value.incompleteCost ? value.cost : nil
                     )
                 }
                 .sorted { lhs, rhs in
@@ -238,48 +267,60 @@ enum HistoryDashboardAggregator {
                 providerID: providerID,
                 displayName: input.displayNameByProviderID[providerID] ?? providerID,
                 tokens: tokens,
-                cost: sawCost ? cost : nil,
-                apiEstimate: sawEstimate ? estimate : nil,
+                cost: sawCost && !sectionCostIncomplete ? cost : nil,
+                hasIncompleteCost: sectionCostIncomplete,
+                apiEstimate: sawEstimate && !sectionEstimateIncomplete ? estimate : nil,
                 rows: rows
             ))
         }
 
         let days = earliestDayKey == nil ? [] : windowKeys.sorted(by: >).map { date -> HistoryDayPoint in
-            let bucket = daysByDate[date] ?? (0, nil, false, nil, false)
+            let bucket = daysByDate[date] ?? (0, nil, false, nil, false, false, false)
             let day = parseDay(date, calendar: calendar)
             return HistoryDayPoint(
                 date: date,
                 label: day.map(Formatters.monthDayLabel) ?? date,
                 tokens: bucket.tokens,
-                cost: bucket.sawCost ? bucket.cost : nil,
-                apiEstimate: bucket.sawEstimate ? bucket.estimate : nil
+                cost: bucket.sawCost && !bucket.incompleteCost ? bucket.cost : nil,
+                hasIncompleteCost: bucket.incompleteCost,
+                apiEstimate: bucket.sawEstimate && !bucket.incompleteEstimate ? bucket.estimate : nil
             )
         }
 
         var todayTokens = 0
         var todayCost: Double?
         var todayCostSeen = false
+        var todayCostIncomplete = false
         var todayEstimate: Double?
         var todayEstimateSeen = false
+        var todayEstimateIncomplete = false
         if let bucket = daysByDate[todayKey] {
             todayTokens = bucket.tokens
             if bucket.sawCost { todayCost = bucket.cost; todayCostSeen = true }
+            todayCostIncomplete = bucket.incompleteCost
             if bucket.sawEstimate { todayEstimate = bucket.estimate; todayEstimateSeen = true }
+            todayEstimateIncomplete = bucket.incompleteEstimate
         }
 
         var weekTokens = 0
         var weekCost: Double?
         var weekCostSeen = false
+        var weekCostIncomplete = false
         var weekEstimate: Double?
         var weekEstimateSeen = false
+        var weekEstimateIncomplete = false
         var monthTokens = 0
         var monthCost: Double?
         var monthCostSeen = false
+        var monthCostIncomplete = false
         var monthEstimate: Double?
         var monthEstimateSeen = false
+        var monthEstimateIncomplete = false
         for (date, bucket) in daysByDate {
             if sevenDayKeys.contains(date) {
                 weekTokens = ProviderParse.addingSaturating(weekTokens, bucket.tokens)
+                if bucket.incompleteCost { weekCostIncomplete = true }
+                if bucket.incompleteEstimate { weekEstimateIncomplete = true }
                 if bucket.sawCost, let dayCost = bucket.cost {
                     weekCost = (weekCost ?? 0) + dayCost
                     weekCostSeen = true
@@ -290,6 +331,8 @@ enum HistoryDashboardAggregator {
                 }
             }
             monthTokens = ProviderParse.addingSaturating(monthTokens, bucket.tokens)
+            if bucket.incompleteCost { monthCostIncomplete = true }
+            if bucket.incompleteEstimate { monthEstimateIncomplete = true }
             if bucket.sawCost, let dayCost = bucket.cost {
                 monthCost = (monthCost ?? 0) + dayCost
                 monthCostSeen = true
@@ -304,29 +347,41 @@ enum HistoryDashboardAggregator {
             days: days,
             today: HistoryPeriodTotal(
                 tokens: todayTokens,
-                cost: todayCostSeen ? todayCost : nil,
-                apiEstimate: todayEstimateSeen ? todayEstimate : nil
+                cost: todayCostSeen && !todayCostIncomplete ? todayCost : nil,
+                apiEstimate: todayEstimateSeen && !todayEstimateIncomplete ? todayEstimate : nil,
+                hasIncompleteCost: todayCostIncomplete
             ),
             last7: HistoryPeriodTotal(
                 tokens: weekTokens,
-                cost: weekCostSeen ? weekCost : nil,
-                apiEstimate: weekEstimateSeen ? weekEstimate : nil
+                cost: weekCostSeen && !weekCostIncomplete ? weekCost : nil,
+                apiEstimate: weekEstimateSeen && !weekEstimateIncomplete ? weekEstimate : nil,
+                hasIncompleteCost: weekCostIncomplete
             ),
             last30: HistoryPeriodTotal(
                 tokens: monthTokens,
-                cost: monthCostSeen ? monthCost : nil,
-                apiEstimate: monthEstimateSeen ? monthEstimate : nil
+                cost: monthCostSeen && !monthCostIncomplete ? monthCost : nil,
+                apiEstimate: monthEstimateSeen && !monthEstimateIncomplete ? monthEstimate : nil,
+                hasIncompleteCost: monthCostIncomplete
             ),
             sections: sections,
             lifetime: HistoryPeriodTotal(
                 tokens: lifetimeTokens,
-                cost: lifetimeCostSeen ? lifetimeCost : nil,
-                apiEstimate: lifetimeEstimateSeen ? lifetimeEstimate : nil
+                cost: lifetimeCostSeen && !lifetimeCostIncomplete ? lifetimeCost : nil,
+                apiEstimate: lifetimeEstimateSeen && !lifetimeEstimateIncomplete ? lifetimeEstimate : nil,
+                hasIncompleteCost: lifetimeCostIncomplete
             ),
             lifetimeSinceLabel: earliestDayKey.flatMap { Self.sinceLabel(for: $0, calendar: calendar) },
             lifetimeCostIsEstimated: lifetimeCostIsEstimated,
+            lifetimeHasIncompleteCost: lifetimeCostIncomplete,
             generatedAt: now
         )
+    }
+
+    private static func hasIncompleteCost(_ day: DailyUsageEntry, history: ProviderUsageHistory) -> Bool {
+        guard day.totalTokens > 0 else { return false }
+        return !day.costIsComplete
+            || day.costUSD == nil
+            || history.unknownModelsByDay[day.date]?.isEmpty == false
     }
 
     /// The hero's "since" caption: the earliest recorded day as the app's localized month + year

@@ -53,13 +53,17 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         XCTAssertTrue(scan.logScan.series.daily.isEmpty)
     }
 
-    func testFailingDatabaseIsSkippedNotFatal() async throws {
+    func testOneFailingDatabaseRejectsPartialHistory() async {
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode-next.db": db2], failing: ["/oc/opencode.db"]),
             databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] }
         )
-        guard let scan = try await scanner.scan(now: now) else { return XCTFail("expected a scan") }
-        XCTAssertEqual(scan.logScan.series.daily.compactMap(\.costUSD).reduce(0, +), 4.0, accuracy: 0.0001)
+        do {
+            _ = try await scanner.scan(now: now)
+            XCTFail("a partial multi-database scan must not replace last-good history")
+        } catch {
+            XCTAssertEqual(error as? OpenCodeUsageError, .databaseUnreadable)
+        }
     }
 
     func testAllDatabasesFailingThrowsInsteadOfEmptyScan() async {
@@ -88,6 +92,38 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         }
     }
 
+    func testMissingConfiguredRouterLedgerRejectsCombinedHistory() async {
+        let missingLedger = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-router-ledger-\(UUID().uuidString).jsonl").path
+        let scanner = OpenCodeUsageScanner(
+            sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": db1]),
+            databasePaths: { ["/oc/opencode.db"] },
+            routerLedgerPaths: { [missingLedger] }
+        )
+        do {
+            _ = try await scanner.scan(now: now, gatewaySources: [.codex])
+            XCTFail("a missing configured router source must not publish the readable subset")
+        } catch {
+            XCTAssertEqual(error as? OpenCodeUsageError, .usageSourcesIncomplete)
+        }
+    }
+
+    func testMissingConfiguredHermesDatabaseRejectsCombinedHistory() async {
+        let missingDatabase = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-hermes-db-\(UUID().uuidString).db").path
+        let scanner = OpenCodeUsageScanner(
+            sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": db1]),
+            databasePaths: { ["/oc/opencode.db"] },
+            hermesStateDBPath: { missingDatabase }
+        )
+        do {
+            _ = try await scanner.scan(now: now, gatewaySources: [.hermes])
+            XCTFail("a missing configured Hermes source must not publish the readable subset")
+        } catch {
+            XCTAssertEqual(error as? OpenCodeUsageError, .usageSourcesIncomplete)
+        }
+    }
+
     func testHasHostedUsageProbe() {
         let db = "[" + openCodeRow("2026-07-12T10:00:00.000Z", "1.0", 500, "gpt-5.5", "opencode") + "]"
         let withUsage = OpenCodeUsageScanner(
@@ -103,6 +139,15 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         XCTAssertFalse(empty.hasHostedUsage())
     }
 
+    func testHasHostedUsageProbeTreatsUnreadableDatabaseAsFootprint() {
+        let scanner = OpenCodeUsageScanner(
+            sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode-next.db": "[]"], failing: ["/oc/opencode.db"]),
+            databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] }
+        )
+
+        XCTAssertTrue(scanner.hasHostedUsage())
+    }
+
     func testSQLCutoffMatchesCalendarTileWindow() async throws {
         let now = d("2026-07-12T18:00:00.000Z")
         let sqlite = OpenCodeFakeSQLite(data: ["/oc/opencode.db": "[]"])
@@ -112,6 +157,17 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         let tileSinceMs = Int(JSONLScanning.sinceDate(daysBack: UsageHistoryWindow.previousDays, now: now).timeIntervalSince1970 * 1000)
         guard let sql = sqlite.lastDataSQL else { return XCTFail("expected a data query") }
         XCTAssertTrue(sql.contains("time_created >= \(tileSinceMs)"), sql)
+    }
+
+    func testSQLCanLoadTheLifetimeHistoryWindow() async throws {
+        let sqlite = OpenCodeFakeSQLite(data: ["/oc/opencode.db": "[]"])
+        let scanner = OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { ["/oc/opencode.db"] })
+        let daysBack = UsageHistoryWindow.lifetimeDays(through: now)
+        _ = try await scanner.scan(now: now, daysBack: daysBack)
+
+        let lifetimeSinceMs = Int(JSONLScanning.sinceDate(daysBack: daysBack, now: now).timeIntervalSince1970 * 1000)
+        guard let sql = sqlite.lastDataSQL else { return XCTFail("expected a data query") }
+        XCTAssertTrue(sql.contains("time_created >= \(lifetimeSinceMs)"), sql)
     }
 
     func testAbsurdTokenCountIsClampedNotCrashing() async throws {

@@ -44,6 +44,19 @@ struct ClaudeUsageClient: Sendable {
         self.httpClient = httpClient
     }
 
+    /// Anthropic reports a missing OAuth permission on `/api/oauth/usage` as HTTP 403 with the
+    /// message `OAuth token does not meet scope requirement user:profile`. Treat only that explicit
+    /// message as a scope problem; other 403s can be expired sessions or account-level denials.
+    static func isMissingProfileScopeFailure(_ response: HTTPResponse) -> Bool {
+        guard response.statusCode == 403,
+              let body = String(data: response.body, encoding: .utf8)?.lowercased()
+        else { return false }
+
+        return (body.contains("oauth token does not meet scope requirement") && body.contains("user:profile"))
+            || body.contains("oauth token missing user:profile scope")
+            || body.contains("missing user:profile scope")
+    }
+
     func refreshToken(_ refreshToken: String, config: ClaudeOAuthConfig) async throws -> HTTPResponse {
         let body: [String: Any] = [
             "grant_type": "refresh_token",
@@ -101,6 +114,7 @@ struct ClaudeUsageClient: Sendable {
                 timeout: 10
             ))
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             throw ClaudeUsageError.connectionFailed
         }
         guard (200..<300).contains(response.statusCode) else { return response }

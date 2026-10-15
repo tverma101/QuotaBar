@@ -1,13 +1,13 @@
 # Hermes
 
-Tracks your Hermes Agent usage — tokens and cost across your sessions — from Hermes' own local session
-database. Nothing is sent anywhere.
+Tracks your Hermes Agent usage — tokens and cost across sessions billed to their configured providers —
+from Hermes' own local session database. Nothing is sent anywhere.
 
 ## What it tracks
 
 | Metric | Meaning |
 |---|---|
-| Today | Tokens (and estimated cost) across all Hermes sessions started today |
+| Today | Tokens (and estimated cost) across Hermes sessions billed outside OpenCode and started today |
 | This Week | Same, for the current week (starts Monday, your local calendar) |
 | This Month | Same, for the current calendar month |
 | Usage Trend | A day-by-day sparkline of tokens over the last month |
@@ -18,8 +18,15 @@ usage reads "No data".
 
 The token counts come straight from Hermes' accounting (`input_tokens`, `output_tokens`,
 `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`), so they include cached and reasoning
-tokens the way Hermes bills them. The dollar figure is Hermes' own per-session estimate, so it carries
-the ⓘ marker; tokens are always measured.
+tokens the way Hermes bills them. OpenCode-billed sessions appear on the OpenCode card, which reflects
+the account that paid for them; including them here as well would double count those tokens in Total
+Spend. The dollar figure is Hermes' own per-session estimate, so it carries the ⓘ marker; tokens are
+always measured.
+
+QuotaBar does not retain per-day model attribution for Hermes, so it cannot price those tokens at
+public API rates. Token days are marked incomplete in Usage History, so the combined public-rate
+estimate is not shown as a complete total. If any token-bearing session has no recorded cost, the
+Hermes dollar total for that period or day is left blank while its measured tokens remain visible.
 
 ## Where the data comes from
 

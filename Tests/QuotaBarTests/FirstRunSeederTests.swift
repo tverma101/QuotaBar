@@ -95,6 +95,66 @@ final class FirstRunSeederTests: XCTestCase {
         XCTAssertEqual(enablement.enabledIDs, ["claude", "cursor"])
     }
 
+    func testInterruptedFirstRunProbeResumesAfterStoreReload() async {
+        let defaults = makeDefaults("resume-after-reload")
+        let enablement = ProviderEnablementStore(defaults: defaults)
+        let gate = ManualCredentialProbe()
+        let providers = [stub("claude", probe: { await gate.probe() })]
+        let onboarding = OnboardingStore(defaults: makeDefaults("resume-onboarding"))
+
+        let firstAttempt = FirstRunSeeder.seedIfNeeded(
+            isFreshInstall: true, providers: providers, enablement: enablement, onboarding: onboarding
+        )
+        await gate.waitForArrivals(1)
+        XCTAssertTrue(enablement.hasPendingFirstRunCredentialProbe)
+
+        // Simulates a relaunch while the first process is still suspended in a local credential probe.
+        let relaunchedEnablement = ProviderEnablementStore(defaults: defaults)
+        let resumedAttempt = FirstRunSeeder.seedIfNeeded(
+            isFreshInstall: false,
+            providers: providers,
+            enablement: relaunchedEnablement,
+            onboarding: OnboardingStore(defaults: makeDefaults("resume-onboarding-reloaded"))
+        )
+        XCTAssertNotNil(resumedAttempt)
+        await gate.waitForArrivals(2)
+        gate.resumeAll(true)
+
+        await firstAttempt?.value
+        await resumedAttempt?.value
+        XCTAssertEqual(relaunchedEnablement.enabledIDs, ["claude"])
+        XCTAssertFalse(relaunchedEnablement.hasPendingFirstRunCredentialProbe)
+    }
+
+    func testInterruptedFirstRunProbeNeverOverwritesChoiceMadeBeforeRelaunch() async {
+        let defaults = makeDefaults("resume-preserves-choice")
+        let enablement = ProviderEnablementStore(defaults: defaults)
+        let gate = ManualCredentialProbe()
+        let providers = [stub("claude", probe: { await gate.probe() })]
+        let firstAttempt = FirstRunSeeder.seedIfNeeded(
+            isFreshInstall: true,
+            providers: providers,
+            enablement: enablement,
+            onboarding: OnboardingStore(defaults: makeDefaults("preserve-choice-onboarding"))
+        )
+        await gate.waitForArrivals(1)
+
+        enablement.setEnabled(false, for: "claude")
+        let relaunchedEnablement = ProviderEnablementStore(defaults: defaults)
+        let resumedAttempt = FirstRunSeeder.seedIfNeeded(
+            isFreshInstall: false,
+            providers: providers,
+            enablement: relaunchedEnablement,
+            onboarding: OnboardingStore(defaults: makeDefaults("preserve-choice-onboarding-reloaded"))
+        )
+
+        XCTAssertNil(resumedAttempt, "a persisted user-choice revision cancels stale first-run detection")
+        XCTAssertFalse(relaunchedEnablement.hasPendingFirstRunCredentialProbe)
+        gate.resumeAll(true)
+        await firstAttempt?.value
+        XCTAssertEqual(relaunchedEnablement.enabledIDs, [])
+    }
+
     // MARK: - Reset All reseed
 
     func testReseedOverwritesCurrentChoicesWithDetectedSet() async {
@@ -180,6 +240,10 @@ final class FirstRunSeederTests: XCTestCase {
         CredentialStubProvider(id: id, hasCredentials: hasCredentials)
     }
 
+    private func stub(_ id: String, probe: @escaping @MainActor () async -> Bool) -> CredentialStubProvider {
+        CredentialStubProvider(id: id, probe: probe)
+    }
+
     private func makeDefaults(_ name: String) -> UserDefaults {
         let suiteName = "OpenUsageTests.FirstRunSeeder.\(name).\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -204,11 +268,37 @@ private final class CredentialStubProvider: ProviderRuntime {
         self.hasCredentials = { await gate.arrive() }
     }
 
+    init(id: String, probe: @escaping @MainActor () async -> Bool) {
+        self.provider = Provider(id: id, displayName: id.capitalized, icon: .providerMark(id))
+        self.hasCredentials = probe
+    }
+
     func refresh() async -> ProviderSnapshot {
         ProviderSnapshot.make(provider: provider, plan: nil, lines: [], refreshedAt: Date())
     }
 
     func hasLocalCredentials() async -> Bool { await hasCredentials() }
+}
+
+@MainActor
+private final class ManualCredentialProbe {
+    private var arrivals = 0
+    private var continuations: [CheckedContinuation<Bool, Never>] = []
+
+    func probe() async -> Bool {
+        arrivals += 1
+        return await withCheckedContinuation { continuations.append($0) }
+    }
+
+    func waitForArrivals(_ count: Int) async {
+        while arrivals < count { await Task.yield() }
+    }
+
+    func resumeAll(_ result: Bool) {
+        let waiting = continuations
+        continuations.removeAll()
+        for continuation in waiting { continuation.resume(returning: result) }
+    }
 }
 
 /// Suspends each arriver until `expected` arrivals are in flight, then resumes them all with `true`.

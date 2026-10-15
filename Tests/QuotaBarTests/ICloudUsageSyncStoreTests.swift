@@ -119,19 +119,69 @@ final class ICloudUsageSyncStoreTests: XCTestCase {
         try await waitUntil { !sync.isSyncing }
     }
 
-    func testDeviceIdentitySurvivesPreferencesResetThroughKeychainStore() {
+    func testDeviceIdentitySurvivesPreferencesResetThroughKeychainStore() async throws {
         let expectedID = UUID().uuidString.lowercased()
         let firstDefaults = makeDefaults("identity-first")
         firstDefaults.set(expectedID, forKey: "openusage.icloudSync.deviceID.v1")
-        let deviceIDStore = MemoryDeviceIDStore()
+        let deviceIDStore = MemoryDeviceIDStore(expectedID)
 
         let first = makeSync(defaults: firstDefaults, fileStore: RecordingHistoryFileStore(), deviceIDStore: deviceIDStore)
         let resetDefaults = makeDefaults("identity-after-reset")
         let afterReset = makeSync(defaults: resetDefaults, fileStore: RecordingHistoryFileStore(), deviceIDStore: deviceIDStore)
 
         XCTAssertEqual(first.deviceID, expectedID)
+        try await waitUntil { afterReset.deviceID == expectedID }
         XCTAssertEqual(afterReset.deviceID, expectedID)
         XCTAssertEqual(resetDefaults.string(forKey: "openusage.icloudSync.deviceID.v1"), expectedID)
+    }
+
+    func testDeviceIDKeychainLookupDoesNotBlockMainActorInitialization() async throws {
+        let expectedID = UUID().uuidString.lowercased()
+        let provisionalID = UUID().uuidString.lowercased()
+        let deviceIDStore = BlockingDeviceIDStore(deviceID: expectedID)
+        defer { deviceIDStore.releaseRead() }
+        let fileStore = RecordingHistoryFileStore()
+        let defaults = makeDefaults("device-id-off-main")
+        defaults.set(provisionalID, forKey: "openusage.icloudSync.deviceID.v1")
+        let sync = makeSync(
+            defaults: defaults,
+            fileStore: fileStore,
+            deviceIDStore: deviceIDStore
+        )
+
+        XCTAssertEqual(sync.deviceID, provisionalID)
+        try await waitUntil { deviceIDStore.didStartRead }
+        XCTAssertEqual(deviceIDStore.readWasOnMainThread, false)
+        XCTAssertEqual(sync.deviceID, provisionalID, "the provisional identity must not race the pending Keychain read")
+
+        deviceIDStore.releaseRead()
+        try await waitUntil { sync.deviceID == expectedID }
+        XCTAssertFalse(sync.enabled, "identity lookup alone must not enable iCloud sync")
+        let writeCount = await fileStore.writeCount
+        XCTAssertEqual(writeCount, 0, "device identity lookup must not activate iCloud history sync")
+    }
+
+    func testEnableDuringDeviceIDLookupReconcilesOnlyOnce() async throws {
+        let expectedID = UUID().uuidString.lowercased()
+        let deviceIDStore = BlockingDeviceIDStore(deviceID: expectedID)
+        defer { deviceIDStore.releaseRead() }
+        let fileStore = RecordingHistoryFileStore()
+        let sync = makeSync(
+            defaults: makeDefaults("enable-during-device-id-read"),
+            fileStore: fileStore,
+            deviceIDStore: deviceIDStore,
+            writeDebounce: .milliseconds(10)
+        )
+
+        try await waitUntil { deviceIDStore.didStartRead }
+        sync.enabled = true
+        deviceIDStore.releaseRead()
+
+        try await waitUntil { await fileStore.writeCount == 1 && !sync.isSyncing }
+        try await Task.sleep(for: .milliseconds(40))
+
+        let writeCount = await fileStore.writeCount
+        XCTAssertEqual(writeCount, 1, "identity completion and the queued toggle must coalesce to one initial write")
     }
 
     func testKeychainIdentityIsScopedToDevelopmentAndProductionBundles() throws {
@@ -155,7 +205,7 @@ final class ICloudUsageSyncStoreTests: XCTestCase {
     private func makeSync(
         defaults: UserDefaults,
         fileStore: RecordingHistoryFileStore,
-        deviceIDStore: MemoryDeviceIDStore = MemoryDeviceIDStore(),
+        deviceIDStore: any ICloudDeviceIDStoring = MemoryDeviceIDStore(),
         writeDebounce: Duration = .seconds(3)
     ) -> ICloudUsageSyncStore {
         let dataStore = WidgetDataStore(
@@ -196,14 +246,62 @@ final class ICloudUsageSyncStoreTests: XCTestCase {
 }
 
 private final class MemoryDeviceIDStore: ICloudDeviceIDStoring, @unchecked Sendable {
+    private let lock = NSLock()
     private var deviceID: String?
 
+    init(_ deviceID: String? = nil) {
+        self.deviceID = deviceID
+    }
+
     func readDeviceID() throws -> String? {
-        deviceID
+        lock.lock(); defer { lock.unlock() }
+        return deviceID
     }
 
     func writeDeviceID(_ deviceID: String) throws {
+        lock.lock(); defer { lock.unlock() }
         self.deviceID = deviceID
+    }
+}
+
+private final class BlockingDeviceIDStore: ICloudDeviceIDStoring, @unchecked Sendable {
+    private let condition = NSCondition()
+    private let deviceID: String
+    private var started = false
+    private var released = false
+    private var mainThread: Bool?
+
+    init(deviceID: String) {
+        self.deviceID = deviceID
+    }
+
+    var didStartRead: Bool {
+        condition.lock(); defer { condition.unlock() }
+        return started
+    }
+
+    var readWasOnMainThread: Bool? {
+        condition.lock(); defer { condition.unlock() }
+        return mainThread
+    }
+
+    func readDeviceID() throws -> String? {
+        condition.lock()
+        started = true
+        mainThread = Thread.isMainThread
+        condition.broadcast()
+        while !released { condition.wait() }
+        condition.unlock()
+        return deviceID
+    }
+
+    func writeDeviceID(_ deviceID: String) throws {}
+
+    func releaseRead() {
+        condition.lock()
+        released = true
+        condition.broadcast()
+        condition.unlock()
     }
 }
 

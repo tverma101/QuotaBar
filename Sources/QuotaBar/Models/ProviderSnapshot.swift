@@ -16,9 +16,9 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
     /// surfaces as the provider header's amber triangle rather than blanking the provider. Cached with the
     /// snapshot; cleared on the next refresh when the condition resolves.
     var warning: String?
-    /// An explicit successful menu-bar refresh can invalidate previously shown quota state when the
-    /// provider has definitive evidence that it no longer applies. Other providers preserve prior
-    /// progress during incomplete menu-bar passes.
+    /// Explicit evidence can invalidate previously shown quota state. Successful partial refreshes
+    /// and authentication/subscription errors may set this when old limits no longer apply; otherwise
+    /// incomplete menu-bar passes preserve prior progress.
     var clearsPriorMenuBarQuotaState: Bool?
     /// True when `usageHistory` was carried over from a previous snapshot by a menu-bar merge (or a
     /// full-scope scan miss) rather than computed by this refresh. A menu-bar merge re-stamps
@@ -104,19 +104,32 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
     /// user-facing `localizedDescription` (UI copy is unchanged), and the telemetry category is derived
     /// from the error's `CategorizedError` conformance (falling back to `.other` for anything that
     /// doesn't classify itself). Preferred over `error(provider:message:)` wherever an `Error` is in hand.
-    static func error(provider: Provider, error: Error) -> ProviderSnapshot {
+    static func error(
+        provider: Provider,
+        error: Error,
+        clearsPriorMenuBarQuotaState: Bool? = nil
+    ) -> ProviderSnapshot {
         Self.error(
             provider: provider,
             message: error.localizedDescription,
-            category: (error as? CategorizedError)?.errorCategory ?? .other
+            category: error is CancellationError
+                ? .cancelled
+                : ((error as? CategorizedError)?.errorCategory ?? .other),
+            clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState
         )
     }
 
-    static func error(provider: Provider, message: String, category: ErrorCategory? = nil) -> ProviderSnapshot {
+    static func error(
+        provider: Provider,
+        message: String,
+        category: ErrorCategory? = nil,
+        clearsPriorMenuBarQuotaState: Bool? = nil
+    ) -> ProviderSnapshot {
         ProviderSnapshot(
             providerID: provider.id,
             displayName: provider.displayName,
             lines: [.badge(label: MetricLine.errorBadgeLabel, text: message, colorHex: "#EF4444")],
+            clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState,
             errorCategory: category
         )
     }

@@ -10,7 +10,7 @@ import Foundation
 /// matches reads nothing. Growth reads only the new bytes. A new inode or a shorter file rebuilds.
 final class CodexRouterAggregateIndex: @unchecked Sendable {
     static let shared = CodexRouterAggregateIndex()
-    static let schema = 4
+    static let schema = 5
     static let maxResidentRecords = 32
 
     struct Key: Codable, Equatable, Sendable {

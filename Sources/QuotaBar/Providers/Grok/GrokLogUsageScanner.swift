@@ -209,9 +209,11 @@ actor GrokLogUsageScanner {
             let day = DailyUsageAccumulator.dayKey(from: entry.timestamp)
             let cost = entry.carriedCost
                 ?? pricing.estimatedCostDollars(model: entry.model, tokens: entry.tokens)
-            if let apiEstimate = pricing.estimatedCostDollars(model: entry.model, tokens: entry.tokens) {
-                accumulator.addApiEstimate(day: day, cost: apiEstimate)
-            }
+            accumulator.recordApiEstimate(
+                day: day,
+                cost: pricing.estimatedCostDollars(model: entry.model, tokens: entry.tokens),
+                tokens: entry.tokens.totalTokens
+            )
             if cost == nil, entry.tokens.totalTokens > 0 {
                 accumulator.addUnknownModel(day: day, model: entry.model)
             }

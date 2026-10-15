@@ -6,6 +6,7 @@ struct OpenRouterAuth: Hashable, Sendable {
 
 enum OpenRouterAuthError: Error, LocalizedError, Equatable {
     case missingKey
+    case credentialsUnreadable
     case invalidKey
     case saveFailed
     case deleteFailed
@@ -22,6 +23,8 @@ enum OpenRouterAuthError: Error, LocalizedError, Equatable {
         switch self {
         case .missingKey:
             return "No OpenRouter API key. Set OPENROUTER_API_KEY or add it to ~/.config/openusage/openrouter.json."
+        case .credentialsUnreadable:
+            return "Couldn't read the saved OpenRouter API key. Check the config file permissions, then refresh again."
         case .invalidKey:
             return "OpenRouter API key invalid. Check your key at openrouter.ai/keys."
         case .saveFailed:
@@ -64,6 +67,14 @@ struct OpenRouterAuthStore: Sendable {
     }
 
     func loadAPIKey() -> OpenRouterAuth? { store.loadKey().map(OpenRouterAuth.init(apiKey:)) }
+    func loadAPIKeyForRefresh() throws -> OpenRouterAuth? {
+        do {
+            return try store.loadKeyForRefresh().map(OpenRouterAuth.init(apiKey:))
+        } catch UserAPIKeyStore.ReadFailure.configUnreadable {
+            throw OpenRouterAuthError.credentialsUnreadable
+        }
+    }
+    func hasKeyOrUnreadableConfig() -> Bool { store.hasKeyOrUnreadableConfig() }
     func currentAPIKey() -> String? { store.loadKey() }
     func keyStatus() -> APIKeyStatus { store.keyStatus() }
     func saveAPIKey(_ key: String) throws { try store.saveKey(key) }

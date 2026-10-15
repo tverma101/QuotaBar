@@ -81,7 +81,9 @@ final class ProviderEnablementEnforcementTests: XCTestCase {
             isProviderEnabled: { enablement.isEnabled($0) },
             now: { now }
         )
-        enablement.onChange = { store.providerEnablementDidChange() }
+        enablement.onChange = { changedProviderIDs in
+            store.providerEnablementDidChange(changedProviderIDs: changedProviderIDs)
+        }
 
         await store.refreshAll(force: true)
         store.setPeerHistoryDocuments([

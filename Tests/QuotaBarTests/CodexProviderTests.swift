@@ -2,6 +2,16 @@ import XCTest
 @testable import QuotaBar
 
 final class CodexAuthStoreTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        KeychainPermissionGate.shared.resetAll()
+    }
+
+    override func tearDown() {
+        KeychainPermissionGate.shared.resetAll()
+        super.tearDown()
+    }
+
     func testParsesHexEncodedAuthPayload() {
         let raw = #"{"tokens":{"access_token":"token"},"last_refresh":"2026-01-01T00:00:00.000Z"}"#
         let hex = raw.utf8.map { String(format: "%02x", $0) }.joined()
@@ -41,7 +51,7 @@ final class CodexAuthStoreTests: XCTestCase {
         return "\(header).\(payload).sig"
     }
 
-    func testUsesCodexHomeAuthPathBeforeDefaultPaths() {
+    func testUsesCodexHomeAuthPathBeforeDefaultPaths() throws {
         let files = FakeFiles([
             "/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#
         ])
@@ -51,13 +61,13 @@ final class CodexAuthStoreTests: XCTestCase {
             keychain: FakeKeychain()
         )
 
-        let candidates = store.loadAuthCandidates()
+        let candidates = try store.loadAuthCandidates()
 
         XCTAssertEqual(candidates.count, 1)
         XCTAssertEqual(candidates.first?.auth.tokens?.accessToken, "token")
     }
 
-    func testExpectedIdentityDropsOtherAccountAndRejectsSavingIt() {
+    func testExpectedIdentityDropsOtherAccountAndRejectsSavingIt() throws {
         let files = FakeFiles([
             "/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token-b","account_id":"account-b"}}"#
         ])
@@ -68,7 +78,7 @@ final class CodexAuthStoreTests: XCTestCase {
             expectedIdentityKey: "account-a"
         )
 
-        XCTAssertTrue(store.loadAuthCandidates().isEmpty)
+        XCTAssertTrue(try store.loadAuthCandidates().isEmpty)
         let wrong = CodexAuthState(
             auth: CodexAuth(
                 tokens: CodexTokens(accessToken: "token-b", accountID: "account-b")
@@ -80,7 +90,140 @@ final class CodexAuthStoreTests: XCTestCase {
         }
     }
 
-    func testAccountIDAndIDTokenMismatchFailsClosed() {
+    func testKeychainLookupUsesTheCodexHomeDerivedAccount() throws {
+        let home = "/tmp/codex-home"
+        let account = CodexAuthStore.keychainAccount(forCodexHome: home)
+        XCTAssertEqual(account, "cli|c790889e29f35b54", "matches the Codex CLI's SHA-256 home key")
+        let keychain = AccountScopedKeychain(values: [account: #"{"tokens":{"access_token":"home-token"}}"#])
+        let store = CodexAuthStore(
+            environment: FakeEnvironment(["CODEX_HOME": home]),
+            files: FakeFiles(),
+            keychain: keychain
+        )
+
+        let state = try XCTUnwrap(try store.loadKeychainAuth())
+
+        XCTAssertEqual(keychain.readAccounts, [account])
+        XCTAssertEqual(state.auth.tokens?.accessToken, "home-token")
+        XCTAssertEqual(state.source, .keychain(account: account))
+    }
+
+    func testCancelledKeychainReadRemainsCancellationError() {
+        let keychain = CancelledCodexKeychain()
+        let store = CodexAuthStore(
+            environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
+            files: FakeFiles(),
+            keychain: keychain
+        )
+
+        XCTAssertThrowsError(try store.loadKeychainAuth()) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(keychain.readCount, 1, "a cancelled read should stop candidate fallback")
+    }
+
+    func testCodexKeychainHomeKeyCanonicalizesExistingSymlinks() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let realHome = root.appendingPathComponent("real-home", isDirectory: true)
+        let linkedHome = root.appendingPathComponent("linked-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: realHome, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: linkedHome, withDestinationURL: realHome)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertEqual(
+            CodexAuthStore.keychainAccount(forCodexHome: realHome.path),
+            CodexAuthStore.keychainAccount(forCodexHome: linkedHome.path)
+        )
+    }
+
+    func testKeychainRefreshWritesBackToTheExactCodexHomeAccount() throws {
+        let home = "/tmp/codex-home"
+        let account = CodexAuthStore.keychainAccount(forCodexHome: home)
+        let keychain = AccountScopedKeychain(values: [account: #"{"tokens":{"access_token":"old-token"}}"#])
+        let store = CodexAuthStore(
+            environment: FakeEnvironment(["CODEX_HOME": home]),
+            files: FakeFiles(),
+            keychain: keychain
+        )
+        var state = try XCTUnwrap(try store.loadKeychainAuth())
+        state.auth.tokens?.accessToken = "rotated-token"
+
+        try store.save(state)
+
+        XCTAssertEqual(keychain.writtenAccounts, [account])
+        XCTAssertEqual(
+            CodexAuthStore.parseAuth(try XCTUnwrap(keychain.values[account]))?.tokens?.accessToken,
+            "rotated-token"
+        )
+    }
+
+    func testSuccessfulCodexKeychainRotationPersistsAfterNewManualActionStarts() async throws {
+        let home = "/tmp/codex-home"
+        let account = CodexAuthStore.keychainAccount(forCodexHome: home)
+        let originalJSON = #"{"tokens":{"access_token":"old-access","refresh_token":"old-refresh"}}"#
+        let keychain = AccountScopedKeychain(values: [account: originalJSON])
+        let store = CodexAuthStore(
+            environment: FakeEnvironment(["CODEX_HOME": home]),
+            files: FakeFiles(),
+            keychain: keychain
+        )
+        let original = try XCTUnwrap(try store.loadKeychainAuth())
+        var rotated = original
+        rotated.auth.tokens?.accessToken = "rotated-access"
+        rotated.auth.tokens?.refreshToken = "rotated-refresh"
+        let persistedState = rotated
+
+        let olderActionID = KeychainPermissionGate.shared.beginManualAction()
+        let saveStarted = DispatchSemaphore(value: 0)
+        let releaseSave = DispatchSemaphore(value: 0)
+        defer { releaseSave.signal() }
+        let save = Task.detached {
+            try await ProviderRefreshContext.$isManual.withValue(true) {
+                try await ProviderRefreshContext.$manualActionID.withValue(olderActionID) {
+                    saveStarted.signal()
+                    _ = releaseSave.wait(timeout: .now() + 5)
+                    try store.save(persistedState, replacing: original)
+                }
+            }
+        }
+
+        XCTAssertEqual(saveStarted.wait(timeout: .now() + 2), .success)
+        _ = KeychainPermissionGate.shared.beginManualAction()
+        releaseSave.signal()
+        try await save.value
+
+        let persistedJSON = try XCTUnwrap(keychain.values[account])
+        let persisted = try XCTUnwrap(persistedJSON.data(using: .utf8))
+        let tokens = try XCTUnwrap(try JSONDecoder().decode(CodexAuth.self, from: persisted).tokens)
+        XCTAssertEqual(tokens.accessToken, "rotated-access")
+        XCTAssertEqual(tokens.refreshToken, "rotated-refresh")
+    }
+
+    private final class AccountScopedKeychain: KeychainAccessing, @unchecked Sendable {
+        var values: [String: String]
+        private(set) var readAccounts: [String] = []
+        private(set) var writtenAccounts: [String] = []
+
+        init(values: [String: String]) {
+            self.values = values
+        }
+
+        func readGenericPassword(service: String) throws -> String? { nil }
+
+        func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? {
+            readAccounts.append(account)
+            return values[account]
+        }
+
+        func writeGenericPassword(service: String, value: String) throws {}
+
+        func writeGenericPassword(service: String, account: String, value: String) throws {
+            writtenAccounts.append(account)
+            values[account] = value
+        }
+    }
+
+    func testAccountIDAndIDTokenMismatchFailsClosed() throws {
         let idToken = identityJWT(accountID: "account-b")
         let auth = "{\"tokens\":{\"access_token\":\"token-a\",\"account_id\":\"account-a\",\"id_token\":\"\(idToken)\"}}"
         let store = CodexAuthStore(
@@ -92,7 +235,27 @@ final class CodexAuthStoreTests: XCTestCase {
             expectedIdentityKey: "account-a"
         )
 
-        XCTAssertTrue(store.loadAuthCandidates().isEmpty)
+        XCTAssertTrue(try store.loadAuthCandidates().isEmpty)
+    }
+
+    @MainActor
+    func testUnreadablePresentAuthFileKeepsCodexDetectedAndSurfacesCredentialAccess() async {
+        let files = UnreadableCodexAuthFile(path: "/tmp/codex-home/auth.json")
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
+                files: files,
+                keychain: FakeKeychain()
+            ),
+            usageClient: CodexUsageClient(http: FakeHTTPClient(
+                response: HTTPResponse(statusCode: 200, headers: [:], body: Data())
+            ))
+        )
+
+        let hasCredentials = await provider.hasLocalCredentials()
+        XCTAssertTrue(hasCredentials)
+        let snapshot = await provider.refresh()
+        XCTAssertTrue(snapshot.warning?.contains(CodexAuthError.credentialsUnreadable.localizedDescription) == true)
     }
 
     private func identityJWT(accountID: String) -> String {
@@ -106,6 +269,59 @@ final class CodexAuthStoreTests: XCTestCase {
         let payload = Data("{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"\(accountID)\"}}".utf8)
         return "\(base64URL(header)).\(base64URL(payload)).sig"
     }
+}
+
+private struct UnreadableCodexAuthFile: TextFileAccessing {
+    let path: String
+
+    func exists(_ path: String) -> Bool { path == self.path }
+    func readText(_ path: String) throws -> String { throw CocoaError(.fileReadNoPermission) }
+    func readTextIfPresent(_ path: String) throws -> String? {
+        guard exists(path) else { return nil }
+        throw CocoaError(.fileReadNoPermission)
+    }
+    func writeText(_ path: String, _ text: String) throws {}
+    func remove(_ path: String) throws {}
+}
+
+private actor CodexRefreshResponseGate {
+    private var paused = false
+    private var released = false
+    private var pauseContinuation: CheckedContinuation<Void, Never>?
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        paused = true
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        guard !released else { return }
+        await withCheckedContinuation { pauseContinuation = $0 }
+    }
+
+    func waitUntilPaused() async {
+        guard !paused else { return }
+        await withCheckedContinuation { enteredContinuation = $0 }
+    }
+
+    func open() {
+        released = true
+        pauseContinuation?.resume()
+        pauseContinuation = nil
+    }
+}
+
+private final class CancelledCodexKeychain: KeychainAccessing, @unchecked Sendable {
+    private(set) var readCount = 0
+
+    func readGenericPassword(service: String) throws -> String? { throw CancellationError() }
+
+    func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? {
+        readCount += 1
+        throw CancellationError()
+    }
+
+    func writeGenericPassword(service: String, value: String) throws {}
+    func writeGenericPassword(service: String, account: String, value: String) throws {}
 }
 
 final class CodexUsageMapperTests: XCTestCase {
@@ -577,6 +793,135 @@ final class CodexProviderTests: XCTestCase {
         })
     }
 
+    func testResetCreditsCancellationStopsProviderRefresh() async {
+        let http = RoutingHTTPClient { request in
+            if request.url == CodexUsageClient.usageURL {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data("{}".utf8))
+            }
+            if request.url == CodexUsageClient.resetCreditsURL {
+                throw URLError(.cancelled)
+            }
+            XCTFail("unexpected Codex endpoint after cancellation: \(request.url)")
+            return HTTPResponse(statusCode: 200, headers: [:], body: Data())
+        }
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
+                files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
+                keychain: FakeKeychain()
+            ),
+            usageClient: CodexUsageClient(http: http),
+            logUsageScanner: CodexLogFixture.scanner(home: nil),
+            proxyUsageScanner: CodexProxyUsageScanner(databasePaths: { [] }),
+            routerUsageScanner: CodexRouterUsageScanner(ledgerPaths: { [] }, identityAliases: { [:] }),
+            allowsUnattributedPiUsage: false
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertEqual(http.requests.map(\.url), [CodexUsageClient.usageURL, CodexUsageClient.resetCreditsURL])
+    }
+
+    func testLateSuccessfulRefreshPersistsRotatedRefreshTokenBeforeReturningCancelled() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let path = "/tmp/codex-home/auth.json"
+        let files = FakeFiles([
+            path: """
+            {"tokens":{"access_token":"old-access","refresh_token":"old-refresh"},"last_refresh":"\(OpenUsageISO8601.string(from: now.addingTimeInterval(-9 * 24 * 60 * 60)))"}
+            """
+        ])
+        let gate = CodexRefreshResponseGate()
+        let http = RoutingHTTPClient { request in
+            guard request.url == CodexUsageClient.refreshURL else {
+                XCTFail("quota requests must not follow a canceled token refresh: \(request.url)")
+                return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+            }
+            await gate.pause()
+            return HTTPResponse(
+                statusCode: 200,
+                headers: [:],
+                body: Data(#"{"access_token":"new-access","refresh_token":"new-refresh"}"#.utf8)
+            )
+        }
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
+                files: files,
+                keychain: FakeKeychain(),
+                now: { now }
+            ),
+            usageClient: CodexUsageClient(http: http),
+            logUsageScanner: CodexLogFixture.scanner(home: nil),
+            now: { now }
+        )
+        let refresh = Task { await provider.refresh() }
+
+        await gate.waitUntilPaused()
+        refresh.cancel()
+        await gate.open()
+
+        let snapshot = await refresh.value
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertEqual(http.requests.map(\.url), [CodexUsageClient.refreshURL])
+        let saved = try XCTUnwrap(files.files[path]?.data(using: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: saved) as? [String: Any])
+        let tokens = try XCTUnwrap(object["tokens"] as? [String: Any])
+        XCTAssertEqual(tokens["refresh_token"] as? String, "new-refresh")
+    }
+
+    func testLateRefreshDoesNotRecreateDeletedOrOverwriteSwitchedCodexLogin() async {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let path = "/tmp/codex-home/auth.json"
+        let oldText = #"{"tokens":{"access_token":"old-access","refresh_token":"old-refresh"},"last_refresh":"2026-01-01T00:00:00.000Z"}"#
+        let switchedText = #"{"tokens":{"access_token":"new-account-access","refresh_token":"new-account-refresh","account_id":"account-new"},"last_refresh":"2026-10-14T00:00:00.000Z"}"#
+        let replacements: [String?] = [nil, switchedText]
+
+        for replacement in replacements {
+            let files = FakeFiles([path: oldText])
+            let gate = CodexRefreshResponseGate()
+            let http = RoutingHTTPClient { request in
+                guard request.url == CodexUsageClient.refreshURL else {
+                    XCTFail("a late refresh must not issue usage requests with the old account: \(request.url)")
+                    return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+                }
+                await gate.pause()
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"late-access","refresh_token":"late-refresh"}"#.utf8))
+            }
+            let provider = CodexProvider(
+                authStore: CodexAuthStore(
+                    environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
+                    files: files,
+                    keychain: FakeKeychain(),
+                    now: { now }
+                ),
+                usageClient: CodexUsageClient(http: http),
+                logUsageScanner: CodexLogFixture.scanner(home: nil),
+                now: { now }
+            )
+            let refresh = Task { await provider.refresh() }
+
+            await gate.waitUntilPaused()
+            if let replacement {
+                files.files[path] = replacement
+            } else {
+                files.files.removeValue(forKey: path)
+            }
+            await gate.open()
+
+            let snapshot = await refresh.value
+            // The live source changed under the refresh, so the provider keeps its last-good meters
+            // and surfaces a warning rather than an auth error: nothing proves this device's
+            // credential is invalid, only that the one in flight no longer matches the file.
+            XCTAssertNil(snapshot.errorCategory)
+            XCTAssertEqual(snapshot.warning?.hasPrefix("Live Codex limits unavailable:"), true)
+            // The refresh response must never reach the usage API, and the file the user changed
+            // must survive: logout stays logged out and an account switch keeps its own tokens.
+            XCTAssertEqual(http.requests.map(\.url), [CodexUsageClient.refreshURL])
+            XCTAssertEqual(files.files[path], replacement, "the late refresh must preserve logout or the replacement account")
+        }
+    }
+
     func testLocalHistoryReplacesStaleSnapshotWhenLiveQuotaAuthFails() async throws {
         let now = TestLocalInstant.date(2026, 2, 20, 12)
         let httpClient = FakeHTTPClient(response: HTTPResponse(
@@ -675,6 +1020,61 @@ final class CodexProviderTests: XCTestCase {
         XCTAssertNil(snapshot.plan)
         XCTAssertNil(snapshot.warning)
         XCTAssertTrue(httpClient.requests.isEmpty, "localAccounting scope must not re-read live quota APIs")
+    }
+
+    func testIncompletePiDiscoveryDoesNotPublishCodexOnlyHistory() async throws {
+        let now = TestLocalInstant.date(2026, 2, 20, 12)
+        let codexHome = try CodexLogFixture.makeHome(files: [
+            "sessions/rollout-1.jsonl": [
+                CodexLogFixture.turnContext(timestamp: TestLocalInstant.iso(2026, 2, 20, 10), model: "gpt-5.2"),
+                CodexLogFixture.tokenCount(
+                    timestamp: TestLocalInstant.iso(2026, 2, 20, 10, 1),
+                    last: CodexLogFixture.usage(input: 100, output: 50)
+                )
+            ].joined(separator: "\n")
+        ])
+        defer { try? FileManager.default.removeItem(at: codexHome) }
+
+        let piHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-pi-incomplete-\(UUID().uuidString)", isDirectory: true)
+        let piSessions = piHome.appendingPathComponent(".pi/agent/sessions")
+        try FileManager.default.createDirectory(
+            at: piSessions.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data("not a directory".utf8).write(to: piSessions)
+        defer { try? FileManager.default.removeItem(at: piHome) }
+
+        let http = RoutingHTTPClient { _ in
+            XCTFail("local accounting must not make network requests")
+            return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+        }
+        let piScanner = PiUsageScanner(
+            environment: FakeEnvironment([:]),
+            homeDirectory: { piHome },
+            incrementalScanner: IncrementalJSONLScanner<PiUsageScanner.Entry>()
+        )
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
+                files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
+                keychain: FakeKeychain()
+            ),
+            usageClient: CodexUsageClient(http: http),
+            logUsageScanner: CodexLogFixture.scanner(home: codexHome),
+            proxyUsageScanner: CodexProxyUsageScanner(databasePaths: { [] }),
+            routerUsageScanner: CodexRouterUsageScanner(ledgerPaths: { [] }, identityAliases: { [:] }),
+            piUsageScanner: piScanner,
+            now: { now },
+            pricing: { .empty }
+        )
+
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.localAccounting) {
+            await provider.refresh()
+        }
+
+        XCTAssertNil(snapshot.usageHistory, "the native-only subset cannot replace combined history")
+        XCTAssertFalse(snapshot.lines.contains { ["Today", "Yesterday", "Last 30 Days", "Usage Trend"].contains($0.label) })
+        XCTAssertTrue(http.requests.isEmpty)
     }
 
     private func values(_ lines: [MetricLine], _ label: String) -> [MetricValue]? {

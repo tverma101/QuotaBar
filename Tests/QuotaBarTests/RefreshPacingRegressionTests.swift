@@ -27,6 +27,78 @@ final class RefreshPacingRegressionTests: XCTestCase {
                 "background menu-bar ticks keep the 7.5% battery ceiling"
             )
         }
+        ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            ProviderRefreshContext.$isManual.withValue(true) {
+                XCTAssertEqual(
+                    JSONLAccountingWorkPacer.targetCPUFraction, 0.25,
+                    accuracy: 0.0001,
+                    "manual retry folds use the interactive budget despite their narrower accounting scope"
+                )
+            }
+        }
+    }
+
+    func testManualPanelMeterRetryUsesInteractivePacedContext() async {
+        let context = await withManualRefresh {
+            await withThrottledPanelMeters {
+                (
+                    ProviderRefreshContext.scope,
+                    ProviderRefreshContext.isManual,
+                    ProviderRefreshContext.accountingCPUThrottleEnabled,
+                    JSONLAccountingWorkPacer.targetCPUFraction
+                )
+            }
+        }
+
+        XCTAssertEqual(context.0, .panelMeters)
+        XCTAssertTrue(context.1)
+        XCTAssertTrue(context.2)
+        XCTAssertEqual(context.3, 0.25, accuracy: 0.0001)
+    }
+
+    func testSilentSupersessionRetryUsesInteractiveBudgetWithoutManualKeychainPermission() async {
+        let context = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await ProviderRefreshContext.$isManual.withValue(false) {
+                await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                    await ProviderRefreshContext.$accountingCPUInteractiveBudgetEnabled.withValue(true) {
+                        (
+                            ProviderRefreshContext.isManual,
+                            ProviderRefreshContext.accountingCPUThrottleEnabled,
+                            JSONLAccountingWorkPacer.targetCPUFraction
+                        )
+                    }
+                }
+            }
+        }
+
+        XCTAssertFalse(context.0, "silent recovery must not inherit Keychain interaction permission")
+        XCTAssertTrue(context.1)
+        XCTAssertEqual(context.2, 0.25, accuracy: 0.0001)
+    }
+
+    func testDetachedProviderWorkPreservesSilentInteractiveBudget() async {
+        let context = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await ProviderRefreshContext.$isManual.withValue(false) {
+                await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                    await ProviderRefreshContext.$accountingCPUInteractiveBudgetEnabled.withValue(true) {
+                        ProviderRefreshContext.detachedValues
+                    }
+                }
+            }
+        }
+        let observed = await Task.detached {
+            context.withValue {
+                (
+                    ProviderRefreshContext.isManual,
+                    ProviderRefreshContext.accountingCPUThrottleEnabled,
+                    JSONLAccountingWorkPacer.targetCPUFraction
+                )
+            }
+        }.value
+
+        XCTAssertFalse(observed.0)
+        XCTAssertTrue(observed.1)
+        XCTAssertEqual(observed.2, 0.25, accuracy: 0.0001)
     }
 
     /// The refresh loop runs user-facing full passes UNPACED by passing
@@ -48,6 +120,23 @@ final class RefreshPacingRegressionTests: XCTestCase {
             loopWiredThrottle(scope: .menuBar),
             "menuBar ticks keep the paced background allowance"
         )
+    }
+
+    func testLedgerAccountingWorkIsPriorityDuringTriggerCooldown() {
+        XCTAssertTrue(AppContainer.hasPriorityRefreshPass(
+            quotaRefreshDue: false,
+            panelPassPending: false,
+            fullScopePassPending: false,
+            historyAccountingPassPending: false,
+            localAccountingPassPending: true
+        ))
+        XCTAssertFalse(AppContainer.hasPriorityRefreshPass(
+            quotaRefreshDue: false,
+            panelPassPending: false,
+            fullScopePassPending: false,
+            historyAccountingPassPending: false,
+            localAccountingPassPending: false
+        ))
     }
 
     /// With pacing disabled (the full-pass wiring), the pacer must run work directly — no pacing

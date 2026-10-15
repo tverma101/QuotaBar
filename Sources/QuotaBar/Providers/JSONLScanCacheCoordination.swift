@@ -10,12 +10,15 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
     static let shared = JSONLAccountingWorkPacer()
 
     // Leave margin below the 10% contract for work between paced slices and sampling variation.
-    // Full-scope passes (panel open, manual refresh, CLI) own the foreground instead: the user is
-    // actively waiting on token accounting, and 7.5% of wall cannot finish this machine's cold
-    // corpora inside the 120s provider deadline (9s of CPU vs 40-100s of real work — the gap was
-    // the OpenCode 120s-timeout loop). Background menu-bar ticks keep the original ceiling.
+    // Full-scope, explicit manual, and silent recovery for a superseded visible retry get the interactive
+    // allowance; 7.5% of wall cannot finish cold corpora inside the provider deadline. Background
+    // menu-bar ticks keep the original ceiling.
     static var targetCPUFraction: Double {
-        ProviderRefreshContext.scope.isFull ? 0.25 : 0.075
+        ProviderRefreshContext.isManual
+            || ProviderRefreshContext.scope.isFull
+            || ProviderRefreshContext.accountingCPUInteractiveBudgetEnabled
+            ? 0.25
+            : 0.075
     }
     // A pathological work slice must not hold the shared accounting lock past one provider deadline.
     private static let maxPacingDebtNanoseconds: Int64 = 120_000_000_000
@@ -105,30 +108,42 @@ final class JSONLAccountingWorkPacer: @unchecked Sendable {
 
     /// Run collection folds in bounded pieces so non-JSONL aggregation and deduplication share the
     /// same process-wide CPU allowance as file parsing and cache hydration.
+    @discardableResult
     func forEach<Element>(
         _ elements: [Element],
         batchSize: Int = 512,
         _ body: (Element) -> Void
-    ) {
+    ) -> Bool {
         precondition(batchSize > 0)
         let enabled = ProviderRefreshContext.accountingCPUThrottleEnabled
-        guard enabled else {
-            elements.forEach(body)
-            return
-        }
-
         var start = 0
         while start < elements.count {
-            guard !Task.isCancelled else { break }
+            guard !Task.isCancelled else { return false }
             let end = min(start + batchSize, elements.count)
-            perform {
+            var completed = true
+            if enabled {
+                perform {
+                    for index in start..<end {
+                        guard !Task.isCancelled else {
+                            completed = false
+                            break
+                        }
+                        body(elements[index])
+                    }
+                }
+            } else {
                 for index in start..<end {
-                    guard !Task.isCancelled else { break }
+                    guard !Task.isCancelled else {
+                        completed = false
+                        break
+                    }
                     body(elements[index])
                 }
             }
+            guard completed, !Task.isCancelled else { return false }
             start = end
         }
+        return true
     }
 
     private func processCPUNanoseconds() -> UInt64 {

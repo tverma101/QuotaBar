@@ -21,12 +21,17 @@ enum JSONLScanning {
     }
 
     /// Every `*.jsonl` regular file under `dir` (recursively), path-sorted so a keep-first dedup is
-    /// deterministic. Empty when `dir` can't be enumerated.
-    static func jsonlFiles(under dir: URL) -> [DiscoveredFile] {
-        JSONLAccountingWorkPacer.shared.perform {
+    /// deterministic. A missing optional root is a complete empty result; an existing root that cannot
+    /// be read or fully enumerated returns nil so a multi-root caller cannot publish partial history.
+    static func jsonlFilesIfComplete(under dir: URL) -> [DiscoveredFile]? {
+        guard !Task.isCancelled else { return nil }
+        return JSONLAccountingWorkPacer.shared.perform {
             // `FileManager.enumerator` silently yields nothing when `dir` itself is a symlink.
             // Resolve first so the enumeration sees the real directory.
             let dir = dir.resolvingSymlinksInPath()
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDirectory) else { return [] }
+            guard isDirectory.boolValue, FileManager.default.isReadableFile(atPath: dir.path) else { return nil }
             let keys: [URLResourceKey] = [
                 .isRegularFileKey,
                 .fileSizeKey,
@@ -35,15 +40,22 @@ enum JSONLScanning {
             ]
             // One set for the whole enumeration: allocating per file dominated deep trees.
             let keySet = Set(keys)
+            var enumerationFailed = false
             guard let enumerator = FileManager.default.enumerator(
-                at: dir, includingPropertiesForKeys: keys, options: []
-            ) else { return [] }
+                at: dir,
+                includingPropertiesForKeys: keys,
+                options: [],
+                errorHandler: { _, _ in
+                    enumerationFailed = true
+                    return false
+                }
+            ) else { return nil }
             var files: [DiscoveredFile] = []
             for case let url as URL in enumerator {
-                guard url.pathExtension == "jsonl",
-                      let values = try? url.resourceValues(forKeys: keySet),
-                      values.isRegularFile == true
-                else { continue }
+                guard !Task.isCancelled else { return nil }
+                guard url.pathExtension == "jsonl" else { continue }
+                guard let values = try? url.resourceValues(forKeys: keySet) else { return nil }
+                guard values.isRegularFile == true else { continue }
                 files.append(DiscoveredFile(
                     path: url.path,
                     size: values.fileSize ?? 0,
@@ -51,8 +63,15 @@ enum JSONLScanning {
                     attributeMtime: values.attributeModificationDate
                 ))
             }
+            guard !enumerationFailed else { return nil }
             return files.sorted { $0.path < $1.path }
         }
+    }
+
+    /// Compatibility wrapper for scanners whose source is not combined with another independent
+    /// source. Completeness-sensitive callers should use `jsonlFilesIfComplete`.
+    static func jsonlFiles(under dir: URL) -> [DiscoveredFile] {
+        jsonlFilesIfComplete(under: dir) ?? []
     }
 }
 
@@ -218,6 +237,10 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         let unreadablePaths = Set(parseResults.lazy.filter(\.readFailed).map(\.file.path))
         await readFailureReporter.update(checkedPaths: checkedPaths, failingPaths: unreadablePaths)
         guard !Task.isCancelled else { return nil }
+        // A scan is one publication unit. If any changed file could not be read or parsed, return no
+        // result and leave the last-good cache untouched; publishing the readable subset made a
+        // transient filesystem error look like usage had disappeared from the failed file.
+        guard parseResults.allSatisfy({ $0.items != nil }) else { return nil }
         var newlyCached: [(path: String, cached: CachedFile)] = []
         for result in parseResults {
             let (file, parsed) = (result.file, result.items)
@@ -326,6 +349,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         let unreadablePaths = Set(parseResults.lazy.filter(\.readFailed).map(\.file.path))
         await readFailureReporter.update(checkedPaths: checkedPaths, failingPaths: unreadablePaths)
         guard !Task.isCancelled else { return false }
+        // Do not publish a partial fold or replace stale cache records until every changed file has
+        // been read and parsed. Callers treat false as an incomplete source and keep last-good data.
+        guard parseResults.allSatisfy({ $0.items != nil }) else { return false }
         var newlyCached: [(path: String, cached: CachedFile)] = []
         for result in parseResults {
             let (file, parsed) = (result.file, result.items)
@@ -958,8 +984,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
     }
 
     /// Read + parse a bounded number of changed files in parallel. Results are keyed back to the input
-    /// order; a `nil` item list marks an unreadable file. Each parser is responsible for streaming its
-    /// file so concurrency does not multiply whole-file allocations.
+    /// order; a `nil` item list keeps the scan incomplete, while `readFailed` marks an existing path
+    /// that could not be read or parsed. A path removed after discovery is not a warning condition.
+    /// Each parser is responsible for streaming its file so concurrency does not multiply whole-file allocations.
     private static func parseFiles(
         _ files: [JSONLScanning.DiscoveredFile],
         maxConcurrentParses: Int,
@@ -975,7 +1002,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
                 group.addTask {
                     guard await permitPool.acquire() else { return (index, nil, false) }
                     let result: (Int, [Item]?, Bool)
-                    if Task.isCancelled || !FileManager.default.fileExists(atPath: file.path) {
+                    if Task.isCancelled {
+                        result = (index, nil, false)
+                    } else if !FileManager.default.fileExists(atPath: file.path) {
                         result = (index, nil, false)
                     } else {
                         let parsed = autoreleasepool {

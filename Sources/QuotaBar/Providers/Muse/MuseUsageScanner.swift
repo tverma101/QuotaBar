@@ -50,15 +50,26 @@ actor MuseUsageScanner {
     /// Raw usage entries from the last `daysBack` days — the same incremental scan the
     /// OpenCode fold calls, but returning Entry items so both consumers share one cache.
     func parsedEntries(daysBack: Int = 33, now: Date = Date(), roots: [URL]) async -> [Entry] {
+        await parsedEntriesIfComplete(daysBack: daysBack, now: now, roots: roots) ?? []
+    }
+
+    /// `nil` means a configured Muse source was unreadable or the incremental parse was incomplete;
+    /// an empty array is a successful scan with no usage entries.
+    func parsedEntriesIfComplete(daysBack: Int = 33, now: Date = Date(), roots: [URL]) async -> [Entry]? {
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
         let identityPaths = Set(roots.map { $0.resolvingSymlinksInPath().standardizedFileURL.path })
             .sorted()
         let cacheIdentity = identityPaths.isEmpty ? "no-muse-root" : identityPaths.joined(separator: "\n")
-        let files = Self.usageFiles(under: roots)
-        guard !files.isEmpty else { return [] }
+        guard let files = Self.usageFilesIfComplete(under: roots) else { return nil }
+        guard !files.isEmpty else {
+            _ = await scanner.items(
+                from: [], since: since, cacheIdentity: cacheIdentity, parseFile: { url in Self.parseFile(at: url) }
+            )
+            return Task.isCancelled ? nil : []
+        }
         return await scanner.items(
             from: files, since: since, cacheIdentity: cacheIdentity, parseFile: { url in Self.parseFile(at: url) }
-        ) ?? []
+        )
     }
 
     /// Every `session.jsonl` under each root, path-sorted. Only session files
@@ -67,7 +78,18 @@ actor MuseUsageScanner {
     /// parse set from ~1755 to ~700 files without missing any billed usage
     /// (subagent sessions also use `session.jsonl` inside `subagent/<id>/`).
     static func usageFiles(under roots: [URL]) -> [JSONLScanning.DiscoveredFile] {
-        roots.flatMap { JSONLScanning.jsonlFiles(under: $0) }
+        usageFilesIfComplete(under: roots) ?? []
+    }
+
+    static func usageFilesIfComplete(under roots: [URL]) -> [JSONLScanning.DiscoveredFile]? {
+        var files: [JSONLScanning.DiscoveredFile] = []
+        for root in roots {
+            guard !Task.isCancelled,
+                  let rootFiles = JSONLScanning.jsonlFilesIfComplete(under: root)
+            else { return nil }
+            files.append(contentsOf: rootFiles)
+        }
+        return files
             .filter { $0.path.hasSuffix("/session.jsonl") }
             .sorted { $0.path < $1.path }
     }

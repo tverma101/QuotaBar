@@ -1,5 +1,12 @@
 import Foundation
 
+/// A missing Pi source is a complete empty result, but a failed directory walk is not. Callers that
+/// merge Pi with another history source must keep the prior combined history on `.incomplete`.
+enum PiUsageScanResult: Sendable {
+    case complete(LogUsageScan?)
+    case incomplete
+}
+
 /// Builds a per-day token/cost series from pi's session logs for one QuotaBar card, so usage that
 /// happened inside pi (e.g. a Claude sub driven through pi) folds into that card's Usage Trend and
 /// spend tiles alongside its native source.
@@ -59,15 +66,34 @@ actor PiUsageScanner {
     /// Scan the last `daysBack` days of pi logs for one card. Returns nil when pi's sessions directory
     /// has no log files at all, so a provider with no pi usage folds in nothing.
     func scan(cardID: String, daysBack: Int = UsageHistoryWindow.previousDays, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+        switch await scanResult(cardID: cardID, daysBack: daysBack, now: now, pricing: pricing) {
+        case .complete(let scan):
+            return scan
+        case .incomplete:
+            return nil
+        }
+    }
+
+    /// Completeness-aware scan used by providers that merge Pi with another source. Returning an
+    /// optional `LogUsageScan` alone cannot distinguish an empty Pi directory from a failed walk.
+    func scanResult(
+        cardID: String,
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing
+    ) async -> PiUsageScanResult {
         let directory = PiPaths.sessionsDirectory(environment: environment, homeDirectory: homeDirectory())
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
         let cacheIdentity = directory.resolvingSymlinksInPath().path
-        let files = JSONLScanning.jsonlFiles(under: directory)
+        guard let files = JSONLScanning.jsonlFilesIfComplete(under: directory) else {
+            AppLog.warn(LogTag.plugin("pi"), "session directory could not be completely enumerated; combined usage history is incomplete")
+            return .incomplete
+        }
         guard !files.isEmpty else {
             _ = await scanner.items(
                 from: [], since: since, cacheIdentity: cacheIdentity, parseFile: { url in Self.parseFile(at: url) }
             )
-            return nil
+            return .complete(nil)
         }
 
         guard let entries = await scanner.items(
@@ -75,12 +101,12 @@ actor PiUsageScanner {
             since: since,
             cacheIdentity: cacheIdentity,
             parseFile: { url in Self.parseFile(at: url) }
-        ), !Task.isCancelled else { return nil }
+        ), !Task.isCancelled else { return .incomplete }
         let deduped = Self.dedup(entries)
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled else { return .incomplete }
         let result = Self.aggregate(entries: deduped, cardID: cardID, since: since, pricing: pricing)
-        guard !Task.isCancelled else { return nil }
-        return result
+        guard !Task.isCancelled else { return .incomplete }
+        return .complete(result)
     }
 
     // MARK: - Parsing
@@ -185,10 +211,11 @@ actor PiUsageScanner {
             if cost == nil, entry.reportedTotalTokens > 0 {
                 accumulator.addUnknownModel(day: day, model: modelName)
             }
-            if let model = trimmedModel,
-               let apiEstimate = pricing.estimatedCostDollars(model: model, tokens: entry.tokens) {
-                accumulator.addApiEstimate(day: day, cost: apiEstimate)
-            }
+            accumulator.recordApiEstimate(
+                day: day,
+                cost: trimmedModel.flatMap { pricing.estimatedCostDollars(model: $0, tokens: entry.tokens) },
+                tokens: entry.reportedTotalTokens
+            )
             accumulator.add(day: day, tokens: entry.reportedTotalTokens, cost: cost, model: modelName)
         }
         return accumulator.build()

@@ -46,23 +46,36 @@ enum ProviderAuthRetry {
         retriedConnectionFailed: Error? = nil,
         authExpired: Error
     ) async throws -> HTTPResponse {
+        try Task.checkCancellation()
         let response: HTTPResponse
         do {
             response = try await attempt(token)
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             throw connectionFailed
         }
+        try Task.checkCancellation()
         guard isAuthFailure(response) else { return response }
 
         AppLog.debug(.auth, "\(response.statusCode) -> refreshing token, retrying once")
-        let refreshed = try await refreshAccessToken()
+        try Task.checkCancellation()
+        let refreshed: String
+        do {
+            refreshed = try await refreshAccessToken()
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            throw error
+        }
+        try Task.checkCancellation()
 
         let retried: HTTPResponse
         do {
             retried = try await attempt(refreshed)
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             throw retriedConnectionFailed ?? connectionFailed
         }
+        try Task.checkCancellation()
         if isAuthFailure(retried) {
             AppLog.warn(.auth, "retry still unauthorized -> auth expired")
             throw authExpired

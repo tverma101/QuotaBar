@@ -7,11 +7,14 @@ struct DevinAuth: Hashable, Sendable {
 
 enum DevinAuthError: Error, LocalizedError, Equatable {
     case notLoggedIn
+    case credentialsUnreadable
 
     var errorDescription: String? {
         switch self {
         case .notLoggedIn:
             return "Run devin auth login or sign in to Devin and try again."
+        case .credentialsUnreadable:
+            return "QuotaBar couldn't read Devin's local credentials. Check access to credentials.toml and Devin's state database, then refresh again."
         }
     }
 }
@@ -32,13 +35,20 @@ struct DevinAuthStore: Sendable {
         self.sqlite = sqlite
     }
 
-    func loadCredentialsFile() -> DevinAuth? {
-        guard files.exists(Self.credentialsPath),
-              let text = try? files.readText(Self.credentialsPath),
-              let apiKey = Self.readTomlString(text, key: "windsurf_api_key")
-        else {
-            return nil
+    func loadCredentialsFile() throws -> DevinAuth? {
+        let text: String?
+        do {
+            // `nil` means the source is truly absent. A present file that cannot be read must remain
+            // distinguishable so provider detection does not silently hide a configured login.
+            text = try files.readTextIfPresent(Self.credentialsPath)
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            AppLog.error(LogTag.auth("devin"), "CLI credentials file read failed")
+            throw DevinAuthError.credentialsUnreadable
         }
+        guard let text,
+              let apiKey = Self.readTomlString(text, key: "windsurf_api_key")
+        else { return nil }
 
         return DevinAuth(
             apiKey: apiKey,
@@ -46,16 +56,29 @@ struct DevinAuthStore: Sendable {
         )
     }
 
-    func loadAppAuth() -> DevinAuth? {
+    func loadAppAuth() throws -> DevinAuth? {
         let sql = "SELECT value FROM ItemTable WHERE key = 'windsurfAuthStatus' LIMIT 1"
-        guard let value = try? sqlite.queryValue(path: Self.stateDBPath, sql: sql),
-              let valueData = value.data(using: .utf8),
-              let auth = (try? JSONSerialization.jsonObject(with: valueData)) as? [String: Any],
-              let apiKey = (auth["apiKey"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !apiKey.isEmpty
-        else {
-            return nil
+        let value: String?
+        do {
+            // A missing database or auth row returns nil from the accessor. Query/open errors are a
+            // configured but unreadable source and must not become a false logged-out result.
+            value = try sqlite.queryValue(path: Self.stateDBPath, sql: sql)
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            AppLog.error(LogTag.auth("devin"), "app state database credential read failed")
+            throw DevinAuthError.credentialsUnreadable
         }
+
+        guard let value else { return nil }
+        guard let valueData = value.data(using: .utf8),
+              let decoded = try? JSONSerialization.jsonObject(with: valueData),
+              let auth = decoded as? [String: Any]
+        else {
+            AppLog.error(LogTag.auth("devin"), "app state database credential data could not be decoded")
+            throw DevinAuthError.credentialsUnreadable
+        }
+        guard let apiKey = (auth["apiKey"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !apiKey.isEmpty else { return nil }
 
         return DevinAuth(apiKey: apiKey, apiServerUrl: nil)
     }

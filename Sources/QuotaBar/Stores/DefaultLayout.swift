@@ -1,7 +1,8 @@
 import Foundation
 
 /// Metrics enabled on first launch. Core quota meters and trends stay visible above the fold, while
-/// balances, reset details, and spend-history rows are enabled but tucked behind each provider's caret.
+/// optional balance and spend-history rows are usually tucked behind each provider's caret. Freebuff's
+/// rows are always visible by owner choice; the provider has no menu-bar pins by default.
 /// `LayoutStore` filters this to whatever the active registry actually knows, so registries that don't
 /// define an ID (e.g. the test fixtures) silently ignore it. The provider-section order isn't seeded
 /// here: an empty saved order reconciles to plain registry order in `LayoutStore`.
@@ -23,6 +24,10 @@ enum DefaultLayout {
         "copilot.chat", "copilot.completions",
 
         "devin.daily", "devin.weekly", "devin.extra",
+
+        "freebuff.session", "freebuff.daily", "freebuff.weekly", "freebuff.fiveDay",
+        "freebuff.monthly", "freebuff.premiumSessions", "freebuff.freePremiumSessions", "freebuff.freebucksDaily",
+        "freebuff.freebucksBalance", "freebuff.monthlySpend",
 
         "grok.weekly", "grok.trend",
         "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",

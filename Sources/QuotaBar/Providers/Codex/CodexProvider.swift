@@ -20,9 +20,13 @@ final class CodexProvider: ProviderRuntime {
     let logUsageScanner: CodexLogUsageScanner
     let proxyUsageScanner: CodexProxyUsageScanner
     let routerUsageScanner: CodexRouterUsageScanner
+    let piUsageScanner: PiUsageScanner
     let expectedIdentityKey: String?
     let allowsKeychainFallback: Bool
     let allowsUnattributedPiUsage: Bool
+    /// Higher-priority peer homes are identity-only sources for excluding shared rollouts. They are
+    /// resolved at scan time and may belong to disabled cards; their contents are never folded here.
+    let peerHomes: @MainActor () -> [URL]
     let now: @Sendable () -> Date
     let pricing: @Sendable () async -> ModelPricing
 
@@ -33,9 +37,11 @@ final class CodexProvider: ProviderRuntime {
         logUsageScanner: CodexLogUsageScanner = CodexLogUsageScanner(),
         proxyUsageScanner: CodexProxyUsageScanner = CodexProxyUsageScanner(),
         routerUsageScanner: CodexRouterUsageScanner = CodexRouterUsageScanner(),
+        piUsageScanner: PiUsageScanner = .shared,
         expectedIdentityKey: String? = nil,
         allowsKeychainFallback: Bool = true,
         allowsUnattributedPiUsage: Bool = true,
+        peerHomes: @escaping @MainActor () -> [URL] = { [] },
         now: @escaping @Sendable () -> Date = Date.init,
         pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
     ) {
@@ -46,9 +52,11 @@ final class CodexProvider: ProviderRuntime {
         self.logUsageScanner = logUsageScanner
         self.proxyUsageScanner = proxyUsageScanner
         self.routerUsageScanner = routerUsageScanner
+        self.piUsageScanner = piUsageScanner
         self.expectedIdentityKey = normalizedIdentity
         self.allowsKeychainFallback = allowsKeychainFallback
         self.allowsUnattributedPiUsage = allowsUnattributedPiUsage
+        self.peerHomes = peerHomes
         self.now = now
         self.pricing = pricing
     }
@@ -79,20 +87,44 @@ final class CodexProvider: ProviderRuntime {
     }
 
     func hasLocalCredentials() async -> Bool {
-        let fileCandidates = authStore.loadAuthCandidates().filter(isExpectedAccount)
+        let fileCandidates: [CodexAuthState]
+        do {
+            fileCandidates = try await loadOffMainActor { [authStore] in
+                try authStore.loadAuthCandidates()
+            }.filter(isExpectedAccount)
+        } catch CodexAuthError.credentialsUnreadable, CodexAuthError.invalidAuthPayload {
+            // Keep a card visible when its local credential source exists but cannot currently be
+            // inspected. The normal refresh surfaces the actionable file/keychain error.
+            return true
+        } catch {
+            return false
+        }
         if fileCandidates.contains(where: \.hasUsableAccessToken) {
             return true
         }
         guard allowsKeychainFallback else { return false }
         // A Keychain refusal means the item is not usable from here, which is the same boolean answer
         // as "no candidate" for this probe; the reason is surfaced separately by `refresh`.
-        let keychain = await loadOffMainActor { [authStore] in
-            try? authStore.loadKeychainAuth()
+        let keychain: CodexAuthState?
+        do {
+            keychain = try await loadOffMainActor { [authStore] in
+                try authStore.loadKeychainAuth()
+            }
+        } catch CodexAuthError.credentialPermissionRequired {
+            // The Keychain confirmed a credential exists but requires consent. Keep this card enabled
+            // so its permission state is visible and the user's manual refresh can request access.
+            return true
+        } catch CodexAuthError.credentialsUnreadable {
+            // An indeterminate Keychain result must not permanently hide a card during one-shot seeding.
+            return true
+        } catch {
+            return false
         }
         return keychain.map { isExpectedAccount($0) && $0.hasUsableAccessToken } == true
     }
 
     func refresh() async -> ProviderSnapshot {
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         // Fold-only passes (closed-panel ledger wakes, panel phase 2) fold the router ledger and
         // native sessions without re-reading the live quota APIs — per-turn re-reads are exactly
         // the burn the watcher's closed-panel rate limit exists to prevent, and the panel's
@@ -100,12 +132,15 @@ final class CodexProvider: ProviderRuntime {
         // meters from the prior snapshot and carries their freshness stamp.
         if ProviderRefreshContext.scope.suppressesLiveQuota {
             var lines: [MetricLine] = []
+            let modelPricing = await pricing()
+            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
             let usageHistory = await appendLocalUsage(
                 to: &lines,
                 now: now(),
-                pricing: await pricing(),
+                pricing: modelPricing,
                 accountIdentityKey: expectedIdentityKey
             )
+            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
             MetricLine.appendNoDataIfNeeded(&lines)
             return ProviderSnapshot.make(
                 provider: provider,
@@ -116,21 +151,43 @@ final class CodexProvider: ProviderRuntime {
             )
         }
 
-        let fileCandidates = authStore.loadAuthCandidates().filter(isExpectedAccount)
+        let fileCandidates: [CodexAuthState]
+        var localSourceError: Error?
+        do {
+            fileCandidates = try await loadOffMainActor { [authStore] in
+                try authStore.loadAuthCandidates()
+            }.filter(isExpectedAccount)
+        } catch is CancellationError {
+            return cancelledRefreshSnapshot(provider: provider)
+        } catch {
+            if ProviderCancellation.isCancellation(error) {
+                return cancelledRefreshSnapshot(provider: provider)
+            }
+            fileCandidates = []
+            localSourceError = error
+        }
         var lastFallbackError: Error?
 
         for candidate in fileCandidates {
+            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
             do {
                 return try await probe(authState: candidate)
             } catch let error as CodexAuthError where error.allowsAuthFallback {
+                guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
                 lastFallbackError = error
                 continue
+            } catch is CancellationError {
+                return cancelledRefreshSnapshot(provider: provider)
             } catch {
+                if ProviderCancellation.isCancellation(error) {
+                    return cancelledRefreshSnapshot(provider: provider)
+                }
                 return await localOnlySnapshot(after: error)
             }
         }
 
         if allowsKeychainFallback {
+            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
             // Surface a credential-permission failure instead of letting it fall through to
             // `notLoggedIn`, whose remedy (re-authenticate) cannot possibly help.
             let keychainCandidate: CodexAuthState?
@@ -138,19 +195,30 @@ final class CodexProvider: ProviderRuntime {
                 keychainCandidate = try await loadOffMainActor({ [authStore] in
                     try authStore.loadKeychainAuth()
                 })
+            } catch is CancellationError {
+                return cancelledRefreshSnapshot(provider: provider)
             } catch {
+                if Task.isCancelled { return cancelledRefreshSnapshot(provider: provider) }
                 return await localOnlySnapshot(after: error)
             }
+            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
             if let keychainCandidate, isExpectedAccount(keychainCandidate) {
                 do {
                     return try await probe(authState: keychainCandidate)
+                } catch is CancellationError {
+                    return cancelledRefreshSnapshot(provider: provider)
                 } catch {
+                    if ProviderCancellation.isCancellation(error) {
+                        return cancelledRefreshSnapshot(provider: provider)
+                    }
                     return await localOnlySnapshot(after: error)
                 }
             }
         }
 
-        return await localOnlySnapshot(after: lastFallbackError ?? CodexAuthError.notLoggedIn)
+        return await localOnlySnapshot(
+            after: lastFallbackError ?? localSourceError ?? CodexAuthError.notLoggedIn
+        )
     }
 
     /// The account boundary for a scoped card. A candidate that cannot prove which ChatGPT/Codex
@@ -166,6 +234,7 @@ final class CodexProvider: ProviderRuntime {
     }
 
     private func probe(authState initialState: CodexAuthState) async throws -> ProviderSnapshot {
+        try Task.checkCancellation()
         var authState = initialState
         guard isExpectedAccount(authState) else { throw CodexAuthError.tokenConflict }
         guard var accessToken = authState.auth.tokens?.accessToken, !accessToken.isEmpty else {
@@ -176,7 +245,7 @@ final class CodexProvider: ProviderRuntime {
         }
 
         if authStore.needsRefresh(authState.auth) {
-            if let live = reloadLiveAuth(source: authState.source),
+            if let live = try await reloadLiveAuth(source: authState.source),
                let liveToken = live.auth.tokens?.accessToken, !liveToken.isEmpty {
                 authState = live
                 accessToken = liveToken
@@ -190,13 +259,16 @@ final class CodexProvider: ProviderRuntime {
             accessToken = refreshed
         }
 
+        try Task.checkCancellation()
         guard isExpectedAccount(authState) else { throw CodexAuthError.tokenConflict }
         let response = try await fetchUsageWithRetry(accessToken: accessToken, authState: &authState)
+        try Task.checkCancellation()
         let currentToken = authState.auth.tokens?.accessToken ?? accessToken
-        let resetCredits = await fetchResetCreditsBestEffort(
+        let resetCredits = try await fetchResetCreditsBestEffort(
             accessToken: currentToken,
             accountID: authState.auth.tokens?.accountID
         )
+        try Task.checkCancellation()
         var mapped = try CodexUsageMapper.mapUsageResponse(response, resetCredits: resetCredits, now: now())
 
         // Menu-bar and panel-meter passes only need Session/Weekly (and sibling) quota meters from
@@ -207,6 +279,7 @@ final class CodexProvider: ProviderRuntime {
             usageHistory = nil
         } else {
             let pricing = await pricing()
+            try Task.checkCancellation()
             usageHistory = await appendLocalUsage(
                 to: &mapped.lines,
                 now: now(),
@@ -229,6 +302,7 @@ final class CodexProvider: ProviderRuntime {
     /// successful snapshot with a warning prevents a stale, possibly mixed cached total from being
     /// presented as current accounting; the live quota meters are simply absent until auth recovers.
     private func localOnlySnapshot(after error: Error) async -> ProviderSnapshot {
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         var lines: [MetricLine] = []
         let usageHistory: ProviderUsageHistory?
         if ProviderRefreshContext.scope.skipsLocalAccounting {
@@ -236,10 +310,12 @@ final class CodexProvider: ProviderRuntime {
             // prior spend/history via the data-store merge.
             usageHistory = nil
         } else {
+            let modelPricing = await pricing()
+            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
             usageHistory = await appendLocalUsage(
                 to: &lines,
                 now: now(),
-                pricing: await pricing(),
+                pricing: modelPricing,
                 accountIdentityKey: expectedIdentityKey
             )
         }
@@ -260,6 +336,7 @@ final class CodexProvider: ProviderRuntime {
         pricing: ModelPricing,
         accountIdentityKey: String?
     ) async -> ProviderUsageHistory? {
+        guard !Task.isCancelled else { return nil }
         // Unscoped legacy router rows (no account fingerprint) are only safe on the
         // single/default card. Multi-account cards always carry expectedIdentityKey and
         // therefore require a matching stamp — see CodexRouterUsageScanner.
@@ -274,21 +351,54 @@ final class CodexProvider: ProviderRuntime {
             now: now,
             pricing: pricing
         )
+        guard !Task.isCancelled else { return nil }
         // Native sessions may contain days that never passed through Codex Router. Their per-file
         // aggregates skip unchanged events, so preserving gap-fill history needs no repeated fold.
-        let nativeScan = await logUsageScanner.scan(
+        let nativeResult = await logUsageScanner.scanResult(
+            daysBack: UsageHistoryWindow.lifetimeDays(through: now),
+            now: now,
+            pricing: pricing,
+            peerHomes: peerHomes()
+        )
+        guard !Task.isCancelled else { return nil }
+        let nativeScan: LogUsageScan?
+        switch nativeResult {
+        case .complete(let scan):
+            nativeScan = scan
+        case .incomplete:
+            AppLog.warn(
+                LogTag.plugin("codex"),
+                "Codex session discovery or fold was incomplete; keeping the previous combined usage history"
+            )
+            return nil
+        }
+        let proxyScan = await proxyUsageScanner.scan(
+            accountIdentityKey: accountIdentityKey,
             daysBack: UsageHistoryWindow.lifetimeDays(through: now),
             now: now,
             pricing: pricing
         )
-        let proxyScan = await proxyUsageScanner.scan(
-            accountIdentityKey: accountIdentityKey,
-            now: now,
-            pricing: pricing
-        )
-        let piScan = allowsUnattributedPiUsage
-            ? await PiUsageScanner.shared.scan(cardID: provider.id, now: now, pricing: pricing)
-            : nil
+        guard !Task.isCancelled else { return nil }
+        let piResult: PiUsageScanResult = allowsUnattributedPiUsage
+            ? await piUsageScanner.scanResult(
+                cardID: provider.id,
+                daysBack: UsageHistoryWindow.lifetimeDays(through: now),
+                now: now,
+                pricing: pricing
+            )
+            : .complete(nil)
+        guard !Task.isCancelled else { return nil }
+        let piScan: LogUsageScan?
+        switch piResult {
+        case .complete(let scan):
+            piScan = scan
+        case .incomplete:
+            AppLog.warn(
+                LogTag.plugin("codex"),
+                "Pi session discovery was incomplete; keeping the previous combined usage history"
+            )
+            return nil
+        }
         // Multi-account cards (expectedIdentityKey set): prefer CodexRouter stamped metering as
         // primary. Shared ~/.codex session trees often mix both accounts' history, so logs-first
         // made both cards show the same inflated chart. Single-card installs keep logs → FCC →
@@ -324,7 +434,7 @@ final class CodexProvider: ProviderRuntime {
             usedProxy = logsAndProxy.usedSupplement
             usedRouter = logsProxyAndRouter.usedSupplement
         }
-        guard !Task.isCancelled, let scan = DailyUsageAccumulator.merged([coreScan, piScan]) else {
+        guard let scan = DailyUsageAccumulator.merged([coreScan, piScan]) else {
             return nil
         }
 
@@ -339,7 +449,8 @@ final class CodexProvider: ProviderRuntime {
             series: scan.series,
             modelUsage: scan.modelUsage,
             unknownModelsByDay: scan.unknownModelsByDay,
-            apiEstimateByDay: scan.apiEstimateByDay
+            apiEstimateByDay: scan.apiEstimateByDay,
+            apiEstimateIncompleteDays: scan.apiEstimateIncompleteDays
         )
         SpendTileMapper.appendTokenUsage(
             scan.series,
@@ -354,22 +465,32 @@ final class CodexProvider: ProviderRuntime {
         return usageHistory
     }
 
-    private func fetchResetCreditsBestEffort(accessToken: String, accountID: String?) async -> HTTPResponse? {
+    private func fetchResetCreditsBestEffort(accessToken: String, accountID: String?) async throws -> HTTPResponse? {
+        guard !Task.isCancelled else { return nil }
         do {
             return try await usageClient.fetchResetCredits(accessToken: accessToken, accountID: accountID)
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             AppLog.warn(LogTag.plugin("codex"), "reset-credit fetch failed; using usage-body count: \(error.localizedDescription)")
             return nil
         }
     }
 
     private func fetchUsageWithRetry(accessToken: String, authState: inout CodexAuthState) async throws -> HTTPResponse {
+        try Task.checkCancellation()
         var working = authState
         defer { authState = working }
         return try await ProviderAuthRetry.fetch(
             token: accessToken,
-            attempt: { try await self.usageClient.fetchUsage(accessToken: $0, accountID: working.auth.tokens?.accountID) },
+            attempt: {
+                try Task.checkCancellation()
+                return try await self.usageClient.fetchUsage(
+                    accessToken: $0,
+                    accountID: working.auth.tokens?.accountID
+                )
+            },
             refreshAccessToken: {
+                try Task.checkCancellation()
                 guard let refreshToken = working.auth.tokens?.refreshToken, !refreshToken.isEmpty else {
                     throw CodexAuthError.tokenExpired
                 }
@@ -378,6 +499,7 @@ final class CodexProvider: ProviderRuntime {
                 } catch let error as CodexAuthError {
                     throw error
                 } catch {
+                    try ProviderCancellation.rethrowIfCancellation(error)
                     throw CodexUsageError.connectionFailed
                 }
             },
@@ -386,16 +508,26 @@ final class CodexProvider: ProviderRuntime {
         )
     }
 
-    private func reloadLiveAuth(source: CodexAuthState.Source) -> CodexAuthState? {
+    private func reloadLiveAuth(source: CodexAuthState.Source) async throws -> CodexAuthState? {
         let candidate: CodexAuthState?
         switch source {
         case .file(let path):
-            candidate = authStore.loadAuth(at: path)
-        case .keychain:
+            do {
+                candidate = try await loadOffMainActor { [authStore] in
+                    try authStore.loadAuth(at: path)
+                }
+            } catch {
+                try ProviderCancellation.rethrowIfCancellation(error)
+                candidate = nil
+            }
+        case .keychain(let account):
             guard allowsKeychainFallback else { return nil }
             do {
-                candidate = try authStore.loadKeychainAuth()
+                candidate = try await loadOffMainActor { [authStore] in
+                    try authStore.loadKeychainAuth(account: account)
+                }
             } catch {
+                try ProviderCancellation.rethrowIfCancellation(error)
                 AppLog.info(LogTag.auth("codex"), "keychain credential unavailable: \(error)")
                 return nil
             }
@@ -405,7 +537,15 @@ final class CodexProvider: ProviderRuntime {
     }
 
     private func refreshAccessToken(authState: inout CodexAuthState, refreshToken: String) async throws -> String {
-        let response = try await usageClient.refreshToken(refreshToken)
+        let originalState = authState
+        try Task.checkCancellation()
+        let response: CodexRefreshResponse
+        do {
+            response = try await usageClient.refreshToken(refreshToken)
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            throw error
+        }
         authState.auth.tokens?.accessToken = response.accessToken
         if let refreshToken = response.refreshToken {
             authState.auth.tokens?.refreshToken = refreshToken
@@ -416,10 +556,32 @@ final class CodexProvider: ProviderRuntime {
         authState.auth.lastRefresh = OpenUsageISO8601.string(from: now())
         guard isExpectedAccount(authState) else { throw CodexAuthError.tokenConflict }
         do {
-            try authStore.save(authState)
+            let persistedState = authState
+            let authStore = self.authStore
+            let refreshContext = ProviderRefreshContext.detachedValues
+            // A successful refresh may rotate the refresh token and invalidate the old one. Persist
+            // that rotation even if the provider task was canceled while the HTTP response was in
+            // flight; otherwise the next refresh can be permanently stranded on a revoked token.
+            try await Task.detached(priority: .utility) {
+                try refreshContext.withValue {
+                    try authStore.save(persistedState, replacing: originalState)
+                }
+            }.value
+        } catch let error as CodexAuthError {
+            switch error {
+            case .tokenConflict, .credentialPermissionRequired, .credentialsUnreadable, .invalidAuthPayload:
+                // The refreshed token must not be used after logout, an account switch, or an
+                // indeterminate live-source check. Only ordinary write failures may use it in-memory.
+                throw error
+            default:
+                AppLog.error(LogTag.auth("codex"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
+            }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             AppLog.error(LogTag.auth("codex"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
         }
+        try Task.checkCancellation()
         return response.accessToken
     }
 }

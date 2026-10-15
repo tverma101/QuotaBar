@@ -6,9 +6,9 @@ app running. The output contains stable scalar limits and balances, not UI rows,
 charts, or spend-history tiles.
 
 ```sh
-openusage                 # every enabled provider, refreshing stale cache entries
-openusage codex           # one provider, refreshing when its cache is stale
-openusage codex --force   # refresh through the shared provider engine, cache, print, exit
+quotabar                 # every enabled provider, refreshing stale cache entries
+quotabar codex           # one provider, refreshing when its cache is stale
+quotabar codex --force   # refresh through the shared provider engine, cache, print, exit
 ```
 
 The command and app import the same providers, authentication stores, pricing, refresh coordinator, and

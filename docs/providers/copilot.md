@@ -34,6 +34,8 @@ Checked in this order (prompt-free files first, Keychain last):
 2. GitHub CLI config: `~/.config/gh/hosts.yml` (`oauth_token`), when `gh` stores its token in a file.
 3. GitHub CLI Keychain item (service `gh:github.com`), when `gh` stores its token in the system keyring.
 
+QuotaBar scopes a GitHub CLI Keychain lookup to the username in `hosts.yml` when that file is readable. If the file exists but cannot be read, QuotaBar keeps Copilot visible and reports a credential-access error rather than making a service-only query that could select a different GitHub account.
+
 ### Setup
 
 If usage doesn't appear, authenticate with the GitHub CLI:
@@ -48,11 +50,15 @@ Using Copilot in a supported editor is enough on its own — the editor writes t
 ## Troubleshooting
 
 - **"Sign in to GitHub Copilot…"** — no token was found. Sign in to Copilot in your editor, or run `gh auth login`.
-- **"GitHub token invalid or expired"** — the token was rejected (401/403). Re-authenticate with `gh auth login`.
+- **"QuotaBar couldn't read a Copilot credential source"** — check that your editor config or GitHub CLI config is readable, or unlock your login Keychain, then refresh.
+- **"QuotaBar found malformed Copilot editor credentials"** — `apps.json` or `hosts.json` is invalid JSON or has a malformed GitHub.com entry (including a non-string `oauth_token`). Repair/remove the malformed file or sign in again; a readable alternate source such as GitHub CLI config or Keychain still takes precedence when it has a token.
+- **The GitHub CLI config cannot be read** — restore read access to `~/.config/gh/hosts.yml`. QuotaBar needs its username to safely select the matching Keychain item, so it will not use an unscoped lookup while the file is unreadable.
+- **"GitHub token invalid or expired"** — GitHub returned 401. Re-authenticate with `gh auth login`.
+- **"GitHub denied access to Copilot usage"** — GitHub returned 403. Check the account's Copilot license and organization policy before changing credentials.
 - **Meters show "No data" but the plan is shown** — expected on an org-managed Copilot Business/Enterprise seat whose response carries no personal `credits_used` and, if you aren't an org owner or billing manager, no org billing access either (GitHub doesn't expose per-seat quota otherwise, and org billing is admin-only). If you *are* an org admin and still see no Org Credits, make sure your token can list your orgs — the GitHub CLI token from `gh auth login` can; some editor-plugin tokens can't.
 
 ## Under the hood
 
 `GET https://api.github.com/copilot_internal/user` with the standard Copilot client headers (API version `2025-04-01`). The response reports each bucket as percent *remaining*; the meters show percent *used*.
 
-For org-managed seats (identified by the token-based-billing placeholder in that response), the provider additionally calls the public REST billing API: `GET /user/orgs` to list your organizations, then `GET /orgs/{org}/settings/billing/usage/summary` per org until one reports Copilot AI-credit usage. The matching org is remembered, so steady-state refreshes make a single extra call; it's re-discovered automatically if it stops answering.
+For org-managed seats (identified by the token-based-billing placeholder in that response), the provider additionally calls the public REST billing API: `GET /user/orgs` to list your organizations, following GitHub's pagination links, then `GET /orgs/{org}/settings/billing/usage/summary` per org until one reports Copilot AI-credit usage. The matching org is remembered, so steady-state refreshes make a single extra call; it's re-discovered automatically if it stops answering. When GitHub reports a rate limit or the remaining request count reaches zero, QuotaBar stops the org scan for that refresh and honors `Retry-After` / reset time when supplied; otherwise org discovery pauses for five minutes. Repeated no-access/no-result scans also pause for five minutes. An explicit Refresh retries an ordinary no-result scan immediately but still honors a server-directed rate-limit deadline.

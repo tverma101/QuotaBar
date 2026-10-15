@@ -27,6 +27,14 @@ struct GrokAuthState: Hashable, Sendable {
     var token: String
 }
 
+struct GrokAuthConflictError: Error, LocalizedError, CategorizedError {
+    var errorDescription: String? {
+        "Grok login changed while the token was refreshing. Refresh again to load the current account."
+    }
+
+    var errorCategory: ErrorCategory { .authExpired }
+}
+
 enum GrokAuthError: Error, LocalizedError, Equatable {
     case notLoggedIn
     case invalidAuth
@@ -42,6 +50,14 @@ enum GrokAuthError: Error, LocalizedError, Equatable {
             return "Grok auth expired. Run `grok login` again."
         }
     }
+}
+
+struct GrokCredentialsUnreadableError: Error, LocalizedError, CategorizedError {
+    var errorDescription: String? {
+        "QuotaBar couldn't read Grok CLI credentials at ~/.grok/auth.json. Check the file permissions, then refresh again."
+    }
+
+    var errorCategory: ErrorCategory { .credentialAccess }
 }
 
 struct GrokAuthStore: Sendable {
@@ -61,11 +77,18 @@ struct GrokAuthStore: Sendable {
     }
 
     func loadAuthCandidates() throws -> [GrokAuthState] {
-        guard files.exists(Self.authPath),
-              let text = try? files.readText(Self.authPath),
-              let auth = Self.parseAuth(text)
-        else {
-            throw GrokAuthError.notLoggedIn
+        let text: String?
+        do {
+            text = try files.readTextIfPresent(Self.authPath)
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            AppLog.error(LogTag.auth("grok"), "Grok auth file read failed")
+            throw GrokCredentialsUnreadableError()
+        }
+        guard let text else { throw GrokAuthError.notLoggedIn }
+
+        guard let auth = Self.parseAuth(text) else {
+            throw GrokAuthError.invalidAuth
         }
 
         let candidates = auth.compactMap { entryKey, entry -> GrokAuthState? in
@@ -83,11 +106,35 @@ struct GrokAuthStore: Sendable {
         // Refuse to overwrite a present-but-unreadable/corrupt auth.json by rebuilding it from
         // in-memory state — that would silently drop OTHER accounts' entries. A genuinely absent file
         // (first write) is seeded from in-memory state instead.
+        try save(state, existingText: try readAuthTextForSave())
+    }
+
+    /// Persist a rotated entry only if the same entry is still live. A logout or account replacement
+    /// during the OAuth request must not recreate the old account or overwrite its replacement.
+    func save(_ state: GrokAuthState, replacing original: GrokAuthState) throws {
+        guard state.entryKey == original.entryKey,
+              let existingText = try readAuthTextForSave(),
+              let liveEntry = Self.parseAuth(existingText)?[original.entryKey],
+              liveEntry == original.entry else {
+            throw GrokAuthConflictError()
+        }
+        try save(state, existingText: existingText)
+    }
+
+    private func readAuthTextForSave() throws -> String? {
+        do {
+            return try files.readTextIfPresent(Self.authPath)
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            AppLog.error(LogTag.auth("grok"), "Grok auth file read failed while saving")
+            throw GrokCredentialsUnreadableError()
+        }
+    }
+
+    private func save(_ state: GrokAuthState, existingText: String?) throws {
         var authObject: [String: Any]
-        if files.exists(Self.authPath) {
-            guard let existingText = try? files.readText(Self.authPath),
-                  let parsed = Self.parseJSONObject(existingText)
-            else {
+        if let existingText {
+            guard let parsed = Self.parseJSONObject(existingText) else {
                 throw GrokAuthError.invalidAuth
             }
             authObject = parsed

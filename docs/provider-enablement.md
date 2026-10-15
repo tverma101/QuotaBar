@@ -13,7 +13,7 @@ The same detection runs for providers that arrive later. On the first launch aft
 - **Credentials are available locally** → the provider turns on and appears on the dashboard.
 - **No credentials are available** → it stays off. You can always turn it on later in **Customize**.
 
-This check happens **once per provider**. After that, the provider is yours to manage: if you turn it off, no update will ever turn it back on, and installing the tool later won't flip it on behind your back either — head to Customize when you want it.
+This check happens **once per provider**. If QuotaBar closes before a check finishes, it resumes that pending check on the next launch. A saved user toggle still wins, and a completed miss is not probed again. After detection finishes, the provider is yours to manage: if you turn it off, no update will turn it back on, and installing the tool later won't flip it on behind your back either — head to Customize when you want it.
 
 ## Your choices always stick
 
@@ -23,10 +23,10 @@ The one exception is deliberate: the **Reset All Customization** button at the t
 
 ## How it works (for the curious)
 
-The app persists three small lists in its settings:
+The app persists provider choices plus the state needed to resume unfinished credential checks:
 
 - **Enabled providers** — the providers currently on. This is the source of truth the dashboard and menu bar read.
-- **Known providers** — every provider this install has ever seen. This is what makes "new in this update" distinguishable from "you turned it off": a provider missing from the enabled list but present in the known list is a deliberate choice, and is left alone. Only providers missing from *both* get the credential check, and each is marked known immediately so the check never repeats.
+- **Known providers and pending checks** — every provider this install has seen, plus any new-provider checks that did not finish before QuotaBar closed. A pending check resumes on launch; a completed miss stays one-shot. Persisted user-choice revisions prevent a resumed first-run check from replacing a toggle.
 - Each provider implements a cheap, local-only credential probe (`hasLocalCredentials()`) — the same files, keychain entries, saved keys, and environment variables its normal refresh reads, never the network.
 
 Older installs (from before first-run detection existed) started with every provider on and stored only the ones turned *off*. A one-time settings migration converts them to the lists above with the exact same providers on and off as before — nothing visibly changes on the launch that migrates; those installs simply join the same new-provider detection from then on.

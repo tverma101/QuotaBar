@@ -1,7 +1,7 @@
 import Foundation
 
 /// The live status of a provider's user-supplied API key, shown in its Customize ▸ API Key section.
-/// Maps to the four states the provider-neutral key editor renders:
+/// Maps to the key-source and repair states the provider-neutral key editor renders:
 ///
 /// - `notSet`: no key in the environment or the saved file — the card offers an Add field.
 /// - `fromEnvironment`: a key is present in the environment only — shown read-only, with an
@@ -10,6 +10,10 @@ import Foundation
 ///   shown as "Saved in App", with reveal and clear controls in Edit mode.
 /// - `overrideActive`: a saved key is overriding a key also present in the environment — shown as
 ///   "Custom Key", with reveal and clear controls (clearing falls back to the environment key).
+/// - `savedUnreadable`: a saved config file exists but cannot be read and no environment fallback is
+///   available — shown as a repair state, not as a missing key.
+/// - `environmentFallback`: the saved config is unreadable, so the environment key remains active —
+///   shown as an environment source that still needs attention.
 ///
 /// The auth store's existing precedence (config file > env) is what makes a saved key an override
 /// for free; this type just reports which combination is present.
@@ -18,6 +22,42 @@ enum APIKeyStatus: Sendable, Equatable {
     case fromEnvironment
     case saved
     case overrideActive
+    case savedUnreadable
+    case environmentFallback
+
+    var indicator: APIKeyStatusIndicator {
+        switch self {
+        case .notSet: .missing
+        case .savedUnreadable, .environmentFallback: .needsAttention
+        case .fromEnvironment, .saved, .overrideActive: .ready
+        }
+    }
+
+    var editorMode: APIKeyEditorMode {
+        switch self {
+        case .notSet: .add
+        case .fromEnvironment: .environment
+        case .saved: .saved
+        case .overrideActive: .override
+        case .savedUnreadable: .savedUnreadable
+        case .environmentFallback: .environmentFallback
+        }
+    }
+}
+
+enum APIKeyStatusIndicator: Sendable, Equatable {
+    case missing
+    case needsAttention
+    case ready
+}
+
+enum APIKeyEditorMode: Sendable, Equatable {
+    case add
+    case environment
+    case saved
+    case override
+    case savedUnreadable
+    case environmentFallback
 }
 
 /// A `ProviderRuntime` that needs a user-supplied API key (currently OpenRouter and Z.ai). The

@@ -45,7 +45,7 @@ enum SpendTileMapper {
                                         modelUsage,
                                         days: [today],
                                         totalTokens: entry.totalTokens,
-                                        totalCostUSD: entry.costUSD,
+                                        totalCostUSD: entry.costIsComplete ? entry.costUSD : nil,
                                         sourceNote: modelSourceNote
                                       )))
         }
@@ -57,7 +57,7 @@ enum SpendTileMapper {
                                         modelUsage,
                                         days: Set([yesterday].compactMap { $0 }),
                                         totalTokens: entry.totalTokens,
-                                        totalCostUSD: entry.costUSD,
+                                        totalCostUSD: entry.costIsComplete ? entry.costUSD : nil,
                                         sourceNote: modelSourceNote
                                       )))
         }
@@ -71,16 +71,17 @@ enum SpendTileMapper {
             dayKey(fromUsageDate: entry.date).map { windowKeys.contains($0) } == true
         }
         let totalTokens = windowed.reduce(0) { ProviderParse.addingSaturating($0, $1.totalTokens) }
+        let allUnknown = unknownModelsByDay
+            .filter { windowKeys.contains($0.key) }
+            .values
+            .reduce(into: Set<String>()) { $0.formUnion($1) }
+        let costIsComplete = windowed.allSatisfy(\.costIsComplete) && allUnknown.isEmpty
         let costSamples = windowed.compactMap(\.costUSD)
-        let totalCost = costSamples.isEmpty ? nil : costSamples.reduce(0, +)
+        let totalCost = costIsComplete && !costSamples.isEmpty ? costSamples.reduce(0, +) : nil
         if totalTokens > 0 || (totalCost ?? 0) > 0 {
             // The 30-day total is incomplete whenever ANY day in the window is partial — a running
             // Hermes session keeps growing, so the sum is real but not final.
             let windowPartial = windowed.contains { dayKey(fromUsageDate: $0.date).map(partialDays.contains) == true }
-            let allUnknown = unknownModelsByDay
-                .filter { windowKeys.contains($0.key) }
-                .values
-                .reduce(into: Set<String>()) { $0.formUnion($1) }
             lines.append(.values(label: "Last 30 Days",
                                  values: spendValues(tokens: totalTokens, costUSD: totalCost, estimated: estimated,
                                                      tokensEstimated: windowPartial),
@@ -199,7 +200,8 @@ enum SpendTileMapper {
         unknownModels: [String],
         modelBreakdown: ModelUsageBreakdown?
     ) -> MetricLine {
-        .values(label: label, values: spendValues(tokens: entry.totalTokens, costUSD: entry.costUSD,
+        .values(label: label, values: spendValues(tokens: entry.totalTokens,
+                                                  costUSD: entry.costIsComplete ? entry.costUSD : nil,
                                                   estimated: estimated, tokensEstimated: partial),
                 unknownModels: unknownModels, modelBreakdown: modelBreakdown)
     }
@@ -254,9 +256,10 @@ enum SpendTileMapper {
     private struct ModelAccumulator {
         var tokens = 0
         var costUSD: Double?
+        private var costIsComplete = true
         private var nameVote = SpellingVote()
         /// Keyed by the case-folded slug; the vote inside restores a display spelling.
-        private var variants: [String: (tokens: Int, costUSD: Double?, vote: SpellingVote)] = [:]
+        private var variants: [String: (tokens: Int, costUSD: Double?, costIsComplete: Bool, vote: SpellingVote)] = [:]
 
         /// The display spelling for this model, elected across every casing that merged into it.
         var displayName: String? { nameVote.best }
@@ -277,6 +280,8 @@ enum SpendTileMapper {
             tokens = ProviderParse.addingSaturating(tokens, entry.totalTokens)
             if let cost = entry.costUSD {
                 costUSD = (costUSD ?? 0) + cost
+            } else if entry.totalTokens > 0 {
+                costIsComplete = false
             }
             mergeVariant(entry.model, tokens: entry.totalTokens, costUSD: entry.costUSD)
         }
@@ -285,15 +290,20 @@ enum SpendTileMapper {
             tokens = ProviderParse.addingSaturating(tokens, entry.totalTokens)
             if let cost = entry.costUSD {
                 costUSD = (costUSD ?? 0) + cost
+            } else if entry.totalTokens > 0 {
+                costIsComplete = false
             }
             nameVote.note(name, weight: entry.totalTokens)
         }
 
         private mutating func mergeVariant(_ model: String, tokens: Int, costUSD: Double?) {
             let key = model.lowercased()
-            var existing = variants[key] ?? (0, nil, SpellingVote())
+            var existing = variants[key] ?? (0, nil, true, SpellingVote())
             existing.tokens = ProviderParse.addingSaturating(existing.tokens, tokens)
             existing.costUSD = costUSD.map { (existing.costUSD ?? 0) + $0 } ?? existing.costUSD
+            if tokens > 0 && costUSD == nil {
+                existing.costIsComplete = false
+            }
             existing.vote.note(model, weight: tokens)
             variants[key] = existing
         }
@@ -302,13 +312,17 @@ enum SpendTileMapper {
             let list = variants
                 .map { key, value in
                     ModelUsageVariant(model: value.vote.best ?? key, totalTokens: value.tokens,
-                                      costUSD: value.costUSD.map(SpendTileMapper.roundToCents))
+                                      costUSD: value.costIsComplete
+                                        ? value.costUSD.map(SpendTileMapper.roundToCents)
+                                        : nil)
                 }
                 .sorted(by: variantSortPrecedes)
             // One variant carrying the row's own name is no breakdown — nil keeps the tooltip on plain figures.
             let isTrivial = list.count == 1 && list[0].model.lowercased() == model.lowercased()
             return ModelUsageEntry(model: model, totalTokens: tokens,
-                                   costUSD: costUSD.map(SpendTileMapper.roundToCents),
+                                   costUSD: costIsComplete
+                                     ? costUSD.map(SpendTileMapper.roundToCents)
+                                     : nil,
                                    variants: isTrivial ? nil : list)
         }
     }

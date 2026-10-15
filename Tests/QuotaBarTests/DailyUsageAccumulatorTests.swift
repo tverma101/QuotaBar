@@ -77,6 +77,61 @@ final class DailyUsageAccumulatorTests: XCTestCase {
         XCTAssertEqual(scan.unknownModelsByDay, ["2024-06-02": ["mystery-model"]])
     }
 
+    func testDailyCostCoverageAndModelCostsBecomeIncompleteForMixedUsage() throws {
+        var accumulator = DailyUsageAccumulator()
+        accumulator.add(day: "2026-10-14", tokens: 100, cost: 1, model: "known")
+        accumulator.add(day: "2026-10-14", tokens: 25, cost: nil, model: "unknown")
+        accumulator.addUnknownModel(day: "2026-10-14", model: "unknown")
+
+        let scan = accumulator.build()
+        let day = try XCTUnwrap(scan.series.daily.first)
+        XCTAssertEqual(day.totalTokens, 125)
+        XCTAssertFalse(day.costIsComplete)
+        let models = Dictionary(uniqueKeysWithValues: try XCTUnwrap(scan.modelUsage?.daily.first?.models).map { ($0.model, $0) })
+        XCTAssertEqual(models["known"]?.costUSD, 1)
+        XCTAssertNil(models["unknown"]?.costUSD)
+    }
+
+    func testPublicAPIEstimateIsMarkedIncompleteWhenProviderOnlyRateExists() throws {
+        var accumulator = DailyUsageAccumulator()
+        accumulator.add(day: "2026-10-14", tokens: 100, cost: 0.25, model: "cursor-native-model")
+        accumulator.recordApiEstimate(day: "2026-10-14", cost: nil, tokens: 100)
+        accumulator.add(day: "2026-10-14", tokens: 200, cost: 0.10, model: "public-model")
+        accumulator.recordApiEstimate(day: "2026-10-14", cost: 0.08, tokens: 200)
+
+        let scan = accumulator.build()
+        XCTAssertEqual(scan.apiEstimateByDay?["2026-10-14"], 0.08)
+        XCTAssertEqual(scan.apiEstimateIncompleteDays, ["2026-10-14"])
+
+        let history = ProviderUsageHistory(
+            series: scan.series,
+            modelUsage: scan.modelUsage,
+            apiEstimateByDay: scan.apiEstimateByDay,
+            apiEstimateIncompleteDays: scan.apiEstimateIncompleteDays
+        )
+        let report = HistoryDashboardAggregator.report(
+            .init(
+                enabledProviderIDs: ["cursor"],
+                displayNameByProviderID: ["cursor": "Cursor"],
+                historyByProviderID: ["cursor": history],
+                estimatedCostByProviderID: [:]
+            ),
+            now: TestLocalInstant.date(2026, 10, 14, 12),
+            calendar: Calendar.current
+        )
+        XCTAssertNil(report.apiEstimateTotal)
+    }
+
+    func testLegacyDailyEntryWithoutCoverageBitIsTreatedAsIncomplete() throws {
+        let legacy = Data(#"{"date":"2026-10-14","totalTokens":100,"costUSD":1}"#.utf8)
+        let decoded = try JSONDecoder().decode(DailyUsageEntry.self, from: legacy)
+        XCTAssertFalse(decoded.costIsComplete)
+
+        let current = DailyUsageEntry(date: "2026-10-14", totalTokens: 100, costUSD: 1, costIsComplete: true)
+        let roundTrip = try JSONDecoder().decode(DailyUsageEntry.self, from: JSONEncoder().encode(current))
+        XCTAssertTrue(roundTrip.costIsComplete)
+    }
+
     func testMergedPreferringPrimaryKeepsPrimaryDaysAndFillsGapsOnly() throws {
         var primaryAcc = DailyUsageAccumulator()
         primaryAcc.add(day: "2024-06-01", tokens: 100, cost: 1.0, model: "gpt-5")

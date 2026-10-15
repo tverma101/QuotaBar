@@ -9,8 +9,8 @@ import Foundation
 final class OpenCodeRouterLedger: @unchecked Sendable {
     static let shared = OpenCodeRouterLedger()
 
-    /// Keep enough history for the 30-day display window plus small clock/window changes.
-    static let retentionDays = 45
+    /// Keep the compact per-day history for the ten-year Usage History window, including leap days.
+    static let retentionDays = 3_660
     private static let retentionInterval = Double(retentionDays) * 86_400
 
     private struct ParserCheckpoint: Sendable, Equatable {}
@@ -37,6 +37,13 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
     }
 
     func rows(atPath path: String, since: Date) -> [OpenCodeUsageScanner.ClaudeGatewayRow] {
+        rowsIfComplete(atPath: path, since: since) ?? []
+    }
+
+    /// Return `nil` when a discovered ledger could not be read completely. The legacy rows-only
+    /// accessor remains for callers that intentionally treat a missing source as empty; the provider
+    /// scanner uses this result to avoid publishing a partial history over its last-good snapshot.
+    func rowsIfComplete(atPath path: String, since: Date) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
         // Only the ledger read is unpaced. The provider-wide pacer stays on for SQLite, Claude/Codex,
         // Hermes, and Muse work; pacing a cold tens-of-MB read at 7.5% used to exceed the deadline and
         // restart from zero on the next tap.
@@ -141,9 +148,9 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
     /// This used to drop the hosted slugs on the assumption that the native fold always had them. That
     /// assumption is wrong whenever the session log is absent, rotated away, or lives in a home this
     /// scan does not open — the turn then vanishes from every card. Instead the ledger owns ALL
-    /// OpenCode-served rows, and `OpenCodeUsageScanner.scan` reads this ledger first so it can hand the
-    /// covered (day, model) pairs to every native fold as a skip set (`OpenCodeUsageScanner.dayModelKey`).
-    /// The router then wins the pairs it covers and native fills only the gaps — one turn, one count.
+    /// OpenCode-served rows, and `OpenCodeUsageScanner.scan` reads it first. Complete measured pairs can
+    /// replace native Claude/Codex rows; Hermes and Muse are independent sources and always fold
+    /// separately even when their day/model labels match.
     static func row(from event: CodexRouterUsageScanner.Event) -> OpenCodeUsageScanner.ClaudeGatewayRow? {
         guard CodexRouterUsageScanner.isOpenCodeServed(event),
               CodexRouterUsageScanner.isSuccessfulStatus(event.status)
@@ -163,27 +170,44 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             // Only the Go subscription's cap meters are consumed by `opencode-go`; Zen and free tiers
             // are billed outside those caps.
             burnsGoQuota: event.provider.lowercased().hasPrefix("opencode-go"),
-            isInProgress: false
+            isInProgress: false,
+            accountId: event.accountId,
+            accountFingerprint: event.accountFingerprint,
+            routerInputWasEstimated: event.hasEstimatedInputTokens,
+            routerCostBreakdownIsComplete: event.hasCompleteMeasuredCostBreakdown
         )
     }
 
-    private func rowsLocked(atPath path: String, since: Date) -> [OpenCodeUsageScanner.ClaudeGatewayRow] {
+    private func rowsLocked(atPath path: String, since: Date) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
         let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         let key = url.path
         guard let current = AppendOnlyFileProbe.revision(at: url) else {
             Self.tailCache.remove(key)
             tailStamps[key] = nil
             discardAggregate(for: key)
-            return []
+            return nil
         }
 
-        let retentionCutoff = Date().addingTimeInterval(-Self.retentionInterval)
-        if let aggregate = aggregates[key] ?? OpenCodeRouterLedgerAggregate.load(path: key) {
-            if aggregate.prune(before: retentionCutoff) {
+        let now = Date()
+        let retentionCutoff = now.addingTimeInterval(-Self.retentionInterval)
+        let detailedGoCutoff = now.addingTimeInterval(-45 * 86_400)
+        let aggregate = aggregates[key] ?? OpenCodeRouterLedgerAggregate.load(path: key)
+        if aggregate == nil {
+            // Invalid or pre-v6 aggregates cannot preserve router cost-breakdown completeness. Drop the stale
+            // checkpoint and rebuild from the source ledger so an old bucket cannot suppress rows.
+            OpenCodeRouterLedgerAggregate.removePersistedAggregate(path: key)
+        }
+        if let aggregate {
+            if aggregate.prune(before: retentionCutoff, detailedGoCutoff: detailedGoCutoff) {
                 aggregate.save()
             }
             storeAggregate(aggregate, for: key)
-            switch aggregate.reconcile(url: url, current: current, since: since) {
+            switch aggregate.reconcile(
+                url: url,
+                current: current,
+                since: since,
+                detailedGoCutoff: detailedGoCutoff
+            ) {
             case .rows(let rows):
                 return rows
             case .stale:
@@ -194,9 +218,9 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             case .aborted:
                 // Deadline cancellation or a transient read failure. The aggregate — in memory and on
                 // disk — is still the best known state; deleting it here turned every timed-out
-                // refresh into a full cold rebuild on the next one. Serve nothing this pass; the
-                // store keeps the last-good snapshot until the next refresh lands.
-                return []
+                // refresh into a full cold rebuild on the next one. Mark the source incomplete so the
+                // provider keeps the last-good snapshot instead of publishing a partial replacement.
+                return nil
             }
         }
 
@@ -225,7 +249,7 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
         }
 
         guard let rows = readWholeFile(at: url, key: key, retentionCutoff: retentionCutoff) else {
-            return []
+            return nil
         }
         return rows.filter { $0.date >= since }
     }
@@ -335,15 +359,19 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
         key: String,
         retentionCutoff: Date
     ) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
-        let before = AppendOnlyFileProbe.revision(at: url)
+        guard let before = AppendOnlyFileProbe.revision(at: url),
+              let beforeStamp = Self.modificationStamp(at: url)
+        else { return nil }
         // Compact immediately once the file is large enough that retaining every parsed row would make
         // menu-bar memory scale with total history instead of the display window.
-        if let revision = before, revision.size > 1_048_576 {
+        if before.size > 1_048_576 {
             return readWholeFileCompact(
                 at: url,
                 key: key,
-                revision: revision,
-                retentionCutoff: retentionCutoff
+                revision: before,
+                modificationStamp: beforeStamp,
+                retentionCutoff: retentionCutoff,
+                detailedGoCutoff: Date().addingTimeInterval(-45 * 86_400)
             )
         }
 
@@ -371,12 +399,11 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
 
         let offset = UInt64(max(0, read.statistics.bytesRead))
         guard let revision = AppendOnlyFileProbe.revision(at: url),
-              let before,
-              revision.device == before.device,
-              revision.inode == before.inode,
-              revision.size >= offset,
+              revision == before,
+              revision.size == offset,
+              Self.modificationStamp(at: url) == beforeStamp,
               let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: offset)
-        else { return rows }
+        else { return nil }
 
         Self.tailCache.store(
             AppendOnlyFileTailCache<OpenCodeUsageScanner.ClaudeGatewayRow, ParserCheckpoint>.Entry(
@@ -400,7 +427,9 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
         at url: URL,
         key: String,
         revision: AppendOnlyFileRevision,
-        retentionCutoff: Date
+        modificationStamp: Stamp,
+        retentionCutoff: Date,
+        detailedGoCutoff: Date
     ) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
         let aggregate = OpenCodeRouterLedgerAggregate.empty(path: key, revision: revision)
         var timestampCache = CodexRouterEventLineParser.TimestampCache()
@@ -410,7 +439,7 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             deliverFinalPartial: false
         ) { line in
             if let row = Self.row(from: line, timestampCache: &timestampCache), row.date >= retentionCutoff {
-                aggregate.addRow(row)
+                aggregate.addRow(row, compactGoBefore: detailedGoCutoff)
             }
         }
         guard read.succeeded else { return nil }
@@ -420,15 +449,15 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             timestampCache: &timestampCache
            ),
            row.date >= retentionCutoff {
-            aggregate.addRow(row)
+            aggregate.addRow(row, compactGoBefore: detailedGoCutoff)
             read.finalPartial = Data()
         }
 
         let offset = UInt64(max(0, read.statistics.bytesRead))
         guard let after = AppendOnlyFileProbe.revision(at: url),
-              after.device == revision.device,
-              after.inode == revision.inode,
-              after.size >= offset,
+              after == revision,
+              after.size == offset,
+              Self.modificationStamp(at: url) == modificationStamp,
               let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: offset)
         else { return nil }
 
@@ -439,6 +468,7 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             discarding: read.isDiscardingOversizedLine,
             anchor: anchor
         )
+        _ = aggregate.prune(before: retentionCutoff, detailedGoCutoff: detailedGoCutoff)
         storeAggregate(aggregate, for: key)
         aggregate.save()
         Self.tailCache.store(

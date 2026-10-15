@@ -42,6 +42,7 @@ enum CodexRouterEventLineParser {
         case outputTokens
         case reasoningTokens
         case totalTokens
+        case estimatedInputTokens
         case accountId
         case accountFingerprint
         case serviceTier
@@ -57,6 +58,7 @@ enum CodexRouterEventLineParser {
         var outputTokens: Int?
         var reasoningTokens: Int?
         var totalTokens: Int?
+        var estimatedInputTokens: Int?
         var accountId: String?
         var accountFingerprint: String?
         var serviceTier: String?
@@ -69,7 +71,8 @@ enum CodexRouterEventLineParser {
             case .accountId: accountId = string
             case .accountFingerprint: accountFingerprint = string
             case .serviceTier: serviceTier = string
-            case .status, .inputTokens, .cachedInputTokens, .outputTokens, .reasoningTokens, .totalTokens:
+            case .status, .inputTokens, .cachedInputTokens, .outputTokens, .reasoningTokens, .totalTokens,
+                 .estimatedInputTokens:
                 break
             }
         }
@@ -82,6 +85,7 @@ enum CodexRouterEventLineParser {
             case .outputTokens: outputTokens = integer
             case .reasoningTokens: reasoningTokens = integer
             case .totalTokens: totalTokens = integer
+            case .estimatedInputTokens: estimatedInputTokens = integer
             case .at, .model, .provider, .accountId, .accountFingerprint, .serviceTier:
                 break
             }
@@ -98,6 +102,7 @@ enum CodexRouterEventLineParser {
             case .outputTokens: outputTokens = nil
             case .reasoningTokens: reasoningTokens = nil
             case .totalTokens: totalTokens = nil
+            case .estimatedInputTokens: estimatedInputTokens = nil
             case .accountId: accountId = nil
             case .accountFingerprint: accountFingerprint = nil
             case .serviceTier: serviceTier = nil
@@ -218,6 +223,7 @@ enum CodexRouterEventLineParser {
             outputTokens: max(0, fields.outputTokens ?? 0),
             reasoningTokens: max(0, fields.reasoningTokens ?? 0),
             totalTokens: fields.totalTokens.map { max(0, $0) },
+            hasEstimatedInputTokens: fields.estimatedInputTokens.map { $0 > 0 } ?? false,
             accountId: fields.accountId?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .nilIfEmpty,
@@ -258,6 +264,7 @@ enum CodexRouterEventLineParser {
         case 15 where matches(bytes, key, "reasoningTokens"): return .reasoningTokens
         case 17 where matches(bytes, key, "cachedInputTokens"): return .cachedInputTokens
         case 18 where matches(bytes, key, "accountFingerprint"): return .accountFingerprint
+        case 20 where matches(bytes, key, "estimatedInputTokens"): return .estimatedInputTokens
         default: break
         }
         return nil
@@ -277,6 +284,7 @@ enum CodexRouterEventLineParser {
         case "accountId": return .accountId
         case "accountFingerprint": return .accountFingerprint
         case "serviceTier": return .serviceTier
+        case "estimatedInputTokens": return .estimatedInputTokens
         default: return nil
         }
     }
@@ -298,7 +306,8 @@ enum CodexRouterEventLineParser {
     private static func isStringField(_ field: Field) -> Bool {
         switch field {
         case .at, .model, .provider, .accountId, .accountFingerprint, .serviceTier: return true
-        case .status, .inputTokens, .cachedInputTokens, .outputTokens, .reasoningTokens, .totalTokens: return false
+        case .status, .inputTokens, .cachedInputTokens, .outputTokens, .reasoningTokens, .totalTokens,
+             .estimatedInputTokens: return false
         }
     }
 

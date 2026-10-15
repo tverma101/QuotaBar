@@ -65,6 +65,7 @@ final class TelemetryRecorderTests: XCTestCase {
         XCTAssertEqual(props["not_logged_in_failure_count"] as? Int, 1)
         XCTAssertEqual(props["not_available_failure_count"] as? Int, 1)
         XCTAssertEqual(props["auth_expired_failure_count"] as? Int, 0)
+        XCTAssertNil(props["cancelled_failure_count"], "cancellation is not a failure category sent to telemetry")
         XCTAssertEqual(props["expected_failure_count"] as? Int, 2)
         XCTAssertEqual(props["unexpected_failure_count"] as? Int, 1)
     }

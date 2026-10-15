@@ -190,6 +190,24 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
         XCTAssertEqual(row.input, 0)
         XCTAssertEqual(row.output, 25)
         XCTAssertEqual(row.tokens, 25, "the estimate must not inflate the measured total")
+        XCTAssertEqual(row.routerInputWasEstimated, true)
+
+        let key = OpenCodeUsageScanner.dayModelKey(row)
+        let completeRows = OpenCodeUsageScanner.completeRouterCoverage(from: [row])
+        XCTAssertFalse(completeRows.contains(key), "estimated input cannot suppress a complete native row")
+        XCTAssertTrue(
+            OpenCodeUsageScanner.reconciledRouterRows(
+                [row], completeCoverage: completeRows, nativeCoverage: [key]
+            ).isEmpty,
+            "prefer the native row when the router has only estimated the input"
+        )
+        XCTAssertEqual(
+            OpenCodeUsageScanner.reconciledRouterRows(
+                [row], completeCoverage: completeRows, nativeCoverage: []
+            ).count,
+            1,
+            "keep measured router output when the native session row is unavailable"
+        )
     }
 
     /// Chunk boundaries must not corrupt or drop rows: the ledger is read in 1MB chunks and a partial

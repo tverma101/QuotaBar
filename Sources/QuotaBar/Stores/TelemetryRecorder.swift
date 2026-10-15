@@ -11,7 +11,7 @@ struct TelemetryConfigSnapshot: Sendable {
 }
 
 /// Turns raw refresh outcomes into the two daily-rollup events, enforcing "at most one event per day"
-/// without flooding the pipeline from the 5-minute refresh timer (~1,440 outcomes/user/day).
+/// without flooding the pipeline from the one-minute quota refresh timer (~1,440 outcomes/user/day).
 ///
 /// - `app_daily_active`: emitted once per local day (DAU + the config snapshot), driven by `tick()`.
 ///   This ping is always sent — the Settings toggle does not gate it.
@@ -138,7 +138,7 @@ final class TelemetryRecorder {
             "manual_refresh_count": counter.manual
         ]
 
-        for category in ErrorCategory.allCases {
+        for category in ErrorCategory.allCases where category != .cancelled {
             properties["\(category.rawValue)_failure_count"] = counter.errors[category.rawValue] ?? 0
         }
 

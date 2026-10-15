@@ -23,7 +23,7 @@ final class GrokProviderTests: XCTestCase {
 
     func testRefreshesExpiredTokenPersistsAuthAndFetchesUsage() async {
         let now = OpenUsageISO8601.date(from: "2026-02-02T00:00:00.000Z")!
-        let files = FakeFiles([
+        let files = ThreadRecordingGrokFiles([
             GrokAuthStore.authPath: """
             {
               "https://auth.x.ai::client": {
@@ -71,14 +71,23 @@ final class GrokProviderTests: XCTestCase {
         XCTAssertEqual(progress(snapshot.lines, "Weekly limit")?.used, 99)
         XCTAssertEqual(badge(snapshot.lines, "Pay as you go")?.text, "Disabled")
 
-        let saved = GrokAuthStore.parseAuth(files.files[GrokAuthStore.authPath] ?? "")
+        let saved = GrokAuthStore.parseAuth(files.text(at: GrokAuthStore.authPath) ?? "")
         let entry = saved?["https://auth.x.ai::client"]
         XCTAssertEqual(entry?.key, "new-token")
         XCTAssertEqual(entry?.refreshToken, "new-refresh")
         XCTAssertEqual(entry?.expiresAt, "2026-02-02T01:00:00.000Z")
-        let savedObject = GrokAuthStore.parseJSONObject(files.files[GrokAuthStore.authPath] ?? "")
+        let savedObject = GrokAuthStore.parseJSONObject(files.text(at: GrokAuthStore.authPath) ?? "")
         let rawEntry = savedObject?["https://auth.x.ai::client"] as? [String: Any]
         XCTAssertEqual(rawEntry?["custom_field"] as? String, "keep-me")
+        XCTAssertEqual(
+            files.accesses.count,
+            3,
+            "credential load, save merge read, and rotated-token write should all go through the file seam"
+        )
+        XCTAssertTrue(
+            files.accesses.allSatisfy { !$0.wasOnMainThread },
+            "credential loading and rotated-token persistence must not run on the UI actor"
+        )
     }
 
     func testRetriesCreditsOnceAfterAuthError() async {
@@ -131,6 +140,177 @@ final class GrokProviderTests: XCTestCase {
             .map { $0.headers["Authorization"] }
         XCTAssertEqual(creditsAuths, ["Bearer old-token", "Bearer new-token"])
         XCTAssertEqual(progress(snapshot.lines, "Weekly limit")?.used, 99)
+    }
+
+    func testAuthRejectionWithRefreshTransportFailureRemainsNetworkError() async {
+        let httpClient = RecordingHTTPClient { request in
+            if request.url == GrokUsageClient.creditsConfigURL {
+                return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+            }
+            if request.url == GrokUsageClient.refreshURL {
+                throw URLError(.timedOut)
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+
+        let snapshot = await makeProvider(httpClient: httpClient).refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .network)
+        XCTAssertEqual(badge(snapshot.lines, "Error")?.text, GrokUsageError.connectionFailed.localizedDescription)
+        XCTAssertEqual(httpClient.requests.filter { $0.url == GrokUsageClient.creditsConfigURL }.count, 1)
+        XCTAssertEqual(httpClient.requests.filter { $0.url == GrokUsageClient.refreshURL }.count, 1)
+    }
+
+    func testAuthRejectionWithRefreshServerErrorRemainsRetryableHTTPError() async {
+        let httpClient = RecordingHTTPClient { request in
+            if request.url == GrokUsageClient.creditsConfigURL {
+                return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+            }
+            if request.url == GrokUsageClient.refreshURL {
+                return HTTPResponse(statusCode: 503, headers: [:], body: Data())
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+
+        let snapshot = await makeProvider(httpClient: httpClient).refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .http5xx)
+        XCTAssertEqual(badge(snapshot.lines, "Error")?.text, GrokUsageError.requestFailed(503).localizedDescription)
+        XCTAssertEqual(httpClient.requests.filter { $0.url == GrokUsageClient.creditsConfigURL }.count, 1)
+        XCTAssertEqual(httpClient.requests.filter { $0.url == GrokUsageClient.refreshURL }.count, 1)
+    }
+
+    func testProactiveRefreshCancellationDoesNotUseTheOldToken() async {
+        let now = TestLocalInstant.date(2026, 6, 18, 12)
+        let files = FakeFiles([
+            GrokAuthStore.authPath: #"{"https://auth.x.ai::client":{"key":"old-token","refresh_token":"refresh-token","expires_at":"2026-06-18T12:02:00.000Z"}}"#
+        ])
+        let httpClient = RecordingHTTPClient { request in
+            if request.url == GrokUsageClient.refreshURL { throw URLError(.cancelled) }
+            return HTTPResponse(statusCode: 200, headers: [:], body: GrokCreditsFixtures.capturedResponseBody)
+        }
+        let provider = GrokProvider(
+            authStore: GrokAuthStore(files: files, now: { now }),
+            usageClient: GrokUsageClient(httpClient: httpClient),
+            logUsageScanner: noLogScanner(),
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertEqual(httpClient.requests.map(\.url), [GrokUsageClient.refreshURL])
+    }
+
+    func testCancellationWhilePersistingRotatedTokenStopsBeforeUsage() async {
+        let now = TestLocalInstant.date(2026, 6, 18, 12)
+        for phase in [GrokCancellationFiles.Phase.saveRead, .write] {
+            let files = GrokCancellationFiles(
+                initialText: #"{"https://auth.x.ai::client":{"key":"expired-token","refresh_token":"refresh-token","expires_at":"2026-06-18T11:00:00.000Z"}}"#,
+                cancellationPhase: phase
+            )
+            let httpClient = RecordingHTTPClient { request in
+                if request.url == GrokUsageClient.refreshURL {
+                    return HTTPResponse(
+                        statusCode: 200,
+                        headers: [:],
+                        body: Data(#"{"access_token":"new-token","refresh_token":"new-refresh","expires_in":3600}"#.utf8)
+                    )
+                }
+                return HTTPResponse(statusCode: 200, headers: [:], body: GrokCreditsFixtures.capturedResponseBody)
+            }
+            let provider = GrokProvider(
+                authStore: GrokAuthStore(files: files, now: { now }),
+                usageClient: GrokUsageClient(httpClient: httpClient),
+                logUsageScanner: noLogScanner(),
+                now: { now },
+                pricing: { TestPricing.bundled }
+            )
+
+            let snapshot = await provider.refresh()
+
+            XCTAssertEqual(snapshot.errorCategory, .cancelled, "cancellation during \(phase) must not be reclassified")
+            XCTAssertEqual(httpClient.requests.map(\.url), [GrokUsageClient.refreshURL], "cancellation during \(phase) must stop before credits")
+        }
+    }
+
+    func testLateRefreshDoesNotRecreateDeletedOrOverwriteSwitchedGrokLogin() async {
+        let now = TestLocalInstant.date(2026, 6, 18, 12)
+        let path = GrokAuthStore.authPath
+        let initialText = #"{"https://auth.x.ai::client":{"key":"expired-token","refresh_token":"old-refresh-token","expires_at":"2000-01-01T00:00:00.000Z"}}"#
+        let switchedText = #"{"https://auth.x.ai::client":{"key":"new-account-token","refresh_token":"new-refresh-token","expires_at":"2099-01-01T00:00:00.000Z"}}"#
+
+        for replacement in [Optional<String>.none, Optional(switchedText)] {
+            let files = FakeFiles([path: initialText])
+            let gate = GrokRefreshResponseGate()
+            let http = RoutingHTTPClient { request in
+                guard request.url == GrokUsageClient.refreshURL else {
+                    XCTFail("a late refresh must not issue usage requests with the old account: \(request.url)")
+                    return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+                }
+                await gate.pause()
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"late-access-token","refresh_token":"late-refresh-token","expires_in":3600}"#.utf8))
+            }
+            let provider = GrokProvider(
+                authStore: GrokAuthStore(files: files, now: { now }),
+                usageClient: GrokUsageClient(httpClient: http),
+                logUsageScanner: noLogScanner(),
+                now: { now },
+                pricing: { TestPricing.bundled }
+            )
+            let refresh = Task { await provider.refresh() }
+
+            await gate.waitUntilPaused()
+            if let replacement {
+                files.files[path] = replacement
+            } else {
+                files.files.removeValue(forKey: path)
+            }
+            await gate.open()
+
+            let snapshot = await refresh.value
+            XCTAssertEqual(snapshot.errorCategory, .authExpired)
+            XCTAssertEqual(http.requests.map(\.url), [GrokUsageClient.refreshURL])
+            XCTAssertEqual(files.files[path], replacement, "the late refresh must preserve logout or the replacement account")
+        }
+    }
+
+    func testSuccessfulGrokRotationPersistsIfRefreshTaskIsCanceledBeforeUsageResumes() async {
+        let now = TestLocalInstant.date(2026, 6, 18, 12)
+        let files = FakeFiles([
+            GrokAuthStore.authPath: #"{"https://auth.x.ai::client":{"key":"expired-token","refresh_token":"old-refresh","expires_at":"2000-01-01T00:00:00.000Z"}}"#
+        ])
+        let gate = GrokRefreshResponseGate()
+        let http = RoutingHTTPClient { request in
+            guard request.url == GrokUsageClient.refreshURL else {
+                XCTFail("a canceled pass must stop before usage: \(request.url)")
+                return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+            }
+            await gate.pause()
+            return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"late-access","refresh_token":"late-refresh","expires_in":3600}"#.utf8))
+        }
+        let provider = GrokProvider(
+            authStore: GrokAuthStore(files: files, now: { now }),
+            usageClient: GrokUsageClient(httpClient: http),
+            logUsageScanner: noLogScanner(),
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+        let refresh = Task { await provider.refresh() }
+
+        await gate.waitUntilPaused()
+        refresh.cancel()
+        await gate.open()
+
+        let snapshot = await refresh.value
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertEqual(http.requests.map(\.url), [GrokUsageClient.refreshURL])
+        let entry = GrokAuthStore.parseAuth(files.files[GrokAuthStore.authPath] ?? "")?[
+            "https://auth.x.ai::client"
+        ]
+        XCTAssertEqual(entry?.key, "late-access")
+        XCTAssertEqual(entry?.refreshToken, "late-refresh")
     }
 
     func testWeeklyMeterAndPayAsYouGoComeFromCreditsConfig() async {
@@ -271,6 +451,36 @@ final class GrokProviderTests: XCTestCase {
         XCTAssertNil(snapshot.lines.first(where: { $0.label == "Usage Trend" }), "no sessions means no trend chart")
     }
 
+    func testUnreadableAuthFileStaysDetectedAndRefreshShowsRepairMessage() async {
+        let provider = GrokProvider(
+            authStore: GrokAuthStore(files: UnreadableFiles(present: [GrokAuthStore.authPath])),
+            usageClient: GrokUsageClient(httpClient: RecordingHTTPClient(handler: Self.defaultRoutes)),
+            logUsageScanner: noLogScanner()
+        )
+
+        let detected = await provider.hasLocalCredentials()
+        let snapshot = await provider.refresh()
+
+        XCTAssertTrue(detected, "a present but unreadable auth file must remain visible to one-shot detection")
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+        XCTAssertEqual(badge(snapshot.lines, "Error")?.text, GrokCredentialsUnreadableError().localizedDescription)
+    }
+
+    func testMalformedAuthFileStaysDetectedAndRefreshReportsInvalidAuth() async {
+        let provider = GrokProvider(
+            authStore: GrokAuthStore(files: FakeFiles([GrokAuthStore.authPath: "not json"])),
+            usageClient: GrokUsageClient(httpClient: RecordingHTTPClient(handler: Self.defaultRoutes)),
+            logUsageScanner: noLogScanner()
+        )
+
+        let detected = await provider.hasLocalCredentials()
+        let snapshot = await provider.refresh()
+
+        XCTAssertTrue(detected, "a present malformed auth file must remain visible to one-shot detection")
+        XCTAssertEqual(snapshot.errorCategory, .authInvalid)
+        XCTAssertEqual(badge(snapshot.lines, "Error")?.text, GrokAuthError.invalidAuth.localizedDescription)
+    }
+
     /// The stock happy-path routes: the captured weekly credits config and the plan name.
     private static func defaultRoutes(_ request: HTTPRequest) -> HTTPResponse {
         if request.url == GrokUsageClient.creditsConfigURL {
@@ -306,6 +516,32 @@ final class GrokProviderTests: XCTestCase {
     private func values(_ lines: [MetricLine], _ label: String) -> [MetricValue]? {
         guard case .values(_, let values, _, _, _, _) = lines.first(where: { $0.label == label }) else { return nil }
         return values
+    }
+}
+
+private actor GrokRefreshResponseGate {
+    private var paused = false
+    private var released = false
+    private var pauseContinuation: CheckedContinuation<Void, Never>?
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        paused = true
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        guard !released else { return }
+        await withCheckedContinuation { pauseContinuation = $0 }
+    }
+
+    func waitUntilPaused() async {
+        guard !paused else { return }
+        await withCheckedContinuation { enteredContinuation = $0 }
+    }
+
+    func open() {
+        released = true
+        pauseContinuation?.resume()
+        pauseContinuation = nil
     }
 }
 
@@ -348,6 +584,113 @@ private final class RecordingHTTPClient: HTTPClient, @unchecked Sendable {
         requests.append(request)
         return try handler(request)
     }
+}
+
+private final class ThreadRecordingGrokFiles: TextFileAccessing, @unchecked Sendable {
+    struct Access {
+        let path: String
+        let wasOnMainThread: Bool
+    }
+
+    private let lock = NSLock()
+    private var contents: [String: String]
+    private var recordedAccesses: [Access] = []
+
+    var accesses: [Access] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedAccesses
+    }
+
+    init(_ contents: [String: String]) {
+        self.contents = contents
+    }
+
+    func text(at path: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return contents[path]
+    }
+
+    func exists(_ path: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return contents[path] != nil
+    }
+
+    func readTextIfPresent(_ path: String) throws -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedAccesses.append(Access(path: path, wasOnMainThread: Thread.isMainThread))
+        return contents[path]
+    }
+
+    func readText(_ path: String) throws -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedAccesses.append(Access(path: path, wasOnMainThread: Thread.isMainThread))
+        return contents[path] ?? ""
+    }
+
+    func writeText(_ path: String, _ text: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedAccesses.append(Access(path: path, wasOnMainThread: Thread.isMainThread))
+        contents[path] = text
+    }
+
+    func remove(_ path: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedAccesses.append(Access(path: path, wasOnMainThread: Thread.isMainThread))
+        contents.removeValue(forKey: path)
+    }
+}
+
+private final class GrokCancellationFiles: TextFileAccessing, @unchecked Sendable {
+    enum Phase: Equatable, CustomStringConvertible {
+        case saveRead
+        case write
+
+        var description: String {
+            switch self {
+            case .saveRead: "auth merge read"
+            case .write: "auth write"
+            }
+        }
+    }
+
+    private let lock = NSLock()
+    private let initialText: String
+    private let cancellationPhase: Phase
+    private var readCount = 0
+
+    init(initialText: String, cancellationPhase: Phase) {
+        self.initialText = initialText
+        self.cancellationPhase = cancellationPhase
+    }
+
+    func exists(_ path: String) -> Bool { true }
+
+    func readTextIfPresent(_ path: String) throws -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        readCount += 1
+        if cancellationPhase == .saveRead, readCount > 1 {
+            throw CancellationError()
+        }
+        return initialText
+    }
+
+    func readText(_ path: String) throws -> String {
+        try readTextIfPresent(path) ?? ""
+    }
+
+    func writeText(_ path: String, _ text: String) throws {
+        if cancellationPhase == .write { throw CancellationError() }
+    }
+
+    func remove(_ path: String) throws {}
 }
 
 private func progress(_ lines: [MetricLine], _ label: String) -> (used: Double, limit: Double, resetsAt: Date?)? {

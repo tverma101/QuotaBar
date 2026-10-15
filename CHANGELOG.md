@@ -2,8 +2,60 @@
 
 ## Unreleased
 
+- Reuse a Keychain prompt that is already on screen for the same item instead of probing the item again: sibling cards wait for that one dialog and retry silently from its grant, and a newer explicit refresh still fails closed rather than waiting behind the prompt it superseded.
+- Keep freshly fetched OpenCode Go meters when the panel's second (history) pass fails its local scan — a fold-only pass never asks the account endpoint, so it has no evidence that those meters are stale.
+- Clear the catch-all provider failure once any later pass succeeds, so a provider whose scopes all resolve to that bucket does not keep an error row and a Retry affordance forever.
+- Fail the whole OpenCode fold closed when Hermes can't be read, instead of publishing the readable subset as if it were the complete card.
+
+- Apply GPT-6.1 Sol's published Codex service-tier multipliers and exact models.dev context thresholds; refresh offline model-price snapshots.
+- Preserve estimated-input flags in compact OpenCode router history, fold older Go events by day/model, and reject partial router-ledger reads.
+- Keep OpenCode-billed Hermes usage on the OpenCode card so Total Spend does not count its tokens twice.
+- Reconcile router rows only against measured Claude/Codex pairs; preserve independent Hermes/Muse sessions and prefer native counts when router input is estimated.
+- Keep incomplete model and folded Other dollar rows blank instead of showing partial subtotals; retain public-rate estimate completeness through the lifetime history window.
+- Mark Hermes public-rate estimates incomplete for token days, hide incomplete Hermes cost subtotals, and withhold Cursor spend exports containing malformed rows.
+- Load OpenCode local usage through the ten-year History window while spend tiles remain limited to their labeled period.
+- Keep valid Cursor CSV rows when the whole export token sum exceeds Int.max, and omit zero-token rows from usage history.
+- Use the selected input rate when a pricing source omits cache-read pricing; do not invent a cache discount.
+- Rebind Antigravity's cached database when its file is renamed, avoiding duplicate history for the moved store.
+- Show a provider-level **Refresh** action beside errors; keep forced meter retries meter-only through the provider deadline, publish quota before history folding, run retry folds only for local-history providers that need a second scan, and preserve retry ownership and recovered meters. Antigravity now overlaps quota and plan lookups and reuses its plan/project request across fallback paths.
+- Separate quota and accounting failure backoff, map full-refresh failures onto their component retry windows, preserve the responsible error until its own refresh succeeds, keep deferred and superseded retry folds, and stop Hermes local scans from postponing quota deadlines.
+- Keep Cursor Grok Bot/Sand product-labeled export rows in token totals as unpriced usage instead of dropping their tokens: Cursor never names the serving model, so the day's cost stays incomplete rather than guessed at, while genuine model rows and the separate Grok Bot quota meter are unchanged.
+- Keep cached Antigravity history when a conversation root is retired from discovery, while remaining roots continue to update.
+- Add the locally authenticated Freebuff usage card with daily, weekly, monthly, Freebucks, free and plan premium-session pools, reset, and provider-reported dollar metrics.
+- Stop provider API and fallback work promptly after cancellation, while persisting a successful Codex refresh-token rotation before discarding its canceled usage refresh.
+- Follow GitHub Copilot org pagination, preserve completed pages after later-page failures, and stop the org scan on rate limits while honoring server cooldowns.
+- Keep cancelled Keychain prompts quiet within one refresh, allow a deliberate retry on the next explicit Refresh, and preserve manual consent through detached loads.
+- Let sibling Keychain reads wait through cancellable preflight and use the shared prompt budget if Security never starts the first read.
+- Discard a superseded Claude Keychain load before trying fallback credentials or sending a usage request.
+- Run CLI account identity discovery off the main actor so silent Keychain and home scans cannot block the read loop.
+- Ignore stale Keychain prompt cancellations after a newer refresh, skip canceled interactive retries, and persist rotated Cursor credentials off MainActor.
+- Write rotated credentials through Security.framework in-process, read Cursor's account-scoped writeback, and scope Codex Keychain reads/writes to the configured Codex home.
+- Keep Keychain-only provider cards visible when access needs approval, and report Copilot/Antigravity 403 responses as access denials instead of expired sign-in.
+- Preserve present-but-unreadable Cursor and Devin credential sources as credential-access errors rather than false logged-out misses.
+- Hide OpenCode Go caps without a current Go credential and clear stale plan state, while keeping local spend history.
+- Keep OpenCode, OpenRouter, and Z.ai visible when a saved Go/API-key file is unreadable, and surface a credential-access error instead of “not logged in”.
+- Keep Antigravity visible when its local language server is available without a Keychain token, and keep Freebuff visible for an invalid configured directory so refresh can show the repair error.
+- Preserve legacy disabled provider choices during settings migration, including OpenCode, Hermes, and account-specific cards.
+- Scan every Antigravity conversation store and retain up to ten years of history; keep last-good rows from a missing cached database while readable stores continue updating, and preserve complete history on read failures and same-inode rewrites.
+- Align the bundled CLI helper and Settings instructions on the `quotabar` path and command name.
+- Stage and verify app replacements before swapping bundles; preserve the prior app if replacement or launch fails.
+- Include Muse gateway sessions in OpenCode's fold when the OpenCode provider is enabled.
+- Leave unverified `-free` model slugs unpriced so their tokens remain visible with an unknown-model warning.
+- Refresh bundled model catalogs and pin current model aliases, cache rates, long-context tiers, and Grok 4.5/4.7 Cursor prices; fast slugs use exact or newest date-matched base rates, Cursor-only rates stay separate from public routes, and fresher bundled entries beat stale caches.
+- Scope Cursor Grok 4.5/4.6 pricing separately from xAI API tiers, and let newer complete supplement feeds re-enable explicitly restored aliases.
+- Keep the menu-bar quota deadline independent from closed-panel ledger folds, preserve latched local-accounting work through cooldown drops, and run due meters before queued folds.
+- Run local history folds on a tracked background task so slow scans cannot hold a due subscription-meter refresh; meter-only requests may overlap a fold for the same enabled card, while all other refresh combinations stay serialized.
+- Derive Codex hardlink peers from currently enabled cards, avoid peer-home enumeration for the default Codex home, and share Claude ownership metadata across account cards; stop file discovery promptly when a provider refresh is cancelled.
+- Keep due menu-bar meters ahead of queued full-history passes, anchor long-pass deadlines to their start, run panel-open history folds on their own five-minute cadence, and schedule one trailing wake for a final ledger append inside the closed-panel cooldown.
+- Make each scheduled five-minute history deadline bypass cached folds while preserving recovered meters and the normal failure backoff.
+- Skip disabled provider cards before refresh, cancel in-flight scans/API stages on toggle, and omit disabled source families and Claude accounts from OpenCode's cross-tool accounting fold; retain distinct refresh wake causes while coalescing repeats.
+- Run quota-only menu-bar and panel-meter requests concurrently during normal operation, including at launch, so a slow provider response cannot hold other pinned subscription meters in line; serialize when memory pressure requires it.
+- Refresh enabled menu-bar subscription meters every minute on AC and every two minutes on battery / Low Power Mode, with a separate meter cache window; keep full local history folding at five minutes and skip disabled cards.
+- Expire the quota cache ten seconds before the one-minute AC deadline; early cache-hit passes no longer move the scheduler or footer countdown, while manual/panel quota fetches synchronize the next deadline.
+- Keep CodexRouter vnode watches armed across ordinary appends and directory replacement, clear missing-file state, cancel enabled Codex siblings when a peer card is toggled, and stop Claude ownership preflight after the first usage row.
+- Arm CodexRouter vnode sources only while a Codex card is enabled; disabling the final Codex card now closes its file and directory watches.
 - Make subscription **usage meters update promptly** instead of freezing for hours: every snapshot now carries a separate meter-freshness stamp, and the cache reads the older of the two stamps — fold-only accounting passes (closed-panel ledger wakes, panel accounting) previously re-stamped recovered meters as fresh on every routed turn, so panel-open passes cache-hit forever and never re-read the live quota API.
-- Open the panel's refresh as **two phases**: every enabled provider's quota meters fetch first (the whole dashboard's meters land in seconds instead of trailing the slowest local log fold by ~15–20s), then local accounting recomputes with those meters recovered onto the refreshed cards. Refresh Now, the CLI, background triggers, and the midnight rollover keep the single-phase full pass.
+- Open panel and scheduled full-history refreshes as **two phases**: every enabled provider's quota meters fetch first, then local accounting recomputes with those meters recovered onto the refreshed cards. Refresh Now and the CLI keep their direct full-refresh behavior.
 - Give OpenCode a **meters-only fast path** for meter passes (Go account API only — the multi-corpus scan folding Claude/Codex session logs, the router ledger, Hermes, and Muse no longer holds the strip's meters hostage) and suppress its local-window meter fallback in fold-only passes so recovered meters can't be clobbered; fold-only scopes across providers likewise skip the live quota fetch and the double per-panel-request meter probe.
 - On the **Usage History** screen, mark the Lifetime hero's dollars with an **Est.** tag when they were imputed at public API rates (subscription logs carry no per-message cost), and hide the "At Public API Rates (Est.)" line when it would display the same figure as the hero — one number no longer presents itself as two different facts.
 - Make the **Today** tile track token spend live instead of lagging minutes-to-hours behind: opening the panel now wakes the refresh loop (which could otherwise sleep out a 15-minute battery cadence showing a stale snapshot), and closed-panel routed turns wake a new paced `localAccounting` pass that re-folds the CodexRouter ledger / native sessions / OpenCode gateway for the codex + opencode cards only — with zero live quota-API re-reads, so turn storms cannot burn ChatGPT Session/Weekly calls (the wake source is rate-limited to one pass per 15 s and the incremental tail parse catches up on everything appended).
@@ -32,7 +84,7 @@
 
 - Price Cursor's GLM 5.3 and Flash CSV aliases, including effort suffixes, using its published cache-read rates.
 
-- Refresh the bundled LiteLLM and models.dev catalogues to October 4 data (the snapshot script targeted a stale OpenUsage path since the rebrand), alias Cursor's Grok Bot CUA rows to Grok 4.7, and pin the Opus 4.6/4.7 fast multipliers the live feed dropped.
+- Refresh the bundled LiteLLM and models.dev catalogues to October 4 data (the snapshot script targeted a stale OpenUsage path since the rebrand), remove the unsupported Cursor Grok Bot CUA → Grok 4.7 attribution, and pin the Opus 4.6/4.7 fast multipliers the live feed dropped.
 
 - Track LiteLLM's corrected rates for Sonnet 5's permanent intro pricing and Grok 4.20's API rate.
 

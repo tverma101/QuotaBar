@@ -39,14 +39,36 @@ final class DevinProvider: ProviderRuntime {
     func hasLocalCredentials() async -> Bool {
         // Same sources as `refresh()`: the credentials file, then the Devin app's stored auth. Both are
         // blocking disk/SQLite reads, so both run off the main actor (see `loadOffMainActor`).
-        if await loadOffMainActor({ [authStore] in authStore.loadCredentialsFile() }) != nil { return true }
-        return await loadOffMainActor { [authStore] in authStore.loadAppAuth() } != nil
+        do {
+            if try await loadOffMainActor({ [authStore] in try authStore.loadCredentialsFile() }) != nil {
+                return true
+            }
+            return try await loadOffMainActor { [authStore] in try authStore.loadAppAuth() } != nil
+        } catch DevinAuthError.credentialsUnreadable {
+            // Keep an indeterminate but present local source enabled so refresh can show its repair path.
+            return true
+        } catch {
+            return false
+        }
     }
 
     func refresh() async -> ProviderSnapshot {
         var sawAPIKey = false
         var sawAuthFailure = false
-        let credentials = await loadOffMainActor { [authStore] in authStore.loadCredentialsFile() }
+        var credentialSourceUnreadable = false
+        let credentials: DevinAuth?
+        do {
+            credentials = try await loadOffMainActor { [authStore] in try authStore.loadCredentialsFile() }
+        } catch DevinAuthError.credentialsUnreadable {
+            credentials = nil
+            credentialSourceUnreadable = true
+        } catch {
+            if ProviderCancellation.isCancellation(error) {
+                return cancelledRefreshSnapshot(provider: provider)
+            }
+            return ProviderSnapshot.error(provider: provider, error: error)
+        }
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
 
         if let credentials {
             sawAPIKey = true
@@ -57,10 +79,21 @@ final class DevinProvider: ProviderRuntime {
                 sawAuthFailure = true
             case .unavailable:
                 break
+            case .cancelled:
+                return cancelledRefreshSnapshot(provider: provider)
             }
         }
 
-        let appAuth = await loadOffMainActor({ [authStore] in authStore.loadAppAuth() })
+        let appAuth: DevinAuth?
+        do {
+            appAuth = try await loadOffMainActor { [authStore] in try authStore.loadAppAuth() }
+        } catch {
+            if ProviderCancellation.isCancellation(error) {
+                return cancelledRefreshSnapshot(provider: provider)
+            }
+            return ProviderSnapshot.error(provider: provider, error: error)
+        }
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         if let appAuth,
            credentials == nil || shouldAttemptAppAuth(appAuth, after: credentials) {
             sawAPIKey = true
@@ -71,9 +104,14 @@ final class DevinProvider: ProviderRuntime {
                 sawAuthFailure = true
             case .unavailable:
                 break
+            case .cancelled:
+                return cancelledRefreshSnapshot(provider: provider)
             }
         }
 
+        if credentialSourceUnreadable {
+            return ProviderSnapshot.error(provider: provider, error: DevinAuthError.credentialsUnreadable)
+        }
         if sawAuthFailure {
             return ProviderSnapshot.error(provider: provider, error: DevinAuthError.notLoggedIn)
         }
@@ -84,9 +122,11 @@ final class DevinProvider: ProviderRuntime {
     }
 
     private func attempt(auth: DevinAuth) async -> DevinAuthAttempt {
+        guard !Task.isCancelled else { return .cancelled }
         let apiServerURL = authStore.effectiveAPIServerURL(auth)
         do {
             let response = try await usageClient.fetchUserStatus(auth: auth, apiServerURL: apiServerURL)
+            try Task.checkCancellation()
             if response.statusCode == 401 || response.statusCode == 403 {
                 return .authFailure
             }
@@ -95,6 +135,7 @@ final class DevinProvider: ProviderRuntime {
             }
             return .success(try DevinUsageMapper.mapUserStatusResponse(response))
         } catch {
+            if ProviderCancellation.isCancellation(error) { return .cancelled }
             return .unavailable
         }
     }
@@ -114,4 +155,5 @@ private enum DevinAuthAttempt {
     case success(DevinMappedUsage)
     case authFailure
     case unavailable
+    case cancelled
 }

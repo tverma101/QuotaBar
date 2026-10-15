@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Builds QuotaBar, stages a signed .app bundle under dist/, and launches it in place — no install
-# to /Applications. The dev build:
+# Builds QuotaBar, stages a signed .app bundle under dist/, and launches it in place by default.
+# The dev build:
 #   - is signed with a stable Apple Development identity, so keychain/permission grants stick across
 #     rebuilds (macOS keys those to the signing identity + bundle id, not the install location);
 #   - uses its own bundle id (com.tverma101.quotabar.dev), so it never touches the real installed
 #     app's settings or keychain. To run against the real app's data instead, set BUNDLE_ID to
 #     com.tverma101.quotabar below;
 #
-# Usage: script/build_and_run.sh [run|build|logs|verify]
+# Usage: script/build_and_run.sh [run|build|install|logs|verify]
 # Env:   CODESIGN_IDENTITY  override signing identity (exact name or hash)
 #        CONFIG             "release" (default) or "debug"
+#        BUILD_JOBS         SwiftPM worker count (default: 2, to limit peak compiler memory)
+#        RELEASE            "1" uses the production app identity; install preserves the destination identity
 #        ICLOUD_PROVISIONING_PROFILE  optional override for the development provisioning profile;
 #                         otherwise the newest matching installed profile is selected automatically
 
@@ -46,7 +48,9 @@ fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_DISPLAY.app"
-APP_CONTENTS="$APP_BUNDLE/Contents"
+STAGING_APP_BUNDLE="$DIST_DIR/.$APP_DISPLAY.staging.$$"
+DIST_BACKUP_BUNDLE="$DIST_DIR/.$APP_DISPLAY.backup.$$"
+APP_CONTENTS="$STAGING_APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_HELPERS="$APP_CONTENTS/Helpers"
 APP_RESOURCES="$APP_CONTENTS/Resources"
@@ -56,12 +60,100 @@ INFO_PLIST="$APP_CONTENTS/Info.plist"
 RESOURCE_BUNDLE_NAME="${TARGET_NAME}_${TARGET_NAME}.bundle"
 ENTITLEMENTS="$ROOT_DIR/script/QuotaBar.dev.entitlements.plist"
 SIGN_ENTITLEMENTS="$ROOT_DIR/script/QuotaBar.local.entitlements.plist"
+INSTALL_DEST="/Applications/$APP_DISPLAY.app"
+INSTALL_STAGE="${INSTALL_DEST}.staging.$$"
+INSTALL_BACKUP="${INSTALL_DEST}.backup.$$"
+DIST_NEW_MOVED=0
+DIST_BACKUP_MOVED=0
+DIST_COMMITTED=0
+INSTALL_NEW_MOVED=0
+INSTALL_BACKUP_MOVED=0
+INSTALL_COMMITTED=0
 
-pkill -x "$TARGET_NAME" >/dev/null 2>&1 || true
+if [ "$MODE" = "install" ]; then
+  if [ ! -d /Applications ] || [ ! -w /Applications ]; then
+    echo "cannot install: /Applications is not writable by the current user" >&2
+    exit 1
+  fi
+  if [ -e "$INSTALL_DEST" ]; then
+    INSTALLED_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INSTALL_DEST/Contents/Info.plist" 2>/dev/null || true)
+    if [ "$INSTALLED_BUNDLE_ID" != "$BUNDLE_ID" ]; then
+      echo "refusing to replace $INSTALL_DEST with a different app identity (installed: ${INSTALLED_BUNDLE_ID:-unknown}, requested: $BUNDLE_ID)" >&2
+      exit 1
+    fi
+  fi
+fi
 
-echo "==> swift build ($CONFIG)"
-swift build -c "$CONFIG"
-BUILD_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
+bundle_is_running() {
+  local bundle_path="$1"
+  local expected="$bundle_path/Contents/MacOS/$TARGET_NAME"
+  local pids pid actual
+  pids="$(pgrep -x "$TARGET_NAME" 2>/dev/null || true)"
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    actual="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$actual" == "$expected" || "$actual" == "$expected "* ]]; then
+      return 0
+    fi
+  done <<< "$pids"
+  return 1
+}
+
+stop_running_bundle() {
+  local bundle_path="$1"
+  local expected="$bundle_path/Contents/MacOS/$TARGET_NAME"
+  local pids pid actual attempt
+  pids="$(pgrep -x "$TARGET_NAME" 2>/dev/null || true)"
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    actual="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ "$actual" == "$expected" || "$actual" == "$expected "* ]] || continue
+    kill "$pid" 2>/dev/null || true
+    for ((attempt = 0; attempt < 25; attempt++)); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done <<< "$pids"
+}
+
+cleanup_build() {
+  local status=$?
+  trap - EXIT
+  if [ -e "$STAGING_APP_BUNDLE" ]; then
+    rm -rf "$STAGING_APP_BUNDLE"
+  fi
+  if [ -e "$INSTALL_STAGE" ]; then
+    rm -rf "$INSTALL_STAGE"
+  fi
+  if [ "$INSTALL_COMMITTED" -eq 0 ]; then
+    if [ "$INSTALL_NEW_MOVED" -eq 1 ] && [ -e "$INSTALL_DEST" ]; then
+      stop_running_bundle "$INSTALL_DEST"
+      rm -rf "$INSTALL_DEST" || echo "could not remove failed replacement; recovery bundle: $INSTALL_DEST" >&2
+    fi
+    if [ "$INSTALL_BACKUP_MOVED" -eq 1 ] && [ -e "$INSTALL_BACKUP" ]; then
+      mv "$INSTALL_BACKUP" "$INSTALL_DEST" || echo "could not restore prior install; recovery bundle: $INSTALL_BACKUP" >&2
+    fi
+  fi
+  if [ "$DIST_COMMITTED" -eq 0 ]; then
+    if [ "$DIST_NEW_MOVED" -eq 1 ] && [ -e "$APP_BUNDLE" ]; then
+      stop_running_bundle "$APP_BUNDLE"
+      rm -rf "$APP_BUNDLE" || echo "could not remove failed dist replacement: $APP_BUNDLE" >&2
+    fi
+    if [ "$DIST_BACKUP_MOVED" -eq 1 ] && [ -e "$DIST_BACKUP_BUNDLE" ]; then
+      mv "$DIST_BACKUP_BUNDLE" "$APP_BUNDLE" || echo "could not restore prior dist app; recovery bundle: $DIST_BACKUP_BUNDLE" >&2
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup_build EXIT
+
+BUILD_JOBS="${BUILD_JOBS:-2}"
+echo "==> swift build ($CONFIG, $BUILD_JOBS jobs, index store disabled)"
+swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store
+BUILD_DIR="$(swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store --show-bin-path)"
 BUILD_BINARY="$BUILD_DIR/$TARGET_NAME"
 BUILD_CLI_BINARY="$BUILD_DIR/quotabar-cli"
 
@@ -74,8 +166,8 @@ if [ ! -x "$BUILD_CLI_BINARY" ]; then
   exit 1
 fi
 
-echo "==> staging $APP_BUNDLE"
-rm -rf "$APP_BUNDLE"
+echo "==> staging $STAGING_APP_BUNDLE"
+rm -rf "$STAGING_APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_HELPERS" "$APP_RESOURCES"
 cp "$BUILD_BINARY" "$APP_BINARY"
 cp "$BUILD_CLI_BINARY" "$CLI_BINARY"
@@ -242,12 +334,37 @@ if [ -n "$CODESIGN_IDENTITY" ]; then
   /usr/bin/codesign --force --options runtime \
     --sign "$CODESIGN_IDENTITY" \
     --entitlements "$RESOLVED_ENTITLEMENTS" \
-    "$APP_BUNDLE" >/dev/null
+    "$STAGING_APP_BUNDLE" >/dev/null
   echo "==> signed with: $CODESIGN_IDENTITY"
 else
   /usr/bin/codesign --force --sign - "$CLI_BINARY" >/dev/null
-  /usr/bin/codesign --force --sign - --entitlements "$RESOLVED_ENTITLEMENTS" "$APP_BUNDLE" >/dev/null
+  /usr/bin/codesign --force --sign - --entitlements "$RESOLVED_ENTITLEMENTS" "$STAGING_APP_BUNDLE" >/dev/null
   echo "WARNING: no Apple Development identity found; ad-hoc signed." >&2
+fi
+
+STAGED_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")
+if [ "$STAGED_BUNDLE_ID" != "$BUNDLE_ID" ]; then
+  echo "staged app identity mismatch: expected $BUNDLE_ID, found $STAGED_BUNDLE_ID" >&2
+  exit 1
+fi
+/usr/bin/codesign --verify --deep --strict "$STAGING_APP_BUNDLE" >/dev/null
+
+echo "==> verifying staged bundle identity and signature"
+stop_running_bundle "$APP_BUNDLE"
+if [ -e "$APP_BUNDLE" ]; then
+  mv "$APP_BUNDLE" "$DIST_BACKUP_BUNDLE"
+  DIST_BACKUP_MOVED=1
+fi
+if ! mv "$STAGING_APP_BUNDLE" "$APP_BUNDLE"; then
+  echo "could not move staged app into place: $APP_BUNDLE" >&2
+  exit 1
+fi
+DIST_NEW_MOVED=1
+/usr/bin/codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null
+DIST_COMMITTED=1
+if [ "$DIST_BACKUP_MOVED" -eq 1 ]; then
+  rm -rf "$DIST_BACKUP_BUNDLE"
+  DIST_BACKUP_MOVED=0
 fi
 
 launch_app() {
@@ -256,6 +373,7 @@ launch_app() {
 
 case "$MODE" in
   run)
+    stop_running_bundle "$APP_BUNDLE"
     launch_app
     echo "==> launched $APP_DISPLAY (dist/$APP_DISPLAY.app)"
     ;;
@@ -269,28 +387,68 @@ case "$MODE" in
     # icon and no Launchpad entry by design, which is correct — but it means /Applications is the only
     # place Spotlight and Finder treat it as an installed application. From a build directory it is
     # effectively invisible: no Spotlight hit, no way to relaunch after the checkout is gone.
-    DEST="/Applications/$APP_DISPLAY.app"
-    if pgrep -x "$TARGET_NAME" >/dev/null; then
-      pkill -x "$TARGET_NAME" || true
-      sleep 1
+    rm -rf "$INSTALL_STAGE"
+    mkdir -p "$INSTALL_STAGE"
+    rsync -a --delete "$APP_BUNDLE/" "$INSTALL_STAGE/"
+    /usr/bin/codesign --verify --deep --strict "$INSTALL_STAGE" >/dev/null
+    INSTALL_STAGE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INSTALL_STAGE/Contents/Info.plist")
+    if [ "$INSTALL_STAGE_ID" != "$BUNDLE_ID" ]; then
+      echo "staged install identity mismatch: expected $BUNDLE_ID, found $INSTALL_STAGE_ID" >&2
+      exit 1
     fi
-    # Replace in place rather than deleting first, so a failed copy cannot leave nothing installed.
-    rsync -a --delete "$APP_BUNDLE/" "$DEST/"
-    /usr/bin/codesign --verify --deep --strict "$DEST" >/dev/null 2>&1 \
-      && echo "==> installed and signature verified: $DEST" \
-      || echo "==> installed (signature verification reported an issue): $DEST"
-    /usr/bin/mdimport -r "$DEST" >/dev/null 2>&1 || true
-    open -a "$DEST"
-    echo "==> launched from $DEST"
+    echo "==> staged and signature verified: $INSTALL_STAGE"
+
+    # Build and verify the replacement before stopping either copy. Stop only the exact bundle paths,
+    # because dev and release builds share the QuotaBar process name but use different identities.
+    stop_running_bundle "$APP_BUNDLE"
+    stop_running_bundle "$INSTALL_DEST"
+
+    if [ -e "$INSTALL_DEST" ]; then
+      mv "$INSTALL_DEST" "$INSTALL_BACKUP"
+      INSTALL_BACKUP_MOVED=1
+    fi
+    if ! mv "$INSTALL_STAGE" "$INSTALL_DEST"; then
+      echo "could not move staged app into place: $INSTALL_DEST" >&2
+      exit 1
+    fi
+    INSTALL_NEW_MOVED=1
+    /usr/bin/codesign --verify --deep --strict "$INSTALL_DEST" >/dev/null
+    INSTALL_FINAL_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INSTALL_DEST/Contents/Info.plist")
+    if [ "$INSTALL_FINAL_ID" != "$BUNDLE_ID" ]; then
+      echo "installed app identity verification failed: $INSTALL_DEST" >&2
+      exit 1
+    fi
+    echo "==> installed and signature verified: $INSTALL_DEST"
+    /usr/bin/mdimport -r "$INSTALL_DEST" >/dev/null 2>&1 || true
+    open -a "$INSTALL_DEST"
+    for ((attempt = 0; attempt < 25; attempt++)); do
+      bundle_is_running "$INSTALL_DEST" && break
+      sleep 0.2
+    done
+    if ! bundle_is_running "$INSTALL_DEST"; then
+      echo "installed app did not start; the prior bundle will be restored from $INSTALL_BACKUP" >&2
+      exit 1
+    fi
+    INSTALL_COMMITTED=1
+    if [ -e "$INSTALL_BACKUP" ]; then
+      rm -rf "$INSTALL_BACKUP"
+      INSTALL_BACKUP_MOVED=0
+    fi
+    echo "==> launched from $INSTALL_DEST"
     ;;
   logs)
+    stop_running_bundle "$APP_BUNDLE"
     launch_app
     /usr/bin/log stream --info --style compact --predicate "process == \"$TARGET_NAME\""
     ;;
   verify)
+    stop_running_bundle "$APP_BUNDLE"
     launch_app
-    sleep 1
-    pgrep -x "$TARGET_NAME" >/dev/null && echo "==> running"
+    for ((attempt = 0; attempt < 25; attempt++)); do
+      bundle_is_running "$APP_BUNDLE" && break
+      sleep 0.2
+    done
+    bundle_is_running "$APP_BUNDLE" && echo "==> running"
     ;;
   *)
     echo "usage: $0 [run|build|install|logs|verify]" >&2

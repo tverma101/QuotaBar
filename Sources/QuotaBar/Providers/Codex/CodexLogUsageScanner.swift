@@ -1,5 +1,12 @@
 import Foundation
 
+/// A missing native source is complete empty data; an incomplete discovery or fold must preserve the
+/// last-good combined history instead of publishing whichever session files happened to succeed.
+enum CodexLogUsageScanResult: Sendable {
+    case complete(LogUsageScan?)
+    case incomplete
+}
+
 /// Builds daily token/cost estimates for Codex by scanning the Codex CLI's local session rollouts
 /// natively (`$CODEX_HOME/sessions/**/*.jsonl` + `archived_sessions/`), replacing the external
 /// `ccusage` CLI.
@@ -24,6 +31,7 @@ actor CodexLogUsageScanner {
         var reasoning: Int
         var total: Int
         var isFast: Bool = false
+        var serviceTier: String? = nil
     }
 
     /// Token fields of a `token_count` usage object, tolerating the older field spellings ccusage
@@ -99,6 +107,7 @@ actor CodexLogUsageScanner {
         var previousTotals: RawUsage?
         var currentModel: String?
         var currentTierIsFast: Bool
+        var currentServiceTier: String?
         var sawSessionMeta: Bool
         var replayGate: ChildReplayGate?
     }
@@ -209,12 +218,49 @@ actor CodexLogUsageScanner {
         self.scanner = incrementalScanner ?? Self.sharedScanner
     }
 
-    func scan(daysBack: Int = UsageHistoryWindow.previousDays, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+    func scan(
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing,
+        peerHomes peerHomesOverride: [URL]? = nil
+    ) async -> LogUsageScan? {
+        switch await scanResult(
+            daysBack: daysBack,
+            now: now,
+            pricing: pricing,
+            peerHomes: peerHomesOverride
+        ) {
+        case .complete(let scan):
+            return scan
+        case .incomplete:
+            return nil
+        }
+    }
+
+    /// Completeness-aware scan used by providers that merge Codex logs with other sources.
+    func scanResult(
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing,
+        peerHomes peerHomesOverride: [URL]? = nil
+    ) async -> CodexLogUsageScanResult {
+        guard !Task.isCancelled else { return .incomplete }
         let homes = codexHomes()
+        guard !Task.isCancelled else { return .incomplete }
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
-        let files = Self.sessionFiles(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory)
+        guard let files = Self.sessionFilesIfComplete(
+            homes: homes,
+            peerHomes: peerHomesOverride ?? peerHomes,
+            homeDirectory: homeDirectory
+        ) else {
+            if !Task.isCancelled {
+                AppLog.warn(LogTag.plugin("codex"), "session files or peer inodes could not be completely discovered; preserving last-good history")
+            }
+            return .incomplete
+        }
+        guard !Task.isCancelled else { return .incomplete }
         guard !files.isEmpty else {
-            _ = await scanner.foldItems(
+            let complete = await scanner.foldItems(
                 from: [], since: context.cacheSince, cacheIdentity: context.identity,
                 parseFile: { url in
                     Self.parseFileIncrementally(
@@ -225,7 +271,13 @@ actor CodexLogUsageScanner {
                 },
                 visit: { _ in }
             )
-            return nil
+            guard complete else {
+                if !Task.isCancelled {
+                    AppLog.warn(LogTag.plugin("codex"), "empty session fold did not complete; preserving last-good history")
+                }
+                return .incomplete
+            }
+            return Task.isCancelled ? .incomplete : .complete(nil)
         }
 
         let pricingToken = pricing.aggregateCacheToken
@@ -249,9 +301,10 @@ actor CodexLogUsageScanner {
         var liveInodes: Set<InodeAggregateKey> = []
         unchanged.reserveCapacity(files.count)
         for file in files {
+            guard !Task.isCancelled else { return .incomplete }
             guard let revision = AppendOnlyFileProbe.revision(at: URL(fileURLWithPath: file.path)) else {
-                changed.append(file)
-                continue
+                AppLog.warn(LogTag.plugin("codex"), "session file identity could not be read; preserving last-good history")
+                return .incomplete
             }
             let key = InodeAggregateKey(device: revision.device, inode: revision.inode)
             liveInodes.insert(key)
@@ -269,12 +322,16 @@ actor CodexLogUsageScanner {
         }
         if changed.isEmpty {
             AppLog.debug(LogTag.plugin("codex"), "aggregate split: unchanged=\(unchanged.count) changed=0")
-            return DailyUsageAccumulator.merged(unchanged, droppingDaysBefore: minDayKey)
-                ?? DailyUsageAccumulator().build()
+            guard !Task.isCancelled else { return .incomplete }
+            return .complete(
+                DailyUsageAccumulator.merged(unchanged, droppingDaysBefore: minDayKey)
+                    ?? DailyUsageAccumulator().build()
+            )
         }
         AppLog.debug(LogTag.plugin("codex"), "aggregate split: unchanged=\(unchanged.count) changed=\(changed.count)")
 
         let bucket = PerFileFoldBucket()
+        guard !Task.isCancelled else { return .incomplete }
         let ok = await scanner.foldItems(
             from: changed, since: context.cacheSince, cacheIdentity: context.identity,
             parseFile: { url in
@@ -300,20 +357,40 @@ actor CodexLogUsageScanner {
                 bucket.finish(path)
             }
         )
-        guard ok, !Task.isCancelled else { return nil }
+        guard ok else {
+            if !Task.isCancelled {
+                AppLog.warn(LogTag.plugin("codex"), "session file fold was incomplete; preserving last-good history")
+            }
+            return .incomplete
+        }
+        guard !Task.isCancelled else { return .incomplete }
 
+        var refreshed: [(key: InodeAggregateKey, record: InodeAggregateRecord, scan: LogUsageScan)] = []
+        refreshed.reserveCapacity(changed.count)
         for file in changed {
             guard let scan = bucket.scans[file.path],
                   let revision = AppendOnlyFileProbe.revision(at: URL(fileURLWithPath: file.path))
-            else { continue }
+            else {
+                if !Task.isCancelled {
+                    AppLog.warn(LogTag.plugin("codex"), "session file changed during fold; preserving last-good history")
+                }
+                return .incomplete
+            }
             let key = InodeAggregateKey(device: revision.device, inode: revision.inode)
-            inodeAggregates[key] = InodeAggregateRecord(
-                size: file.size,
-                mtime: file.mtime,
-                attributeMtime: file.attributeMtime,
+            refreshed.append((
+                key: key,
+                record: InodeAggregateRecord(
+                    size: file.size,
+                    mtime: file.mtime,
+                    attributeMtime: file.attributeMtime,
+                    scan: scan
+                ),
                 scan: scan
-            )
-            unchanged.append(scan)
+            ))
+        }
+        for item in refreshed {
+            inodeAggregates[item.key] = item.record
+            unchanged.append(item.scan)
         }
         persistInodeAggregates(
             identity: context.identity,
@@ -321,8 +398,11 @@ actor CodexLogUsageScanner {
             since: context.cacheSince,
             timeZone: timeZone
         )
-        return DailyUsageAccumulator.merged(unchanged, droppingDaysBefore: minDayKey)
-            ?? DailyUsageAccumulator().build()
+        guard !Task.isCancelled else { return .incomplete }
+        return .complete(
+            DailyUsageAccumulator.merged(unchanged, droppingDaysBefore: minDayKey)
+                ?? DailyUsageAccumulator().build()
+        )
     }
 
     private func prepareInodeAggregates(
@@ -432,7 +512,11 @@ actor CodexLogUsageScanner {
     func parsedEvents(daysBack: Int = 33, now: Date = Date(), homes: [URL]? = nil) async -> [Event] {
         let homes = homes ?? codexHomes()
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
-        let files = Self.sessionFiles(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory)
+        guard let files = Self.sessionFilesIfComplete(
+            homes: homes,
+            peerHomes: peerHomes,
+            homeDirectory: homeDirectory
+        ) else { return [] }
         guard !files.isEmpty else { return [] }
         let cached = await scanner.items(
             from: files, since: context.cacheSince, cacheIdentity: context.identity,
@@ -458,7 +542,11 @@ actor CodexLogUsageScanner {
     ) async -> Bool {
         let homes = homes ?? codexHomes()
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
-        let files = Self.sessionFiles(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory)
+        guard let files = Self.sessionFilesIfComplete(
+            homes: homes,
+            peerHomes: peerHomes,
+            homeDirectory: homeDirectory
+        ) else { return false }
         guard !files.isEmpty else { return true }
         return await scanner.foldItems(
             from: files, since: context.cacheSince, cacheIdentity: context.identity,
@@ -485,10 +573,16 @@ actor CodexLogUsageScanner {
         homes: [URL],
         gatewayScanner: IncrementalJSONLScanner<Event>? = nil,
         nativeCachePersistence: JSONLScanCachePersistence? = nil,
+        rolloutNameDeduper: CodexRolloutNameDeduper? = nil,
         visit: @Sendable (Event) -> Void
     ) async -> Bool {
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
-        let files = Self.sessionFiles(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory)
+        guard let discovered = Self.sessionFilesIfComplete(
+            homes: homes,
+            peerHomes: peerHomes,
+            homeDirectory: homeDirectory
+        ) else { return false }
+        let files = rolloutNameDeduper?.retainingFirstOccurrence(of: discovered) ?? discovered
         guard !files.isEmpty else { return true }
         let projection = CodexGatewayCacheProjection.load(
             persistence: nativeCachePersistence ?? Self.parsedEventCachePersistence,
@@ -570,7 +664,7 @@ actor CodexLogUsageScanner {
     // MARK: - Discovery
 
     /// Device+inode identity used to detect hardlinked Codex rollouts across homes.
-    private struct FileIdentity: Hashable, Sendable {
+    struct FileIdentity: Hashable, Sendable {
         var device: UInt64
         var inode: UInt64
     }
@@ -600,6 +694,7 @@ actor CodexLogUsageScanner {
     ///   - peerHomes: Other account homes whose hardlinked copies should not be priced when
     ///     enumerating a non-default / managed home (Orca backfilled from `~/.codex`).
     ///   - homeDirectory: User home used to identify the default `~/.codex` path.
+    ///   - peerInodeDiscovery: Optional test seam for simulating a complete or incomplete peer walk.
     ///
     /// Attribution rules:
     /// 1. Collect `(st_dev, st_ino)` for every `*.jsonl` under each peer home's `sessions/` and
@@ -616,21 +711,46 @@ actor CodexLogUsageScanner {
         peerHomes: [URL] = [],
         homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser }
     ) -> [JSONLScanning.DiscoveredFile] {
+        sessionFilesIfComplete(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory) ?? []
+    }
+
+    /// `nil` means a present Codex session root could not be fully enumerated. A caller must keep
+    /// its last-good history rather than publishing whichever other roots happened to be readable.
+    static func sessionFilesIfComplete(
+        homes: [URL],
+        peerHomes: [URL] = [],
+        homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
+        peerInodeDiscovery: (@Sendable (URL) -> Set<FileIdentity>?)? = nil
+    ) -> [JSONLScanning.DiscoveredFile]? {
+        guard !Task.isCancelled else { return nil }
         let defaultCodexPath = homeDirectory()
             .appendingPathComponent(".codex")
             .resolvingSymlinksInPath()
             .standardizedFileURL
             .path
-        let peerInodes = collectSessionInodes(under: peerHomes)
-
         var nonDefaultHomes: [URL] = []
         var defaultHomes: [URL] = []
         for home in homes {
+            guard !Task.isCancelled else { return nil }
             if isDefaultCodexHome(home, defaultCodexPath: defaultCodexPath) {
                 defaultHomes.append(home)
             } else {
                 nonDefaultHomes.append(home)
             }
+        }
+        // The default ~/.codex card keeps shared hardlinks and never needs peer inode discovery.
+        // For a managed card, every known peer home is supplied by CodexProvider, even when its card
+        // is disabled. This pass reads file identities only (not rollout contents), preserving source
+        // attribution without refreshing or folding the disabled account.
+        let peerInodes: Set<FileIdentity>
+        if nonDefaultHomes.isEmpty {
+            peerInodes = []
+        } else {
+            let discovery = peerInodeDiscovery ?? { home in Self.collectSessionInodesUncached(under: home) }
+            guard let collectedPeerInodes = collectSessionInodes(under: peerHomes, discoverHome: discovery) else {
+                return nil
+            }
+            peerInodes = collectedPeerInodes
         }
         // Prefer default ~/.codex when the same inode appears under both a peer managed home and ~/.codex.
         let orderedHomes = defaultHomes + nonDefaultHomes
@@ -640,6 +760,7 @@ actor CodexLogUsageScanner {
         var seenInodes: Set<FileIdentity> = []
         var seenRolloutNames: Set<String> = []
         for home in orderedHomes {
+            guard !Task.isCancelled else { return nil }
             // Managed/non-default homes skip inodes that already exist under peer ~/.codex.
             // Default keeps shared hardlinks (Orca backfilled FROM system root INTO managed home).
             let skipPeerHardlinks = !isDefaultCodexHome(home, defaultCodexPath: defaultCodexPath)
@@ -647,11 +768,17 @@ actor CodexLogUsageScanner {
             var seenRelative: Set<String> = []
             var sourceDirs: [URL] = []
             for name in ["sessions", "archived_sessions"] {
-                let dir = home.appendingPathComponent(name)
-                var isDirectory: ObjCBool = false
-                if FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDirectory), isDirectory.boolValue {
-                    sourceDirs.append(dir)
+                let dir = home.appendingPathComponent(name).resolvingSymlinksInPath()
+                let attributes: [FileAttributeKey: Any]
+                do {
+                    attributes = try FileManager.default.attributesOfItem(atPath: dir.path)
+                } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                    continue
+                } catch {
+                    return nil
                 }
+                guard attributes[.type] as? FileAttributeType == .typeDirectory else { return nil }
+                sourceDirs.append(dir)
             }
             // CodexRouter chatgpt-accounts homes often have auth + plugins but no session rollouts.
             // Falling back to the whole CODEX_HOME walked plugins/ (tens of thousands of files) for
@@ -660,7 +787,11 @@ actor CodexLogUsageScanner {
                 continue
             }
             for dir in sourceDirs.map({ $0.resolvingSymlinksInPath() }) where seenDirs.insert(dir.path).inserted {
-                for file in JSONLScanning.jsonlFiles(under: dir) {
+                guard !Task.isCancelled,
+                      let discovered = JSONLScanning.jsonlFilesIfComplete(under: dir)
+                else { return nil }
+                for file in discovered {
+                    guard !Task.isCancelled else { return nil }
                     let relative = String(file.path.dropFirst(dir.path.count))
                     guard seenRelative.insert(relative).inserted else { continue }
                     let fileURL = URL(fileURLWithPath: file.path)
@@ -671,12 +802,11 @@ actor CodexLogUsageScanner {
                     if rolloutName.hasPrefix("rollout-"), !seenRolloutNames.insert(rolloutName).inserted {
                         continue
                     }
-                    if let identity = fileIdentity(at: fileURL) {
-                        if skipPeerHardlinks, peerInodes.contains(identity) {
-                            continue
-                        }
-                        guard seenInodes.insert(identity).inserted else { continue }
+                    guard let identity = fileIdentity(at: fileURL) else { return nil }
+                    if skipPeerHardlinks, peerInodes.contains(identity) {
+                        continue
                     }
+                    guard seenInodes.insert(identity).inserted else { continue }
                     files.append(file)
                 }
             }
@@ -714,8 +844,9 @@ actor CodexLogUsageScanner {
         func lookupOrCompute(
             key: String,
             signature: String,
-            compute: () -> Set<FileIdentity>
-        ) -> Set<FileIdentity> {
+            shouldCache: () -> Bool,
+            compute: () -> Set<FileIdentity>?
+        ) -> Set<FileIdentity>? {
             let now = ProcessInfo.processInfo.systemUptime
             lock.lock()
             if let entry = entries[key],
@@ -726,8 +857,14 @@ actor CodexLogUsageScanner {
                 return hit
             }
             lock.unlock()
-            let inodes = compute()
+            guard let inodes = compute() else { return nil }
+            // An incomplete or cancelled traversal never becomes an authoritative cache entry.
+            guard shouldCache() else { return inodes }
             lock.lock()
+            guard shouldCache() else {
+                lock.unlock()
+                return inodes
+            }
             entries[key] = (signature, now, inodes)
             lock.unlock()
             return inodes
@@ -745,64 +882,88 @@ actor CodexLogUsageScanner {
     /// `(st_dev, st_ino)` for every `*.jsonl` under each home's `sessions/` and `archived_sessions/`.
     /// Lightweight enumerator only — no `DiscoveredFile` / mtime arrays (those were ~11GB-path peak RSS
     /// amplifiers when peer homes held hundreds of hardlinked rollouts).
-    private static func collectSessionInodes(under homes: [URL]) -> Set<FileIdentity> {
+    private static func collectSessionInodes(
+        under homes: [URL],
+        discoverHome: @Sendable (URL) -> Set<FileIdentity>?
+    ) -> Set<FileIdentity>? {
         var result: Set<FileIdentity> = []
         for home in homes {
+            guard !Task.isCancelled else { return nil }
             let key = home.resolvingSymlinksInPath().standardizedFileURL.path
-            let signature = sessionDirectorySignature(for: home)
-            result.formUnion(
-                SessionInodeSetCache.shared.lookupOrCompute(key: key, signature: signature) {
-                    collectSessionInodesUncached(under: home)
-                }
-            )
+            guard let signature = sessionDirectorySignature(for: home),
+                  let inodes = SessionInodeSetCache.shared.lookupOrCompute(
+                    key: key,
+                    signature: signature,
+                    shouldCache: { !Task.isCancelled },
+                    compute: { discoverHome(home) }
+                  )
+            else { return nil }
+            result.formUnion(inodes)
         }
         return result
     }
 
     /// Directory mtime signature for the refresh-lifetime inode cache. Nested file adds may not bump
     /// the top-level dir mtime on every FS; unique per-test paths keep hermetic tests correct.
-    private static func sessionDirectorySignature(for home: URL) -> String {
+    private static func sessionDirectorySignature(for home: URL) -> String? {
         var parts: [String] = []
         for name in ["sessions", "archived_sessions"] {
-            let dir = home.appendingPathComponent(name)
-            guard let values = try? dir.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey]),
-                  values.isDirectory == true,
-                  let mtime = values.contentModificationDate
-            else {
+            let dir = home.appendingPathComponent(name).resolvingSymlinksInPath()
+            let attributes: [FileAttributeKey: Any]
+            do {
+                attributes = try FileManager.default.attributesOfItem(atPath: dir.path)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
                 parts.append("\(name)=missing")
                 continue
+            } catch {
+                return nil
             }
+            guard attributes[.type] as? FileAttributeType == .typeDirectory,
+                  let mtime = attributes[.modificationDate] as? Date
+            else { return nil }
             parts.append("\(name)=\(mtime.timeIntervalSince1970)")
         }
         return parts.joined(separator: ";")
     }
 
-    private static func collectSessionInodesUncached(under home: URL) -> Set<FileIdentity> {
+    private static func collectSessionInodesUncached(under home: URL) -> Set<FileIdentity>? {
         var result: Set<FileIdentity> = []
         for name in ["sessions", "archived_sessions"] {
+            guard !Task.isCancelled else { return nil }
             let dir = home.appendingPathComponent(name).resolvingSymlinksInPath()
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDirectory),
-                  isDirectory.boolValue
-            else { continue }
+            let attributes: [FileAttributeKey: Any]
+            do {
+                attributes = try FileManager.default.attributesOfItem(atPath: dir.path)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                continue
+            } catch {
+                return nil
+            }
+            guard attributes[.type] as? FileAttributeType == .typeDirectory else { return nil }
+            var enumerationFailed = false
             guard let enumerator = FileManager.default.enumerator(
                 at: dir,
                 includingPropertiesForKeys: [.isRegularFileKey],
-                options: []
-            ) else { continue }
-            for case let url as URL in enumerator {
-                guard url.pathExtension == "jsonl" else { continue }
-                let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
-                guard values?.isRegularFile == true else { continue }
-                if let identity = fileIdentity(at: url) {
-                    result.insert(identity)
+                options: [],
+                errorHandler: { _, _ in
+                    enumerationFailed = true
+                    return false
                 }
+            ) else { return nil }
+            for case let url as URL in enumerator {
+                guard !Task.isCancelled else { return nil }
+                guard url.pathExtension == "jsonl" else { continue }
+                guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]) else { return nil }
+                guard values.isRegularFile == true else { continue }
+                guard let identity = fileIdentity(at: url) else { return nil }
+                result.insert(identity)
             }
+            guard !enumerationFailed else { return nil }
         }
         return result
     }
 
-    private static func fileIdentity(at url: URL) -> FileIdentity? {
+    static func fileIdentity(at url: URL) -> FileIdentity? {
         // Reuse AppendOnlyFileProbe's resolve+lstat path so hardlinks share identity with the probe.
         guard let revision = AppendOnlyFileProbe.revision(at: url) else { return nil }
         return FileIdentity(device: revision.device, inode: revision.inode)
@@ -1000,6 +1161,7 @@ actor CodexLogUsageScanner {
         private var previousTotals: RawUsage?
         private var currentModel: String?
         private var currentTierIsFast = false
+        private var currentServiceTier: String?
         private var sawSessionMeta = false
         private var replayGate: ChildReplayGate?
         private let emitSince: Date?
@@ -1010,6 +1172,7 @@ actor CodexLogUsageScanner {
                 self.previousTotals = checkpoint.previousTotals
                 self.currentModel = checkpoint.currentModel
                 self.currentTierIsFast = checkpoint.currentTierIsFast
+                self.currentServiceTier = checkpoint.currentServiceTier
                 self.sawSessionMeta = checkpoint.sawSessionMeta
                 self.replayGate = checkpoint.replayGate
             }
@@ -1049,7 +1212,8 @@ actor CodexLogUsageScanner {
             if isThreadSettings, type == "event_msg",
                payload?["type"] as? String == "thread_settings_applied" {
                 if let tier = CodexLogUsageScanner.serviceTier(in: payload) {
-                    currentTierIsFast = tier == "fast" || tier == "priority"
+                    currentServiceTier = tier.lowercased()
+                    currentTierIsFast = currentServiceTier == "fast" || currentServiceTier == "priority"
                 }
                 return
             }
@@ -1105,7 +1269,8 @@ actor CodexLogUsageScanner {
                 output: usage.output,
                 reasoning: usage.reasoning,
                 total: usage.total,
-                isFast: currentTierIsFast
+                isFast: currentTierIsFast,
+                serviceTier: currentServiceTier
             )
             if emitSince == nil || timestamp >= emitSince! {
                 events.append(event)
@@ -1121,6 +1286,7 @@ actor CodexLogUsageScanner {
                 previousTotals: previousTotals,
                 currentModel: currentModel,
                 currentTierIsFast: currentTierIsFast,
+                currentServiceTier: currentServiceTier,
                 sawSessionMeta: sawSessionMeta,
                 replayGate: replayGate
             )
@@ -1303,16 +1469,18 @@ actor CodexLogUsageScanner {
             return
         }
         let appliesCodexFastTier = isFastAlias ? baseRates != nil : event.isFast
+        let serviceTierMultiplier = codexServiceTierMultiplier(
+            for: rateModel,
+            serviceTier: event.serviceTier
+        )
         let eventCost = cost(
             rates: rates,
             event: event,
             model: rateModel,
-            fastTier: appliesCodexFastTier,
-            fastMultiplier: codexPriorityMultiplier(for: rateModel, rates: rates)
+            fastTier: serviceTierMultiplier != nil || appliesCodexFastTier,
+            fastMultiplier: serviceTierMultiplier ?? codexPriorityMultiplier(for: rateModel, rates: rates)
         )
-        if let apiEstimate {
-            accumulator.addApiEstimate(day: day, cost: apiEstimate)
-        }
+        accumulator.recordApiEstimate(day: day, cost: apiEstimate, tokens: event.total)
         // Key the row on the resolved model, not the emitted slug. Session logs carry gateway-prefixed
         // slugs too, so the same model can arrive both tagged and untagged; grouping on the raw slug split
         // it across rows and into the period total twice. The spelling is kept as a tooltip variant.
@@ -1383,6 +1551,20 @@ actor CodexLogUsageScanner {
         }
     }
 
+    /// OpenAI publishes the named GPT-6.1 Sol service-tier multipliers. Keep these exact-model
+    /// overrides scoped to that published schedule; unknown tiers and sibling models stay standard.
+    static func codexServiceTierMultiplier(for model: String, serviceTier: String?) -> Double? {
+        let base = datedBaseModel(model)
+        let slug = base.split(separator: "/").last.map(String.init) ?? base
+        guard slug == "gpt-6.1-sol", let serviceTier = serviceTier?.lowercased() else { return nil }
+        switch serviceTier {
+        case "fast", "priority": return 2
+        case "flex", "batch": return 0.5
+        case "ultrafast": return 6
+        default: return nil
+        }
+    }
+
     private static func codexModelHasNoCacheDiscount(_ model: String) -> Bool {
         switch datedBaseModel(model) {
         case "gpt-5.4-pro", "gpt-5.5-pro": return true
@@ -1443,5 +1625,25 @@ actor CodexLogUsageScanner {
 
         guard let stringStart = String.Index(start, within: model) else { return nil }
         return String(model[..<stringStart])
+    }
+}
+
+/// OpenCode folds enabled Codex homes one at a time to release each home's parsed tail before moving
+/// on. Rollout ids are global across Codex homes, so keep first-seen names across those calls too;
+/// otherwise a copied backfill with a different inode is counted once per home.
+final class CodexRolloutNameDeduper: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen: Set<String> = []
+
+    func retainingFirstOccurrence(
+        of files: [JSONLScanning.DiscoveredFile]
+    ) -> [JSONLScanning.DiscoveredFile] {
+        lock.lock()
+        defer { lock.unlock() }
+        return files.filter { file in
+            let name = URL(fileURLWithPath: file.path).lastPathComponent
+            guard name.hasPrefix("rollout-") else { return true }
+            return seen.insert(name).inserted
+        }
     }
 }

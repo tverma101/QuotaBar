@@ -28,6 +28,15 @@ struct OpenCodeUsageScan: Sendable {
 /// A `Sendable` struct (like the Grok scanner), `async` and nonisolated, so the SQLite reads run off the
 /// main actor when the `@MainActor` provider `await`s it.
 struct OpenCodeUsageScanner: Sendable {
+    /// Other provider tools whose local histories can contain OpenCode-hosted turns. These folds
+    /// are only useful while the corresponding card family is enabled.
+    enum GatewaySource: String, CaseIterable, Hashable, Sendable {
+        case claude
+        case codex
+        case hermes
+        case muse
+    }
+
     /// Per-stage wall-clock attribution for one scan, logged at the end so the closed-panel
     /// accounting cadence's slow fold (~17-21s observed) can be pinned to a stage in the log
     /// file before optimizing it. Only scans slower than the threshold are logged — a healthy
@@ -74,12 +83,12 @@ struct OpenCodeUsageScanner: Sendable {
     /// Hermes' session database, when present — sessions billed to the OpenCode hosted account
     /// (`billing_provider` `opencode-go`/`opencode`) never reach `opencode*.db` and are folded from
     /// here. Nil by default — the production provider wires real discovery.
-    var hermesStateDBPath: @Sendable () -> String?
+    var hermesStateDBPath: @Sendable () throws -> String?
     /// CodexRouter's append-only `usage-events.jsonl` ledgers, for the turns it served against an
     /// OpenCode-hosted account. These are Codex-CLI turns, so they live in the router's ledger rather
     /// than `opencode*.db`, and they never reach the Codex card either (it defers them to us) — without
     /// this fold they were simply not counted anywhere.
-    var routerLedgerPaths: @Sendable () -> [String]
+    var routerLedgerPaths: @Sendable () throws -> [String]
     /// Muse harness roots for `muse-go` sessions (`~/.local/share/muse/sessions/**/*.jsonl`).
     /// Muse routes Muse Spark through the OpenCode Go account via the local `muse-opencode-go-bridge`
     /// (see `~/.hermes/tools/muse-opencode-go-bridge/`), so its `goal_usage_attribution`
@@ -93,8 +102,8 @@ struct OpenCodeUsageScanner: Sendable {
         claudeRoots: @escaping @Sendable () -> [URL] = { [] },
         claudeCacheIdentity: @escaping @Sendable () -> String = { ClaudeLogUsageScanner.parseSourceIdentity() },
         codexHomes: @escaping @Sendable () -> [URL] = { [] },
-        hermesStateDBPath: @escaping @Sendable () -> String? = { nil },
-        routerLedgerPaths: @escaping @Sendable () -> [String] = { [] },
+        hermesStateDBPath: @escaping @Sendable () throws -> String? = { nil },
+        routerLedgerPaths: @escaping @Sendable () throws -> [String] = { [] },
         museRoots: @escaping @Sendable () -> [URL] = { [] },
         readFailureWarning: UsageLogReadFailureReporter.Warning? = nil
     ) {
@@ -118,6 +127,39 @@ struct OpenCodeUsageScanner: Sendable {
             homeDirectory: FileManager.default.homeDirectoryForCurrentUser
         )
         return try OpenCodePaths.databaseFiles(in: dir)
+    }
+
+    /// A missing implicit Hermes installation is an optional source. An explicit HERMES_HOME is a
+    /// configured source even before its state file is created, so disappearance/read errors fail the fold.
+    static func configuredHermesStateDBPath(
+        environment: EnvironmentReading,
+        homeDirectory: URL
+    ) throws -> String? {
+        let path = HermesPaths.stateDBPath(environment: environment, homeDirectory: homeDirectory)
+        if FileManager.default.fileExists(atPath: path) { return path }
+        let configuredHome = environment.value(for: "HERMES_HOME")?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        return configuredHome == nil ? nil : path
+    }
+
+    /// The implicit router ledger is optional until it appears. Environment-selected ledger paths are
+    /// explicit sources; keep them in the set so the scan can detect deletion or read failure.
+    static func configuredRouterLedgerPaths(
+        environment: EnvironmentReading,
+        homeDirectory: URL
+    ) -> [String] {
+        let paths = CodexRouterUsageScanner.defaultLedgerPaths(
+            environment: environment,
+            homeDirectory: homeDirectory
+        )
+        let isConfigured = [
+            "OPENUSAGE_CODEX_ROUTER_USAGE_EVENTS",
+            "CODEX_ROUTER_STATE_DIR",
+            "MODEL_ROUTER_STATE_DIR"
+        ].contains { key in
+            environment.value(for: key)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty != nil
+        }
+        return isConfigured ? paths : paths.filter { FileManager.default.fileExists(atPath: $0) }
     }
 
     /// Claude Code config roots (with a `projects/` folder), mirroring the Claude scanner's discovery:
@@ -208,19 +250,20 @@ struct OpenCodeUsageScanner: Sendable {
     /// could be read — an all-failed refresh has no data source and must not render as zero usage.
     /// Escaping fold visits mutate OpenCode accumulators through this box.
     private final class GatewayFoldState: @unchecked Sendable {
-        let tileSince: Date
+        let scanSince: Date
         let pricing: ModelPricing
         let rates: [String: Double]
-        /// (local day, model) pairs the router ledger already accounts for. Native gateway rows for these
-        /// are skipped so one turn is never counted from both sources.
+        /// Complete (local day, model) pairs the router ledger can safely replace in native
+        /// Claude/Codex logs. Hermes and Muse are independently billed sources and do not use this set.
         let routerCoverage: Set<String>
         var accumulator: DailyUsageAccumulator
         var goWindowCosts: [(ms: Double, cost: Double)]
         var includesEstimatedCost: Bool
         var partialDays: Set<String>
+        var nativeCoverage: Set<String> = []
 
         init(
-            tileSince: Date,
+            scanSince: Date,
             pricing: ModelPricing,
             rates: [String: Double],
             routerCoverage: Set<String>,
@@ -229,7 +272,7 @@ struct OpenCodeUsageScanner: Sendable {
             includesEstimatedCost: Bool,
             partialDays: Set<String>
         ) {
-            self.tileSince = tileSince
+            self.scanSince = scanSince
             self.pricing = pricing
             self.rates = rates
             self.routerCoverage = routerCoverage
@@ -240,9 +283,11 @@ struct OpenCodeUsageScanner: Sendable {
         }
 
         func foldClaude(_ entry: ClaudeLogUsageScanner.Entry) {
+            let rows = OpenCodeUsageScanner.claudeGatewayRows(from: [entry])
+            recordNativeCoverage(rows)
             OpenCodeUsageScanner.foldGatewayRows(
-                OpenCodeUsageScanner.claudeGatewayRows(from: [entry]),
-                since: tileSince, pricing: pricing, effectiveRates: rates,
+                rows,
+                since: scanSince, pricing: pricing, effectiveRates: rates,
                 accumulator: &accumulator, goWindowCosts: &goWindowCosts,
                 includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays,
                 skippingDayModels: routerCoverage
@@ -250,13 +295,24 @@ struct OpenCodeUsageScanner: Sendable {
         }
 
         func foldCodex(_ event: CodexLogUsageScanner.Event) {
+            let rows = OpenCodeUsageScanner.codexGatewayRows(from: [event])
+            recordNativeCoverage(rows)
             OpenCodeUsageScanner.foldGatewayRows(
-                OpenCodeUsageScanner.codexGatewayRows(from: [event]),
-                since: tileSince, pricing: pricing, effectiveRates: rates,
+                rows,
+                since: scanSince, pricing: pricing, effectiveRates: rates,
                 accumulator: &accumulator, goWindowCosts: &goWindowCosts,
                 includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays,
                 skippingDayModels: routerCoverage
             )
+        }
+
+        func recordNativeCoverage(_ rows: [ClaudeGatewayRow]) {
+            for row in rows where row.date >= scanSince {
+                let key = OpenCodeUsageScanner.dayModelKey(row)
+                if !routerCoverage.contains(key) {
+                    nativeCoverage.insert(key)
+                }
+            }
         }
     }
 
@@ -272,12 +328,46 @@ struct OpenCodeUsageScanner: Sendable {
         dayModelKey(day: DailyUsageAccumulator.dayKey(from: row.date), model: row.model)
     }
 
+    /// A router pair only owns the native Claude/Codex fold when all of its rows carry measured
+    /// input and a cost breakdown that reconciles to that measured total. Older cached rows have no
+    /// completeness signal, so they cannot suppress a fresh native row.
+    static func completeRouterCoverage(from rows: [ClaudeGatewayRow]) -> Set<String> {
+        var completeness: [String: Bool] = [:]
+        for row in rows {
+            let key = dayModelKey(row)
+            completeness[key] = (completeness[key] ?? true) && row.hasCompleteRouterCounts
+        }
+        var result: Set<String> = []
+        for (key, complete) in completeness where complete {
+            result.insert(key)
+        }
+        return result
+    }
+
+    /// An incomplete router row remains a fallback when no native Claude/Codex row exists. If the
+    /// native source is available, use its complete measured counts and avoid duplicating router output.
+    static func reconciledRouterRows(
+        _ rows: [ClaudeGatewayRow],
+        completeCoverage: Set<String>,
+        nativeCoverage: Set<String>
+    ) -> [ClaudeGatewayRow] {
+        rows.filter { row in
+            let key = dayModelKey(row)
+            return completeCoverage.contains(key) || !nativeCoverage.contains(key)
+        }
+    }
+
     func scan(
         now: Date,
         daysBack: Int = UsageHistoryWindow.previousDays,
         pricing: ModelPricing = .empty,
-        windowFallbackOnly: Bool = false
+        windowFallbackOnly: Bool = false,
+        gatewaySources: Set<GatewaySource> = Set(GatewaySource.allCases),
+        enabledCodexHomes: [URL]? = nil,
+        enabledClaudeScanners: [ClaudeLogUsageScanner]? = nil,
+        enabledCodexAccountKeys: Set<String>? = nil
     ) async throws -> OpenCodeUsageScan? {
+        guard !Task.isCancelled else { return nil }
         let paths: [String]
         do {
             paths = try databasePaths()
@@ -307,18 +397,24 @@ struct OpenCodeUsageScanner: Sendable {
         var failures: [String: String] = [:]
 
         for path in paths {
+            // sqlite3 is a synchronous subprocess (bounded to five seconds). A disable cannot stop the
+            // query already running, but this prevents later database/anchor queries from starting.
+            guard !Task.isCancelled else { return nil }
             checked.insert(path)
             do {
                 if let json = try JSONLAccountingWorkPacer.shared.perform({
                     try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs))
                 }) {
+                    guard !Task.isCancelled else { return nil }
                     let parsedRows = JSONLAccountingWorkPacer.shared.perform { Self.parseRows(json) }
                     rows.append(contentsOf: parsedRows)
                 }
             } catch {
+                guard !Task.isCancelled else { return nil }
                 failures[path] = error.localizedDescription
                 continue
             }
+            guard !Task.isCancelled else { return nil }
             // Monthly cycle anchor: the earliest-ever local Go usage (unbounded, so it survives the
             // day-window cutoff). Best-effort per path — anchor failures are edge-warned (not silent)
             // so a persistently broken anchor query surfaces once, then falls back to calendar month.
@@ -331,22 +427,26 @@ struct OpenCodeUsageScanner: Sendable {
                 anchorMs = Swift.min(anchorMs ?? anchor, anchor)
             } else {
                 do {
+                    guard !Task.isCancelled else { return nil }
                     if let text = try JSONLAccountingWorkPacer.shared.perform({
                         try sqlite.queryValue(path: path, sql: Self.anchorSQL)
                     }),
                        let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        guard !Task.isCancelled else { return nil }
                         anchorMs = Swift.min(anchorMs ?? value, value)
                         if let memoKey {
                             Self.storeGoAnchor(key: memoKey, anchorMs: value)
                         }
                     }
                 } catch {
+                    guard !Task.isCancelled else { return nil }
                     // Edge-warn via reporter path for consistency: treat anchor as a separate check;
                     // a per-path anchor failure is rare (table missing) and should not be silent.
                     AppLog.warn(LogTag.plugin("opencode"), "anchor query failed for \(path): \(error.localizedDescription) — monthly window falls back to calendar month")
                 }
             }
         }
+        guard !Task.isCancelled else { return nil }
         // Per-path detail is logged only for newly failing paths (the reporter edge-triggers), so a
         // persistently locked database warns once, not on every 5-minute refresh.
         let newlyFailing = await readFailureReporter.update(checkedPaths: checked, failingPaths: Set(failures.keys))
@@ -354,18 +454,19 @@ struct OpenCodeUsageScanner: Sendable {
             AppLog.warn(LogTag.plugin("opencode"), "usage query failed for \(path): \(failures[path] ?? "unknown error")")
         }
         stageTimer.end("sqlite")
-        if failures.count == checked.count {
+        if !failures.isEmpty {
             throw OpenCodeUsageError.databaseUnreadable
         }
 
         // Combined hosted daily series (opencode-go + opencode) → the spend tiles + usage trend. Cost is
         // authoritative, so every row is "priced": feed it straight into the shared accumulator.
         // Same window the tiles label (today + the previous 29 days), so the sum matches the label.
+        let scanSince = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
         let tileSince = JSONLScanning.sinceDate(daysBack: UsageHistoryWindow.previousDays, now: now)
         var accumulator = DailyUsageAccumulator()
         JSONLAccountingWorkPacer.shared.forEach(rows) { row in
             let date = Date(timeIntervalSince1970: row.ms / 1000)
-            guard date >= tileSince else { return }
+            guard date >= scanSince else { return }
             accumulator.add(
                 day: DailyUsageAccumulator.dayKey(from: date),
                 tokens: row.tokens, cost: row.cost, model: row.model
@@ -405,7 +506,9 @@ struct OpenCodeUsageScanner: Sendable {
         // same factor), else through the pricing engine. Either way the series is marked estimated
         // (ⓘ) and unpriced models fall to the unknown-model warning, the convention the Claude
         // tiles use.
-        let rates = Self.effectiveRates(from: rows)
+        // Current spend tiles use a recent observed average. Older rates can differ after a provider
+        // changes pricing or cache billing, so lifetime history must not recalibrate today's tile.
+        let rates = Self.effectiveRates(from: rows.filter { Date(timeIntervalSince1970: $0.ms / 1000) >= tileSince })
         stageTimer.end("accumulate")
         if windowFallbackOnly {
             // Meters-only pass needs window caps but the account API didn't answer: stop after the
@@ -426,22 +529,48 @@ struct OpenCodeUsageScanner: Sendable {
                 partialDays: []
             )
         }
-        // Read the router ledger FIRST: it is the complete record of OpenCode-served turns, including the
-        // `anthropic/opencode_go/…` slugs the native folds also see. Knowing which (day, model) pairs it
-        // covers lets every native fold below skip exactly those and fill only the gaps, so one turn is
-        // counted once whether it came from the router, a Claude/Codex session log, Hermes, or Muse.
+        // Read the router ledger FIRST. Complete measured pairs can replace matching Claude/Codex log
+        // rows; OpenCode-billed Hermes and Muse sessions are independent sources and are never suppressed
+        // by a same-day/model router event.
         var routerRows: [ClaudeGatewayRow] = []
         var seenLedgerPaths: Set<String> = []
-        for path in routerLedgerPaths().map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
-        where FileManager.default.isReadableFile(atPath: path)
-            && seenLedgerPaths.insert(path).inserted {
-            routerRows += Self.routerGatewayRows(atPath: path, since: tileSince)
+        if gatewaySources.contains(.codex) {
+            let discoveredLedgerPaths: [String]
+            do {
+                discoveredLedgerPaths = try routerLedgerPaths()
+            } catch {
+                throw OpenCodeUsageError.usageSourcesIncomplete
+            }
+            for path in discoveredLedgerPaths.map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
+            where seenLedgerPaths.insert(path).inserted {
+                guard !Task.isCancelled else { return nil }
+                guard FileManager.default.fileExists(atPath: path),
+                      FileManager.default.isReadableFile(atPath: path),
+                      let rows = Self.routerGatewayRowsIfComplete(atPath: path, since: scanSince)
+                else {
+                    throw OpenCodeUsageError.usageSourcesIncomplete
+                }
+                routerRows += rows
+            }
         }
-        let routerCoverage = Set(routerRows.map(Self.dayModelKey))
+        if let enabledCodexAccountKeys {
+            let enabledKeys = Set(enabledCodexAccountKeys.map { $0.lowercased() })
+            routerRows.removeAll { row in
+                guard !enabledKeys.isEmpty else { return true }
+                if let accountId = row.accountId?.lowercased(), enabledKeys.contains(accountId) {
+                    return false
+                }
+                if let fingerprint = row.accountFingerprint?.lowercased(), enabledKeys.contains(fingerprint) {
+                    return false
+                }
+                return true
+            }
+        }
+        let routerCoverage = Self.completeRouterCoverage(from: routerRows)
         stageTimer.end("routerLedger")
         // Stream Claude/Codex gateway rows; unload Codex tail-cache between homes so peaks cannot stack.
         let gatewayFold = GatewayFoldState(
-            tileSince: tileSince,
+            scanSince: scanSince,
             pricing: pricing,
             rates: rates,
             routerCoverage: routerCoverage,
@@ -450,31 +579,52 @@ struct OpenCodeUsageScanner: Sendable {
             includesEstimatedCost: includesEstimatedCost,
             partialDays: partialDays
         )
-        _ = await ClaudeLogUsageScanner().foldParsedEntries(
-            daysBack: daysBack, now: now, roots: claudeRoots(),
-            cacheIdentityOverride: claudeCacheIdentity()
-        ) { entry in
-            gatewayFold.foldClaude(entry)
+        if gatewaySources.contains(.claude) {
+            let scanners = enabledClaudeScanners ?? [ClaudeLogUsageScanner()]
+            let roots = claudeRoots()
+            for scanner in scanners {
+                guard !Task.isCancelled else { return nil }
+                let complete = await scanner.foldParsedEntries(
+                    daysBack: daysBack, now: now, roots: roots,
+                    cacheIdentityOverride: claudeCacheIdentity()
+                ) { entry in
+                    gatewayFold.foldClaude(entry)
+                }
+                guard complete else {
+                    throw OpenCodeUsageError.usageSourcesIncomplete
+                }
+            }
         }
         stageTimer.end("claudeFold")
-        let partitionedCodex = Self.partitionCodexHomes(codexHomes())
-        for home in partitionedCodex.defaultHomes {
-            guard !Task.isCancelled else { return nil }
-            _ = await CodexLogUsageScanner().foldHostedGatewayEvents(
-                daysBack: daysBack, now: now, homes: [home]
-            ) { event in
-                gatewayFold.foldCodex(event)
+        if gatewaySources.contains(.codex) {
+            let partitionedCodex = Self.partitionCodexHomes(enabledCodexHomes ?? codexHomes())
+            let rolloutNameDeduper = CodexRolloutNameDeduper()
+            for home in partitionedCodex.defaultHomes {
+                guard !Task.isCancelled else { return nil }
+                let complete = await CodexLogUsageScanner().foldHostedGatewayEvents(
+                    daysBack: daysBack, now: now, homes: [home],
+                    rolloutNameDeduper: rolloutNameDeduper
+                ) { event in
+                    gatewayFold.foldCodex(event)
+                }
+                guard complete else {
+                    throw OpenCodeUsageError.usageSourcesIncomplete
+                }
+                CodexLogUsageScanner.unloadSharedTailCacheItems()
             }
-            CodexLogUsageScanner.unloadSharedTailCacheItems()
-        }
-        for home in partitionedCodex.managed {
-            guard !Task.isCancelled else { return nil }
-            _ = await CodexLogUsageScanner(peerHomes: partitionedCodex.defaultHomes).foldHostedGatewayEvents(
-                daysBack: daysBack, now: now, homes: [home]
-            ) { event in
-                gatewayFold.foldCodex(event)
+            for home in partitionedCodex.managed {
+                guard !Task.isCancelled else { return nil }
+                let complete = await CodexLogUsageScanner(peerHomes: partitionedCodex.defaultHomes).foldHostedGatewayEvents(
+                    daysBack: daysBack, now: now, homes: [home],
+                    rolloutNameDeduper: rolloutNameDeduper
+                ) { event in
+                    gatewayFold.foldCodex(event)
+                }
+                guard complete else {
+                    throw OpenCodeUsageError.usageSourcesIncomplete
+                }
+                CodexLogUsageScanner.unloadSharedTailCacheItems()
             }
-            CodexLogUsageScanner.unloadSharedTailCacheItems()
         }
         accumulator = gatewayFold.accumulator
         goWindowCosts = gatewayFold.goWindowCosts
@@ -482,44 +632,68 @@ struct OpenCodeUsageScanner: Sendable {
         partialDays = gatewayFold.partialDays
         stageTimer.end("codexFold")
         // Hermes sessions billed to the OpenCode hosted account — they never reach `opencode*.db`.
-        // A supplementary source: an unreadable Hermes database logs a warn (edge-triggered) and never
-        // fails the scan (the tiles still have the OpenCode DBs + gateway logs) — but it must never
-        // be SILENT: a WAL-locked read during a busy write burst would quietly drop the whole fold
-        // and the day would read as ~$0 while the account meter proves otherwise.
-        if let hermesPath = hermesStateDBPath() {
+        // If its database cannot be read, the combined fold is incomplete: publishing the readable
+        // OpenCode/router subset would silently omit this independent source and understate spend.
+        // Keep the last complete snapshot and edge-log the failure until the database recovers.
+        let hermesPath: String?
+        do {
+            hermesPath = gatewaySources.contains(.hermes) ? try hermesStateDBPath() : nil
+        } catch {
+            throw OpenCodeUsageError.usageSourcesIncomplete
+        }
+        if let hermesPath {
+            guard FileManager.default.fileExists(atPath: hermesPath),
+                  FileManager.default.isReadableFile(atPath: hermesPath)
+            else {
+                let newlyFailing = await readFailureReporter.update(
+                    checkedPaths: [hermesPath], failingPaths: [hermesPath]
+                )
+                if !newlyFailing.isEmpty {
+                    AppLog.warn(LogTag.plugin("opencode"), "Hermes session database is missing or unreadable: \(hermesPath) — keeping the last complete history")
+                }
+                throw OpenCodeUsageError.usageSourcesIncomplete
+            }
             do {
+                guard !Task.isCancelled else { return nil }
                 if let json = try JSONLAccountingWorkPacer.shared.perform({
                     try sqlite.queryValue(
                         path: hermesPath,
                         sql: Self.hermesGatewaySQL(cutoffSeconds: Double(cutoffMs) / 1000)
                     )
                 }) {
+                    guard !Task.isCancelled else { return nil }
                     Self.foldGatewayRows(
                         JSONLAccountingWorkPacer.shared.perform { Self.parseHermesGatewayRows(json) },
-                        since: tileSince, pricing: pricing,
+                        since: scanSince, pricing: pricing,
                         effectiveRates: rates,
                         accumulator: &accumulator, goWindowCosts: &goWindowCosts,
-                        includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays,
-                        skippingDayModels: routerCoverage
+                        includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays
                     )
                 }
+                guard !Task.isCancelled else { return nil }
                 await readFailureReporter.update(checkedPaths: [hermesPath], failingPaths: [])
             } catch {
+                guard !Task.isCancelled else { return nil }
                 let newlyFailing = await readFailureReporter.update(checkedPaths: [hermesPath], failingPaths: [hermesPath])
                 if !newlyFailing.isEmpty {
                     AppLog.warn(LogTag.plugin("opencode"), "Hermes session database \(hermesPath): \(error.localizedDescription) — Hermes usage is not folded into this card until it recovers")
                 }
+                return nil
             }
         }
-        // Fold the router rows themselves. Nothing is skipped here: this source wins every (day, model)
-        // pair it covers, and the native folds above already deferred those pairs to it. Reading the
-        // ledger also means a turn whose session log is gone, moved, or outside the discovered homes is
-        // still counted — previously such `anthropic/opencode_go/…` rows were dropped on the assumption
-        // the native fold always had them, and vanished from every card.
+        // Fold router rows after native Claude/Codex discovery. Complete pairs were used instead of
+        // their native copies. An incomplete router pair stays only when no native copy was available;
+        // otherwise the native row supplies the full measured counts.
         stageTimer.end("hermes")
         if !routerRows.isEmpty {
+            guard !Task.isCancelled else { return nil }
             Self.foldGatewayRows(
-                routerRows, since: tileSince, pricing: pricing,
+                Self.reconciledRouterRows(
+                    routerRows,
+                    completeCoverage: routerCoverage,
+                    nativeCoverage: gatewayFold.nativeCoverage
+                ),
+                since: scanSince, pricing: pricing,
                 effectiveRates: rates,
                 accumulator: &accumulator, goWindowCosts: &goWindowCosts,
                 includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays
@@ -529,20 +703,24 @@ struct OpenCodeUsageScanner: Sendable {
         // same `muse-spark-1.*` billed quota. Muse's `goal_usage_attribution` with
         // `reported:true` carries per-step provider tokens; without this fold the tiles +
         // meter-detail dollars undercount Muse spend by omitting the harness entirely.
-        let museRootsValue = museRoots()
-        if !museRootsValue.isEmpty {
-            let museEntries = await MuseUsageScanner().parsedEntries(
-                daysBack: daysBack, now: now, roots: museRootsValue
-            )
-            Self.foldGatewayRows(
-                Self.museGatewayRows(from: museEntries), since: tileSince, pricing: pricing,
-                effectiveRates: rates,
-                accumulator: &accumulator, goWindowCosts: &goWindowCosts,
-                includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays,
-                skippingDayModels: routerCoverage
-            )
+        if gatewaySources.contains(.muse) {
+            let museRootsValue = museRoots()
+            if !museRootsValue.isEmpty {
+                guard !Task.isCancelled else { return nil }
+                guard let museEntries = await MuseUsageScanner().parsedEntriesIfComplete(
+                    daysBack: daysBack, now: now, roots: museRootsValue
+                ) else { throw OpenCodeUsageError.usageSourcesIncomplete }
+                guard !Task.isCancelled else { return nil }
+                Self.foldGatewayRows(
+                    Self.museGatewayRows(from: museEntries), since: scanSince, pricing: pricing,
+                    effectiveRates: rates,
+                    accumulator: &accumulator, goWindowCosts: &goWindowCosts,
+                    includesEstimatedCost: &includesEstimatedCost, partialDays: &partialDays
+                )
+            }
         }
         stageTimer.end("museFold")
+        guard !Task.isCancelled else { return nil }
         let logScan = accumulator.build()
         stageTimer.end("build")
 
@@ -564,7 +742,8 @@ struct OpenCodeUsageScanner: Sendable {
     /// Cheap local probe for `hasLocalCredentials()`: does any tracked database hold at least one hosted
     /// assistant row with a numeric cost? Read-only, no network. Failures are logged (this runs only
     /// during first-run / new-provider detection, so there's no refresh spam to throttle); an unreadable
-    /// data directory counts as an OpenCode footprint so `refresh()` gets to surface the real error.
+    /// data directory or database counts as an OpenCode footprint so `refresh()` gets to surface the
+    /// real error.
     func hasHostedUsage() -> Bool {
         let paths: [String]
         do {
@@ -580,6 +759,9 @@ struct OpenCodeUsageScanner: Sendable {
                 }
             } catch {
                 AppLog.warn(LogTag.plugin("opencode"), "usage probe failed for \(path): \(error.localizedDescription)")
+                // We cannot establish that this database is empty. Keep OpenCode enabled so refresh
+                // can surface the database read error instead of recording a one-shot detection miss.
+                return true
             }
         }
         return false
@@ -613,6 +795,25 @@ struct OpenCodeUsageScanner: Sendable {
         var isInProgress: Bool
         /// Summed day/model bucket, not one ledger event. Long-context rates must not treat the sum as one call.
         var isAggregated: Bool = false
+        /// CodexRouter account identity, retained by its compact aggregate so disabled account rows can
+        /// be omitted without rebuilding the shared append-only ledger cache.
+        var accountId: String? = nil
+        var accountFingerprint: String? = nil
+        /// False when the router reports full measured input, true when it only has an input estimate,
+        /// and nil for older persisted rows that predate this signal.
+        var routerInputWasEstimated: Bool? = nil
+        /// False when the router's own record reconciles to a complete measured cost breakdown
+        /// (`totalTokens` equals measured input + output, with no estimate standing in for input),
+        /// true when it does not, and nil for rows from sources that carry no such record — the
+        /// native Claude/Codex folds and aggregates written before this signal existed.
+        var routerCostBreakdownIsComplete: Bool? = nil
+
+        /// True only when the router row carries measured counts a native Claude/Codex row has no
+        /// reason to override. A missing signal is never proof of completeness, so an unknown flag
+        /// cannot suppress a native row.
+        var hasCompleteRouterCounts: Bool {
+            routerInputWasEstimated == false && routerCostBreakdownIsComplete == true
+        }
 
         /// Saturating: every component is an externally supplied count, and the router parser clamps a
         /// hostile line to `Int.max` rather than rejecting it, so a plain `+` can overflow and trap.
@@ -793,6 +994,10 @@ struct OpenCodeUsageScanner: Sendable {
         OpenCodeRouterLedger.shared.rows(atPath: path, since: since)
     }
 
+    static func routerGatewayRowsIfComplete(atPath path: String, since: Date) -> [ClaudeGatewayRow]? {
+        OpenCodeRouterLedger.shared.rowsIfComplete(atPath: path, since: since)
+    }
+
     /// Read counters for the offline performance benchmark and cache regression tests.
     static func routerLedgerReadStatisticsForTesting(path: String) -> (fullParses: Int, tailParses: Int, bytesRead: Int)? {
         OpenCodeRouterLedger.shared.statistics(path: path)
@@ -888,25 +1093,33 @@ struct OpenCodeUsageScanner: Sendable {
             } else {
                 cost = nil
             }
-            if let apiEstimate = pricing.estimatedCostDollars(
+            let apiEstimate = pricing.estimatedCostDollars(
                 model: row.model,
                 tokens: TokenBreakdown(
                     input: row.input, cacheWrite5m: row.cacheWrite, cacheRead: row.cacheRead, output: row.output
                 ),
                 applyLongContextRates: !row.isAggregated
-            ) {
-                accumulator.addApiEstimate(day: day, cost: apiEstimate)
-            }
+            )
+            let hasEstimatedRouterInput = row.routerInputWasEstimated == true
+            accumulator.recordApiEstimate(
+                day: day,
+                cost: hasEstimatedRouterInput ? nil : apiEstimate,
+                tokens: row.tokens
+            )
             if let cost {
                 accumulator.add(day: day, tokens: row.tokens, cost: cost, model: row.model)
-                if row.burnsGoQuota {
+                if hasEstimatedRouterInput {
+                    // Keep the priced measured components as an internal subtotal, but never present
+                    // them as the full cost while the router's input count is only an estimate.
+                    accumulator.markCostIncomplete(day: day, model: row.model)
+                } else if row.burnsGoQuota {
                     goWindowCosts.append((ms: row.date.timeIntervalSince1970 * 1000, cost: cost))
                 }
                 includesEstimatedCost = true
             } else {
                 // Unpriced rows count their tokens with a dashed cost (owner policy), so an
                 // unrevealed codename stays visible in the totals.
-                if row.tokens > 0 {
+                if row.tokens > 0, !hasEstimatedRouterInput {
                     accumulator.addUnknownModel(day: day, model: row.model)
                 }
                 accumulator.add(day: day, tokens: row.tokens, cost: nil, model: row.model)

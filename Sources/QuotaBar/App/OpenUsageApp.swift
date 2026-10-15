@@ -82,13 +82,29 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         finishLaunching(isFreshInstall: isFreshInstall)
     }
 
-    private func finishLaunching(isFreshInstall: Bool) {
-        let container = AppContainer(isFreshInstall: isFreshInstall)
-        container.codexAccountRegistration.onAccountRegistered = { [weak self] in
-            self?.reloadAfterCodexAccountRegistration()
+    private func finishLaunching(isFreshInstall: Bool, completesCodexReload: Bool = false) {
+        let rawRegisteredHomes = UserDefaults.standard.stringArray(
+            forKey: CodexAccountRegistrationStore.storageKey
+        ) ?? []
+        Task { [weak self] in
+            let discovery = await loadOffMainActor {
+                ProviderAccountAssembly.scanForLaunch(
+                    waitsForLoginShell: true,
+                    rawRegisteredCodexHomes: rawRegisteredHomes
+                )
+            }
+            guard let self else { return }
+            let container = AppContainer(
+                isFreshInstall: isFreshInstall,
+                accountDiscovery: discovery
+            )
+            container.codexAccountRegistration.onAccountRegistered = { [weak self] in
+                self?.reloadAfterCodexAccountRegistration()
+            }
+            self.container = container
+            self.statusItemController = StatusItemController(container: container)
+            if completesCodexReload { self.isReloadingForCodexAccount = false }
         }
-        self.container = container
-        statusItemController = StatusItemController(container: container)
     }
 
     /// Account discovery is normally a launch-time operation because provider runtimes own their
@@ -101,8 +117,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItemController?.tearDown()
         statusItemController = nil
         container = nil
-        finishLaunching(isFreshInstall: false)
-        isReloadingForCodexAccount = false
+        finishLaunching(isFreshInstall: false, completesCodexReload: true)
     }
 
     /// Flush queued telemetry on quit. The SDK's lifecycle autocapture is off (we emit our own daily

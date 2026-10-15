@@ -54,6 +54,8 @@ Rows with a reset date tick every 30 seconds, so countdowns and pace stay live b
 Every row: **Hide · Star for menu bar / Unstar · Refresh \<provider\> · Customize…** (Customize opens straight to that provider's metrics.)
 Provider headers: **Hide \<provider\> · Refresh \<provider\> · Customize…** (Hide turns the whole provider off; turn it back on in Customize. Customize opens straight to that provider's metrics.) plus **Share Screenshot** (see below).
 
+When a provider has a refresh error, its header also shows a visible **Refresh** button beside the warning. It retries only that provider, so macOS can ask for the Keychain permission it needs even while another provider is updating. The live quota result appears first; local usage history refreshes afterward in the background. If that quota retry fails, a history provider still folds local records, while the quota error remains until a live quota pass succeeds.
+
 ## Share
 
 Copy a clean, branded PNG of one provider's usage to your clipboard, ready to paste into a chat, a tweet, or a doc. There are two ways to reach it:

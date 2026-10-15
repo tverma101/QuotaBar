@@ -14,6 +14,30 @@ struct DailyUsageEntry: Hashable, Sendable, Codable {
     var date: String
     var totalTokens: Int
     var costUSD: Double?
+    /// False when some usage for this day has no reliable price. Kept beyond the 30-day model-detail
+    /// window so lifetime totals never mistake a priced subtotal for the full cost.
+    var costIsComplete: Bool
+
+    init(date: String, totalTokens: Int, costUSD: Double?, costIsComplete: Bool = true) {
+        self.date = date
+        self.totalTokens = totalTokens
+        self.costUSD = costUSD
+        self.costIsComplete = costIsComplete
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case date, totalTokens, costUSD, costIsComplete
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        date = try values.decode(String.self, forKey: .date)
+        totalTokens = try values.decode(Int.self, forKey: .totalTokens)
+        costUSD = try values.decodeIfPresent(Double.self, forKey: .costUSD)
+        // Old persisted days do not say whether a non-nil amount is a subtotal. Treat them as
+        // incomplete until the next source scan replaces them with explicit coverage evidence.
+        costIsComplete = try values.decodeIfPresent(Bool.self, forKey: .costIsComplete) ?? false
+    }
 }
 
 struct DailyUsageSeries: Hashable, Sendable, Codable {
@@ -113,17 +137,22 @@ struct ProviderUsageHistory: Hashable, Sendable, Codable {
     /// Per-day public-API-rate estimate (see `LogUsageScan.apiEstimateByDay`). Additive optional so
     /// snapshots persisted before the field decode with nil and backfill on the next full pass.
     var apiEstimateByDay: [String: Double]? = nil
+    /// Days whose public-rate estimate is partial. Kept for the full lifetime window even though
+    /// model names are retained only for the 30-day spend detail. Optional for older snapshots.
+    var apiEstimateIncompleteDays: Set<String>? = nil
 
     init(
         series: DailyUsageSeries,
         modelUsage: ModelUsageSeries? = nil,
         unknownModelsByDay: [String: Set<String>] = [:],
-        apiEstimateByDay: [String: Double]? = nil
+        apiEstimateByDay: [String: Double]? = nil,
+        apiEstimateIncompleteDays: Set<String>? = nil
     ) {
         self.series = series
         self.modelUsage = modelUsage
         self.unknownModelsByDay = unknownModelsByDay
         self.apiEstimateByDay = apiEstimateByDay
+        self.apiEstimateIncompleteDays = apiEstimateIncompleteDays ?? Set(unknownModelsByDay.keys)
     }
 }
 
@@ -143,11 +172,13 @@ extension ProviderUsageHistory {
     ) -> ProviderUsageHistory {
         let modelDays = modelUsage?.daily.filter { detailDayKeys.contains($0.date) } ?? []
         let apiEstimates = apiEstimateByDay?.filter { lifetimeDayKeys.contains($0.key) }
+        let incompleteEstimateDays = apiEstimateIncompleteDays ?? Set(unknownModelsByDay.keys)
         return ProviderUsageHistory(
             series: DailyUsageSeries(daily: series.daily.filter { lifetimeDayKeys.contains($0.date) }),
             modelUsage: modelDays.isEmpty ? nil : ModelUsageSeries(daily: modelDays),
             unknownModelsByDay: unknownModelsByDay.filter { detailDayKeys.contains($0.key) },
-            apiEstimateByDay: apiEstimates?.isEmpty == false ? apiEstimates : nil
+            apiEstimateByDay: apiEstimates?.isEmpty == false ? apiEstimates : nil,
+            apiEstimateIncompleteDays: Set(incompleteEstimateDays.filter { lifetimeDayKeys.contains($0) })
         )
     }
 }
@@ -173,16 +204,21 @@ struct LogUsageScan: Sendable, Codable {
     /// API" comparison). Rows without any resolvable rate contribute nothing, so the estimate is honest
     /// about coverage; nil when no row in the window could be estimated at all.
     var apiEstimateByDay: [String: Double]?
+    /// Full-retention marker for days where public-rate rows were unpriceable. Unknown model names
+    /// remain a shorter-lived spend-detail field, but estimate completeness must survive to lifetime.
+    var apiEstimateIncompleteDays: Set<String>? = nil
 
     init(
         series: DailyUsageSeries,
         modelUsage: ModelUsageSeries? = nil,
         unknownModelsByDay: [String: Set<String>],
-        apiEstimateByDay: [String: Double]? = nil
+        apiEstimateByDay: [String: Double]? = nil,
+        apiEstimateIncompleteDays: Set<String>? = nil
     ) {
         self.series = series
         self.modelUsage = modelUsage
         self.unknownModelsByDay = unknownModelsByDay
         self.apiEstimateByDay = apiEstimateByDay
+        self.apiEstimateIncompleteDays = apiEstimateIncompleteDays ?? Set(unknownModelsByDay.keys)
     }
 }

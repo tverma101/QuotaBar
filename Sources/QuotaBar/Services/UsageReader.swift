@@ -55,12 +55,24 @@ public struct UsageReader {
         let registeredCodexHomes = providersOverride == nil
             ? CodexAccountRegistrationStore(defaults: defaults).registeredHomes
             : []
-        let accountAssembly = providersOverride == nil
-            ? ProviderAccountAssembly.make(
-                defaults: defaults, waitsForLoginShell: false,
-                registeredCodexHomes: registeredCodexHomes
+        let accountAssembly: ProviderAccountAssembly
+        if providersOverride == nil {
+            // Account discovery reads provider auth files and performs silent Keychain metadata
+            // queries. Keep that synchronous work off the CLI's MainActor, matching app launch.
+            let discovery = await loadOffMainActor {
+                ProviderAccountAssembly.scanForLaunch(
+                    waitsForLoginShell: false,
+                    rawRegisteredCodexHomes: registeredCodexHomes
+                )
+            }
+            accountAssembly = ProviderAccountAssembly.make(
+                observer: DefaultAccountObserver(),
+                accountsStore: ProviderAccountsStore(defaults: defaults),
+                precomputedDiscovery: discovery
             )
-            : ProviderAccountAssembly(identityKeysByCard: [:])
+        } else {
+            accountAssembly = ProviderAccountAssembly(identityKeysByCard: [:])
+        }
         let providers = providersOverride ?? ProviderCatalog.make(
             defaults: defaults,
             claudeCards: accountAssembly.claudeCards,

@@ -25,13 +25,44 @@ enum FirstRunSeeder {
         enablement: ProviderEnablementStore,
         onboarding: OnboardingStore
     ) -> Task<Void, Never>? {
-        guard isFreshInstall, enablement.enabledIDs == nil else { return nil }
+        if isFreshInstall, enablement.enabledIDs == nil {
+            // Write the recovery marker first. If the app exits between this point and the probe's
+            // completion, the next launch resumes detection instead of treating the fallback as final.
+            enablement.beginFirstRunCredentialProbe()
+            enablement.registerKnownProviders(Set(providers.map(\.provider.id)))
+            onboarding.markCustomizeHintPending()
+            return seedFallbackThenDetect(
+                providers: providers,
+                enablement: enablement,
+                logPrefix: "first run",
+                expectedPersistentChoiceRevision: enablement.firstRunCredentialProbeRevision,
+                completesFirstRunProbe: true
+            )
+        }
 
-        // Baseline the known-provider set: everything shipping today has been "seen" by this install,
-        // so `NewProviderSeeder` only ever probes providers added in a later release.
-        enablement.registerKnownProviders(Set(providers.map(\.provider.id)))
-        onboarding.markCustomizeHintPending()
-        return seedFallbackThenDetect(providers: providers, enablement: enablement, logPrefix: "first run")
+        // The app may have been terminated while first-run probes were in flight. Resume only while
+        // the user-choice revision still matches the one captured before the fallback was seeded.
+        guard enablement.hasPendingFirstRunCredentialProbe else { return nil }
+        guard let revision = enablement.firstRunCredentialProbeRevision else {
+            enablement.completeFirstRunCredentialProbe()
+            return nil
+        }
+        guard revision == enablement.persistentUserChoiceRevision else {
+            enablement.completeFirstRunCredentialProbe()
+            return nil
+        }
+        let ids = Set(providers.map(\.provider.id))
+        if enablement.knownIDs.isEmpty {
+            enablement.registerKnownProviders(ids)
+        }
+        return seedFallbackThenDetect(
+            providers: providers,
+            enablement: enablement,
+            logPrefix: "resumed first run",
+            seedFallback: enablement.enabledIDs == nil,
+            expectedPersistentChoiceRevision: revision,
+            completesFirstRunProbe: true
+        )
     }
 
     /// Re-runs first-launch detection on demand for the Customize "Reset All" action. Unlike first-run
@@ -60,15 +91,35 @@ enum FirstRunSeeder {
         providers: [ProviderRuntime],
         enablement: ProviderEnablementStore,
         logPrefix: String,
-        probeVerb: String = "probing"
+        probeVerb: String = "probing",
+        seedFallback: Bool = true,
+        expectedPersistentChoiceRevision: UInt64? = nil,
+        completesFirstRunProbe: Bool = false
     ) -> Task<Void, Never> {
         let fallback = fallbackProviderIDs.intersection(Set(providers.map(\.provider.id)))
-        enablement.seedEnabledProviders(fallback)
+        if seedFallback {
+            enablement.seedEnabledProviders(fallback)
+        }
+        let userChoiceRevisions = enablement.userChoiceRevisionsSnapshot(
+            for: Set(providers.map(\.provider.id))
+        )
         AppLog.info(.config, "\(logPrefix): seeded providers \(fallback.sorted()); \(probeVerb) local credentials")
         return Task {
+            defer {
+                if completesFirstRunProbe {
+                    enablement.completeFirstRunCredentialProbe()
+                }
+            }
             let detected = await detectLocalProviders(providers)
             AppLog.info(.config, "\(logPrefix): detected credentials for \(detected.sorted())")
-            guard enablement.enabledIDs == fallback, !detected.isEmpty else { return }
+            if let expectedPersistentChoiceRevision,
+               enablement.persistentUserChoiceRevision != expectedPersistentChoiceRevision {
+                return
+            }
+            guard !enablement.userChangedChoices(since: userChoiceRevisions),
+                  enablement.enabledIDs == fallback,
+                  !detected.isEmpty
+            else { return }
             enablement.seedEnabledProviders(detected)
         }
     }

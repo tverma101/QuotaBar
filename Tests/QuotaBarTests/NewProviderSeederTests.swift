@@ -41,6 +41,50 @@ final class NewProviderSeederTests: XCTestCase {
         XCTAssertEqual(newcomer.probeCount, 1)
     }
 
+    func testInterruptedNewProviderProbeResumesAfterStoreReload() async {
+        let defaults = makeDefaults("resume-pending")
+        let original = ProviderEnablementStore(defaults: defaults)
+        original.seedEnabledProviders(["claude"])
+        original.registerKnownProviders(["claude"])
+        XCTAssertEqual(original.registerProvidersForCredentialProbe(["claude", "windsurf"]), ["windsurf"])
+        XCTAssertEqual(original.pendingProviderCredentialProbeIDs, ["windsurf"])
+
+        // The original process exits before it starts or completes the asynchronous probe.
+        let relaunched = ProviderEnablementStore(defaults: defaults)
+        let newcomer = probe("windsurf", hasCredentials: true)
+        let task = NewProviderSeeder.reconcileIfNeeded(
+            providers: [probe("claude", hasCredentials: false), newcomer],
+            enablement: relaunched
+        )
+        await task?.value
+
+        XCTAssertTrue(relaunched.isEnabled("windsurf"))
+        XCTAssertTrue(relaunched.pendingProviderCredentialProbeIDs.isEmpty)
+        XCTAssertEqual(newcomer.probeCount, 1)
+    }
+
+    func testInterruptedProbePreservesPersistedUserChoice() async {
+        let defaults = makeDefaults("resume-choice")
+        let original = ProviderEnablementStore(defaults: defaults)
+        original.seedEnabledProviders(["claude"])
+        original.registerKnownProviders(["claude"])
+        original.setEnabled(true, for: "windsurf")
+        original.setEnabled(false, for: "windsurf")
+        original.registerProvidersForCredentialProbe(["claude", "windsurf"])
+
+        let relaunched = ProviderEnablementStore(defaults: defaults)
+        let newcomer = probe("windsurf", hasCredentials: true)
+        let task = NewProviderSeeder.reconcileIfNeeded(
+            providers: [probe("claude", hasCredentials: false), newcomer],
+            enablement: relaunched
+        )
+        await task?.value
+
+        XCTAssertFalse(relaunched.isEnabled("windsurf"))
+        XCTAssertTrue(relaunched.pendingProviderCredentialProbeIDs.isEmpty)
+        XCTAssertEqual(newcomer.probeCount, 1)
+    }
+
     func testKnownButDisabledProviderIsNeverProbedOrReenabled() async {
         // The user turned grok off at some point; it must never come back on its own — even though a
         // credential probe would hit.

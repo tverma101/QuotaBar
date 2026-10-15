@@ -78,6 +78,42 @@ final class ProviderAccountAssemblyTests: XCTestCase {
         XCTAssertNil(defaults.data(forKey: ProviderAccountsStore.storageKey), "no observations, no write")
     }
 
+    func testDefaultIdentitySourceScanRunsOffMainActor() async {
+        let files = ThreadRecordingAccountFiles([
+            "/Users/dev/.claude.json": #"{"oauthAccount":{"accountUuid":"ACCT-1","emailAddress":"dev@example.com"}}"#,
+            "/Users/dev/.codex/auth.json": #"{"tokens":{"access_token":"token","account_id":"CODEX-1"}}"#
+        ])
+        let keychain = ThreadRecordingAccountKeychain()
+        let observer = DefaultAccountObserver(
+            environment: FakeEnvironment([:]),
+            files: files,
+            keychain: keychain,
+            homeDirectory: { URL(fileURLWithPath: "/Users/dev") }
+        )
+
+        let discovery = await loadOffMainActor {
+            ProviderAccountAssembly.scan(
+                observer: observer,
+                families: ["claude", "codex"]
+            )
+        }
+
+        XCTAssertEqual(files.lastReadWasOnMainThread, false)
+        XCTAssertEqual(keychain.existenceProbeWasOnMainThread, false)
+        guard case .resolved(let identityKey, _, _)? = discovery.defaultOutcomes.first(where: {
+            $0.family == "claude"
+        })?.outcome else {
+            return XCTFail("expected Claude's source identity to remain resolved")
+        }
+        XCTAssertEqual(identityKey, "acct-1")
+        guard case .resolved(let codexIdentity, _, _)? = discovery.defaultOutcomes.first(where: {
+            $0.family == "codex"
+        })?.outcome else {
+            return XCTFail("expected Codex's source identity to remain resolved")
+        }
+        XCTAssertEqual(codexIdentity, "codex-1")
+    }
+
     func testRegisteredCodexHomesStayInThePassWhenShellFactsAreUnavailable() {
         let families = ProviderAccountAssembly.familiesForAccountPass(
             shellFactsReadable: false,
@@ -96,5 +132,63 @@ final class ProviderAccountAssemblyTests: XCTestCase {
         )
 
         XCTAssertEqual(families, ["codex"])
+    }
+}
+
+private final class ThreadRecordingAccountFiles: TextFileAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private let contents: [String: String]
+    private var readWasOnMainThread: Bool?
+
+    init(_ contents: [String: String]) {
+        self.contents = contents
+    }
+
+    var lastReadWasOnMainThread: Bool? {
+        lock.lock(); defer { lock.unlock() }
+        return readWasOnMainThread
+    }
+
+    func exists(_ path: String) -> Bool {
+        contents[path] != nil
+    }
+
+    func readTextIfPresent(_ path: String) throws -> String? {
+        lock.lock()
+        readWasOnMainThread = Thread.isMainThread
+        lock.unlock()
+        return contents[path]
+    }
+
+    func readText(_ path: String) throws -> String {
+        lock.lock()
+        readWasOnMainThread = Thread.isMainThread
+        lock.unlock()
+        return contents[path] ?? ""
+    }
+
+    func writeText(_ path: String, _ text: String) throws {}
+
+    func remove(_ path: String) throws {}
+}
+
+private final class ThreadRecordingAccountKeychain: KeychainAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var probeWasOnMainThread: Bool?
+
+    var existenceProbeWasOnMainThread: Bool? {
+        lock.lock(); defer { lock.unlock() }
+        return probeWasOnMainThread
+    }
+
+    func readGenericPassword(service: String) throws -> String? { nil }
+
+    func writeGenericPassword(service: String, value: String) throws {}
+
+    func genericPasswordExists(service: String) -> Bool? {
+        lock.lock()
+        probeWasOnMainThread = Thread.isMainThread
+        lock.unlock()
+        return false
     }
 }
