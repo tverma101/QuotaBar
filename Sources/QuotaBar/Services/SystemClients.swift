@@ -235,24 +235,32 @@ struct SQLiteCLIAccessor: SQLiteAccessing {
     }
 
     func execute(path: String, sql: String) throws {
-        let result = try run(path: path, sql: sql)
+        // SQL can contain credential values (for example Cursor's rotated access token). Keep it
+        // off the process argument list, where other local processes can inspect it with `ps`.
+        let result = try run(path: path, sql: sql, sendSQLOnStandardInput: true)
         guard result.succeeded else {
             throw SQLiteError.queryFailed(result.stderr)
         }
     }
 
-    private func run(path: String, sql: String, readOnly: Bool = false) throws -> ProcessResult {
+    private func run(
+        path: String,
+        sql: String,
+        readOnly: Bool = false,
+        sendSQLOnStandardInput: Bool = false
+    ) throws -> ProcessResult {
         var arguments = ["-batch", "-noheader"]
         if readOnly { arguments.append("-readonly") }
         arguments += [
             "-cmd", ".timeout 1000",
-            expandHome(path),
-            sql
+            expandHome(path)
         ]
+        if !sendSQLOnStandardInput { arguments.append(sql) }
         return try processRunner.run(
             executable: "/usr/bin/sqlite3",
             arguments: arguments,
             environment: [:],
+            standardInput: sendSQLOnStandardInput ? Data(sql.utf8) : nil,
             timeout: 5
         )
     }
@@ -281,9 +289,20 @@ enum SQLiteError: Error, LocalizedError, Equatable {
 protocol KeychainAccessing: Sendable {
     func readGenericPassword(service: String) throws -> String?
     func readGenericPassword(service: String, allowInteraction: Bool) throws -> String?
+    func readGenericPassword(
+        service: String,
+        allowInteraction: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease?
+    ) throws -> String?
     func writeGenericPassword(service: String, value: String) throws
+    func writeGenericPassword(service: String, account: String, value: String) throws
     func readGenericPasswordForCurrentUser(service: String) throws -> String?
     func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String?
+    func readGenericPasswordForCurrentUser(
+        service: String,
+        allowInteraction: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease?
+    ) throws -> String?
     func writeGenericPasswordForCurrentUser(service: String, value: String) throws
     /// Read a generic password scoped to an explicit account (`-a`). Used when another app stored the
     /// item under a known account name (e.g. Antigravity's `agy` token under service `gemini`,
@@ -293,11 +312,148 @@ protocol KeychainAccessing: Sendable {
     /// ignores the flag; the real `SecurityKeychainAccessor` overrides it with the in-process
     /// `LAContext` path, which is what keeps a scheduled refresh from opening a Keychain dialog.
     func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String?
+    func readGenericPassword(
+        service: String,
+        account: String,
+        allowInteraction: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease?
+    ) throws -> String?
+    /// Attributes-only existence probe for first-run detection. This must dispatch to the real
+    /// Security.framework implementation rather than reading the secret through the mock fallback.
+    func genericPasswordExists(service: String) -> Bool?
+}
+
+protocol SecurityKeychainItemWriting: Sendable {
+    func defaultFileKeychainWriteScope() throws -> SecurityKeychainWriteScope
+    func addGenericPassword(attributes: [String: Any]) -> OSStatus
+    func updateGenericPassword(matching query: [String: Any], attributes: [String: Any]) -> OSStatus
+}
+
+/// An explicit context for one Security.framework query. Supplying the context even for an interactive
+/// retry gives the per-load cancellation token a handle to invalidate while Keychain authentication is
+/// pending; Security creates and discards an inaccessible context when this attribute is omitted.
+struct KeychainAuthenticationContextLease {
+    let context: LAContext
+    private let cancellationToken: KeychainReadCancellationToken?
+    private let interactiveQueryLease: KeychainInteractiveQueryLease?
+
+    init(
+        interactionAllowed: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease? = nil
+    ) throws {
+        let context = LAContext()
+        context.interactionNotAllowed = !interactionAllowed
+        let cancellationToken = ProviderRefreshContext.keychainReadCancellationToken
+        guard !ProviderRefreshContext.credentialReadIsCancelled else {
+            context.invalidate()
+            throw CancellationError()
+        }
+        if let interactiveQueryLease,
+           !KeychainPermissionGate.shared.register(context, for: interactiveQueryLease)
+        {
+            throw CancellationError()
+        }
+        if let cancellationToken, !cancellationToken.register(context) {
+            if let interactiveQueryLease {
+                KeychainPermissionGate.shared.unregister(context, for: interactiveQueryLease)
+            }
+            context.invalidate()
+            throw CancellationError()
+        }
+        self.context = context
+        self.cancellationToken = cancellationToken
+        self.interactiveQueryLease = interactiveQueryLease
+    }
+
+    var mayBeginQuery: Bool {
+        !ProviderRefreshContext.credentialReadIsCancelled
+            && (interactiveQueryLease.map { KeychainPermissionGate.shared.isCurrent($0) } ?? true)
+    }
+
+    /// Retires the context after SecItemCopyMatching returns and reports whether cancellation happened
+    /// before the query completed. Each lease is one-shot because an invalidated context is not reusable.
+    func finish() -> Bool {
+        let tokenAllowsResult = cancellationToken?.finish(context) ?? true
+        let actionAllowsResult = interactiveQueryLease.map {
+            KeychainPermissionGate.shared.finishContext(context, for: $0)
+        } ?? true
+        return tokenAllowsResult && actionAllowsResult && !Task<Never, Never>.isCancelled
+    }
+}
+
+/// The keychain and authentication context shared by the add and duplicate-update halves of one write.
+/// Keeping this scope intact ensures both operations target the same default file-based keychain and
+/// neither can open authentication UI during a provider refresh.
+struct SecurityKeychainWriteScope: @unchecked Sendable {
+    let defaultKeychain: AnyObject
+    let authenticationContext: LAContext
+
+    var addAttributes: [String: Any] {
+        [
+            kSecUseKeychain as String: defaultKeychain,
+            kSecUseAuthenticationContext as String: authenticationContext
+        ]
+    }
+
+    var updateQueryAttributes: [String: Any] {
+        [
+            kSecMatchSearchList as String: [defaultKeychain] as CFArray,
+            kSecUseAuthenticationContext as String: authenticationContext
+        ]
+    }
+}
+
+struct SecurityFrameworkKeychainWriter: SecurityKeychainItemWriting {
+    func defaultFileKeychainWriteScope() throws -> SecurityKeychainWriteScope {
+        // File-based SecItem writes default to this keychain. SecKeychainCopyDefault is deprecated,
+        // but remains the public API for obtaining its SecKeychainRef so the duplicate-update query
+        // can be constrained to exactly the same keychain. We still use SecItem for the item itself.
+        var defaultKeychain: SecKeychain?
+        let status = SecKeychainCopyDefault(&defaultKeychain)
+        guard status == errSecSuccess else {
+            throw KeychainError.writeFailed("Could not resolve default file keychain (Security.framework OSStatus \(status)).")
+        }
+        guard let defaultKeychain else {
+            throw KeychainError.writeFailed("Security.framework returned no default file keychain.")
+        }
+
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
+        return SecurityKeychainWriteScope(
+            defaultKeychain: defaultKeychain,
+            authenticationContext: authenticationContext
+        )
+    }
+
+    func addGenericPassword(attributes: [String: Any]) -> OSStatus {
+        SecItemAdd(attributes as CFDictionary, nil)
+    }
+
+    func updateGenericPassword(matching query: [String: Any], attributes: [String: Any]) -> OSStatus {
+        SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+    }
 }
 
 extension KeychainAccessing {
+    func writeGenericPassword(service: String, account: String, value: String) throws {
+        _ = account
+        try writeGenericPassword(service: service, value: value)
+    }
+
     func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? {
         try readGenericPassword(service: service)
+    }
+
+    func readGenericPassword(
+        service: String,
+        allowInteraction: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease?
+    ) throws -> String? {
+        if allowInteraction, let interactiveQueryLease,
+           !interactiveQueryLease.markQueryStarted() {
+            throw CancellationError()
+        }
+        return try readGenericPassword(service: service, allowInteraction: allowInteraction)
     }
 
     func readGenericPasswordForCurrentUser(service: String) throws -> String? {
@@ -306,6 +462,18 @@ extension KeychainAccessing {
 
     func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? {
         try readGenericPasswordForCurrentUser(service: service)
+    }
+
+    func readGenericPasswordForCurrentUser(
+        service: String,
+        allowInteraction: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease?
+    ) throws -> String? {
+        if allowInteraction, let interactiveQueryLease,
+           !interactiveQueryLease.markQueryStarted() {
+            throw CancellationError()
+        }
+        return try readGenericPasswordForCurrentUser(service: service, allowInteraction: allowInteraction)
     }
 
     func writeGenericPasswordForCurrentUser(service: String, value: String) throws {
@@ -323,6 +491,19 @@ extension KeychainAccessing {
         return try readGenericPassword(service: service)
     }
 
+    func readGenericPassword(
+        service: String,
+        account: String,
+        allowInteraction: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease?
+    ) throws -> String? {
+        if allowInteraction, let interactiveQueryLease,
+           !interactiveQueryLease.markQueryStarted() {
+            throw CancellationError()
+        }
+        return try readGenericPassword(service: service, account: account, allowInteraction: allowInteraction)
+    }
+
     /// Read a generic password the way a provider refresh should: **silent first**, escalating to a
     /// Keychain dialog only when the user explicitly asked for a refresh.
     ///
@@ -336,36 +517,52 @@ extension KeychainAccessing {
     /// retry with UI, but only for a manual refresh, and only once per manual action across all
     /// providers via the shared `CredentialInteractionGate` — so ⌘R opens at most one Keychain dialog
     /// no matter how many provider cards are enabled.
-    func readGenericPasswordForRefresh(service: String, account: String? = nil) throws -> String? {
-        // A silent read already proved this item needs user interaction. Another background refresh
-        // cannot grant that — it has no way to show a dialog — so answer from memory instead of
-        // re-reading and re-failing every cycle. A manual refresh always retries, because it is the
-        // one context that can present the dialog.
+    func readGenericPasswordForRefresh(
+        service: String,
+        account: String? = nil,
+        allowInteraction: Bool? = nil,
+        interactionGate: CredentialInteractionGate? = nil
+    ) throws -> String? {
         let key = KeychainItemKey(service: service, account: account)
-        if KeychainPermissionGate.shared.isBlocked(key),
-           !ProviderRefreshContext.isManual {
-            throw KeychainError.interactionNotAllowed
-        }
-        let result = try escalatingRead(key) {
+        let mayInteract = allowInteraction ?? ProviderRefreshContext.isManual
+        let actionGate = interactionGate ?? ProviderRefreshContext.credentialInteractionGate
+        return try readForRefresh(key, allowInteraction: mayInteract, interactionGate: actionGate) {
+            allowInteraction, interactiveQueryLease in
             if let account {
-                return try readGenericPassword(service: service, account: account, allowInteraction: $0)
+                return try readGenericPassword(
+                    service: service,
+                    account: account,
+                    allowInteraction: allowInteraction,
+                    interactiveQueryLease: interactiveQueryLease
+                )
             }
-            return try readGenericPassword(service: service, allowInteraction: $0)
+            return try readGenericPassword(
+                service: service,
+                allowInteraction: allowInteraction,
+                interactiveQueryLease: interactiveQueryLease
+            )
         }
-        // Reached without a silent-read failure, so access is granted for *this* item now. Scoped to
-        // this key on purpose: clearing the whole gate here would let an unrelated provider's success
-        // un-block an item that still needs a dialog, and the re-read spam would resume.
-        KeychainPermissionGate.shared.reset(key)
-        return result
     }
 
     /// Current-user-scoped variant of `readGenericPasswordForRefresh`, for items this app *writes*
     /// itself under `kSecAttrAccount` (see `writeGenericPasswordForCurrentUser`). Account scoping is
     /// part of the query, not a detail: a service-only read is a different lookup, so this must not
     /// collapse into the service-only helper.
-    func readGenericPasswordForRefreshForCurrentUser(service: String) throws -> String? {
-        try escalatingRead(KeychainItemKey(service: service, scopedToCurrentUser: true)) {
-            try readGenericPasswordForCurrentUser(service: service, allowInteraction: $0)
+    func readGenericPasswordForRefreshForCurrentUser(
+        service: String,
+        allowInteraction: Bool? = nil,
+        interactionGate: CredentialInteractionGate? = nil
+    ) throws -> String? {
+        let key = KeychainItemKey(service: service, account: currentUserKeychainAccount())
+        let mayInteract = allowInteraction ?? ProviderRefreshContext.isManual
+        let actionGate = interactionGate ?? ProviderRefreshContext.credentialInteractionGate
+        return try readForRefresh(key, allowInteraction: mayInteract, interactionGate: actionGate) {
+            allowInteraction, interactiveQueryLease in
+            try readGenericPasswordForCurrentUser(
+                service: service,
+                allowInteraction: allowInteraction,
+                interactiveQueryLease: interactiveQueryLease
+            )
         }
     }
 
@@ -377,32 +574,205 @@ extension KeychainAccessing {
     /// `key` identifies the item being read, so a failure marks only that item as needing
     /// interaction. That is the whole point: a provider that cannot be read silently must not stop
     /// every other provider from being refreshed.
-    private func escalatingRead(_ key: KeychainItemKey, _ read: (Bool) throws -> String?) throws -> String? {
-        do {
-            return try read(false)
-        } catch KeychainError.interactionNotAllowed {
-            // Remember it: without this every five-minute cycle re-reads an item it cannot read and
-            // fails again, which is the "keychain access" spam.
-            KeychainPermissionGate.shared.block(key)
-            // Already asked and refused. Escalating again would raise the identical dialog for the same
-            // item, which is the complaint this exists to answer: the app kept asking after the user had
-            // already said no. Report the same definitive answer instead.
-            guard !KeychainPermissionGate.shared.isDeclined(key) else {
+    private func readForRefresh(
+        _ key: KeychainItemKey,
+        allowInteraction: Bool,
+        interactionGate: CredentialInteractionGate?,
+        _ read: (Bool, KeychainInteractiveQueryLease?) throws -> String?
+    ) throws -> String? {
+        guard !ProviderRefreshContext.credentialReadIsCancelled else {
+            throw CancellationError()
+        }
+        let permissionGate = KeychainPermissionGate.shared
+        let manualActionID = ProviderRefreshContext.manualActionID
+        guard !permissionGate.isDeclined(key) else {
+            throw KeychainError.interactionNotAllowed
+        }
+        if permissionGate.isBlocked(key), !allowInteraction {
+            throw KeychainError.interactionNotAllowed
+        }
+
+        let observedGeneration = permissionGate.generation(for: key)
+        // A prompt for this same item is already on screen. A silent probe now can only fail and
+        // would spend another Security read on an item whose answer is already arriving, so wait for
+        // the in-flight query instead and retry silently only if its grant cleared this item.
+        if let granted = permissionGate.waitForInFlightSameItemInteractiveQuery(
+            matching: key,
+            manualActionID: manualActionID
+        ) {
+            guard !ProviderRefreshContext.credentialReadIsCancelled,
+                  permissionGate.isCurrentManualAction(manualActionID)
+            else { throw CancellationError() }
+            guard granted else { throw KeychainError.interactionNotAllowed }
+            return try retrySilently(after: permissionGate.generation(for: key))
+        }
+        func retrySilently(after generation: UInt64) throws -> String? {
+            do {
+                let value = try read(false, nil)
+                guard !ProviderRefreshContext.credentialReadIsCancelled,
+                      permissionGate.isCurrentManualAction(manualActionID)
+                else { throw CancellationError() }
+                permissionGate.reset(
+                    key,
+                    ifGenerationIs: generation,
+                    manualActionID: manualActionID
+                )
+                return value
+            } catch KeychainError.interactionNotAllowed {
+                guard !ProviderRefreshContext.credentialReadIsCancelled,
+                      permissionGate.isCurrentManualAction(manualActionID)
+                else { throw CancellationError() }
+                permissionGate.block(
+                    key,
+                    ifGenerationIs: generation,
+                    manualActionID: manualActionID
+                )
                 throw KeychainError.interactionNotAllowed
             }
-            guard ProviderRefreshContext.isManual,
-                  ProviderRefreshContext.credentialInteractionGate?.claim() ?? true
-            else {
+        }
+        do {
+            let value = try read(false, nil)
+            guard !ProviderRefreshContext.credentialReadIsCancelled else {
+                throw CancellationError()
+            }
+            guard permissionGate.isCurrentManualAction(manualActionID) else {
+                throw CancellationError()
+            }
+            permissionGate.reset(
+                key,
+                ifGenerationIs: observedGeneration,
+                manualActionID: manualActionID
+            )
+            return value
+        } catch KeychainError.interactionNotAllowed {
+            // Remember it: without this every periodic refresh re-reads an item it cannot read and
+            // fails again, which is the "keychain access" spam.
+            permissionGate.block(
+                key,
+                ifGenerationIs: observedGeneration,
+                manualActionID: manualActionID
+            )
+            guard !ProviderRefreshContext.credentialReadIsCancelled else {
+                throw CancellationError()
+            }
+            if allowInteraction,
+               permissionGate.hasSuccessfulInteractiveGrant(for: key, manualActionID: manualActionID) {
+                permissionGate.reset(
+                    key,
+                    ifGenerationIs: observedGeneration,
+                    manualActionID: manualActionID
+                )
+                return try retrySilently(after: permissionGate.generation(for: key))
+            }
+            guard allowInteraction, !permissionGate.isDeclined(key) else {
                 throw KeychainError.interactionNotAllowed
+            }
+            let interactiveQueryClaim = permissionGate.claimInteractiveQueryResult(
+                for: manualActionID,
+                using: interactionGate,
+                key: key
+            )
+            let interactiveQueryLease: KeychainInteractiveQueryLease
+            switch interactiveQueryClaim {
+            case .claimed(let lease):
+                interactiveQueryLease = lease
+            case .actionSuperseded:
+                throw CancellationError()
+            case .queryInFlight(let activeLease, let sameItem):
+                // A sibling reading this same item can reuse the result of the one in-flight prompt.
+                // Wait for its synchronous Security call to finish, then retry silently only if it
+                // actually cleared this item's permission block. Different-item prompts still fail
+                // closed without waiting or opening another dialog.
+                guard sameItem, permissionGate.waitForSuccessfulInteractiveQuery(
+                    activeLease,
+                    matching: key,
+                    manualActionID: manualActionID
+                ) else {
+                    guard !ProviderRefreshContext.credentialReadIsCancelled,
+                          permissionGate.isCurrentManualAction(manualActionID)
+                    else { throw CancellationError() }
+                    throw KeychainError.interactionNotAllowed
+                }
+                guard !ProviderRefreshContext.credentialReadIsCancelled,
+                      permissionGate.isCurrentManualAction(manualActionID)
+                else { throw CancellationError() }
+                return try retrySilently(after: permissionGate.generation(for: key))
+            case .actionBudgetSpent:
+                if permissionGate.hasSuccessfulInteractiveGrant(for: key, manualActionID: manualActionID)
+                    || permissionGate.wasSuccessfullyUnblocked(
+                        key,
+                        since: observedGeneration,
+                        manualActionID: manualActionID
+                    ) {
+                    permissionGate.reset(
+                        key,
+                        ifGenerationIs: observedGeneration,
+                        manualActionID: manualActionID
+                    )
+                    return try retrySilently(after: permissionGate.generation(for: key))
+                }
+                // Remember that this action could not obtain the item. Without this, a second card
+                // that shares the same credential would repeat the silent read after the shared
+                // prompt budget had already been spent elsewhere in this action.
+                permissionGate.markDeclined(key, ifGenerationIs: observedGeneration)
+                throw KeychainError.interactionNotAllowed
+            }
+            // Keep the process-wide slot until the synchronous read closure returns. Task cancellation
+            // and a newer manual action invalidate its LAContext, but neither can release this slot
+            // while SecItemCopyMatching is still executing.
+            defer { permissionGate.finishInteractiveQuery(interactiveQueryLease) }
+            // The interactive Security.framework call can display UI. Recheck after claiming the
+            // action budget so a task canceled or superseded in the meantime cannot open a stale prompt.
+            guard !ProviderRefreshContext.credentialReadIsCancelled else {
+                throw CancellationError()
+            }
+            guard permissionGate.isCurrentManualAction(manualActionID) else {
+                throw CancellationError()
             }
             do {
-                return try read(true)
+                let value = try read(true, interactiveQueryLease)
+                guard !ProviderRefreshContext.credentialReadIsCancelled else {
+                    throw CancellationError()
+                }
+                guard permissionGate.isCurrentManualAction(manualActionID) else {
+                    throw CancellationError()
+                }
+                permissionGate.reset(
+                    key,
+                    ifGenerationIs: observedGeneration,
+                    manualActionID: manualActionID
+                )
+                guard permissionGate.markInteractiveQuerySucceeded(interactiveQueryLease) else {
+                    throw CancellationError()
+                }
+                return value
+            } catch KeychainError.interactionNotAllowed {
+                guard !ProviderRefreshContext.credentialReadIsCancelled else {
+                    throw CancellationError()
+                }
+                guard permissionGate.isCurrentManualAction(manualActionID) else {
+                    throw CancellationError()
+                }
+                // A canceled prompt is remembered; unrelated read failures remain retryable.
+                permissionGate.markDeclined(key, ifGenerationIs: observedGeneration)
+                throw KeychainError.interactionNotAllowed
             } catch {
-                // Cancelled, or the grant did not take. Either way the user has been asked once for this
-                // item and did not grant it, so stop asking for the rest of the session.
-                KeychainPermissionGate.shared.markDeclined(key)
+                guard !ProviderRefreshContext.credentialReadIsCancelled else {
+                    throw CancellationError()
+                }
+                guard permissionGate.isCurrentManualAction(manualActionID) else {
+                    throw CancellationError()
+                }
                 throw error
             }
+        } catch {
+            guard !ProviderRefreshContext.credentialReadIsCancelled else {
+                throw CancellationError()
+            }
+            guard permissionGate.isCurrentManualAction(manualActionID) else {
+                throw CancellationError()
+            }
+            throw error
         }
     }
 
@@ -422,9 +792,14 @@ extension KeychainAccessing {
 
 struct SecurityKeychainAccessor: KeychainAccessing {
     let processRunner: ProcessRunning
+    let itemWriter: SecurityKeychainItemWriting
 
-    init(processRunner: ProcessRunning = SystemProcessRunner()) {
+    init(
+        processRunner: ProcessRunning = SystemProcessRunner(),
+        itemWriter: SecurityKeychainItemWriting = SecurityFrameworkKeychainWriter()
+    ) {
         self.processRunner = processRunner
+        self.itemWriter = itemWriter
     }
 
     // `security find-generic-password` exits 44 (errSecItemNotFound) when no item matches — the
@@ -459,18 +834,54 @@ struct SecurityKeychainAccessor: KeychainAccessing {
     }
 
     func readGenericPasswordForCurrentUser(service: String) throws -> String? {
-        try readPassword(["find-generic-password", "-a", currentUserAccount(), "-s", service, "-w"], service: service)
+        try readPassword(["find-generic-password", "-a", currentUserKeychainAccount(), "-s", service, "-w"], service: service)
     }
 
     /// Claude uses this overload so background refreshes can read an already-authorized login while
     /// immediately returning when macOS would otherwise need to present Keychain UI.
     func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? {
-        try readPassword(service: service, account: currentUserAccount(), allowInteraction: allowInteraction)
+        try readPassword(
+            service: service,
+            account: currentUserKeychainAccount(),
+            allowInteraction: allowInteraction,
+            interactiveQueryLease: nil
+        )
+    }
+
+    func readGenericPasswordForCurrentUser(
+        service: String,
+        allowInteraction: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease?
+    ) throws -> String? {
+        try readPassword(
+            service: service,
+            account: currentUserKeychainAccount(),
+            allowInteraction: allowInteraction,
+            interactiveQueryLease: interactiveQueryLease
+        )
     }
 
     /// Service-only fallback used by older Claude Code Keychain entries.
     func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? {
-        try readPassword(service: service, account: nil, allowInteraction: allowInteraction)
+        try readPassword(
+            service: service,
+            account: nil,
+            allowInteraction: allowInteraction,
+            interactiveQueryLease: nil
+        )
+    }
+
+    func readGenericPassword(
+        service: String,
+        allowInteraction: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease?
+    ) throws -> String? {
+        try readPassword(
+            service: service,
+            account: nil,
+            allowInteraction: allowInteraction,
+            interactiveQueryLease: interactiveQueryLease
+        )
     }
 
     func readGenericPassword(service: String, account: String) throws -> String? {
@@ -481,7 +892,26 @@ struct SecurityKeychainAccessor: KeychainAccessing {
     /// this, the only account-scoped path was the `security` subprocess, so a provider reading another
     /// app's item (Antigravity's `agy` token) had no way to stay silent on a scheduled refresh.
     func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? {
-        try readPassword(service: service, account: account, allowInteraction: allowInteraction)
+        try readPassword(
+            service: service,
+            account: account,
+            allowInteraction: allowInteraction,
+            interactiveQueryLease: nil
+        )
+    }
+
+    func readGenericPassword(
+        service: String,
+        account: String,
+        allowInteraction: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease?
+    ) throws -> String? {
+        try readPassword(
+            service: service,
+            account: account,
+            allowInteraction: allowInteraction,
+            interactiveQueryLease: interactiveQueryLease
+        )
     }
 
     private func readPassword(_ arguments: [String], service: String) throws -> String? {
@@ -503,7 +933,12 @@ struct SecurityKeychainAccessor: KeychainAccessing {
         return value.isEmpty ? nil : value
     }
 
-    private func readPassword(service: String, account: String?, allowInteraction: Bool) throws -> String? {
+    private func readPassword(
+        service: String,
+        account: String?,
+        allowInteraction: Bool,
+        interactiveQueryLease: KeychainInteractiveQueryLease?
+    ) throws -> String? {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -513,14 +948,24 @@ struct SecurityKeychainAccessor: KeychainAccessing {
         if let account {
             query[kSecAttrAccount as String] = account
         }
-        if !allowInteraction {
-            let context = LAContext()
-            context.interactionNotAllowed = true
-            query[kSecUseAuthenticationContext as String] = context
-        }
+        let authenticationContext = try KeychainAuthenticationContextLease(
+            interactionAllowed: allowInteraction,
+            interactiveQueryLease: interactiveQueryLease
+        )
+        query[kSecUseAuthenticationContext as String] = authenticationContext.context
 
+        guard authenticationContext.mayBeginQuery else {
+            _ = authenticationContext.finish()
+            throw CancellationError()
+        }
+        if allowInteraction, let interactiveQueryLease,
+           !interactiveQueryLease.markQueryStarted() {
+            _ = authenticationContext.finish()
+            throw CancellationError()
+        }
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard authenticationContext.finish() else { throw CancellationError() }
         switch status {
         case errSecSuccess:
             guard let data = result as? Data,
@@ -552,29 +997,52 @@ struct SecurityKeychainAccessor: KeychainAccessing {
     }
 
     func writeGenericPassword(service: String, value: String) throws {
-        try writePassword(["add-generic-password", "-U", "-s", service, "-w", value])
+        try writePassword(service: service, account: currentUserKeychainAccount(), value: value)
+    }
+
+    func writeGenericPassword(service: String, account: String, value: String) throws {
+        try writePassword(service: service, account: account, value: value)
     }
 
     func writeGenericPasswordForCurrentUser(service: String, value: String) throws {
-        try writePassword(["add-generic-password", "-U", "-a", currentUserAccount(), "-s", service, "-w", value])
+        try writePassword(service: service, account: currentUserKeychainAccount(), value: value)
     }
 
-    private func writePassword(_ arguments: [String]) throws {
-        let result = try processRunner.run(
-            executable: "/usr/bin/security",
-            arguments: arguments,
-            environment: [:],
-            timeout: 5
-        )
-        if !result.succeeded {
-            throw KeychainError.writeFailed(result.stderr)
+    private func writePassword(service: String, account: String, value: String) throws {
+        let scope = try itemWriter.defaultFileKeychainWriteScope()
+        let identity: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let secret = Data(value.utf8)
+        var attributes = identity.merging(scope.addAttributes) { _, scoped in scoped }
+        attributes[kSecValueData as String] = secret
+
+        let addStatus = itemWriter.addGenericPassword(attributes: attributes)
+        guard addStatus != errSecDuplicateItem else {
+            let updateQuery = identity.merging(scope.updateQueryAttributes) { _, scoped in scoped }
+            let updateStatus = itemWriter.updateGenericPassword(
+                matching: updateQuery,
+                attributes: [kSecValueData as String: secret]
+            )
+            guard updateStatus == errSecSuccess else { throw writeError(status: updateStatus) }
+            return
         }
+        guard addStatus == errSecSuccess else { throw writeError(status: addStatus) }
     }
 
-    private func currentUserAccount() -> String {
-        ProcessInfo.processInfo.environment["USER"]?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-        ?? NSUserName()
+    private func writeError(status: OSStatus) -> KeychainError {
+        if status == errSecInteractionNotAllowed || status == errSecInteractionRequired {
+            return .interactionNotAllowed
+        }
+        return .writeFailed("Security.framework OSStatus \(status)")
     }
+}
+
+func currentUserKeychainAccount() -> String {
+    ProcessInfo.processInfo.environment["USER"]?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    ?? NSUserName()
 }
 
 enum KeychainError: Error, LocalizedError {
@@ -604,20 +1072,38 @@ func expandHome(_ path: String) -> String {
 /// Identity of the Keychain item a read targets, for [`KeychainPermissionGate`] bookkeeping.
 ///
 /// The gate has to be per item, not per process: the "needs a dialog" condition belongs to one item's
-/// ACL, and two different items in the same app routinely differ. `account` and `scopedToCurrentUser`
-/// are part of the key because they are part of the *query* — a service-only lookup, an
-/// account-scoped lookup, and a current-user-scoped lookup are three different items, and collapsing
-/// them would let one item's block suppress the others.
-struct KeychainItemKey: Hashable {
+/// ACL, and two different items in the same app routinely differ. `account` is part of the key
+/// because it is part of the query. A service-only lookup remains distinct, while a current-user
+/// lookup is normalized to its account value so it shares state with the equivalent explicit query.
+struct KeychainItemKey: Hashable, Sendable {
     let service: String
     let account: String?
-    let scopedToCurrentUser: Bool
 
-    init(service: String, account: String? = nil, scopedToCurrentUser: Bool = false) {
+    init(service: String, account: String? = nil) {
         self.service = service
         self.account = account
-        self.scopedToCurrentUser = scopedToCurrentUser
     }
+}
+
+/// Owns the process-wide slot for one interactive Security.framework query. It remains active until
+/// the synchronous `SecItemCopyMatching` call returns, even if its LAContext is invalidated first.
+struct KeychainInteractiveQueryLease: Sendable, Hashable {
+    fileprivate let id: UUID
+    fileprivate let manualActionID: UInt64
+    fileprivate let key: KeychainItemKey?
+
+    /// Confirms that the interactive Security query is about to start. Finishing an unstarted lease
+    /// returns the still-unused prompt budget to the action's other provider reads.
+    func markQueryStarted() -> Bool {
+        KeychainPermissionGate.shared.markInteractiveQueryStarted(self)
+    }
+}
+
+enum KeychainInteractiveQueryClaim {
+    case claimed(KeychainInteractiveQueryLease)
+    case actionSuperseded
+    case queryInFlight(KeychainInteractiveQueryLease, sameItem: Bool)
+    case actionBudgetSpent
 }
 
 /// Process-wide memory that a silent Keychain read needs user interaction.
@@ -638,42 +1124,244 @@ struct KeychainItemKey: Hashable {
 ///   some other provider's success, and the five-minute re-read-and-fail spam came right back — the
 ///   exact thing the gate exists to prevent.
 ///
-/// Keyed by [`KeychainItemKey`] so block and reset both stay scoped to the item that earned them.
+/// Keyed by [`KeychainItemKey`] so block and reset both stay scoped to the item that earned them. It also
+/// owns one process-wide interactive-query lease so overlapping manual actions cannot stack prompts.
 final class KeychainPermissionGate: @unchecked Sendable {
     static let shared = KeychainPermissionGate()
 
-    private init() {}
-    private let lock = NSLock()
+    private let invalidateContext: @Sendable (LAContext) -> Void
+
+    init(invalidateContext: @escaping @Sendable (LAContext) -> Void = { $0.invalidate() }) {
+        self.invalidateContext = invalidateContext
+    }
+    private let lock = NSCondition()
     private var blocked: Set<KeychainItemKey> = []
-    /// Items the user has already been prompted for and did not grant — cancelled the dialog, or the
-    /// interactive read came back refused.
+    private var generations: [KeychainItemKey: UInt64] = [:]
+    /// Identity of the latest explicit refresh action, including actions whose detached reads have
+    /// not reached a Keychain item yet.
+    private var latestManualActionID: UInt64 = 0
+    private struct ActiveInteractiveQuery {
+        let lease: KeychainInteractiveQueryLease
+        var context: LAContext?
+        let interactionGate: CredentialInteractionGate?
+        var queryStarted: Bool
+        var succeeded: Bool
+    }
+    /// Only one interactive Security call may be in flight across all manual actions and providers.
+    private var activeInteractiveQuery: ActiveInteractiveQuery?
+    private var interactiveQueryWaiterCount = 0
+    private var registeredInteractiveWaiters: [UUID: Int] = [:]
+    private var completedInteractiveQueryResults: [UUID: Bool] = [:]
+    private var successfulInteractiveItems: Set<KeychainItemKey> = []
+    /// Items whose interactive read was declined during one manual refresh action.
     ///
-    /// Without this, declining is indistinguishable from never having been asked: the item stays blocked
-    /// for background reads, but the *next* manual refresh escalates again and raises the same dialog.
-    /// That is the "it keeps asking" loop — the user's only escape was to stop pressing Refresh Now, and
-    /// the app had no way to say it would stop asking.
+    /// This prevents duplicate provider tasks in that same action from asking again. Background passes
+    /// remain blocked until a later explicit action, which clears this set once and grants one new
+    /// shared prompt budget.
     private var declined: Set<KeychainItemKey> = []
 
-    /// Whether the user has already declined this item, so a further manual refresh must not re-prompt.
+    /// Whether this manual action has already failed to obtain the item.
     func isDeclined(_ key: KeychainItemKey) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         return declined.contains(key)
     }
 
-    /// Records that the user declined, so the dialog is shown at most once per item per session.
+    /// Records that this action did not obtain the item, so sibling tasks do not retry it.
     func markDeclined(_ key: KeychainItemKey) {
         lock.lock()
         declined.insert(key)
         lock.unlock()
     }
 
-    /// Forgets a decline. Called when the user explicitly asks to try again, so the offer to grant is
-    /// reachable without restarting the app.
-    func clearDeclined(_ key: KeychainItemKey) {
+    /// A new explicit Refresh is a deliberate retry. Clear the previous action's per-item declines;
+    /// the fresh shared interaction budget still caps this action at one dialog across all providers.
+    @discardableResult
+    func beginManualAction() -> UInt64 {
         lock.lock()
-        declined.remove(key)
+        latestManualActionID &+= 1
+        declined.removeAll()
+        successfulInteractiveItems.removeAll()
+        // In-flight reads from an older action may finish after the new Refresh starts. Advance every
+        // item already observed by the gate so an old cancellation/failure cannot restore stale state.
+        for key in Array(generations.keys) {
+            generations[key, default: 0] &+= 1
+        }
+        let actionID = latestManualActionID
+        let supersededContext = activeInteractiveQuery?.context
+        lock.broadcast()
         lock.unlock()
+        // Retire a stale prompt, but keep its query lease occupied until SecItemCopyMatching returns.
+        // Invalidation is not a reliable signal that Security has stopped using the context.
+        if let supersededContext { invalidateContext(supersededContext) }
+        return actionID
+    }
+
+    func isCurrentManualAction(_ actionID: UInt64?) -> Bool {
+        guard let actionID else { return true }
+        lock.lock()
+        defer { lock.unlock() }
+        return latestManualActionID == actionID
+    }
+
+    /// Validates the action, spends its per-action budget, and reserves the process-wide interactive
+    /// query slot under the same lock. A newer action cannot start a second Security call while an old
+    /// synchronous call is still in flight.
+    func claimInteractiveQuery(
+        for actionID: UInt64?,
+        using interactionGate: CredentialInteractionGate?
+    ) -> KeychainInteractiveQueryLease? {
+        guard case .claimed(let lease) = claimInteractiveQueryResult(
+            for: actionID,
+            using: interactionGate
+        ) else { return nil }
+        return lease
+    }
+
+    func claimInteractiveQueryResult(
+        for actionID: UInt64?,
+        using interactionGate: CredentialInteractionGate?,
+        key: KeychainItemKey? = nil
+    ) -> KeychainInteractiveQueryClaim {
+        lock.lock()
+        defer { lock.unlock() }
+        while true {
+            if let actionID, latestManualActionID != actionID {
+                return .actionSuperseded
+            }
+            if let activeInteractiveQuery {
+                // A sibling must not be denied while the current lease is still doing cancellable
+                // setup. Wait until it either enters Security.framework (then no second prompt may
+                // start) or finishes without starting (then its unused budget is returned).
+                if activeInteractiveQuery.queryStarted {
+                    let lease = activeInteractiveQuery.lease
+                    let sameItem = key != nil && lease.key == key
+                    if sameItem {
+                        registeredInteractiveWaiters[lease.id, default: 0] += 1
+                    }
+                    return .queryInFlight(lease, sameItem: sameItem)
+                }
+                interactiveQueryWaiterCount += 1
+                lock.wait()
+                interactiveQueryWaiterCount -= 1
+                continue
+            }
+            guard interactionGate?.claim() ?? true else { return .actionBudgetSpent }
+            let lease = KeychainInteractiveQueryLease(
+                id: UUID(),
+                manualActionID: latestManualActionID,
+                key: key
+            )
+            activeInteractiveQuery = ActiveInteractiveQuery(
+                lease: lease,
+                context: nil,
+                interactionGate: interactionGate,
+                queryStarted: false,
+                succeeded: false
+            )
+            return .claimed(lease)
+        }
+    }
+
+    func markInteractiveQueryStarted(_ lease: KeychainInteractiveQueryLease) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeInteractiveQuery?.lease == lease,
+              latestManualActionID == lease.manualActionID
+        else { return false }
+        activeInteractiveQuery?.queryStarted = true
+        lock.broadcast()
+        return true
+    }
+
+    /// Registers the context atomically with the active lease and current action. If a newer manual
+    /// action already superseded this query, reject the context before it reaches Security.framework.
+    func register(_ context: LAContext, for lease: KeychainInteractiveQueryLease) -> Bool {
+        lock.lock()
+        guard activeInteractiveQuery?.lease == lease,
+              latestManualActionID == lease.manualActionID
+        else {
+            lock.unlock()
+            invalidateContext(context)
+            return false
+        }
+        activeInteractiveQuery?.context = context
+        lock.unlock()
+        return true
+    }
+
+    func unregister(_ context: LAContext, for lease: KeychainInteractiveQueryLease) {
+        lock.lock()
+        if activeInteractiveQuery?.lease == lease,
+           let registeredContext = activeInteractiveQuery?.context,
+           registeredContext === context {
+            activeInteractiveQuery?.context = nil
+        }
+        lock.unlock()
+    }
+
+    func isCurrent(_ lease: KeychainInteractiveQueryLease) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeInteractiveQuery?.lease == lease
+            && latestManualActionID == lease.manualActionID
+    }
+
+    /// Clears a completed context but keeps the process slot held until the caller retires the query
+    /// lease after the Security call has fully returned.
+    func finishContext(_ context: LAContext, for lease: KeychainInteractiveQueryLease) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeInteractiveQuery?.lease == lease else { return false }
+        if let registeredContext = activeInteractiveQuery?.context,
+           registeredContext === context {
+            activeInteractiveQuery?.context = nil
+        }
+        return latestManualActionID == lease.manualActionID
+    }
+
+    func finishInteractiveQuery(_ lease: KeychainInteractiveQueryLease) {
+        lock.lock()
+        if activeInteractiveQuery?.lease == lease {
+            if registeredInteractiveWaiters[lease.id, default: 0] > 0 {
+                completedInteractiveQueryResults[lease.id] = activeInteractiveQuery?.succeeded ?? false
+            }
+            if activeInteractiveQuery?.queryStarted == false {
+                // Return the unused action budget before exposing the process slot as free. A
+                // sibling must not observe an empty slot while the old claim still looks spent.
+                activeInteractiveQuery?.interactionGate?.releaseClaim()
+            }
+            activeInteractiveQuery = nil
+            lock.broadcast()
+        }
+        lock.unlock()
+    }
+
+    func markInteractiveQuerySucceeded(_ lease: KeychainInteractiveQueryLease) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeInteractiveQuery?.lease == lease,
+              latestManualActionID == lease.manualActionID else { return false }
+        activeInteractiveQuery?.succeeded = true
+        if let key = lease.key {
+            successfulInteractiveItems.insert(key)
+        }
+        return true
+    }
+
+    func hasSuccessfulInteractiveGrant(
+        for key: KeychainItemKey,
+        manualActionID: UInt64?
+    ) -> Bool {
+        // A grant belongs to the explicit action that earned it. A reader with no action identity
+        // (a background pass) has no claim on it, and neither does a later action — the grant memory
+        // would otherwise outlive the prompt that produced it and hand a silent retry to a reader
+        // that never saw that dialog.
+        guard let manualActionID else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        return latestManualActionID == manualActionID
+            && successfulInteractiveItems.contains(key)
     }
 
     func isBlocked(_ key: KeychainItemKey) -> Bool {
@@ -682,9 +1370,121 @@ final class KeychainPermissionGate: @unchecked Sendable {
         return blocked.contains(key)
     }
 
-    func block(_ key: KeychainItemKey) {
+    /// Synchronization point for the regression that proves an unstarted lease wakes its sibling.
+    func interactiveQueryWaiterCountForTesting() -> Int {
         lock.lock()
-        blocked.insert(key)
+        defer { lock.unlock() }
+        return interactiveQueryWaiterCount
+    }
+
+    /// Waits for one already-started interactive query on the same item. Its result is retained only
+    /// while registered siblings need it, so a fast completion cannot race the silent retry. Timed
+    /// waits let cancellation be observed even when Security.framework keeps a prompt open.
+    func waitForSuccessfulInteractiveQuery(
+        _ lease: KeychainInteractiveQueryLease,
+        matching key: KeychainItemKey,
+        manualActionID: UInt64?
+    ) -> Bool {
+        lock.lock()
+        guard lease.key == key,
+              registeredInteractiveWaiters[lease.id, default: 0] > 0 else {
+            lock.unlock()
+            return false
+        }
+        return waitForInteractiveLease(lease, matching: key, manualActionID: manualActionID)
+    }
+
+    /// Same wait, but for a caller that has not claimed anything yet: it registers as a waiter for
+    /// the query already on screen for this item. Returns `nil` when no such query is in flight, so
+    /// the caller can fall back to its own silent read.
+    ///
+    /// Only a prompt owned by the caller's own action is reusable. A newer action must fail closed
+    /// rather than wait behind the older prompt it just superseded.
+    func waitForInFlightSameItemInteractiveQuery(
+        matching key: KeychainItemKey,
+        manualActionID: UInt64?
+    ) -> Bool? {
+        lock.lock()
+        guard let active = activeInteractiveQuery,
+              active.queryStarted,
+              active.lease.key == key,
+              manualActionID == nil || active.lease.manualActionID == manualActionID
+        else {
+            lock.unlock()
+            return nil
+        }
+        let lease = active.lease
+        registeredInteractiveWaiters[lease.id, default: 0] += 1
+        return waitForInteractiveLease(lease, matching: key, manualActionID: manualActionID)
+    }
+
+    /// Caller holds the lock and has registered as a waiter for `lease`. Waits until the query
+    /// leaves the process slot, then reports whether it granted this item.
+    private func waitForInteractiveLease(
+        _ lease: KeychainInteractiveQueryLease,
+        matching key: KeychainItemKey,
+        manualActionID: UInt64?
+    ) -> Bool {
+        interactiveQueryWaiterCount += 1
+        defer {
+            interactiveQueryWaiterCount -= 1
+            let remaining = registeredInteractiveWaiters[lease.id, default: 1] - 1
+            if remaining <= 0 {
+                registeredInteractiveWaiters.removeValue(forKey: lease.id)
+                completedInteractiveQueryResults.removeValue(forKey: lease.id)
+            } else {
+                registeredInteractiveWaiters[lease.id] = remaining
+            }
+            lock.unlock()
+        }
+        while activeInteractiveQuery?.lease == lease {
+            let actionIsCurrent = manualActionID == nil || latestManualActionID == manualActionID
+            guard actionIsCurrent,
+                  latestManualActionID == lease.manualActionID,
+                  !ProviderRefreshContext.credentialReadIsCancelled else {
+                return false
+            }
+            _ = lock.wait(until: Date(timeIntervalSinceNow: 0.05))
+        }
+        let actionIsCurrent = manualActionID == nil || latestManualActionID == manualActionID
+        return actionIsCurrent
+            && latestManualActionID == lease.manualActionID
+            && !ProviderRefreshContext.credentialReadIsCancelled
+            && completedInteractiveQueryResults[lease.id] == true
+            && !blocked.contains(key)
+    }
+
+    func generation(for key: KeychainItemKey) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = generations[key, default: 0]
+        generations[key] = value
+        return value
+    }
+
+    func wasSuccessfullyUnblocked(
+        _ key: KeychainItemKey,
+        since generation: UInt64,
+        manualActionID: UInt64?
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let actionIsCurrent = manualActionID == nil || latestManualActionID == manualActionID
+        return actionIsCurrent
+            && generations[key, default: 0] != generation
+            && !blocked.contains(key)
+    }
+
+    func block(
+        _ key: KeychainItemKey,
+        ifGenerationIs expected: UInt64,
+        manualActionID: UInt64? = nil
+    ) {
+        lock.lock()
+        let actionIsCurrent = manualActionID == nil || latestManualActionID == manualActionID
+        if actionIsCurrent, generations[key, default: 0] == expected {
+            blocked.insert(key)
+        }
         lock.unlock()
     }
 
@@ -692,6 +1492,34 @@ final class KeychainPermissionGate: @unchecked Sendable {
     func reset(_ key: KeychainItemKey) {
         lock.lock()
         blocked.remove(key)
+        declined.remove(key)
+        generations[key, default: 0] &+= 1
+        lock.unlock()
+    }
+
+    /// Reset only when this read still owns the generation and manual action it observed. A late
+    /// result from an older load cannot erase a newer action's blocked/declined state.
+    func reset(
+        _ key: KeychainItemKey,
+        ifGenerationIs expected: UInt64,
+        manualActionID: UInt64?
+    ) {
+        lock.lock()
+        let actionIsCurrent = manualActionID == nil || latestManualActionID == manualActionID
+        if actionIsCurrent, generations[key, default: 0] == expected {
+            blocked.remove(key)
+            declined.remove(key)
+            generations[key, default: 0] &+= 1
+        }
+        lock.unlock()
+    }
+
+    func markDeclined(_ key: KeychainItemKey, ifGenerationIs expected: UInt64) {
+        lock.lock()
+        if generations[key, default: 0] == expected {
+            blocked.insert(key)
+            declined.insert(key)
+        }
         lock.unlock()
     }
 
@@ -699,7 +1527,18 @@ final class KeychainPermissionGate: @unchecked Sendable {
     func resetAll() {
         lock.lock()
         blocked.removeAll()
+        generations.removeAll()
         declined.removeAll()
+        registeredInteractiveWaiters.removeAll()
+        completedInteractiveQueryResults.removeAll()
+        successfulInteractiveItems.removeAll()
+        let context = activeInteractiveQuery?.context
+        if activeInteractiveQuery?.queryStarted == false {
+            activeInteractiveQuery?.interactionGate?.releaseClaim()
+        }
+        activeInteractiveQuery = nil
+        lock.broadcast()
         lock.unlock()
+        if let context { invalidateContext(context) }
     }
 }
