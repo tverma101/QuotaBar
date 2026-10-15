@@ -44,6 +44,7 @@ final class ModelPricing: Sendable {
     /// Alias misses matter too: local logs repeat the same model slug for thousands of events, and
     /// testing every supplement regex for each event dominates the actual cost fold.
     private let canonicalNameMemo = OSAllocatedUnfairLock<[String: CanonicalNameLookup]>(initialState: [:])
+    private let cursorCanonicalNameMemo = OSAllocatedUnfairLock<[String: CanonicalNameLookup]>(initialState: [:])
 
     init(
         supplement: PricingSupplement,
@@ -81,18 +82,31 @@ final class ModelPricing: Sendable {
         secondary: PricingCatalog,
         openRouter: PricingCatalog
     ) -> String {
-        var parts: [String] = ["pricing-v2"]
+        var parts: [String] = ["pricing-v3"]
         func rateStamp(_ rates: ModelRates) -> String {
-            [
+            let base = [
                 String(rates.inputPerMillion), String(rates.outputPerMillion),
                 String(rates.cacheWritePerMillion), String(rates.cacheReadPerMillion),
+                rates.cacheWrite1hPerMillion.map { String($0) } ?? "nil",
                 rates.inputAbove200kPerMillion.map { String($0) } ?? "nil",
                 rates.outputAbove200kPerMillion.map { String($0) } ?? "nil",
                 rates.cacheWriteAbove200kPerMillion.map { String($0) } ?? "nil",
                 rates.cacheReadAbove200kPerMillion.map { String($0) } ?? "nil",
                 String(rates.cacheReadIsExplicit), String(rates.longContextThresholdTokens),
                 String(rates.fastMultiplier)
-            ].joined(separator: ":")
+            ]
+            let tiers = rates.promptRateTiers.map { tier in
+                [
+                    String(tier.thresholdPromptTokens),
+                    String(tier.includesThreshold),
+                    tier.inputPerMillion.map { String($0) } ?? "nil",
+                    tier.outputPerMillion.map { String($0) } ?? "nil",
+                    tier.cacheWritePerMillion.map { String($0) } ?? "nil",
+                    tier.cacheReadPerMillion.map { String($0) } ?? "nil",
+                    tier.cacheWrite1hPerMillion.map { String($0) } ?? "nil"
+                ].joined(separator: ":")
+            }
+            return (base + tiers).joined(separator: ":")
         }
         func stamp(_ name: String, _ entries: [String: ModelRates]) {
             parts.append(name)
@@ -109,6 +123,12 @@ final class ModelPricing: Sendable {
         stamp("supplement", supplement.pricing)
         for rule in supplement.aliasRules {
             parts.append("alias:\(rule.pattern.pattern):\(rule.pattern.options.rawValue):\(rule.canonical)")
+        }
+        for rule in supplement.cursorAliasRules {
+            parts.append("cursor-alias:\(rule.pattern.pattern):\(rule.pattern.options.rawValue):\(rule.canonical)")
+        }
+        for key in supplement.retiredPricingKeys.sorted() {
+            parts.append("retired-pricing:\(key)")
         }
         for key in supplement.fastMultipliers.keys.sorted() {
             parts.append("fast:\(key):\(supplement.fastMultipliers[key]!)")
@@ -150,6 +170,19 @@ final class ModelPricing: Sendable {
         }
         let resolved = supplement.canonicalName(for: model)
         canonicalNameMemo.withLock {
+            $0[model] = resolved.map(CanonicalNameLookup.found) ?? .missing
+        }
+        return resolved
+    }
+
+    /// Cursor-specific identity for exports whose rates differ from the matching public API model.
+    func cursorCanonicalName(for model: String) -> String? {
+        if let cached = cursorCanonicalNameMemo.withLock({ $0[model] }) {
+            if case .found(let name) = cached { return name }
+            return nil
+        }
+        let resolved = supplement.cursorCanonicalName(for: model)
+        cursorCanonicalNameMemo.withLock {
             $0[model] = resolved.map(CanonicalNameLookup.found) ?? .missing
         }
         return resolved
@@ -213,6 +246,23 @@ final class ModelPricing: Sendable {
         return rates.costDollars(for: tokens, applyLongContextRates: applyLongContextRates)
     }
 
+    /// Dollar cost for Cursor's usage CSV. Its scoped aliases can select Cursor-specific rates,
+    /// while every other model continues through the shared public-catalog lookup.
+    func estimatedCursorCostDollars(
+        model: String,
+        tokens: TokenBreakdown,
+        applyLongContextRates: Bool = true
+    ) -> Double? {
+        let rates: ModelRates?
+        if let canonical = cursorCanonicalName(for: model) {
+            rates = lookup("cursor-\(canonical)") ?? lookup(canonical) ?? resolve(model: model)
+        } else {
+            rates = resolve(model: model)
+        }
+        guard let rates else { return nil }
+        return rates.costDollars(for: tokens, applyLongContextRates: applyLongContextRates)
+    }
+
     private func resolveUncached(model: String) -> ModelRates? {
         if let canonical = canonicalName(for: model), canonical != model {
             return lookup(canonical) ?? lookup(model)
@@ -239,17 +289,19 @@ final class ModelPricing: Sendable {
         }
         if let fast = fastVariant(name) { return fast }
         if name.hasSuffix("-fast") { return secondary.findExact(name)?.rates }
+        // A free-looking sibling must not inherit a paid catalog entry through the boundary-aware
+        // fuzzy matcher. Exact supplement/catalog matches above still price verified free models;
+        // this exact-only secondary check is their final public-catalog fallback.
+        if hasFreeSuffix(name) { return secondary.findExact(name)?.rates }
         if let fuzzy = primary.findFuzzy(name) { return withSupplementFastMultiplier(name, fuzzy.rates) }
         if let exact = secondary.findExact(name) { return withSupplementFastMultiplier(name, exact.rates) }
-        // A model no catalog carries, whose name says it is free.
-        //
-        // The supplement's own convention is that a `-free` model is priced at $0 and *counted*
-        // (`deepseek-v4-flash-free`, `mimo-v2.5-free`, `mimo-v2.5-pro-free` all ship explicit zero rates).
-        // Without this, a genuinely free model is not mispriced — it is withheld: a fold drops every
-        // unpriced row's tokens, so a router ledger carrying 2.09B tokens of `space-bunny-free` showed
-        // ~20M on the card and the rest was silently discarded as "unknown".
-        if let free = freeVariantRates(name) { return free }
         return nil
+    }
+
+    private func hasFreeSuffix(_ name: String) -> Bool {
+        let normalized = PricingCatalog.normalizedKey(name).lowercased()
+        let lastSegment = normalized.split(separator: "/").last.map(String.init) ?? normalized
+        return lastSegment.hasSuffix("-free")
     }
 
     /// Catalog-resolved entries carry the feed's own fast multiplier, but feeds can drop it
@@ -264,24 +316,6 @@ final class ModelPricing: Sendable {
         var stamped = rates
         stamped.fastMultiplier = multiplier
         return stamped
-    }
-
-    /// Zero rates for a model whose final name segment ends in `-free`, so its tokens are counted and its
-    /// cost is an honest $0.00 rather than the row being withheld from every total.
-    ///
-    /// Narrow by design: it keys on the last segment only (`space-bunny-free` and
-    /// `opencode-free/space-bunny-free` both qualify; `free-tier-model` and `model-free-beta` do not) and
-    /// never overrides a real rate, so a paid model is untouched and an unknown *paid* model still stays
-    /// unpriced and flagged.
-    private func freeVariantRates(_ name: String) -> ModelRates? {
-        let lastSegment = name.lowercased().split(separator: "/").last.map { String($0) } ?? name.lowercased()
-        guard lastSegment.hasSuffix("-free") else { return nil }
-        return ModelRates(
-            inputPerMillion: 0,
-            outputPerMillion: 0,
-            cacheWritePerMillion: 0,
-            cacheReadPerMillion: 0
-        )
     }
 
     /// Prices `<base>-fast` slugs from their base entry when a fast multiplier is known. Returns
@@ -307,7 +341,34 @@ final class ModelPricing: Sendable {
         if let entry = supplement.pricing[base] { return (base, entry) }
         if let entry = openRouter.findExact(base) { return (base, entry.rates) }
         return primary.findExact(base)
-            ?? primary.findFuzzy(base)
+            ?? datedPrimaryEntry(for: base)
             ?? secondary.findExact(base)
+    }
+
+    /// Keep the historical dated-slug compatibility for fast variants without letting a nearby
+    /// sibling such as `gpt-9-pro` supply the base rates for `gpt-9-fast`.
+    private func datedPrimaryEntry(for base: String) -> (key: String, rates: ModelRates)? {
+        let normalizedBase = PricingCatalog.normalizedKey(base)
+        let baseHasProviderPrefix = normalizedBase.contains("/")
+        let baseSlug = normalizedBase.split(separator: "/").last.map(String.init) ?? normalizedBase
+        let candidates = primary.entries.compactMap { key, rates -> (key: String, date: String, rates: ModelRates)? in
+            let normalizedKey = PricingCatalog.normalizedKey(key)
+            let candidateSlug = normalizedKey.split(separator: "/").last.map(String.init) ?? normalizedKey
+            let comparableBase = baseHasProviderPrefix ? normalizedBase : baseSlug
+            let comparableKey = baseHasProviderPrefix ? normalizedKey : candidateSlug
+            let datedPrefix = comparableBase + "-"
+            guard comparableKey.hasPrefix(datedPrefix) else { return nil }
+            let suffix = comparableKey.dropFirst(datedPrefix.count)
+            let date = suffix.prefix(8)
+            guard date.utf8.count == 8,
+                  date.utf8.allSatisfy({ (48...57).contains($0) }),
+                  suffix.count == 8 || suffix.dropFirst(8).first == "-" else { return nil }
+            return (key, String(date), rates)
+        }
+        guard let candidate = candidates.sorted(by: {
+            if $0.date != $1.date { return $0.date > $1.date }
+            return $0.key.count == $1.key.count ? $0.key < $1.key : $0.key.count > $1.key.count
+        }).first else { return nil }
+        return (candidate.key, candidate.rates)
     }
 }

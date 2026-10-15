@@ -31,7 +31,7 @@ final class ModelPricingTests: XCTestCase {
             inputPerMillion: input,
             outputPerMillion: output,
             cacheWritePerMillion: cacheWrite ?? input,
-            cacheReadPerMillion: cacheRead ?? input * 0.1,
+            cacheReadPerMillion: cacheRead ?? input,
             fastMultiplier: fast
         )
     }
@@ -51,6 +51,45 @@ final class ModelPricingTests: XCTestCase {
             let pricing = try makePricing(primary: [scenario.catalogKey: rates(scenario.expected, 15)])
             XCTAssertEqual(pricing.resolve(model: scenario.model)?.inputPerMillion, scenario.expected, scenario.model)
         }
+    }
+
+    func testCursorGeminiRateDoesNotReplacePublicOpenRouterCacheWriteRate() throws {
+        let supplement = #"""
+        {
+          "pricing": {
+            "cursor-gemini-4-argon": {
+              "input_per_million": 2,
+              "output_per_million": 10,
+              "cache_write_per_million": 2,
+              "cache_read_per_million": 0.1
+            }
+          },
+          "alias_rules": [],
+          "cursor_alias_rules": [
+            {"pattern":"^gemini-4-argon$","canonical":"gemini-4-argon"},
+            {"pattern":"(?i)^Gemini 4 Argon(?: \\(Auto[^)]*\\))?$","canonical":"gemini-4-argon"}
+          ]
+        }
+        """#
+        let route = rates(4, 20, cacheWrite: 0.1875, cacheRead: 0.2)
+        let pricing = try makePricing(
+            supplementJSON: supplement,
+            openRouter: ["google/gemini-4-argon": route, "gemini-4-argon": route]
+        )
+        let cacheWrite = TokenBreakdown(cacheWrite5m: 1_000_000)
+
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCostDollars(model: "gemini-4-argon", tokens: cacheWrite)),
+            0.1875,
+            accuracy: 0.000_001,
+            "the public API slug uses the OpenRouter route rate"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCursorCostDollars(model: "Gemini 4 Argon (Auto Balanced)", tokens: cacheWrite)),
+            2,
+            accuracy: 0.000_001,
+            "Cursor's scoped alias uses its own published cache-write rate"
+        )
     }
 
     func testNumericVersionsDoNotConflate() throws {
@@ -211,6 +250,44 @@ final class ModelPricingTests: XCTestCase {
         XCTAssertEqual(pricing.resolve(model: "gpt-5.5-fast")?.inputPerMillion, 12.5)
     }
 
+    func testDatedFastBasePrefersNewestCatalogDate() throws {
+        let supplement = """
+        {"pricing": {}, "fast_multipliers": {"gpt-5.5": 2.5}, "alias_rules": []}
+        """
+        let pricing = try makePricing(supplementJSON: supplement, primary: [
+            "gpt-5.5-20250423": rates(2, 8),
+            "gpt-5.5-20260423": rates(5, 30)
+        ])
+        XCTAssertEqual(pricing.resolve(model: "gpt-5.5-fast")?.inputPerMillion, 12.5)
+        XCTAssertEqual(pricing.resolve(model: "gpt-5.5-fast")?.outputPerMillion, 75)
+    }
+
+    func testDatedFastMultiplierChoosesMostSpecificBase() throws {
+        let supplement = """
+        {"pricing": {}, "fast_multipliers": {"gpt-5": 2, "gpt-5.5": 2.5}, "alias_rules": []}
+        """
+        let pricing = try makePricing(supplementJSON: supplement)
+
+        XCTAssertEqual(pricing.supplement.fastMultiplier(for: "gpt-5.5-2026-04-23"), 2.5)
+    }
+
+    func testFastVariantDoesNotBorrowFuzzySiblingRates() throws {
+        let supplement = """
+        {"pricing": {}, "fast_multipliers": {"gpt-9": 2}, "alias_rules": []}
+        """
+        let pricing = try makePricing(
+            supplementJSON: supplement,
+            primary: ["gpt-9-pro": rates(5, 30)]
+        )
+
+        XCTAssertNil(pricing.resolve(model: "gpt-9-fast"))
+    }
+
+    func testFreeSuffixDoesNotBorrowPaidFuzzySiblingRates() throws {
+        let pricing = try makePricing(primary: ["gpt-5.5": rates(5, 30)])
+        XCTAssertNil(pricing.resolve(model: "gpt-5.5-free"))
+    }
+
     func testCatalogCodecsPreserveSynthesizedCacheReadProvenance() throws {
         let source = Data(#"""
         {
@@ -227,14 +304,130 @@ final class ModelPricingTests: XCTestCase {
         """#.utf8)
 
         let decoded = try PricingCatalogCodecs.catalogFromLiteLLM(source)
-        XCTAssertTrue(try XCTUnwrap(decoded.entries["explicit"]).cacheReadIsExplicit)
-        XCTAssertFalse(try XCTUnwrap(decoded.entries["missing"]).cacheReadIsExplicit)
+        let explicitRates = try XCTUnwrap(decoded.entries["explicit"])
+        let missingRates = try XCTUnwrap(decoded.entries["missing"])
+        XCTAssertTrue(explicitRates.cacheReadIsExplicit)
+        XCTAssertFalse(missingRates.cacheReadIsExplicit)
+        XCTAssertEqual(missingRates.cacheReadPerMillion, missingRates.inputPerMillion)
+        XCTAssertEqual(
+            missingRates.costDollars(for: TokenBreakdown(cacheRead: 1_000_000)),
+            missingRates.inputPerMillion,
+            accuracy: 0.000_001,
+            "a missing published cache-read rate must not invent a discount"
+        )
 
         let restored = try PricingCatalogCodecs.catalogFromCompact(
             PricingCatalogCodecs.compactData(from: decoded)
         )
         XCTAssertTrue(try XCTUnwrap(restored.entries["explicit"]).cacheReadIsExplicit)
         XCTAssertFalse(try XCTUnwrap(restored.entries["missing"]).cacheReadIsExplicit)
+        XCTAssertEqual(try XCTUnwrap(restored.entries["missing"]).cacheReadPerMillion, missingRates.inputPerMillion)
+    }
+
+    func testLiteLLMImportsAllPublishedPromptThresholdsAndRoundTripsThem() throws {
+        let source = Data(#"""
+        {
+          "tiered": {
+            "input_cost_per_token": 0.000001,
+            "output_cost_per_token": 0.000002,
+            "cache_creation_input_token_cost": 0.00000125,
+            "cache_read_input_token_cost": 0.0000001,
+            "input_cost_per_token_above_200k_tokens": 0.000002,
+            "output_cost_per_token_above_200k_tokens": 0.000003,
+            "cache_creation_input_token_cost_above_200k_tokens": 0.0000025,
+            "cache_read_input_token_cost_above_200k_tokens": 0.0000002,
+            "input_cost_per_token_above_272k_tokens": 0.000003,
+            "output_cost_per_token_above_272k_tokens": 0.0000045,
+            "cache_creation_input_token_cost_above_272k_tokens": 0.00000375,
+            "cache_read_input_token_cost_above_272k_tokens": 0.0000003
+          }
+        }
+        """#.utf8)
+
+        let catalog = try PricingCatalogCodecs.catalogFromLiteLLM(source)
+        let rates = try XCTUnwrap(catalog.entries["tiered"])
+        XCTAssertEqual(rates.promptRateTiers.map(\.thresholdPromptTokens), [200_000, 272_000])
+        XCTAssertEqual(try XCTUnwrap(rates.promptRateTiers.last?.inputPerMillion), 3, accuracy: 0.000_001)
+        XCTAssertEqual(try XCTUnwrap(rates.promptRateTiers.last?.cacheWritePerMillion), 3.75, accuracy: 0.000_001)
+
+        let restored = try PricingCatalogCodecs.catalogFromCompact(PricingCatalogCodecs.compactData(from: catalog))
+        XCTAssertEqual(restored.entries["tiered"]?.promptRateTiers, rates.promptRateTiers)
+    }
+
+    func testModelsDevImportsContextTiersAndOmitsConflictingDuplicateIDs() throws {
+        let source = Data(#"""
+        {
+          "provider-a": {"models": {
+            "tiered": {"cost": {
+              "input": 1, "output": 2, "cache_read": 0.1,
+              "tiers": [
+                {"input": 2, "output": 3, "cache_read": 0.2, "tier": {"type": "context", "size": 32000}},
+                {"input": 3, "output": 4, "cache_read": 0.3, "tier": {"type": "context", "size": 128000}}
+              ],
+              "context_over_200k": {"input": 4, "output": 5, "cache_read": 0.4}
+            }},
+            "ambiguous": {"cost": {"input": 1, "output": 2}}
+          }},
+          "provider-b": {"models": {
+            "tiered": {"cost": {
+              "input": 1, "output": 2, "cache_read": 0.1,
+              "tiers": [
+                {"input": 2, "output": 3, "cache_read": 0.2, "tier": {"type": "context", "size": 32000}},
+                {"input": 3, "output": 4, "cache_read": 0.3, "tier": {"type": "context", "size": 128000}}
+              ],
+              "context_over_200k": {"input": 4, "output": 5, "cache_read": 0.4}
+            }},
+            "ambiguous": {"cost": {"input": 9, "output": 9}}
+          }}
+        }
+        """#.utf8)
+
+        let catalog = try PricingCatalogCodecs.catalogFromModelsDev(source)
+        let tieredRates = try XCTUnwrap(catalog.entries["tiered"])
+        XCTAssertEqual(tieredRates.promptRateTiers.map(\.thresholdPromptTokens), [32_000, 128_000, 200_000])
+        XCTAssertEqual(tieredRates.promptRateTiers.last?.inputPerMillion, 4)
+        XCTAssertTrue(try XCTUnwrap(tieredRates.promptRateTiers.first?.includesThreshold))
+        XCTAssertEqual(
+            tieredRates.costDollars(for: TokenBreakdown(input: 32_000)),
+            0.064,
+            accuracy: 0.000_001,
+            "models.dev context tiers begin at the stated threshold"
+        )
+        XCTAssertNil(catalog.entries["ambiguous"], "different reseller prices must not pick an arbitrary provider")
+        XCTAssertEqual(catalog.retiredKeys, Set(["ambiguous"]))
+        XCTAssertTrue(catalog.retiredKeysAreAuthoritative)
+
+        let restored = try PricingCatalogCodecs.catalogFromCompact(PricingCatalogCodecs.compactData(from: catalog))
+        XCTAssertTrue(restored.retiredKeysAreAuthoritative)
+        let withOldBundle = PricingCatalog(entries: ["ambiguous": rates(7, 9)]).merging(restored)
+        XCTAssertNil(withOldBundle.entries["ambiguous"], "the live conflict tombstone must beat an older bundled rate")
+    }
+
+    func testModelsDevUsesExplicitPromptTierCacheReadRateWithoutBaseCacheRate() throws {
+        let source = Data(#"{"provider":{"models":{"tiered":{"cost":{"input":1,"output":2,"tiers":[{"input":3,"output":4,"cache_read":0.5,"tier":{"type":"context","size":1000}}]}}}}}"#.utf8)
+
+        let catalog = try PricingCatalogCodecs.catalogFromModelsDev(source)
+        let rates = try XCTUnwrap(catalog.entries["tiered"])
+
+        XCTAssertTrue(rates.cacheReadIsExplicit)
+        XCTAssertEqual(rates.costDollars(for: TokenBreakdown(input: 1_000, cacheRead: 2_000)), 0.004, accuracy: 0.000_001)
+    }
+
+    func testLiteLLMTierOnlyCacheReadRateIsExplicitAndSurvivesCompaction() throws {
+        let source = Data(#"{"tiered":{"input_cost_per_token":0.000001,"output_cost_per_token":0.000002,"cache_read_input_token_cost_above_272k_tokens":0.0000002}}"#.utf8)
+
+        let catalog = try PricingCatalogCodecs.catalogFromLiteLLM(source)
+        let original = try XCTUnwrap(catalog.entries["tiered"])
+        XCTAssertTrue(original.cacheReadIsExplicit)
+
+        let compact = try PricingCatalogCodecs.compactData(from: catalog)
+        let restored = try XCTUnwrap(PricingCatalogCodecs.catalogFromCompact(compact).entries["tiered"])
+        XCTAssertTrue(restored.cacheReadIsExplicit)
+        XCTAssertEqual(
+            restored.costDollars(for: TokenBreakdown(cacheRead: 272_001)),
+            272_001 * 0.2 / 1_000_000,
+            accuracy: 0.000_001
+        )
     }
 
     func testOpenRouterCodecAddsOnlyUniqueBaseAliasesAndKeepsVariantPricingExact() throws {
@@ -262,6 +455,130 @@ final class ModelPricingTests: XCTestCase {
         let rates = try XCTUnwrap(catalog.findExact("model-a")?.rates)
         XCTAssertEqual(rates.cacheReadPerMillion, 3, "unknown caching must not assume a discount")
         XCTAssertFalse(rates.cacheReadIsExplicit)
+    }
+
+    func testOpenRouterCachePricesAndMultiplePromptTiersSurviveCompactCaching() throws {
+        let source = Data(#"""
+        {
+          "data": [
+            {
+              "id": "qwen/qwen3.7-flash",
+              "pricing": {
+                "prompt": "0.00000003",
+                "completion": "0.00000013",
+                "input_cache_read": "0.000000006",
+                "input_cache_write": "0.000000038",
+                "input_cache_write_1h": "0.00000006",
+                "overrides": [
+                  {
+                    "min_prompt_tokens": 32000,
+                    "prompt": "0.0000001",
+                    "completion": "0.0000004",
+                    "input_cache_read": "0.00000002",
+                    "input_cache_write": "0.000000125",
+                    "input_cache_write_1h": "0.0000002"
+                  },
+                  {
+                    "min_prompt_tokens": 256000,
+                    "prompt": "0.0000002",
+                    "completion": "0.0000008",
+                    "input_cache_read": "0.00000004",
+                    "input_cache_write": "0.00000025",
+                    "input_cache_write_1h": "0.0000005"
+                  },
+                  {"utc_days": ["monday"], "prompt": "0.0001", "completion": "0.0002"}
+                ]
+              }
+            }
+          ],
+          "total_count": 1,
+          "links": {"next": null}
+        }
+        """#.utf8)
+
+        let fetched = try PricingCatalogCodecs.catalogFromOpenRouter(source)
+        let original = try XCTUnwrap(fetched.findExact("qwen/qwen3.7-flash")?.rates)
+        XCTAssertEqual(original.cacheWritePerMillion, 0.038, accuracy: 0.000_001)
+        XCTAssertEqual(original.cacheReadPerMillion, 0.006, accuracy: 0.000_001)
+        XCTAssertEqual(try XCTUnwrap(original.cacheWrite1hPerMillion), 0.06, accuracy: 0.000_001)
+        XCTAssertTrue(original.cacheReadIsExplicit)
+        XCTAssertEqual(original.promptRateTiers.count, 2, "time-of-day overrides are not prompt-length tiers")
+        XCTAssertTrue(original.promptRateTiers[0].includesThreshold)
+
+        let cached = try PricingCatalogCodecs.catalogFromCompact(
+            PricingCatalogCodecs.compactData(from: fetched)
+        )
+        let restored = try XCTUnwrap(cached.findExact("qwen/qwen3.7-flash")?.rates)
+        XCTAssertEqual(restored, original)
+
+        XCTAssertEqual(
+            original.costDollars(for: TokenBreakdown(input: 31_999)),
+            Double(31_999) * 0.03 / 1_000_000,
+            accuracy: 0.000_000_001
+        )
+        XCTAssertEqual(
+            original.costDollars(for: TokenBreakdown(input: 32_000)),
+            32_000 * 0.1 / 1_000_000,
+            accuracy: 0.000_000_001,
+            "OpenRouter's min_prompt_tokens threshold is inclusive"
+        )
+        XCTAssertEqual(
+            original.costDollars(for: TokenBreakdown(input: 256_000)),
+            256_000 * 0.2 / 1_000_000,
+            accuracy: 0.000_000_001
+        )
+
+        var allBuckets = TokenBreakdown(input: 1_000_000, cacheWrite5m: 1_000_000, cacheWrite1h: 1_000_000, cacheRead: 1_000_000, output: 1_000_000)
+        XCTAssertEqual(original.costDollars(for: allBuckets), 1.79, accuracy: 0.000_001)
+        allBuckets.isFast = true
+        XCTAssertEqual(original.costDollars(for: allBuckets), 1.79, accuracy: 0.000_001)
+    }
+
+    func testOpenRouterGPT61Sol272KBoundaryIsExclusiveForStandardAndBatch() throws {
+        let source = Data(#"""
+        {
+          "data": [
+            {
+              "id": "openai/gpt-6.1-sol",
+              "pricing": {
+                "prompt": "0.000002", "completion": "0.00001",
+                "overrides": [{"min_prompt_tokens":272000,"prompt":"0.000004","completion":"0.000015"}]
+              }
+            },
+            {
+              "id": "openai/gpt-6.1-sol:batch",
+              "pricing": {
+                "prompt": "0.000001", "completion": "0.000005",
+                "overrides": [{"min_prompt_tokens":272000,"prompt":"0.000002","completion":"0.0000075"}]
+              }
+            },
+            {
+              "id": "vendor/other-model",
+              "pricing": {
+                "prompt": "0.000001", "completion": "0.000002",
+                "overrides": [{"min_prompt_tokens":32000,"prompt":"0.000003","completion":"0.000004"}]
+              }
+            }
+          ],
+          "total_count": 3,
+          "links": {"next": null}
+        }
+        """#.utf8)
+
+        let catalog = try PricingCatalogCodecs.catalogFromOpenRouter(source)
+        let standard = try XCTUnwrap(catalog.findExact("openai/gpt-6.1-sol")?.rates)
+        let batch = try XCTUnwrap(catalog.findExact("openai/gpt-6.1-sol:batch")?.rates)
+        let ordinary = try XCTUnwrap(catalog.findExact("vendor/other-model")?.rates)
+
+        XCTAssertFalse(try XCTUnwrap(standard.promptRateTiers.first).includesThreshold)
+        XCTAssertFalse(try XCTUnwrap(batch.promptRateTiers.first).includesThreshold)
+        XCTAssertEqual(standard.costDollars(for: TokenBreakdown(input: 272_000)), 0.544, accuracy: 0.000_001)
+        XCTAssertEqual(standard.costDollars(for: TokenBreakdown(input: 272_001)), 1.088004, accuracy: 0.000_001)
+        XCTAssertEqual(batch.costDollars(for: TokenBreakdown(input: 272_000)), 0.272, accuracy: 0.000_001)
+        XCTAssertEqual(batch.costDollars(for: TokenBreakdown(input: 272_001)), 0.544002, accuracy: 0.000_001)
+        XCTAssertTrue(try XCTUnwrap(ordinary.promptRateTiers.first).includesThreshold,
+                      "other OpenRouter min_prompt_tokens tiers remain inclusive")
+        XCTAssertEqual(ordinary.costDollars(for: TokenBreakdown(input: 32_000)), 0.096, accuracy: 0.000_001)
     }
 
     func testOpenRouterCodecRejectsIncompletePaginatedFeed() {
