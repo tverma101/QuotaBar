@@ -23,6 +23,9 @@ final class CodexProvider: ProviderRuntime {
     let piUsageScanner: PiUsageScanner
     let expectedIdentityKey: String?
     private var lastResolvedAccountIdentityKey: String?
+    private var lastNativeScan: LogUsageScan?
+    private var lastProxyScan: LogUsageScan?
+    private var lastPiScan: LogUsageScan?
     let allowsKeychainFallback: Bool
     let allowsUnattributedPiUsage: Bool
     /// Higher-priority peer homes are identity-only sources for excluding shared rollouts. They are
@@ -397,63 +400,82 @@ final class CodexProvider: ProviderRuntime {
         }
         // Native sessions may contain days that never passed through Codex Router. Their per-file
         // aggregates skip unchanged events, so preserving gap-fill history needs no repeated fold.
-        let nativeResult = await logUsageScanner.scanResult(
-            daysBack: UsageHistoryWindow.lifetimeDays(through: now),
-            now: now,
-            pricing: pricing,
-            peerHomes: peerHomes()
-        )
-        guard !Task.isCancelled else { return nil }
+        let isLocalAccountingWake = ProviderRefreshContext.scope == .localAccounting
+
         let nativeScan: LogUsageScan?
-        switch nativeResult {
-        case .complete(let scan):
-            nativeScan = scan
-            DiagnosticGate.clearFailure(nativeIncompleteDiagnosticKey)
-        case .incomplete:
-            DiagnosticGate.logOnce(for: nativeIncompleteDiagnosticKey) {
-                AppLog.warn(
-                    LogTag.plugin("codex"),
-                    "Codex session discovery or fold was incomplete; keeping the previous combined usage history"
-                )
+        if isLocalAccountingWake, let cached = lastNativeScan {
+            nativeScan = cached
+        } else {
+            let nativeResult = await logUsageScanner.scanResult(
+                daysBack: UsageHistoryWindow.lifetimeDays(through: now),
+                now: now,
+                pricing: pricing,
+                peerHomes: peerHomes()
+            )
+            guard !Task.isCancelled else { return nil }
+            switch nativeResult {
+            case .complete(let scan):
+                nativeScan = scan
+                lastNativeScan = scan
+                DiagnosticGate.clearFailure(nativeIncompleteDiagnosticKey)
+            case .incomplete:
+                DiagnosticGate.logOnce(for: nativeIncompleteDiagnosticKey) {
+                    AppLog.warn(
+                        LogTag.plugin("codex"),
+                        "Codex session discovery or fold was incomplete; keeping the previous combined usage history"
+                    )
+                }
+                return nil
             }
-            return nil
         }
-        let proxyResult = await proxyUsageScanner.scanResult(
-            accountIdentityKey: accountIdentityKey,
-            daysBack: UsageHistoryWindow.lifetimeDays(through: now),
-            now: now,
-            pricing: pricing
-        )
-        guard !Task.isCancelled else { return nil }
+
         let proxyScan: LogUsageScan?
-        switch proxyResult {
-        case .complete(let scan):
-            proxyScan = scan
-        case .incomplete:
-            return nil
-        }
-        let piResult: PiUsageScanResult = allowsUnattributedPiUsage
-            ? await piUsageScanner.scanResult(
-                cardID: provider.id,
+        if isLocalAccountingWake, let cached = lastProxyScan {
+            proxyScan = cached
+        } else {
+            let proxyResult = await proxyUsageScanner.scanResult(
+                accountIdentityKey: accountIdentityKey,
                 daysBack: UsageHistoryWindow.lifetimeDays(through: now),
                 now: now,
                 pricing: pricing
             )
-            : .complete(nil)
-        guard !Task.isCancelled else { return nil }
-        let piScan: LogUsageScan?
-        switch piResult {
-        case .complete(let scan):
-            piScan = scan
-            DiagnosticGate.clearFailure(piIncompleteDiagnosticKey)
-        case .incomplete:
-            DiagnosticGate.logOnce(for: piIncompleteDiagnosticKey) {
-                AppLog.warn(
-                    LogTag.plugin("codex"),
-                    "Pi session discovery was incomplete; keeping the previous combined usage history"
-                )
+            guard !Task.isCancelled else { return nil }
+            switch proxyResult {
+            case .complete(let scan):
+                proxyScan = scan
+                lastProxyScan = scan
+            case .incomplete:
+                return nil
             }
-            return nil
+        }
+
+        let piScan: LogUsageScan?
+        if isLocalAccountingWake, let cached = lastPiScan {
+            piScan = cached
+        } else {
+            let piResult: PiUsageScanResult = allowsUnattributedPiUsage
+                ? await piUsageScanner.scanResult(
+                    cardID: provider.id,
+                    daysBack: UsageHistoryWindow.lifetimeDays(through: now),
+                    now: now,
+                    pricing: pricing
+                )
+                : .complete(nil)
+            guard !Task.isCancelled else { return nil }
+            switch piResult {
+            case .complete(let scan):
+                piScan = scan
+                lastPiScan = scan
+                DiagnosticGate.clearFailure(piIncompleteDiagnosticKey)
+            case .incomplete:
+                DiagnosticGate.logOnce(for: piIncompleteDiagnosticKey) {
+                    AppLog.warn(
+                        LogTag.plugin("codex"),
+                        "Codex pi session discovery was incomplete; keeping the previous combined usage history"
+                    )
+                }
+                return nil
+            }
         }
         // Multi-account cards (expectedIdentityKey set): prefer CodexRouter stamped metering as
         // primary. Shared ~/.codex session trees often mix both accounts' history, so logs-first

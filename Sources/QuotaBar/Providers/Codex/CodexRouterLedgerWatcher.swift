@@ -29,12 +29,14 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
     private let debounceNanoseconds: UInt64
     /// Mutated only on `queue` (the debounce/tap handlers run there).
     private var closedPanelWakeGate: BackgroundRefreshGate
+    private var panelOpenWakeGate: BackgroundRefreshGate
 
     private typealias SourceRecord = (source: DispatchSourceFileSystemObject, descriptor: Int32)
     private var fileSources: [String: SourceRecord] = [:]
     private var directorySources: [String: SourceRecord] = [:]
     private var debounceWorkItem: DispatchWorkItem?
     private var trailingClosedPanelWakeWorkItem: DispatchWorkItem?
+    private var trailingPanelOpenWakeWorkItem: DispatchWorkItem?
     private var started = false
     /// Standardized ledger path → size when last armed/observed (directory-wake filter).
     private var lastLedgerSizes: [String: UInt64] = [:]
@@ -48,6 +50,9 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
         debounceNanoseconds: UInt64 = 1_000_000_000,
         closedPanelWakeGate: BackgroundRefreshGate = BackgroundRefreshGate(
             minimumInterval: BackgroundRefreshTrigger.minimumPassInterval
+        ),
+        panelOpenWakeGate: BackgroundRefreshGate = BackgroundRefreshGate(
+            minimumInterval: 10.0
         )
     ) {
         self.ledgerPaths = ledgerPaths ?? {
@@ -60,6 +65,7 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
         self.center = center
         self.debounceNanoseconds = debounceNanoseconds
         self.closedPanelWakeGate = closedPanelWakeGate
+        self.panelOpenWakeGate = panelOpenWakeGate
     }
 
     func start() {
@@ -80,6 +86,8 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
                 self.debounceWorkItem = nil
                 self.trailingClosedPanelWakeWorkItem?.cancel()
                 self.trailingClosedPanelWakeWorkItem = nil
+                self.trailingPanelOpenWakeWorkItem?.cancel()
+                self.trailingPanelOpenWakeWorkItem = nil
             }
         }
     }
@@ -92,6 +100,7 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
         teardownSources()
         debounceWorkItem?.cancel()
         trailingClosedPanelWakeWorkItem?.cancel()
+        trailingPanelOpenWakeWorkItem?.cancel()
     }
 
     private func installSources() {
@@ -274,18 +283,25 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
     }
 
     private func postIfWorthy() {
-        // Panel-open wakes are ungated: the user is actively looking at spend tiles. Closed-panel
-        // wakes pass the background gate so a continuous turn stream wakes the loop at most once
-        // per cooldown window. A rejected event schedules one trailing wake at the next allowed
-        // time, so the final append is not lost when no later file event arrives.
+        // Panel-open wakes have a 10s cooldown to prevent streaming agents from pinning CPU at 100%.
+        // Closed-panel wakes pass the 15s background gate. In both cases, a rejected event schedules
+        // a trailing wake at the next allowed time, ensuring no final append is lost.
+        let now = Date()
         if isPanelOpen() {
             trailingClosedPanelWakeWorkItem?.cancel()
             trailingClosedPanelWakeWorkItem = nil
+            guard panelOpenWakeGate.shouldAccept(at: now) else {
+                scheduleTrailingPanelOpenWake(after: panelOpenWakeGate.delayUntilNextAcceptance(at: now))
+                return
+            }
+            trailingPanelOpenWakeWorkItem?.cancel()
+            trailingPanelOpenWakeWorkItem = nil
             center.post(name: Self.didChangeNotification, object: nil)
             return
         }
 
-        let now = Date()
+        trailingPanelOpenWakeWorkItem?.cancel()
+        trailingPanelOpenWakeWorkItem = nil
         guard closedPanelWakeGate.shouldAccept(at: now) else {
             scheduleTrailingClosedPanelWake(after: closedPanelWakeGate.delayUntilNextAcceptance(at: now))
             return
@@ -293,6 +309,17 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
         trailingClosedPanelWakeWorkItem?.cancel()
         trailingClosedPanelWakeWorkItem = nil
         center.post(name: Self.didChangeNotification, object: nil)
+    }
+
+    private func scheduleTrailingPanelOpenWake(after delay: TimeInterval) {
+        guard trailingPanelOpenWakeWorkItem == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.trailingPanelOpenWakeWorkItem = nil
+            self.postIfWorthy()
+        }
+        trailingPanelOpenWakeWorkItem = work
+        queue.asyncAfter(deadline: .now() + max(0, delay), execute: work)
     }
 
     private func scheduleTrailingClosedPanelWake(after delay: TimeInterval) {

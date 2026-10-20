@@ -348,6 +348,18 @@ final class WidgetDataStore {
         }
     }
 
+    func descriptor(id: String) -> WidgetDescriptor? {
+        registry.descriptor(id: id)
+    }
+
+    /// Whether any pinned metric derives from a ledger append (Codex spend or OpenCode metrics).
+    func closedPanelLedgerWakeAffectsVisibleMetrics() -> Bool {
+        MenuBarRefreshFilter.closedPanelLedgerWakeAffectsVisibleMetrics(
+            pinnedMetricIDs: pinnedMetricIDs(),
+            descriptorForMetric: { [registry] id in registry.descriptor(id: id) }
+        )
+    }
+
     /// Refresh every enabled provider, concurrently by default — one slow provider never delays the
     /// rest. Callers can cap the first pass with `maxConcurrentProviders` so a cold launch with large
     /// local indexes does not start every parser and network client at once; later periodic passes keep
