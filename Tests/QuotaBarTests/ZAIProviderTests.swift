@@ -152,8 +152,12 @@ final class ZAIAuthStoreTests: XCTestCase {
 // MARK: - ZAIUsageMapperTests
 
 final class ZAIUsageMapperTests: XCTestCase {
+    /// The mapper only accepts a reset that is still ahead of the reference time, so the fixtures'
+    /// reset instants are read against a fixed "now" that sits before them.
+    private let now = Date(timeIntervalSince1970: 1_770_000_000)
+
     func testMapsBothLimitsToSessionAndWebSearches() throws {
-        let mapped = try ZAIUsageMapper.map(quotaBody: data(quotaBothLimitsJSON), subscriptionBody: data(subscriptionJSON))
+        let mapped = try ZAIUsageMapper.map(quotaBody: data(quotaBothLimitsJSON), subscriptionBody: data(subscriptionJSON), now: now)
 
         XCTAssertEqual(mapped.plan, "GLM Coding Max")
 
@@ -248,6 +252,44 @@ final class ZAIUsageMapperTests: XCTestCase {
         XCTAssertEqual(weekly.used, 25, accuracy: 0.001)
     }
 
+    func testStaleResetTimestampIsDroppedSoTheCadenceAnswers() throws {
+        // A zero reset instant becomes 1 Jan 1970, which renders as "Resets soon" on every refresh.
+        let body = data(#"""
+        {"data":{"limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":15,"nextResetTime":0}]}}
+        """#)
+        let mapped = try ZAIUsageMapper.map(quotaBody: body, subscriptionBody: nil, now: now)
+
+        let session = try XCTUnwrap(progress(mapped.lines, "Session"))
+        XCTAssertNil(session.resetsAt)
+        XCTAssertEqual(session.periodDurationMs, 5 * 60 * 60 * 1000,
+                       "the meter's own cadence still answers when the reset instant is unusable")
+    }
+
+    func testZeroWebSearchCapProducesNoMeter() throws {
+        // A zero cap means the plan carries no web-search allowance; an empty meter would read as
+        // "0 searches used" against an allowance that does not exist.
+        let body = data(#"""
+        {"data":{"limits":[{"type":"TIME_LIMIT","unit":5,"number":1,"usage":0,"currentValue":0}]}}
+        """#)
+        let lines = try ZAIUsageMapper.mapQuota(body, now: now)
+
+        XCTAssertNil(lines.first { $0.label == "Web Searches" })
+        XCTAssertFalse(lines.contains { line in
+            guard case .progress(_, _, let limit, _, _, _, _, _) = line else { return false }
+            return limit == 0
+        }, "a meter with a zero limit would read as an untouched allowance")
+    }
+
+    func testZeroWebSearchCapIsNotReportedAsABrokenResponse() throws {
+        let body = data(#"""
+        {"data":{"limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":15},{"type":"TIME_LIMIT","unit":5,"number":1,"usage":0,"currentValue":0}]}}
+        """#)
+        let lines = try ZAIUsageMapper.mapQuota(body, now: now)
+
+        XCTAssertNotNil(lines.first { $0.label == "Session" })
+        XCTAssertNil(lines.first { $0.label == "Web Searches" })
+    }
+
     private func progress(_ lines: [MetricLine], _ label: String) -> (used: Double, limit: Double, format: ProgressFormat, resetsAt: Date?, periodDurationMs: Int?)? {
         guard case .progress(_, let used, let limit, let format, let resetsAt, let periodDurationMs, _, _) = lines.first(where: { $0.label == label }) else {
             return nil
@@ -314,6 +356,40 @@ final class ZAIProviderTests: XCTestCase {
         XCTAssertFalse(snapshot.lines.contains { $0.isError })
         XCTAssertNotNil(snapshot.line(label: "Session"))
         XCTAssertNil(snapshot.plan)
+    }
+
+    func testPlanNameIsReadOnceAndKeptWhenTheRequestFails() async {
+        // The plan name changes about once a month; re-reading it on every refresh doubled the
+        // provider's request count, and a failed request used to drop the label from the card.
+        let clock = ZAIMutableClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let subscription = ZAIRequestCounter()
+        let provider = ZAIProvider(
+            authStore: makeAuthStore(key: "zai-test"),
+            usageClient: ZAIUsageClient(http: RoutingHTTPClient { request in
+                if request.url == ZAIUsageClient.quotaURL {
+                    return jsonResponse(quotaBothLimitsJSON)
+                }
+                subscription.value += 1
+                if subscription.failing {
+                    return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+                }
+                return jsonResponse(subscriptionJSON)
+            }),
+            now: { clock.value }
+        )
+
+        let first = await provider.refresh()
+        XCTAssertEqual(first.plan, "GLM Coding Max")
+
+        let second = await provider.refresh()
+        XCTAssertEqual(second.plan, "GLM Coding Max")
+        XCTAssertEqual(subscription.value, 1, "the plan name must not be re-read on every refresh")
+
+        subscription.failing = true
+        clock.value = clock.value.addingTimeInterval(ZAIProvider.planCacheInterval + 60)
+        let third = await provider.refresh()
+        XCTAssertEqual(third.plan, "GLM Coding Max", "a failed plan request must not drop the label")
+        XCTAssertEqual(subscription.value, 2)
     }
 
     func testRefreshWithoutKeyReportsNotLoggedIn() async {
@@ -447,4 +523,19 @@ final class ZAIProviderTests: XCTestCase {
 
 private func jsonResponse(_ jsonString: String) -> HTTPResponse {
     HTTPResponse(statusCode: 200, headers: [:], body: Data(jsonString.utf8))
+}
+
+/// A clock a test can move forward.
+private final class ZAIMutableClock: @unchecked Sendable {
+    var value: Date
+
+    init(_ value: Date) {
+        self.value = value
+    }
+}
+
+/// A request counter a test can also make fail.
+private final class ZAIRequestCounter: @unchecked Sendable {
+    var value = 0
+    var failing = false
 }

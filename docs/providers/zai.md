@@ -8,7 +8,7 @@ Tracks [Z.ai](https://z.ai) (Zhipu AI) GLM Coding Plan usage quotas for coding s
 |---|---|
 | Session | 5-hour rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
 | Weekly | 7-day rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
-| Web Searches | Monthly web-search / web-reader / Zread calls (used / limit) |
+| Web Searches | Monthly web-search / web-reader / Zread calls (used / limit); hidden when the plan carries no web-search allowance |
 
 When Z.ai reports your plan name, QuotaBar shows it beside the provider name.
 
@@ -42,14 +42,18 @@ export ZAI_API_KEY="YOUR_API_KEY"
 Two undocumented internal endpoints Z.ai's own subscription UI uses (stable in practice):
 
 - `GET https://api.z.ai/api/biz/subscription/list` — plan name (best-effort; a failure here doesn't
-  blank the meters).
+  blank the meters). The plan name changes about once a month, so it is read at most hourly (a manual
+  refresh re-reads it) and the last known name is kept when a request fails.
 - `GET https://api.z.ai/api/monitor/usage/quota/limit` — the quota meters.
 
 The quota response carries a `limits` array. Each `CREDIT_LIMIT` entry (called `TOKENS_LIMIT` in
 older responses) is a percentage quota window; its window length decides which meter it feeds
 (sub-daily → Session, multi-day → Weekly), while a `TIME_LIMIT` entry is the monthly web-search
 count. Reset times come back as epoch milliseconds. Missing required usage values are reported as
-an invalid response instead of being shown as zero.
+an invalid response instead of being shown as zero. A reset time that is zero, stale, or outside a
+believable window is ignored, so the meter falls back to its own cadence ("Resets in 5h") instead of
+reading "Resets soon" forever. A web-search entry with a zero cap means the plan has no web-search
+allowance, so that meter is hidden rather than drawn empty.
 
 ## Troubleshooting
 

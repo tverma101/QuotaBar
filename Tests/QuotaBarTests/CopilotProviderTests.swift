@@ -132,6 +132,19 @@ final class CopilotAuthStoreTests: XCTestCase {
         XCTAssertFalse(logs.contains("[ERROR] [auth:copilot]"), logs)
     }
 
+    func testGitHubCLIConfigIsReadOncePerLoad() throws {
+        // The file carries both the token and the Keychain account; reading it twice per load meant
+        // two file reads on every refresh.
+        let files = CountingCopilotFiles([
+            CopilotAuthStore.ghHostsPath: "github.com:\n  user: tejas\n"
+        ])
+        let store = CopilotAuthStore(files: files, keychain: FakeKeychain())
+
+        _ = try store.loadToken()
+
+        XCTAssertEqual(files.reads(of: CopilotAuthStore.ghHostsPath), 1)
+    }
+
     func testUnreadableEditorConfigFallsThroughToReadableGitHubCLIConfig() throws {
         let store = CopilotAuthStore(
             files: PartiallyUnreadableFiles(
@@ -1298,6 +1311,37 @@ private struct PartiallyUnreadableFiles: TextFileAccessing {
 
     func readText(_ path: String) throws -> String {
         if unreadable.contains(path) { throw CocoaError(.fileReadNoPermission) }
+        guard let text = files[path] else { throw CocoaError(.fileReadNoSuchFile) }
+        return text
+    }
+
+    func writeText(_ path: String, _ text: String) throws {}
+    func remove(_ path: String) throws {}
+}
+
+/// A file accessor that counts how often each file is read.
+private final class CountingCopilotFiles: TextFileAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var files: [String: String]
+    private var readCounts: [String: Int] = [:]
+
+    init(_ files: [String: String]) {
+        self.files = files
+    }
+
+    func reads(of path: String) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return readCounts[path] ?? 0
+    }
+
+    func exists(_ path: String) -> Bool {
+        files[path] != nil
+    }
+
+    func readText(_ path: String) throws -> String {
+        lock.lock()
+        readCounts[path, default: 0] += 1
+        lock.unlock()
         guard let text = files[path] else { throw CocoaError(.fileReadNoSuchFile) }
         return text
     }

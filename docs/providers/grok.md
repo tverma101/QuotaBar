@@ -33,4 +33,4 @@ Today / Yesterday / Last 30 Days are computed **locally** from completed Grok CL
 
 ## Under the hood
 
-`GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` for the weekly pool and pay-as-you-go cap — the exact call the Grok CLI itself makes — and `…/v1/settings` for the plan name; token refresh via `auth.x.ai`. A 401/403 triggers one token refresh and retry. An invalid refresh grant asks you to sign in again; transport and server failures from the token endpoint remain network or HTTP request errors rather than expired-auth errors.
+`GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` for the weekly pool and pay-as-you-go cap — the exact call the Grok CLI itself makes — and `…/v1/settings` for the plan name; token refresh via `auth.x.ai`. A 401/403 triggers one token refresh and retry. An invalid refresh grant asks you to sign in again; transport and server failures from the token endpoint remain network or HTTP request errors rather than expired-auth errors. The plan name changes about once a month, so it is read at most hourly (a manual refresh re-reads it) and the last known name is kept when a request fails.

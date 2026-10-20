@@ -218,6 +218,36 @@ final class FreebuffAuthStoreTests: XCTestCase {
         )
         XCTAssertNil(try store.loadAuth())
     }
+
+    func testCredentialsWithoutDefaultProfileAreReportedAsANamingMismatch() throws {
+        // A renamed profile is not a missing login: the remedy shown must not send the user back to
+        // the CLI for a login that already exists.
+        let path = "/Users/tester/.config/manicode/credentials.json"
+        let store = FreebuffAuthStore(
+            files: FakeFiles([path: #"{"work":{"authToken":"work-token"}}"#]),
+            keychain: FakeKeychain(), environment: FakeEnvironment(),
+            homeDirectory: { URL(fileURLWithPath: "/Users/tester") }
+        )
+
+        let (error, logs) = try captureFreebuffAuthStoreLogs {
+            _ = try store.loadAuth()
+        }
+
+        XCTAssertEqual(error as? FreebuffProfileError, .missingDefaultProfile)
+        XCTAssertTrue(logs.contains("default"), "the missing profile must leave a diagnostic: \(logs)")
+        XCTAssertTrue(store.hasLocalCredentials(), "a configured source stays visible for repair")
+    }
+
+    func testCredentialsWithoutDefaultProfileStillUseTheEnvironmentFallback() throws {
+        let path = "/Users/tester/.config/manicode/credentials.json"
+        let store = FreebuffAuthStore(
+            files: FakeFiles([path: #"{"work":{"authToken":"work-token"}}"#]),
+            keychain: FakeKeychain(), environment: FakeEnvironment(["CODEBUFF_API_KEY": "env-token"]),
+            homeDirectory: { URL(fileURLWithPath: "/Users/tester") }
+        )
+
+        XCTAssertEqual(try store.loadAuth()?.token, "env-token")
+    }
 }
 
 final class FreebuffUsageMapperTests: XCTestCase {
@@ -269,6 +299,20 @@ final class FreebuffUsageMapperTests: XCTestCase {
         XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.number, 15)
         XCTAssertEqual(progress(mapped.lines, "Monthly Spend")?.used, 3.5)
         XCTAssertEqual(progress(mapped.lines, "Monthly Spend")?.limit, 12)
+    }
+
+    func testFractionalSecondResetTimestampsStillParse() throws {
+        // The payload sometimes carries fractional seconds; both forms must resolve.
+        let mapped = try FreebuffUsageMapper.map(response: response([
+            "status": "none",
+            "freebucks": [
+                "balance": 75,
+                "daily": ["limit": 100, "spent": 25, "remaining": 75, "resetAt": "2026-10-14T07:00:00.500Z"]
+            ]
+        ]))
+
+        XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.resetsAt?.timeIntervalSince1970 ?? 0,
+                       1_791_961_200.5, accuracy: 0.001)
     }
 
     func testMapsSubscriberFiveDayAndMonthlyMetersAndActualUsdSpend() throws {
