@@ -116,7 +116,7 @@ final class ProviderSnapshotCachePersistenceTests: XCTestCase {
         let now = Date()
         let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
 
-        let opensBefore = ProviderSnapshotCache.persistentLockOpenCount.withLock { $0 }
+        let opensBefore = PersistentStoreLock.openCount.withLock { $0 }
         for index in 0..<5 {
             cache.store(snapshot("alpha", used: Double(index), now: now))
             cache.beginRefreshOrder(providerID: "alpha")
@@ -127,7 +127,7 @@ final class ProviderSnapshotCachePersistenceTests: XCTestCase {
                 hasHistoryDomain: false
             )
         }
-        let opensAfter = ProviderSnapshotCache.persistentLockOpenCount.withLock { $0 }
+        let opensAfter = PersistentStoreLock.openCount.withLock { $0 }
         XCTAssertLessThanOrEqual(
             opensAfter - opensBefore, 1,
             "the lock file must be opened once and reused"
