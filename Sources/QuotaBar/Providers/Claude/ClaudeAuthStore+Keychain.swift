@@ -89,6 +89,6 @@ extension ClaudeAuthStore {
         else {
             return nil
         }
-        return ClaudeCredentialState(oauth: oauth, source: source, fullData: parsed, inferenceOnly: false)
+        return ClaudeCredentialState(oauth: oauth, source: source, fullData: parsed, rawText: value, inferenceOnly: false)
     }
 }
