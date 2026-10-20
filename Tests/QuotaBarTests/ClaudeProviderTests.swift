@@ -12,6 +12,40 @@ final class ClaudeAuthStoreTests: XCTestCase {
         XCTAssertEqual(credentials?.claudeAiOauth?.subscriptionType, "pro")
     }
 
+    func testPatchCredentialsPreservesUnknownFieldsAndUpdatesOAuth() throws {
+        let original = """
+        {
+          "mcpServers": {"test": {"command": "node"}},
+          "customSetting": 42,
+          "claudeAiOauth": {
+            "accessToken": "old-token",
+            "refreshToken": "old-refresh",
+            "futureField": "keep-me"
+          }
+        }
+        """
+        let newOAuth = ClaudeOAuth(
+            accessToken: "new-token",
+            refreshToken: "new-refresh",
+            expiresAt: 5_000_000_000_000,
+            subscriptionType: "max"
+        )
+
+        let patched = try XCTUnwrap(ClaudeAuthStore.patchCredentials(rawText: original, newOAuth: newOAuth))
+        let data = try XCTUnwrap(patched.data(using: .utf8))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(json["customSetting"] as? Int, 42)
+        let mcp = try XCTUnwrap(json["mcpServers"] as? [String: Any])
+        XCTAssertNotNil(mcp["test"])
+
+        let oauth = try XCTUnwrap(json["claudeAiOauth"] as? [String: Any])
+        XCTAssertEqual(oauth["accessToken"] as? String, "new-token")
+        XCTAssertEqual(oauth["refreshToken"] as? String, "new-refresh")
+        XCTAssertEqual(oauth["futureField"] as? String, "keep-me")
+        XCTAssertEqual(oauth["subscriptionType"] as? String, "max")
+    }
+
     func testCredentialDiagnosticsLabelIsTokenFreeWithSourceRefreshAndExpiredFlags() {
         let now = Date(timeIntervalSince1970: 1_000_000)
         let cases: [(oauth: ClaudeOAuth, source: ClaudeCredentialState.Source, expected: String)] = [

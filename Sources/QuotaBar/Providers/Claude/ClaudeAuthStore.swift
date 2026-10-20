@@ -37,7 +37,22 @@ struct ClaudeCredentialState: Hashable, Sendable {
     var oauth: ClaudeOAuth
     var source: Source
     var fullData: ClaudeCredentialsFile?
+    var rawText: String?
     var inferenceOnly: Bool
+
+    init(
+        oauth: ClaudeOAuth,
+        source: Source,
+        fullData: ClaudeCredentialsFile? = nil,
+        rawText: String? = nil,
+        inferenceOnly: Bool = false
+    ) {
+        self.oauth = oauth
+        self.source = source
+        self.fullData = fullData
+        self.rawText = rawText
+        self.inferenceOnly = inferenceOnly
+    }
 
     /// Whether this candidate carries a non-blank access token — the single definition of "usable"
     /// shared by refresh's candidate filter and the optional local credential probe.
@@ -373,10 +388,9 @@ struct ClaudeAuthStore: Sendable {
     /// The underlying stores provide no atomic compare-and-swap, so this remains best-effort.
     func save(_ state: ClaudeCredentialState, ifUnchanged expected: ClaudeCredentialGeneration) throws -> Bool {
         guard credentialGeneration() == expected else { return false }
-        var fullData = state.fullData ?? ClaudeCredentialsFile()
-        fullData.claudeAiOauth = state.oauth
-        let data = try JSONEncoder().encode(fullData)
-        guard let text = String(data: data, encoding: .utf8) else { return false }
+        guard let text = Self.patchCredentials(rawText: state.rawText, newOAuth: state.oauth) else {
+            return false
+        }
 
         switch state.source {
         case .file:
@@ -393,6 +407,33 @@ struct ClaudeAuthStore: Sendable {
         // NEVER log the credential blob/tokens — only that a rotation was persisted, and to where.
         AppLog.debug(LogTag.auth("claude"), "persisted rotated credentials (source=\(state.source.label))")
         return true
+    }
+
+    /// Patches `claudeAiOauth` in the existing credential payload without dropping unknown keys
+    /// (such as sibling properties or future OAuth fields Claude Code adds).
+    static func patchCredentials(rawText: String?, newOAuth: ClaudeOAuth) -> String? {
+        guard let rawText,
+              let data = rawText.data(using: .utf8),
+              var jsonObject = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            let fullData = ClaudeCredentialsFile(claudeAiOauth: newOAuth)
+            guard let data = try? JSONEncoder().encode(fullData) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+        guard let oauthData = try? JSONEncoder().encode(newOAuth),
+              let oauthJson = (try? JSONSerialization.jsonObject(with: oauthData)) as? [String: Any]
+        else {
+            return nil
+        }
+        var mergedOAuth = (jsonObject["claudeAiOauth"] as? [String: Any]) ?? [:]
+        for (k, v) in oauthJson {
+            mergedOAuth[k] = v
+        }
+        jsonObject["claudeAiOauth"] = mergedOAuth
+        guard let patchedData = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.sortedKeys]) else {
+            return nil
+        }
+        return String(data: patchedData, encoding: .utf8)
     }
 
     /// Why the live-usage endpoint (`/api/oauth/usage`, which backs Session / Weekly / Sonnet / Extra
@@ -578,7 +619,7 @@ struct ClaudeAuthStore: Sendable {
             return (nil, false, true)
         }
         return (
-            ClaudeCredentialState(oauth: oauth, source: .file, fullData: parsed, inferenceOnly: false),
+            ClaudeCredentialState(oauth: oauth, source: .file, fullData: parsed, rawText: text, inferenceOnly: false),
             false,
             false
         )
