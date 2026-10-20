@@ -6,6 +6,7 @@ import Foundation
 enum ProviderCatalog {
     static func make(
         defaults: UserDefaults = .standard,
+        openUsageEnvironment: EnvironmentReading = QuotaBarEnvironmentReader(),
         claudeCards: [ClaudeAccountCard] = [],
         codexCards: [CodexAccountCard] = [],
         claudeIdentityKeys: [String: String] = [:],
@@ -22,7 +23,6 @@ enum ProviderCatalog {
         onOpenCodeGoKeysChanged: @escaping @MainActor () -> Void = {},
         isProviderEnabled: @escaping @MainActor (String) -> Bool = { _ in true }
     ) -> [ProviderRuntime] {
-        let openUsageEnvironment = QuotaBarEnvironmentReader()
         // Discovery and every runtime must share this cache, including the generic fallback used
         // when no account card could be materialized. Otherwise a successful launch-time Safe Storage
         // read can be repeated by the fallback provider on its first refresh.
