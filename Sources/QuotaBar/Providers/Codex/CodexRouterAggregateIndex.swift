@@ -6,11 +6,11 @@ import Foundation
 /// The ledger is append-only and large (tens of MB, well over 100k lines). Keeping those lines as
 /// `Event` values blows past the menu-bar RSS budget, the tail cache then evicts itself, and the next
 /// tap parses the whole file again. This index stores only the priced daily aggregate plus the byte
-/// checkpoint (device, inode, size, mtime, offset, prefix anchor). A panel open whose stat still
+/// checkpoint (device, inode, size, mtime, ctime, offset, prefix anchor). A panel open whose stat still
 /// matches reads nothing. Growth reads only the new bytes. A new inode or a shorter file rebuilds.
 final class CodexRouterAggregateIndex: @unchecked Sendable {
     static let shared = CodexRouterAggregateIndex()
-    static let schema = 5
+    static let schema = 14
     static let maxResidentRecords = 32
 
     struct Key: Codable, Equatable, Sendable {
@@ -31,6 +31,8 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
         var size: UInt64
         var mtimeSec: Int64
         var mtimeNsec: Int64
+        var ctimeSec: Int64
+        var ctimeNsec: Int64
         var offset: UInt64
         var partial: Data
         var discardingOversizedLine: Bool
@@ -43,6 +45,7 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
         var files: [FileCheckpoint]
         var result: LogUsageScan?
         var nextFutureEventAt: Date?
+        var latestIncludedEventAt: Date?
         var complete: Bool
     }
 
@@ -86,6 +89,9 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
         if let future = record.nextFutureEventAt, now >= future {
             return .rebuild
         }
+        if let latest = record.latestIncludedEventAt, latest > now {
+            return .rebuild
+        }
         guard record.files.count == live.count else { return .rebuild }
         var append = false
         for (saved, current) in zip(record.files, live) {
@@ -94,10 +100,13 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
                   saved.inode == current.inode
             else { return .rebuild }
             if current.size == saved.size, current.size == saved.offset {
-                if saved.mtimeSec == current.mtimeSec, saved.mtimeNsec == current.mtimeNsec {
+                if saved.mtimeSec == current.mtimeSec,
+                   saved.mtimeNsec == current.mtimeNsec,
+                   saved.ctimeSec == current.ctimeSec,
+                   saved.ctimeNsec == current.ctimeNsec {
                     continue
                 }
-                // A changed timestamp can mean an in-place rewrite anywhere in the file.
+                // Changed content or metadata time can mean an in-place rewrite anywhere in the file.
                 // The tail anchor cannot prove that earlier events stayed unchanged.
                 return .rebuild
             }
@@ -116,6 +125,7 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
 
     func save(_ record: Record) {
         let id = Self.fingerprint(record.key)
+        let diagnosticKey = "codex.router.aggregate.save.\(id)"
         remember(record, id: id)
         let url = Self.fileURL(id: id)
         do {
@@ -127,8 +137,11 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
             encoder.dateEncodingStrategy = .secondsSince1970
             let data = try encoder.encode(record)
             try data.write(to: url, options: .atomic)
+            DiagnosticGate.clearFailure(diagnosticKey)
         } catch {
-            AppLog.warn(LogTag.plugin("codex"), "router aggregate save failed: \(error.localizedDescription)")
+            DiagnosticGate.logOnce(for: diagnosticKey) {
+                AppLog.warn(LogTag.plugin("codex"), "router aggregate save failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -203,6 +216,8 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
             size: stat.size,
             mtimeSec: stat.mtimeSec,
             mtimeNsec: stat.mtimeNsec,
+            ctimeSec: stat.ctimeSec,
+            ctimeNsec: stat.ctimeNsec,
             offset: offset,
             partial: partial,
             discardingOversizedLine: discardingOversizedLine,
@@ -224,6 +239,8 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
                 size: stat.size,
                 mtimeSec: stat.mtimeSec,
                 mtimeNsec: stat.mtimeNsec,
+                ctimeSec: stat.ctimeSec,
+                ctimeNsec: stat.ctimeNsec,
                 offset: stat.size,
                 partial: Data(),
                 discardingOversizedLine: false,
@@ -239,6 +256,8 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
         var size: UInt64
         var mtimeSec: Int64
         var mtimeNsec: Int64
+        var ctimeSec: Int64
+        var ctimeNsec: Int64
     }
 
     private static func fileStat(_ url: URL) -> RawStat? {
@@ -251,7 +270,9 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
             inode: UInt64(value.st_ino),
             size: UInt64(value.st_size),
             mtimeSec: Int64(value.st_mtimespec.tv_sec),
-            mtimeNsec: Int64(value.st_mtimespec.tv_nsec)
+            mtimeNsec: Int64(value.st_mtimespec.tv_nsec),
+            ctimeSec: Int64(value.st_ctimespec.tv_sec),
+            ctimeNsec: Int64(value.st_ctimespec.tv_nsec)
         )
     }
 

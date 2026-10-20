@@ -399,6 +399,7 @@ final class ZAIProviderTests: XCTestCase {
         let snapshot = await provider.refresh()
 
         XCTAssertEqual(snapshot.errorCategory, .notAvailable)
+        XCTAssertEqual(snapshot.clearsPriorMenuBarQuotaState, true)
         XCTAssertEqual(snapshot.lines.first?.label, "Error")
         guard case .badge(_, let text, _, _) = snapshot.lines.first else {
             return XCTFail("expected an error badge")

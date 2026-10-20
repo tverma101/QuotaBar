@@ -226,13 +226,18 @@ final class BackgroundRefreshTriggerTests: XCTestCase {
         let codex = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
         let opencode = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
         let cursor = Provider(id: "cursor", displayName: "Cursor", icon: .providerMark("cursor"))
-        let descriptors = [codex, opencode, cursor].map {
-            WidgetDescriptor.percent(
-                id: "\($0.id).auto",
-                provider: $0,
-                title: $0.displayName,
+        let descriptors = [codex, opencode, cursor].flatMap { provider -> [WidgetDescriptor] in
+            let quota = WidgetDescriptor.percent(
+                id: "\(provider.id).auto",
+                provider: provider,
+                title: provider.displayName,
                 sessionStartSignal: .zeroUsage
             )
+            guard provider.id == "codex" || provider.id == "opencode" else { return [quota] }
+            let history = WidgetDescriptor.spendTiles(provider: provider).map {
+                $0.exportingHistory(scope: .machineLocal, estimatedCost: true, sourceNote: "local")
+            }
+            return [quota] + history
         }
         let runtimes = [codex, opencode, cursor].map {
             CountingProviderRuntime(

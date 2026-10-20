@@ -1,31 +1,33 @@
 import Foundation
 
-/// Unknown-model discovery: when the current catalogues cannot price a model a user actually used,
-/// revalidate the public OpenRouter catalogue once and fold the result into the next snapshot.
+/// OpenRouter model discovery: when a model has no curated price or exact OpenRouter rate, revalidate
+/// the public catalog once and fold any newly published route into the next pricing snapshot. This
+/// includes names that currently receive only a LiteLLM/models.dev fallback estimate.
 ///
-/// The whole point is cost control. One ledger can mention the same unpriceable slug thousands of
-/// times per pass, and providers re-run on every menu-bar tap, so this path must never turn a miss
-/// into a request:
+/// The whole point is cost control. One ledger can mention the same model name thousands of times
+/// per pass, and providers re-run on every menu-bar tap, so this path must never turn a model into
+/// an unbounded series of requests:
 ///
 /// - `ModelPricing` reports each distinct name once per snapshot; the sink coalesces those reports.
 /// - A round waits for an in-flight hourly refresh and reuses that fetch instead of repeating it.
-/// - Everything else gets a five-minute floor, whether the catalogue fixed the miss or not.
-/// - The unknown names are only a local hint. No name is ever put in a URL, header, or body: the
+/// - Discovery gets a five-minute floor, and stops checking a name after three misses. Normal hourly
+///   catalogue refreshes continue and pick up later model releases without per-model retries.
+/// - The names are only a local hint. No name is ever put in a URL, header, or body: the
 ///   only request this can produce is the same public `/api/v1/models` GET the hourly refresh uses.
 extension ModelPricingStore {
-    /// Floor between catalogue fetches that a newly seen unknown model triggers. The hourly TTL may be
-    /// shortened for a genuinely new model, but never past one fetch per five minutes.
+    /// Floor between catalogue fetches that a newly seen model without an exact OpenRouter route
+    /// triggers. The hourly TTL may be shortened for a new route, but never past one fetch per five minutes.
     static let unknownModelRetryInterval: TimeInterval = 5 * 60
-    /// Consecutive unpriced discovery rounds a name may drive before it stops queuing fetches (see
-    /// `backoff`). A real catalogue change resets the streak by rebuilding pricing.
+    /// Consecutive discovery attempts a name may drive before it stops queuing fetches (see
+    /// `backoff`). An exact OpenRouter match clears the name; unrelated catalog rebuilds do not.
     static let maxDiscoveryMissStreak = 3
     /// Cap on distinct unknown names held in memory. Names never leave the machine, so this only stops
     /// a pathological log from growing the queue and the negative cache without limit.
     static let maxTrackedUnknownModels = 64
 
-    /// Report model names a caller could not price. Duplicate, blank, over-long, and recently
-    /// negative-cached names are dropped; everything else is coalesced into one background
-    /// OpenRouter revalidation.
+    /// Report names without a curated price or exact OpenRouter rate. Duplicate, blank, over-long,
+    /// and recently capped names are filtered; everything else is coalesced into a background
+    /// OpenRouter revalidation, even when another catalog currently supplies a fallback estimate.
     func reportUnknownModels<S: Sequence>(_ names: S) where S.Element == String {
         for name in names { unresolvedSink.record(name) }
     }
@@ -36,6 +38,7 @@ extension ModelPricingStore {
         loadIfNeeded()
         pendingUnknownModels.formUnion(unresolvedSink.drain())
         boundPendingNames()
+        pruneCompletedOpenRouterChecks()
         guard !pendingUnknownModels.isEmpty else {
             await unresolvedDiscoveryTask?.value
             return
@@ -57,16 +60,13 @@ extension ModelPricingStore {
             return
         }
 
-        // Names stay queued across the whole cooling window: a pricing snapshot can outlive the
-        // five-minute floor, and dropping a name on the first attempt would strand it with no later
-        // reporter, because that snapshot already marked the name as reported.
-        pendingUnknownModels = pendingUnknownModels.filter { !pricing.isPriced($0) }
         let wanted = takeUnknownModelsWorthRevalidating()
         guard !wanted.isEmpty else { return }
         guard openRouterAttemptCount == attemptsBefore else {
             // The fetch we waited on already revalidated OpenRouter and `pricing` reflects it. Back
-            // the names off rather than repeating the same GET seconds later.
+            // the names off and count its result rather than repeating the same GET seconds later.
             backoff(wanted)
+            applyMissStreak(wanted)
             return
         }
         guard isDiscoveryAllowedByRefreshScope() else {
@@ -101,6 +101,7 @@ extension ModelPricingStore {
     func scheduleUnresolvedDiscoveryIfQueued() {
         pendingUnknownModels.formUnion(unresolvedSink.peek())
         boundPendingNames()
+        pruneCompletedOpenRouterChecks()
         guard !pendingUnknownModels.isEmpty, unresolvedFlushTask == nil,
               unresolvedDiscoveryTask == nil, refreshTask == nil,
               isDiscoveryAllowedByRefreshScope(), !failureRetryBlocked(.openRouter),
@@ -132,9 +133,9 @@ extension ModelPricingStore {
         }
         if await fetch(.openRouter) {
             rebuildPricing()
-            let priced = names.filter { pricing.isPriced($0) }
-            if !priced.isEmpty {
-                AppLog.info("pricing", "catalogue discovery priced \(priced.count) of \(names.count) newly seen model name(s)")
+            let matched = names.filter { pricing.hasExactOpenRouterRate($0) }
+            if !matched.isEmpty {
+                AppLog.info("pricing", "OpenRouter catalogue matched \(matched.count) of \(names.count) model name(s)")
             }
         }
         writeSourceStates()
@@ -144,27 +145,27 @@ extension ModelPricingStore {
         applyMissStreak(names)
     }
 
-    /// Keep unpriced names queued through their cooldown so a later full refresh can retry them.
+    /// Keep unmatched names queued through their cooldown so a later pass can retry them.
     private func backoff(_ names: Set<String>) {
         let until = now().addingTimeInterval(Self.unknownModelRetryInterval)
         for name in names { unresolvedBackoff[name] = until }
         for name in names {
-            if pricing.isPriced(name) { pendingUnknownModels.remove(name) }
+            if pricing.hasExactOpenRouterRate(name) { pendingUnknownModels.remove(name) }
             else { pendingUnknownModels.insert(name) }
         }
         boundPendingNames()
         trimBackoff()
     }
 
-    /// Miss accounting for one completed discovery fetch: names the fetched catalogue still cannot
-    /// price burn one miss, and after `maxDiscoveryMissStreak` consecutive fetch-misses a name stops
+    /// Miss accounting for one completed discovery attempt: names the fetched catalogue still has no
+    /// exact OpenRouter rate for burn one miss. After `maxDiscoveryMissStreak` misses, a name stops
     /// queuing fetches — forever-retrying a parse artifact would spend one fetch per floor interval
-    /// indefinitely, and its fetches re-arm `fetchedAt`, starving the hourly refresh. A real
-    /// catalogue change rebuilds pricing, resets the per-snapshot memo, and re-reports the name with
-    /// a fresh streak. Blocked rounds never get here: only fetch attempts count.
+    /// indefinitely, and its fetches re-arm `fetchedAt`, starving the hourly refresh. Unrelated
+    /// catalog changes preserve the streak; a later hourly OpenRouter refresh still detects a newly
+    /// published exact route. Blocked rounds never get here: only actual OpenRouter attempts count.
     private func applyMissStreak(_ names: Set<String>) {
         for name in names {
-            if pricing.isPriced(name) {
+            if pricing.hasExactOpenRouterRate(name) {
                 unresolvedMissStreaks[name] = nil
                 continue
             }
@@ -182,6 +183,7 @@ extension ModelPricingStore {
         let timestamp = now()
         var wanted = Set<String>()
         for name in pendingUnknownModels {
+            guard (unresolvedMissStreaks[name] ?? 0) < Self.maxDiscoveryMissStreak else { continue }
             guard let eligibleAt = unresolvedBackoff[name] else {
                 wanted.insert(name)
                 continue
@@ -189,6 +191,21 @@ extension ModelPricingStore {
             if timestamp >= eligibleAt { wanted.insert(name) }
         }
         return Set(wanted.sorted().prefix(Self.maxTrackedUnknownModels))
+    }
+
+    /// Clear completed or exhausted candidates after a catalog rebuild or before scheduling work.
+    /// Exact OpenRouter matches no longer need discovery; capped misses stay stopped even when a
+    /// different source causes a new pricing snapshot and the model name is reported again.
+    func pruneCompletedOpenRouterChecks() {
+        let matched = pendingUnknownModels.filter { pricing.hasExactOpenRouterRate($0) }
+        let exhausted = pendingUnknownModels.filter {
+            (unresolvedMissStreaks[$0] ?? 0) >= Self.maxDiscoveryMissStreak
+        }
+        for name in matched {
+            unresolvedMissStreaks[name] = nil
+            unresolvedBackoff[name] = nil
+        }
+        for name in matched.union(exhausted) { pendingUnknownModels.remove(name) }
     }
 
     private func boundPendingNames() {

@@ -30,10 +30,12 @@ final class OpenRouterProvider: ProviderRuntime {
         [
             .boundedDollars(id: "openrouter.credits", provider: provider, title: "Credits",
                             metricLabel: "Credits", limit: 100, limitNoun: "purchased")
-                .exportingLimit("credits", unit: "usd"),
+                .exportingLimit("credits", unit: "usd")
+                .hidingWhenEmpty(),
             .dollarBalance(id: "openrouter.balance", provider: provider, title: "Balance",
                            metricLabel: "Balance", valueWord: "left")
-                .exportingLimit("balance", kind: .balance, unit: "usd", source: .value(kind: .dollars)),
+                .exportingLimit("balance", kind: .balance, unit: "usd", source: .value(kind: .dollars))
+                .hidingWhenEmpty(),
             .values(id: "openrouter.today", provider: provider, title: "Today",
                     metricLabel: "Today", selection: .kind(.dollars), isUsagePeriod: true),
             .values(id: "openrouter.week", provider: provider, title: "This Week",

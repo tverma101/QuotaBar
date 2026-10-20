@@ -1657,4 +1657,48 @@ extension LayoutStoreTests {
 
         XCTAssertEqual(store.explicitlyEnabledMetricIDs, ["claude.extra"])
     }
+
+    func testUpgradeInfersManualConditionalRowsOutsideTheHistoricalDefaultSet() throws {
+        let defaults = makeDefaults("InferLegacyConditionalOptIn")
+        let conditional = try conditionalDescriptor()
+        let descriptors = MockData.descriptors.filter { $0.id != conditional.id } + [conditional]
+        let registry = WidgetRegistry(providers: MockData.providers, descriptors: descriptors)
+        saveStored([
+            PlacedWidget(id: UUID(), descriptorID: "claude.session"),
+            PlacedWidget(id: UUID(), descriptorID: "claude.extra")
+        ], forKey: "layout", in: defaults)
+        saveStored(["claude.session"], forKey: "layout.seededDefaults", in: defaults)
+
+        let store = LayoutStore(
+            registry: registry,
+            defaults: defaults,
+            storageKey: "layout",
+            defaultMetricIDs: ["claude.session"],
+            migrationBaselineMetricIDs: ["claude.session"]
+        )
+
+        XCTAssertTrue(store.explicitlyEnabledMetricIDs.contains("claude.extra"))
+        XCTAssertTrue(store.showsRow(conditional, hasData: false))
+        XCTAssertEqual(defaults.stringArray(forKey: "layout.explicitlyEnabledMetrics"), ["claude.extra"])
+    }
+
+    func testUpgradeDoesNotInferAManualOptInFromAnAmbiguousDefaultRow() throws {
+        let defaults = makeDefaults("DoNotInferDefaultOptIn")
+        let conditional = try conditionalDescriptor()
+        let descriptors = MockData.descriptors.filter { $0.id != conditional.id } + [conditional]
+        let registry = WidgetRegistry(providers: MockData.providers, descriptors: descriptors)
+        saveStored([PlacedWidget(id: UUID(), descriptorID: "claude.extra")], forKey: "layout", in: defaults)
+        saveStored(["claude.extra"], forKey: "layout.seededDefaults", in: defaults)
+
+        let store = LayoutStore(
+            registry: registry,
+            defaults: defaults,
+            storageKey: "layout",
+            defaultMetricIDs: ["claude.extra"],
+            migrationBaselineMetricIDs: ["claude.extra"]
+        )
+
+        XCTAssertFalse(store.explicitlyEnabledMetricIDs.contains("claude.extra"))
+        XCTAssertFalse(store.showsRow(conditional, hasData: false))
+    }
 }

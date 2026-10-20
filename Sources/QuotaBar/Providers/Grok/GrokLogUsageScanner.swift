@@ -1,9 +1,12 @@
 import Foundation
+import CoreFoundation
+import Darwin
 
 /// Builds Grok's daily usage from completed turns in the CLI's durable session transcripts.
 /// `logs/unified.jsonl` is a capped debug log, so it cannot back historical spend or reliable model
 /// attribution. Session `updates.jsonl` files carry both per-model token counts and Grok's own costs.
 actor GrokLogUsageScanner {
+    private static let futureTimestampDiagnosticKey = "grok.sessions.future-timestamp"
     private let environment: EnvironmentReading
     private let homeDirectory: @Sendable () -> URL
     private let scanner: IncrementalJSONLScanner<Entry>
@@ -21,7 +24,7 @@ actor GrokLogUsageScanner {
     private static let sharedScanner = IncrementalJSONLScanner<Entry>(
         retainResidentItems: false,
         logTag: LogTag.plugin("grok"),
-        persistence: JSONLScanCachePersistence(namespace: "grok", schemaVersion: 1)
+        persistence: JSONLScanCachePersistence(namespace: "grok", schemaVersion: 2)
     )
 
     static func flushPersistentCacheWrites() async {
@@ -44,25 +47,70 @@ actor GrokLogUsageScanner {
         let directory = grokHome().appendingPathComponent("sessions", isDirectory: true)
         let identity = directory.resolvingSymlinksInPath().standardizedFileURL.path
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
-        let files = JSONLScanning.jsonlFiles(under: directory)
-            .filter(Self.isCoordinatorSession)
+        guard let discoveredFiles = JSONLScanning.jsonlFilesIfComplete(under: directory) else {
+            DiagnosticGate.logOnce(for: "grok.sessions.enumeration") {
+                AppLog.warn(LogTag.plugin("grok"), "session files could not be completely enumerated; preserving last-good history")
+            }
+            return nil
+        }
+        DiagnosticGate.clearFailure("grok.sessions.enumeration")
+        var files: [JSONLScanning.DiscoveredFile] = []
+        for file in discoveredFiles where URL(fileURLWithPath: file.path).lastPathComponent == "updates.jsonl" {
+            guard let isCoordinator = Self.isCoordinatorSession(file) else { return nil }
+            if isCoordinator { files.append(file) }
+        }
 
+        let futureIdentity = "grok.sessions.\(identity)"
         guard !files.isEmpty else {
+            FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: [])
             _ = await scanner.items(from: [], since: since, cacheIdentity: identity, parse: Self.parseFile)
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey)
             return nil
         }
 
-        guard let entries = await scanner.items(
+        let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        for file in files where FutureTimestampRevisionGate.shouldDefer(
+            identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
+        ) {
+            Self.logFutureTimestamp()
+            return nil
+        }
+        let bucket = FutureTimestampFoldBucket<Entry>()
+        let complete = await scanner.foldItems(
             from: files,
             since: since,
             cacheIdentity: identity,
-            parse: Self.parseFile
-        ), !Task.isCancelled else { return nil }
-        let deduped = Self.dedup(entries)
+            parseFile: Self.parseFile(at:),
+            visit: { entry in
+                guard entry.tokens.totalTokens > 0 || (entry.carriedCost ?? 0) > 0 else { return }
+                bucket.append(entry, timestamp: entry.timestamp, maximumTimestamp: maximumTimestamp)
+            },
+            fileStarted: { bucket.begin($0) },
+            fileCompleted: { path, _ in bucket.finish(path) }
+        )
+        guard complete, !Task.isCancelled else { return nil }
+        for (path, timestamp) in bucket.futureTimestamps {
+            guard let file = files.first(where: { $0.path == path }),
+                  FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
+            else { return nil }
+        }
+        guard bucket.futureTimestamps.isEmpty else {
+            Self.logFutureTimestamp()
+            return nil
+        }
+        DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey)
+        let deduped = Self.dedup(bucket.items)
         guard !Task.isCancelled else { return nil }
         let result = Self.aggregate(entries: deduped, since: since, pricing: pricing)
         guard !Task.isCancelled else { return nil }
         return result
+    }
+
+    private static func logFutureTimestamp() {
+        DiagnosticGate.logOnce(for: futureTimestampDiagnosticKey) {
+            AppLog.warn(LogTag.plugin("grok"), "session usage contains a timestamp more than five minutes ahead; preserving last-good history")
+        }
     }
 
     private func grokHome() -> URL {
@@ -75,83 +123,159 @@ actor GrokLogUsageScanner {
 
     /// Coordinator turns already include their subagents, so reading both ledgers would charge every
     /// child task twice. Older sessions without a summary remain eligible because their kind is unknown.
-    private static func isCoordinatorSession(_ file: JSONLScanning.DiscoveredFile) -> Bool {
+    private static func isCoordinatorSession(_ file: JSONLScanning.DiscoveredFile) -> Bool? {
         let fileURL = URL(fileURLWithPath: file.path)
-        guard fileURL.lastPathComponent == "updates.jsonl" else { return false }
-
         let summaryURL = fileURL.deletingLastPathComponent().appendingPathComponent("summary.json")
-        guard FileManager.default.fileExists(atPath: summaryURL.path) else { return true }
+        var metadata = stat()
+        guard Darwin.lstat(summaryURL.path, &metadata) == 0 else {
+            if errno == ENOENT {
+                DiagnosticGate.clearFailure(summaryDiagnosticKey(for: file.path))
+                return true
+            }
+            logSummaryFailure(file: file.path, message: "Could not inspect Grok session summary")
+            return nil
+        }
 
         do {
+            guard FileManager.default.isReadableFile(atPath: summaryURL.path) else {
+                logSummaryFailure(file: file.path, message: "Could not read Grok session summary")
+                return nil
+            }
             let data = try Data(contentsOf: summaryURL)
             guard let summary = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                AppLog.warn(LogTag.plugin("grok"), "Session summary is not a JSON object; skipped session")
-                return false
+                logSummaryFailure(file: file.path, message: "Grok session summary is not a JSON object")
+                return nil
             }
-            guard let kind = summary["session_kind"] as? String else { return true }
-            return !kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("subagent")
+            if let rawKind = summary["session_kind"] {
+                guard let kind = rawKind as? String else {
+                    logSummaryFailure(file: file.path, message: "Grok session summary has an invalid session kind")
+                    return nil
+                }
+                DiagnosticGate.clearFailure(summaryDiagnosticKey(for: file.path))
+                return !kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("subagent")
+            }
+            DiagnosticGate.clearFailure(summaryDiagnosticKey(for: file.path))
+            return true
         } catch {
-            AppLog.warn(LogTag.plugin("grok"), "Could not read session summary; skipped session: \(error.localizedDescription)")
-            return false
+            logSummaryFailure(
+                file: file.path,
+                message: "Could not read Grok session summary: \(error.localizedDescription)"
+            )
+            return nil
+        }
+    }
+
+    private static func summaryDiagnosticKey(for path: String) -> String {
+        "grok.session.summary.\(JSONLScanCachePaths.stableFingerprint(path))"
+    }
+
+    private static func logSummaryFailure(file path: String, message: String) {
+        DiagnosticGate.logOnce(for: summaryDiagnosticKey(for: path)) {
+            AppLog.warn(LogTag.plugin("grok"), message)
         }
     }
 
     // MARK: - Session parsing
 
     static func parseFile(_ data: Data) -> [Entry] {
-        let completedTurnMarker = Data("turn_completed".utf8)
         var entries: [Entry] = []
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            guard line.range(of: completedTurnMarker) != nil,
-                  let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
-            else { continue }
-            entries.append(contentsOf: parseCompletedTurn(object))
+            if case .entries(let parsed) = parseLine(Data(line)) { entries.append(contentsOf: parsed) }
         }
         return entries
     }
 
-    private static func parseCompletedTurn(_ object: [String: Any]) -> [Entry] {
+    nonisolated static func parseFile(at url: URL) -> [Entry]? {
+        var entries: [Entry] = []
+        var malformed = false
+        let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
+            switch parseLine(Data(line)) {
+            case .entries(let parsed): entries.append(contentsOf: parsed)
+            case .irrelevant: break
+            case .malformed: malformed = true
+            }
+        }
+        guard readSucceeded, !malformed else { return nil }
+        return entries
+    }
+
+    private enum LineResult {
+        case entries([Entry])
+        case irrelevant
+        case malformed
+    }
+
+    private static let completedTurnMarker = Data("turn_completed".utf8)
+
+    private static func parseLine(_ line: Data) -> LineResult {
+        guard line.range(of: completedTurnMarker) != nil else { return .irrelevant }
+        guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
+            return .malformed
+        }
         let params = object["params"] as? [String: Any]
         let update = (params?["update"] as? [String: Any]) ?? (object["update"] as? [String: Any])
-        guard let update,
-              update["sessionUpdate"] as? String == "turn_completed",
-              let usage = update["usage"] as? [String: Any],
+        guard let update else { return .irrelevant }
+        guard let sessionUpdate = update["sessionUpdate"] as? String else { return .irrelevant }
+        guard sessionUpdate == "turn_completed" else { return .irrelevant }
+        guard let entries = parseCompletedTurn(object, params: params, update: update) else {
+            return .malformed
+        }
+        return .entries(entries)
+    }
+
+    private static func parseCompletedTurn(
+        _ object: [String: Any],
+        params: [String: Any]?,
+        update: [String: Any]
+    ) -> [Entry]? {
+        guard let usage = update["usage"] as? [String: Any],
               let modelUsage = usage["modelUsage"] as? [String: Any],
               let timestamp = timestamp(in: object, params: params)
-        else { return [] }
+        else { return nil }
 
         let metadata = (params?["_meta"] as? [String: Any]) ?? (object["_meta"] as? [String: Any])
-        let eventID = (metadata?["eventId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let topLevelTicks = ProviderParse.number(usage["costUsdTicks"])
+        var eventID: String?
+        if let rawMetadata = params?["_meta"] ?? object["_meta"], !(rawMetadata is NSNull),
+           !(rawMetadata is [String: Any]) { return nil }
+        if let rawID = metadata?["eventId"], !(rawID is NSNull) {
+            guard let text = rawID as? String,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+            eventID = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let topLevelTicks: Double?
+        if let rawTicks = usage["costUsdTicks"], !(rawTicks is NSNull) {
+            guard let ticks = validTicks(rawTicks) else { return nil }
+            topLevelTicks = ticks
+        } else {
+            topLevelTicks = nil
+        }
         var entries: [Entry] = []
 
         for (rawModel, rawUsage) in modelUsage.sorted(by: { $0.key < $1.key }) {
             let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !model.isEmpty,
                   let values = rawUsage as? [String: Any],
-                  let inputValue = ProviderParse.number(values["inputTokens"]),
-                  inputValue >= 0
-            else { continue }
+                  let input = strictCount(values["inputTokens"], required: true),
+                  let output = strictCount(values["outputTokens"], required: true),
+                  let cacheRead = strictCount(values["cachedReadTokens"], required: false),
+                  let cacheWrite = strictCount(values["cacheCreationTokens"], required: false),
+                  cacheRead <= input,
+                  cacheWrite <= input - cacheRead
+            else { return nil }
 
-            // Saturating: `Int(1e30)` is a fatal error, and these counts come from a log another app
-            // writes. A guard on `>= 0` bounds the wrong end.
-            let input = ProviderParse.intFromClampedDouble(inputValue)
-            let cacheRead = min(
-                max(ProviderParse.int(ProviderParse.number(values["cachedReadTokens"]) ?? 0), 0),
-                input
-            )
-            let cacheWrite = min(
-                max(ProviderParse.int(ProviderParse.number(values["cacheCreationTokens"]) ?? 0), 0),
-                input - cacheRead
-            )
             // Grok reports reasoning as a subset of outputTokens, so it must never be added again.
-            let output = max(Int(ProviderParse.number(values["outputTokens"]) ?? 0), 0)
-            let ticks = ProviderParse.number(values["costUsdTicks"])
-                ?? (modelUsage.count == 1 ? topLevelTicks : nil)
-            let carriedCost = ticks.flatMap { $0 >= 0 ? $0 / 10_000_000_000 : nil }
+            let ticks: Double?
+            if let rawTicks = values["costUsdTicks"], !(rawTicks is NSNull) {
+                guard let parsedTicks = validTicks(rawTicks) else { return nil }
+                ticks = parsedTicks
+            } else {
+                ticks = modelUsage.count == 1 ? topLevelTicks : nil
+            }
+            let carriedCost = ticks.map { $0 / 10_000_000_000 }
 
             entries.append(Entry(
-                eventID: eventID?.isEmpty == false ? eventID : nil,
+                eventID: eventID,
                 timestamp: timestamp,
                 model: model,
                 tokens: TokenBreakdown(
@@ -166,16 +290,50 @@ actor GrokLogUsageScanner {
         return entries
     }
 
+    private static func strictCount(_ raw: Any?, required: Bool) -> Int? {
+        guard let raw else { return required ? nil : 0 }
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return nil }
+        let value = number.doubleValue
+        guard value.isFinite,
+              value >= 0,
+              value <= 1e15,
+              value.rounded(.towardZero) == value
+        else { return nil }
+        return Int(value)
+    }
+
+    private static func validTicks(_ raw: Any) -> Double? {
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return nil }
+        let value = number.doubleValue
+        guard value.isFinite,
+              value >= 0,
+              value <= 1e22,
+              value.rounded(.towardZero) == value
+        else { return nil }
+        return value
+    }
+
     private static func timestamp(in object: [String: Any], params: [String: Any]?) -> Date? {
-        for metadata in [params?["_meta"], object["_meta"]] {
-            guard let values = metadata as? [String: Any],
-                  let milliseconds = ProviderParse.number(values["agentTimestampMs"]),
-                  milliseconds > 0
-            else { continue }
-            return Date(timeIntervalSince1970: milliseconds / 1_000)
+        for rawMetadata in [params?["_meta"], object["_meta"]] {
+            guard let rawMetadata else { continue }
+            if rawMetadata is NSNull { continue }
+            guard let values = rawMetadata as? [String: Any] else { return nil }
+            if let rawMilliseconds = values["agentTimestampMs"] {
+                guard let milliseconds = strictCount(rawMilliseconds, required: true), milliseconds > 0 else {
+                    return nil
+                }
+                return Date(timeIntervalSince1970: Double(milliseconds) / 1_000)
+            }
         }
 
-        if let seconds = ProviderParse.number(object["timestamp"]), seconds > 0 {
+        if let rawTimestamp = object["timestamp"] as? NSNumber {
+            guard CFGetTypeID(rawTimestamp) != CFBooleanGetTypeID() else { return nil }
+            let seconds = rawTimestamp.doubleValue
+            guard seconds.isFinite, seconds > 0, seconds <= 1e12 else { return nil }
             return Date(timeIntervalSince1970: seconds)
         }
         if let value = object["timestamp"] as? String {

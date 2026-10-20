@@ -39,6 +39,8 @@ struct ProviderAccountDiscovery: Sendable {
     let defaultOutcomes: [FamilyOutcome]
     let configuredCodexOutcomes: [ConfiguredCodexOutcome]
     let desktopOrganizations: [DesktopOrganization]
+    let desktopKeyCache: SafeStorageKeyCache
+    let didSkipClaudeDesktopDiscovery: Bool
     let desktopAnchor: String
     let normalizedCodexHomesByAnchor: [String: String]
     let defaultCodexHome: String?
@@ -55,6 +57,8 @@ struct DesktopOrganization: Sendable {
 @MainActor
 struct ProviderAccountAssembly {
     let identityKeysByCard: [String: String]
+    var desktopKeyCache: SafeStorageKeyCache = SafeStorageKeyCache()
+    var defaultCodexHome: String? = nil
     var claudeCards: [ClaudeAccountCard] = []
     var codexCards: [CodexAccountCard] = []
 
@@ -79,6 +83,8 @@ struct ProviderAccountAssembly {
     nonisolated static func scanForLaunch(
         waitsForLoginShell: Bool,
         rawRegisteredCodexHomes: [String],
+        discoverClaudeDesktopOrganizations: Bool = true,
+        forceClaudeAccountDiscovery: Bool = false,
         observer: DefaultAccountObserver = DefaultAccountObserver()
     ) -> ProviderAccountDiscovery {
         let homeDirectory = observer.homeDirectory()
@@ -97,7 +103,8 @@ struct ProviderAccountAssembly {
             shellFactsReadable: shellFactsReadable,
             processEnvironment: ProcessInfo.processInfo.environment,
             registeredCodexHomes: registeredHomes,
-            hasRouterChatGPTHomes: !routerHomes.isEmpty
+            hasRouterChatGPTHomes: !routerHomes.isEmpty,
+            forceClaudeAccountDiscovery: forceClaudeAccountDiscovery
         )
         if families.count < ProviderAccountID.families.count {
             AppLog.info(.config, "account identity read skipped for \(ProviderAccountID.families.subtracting(families).sorted().joined(separator: ", ")): login shell cold and no shell-environment snapshot exists yet")
@@ -106,6 +113,7 @@ struct ProviderAccountAssembly {
             observer: observer,
             families: families,
             registeredCodexHomes: registeredHomes,
+            discoverClaudeDesktopOrganizations: discoverClaudeDesktopOrganizations,
             discoveredRouterHomes: routerHomes
         )
     }
@@ -118,11 +126,12 @@ struct ProviderAccountAssembly {
         shellFactsReadable: Bool,
         processEnvironment: [String: String],
         registeredCodexHomes: [String],
-        hasRouterChatGPTHomes: Bool = false
+        hasRouterChatGPTHomes: Bool = false,
+        forceClaudeAccountDiscovery: Bool = false
     ) -> Set<String> {
         guard !shellFactsReadable else { return ProviderAccountID.families }
         let homeOverrideKeys = ["claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"]
-        return ProviderAccountID.families.filter { family in
+        var families = Set(ProviderAccountID.families.filter { family in
             if family == "codex",
                !registeredCodexHomes.isEmpty
                 || processEnvironment["OPENUSAGE_CODEX_HOMES"]?.nilIfEmpty != nil
@@ -132,7 +141,9 @@ struct ProviderAccountAssembly {
             }
             guard let key = homeOverrideKeys[family] else { return false }
             return processEnvironment[key]?.nilIfEmpty != nil
-        }
+        })
+        if forceClaudeAccountDiscovery { families.insert("claude") }
+        return families
     }
 
     nonisolated static func scan(
@@ -140,6 +151,7 @@ struct ProviderAccountAssembly {
         families: Set<String>,
         registeredCodexHomes: [String] = [],
         desktop: ClaudeDesktopAuthStore? = nil,
+        discoverClaudeDesktopOrganizations: Bool = true,
         listDesktopOrganizationDirectories: @escaping @Sendable (URL) -> [String] = { root in
             let urls = (try? FileManager.default.contentsOfDirectory(
                 at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
@@ -197,7 +209,8 @@ struct ProviderAccountAssembly {
         let desktopStore = desktop ?? ClaudeDesktopAuthStore(
             files: observer.files, homeDirectory: observer.homeDirectory
         )
-        if families.contains("claude"), defaultClaudeIdentity?.contains("|") != false {
+        if discoverClaudeDesktopOrganizations,
+           families.contains("claude"), defaultClaudeIdentity?.contains("|") != false {
             desktopOrganizations = discoverDesktopOrganizations(
                 desktop: desktopStore,
                 cliIdentity: defaultClaudeIdentity,
@@ -232,6 +245,8 @@ struct ProviderAccountAssembly {
             defaultOutcomes: defaultOutcomes,
             configuredCodexOutcomes: configuredOutcomes,
             desktopOrganizations: desktopOrganizations,
+            desktopKeyCache: desktopStore.keyCache,
+            didSkipClaudeDesktopDiscovery: !families.contains("claude") || !discoverClaudeDesktopOrganizations,
             desktopAnchor: desktopStore.homeDirectory()
                 .appendingPathComponent("Library/Application Support/Claude").path,
             normalizedCodexHomesByAnchor: normalizedCodexHomesByAnchor,
@@ -446,8 +461,14 @@ struct ProviderAccountAssembly {
             }
         }
 
+        let defaultCodexHome: String? = discovery.defaultOutcomes.first(where: { $0.family == "codex" }).flatMap {
+            guard case .resolved(_, _, let anchor) = $0.outcome else { return nil }
+            return discovery.normalizedCodexHomesByAnchor[anchor]
+        }
         return ProviderAccountAssembly(
             identityKeysByCard: identityKeys,
+            desktopKeyCache: discovery.desktopKeyCache,
+            defaultCodexHome: defaultCodexHome,
             claudeCards: claudeCards,
             codexCards: codexCards
         )
@@ -605,33 +626,13 @@ struct ProviderAccountAssembly {
         cliIdentity: String?,
         listDirectories: @Sendable (URL) -> [String]
     ) -> [DesktopOrganization] {
-        guard let user = desktop.lastKnownAccountUUID(), desktop.hasCredentialMaterial() else { return [] }
-        let active = desktop.load(allowInteraction: false, expectedAccountUUID: user)
-        let activeOrganization = active.organization
+        guard let user = desktop.lastKnownAccountUUID() else { return [] }
 
         let root = desktop.homeDirectory().appendingPathComponent("Library/Application Support/Claude")
         let memberships = Set(["claude-code-sessions", "local-agent-mode-sessions"].flatMap { directory in
             listDirectories(root.appendingPathComponent(directory).appendingPathComponent(user))
                 .compactMap { UUID(uuidString: $0)?.uuidString.lowercased() }
         })
-        var organizations = memberships
-        if let activeOrganization { organizations.insert(activeOrganization) }
-        if let text = try? desktop.files.readTextIfPresent(root.appendingPathComponent("config.json").path),
-           let rootObject = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
-        {
-            organizations.formUnion(rootObject.keys.compactMap {
-                $0.split(separator: ":").last.flatMap { UUID(uuidString: String($0))?.uuidString.lowercased() }
-            })
-        }
-        if let text = try? desktop.files.readTextIfPresent(
-            root.appendingPathComponent("plan-usage-history.json").path
-        ), let history = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-           let samples = history["samples"] as? [[String: Any]]
-        {
-            organizations.formUnion(samples.compactMap {
-                ($0["org"] as? String).flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
-            })
-        }
         let cliOrganization = cliIdentity.flatMap { identity -> String? in
             let parts = identity.split(separator: "|")
             guard parts.count == 2,
@@ -639,16 +640,22 @@ struct ProviderAccountAssembly {
             else { return nil }
             return String(parts[1]).lowercased()
         }
+        let candidates = memberships.union(cliOrganization.map { [$0] } ?? [])
+        let loaded = desktop.loadOrganizations(
+            candidates,
+            allowInteraction: false,
+            expectedAccountUUID: user
+        )
+        let activeOrganization = loaded.activeOrganization
+        let organizations = memberships
+            .union(activeOrganization.map { [$0] } ?? [])
+            .union(cliOrganization.map { [$0] } ?? [])
 
         return organizations.sorted { lhs, rhs in
-            lhs == activeOrganization ? true : rhs == activeOrganization ? false : lhs < rhs
+            if lhs == rhs { return false }
+            return lhs == activeOrganization ? true : rhs == activeOrganization ? false : lhs < rhs
         }.compactMap { organization in
-            guard memberships.contains(organization)
-                || organization == activeOrganization || organization == cliOrganization
-            else { return nil }
-            let result = organization == activeOrganization ? active : desktop.load(
-                allowInteraction: false, organization: organization, expectedAccountUUID: user
-            )
+            guard let result = loaded.credentialsByOrganization[organization] else { return nil }
             guard result.status == .available || result.status == .permissionRequired else { return nil }
             let plan = result.oauth?.subscriptionType?.lowercased()
             let label = plan.map { ["max", "pro", "free"].contains($0) } == true ? "Personal"

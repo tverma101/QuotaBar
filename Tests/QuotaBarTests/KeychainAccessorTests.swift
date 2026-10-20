@@ -4,12 +4,22 @@ import Security
 @testable import QuotaBar
 
 final class KeychainAccessorTests: XCTestCase {
-    /// Returns a fixed `ProcessResult` for any invocation — lets us drive the accessor's exit-code
-    /// handling without a real `security` subprocess.
-    private struct StubRunner: ProcessRunning {
-        let result: ProcessResult
-        func run(executable: String, arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> ProcessResult {
-            result
+    override func setUp() {
+        super.setUp()
+        KeychainMissingItemCache.shared.resetAll()
+    }
+
+    override func tearDown() {
+        KeychainMissingItemCache.shared.resetAll()
+        super.tearDown()
+    }
+
+    private struct StubReader: SecurityKeychainItemReading {
+        let status: OSStatus
+        var value: String = ""
+        func copyMatching(_ query: [String: Any], result: UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus {
+            result?.pointee = Data(value.utf8) as CFData
+            return status
         }
     }
 
@@ -40,6 +50,7 @@ final class KeychainAccessorTests: XCTestCase {
         private(set) var updateQuery: [String: Any]?
         private(set) var updatedAttributes: [String: Any]?
         private(set) var scopeCalls = 0
+        private(set) var interactionFlags: [Bool] = []
 
         init(
             addStatus: OSStatus,
@@ -66,25 +77,37 @@ final class KeychainAccessorTests: XCTestCase {
         }
 
         func addGenericPassword(attributes: [String: Any]) -> OSStatus {
+            recordInteractionPolicy()
             addedAttributes = attributes
             return addStatus
         }
 
         func updateGenericPassword(matching query: [String: Any], attributes: [String: Any]) -> OSStatus {
+            recordInteractionPolicy()
             updateQuery = query
             updatedAttributes = attributes
             return updateStatus
         }
+
+        private func recordInteractionPolicy() {
+            var allowed = DarwinBoolean(true)
+            XCTAssertEqual(SecKeychainGetUserInteractionAllowed(&allowed), errSecSuccess)
+            interactionFlags.append(allowed.boolValue)
+        }
     }
 
-    private final class RecordingRunner: ProcessRunning, @unchecked Sendable {
-        private let lock = NSLock()
-        private var _calls = 0
-        var calls: Int { lock.lock(); defer { lock.unlock() }; return _calls }
-
-        func run(executable: String, arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> ProcessResult {
-            lock.lock(); _calls += 1; lock.unlock()
-            return ProcessResult(exitCode: 0, stdout: "", stderr: "")
+    private final class RecordingReader: SecurityKeychainItemReading, @unchecked Sendable {
+        private(set) var calls = 0
+        private(set) var interactionFlags: [Bool] = []
+        private(set) var queries: [[String: Any]] = []
+        func copyMatching(_ query: [String: Any], result: UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus {
+            calls += 1
+            var allowed = DarwinBoolean(true)
+            XCTAssertEqual(SecKeychainGetUserInteractionAllowed(&allowed), errSecSuccess)
+            interactionFlags.append(allowed.boolValue)
+            queries.append(query)
+            result?.pointee = Data() as CFData
+            return errSecSuccess
         }
     }
 
@@ -155,20 +178,28 @@ final class KeychainAccessorTests: XCTestCase {
         }
     }
 
-    func testItemNotFoundExitReturnsNil() throws {
-        // Exit 44 (errSecItemNotFound) is the legitimate "no credential stored" case → nil.
-        let accessor = SecurityKeychainAccessor(processRunner: StubRunner(
-            result: ProcessResult(exitCode: 44, stdout: "", stderr: "The specified item could not be found in the keychain.")
-        ))
+    func testItemNotFoundStatusReturnsNil() throws {
+        let accessor = SecurityKeychainAccessor(itemReader: StubReader(status: errSecItemNotFound))
         XCTAssertNil(try accessor.readGenericPassword(service: "Test"))
     }
 
+    func testMissingItemCacheExpiresAndManualReadBypassesIt() {
+        let cache = KeychainMissingItemCache(ttl: 30)
+        let key = KeychainItemKey(service: "optional.credential", account: "profile")
+        cache.markMissing(for: key, now: 100)
+
+        XCTAssertTrue(cache.shouldSkipRead(for: key, now: 110))
+        XCTAssertFalse(cache.shouldSkipRead(for: key, manualActionID: 7, now: 110))
+        XCTAssertTrue(cache.shouldSkipRead(for: key, now: 111), "a bypass alone must preserve the result if its query is cancelled")
+        cache.markPresent(key)
+        XCTAssertFalse(cache.shouldSkipRead(for: key, now: 112), "a successful recheck clears the negative result")
+
+        cache.markMissing(for: key, now: 200)
+        XCTAssertFalse(cache.shouldSkipRead(for: key, now: 231), "negative results expire")
+    }
+
     func testNonItemNotFoundFailureThrowsReadFailed() {
-        // A non-44 non-zero exit (locked keychain / access denied / cancelled unlock) must throw, not
-        // collapse into the same nil as "no credential" — otherwise it gets mislabeled "not signed in".
-        let accessor = SecurityKeychainAccessor(processRunner: StubRunner(
-            result: ProcessResult(exitCode: 51, stdout: "", stderr: "User interaction is not allowed.")
-        ))
+        let accessor = SecurityKeychainAccessor(itemReader: StubReader(status: errSecIO))
         XCTAssertThrowsError(try accessor.readGenericPassword(service: "Test")) { error in
             guard case KeychainError.readFailed = error else {
                 return XCTFail("expected KeychainError.readFailed, got \(error)")
@@ -177,16 +208,67 @@ final class KeychainAccessorTests: XCTestCase {
     }
 
     func testFoundValueIsReturnedTrimmed() throws {
-        let accessor = SecurityKeychainAccessor(processRunner: StubRunner(
-            result: ProcessResult(exitCode: 0, stdout: "secret-token\n", stderr: "")
-        ))
+        let accessor = SecurityKeychainAccessor(itemReader: StubReader(status: errSecSuccess, value: "secret-token\n"))
         XCTAssertEqual(try accessor.readGenericPassword(service: "Test"), "secret-token")
+    }
+
+    func testEmptyFoundValueIsCachedAsMissing() throws {
+        let reader = RecordingReader()
+        let accessor = SecurityKeychainAccessor(itemReader: reader)
+
+        XCTAssertNil(try accessor.readGenericPassword(service: "empty.optional"))
+        XCTAssertNil(try accessor.readGenericPassword(service: "empty.optional"))
+        XCTAssertEqual(reader.calls, 1, "an empty item is unusable and should not trigger another background query during the cache TTL")
+    }
+
+    func testEveryReadOverloadAndExistenceProbeSuppressesLegacyKeychainUI() throws {
+        let reader = RecordingReader()
+        let accessor = SecurityKeychainAccessor(itemReader: reader)
+        // Start with UI allowed, as in a freshly launched app. LAContext alone did not change this
+        // legacy policy, which let Claude/Cursor refreshes display dialogs despite being "silent".
+        let status = KeychainUserInteraction.shared.perform(allowInteraction: true) {
+            do {
+                _ = try accessor.readGenericPassword(service: "silent.service")
+                _ = try accessor.readGenericPassword(service: "silent.account", account: "profile")
+                _ = try accessor.readGenericPasswordForCurrentUser(service: "silent.user")
+                _ = try accessor.readGenericPassword(service: "silent.explicit", allowInteraction: false)
+                XCTAssertEqual(accessor.genericPasswordExists(service: "silent.probe"), true)
+                return errSecSuccess
+            } catch {
+                XCTFail("unexpected read failure: \(error)")
+                return errSecInternalComponent
+            }
+        }
+        XCTAssertEqual(status, errSecSuccess)
+        XCTAssertEqual(reader.interactionFlags, [false, false, false, false, false])
+        XCTAssertEqual(reader.queries[1][kSecAttrAccount as String] as? String, "profile")
+        XCTAssertEqual(reader.queries[2][kSecAttrAccount as String] as? String, currentUserKeychainAccount())
+        for query in reader.queries {
+            XCTAssertEqual((query[kSecUseAuthenticationContext as String] as? LAContext)?.interactionNotAllowed, true)
+        }
+    }
+
+    func testExplicitInteractiveReadAllowsLegacyKeychainUI() throws {
+        let reader = RecordingReader()
+        let accessor = SecurityKeychainAccessor(itemReader: reader)
+        _ = try accessor.readGenericPassword(service: "manual.service", allowInteraction: true)
+        XCTAssertEqual(reader.interactionFlags, [true])
+        XCTAssertEqual((reader.queries.first?[kSecUseAuthenticationContext as String] as? LAContext)?.interactionNotAllowed, false)
+    }
+
+    func testInteractionRequiredReadIsTypedAndNeverRetriedByFlaglessRead() {
+        let accessor = SecurityKeychainAccessor(itemReader: StubReader(status: errSecInteractionNotAllowed))
+        XCTAssertThrowsError(try accessor.readGenericPassword(service: "protected")) { error in
+            guard case KeychainError.interactionNotAllowed = error else {
+                return XCTFail("expected interactionNotAllowed, got \(error)")
+            }
+        }
     }
 
     func testWritesCredentialInProcessWithExplicitAccount() throws {
         let writer = RecordingWriter(addStatus: errSecSuccess)
-        let runner = RecordingRunner()
-        let accessor = SecurityKeychainAccessor(processRunner: runner, itemWriter: writer)
+        let reader = RecordingReader()
+        let accessor = SecurityKeychainAccessor(itemReader: reader, itemWriter: writer)
 
         try accessor.writeGenericPassword(service: "Codex Auth", account: "cli|profile", value: "secret-token")
 
@@ -201,8 +283,9 @@ final class KeychainAccessorTests: XCTestCase {
             String(data: try XCTUnwrap(attributes[kSecValueData as String] as? Data), encoding: .utf8),
             "secret-token"
         )
-        XCTAssertEqual(runner.calls, 0, "credential material must not pass through process arguments")
+        XCTAssertEqual(reader.calls, 0, "writes must not read credential data")
         XCTAssertEqual(writer.scopeCalls, 1)
+        XCTAssertEqual(writer.interactionFlags, [false])
         XCTAssertNil(writer.updateQuery)
     }
 
@@ -227,6 +310,7 @@ final class KeychainAccessorTests: XCTestCase {
             "rotated-secret"
         )
         XCTAssertEqual(writer.updatedAttributes?.count, 1, "the update changes only the secret data")
+        XCTAssertEqual(writer.interactionFlags, [false, false])
     }
 
     func testWriteThatRequiresInteractionReturnsTypedErrorWithoutRetryingInteractively() {
@@ -491,10 +575,12 @@ final class KeychainRefreshReadTests: XCTestCase {
     override func setUp() {
         super.setUp()
         KeychainPermissionGate.shared.resetAll()
+        KeychainMissingItemCache.shared.resetAll()
     }
 
     override func tearDown() {
         KeychainPermissionGate.shared.resetAll()
+        KeychainMissingItemCache.shared.resetAll()
         super.tearDown()
     }
 
@@ -658,6 +744,25 @@ final class KeychainRefreshReadTests: XCTestCase {
         }
         XCTAssertEqual(value, "secret")
         XCTAssertEqual(keychain.calls, [false])
+    }
+
+    func testRepeatedKeychainReadLogsAreSuppressedPerItemAndStatusUntilRecovery() {
+        let gate = KeychainPermissionGate()
+        let item = KeychainItemKey(service: "persistent.failure", account: "account")
+        let otherItem = KeychainItemKey(service: "other.failure")
+
+        XCTAssertTrue(gate.shouldLogInteractionRefusal(for: item))
+        XCTAssertFalse(gate.shouldLogInteractionRefusal(for: item))
+        XCTAssertTrue(gate.shouldLogReadFailure(for: item, status: errSecIO))
+        XCTAssertFalse(gate.shouldLogReadFailure(for: item, status: errSecIO))
+        XCTAssertTrue(gate.shouldLogReadFailure(for: item, status: errSecAuthFailed))
+        XCTAssertTrue(gate.shouldLogReadFailure(for: otherItem, status: errSecIO))
+
+        gate.reset(item)
+
+        XCTAssertTrue(gate.shouldLogInteractionRefusal(for: item), "recovery allows a later refusal to be logged")
+        XCTAssertTrue(gate.shouldLogReadFailure(for: item, status: errSecIO), "recovery allows a later status to be logged")
+        XCTAssertFalse(gate.shouldLogReadFailure(for: otherItem, status: errSecIO), "resetting one item keeps other suppression state")
     }
 
     /// One manual refresh opens at most one dialog across every provider, so the shared gate caps

@@ -82,9 +82,12 @@ struct GrokAuthStore: Sendable {
             text = try files.readTextIfPresent(Self.authPath)
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.error(LogTag.auth("grok"), "Grok auth file read failed")
+            DiagnosticGate.logOnce(for: "auth.grok.auth-file-read") {
+                AppLog.error(LogTag.auth("grok"), "Grok auth file read failed")
+            }
             throw GrokCredentialsUnreadableError()
         }
+        DiagnosticGate.clearFailure("auth.grok.auth-file-read")
         guard let text else { throw GrokAuthError.notLoggedIn }
 
         guard let auth = Self.parseAuth(text) else {
@@ -123,10 +126,14 @@ struct GrokAuthStore: Sendable {
 
     private func readAuthTextForSave() throws -> String? {
         do {
-            return try files.readTextIfPresent(Self.authPath)
+            let text = try files.readTextIfPresent(Self.authPath)
+            DiagnosticGate.clearFailure("auth.grok.auth-file-read")
+            return text
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.error(LogTag.auth("grok"), "Grok auth file read failed while saving")
+            DiagnosticGate.logOnce(for: "auth.grok.auth-file-read") {
+                AppLog.error(LogTag.auth("grok"), "Grok auth file read failed while saving")
+            }
             throw GrokCredentialsUnreadableError()
         }
     }

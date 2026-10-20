@@ -1,9 +1,9 @@
 # Freebuff
 
-QuotaBar reads Freebuff's existing CLI login and shows current session quotas, Freebucks, and reset times.
-It does not start a Freebuff session. The provider is enabled when QuotaBar finds usable Freebuff
-credentials or a configured local source needs repair; its default card is enabled, always visible,
-unpinned, and alphabetically ordered.
+QuotaBar reads Freebuff's existing CLI login and shows current hours balances and reset times.
+It does not start a Freebuff session. Freebuff is enabled by default even when you have not logged in;
+turn it off in Customize if you do not want its card. Its metrics are always-visible by default, it is
+unpinned, and it appears in the alphabetical provider order.
 
 ## Credentials
 
@@ -12,25 +12,59 @@ QuotaBar reads the CLI's `default` profile from `credentials.json`. The default 
 directory. The Freebuff CLI may keep an older token in that file or store it in macOS Keychain under
 service `freebuff-cli`, with the credentials file path as the Keychain account. A readable file or
 Keychain token takes precedence; when a Keychain pointer cannot be resolved, QuotaBar uses
-`CODEBUFF_API_KEY` as the CLI does. Without an environment key, an interaction-required Keychain item
-still shows the permission message and can be retried with Refresh Now.
+`CODEBUFF_API_KEY` as the CLI does. When that environment fallback exists, Keychain reads stay silent;
+each manual refresh rechecks silently so newly granted access can replace a stale environment token.
+Without an environment key, an interaction-required Keychain item can show the permission message and
+be retried with Refresh Now.
 
 If `FREEBUFF_CONFIG_DIR` is set to a relative path, the provider stays visible and refresh shows a
 configuration error so you can correct the path.
 
-QuotaBar reads Keychain without prompting during scheduled refreshes. If macOS requires permission, use
-Refresh Now and allow access. Credentials are sent only to Freebuff's session-usage endpoint.
+If the card says no login was found, sign in once with the Freebuff CLI, then choose **Refresh** on
+the card. The default local binary command is `~/.config/manicode/freebuff login`; use `freebuff login`
+if the CLI wrapper is on your `PATH`. Enabling the card only makes it visible; it does not sign in or
+create credentials.
+
+On a fresh Mac, install the [official Freebuff CLI](https://freebuff.com/cli), then run
+`freebuff login` and finish **Connect** in your browser. QuotaBar needs this one-time login even
+though the card is enabled by default. When its Keychain item is first read, use **Refresh** and
+choose **Always Allow** if macOS asks. Reinstalling or rebuilding QuotaBar with the same stable
+signing identity keeps the CLI login and its existing Keychain grant. Background refreshes stay silent.
+
+QuotaBar reads Keychain without prompting during scheduled refreshes. A manual refresh can prompt for
+an interaction-required item when no environment fallback is available. Credentials are sent only to
+Freebuff's session and model-catalogue endpoints.
 
 ## Metrics
 
-The card maps free-tier daily, weekly, and monthly session windows; subscriber daily, five-day, and
-monthly usage; the subscriber's optional free premium-session pool and separate plan premium-session
-cap; limited-access session pools; and the daily Freebucks pool and current Freebucks balance. Freebucks
-are credits, not dollars. The Monthly Spend row appears only if Freebuff includes its actual USD spend
-fields in the response; QuotaBar does not estimate or convert Freebucks into dollars. Some Freebuff
-deployments omit the legacy monthly USD fields, so that row can be absent.
+Current accounts show **Daily Hours** and **Hours Balance**, matching Freebuff's conversion of five
+Freebucks per hour. The balance includes the remaining daily pool and the wallet; it is not added to
+the daily pool again. Whole balance hours round down like Freebuff. Legacy daily/weekly/monthly
+session caps are hidden when the current hours meter is present. Older servers without that meter
+keep their session windows. Monthly Spend appears only when the server supplies actual USD values.
+Hours and tokens are separate measurements; neither is converted into the other.
 
-QuotaBar sends a read-only `GET /api/v1/freebuff/session` request. A `404` is treated as a normal
+**Today**, **Yesterday**, and **Last 30 Days** show measured tokens from Freebuff Desktop on this Mac.
+They are enabled, Always Visible, and unpinned by default. QuotaBar reads only the measured usage
+column in `~/.config/freebuff-desktop/projects/*/desktop-v2.db`, not conversation text. Unchanged
+database and WAL files reuse the previous read; changed turns replace their latest measurement.
+Cached input tokens are already in input, and reasoning tokens are already in output, so neither is
+added again. Incomplete receipts keep their coverage flags in details. Missing history stays No Data.
+
+Dollar values are **OpenRouter API price estimates**, not Freebuff's recorded charges. Models
+recorded on receipts take priority. For older receipts, estimates use each thread's saved model
+selection, resolved through Freebuff's model catalogue and an exact OpenRouter route. That selection
+can differ from past serving models or subagents; the model detail explains this limitation. Opaque
+or ambiguous identities remain Unattributed or unpriced, and all measured tokens still count.
+Cached input is priced separately from uncached input; reasoning stays inside output. Since a turn
+aggregates multiple requests, single-request long-context tiers are not applied. The local rows cover
+Desktop only, not CLI or web traffic. Model identities are cached locally without handles or tokens;
+unchanged catalogues refresh at most hourly. Public OpenRouter rates use the app's existing pricing
+cache. A fresh installation needs Desktop usage before local history can appear.
+
+QuotaBar sends a read-only `GET https://www.codebuff.com/api/v1/freebuff/session` request directly to
+the canonical API host, so a redirect cannot strip the login header and make a new login look expired.
+A `404` is treated as a normal
 no-active-session response; other HTTP and decoding failures remain visible on the provider card.
 Transport failures are shown as a retryable network error. Cancelled refreshes remain cancellations and
 are not presented as connection failures.
@@ -42,3 +76,4 @@ are not presented as connection failures.
 - [Freebuff authentication](https://github.com/CodebuffAI/freebuff/blob/main/cli/src/utils/auth.ts)
 - [Freebuff Keychain token store](https://github.com/CodebuffAI/freebuff/blob/main/cli/src/utils/auth-token-store.ts)
 - [Freebuff config directory](https://github.com/CodebuffAI/freebuff/blob/main/cli/src/utils/config-dir.ts)
+- [Freebuff hours conversion](https://github.com/CodebuffAI/freebuff/blob/main/common/src/util/freebuff-hours.ts)

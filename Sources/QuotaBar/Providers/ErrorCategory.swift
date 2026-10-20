@@ -177,6 +177,7 @@ extension FreebuffUsageError: CategorizedError {
         case .invalidResponse: .decoding
         case .requestFailed(let status): ErrorCategory.http(status)
         case .quotaUnavailable: .notAvailable
+        case .localHistoryUnreadable: .decoding
         }
     }
 }
@@ -282,6 +283,7 @@ extension AntigravityError: CategorizedError {
         case .oauthClientConfigurationInvalid: .authInvalid
         case .authExpired: .authExpired
         case .accessDenied: .http4xx
+        case .quotaEndpointUnavailable: .notAvailable
         case .unavailable: .network
         }
     }

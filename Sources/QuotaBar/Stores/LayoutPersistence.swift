@@ -17,6 +17,7 @@ final class LayoutPersistence {
     var hasStoredLayout: Bool { defaults.data(forKey: keys.placed) != nil }
     var hasStoredSeededDefaults: Bool { defaults.data(forKey: keys.seededDefaults) != nil }
     var hasStoredSeededAccountPins: Bool { defaults.data(forKey: keys.seededAccountPins) != nil }
+    var hasStoredExplicitlyEnabledMetrics: Bool { defaults.object(forKey: keys.explicitlyEnabledMetrics) != nil }
 
     func loadPlaced() -> [PlacedWidget]? { decode([PlacedWidget].self, forKey: keys.placed) }
     func loadProviderOrder() -> [String]? { decode([String].self, forKey: keys.providerOrder) }

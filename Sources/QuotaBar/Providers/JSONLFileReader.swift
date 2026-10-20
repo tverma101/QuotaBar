@@ -30,10 +30,16 @@ enum JSONLFileReader {
         var statistics: Statistics
         var finalPartial: Data
         var isDiscardingOversizedLine: Bool
+
+        /// True only when the read succeeded without discarding any logical record. Usage scanners
+        /// must not checkpoint a partial sum after an oversized row may have contained tokens.
+        var isComplete: Bool {
+            succeeded && statistics.oversizedLinesSkipped == 0 && !isDiscardingOversizedLine
+        }
     }
 
     static func forEachLine(at url: URL, _ body: (Data.SubSequence) -> Void) -> Bool {
-        readLines(at: url, chunkSize: chunkSize, body).succeeded
+        readLines(at: url, chunkSize: chunkSize, body).isComplete
     }
 
     /// Internal/testable form with configurable chunk/record bounds and append-resume state.
@@ -46,6 +52,7 @@ enum JSONLFileReader {
         at url: URL,
         chunkSize: Int,
         startOffset: UInt64 = 0,
+        endOffset: UInt64? = nil,
         initialCarry: Data = Data(),
         discardingOversizedLine: Bool = false,
         deliverFinalPartial: Bool = true,
@@ -53,6 +60,7 @@ enum JSONLFileReader {
         _ body: (Data.SubSequence) -> Void
     ) -> ReadResult {
         precondition(chunkSize > 0)
+        precondition(endOffset.map { $0 >= startOffset } ?? true)
         precondition(maxLineBytes > 0)
         precondition(initialCarry.count <= maxLineBytes)
         guard let handle = try? FileHandle(forReadingFrom: url) else {
@@ -100,6 +108,8 @@ enum JSONLFileReader {
         var reachedEnd = false
 
         while !reachedEnd {
+            let remaining = endOffset.map { $0 - startOffset - UInt64(statistics.bytesRead) }
+            if remaining == 0 { break }
             // FileHandle reads are synchronous, so cancellation cannot interrupt one in-flight read.
             // Checking once per chunk bounds canceled work to at most one chunk plus its line parsing.
             guard !Task.isCancelled else {
@@ -125,7 +135,9 @@ enum JSONLFileReader {
                 autoreleasepool {
                     let chunk: Data
                     do {
-                        guard let next = try handle.read(upToCount: chunkSize), !next.isEmpty else {
+                        let requested = remaining.map { Int(min(UInt64(chunkSize), $0)) } ?? chunkSize
+                        guard let next = try handle.read(upToCount: requested), !next.isEmpty else {
+                            if remaining != nil { readFailed = true }
                             reachedEnd = true
                             return
                         }

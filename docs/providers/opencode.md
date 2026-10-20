@@ -28,6 +28,12 @@ use the Zen pay-as-you-go gateway (no Go subscription), the cap meters are hidde
 spend tiles. Local `opencode-go` history without a current Go key is not evidence of an active
 subscription and never enables the cap meters.
 
+QuotaBar fingerprints the complete inventory of Go keys, including when there is one key or no keys.
+At launch, if a key rotated under the same label or the inventory could not be read, cached Go caps
+are hidden until the complete inventory is readable and the current key answers. During a refresh,
+an unreadable source withholds new Go quota requests and clears caps whose owner cannot be verified.
+Machine-local spend and token history remains visible across the change.
+
 ## Multiple keys
 
 OpenCode stores separate credentials for separate products. Only the `opencode-go` API key belongs to
@@ -35,16 +41,19 @@ the Go account-usage endpoint; the sibling `opencode` key is a Zen gateway crede
 to the Go endpoint. QuotaBar also accepts app-saved Go keys for additional accounts. An exact duplicate
 key (for example, the same key in `auth.json` and QuotaBar settings) is fetched safely but shown once;
 different keys remain separate even if their current percentages happen to match, because the endpoint
-does not return a stable account id that would justify merging them.
+does not return a stable account id that would justify merging them. The card creates separate Session,
+Weekly, and Monthly rows for every distinct configured account; repeated display labels are numbered so
+each row remains identifiable.
 
 **Keys in settings.** OpenCode ▸ Customize ▸ **OpenCode Go Keys** lets you save extra Go keys (for
 example a second account's key from another machine) with a label, remove them, and pick which account
 the card shows. Saved keys are stored in QuotaBar's Application Support folder; the `auth.json` keys
 themselves are listed read-only. The list reloads when the section opens and after an edit. Tapping a
-key row pins the card to that key's account — the meters swap to its numbers, labeled with the key —
-and tapping **Show All Accounts** unpins back to one row per distinct account. Removing the pinned key
-clears the selection automatically. The spend tiles are local to this Mac, so they do not change when
-you swap accounts.
+key row pins the card to that key's account — the meters swap to its numbers — and tapping **Show All
+Accounts** unpins back to one row per distinct account. Adding or removing a key rebuilds those account
+rows and refreshes OpenCode without repeating the startup account scan. Removing the pinned key clears
+the selection automatically. The spend tiles are local to this Mac, so they do not change when you swap
+accounts.
 
 ## Where credentials come from
 
@@ -52,8 +61,9 @@ Use OpenCode as usual. QuotaBar reads OpenCode's local data directory
 (`~/.local/share/opencode`, or `$OPENCODE_DATA_DIR` / `$XDG_DATA_HOME` if you've set them): the
 `opencode-go` entry in `auth.json` to detect Go usage, and the local SQLite logs for the numbers. There's no login
 prompt and no token to paste. Keys saved through the app's settings are read alongside the `auth.json`
-keys. The keys are used only in the request to OpenCode's usage endpoint and are never persisted in
-logs.
+keys. Routine startup inventories those Go keys only while the OpenCode provider is enabled. Opening
+**OpenCode Go Keys** in Customize or making a CLI request for OpenCode also reads them for that action.
+The keys are used only in the request to OpenCode's usage endpoint and are never persisted in logs.
 
 ## The meters and spend tiles
 
@@ -74,11 +84,38 @@ The spend tiles combine every client that dials the OpenCode gateway on this Mac
    so cumulative-total deltas and subagent replay gating are handled exactly as the Codex card does).
    A separate gateway-only cache reuses the native parse records and keeps unrelated Codex turns out
    of repeated OpenCode folds. Codex output includes reasoning, which is counted once.
-5. Hermes sessions billed to the OpenCode account (`billing_provider` `opencode-go` / `opencode` in
-   `~/.hermes/state.db`) — Hermes talks to the gateway directly and never writes `opencode*.db`.
+5. Hermes sessions billed to the OpenCode account (`billing_provider` `opencode-go` / `opencode`, or
+   the OpenCode Go base URL, in `~/.hermes/state.db`) — Hermes talks to the gateway directly and never
+   writes `opencode*.db`.
+
+When a spend period includes a gateway row priced from tokens, its dollar value carries the estimate
+marker. A period made only of OpenCode's recorded SQLite costs stays unmarked, even if an older day
+contains an estimate. The lifetime History total keeps the marker when any included day has imputed
+dollars.
 
 If any configured usage source cannot be read completely, QuotaBar keeps the last complete spend
 history instead of publishing a partial subtotal; it records the source failure in the diagnostic log.
+The Router source list and revisions are checked again after the wider fold, so a malformed event or
+mid-scan append also keeps the prior history until a complete scan is available.
+For CodexRouter rows, QuotaBar keeps the reported token total when it disagrees with the measured
+components, but marks the spend and public-rate estimate incomplete. A zero-token row never suppresses
+matching native usage. If a Router reports a zero total with positive input or output but omits the other
+measured component, OpenCode keeps the last-good history until the row has a complete breakdown.
+Router `estimatedInputTokens` never contributes to measured usage, even when the estimate itself exceeds
+the safe integer range. If finite SQLite costs overflow when they are combined, QuotaBar keeps the finite
+priced subtotal as a lower bound and marks it Partial. The local Go fallback meter clamps over-cap spend
+to 100% and keeps its window totals finite.
+
+OpenCode's SQLite logs use a reported total when it is positive, or derive the total from valid token
+components when the stored total is zero or missing. The fallback requires a token object with valid
+input and output counts. If a row has malformed token or cost values, or a Router JSONL record is too
+large to parse safely, that fold keeps the previous complete history. Pi and Muse session records with
+invalid counters, impossible cache buckets, or mismatched reported totals also keep the previous history.
+Malformed Router records with uniquely validated routing, status, and account stamps are kept as validation
+markers and do not block enabled accounts; enabling that account makes the source incomplete until the row
+is repaired or removed. Failed requests with a valid non-success status are ignored even if their usage
+fields are malformed. Unknown, conflicting, or malformed account stamps still fail closed. Timezone changes
+rebuild local-day Router buckets from the source ledger.
 
 The Claude gateway fold shares the native Claude card's incremental parse cache and deduplicates
 overlapping Claude roots. The Codex gateway fold includes app-registered Codex homes and visits each
@@ -97,6 +134,16 @@ sample) and DeepSeek V4 Pro (cache-mix mismatch) use the catalog card, and Space
 `space-bunny-free` rows recorded $0 during its free-promo period while the model is paid on the GO plan
 now, so the supplement's GO card prices its folds.
 
+Go and Zen observations stay separate even when they use the same model, since the two products can
+bill at different rates. A hosted database row dated more than five minutes in the future makes the
+scan incomplete, so QuotaBar keeps the last complete spend history instead of adding a future-day total.
+CodexRouter rows for enabled or unresolved accounts follow the same bound. A future row positively
+identified as belonging to a disabled Codex account does not block other enabled accounts; QuotaBar keeps
+its account watermark in the compact ledger so enabling that account later still waits for the clock or
+source revision before counting the row.
+Future-dated Hermes sessions with no tokens in any usage bucket are ignored after their fields are validated,
+since they cannot change spend totals.
+
 Whenever imputed dollars are present the tiles carry the ⓘ estimate marker; models the catalogs don't
 know surface as a warning instead of a guess.
 
@@ -107,6 +154,9 @@ detects those sessions (`ended_at` not yet set) and marks the affected day's til
 on BOTH the dollars and the token count, and the Usage Trend note explains it — a live session is
 never presented as a settled total. Once the session ends, the ledger finalizes and the numbers
 converge on the next refresh. The card's official account meters are unaffected and stay current.
+Usage History totals and model rows also show Partial for those days, and Total Spend excludes an
+active-session period from Cost/MTok. The local `/v1/usage` response adds `partial: true` while keeping
+the current values available.
 If the Hermes database can't be read at all during a refresh (e.g. locked by a busy write), the whole
 fold fails closed: nothing narrower is published as if it were the complete card, the failure is logged
 loudly (once per persistent failure), and the last good history stays on screen until the source
@@ -139,7 +189,10 @@ beneath that row's label, led by the model with the most tokens.
   `~/.local/share/opencode`.
 - **"Couldn't read OpenCode credentials"** — `auth.json` or QuotaBar's saved Go-key file
   (`~/Library/Application Support/QuotaBar/opencode-go-keys.json`) exists but couldn't be read. Check
-  file permissions, then refresh.
+  file permissions, then refresh. QuotaBar waits for both credential sources before making Go quota
+  requests, including when only one key is currently known. Unreadable credentials clear cached caps
+  because their account owner cannot be verified. Local spend history still refreshes when its database
+  can be read, and the last confirmed local history stays available if the database scan fails.
 - **The ⓘ appears on the spend tiles** — some of the dollars are imputed from token counts (Claude Code
   sessions routed through the gateway don't record a per-message cost); the tokens are always measured.
 - **A warning triangle names a model** — a model the pricing catalogs don't know was used through the
@@ -172,12 +225,16 @@ A row is named for the model (`space-bunny-free`), not the serving account (`ope
 tier usage is billed outside them.
 
 The router ledger includes legacy `anthropic/opencode_go/…` and `anthropic/opencode/…` rows even
-when no native session log exists. A router day/model pair replaces matching Claude/Codex log rows only
-when every router row has complete measured input. If the router supplies only estimated input and a
-native row exists, the native row wins; otherwise the measured router fields remain visible. Hermes and
-Muse sessions come from separate stores and always count independently, even if another router event has
-the same model and day. Without a shared request ID, independently used Claude/Codex sessions of the same
-model on a covered day still cannot be separated reliably; the router source takes precedence.
+when no native session log exists. A router row can replace native Codex log usage only when its account
+identity resolves to an enabled Codex account and every router bucket for that local day/model/account
+has complete measured input. Claude, Hermes, and Muse rows always count independently. Rows without a
+resolvable router account identity stay additive. If the router supplies only estimated input and a
+matching native Codex row exists, the native row wins; otherwise the measured router fields remain visible.
+
+The native Codex logs and router ledger do not share a request ID. QuotaBar therefore cannot separate
+independent same-model Codex work by the same account on one local day: when a complete router bucket and
+a native row overlap, the router bucket takes precedence for that whole day/model/account pair. Known
+pricing aliases share a reconciliation key, so alternate model spellings do not count one turn twice.
 
 CodexRouter sometimes records `estimatedInputTokens` when the upstream provider reported zero input tokens.
 That is a router approximation used for context-window bookkeeping, not a measured count. QuotaBar does not
@@ -197,6 +254,8 @@ rows for the window. Large ledgers fold into durable local-calendar day/model bu
 small aggregate plus the individual Go rows still needed by the rolling cap meters instead of keeping every
 OpenCode row resident. The compact checkpoint is persisted, so an unchanged ledger after a relaunch is a
 metadata check rather than a full parse. Rewriting or replacing existing data invalidates the checkpoint.
+The checkpoint checks both modification and change timestamps, including when a same-size rewrite restores
+the original modification time, and only records a stamp validated against the bytes it just read.
 The hosted production benchmark uses 8,192 synthetic rows across multiple models and days, verifies
 exact totals, and checks that repeated reads consume zero new ledger bytes:
 

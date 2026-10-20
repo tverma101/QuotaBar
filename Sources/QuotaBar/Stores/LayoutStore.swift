@@ -182,12 +182,35 @@ final class LayoutStore {
         // ever reappeared would silently re-arm the opt-in for a row the user had never chosen. The stale
         // entry is also unreachable from Customize, because that switch reads `placed` rather than the
         // opt-in, so nothing could clear it.
-        let loadedExplicitlyEnabled = Set(persistence.loadExplicitlyEnabledMetrics())
+        let hadStoredMetricOptIns = persistence.hasStoredExplicitlyEnabledMetrics
+        let savedExplicitlyEnabled = persistence.loadExplicitlyEnabledMetrics()
+        let inferredLegacyOptIns: Set<String>
+        if hadStoredMetricOptIns || !persistence.hasStoredLayout {
+            inferredLegacyOptIns = []
+        } else {
+            // Before explicit opt-ins had their own key, a saved optional row outside the historical
+            // default set is evidence that the user added it in Customize. Recover those choices once.
+            // Rows that were themselves historical defaults are ambiguous in the old layout and stay
+            // unmarked; treating every placed default as manual would revive the empty rows this filter
+            // is meant to remove.
+            let historicalDefaults = Set(
+                persistence.loadSeededDefaults() ?? migrationBaselineMetricIDs
+            )
+            inferredLegacyOptIns = Set(
+                (persistence.loadPlaced() ?? []).map(\.descriptorID).filter { id in
+                    guard !historicalDefaults.contains(id),
+                          let descriptor = registry.descriptor(id: id)
+                    else { return false }
+                    return descriptor.hidesWhenEmpty
+                }
+            )
+        }
+        let loadedExplicitlyEnabled = savedExplicitlyEnabled.union(inferredLegacyOptIns)
         explicitlyEnabledMetricIDs = loadedExplicitlyEnabled.filter { registry.descriptor(id: $0) != nil }
         menuBarStyle = initial.menuBarStyle
 
         // Write the pruned set back so the blob cannot keep accumulating dead ids.
-        if explicitlyEnabledMetricIDs != loadedExplicitlyEnabled {
+        if !hadStoredMetricOptIns || explicitlyEnabledMetricIDs != savedExplicitlyEnabled {
             persistExplicitlyEnabledMetrics()
         }
         if initial.shouldPersistExpandOnEnable { persistExpandOnEnable() }

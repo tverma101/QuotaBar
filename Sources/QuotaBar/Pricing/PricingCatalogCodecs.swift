@@ -6,6 +6,38 @@ import CoreFoundation
 enum PricingCatalogCodecs {
     // MARK: - OpenRouter (/api/v1/models)
 
+    struct OpenRouterCatalogPage {
+        let models: [[String: Any]]
+        let totalCount: Int
+        let nextOffset: Int?
+    }
+
+    /// Reads one page's pagination metadata. The store follows `nextOffset` using the configured
+    /// OpenRouter endpoint, then validates the combined list before replacing its on-disk catalog.
+    static func openRouterCatalogPage(from data: Data) throws -> OpenRouterCatalogPage {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = root["data"] as? [[String: Any]],
+              let totalCount = integerValue(root["total_count"]),
+              let links = root["links"] as? [String: Any],
+              let next = links["next"] else {
+            throw PricingCodecError.incompleteModelList
+        }
+
+        let nextOffset: Int?
+        if next is NSNull {
+            nextOffset = nil
+        } else if let nextURL = next as? String,
+                  let components = URLComponents(string: nextURL),
+                  let rawOffset = components.queryItems?.first(where: { $0.name == "offset" })?.value,
+                  let offset = Int(rawOffset), offset >= 0 {
+            nextOffset = offset
+        } else {
+            throw PricingCodecError.incompleteModelList
+        }
+
+        return OpenRouterCatalogPage(models: models, totalCount: totalCount, nextOffset: nextOffset)
+    }
+
     /// Builds an exact-match estimate catalog from OpenRouter's public model list. Prices are USD
     /// per token in the API; QuotaBar stores per-million rates. Retain published cache prices and
     /// prompt-length overrides, while ignoring time/day overrides that cannot be resolved for

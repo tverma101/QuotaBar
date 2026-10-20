@@ -77,7 +77,11 @@ final class ZAIProvider: ProviderRuntime {
             // that as a clear provider warning (the header's amber notice) rather than three blank "No
             // data" meters that don't explain why nothing's there.
             if ZAIUsageMapper.isNoCodingPlan(body) {
-                return ProviderSnapshot.error(provider: provider, error: ZAIUsageError.noCodingPlan)
+                return ProviderSnapshot.error(
+                    provider: provider,
+                    error: ZAIUsageError.noCodingPlan,
+                    clearsPriorMenuBarQuotaState: true
+                )
             }
             do {
                 let mapped = try ZAIUsageMapper.map(quotaBody: body, subscriptionBody: subscription)

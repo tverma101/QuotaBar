@@ -36,9 +36,9 @@ struct CodexAuthState: Hashable, Sendable {
     var auth: CodexAuth
     var source: Source
 
-    /// Whether this candidate carries a non-empty OAuth access token — the same bar `refresh()`'s
-    /// probe requires before fetching usage (an API-key-only auth.json can't serve the usage API).
-    /// `hasLocalCredentials()`'s first-run detection checks this, so the two can never drift.
+    /// Whether this candidate carries a non-empty OAuth access token — the same bar refresh requires
+    /// before fetching usage (an API-key-only auth.json can't serve the usage API). Keep the optional
+    /// local credential probe aligned with this check.
     var hasUsableAccessToken: Bool {
         auth.tokens?.accessToken?.isEmpty == false
     }
@@ -194,7 +194,6 @@ struct CodexAuthStore: Sendable {
             throw CodexAuthError.credentialPermissionRequired
         }
         if unreadable {
-            AppLog.error(LogTag.auth("codex"), "keychain credential read failed")
             throw CodexAuthError.credentialsUnreadable
         }
         return nil

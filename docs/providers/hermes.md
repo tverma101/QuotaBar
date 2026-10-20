@@ -21,12 +21,17 @@ The token counts come straight from Hermes' accounting (`input_tokens`, `output_
 tokens the way Hermes bills them. OpenCode-billed sessions appear on the OpenCode card, which reflects
 the account that paid for them; including them here as well would double count those tokens in Total
 Spend. The dollar figure is Hermes' own per-session estimate, so it carries the ⓘ marker; tokens are
-always measured.
+always measured. Sessions whose `ended_at` is still empty are marked Partial on the provider row, in
+spend totals, their affected model breakdown rows, and Usage History until Hermes closes them. The
+marker stays with the lifetime total after older per-model details age out.
 
 QuotaBar does not retain per-day model attribution for Hermes, so it cannot price those tokens at
 public API rates. Token days are marked incomplete in Usage History, so the combined public-rate
-estimate is not shown as a complete total. If any token-bearing session has no recorded cost, the
-Hermes dollar total for that period or day is left blank while its measured tokens remain visible.
+estimate is not shown as a complete total. If any token-bearing session has no recorded cost (including
+the database's default-zero value), the Hermes dollar total for that period or day is left blank while
+its measured tokens remain visible.
+If a source counter or recorded cost is malformed, QuotaBar keeps the last complete history instead of
+publishing a smaller subtotal.
 
 ## Where the data comes from
 

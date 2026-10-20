@@ -17,11 +17,11 @@ Credits and Extra Usage are Always Visible by default; Org Credits, Org Spend, C
 
 Since June 2026 GitHub Copilot bills all plans by **AI credits**, so what each account shows differs by plan:
 
-- **Paid plans** meter the credit pool — so you see Credits (and Extra Usage if you've turned on additional spend). Chat and completions are unlimited on paid plans, so those rows read "No data".
-- **Free plans** have no credits, so Credits reads "No data"; instead you see your fixed Chat and Completions counts under the caret.
+- **Paid plans** meter the credit pool — so you see Credits (and Extra Usage if you've turned on additional spend). Chat and completions are unlimited on paid plans, so those optional rows stay hidden unless you explicitly enable them in Customize.
+- **Free plans** have no premium-credit allotment, so the Credits row stays hidden by default when there is no credit data; instead you see your fixed Chat and Completions counts under the caret. Org Credits and Org Spend stay hidden when there is no organization billing data, unless you explicitly enable a row to see its empty state.
 - **Org-managed seats (Copilot Business / Enterprise assigned by an organization)** return no per-seat percent quota. If the response's `premium_interactions` bucket carries a real `credits_used` count, QuotaBar shows it as **Credits** — a plain count, not a percentage, since this bucket's `entitlement` is 0 (no allotment to divide by). This is your *own* consumption and needs no special access. QuotaBar also looks the usage up in the organization's billing: it lists your organizations, finds the one whose billing reports Copilot AI-credit usage, and shows **Org Credits** (credits the whole org used this month) and **Org Spend** (dollars billed beyond the included pool). Two caveats there:
   - The Org Credits/Org Spend numbers are **organization-wide**, not your personal share — GitHub doesn't expose per-seat usage through that API.
-  - Reading an org's billing requires you to be an **org owner or billing manager**. Regular members don't get Org Credits/Org Spend, but still see their own Credits count when the response carries one; if it doesn't, the meters read "No data".
+  - Reading an org's billing requires you to be an **org owner or billing manager**. Regular members don't get Org Credits/Org Spend, but still see their own Credits count when the response carries one; if not, the org rows remain hidden unless you explicitly enable them.
 - Org Credits is shown as a plain count, not a percentage: the billing API reports usage only, never the org's credit allotment, and QuotaBar doesn't fabricate a denominator.
 
 A dollar credit figure (e.g. "$12 of $15 used") isn't shown: GitHub only exposes that through its logged-in web billing page, which would require reading browser cookies — QuotaBar does not do that. Editors like VS Code show the same credit *percentage* from this endpoint, not a dollar amount.
@@ -55,7 +55,7 @@ Using Copilot in a supported editor is enough on its own — the editor writes t
 - **The GitHub CLI config cannot be read** — restore read access to `~/.config/gh/hosts.yml`. QuotaBar needs its username to safely select the matching Keychain item, so it will not use an unscoped lookup while the file is unreadable.
 - **"GitHub token invalid or expired"** — GitHub returned 401. Re-authenticate with `gh auth login`.
 - **"GitHub denied access to Copilot usage"** — GitHub returned 403. Check the account's Copilot license and organization policy before changing credentials.
-- **Meters show "No data" but the plan is shown** — expected on an org-managed Copilot Business/Enterprise seat whose response carries no personal `credits_used` and, if you aren't an org owner or billing manager, no org billing access either (GitHub doesn't expose per-seat quota otherwise, and org billing is admin-only). If you *are* an org admin and still see no Org Credits, make sure your token can list your orgs — the GitHub CLI token from `gh auth login` can; some editor-plugin tokens can't.
+- **An explicitly enabled row shows "No data" but the plan is shown** — expected on an org-managed Copilot Business/Enterprise seat whose response carries no personal `credits_used` and, if you aren't an org owner or billing manager, no org billing access either (GitHub doesn't expose per-seat quota otherwise, and org billing is admin-only). Missing Credits and organization rows stay hidden by default. If you *are* an org admin and still see no Org Credits, make sure your token can list your orgs — the GitHub CLI token from `gh auth login` can; some editor-plugin tokens can't.
 
 ## Under the hood
 

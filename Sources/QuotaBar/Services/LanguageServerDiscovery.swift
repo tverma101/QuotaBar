@@ -29,18 +29,39 @@ struct LanguageServerDiscovery: Sendable {
 
     var processRunner: ProcessRunning = SystemProcessRunner()
 
-    func discover(_ options: Options) -> Result? {
-        guard let psOutput = try? processRunner.run(
-            executable: "/bin/ps",
-            arguments: ["-ax", "-o", "pid=,command="],
-            environment: [:],
-            timeout: 5
-        ), psOutput.succeeded else {
-            AppLog.warn(.subprocess, "ls discover: ps failed for \(options.processName)")
+    /// Capture one process table for a refresh that has several matching strategies. This avoids
+    /// spawning and parsing `ps` again when the first candidate set has no usable listener.
+    func processSnapshot() -> String? {
+        let result: ProcessResult
+        do {
+            result = try processRunner.run(
+                executable: "/bin/ps",
+                arguments: ["-ax", "-o", "pid=,command="],
+                environment: [:],
+                timeout: 5
+            )
+        } catch is CancellationError {
+            return nil
+        } catch {
+            guard !Task<Never, Never>.isCancelled else { return nil }
+            AppLog.warn(.subprocess, "ls discover: ps failed")
             return nil
         }
+        guard result.succeeded else {
+            guard !Task<Never, Never>.isCancelled else { return nil }
+            AppLog.warn(.subprocess, "ls discover: ps failed")
+            return nil
+        }
+        return result.stdout
+    }
 
-        let candidates = Self.rankedCandidates(psOutput: psOutput.stdout, options: options)
+    func discover(_ options: Options) -> Result? {
+        guard let processSnapshot = processSnapshot() else { return nil }
+        return discover(options, processSnapshot: processSnapshot)
+    }
+
+    func discover(_ options: Options, processSnapshot: String) -> Result? {
+        let candidates = Self.rankedCandidates(psOutput: processSnapshot, options: options)
         guard !candidates.isEmpty else {
             AppLog.info(.subprocess, "ls discover: \(options.processName) process not found")
             return nil

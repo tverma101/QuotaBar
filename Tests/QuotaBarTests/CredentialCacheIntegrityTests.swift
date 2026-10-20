@@ -61,6 +61,21 @@ final class CredentialSystemClientIntegrityTests: XCTestCase {
         XCTAssertFalse(runner.lastArguments.contains("-readonly"))
     }
 
+    func testSQLiteQueryCanKeepAntigravityConversationStoresReadOnly() throws {
+        let database = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenUsageTests.antigravity-readonly.\(UUID().uuidString).sqlite")
+        try Data().write(to: database)
+        defer { try? FileManager.default.removeItem(at: database) }
+        let runner = ReadOnlyFailingProcessRunner()
+
+        XCTAssertThrowsError(
+            try SQLiteCLIAccessor(processRunner: runner, allowsReadWriteFallback: false)
+                .queryValue(path: database.path, sql: "SELECT 42")
+        )
+        XCTAssertEqual(runner.callCount, 1, "Antigravity readers must not retry by opening the DB read-write")
+        XCTAssertTrue(runner.lastArguments.contains("-readonly"))
+    }
+
     func testSQLiteExecuteKeepsCredentialSQLOffTheProcessArgumentList() throws {
         let database = FileManager.default.temporaryDirectory
             .appendingPathComponent("OpenUsageTests.private-sql.\(UUID().uuidString).sqlite")

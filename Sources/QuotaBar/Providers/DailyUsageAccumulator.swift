@@ -8,15 +8,26 @@ import Foundation
 /// Days are keyed by the shared local-calendar `dayKey`, matching `SpendTileMapper`'s Today / Yesterday
 /// lookup — the day-key contract is one function, not five copies (drift here is the class of bug behind
 /// the ccusage false-zero fix). Unpriced rows are added token-only (nil cost) and flagged for the
-/// reveal system, so token totals stay complete while dollars only count priced usage.
+/// reveal system, so token totals stay complete while dollar subtotals retain priced usage.
 struct DailyUsageAccumulator {
     private var tokensByDay: [String: Int] = [:]
     private var costByDay: [String: Double] = [:]
+    private var estimatedCostDays: Set<String> = []
     private var apiEstimateByDay: [String: Double] = [:]
     private var apiEstimateIncompleteDays: Set<String> = []
     private var unknownModelsByDay: [String: Set<String>] = [:]
     private var incompleteCostDays: Set<String> = []
+    private var structuralIncompleteCostDays: Set<String> = []
+    private var incompleteModelCostsByDay: [String: Set<String>] = [:]
+    private var tokenCountSaturatedDays: Set<String> = []
     private var modelsByDay: [String: [String: ModelAccumulator]] = [:]
+    private var overflowedCostDays: Set<String> = []
+    private var overflowedApiEstimateDays: Set<String> = []
+    private var unmeasuredUsageDays: Set<String> = []
+
+    mutating func markUnmeasuredUsage(day: String) {
+        unmeasuredUsageDays.insert(day)
+    }
 
     /// Local calendar day as `yyyy-MM-dd`. The single day-key contract shared by the accumulator,
     /// `SpendTileMapper`, and the Cursor CSV aggregation. `calendar` is injectable for tests; production
@@ -37,8 +48,8 @@ struct DailyUsageAccumulator {
     /// the catalog id, while the observed spellings survive as tooltip variants.
     ///
     /// `cost` is nil for a row no pricing source can price (a stealth codename slug, an unattributed
-    /// stream). Those rows count their tokens and show a dash for cost — the owner's "count tokens,
-    /// dash cost" policy — instead of being withheld from every total. `apiEstimate` carries what the
+    /// stream). Those rows count their tokens and leave their own model cost blank; priced models on
+    /// the same day retain their subtotal with an incomplete-cost marker. `apiEstimate` carries what the
     /// same tokens would cost at public API rates when a rate exists for the row (the "if it were all
     /// API" comparison); nil when the model is unidentified.
     ///
@@ -48,17 +59,37 @@ struct DailyUsageAccumulator {
         tokens: Int,
         cost: Double?,
         model: String,
-        canonical: String? = nil
+        canonical: String? = nil,
+        costIsComplete: Bool = true,
+        tokenCountSaturated: Bool = false
     ) {
-        tokensByDay[day] = ProviderParse.addingSaturating(tokensByDay[day, default: 0], tokens)
+        let priorTokens = tokensByDay[day, default: 0]
+        if tokens > 0 && priorTokens > Int.max - tokens {
+            tokenCountSaturatedDays.insert(day)
+        }
+        if tokenCountSaturated { tokenCountSaturatedDays.insert(day) }
+        tokensByDay[day] = ProviderParse.addingSaturating(priorTokens, tokens)
         if let cost {
-            costByDay[day, default: 0] += cost
+            if overflowedCostDays.contains(day) {
+                incompleteCostDays.insert(day)
+            } else if let total = Self.addingFiniteCost(costByDay[day], cost) {
+                costByDay[day] = total
+            } else {
+                overflowedCostDays.insert(day)
+                incompleteCostDays.insert(day)
+            }
         } else if tokens > 0 {
             incompleteCostDays.insert(day)
+            incompleteModelCostsByDay[day, default: []].insert(model)
+        }
+        if !costIsComplete {
+            incompleteCostDays.insert(day)
+            incompleteModelCostsByDay[day, default: []].insert(model)
         }
         let identity = canonical ?? model
         modelsByDay[day, default: [:]][identity, default: ModelAccumulator()]
-            .add(tokens: tokens, costUSD: cost, spelling: model)
+            .add(tokens: tokens, costUSD: cost, spelling: model, costIsComplete: costIsComplete,
+                 sourceTokenCountSaturated: tokenCountSaturated)
     }
 
     /// Keep a known component subtotal available internally while preventing it from being presented
@@ -66,6 +97,13 @@ struct DailyUsageAccumulator {
     /// billing breakdown does not cover the reported total.
     mutating func markCostIncomplete(day: String, model: String, canonical: String? = nil) {
         incompleteCostDays.insert(day)
+        structuralIncompleteCostDays.insert(day)
+        markModelCostIncomplete(day: day, model: model, canonical: canonical)
+    }
+
+    /// Mark one model's subtotal as unsettled without making the whole day's known subtotal
+    /// unpresentable. Used for an active session when sibling models on the same day are complete.
+    mutating func markModelCostIncomplete(day: String, model: String, canonical: String? = nil) {
         let identity = canonical ?? model
         guard var dailyModels = modelsByDay[day],
               var modelAccumulator = dailyModels[identity]
@@ -78,7 +116,28 @@ struct DailyUsageAccumulator {
     /// Add the public-API-rate estimate for one row (see `add`). Sums per day; rows without any
     /// resolvable rate contribute nothing, so the estimate is honest about coverage.
     mutating func addApiEstimate(day: String, cost: Double) {
-        apiEstimateByDay[day, default: 0] += cost
+        guard !overflowedApiEstimateDays.contains(day) else {
+            apiEstimateIncompleteDays.insert(day)
+            return
+        }
+        guard let total = Self.addingFiniteCost(apiEstimateByDay[day], cost) else {
+            apiEstimateByDay.removeValue(forKey: day)
+            overflowedApiEstimateDays.insert(day)
+            apiEstimateIncompleteDays.insert(day)
+            return
+        }
+        apiEstimateByDay[day] = total
+    }
+
+    private static func addingFiniteCost(_ current: Double?, _ addition: Double) -> Double? {
+        guard addition.isFinite, addition >= 0 else { return nil }
+        let total = (current ?? 0) + addition
+        return total.isFinite ? total : nil
+    }
+
+    /// Mark a day's plan-priced dollars as imputed rather than provider-recorded.
+    mutating func markEstimatedCost(day: String) {
+        estimatedCostDays.insert(day)
     }
 
     /// Record public-rate coverage for a row. Provider-specific or carried dollars can exist even
@@ -119,6 +178,15 @@ struct DailyUsageAccumulator {
     /// Nil-cost rows (unpriced/unidentified models) replay as token-only rows so the merged scan keeps
     /// counting their tokens; the unknown-model flags merge separately below.
     private mutating func merge(_ scan: LogUsageScan, droppingDaysBefore minDayKey: String? = nil) {
+        for day in scan.unmeasuredUsageDays ?? [] where minDayKey.map({ day >= $0 }) ?? true {
+            unmeasuredUsageDays.insert(day)
+        }
+        for (day, models) in scan.unknownModelsByDay
+        where minDayKey.map({ day >= $0 }) ?? true {
+            for model in models {
+                addUnknownModel(day: day, model: model)
+            }
+        }
         for day in scan.modelUsage?.daily ?? [] where minDayKey.map({ day.date >= $0 }) ?? true {
             for model in day.models {
                 if let variants = model.variants, !variants.isEmpty {
@@ -128,7 +196,10 @@ struct DailyUsageAccumulator {
                             tokens: variant.totalTokens,
                             cost: variant.costUSD,
                             model: variant.model,
-                            canonical: model.model
+                            canonical: model.model,
+                            costIsComplete: variant.costIsComplete ?? true,
+                            tokenCountSaturated: variant.tokenCountSaturated == true
+                                || model.tokenCountSaturated == true
                         )
                     }
                 } else {
@@ -136,15 +207,23 @@ struct DailyUsageAccumulator {
                         day: day.date,
                         tokens: model.totalTokens,
                         cost: model.costUSD,
-                        model: model.model
+                        model: model.model,
+                        costIsComplete: model.costIsComplete ?? true,
+                        tokenCountSaturated: model.tokenCountSaturated == true
                     )
                 }
             }
         }
-        for (day, models) in scan.unknownModelsByDay
-        where minDayKey.map({ day >= $0 }) ?? true {
-            for model in models {
-                addUnknownModel(day: day, model: model)
+        for day in scan.series.daily
+        where minDayKey.map({ day.date >= $0 }) ?? true {
+            if !day.costIsComplete {
+                incompleteCostDays.insert(day.date)
+            }
+            if day.hasUnexplainedIncompleteCost == true {
+                structuralIncompleteCostDays.insert(day.date)
+            }
+            if day.tokenCountSaturated {
+                tokenCountSaturatedDays.insert(day.date)
             }
         }
         for day in scan.apiEstimateIncompleteDays ?? Set(scan.unknownModelsByDay.keys)
@@ -185,6 +264,12 @@ struct DailyUsageAccumulator {
 
         func absorb(_ scan: LogUsageScan, skipping daysToSkip: Set<String>) -> Bool {
             var absorbed = false
+            for (day, models) in scan.unknownModelsByDay where !daysToSkip.contains(day) {
+                for model in models {
+                    accumulator.addUnknownModel(day: day, model: model)
+                    absorbed = true
+                }
+            }
             for day in scan.modelUsage?.daily ?? [] {
                 guard !daysToSkip.contains(day.date) else { continue }
                 for model in day.models {
@@ -195,7 +280,10 @@ struct DailyUsageAccumulator {
                                 tokens: variant.totalTokens,
                                 cost: variant.costUSD,
                                 model: variant.model,
-                                canonical: model.model
+                                canonical: model.model,
+                                costIsComplete: variant.costIsComplete ?? true,
+                                tokenCountSaturated: variant.tokenCountSaturated == true
+                                    || model.tokenCountSaturated == true
                             )
                             absorbed = true
                         }
@@ -204,17 +292,20 @@ struct DailyUsageAccumulator {
                             day: day.date,
                             tokens: model.totalTokens,
                             cost: model.costUSD,
-                            model: model.model
+                            model: model.model,
+                            costIsComplete: model.costIsComplete ?? true,
+                            tokenCountSaturated: model.tokenCountSaturated == true
                         )
                         absorbed = true
                     }
                 }
             }
-            for (day, models) in scan.unknownModelsByDay where !daysToSkip.contains(day) {
-                for model in models {
-                    accumulator.addUnknownModel(day: day, model: model)
-                    absorbed = true
+            for day in scan.series.daily where !daysToSkip.contains(day.date) {
+                if !day.costIsComplete { accumulator.incompleteCostDays.insert(day.date) }
+                if day.hasUnexplainedIncompleteCost == true {
+                    accumulator.structuralIncompleteCostDays.insert(day.date)
                 }
+                if day.tokenCountSaturated { accumulator.tokenCountSaturatedDays.insert(day.date) }
             }
             for day in scan.apiEstimateIncompleteDays ?? Set(scan.unknownModelsByDay.keys)
             where !daysToSkip.contains(day) {
@@ -240,8 +331,146 @@ struct DailyUsageAccumulator {
         return (accumulator.build(), usedSupplement)
     }
 
+    /// Merge Codex sources by day and canonical model. A router row for one model must not hide a
+    /// different native model observed on that same day. When both sources contain the same model,
+    /// the primary row wins because the sources do not share a request identifier for event-level
+    /// deduplication. If a supplement adds a model to a day already covered by another source, the
+    /// aggregate API-rate estimate becomes incomplete: those estimates are daily totals and cannot
+    /// be safely split into model-level pieces here.
+    static func mergedPreferringPrimaryByModel(
+        _ primary: LogUsageScan?,
+        fillingGapsFrom supplements: [LogUsageScan?],
+        modelIdentity: (String) -> String = { $0.lowercased() }
+    ) -> (scan: LogUsageScan?, usedSupplement: Bool) {
+        struct DayModel: Hashable {
+            let day: String
+            let model: String
+        }
+
+        var accumulator = DailyUsageAccumulator()
+        var seenModels: Set<DayModel> = []
+        var coveredDays: Set<String> = []
+        var sawAny = false
+        var usedSupplement = false
+
+        func absorbRows(_ scan: LogUsageScan, skippingSeenModels: Bool) -> Set<String> {
+            var addedDays: Set<String> = []
+            for day in scan.modelUsage?.daily ?? [] {
+                for model in day.models {
+                    guard model.totalTokens > 0 || (model.costUSD ?? 0) > 0 else { continue }
+                    let key = DayModel(day: day.date, model: modelIdentity(model.model))
+                    if skippingSeenModels, seenModels.contains(key) { continue }
+                    seenModels.insert(key)
+                    addedDays.insert(day.date)
+
+                    if let variants = model.variants, !variants.isEmpty {
+                        for variant in variants {
+                            accumulator.add(
+                                day: day.date,
+                                tokens: variant.totalTokens,
+                                cost: variant.costUSD,
+                                model: variant.model,
+                                canonical: model.model,
+                                costIsComplete: variant.costIsComplete ?? true,
+                                tokenCountSaturated: variant.tokenCountSaturated == true
+                                    || model.tokenCountSaturated == true
+                            )
+                        }
+                    } else {
+                        accumulator.add(
+                            day: day.date,
+                            tokens: model.totalTokens,
+                            cost: model.costUSD,
+                            model: model.model,
+                            costIsComplete: model.costIsComplete ?? true,
+                            tokenCountSaturated: model.tokenCountSaturated == true
+                        )
+                    }
+                }
+            }
+            for day in addedDays {
+                guard let entry = scan.series.daily.first(where: { $0.date == day }) else { continue }
+                if !entry.costIsComplete { accumulator.incompleteCostDays.insert(day) }
+                if entry.hasUnexplainedIncompleteCost == true {
+                    accumulator.structuralIncompleteCostDays.insert(day)
+                }
+                if entry.tokenCountSaturated { accumulator.tokenCountSaturatedDays.insert(day) }
+            }
+            return addedDays
+        }
+
+        if let primary {
+            for day in primary.series.daily where day.totalTokens > 0 || (day.costUSD ?? 0) > 0 {
+                coveredDays.insert(day.date)
+            }
+            for (day, models) in primary.unknownModelsByDay {
+                for model in models { accumulator.addUnknownModel(day: day, model: model) }
+            }
+            let addedDays = absorbRows(primary, skippingSeenModels: false)
+            coveredDays.formUnion(addedDays)
+            sawAny = !addedDays.isEmpty
+            sawAny = sawAny || !primary.unknownModelsByDay.isEmpty
+            coveredDays.formUnion(primary.unknownModelsByDay.keys)
+            for day in primary.apiEstimateIncompleteDays ?? Set(primary.unknownModelsByDay.keys) {
+                accumulator.apiEstimateIncompleteDays.insert(day)
+            }
+            for (day, estimate) in primary.apiEstimateByDay ?? [:] {
+                accumulator.addApiEstimate(day: day, cost: estimate)
+            }
+        }
+
+        for supplement in supplements.compactMap({ $0 }) {
+            let priorCoverage = coveredDays
+            var addedUnknownDays: Set<String> = []
+            for (day, models) in supplement.unknownModelsByDay {
+                for model in models where !accumulator.unknownModelsByDay[day, default: []].contains(model) {
+                    accumulator.addUnknownModel(day: day, model: model)
+                    addedUnknownDays.insert(day)
+                }
+            }
+            let addedDays = absorbRows(supplement, skippingSeenModels: true)
+            let incompleteEstimateDays = supplement.apiEstimateIncompleteDays
+                ?? Set(supplement.unknownModelsByDay.keys)
+            guard !addedDays.isEmpty || !addedUnknownDays.isEmpty else { continue }
+
+            sawAny = true
+            usedSupplement = true
+            for day in addedDays {
+                if priorCoverage.contains(day) {
+                    accumulator.apiEstimateIncompleteDays.insert(day)
+                } else {
+                    if incompleteEstimateDays.contains(day) {
+                        accumulator.apiEstimateIncompleteDays.insert(day)
+                    }
+                    if let estimate = supplement.apiEstimateByDay?[day] {
+                        accumulator.addApiEstimate(day: day, cost: estimate)
+                    }
+                }
+                coveredDays.insert(day)
+            }
+            for day in addedUnknownDays {
+                accumulator.apiEstimateIncompleteDays.insert(day)
+            }
+            coveredDays.formUnion(addedUnknownDays)
+        }
+
+        guard sawAny else { return (nil, false) }
+        return (accumulator.build(), usedSupplement)
+    }
+
+    /// Codex native logs and routed rows can spell one model differently: pricing aliases may rewrite
+    /// mode suffixes (for example `gpt-5.6-sol-ultra` to `gpt-5.6-sol`). Resolve every known pricing
+    /// alias before cross-source reconciliation, then fold fast tiers into the base model. Displayed
+    /// model spellings remain untouched.
+    static func codexCrossSourceModelIdentity(_ model: String, pricing: ModelPricing) -> String {
+        let normalized = model.lowercased()
+        let canonical = pricing.canonicalName(for: model)?.lowercased() ?? normalized
+        guard canonical.hasPrefix("gpt-"), canonical.hasSuffix("-fast") else { return canonical }
+        return String(canonical.dropLast("-fast".count))
+    }
+
     /// Note a model that couldn't be priced but still carried tokens — surfaced as the tile's warning
-    /// triangle, the only place unpriceable usage appears (it's excluded from every displayed total).
+    /// triangle. Its cost is excluded, while known priced usage remains in the displayed subtotal.
     mutating func addUnknownModel(day: String, model: String) {
         unknownModelsByDay[day, default: []].insert(model)
         incompleteCostDays.insert(day)
@@ -249,15 +478,23 @@ struct DailyUsageAccumulator {
     }
 
     /// Assemble the scan: per-day tokens/cost (days sorted newest-first), the per-day model breakdown,
-    /// and the unknown-model set. Days with unpriced rows carry their tokens (cost shows the priced
-    /// subtotal); `apiEstimateByDay` carries the public-API-rate comparison when any row could be priced.
+    /// and the unknown-model set. Days with unpriced rows carry all tokens and any known priced subtotal;
+    /// `apiEstimateByDay` carries the public-API-rate comparison when any row could be priced.
     func build() -> LogUsageScan {
         let days = tokensByDay.keys.sorted(by: >).map { day in
-            DailyUsageEntry(
+            let hasStructuralGap = structuralIncompleteCostDays.contains(day)
+                || !incompleteModelCostsByDay[day, default: []]
+                    .subtracting(unknownModelsByDay[day, default: []]).isEmpty
+            let hasKnownCostGap = overflowedCostDays.contains(day)
+                || !unknownModelsByDay[day, default: []].isEmpty
+            let hasUnexplainedIncompleteCost: Bool? = hasStructuralGap ? true : (hasKnownCostGap ? false : nil)
+            return DailyUsageEntry(
                 date: day,
                 totalTokens: tokensByDay[day] ?? 0,
                 costUSD: costByDay[day],
-                costIsComplete: !incompleteCostDays.contains(day)
+                costIsComplete: !incompleteCostDays.contains(day),
+                hasUnexplainedIncompleteCost: hasUnexplainedIncompleteCost,
+                tokenCountSaturated: tokenCountSaturatedDays.contains(day)
             )
         }
         let modelUsage = ModelUsageSeries(daily: modelsByDay.keys.sorted(by: >).map { day in
@@ -282,33 +519,72 @@ struct DailyUsageAccumulator {
             modelUsage: modelUsage,
             unknownModelsByDay: unknownModelsByDay,
             apiEstimateByDay: apiEstimateByDay.isEmpty ? nil : apiEstimateByDay,
-            apiEstimateIncompleteDays: apiEstimateIncompleteDays
+            apiEstimateIncompleteDays: apiEstimateIncompleteDays,
+            estimatedCostDays: estimatedCostDays.isEmpty ? nil : estimatedCostDays,
+            unmeasuredUsageDays: unmeasuredUsageDays.isEmpty ? nil : unmeasuredUsageDays
         )
     }
 
     private struct ModelAccumulator {
         var tokens = 0
+        var tokenCountSaturated = false
         var costUSD: Double?
         var costIsComplete = true
+        var costOverflowed = false
         /// The exact slugs this row absorbed, keyed case-folded. These are what the hover panel lists, so a
         /// gateway-tagged spelling is still visible — just no longer as a row of its own.
-        private var spellings: [String: (tokens: Int, costUSD: Double?, spelling: String, costIsComplete: Bool)] = [:]
+        private var spellings: [String: (
+            tokens: Int,
+            costUSD: Double?,
+            spelling: String,
+            costIsComplete: Bool,
+            tokenCountSaturated: Bool,
+            costOverflowed: Bool
+        )] = [:]
 
-        mutating func add(tokens: Int, costUSD: Double?, spelling: String) {
+        mutating func add(
+            tokens: Int,
+            costUSD: Double?,
+            spelling: String,
+            costIsComplete: Bool = true,
+            sourceTokenCountSaturated: Bool = false
+        ) {
+            if tokens > 0 && self.tokens > Int.max - tokens { self.tokenCountSaturated = true }
             self.tokens = ProviderParse.addingSaturating(self.tokens, tokens)
+            self.tokenCountSaturated = self.tokenCountSaturated || sourceTokenCountSaturated
             if let costUSD {
-                self.costUSD = (self.costUSD ?? 0) + costUSD
+                if !self.costOverflowed {
+                    if let total = DailyUsageAccumulator.addingFiniteCost(self.costUSD, costUSD) {
+                        self.costUSD = total
+                    } else {
+                        self.costOverflowed = true
+                        self.costIsComplete = false
+                    }
+                }
             } else if tokens > 0 {
                 self.costIsComplete = false
             }
+            if !costIsComplete { self.costIsComplete = false }
             let key = spelling.lowercased()
-            var existing = spellings[key] ?? (tokens: 0, costUSD: nil, spelling: spelling, costIsComplete: true)
+            var existing = spellings[key] ?? (tokens: 0, costUSD: nil, spelling: spelling,
+                                               costIsComplete: true, tokenCountSaturated: false,
+                                               costOverflowed: false)
+            if tokens > 0 && existing.tokens > Int.max - tokens { existing.tokenCountSaturated = true }
             existing.tokens = ProviderParse.addingSaturating(existing.tokens, tokens)
+            existing.tokenCountSaturated = existing.tokenCountSaturated || sourceTokenCountSaturated
             if let costUSD {
-                existing.costUSD = (existing.costUSD ?? 0) + costUSD
+                if !existing.costOverflowed {
+                    if let total = DailyUsageAccumulator.addingFiniteCost(existing.costUSD, costUSD) {
+                        existing.costUSD = total
+                    } else {
+                        existing.costOverflowed = true
+                        existing.costIsComplete = false
+                    }
+                }
             } else if tokens > 0 {
                 existing.costIsComplete = false
             }
+            if !costIsComplete { existing.costIsComplete = false }
             spellings[key] = existing
         }
 
@@ -326,7 +602,9 @@ struct DailyUsageAccumulator {
                     ModelUsageVariant(
                         model: value.spelling,
                         totalTokens: value.tokens,
-                        costUSD: value.costIsComplete ? value.costUSD : nil
+                        costUSD: value.costUSD,
+                        costIsComplete: value.costIsComplete ? nil : false,
+                        tokenCountSaturated: value.tokenCountSaturated ? true : nil
                     )
                 }
                 .sorted { $0.totalTokens > $1.totalTokens }
@@ -336,8 +614,10 @@ struct DailyUsageAccumulator {
             return ModelUsageEntry(
                 model: model,
                 totalTokens: tokens,
-                costUSD: costIsComplete ? costUSD : nil,
-                variants: isTrivial ? nil : (variants.isEmpty ? nil : variants)
+                costUSD: costUSD,
+                variants: isTrivial ? nil : (variants.isEmpty ? nil : variants),
+                costIsComplete: costIsComplete ? nil : false,
+                tokenCountSaturated: tokenCountSaturated ? true : nil
             )
         }
     }

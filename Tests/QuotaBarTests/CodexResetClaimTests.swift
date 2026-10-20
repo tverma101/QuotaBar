@@ -333,7 +333,7 @@ final class CodexResetClaimTests: XCTestCase {
         }
 
         XCTAssertEqual(outcome, .success, "a readable file candidate remains available if Keychain fails")
-        XCTAssertEqual(keychain.interactionFlags, [false, true])
+        XCTAssertEqual(keychain.interactionFlags, [])
         XCTAssertEqual(http.requests.count, 2)
     }
 

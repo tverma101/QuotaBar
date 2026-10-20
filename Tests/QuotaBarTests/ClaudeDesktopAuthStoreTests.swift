@@ -72,6 +72,51 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
         ).status, .notFound)
     }
 
+    func testBatchOrganizationLoadRejectsAccountSwitchDuringSafeStorageRead() async throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("account-a-token", expiresIn: 3_600)],
+            accountUUID: accountUUID
+        )
+        let keyReader = AccountSwitchingClaudeDesktopKeyReader(password: password)
+        let fixtureHome = home
+        let fixtureNow = now
+        let expectedAccountUUID = accountUUID
+        let organizationID = organization
+        let store = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow },
+            keyCache: SafeStorageKeyCache()
+        )
+        let task = Task.detached {
+            store.loadOrganizations(
+                [organizationID],
+                allowInteraction: false,
+                expectedAccountUUID: expectedAccountUUID
+            )
+        }
+        XCTAssertEqual(keyReader.readStarted.wait(timeout: .now() + 5), .success)
+        defer { keyReader.allowRead.signal() }
+
+        let configPath = home.appendingPathComponent("Library/Application Support/Claude/config.json").path
+        let config = try XCTUnwrap(fixture.files.files[configPath])
+        var object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(config.utf8)) as? [String: Any]
+        )
+        object["lastKnownAccountUuid"] = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        let switchedConfig = try JSONSerialization.data(withJSONObject: object)
+        fixture.files.files[configPath] = String(decoding: switchedConfig, as: UTF8.self)
+        keyReader.allowRead.signal()
+
+        let result = await task.value
+
+        XCTAssertEqual(result.credentialsByOrganization[organization]?.status, .notFound)
+        XCTAssertNil(result.credentialsByOrganization[organization]?.oauth)
+    }
+
     func testLogoutWithRetainedDatabaseAndCacheDoesNotExposeCredentials() throws {
         let fixture = try makeFixture(
             activeOrganization: organization,
@@ -162,6 +207,40 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
         XCTAssertTrue(fixture.keyReader.calls.isEmpty)
     }
 
+    func testDisabledClaudeSkipsSafeStorageDuringDesktopAccountDiscovery() throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)],
+            accountUUID: accountUUID
+        )
+        let fixtureHome = home
+        let observer = DefaultAccountObserver(
+            environment: FakeEnvironment(), files: fixture.files, keychain: FakeKeychain(),
+            homeDirectory: { fixtureHome }
+        )
+
+        let discovery = ProviderAccountAssembly.scan(
+            observer: observer,
+            families: ["claude"],
+            desktop: fixture.store,
+            discoverClaudeDesktopOrganizations: false
+        )
+
+        XCTAssertTrue(discovery.didSkipClaudeDesktopDiscovery)
+        XCTAssertTrue(discovery.desktopOrganizations.isEmpty)
+        XCTAssertTrue(fixture.keyReader.calls.isEmpty, "a disabled provider must not read Desktop Safe Storage")
+    }
+
+    @MainActor
+    func testGenericClaudeFallbackReusesDiscoverySafeStorageKeyCache() throws {
+        let keyCache = SafeStorageKeyCache()
+        let provider = try XCTUnwrap(
+            ProviderCatalog.make(claudeDesktopKeyCache: keyCache).compactMap { $0 as? ClaudeProvider }.first
+        )
+
+        XCTAssertTrue(provider.authStore.desktop.keyCache === keyCache)
+    }
+
     @MainActor
     func testOrganizationSwitchKeepsPersistedCardIDsAndDistinctScopedRuntimes() throws {
         let fixture = try makeFixture(
@@ -201,8 +280,16 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
         XCTAssertEqual(assembly.identityKeysByCard, [workID: currentIdentity, "claude": previousIdentity])
         XCTAssertEqual(assembly.claudeCards.map(\.displayName), ["Claude — SUNSTORY", "Claude — Personal"])
         let providers = ProviderCatalog.make(
-            claudeCards: assembly.claudeCards, claudeIdentityKeys: assembly.identityKeysByCard
+            claudeCards: assembly.claudeCards,
+            claudeIdentityKeys: assembly.identityKeysByCard,
+            claudeDesktopKeyCache: assembly.desktopKeyCache
         ).compactMap { $0 as? ClaudeProvider }
+        XCTAssertTrue(providers.allSatisfy { $0.authStore.desktop.keyCache === assembly.desktopKeyCache })
+        XCTAssertEqual(fixture.keyReader.calls.count, 1, "discovery performs one successful Safe Storage read")
+        _ = try assembly.desktopKeyCache.getOrLoad {
+            try fixture.keyReader.readPassword(allowInteraction: false).map { Data($0.utf8) }
+        }
+        XCTAssertEqual(fixture.keyReader.calls.count, 1, "the provider cache reuses the discovery key")
         XCTAssertEqual(providers.map { $0.provider.id }, [workID, "claude"])
         XCTAssertEqual(providers.map { $0.authStore.desktopOnly }, [false, true])
         XCTAssertEqual(providers.map { $0.authStore.preferOrganizationScopedDesktop }, [true, false])
@@ -1304,6 +1391,22 @@ private final class BlockingClaudeDesktopKeyReader: ClaudeDesktopSafeStorageKeyR
         if !allowInteraction {
             throw ClaudeDesktopCredentialError.permissionRequired
         }
+        return password
+    }
+}
+
+private final class AccountSwitchingClaudeDesktopKeyReader: ClaudeDesktopSafeStorageKeyReading, @unchecked Sendable {
+    let password: String
+    let readStarted = DispatchSemaphore(value: 0)
+    let allowRead = DispatchSemaphore(value: 0)
+
+    init(password: String) {
+        self.password = password
+    }
+
+    func readPassword(allowInteraction: Bool) throws -> String? {
+        readStarted.signal()
+        _ = allowRead.wait(timeout: .now() + 5)
         return password
     }
 }

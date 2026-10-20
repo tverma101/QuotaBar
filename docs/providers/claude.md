@@ -12,7 +12,7 @@ the same account and organization through both Claude Code and Claude Desktop st
 | Session | 5-hour rolling window usage |
 | Weekly | 7-day window usage |
 | Fable | Separate weekly Fable limit (model-scoped window from the `limits` array) |
-| Sonnet | Separate weekly Sonnet limit (plan-dependent) |
+| Sonnet | Separate weekly Sonnet limit (plan-dependent; hidden until Claude returns it, unless you explicitly enable the row) |
 | Extra Usage | Extra-usage credits spent against your monthly cap |
 | Today / Yesterday / Last 30 Days | Local spend, as cost, tokens, or both (see below) |
 
@@ -34,7 +34,13 @@ when needed. QuotaBar verifies that a credential belongs to the correct account 
 Claude Desktop support is read-only. QuotaBar decrypts its currently valid access token using the
 `Claude Safe Storage` item in your macOS Keychain. It never reads or uses Desktop's refresh token, and
 never changes Desktop's config, cookies, or Keychain entry. This prevents QuotaBar from invalidating
-Claude Desktop's session.
+Claude Desktop's session. If the Safe Storage item is replaced while QuotaBar is open, a decryption
+mismatch triggers one coordinated key reload and retry. If that replacement still cannot decrypt the
+cache, a later explicit refresh gets one bounded reload attempt for that cached key generation.
+
+QuotaBar discovers Desktop organization cards only while a Claude card is enabled. Enabling Claude
+after it was fully off rebuilds the account list first. The key read during discovery is shared with
+the provider cards, so the first refresh reuses it.
 
 Opening the panel and background refreshes never open a Keychain dialog. If macOS requires approval,
 use **Refresh Now**; one explicit refresh can show at most one Keychain dialog across Claude account
@@ -50,7 +56,7 @@ Some older Claude credentials do not include a scope list, so QuotaBar still tri
 
 ## The spend tiles
 
-Today / Yesterday / Last 30 Days are computed **locally**: QuotaBar reads the Claude Code session logs under `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR`) itself — no external tools needed. Symlinks are followed, so a projects folder linked into a synced location (say, a Dropbox folder) is read all the same. With one known account, Claude usage from the [pi](https://github.com/earendil-works/pi) coding agent counts too: QuotaBar reads pi's session logs under `~/.pi/agent/sessions/` (or `$PI_CODING_AGENT_SESSION_DIR`) and folds any Claude usage there into the same tiles and trend, so a Claude sub driven through pi still shows up here. pi records its own per-message cost, so those dollars come straight from pi rather than being re-estimated. Cowork (the Claude desktop app's agent mode) counts too: it writes the same logs into per-session folders under `~/Library/Application Support/Claude/local-agent-mode-sessions/`, and QuotaBar scans those as well, so desktop agent sessions show up in the tiles alongside terminal ones. Persisted `claude -p` runs count as well. Runs made with `--no-session-persistence` cannot appear because Claude deliberately writes no session log for QuotaBar to read. Advisor work recorded inside a message is counted once under the advisor's own model; the parent's main-model totals are kept separate, and ordinary iteration details are not counted again. A log's recorded fast or standard speed controls its price; QuotaBar does not infer speed from the event date. Days are grouped in your Mac's local time zone, so they line up with your own calendar. Each period is one tile showing cost and tokens together (`$4.08 · 1.2M tokens`); a day with no usage reads **No data** rather than a misleading `$0.00 · 0 tokens` — the same as every other spend-tracking provider. The live Session and Weekly meters are unaffected. The dollars are estimated from token counts at API rates (that's the ⓘ) using the shared [model pricing](../pricing.md); the token counts themselves are measured. No log data leaves your Mac.
+Today / Yesterday / Last 30 Days are computed **locally**: QuotaBar reads the Claude Code session logs under `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR`) itself — no external tools needed. Symlinks are followed, so a projects folder linked into a synced location (say, a Dropbox folder) is read all the same. With one known account, Claude usage from the [pi](https://github.com/earendil-works/pi) coding agent counts too: QuotaBar reads pi's session logs under `~/.pi/agent/sessions/` (or `$PI_CODING_AGENT_SESSION_DIR`) and folds any Claude usage there into the same tiles and trend, so a Claude sub driven through pi still shows up here. pi records its own per-message cost, so those dollars come straight from pi rather than being re-estimated. Cowork (the Claude desktop app's agent mode) counts too: it writes the same logs into per-session folders under `~/Library/Application Support/Claude/local-agent-mode-sessions/`, and QuotaBar scans those as well, so desktop agent sessions show up in the tiles alongside terminal ones. Persisted `claude -p` runs count as well. Runs made with `--no-session-persistence` cannot appear because Claude deliberately writes no session log for QuotaBar to read. Advisor work recorded inside a message is counted once under the advisor's own model; the parent's main-model totals are kept separate, and ordinary iteration details are not counted again. A log's recorded fast or standard speed controls its price; QuotaBar does not infer speed from the event date. Days are grouped in your Mac's local time zone, so they line up with your own calendar. Each period is one tile showing cost and tokens together (`$4.08 · 1.2M tokens`); a day with no usage reads **No data** rather than a misleading `$0.00 · 0 tokens` — the same as every other spend-tracking provider. The live Session and Weekly meters are unaffected. The dollars are estimated from token counts at API rates (that's the ⓘ) using the shared [model pricing](../pricing.md); invalid log versions or malformed or negative token buckets keep that source incomplete and preserve last-good history. No log data leaves your Mac.
 
 Sessions that do not identify their account, including usage from pi and third-party tools such as
 Conductor, count as long as QuotaBar has never seen more than one Claude account. Once multiple

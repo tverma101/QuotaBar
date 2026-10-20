@@ -71,7 +71,7 @@ struct OpenCodeGoKeysSection: View {
     /// Tapping a row pins the card to that key's account; the checkmark marks the active state.
     private var keyRows: some View {
         VStack(spacing: 0) {
-            if entries.count > 1 {
+            if OpenCodeGoKeyEntry.hasMultipleAccounts(entries) {
                 selectionRow(
                     id: nil,
                     label: "Show All Accounts",
@@ -218,6 +218,7 @@ struct OpenCodeGoKeysSection: View {
     }
 
     private func select(_ id: String) {
+        dataStore.invalidateQuotaStateForAccountSelectionChange(providerID: provider.provider.id)
         provider.selectGoKey(id: id)
         Task {
             await refreshEntries()
@@ -227,6 +228,7 @@ struct OpenCodeGoKeysSection: View {
 
     private func clearSelection() {
         // No protocol-level clear: selecting nothing = the default "show all accounts" state.
+        dataStore.invalidateQuotaStateForAccountSelectionChange(providerID: provider.provider.id)
         if provider.activeGoKeyID() != nil {
             OpenCodeGoKeyStore.setActiveSelection(nil)
         }
@@ -245,9 +247,8 @@ struct OpenCodeGoKeysSection: View {
             defer { isPerformingKeyAction = false }
             do {
                 try await provider.saveGoKey(label: label, key: key)
-                resetEditor()
-                await refreshEntries()
-                triggerRefresh()
+                // Saving changes the provider's descriptor inventory. The app rebuilds its registry
+                // from the cached account-discovery result and closes this obsolete settings tree.
             } catch {
                 actionError = error.localizedDescription
                 AppLog.error(.auth, "OpenCode Go key save failed: \(error.localizedDescription)")
@@ -262,8 +263,8 @@ struct OpenCodeGoKeysSection: View {
             defer { isPerformingKeyAction = false }
             do {
                 try await provider.removeGoKey(id: id)
-                await refreshEntries()
-                triggerRefresh()
+                // Removing a key changes the provider's descriptor inventory, so the owning app
+                // rebuilds the registry and refreshes the replacement provider runtime.
             } catch {
                 actionError = error.localizedDescription
                 AppLog.error(.auth, "OpenCode Go key remove failed: \(error.localizedDescription)")

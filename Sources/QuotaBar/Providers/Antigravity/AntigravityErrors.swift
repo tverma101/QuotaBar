@@ -20,6 +20,8 @@ enum AntigravityError: Error, LocalizedError, Equatable {
     case authExpired
     /// Cloud Code explicitly denied access. A permission denial is not evidence that the token expired.
     case accessDenied
+    /// Credentials are valid, but this Antigravity client/account exposes none of the known quota endpoints.
+    case quotaEndpointUnavailable
     /// Credentials exist and look valid, but every endpoint was unreachable (network / server outage).
     /// Distinct from `notSignedIn` so a signed-in user isn't told to start Antigravity during an outage.
     case unavailable
@@ -40,6 +42,8 @@ enum AntigravityError: Error, LocalizedError, Equatable {
             return "Antigravity sign-in expired. Open Antigravity or run `agy` to refresh."
         case .accessDenied:
             return "Google denied access to Antigravity usage. Check that this account and project have access."
+        case .quotaEndpointUnavailable:
+            return "Antigravity did not provide a supported usage endpoint for this account or app version."
         case .unavailable:
             return "Antigravity usage is temporarily unavailable. Try again shortly."
         }

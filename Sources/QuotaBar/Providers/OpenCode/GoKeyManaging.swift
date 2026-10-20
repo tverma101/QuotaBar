@@ -14,8 +14,14 @@ struct OpenCodeGoKeyEntry: Sendable, Equatable, Identifiable {
     var id: String
     var label: String
     var maskedKey: String
+    /// Opaque hash used only to distinguish duplicate key copies from distinct account credentials.
+    var accountID: String
     var source: OpenCodeGoKeySource
     var isActive: Bool
+
+    static func hasMultipleAccounts(_ entries: [OpenCodeGoKeyEntry]) -> Bool {
+        Set(entries.map(\.accountID)).count > 1
+    }
 }
 
 /// A `ProviderRuntime` whose account meters are keyed to one of several OpenCode Go API keys.

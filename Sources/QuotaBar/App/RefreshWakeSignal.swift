@@ -7,12 +7,9 @@ import os
 ///
 /// The bug this replaces: the loop used to subscribe to
 /// `ProviderEnablementStore.didChangeNotification` only inside its wait, after `refreshAll()` had
-/// finished. First-run credential detection is local-only and fast while the first refresh pass does
-/// network I/O and is slow, so the "providers enabled" notification almost always fired mid-pass with
-/// nobody listening — `NotificationCenter.notifications(named:)` doesn't buffer events from before
-/// iteration starts. The wake was silently dropped and the newly detected providers sat dataless until
-/// the next scheduled pass or a manual refresh. The same lost wake hit `NewProviderSeeder` and the
-/// Customize "Reset All" reseed.
+/// finished. A provider toggle or Customize "Reset All" could therefore happen mid-pass with nobody
+/// listening — `NotificationCenter.notifications(named:)` doesn't buffer events from before iteration
+/// starts — leaving the newly enabled providers dataless until the next scheduled pass or manual refresh.
 ///
 /// Here the subscription is installed once, synchronously, in `init` — before the loop's first pass.
 /// The stream uses `.bufferingNewest(1)` only as a wake token; a locked set separately retains every

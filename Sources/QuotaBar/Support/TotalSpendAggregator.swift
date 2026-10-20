@@ -68,7 +68,9 @@ struct TotalSpendSlice: Identifiable, Equatable {
     let amountUSD: Double
     let hasDollarAmount: Bool
     let tokenCount: Double
+    let tokenCountSaturated: Bool
     let estimated: Bool
+    let isPartial: Bool
     let hasIncompleteCost: Bool
 
     var id: String { provider.id }
@@ -76,7 +78,8 @@ struct TotalSpendSlice: Identifiable, Equatable {
     /// Dollars per million tokens for this provider alone. `nil` when either side is missing.
     var costPerMtok: Double? {
         guard hasDollarAmount, tokenCount > 0 else { return nil }
-        return (amountUSD / tokenCount) * 1_000_000
+        let rate = (amountUSD / tokenCount) * 1_000_000
+        return rate.isFinite ? rate : nil
     }
 }
 
@@ -85,6 +88,7 @@ struct TotalSpendSlice: Identifiable, Equatable {
 struct TotalSpendProjectedSlice: Identifiable, Equatable {
     let provider: Provider
     let displayAmount: Double
+    let displayAmountIsLowerBound: Bool
     let estimated: Bool
 
     var id: String { provider.id }
@@ -97,6 +101,10 @@ struct TotalSpendProjection: Equatable {
     let centerValue: Double
     let isEstimated: Bool
     let hasIncompleteCost: Bool
+    let hasPartialData: Bool
+    let centerValueIsLowerBound: Bool
+    let hasActiveSessionData: Bool
+    let hasSaturatedTokenData: Bool
 
     var isEmpty: Bool { slices.isEmpty }
 }
@@ -107,8 +115,24 @@ struct TotalSpend: Equatable {
     let period: TotalSpendPeriod
     let slices: [TotalSpendSlice]
 
-    var totalUSD: Double { slices.reduce(0) { $0 + $1.amountUSD } }
-    var totalTokens: Double { slices.reduce(0) { $0 + $1.tokenCount } }
+    var totalUSD: Double {
+        var total = 0.0
+        for slice in slices {
+            let next = total + slice.amountUSD
+            guard next.isFinite else { return total }
+            total = next
+        }
+        return total
+    }
+    var totalTokens: Double {
+        var total = 0.0
+        for slice in slices {
+            let next = total + slice.tokenCount
+            guard next.isFinite else { return total }
+            total = next
+        }
+        return total
+    }
     /// The combined number is an estimate as soon as any contributor's dollars are imputed locally.
     var isEstimated: Bool { slices.contains(where: \.estimated) }
     /// Raw storage empty — no provider had dollars or tokens for the period.
@@ -119,13 +143,16 @@ struct TotalSpend: Equatable {
         let included: [(slice: TotalSpendSlice, display: Double)] = slices.compactMap { slice in
             switch metric {
             case .cost:
-                guard slice.hasDollarAmount, !slice.hasIncompleteCost else { return nil }
+                // Show each known priced subtotal; the projection keeps the Partial marker when
+                // another model/provider contribution has no known price.
+                guard slice.hasDollarAmount else { return nil }
                 return (slice, slice.amountUSD)
             case .tokens:
                 guard slice.tokenCount > 0 else { return nil }
                 return (slice, slice.tokenCount)
             case .costPerMtok:
                 guard !slice.hasIncompleteCost else { return nil }
+                guard !slice.tokenCountSaturated else { return nil }
                 guard let rate = slice.costPerMtok else { return nil }
                 return (slice, rate)
             }
@@ -137,33 +164,95 @@ struct TotalSpend: Equatable {
         }
 
         let projected = ranked.map {
-            TotalSpendProjectedSlice(provider: $0.slice.provider, displayAmount: $0.display, estimated: $0.slice.estimated)
+            TotalSpendProjectedSlice(
+                provider: $0.slice.provider,
+                displayAmount: $0.display,
+                displayAmountIsLowerBound: (metric == .cost && $0.slice.hasIncompleteCost)
+                    || (metric == .tokens && ($0.slice.tokenCountSaturated || $0.slice.isPartial)),
+                estimated: $0.slice.estimated
+            )
         }
 
         let center: Double
         let estimated: Bool
+        var aggregateCostOverflowed = false
+        var aggregateTokenOverflowed = false
         switch metric {
         case .cost:
-            center = ranked.reduce(0) { $0 + $1.slice.amountUSD }
+            var total = 0.0
+            for item in ranked {
+                let next = total + item.slice.amountUSD
+                guard next.isFinite else {
+                    aggregateCostOverflowed = true
+                    break
+                }
+                total = next
+            }
+            center = total
             estimated = ranked.contains { $0.slice.estimated }
         case .tokens:
-            center = ranked.reduce(0) { $0 + $1.slice.tokenCount }
+            var total = 0.0
+            for item in ranked {
+                let next = total + item.slice.tokenCount
+                guard next.isFinite else {
+                    aggregateTokenOverflowed = true
+                    break
+                }
+                total = next
+            }
+            center = total
             estimated = false
         case .costPerMtok:
-            let usd = ranked.reduce(0) { $0 + $1.slice.amountUSD }
-            let tokens = ranked.reduce(0) { $0 + $1.slice.tokenCount }
-            center = tokens > 0 ? (usd / tokens) * 1_000_000 : 0
+            var weightedRate = 0.0
+            let largestTokenCount = ranked.map(\.slice.tokenCount).max() ?? 0
+            let normalizedTokenTotal = largestTokenCount > 0
+                ? ranked.reduce(0) { $0 + ($1.slice.tokenCount / largestTokenCount) }
+                : 0
+            if normalizedTokenTotal > 0, normalizedTokenTotal.isFinite {
+                for item in ranked {
+                    guard let rate = item.slice.costPerMtok else { continue }
+                    let weight = (item.slice.tokenCount / largestTokenCount) / normalizedTokenTotal
+                    let next = weightedRate + (rate * weight)
+                    guard next.isFinite else {
+                        aggregateCostOverflowed = true
+                        break
+                    }
+                    weightedRate = next
+                }
+            }
+            center = weightedRate
             estimated = ranked.contains { $0.slice.estimated }
         }
 
-        let hasIncompleteCost = metric.usesDollarEstimateNote
-            && slices.contains(where: \.hasIncompleteCost)
+        let hasIncompleteCost: Bool
+        let hasPartialData: Bool
+        switch metric {
+        case .cost:
+            hasIncompleteCost = aggregateCostOverflowed || slices.contains(where: \.hasIncompleteCost)
+            hasPartialData = hasIncompleteCost
+        case .costPerMtok:
+            hasIncompleteCost = aggregateCostOverflowed || slices.contains(where: {
+                $0.hasIncompleteCost || $0.tokenCountSaturated
+                    || ($0.hasDollarAmount && $0.tokenCount > 0 && $0.costPerMtok == nil)
+            })
+            hasPartialData = hasIncompleteCost
+        case .tokens:
+            hasIncompleteCost = false
+            hasPartialData = aggregateTokenOverflowed || slices.contains(where: {
+                $0.isPartial || $0.tokenCountSaturated
+            })
+        }
         return TotalSpendProjection(
             metric: metric,
             slices: projected,
             centerValue: center,
             isEstimated: estimated,
-            hasIncompleteCost: hasIncompleteCost
+            hasIncompleteCost: hasIncompleteCost,
+            hasPartialData: hasPartialData,
+            centerValueIsLowerBound: (metric == .cost && hasIncompleteCost)
+                || (metric == .tokens && hasPartialData),
+            hasActiveSessionData: slices.contains(where: \.isPartial),
+            hasSaturatedTokenData: slices.contains(where: \.tokenCountSaturated)
         )
     }
 }
@@ -186,19 +275,55 @@ enum TotalSpendAggregator {
                   case .values(_, let values, _, _, let unknownModels, _) = line else { return nil }
 
             let dollars = values.filter { $0.kind == .dollars }
-            let amount = dollars.reduce(0) { $0 + $1.number }
-            let tokens = values
+            var amount = 0.0
+            var hasValidDollarAmount = false
+            var dollarAggregationIncomplete = false
+            let hasLowerBoundDollar = dollars.contains { $0.isLowerBound == true }
+            var estimated = false
+            for dollar in dollars {
+                guard dollar.number.isFinite, dollar.number >= 0 else {
+                    dollarAggregationIncomplete = true
+                    continue
+                }
+                hasValidDollarAmount = true
+                estimated = estimated || dollar.estimated
+                guard !dollarAggregationIncomplete else { continue }
+                let next = amount + dollar.number
+                guard next.isFinite else {
+                    dollarAggregationIncomplete = true
+                    continue
+                }
+                amount = next
+            }
+            let tokenValues = values
                 .filter { $0.kind == .count && $0.label == "tokens" }
-                .reduce(0) { $0 + $1.number }
-            guard amount > 0 || tokens > 0 else { return nil }
+            var tokens = 0.0
+            var tokenCountSaturated = tokenValues.contains { $0.tokenCountSaturated == true }
+            for tokenValue in tokenValues {
+                guard tokenValue.number.isFinite, tokenValue.number >= 0 else {
+                    tokenCountSaturated = true
+                    continue
+                }
+                let next = tokens + tokenValue.number
+                guard next.isFinite else {
+                    tokenCountSaturated = true
+                    continue
+                }
+                tokens = next
+            }
+            guard !dollars.isEmpty || tokens > 0 || tokenCountSaturated else { return nil }
+            let isPartial = values.contains { $0.isPartial == true }
 
             return TotalSpendSlice(
                 provider: provider,
-                amountUSD: max(amount, 0),
-                hasDollarAmount: !dollars.isEmpty,
-                tokenCount: max(tokens, 0),
-                estimated: dollars.contains(where: \.estimated),
-                hasIncompleteCost: !unknownModels.isEmpty || (tokens > 0 && dollars.isEmpty)
+                amountUSD: amount,
+                hasDollarAmount: hasValidDollarAmount,
+                tokenCount: tokens,
+                tokenCountSaturated: tokenCountSaturated,
+                estimated: estimated,
+                isPartial: isPartial,
+                hasIncompleteCost: !unknownModels.isEmpty || (tokens > 0 && !hasValidDollarAmount)
+                    || dollarAggregationIncomplete || hasLowerBoundDollar || isPartial
             )
         }
         return TotalSpend(period: period, slices: slices)

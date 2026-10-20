@@ -14,9 +14,14 @@ struct AntigravityKeychainToken: Sendable, Equatable {
 struct AntigravityAuthStore: Sendable {
     static let keychainService = "gemini"
     static let keychainAccount = "antigravity"
+    static let unresolvedCacheIdentityKey = "antigravity-unresolved"
     /// Our own cache of refreshed access tokens, so a Google OAuth refresh happens ~once per token
     /// lifetime instead of every refresh cycle. We never write back to Antigravity's keychain item.
     static let cachePath = "~/Library/Application Support/QuotaBar/antigravity/auth.json"
+    private static let cacheReadFailureKey = "auth.antigravity.cache.read"
+    private static let cacheDecodeFailureKey = "auth.antigravity.cache.decode"
+    private static let cacheWriteFailureKey = "auth.antigravity.cache.write"
+    private static let cacheRemoveFailureKey = "auth.antigravity.cache.remove"
     /// Treat a token with less than this left as already expired (skip straight to refresh).
     static let refreshBuffer: TimeInterval = 60
 
@@ -53,15 +58,43 @@ struct AntigravityAuthStore: Sendable {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            AppLog.error(LogTag.auth("antigravity"), "keychain credential read failed")
             throw AntigravityError.credentialStoreUnreadable
         }
         guard let raw else { return nil }
         guard let token = Self.extractToken(fromKeychainRaw: raw) else {
-            AppLog.error(LogTag.auth("antigravity"), "keychain credential is malformed")
+            // Let the provider surface this typed failure once through WidgetDataStore's
+            // persistent-failure logging. Logging here repeats on every scheduled retry.
             throw AntigravityError.invalidCredentialData
         }
         return token
+    }
+
+    /// Stable, non-secret account stamp for quota snapshots. Refresh credentials remain stable across
+    /// access-token rotation; access-token-only records still get a conservative account fence.
+    static func cacheIdentityKey(for token: AntigravityKeychainToken) -> String? {
+        guard let fingerprint = credentialFingerprint(for: token.refreshToken)
+                ?? credentialFingerprint(for: token.accessToken) else { return nil }
+        let digest = fingerprint.map { String(format: "%02x", $0) }.joined()
+        return "antigravity-\(digest)"
+    }
+
+    /// Resolve the launch identity without ever presenting a Keychain prompt. If Antigravity's ACL
+    /// blocks this background read, the stable unresolved marker fences previously attributed quota;
+    /// the next live Cloud Code refresh can replace it with the credential fingerprint.
+    func cacheIdentityKeyForLaunch() -> String {
+        do {
+            guard let raw = try keychain.readGenericPasswordForRefresh(
+                service: Self.keychainService,
+                account: Self.keychainAccount,
+                allowInteraction: false
+            ),
+                  let token = Self.extractToken(fromKeychainRaw: raw),
+                  let identity = Self.cacheIdentityKey(for: token)
+            else { return Self.unresolvedCacheIdentityKey }
+            return identity
+        } catch {
+            return Self.unresolvedCacheIdentityKey
+        }
     }
 
     /// Whether a keychain access token is worth attempting: expiry unknown, or it hasn't passed yet.
@@ -90,17 +123,27 @@ struct AntigravityAuthStore: Sendable {
         // extra refresh.
         let text: String
         do {
-            guard let stored = try files.readTextIfPresent(Self.cachePath) else { return nil }
+            guard let stored = try files.readTextIfPresent(Self.cachePath) else {
+                DiagnosticGate.clearFailure(Self.cacheReadFailureKey)
+                DiagnosticGate.clearFailure(Self.cacheDecodeFailureKey)
+                return nil
+            }
+            DiagnosticGate.clearFailure(Self.cacheReadFailureKey)
             text = stored
         } catch {
-            AppLog.warn(LogTag.auth("antigravity"), "refreshed-token cache read failed; ignoring it")
+            DiagnosticGate.logOnce(for: Self.cacheReadFailureKey) {
+                AppLog.warn(LogTag.auth("antigravity"), "refreshed-token cache read failed; ignoring it")
+            }
             return nil
         }
         guard let cached = try? JSONDecoder().decode(CachedToken.self, from: Data(text.utf8)) else {
-            AppLog.warn(LogTag.auth("antigravity"), "refreshed-token cache is malformed; discarding it")
+            DiagnosticGate.logOnce(for: Self.cacheDecodeFailureKey) {
+                AppLog.warn(LogTag.auth("antigravity"), "refreshed-token cache is malformed; discarding it")
+            }
             discardCachedToken()
             return nil
         }
+        DiagnosticGate.clearFailure(Self.cacheDecodeFailureKey)
         guard cached.credentialFingerprint == expectedFingerprint,
               cached.expiresAtMs > (now().timeIntervalSince1970 + Self.refreshBuffer) * 1000,
               let token = cached.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
@@ -141,10 +184,13 @@ struct AntigravityAuthStore: Sendable {
         do {
             let data = try JSONEncoder().encode(cached)
             try files.writeText(Self.cachePath, String(decoding: data, as: UTF8.self))
+            DiagnosticGate.clearFailure(Self.cacheWriteFailureKey)
         } catch {
             // The refreshed token still works for this session; a failed cache only means we refresh
             // again next cycle. Log loudly rather than fail the live fetch.
-            AppLog.warn(LogTag.auth("antigravity"), "failed to cache refreshed token: \(error.localizedDescription)")
+            DiagnosticGate.logOnce(for: Self.cacheWriteFailureKey) {
+                AppLog.warn(LogTag.auth("antigravity"), "failed to cache refreshed token: \(error.localizedDescription)")
+            }
         }
         return true
     }
@@ -153,8 +199,11 @@ struct AntigravityAuthStore: Sendable {
     func discardCachedToken() {
         do {
             try files.remove(Self.cachePath)
+            DiagnosticGate.clearFailure(Self.cacheRemoveFailureKey)
         } catch {
-            AppLog.warn(LogTag.auth("antigravity"), "failed to remove stale refreshed-token cache")
+            DiagnosticGate.logOnce(for: Self.cacheRemoveFailureKey) {
+                AppLog.warn(LogTag.auth("antigravity"), "failed to remove stale refreshed-token cache")
+            }
         }
     }
 

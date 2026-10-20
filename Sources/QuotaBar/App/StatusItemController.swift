@@ -47,6 +47,12 @@ private final class MenuBarStatusItem {
 /// window and a real show/hide pair the global shortcut can call directly.
 @MainActor
 final class StatusItemController: NSObject {
+    struct ReplacementPresentationState {
+        var wasVisible: Bool
+        var screen: PopoverScreen
+        var customizeProviderID: String?
+    }
+
     private let container: AppContainer
     private let statusItems: [MenuBarStatusItem]
     private let panel: MenuBarPanel
@@ -64,6 +70,7 @@ final class StatusItemController: NSObject {
     private let backdrop = PopoverBackdropView(cornerRadius: StatusItemController.cornerRadius)
     /// Token for the appearance-change observer; held to follow the documented removal pattern.
     private var appearanceObserver: NSObjectProtocol?
+    private var diagnosticControl: DiagnosticDashboardController?
     /// Corner radius of the panel surface; tuned to read like a system menu-bar popover.
     private static let cornerRadius: CGFloat = 13
 
@@ -133,6 +140,14 @@ final class StatusItemController: NSObject {
         }
 
         heightController.installBridge()
+        diagnosticControl = DiagnosticDashboardController(
+            dataStore: container.dataStore,
+            show: { [weak self] in
+                self?.container.layout.presentWithoutSlide(.dashboard)
+                self?.showPopover()
+            },
+            close: { [weak self] in self?.hidePanel() }
+        )
 
         AppLog.info(
             .statusItem,
@@ -143,6 +158,23 @@ final class StatusItemController: NSObject {
     /// There is exactly one QuotaBar status item. Provider/account multiplicity belongs inside the
     /// aggregate strip and dashboard, not in the macOS status-bar item graph.
     static func statusItemScopes() -> [String?] { [nil] }
+
+    func replacementPresentationState() -> ReplacementPresentationState {
+        ReplacementPresentationState(
+            wasVisible: panel.isVisible,
+            screen: container.layout.screen,
+            customizeProviderID: container.layout.customizeProviderID
+        )
+    }
+
+    func restorePresentation(_ state: ReplacementPresentationState) {
+        guard state.wasVisible else { return }
+        container.layout.presentWithoutSlide(state.screen)
+        if state.screen == .customize {
+            container.layout.customizeProviderID = state.customizeProviderID
+        }
+        showPopover()
+    }
 
     /// Tears down the current status-item graph before AppContainer is rebuilt after a newly added
     /// Codex account. Explicit cleanup prevents a transient duplicate menu-bar item and leaves no
@@ -156,6 +188,8 @@ final class StatusItemController: NSObject {
         }
         appearanceObserver.map(NotificationCenter.default.removeObserver)
         appearanceObserver = nil
+        diagnosticControl?.stop()
+        diagnosticControl = nil
         // The account-registration reload creates a new controller in the same process. Remove the
         // old callback before the replacement registers, otherwise one shortcut press toggles twice.
         KeyboardShortcuts.removeHandler(for: .togglePopover)

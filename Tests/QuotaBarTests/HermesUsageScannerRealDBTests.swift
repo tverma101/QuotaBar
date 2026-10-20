@@ -21,6 +21,7 @@ final class HermesUsageScannerRealDBTests: XCTestCase {
                 id TEXT PRIMARY KEY,
                 model TEXT,
                 started_at REAL NOT NULL,
+                ended_at REAL DEFAULT 0,
                 input_tokens INTEGER DEFAULT 0,
                 output_tokens INTEGER DEFAULT 0,
                 cache_read_tokens INTEGER DEFAULT 0,
@@ -115,23 +116,25 @@ final class HermesUsageScannerRealDBTests: XCTestCase {
         XCTAssertEqual(scan.daily.daily.reduce(0) { $0 + $1.totalTokens }, 120)
     }
 
-    func testNullSessionCostMakesPeriodModelAndDailyTotalsIncomplete() async throws {
+    func testDefaultZeroSessionCostMakesPeriodModelAndDailyTotalsIncomplete() async throws {
         let now = Date()
         let started = now.timeIntervalSince1970 - 60
         try sqlite("""
             INSERT INTO sessions (id, model, started_at, input_tokens, output_tokens, estimated_cost_usd) VALUES
-              ('priced', 'priced-model', \(started), 100, 20, 0.25),
-              ('missing-cost', 'missing-cost-model', \(started + 1), 300, 30, NULL);
+              ('priced', 'priced-model', \(started), 100, 20, 0.25);
+            INSERT INTO sessions (id, model, started_at, input_tokens, output_tokens) VALUES
+              ('missing-cost', 'missing-cost-model', \(started + 1), 300, 30);
             INSERT INTO session_model_usage (session_id, model, input_tokens, output_tokens, estimated_cost_usd) VALUES
-              ('priced', 'priced-model', 100, 20, 0.25),
-              ('missing-cost', 'missing-cost-model', 300, 30, NULL);
+              ('priced', 'priced-model', 100, 20, 0.25);
+            INSERT INTO session_model_usage (session_id, model, input_tokens, output_tokens) VALUES
+              ('missing-cost', 'missing-cost-model', 300, 30);
             """)
 
         let maybeScan = try await scanner.scan(now: now)
         let scan = try XCTUnwrap(maybeScan)
         let today = try XCTUnwrap(scan.periods.first { $0.period == .today })
         XCTAssertEqual(today.counts.total, 450)
-        XCTAssertNil(today.costUSD, "a positive subtotal must not hide a token row without a cost")
+        XCTAssertNil(today.costUSD, "a positive subtotal must not hide a token row whose cost defaulted to zero")
 
         let models = try XCTUnwrap(scan.modelUsageByPeriod[.today])
         XCTAssertEqual(models.first { $0.model == "priced-model" }?.costUSD ?? 0, 0.25, accuracy: 0.0001)
@@ -160,6 +163,54 @@ final class HermesUsageScannerRealDBTests: XCTestCase {
         XCTAssertEqual(day.totalTokens, 0)
         XCTAssertEqual(day.costUSD ?? 0, 0.25, accuracy: 0.0001)
         XCTAssertTrue(day.costIsComplete)
+    }
+
+    func testActiveSessionPropagatesPartialStateThroughHermesCardAndHistory() async throws {
+        let now = Date()
+        let started = now.timeIntervalSince1970 - 60
+        try sqlite("""
+            INSERT INTO sessions (id, model, started_at, ended_at, input_tokens, output_tokens, estimated_cost_usd) VALUES
+              ('active', 'kimi-k2.7', \(started), NULL, 100, 40, 0.5),
+              ('completed', 'claude-opus-4-6', \(started - 120), \(started - 60), 50, 25, 0.3);
+            INSERT INTO session_model_usage (session_id, model, input_tokens, output_tokens, estimated_cost_usd) VALUES
+              ('active', 'kimi-k2.7', 100, 40, 0.5),
+              ('completed', 'claude-opus-4-6', 50, 25, 0.3);
+            """)
+
+        let scanned = try await scanner.scan(now: now)
+        let scan = try XCTUnwrap(scanned)
+        let today = try XCTUnwrap(scan.periods.first { $0.period == .today })
+        XCTAssertTrue(today.isPartial)
+        let todayKey = DailyUsageAccumulator.dayKey(from: now, calendar: .current)
+        XCTAssertEqual(scan.partialDays, [todayKey])
+
+        let lines = HermesUsageMapper.lines(scan: scan, now: now)
+        guard case .values(_, let values, _, _, _, let breakdown)? = lines.first(where: {
+            if case .values(let label, _, _, _, _, _) = $0 { return label == "Today" }
+            return false
+        }) else {
+            return XCTFail("expected today's Hermes spend line")
+        }
+        XCTAssertTrue(values.allSatisfy { $0.isPartial == true })
+        XCTAssertTrue(breakdown?.models.first?.hasIncompleteCost == true)
+
+        let history = HermesProvider.usageHistory(from: scan)
+        XCTAssertEqual(history.partialDays, scan.partialDays)
+        let report = HistoryDashboardAggregator.report(
+            .init(
+                enabledProviderIDs: ["hermes"],
+                displayNameByProviderID: ["hermes": "Hermes"],
+                historyByProviderID: ["hermes": history]
+            ),
+            now: now
+        )
+        XCTAssertTrue(report.today.hasIncompleteCost)
+        XCTAssertEqual(report.today.cost, 0.8)
+        let activeModel = try XCTUnwrap(breakdown?.models.first { $0.model == "kimi-k2.7" })
+        let completedModel = try XCTUnwrap(breakdown?.models.first { $0.model == "claude-opus-4-6" })
+        XCTAssertTrue(activeModel.hasIncompleteCost)
+        XCTAssertNotNil(activeModel.costUSD)
+        XCTAssertFalse(completedModel.hasIncompleteCost, "a completed model on the same day stays settled")
     }
 
     func testHermesTokenDaysMarkPublicAPIRateEstimateIncomplete() {

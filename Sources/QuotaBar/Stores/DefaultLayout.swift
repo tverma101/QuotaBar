@@ -28,6 +28,7 @@ enum DefaultLayout {
         "freebuff.session", "freebuff.daily", "freebuff.weekly", "freebuff.fiveDay",
         "freebuff.monthly", "freebuff.premiumSessions", "freebuff.freePremiumSessions", "freebuff.freebucksDaily",
         "freebuff.freebucksBalance", "freebuff.monthlySpend",
+        "freebuff.today", "freebuff.yesterday", "freebuff.last30",
 
         "grok.weekly", "grok.trend",
         "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",
@@ -77,8 +78,8 @@ enum DefaultLayout {
     ]
 
     /// Metrics placed in the per-provider On Demand section on a fresh install. This is
-    /// membership, not enablement: optional disabled rows like Sonnet or Cursor Requests/Credits are
-    /// listed here so if the user enables them later they appear below the caret by default.
+    /// membership, not enablement: optional rows like Sonnet, Codex Spark, or Cursor Requests are
+    /// listed here so they appear below the caret by default when data arrives or the user enables them.
     /// Filtered to the active registry by `LayoutStore`, and only seeded on a genuinely fresh launch
     /// (existing layouts keep everything always-shown unless they reset customization).
     static let expandedMetricIDs: [String] = [
@@ -97,8 +98,8 @@ enum DefaultLayout {
         "cursor.today", "cursor.yesterday", "cursor.last30",
         // Copilot: Credits (the metered premium pool) + Extra Usage stay above the fold; the org
         // billing pair (org-managed Business/Enterprise seats) and Chat + Completions sit below the
-        // caret. Chat/Completions carry real counts on free only — on paid they're unlimited
-        // (suppressed), so they read "No data" there.
+        // caret. Org billing is role-dependent; Chat/Completions carry real counts on free only.
+        // These optional rows hide when the response has no corresponding data.
         "copilot.orgCredits", "copilot.orgSpend", "copilot.chat", "copilot.completions",
         "devin.extra",
         "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",

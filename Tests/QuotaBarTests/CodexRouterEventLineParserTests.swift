@@ -23,6 +23,9 @@ final class CodexRouterEventLineParserTests: XCTestCase {
 
         XCTAssertEqual(event.status, 0)
         XCTAssertEqual(event.inputTokens, 0)
+        XCTAssertFalse(event.hasInputTokensField)
+        XCTAssertFalse(event.hasOutputTokensField)
+        XCTAssertFalse(event.hasCompleteMeasuredCostBreakdown)
         XCTAssertEqual(event.model, ModelUsageEntry.unattributedModelName)
         XCTAssertEqual(event.provider, "unknown")
     }
@@ -52,6 +55,16 @@ final class CodexRouterEventLineParserTests: XCTestCase {
     func testSaturatesExponentOverflowInsteadOfDroppingTheEvent() throws {
         let event = try XCTUnwrap(parse(#"{"at":"2026-10-02T12:00:00Z","inputTokens":1e309}"#))
         XCTAssertEqual(event.inputTokens, 1_000_000_000_000_000)
+    }
+
+    func testEstimatedInputOverflowDoesNotSaturateMeasuredTokens() throws {
+        let event = try XCTUnwrap(parse(#"{"at":"2026-10-02T12:00:00Z","inputTokens":10,"outputTokens":20,"totalTokens":30,"estimatedInputTokens":1000000000000001}"#))
+
+        XCTAssertEqual(event.measuredTokenTotal, 30)
+        XCTAssertNil(event.tokenCountSaturated,
+                     "the oversized router estimate is not part of measured token accounting")
+        XCTAssertFalse(event.hasCompleteMeasuredCostBreakdown,
+                       "estimated input still means the measured dollar breakdown is incomplete")
     }
 
     func testLastKnownFieldOccurrenceWinsWhenItsValueIsInvalid() throws {

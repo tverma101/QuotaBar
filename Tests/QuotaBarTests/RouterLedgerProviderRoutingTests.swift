@@ -65,14 +65,11 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
     }
 
     /// The OpenCode card partitions provider-stamped router rows from legacy native gateway slugs.
-    /// `anthropic/opencode_go/...` also appears in Codex/Claude session logs, so the router fold leaves
-    /// that spelling to the native fold instead of counting the same turn twice.
     /// The router ledger owns every OpenCode-served turn, the legacy `anthropic/opencode_go/…` slug
     /// included. Dropping that slug here used to rely on the native session-log fold always having it,
     /// which is false whenever the log is absent, rotated away, or lives in a home this scan does not open
     /// — those turns then disappeared from every card. Exactly-once is now enforced one layer up: the
-    /// scanner reconciles the two sources per (day, model) and lets the router win the pairs it covers
-    /// (`OpenCodeUsageScanner.dayModelKey`).
+    /// scanner reconciles the two sources per (day, model, Codex account) when router identity resolves.
     func testRouterOwnsEveryOpenCodeServedRowIncludingTheLegacyHostedSlug() throws {
         let path = try ledger([
             ("opencode-go", "anthropic/opencode_go/deepseek-v4-flash", 100, 0, 10),
@@ -105,27 +102,129 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
         XCTAssertTrue(folded[0].burnsGoQuota)
     }
 
-    /// Both sources must land on the same merge key for a given turn, otherwise the reconciliation in
-    /// `scan` treats one turn as two.
-    func testRouterAndNativeRowsShareOneDayModelMergeKey() {
+    /// Both sources must land on the same account-scoped key for a given turn, otherwise the
+    /// reconciliation in `scan` treats one turn as two or suppresses another account's usage.
+    func testRouterAndNativeRowsShareOneDayModelAccountMergeKey() {
         let day = "2026-10-04"
         let router = OpenCodeUsageScanner.ClaudeGatewayRow(
             date: Date(), input: 10, output: 2, cacheWrite: 0, cacheRead: 0,
-            model: "deepseek-v4-flash", burnsGoQuota: true, isInProgress: false
+            model: "deepseek-v4-flash", burnsGoQuota: true, isInProgress: false,
+            accountId: "account-a", accountFingerprint: "fingerprint-a"
         )
         let native = OpenCodeUsageScanner.ClaudeGatewayRow(
             date: Date(), input: 10, output: 2, cacheWrite: 0, cacheRead: 0,
             model: "deepseek-v4-flash", burnsGoQuota: true, isInProgress: false
         )
+        let identityKeys = ["account-a": "codex-a", "fingerprint-a": "codex-a"]
+        let routerIdentity = try! XCTUnwrap(OpenCodeUsageScanner.routerAccountIdentityKey(
+            for: router, identifiersToIdentityKeys: identityKeys
+        ))
+        let nativeKey = OpenCodeUsageScanner.dayModelAccountKey(
+            day: day, model: native.model, accountIdentityKey: routerIdentity
+        )
         XCTAssertEqual(
-            OpenCodeUsageScanner.dayModelKey(day: day, model: router.model),
-            OpenCodeUsageScanner.dayModelKey(day: day, model: native.model)
+            OpenCodeUsageScanner.dayModelAccountKey(
+                day: day, model: router.model, accountIdentityKey: routerIdentity
+            ),
+            nativeKey
         )
         XCTAssertNotEqual(
-            OpenCodeUsageScanner.dayModelKey(day: day, model: router.model),
-            OpenCodeUsageScanner.dayModelKey(day: "2026-10-05", model: native.model),
+            nativeKey,
+            OpenCodeUsageScanner.dayModelAccountKey(
+                day: "2026-10-05", model: native.model, accountIdentityKey: routerIdentity
+            ),
             "different days must not collapse into one key"
         )
+    }
+
+    func testRouterCoverageDoesNotSuppressAnotherCodexAccountOrUnknownIdentity() {
+        let date = Date()
+        let router = OpenCodeUsageScanner.ClaudeGatewayRow(
+            date: date, input: 10, output: 2, cacheWrite: 0, cacheRead: 0,
+            model: "deepseek-v4-flash", burnsGoQuota: true, isInProgress: false,
+            accountId: "account-a", accountFingerprint: "fingerprint-a",
+            routerInputWasEstimated: false, routerCostBreakdownIsComplete: true
+        )
+        let identities = ["account-a": "codex-a", "fingerprint-a": "codex-a"]
+        let coverage = OpenCodeUsageScanner.completeRouterCoverage(
+            from: [router], identifiersToIdentityKeys: identities
+        )
+        let otherAccountRow = OpenCodeUsageScanner.ClaudeGatewayRow(
+            date: date, input: 7, output: 3, cacheWrite: 0, cacheRead: 0,
+            model: router.model, burnsGoQuota: true, isInProgress: false
+        )
+
+        XCTAssertFalse(OpenCodeUsageScanner.shouldFoldNativeCodexRow(
+            otherAccountRow, accountIdentityKey: "codex-a", completeRouterCoverage: coverage
+        ), "the router owns only the account named by its resolved identity")
+        XCTAssertTrue(OpenCodeUsageScanner.shouldFoldNativeCodexRow(
+            otherAccountRow, accountIdentityKey: "codex-b", completeRouterCoverage: coverage
+        ), "matching model and day cannot suppress a different account")
+        XCTAssertEqual(
+            OpenCodeUsageScanner.reconciledRouterRows(
+                [router], completeCoverage: coverage, nativeCoverage: [], identifiersToIdentityKeys: [:]
+            ).count,
+            1,
+            "unknown account identities stay additive"
+        )
+    }
+
+    func testAccountFilteringKeepsUnscopedAndUnknownLegacyRowsAdditive() {
+        let date = Date()
+        let enabled = OpenCodeUsageScanner.ClaudeGatewayRow(
+            date: date, input: 10, output: 2, cacheWrite: 0, cacheRead: 0,
+            model: "deepseek-v4-flash", burnsGoQuota: true, isInProgress: false,
+            accountId: "account-a"
+        )
+        let disabled = OpenCodeUsageScanner.ClaudeGatewayRow(
+            date: date, input: 20, output: 4, cacheWrite: 0, cacheRead: 0,
+            model: "deepseek-v4-flash", burnsGoQuota: true, isInProgress: false,
+            accountId: "account-b"
+        )
+        let noIdentity = OpenCodeUsageScanner.ClaudeGatewayRow(
+            date: date, input: 30, output: 6, cacheWrite: 0, cacheRead: 0,
+            model: "deepseek-v4-flash", burnsGoQuota: true, isInProgress: false
+        )
+        let unknownIdentity = OpenCodeUsageScanner.ClaudeGatewayRow(
+            date: date, input: 40, output: 8, cacheWrite: 0, cacheRead: 0,
+            model: "deepseek-v4-flash", burnsGoQuota: true, isInProgress: false,
+            accountId: "legacy-pool-id"
+        )
+        let identities = ["account-a": "codex-a", "account-b": "codex-b"]
+
+        let retained = OpenCodeUsageScanner.routerRowsForEnabledAccounts(
+            [enabled, disabled, noIdentity, unknownIdentity],
+            enabledIdentityKeys: ["codex-a"],
+            identifiersToIdentityKeys: identities
+        )
+
+        XCTAssertEqual(retained.map(\.input), [10, 30, 40],
+                       "only the known disabled account is omitted; legacy/unresolved token rows stay additive")
+    }
+
+    func testRouterRowWithoutUsageFieldsCannotSuppressNativeCodexCounts() throws {
+        let stamp = OpenUsageISO8601.string(from: Date())
+        let text = #"{"at":"\#(stamp)","model":"opencode-free/deepseek-v4-flash","provider":"opencode-free","status":200,"accountId":"account-a","accountFingerprint":"fingerprint-a"}"#
+        let row = try XCTUnwrap(OpenCodeUsageScanner.routerGatewayRow(from: Data(text.utf8)))
+        let identities = ["account-a": "codex-a", "fingerprint-a": "codex-a"]
+        let coverage = OpenCodeUsageScanner.completeRouterCoverage(
+            from: [row], identifiersToIdentityKeys: identities
+        )
+        let native = OpenCodeUsageScanner.ClaudeGatewayRow(
+            date: row.date, input: 80, output: 20, cacheWrite: 0, cacheRead: 0,
+            model: row.model, burnsGoQuota: true, isInProgress: false
+        )
+        let nativeKey = OpenCodeUsageScanner.dayModelAccountKey(native, accountIdentityKey: "codex-a")
+
+        XCTAssertFalse(row.hasCompleteRouterCounts)
+        XCTAssertTrue(coverage.isEmpty)
+        XCTAssertTrue(OpenCodeUsageScanner.shouldFoldNativeCodexRow(
+            native, accountIdentityKey: "codex-a", completeRouterCoverage: coverage
+        ))
+        XCTAssertTrue(OpenCodeUsageScanner.reconciledRouterRows(
+            [row], completeCoverage: coverage, nativeCoverage: [nativeKey],
+            identifiersToIdentityKeys: identities
+        ).isEmpty)
     }
 
     func testLegacyAnthropicGatewaySlugIsStillOwnedByTheNativeCodexFold() {
@@ -185,29 +284,46 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
     /// QuotaBar must not fold it into the token tiles alongside real usage.
     func testEstimatedInputTokensAreNotCountedAsMeasuredUsage() throws {
         let stamp = OpenUsageISO8601.string(from: Date().addingTimeInterval(-600))
-        let text = #"{"at":"\#(stamp)","model":"opencode-free/space-bunny-free","provider":"opencode-free","status":200,"inputTokens":0,"cachedInputTokens":0,"outputTokens":25,"totalTokens":25,"estimatedInputTokens":999999}"#
-        let row = try XCTUnwrap(OpenCodeUsageScanner.routerGatewayRow(from: Data(text.utf8)))
+        let text = #"{"at":"\#(stamp)","model":"opencode-free/space-bunny-free","provider":"opencode-free","status":200,"inputTokens":0,"cachedInputTokens":0,"outputTokens":25,"totalTokens":25,"estimatedInputTokens":1000000000000001}"#
+        var row = try XCTUnwrap(OpenCodeUsageScanner.routerGatewayRow(from: Data(text.utf8)))
+        row.accountId = "account-a"
+        row.accountFingerprint = "fingerprint-a"
         XCTAssertEqual(row.input, 0)
         XCTAssertEqual(row.output, 25)
         XCTAssertEqual(row.tokens, 25, "the estimate must not inflate the measured total")
+        XCTAssertFalse(row.tokenCountSaturated,
+                       "an overflowing estimated input does not saturate OpenCode's measured token row")
         XCTAssertEqual(row.routerInputWasEstimated, true)
 
-        let key = OpenCodeUsageScanner.dayModelKey(row)
-        let completeRows = OpenCodeUsageScanner.completeRouterCoverage(from: [row])
+        let identities = ["account-a": "codex-a", "fingerprint-a": "codex-a"]
+        let key = OpenCodeUsageScanner.dayModelAccountKey(row, accountIdentityKey: "codex-a")
+        let completeRows = OpenCodeUsageScanner.completeRouterCoverage(
+            from: [row], identifiersToIdentityKeys: identities
+        )
         XCTAssertFalse(completeRows.contains(key), "estimated input cannot suppress a complete native row")
         XCTAssertTrue(
             OpenCodeUsageScanner.reconciledRouterRows(
-                [row], completeCoverage: completeRows, nativeCoverage: [key]
+                [row], completeCoverage: completeRows, nativeCoverage: [key],
+                identifiersToIdentityKeys: identities
             ).isEmpty,
             "prefer the native row when the router has only estimated the input"
         )
         XCTAssertEqual(
             OpenCodeUsageScanner.reconciledRouterRows(
-                [row], completeCoverage: completeRows, nativeCoverage: []
+                [row], completeCoverage: completeRows, nativeCoverage: [],
+                identifiersToIdentityKeys: identities
             ).count,
             1,
             "keep measured router output when the native session row is unavailable"
         )
+
+        let path = try writeRaw(String(repeating: text + "\n", count: 8_192))
+        defer { OpenCodeUsageScanner.routerLedgerClearCacheForTesting(path: path) }
+        let compact = try XCTUnwrap(rows(path).first)
+        XCTAssertTrue(compact.isAggregated)
+        XCTAssertEqual(compact.tokens, 25 * 8_192)
+        XCTAssertFalse(compact.tokenCountSaturated,
+                       "the compact fold keeps estimated-input overflow outside measured saturation")
     }
 
     /// Chunk boundaries must not corrupt or drop rows: the ledger is read in 1MB chunks and a partial
@@ -415,7 +531,7 @@ extension RouterLedgerProviderRoutingTests {
             "a cut line must be skipped, not turned into a partial row"
         )
 
-        let path = try writeLedger([whole, truncated])
+        let path = try writeRaw(whole + "\n" + truncated)
         XCTAssertEqual(rows(path).count, 1, "only the whole line becomes a row")
     }
 
@@ -440,6 +556,7 @@ extension RouterLedgerProviderRoutingTests {
             .replacingOccurrences(of: #""inputTokens":1"#, with: #""inputTokens":\#(huge)"#)
         let row = OpenCodeUsageScanner.routerGatewayRow(from: Data(text.utf8))
         XCTAssertEqual(row?.input, 1_000_000_000_000_000, "must saturate at the codebase's clamp")
+        XCTAssertTrue(row?.tokenCountSaturated == true, "the clamped value is a lower bound")
     }
 
     /// The parser clamps an over-long digit run to `Int.max`, so two hostile rows in one day/model bucket
@@ -461,6 +578,7 @@ extension RouterLedgerProviderRoutingTests {
         for row in folded {
             XCTAssertEqual(row.input, 1_000_000_000_000_000)
             XCTAssertEqual(row.tokens, 1_000_000_000_000_001)
+            XCTAssertTrue(row.tokenCountSaturated, "clamped input counts remain lower bounds")
         }
 
         // Compact path: the day/model bucket adds `Int.max + Int.max`, which traps without saturation.
@@ -476,6 +594,9 @@ extension RouterLedgerProviderRoutingTests {
         }
         let bucket = try XCTUnwrap(aggregate.materialize(since: .distantPast).first)
         XCTAssertEqual(bucket.input, .max, "Int.max + Int.max saturates instead of trapping")
+        XCTAssertTrue(bucket.tokenCountSaturated, "the aggregate sum is a lower bound")
+        XCTAssertFalse(bucket.routerCostBreakdownIsComplete ?? true,
+                       "overflowed components cannot support a complete cost breakdown")
         XCTAssertTrue(bucket.isAggregated)
 
         let single = try XCTUnwrap(OpenCodeUsageScanner.routerGatewayRow(from: Data(rows[0].utf8)))

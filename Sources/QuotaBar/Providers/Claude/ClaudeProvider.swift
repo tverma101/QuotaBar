@@ -65,7 +65,8 @@ final class ClaudeProvider: ProviderRuntime {
                 .exportingLimit("fable", unit: "percent")
                 .hidingWhenEmpty(),
             .percent(id: "\(provider.id).sonnet", provider: provider, title: "Sonnet")
-                .exportingLimit("sonnet", unit: "percent"),
+                .exportingLimit("sonnet", unit: "percent")
+                .hidingWhenEmpty(),
             .boundedDollars(id: "\(provider.id).extra", provider: provider, title: "Extra Usage", metricLabel: "Extra usage spent", limit: 100, valueWord: "spent")
                 .exportingLimit("extraUsage", unit: "usd", source: .progressOrValue(kind: .dollars))
                 .hidingWhenEmpty(),
@@ -79,7 +80,7 @@ final class ClaudeProvider: ProviderRuntime {
     }
 
     func hasLocalCredentials() async -> Bool {
-        // Never trigger another app's Keychain prompt during first-run detection. Encrypted Desktop
+        // Never trigger another app's Keychain prompt during a local credential probe. Encrypted Desktop
         // material still counts as a local login; only the explicit Refresh Now action may request access.
         let probe: (load: ClaudeCredentialLoad, hasKeychainMaterial: Bool?) = await loadOffMainActor { [authStore] in
             let load = authStore.loadCredentialSet()
@@ -118,6 +119,16 @@ final class ClaudeProvider: ProviderRuntime {
         previousKeychainAccessError: ClaudeAuthError?
     ) async -> ProviderSnapshot {
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        if ProviderRefreshContext.scope.suppressesLiveQuota {
+            // Fold-only passes need only this card's account-scoped local logs. Reloading OAuth
+            // credentials here can repeat a failed Keychain read during the visible retry's
+            // history follow-up, even though this pass never uses the token or calls Anthropic.
+            // The scanner is already bound to the card identity when account cards are created.
+            return await snapshotWithLocalUsage(
+                mapped: ClaudeMappedUsage(plan: nil, lines: []),
+                warning: nil
+            )
+        }
         let manualActionID = ProviderRefreshContext.manualActionID
         let allowCredentialInteraction = ProviderRefreshContext.isManual
         let interactionGate = ProviderRefreshContext.credentialInteractionGate
@@ -143,6 +154,10 @@ final class ClaudeProvider: ProviderRuntime {
         let storedCandidates = credentialLoad.candidates
         let candidates = storedCandidates.filter {
             $0.hasUsableAccessToken && (!forceDesktopFallback || $0.source == .desktop)
+        }
+        let noCredentialDiagnosticKey = "auth.claude.no-credential.\(provider.id)"
+        if !candidates.isEmpty {
+            DiagnosticGate.clearFailure(noCredentialDiagnosticKey)
         }
         if credentialLoad.keychainPermissionRequired, candidates.isEmpty {
             return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.credentialPermissionRequired)
@@ -224,7 +239,9 @@ final class ClaudeProvider: ProviderRuntime {
             if credentialLoad.keychainReadFailed {
                 return ProviderSnapshot.error(provider: provider, error: ClaudeAuthError.credentialKeychainReadFailed)
             }
-            AppLog.info(LogTag.auth("claude"), "no access token, not logged in")
+            DiagnosticGate.logOnce(for: noCredentialDiagnosticKey) {
+                AppLog.info(LogTag.auth("claude"), "no access token, not logged in")
+            }
             let error = ClaudeAuthError.notLoggedIn
             let snapshot = await snapshotWithLocalUsage(
                 mapped: ClaudeMappedUsage(plan: nil, lines: []),
@@ -279,6 +296,16 @@ final class ClaudeProvider: ProviderRuntime {
                 guard !Task.isCancelled,
                       KeychainPermissionGate.shared.isCurrentManualAction(manualActionID)
                 else { return cancelledRefreshSnapshot(provider: provider) }
+                DiagnosticGate.clearFailures(prefix: Self.sourceFallbackDiagnosticPrefix(
+                    providerID: provider.id,
+                    source: state.source
+                ))
+                if case .desktop = state.source {
+                    // Desktop succeeding does not mean the stored Claude login recovered; keep the
+                    // fallback transition latched until a non-Desktop credential source works.
+                } else {
+                    DiagnosticGate.clearFailure(Self.desktopFallbackDiagnosticKey(providerID: provider.id))
+                }
                 AppLog.info(LogTag.plugin("claude"), "refresh end (\(Int(Date().timeIntervalSince(start) * 1000))ms)")
                 return snapshot
             } catch ClaudeAuthError.credentialsChanged where credentialReloadsRemaining > 0 {
@@ -291,7 +318,15 @@ final class ClaudeProvider: ProviderRuntime {
                 )
             } catch let error as ClaudeAuthError where error.allowsAuthFallback {
                 guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-                AppLog.warn(LogTag.auth("claude"), "\(state.source.label) failed (\(error)); falling back to next source if any")
+                let diagnosticPrefix = Self.sourceFallbackDiagnosticPrefix(
+                    providerID: provider.id,
+                    source: state.source
+                )
+                DiagnosticGate.logOnce(
+                    for: diagnosticPrefix + error.errorCategory.rawValue
+                ) {
+                    AppLog.warn(LogTag.auth("claude"), "\(state.source.label) failed (\(error)); falling back to next source if any")
+                }
                 lastFallbackError = error
                 continue
             } catch {
@@ -306,7 +341,9 @@ final class ClaudeProvider: ProviderRuntime {
            credentialLoad.desktopStatus == .notChecked
         {
             guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-            AppLog.info(LogTag.auth("claude"), "stored Claude login failed; trying Claude Desktop")
+            DiagnosticGate.logOnce(for: Self.desktopFallbackDiagnosticKey(providerID: provider.id)) {
+                AppLog.info(LogTag.auth("claude"), "stored Claude login failed; trying Claude Desktop")
+            }
             return await refresh(
                 credentialReloadsRemaining: credentialReloadsRemaining,
                 forceDesktopFallback: true,
@@ -330,6 +367,52 @@ final class ClaudeProvider: ProviderRuntime {
             provider: provider,
             error: lastFallbackError ?? ClaudeAuthError.notLoggedIn
         )
+    }
+
+    private static func diagnosticIdentity(for source: ClaudeCredentialState.Source) -> String {
+        switch source {
+        case .file: "file"
+        case .keychainCurrentUser(let service): "keychainCurrentUser.\(service)"
+        case .keychainLegacy(let service): "keychainLegacy.\(service)"
+        case .desktop: "desktop"
+        case .environment: "environment"
+        }
+    }
+
+    private static func sourceFallbackDiagnosticPrefix(
+        providerID: String,
+        source: ClaudeCredentialState.Source
+    ) -> String {
+        let identity = JSONLScanCachePaths.stableFingerprint(diagnosticIdentity(for: source))
+        return "auth.claude.sourceFallback.\(providerID).\(identity)."
+    }
+
+    private static func credentialPersistenceDiagnosticKey(
+        providerID: String,
+        source: ClaudeCredentialState.Source
+    ) -> String {
+        let identity = JSONLScanCachePaths.stableFingerprint(diagnosticIdentity(for: source))
+        return "auth.claude.token-persist.\(providerID).\(identity)"
+    }
+
+    private static func liveUsageDiagnosticPrefix(kind: String, providerID: String) -> String {
+        "auth.claude.live-usage.\(kind).\(providerID)."
+    }
+
+    private static func liveUsageDiagnosticKey(
+        kind: String,
+        providerID: String,
+        state: ClaudeCredentialState
+    ) -> String {
+        // A token rotation does not make a persistent warning new; the credential source is the
+        // recovery unit. A different fallback source has an independent gate and cannot clear it.
+        let identity = diagnosticIdentity(for: state.source)
+        return liveUsageDiagnosticPrefix(kind: kind, providerID: providerID)
+            + JSONLScanCachePaths.stableFingerprint(identity)
+    }
+
+    private static func desktopFallbackDiagnosticKey(providerID: String) -> String {
+        "auth.claude.desktopFallback.\(providerID)"
     }
 
     private func probe(
@@ -371,11 +454,27 @@ final class ClaudeProvider: ProviderRuntime {
             // blank — log it for diagnosis and surface a provider header warning (the amber triangle, like
             // Z.ai's "no coding plan" notice) telling the user a re-login restores them. The local-log
             // spend tiles below are unaffected and still load.
-            AppLog.warn(LogTag.plugin("claude"), "live usage unavailable: credential lacks the user:profile scope (inference-only token); re-login with `claude` to restore session/weekly limits")
+            DiagnosticGate.logOnce(for: Self.liveUsageDiagnosticKey(
+                kind: "missingProfileScope",
+                providerID: provider.id,
+                state: state
+            )) {
+                AppLog.warn(LogTag.plugin("claude"), "live usage unavailable: credential lacks the user:profile scope (inference-only token); re-login with `claude` to restore session/weekly limits")
+            }
+            DiagnosticGate.clearFailure(Self.liveUsageDiagnosticKey(
+                kind: "retryUnauthorized",
+                providerID: provider.id,
+                state: state
+            ))
             warning = ClaudeUsageMapper.missingProfileScopeWarning
         case .inferenceOnlyToken:
             // An explicit CLAUDE_CODE_OAUTH_TOKEN is inference-only by design; nothing to fetch and nothing
             // to nag about — the spend tiles still load below.
+            DiagnosticGate.clearFailure(Self.liveUsageDiagnosticKey(
+                kind: "retryUnauthorized",
+                providerID: provider.id,
+                state: state
+            ))
             break
         }
         if let fallbackWarning {
@@ -494,7 +593,13 @@ final class ClaudeProvider: ProviderRuntime {
         // Inside an active rate-limit cooldown, skip the live call and serve the last-good usage so a
         // constantly-limited endpoint doesn't blank the dashboard (and we don't pile on more 429s).
         if let until = rateLimitedUntil, now() < until {
-            AppLog.info(LogTag.plugin("claude"), "rate-limited (cooldown active, serving \(lastGoodUsage == nil ? "badge" : "last-good usage"))")
+            DiagnosticGate.logOnce(for: Self.liveUsageDiagnosticKey(
+                kind: "rateLimit",
+                providerID: provider.id,
+                state: state
+            )) {
+                AppLog.info(LogTag.plugin("claude"), "rate-limited (cooldown active, serving \(lastGoodUsage == nil ? "badge" : "last-good usage"))")
+            }
             return rateLimitedSnapshot(credentials: state.oauth, retryAfterSeconds: Int(until.timeIntervalSince(now()).rounded(.up)))
         }
 
@@ -573,7 +678,13 @@ final class ClaudeProvider: ProviderRuntime {
             if ClaudeUsageClient.isMissingProfileScopeFailure(retried) {
                 response = retried
             } else if ProviderAuthRetry.isAuthFailure(retried) {
-                AppLog.warn(.auth, "retry still unauthorized -> auth expired")
+                DiagnosticGate.logOnce(for: Self.liveUsageDiagnosticKey(
+                    kind: "retryUnauthorized",
+                    providerID: provider.id,
+                    state: working
+                )) {
+                    AppLog.warn(.auth, "retry still unauthorized -> auth expired")
+                }
                 throw ClaudeAuthError.tokenExpired
             } else {
                 response = retried
@@ -589,9 +700,30 @@ final class ClaudeProvider: ProviderRuntime {
         }
         try Task.checkCancellation()
         guard currentGeneration == expectedGeneration else { throw ClaudeAuthError.credentialsChanged }
+        if response.statusCode != 429 {
+            DiagnosticGate.clearFailure(Self.liveUsageDiagnosticKey(
+                kind: "rateLimit",
+                providerID: provider.id,
+                state: working
+            ))
+        }
+
+        // A non-auth response proves this source recovered from the earlier unauthorized retry,
+        // even when it has since lost the profile scope or is currently rate limited.
+        DiagnosticGate.clearFailure(Self.liveUsageDiagnosticKey(
+            kind: "retryUnauthorized",
+            providerID: provider.id,
+            state: working
+        ))
 
         if ClaudeUsageClient.isMissingProfileScopeFailure(response) {
-            AppLog.warn(LogTag.plugin("claude"), "live usage unavailable: OAuth response says the credential lacks the user:profile scope; re-login with `claude` to restore session/weekly limits")
+            DiagnosticGate.logOnce(for: Self.liveUsageDiagnosticKey(
+                kind: "missingProfileScope",
+                providerID: provider.id,
+                state: working
+            )) {
+                AppLog.warn(LogTag.plugin("claude"), "live usage unavailable: OAuth response says the credential lacks the user:profile scope; re-login with `claude` to restore session/weekly limits")
+            }
             return ClaudeMappedUsage(
                 plan: ClaudeUsageMapper.formatPlan(
                     subscriptionType: working.oauth.subscriptionType,
@@ -607,11 +739,22 @@ final class ClaudeProvider: ProviderRuntime {
         if response.statusCode == 429 {
             let retryAfterSeconds = ClaudeUsageMapper.parseRetryAfterSeconds(response, now: now())
             rateLimitedUntil = now().addingTimeInterval(TimeInterval(retryAfterSeconds ?? Int(Self.rateLimitCooldown)))
-            AppLog.info(LogTag.plugin("claude"), "rate-limited (serving \(lastGoodUsage == nil ? "badge" : "last-good usage"))")
+            DiagnosticGate.logOnce(for: Self.liveUsageDiagnosticKey(
+                kind: "rateLimit",
+                providerID: provider.id,
+                state: working
+            )) {
+                AppLog.info(LogTag.plugin("claude"), "rate-limited (serving \(lastGoodUsage == nil ? "badge" : "last-good usage"))")
+            }
             return rateLimitedSnapshot(credentials: working.oauth, retryAfterSeconds: retryAfterSeconds)
         }
 
         let mapped = try ClaudeUsageMapper.mapUsageResponse(response, credentials: working.oauth, now: now())
+        DiagnosticGate.clearFailure(Self.liveUsageDiagnosticKey(
+            kind: "missingProfileScope",
+            providerID: provider.id,
+            state: working
+        ))
         lastGoodUsage = mapped
         rateLimitedUntil = nil
         return mapped
@@ -654,6 +797,10 @@ final class ClaudeProvider: ProviderRuntime {
         cachedCredentialFingerprint = fingerprint
         lastGoodUsage = nil
         rateLimitedUntil = nil
+        DiagnosticGate.clearFailures(prefix: Self.liveUsageDiagnosticPrefix(
+            kind: "rateLimit",
+            providerID: provider.id
+        ))
     }
 
     private static func credentialFingerprint(_ credentials: ClaudeOAuth) -> Data {
@@ -674,7 +821,13 @@ final class ClaudeProvider: ProviderRuntime {
         refreshToken: String,
         expectedGeneration: ClaudeCredentialGeneration
     ) async throws -> RefreshedAccess {
-        AppLog.info(LogTag.auth("claude"), "token refresh attempt")
+        let refreshAttemptDiagnosticKey = Self.sourceFallbackDiagnosticPrefix(
+            providerID: provider.id,
+            source: state.source
+        ) + "refresh.attempt"
+        DiagnosticGate.logOnce(for: refreshAttemptDiagnosticKey) {
+            AppLog.info(LogTag.auth("claude"), "token refresh attempt")
+        }
         let response: HTTPResponse
         do {
             response = try await usageClient.refreshToken(refreshToken, config: authStore.oauthConfig())
@@ -686,7 +839,13 @@ final class ClaudeProvider: ProviderRuntime {
             let body = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any]
             let errorCode = body?["error"] as? String ?? body?["error_description"] as? String
             if errorCode == "invalid_grant" {
-                AppLog.warn(LogTag.auth("claude"), "session expired (invalid_grant)")
+                let key = Self.sourceFallbackDiagnosticPrefix(
+                    providerID: provider.id,
+                    source: state.source
+                ) + "refresh.invalidGrant"
+                DiagnosticGate.logOnce(for: key) {
+                    AppLog.warn(LogTag.auth("claude"), "session expired (invalid_grant)")
+                }
                 throw ClaudeAuthError.sessionExpired
             }
             // A 400/401 without a recognized OAuth error code isn't necessarily an expired token — it
@@ -699,6 +858,10 @@ final class ClaudeProvider: ProviderRuntime {
         }
         // NEVER log decoded.accessToken / refreshToken — only the fact that a rotation happened.
         let decoded = try JSONDecoder().decode(ClaudeRefreshResponse.self, from: response.body)
+        DiagnosticGate.clearFailures(prefix: Self.sourceFallbackDiagnosticPrefix(
+            providerID: provider.id,
+            source: state.source
+        ))
         let previousOAuth = state.oauth
         state.oauth.accessToken = decoded.accessToken
         if let refreshToken = decoded.refreshToken {
@@ -712,17 +875,24 @@ final class ClaudeProvider: ProviderRuntime {
         // "session expired". The refreshed token still works for this session, so we log and continue
         // rather than fail the live fetch.
         let persisted: Bool
+        let persistenceDiagnosticKey = Self.credentialPersistenceDiagnosticKey(
+            providerID: provider.id,
+            source: state.source
+        )
         do {
             guard try await loadOffMainActor({ [authStore, state] in
                 try authStore.save(state, ifUnchanged: expectedGeneration)
             }) else {
                 throw ClaudeAuthError.credentialsChanged
             }
+            DiagnosticGate.clearFailure(persistenceDiagnosticKey)
             persisted = true
         } catch let error as ClaudeAuthError where error == .credentialsChanged {
             throw error
         } catch {
-            AppLog.error(LogTag.auth("claude"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
+            DiagnosticGate.logOnce(for: persistenceDiagnosticKey) {
+                AppLog.error(LogTag.auth("claude"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
+            }
             persisted = false
         }
         if cachedCredentialFingerprint == Self.credentialFingerprint(previousOAuth) {

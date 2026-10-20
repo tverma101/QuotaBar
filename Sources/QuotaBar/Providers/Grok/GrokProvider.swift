@@ -189,6 +189,9 @@ final class GrokProvider: ProviderRuntime {
         var working = state
         defer { state = working }
         return try await ProviderAuthRetry.fetch(
+            providerID: provider.id,
+            diagnosticSourceID: working.entryKey + "\n"
+                + (ProviderParse.jwtPayload(working.entry.idToken ?? working.token)?["sub"] as? String ?? ""),
             token: accessToken,
             attempt: { try await self.usageClient.fetchCreditsConfig(accessToken: $0) },
             refreshAccessToken: {
@@ -216,11 +219,18 @@ final class GrokProvider: ProviderRuntime {
             )
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.warn(LogTag.auth("grok"), "token refresh request failed (transport)")
+            DiagnosticGate.logOnce(for: refreshFailureKey(state: originalState, kind: "transport")) {
+                AppLog.warn(LogTag.auth("grok"), "token refresh request failed (transport)")
+            }
             throw GrokUsageError.connectionFailed
         }
         guard (200..<300).contains(response.statusCode) else {
-            AppLog.warn(LogTag.auth("grok"), "token refresh failed (HTTP \(response.statusCode))")
+            DiagnosticGate.logOnce(for: refreshFailureKey(
+                state: originalState,
+                kind: "http.\(response.statusCode)"
+            )) {
+                AppLog.warn(LogTag.auth("grok"), "token refresh failed (HTTP \(response.statusCode))")
+            }
             // OAuth's 400/401 rejection means the refresh grant is no longer usable. Other statuses
             // (notably 429 and 5xx) are retryable service/HTTP failures, not evidence that the user
             // needs to sign in again.
@@ -230,10 +240,13 @@ final class GrokProvider: ProviderRuntime {
         guard let decoded = usageClient.decodeRefreshResponse(response),
               !decoded.accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
-            AppLog.warn(LogTag.auth("grok"), "token refresh returned an undecodable or empty access token")
+            DiagnosticGate.logOnce(for: refreshFailureKey(state: originalState, kind: "invalid-response")) {
+                AppLog.warn(LogTag.auth("grok"), "token refresh returned an undecodable or empty access token")
+            }
             return nil
         }
 
+        DiagnosticGate.clearFailures(prefix: refreshDiagnosticPrefix(entryKey: originalState.entryKey))
         let accessToken = decoded.accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
         state.token = accessToken
         state.entry.key = accessToken
@@ -260,6 +273,7 @@ final class GrokProvider: ProviderRuntime {
                     try authStore.save(persistedState, replacing: originalState)
                 }
             }.value
+            DiagnosticGate.clearFailures(prefix: refreshDiagnosticPrefix(entryKey: originalState.entryKey))
         } catch is GrokAuthConflictError {
             // The login was removed/replaced while OAuth was in flight. Do not use the old
             // account's late response for this refresh either.
@@ -270,10 +284,24 @@ final class GrokProvider: ProviderRuntime {
             throw error
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.error(LogTag.auth("grok"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
+            DiagnosticGate.logOnce(for: refreshFailureKey(state: originalState, kind: "persist")) {
+                AppLog.error(LogTag.auth("grok"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
+            }
         }
         try Task.checkCancellation()
         return accessToken
+    }
+
+    private func refreshDiagnosticPrefix(entryKey: String) -> String {
+        "auth.grok.refresh.\(JSONLScanCachePaths.stableFingerprint(entryKey))."
+    }
+
+    private func refreshFailureKey(state: GrokAuthState, kind: String) -> String {
+        let refreshToken = authStore.refreshToken(for: state.entry) ?? ""
+        return refreshDiagnosticPrefix(entryKey: state.entryKey)
+            + JSONLScanCachePaths.stableFingerprint(refreshToken)
+            + "."
+            + kind
     }
 
     private func refreshExpiryDate(response: GrokRefreshResponse, accessToken: String) -> Date {

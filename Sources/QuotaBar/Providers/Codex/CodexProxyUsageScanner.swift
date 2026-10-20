@@ -1,4 +1,6 @@
 import CryptoKit
+import CoreFoundation
+import Darwin
 import Foundation
 
 enum CodexProxyUsageScanResult: Sendable {
@@ -68,7 +70,11 @@ actor CodexProxyUsageScanner {
         now: Date = Date(),
         pricing: ModelPricing
     ) async -> CodexProxyUsageScanResult {
-        guard let fingerprint = Self.accountFingerprint(for: accountIdentityKey) else { return .complete(nil) }
+        guard let fingerprint = Self.accountFingerprint(for: accountIdentityKey) else {
+            return .complete(nil)
+        }
+        let paths = Self.uniqueDatabasePaths(databasePaths())
+        let diagnosticPrefix = Self.diagnosticPrefix(fingerprint: fingerprint, paths: paths)
         let days = max(1, daysBack)
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
@@ -79,9 +85,9 @@ actor CodexProxyUsageScanner {
         var accumulator = DailyUsageAccumulator()
         var sawRows = false
         var sawSource = false
-        for path in databasePaths() {
+        for path in paths {
             guard !Task.isCancelled else { return .incomplete }
-            if path == optionalDefaultDatabasePath, !FileManager.default.fileExists(atPath: path) {
+            if Self.isDefinitelyMissingOptionalDefault(path, optionalPath: optionalDefaultDatabasePath) {
                 continue
             }
             sawSource = true
@@ -91,11 +97,11 @@ actor CodexProxyUsageScanner {
                     try sqlite.queryValue(path: path, sql: Self.schemaSQL)
                 }
             } catch {
-                AppLog.warn(LogTag.plugin("codex"), "FCC usage database could not be read; preserving last-good history")
+                Self.logIncomplete("read", "FCC usage database could not be read; preserving last-good history", prefix: diagnosticPrefix)
                 return .incomplete
             }
             guard Self.hasRequiredSchema(schema) else {
-                AppLog.warn(LogTag.plugin("codex"), "FCC usage database schema is incomplete; preserving last-good history")
+                Self.logIncomplete("schema", "FCC usage database schema is incomplete; preserving last-good history", prefix: diagnosticPrefix)
                 return .incomplete
             }
             let payload: String?
@@ -111,11 +117,11 @@ actor CodexProxyUsageScanner {
                     )
                 }
             } catch {
-                AppLog.warn(LogTag.plugin("codex"), "FCC usage query failed; preserving last-good history")
+                Self.logIncomplete("query", "FCC usage query failed; preserving last-good history", prefix: diagnosticPrefix)
                 return .incomplete
             }
             guard let payload, let rows = JSONLAccountingWorkPacer.shared.perform({ Self.rows(from: payload) }) else {
-                AppLog.warn(LogTag.plugin("codex"), "FCC usage rows could not be decoded; preserving last-good history")
+                Self.logIncomplete("decode", "FCC usage rows could not be decoded; preserving last-good history", prefix: diagnosticPrefix)
                 return .incomplete
             }
             var malformedRow = false
@@ -170,12 +176,13 @@ actor CodexProxyUsageScanner {
                 )
             }
             guard !malformedRow else {
-                AppLog.warn(LogTag.plugin("codex"), "FCC usage database contains malformed rows; preserving last-good history")
+                Self.logIncomplete("malformed", "FCC usage database contains malformed rows; preserving last-good history", prefix: diagnosticPrefix)
                 return .incomplete
             }
         }
 
         guard !Task.isCancelled else { return .incomplete }
+        DiagnosticGate.clearFailures(prefix: diagnosticPrefix)
         guard sawSource, sawRows else { return .complete(nil) }
         let result = accumulator.build()
         return .complete(result.series.daily.isEmpty && result.unknownModelsByDay.isEmpty ? nil : result)
@@ -197,7 +204,7 @@ actor CodexProxyUsageScanner {
         homeDirectory: URL
     ) -> [String] {
         let configured = configuredDatabasePaths(environment: environment)
-        guard configured.isEmpty else { return unique(configured) }
+        guard configured.isEmpty else { return uniqueDatabasePaths(configured) }
         return [homeDirectory.appendingPathComponent(".fcc/usage.db").path]
     }
 
@@ -209,6 +216,24 @@ actor CodexProxyUsageScanner {
     }
 
     private static let schemaSQL = "PRAGMA table_info(usage_events);"
+    private static let diagnosticPrefixBase = "codex.proxy.scan."
+
+    private static func diagnosticPrefix(fingerprint: String, paths: [String]) -> String {
+        let sourceIdentity = paths.sorted().joined(separator: "\n")
+        return "\(diagnosticPrefixBase)\(fingerprint).\(JSONLScanCachePaths.stableFingerprint(sourceIdentity))."
+    }
+
+    private static func logIncomplete(_ kind: String, _ message: String, prefix: String) {
+        DiagnosticGate.logOnce(for: prefix + kind) {
+            AppLog.warn(LogTag.plugin("codex"), message)
+        }
+    }
+
+    private static func isDefinitelyMissingOptionalDefault(_ path: String, optionalPath: String?) -> Bool {
+        guard path == optionalPath else { return false }
+        var status = stat()
+        return Darwin.lstat(path, &status) != 0 && errno == ENOENT
+    }
 
     private static func eventsSQL(fingerprint: String, sinceDay: String, throughDay: String) -> String {
         let escapedFingerprint = fingerprint.replacingOccurrences(of: "'", with: "''")
@@ -266,12 +291,16 @@ actor CodexProxyUsageScanner {
     }
 
     private static func count(_ value: Any?) -> Int? {
-        // `Double(Int.max)` rounds up to 2^63, so `<= Double(Int.max)` admits exactly 2^63 — which then
-        // traps in the conversion below. Compare in the clamped domain instead.
-        guard let number = ProviderParse.number(value), number >= 0, number < 9_223_372_036_854_775_808 else {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else {
             return nil
         }
-        return Int(number.rounded(.down))
+        let count = number.doubleValue
+        guard count.isFinite, count >= 0, count <= 1e15, count.rounded(.towardZero) == count else {
+            return nil
+        }
+        return Int(count)
     }
 
     private static func total(input: Int, cacheRead: Int, cacheWrite: Int, output: Int) -> Int? {
@@ -295,7 +324,7 @@ actor CodexProxyUsageScanner {
             guard !remainder.isEmpty else { break }
             candidates.append(remainder)
         }
-        return unique(candidates)
+        return uniqueStrings(candidates)
     }
 
     private static func splitPaths(_ raw: String?) -> [String] {
@@ -305,8 +334,30 @@ actor CodexProxyUsageScanner {
             .filter { !$0.isEmpty }
     }
 
-    private static func unique(_ paths: [String]) -> [String] {
+    private static func uniqueStrings(_ values: [String]) -> [String] {
         var seen: Set<String> = []
-        return paths.filter { seen.insert($0).inserted }
+        return values.filter { seen.insert($0).inserted }
+    }
+
+    private static func uniqueDatabasePaths(_ paths: [String]) -> [String] {
+        var seen: Set<String> = []
+        return paths.filter { path in
+            let canonical = URL(fileURLWithPath: path)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+            var metadata = stat()
+            let identity: String
+            if Darwin.lstat(canonical, &metadata) == 0 {
+                // Distinct symlink, relative, and hard-link spellings of one SQLite database still
+                // describe one source; scanning each alias would count every event more than once.
+                identity = "inode:\(metadata.st_dev):\(metadata.st_ino)"
+            } else {
+                // Preserve explicit missing paths so the scan can report an incomplete source, while
+                // still coalescing repeated spellings of that same missing path.
+                identity = "path:\(canonical)"
+            }
+            return seen.insert(identity).inserted
+        }
     }
 }

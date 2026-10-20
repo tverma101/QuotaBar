@@ -28,13 +28,11 @@ final class ModelPricing: Sendable {
     /// Resolution walks every catalog entry on a fuzzy miss, so memoize per model name. Shared
     /// across threads; a pricing snapshot is immutable so entries never invalidate.
     ///
-    /// `unresolved(reported:)` remembers that a name had no rate and whether
-    /// `onUnresolvedModel` already fired for it. One miss repeats across every usage event in a
-    /// ledger, so the hook must run at most once per distinct name per snapshot — including when a
-    /// memoized nil is what answered.
+    /// A resolved fallback can still need an OpenRouter exact-route check. `reported` ensures that
+    /// both fallback-priced and unpriced models are handed to discovery at most once per snapshot.
     private let memo = OSAllocatedUnfairLock<[String: MemoEntry]>(initialState: [:])
     private enum MemoEntry: Sendable {
-        case rates(ModelRates)
+        case rates(ModelRates, needsOpenRouterRecheck: Bool, reported: Bool)
         case unresolved(reported: Bool)
     }
     private enum CanonicalNameLookup: Sendable {
@@ -51,13 +49,13 @@ final class ModelPricing: Sendable {
         primary: PricingCatalog,
         secondary: PricingCatalog,
         openRouter: PricingCatalog = PricingCatalog(),
-        onUnresolvedModel: (@Sendable (String) -> Void)? = nil
+        onOpenRouterRecheckModel: (@Sendable (String) -> Void)? = nil
     ) {
         self.supplement = supplement
         self.primary = primary
         self.secondary = secondary
         self.openRouter = openRouter
-        self.onUnresolvedModel = onUnresolvedModel
+        self.onOpenRouterRecheckModel = onOpenRouterRecheckModel
         self.aggregateCacheToken = Self.makeAggregateCacheToken(
             supplement: supplement, primary: primary, secondary: secondary, openRouter: openRouter
         )
@@ -71,10 +69,10 @@ final class ModelPricing: Sendable {
     /// Stable across launches for the same catalogs. See `makeAggregateCacheToken`.
     let aggregateCacheToken: String
 
-    /// Called once per distinct model name this snapshot cannot price, so `ModelPricingStore` can
-    /// coalesce a newly seen model into one public-catalogue revalidation. Nil by default, keeping
-    /// `ModelPricing` a pure value for callers that do not want discovery.
-    let onUnresolvedModel: (@Sendable (String) -> Void)?
+    /// Called once per distinct name that lacks a curated rate and exact OpenRouter rate. This also
+    /// includes fallback-priced names: an exact public route can replace a fuzzy LiteLLM estimate
+    /// automatically when a new model appears. Nil by default for callers that do not want discovery.
+    let onOpenRouterRecheckModel: (@Sendable (String) -> Void)?
 
     private static func makeAggregateCacheToken(
         supplement: PricingSupplement,
@@ -189,50 +187,82 @@ final class ModelPricing: Sendable {
     }
 
     func resolve(model: String) -> ModelRates? {
-        if let cached = memo.withLock({ $0[model] }) {
-            if case .rates(let rates) = cached { return rates }
-            reportUnresolvedIfNeeded(model)
-            return nil
-        }
-        let resolved = resolveUncached(model: model)
-        if let resolved {
-            memo.withLock { $0[model] = .rates(resolved) }
-            return resolved
-        }
-        memo.withLock { $0[model] = .unresolved(reported: false) }
-        reportUnresolvedIfNeeded(model)
-        return nil
+        let entry = memoizedEntry(model: model)
+        reportOpenRouterRecheckIfNeeded(model)
+        guard case .rates(let rates, _, _) = entry else { return nil }
+        return rates
     }
 
     /// Same lookup as `resolve`, minus the discovery hook. Internal identity probes walk several
     /// candidate spellings of one slug; only the caller's actual name is worth reporting.
     private func resolveQuietly(model: String) -> ModelRates? {
-        if let cached = memo.withLock({ $0[model] }) {
-            guard case .rates(let rates) = cached else { return nil }
-            return rates
-        }
+        guard case .rates(let rates, _, _) = memoizedEntry(model: model) else { return nil }
+        return rates
+    }
+
+    /// Concurrent scans may resolve the same name at once. Keep whichever result is first memoized,
+    /// then atomically mark it before invoking the callback so the hook cannot fire twice.
+    private func memoizedEntry(model: String) -> MemoEntry {
+        if let cached = memo.withLock({ $0[model] }) { return cached }
         let resolved = resolveUncached(model: model)
-        memo.withLock { $0[model] = resolved.map(MemoEntry.rates) ?? .unresolved(reported: false) }
-        return resolved
-    }
-
-    /// Marks the memo entry reported *before* calling out, so a re-entrant resolve of the same name
-    /// cannot fire the hook twice.
-    private func reportUnresolvedIfNeeded(_ model: String) {
-        guard let onUnresolvedModel else { return }
-        let shouldReport = memo.withLock { (entries: inout [String: MemoEntry]) -> Bool in
-            guard case .unresolved(let reported) = entries[model], !reported else { return false }
-            entries[model] = .unresolved(reported: true)
-            return true
+        let candidate: MemoEntry
+        if let resolved {
+            candidate = .rates(
+                resolved,
+                needsOpenRouterRecheck: !hasExactOpenRouterRate(model) && !hasCuratedSupplementRate(model),
+                reported: false
+            )
+        } else {
+            candidate = .unresolved(reported: false)
         }
-        if shouldReport { onUnresolvedModel(model) }
+        return memo.withLock { entries in
+            if let existing = entries[model] { return existing }
+            entries[model] = candidate
+            return candidate
+        }
     }
 
-    /// Whether `model` resolves, without reporting a miss. `ModelPricingStore` uses it to tell
-    /// "the catalogue already covers this name" from "still unknown" after a discovery fetch, without
-    /// feeding its own probe back into the discovery queue.
+    private func reportOpenRouterRecheckIfNeeded(_ model: String) {
+        guard let onOpenRouterRecheckModel else { return }
+        let shouldReport = memo.withLock { (entries: inout [String: MemoEntry]) -> Bool in
+            guard let entry = entries[model] else { return false }
+            switch entry {
+            case .rates(let rates, needsOpenRouterRecheck: true, reported: false):
+                entries[model] = .rates(rates, needsOpenRouterRecheck: true, reported: true)
+                return true
+            case .unresolved(reported: false):
+                entries[model] = .unresolved(reported: true)
+                return true
+            case .rates, .unresolved:
+                return false
+            }
+        }
+        if shouldReport { onOpenRouterRecheckModel(model) }
+    }
+
+    /// Whether any catalog can price `model`, without reporting it to OpenRouter discovery. This is
+    /// useful for identity probes; discovery uses `hasExactOpenRouterRate(_:)` instead.
     func isPriced(_ model: String) -> Bool {
         resolveQuietly(model: model) != nil
+    }
+
+    /// Whether OpenRouter itself has an exact rate for this name. This deliberately ignores
+    /// LiteLLM fuzzy matches and models.dev: discovery must not mistake a fallback estimate for a
+    /// fresh public-route match.
+    func hasExactOpenRouterRate(_ model: String) -> Bool {
+        if openRouter.findExact(model) != nil { return true }
+        if let canonical = canonicalName(for: model), openRouter.findExact(canonical) != nil { return true }
+        let normalized = PricingCatalog.normalizedKey(model)
+        if normalized != model, openRouter.findExact(normalized) != nil { return true }
+        return false
+    }
+
+    private func hasCuratedSupplementRate(_ model: String) -> Bool {
+        if supplement.pricing[model] != nil { return true }
+        let normalized = PricingCatalog.normalizedKey(model)
+        if supplement.pricing[normalized] != nil { return true }
+        if let canonical = canonicalName(for: model), supplement.pricing[canonical] != nil { return true }
+        return false
     }
 
     /// Dollar cost of `tokens` for `model`, or nil when the model can't be priced. Aggregated sources

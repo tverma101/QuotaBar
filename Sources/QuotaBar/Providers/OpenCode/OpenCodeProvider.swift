@@ -52,11 +52,63 @@ enum OpenCodeUsageError: Error, LocalizedError, Equatable {
     }
 }
 
+/// Non-secret identity metadata used to construct account-specific meter descriptors before the
+/// provider catalog is published. `credentialID` is a one-way hash and is never rendered or logged.
+struct OpenCodeGoAccountIdentity: Sendable, Equatable {
+    let credentialID: String
+    let descriptorKey: String
+    let displayName: String
+}
+
+/// The local Go-key inventory discovered before the provider catalog is published. The cache key is
+/// a fingerprint of sorted credential-to-descriptor mappings, including one-way credential IDs and
+/// display labels. It stays stable across source-order changes and changes when a key rotates or its
+/// label is reassigned. An unreadable source is represented separately from a complete empty inventory.
+struct OpenCodeGoAccountInventory: Sendable, Equatable {
+    static let incompleteCacheIdentityKey = "opencode-go-inventory-incomplete-v1"
+
+    let identities: [OpenCodeGoAccountIdentity]
+    let credentialIDs: [String]
+    let isComplete: Bool
+    let cacheIdentityKey: String
+
+    init(accountIdentities: [OpenCodeGoAccountIdentity], isComplete: Bool) {
+        let sortedAccounts = accountIdentities.sorted {
+            if $0.credentialID != $1.credentialID { return $0.credentialID < $1.credentialID }
+            if $0.descriptorKey != $1.descriptorKey { return $0.descriptorKey < $1.descriptorKey }
+            return $0.displayName < $1.displayName
+        }
+        let distinctCredentialIDs = Array(Set(accountIdentities.map(\.credentialID))).sorted()
+        self.identities = accountIdentities.count > 1 ? accountIdentities : []
+        self.credentialIDs = distinctCredentialIDs
+        self.isComplete = isComplete
+        if isComplete {
+            // Length-prefix arbitrary labels so a label containing a delimiter cannot alias another
+            // credential-to-descriptor mapping. Include labels and stable source IDs: an unchanged
+            // key set with reassigned names must not paint one account's cached meter under another.
+            let mapping = sortedAccounts.map { account in
+                [account.credentialID, account.descriptorKey, account.displayName]
+                    .map { "\($0.utf8.count):\($0)" }
+                    .joined()
+            }.joined(separator: ";")
+            let material = "opencode-go-inventory-v2|\(mapping)"
+            self.cacheIdentityKey = SHA256.hash(data: Data(material.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+        } else {
+            self.cacheIdentityKey = Self.incompleteCacheIdentityKey
+        }
+    }
+}
+
 /// Tracks OpenCode-hosted usage (the Go subscription + the Zen pay-as-you-go gateway). Go plan caps
 /// come only from a successful `/zen/go/v1/usage` response; local SQLite logs provide spend tiles and
 /// history, never subscription caps. See `OpenCodeUsageScanner` and `OpenCodeGoUsageClient`.
 @MainActor
 final class OpenCodeProvider: ProviderRuntime {
+    private static let authFileInventoryReadDiagnosticKey = "opencode.account-inventory.auth-file-read"
+    private static let savedKeysInventoryReadDiagnosticKey = "opencode.account-inventory.saved-keys-read"
+
     let provider = Provider(
         id: "opencode",
         displayName: "OpenCode",
@@ -77,8 +129,15 @@ final class OpenCodeProvider: ProviderRuntime {
     let now: @Sendable () -> Date
     private let enabledGatewaySources: @MainActor () -> Set<OpenCodeUsageScanner.GatewaySource>
     private let enabledCodexHomes: @MainActor () -> [URL]?
+    private let enabledCodexHomeIdentityKeys: @MainActor () -> [String: String]?
     private let enabledClaudeScanners: @MainActor () -> [ClaudeLogUsageScanner]?
-    private let enabledCodexAccountKeys: @MainActor () -> Set<String>?
+    private let enabledCodexIdentityKeys: @MainActor () -> Set<String>?
+    private let codexAccountIdentityKeys: @MainActor () -> [String: String]
+    private let routerAccountIdentityKeys: @MainActor () -> [String: String]
+    private let onGoKeysChanged: @MainActor () -> Void
+    private let preloadedAccountIdentities: [OpenCodeGoAccountIdentity]?
+    private let preloadedAccountInventory: OpenCodeGoAccountInventory?
+    private let accountInventoryDiscoveryDeferred: Bool
 
     /// Names the local source on hover (the dollars can only undercount true account usage — this
     /// machine only). No "(estimated)": OpenCode records its own per-message cost, so the values are
@@ -91,7 +150,6 @@ final class OpenCodeProvider: ProviderRuntime {
 
     /// Edge-triggers the account-API failure log the same way — a long offline stretch must not spam
     /// the log every refresh.
-    private var loggedAccountAPIFailure = false
 
     /// Edge-triggers the app-saved-keys read failure the same way (corrupt store file).
     private var loggedStoredKeysFailure = false
@@ -123,8 +181,15 @@ final class OpenCodeProvider: ProviderRuntime {
             Set(OpenCodeUsageScanner.GatewaySource.allCases)
         },
         enabledCodexHomes: @escaping @MainActor () -> [URL]? = { nil },
+        enabledCodexHomeIdentityKeys: @escaping @MainActor () -> [String: String]? = { nil },
         enabledClaudeScanners: @escaping @MainActor () -> [ClaudeLogUsageScanner]? = { nil },
-        enabledCodexAccountKeys: @escaping @MainActor () -> Set<String>? = { nil },
+        enabledCodexIdentityKeys: @escaping @MainActor () -> Set<String>? = { nil },
+        codexAccountIdentityKeys: @escaping @MainActor () -> [String: String] = { [:] },
+        routerAccountIdentityKeys: @escaping @MainActor () -> [String: String] = { [:] },
+        onGoKeysChanged: @escaping @MainActor () -> Void = {},
+        preloadedAccountIdentities: [OpenCodeGoAccountIdentity]? = nil,
+        preloadedAccountInventory: OpenCodeGoAccountInventory? = nil,
+        accountInventoryDiscoveryDeferred: Bool = false,
         activeKeyID: @escaping @Sendable () -> String? = {
             UserDefaults.standard.string(forKey: OpenCodeGoKeyStore.selectionKey)
         }
@@ -138,20 +203,38 @@ final class OpenCodeProvider: ProviderRuntime {
         self.activeKeyID = activeKeyID
         self.enabledGatewaySources = enabledGatewaySources
         self.enabledCodexHomes = enabledCodexHomes
+        self.enabledCodexHomeIdentityKeys = enabledCodexHomeIdentityKeys
         self.enabledClaudeScanners = enabledClaudeScanners
-        self.enabledCodexAccountKeys = enabledCodexAccountKeys
+        self.enabledCodexIdentityKeys = enabledCodexIdentityKeys
+        self.codexAccountIdentityKeys = codexAccountIdentityKeys
+        self.routerAccountIdentityKeys = routerAccountIdentityKeys
+        self.onGoKeysChanged = onGoKeysChanged
+        self.preloadedAccountInventory = preloadedAccountInventory ?? preloadedAccountIdentities.map {
+            OpenCodeGoAccountInventory(accountIdentities: $0, isComplete: true)
+        }
+        self.preloadedAccountIdentities = preloadedAccountInventory?.identities ?? preloadedAccountIdentities
+        self.accountInventoryDiscoveryDeferred = accountInventoryDiscoveryDeferred
     }
 
     var widgetDescriptors: [WidgetDescriptor] {
-        // Go plan caps as percent meters (Session/Weekly above the fold, Monthly on demand) — only
+        // Go plan caps as percent meters (Session/Weekly/Monthly) — only
         // from a current account-wide API response; local spend tiles + trend sum Go + Zen history.
-        [
+        let baseMeters: [WidgetDescriptor] = [
             .percent(id: "opencode.session", provider: provider, title: "Session", sessionStartSignal: .zeroUsage)
-                .exportingLimit("session", unit: "percent", estimated: true),
+                .exportingLimit("session", unit: "percent", estimated: true)
+                .hidingWhenEmpty(),
             .percent(id: "opencode.weekly", provider: provider, title: "Weekly")
-                .exportingLimit("weekly", unit: "percent", estimated: true),
+                .exportingLimit("weekly", unit: "percent", estimated: true)
+                .hidingWhenEmpty(),
             .percent(id: "opencode.monthly", provider: provider, title: "Monthly")
-                .exportingLimit("monthly", unit: "percent", estimated: true),
+                .exportingLimit("monthly", unit: "percent", estimated: true)
+                .hidingWhenEmpty(),
+        ]
+        let accountIdentities = preloadedAccountIdentities
+            ?? (accountInventoryDiscoveryDeferred ? [] : configuredAccountIdentities())
+        return baseMeters + accountIdentities.flatMap { account in
+            Self.accountMeterDescriptors(for: account, provider: provider)
+        } + [
             .usageTrend(provider: provider)
                 .exportingHistory(
                     scope: .machineLocal,
@@ -159,6 +242,189 @@ final class OpenCodeProvider: ProviderRuntime {
                     sourceNote: sourceNote
                 )
         ] + WidgetDescriptor.spendTiles(provider: provider)
+    }
+
+    /// Direct, non-deferred provider compositions that omit a preload can derive account descriptors
+    /// from the two credential files. A deferred composition must stay read-free even when it omits
+    /// an explicit empty preload.
+    private func configuredAccountIdentities() -> [OpenCodeGoAccountIdentity] {
+        var apiKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)] = []
+        if let fileKeys = try? authStore.apiKeys() {
+            apiKeys += fileKeys.map { (name: $0.name, key: $0.key, id: $0.name, source: .authFile) }
+        }
+        if let storedKeys = try? goKeyStore.loadKeys() {
+            apiKeys += storedKeys.map {
+                (name: $0.label, key: $0.key, id: $0.id.uuidString, source: .appSaved)
+            }
+        }
+        let identities = Self.distinctAccountIdentities(apiKeys: apiKeys)
+        return identities.count > 1 ? identities : []
+    }
+
+    private func accountInventoryChanged(
+        apiKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)],
+        authReadSucceeded: Bool,
+        savedKeysReadSucceeded: Bool
+    ) -> Bool {
+        guard !accountInventoryDiscoveryDeferred,
+              let preloadedAccountInventory,
+              authReadSucceeded,
+              savedKeysReadSucceeded
+        else { return false }
+        let currentInventory = OpenCodeGoAccountInventory(
+            accountIdentities: Self.distinctAccountIdentities(apiKeys: apiKeys),
+            isComplete: true
+        )
+        return currentInventory.cacheIdentityKey != preloadedAccountInventory.cacheIdentityKey
+            || currentInventory.identities != preloadedAccountInventory.identities
+    }
+
+    private func incompleteInventoryErrorSnapshot(_ error: Error) -> ProviderSnapshot {
+        ProviderSnapshot.error(
+            provider: provider,
+            error: error,
+            clearsPriorMenuBarQuotaState: true,
+            invalidatesQuotaIdentity: true
+        )
+    }
+
+    /// Read both small credential sources away from the main actor before the app builds its immutable
+    /// widget registry. Preserve read completeness as well as descriptors: one readable key does not
+    /// prove there are no keys in the unreadable source.
+    static func discoverAccountInventory(
+        authStore: OpenCodeAuthStore = OpenCodeAuthStore(),
+        goKeyStore: OpenCodeGoKeyStore = OpenCodeGoKeyStore()
+    ) async -> OpenCodeGoAccountInventory {
+        async let fileRead: ([(name: String, key: String)], String?) = loadOffMainActor {
+            do { return (try authStore.apiKeys(), nil) }
+            catch { return ([], error.localizedDescription) }
+        }
+        async let savedRead: ([OpenCodeGoKey], String?) = loadOffMainActor {
+            do { return (try goKeyStore.loadKeys(), nil) }
+            catch { return ([], error.localizedDescription) }
+        }
+        let (fileResult, savedResult) = await (fileRead, savedRead)
+        if let error = fileResult.1 {
+            DiagnosticGate.logOnce(for: authFileInventoryReadDiagnosticKey) {
+                AppLog.warn(LogTag.plugin("opencode"), "Go account descriptor discovery could not read auth.json: \(error)")
+            }
+        } else {
+            DiagnosticGate.clearFailure(authFileInventoryReadDiagnosticKey)
+        }
+        if let error = savedResult.1 {
+            DiagnosticGate.logOnce(for: savedKeysInventoryReadDiagnosticKey) {
+                AppLog.warn(LogTag.plugin("opencode"), "Go account descriptor discovery could not read saved keys: \(error)")
+            }
+        } else {
+            DiagnosticGate.clearFailure(savedKeysInventoryReadDiagnosticKey)
+        }
+        let apiKeys = fileResult.0.map {
+            (name: $0.name, key: $0.key, id: $0.name, source: OpenCodeGoKeySource.authFile)
+        } + savedResult.0.map {
+            (name: $0.label, key: $0.key, id: $0.id.uuidString, source: OpenCodeGoKeySource.appSaved)
+        }
+        return OpenCodeGoAccountInventory(
+            accountIdentities: distinctAccountIdentities(apiKeys: apiKeys),
+            isComplete: fileResult.1 == nil && savedResult.1 == nil
+        )
+    }
+
+    /// Compatibility view for callers that only need account-specific descriptors.
+    static func discoverAccountIdentities(
+        authStore: OpenCodeAuthStore = OpenCodeAuthStore(),
+        goKeyStore: OpenCodeGoKeyStore = OpenCodeGoKeyStore()
+    ) async -> [OpenCodeGoAccountIdentity] {
+        await discoverAccountInventory(authStore: authStore, goKeyStore: goKeyStore).identities
+    }
+
+    private static func distinctAccountIdentities(
+        apiKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)]
+    ) -> [OpenCodeGoAccountIdentity] {
+        var seenCredentials = Set<String>()
+        var identities: [(credentialID: String, descriptorKey: String, displayName: String)] = []
+        for entry in apiKeys {
+            let credentialID = Self.credentialID(for: entry.key)
+            guard seenCredentials.insert(credentialID).inserted else { continue }
+            let name = entry.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            identities.append((
+                credentialID,
+                Self.stableDescriptorKey(for: entry.id),
+                name.isEmpty ? "Account \(identities.count + 1)" : name
+            ))
+        }
+
+        let nameCounts = Dictionary(grouping: identities, by: { $0.displayName }).mapValues(\.count)
+        var nameOrdinals: [String: Int] = [:]
+        let preferredNames = identities.map { identity -> String in
+            guard nameCounts[identity.displayName, default: 0] > 1 else { return identity.displayName }
+            let ordinal = nameOrdinals[identity.displayName, default: 0] + 1
+            nameOrdinals[identity.displayName] = ordinal
+            return "\(identity.displayName) · \(ordinal)"
+        }
+        let preferredNameCounts = Dictionary(grouping: preferredNames, by: \.self).mapValues(\.count)
+        let reservedNames = Set(preferredNames)
+        var usedNames = Set<String>()
+        return identities.enumerated().map { index, identity in
+            let preferred = preferredNames[index]
+            var displayName = preferred
+            if preferredNameCounts[preferred, default: 0] > 1 {
+                displayName = "\(preferred) · \(identity.descriptorKey.prefix(8))"
+                var suffix = 2
+                while reservedNames.contains(displayName) || usedNames.contains(displayName) {
+                    displayName = "\(preferred) · \(identity.descriptorKey) · \(suffix)"
+                    suffix += 1
+                }
+            }
+            if usedNames.contains(displayName) {
+                // A configured label can itself match a generated suffix; preserve one row per account.
+                var suffix = 2
+                let base = displayName
+                repeat {
+                    displayName = "\(base) · \(suffix)"
+                    suffix += 1
+                } while reservedNames.contains(displayName) || usedNames.contains(displayName)
+            }
+            usedNames.insert(displayName)
+            return OpenCodeGoAccountIdentity(
+                credentialID: identity.credentialID,
+                descriptorKey: identity.descriptorKey,
+                displayName: displayName
+            )
+        }
+    }
+
+    private static func stableDescriptorKey(for accountID: String) -> String {
+        SHA256.hash(data: Data(accountID.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func accountMeterDescriptors(
+        for account: OpenCodeGoAccountIdentity,
+        provider: Provider
+    ) -> [WidgetDescriptor] {
+        let suffix = "account.\(account.descriptorKey)"
+        let sessionLabel = "Session (\(account.displayName))"
+        let weeklyLabel = "Weekly (\(account.displayName))"
+        let monthlyLabel = "Monthly (\(account.displayName))"
+        return [
+            .percent(
+                id: "opencode.session.\(suffix)", provider: provider, title: sessionLabel,
+                metricLabel: sessionLabel, sessionStartSignal: .zeroUsage
+            )
+            .exportingLimit("session.\(account.descriptorKey)", unit: "percent", estimated: true)
+            .hidingWhenEmpty(),
+            .percent(
+                id: "opencode.weekly.\(suffix)", provider: provider, title: weeklyLabel,
+                metricLabel: weeklyLabel
+            )
+            .exportingLimit("weekly.\(account.descriptorKey)", unit: "percent", estimated: true)
+            .hidingWhenEmpty(),
+            .percent(
+                id: "opencode.monthly.\(suffix)", provider: provider, title: monthlyLabel,
+                metricLabel: monthlyLabel
+            )
+            .exportingLimit("monthly.\(account.descriptorKey)", unit: "percent", estimated: true)
+            .hidingWhenEmpty()
+        ]
     }
 
     func hasLocalCredentials() async -> Bool {
@@ -225,12 +491,33 @@ final class OpenCodeProvider: ProviderRuntime {
         }
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         if let storedKeys {
+            loggedStoredKeysFailure = false
             apiKeys += storedKeys.map {
                 (name: $0.label, key: $0.key, id: $0.id.uuidString, source: .appSaved)
             }
         } else if !loggedStoredKeysFailure {
             loggedStoredKeysFailure = true
-            AppLog.warn(LogTag.plugin("opencode"), "app-saved OpenCode Go keys unreadable; using auth.json keys only")
+            AppLog.warn(LogTag.plugin("opencode"), "app-saved OpenCode Go keys unreadable")
+        }
+        let incompleteAccountInventoryError = authReadError ?? storedKeysReadError
+        if ProviderRefreshContext.scope.skipsLocalAccounting,
+           let sourceReadError = incompleteAccountInventoryError {
+            // A partial credential read cannot prove the full account inventory, even when the
+            // readable source contains only one key. Withhold Go calls until both sources are read;
+            // this scoped pass does no local history work, so it can fail immediately.
+            return incompleteInventoryErrorSnapshot(sourceReadError)
+        }
+        // `auth.json` can be changed by OpenCode while QuotaBar is running. If a complete read changes
+        // the account-specific descriptor inventory, rebuild the registry before publishing rows;
+        // otherwise exact-label resolution would silently drop valid quota and local-limit rows.
+        if accountInventoryChanged(
+            apiKeys: apiKeys,
+            authReadSucceeded: authReadError == nil,
+            savedKeysReadSucceeded: storedKeysReadError == nil
+        ) {
+            AppLog.info(LogTag.plugin("opencode"), "Go account inventory changed; rebuilding provider descriptors")
+            onGoKeysChanged()
+            return cancelledRefreshSnapshot(provider: provider)
         }
         // Meters-only passes (menu-bar ticks, panel phase 1) need the live Go meters, not the
         // multi-corpus scan: the scan folds Claude/Codex session logs, the router ledger, Hermes,
@@ -299,14 +586,24 @@ final class OpenCodeProvider: ProviderRuntime {
                     ? (enabledCodexHomes() ?? usageScanner.codexHomes())
                     : [],
                 enabledClaudeScanners: enabledSources.contains(.claude) ? enabledClaudeScanners() : [],
-                enabledCodexAccountKeys: enabledSources.contains(.codex) ? enabledCodexAccountKeys() : []
+                enabledCodexIdentityKeys: enabledSources.contains(.codex) ? enabledCodexIdentityKeys() : [],
+                codexHomeIdentityKeys: enabledSources.contains(.codex) ? enabledCodexHomeIdentityKeys() : [:],
+                codexAccountIdentityKeys: enabledSources.contains(.codex) ? codexAccountIdentityKeys() : [:],
+                routerAccountIdentityKeys: enabledSources.contains(.codex) ? routerAccountIdentityKeys() : [:]
             )
         } catch {
             if Task.isCancelled { return cancelledRefreshSnapshot(provider: provider) }
+            if let sourceReadError = incompleteAccountInventoryError {
+                return incompleteInventoryErrorSnapshot(sourceReadError)
+            }
             // A fold-only pass never asked the account endpoint, so it has no evidence that the
             // meters the meters-only phase just fetched are stale. Clearing them here would wipe
             // freshly recovered quota rows because a local scan failed; the meters phase owns them.
+            // A failed local fold proves quotas stale only when this pass actually had a complete
+            // credential inventory and was able to ask the account endpoint. Withheld account calls
+            // provide no new evidence about the last confirmed Go meters.
             let clearsPriorQuotaState = !ProviderRefreshContext.scope.suppressesLiveQuota
+                && incompleteAccountInventoryError == nil
             return ProviderSnapshot.error(
                 provider: provider,
                 error: error,
@@ -314,6 +611,27 @@ final class OpenCodeProvider: ProviderRuntime {
             )
         }
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+
+        if let sourceReadError = incompleteAccountInventoryError {
+            // Go credentials own the account-cap request, not OpenCode's independent local history.
+            // Complete the fold above, publish its history through the failed-refresh merge, and
+            // invalidate caps whose current credential owner cannot be verified.
+            guard let scan else {
+                return incompleteInventoryErrorSnapshot(sourceReadError)
+            }
+            var snapshot = incompleteInventoryErrorSnapshot(sourceReadError)
+            snapshot.refreshedAt = refreshedAt
+            snapshot.usageHistory = ProviderUsageHistory(
+                series: scan.logScan.series,
+                modelUsage: scan.logScan.modelUsage,
+                unknownModelsByDay: scan.logScan.unknownModelsByDay,
+                apiEstimateByDay: scan.logScan.apiEstimateByDay,
+                apiEstimateIncompleteDays: scan.logScan.apiEstimateIncompleteDays,
+                partialDays: scan.partialDays,
+                estimatedCostDays: scan.logScan.estimatedCostDays ?? []
+            )
+            return snapshot
+        }
 
         // Account-wide Go meters are fetched only with Go credentials. The API does not return a
         // stable account id, so the exact credential is the only honest identity boundary. Duplicate
@@ -389,7 +707,8 @@ final class OpenCodeProvider: ProviderRuntime {
             modelUsage: scan.logScan.modelUsage,
             modelSourceNote: sourceNote,
             partialDays: scan.partialDays,
-            apiEstimateByDay: scan.logScan.apiEstimateByDay
+            apiEstimateByDay: scan.logScan.apiEstimateByDay,
+            estimatedCostDays: scan.logScan.estimatedCostDays ?? []
         )
         SpendTileMapper.appendUsageTrend(scan.logScan.series, to: &lines, now: refreshedAt, note: sourceNote,
                                          partialDays: scan.partialDays)
@@ -408,7 +727,9 @@ final class OpenCodeProvider: ProviderRuntime {
                 modelUsage: scan.logScan.modelUsage,
                 unknownModelsByDay: scan.logScan.unknownModelsByDay,
                 apiEstimateByDay: scan.logScan.apiEstimateByDay,
-                apiEstimateIncompleteDays: scan.logScan.apiEstimateIncompleteDays
+                apiEstimateIncompleteDays: scan.logScan.apiEstimateIncompleteDays,
+                partialDays: scan.partialDays,
+                estimatedCostDays: scan.logScan.estimatedCostDays ?? []
             ),
             warning: accountErrorForDisplay?.error.localizedDescription
                 ?? (apiKeys.isEmpty ? (authReadError ?? storedKeysReadError)?.localizedDescription : nil),
@@ -418,6 +739,10 @@ final class OpenCodeProvider: ProviderRuntime {
 
     private static func credentialID(for key: String) -> String {
         SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func accountAPIDiagnosticKey(for credentialID: String) -> String {
+        "provider.opencode.account-api.\(credentialID)"
     }
 
     /// One pass's Go-account meter answer: the display meters (deduplicated, selection-applied),
@@ -437,11 +762,23 @@ final class OpenCodeProvider: ProviderRuntime {
     private func fetchGoAccountMeters(
         apiKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)]
     ) async -> GoAccountMeters {
+        let configuredIdentities = Self.distinctAccountIdentities(apiKeys: apiKeys)
+        let displayNameByCredentialID = Dictionary(
+            configuredIdentities.map { ($0.credentialID, $0.displayName) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        // auth.json and the app-owned key list can contain the exact same credential. It is one
+        // account, so issue one quota request and map every source entry (including a selected copy)
+        // back to that result instead of letting a redundant failed request hide the successful one.
+        var seenCredentialIDs = Set<String>()
+        let uniqueAPIKeys = apiKeys.filter { entry in
+            seenCredentialIDs.insert(Self.credentialID(for: entry.key)).inserted
+        }
         var accountUsages: [(name: String, keyID: String, credentialID: String, usage: OpenCodeGoAccountUsage)] = []
-        var accountAPIErrors: [(name: String, keyID: String, error: OpenCodeUsageError)] = []
+        var accountAPIErrors: [(name: String, keyID: String, credentialID: String, error: OpenCodeUsageError)] = []
         var wasCancelled = false
-        if !apiKeys.isEmpty, !ProviderRefreshContext.scope.suppressesLiveQuota {
-            for entry in apiKeys {
+        if !uniqueAPIKeys.isEmpty, !ProviderRefreshContext.scope.suppressesLiveQuota {
+            for entry in uniqueAPIKeys {
                 guard !Task.isCancelled else {
                     wasCancelled = true
                     break
@@ -458,7 +795,7 @@ final class OpenCodeProvider: ProviderRuntime {
                         Self.credentialID(for: entry.key),
                         usage
                     ))
-                    loggedAccountAPIFailure = false
+                    DiagnosticGate.clearFailure(accountAPIDiagnosticKey(for: Self.credentialID(for: entry.key)))
                 } catch {
                     if ProviderCancellation.isCancellation(error) {
                         wasCancelled = true
@@ -467,10 +804,15 @@ final class OpenCodeProvider: ProviderRuntime {
                     let usageError = (error as? OpenCodeUsageError)
                         ?? .accountAPIUnavailable(detail: error.localizedDescription)
                     accountAPIErrors.append(
-                        (name: entry.name, keyID: entry.id, error: usageError)
+                        (
+                            name: entry.name,
+                            keyID: entry.id,
+                            credentialID: Self.credentialID(for: entry.key),
+                            error: usageError
+                        )
                     )
-                    if !loggedAccountAPIFailure {
-                        loggedAccountAPIFailure = true
+                    let diagnosticKey = accountAPIDiagnosticKey(for: Self.credentialID(for: entry.key))
+                    DiagnosticGate.logOnce(for: diagnosticKey) {
                         AppLog.warn(LogTag.plugin("opencode"), "account usage API unavailable (\(entry.name)): \(usageError.localizedDescription)")
                     }
                 }
@@ -479,15 +821,24 @@ final class OpenCodeProvider: ProviderRuntime {
         // Deduplicate exact-key answers while remembering which key resolved to which account, so a
         // pinned selection can narrow the card to one account's meters.
         var accountIndexByKeyID: [String: Int] = [:]
-        var keyNameByKeyID: [String: String] = [:]
         var distinctAccounts: [(name: String, credentialID: String, usage: OpenCodeGoAccountUsage)] = []
         for entry in accountUsages {
-            keyNameByKeyID[entry.keyID] = entry.name
             if let idx = distinctAccounts.firstIndex(where: { $0.credentialID == entry.credentialID }) {
                 accountIndexByKeyID[entry.keyID] = idx
             } else {
                 accountIndexByKeyID[entry.keyID] = distinctAccounts.count
-                distinctAccounts.append((entry.name, entry.credentialID, entry.usage))
+                distinctAccounts.append((
+                    displayNameByCredentialID[entry.credentialID] ?? entry.name,
+                    entry.credentialID,
+                    entry.usage
+                ))
+            }
+        }
+        for entry in apiKeys {
+            if let idx = distinctAccounts.firstIndex(where: {
+                $0.credentialID == Self.credentialID(for: entry.key)
+            }) {
+                accountIndexByKeyID[entry.id] = idx
             }
         }
         let selectedKeyID = activeKeyID()
@@ -496,17 +847,21 @@ final class OpenCodeProvider: ProviderRuntime {
         } ?? false
         let selectedKeyHasAccount = selectedKeyID.map { accountIndexByKeyID[$0] != nil } ?? false
         let meters: [MetricLine]
-        if distinctAccounts.count == 1,
+        if configuredIdentities.count == 1,
+           distinctAccounts.count == 1,
            (!selectedKeyIsKnown || selectedKeyHasAccount) {
-            // With one distinct account, deduplicated copies and stored selections collapse to one
-            // unsuffixed set of meters as before.
+            // Only one configured account uses the legacy unsuffixed rows. When several accounts are
+            // configured but one API call fails, keep the successful account attached to its descriptor.
             meters = OpenCodeUsageMapper.accountMeterLines(distinctAccounts[0].usage)
         } else if selectedKeyIsKnown,
            let selectedKeyID,
-           let idx = accountIndexByKeyID[selectedKeyID],
-           let selectedName = keyNameByKeyID[selectedKeyID] {
+           let idx = accountIndexByKeyID[selectedKeyID] {
             // A pinned key: swap the card to its account only, labeled so the view stays unambiguous.
-            meters = OpenCodeUsageMapper.accountMeterLines(distinctAccounts[idx].usage, labelSuffix: selectedName)
+            // Duplicate copies of one credential use the same canonical account label/descriptor.
+            meters = OpenCodeUsageMapper.accountMeterLines(
+                distinctAccounts[idx].usage,
+                labelSuffix: distinctAccounts[idx].name
+            )
         } else if selectedKeyIsKnown {
             // The selected key is not one of the usable account responses. Never show a different
             // key's account-wide meter as though it belonged to the pinned account.
@@ -517,8 +872,19 @@ final class OpenCodeProvider: ProviderRuntime {
                 OpenCodeUsageMapper.accountMeterLines(entry.usage, labelSuffix: entry.name)
             }
         }
-        let relevantAccountErrors = selectedKeyIsKnown ? accountAPIErrors.filter { $0.keyID == selectedKeyID } : accountAPIErrors
-        let displayError = relevantAccountErrors.first
+        let relevantAccountErrors: [(name: String, keyID: String, credentialID: String, error: OpenCodeUsageError)]
+        if selectedKeyIsKnown,
+           let selectedKeyID,
+           let selectedCredentialID = apiKeys.first(where: { $0.id == selectedKeyID }).map({
+               Self.credentialID(for: $0.key)
+           }) {
+            relevantAccountErrors = accountAPIErrors.filter { $0.credentialID == selectedCredentialID }
+        } else {
+            relevantAccountErrors = accountAPIErrors
+        }
+        let displayError = relevantAccountErrors.first.map {
+            (name: $0.name, keyID: $0.keyID, error: $0.error)
+        }
         let hasUsage = !meters.isEmpty
         return GoAccountMeters(
             meters: meters,
@@ -556,9 +922,36 @@ extension OpenCodeProvider: GoKeyManaging {
     }
 
     func goKeyEntries() async -> [OpenCodeGoKeyEntry] {
-        guard let keys = try? await allGoKeys() else {
-            AppLog.warn(LogTag.plugin("opencode"), "Go keys unreadable; settings list empty")
+        async let fileRead: ([(name: String, key: String)], String?) = loadOffMainActor { [authStore] in
+            do { return (try authStore.apiKeys(), nil) }
+            catch { return ([], error.localizedDescription) }
+        }
+        async let savedRead: ([OpenCodeGoKey], String?) = loadOffMainActor { [goKeyStore] in
+            do { return (try goKeyStore.loadKeys(), nil) }
+            catch { return ([], error.localizedDescription) }
+        }
+        let (fileResult, savedResult) = await (fileRead, savedRead)
+        if let error = fileResult.1 {
+            DiagnosticGate.logOnce(for: Self.authFileInventoryReadDiagnosticKey) {
+                AppLog.warn(LogTag.plugin("opencode"), "Go keys unreadable from auth.json: \(error)")
+            }
+        } else {
+            DiagnosticGate.clearFailure(Self.authFileInventoryReadDiagnosticKey)
+        }
+        if let error = savedResult.1 {
+            DiagnosticGate.logOnce(for: Self.savedKeysInventoryReadDiagnosticKey) {
+                AppLog.warn(LogTag.plugin("opencode"), "Go saved keys unreadable: \(error)")
+            }
+        } else {
+            DiagnosticGate.clearFailure(Self.savedKeysInventoryReadDiagnosticKey)
+        }
+        guard fileResult.1 == nil, savedResult.1 == nil else {
             return []
+        }
+        let keys = fileResult.0.map {
+            (name: $0.name, key: $0.key, id: $0.name, source: OpenCodeGoKeySource.authFile)
+        } + savedResult.0.map {
+            (name: $0.label, key: $0.key, id: $0.id.uuidString, source: OpenCodeGoKeySource.appSaved)
         }
         let selection = activeKeyID()
         return keys.map { entry in
@@ -566,6 +959,7 @@ extension OpenCodeProvider: GoKeyManaging {
                 id: entry.id,
                 label: entry.name,
                 maskedKey: Self.mask(entry.key),
+                accountID: Self.credentialID(for: entry.key),
                 source: entry.source,
                 isActive: entry.id == selection
             )
@@ -574,9 +968,11 @@ extension OpenCodeProvider: GoKeyManaging {
 
     @discardableResult
     func saveGoKey(label: String, key: String) async throws -> OpenCodeGoKey {
-        try await loadOffMainActor { [goKeyStore, label, key] in
+        let saved = try await loadOffMainActor { [goKeyStore, label, key] in
             try goKeyStore.addKey(label: label, key: key)
         }
+        onGoKeysChanged()
+        return saved
     }
 
     func removeGoKey(id: UUID) async throws {
@@ -588,6 +984,7 @@ extension OpenCodeProvider: GoKeyManaging {
         if OpenCodeGoKeyStore.activeSelection() == id.uuidString {
             OpenCodeGoKeyStore.setActiveSelection(nil)
         }
+        onGoKeysChanged()
     }
 
     func selectGoKey(id: String) {

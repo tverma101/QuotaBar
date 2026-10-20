@@ -43,9 +43,12 @@ struct DevinAuthStore: Sendable {
             text = try files.readTextIfPresent(Self.credentialsPath)
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.error(LogTag.auth("devin"), "CLI credentials file read failed")
+            DiagnosticGate.logOnce(for: "auth.devin.credentials-file-read") {
+                AppLog.error(LogTag.auth("devin"), "CLI credentials file read failed")
+            }
             throw DevinAuthError.credentialsUnreadable
         }
+        DiagnosticGate.clearFailure("auth.devin.credentials-file-read")
         guard let text,
               let apiKey = Self.readTomlString(text, key: "windsurf_api_key")
         else { return nil }
@@ -65,18 +68,27 @@ struct DevinAuthStore: Sendable {
             value = try sqlite.queryValue(path: Self.stateDBPath, sql: sql)
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.error(LogTag.auth("devin"), "app state database credential read failed")
+            DiagnosticGate.logOnce(for: "auth.devin.state-db-read") {
+                AppLog.error(LogTag.auth("devin"), "app state database credential read failed")
+            }
             throw DevinAuthError.credentialsUnreadable
         }
+        DiagnosticGate.clearFailure("auth.devin.state-db-read")
 
-        guard let value else { return nil }
+        guard let value else {
+            DiagnosticGate.clearFailure("auth.devin.state-db-decode")
+            return nil
+        }
         guard let valueData = value.data(using: .utf8),
               let decoded = try? JSONSerialization.jsonObject(with: valueData),
               let auth = decoded as? [String: Any]
         else {
-            AppLog.error(LogTag.auth("devin"), "app state database credential data could not be decoded")
+            DiagnosticGate.logOnce(for: "auth.devin.state-db-decode") {
+                AppLog.error(LogTag.auth("devin"), "app state database credential data could not be decoded")
+            }
             throw DevinAuthError.credentialsUnreadable
         }
+        DiagnosticGate.clearFailure("auth.devin.state-db-decode")
         guard let apiKey = (auth["apiKey"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !apiKey.isEmpty else { return nil }
 

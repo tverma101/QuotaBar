@@ -43,6 +43,38 @@ final class StalenessLabelTests: XCTestCase {
         XCTAssertNil(store.stalenessHint(for: "devin"))
     }
 
+    func testFreshQuotaDoesNotHideStaleUsageHistory() {
+        let store = makeStore()
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: []))
+        var value = ProviderSnapshot(
+            providerID: "devin",
+            displayName: "Devin",
+            lines: [.progress(label: "Weekly quota", used: 40, limit: 100, format: .percent)],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        value.historyRefreshedAt = now.addingTimeInterval(-3 * 60 * 60)
+        value.quotaRefreshedAt = now
+        store.snapshots["devin"] = value
+
+        XCTAssertEqual(store.stalenessHint(for: "devin")?.tooltip, "Last updated 3h ago")
+    }
+
+    func testFreshHistoryDoesNotHideStaleQuota() {
+        let store = makeStore()
+        var value = ProviderSnapshot(
+            providerID: "devin",
+            displayName: "Devin",
+            lines: [.progress(label: "Weekly quota", used: 40, limit: 100, format: .percent)],
+            refreshedAt: now,
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: []))
+        )
+        value.quotaRefreshedAt = now.addingTimeInterval(-3 * 60 * 60)
+        store.snapshots["devin"] = value
+
+        XCTAssertEqual(store.stalenessHint(for: "devin")?.tooltip, "Last updated 3h ago")
+    }
+
     /// The exact #582 scenario, end to end: a cached snapshot is on screen, the live refresh keeps
     /// failing, so the fossil persists — and is now labelled with its age instead of silently passing
     /// for current data.

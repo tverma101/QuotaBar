@@ -14,10 +14,10 @@ enum SpendTileMapper {
     /// Cursor's CSV export); there's no per-source branching. "No data" is also what a tile shows when
     /// the source couldn't be read at all (missing log, failed API/CSV), where the caller appends
     /// nothing. `estimated` controls whether the dollar value carries the local-estimate marker (ⓘ).
-    /// `unknownModelsByDay` maps a `yyyy-MM-dd` day key to the set of model names used that day that no
-    /// pricing source can price. Today / Yesterday pick up their own day's set; Last 30 Days carries the
-    /// union across the whole window. Empty (the default) for sources without unknown-model detection, so
-    /// their tiles never carry unknown-model warnings.
+    /// `unknownModelsByDay` maps a `yyyy-MM-dd` day key to model names no pricing source can price.
+    /// Their tokens still count, and any known priced subtotal remains visible beside the warning.
+    /// Today / Yesterday pick up their own day's set; Last 30 Days carries the union across the whole
+    /// window. Empty (the default) for sources without unknown-model detection.
     ///
     /// `apiEstimateByDay` carries a parallel per-day figure: what the same tokens would have cost at
     /// each model's public API rates. It is not rendered here — the Usage History screen's
@@ -32,33 +32,75 @@ enum SpendTileMapper {
         modelUsage: ModelUsageSeries? = nil,
         modelSourceNote: String? = nil,
         partialDays: Set<String> = [],
-        apiEstimateByDay: [String: Double]? = nil
+        apiEstimateByDay: [String: Double]? = nil,
+        estimatedCostDays: Set<String>? = nil
     ) {
         let today = dayKey(from: now)
         let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: now).map(dayKey(from:))
+        func estimatedCost(on day: String?) -> Bool {
+            guard let estimatedCostDays else { return estimated }
+            guard let day else { return false }
+            return estimatedCostDays.contains(day)
+        }
+        let unexplainedIncompleteDays = Set(usage.daily.compactMap { entry -> String? in
+            guard let day = dayKey(fromUsageDate: entry.date) else { return nil }
+            if entry.hasUnexplainedIncompleteCost == true
+                || (!entry.costIsComplete && entry.hasUnexplainedIncompleteCost == nil
+                    && unknownModelsByDay[day]?.isEmpty != false && !partialDays.contains(day))
+            {
+                return day
+            }
+            return nil
+        })
 
         if let entry = usage.daily.first(where: { dayKey(fromUsageDate: $0.date) == today }), hasUsage(entry) {
-            lines.append(dayUsageLine(label: "Today", entry: entry, estimated: estimated,
+            lines.append(dayUsageLine(label: "Today", entry: entry, costUSD: displayableCost(
+                                          entry, day: today, unknownModelsByDay: unknownModelsByDay,
+                                          partialDays: partialDays
+                                      ), estimated: estimatedCost(on: today),
                                       partial: partialDays.contains(today),
+                                      costIsLowerBound: partialDays.contains(today)
+                                        || hasKnownPartialCost(entry, day: today, unknownModelsByDay: unknownModelsByDay),
+                                      tokenCountSaturated: entry.tokenCountSaturated,
                                       unknownModels: sortedModels(unknownModelsByDay[today]),
                                       modelBreakdown: modelBreakdown(
                                         modelUsage,
                                         days: [today],
                                         totalTokens: entry.totalTokens,
-                                        totalCostUSD: entry.costIsComplete ? entry.costUSD : nil,
-                                        sourceNote: modelSourceNote
+                                        tokenCountSaturated: entry.tokenCountSaturated,
+                                        totalCostUSD: displayableCost(
+                                            entry,
+                                            day: today,
+                                            unknownModelsByDay: unknownModelsByDay,
+                                            partialDays: partialDays
+                                        ),
+                                        sourceNote: modelSourceNote,
+                                        unexplainedIncompleteDays: unexplainedIncompleteDays
                                       )))
         }
         if let entry = usage.daily.first(where: { dayKey(fromUsageDate: $0.date) == yesterday }), hasUsage(entry) {
-            lines.append(dayUsageLine(label: "Yesterday", entry: entry, estimated: estimated,
+            lines.append(dayUsageLine(label: "Yesterday", entry: entry, costUSD: yesterday.flatMap {
+                                          displayableCost(entry, day: $0, unknownModelsByDay: unknownModelsByDay,
+                                                          partialDays: partialDays)
+                                      }, estimated: estimatedCost(on: yesterday),
                                       partial: yesterday.map(partialDays.contains) == true,
+                                      costIsLowerBound: yesterday.map {
+                                        partialDays.contains($0)
+                                            || hasKnownPartialCost(entry, day: $0, unknownModelsByDay: unknownModelsByDay)
+                                      } ?? false,
+                                      tokenCountSaturated: entry.tokenCountSaturated,
                                       unknownModels: sortedModels(yesterday.flatMap { unknownModelsByDay[$0] }),
                                       modelBreakdown: modelBreakdown(
                                         modelUsage,
                                         days: Set([yesterday].compactMap { $0 }),
                                         totalTokens: entry.totalTokens,
-                                        totalCostUSD: entry.costIsComplete ? entry.costUSD : nil,
-                                        sourceNote: modelSourceNote
+                                        tokenCountSaturated: entry.tokenCountSaturated,
+                                        totalCostUSD: yesterday.flatMap {
+                                            displayableCost(entry, day: $0, unknownModelsByDay: unknownModelsByDay,
+                                                            partialDays: partialDays)
+                                        },
+                                        sourceNote: modelSourceNote,
+                                        unexplainedIncompleteDays: unexplainedIncompleteDays
                                       )))
         }
 
@@ -70,28 +112,73 @@ enum SpendTileMapper {
         let windowed = usage.daily.filter { entry in
             dayKey(fromUsageDate: entry.date).map { windowKeys.contains($0) } == true
         }
-        let totalTokens = windowed.reduce(0) { ProviderParse.addingSaturating($0, $1.totalTokens) }
+        var totalTokens = 0
+        var totalTokensSaturated = false
+        for entry in windowed {
+            totalTokensSaturated = totalTokensSaturated || entry.tokenCountSaturated
+            if entry.totalTokens > 0 && totalTokens > Int.max - entry.totalTokens {
+                totalTokensSaturated = true
+            }
+            totalTokens = ProviderParse.addingSaturating(totalTokens, entry.totalTokens)
+        }
         let allUnknown = unknownModelsByDay
             .filter { windowKeys.contains($0.key) }
             .values
             .reduce(into: Set<String>()) { $0.formUnion($1) }
-        let costIsComplete = windowed.allSatisfy(\.costIsComplete) && allUnknown.isEmpty
-        let costSamples = windowed.compactMap(\.costUSD)
-        let totalCost = costIsComplete && !costSamples.isEmpty ? costSamples.reduce(0, +) : nil
+        // Keep the priced subtotal when incompleteness is explained by named unknown models. Other
+        // incomplete accounting (for example, a provider-reported token mismatch) remains hidden until
+        // its source can produce a trustworthy subtotal and a matching warning.
+        let hasUnexplainedIncompleteCost = windowed.contains { entry in
+            guard !entry.costIsComplete,
+                  let day = dayKey(fromUsageDate: entry.date)
+            else { return false }
+            return entry.hasUnexplainedIncompleteCost == true
+                || (entry.hasUnexplainedIncompleteCost == nil && unknownModelsByDay[day]?.isEmpty != false
+                    && !partialDays.contains(day))
+        }
+        let costSamples = windowed.compactMap { entry -> Double? in
+            guard let day = dayKey(fromUsageDate: entry.date) else { return nil }
+            return displayableCost(entry, day: day, unknownModelsByDay: unknownModelsByDay,
+                                   partialDays: partialDays)
+        }
+        var finiteCostTotal = 0.0
+        var finiteCostTotalOverflowed = false
+        for sample in costSamples {
+            let next = finiteCostTotal + sample
+            guard next.isFinite else {
+                finiteCostTotalOverflowed = true
+                break
+            }
+            finiteCostTotal = next
+        }
+        let totalCost = !hasUnexplainedIncompleteCost && !costSamples.isEmpty
+            ? finiteCostTotal
+            : nil
         if totalTokens > 0 || (totalCost ?? 0) > 0 {
             // The 30-day total is incomplete whenever ANY day in the window is partial — a running
             // Hermes session keeps growing, so the sum is real but not final.
             let windowPartial = windowed.contains { dayKey(fromUsageDate: $0.date).map(partialDays.contains) == true }
+            let costIsLowerBound = finiteCostTotalOverflowed || windowPartial || windowed.contains { entry in
+                guard !entry.costIsComplete, let day = dayKey(fromUsageDate: entry.date) else { return false }
+                return entry.hasUnexplainedIncompleteCost == false || unknownModelsByDay[day]?.isEmpty == false
+            }
+            let windowEstimated = estimatedCostDays.map { estimatedDays in
+                windowed.contains { dayKey(fromUsageDate: $0.date).map(estimatedDays.contains) == true }
+            } ?? estimated
             lines.append(.values(label: "Last 30 Days",
-                                 values: spendValues(tokens: totalTokens, costUSD: totalCost, estimated: estimated,
-                                                     tokensEstimated: windowPartial),
+                                 values: spendValues(tokens: totalTokens, costUSD: totalCost, estimated: windowEstimated,
+                                                     tokensEstimated: windowPartial,
+                                                     costIsLowerBound: costIsLowerBound,
+                                                     tokenCountSaturated: totalTokensSaturated),
                                  unknownModels: sortedModels(allUnknown),
                                  modelBreakdown: modelBreakdown(
                                     modelUsage,
                                     days: Set(windowed.compactMap { dayKey(fromUsageDate: $0.date) }),
                                     totalTokens: totalTokens,
+                                    tokenCountSaturated: totalTokensSaturated,
                                     totalCostUSD: totalCost,
-                                    sourceNote: modelSourceNote
+                                    sourceNote: modelSourceNote,
+                                    unexplainedIncompleteDays: unexplainedIncompleteDays
                                  )))
         }
 
@@ -110,13 +197,21 @@ enum SpendTileMapper {
     /// that day. Tokens are always measured (no estimate flag), so the chart needs only the per-day
     /// counts plus a source note. Appends nothing when the whole window is idle, so a source with no
     /// usage leaves "No data" rather than a flat row of zero bars.
-    static func appendUsageTrend(_ usage: DailyUsageSeries, to lines: inout [MetricLine], now: Date = Date(), note: String, partialDays: Set<String> = []) {
+    static func appendUsageTrend(
+        _ usage: DailyUsageSeries,
+        to lines: inout [MetricLine],
+        now: Date = Date(),
+        note: String,
+        partialDays: Set<String> = [],
+        partialNote: String? = nil
+    ) {
         let points = trendPoints(usage, now: now)
         guard !points.isEmpty else { return }
         var trendNote = note
         if !partialDays.isEmpty {
-            // A running Hermes session keeps growing, so its days' bars are real but not final.
-            trendNote += " · days with an active Hermes session are partial until it ends"
+            // Some providers have an explicit partial-day cause such as an active session or a
+            // skipped oversized source record; retain the established Hermes copy by default.
+            trendNote += " · " + (partialNote ?? "days with an active Hermes session are partial until it ends")
         }
         lines.append(.chart(label: "Usage Trend", points: points, note: trendNote))
     }
@@ -129,11 +224,16 @@ enum SpendTileMapper {
     /// not active ones. Returns empty when nothing was used in the window — there's no trend to draw.
     /// Each point carries a "Jun 21" axis label and a pre-formatted "222M tokens" readout.
     private static func trendPoints(_ usage: DailyUsageSeries, now: Date) -> [MetricChartPoint] {
-        var tokensByDay: [String: Double] = [:]
+        var tokensByDay: [String: Int] = [:]
+        var saturatedDays: Set<String> = []
         for day in usage.daily {
-            let tokens = Double(day.totalTokens)
-            guard tokens.isFinite, tokens >= 0, let key = dayKey(fromUsageDate: day.date) else { continue }
-            tokensByDay[key, default: 0] += tokens
+            guard day.totalTokens >= 0, let key = dayKey(fromUsageDate: day.date) else { continue }
+            let previous = tokensByDay[key, default: 0]
+            if day.totalTokens > 0 && previous > Int.max - day.totalTokens {
+                saturatedDays.insert(key)
+            }
+            tokensByDay[key] = ProviderParse.addingSaturating(previous, day.totalTokens)
+            if day.tokenCountSaturated { saturatedDays.insert(key) }
         }
         guard tokensByDay.values.contains(where: { $0 > 0 }) else { return [] }
 
@@ -144,10 +244,15 @@ enum SpendTileMapper {
             let key = dayKey(from: day)
             let tokens = tokensByDay[key] ?? 0
             return MetricChartPoint(
-                value: tokens,
+                value: Double(tokens),
                 // The app's localized "Jun 21" month/day, not a hardcoded "6/21".
                 label: Formatters.monthDayLabel(day),
-                valueLabel: MetricFormatter.number(tokens, kind: .count, style: .row) + " tokens"
+                valueLabel: MetricFormatter.string(for: MetricValue(
+                    number: Double(tokens),
+                    kind: .count,
+                    label: "tokens",
+                    tokenCountSaturated: saturatedDays.contains(key)
+                ), style: .row)
             )
         }
     }
@@ -195,15 +300,44 @@ enum SpendTileMapper {
     private static func dayUsageLine(
         label: String,
         entry: DailyUsageEntry,
+        costUSD: Double?,
         estimated: Bool,
         partial: Bool,
+        costIsLowerBound: Bool,
+        tokenCountSaturated: Bool,
         unknownModels: [String],
         modelBreakdown: ModelUsageBreakdown?
     ) -> MetricLine {
         .values(label: label, values: spendValues(tokens: entry.totalTokens,
-                                                  costUSD: entry.costIsComplete ? entry.costUSD : nil,
-                                                  estimated: estimated, tokensEstimated: partial),
+                                                  costUSD: costUSD,
+                                                  estimated: estimated, tokensEstimated: partial,
+                                                  costIsLowerBound: costIsLowerBound,
+                                                  tokenCountSaturated: tokenCountSaturated),
                 unknownModels: unknownModels, modelBreakdown: modelBreakdown)
+    }
+
+    private static func displayableCost(
+        _ entry: DailyUsageEntry,
+        day: String,
+        unknownModelsByDay: [String: Set<String>],
+        partialDays: Set<String>
+    ) -> Double? {
+        guard let cost = entry.costUSD, cost.isFinite, cost >= 0 else { return nil }
+        guard entry.costIsComplete
+            || entry.hasUnexplainedIncompleteCost == false
+            || partialDays.contains(day)
+            || (entry.hasUnexplainedIncompleteCost != true && unknownModelsByDay[day]?.isEmpty == false)
+        else { return nil }
+        return cost
+    }
+
+    private static func hasKnownPartialCost(
+        _ entry: DailyUsageEntry,
+        day: String,
+        unknownModelsByDay: [String: Set<String>]
+    ) -> Bool {
+        guard !entry.costIsComplete, entry.hasUnexplainedIncompleteCost != true else { return false }
+        return entry.hasUnexplainedIncompleteCost == false || unknownModelsByDay[day]?.isEmpty == false
     }
 
     /// Stable, de-duplicated display order for a period's unknown-model names (the set is unordered).
@@ -220,12 +354,32 @@ enum SpendTileMapper {
     /// measured, never flagged. `tokensEstimated` marks the period PARTIAL (a Hermes session is still
     /// running, so the recorded total is real but not final) — both values carry the ⓘ then, so a
     /// live-session day is never presented as a settled number.
-    private static func spendValues(tokens: Int, costUSD: Double?, estimated: Bool, tokensEstimated: Bool = false) -> [MetricValue] {
+    private static func spendValues(
+        tokens: Int,
+        costUSD: Double?,
+        estimated: Bool,
+        tokensEstimated: Bool = false,
+        costIsLowerBound: Bool = false,
+        tokenCountSaturated: Bool = false
+    ) -> [MetricValue] {
         var values: [MetricValue] = []
         if let costUSD {
-            values.append(MetricValue(number: costUSD, kind: .dollars, estimated: estimated || tokensEstimated))
+            values.append(MetricValue(
+                number: costUSD,
+                kind: .dollars,
+                estimated: estimated || tokensEstimated,
+                isPartial: tokensEstimated,
+                isLowerBound: costIsLowerBound
+            ))
         }
-        values.append(MetricValue(number: Double(tokens), kind: .count, label: "tokens", estimated: tokensEstimated))
+        values.append(MetricValue(
+            number: Double(tokens),
+            kind: .count,
+            label: "tokens",
+            estimated: tokensEstimated,
+            tokenCountSaturated: tokenCountSaturated ? true : nil,
+            isPartial: tokensEstimated
+        ))
         return values
     }
 
@@ -239,7 +393,10 @@ enum SpendTileMapper {
 
         mutating func note(_ spelling: String, weight: Int) {
             // Zero-token entries (cost-only lines) still get a say.
-            tokensBySpelling[spelling, default: 0] += max(weight, 1)
+            tokensBySpelling[spelling] = ProviderParse.addingSaturating(
+                tokensBySpelling[spelling, default: 0],
+                max(weight, 1)
+            )
         }
 
         var best: String? {
@@ -255,11 +412,20 @@ enum SpendTileMapper {
 
     private struct ModelAccumulator {
         var tokens = 0
+        private var tokenCountSaturated = false
         var costUSD: Double?
         private var costIsComplete = true
+        private var costOverflowed = false
         private var nameVote = SpellingVote()
         /// Keyed by the case-folded slug; the vote inside restores a display spelling.
-        private var variants: [String: (tokens: Int, costUSD: Double?, costIsComplete: Bool, vote: SpellingVote)] = [:]
+        private var variants: [String: (
+            tokens: Int,
+            costUSD: Double?,
+            costIsComplete: Bool,
+            tokenCountSaturated: Bool,
+            costOverflowed: Bool,
+            vote: SpellingVote
+        )] = [:]
 
         /// The display spelling for this model, elected across every casing that merged into it.
         var displayName: String? { nameVote.best }
@@ -268,8 +434,16 @@ enum SpendTileMapper {
         /// keeps one line per slug.
         mutating func add(_ entry: ModelUsageEntry, spelledAs name: String) {
             addTotals(of: entry, spelledAs: name)
-            for variant in entry.variants ?? [ModelUsageVariant(model: name, totalTokens: entry.totalTokens, costUSD: entry.costUSD)] {
-                mergeVariant(variant.model, tokens: variant.totalTokens, costUSD: variant.costUSD)
+            for variant in entry.variants ?? [ModelUsageVariant(
+                model: name,
+                totalTokens: entry.totalTokens,
+                costUSD: entry.costUSD,
+                costIsComplete: entry.costIsComplete,
+                tokenCountSaturated: entry.tokenCountSaturated
+            )] {
+                mergeVariant(variant.model, tokens: variant.totalTokens, costUSD: variant.costUSD,
+                             costIsComplete: !variant.hasIncompleteCost,
+                             tokenCountSaturated: variant.tokenCountSaturated == true)
             }
         }
 
@@ -277,53 +451,88 @@ enum SpendTileMapper {
         /// its hover detail lists models, not their raw effort slugs. The Other row's own name is
         /// fixed, so folded spellings only vote inside the variant lines.
         mutating func fold(_ entry: ModelUsageEntry) {
+            if entry.totalTokens > 0 && tokens > Int.max - entry.totalTokens { tokenCountSaturated = true }
             tokens = ProviderParse.addingSaturating(tokens, entry.totalTokens)
+            tokenCountSaturated = tokenCountSaturated || entry.tokenCountSaturated == true
             if let cost = entry.costUSD {
-                costUSD = (costUSD ?? 0) + cost
-            } else if entry.totalTokens > 0 {
+                accumulateCost(cost)
+            }
+            if entry.hasIncompleteCost {
                 costIsComplete = false
             }
-            mergeVariant(entry.model, tokens: entry.totalTokens, costUSD: entry.costUSD)
+            mergeVariant(entry.model, tokens: entry.totalTokens, costUSD: entry.costUSD,
+                         costIsComplete: !entry.hasIncompleteCost,
+                         tokenCountSaturated: entry.tokenCountSaturated == true)
         }
 
         private mutating func addTotals(of entry: ModelUsageEntry, spelledAs name: String) {
+            if entry.totalTokens > 0 && tokens > Int.max - entry.totalTokens { tokenCountSaturated = true }
             tokens = ProviderParse.addingSaturating(tokens, entry.totalTokens)
+            tokenCountSaturated = tokenCountSaturated || entry.tokenCountSaturated == true
             if let cost = entry.costUSD {
-                costUSD = (costUSD ?? 0) + cost
-            } else if entry.totalTokens > 0 {
+                accumulateCost(cost)
+            }
+            if entry.hasIncompleteCost {
                 costIsComplete = false
             }
             nameVote.note(name, weight: entry.totalTokens)
         }
 
-        private mutating func mergeVariant(_ model: String, tokens: Int, costUSD: Double?) {
+        private mutating func mergeVariant(
+            _ model: String,
+            tokens: Int,
+            costUSD: Double?,
+            costIsComplete: Bool,
+            tokenCountSaturated: Bool
+        ) {
             let key = model.lowercased()
-            var existing = variants[key] ?? (0, nil, true, SpellingVote())
+            var existing = variants[key] ?? (tokens: 0, costUSD: nil, costIsComplete: true,
+                                              tokenCountSaturated: false, costOverflowed: false,
+                                              vote: SpellingVote())
+            if tokens > 0 && existing.tokens > Int.max - tokens { existing.tokenCountSaturated = true }
             existing.tokens = ProviderParse.addingSaturating(existing.tokens, tokens)
-            existing.costUSD = costUSD.map { (existing.costUSD ?? 0) + $0 } ?? existing.costUSD
-            if tokens > 0 && costUSD == nil {
+            existing.tokenCountSaturated = existing.tokenCountSaturated || tokenCountSaturated
+            if let costUSD, !existing.costOverflowed {
+                if let total = SpendTileMapper.addingFiniteCost(existing.costUSD, costUSD) {
+                    existing.costUSD = total
+                } else {
+                    existing.costOverflowed = true
+                    existing.costIsComplete = false
+                }
+            }
+            if !costIsComplete || (tokens > 0 && costUSD == nil) {
                 existing.costIsComplete = false
             }
             existing.vote.note(model, weight: tokens)
             variants[key] = existing
         }
 
+        private mutating func accumulateCost(_ cost: Double) {
+            guard !costOverflowed else { return }
+            if let total = SpendTileMapper.addingFiniteCost(costUSD, cost) {
+                costUSD = total
+            } else {
+                costOverflowed = true
+                costIsComplete = false
+            }
+        }
+
         func entry(model: String) -> ModelUsageEntry {
             let list = variants
                 .map { key, value in
                     ModelUsageVariant(model: value.vote.best ?? key, totalTokens: value.tokens,
-                                      costUSD: value.costIsComplete
-                                        ? value.costUSD.map(SpendTileMapper.roundToCents)
-                                        : nil)
+                                      costUSD: value.costUSD.map(SpendTileMapper.roundToCents),
+                                      costIsComplete: value.costIsComplete ? nil : false,
+                                      tokenCountSaturated: value.tokenCountSaturated ? true : nil)
                 }
                 .sorted(by: variantSortPrecedes)
             // One variant carrying the row's own name is no breakdown — nil keeps the tooltip on plain figures.
             let isTrivial = list.count == 1 && list[0].model.lowercased() == model.lowercased()
             return ModelUsageEntry(model: model, totalTokens: tokens,
-                                   costUSD: costIsComplete
-                                     ? costUSD.map(SpendTileMapper.roundToCents)
-                                     : nil,
-                                   variants: isTrivial ? nil : list)
+                                   costUSD: costUSD.map(SpendTileMapper.roundToCents),
+                                   variants: isTrivial ? nil : list,
+                                   costIsComplete: costIsComplete ? nil : false,
+                                   tokenCountSaturated: tokenCountSaturated ? true : nil)
         }
     }
 
@@ -339,8 +548,10 @@ enum SpendTileMapper {
         _ usage: ModelUsageSeries?,
         days: Set<String>,
         totalTokens: Int,
+        tokenCountSaturated: Bool,
         totalCostUSD: Double?,
-        sourceNote: String?
+        sourceNote: String?,
+        unexplainedIncompleteDays: Set<String>
     ) -> ModelUsageBreakdown? {
         guard let usage, let sourceNote, !days.isEmpty else { return nil }
 
@@ -348,9 +559,14 @@ enum SpendTileMapper {
         // spelling vote decides which casing titles it.
         var byModel: [String: ModelAccumulator] = [:]
         for day in usage.daily where dayKey(fromUsageDate: day.date).map(days.contains) == true {
+            guard let dayKey = dayKey(fromUsageDate: day.date) else { continue }
             for model in day.models where model.totalTokens > 0 || (model.costUSD ?? 0) > 0 {
                 let name = normalizedModelName(model.model)
-                byModel[name.lowercased(), default: ModelAccumulator()].add(model, spelledAs: name)
+                var adjustedModel = model
+                if unexplainedIncompleteDays.contains(dayKey) {
+                    adjustedModel = hidingCost(of: adjustedModel)
+                }
+                byModel[name.lowercased(), default: ModelAccumulator()].add(adjustedModel, spelledAs: name)
             }
         }
 
@@ -360,10 +576,26 @@ enum SpendTileMapper {
         guard !folded.isEmpty else { return nil }
         return ModelUsageBreakdown(
             totalTokens: totalTokens,
+            tokenCountSaturated: tokenCountSaturated ? true : nil,
             totalCostUSD: totalCostUSD,
             models: folded,
             sourceNote: sourceNote
         )
+    }
+
+    private static func hidingCost(of model: ModelUsageEntry) -> ModelUsageEntry {
+        var adjusted = model
+        adjusted.costUSD = nil
+        adjusted.costIsComplete = false
+        if let variants = adjusted.variants {
+            adjusted.variants = variants.map { variant in
+                var adjustedVariant = variant
+                adjustedVariant.costUSD = nil
+                adjustedVariant.costIsComplete = false
+                return adjustedVariant
+            }
+        }
+        return adjusted
     }
 
     private static func normalizedModelName(_ raw: String) -> String {
@@ -391,11 +623,19 @@ enum SpendTileMapper {
         // are the measured quantity and cost is the imputed one, so a model holding half the
         // period's tokens must never disappear behind "Other" just because its cost share is small
         // (the bug that hid 488M glm tokens under a 3% Other row).
-        let allPriced = entries.allSatisfy { $0.costUSD != nil }
-        let costTotal = entries.reduce(0.0) { $0 + ($1.costUSD ?? 0) }
+        let allCostsComplete = entries.allSatisfy { $0.costUSD != nil && !$0.hasIncompleteCost }
+        let largestCost = entries.compactMap(\.costUSD).max() ?? 0
+        // Normalize by the largest entry before summing so a finite set of prices cannot overflow
+        // the denominator and make every model appear to have a zero share.
+        let normalizedCostTotal = largestCost > 0 && largestCost.isFinite
+            ? entries.reduce(0.0) { $0 + (($1.costUSD ?? 0) / largestCost) }
+            : 0
+        let canUseCostShares = allCostsComplete && normalizedCostTotal.isFinite && normalizedCostTotal > 0
         let tokenTotal = entries.reduce(0) { ProviderParse.addingSaturating($0, $1.totalTokens) }
         func share(_ entry: ModelUsageEntry) -> Double {
-            if allPriced, costTotal > 0 { return (entry.costUSD ?? 0) / costTotal }
+            if canUseCostShares {
+                return ((entry.costUSD ?? 0) / largestCost) / normalizedCostTotal
+            }
             guard tokenTotal > 0 else { return 0 }
             return Double(entry.totalTokens) / Double(tokenTotal)
         }
@@ -438,7 +678,15 @@ enum SpendTileMapper {
         return visible
     }
 
+    private static func addingFiniteCost(_ current: Double?, _ addition: Double) -> Double? {
+        guard addition.isFinite, addition >= 0 else { return nil }
+        let total = (current ?? 0) + addition
+        return total.isFinite ? total : nil
+    }
+
     private static func roundToCents(_ value: Double) -> Double {
-        (value * 100).rounded() / 100
+        let scaled = value * 100
+        guard value.isFinite, scaled.isFinite else { return value }
+        return scaled.rounded() / 100
     }
 }

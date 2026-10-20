@@ -5,10 +5,11 @@ struct FreebuffMappedUsage: Equatable, Sendable {
     var lines: [MetricLine]
 }
 
-/// Maps only values returned by Freebuff's read-only session endpoint. Freebucks remain credits;
-/// USD rows are emitted only when the response itself contains a dollar amount.
+/// Maps Freebuff's read-only session endpoint. The current meter supersedes legacy session caps;
+/// its wire values remain Freebucks but the provider displays five Freebucks as one hour.
 enum FreebuffUsageMapper {
     static let fiveDayPeriodMs = 5 * MetricPeriod.dayMs
+    static let freebucksPerHour = 5.0
 
     static func map(response: HTTPResponse) throws -> FreebuffMappedUsage {
         let root: [String: Any]
@@ -27,7 +28,10 @@ enum FreebuffUsageMapper {
         let freebucks = root["freebucks"] as? [String: Any]
         var lines: [MetricLine] = []
 
-        if let usage = subscriptionUsage {
+        if root.keys.contains("freebucks") {
+            // Legacy free/subscription windows are still sent for compatibility. They no longer
+            // describe the available budget when the account has the current hours meter.
+        } else if let usage = subscriptionUsage {
             appendProgress(
                 label: "Daily",
                 used: usage["dayUsed"], limit: usage["dayLimit"],
@@ -92,16 +96,17 @@ enum FreebuffUsageMapper {
 
         if let daily = freebucks?["daily"] as? [String: Any] {
             appendProgress(
-                label: "Freebucks Daily",
-                used: daily["spent"], limit: daily["limit"],
-                format: .count(suffix: "Freebucks"), resetsAt: daily["resetAt"],
+                label: "Daily Hours",
+                used: ProviderParse.number(daily["spent"]).map { $0 / freebucksPerHour },
+                limit: ProviderParse.number(daily["limit"]).map { $0 / freebucksPerHour },
+                format: .count(suffix: "hours"), resetsAt: daily["resetAt"],
                 periodDurationMs: MetricPeriod.dayMs, to: &lines
             )
         }
         if let balance = ProviderParse.number(freebucks?["balance"]), balance >= 0 {
             lines.append(.values(
-                label: "Freebucks Balance",
-                values: [MetricValue(number: balance, kind: .count, label: "Freebucks")]
+                label: "Hours Balance",
+                values: [MetricValue(number: floor(balance / freebucksPerHour + 1e-9), kind: .count, label: "hours")]
             ))
         }
 

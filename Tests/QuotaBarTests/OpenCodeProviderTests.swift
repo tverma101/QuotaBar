@@ -734,7 +734,7 @@ private final class StubSQLite: SQLiteAccessing, @unchecked Sendable {
 
     func queryValue(path: String, sql: String) throws -> String? {
         if failing.contains(path) { throw SQLiteError.queryFailed("boom") }
-        if sql.contains("json_group_array") { return data[path] }
+        if sql.contains("json_group_array") { return data[path] ?? "[]" }
         if sql.contains("MIN(time_created)") { return anchor }
         if sql.contains("SELECT 1") {
             let payload = data[path]

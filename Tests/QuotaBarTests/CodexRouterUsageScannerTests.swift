@@ -99,7 +99,9 @@ final class CodexRouterUsageScannerTests: XCTestCase {
         XCTAssertFalse(day.costIsComplete)
         XCTAssertNil(scan.apiEstimateByDay?[day.date])
         XCTAssertTrue(scan.apiEstimateIncompleteDays?.contains(day.date) == true)
-        XCTAssertNil(scan.modelUsage?.daily.first?.models.first?.costUSD)
+        XCTAssertEqual(scan.modelUsage?.daily.first?.models.first?.costUSD ?? -1,
+                       0.2275, accuracy: 0.000_000_1,
+                       "keep the known priced subtotal while marking the reported total incomplete")
     }
 
     func testEstimatedInputKeepsMeasuredTokensAndMarksDollarCoverageIncomplete() async throws {
@@ -114,7 +116,7 @@ final class CodexRouterUsageScannerTests: XCTestCase {
             "cachedInputTokens": 0,
             "outputTokens": 25,
             "totalTokens": 25,
-            "estimatedInputTokens": 999_999,
+            "estimatedInputTokens": 1_000_000_000_000_001,
             "accountFingerprint": fingerprint,
             "accountId": accountID
         ]])
@@ -134,10 +136,14 @@ final class CodexRouterUsageScannerTests: XCTestCase {
         let day = try XCTUnwrap(scan.series.daily.first)
 
         XCTAssertEqual(day.totalTokens, 25, "the router approximation must not inflate measured tokens")
+        XCTAssertFalse(day.tokenCountSaturated,
+                       "an oversized estimated input does not make the measured count a lower bound")
         XCTAssertFalse(day.costIsComplete)
         XCTAssertTrue(scan.apiEstimateIncompleteDays?.contains(day.date) == true)
         XCTAssertNil(scan.apiEstimateByDay?[day.date])
-        XCTAssertNil(scan.modelUsage?.daily.first?.models.first?.costUSD)
+        XCTAssertEqual(scan.modelUsage?.daily.first?.models.first?.costUSD ?? -1,
+                       0.075, accuracy: 0.000_000_1,
+                       "estimated input must not hide the measured output subtotal")
     }
 
     func testLegacyUnscopedEventsOnlyWhenAllowed() async {

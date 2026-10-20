@@ -412,11 +412,20 @@ actor JSONLScanCacheWriter {
         persistence: JSONLScanCachePersistence,
         identity: String
     ) throws -> JSONLScanCacheManifest? {
+        let diagnosticIdentity = [
+            persistence.directory.standardizedFileURL.path,
+            persistence.namespace,
+            identity
+        ].joined(separator: "|")
+        let diagnosticKey = "jsonl.cache.touch.\(JSONLScanCachePaths.stableFingerprint(diagnosticIdentity))"
         let identityDirectory = JSONLScanCachePaths.identityDirectory(
             persistence: persistence,
             identity: identity
         )
-        guard FileManager.default.fileExists(atPath: identityDirectory.path) else { return nil }
+        guard FileManager.default.fileExists(atPath: identityDirectory.path) else {
+            DiagnosticGate.clearFailure(diagnosticKey)
+            return nil
+        }
         let manifestData = try Self.withSharedLock(
             at: JSONLScanCachePaths.lockURL(persistence: persistence, identity: identity)
         ) {
@@ -430,11 +439,14 @@ actor JSONLScanCacheWriter {
                     [.modificationDate: Date()],
                     ofItemAtPath: identityDirectory.path
                 )
+                DiagnosticGate.clearFailure(diagnosticKey)
             } catch {
-                AppLog.warn(
-                    .cache,
-                    "could not mark \(persistence.namespace) log parse cache as used: \(error.localizedDescription)"
-                )
+                DiagnosticGate.logOnce(for: diagnosticKey) {
+                    AppLog.warn(
+                        .cache,
+                        "could not mark \(persistence.namespace) log parse cache as used: \(error.localizedDescription)"
+                    )
+                }
             }
             return manifestData
         }

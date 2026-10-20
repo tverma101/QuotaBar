@@ -65,7 +65,9 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         guard let json = try accessor.queryValue(path: hermesDB, sql: OpenCodeUsageScanner.hermesGatewaySQL(cutoffSeconds: 0)) else {
             return XCTFail("expected a payload")
         }
-        let rows = OpenCodeUsageScanner.parseHermesGatewayRows(json)
+        guard let rows = OpenCodeUsageScanner.parseHermesGatewayRows(json) else {
+            return XCTFail("valid Hermes token rows should parse")
+        }
         // opencode-go + opencode sessions only; BOTH nous sessions (incl. the big deepseek one)
         // and the NULL-provider session are excluded; NULL tokens zero-filled.
         XCTAssertEqual(rows.count, 4)
@@ -145,6 +147,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         try sqlite(hermesDB, """
             INSERT INTO sessions (id, model, started_at, billing_provider, billing_base_url, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, ended_at) VALUES
               ('finished-yesterday', 'deepseek-v4-flash', \(now.timeIntervalSince1970 - 90_000), 'opencode-go', 'https://opencode.ai/zen/go/v1', 1000, 200, 8000, 0, 0, \(now.timeIntervalSince1970 - 86_400)),
+              ('finished-today',     'kimi-k2.7',          \(now.timeIntervalSince1970 - 1200), 'opencode-go', 'https://opencode.ai/zen/go/v1', 200, 50, 500, 0, 0, \(now.timeIntervalSince1970 - 600)),
               ('live-today',         'deepseek-v4-flash', \(now.timeIntervalSince1970 - 600), 'opencode-go', 'https://opencode.ai/zen/go/v1', 500, 50, 4000, 0, 10, NULL);
             """)
         let hermesPath: String = self.hermesDB
@@ -159,11 +162,14 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         let today = DailyUsageAccumulator.dayKey(from: now)
         let yesterday = DailyUsageAccumulator.dayKey(from: now.addingTimeInterval(-86400))
         XCTAssertEqual(scan!.partialDays, [today])
+        XCTAssertEqual(scan!.logScan.estimatedCostDays, [today, yesterday], "gateway-priced dollars carry per-day estimate provenance")
         XCTAssertFalse(scan!.partialDays.contains(yesterday), "finished sessions must not mark their day partial")
 
         var lines: [MetricLine] = []
         SpendTileMapper.appendTokenUsage(scan!.logScan.series, to: &lines, now: now,
                                          estimated: scan!.includesEstimatedCost,
+                                         modelUsage: scan!.logScan.modelUsage,
+                                         modelSourceNote: "From OpenCode logs",
                                          partialDays: scan!.partialDays)
         guard case let .values(_, todayValues, _, _, _, _)? = lines.first(where: { $0.label == "Today" }) else {
             return XCTFail("expected a Today tile")
@@ -171,6 +177,18 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         // Today's tokens carry the ⓘ-estimated marker because the live session is partial.
         XCTAssertTrue(todayValues.contains { $0.kind == .count && $0.estimated },
                       "partial day's token count must carry the ⓘ marker")
+        guard case let .values(_, _, _, _, _, todayBreakdown)? = lines.first(where: { $0.label == "Today" }) else {
+            return XCTFail("expected model details for the Today tile")
+        }
+        let activeModel = try XCTUnwrap(todayBreakdown?.models.first {
+            $0.model.caseInsensitiveCompare("deepseek-v4-flash") == .orderedSame
+        })
+        XCTAssertTrue(activeModel.hasIncompleteCost, "the model subtotal from a live session must be Partial too")
+        XCTAssertNotNil(activeModel.costUSD, "known priced dollars remain visible while marked Partial")
+        let completedModel = try XCTUnwrap(todayBreakdown?.models.first {
+            $0.model.caseInsensitiveCompare("kimi-k2.7") == .orderedSame
+        })
+        XCTAssertFalse(completedModel.hasIncompleteCost, "a finished model on the same day stays settled")
         guard case let .values(_, yesterdayValues, _, _, _, _)? = lines.first(where: { $0.label == "Yesterday" }) else {
             return XCTFail("expected a Yesterday tile")
         }
@@ -199,6 +217,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
             var warned: Int = 0
             func queryValue(path: String, sql: String) throws -> String? {
                 if sql.contains("billing_provider") { throw SQLiteError.queryFailed("database is locked") }
+                if sql.contains("json_group_array") { return "[]" }
                 return nil
             }
             func execute(path: String, sql: String) throws {}

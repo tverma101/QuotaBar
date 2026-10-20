@@ -37,11 +37,9 @@ final class WidgetDataStore {
     /// Quota-notification preferences (three independent triggers). Injected; `nil` disables
     /// notifications entirely (tests and previews that don't wire it).
     private let notificationSettings: (@MainActor () -> NotificationSettingsStore)?
-    /// Card id → the account identity currently signed in there, resolved once at launch by
-    /// `ProviderAccountAssembly`. Drives the snapshot cache's account stamp: writes record the
-    /// producer, and launch loads only paint an entry whose stamp matches. A card absent here has an
-    /// unresolved identity this launch (or isn't account-aware) — its cache behaves as it always did.
-    private let providerIdentityKeys: [String: String]
+    /// Card id → the identity that produced or currently owns the account-scoped snapshot. Launch
+    /// discovery seeds this map; providers that detect an account switch during refresh update it.
+    private var providerIdentityKeys: [String: String]
     /// Where a fired milestone is delivered: `(idPrefix, title, subtitle, body) -> Bool`. The Bool is
     /// whether it was actually delivered (authorized + scheduled); on false the caller leaves the
     /// milestone un-marked so it retries next pass. Injected so tests can record posts without a live
@@ -137,13 +135,21 @@ final class WidgetDataStore {
 
     private struct ProviderFailureState {
         let message: String
+        let category: ErrorCategory?
         let order: UInt64
+    }
+
+    private struct ProviderFailureLogIdentity: Equatable {
+        let message: String
+        let category: ErrorCategory?
     }
 
     private var activeBatches: [RefreshBatchKey: Task<Void, Never>] = [:]
     /// Publication ownership is per provider. The Keychain gate retains a global action identity for
     /// prompt safety, but a targeted refresh must not invalidate unrelated cards in an older full pass.
     @ObservationIgnored private var providerRequestGenerations: [String: UInt64] = [:]
+    @ObservationIgnored private var providerRefreshRequestOrders: [String: UInt64] = [:]
+    @ObservationIgnored private var providerIdentityResolutionOrders: [String: UInt64] = [:]
     @ObservationIgnored private var latestManualActionByProvider: [String: UInt64] = [:]
     /// Manual actions issued before a provider was disabled must not become valid again if that card is
     /// re-enabled while a delayed phase-two request is still queued.
@@ -185,10 +191,10 @@ final class WidgetDataStore {
     @ObservationIgnored private var providerFailureStates: [String: [FailureDomain: ProviderFailureState]] = [:]
     @ObservationIgnored private var nextProviderFailureOrder: UInt64 = 0
 
-    /// The same persistent provider failure is reported once until recovery, a changed error, or an
-    /// explicit forced refresh. Scheduled retries after a blocked Keychain read must not write the
-    /// identical warning to the log on every backoff interval.
-    @ObservationIgnored private var lastLoggedProviderError: [String: String] = [:]
+    /// The same persistent provider failure is logged once until recovery or a changed error. A forced
+    /// retry may repeat transient diagnostics, but not credential-access or structurally invalid auth
+    /// failures that another read cannot repair.
+    @ObservationIgnored private var lastLoggedProviderFailure: [String: [FailureDomain: ProviderFailureLogIdentity]] = [:]
 
     /// Per-provider earliest next-probe time after a failure (see `failureRetryBackoff`). Not part of
     /// observable UI state, so it's excluded from `@Observable` tracking.
@@ -285,24 +291,26 @@ final class WidgetDataStore {
         // dashboard show last-known values immediately at launch instead of "—"; the refresh loop
         // replaces them as soon as fresh data lands.
         //
-        // Account swap guard: when a claude/codex card's CURRENT account identity is known, a cached
-        // entry only paints if the account that produced it matches. After a swap at the same home the
-        // card id still matches, so without this check the previous account's limits and plan would
-        // paint under the new account until the first successful refresh. A card whose current
-        // identity is unresolved (logged out, keyring-mode Codex) can't be verified either way — it
-        // keeps its cache, exactly as before the guard existed. Non-account providers are unaffected.
+        // Account swap guard: account-scoped rows only paint when their producer identity matches.
+        // OpenCode and Antigravity quota belong to credentials, while their usage history is
+        // machine-local. Account changes clear plan/progress but keep local history.
         let retentionDate = now()
         let lifetimeDayKeys = UsageHistoryWindow.lifetimeDayKeys(through: retentionDate)
         let detailDayKeys = UsageHistoryWindow.dayKeys(through: retentionDate)
         cache.compactHistories(lifetimeDayKeys: lifetimeDayKeys, detailDayKeys: detailDayKeys)
-        let loaded = cache.loadSnapshots(providerIDs: registry.providers.map(\.id))
-            .filter { cardID, _ in
-                guard cache.hasStaleAccountStamp(providerID: cardID, currentIdentityKey: providerIdentityKeys[cardID]) else {
-                    return true
-                }
-                AppLog.info(.cache, "stale account cache discarded for \(cardID)")
-                return false
+        var loaded = cache.loadSnapshots(providerIDs: registry.providers.map(\.id))
+        for cardID in Array(loaded.keys) where cache.hasStaleAccountStamp(
+            providerID: cardID,
+            currentIdentityKey: providerIdentityKeys[cardID]
+        ) {
+            guard let snapshot = loaded[cardID] else { continue }
+            AppLog.info(.cache, "stale account cache filtered for \(cardID)")
+            if cardID == "opencode" || cardID == "antigravity" {
+                loaded[cardID] = Self.snapshotByClearingQuotaState(snapshot)
+            } else {
+                loaded.removeValue(forKey: cardID)
             }
+        }
         self.localSnapshots = loaded
         self.snapshots = loaded
     }
@@ -321,19 +329,16 @@ final class WidgetDataStore {
         }
     }
 
-    /// Same invalidation, for an external background refresh request. The router ledger is folded
-    /// into both Codex and OpenCode cards, so invalidating only Codex would leave OpenCode served
-    /// from a TTL-fresh snapshot while its own history changed.
-    ///
-    /// Drops session freshness only (no `force`), so unrelated providers keep their cache. A Codex
-    /// card's `refresh()` still re-reads its live quota API on the resulting miss.
+    /// An external background refresh can append or replace local usage data for any provider with
+    /// a history descriptor. Drop those providers' session freshness so the next ordinary refresh
+    /// recomputes their local history while unrelated cards continue to use their cache.
     func invalidateLocalAccountingFreshness() {
         let ids = providersByID.keys.filter {
-            isProviderEnabled($0) && Self.foldsLocalAccounting($0)
+            isProviderEnabled($0) && registry.historyDescriptorsByProvider[$0] != nil
         }
         cache.invalidateSessionFreshness(providerIDs: Array(ids))
         if !ids.isEmpty {
-            AppLog.debug(.refresh, "local accounting cache invalidated (\(ids.count) cards) for background refresh")
+            AppLog.debug(.refresh, "local history cache invalidated (\(ids.count) cards) for background refresh")
         }
     }
 
@@ -341,13 +346,6 @@ final class WidgetDataStore {
         providersByID.keys.contains {
             ProviderAccountID.family(of: $0) == family && isProviderEnabled($0)
         }
-    }
-
-    /// Card ids whose history is a local fold over the CodexRouter ledger plus session rollouts, so a
-    /// background trigger must invalidate both families together or the cards disagree.
-    private static func foldsLocalAccounting(_ providerID: String) -> Bool {
-        let family = ProviderAccountID.family(of: providerID)
-        return family == "codex" || family == "opencode"
     }
 
     /// Refresh every enabled provider, concurrently by default — one slow provider never delays the
@@ -868,6 +866,17 @@ final class WidgetDataStore {
         }
     }
 
+    /// A provider catalog replacement owns a new refresh store. Stop every request and batch that
+    /// belongs to this instance before the replacement starts, so a retired manual refresh cannot
+    /// keep making requests or trying interactive credential reads beside the new scheduler.
+    func cancelActiveProviderRefreshesForCatalogReload() {
+        for batch in activeBatches.values { batch.cancel() }
+        for tasks in activeProviderRefreshTasks.values {
+            for task in tasks.values { task.cancel() }
+        }
+        deferredRefreshRequests.removeAll()
+    }
+
     private func cancelProviderRefreshes(batchID: UUID) {
         for (providerID, tasks) in activeProviderRefreshTasks {
             for (id, task) in tasks where activeProviderRefreshTaskBatchIDs[providerID]?[id] == batchID {
@@ -879,6 +888,12 @@ final class WidgetDataStore {
     /// Returns a stable per-provider request generation. Two refreshes in one manual action share one
     /// generation; a later action advances it once for each provider it covers. A superseded action
     /// that reaches this store late receives a sentinel that cannot publish.
+    private func nextProviderRefreshRequestOrder(_ providerID: String) -> UInt64 {
+        let next = providerRefreshRequestOrders[providerID, default: 0] &+ 1
+        providerRefreshRequestOrders[providerID] = next
+        return next
+    }
+
     private func beginProviderRequest(providerID: String, manualActionID: UInt64?) -> UInt64 {
         let current = providerRequestGenerations[providerID, default: 0]
         guard let manualActionID else { return current }
@@ -968,6 +983,7 @@ final class WidgetDataStore {
         guard isCurrentProviderRequest(providerID: providerID, generation: requestGeneration) else {
             return .skipped
         }
+        let requestOrder = nextProviderRefreshRequestOrder(providerID)
         if let manualActionID,
            !KeychainPermissionGate.shared.isCurrentManualAction(manualActionID)
         {
@@ -995,7 +1011,7 @@ final class WidgetDataStore {
                 let compacted = history.retainingHistory(through: now())
                 if compacted != history {
                     cached.usageHistory = compacted
-                    cache.store(cached, producedByIdentityKey: providerIdentityKeys[providerID])
+                    cache.compactHistory(providerID: providerID, through: now())
                 }
             }
             // A menu-bar merge re-stamps `refreshedAt` for the meters it computed, but its history
@@ -1134,16 +1150,59 @@ final class WidgetDataStore {
                 refreshingProviderIDs.remove(providerID)
             }
         }
+        // App and CLI share persisted snapshots but have independent in-process request generations.
+        // The cache order fences a slower result if a newer refresh starts in the other process.
+        let cacheRefreshOrder = cache.beginRefreshOrder(providerID: providerID)
         let start = monotonicNow()
         // A provider that never returns would otherwise hold the in-flight entry — and the spinner —
         // forever. Past the deadline, stop waiting and treat it as any other failed refresh.
-        let fetchedSnapshot = await ProviderRefreshDeadline.snapshot(
-            from: provider,
-            timeout: providerRefreshTimeout
-        )
+        let cacheIdentityResult = ProviderCacheIdentityResult()
+        let fetchedSnapshot = await ProviderRefreshContext.$cacheIdentityResult.withValue(cacheIdentityResult) {
+            await ProviderRefreshDeadline.snapshot(from: provider, timeout: providerRefreshTimeout)
+        }
         guard isCurrentProviderRequest(providerID: providerID, generation: requestGeneration) else {
             AppLog.debug(.refresh, "superseded provider request (\(providerID)); discarding stale result")
             return .skipped
+        }
+        if let cacheRefreshOrder,
+           !cache.isCurrentRefresh(
+            providerID: providerID,
+            order: cacheRefreshOrder,
+            scope: scope,
+            hasHistoryDomain: registry.historyDescriptorsByProvider[providerID] != nil,
+            panelMetersIncludesHistory: providersByID[providerID]?.panelMetersRefreshIncludesHistory == true
+           )
+        {
+            AppLog.debug(.refresh, "superseded cross-process provider request (\(providerID))")
+            return .skipped
+        }
+        if let identityKey = cacheIdentityResult.value {
+            let lastIdentityOrder = providerIdentityResolutionOrders[providerID, default: 0]
+            let currentIdentityKey = providerIdentityKeys[providerID]
+            if requestOrder < lastIdentityOrder, currentIdentityKey != identityKey {
+                AppLog.debug(.cache, "discarding stale account result for \(providerID)")
+                if !ProviderRefreshContext.scope.skipsLocalAccounting,
+                   registry.historyDescriptorsByProvider[providerID] != nil
+                {
+                    deferredRefreshRequests[providerID, default: []].insert(DeferredRefreshRequest(
+                        providerID: providerID,
+                        scope: .panelAccounting,
+                        bypassSnapshotCache: true,
+                        bypassFailureBackoff: true,
+                        requestGeneration: requestGeneration
+                    ))
+                }
+                return .skipped
+            }
+            if requestOrder >= lastIdentityOrder {
+                providerIdentityResolutionOrders[providerID] = requestOrder
+            }
+            guard updateProviderCacheIdentity(
+                to: identityKey,
+                providerID: providerID,
+                notifyHistoryChange: notifyHistoryChange,
+                refreshOrder: cacheRefreshOrder
+            ) else { return .skipped }
         }
         guard var snapshot = fetchedSnapshot else {
             // A disabled provider's non-cooperative work can outlive the deadline after its task was
@@ -1164,7 +1223,7 @@ final class WidgetDataStore {
                 return .skipped
             }
             let message = "Refresh timed out after \(Int(providerRefreshTimeout))s"
-            recordProviderFailure(message, for: providerID, domains: failureDomains)
+            recordProviderFailure(message, category: .network, for: providerID, domains: failureDomains)
             let retryAfter = now().addingTimeInterval(Self.failureRetryBackoff)
             for key in failureBackoffKeys { failureRetryAfter[key] = retryAfter }
             AppLog.warn(.refresh, "\(providerID) timed out after \(Int(providerRefreshTimeout))s")
@@ -1203,22 +1262,39 @@ final class WidgetDataStore {
             // when the failure proves that a prior subscription/credential no longer applies; keep
             // its spend history while dropping the stale plan and progress rows.
             if snapshot.clearsPriorMenuBarQuotaState == true,
-               !ProviderRefreshContext.scope.suppressesLiveQuota
+               (!ProviderRefreshContext.scope.suppressesLiveQuota || snapshot.invalidatesQuotaIdentity == true)
             {
-                clearPriorQuotaState(for: providerID)
+                // Quota and history have independent commit orders. A newer meter pass can supersede
+                // this clear while this full result still carries the newest valid history.
+                _ = clearPriorQuotaState(for: providerID, refreshOrder: cacheRefreshOrder)
             }
-            mergeHistoryFromFailedRefresh(
+            guard mergeHistoryFromFailedRefresh(
                 snapshot,
                 providerID: providerID,
-                notifyHistoryChange: notifyHistoryChange
+                notifyHistoryChange: notifyHistoryChange,
+                refreshOrder: cacheRefreshOrder
+            ) else { return .skipped }
+            recordProviderFailure(
+                message,
+                category: snapshot.errorCategory,
+                for: providerID,
+                domains: failureDomains
             )
-            recordProviderFailure(message, for: providerID, domains: failureDomains)
             // Negative-cache the failure so a wake burst can't re-probe this provider in a tight loop.
             let retryAfter = now().addingTimeInterval(Self.failureRetryBackoff)
             for key in failureBackoffKeys { failureRetryAfter[key] = retryAfter }
-            if force || lastLoggedProviderError[providerID] != message {
+            let failureIdentity = ProviderFailureLogIdentity(message: message, category: snapshot.errorCategory)
+            let priorLoggedFailures = lastLoggedProviderFailure[providerID, default: [:]]
+            if failureDomains.contains(where: { priorLoggedFailures[$0] != failureIdentity })
+                || (force
+                    && snapshot.errorCategory != .credentialAccess
+                    && snapshot.errorCategory != .authInvalid
+                    && snapshot.errorCategory != .notLoggedIn)
+            {
                 AppLog.warn(.refresh, "\(providerID) failed: \(message)")
-                lastLoggedProviderError[providerID] = message
+                var loggedFailures = priorLoggedFailures
+                for domain in failureDomains { loggedFailures[domain] = failureIdentity }
+                lastLoggedProviderFailure[providerID] = loggedFailures
             }
             onRefreshOutcome?(providerID, .failed, snapshot.errorCategory, force)
             return .failed
@@ -1233,6 +1309,9 @@ final class WidgetDataStore {
         if let history = snapshot.usageHistory {
             snapshot.usageHistory = history.retainingHistory(through: now())
         }
+        // Keep the provider's raw result separate from this process's local composite. The cache
+        // combines partial domains with the newest persisted snapshot under its cross-process lock.
+        var snapshotForCache = snapshot
         // A provider can refresh its live limits successfully while its optional local log/CSV scan
         // produces no result. Keep only the last-good normalized history in that case; the new plan,
         // limits, warnings, and timestamp still win. A non-nil empty history remains authoritative and
@@ -1256,6 +1335,7 @@ final class WidgetDataStore {
                 // A first-run fold has no prior meter stamp to carry. It must not make the failed
                 // or skipped quota request look fresh just because local history completed.
                 snapshot.quotaRefreshedAt = .distantPast
+                snapshotForCache.quotaRefreshedAt = .distantPast
             }
         } else if snapshot.usageHistory == nil,
            let history = localSnapshots[providerID]?.usageHistory,
@@ -1265,6 +1345,8 @@ final class WidgetDataStore {
             // trust this snapshot's freshness stamp (see `carriesPriorHistory`).
             snapshot.carriesPriorHistory = true
             snapshot.usageHistory = history
+            snapshot.historyRefreshedAt = localSnapshots[providerID]?.historyRefreshedAt
+                ?? localSnapshots[providerID]?.refreshedAt
             snapshot = UsageHistorySnapshotRenderer.render(
                 local: snapshot,
                 history: history,
@@ -1272,7 +1354,39 @@ final class WidgetDataStore {
                 now: now(),
                 combined: false
             )
+            snapshotForCache = snapshot
             AppLog.debug(.refresh, "preserved last-good history for \(providerID) after scan miss")
+        }
+        let cacheWrite = cache.store(
+            snapshotForCache,
+            producedByIdentityKey: providerIdentityKeys[providerID],
+            refreshOrder: cacheRefreshOrder,
+            scope: scope,
+            historyDescriptor: registry.historyDescriptorsByProvider[providerID],
+            panelMetersIncludesHistory: providersByID[providerID]?.panelMetersRefreshIncludesHistory == true,
+            now: now()
+        )
+        switch cacheWrite {
+        case .stored(let persistedSnapshot):
+            if let persistedSnapshot { snapshot = persistedSnapshot }
+        case .unchanged(let persistedSnapshot):
+            if let persistedSnapshot { snapshot = persistedSnapshot }
+        case .superseded(let newerSnapshot):
+            let historyChanged = localSnapshots[providerID]?.usageHistory != newerSnapshot?.usageHistory
+            if let newerSnapshot {
+                localSnapshots[providerID] = newerSnapshot
+            } else {
+                localSnapshots[providerID] = nil
+            }
+            if historyChanged {
+                localHistoryRevision &+= 1
+                invalidateMergedHistoryCache()
+            }
+            rebuildRenderedSnapshots()
+            if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
+            return .skipped
+        case .unavailable:
+            break
         }
         let historyChanged = localSnapshots[providerID]?.usageHistory != snapshot.usageHistory
         localSnapshots[providerID] = snapshot
@@ -1280,9 +1394,6 @@ final class WidgetDataStore {
             localHistoryRevision &+= 1
             invalidateMergedHistoryCache()
         }
-        // Stamp the write with the card's launch-resolved account identity; nil (no stamp) for
-        // non-account providers and for cards whose identity didn't resolve this launch.
-        cache.store(snapshot, producedByIdentityKey: providerIdentityKeys[providerID])
         rebuildRenderedSnapshots()
         if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
         AppLog.info(.refresh, "\(providerID) ok (\(durationMs)ms)")
@@ -1304,11 +1415,12 @@ final class WidgetDataStore {
     private func mergeHistoryFromFailedRefresh(
         _ failedSnapshot: ProviderSnapshot,
         providerID: String,
-        notifyHistoryChange: Bool
-    ) {
+        notifyHistoryChange: Bool,
+        refreshOrder: UInt64?
+    ) -> Bool {
         guard let incomingHistory = failedSnapshot.usageHistory,
               let descriptor = registry.historyDescriptorsByProvider[providerID]
-        else { return }
+        else { return true }
 
         let previous = localSnapshots[providerID]
         let history = incomingHistory.retainingHistory(through: now())
@@ -1322,6 +1434,10 @@ final class WidgetDataStore {
         let previousQuotaStamp = previous.map { $0.quotaRefreshedAt ?? $0.refreshedAt }
         updated.refreshedAt = failedSnapshot.refreshedAt
         updated.quotaRefreshedAt = hasPreviousQuota ? previousQuotaStamp : .distantPast
+        updated.historyRefreshedAt = failedSnapshot.historyRefreshedAt ?? failedSnapshot.refreshedAt
+        if failedSnapshot.usageHistory != nil || failedSnapshot.historyWarning != nil {
+            updated.historyWarning = failedSnapshot.historyWarning
+        }
         updated = UsageHistorySnapshotRenderer.render(
             local: updated,
             history: history,
@@ -1330,20 +1446,63 @@ final class WidgetDataStore {
             combined: false
         )
 
+        var historyOnly = ProviderSnapshot(
+            providerID: failedSnapshot.providerID,
+            displayName: failedSnapshot.displayName,
+            lines: [],
+            refreshedAt: failedSnapshot.refreshedAt,
+            usageHistory: history,
+            historyWarning: failedSnapshot.historyWarning
+        )
+        historyOnly = UsageHistorySnapshotRenderer.render(
+            local: historyOnly,
+            history: history,
+            descriptor: descriptor,
+            now: now(),
+            combined: false
+        )
+        historyOnly.quotaRefreshedAt = .distantPast
+        let cacheResult = cache.store(
+            historyOnly,
+            producedByIdentityKey: providerIdentityKeys[providerID],
+            refreshOrder: refreshOrder,
+            scope: .panelAccounting,
+            historyDescriptor: descriptor,
+            now: now()
+        )
+        switch cacheResult {
+        case .stored(let persistedSnapshot):
+            if let persistedSnapshot { updated = persistedSnapshot }
+        case .unchanged(let persistedSnapshot):
+            if let persistedSnapshot { updated = persistedSnapshot }
+        case .superseded(let newerSnapshot):
+            let historyChanged = previous?.usageHistory != newerSnapshot?.usageHistory
+            localSnapshots[providerID] = newerSnapshot
+            if historyChanged {
+                localHistoryRevision &+= 1
+                invalidateMergedHistoryCache()
+            }
+            rebuildRenderedSnapshots()
+            if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
+            return false
+        case .unavailable:
+            break
+        }
+
         let historyChanged = previous?.usageHistory != updated.usageHistory
         localSnapshots[providerID] = updated
-        cache.store(updated, producedByIdentityKey: providerIdentityKeys[providerID])
         if historyChanged {
             localHistoryRevision &+= 1
             invalidateMergedHistoryCache()
         }
         rebuildRenderedSnapshots()
         if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
+        return true
     }
 
     /// Provider IDs / families whose refresh parses large on-disk JSONL corpora.
     private static let heavyLocalLogProviders: Set<String> = [
-        "claude", "codex", "opencode", "grok", "muse", "pi", "hermes",
+        "claude", "codex", "opencode", "grok", "muse", "pi", "hermes", "freebuff",
     ]
 
     private static func heavyProvidersToSerialize(in scope: ProviderRefreshContext.Scope) -> Set<String> {
@@ -1401,6 +1560,7 @@ final class WidgetDataStore {
 
     private func recordProviderFailure(
         _ message: String,
+        category: ErrorCategory?,
         for providerID: String,
         domains: [FailureDomain]
     ) {
@@ -1408,6 +1568,7 @@ final class WidgetDataStore {
             nextProviderFailureOrder &+= 1
             providerFailureStates[providerID, default: [:]][affectedDomain] = ProviderFailureState(
                 message: message,
+                category: category,
                 order: nextProviderFailureOrder
             )
         }
@@ -1434,8 +1595,14 @@ final class WidgetDataStore {
             }
         }
         updateDisplayedProviderError(for: providerID)
-        if providerErrors[providerID] == nil {
-            lastLoggedProviderError[providerID] = nil
+        if clearAll {
+            lastLoggedProviderFailure[providerID] = nil
+        } else if var loggedFailures = lastLoggedProviderFailure[providerID] {
+            for domain in domains + [.full] { loggedFailures[domain] = nil }
+            lastLoggedProviderFailure[providerID] = loggedFailures.isEmpty ? nil : loggedFailures
+            if providerErrors[providerID] == nil {
+                lastLoggedProviderFailure[providerID] = nil
+            }
         }
     }
 
@@ -1654,13 +1821,23 @@ final class WidgetDataStore {
         providerErrors[providerID]
     }
 
+    /// The category attached to the latest rendered provider failure. Views use this only for
+    /// provider-specific empty-state presentation; the localized message remains the user-facing copy.
+    func errorCategory(for providerID: String) -> ErrorCategory? {
+        providerFailureStates[providerID]?.values.max { $0.order < $1.order }?.category
+    }
+
     /// A soft, non-blocking notice from the provider's latest *successful* snapshot (e.g. Claude's
     /// "Re-login for live usage" when the login lacks the `user:profile` scope). `nil` when there's no
     /// warning. After a *failed* refresh the store keeps the last good snapshot (so this warning can
     /// linger) while setting `providerErrors` — use `headerNotice(for:)` for the rendered triangle so a
     /// current hard error isn't masked by a stale soft warning.
     func warningMessage(for providerID: String) -> String? {
-        snapshots[providerID]?.warning
+        guard let snapshot = snapshots[providerID] else { return nil }
+        let warnings = [snapshot.warning, snapshot.historyWarning]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return warnings.isEmpty ? nil : warnings.joined(separator: " ")
     }
 
     /// The provider header's amber-triangle notice: a hard refresh error takes precedence over a stale
@@ -1686,19 +1863,99 @@ final class WidgetDataStore {
         }
     }
 
-    private func clearPriorQuotaState(for providerID: String) {
-        guard var previous = localSnapshots[providerID] else { return }
-        previous.plan = nil
-        previous.lines.removeAll { line in
+    @discardableResult
+    private func clearPriorQuotaState(for providerID: String, refreshOrder: UInt64? = nil) -> Bool {
+        let previous = localSnapshots[providerID]
+        if let previous {
+            localSnapshots[providerID] = Self.snapshotByClearingQuotaState(previous)
+        }
+        let result = cache.clearQuotaState(providerID: providerID, refreshOrder: refreshOrder)
+        switch result {
+        case .stored(let persistedSnapshot):
+            if let persistedSnapshot {
+                localSnapshots[providerID] = persistedSnapshot
+            } else if let previous {
+                localSnapshots[providerID] = Self.snapshotByClearingQuotaState(previous)
+            }
+        case .unchanged(let persistedSnapshot):
+            if let persistedSnapshot { localSnapshots[providerID] = persistedSnapshot }
+        case .superseded(let newerSnapshot):
+            localSnapshots[providerID] = newerSnapshot
+            rebuildRenderedSnapshots()
+            return false
+        case .unavailable:
+            break
+        }
+        rebuildRenderedSnapshots()
+        return true
+    }
+
+    @discardableResult
+    private func updateProviderCacheIdentity(
+        to currentIdentityKey: String,
+        providerID: String,
+        notifyHistoryChange: Bool,
+        refreshOrder: UInt64?
+    ) -> Bool {
+        guard providerIdentityKeys[providerID] != currentIdentityKey else { return true }
+
+        if providerID == "antigravity" {
+            guard clearPriorQuotaState(for: providerID, refreshOrder: refreshOrder) else { return false }
+            providerIdentityKeys[providerID] = currentIdentityKey
+            AppLog.info(.cache, "account identity changed during refresh; cleared prior quota state for antigravity")
+            return true
+        }
+
+        guard cache.removeSnapshot(providerID: providerID, refreshOrder: refreshOrder) else {
+            return false
+        }
+
+        providerIdentityKeys[providerID] = currentIdentityKey
+        let previous = localSnapshots.removeValue(forKey: providerID)
+        let historyChanged = previous?.usageHistory != nil
+        if historyChanged {
+            localHistoryRevision &+= 1
+            invalidateMergedHistoryCache()
+        }
+        AppLog.info(.cache, "account identity changed during refresh; cleared prior snapshot for \(providerID)")
+        rebuildRenderedSnapshots()
+        if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
+        return true
+    }
+
+    /// Strip account-bound meters while retaining provider history stored on this Mac. Used at launch
+    /// and by explicit catalog reloads for providers whose history is independent of quota identity.
+    static func snapshotByClearingQuotaState(_ snapshot: ProviderSnapshot) -> ProviderSnapshot {
+        var cleared = snapshot
+        cleared.plan = nil
+        cleared.lines.removeAll { line in
             if case .progress = line { return true }
             return false
         }
-        previous.warning = nil
-        previous.clearsPriorMenuBarQuotaState = nil
-        previous.quotaRefreshedAt = nil
-        localSnapshots[providerID] = previous
-        cache.store(previous, producedByIdentityKey: providerIdentityKeys[providerID])
-        rebuildRenderedSnapshots()
+        cleared.warning = nil
+        cleared.clearsPriorMenuBarQuotaState = nil
+        cleared.replacesPriorQuotaProgress = nil
+        cleared.invalidatesQuotaIdentity = nil
+        cleared.quotaRefreshedAt = nil
+        return cleared
+    }
+
+    /// Discard quota rows before an account-scoped descriptor inventory is replaced. Local history
+    /// stays cached; quotas from a rotated OpenCode key must never paint under its new identity.
+    func invalidateQuotaStateForCatalogReload(providerID: String) {
+        clearPriorQuotaState(for: providerID)
+        cache.invalidateSessionFreshness(providerIDs: [providerID])
+    }
+
+    /// Drop account-bound quota rows before a persisted credential selection changes. The selection
+    /// is not part of OpenCode's credential-inventory stamp, so clear synchronously and supersede
+    /// in-flight work before the new preference is written.
+    func invalidateQuotaStateForAccountSelectionChange(providerID: String) {
+        providerRequestGenerations[providerID, default: 0] &+= 1
+        deferredRefreshRequests[providerID] = nil
+        activeProviderRefreshTasks[providerID]?.values.forEach { $0.cancel() }
+        clearPriorQuotaState(for: providerID)
+        cache.invalidateSessionFreshness(providerIDs: [providerID])
     }
 
     func data(for descriptor: WidgetDescriptor) -> WidgetData {
@@ -1743,16 +2000,18 @@ final class WidgetDataStore {
         max(RefreshSetting.interval, RefreshSetting.backgroundInterval) * 2
     }
 
-    /// A compact "Outdated" hint for the provider's on-screen snapshot, surfaced only once that snapshot
-    /// has aged past `stalenessThreshold`; `nil` while the data is still current (the common case), so the
-    /// header stays clean until staleness is real. The label is short on purpose — a long plan name plus a
-    /// full "Updated 3h ago" string would overflow the header — so the precise age rides in the tooltip.
-    /// This is the visible counterpart to the silent fossilized-cache problem (#582): a failing-refresh
-    /// loop keeps the last good plan/limits on screen, and without this nothing told the user that data was
-    /// stale. Reads the store's injected clock, which tests pin to a fixed value.
+    /// A compact "Outdated" hint for the oldest visible data domain. Fresh quota responses must not hide
+    /// carried history, and a fresh history fold must not make carried quota appear current.
     func stalenessHint(for providerID: String) -> StalenessHint? {
-        guard let refreshedAt = snapshots[providerID]?.refreshedAt else { return nil }
-        let age = now().timeIntervalSince(refreshedAt)
+        guard let snapshot = snapshots[providerID] else { return nil }
+        var stamps = [snapshot.refreshedAt]
+        if Self.hasQuotaProgress(snapshot.lines) {
+            stamps.append(snapshot.quotaRefreshedAt ?? snapshot.refreshedAt)
+        }
+        if snapshot.usageHistory != nil {
+            stamps.append(snapshot.historyRefreshedAt ?? snapshot.refreshedAt)
+        }
+        let age = now().timeIntervalSince(stamps.min() ?? snapshot.refreshedAt)
         guard age >= Self.stalenessThreshold, let duration = Formatters.compactDuration(age) else {
             return nil
         }

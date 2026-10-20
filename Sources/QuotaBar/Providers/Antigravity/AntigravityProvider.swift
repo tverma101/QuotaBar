@@ -23,13 +23,13 @@ final class AntigravityProvider: ProviderRuntime {
     let now: @Sendable () -> Date
     let pricing: @Sendable () async -> ModelPricing
 
-    private static let antigravityServerOptions = LanguageServerDiscovery.Options(
+    nonisolated private static let antigravityServerOptions = LanguageServerDiscovery.Options(
         processName: "language_server",
         markers: ["antigravity", "antigravity-ide"],
         csrfFlag: "--csrf_token",
         portFlag: "--extension_server_port"
     )
-    private static let agyServerOptions = LanguageServerDiscovery.Options(
+    nonisolated private static let agyServerOptions = LanguageServerDiscovery.Options(
         processName: "agy",
         markers: [],
         csrfFlag: "",
@@ -61,9 +61,11 @@ final class AntigravityProvider: ProviderRuntime {
             .percent(id: AntigravityMetric.geminiWeeklyID, provider: provider, title: AntigravityMetric.weeklyLabel)
                 .exportingLimit("geminiWeekly", unit: "percent"),
             .percent(id: AntigravityMetric.claudeID, provider: provider, title: AntigravityMetric.claudeLabel, sessionStartSignal: .zeroUsage)
-                .exportingLimit("nonGeminiSession", unit: "percent"),
+                .exportingLimit("nonGeminiSession", unit: "percent")
+                .hidingWhenEmpty(),
             .percent(id: AntigravityMetric.claudeWeeklyID, provider: provider, title: AntigravityMetric.claudeWeeklyLabel)
-                .exportingLimit("nonGeminiWeekly", unit: "percent"),
+                .exportingLimit("nonGeminiWeekly", unit: "percent")
+                .hidingWhenEmpty(),
             .usageTrend(provider: provider)
                 .exportingHistory(
                     scope: .machineLocal,
@@ -76,9 +78,14 @@ final class AntigravityProvider: ProviderRuntime {
     func hasLocalCredentials() async -> Bool {
         // A running local server is an independent quota source. Discovery only inspects the local
         // process table and its listening sockets; it never calls Google during first-run seeding.
-        var hasLocalServer = await hasDiscoveredLocalServer(options: Self.antigravityServerOptions)
-        if !hasLocalServer {
-            hasLocalServer = await hasDiscoveredLocalServer(options: Self.agyServerOptions)
+        let discovery = self.discovery
+        let hasLocalServer = await loadOffMainActor {
+            guard let processSnapshot = discovery.processSnapshot(), !Task.isCancelled else { return false }
+            if discovery.discover(Self.antigravityServerOptions, processSnapshot: processSnapshot) != nil {
+                return true
+            }
+            guard !Task.isCancelled else { return false }
+            return discovery.discover(Self.agyServerOptions, processSnapshot: processSnapshot) != nil
         }
 
         // The Keychain login remains the source of truth for Cloud Code. The app-owned access-token
@@ -105,6 +112,9 @@ final class AntigravityProvider: ProviderRuntime {
     func refresh() async -> ProviderSnapshot {
         let scope = ProviderRefreshContext.scope
         let refreshedAt = now()
+        // Fold-only passes have no live quota evidence. Any quota-refreshing scope may replace old
+        // rows only when its response proves that every bucket was represented.
+        let mayReplacePriorQuotaProgress = scope.refreshesQuotaDomain
         let historyTask: Task<LocalHistoryResult?, Never>?
         if scope.skipsLocalAccounting {
             historyTask = nil
@@ -131,7 +141,9 @@ final class AntigravityProvider: ProviderRuntime {
                         plan: result.plan,
                         lines: result.lines,
                         refreshedAt: refreshedAt,
-                        usageHistory: nil
+                        usageHistory: nil,
+                        warning: result.warning,
+                        replacesPriorQuotaProgress: mayReplacePriorQuotaProgress && result.replacesPriorQuotaProgress
                     )
                 }
 
@@ -147,7 +159,10 @@ final class AntigravityProvider: ProviderRuntime {
                     plan: result.plan,
                     lines: lines,
                     refreshedAt: refreshedAt,
-                    usageHistory: history?.history
+                    usageHistory: history?.history,
+                    warning: result.warning,
+                    historyWarning: history?.warning,
+                    replacesPriorQuotaProgress: mayReplacePriorQuotaProgress && result.replacesPriorQuotaProgress
                 )
             } catch is CancellationError {
                 return cancelledRefreshSnapshot(provider: provider)
@@ -161,6 +176,8 @@ final class AntigravityProvider: ProviderRuntime {
                     // Keep the error badge as the only error line; WidgetDataStore merges this history
                     // into the last-good display while retaining the error and retry backoff.
                     snapshot.usageHistory = history.history
+                    if history.history != nil { snapshot.historyRefreshedAt = refreshedAt }
+                    snapshot.historyWarning = history.warning
                 }
                 return snapshot
             }
@@ -170,58 +187,92 @@ final class AntigravityProvider: ProviderRuntime {
     }
 
     private struct LocalHistoryResult: Sendable {
-        let history: ProviderUsageHistory
+        let history: ProviderUsageHistory?
         let lines: [MetricLine]
+        let warning: String?
     }
 
     private func scanLocalHistory(through refreshedAt: Date) async -> LocalHistoryResult? {
-        guard !Task.isCancelled,
-              let scan = await dbUsageScanner.scan(
-                  daysBack: UsageHistoryWindow.lifetimeDays(through: refreshedAt),
-                  now: refreshedAt,
-                  pricing: await pricing()
-              ),
-              !Task.isCancelled
-        else { return nil }
+        guard !Task.isCancelled else { return nil }
+        let scanResult = await dbUsageScanner.scanWithStatus(
+            daysBack: UsageHistoryWindow.lifetimeDays(through: refreshedAt),
+            now: refreshedAt,
+            pricing: await pricing()
+        )
+        guard !Task.isCancelled else { return nil }
+        guard let scan = scanResult.scan else {
+            guard scanResult.hasReadFailures else { return nil }
+            return LocalHistoryResult(
+                history: nil,
+                lines: [],
+                warning: "Antigravity conversation history could not be read. Any displayed totals are last known and may be stale."
+            )
+        }
 
-        let history = ProviderUsageHistory(
+        let partialDays = scan.unmeasuredUsageDays ?? []
+        let hasOnlyUnmeasuredUsage = scan.series.daily.isEmpty && !partialDays.isEmpty
+        let history = hasOnlyUnmeasuredUsage ? nil : ProviderUsageHistory(
             series: scan.series,
             modelUsage: scan.modelUsage,
             unknownModelsByDay: scan.unknownModelsByDay,
             apiEstimateByDay: scan.apiEstimateByDay,
-            apiEstimateIncompleteDays: scan.apiEstimateIncompleteDays
+            apiEstimateIncompleteDays: scan.apiEstimateIncompleteDays,
+            partialDays: scan.unmeasuredUsageDays
         )
         var lines: [MetricLine] = []
-        SpendTileMapper.appendTokenUsage(
-            scan.series,
-            to: &lines,
-            now: refreshedAt,
-            unknownModelsByDay: scan.unknownModelsByDay,
-            modelUsage: scan.modelUsage,
-            modelSourceNote: Self.usageSourceNote,
-            apiEstimateByDay: scan.apiEstimateByDay
-        )
-        SpendTileMapper.appendUsageTrend(
-            scan.series,
-            to: &lines,
-            now: refreshedAt,
-            note: Self.usageSourceNote
-        )
-        return LocalHistoryResult(history: history, lines: lines)
+        if !hasOnlyUnmeasuredUsage {
+            SpendTileMapper.appendTokenUsage(
+                scan.series,
+                to: &lines,
+                now: refreshedAt,
+                unknownModelsByDay: scan.unknownModelsByDay,
+                modelUsage: scan.modelUsage,
+                modelSourceNote: Self.usageSourceNote,
+                partialDays: partialDays,
+                apiEstimateByDay: scan.apiEstimateByDay
+            )
+            SpendTileMapper.appendUsageTrend(
+                scan.series,
+                to: &lines,
+                now: refreshedAt,
+                note: Self.usageSourceNote,
+                partialDays: partialDays,
+                partialNote: "incomplete Antigravity history is shown as a lower bound"
+            )
+        }
+        let warning = partialDays.isEmpty
+            ? (scanResult.hasReadFailures
+                ? "Some Antigravity conversation stores could not be read. Visible totals are lower bounds."
+                : nil)
+            : "Some Antigravity history could not be counted. Visible totals are lower bounds."
+        return LocalHistoryResult(history: history, lines: lines, warning: warning)
     }
 
     private struct StrategyResult {
         var plan: String?
         var lines: [MetricLine]
+        var replacesPriorQuotaProgress = true
+        var warning: String?
     }
 
     private func probe() async throws -> StrategyResult {
         try Task.checkCancellation()
-        if let result = try await probeLS(options: Self.antigravityServerOptions) {
-            return result
-        }
-        if let result = try await probeLS(options: Self.agyServerOptions) {
-            return result
+        let discovery = self.discovery
+        let processSnapshot = await loadOffMainActor { discovery.processSnapshot() }
+        try Task.checkCancellation()
+        if let processSnapshot {
+            if let result = try await probeLS(
+                options: Self.antigravityServerOptions,
+                processSnapshot: processSnapshot
+            ) {
+                return result
+            }
+            if let result = try await probeLS(
+                options: Self.agyServerOptions,
+                processSnapshot: processSnapshot
+            ) {
+                return result
+            }
         }
         try Task.checkCancellation()
         return try await probeCloudCode()
@@ -229,14 +280,14 @@ final class AntigravityProvider: ProviderRuntime {
 
     // MARK: - Language server
 
-    private func hasDiscoveredLocalServer(options: LanguageServerDiscovery.Options) async -> Bool {
+    private func probeLS(
+        options: LanguageServerDiscovery.Options,
+        processSnapshot: String
+    ) async throws -> StrategyResult? {
         let discovery = self.discovery
-        return await loadOffMainActor { discovery.discover(options) != nil }
-    }
-
-    private func probeLS(options: LanguageServerDiscovery.Options) async throws -> StrategyResult? {
-        let discovery = self.discovery
-        guard let discovered = await loadOffMainActor({ discovery.discover(options) }) else { return nil }
+        guard let discovered = await loadOffMainActor({
+            discovery.discover(options, processSnapshot: processSnapshot)
+        }) else { return nil }
 
         // HTTPS first (the LS serves a self-signed cert), then HTTP, then the HTTP-only extension port.
         var endpoints: [(scheme: String, port: Int)] = []
@@ -256,7 +307,12 @@ final class AntigravityProvider: ProviderRuntime {
             // answer must never fall through to them. Empty lines render as "No data" rows.
             if let summary = try await usageClient.callLS(scheme: endpoint.scheme, port: endpoint.port, csrf: discovered.csrf, method: "RetrieveUserQuotaSummary") {
                 if (200..<300).contains(summary.statusCode) {
-                    if let lines = AntigravityUsageMapper.parseQuotaSummary(summary.body) {
+                    DiagnosticGate.clearFailures(prefix: Self.quotaSummaryDiagnosticPrefix(for: endpoint))
+                    let sourceID = "language-server:\(endpoint.scheme):\(endpoint.port)"
+                    if let summary = AntigravityUsageMapper.parseQuotaSummaryResult(
+                        summary.body,
+                        sourceID: sourceID
+                    ) {
                         // The plan comes from an independent GetUserStatus call; the summary never
                         // gates on it — a failed plan lookup just leaves the plan blank.
                         var plan: String?
@@ -264,13 +320,37 @@ final class AntigravityProvider: ProviderRuntime {
                            (200..<300).contains(status.statusCode) {
                             plan = AntigravityUsageMapper.parseUserStatus(status.body)?.plan
                         }
-                        return StrategyResult(plan: plan, lines: lines)
+                        return StrategyResult(
+                            plan: plan,
+                            lines: summary.lines,
+                            replacesPriorQuotaProgress: summary.isComplete,
+                            warning: summary.isComplete
+                                ? nil
+                                : "Some Antigravity quota limits could not be read. Missing limits may retain older values."
+                        )
                     }
-                    // 2xx but not a summary payload — the parser warned; fall to the legacy flow.
-                } else if summary.statusCode != 404 {
+                    // The named RPC answered, but its schema is not usable. Preserve prior meters
+                    // with an explicit warning; legacy per-model endpoints turn missing quota into
+                    // fabricated depleted meters and would hide the schema failure.
+                    return StrategyResult(
+                        plan: nil,
+                        lines: [],
+                        replacesPriorQuotaProgress: false,
+                        warning: "Antigravity quota summary could not be read. Existing limits are retained."
+                    )
+                } else if summary.statusCode == 404 {
+                    DiagnosticGate.clearFailures(prefix: Self.quotaSummaryDiagnosticPrefix(for: endpoint))
+                    AntigravityUsageMapper.clearQuotaSummaryDiagnostics(
+                        sourceID: "language-server:\(endpoint.scheme):\(endpoint.port)"
+                    )
+                } else {
                     // 404 = a build without the RPC (expected; legacy is the truth there, no retry).
                     // Anything else is surprising enough to say before degrading to 5h-only data.
-                    AppLog.warn(LogTag.plugin("antigravity"), "RetrieveUserQuotaSummary HTTP \(summary.statusCode); falling back to legacy quota endpoints")
+                    DiagnosticGate.logOnce(
+                        for: Self.quotaSummaryDiagnosticPrefix(for: endpoint) + String(summary.statusCode)
+                    ) {
+                        AppLog.warn(LogTag.plugin("antigravity"), "RetrieveUserQuotaSummary HTTP \(summary.statusCode); falling back to legacy quota endpoints")
+                    }
                 }
             }
 
@@ -296,6 +376,11 @@ final class AntigravityProvider: ProviderRuntime {
         return nil
     }
 
+    private static func quotaSummaryDiagnosticPrefix(for endpoint: (scheme: String, port: Int)) -> String {
+        let identity = JSONLScanCachePaths.stableFingerprint("\(endpoint.scheme):\(endpoint.port)")
+        return "antigravity.quota-summary.\(identity)."
+    }
+
     // MARK: - Cloud Code
 
     private func probeCloudCode() async throws -> StrategyResult {
@@ -309,20 +394,27 @@ final class AntigravityProvider: ProviderRuntime {
             await loadOffMainActor { authStore.discardCachedToken() }
             throw AntigravityError.notSignedIn
         }
+        if let identityKey = AntigravityAuthStore.cacheIdentityKey(for: keychainToken) {
+            ProviderRefreshContext.cacheIdentityResult?.set(identityKey)
+        }
 
-        var tokens: [String] = []
+        struct AccessTokenAttempt {
+            let value: String
+            let isDerivedCache: Bool
+        }
+        var tokens: [AccessTokenAttempt] = []
         var hasKnownExpiredAccessToken = false
         if let access = keychainToken.accessToken {
             if authStore.isUsable(expiry: keychainToken.expiry) {
-                tokens.append(access)
+                tokens.append(AccessTokenAttempt(value: access, isDerivedCache: false))
             } else {
                 hasKnownExpiredAccessToken = true
             }
         }
         if let cached = await loadOffMainActor({ authStore.loadCachedToken(matching: keychainToken) }),
-           !tokens.contains(cached) {
+           !tokens.contains(where: { $0.value == cached }) {
             try Task.checkCancellation()
-            tokens.append(cached)
+            tokens.append(AccessTokenAttempt(value: cached, isDerivedCache: true))
         }
         try Task.checkCancellation()
 
@@ -331,12 +423,20 @@ final class AntigravityProvider: ProviderRuntime {
         let hasCredentials = !tokens.isEmpty || (keychainToken.refreshToken?.isEmpty == false)
 
         var sawAuthFailure = false
-        for token in tokens {
-            switch try await fetchCloudCode(token: token) {
+        var sawForbidden = false
+        var sawNoQuotaEndpoint = false
+        var sawTransientFailure = false
+        for attempt in tokens {
+            switch try await fetchCloudCode(token: attempt.value) {
             case .success(let result): return result
-            case .authFailed: sawAuthFailure = true
-            case .forbidden: throw AntigravityError.accessDenied
-            case .unavailable: break
+            case .authFailed:
+                sawAuthFailure = true
+                if attempt.isDerivedCache {
+                    await loadOffMainActor { authStore.discardCachedToken() }
+                }
+            case .forbidden: sawForbidden = true
+            case .notFound: sawNoQuotaEndpoint = true
+            case .unavailable: sawTransientFailure = true
             }
         }
 
@@ -359,6 +459,7 @@ final class AntigravityProvider: ProviderRuntime {
                 case .success(let result): return result
                 case .authFailed: throw AntigravityError.authExpired
                 case .forbidden: throw AntigravityError.accessDenied
+                case .notFound: throw AntigravityError.quotaEndpointUnavailable
                 // The refreshed token is valid, so a non-2xx here is a transient outage, not bad auth.
                 case .unavailable: throw AntigravityError.unavailable
                 }
@@ -375,6 +476,10 @@ final class AntigravityProvider: ProviderRuntime {
         // Reached only when no refresh was attempted (no refresh token): a rejected token with no way to
         // refresh is genuinely expired auth.
         if sawAuthFailure || hasKnownExpiredAccessToken { throw AntigravityError.authExpired }
+        if sawForbidden { throw AntigravityError.accessDenied }
+        if sawNoQuotaEndpoint, !sawTransientFailure {
+            throw AntigravityError.quotaEndpointUnavailable
+        }
         // Signed in but every endpoint was unreachable — report a transient failure, not "not signed in".
         if hasCredentials { throw AntigravityError.unavailable }
         throw AntigravityError.notSignedIn
@@ -384,6 +489,7 @@ final class AntigravityProvider: ProviderRuntime {
         case success(StrategyResult)
         case authFailed
         case forbidden
+        case notFound
         case unavailable
     }
 
@@ -391,6 +497,7 @@ final class AntigravityProvider: ProviderRuntime {
         case response(plan: String?, project: String?)
         case authFailed
         case forbidden
+        case notFound
         case unavailable
 
         var plan: String? {
@@ -402,22 +509,44 @@ final class AntigravityProvider: ProviderRuntime {
     private func fetchCloudCode(token: String) async throws -> CloudCodeProbe {
         // Authoritative first: the quota summary (merged pools + weekly windows). A parsed summary —
         // even one with zero usable buckets — is the answer and must never fall into the legacy chain
-        // below, which fabricates "fully used" from missing quota info. A 404 (build without the RPC)
-        // reads as `.unavailable` and falls through. The independent plan lookup runs in parallel.
+        // below, which fabricates "fully used" from missing quota info. A 404 falls through; if every
+        // quota endpoint is absent and no request has a transient failure, report that permanent state.
         let codeAssistTask = Task { try await loadCodeAssist(token: token) }
         return try await withTaskCancellationHandler {
             defer { codeAssistTask.cancel() }
+            var sawNotFound = false
+            var sawTransientFailure = false
+            var sawUnusableSuccess = false
             switch try await usageClient.cloudCode(path: AntigravityUsageClient.quotaSummaryPath, token: token, userAgent: "antigravity", body: [:]) {
             case .authFailed:
                 return .authFailed
             case .forbidden:
                 return .forbidden
+            case .notFound:
+                sawNotFound = true
+                AntigravityUsageMapper.clearQuotaSummaryDiagnostics(sourceID: "cloud-code")
+                break
             case .ok(let data):
-                if let lines = AntigravityUsageMapper.parseQuotaSummary(data) {
-                    return .success(StrategyResult(plan: try await codeAssistTask.value.plan, lines: lines))
+                if let summary = AntigravityUsageMapper.parseQuotaSummaryResult(data, sourceID: "cloud-code") {
+                    return .success(StrategyResult(
+                        plan: try await codeAssistTask.value.plan,
+                        lines: summary.lines,
+                        replacesPriorQuotaProgress: summary.isComplete,
+                        warning: summary.isComplete
+                            ? nil
+                            : "Some Antigravity quota limits could not be read. Missing limits may retain older values."
+                    ))
                 }
-                // 2xx but not a summary payload — the parser warned; fall to the legacy chain.
+                // The named RPC answered, but its schema is not usable. Do not query legacy endpoints:
+                // they turn missing quota into fabricated depleted meters.
+                return .success(StrategyResult(
+                    plan: try await codeAssistTask.value.plan,
+                    lines: [],
+                    replacesPriorQuotaProgress: false,
+                    warning: "Antigravity quota summary could not be read. Existing limits are retained."
+                ))
             case .unavailable:
+                sawTransientFailure = true
                 break
             }
 
@@ -427,12 +556,17 @@ final class AntigravityProvider: ProviderRuntime {
                 return .authFailed
             case .forbidden:
                 return .forbidden
+            case .notFound:
+                sawNotFound = true
+                break
             case .ok(let data):
                 let lines = AntigravityUsageMapper.buildLines(AntigravityUsageMapper.parseCloudCodeModels(data))
                 if !lines.isEmpty {
                     return .success(StrategyResult(plan: try await codeAssistTask.value.plan, lines: lines))
                 }
+                sawUnusableSuccess = true
             case .unavailable:
+                sawTransientFailure = true
                 break
             }
 
@@ -446,7 +580,9 @@ final class AntigravityProvider: ProviderRuntime {
             case .response(let loadedPlan, let loadedProject):
                 plan = loadedPlan
                 project = loadedProject
-            case .unavailable: break
+            case .notFound:
+                sawNotFound = true
+            case .unavailable: sawTransientFailure = true
             }
 
             var quota = try await usageClient.cloudCode(
@@ -455,18 +591,22 @@ final class AntigravityProvider: ProviderRuntime {
                 userAgent: "agy",
                 body: project.map { ["project": $0] } ?? [:]
             )
-            if case .unavailable = quota, project != nil {
+            if project != nil, quota.isUnavailable {
                 quota = try await usageClient.cloudCode(path: AntigravityUsageClient.retrieveQuotaPath, token: token, userAgent: "agy", body: [:])
             }
             switch quota {
             case .authFailed: return .authFailed
             case .forbidden: return .forbidden
+            case .notFound:
+                sawNotFound = true
             case .ok(let data):
                 let lines = AntigravityUsageMapper.buildLines(AntigravityUsageMapper.parseQuotaBuckets(data))
                 if !lines.isEmpty { return .success(StrategyResult(plan: plan, lines: lines)) }
-            case .unavailable: break
+                sawUnusableSuccess = true
+            case .unavailable:
+                sawTransientFailure = true
             }
-            return .unavailable
+            return (sawNotFound || sawUnusableSuccess) && !sawTransientFailure ? .notFound : .unavailable
         } onCancel: {
             codeAssistTask.cancel()
         }
@@ -483,6 +623,8 @@ final class AntigravityProvider: ProviderRuntime {
             return .authFailed
         case .forbidden:
             return .forbidden
+        case .notFound:
+            return .notFound
         case .ok(let data):
             return .response(
                 plan: AntigravityUsageMapper.parseLoadCodeAssistPlan(data),

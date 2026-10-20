@@ -393,7 +393,7 @@ struct WidgetRowView: View {
                         // the right backing; absent from the environment (previews, share renders) the
                         // timeline is read-only.
                         claim: codexResetClaim.map { service in
-                            { expiry, redeemRequestID in
+                            { @Sendable (expiry: Date, redeemRequestID: String) async -> ResetClaimOutcome in
                                 await service.claim(creditExpiringAt: expiry, redeemRequestID: redeemRequestID)
                             }
                         }

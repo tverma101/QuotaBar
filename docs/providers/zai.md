@@ -6,8 +6,8 @@ Tracks [Z.ai](https://z.ai) (Zhipu AI) GLM Coding Plan usage quotas for coding s
 
 | Metric | Meaning |
 |---|---|
-| Session | 5-hour rolling window token usage (percentage) |
-| Weekly | 7-day rolling window token usage (percentage) |
+| Session | 5-hour rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
+| Weekly | 7-day rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
 | Web Searches | Monthly web-search / web-reader / Zread calls (used / limit) |
 
 When Z.ai reports your plan name, QuotaBar shows it beside the provider name.
@@ -59,6 +59,7 @@ an invalid response instead of being shown as zero.
   [Z.ai console](https://z.ai/manage-apikey/apikey-list).
 - **"No active GLM Coding Plan"** (amber notice by the name) — the key is valid, but the account has no
   GLM Coding Plan, so there's nothing to meter. Subscribe at [z.ai/subscribe](https://z.ai/subscribe);
-  usage appears once your plan is active.
-- **Meters show "No usage data"** — you have a plan, but the quota endpoint returned no usable limits
-  yet. Check your [plan](https://z.ai/manage-apikey/coding-plan/personal/my-plan).
+  usage appears once your plan is active. Empty Session and Weekly rows are suppressed for this state.
+- **Meters show "No data"** — you have a plan, but the quota endpoint returned no usable limits
+  yet. The core rows stay visible so this state is distinguishable from an account with no plan. Check
+  your [plan](https://z.ai/manage-apikey/coding-plan/personal/my-plan).

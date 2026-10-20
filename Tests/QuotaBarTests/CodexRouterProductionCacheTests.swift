@@ -4,7 +4,165 @@ import XCTest
 
 /// Exercises the default production scanner, rather than the injected incremental test scanner.
 final class CodexRouterProductionCacheTests: XCTestCase {
+    /// Explicit local audit only: reads the owner's ledger, emits aggregate diagnostics without rows
+    /// or account IDs, and never changes provider state or credentials.
+    func testOptInLocalLedgerParserAudit() async throws {
+        guard ProcessInfo.processInfo.environment["QUOTABAR_LOCAL_LEDGER_AUDIT"] == "1" else {
+            throw XCTSkip("Enable QUOTABAR_LOCAL_LEDGER_AUDIT for a local read-only parser audit")
+        }
+        let diagnosticDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("QuotaBarLedgerAudit")
+        let previousSink = AppLog.sink
+        AppLog.sink = LogFile(directory: diagnosticDirectory, fileName: "audit.log")
+        AppLog.sink.open()
+        defer { AppLog.sink = previousSink }
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/codex-router/usage-events.jsonl")
+        var counts: [String: Int] = [:]
+        var firstLine: [String: Int] = [:]
+        var lineNumber = 0
+        var cache = CodexRouterEventLineParser.TimestampCache()
+        func note(_ reason: String) {
+            counts[reason, default: 0] += 1
+            if firstLine[reason] == nil { firstLine[reason] = lineNumber }
+        }
+        let read = JSONLFileReader.readLines(at: url, chunkSize: 256 * 1024) { line in
+            lineNumber += 1
+            switch CodexRouterEventLineParser.parseResult(line, timestampCache: &cache) {
+            case .irrelevant: note("irrelevant")
+            case .malformed: note("malformed-json-or-timestamp")
+            case .event(let event), .malformedEvent(let event):
+                note("events")
+                if event.isMalformedRouterEvent { note("any-malformed-status-\(event.status)") }
+                guard (200..<300).contains(event.status) else { return }
+                if !event.hasValidStatusField { note("invalid-status") }
+                if !event.hasValidTimestampField { note("invalid-timestamp") }
+                if !event.hasValidModelField { note("invalid-model") }
+                if !event.hasValidAccountIdentityFields { note("invalid-account") }
+                if !event.hasValidNumericCountFields { note("invalid-numeric-fields") }
+                if !event.hasUniqueRecognizedFields { note("duplicate-recognized-fields") }
+                if event.hasValidProviderField == false { note("invalid-provider") }
+                if event.measuredTokenTotal == nil {
+                    note("missing-measured-total")
+                    if !CodexRouterUsageScanner.isOpenCodeServed(event) && !event.hasNoMeasuredUsageFields {
+                        note("incomplete-components-\(event.hasInputTokensField)-\(event.hasOutputTokensField)-\(event.totalTokens == nil)-\(event.cachedInputTokens == 0)-\(event.reasoningTokens == 0)")
+                    }
+                }
+            }
+        }
+        print("LOCAL_LEDGER_AUDIT lines=\(lineNumber) bytes=\(read.statistics.bytesRead) complete=\(read.isComplete) counts=\(counts) firstLines=\(firstLine)")
+        XCTAssertTrue(read.isComplete)
+        let scanner = CodexRouterUsageScanner(ledgerPaths: { [url.path] }, identityAliases: { [:] })
+        let result = await scanner.scan(accountIdentityKey: nil, allowsUnscopedEvents: true,
+                                        daysBack: 30, now: Date(), pricing: .empty)
+        print("LOCAL_LEDGER_PRODUCTION_SCAN complete=\(result != nil) days=\(result?.series.daily.count ?? 0)")
+        print(try String(contentsOf: diagnosticDirectory.appendingPathComponent("audit.log"), encoding: .utf8))
+
+    }
+
+    private final class AppendOnFinalDiscovery: @unchecked Sendable {
+        let ledger: URL
+        let extra: Data
+        let rewrites: Bool
+        private let lock = NSLock()
+        private var calls = 0
+        init(ledger: URL, extra: Data, rewrites: Bool = false) {
+            self.ledger = ledger; self.extra = extra; self.rewrites = rewrites
+        }
+        func apply() {
+            lock.lock()
+            defer { lock.unlock() }
+            calls += 1
+            if calls == 1 {
+                let handle = try! FileHandle(forWritingTo: ledger)
+                if !rewrites { try! handle.seekToEnd() }
+                try! handle.write(contentsOf: extra)
+                try! handle.close()
+            }
+        }
+    }
+
+    func testSameSizeRewriteDuringFinalValidationDoesNotPublishMixedHistory() async throws {
+        try await withLedger { ledger in
+            try line(tokens: 100).write(to: ledger, atomically: true, encoding: .utf8)
+            let source = AppendOnFinalDiscovery(ledger: ledger, extra: Data(line(tokens: 999).utf8), rewrites: true)
+            let scanner = CodexRouterUsageScanner(ledgerPaths: { [ledger.path] }, identityAliases: { [:] },
+                                                  beforeAggregateValidationForTesting: source.apply)
+            let first = await scanner.scan(accountIdentityKey: nil, allowsUnscopedEvents: true,
+                                           daysBack: 30, now: now, pricing: pricing())
+            XCTAssertNil(first)
+            let second = await scan(ledger)
+            XCTAssertEqual(second?.series.daily.first?.totalTokens, 999)
+        }
+    }
+
+    func testAppendDuringFinalValidationKeepsCompletedPrefixAndReadsTailNext() async throws {
+        try await withLedger { ledger in
+            try line(tokens: 100).write(to: ledger, atomically: true, encoding: .utf8)
+            let extra = Data(line(tokens: 50, hour: 11).utf8)
+            let source = AppendOnFinalDiscovery(ledger: ledger, extra: extra)
+            let scanner = CodexRouterUsageScanner(ledgerPaths: { [ledger.path] }, identityAliases: { [:] },
+                                                  beforeAggregateValidationForTesting: source.apply)
+            let prices = pricing()
+            let first = await scanner.scan(accountIdentityKey: nil, allowsUnscopedEvents: true,
+                                           daysBack: 30, now: now, pricing: prices)
+            XCTAssertEqual(first?.series.daily.first?.totalTokens, 100,
+                           "a valid completed prefix must survive a concurrent append")
+            let initial = try XCTUnwrap(CodexRouterUsageScanner.incrementalReadStatisticsForTesting(path: ledger.path))
+            let second = await scan(ledger, pricing: prices)
+            XCTAssertEqual(second?.series.daily.first?.totalTokens, 150)
+            let final = try XCTUnwrap(CodexRouterUsageScanner.incrementalReadStatisticsForTesting(path: ledger.path))
+            XCTAssertEqual(final.fullParses, initial.fullParses)
+            XCTAssertEqual(final.bytesRead - initial.bytesRead, extra.count)
+        }
+    }
+
     private let now = TestLocalInstant.date(2026, 10, 4, 12)
+
+    func testRequestsWithoutMeasurementsKeepKnownTokensAndPersistPartialDays() async throws {
+        try await withLedger { ledger in
+            let missing = "{\"at\":\"\(TestLocalInstant.iso(2026, 10, 4, 10))\",\"model\":\"test-model\",\"provider\":\"openai\",\"status\":200}\n"
+            try (line(tokens: 100) + missing).write(to: ledger, atomically: true, encoding: .utf8)
+            let first = await scan(ledger)
+            XCTAssertEqual(first?.series.daily.first?.totalTokens, 100)
+            XCTAssertEqual(first?.unmeasuredUsageDays, ["2026-10-04"])
+            let initial = try XCTUnwrap(CodexRouterUsageScanner.incrementalReadStatisticsForTesting(path: ledger.path))
+            CodexRouterAggregateIndex.shared.unloadMemoryForTesting(path: ledger.path)
+            let warm = await scan(ledger)
+            XCTAssertEqual(warm?.unmeasuredUsageDays, ["2026-10-04"])
+            let reused = try XCTUnwrap(CodexRouterUsageScanner.incrementalReadStatisticsForTesting(path: ledger.path))
+            XCTAssertEqual(reused.bytesRead, initial.bytesRead)
+            let handle = try FileHandle(forWritingTo: ledger)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data(line(tokens: 50, hour: 11).utf8))
+            try handle.close()
+            let appended = await scan(ledger)
+            XCTAssertEqual(appended?.series.daily.first?.totalTokens, 150)
+            XCTAssertEqual(appended?.unmeasuredUsageDays, ["2026-10-04"])
+        }
+    }
+
+    func testHalfSpecifiedUsageStillRejectsIncompleteMeasurement() async throws {
+        try await withLedger { ledger in
+            let damaged = "{\"at\":\"\(TestLocalInstant.iso(2026, 10, 4, 10))\",\"model\":\"test-model\",\"provider\":\"openai\",\"status\":200,\"inputTokens\":100}\n"
+            try (line(tokens: 100) + damaged).write(to: ledger, atomically: true, encoding: .utf8)
+            let result = await scan(ledger)
+            XCTAssertNil(result)
+        }
+    }
+
+    func testCancelledTransportStatusZeroDoesNotInvalidateOrInflateMeasuredHistory() async throws {
+        try await withLedger { ledger in
+            let cancelled = line(tokens: 999).replacingOccurrences(of: "\"status\":200", with: "\"status\":0")
+            try (line(tokens: 100) + cancelled).write(to: ledger, atomically: true, encoding: .utf8)
+            let first = await scan(ledger)
+            XCTAssertEqual(first?.series.daily.first?.totalTokens, 100)
+            let initial = try XCTUnwrap(CodexRouterUsageScanner.incrementalReadStatisticsForTesting(path: ledger.path))
+            let warm = await scan(ledger)
+            XCTAssertEqual(warm?.series.daily.first?.totalTokens, 100)
+            let final = try XCTUnwrap(CodexRouterUsageScanner.incrementalReadStatisticsForTesting(path: ledger.path))
+            XCTAssertEqual(initial.bytesRead, final.bytesRead)
+        }
+    }
 
     private func pricing(rate: Double = 1) -> ModelPricing {
         ModelPricing(
@@ -98,7 +256,7 @@ final class CodexRouterProductionCacheTests: XCTestCase {
 
     func testProductionFoldMarksIncompleteRouterCostCoverage() async throws {
         try await withLedger { ledger in
-            let estimatedInput = #"{"at":"\#(TestLocalInstant.iso(2026, 10, 4, 10))","model":"test-model","provider":"openai","status":200,"inputTokens":0,"cachedInputTokens":0,"outputTokens":25,"totalTokens":25,"estimatedInputTokens":900}"# + "\n"
+            let estimatedInput = #"{"at":"\#(TestLocalInstant.iso(2026, 10, 4, 10))","model":"test-model","provider":"openai","status":200,"inputTokens":0,"cachedInputTokens":0,"outputTokens":25,"totalTokens":25,"estimatedInputTokens":1000000000000001}"# + "\n"
             let mismatchedTotal = #"{"at":"\#(TestLocalInstant.iso(2026, 10, 4, 11))","model":"test-model","provider":"openai","status":200,"inputTokens":100,"cachedInputTokens":25,"outputTokens":50,"totalTokens":160}"# + "\n"
             try (estimatedInput + mismatchedTotal).write(to: ledger, atomically: true, encoding: .utf8)
 
@@ -107,16 +265,22 @@ final class CodexRouterProductionCacheTests: XCTestCase {
             let day = try XCTUnwrap(scan.series.daily.first)
 
             XCTAssertEqual(day.totalTokens, 185)
+            XCTAssertFalse(day.tokenCountSaturated,
+                           "an overflowing estimate must not saturate the measured production aggregate")
             XCTAssertFalse(day.costIsComplete)
             XCTAssertNil(scan.apiEstimateByDay?[day.date])
             XCTAssertTrue(scan.apiEstimateIncompleteDays?.contains(day.date) == true)
-            XCTAssertNil(scan.modelUsage?.daily.first?.models.first?.costUSD)
+            XCTAssertEqual(scan.modelUsage?.daily.first?.models.first?.costUSD ?? -1,
+                           0.000175, accuracy: 1e-10,
+                           "keep the known subtotal while flagging the incomplete router breakdown")
 
             CodexRouterAggregateIndex.shared.unloadMemoryForTesting(path: ledger.path)
             let maybeRestoredScan = await self.scan(ledger)
             let restoredScan = try XCTUnwrap(maybeRestoredScan)
             let restoredDay = try XCTUnwrap(restoredScan.series.daily.first)
             XCTAssertEqual(restoredDay.totalTokens, 185)
+            XCTAssertFalse(restoredDay.tokenCountSaturated,
+                           "persisted aggregate metadata separates measured counts from estimates")
             XCTAssertFalse(restoredDay.costIsComplete)
             XCTAssertTrue(restoredScan.apiEstimateIncompleteDays?.contains(restoredDay.date) == true)
         }
@@ -204,14 +368,40 @@ final class CodexRouterProductionCacheTests: XCTestCase {
             try (line(tokens: .max) + line(tokens: .max, hour: 11)).write(to: ledger, atomically: true, encoding: .utf8)
             let cold = await scan(ledger)
             XCTAssertEqual(cold?.series.daily.first?.totalTokens, 2_000_000_000_000_000)
+            XCTAssertTrue(cold?.series.daily.first?.tokenCountSaturated == true,
+                          "clamped source counts are lower bounds")
             let warm = await scan(ledger)
             XCTAssertEqual(warm?.series.daily.first?.totalTokens, 2_000_000_000_000_000)
+            XCTAssertTrue(warm?.series.daily.first?.tokenCountSaturated == true,
+                          "the persisted aggregate keeps the lower-bound marker")
             let handle = try FileHandle(forWritingTo: ledger)
             try handle.seekToEnd()
             try handle.write(contentsOf: Data(line(tokens: 1, hour: 11).utf8))
             try handle.close()
             let append = await scan(ledger)
             XCTAssertEqual(append?.series.daily.first?.totalTokens, 2_000_000_000_000_001)
+            XCTAssertTrue(append?.series.daily.first?.tokenCountSaturated == true)
+        }
+    }
+
+    func testSaturatedUnknownModelStaysCountedAndMarkedAcrossAggregateCache() async throws {
+        try await withLedger { ledger in
+            try (line(tokens: .max, model: "test-model")
+                 + line(tokens: .max, hour: 11, model: "unknown-model"))
+                .write(to: ledger, atomically: true, encoding: .utf8)
+
+            for _ in 0..<2 {
+                let maybeScan = await self.scan(ledger)
+                let scan = try XCTUnwrap(maybeScan)
+                let day = try XCTUnwrap(scan.series.daily.first)
+                XCTAssertEqual(day.totalTokens, 2_000_000_000_000_000)
+                XCTAssertTrue(day.tokenCountSaturated)
+                XCTAssertEqual(scan.unknownModelsByDay[day.date], ["unknown-model"])
+                let models = try XCTUnwrap(scan.modelUsage?.daily.first?.models)
+                XCTAssertTrue(models.first(where: { $0.model == "test-model" })?.tokenCountSaturated == true)
+                XCTAssertTrue(models.first(where: { $0.model == "unknown-model" })?.tokenCountSaturated == true)
+                XCTAssertNil(models.first(where: { $0.model == "unknown-model" })?.costUSD)
+            }
         }
     }
 

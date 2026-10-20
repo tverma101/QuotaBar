@@ -92,10 +92,9 @@ final class CursorCSVParserTests: XCTestCase {
                        "the generic xAI model uses its public long-context tier above 200K")
     }
 
-    /// Cursor names Grok Bot work by product, never by the model that served it. Those rows cannot be
-    /// priced, but their token counts are measured usage — dropping them silently under-counted a
-    /// real product. They land in the unattributed nil-cost bucket instead.
-    func testOpaqueGrokBotCSVRowsKeepTokensWithoutModelAttribution() throws {
+    /// Cursor names Grok Bot work by product, never by the model that served it. Keep measured tokens
+    /// under the product label while leaving cost unpriced and the serving model unattributed.
+    func testOpaqueGrokBotCSVRowsKeepMeasuredTokensWithoutInferringServingModel() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let date = ISO8601DateFormatter().string(from: now)
         let csv = """
@@ -103,15 +102,15 @@ final class CursorCSVParserTests: XCTestCase {
         \(date),grok-bot-cua,No,0,100,0,0,Included
         \(date),grok-bot-default,No,0,200,0,0,Included
         \(date),sand-automation,No,0,300,0,0,Included
-        \(date),grok-4.7,No,0,50,0,0,Included
+        \(date),grok-4.7,No,0,50000,0,0,Included
         """
 
-        let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
+        let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled, maximumTimestamp: now)
         XCTAssertEqual(parsed.unpricedGrokBotRowCount, 3)
         XCTAssertEqual(parsed.rejectedRowCount, 0)
         XCTAssertEqual(parsed.rows.map(\.model), ["grok-bot-cua", "grok-bot-default", "sand-automation", "grok-4.7"])
-        XCTAssertTrue(parsed.rows.prefix(3).allSatisfy { $0.imputedCostDollars == nil },
-                      "an opaque product label must never be priced")
+        XCTAssertEqual(parsed.rows.prefix(3).map(\.tokens.totalTokens), [100, 200, 300])
+        XCTAssertTrue(parsed.rows.prefix(3).allSatisfy { $0.imputedCostDollars == nil })
 
         var lines: [MetricLine] = []
         let history = try CursorUsageMapper.appendSpendLines(
@@ -120,26 +119,37 @@ final class CursorCSVParserTests: XCTestCase {
             pricing: TestPricing.bundled,
             to: &lines
         )
-        XCTAssertEqual(history.series.daily.filter { $0.totalTokens > 0 }.first?.totalTokens, 650,
-                       "priced and unpriced rows both contribute their measured tokens")
-        // The unpriced product rows keep the day's cost incomplete and surface as unattributed, so the
-        // tile warns instead of presenting a partial dollar figure as the whole truth.
-        XCTAssertEqual(history.series.daily.first?.costIsComplete, false,
-                       "a day with unpriced rows must not report its dollars as complete")
-        XCTAssertEqual(history.unknownModelsByDay[DailyUsageAccumulator.dayKey(from: now)]?.count, 3)
+        let dayKey = DailyUsageAccumulator.dayKey(from: now)
+        XCTAssertEqual(history.series.daily.first?.totalTokens, 50_600,
+                       "opaque product rows carry measured tokens even when their serving model is unknown")
+        XCTAssertEqual(history.series.daily.first?.costIsComplete, false)
+        XCTAssertEqual(history.unknownModelsByDay[dayKey], Set(["grok-bot-cua", "grok-bot-default", "sand-automation"]))
+        XCTAssertEqual(history.modelUsage?.daily.first?.models.reduce(0) {
+            ProviderParse.addingSaturating($0, $1.totalTokens)
+        }, 50_600)
+        guard case .values(_, let todayValues, _, _, let unknownModels, _) = try XCTUnwrap(
+            lines.first(where: { $0.label == "Today" })
+        ) else {
+            return XCTFail("the Today spend row must contain the priced subtotal and token total")
+        }
+        XCTAssertEqual(todayValues, [
+            MetricValue(number: 0.10, kind: .dollars, estimated: true, isLowerBound: true),
+            MetricValue(number: 50_600, kind: .count, label: "tokens")
+        ], "the known Grok subtotal remains visible beside unpriced Bot rows")
+        XCTAssertEqual(unknownModels, ["grok-bot-cua", "grok-bot-default", "sand-automation"])
     }
 
-    func testUsageCSVKeepsRowsWhenCombinedExportTokensExceedIntMax() throws {
+    func testUsageCSVKeepsLargeNonOverflowingTokenCounts() throws {
         let csv = """
         Date,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost
-        2026-01-01T00:00:00Z,unknown-a,No,0,\(Int.max),0,0,Included
+        2026-01-01T00:00:00Z,unknown-a,No,0,1000000000000001,0,0,Included
         2026-01-02T00:00:00Z,unknown-b,No,0,1,0,0,Included
         """
 
         let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
 
         XCTAssertEqual(parsed.rows.count, 2)
-        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [.max, 1])
+        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [1_000_000_000_000_001, 1])
         XCTAssertEqual(parsed.rejectedRowCount, 0)
     }
 
@@ -235,14 +245,18 @@ final class CursorSpendRangeTests: XCTestCase {
         XCTAssertEqual(unknown(lines, "Today"), ["totally-unknown-model-xyz"])
         XCTAssertEqual(unknown(lines, "Yesterday"), [])
         XCTAssertEqual(unknown(lines, "Last 30 Days"), ["another-unknown-abc", "totally-unknown-model-xyz"])
-        XCTAssertEqual(values(lines, "Today"), [MetricValue(number: 150, kind: .count, label: "tokens")],
-                       "the same-day priced subtotal must stay hidden when another model is unpriced")
+        XCTAssertEqual(values(lines, "Today"), [
+            MetricValue(number: 1.00, kind: .dollars, estimated: true, isLowerBound: true),
+            MetricValue(number: 150, kind: .count, label: "tokens")
+        ], "the same-day priced subtotal remains visible beside the unknown-model warning")
         XCTAssertEqual(values(lines, "Yesterday"), [
             MetricValue(number: 2.00, kind: .dollars, estimated: true),
             MetricValue(number: 200, kind: .count, label: "tokens")
         ])
-        XCTAssertEqual(values(lines, "Last 30 Days"), [MetricValue(number: 430, kind: .count, label: "tokens")],
-                       "the 30-day subtotal must stay hidden if any day has unknown cost")
+        XCTAssertEqual(values(lines, "Last 30 Days"), [
+            MetricValue(number: 3.00, kind: .dollars, estimated: true, isLowerBound: true),
+            MetricValue(number: 430, kind: .count, label: "tokens")
+        ], "the 30-day priced subtotal remains visible beside unknown-model warnings")
     }
 
     func testUnknownModelWithZeroTokensIsNotFlagged() throws {
@@ -274,15 +288,16 @@ final class CursorSpendRangeTests: XCTestCase {
         var lines: [MetricLine] = []
         try CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: TestPricing.bundled, to: &lines)
 
-        // The unpriced row keeps counting tokens (owner decision: never hide volume) and joins the
-        // breakdown with a nil cost (the tile reads its dash); it also surfaces through the
-        // unknown-model warning.
-        XCTAssertEqual(values(lines, "Today"), [MetricValue(number: 600, kind: .count, label: "tokens")],
-                       "partial dollar subtotals must not be presented as full cost")
+        // The unpriced row keeps counting tokens and joins the breakdown with a nil cost. The tile
+        // shows the known subtotal beside the unknown-model warning.
+        XCTAssertEqual(values(lines, "Today"), [
+            MetricValue(number: 3.01, kind: .dollars, estimated: true, isLowerBound: true),
+            MetricValue(number: 600, kind: .count, label: "tokens")
+        ])
         XCTAssertEqual(unknown(lines, "Today"), ["unpriced-cursor-model"])
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
         XCTAssertEqual(breakdown.sourceNote, "From your Cursor usage export")
-        XCTAssertNil(breakdown.totalCostUSD, "the breakdown header cannot claim a partial dollar subtotal")
+        XCTAssertEqual(breakdown.totalCostUSD, 3.01, "the breakdown header keeps the known dollar subtotal")
         XCTAssertEqual(breakdown.models.map(\.model), ["gpt-5.5", "composer-1", "unpriced-cursor-model"])
         XCTAssertEqual(breakdown.models.map(\.totalTokens), [200, 100, 300])
         XCTAssertEqual(breakdown.models[0].costUSD, 2.01, "model cost rounds once at the displayed aggregate")
@@ -353,6 +368,56 @@ final class CursorSpendRangeTests: XCTestCase {
         XCTAssertEqual(history.modelUsage?.daily.first?.models.reduce(0) {
             ProviderParse.addingSaturating($0, $1.totalTokens)
         }, .max)
+    }
+
+    @MainActor
+    func testDistinctModelRowsCannotShowSharesWhenDailyTotalSaturates() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let rows = [
+            makeRow(date: now, cost: nil, tokens: 6_000_000_000_000_000_000, model: "unknown-alpha"),
+            makeRow(date: now, cost: nil, tokens: 6_000_000_000_000_000_000, model: "unknown-beta")
+        ]
+        var lines: [MetricLine] = []
+
+        let history = try CursorUsageMapper.appendSpendLines(
+            rows: rows, now: now, pricing: TestPricing.bundled, to: &lines
+        )
+
+        XCTAssertTrue(history.series.daily.first?.tokenCountSaturated == true)
+        XCTAssertTrue(history.modelUsage?.daily.first?.models.allSatisfy { $0.tokenCountSaturated != true } == true,
+                      "each distinct model remains below Int.max on its own")
+        let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
+        XCTAssertTrue(breakdown.tokenCountSaturated == true,
+                      "the period breakdown carries aggregate lower-bound provenance")
+        XCTAssertEqual(ModelUsageDetail.shares(
+            for: breakdown.models,
+            aggregateTokenCountSaturated: breakdown.tokenCountSaturated == true
+        ), [0, 0])
+    }
+
+    func testFiniteSourceCostsThatOverflowDailySumKeepLowerBoundAndRemainEncodable() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let rows = [
+            makeRow(date: now, cost: 1e308, tokens: 1, model: "unknown-alpha"),
+            makeRow(date: now, cost: 1e308, tokens: 1, model: "unknown-beta")
+        ]
+        var lines: [MetricLine] = []
+
+        let history = try CursorUsageMapper.appendSpendLines(
+            rows: rows, now: now, pricing: TestPricing.bundled, to: &lines
+        )
+
+        let day = try XCTUnwrap(history.series.daily.first)
+        XCTAssertEqual(day.totalTokens, 2)
+        XCTAssertEqual(day.costUSD, 1e308)
+        XCTAssertFalse(day.costIsComplete)
+        XCTAssertTrue(day.hasUnexplainedIncompleteCost == false)
+        let todayValues = try XCTUnwrap(values(lines, "Today"))
+        XCTAssertEqual(todayValues.map(\.number), [1e308, 2])
+        XCTAssertTrue(todayValues[0].isLowerBound == true)
+        XCTAssertTrue(MetricFormatter.string(for: todayValues[0], style: .row).hasPrefix("≥"))
+        XCTAssertNoThrow(try JSONEncoder().encode(history),
+                         "finite row amounts cannot create an unencodable infinite daily/model sum")
     }
 
     private func modelBreakdown(_ lines: [MetricLine], _ label: String) -> ModelUsageBreakdown? {

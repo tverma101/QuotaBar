@@ -47,7 +47,9 @@ final class OpenCodeGatewayMergeRegressionTests: XCTestCase {
         XCTAssertEqual(daily?.totalTokens, 25, "router-authored estimated input must not become tokens")
         XCTAssertFalse(daily?.costIsComplete ?? true)
         XCTAssertTrue(scan.apiEstimateIncompleteDays?.contains(day) ?? false)
-        XCTAssertNil(scan.modelUsage?.daily.first?.models.first?.costUSD)
+        XCTAssertEqual(scan.modelUsage?.daily.first?.models.first?.costUSD ?? -1,
+                       0.000025, accuracy: 1e-10,
+                       "measured output remains visible as a partial subtotal")
         XCTAssertTrue(scan.unknownModelsByDay.isEmpty, "known model is incomplete, not unknown")
         XCTAssertTrue(goWindowCosts.isEmpty, "an incomplete subtotal cannot feed Go dollar context")
         XCTAssertTrue(includesEstimatedCost)
@@ -84,14 +86,19 @@ final class OpenCodeGatewayMergeRegressionTests: XCTestCase {
             revision: .init(device: 1, inode: 1, size: 0))
         aggregate.addRow(.init(date: date, input: 10, output: 4, cacheWrite: 0, cacheRead: 0,
             model: "space-bunny", burnsGoQuota: false, isInProgress: false,
+            accountId: "account-a", accountFingerprint: "fingerprint-a",
             routerInputWasEstimated: false))
         aggregate.addRow(.init(date: date, input: 0, output: 3, cacheWrite: 0, cacheRead: 0,
             model: "space-bunny", burnsGoQuota: false, isInProgress: false,
+            accountId: "account-a", accountFingerprint: "fingerprint-a",
             routerInputWasEstimated: true))
 
         let rows = aggregate.materialize(since: .distantPast)
         XCTAssertEqual(Set(rows.compactMap(\.routerInputWasEstimated)), Set([false, true]))
-        XCTAssertTrue(OpenCodeUsageScanner.completeRouterCoverage(from: rows).isEmpty,
+        XCTAssertTrue(OpenCodeUsageScanner.completeRouterCoverage(
+            from: rows,
+            identifiersToIdentityKeys: ["account-a": "codex-a", "fingerprint-a": "codex-a"]
+        ).isEmpty,
                       "a daily bucket with estimated input cannot suppress a complete native row")
     }
 

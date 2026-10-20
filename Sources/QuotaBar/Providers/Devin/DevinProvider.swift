@@ -28,7 +28,8 @@ final class DevinProvider: ProviderRuntime {
     var widgetDescriptors: [WidgetDescriptor] {
         [
             .percent(id: "devin.daily", provider: provider, title: "Daily", metricLabel: "Daily quota")
-                .exportingLimit("daily", unit: "percent"),
+                .exportingLimit("daily", unit: "percent")
+                .hidingWhenEmpty(),
             .percent(id: "devin.weekly", provider: provider, title: "Weekly", metricLabel: "Weekly quota")
                 .exportingLimit("weekly", unit: "percent"),
             .dollarBalance(id: "devin.extra", provider: provider, title: "Extra Balance", metricLabel: "Extra usage balance", valueWord: "left").hidingWhenEmpty()

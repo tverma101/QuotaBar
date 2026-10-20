@@ -46,6 +46,7 @@ final class ProviderAuthRetryTests: XCTestCase {
         var refreshCount = 0
         do {
             _ = try await ProviderAuthRetry.fetch(
+                providerID: "test-provider",
                 token: "old-token",
                 attempt: { _ in throw CancellationError() },
                 refreshAccessToken: {
@@ -70,6 +71,7 @@ final class ProviderAuthRetryTests: XCTestCase {
         var refreshCount = 0
         do {
             _ = try await ProviderAuthRetry.fetch(
+                providerID: "test-provider",
                 token: "old-token",
                 attempt: { _ in
                     attemptCount += 1
@@ -100,6 +102,7 @@ final class ProviderAuthRetryTests: XCTestCase {
         var attemptCount = 0
         do {
             _ = try await ProviderAuthRetry.fetch(
+                providerID: "test-provider",
                 token: "old-token",
                 attempt: { _ in
                     attemptCount += 1
@@ -125,6 +128,7 @@ final class ProviderAuthRetryTests: XCTestCase {
         var refreshCount = 0
         let task = Task {
             try await ProviderAuthRetry.fetch(
+                providerID: "test-provider",
                 token: "old-token",
                 attempt: { _ in
                     attempts += 1
@@ -161,6 +165,7 @@ final class ProviderAuthRetryTests: XCTestCase {
         var attempts = 0
         let task = Task {
             try await ProviderAuthRetry.fetch(
+                providerID: "test-provider",
                 token: "old-token",
                 attempt: { _ in
                     attempts += 1

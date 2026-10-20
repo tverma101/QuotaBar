@@ -193,10 +193,10 @@ final class CursorAuthStoreTests: XCTestCase {
             }
         }
 
-        XCTAssertEqual(keychain.calls, [false], "a remembered Keychain refusal must not be queried again")
+        XCTAssertTrue(keychain.calls.isEmpty, "usable SQLite auth must skip optional Keychain reads")
         XCTAssertFalse(logs.contains("keychain credential unavailable; using the Cursor database"), logs)
         XCTAssertFalse(logs.contains("[INFO] [auth:cursor]"), logs)
-        XCTAssertTrue(KeychainPermissionGate.shared.isBlocked(key))
+        XCTAssertFalse(KeychainPermissionGate.shared.isBlocked(key))
     }
 }
 

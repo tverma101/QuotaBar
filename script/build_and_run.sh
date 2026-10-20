@@ -11,6 +11,7 @@ set -euo pipefail
 #
 # Usage: script/build_and_run.sh [run|build|install|logs|verify]
 # Env:   CODESIGN_IDENTITY  override signing identity (exact name or hash)
+#        ALLOW_ADHOC_SIGNING "1" permits signing without a stable identity (grants reset on rebuild)
 #        CONFIG             "release" (default) or "debug"
 #        BUILD_JOBS         SwiftPM worker count (default: 2, to limit peak compiler memory)
 #        RELEASE            "1" uses the production app identity; install preserves the destination identity
@@ -119,19 +120,25 @@ stop_running_bundle() {
   done <<< "$pids"
 }
 
+trash_if_present() {
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    /usr/bin/trash -v "$1"
+  fi
+}
+
 cleanup_build() {
   local status=$?
   trap - EXIT
   if [ -e "$STAGING_APP_BUNDLE" ]; then
-    rm -rf "$STAGING_APP_BUNDLE"
+    trash_if_present "$STAGING_APP_BUNDLE"
   fi
   if [ -e "$INSTALL_STAGE" ]; then
-    rm -rf "$INSTALL_STAGE"
+    trash_if_present "$INSTALL_STAGE"
   fi
   if [ "$INSTALL_COMMITTED" -eq 0 ]; then
     if [ "$INSTALL_NEW_MOVED" -eq 1 ] && [ -e "$INSTALL_DEST" ]; then
       stop_running_bundle "$INSTALL_DEST"
-      rm -rf "$INSTALL_DEST" || echo "could not remove failed replacement; recovery bundle: $INSTALL_DEST" >&2
+      trash_if_present "$INSTALL_DEST" || echo "could not remove failed replacement; recovery bundle: $INSTALL_DEST" >&2
     fi
     if [ "$INSTALL_BACKUP_MOVED" -eq 1 ] && [ -e "$INSTALL_BACKUP" ]; then
       mv "$INSTALL_BACKUP" "$INSTALL_DEST" || echo "could not restore prior install; recovery bundle: $INSTALL_BACKUP" >&2
@@ -140,7 +147,7 @@ cleanup_build() {
   if [ "$DIST_COMMITTED" -eq 0 ]; then
     if [ "$DIST_NEW_MOVED" -eq 1 ] && [ -e "$APP_BUNDLE" ]; then
       stop_running_bundle "$APP_BUNDLE"
-      rm -rf "$APP_BUNDLE" || echo "could not remove failed dist replacement: $APP_BUNDLE" >&2
+      trash_if_present "$APP_BUNDLE" || echo "could not remove failed dist replacement: $APP_BUNDLE" >&2
     fi
     if [ "$DIST_BACKUP_MOVED" -eq 1 ] && [ -e "$DIST_BACKUP_BUNDLE" ]; then
       mv "$DIST_BACKUP_BUNDLE" "$APP_BUNDLE" || echo "could not restore prior dist app; recovery bundle: $DIST_BACKUP_BUNDLE" >&2
@@ -149,6 +156,18 @@ cleanup_build() {
   exit "$status"
 }
 trap cleanup_build EXIT
+
+# Resolve signing before building. Quietly falling back to ad hoc signing changes the designated
+# requirement on every rebuild and loses the user's Always Allow grants.
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
+if [ -z "$CODESIGN_IDENTITY" ]; then
+  CODESIGN_IDENTITY=$(/usr/bin/security find-identity -p codesigning -v 2>/dev/null \
+    | /usr/bin/awk -F\" '/Apple Development:/ { print $2; exit }')
+fi
+if { [ -z "$CODESIGN_IDENTITY" ] || [ "$CODESIGN_IDENTITY" = "-" ]; } && [ "${ALLOW_ADHOC_SIGNING:-0}" != "1" ]; then
+  echo "cannot preserve Keychain grants: select a stable CODESIGN_IDENTITY; use ALLOW_ADHOC_SIGNING=1 only for an intentional ad hoc build" >&2
+  exit 1
+fi
 
 BUILD_JOBS="${BUILD_JOBS:-2}"
 echo "==> swift build ($CONFIG, $BUILD_JOBS jobs, index store disabled)"
@@ -167,7 +186,7 @@ if [ ! -x "$BUILD_CLI_BINARY" ]; then
 fi
 
 echo "==> staging $STAGING_APP_BUNDLE"
-rm -rf "$STAGING_APP_BUNDLE"
+trash_if_present "$STAGING_APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_HELPERS" "$APP_RESOURCES"
 cp "$BUILD_BINARY" "$APP_BINARY"
 cp "$BUILD_CLI_BINARY" "$CLI_BINARY"
@@ -321,15 +340,7 @@ else
   echo "==> no provisioning profile: omitting keychain-access-groups (unclaimed groups block launch)"
 fi
 
-# Pick a stable Apple Development identity so ad-hoc cdhash churn doesn't re-trigger
-# permission prompts on every rebuild. Fall back to ad-hoc only if none is found.
-CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
-if [ -z "$CODESIGN_IDENTITY" ]; then
-  CODESIGN_IDENTITY=$(/usr/bin/security find-identity -p codesigning -v 2>/dev/null \
-    | /usr/bin/awk -F\" '/Apple Development:/ { print $2; exit }')
-fi
-
-if [ -n "$CODESIGN_IDENTITY" ]; then
+if [ -n "$CODESIGN_IDENTITY" ] && [ "$CODESIGN_IDENTITY" != "-" ]; then
   /usr/bin/codesign --force --options runtime --sign "$CODESIGN_IDENTITY" "$CLI_BINARY" >/dev/null
   /usr/bin/codesign --force --options runtime \
     --sign "$CODESIGN_IDENTITY" \
@@ -363,7 +374,7 @@ DIST_NEW_MOVED=1
 /usr/bin/codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null
 DIST_COMMITTED=1
 if [ "$DIST_BACKUP_MOVED" -eq 1 ]; then
-  rm -rf "$DIST_BACKUP_BUNDLE"
+  trash_if_present "$DIST_BACKUP_BUNDLE"
   DIST_BACKUP_MOVED=0
 fi
 
@@ -387,7 +398,7 @@ case "$MODE" in
     # icon and no Launchpad entry by design, which is correct — but it means /Applications is the only
     # place Spotlight and Finder treat it as an installed application. From a build directory it is
     # effectively invisible: no Spotlight hit, no way to relaunch after the checkout is gone.
-    rm -rf "$INSTALL_STAGE"
+    trash_if_present "$INSTALL_STAGE"
     mkdir -p "$INSTALL_STAGE"
     rsync -a --delete "$APP_BUNDLE/" "$INSTALL_STAGE/"
     /usr/bin/codesign --verify --deep --strict "$INSTALL_STAGE" >/dev/null
@@ -431,7 +442,7 @@ case "$MODE" in
     fi
     INSTALL_COMMITTED=1
     if [ -e "$INSTALL_BACKUP" ]; then
-      rm -rf "$INSTALL_BACKUP"
+      trash_if_present "$INSTALL_BACKUP"
       INSTALL_BACKUP_MOVED=0
     fi
     echo "==> launched from $INSTALL_DEST"

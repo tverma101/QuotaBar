@@ -309,6 +309,10 @@ enum CursorUsageMapper {
         var apiEstimateIncompleteDays: Set<String> = []
         var modelsByDay: [String: [String: ModelAccumulator]] = [:]
         var incompleteCostDays: Set<String> = []
+        var unexplainedIncompleteCostDays: Set<String> = []
+        var tokenCountSaturatedDays: Set<String> = []
+        var overflowedCostDays: Set<String> = []
+        var overflowedApiEstimateDays: Set<String> = []
         // Rows no pricing source can price (nil imputed cost) still count their tokens with a dashed
         // cost (owner's "count tokens, dash cost" policy) — the token total stays complete while the
         // dollar figure only reflects priced rows. Their model names surface through the warning
@@ -322,13 +326,23 @@ enum CursorUsageMapper {
             let modelName = model.isEmpty ? ModelUsageEntry.unattributedModelName : model
             // Public-API-rate comparison for the row's tokens (regardless of how the CSV cost was
             // imputed — Cursor's own dollars are the displayed estimate).
-            let apiEstimate = model.isEmpty ? nil : pricing.estimatedCostDollars(
+            let apiEstimate = model.isEmpty || CursorUsageCSV.isOpaqueGrokBotProductLabel(model)
+                ? nil
+                : pricing.estimatedCostDollars(
                 model: model,
                 tokens: row.tokens,
                 applyLongContextRates: false
             )
             if let apiEstimate {
-                apiEstimateByDay[day, default: 0] += apiEstimate
+                if !overflowedApiEstimateDays.contains(day) {
+                    if let total = Self.addingFiniteCost(apiEstimateByDay[day], apiEstimate) {
+                        apiEstimateByDay[day] = total
+                    } else {
+                        apiEstimateByDay.removeValue(forKey: day)
+                        overflowedApiEstimateDays.insert(day)
+                        apiEstimateIncompleteDays.insert(day)
+                    }
+                }
             } else if row.tokens.totalTokens > 0 {
                 apiEstimateIncompleteDays.insert(day)
             }
@@ -337,10 +351,16 @@ enum CursorUsageMapper {
                     incompleteCostDays.insert(day)
                     if !model.isEmpty {
                         unknownModelsByDay[day, default: []].insert(model)
+                    } else {
+                        unexplainedIncompleteCostDays.insert(day)
                     }
                 }
+                let previousTokens = tokensByDay[day, default: 0]
+                if row.tokens.totalTokens > 0 && previousTokens > Int.max - row.tokens.totalTokens {
+                    tokenCountSaturatedDays.insert(day)
+                }
                 tokensByDay[day] = ProviderParse.addingSaturating(
-                    tokensByDay[day, default: 0],
+                    previousTokens,
                     row.tokens.totalTokens
                 )
                 let family = model.isEmpty ? modelName : familyName(for: model, pricing: pricing)
@@ -351,9 +371,20 @@ enum CursorUsageMapper {
                 )
                 continue
             }
-            costByDay[day, default: 0] += cost
+            if overflowedCostDays.contains(day) {
+                incompleteCostDays.insert(day)
+            } else if let total = Self.addingFiniteCost(costByDay[day], cost) {
+                costByDay[day] = total
+            } else {
+                overflowedCostDays.insert(day)
+                incompleteCostDays.insert(day)
+            }
+            let previousTokens = tokensByDay[day, default: 0]
+            if row.tokens.totalTokens > 0 && previousTokens > Int.max - row.tokens.totalTokens {
+                tokenCountSaturatedDays.insert(day)
+            }
             tokensByDay[day] = ProviderParse.addingSaturating(
-                tokensByDay[day, default: 0],
+                previousTokens,
                 row.tokens.totalTokens
             )
             let family = model.isEmpty ? modelName : familyName(for: model, pricing: pricing)
@@ -370,8 +401,11 @@ enum CursorUsageMapper {
             DailyUsageEntry(
                 date: day,
                 totalTokens: tokensByDay[day] ?? 0,
-                costUSD: costByDay[day].map { ($0 * 100).rounded() / 100 },
-                costIsComplete: !incompleteCostDays.contains(day)
+                costUSD: costByDay[day].map(Self.roundToCents),
+                costIsComplete: !incompleteCostDays.contains(day),
+                hasUnexplainedIncompleteCost: unexplainedIncompleteCostDays.contains(day)
+                    ? true : (overflowedCostDays.contains(day) ? false : nil),
+                tokenCountSaturated: tokenCountSaturatedDays.contains(day)
             )
         }
         let series = DailyUsageSeries(daily: daily)
@@ -411,23 +445,60 @@ enum CursorUsageMapper {
         return base.isEmpty ? canonical : base
     }
 
+    private static func addingFiniteCost(_ current: Double?, _ addition: Double) -> Double? {
+        guard addition.isFinite, addition >= 0 else { return nil }
+        let total = (current ?? 0) + addition
+        return total.isFinite ? total : nil
+    }
+
+    private static func roundToCents(_ value: Double) -> Double {
+        let scaled = value * 100
+        guard value.isFinite, scaled.isFinite else { return value }
+        return scaled.rounded() / 100
+    }
+
     private struct ModelAccumulator {
         var tokens = 0
+        var tokenCountSaturated = false
         var costUSD: Double?
         var costIsComplete = true
-        var variants: [String: (tokens: Int, costUSD: Double?, costIsComplete: Bool)] = [:]
+        var costOverflowed = false
+        var variants: [String: (
+            tokens: Int,
+            costUSD: Double?,
+            costIsComplete: Bool,
+            tokenCountSaturated: Bool,
+            costOverflowed: Bool
+        )] = [:]
 
         mutating func add(variant: String, tokens: Int, costUSD: Double?) {
+            if tokens > 0 && self.tokens > Int.max - tokens { tokenCountSaturated = true }
             self.tokens = ProviderParse.addingSaturating(self.tokens, tokens)
             if let costUSD {
-                self.costUSD = (self.costUSD ?? 0) + costUSD
+                if !self.costOverflowed {
+                    if let total = CursorUsageMapper.addingFiniteCost(self.costUSD, costUSD) {
+                        self.costUSD = total
+                    } else {
+                        self.costOverflowed = true
+                        self.costIsComplete = false
+                    }
+                }
             } else if tokens > 0 {
                 self.costIsComplete = false
             }
-            var existing = variants[variant] ?? (tokens: 0, costUSD: nil, costIsComplete: true)
+            var existing = variants[variant] ?? (tokens: 0, costUSD: nil, costIsComplete: true,
+                                                  tokenCountSaturated: false, costOverflowed: false)
+            if tokens > 0 && existing.tokens > Int.max - tokens { existing.tokenCountSaturated = true }
             existing.tokens = ProviderParse.addingSaturating(existing.tokens, tokens)
             if let costUSD {
-                existing.costUSD = (existing.costUSD ?? 0) + costUSD
+                if !existing.costOverflowed {
+                    if let total = CursorUsageMapper.addingFiniteCost(existing.costUSD, costUSD) {
+                        existing.costUSD = total
+                    } else {
+                        existing.costOverflowed = true
+                        existing.costIsComplete = false
+                    }
+                }
             } else if tokens > 0 {
                 existing.costIsComplete = false
             }
@@ -441,12 +512,16 @@ enum CursorUsageMapper {
                 ModelUsageVariant(
                     model: $0.key,
                     totalTokens: $0.value.tokens,
-                    costUSD: $0.value.costIsComplete ? $0.value.costUSD : nil
+                    costUSD: $0.value.costUSD,
+                    costIsComplete: $0.value.costIsComplete ? nil : false,
+                    tokenCountSaturated: $0.value.tokenCountSaturated ? true : nil
                 )
             }
             let isTrivial = list.count == 1 && list[0].model == model
-            return ModelUsageEntry(model: model, totalTokens: tokens, costUSD: costIsComplete ? costUSD : nil,
-                                   variants: isTrivial ? nil : list)
+            return ModelUsageEntry(model: model, totalTokens: tokens, costUSD: costUSD,
+                                   variants: isTrivial ? nil : list,
+                                   costIsComplete: costIsComplete ? nil : false,
+                                   tokenCountSaturated: tokenCountSaturated ? true : nil)
         }
     }
 
