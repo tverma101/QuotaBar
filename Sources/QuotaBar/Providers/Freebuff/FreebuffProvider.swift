@@ -155,7 +155,7 @@ final class FreebuffProvider: ProviderRuntime {
             DiagnosticGate.clearFailures(prefix: Self.usageFailureDiagnosticPrefix)
             var result = ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines,
                                          refreshedAt: now(), clearsPriorMenuBarQuotaState: true)
-            if try await historyScanner.hasHistory() {
+            if try await historyScanner.hasHistory(now: now()) {
                 do {
                     try await modelCatalog.refresh(auth: auth, client: usageClient, now: now())
                     DiagnosticGate.clearFailure("auth.freebuff.catalog.failure")

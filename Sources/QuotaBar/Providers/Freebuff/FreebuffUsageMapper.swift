@@ -211,11 +211,10 @@ enum FreebuffUsageMapper {
         ))
     }
 
+    /// A reset timestamp from the payload. The shared ISO-8601 helper parses both the plain and the
+    /// fractional form with pre-built formatters; building one per reset date was pure overhead.
     private static func date(_ value: Any?) -> Date? {
         guard let value = value as? String, !value.isEmpty else { return nil }
-        let formatter = ISO8601DateFormatter()
-        if let parsed = formatter.date(from: value) { return parsed }
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: value)
+        return OpenUsageISO8601.date(from: value)
     }
 }

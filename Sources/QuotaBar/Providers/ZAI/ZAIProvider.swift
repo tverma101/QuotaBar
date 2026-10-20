@@ -16,6 +16,12 @@ final class ZAIProvider: ProviderRuntime {
     let usageClient: ZAIUsageClient
     let now: @Sendable () -> Date
 
+    /// The plan name changes about once a month, so re-reading it on every refresh doubled the
+    /// provider's request count for a near-constant value.
+    static let planCacheInterval: TimeInterval = 3600
+    private var cachedSubscription: Data?
+    private var cachedSubscriptionAt: Date?
+
     init(
         authStore: ZAIAuthStore = ZAIAuthStore(),
         usageClient: ZAIUsageClient = ZAIUsageClient(),
@@ -66,7 +72,7 @@ final class ZAIProvider: ProviderRuntime {
         let subscription: Data?
         do {
             quota = try await load { try await usageClient.fetchQuota(apiKey: auth.apiKey) }
-            subscription = try await loadOptional { try await usageClient.fetchSubscription(apiKey: auth.apiKey) }
+            subscription = try await subscriptionBody(apiKey: auth.apiKey)
         } catch {
             return ProviderSnapshot.error(provider: provider, error: error)
         }
@@ -84,7 +90,7 @@ final class ZAIProvider: ProviderRuntime {
                 )
             }
             do {
-                let mapped = try ZAIUsageMapper.map(quotaBody: body, subscriptionBody: subscription)
+                let mapped = try ZAIUsageMapper.map(quotaBody: body, subscriptionBody: subscription, now: now())
                 return ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines, refreshedAt: now())
             } catch {
                 return ProviderSnapshot.error(provider: provider, error: error)
@@ -112,6 +118,23 @@ final class ZAIProvider: ProviderRuntime {
             try ProviderCancellation.rethrowIfCancellation(error)
             return .failed(.connectionFailed)
         }
+    }
+
+    /// The subscription body, which carries the plan name.
+    ///
+    /// It is kept for an hour (a manual refresh re-reads it right away), and the last good value
+    /// survives a failed request, so a transient blip no longer drops the plan from the card.
+    private func subscriptionBody(apiKey: String) async throws -> Data? {
+        if !ProviderRefreshContext.isManual,
+           let cachedSubscriptionAt,
+           now().timeIntervalSince(cachedSubscriptionAt) < Self.planCacheInterval {
+            return cachedSubscription
+        }
+        let body = try await loadOptional { try await usageClient.fetchSubscription(apiKey: apiKey) }
+        guard let body else { return cachedSubscription }
+        cachedSubscription = body
+        cachedSubscriptionAt = now()
+        return body
     }
 
     /// Run the optional subscription call — never throws into the snapshot: a transport error, a

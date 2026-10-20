@@ -30,6 +30,30 @@ enum FreebuffAuthError: Error, LocalizedError, Equatable {
     }
 }
 
+/// The credentials file was readable and valid JSON, but the profile QuotaBar reads is not in it.
+/// A renamed profile or a newer CLI layout is a naming mismatch, not a missing login, so it must not
+/// be reported as "no login was found" — that remedy cannot fix it.
+enum FreebuffProfileError: Error, LocalizedError, Equatable {
+    case missingDefaultProfile
+
+    var errorDescription: String? {
+        switch self {
+        case .missingDefaultProfile:
+            return "QuotaBar found Freebuff credentials, but they have no `default` profile. Sign in again with the Freebuff CLI, or point FREEBUFF_CONFIG_DIR at the config directory that holds it."
+        }
+    }
+}
+
+/// Declared next to the error it describes so this provider keeps its own telemetry bucket without
+/// touching the shared provider-error map.
+extension FreebuffProfileError: CategorizedError {
+    var errorCategory: ErrorCategory {
+        switch self {
+        case .missingDefaultProfile: .authInvalid
+        }
+    }
+}
+
 /// Reads the Freebuff CLI's existing `default` profile. Current Freebuff versions keep the token in
 /// Keychain (`freebuff-cli`, account = credentials file path) and leave a pointer in credentials.json;
 /// older versions may still keep `authToken` in that file. `CODEBUFF_API_KEY` is the CLI's own
@@ -39,6 +63,7 @@ struct FreebuffAuthStore: Sendable {
     static let credentialsFileName = "credentials.json"
     private static let credentialsReadDiagnosticKey = "auth.freebuff.credentials-read"
     private static let invalidCredentialsDiagnosticKey = "auth.freebuff.credentials-invalid"
+    private static let missingDefaultProfileDiagnosticKey = "auth.freebuff.credentials-no-default-profile"
 
     var files: TextFileAccessing
     var keychain: KeychainAccessing
@@ -102,8 +127,16 @@ struct FreebuffAuthStore: Sendable {
             }
             DiagnosticGate.clearFailure(Self.invalidCredentialsDiagnosticKey)
             guard let profile = object["default"] as? [String: Any] else {
-                return environmentToken()
+                // The file parsed but names its profile something else. Report that instead of
+                // "no login was found", which sends the user back to the CLI for a login that
+                // already exists.
+                DiagnosticGate.logOnce(for: Self.missingDefaultProfileDiagnosticKey) {
+                    AppLog.error(LogTag.auth("freebuff"), "credentials file has no `default` profile")
+                }
+                if let fallback = environmentToken() { return fallback }
+                throw FreebuffProfileError.missingDefaultProfile
             }
+            DiagnosticGate.clearFailure(Self.missingDefaultProfileDiagnosticKey)
 
             let fileToken = Self.trimmed(profile["authToken"])
             if let fileToken {
@@ -157,6 +190,11 @@ struct FreebuffAuthStore: Sendable {
             // Keep a present but broken profile enabled so the provider can show its typed repair
             // message instead of making a local installation look absent.
             return (try? credentialsFilePath()).map(files.exists) ?? false
+        } catch FreebuffProfileError.missingDefaultProfile {
+            // The credentials file is present and readable; it just names its profile differently.
+            // That is still a configured Freebuff setup, so the card stays visible with its repair
+            // message.
+            return true
         } catch FreebuffAuthError.invalidConfigDirectory {
             // A configured but invalid path is still an explicit Freebuff setup. Keep the provider
             // visible so refresh can show the actionable absolute-path error.
