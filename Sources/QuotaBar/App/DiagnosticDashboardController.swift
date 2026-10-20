@@ -8,6 +8,7 @@ final class DiagnosticDashboardController {
     private let close: () -> Void
     private var control: DiagnosticControl?
     private var refreshTask: Task<Void, Never>?
+    private var refreshGate = BackgroundRefreshGate(minimumInterval: 5.0)
 
     init(dataStore: WidgetDataStore, show: @escaping () -> Void,
          close: @escaping () -> Void) {
@@ -37,6 +38,10 @@ final class DiagnosticDashboardController {
             AppLog.info(.statusItem, "diagnostic dashboard opened")
         case .close: close()
         case .refresh(let providerID):
+            guard refreshGate.shouldAccept(at: Date()) else {
+                AppLog.debug(.refresh, "ignored rate-limited diagnostic refresh command")
+                return
+            }
             guard refreshTask == nil else { return }
             refreshTask = ProviderRefreshContext.withBackgroundContext {
                 Task { @MainActor [weak self] in

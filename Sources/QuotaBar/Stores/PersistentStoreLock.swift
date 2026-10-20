@@ -50,9 +50,15 @@ enum PersistentStoreLock {
             return existing.descriptor
         }
         guard let opened = openLockFile() else { return -1 }
-        if let existing, existing.descriptor >= 0 { Darwin.close(existing.descriptor) }
-        cached.withLock { $0 = opened }
-        return opened.descriptor
+        return cached.withLock { current in
+            if let current, current.descriptor >= 0, descriptorMatchesFile(current.descriptor, path: current.url) {
+                Darwin.close(opened.descriptor)
+                return current.descriptor
+            }
+            if let current, current.descriptor >= 0 { Darwin.close(current.descriptor) }
+            current = opened
+            return opened.descriptor
+        }
     }
 
     private static func openLockFile() -> Handle? {
