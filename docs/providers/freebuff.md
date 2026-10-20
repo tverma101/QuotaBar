@@ -25,6 +25,10 @@ the card. The default local binary command is `~/.config/manicode/freebuff login
 if the CLI wrapper is on your `PATH`. Enabling the card only makes it visible; it does not sign in or
 create credentials.
 
+If the card says QuotaBar found Freebuff credentials but they have no `default` profile, the CLI
+wrote its login under a different profile name. QuotaBar logs this; sign in again with the Freebuff
+CLI, or point `FREEBUFF_CONFIG_DIR` at the config directory that holds the `default` profile.
+
 On a fresh Mac, install the [official Freebuff CLI](https://freebuff.com/cli), then run
 `freebuff login` and finish **Connect** in your browser. QuotaBar needs this one-time login even
 though the card is enabled by default. When its Keychain item is first read, use **Refresh** and
