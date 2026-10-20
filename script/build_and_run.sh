@@ -379,7 +379,8 @@ if [ "$DIST_BACKUP_MOVED" -eq 1 ]; then
 fi
 
 launch_app() {
-  /usr/bin/open -n "$APP_BUNDLE"
+  # -g keeps the launch in the background so rebuilds never steal focus from the active app.
+  /usr/bin/open -g -n "$APP_BUNDLE"
 }
 
 case "$MODE" in
@@ -431,7 +432,7 @@ case "$MODE" in
     fi
     echo "==> installed and signature verified: $INSTALL_DEST"
     /usr/bin/mdimport -r "$INSTALL_DEST" >/dev/null 2>&1 || true
-    open -a "$INSTALL_DEST"
+    /usr/bin/open -g -a "$INSTALL_DEST"
     for ((attempt = 0; attempt < 25; attempt++)); do
       bundle_is_running "$INSTALL_DEST" && break
       sleep 0.2
