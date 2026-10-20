@@ -71,13 +71,19 @@ struct CopilotAuthStore: Sendable {
         } catch CopilotAuthError.invalidCredentials {
             sawInvalidCredentials = true
         }
+        // The GitHub CLI config carries both the file token and the account its Keychain item is
+        // stored under. It is read once per load: reading it twice meant two file reads on every
+        // refresh, and a third for the Keychain's account.
+        let ghConfig: GhConfig
         do {
-            if let config = try loadFromGhConfig() { return config }
+            ghConfig = try readGhConfig()
         } catch CopilotAuthError.credentialsUnreadable {
+            ghConfig = .unreadable
             sawUnreadableSource = true
         }
+        if let token = ghConfig.fileToken { return CopilotToken(value: token) }
         do {
-            if let keychain = try loadFromGhKeychain() { return keychain }
+            if let keychain = try loadFromGhKeychain(config: ghConfig) { return keychain }
         } catch CopilotAuthError.credentialsUnreadable {
             sawUnreadableSource = true
         }
@@ -87,6 +93,24 @@ struct CopilotAuthStore: Sendable {
     }
 
     // MARK: - Sources
+
+    /// The GitHub CLI's `hosts.yml`, read once per load.
+    private enum GhConfig {
+        case unreadable
+        case present(text: String)
+
+        /// The `oauth_token` the CLI stores in the file.
+        var fileToken: String? {
+            guard case .present(let text) = self else { return nil }
+            return CopilotAuthStore.yamlValue(text, key: "oauth_token")
+        }
+
+        /// The account the CLI's Keychain item is stored under.
+        var account: String? {
+            guard case .present(let text) = self else { return nil }
+            return CopilotAuthStore.yamlValue(text, key: "user")
+        }
+    }
 
     func loadFromEditorConfig() throws -> CopilotToken? {
         var sawUnreadableFile = false
@@ -115,16 +139,22 @@ struct CopilotAuthStore: Sendable {
     }
 
     func loadFromGhConfig() throws -> CopilotToken? {
-        guard let text = try readConfigText(Self.ghHostsPath),
-              let token = Self.yamlValue(text, key: "oauth_token")
-        else {
-            return nil
-        }
+        let config = try readGhConfig()
+        guard let token = config.fileToken else { return nil }
         return CopilotToken(value: token)
     }
 
     func loadFromGhKeychain() throws -> CopilotToken? {
-        guard let raw = try readGhKeychainRaw(),
+        try loadFromGhKeychain(config: readGhConfig())
+    }
+
+    /// The CLI's Keychain item, read with the account the config names.
+    ///
+    /// When the config itself is unreadable the account cannot be recovered, so the lookup cannot be
+    /// scoped to it: the unreadable source is reported instead of reading a broader item.
+    private func loadFromGhKeychain(config: GhConfig) throws -> CopilotToken? {
+        if case .unreadable = config { throw CopilotAuthError.credentialsUnreadable }
+        guard let raw = try readGhKeychainRaw(account: config.account),
               let token = ProviderParse.unwrapGoKeyring(raw)
         else {
             return nil
@@ -132,12 +162,18 @@ struct CopilotAuthStore: Sendable {
         return CopilotToken(value: token)
     }
 
+    /// The GitHub CLI's `hosts.yml`, read once.
+    private func readGhConfig() throws -> GhConfig {
+        guard let text = try readConfigText(Self.ghHostsPath) else { return .present(text: "") }
+        return .present(text: text)
+    }
+
     /// Throws `credentialPermissionRequired` when the item exists but macOS will not release it, so the
     /// caller stops at "macOS needs permission" instead of falling through to "not logged in".
-    private func readGhKeychainRaw() throws -> String? {
+    private func readGhKeychainRaw(account: String?) throws -> String? {
         // `gh` stores its Keychain item under the GitHub username as the account. Read it scoped to that
-        // account when we can recover it from hosts.yml; otherwise fall back to a service-only lookup.
-        if let account = try ghUsername() {
+        // account when the config names it; otherwise fall back to a service-only lookup.
+        if let account {
             do {
                 return try keychain.readGenericPasswordForRefresh(
                     service: Self.ghKeychainService,
@@ -174,11 +210,6 @@ struct CopilotAuthStore: Sendable {
             try ProviderCancellation.rethrowIfCancellation(error)
             throw CopilotAuthError.credentialsUnreadable
         }
-    }
-
-    private func ghUsername() throws -> String? {
-        guard let text = try readConfigText(Self.ghHostsPath) else { return nil }
-        return Self.yamlValue(text, key: "user")
     }
 
     /// Missing files are ordinary source misses. A present file that cannot be read is indeterminate,
