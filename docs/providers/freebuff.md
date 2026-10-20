@@ -65,8 +65,9 @@ or ambiguous identities remain Unattributed or unpriced, and all measured tokens
 Cached input is priced separately from uncached input; reasoning stays inside output. Since a turn
 aggregates multiple requests, single-request long-context tiers are not applied. The local rows cover
 Desktop only, not CLI or web traffic. Model identities are cached locally without handles or tokens;
-unchanged catalogues refresh at most hourly. Public OpenRouter rates use the app's existing pricing
-cache. A fresh installation needs Desktop usage before local history can appear.
+unchanged catalogues refresh at most hourly, and a catalogue endpoint that keeps failing is retried
+at most hourly as well. Public OpenRouter rates use the app's existing pricing cache. A fresh
+installation needs Desktop usage before local history can appear.
 
 QuotaBar sends a read-only `GET https://www.codebuff.com/api/v1/freebuff/session` request directly to
 the canonical API host, so a redirect cannot strip the login header and make a new login look expired.
