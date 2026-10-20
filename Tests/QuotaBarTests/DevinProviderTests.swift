@@ -61,8 +61,12 @@ final class DevinAuthStoreTests: XCTestCase {
 }
 
 final class DevinUsageMapperTests: XCTestCase {
+    /// The mapper only accepts a reset that is still ahead of the reference time, so the fixture's
+    /// reset instants are read against a fixed "now" that sits before them.
+    private let now = Date(timeIntervalSince1970: 1_773_000_000)
+
     func testMapsQuotaLinesAndExtraUsageBalance() throws {
-        let mapped = try DevinUsageMapper.mapUserStatus(makeUserStatus())
+        let mapped = try DevinUsageMapper.mapUserStatus(makeUserStatus(), now: now)
 
         XCTAssertEqual(mapped.plan, "Max")
         XCTAssertEqual(progress(mapped.lines, "Daily quota")?.used, 0)
@@ -71,6 +75,22 @@ final class DevinUsageMapperTests: XCTestCase {
         XCTAssertEqual(progress(mapped.lines, "Weekly quota")?.periodDurationMs, DevinUsageMapper.weekPeriodMs)
         XCTAssertEqual(try XCTUnwrap(dollars(mapped.lines, "Extra usage balance")), 964.22, accuracy: 0.0001)
         XCTAssertNotNil(progress(mapped.lines, "Weekly quota")?.resetsAt)
+    }
+
+    func testStaleResetTimestampsAreDroppedSoTheCadenceAnswers() throws {
+        // A zero (or an unadvanced) reset instant would otherwise read as "Resets soon" forever.
+        var userStatus = makeUserStatus()
+        var planStatus = userStatus["planStatus"] as! [String: Any]
+        planStatus["dailyQuotaResetAtUnix"] = "0"
+        planStatus["weeklyQuotaResetAtUnix"] = "0"
+        userStatus["planStatus"] = planStatus
+
+        let mapped = try DevinUsageMapper.mapUserStatus(userStatus, now: now)
+
+        XCTAssertNil(progress(mapped.lines, "Daily quota")?.resetsAt)
+        XCTAssertNil(progress(mapped.lines, "Weekly quota")?.resetsAt)
+        XCTAssertEqual(progress(mapped.lines, "Weekly quota")?.periodDurationMs, DevinUsageMapper.weekPeriodMs,
+                       "the meter's own cadence still answers when the reset instant is unusable")
     }
 
     func testZeroOverageBalanceReadsZeroDollarsNotNoData() throws {

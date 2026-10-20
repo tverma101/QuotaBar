@@ -8,7 +8,7 @@ Tracks [Z.ai](https://z.ai) (Zhipu AI) GLM Coding Plan usage quotas for coding s
 |---|---|
 | Session | 5-hour rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
 | Weekly | 7-day rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
-| Web Searches | Monthly web-search / web-reader / Zread calls (used / limit) |
+| Web Searches | Monthly web-search / web-reader / Zread calls (used / limit); hidden when the plan carries no web-search allowance |
 
 When Z.ai reports your plan name, QuotaBar shows it beside the provider name.
 
@@ -49,7 +49,10 @@ The quota response carries a `limits` array. Each `CREDIT_LIMIT` entry (called `
 older responses) is a percentage quota window; its window length decides which meter it feeds
 (sub-daily → Session, multi-day → Weekly), while a `TIME_LIMIT` entry is the monthly web-search
 count. Reset times come back as epoch milliseconds. Missing required usage values are reported as
-an invalid response instead of being shown as zero.
+an invalid response instead of being shown as zero. A reset time that is zero, stale, or outside a
+believable window is ignored, so the meter falls back to its own cadence ("Resets in 5h") instead of
+reading "Resets soon" forever. A web-search entry with a zero cap means the plan has no web-search
+allowance, so that meter is hidden rather than drawn empty.
 
 ## Troubleshooting
 
