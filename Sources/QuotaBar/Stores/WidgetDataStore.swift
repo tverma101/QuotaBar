@@ -1366,6 +1366,8 @@ final class WidgetDataStore {
             panelMetersIncludesHistory: providersByID[providerID]?.panelMetersRefreshIncludesHistory == true,
             now: now()
         )
+        var persistedToBlob = true
+        var historyChanged = false
         switch cacheWrite {
         case .stored(let persistedSnapshot):
             if let persistedSnapshot { snapshot = persistedSnapshot }
@@ -1386,13 +1388,24 @@ final class WidgetDataStore {
             if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
             return .skipped
         case .unavailable:
-            break
+            // The write could not be persisted (the shared lock or an encode failure). Keep the
+            // in-memory copy aligned with the blob instead of adopting a value the blob never saw:
+            // the store merges over its own copy while the cache merges over the persisted one, so
+            // a divergent copy is folded over on the next pass and rolls the card back to older
+            // data. Loud, because the fresh values are dropped until the next pass.
+            persistedToBlob = false
+            AppLog.error(
+                .cache,
+                "\(providerID) snapshot could not be persisted; keeping the last persisted values"
+            )
         }
-        let historyChanged = localSnapshots[providerID]?.usageHistory != snapshot.usageHistory
-        localSnapshots[providerID] = snapshot
-        if historyChanged {
-            localHistoryRevision &+= 1
-            invalidateMergedHistoryCache()
+        if persistedToBlob {
+            historyChanged = localSnapshots[providerID]?.usageHistory != snapshot.usageHistory
+            localSnapshots[providerID] = snapshot
+            if historyChanged {
+                localHistoryRevision &+= 1
+                invalidateMergedHistoryCache()
+            }
         }
         rebuildRenderedSnapshots()
         if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
@@ -1470,6 +1483,8 @@ final class WidgetDataStore {
             historyDescriptor: descriptor,
             now: now()
         )
+        var persistedToBlob = true
+        var historyChanged = false
         switch cacheResult {
         case .stored(let persistedSnapshot):
             if let persistedSnapshot { updated = persistedSnapshot }
@@ -1486,14 +1501,21 @@ final class WidgetDataStore {
             if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
             return false
         case .unavailable:
-            break
+            // Not persisted: keep the in-memory copy aligned with the blob (see `performRefresh`).
+            persistedToBlob = false
+            AppLog.error(
+                .cache,
+                "\(providerID) history could not be persisted; keeping the last persisted values"
+            )
         }
 
-        let historyChanged = previous?.usageHistory != updated.usageHistory
-        localSnapshots[providerID] = updated
-        if historyChanged {
-            localHistoryRevision &+= 1
-            invalidateMergedHistoryCache()
+        if persistedToBlob {
+            historyChanged = previous?.usageHistory != updated.usageHistory
+            localSnapshots[providerID] = updated
+            if historyChanged {
+                localHistoryRevision &+= 1
+                invalidateMergedHistoryCache()
+            }
         }
         rebuildRenderedSnapshots()
         if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
