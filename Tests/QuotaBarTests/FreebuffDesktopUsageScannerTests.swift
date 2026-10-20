@@ -141,6 +141,64 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         XCTAssertEqual(withRoute?.usage.modelUsage?.daily.first?.models.map(\.model), ["vendor/model-1"])
     }
 
+    func testUnchangedHistoryIsNotDecodedAgain() async throws {
+        // The receipt JSON is decoded once, when the database changes. Re-decoding every retained
+        // row on every fold was the whole cost of a history fold.
+        let sqlite = SQLite()
+        sqlite.rows = [try row("turn:1"), try row("turn:2")]
+        let decodes = Counter()
+        let scanner = FreebuffDesktopUsageScanner(
+            sqlite: sqlite,
+            databasePaths: { ["/fixture/not-a-real.db"] },
+            parseMetrics: { text in
+                decodes.value += 1
+                return ProviderParse.jsonObject(Data(text.utf8))
+            }
+        )
+
+        let first = try await scanner.scan(now: now)
+        XCTAssertEqual(first?.usage.series.daily.first?.totalTokens, 300)
+        XCTAssertEqual(decodes.value, 2, "each receipt is decoded once")
+
+        let second = try await scanner.scan(now: now)
+        XCTAssertEqual(second?.usage.series.daily.first?.totalTokens, 300)
+        XCTAssertEqual(decodes.value, 2, "an unchanged history must not be decoded again")
+    }
+
+    func testRetainedHistoryStaysWithinItsCap() async throws {
+        // Every project's history used to stay resident for the life of the process. The oldest
+        // project's cache is dropped instead, and it is read again on the next fold.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = directory.appendingPathComponent("first.db")
+        let second = directory.appendingPathComponent("second.db")
+        let third = directory.appendingPathComponent("third.db")
+        try Data().write(to: first)
+        try Data().write(to: second)
+        try Data().write(to: third)
+        let sqlite = SQLite()
+        sqlite.rowsByPath = [
+            first.path: [try row("turn:1")],
+            second.path: [try row("turn:2")],
+            third.path: [try row("turn:3")]
+        ]
+        let scanner = FreebuffDesktopUsageScanner(
+            sqlite: sqlite,
+            databasePaths: { [first.path, second.path, third.path] },
+            maximumRetainedTurns: 2
+        )
+
+        _ = try await scanner.scan(now: now)
+        XCTAssertEqual(sqlite.calls, 3)
+
+        _ = try await scanner.scan(now: now)
+        XCTAssertEqual(sqlite.calls, 4, "only the project beyond the cap is read again")
+
+        _ = try await scanner.scan(now: now)
+        XCTAssertEqual(sqlite.calls, 5, "the trimmed projects rotate; the rest stay cached")
+    }
+
     func testProjectDatabaseListIsResolvedOncePerInterval() async throws {
         // The live-quota refresh and the history fold both need the project list, and resolving it
         // reads the projects directory and stats every project.
