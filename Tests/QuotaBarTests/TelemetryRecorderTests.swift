@@ -167,6 +167,68 @@ final class TelemetryRecorderTests: XCTestCase {
         XCTAssertEqual(first, second)
     }
 
+    /// The counters used to be decoded, re-encoded and written for every provider outcome — one
+    /// `UserDefaults` write per provider per minute. They are accumulated in memory and written once
+    /// per refresh pass, and the counts must still be complete.
+    func testProviderCountersAreWrittenOncePerPassAndStayComplete() {
+        let sink = FakeSink()
+        let store = makeStore("batched-counters")
+        var clock = day(25)
+        let recorder = TelemetryRecorder(sink: sink, store: store, snapshot: { self.snapshot }, now: { clock })
+
+        let writesBefore = TelemetryStore.counterWriteCount.withLock { $0 }
+        for _ in 0..<10 {
+            recorder.record(providerID: "claude", outcome: .refreshed, category: nil, manual: false)
+        }
+        XCTAssertEqual(
+            TelemetryStore.counterWriteCount.withLock { $0 },
+            writesBefore,
+            "a refresh outcome must not write the counters"
+        )
+
+        recorder.tick()
+        XCTAssertEqual(
+            TelemetryStore.counterWriteCount.withLock { $0 } - writesBefore,
+            1,
+            "one write per refresh pass"
+        )
+
+        // The next day's sweep must still report every outcome.
+        clock = day(26)
+        recorder.tick()
+        let rollups = sink.events(named: "provider_refresh_daily")
+        XCTAssertEqual(rollups.count, 1)
+        XCTAssertEqual(rollups[0]["provider_id"] as? String, "claude")
+        XCTAssertEqual(rollups[0]["success_count"] as? Int, 10)
+    }
+
+    /// A rollup that was already emitted must not be emitted again after a restart: the cleared state
+    /// has to reach the store as soon as the rollup goes out.
+    func testAnEmittedRollupIsNotEmittedTwiceAfterARestart() {
+        let sink = FakeSink()
+        let defaults = makeDefaults("rollup-once")
+        let store = TelemetryStore(defaults: defaults)
+        var clock = day(25)
+        let recorder = TelemetryRecorder(sink: sink, store: store, snapshot: { self.snapshot }, now: { clock })
+
+        recorder.record(providerID: "claude", outcome: .refreshed, category: nil, manual: false)
+        clock = day(26)
+        recorder.record(providerID: "claude", outcome: .refreshed, category: nil, manual: false)
+
+        XCTAssertEqual(sink.events(named: "provider_refresh_daily").count, 1)
+
+        // A restart reads the persisted counters: day 25's rollup is gone, day 26's is still counted.
+        let restarted = TelemetryRecorder(
+            sink: sink,
+            store: TelemetryStore(defaults: defaults),
+            snapshot: { self.snapshot },
+            now: { clock }
+        )
+        restarted.tick()
+        let rollups = sink.events(named: "provider_refresh_daily")
+        XCTAssertEqual(rollups.count, 1, "day 25's rollup must not be emitted twice")
+    }
+
     // MARK: - Helpers
 
     /// Local noon on 2026-06-`d`, matching the recorder's local-calendar day boundary.
