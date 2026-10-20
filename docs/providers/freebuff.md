@@ -48,8 +48,10 @@ Hours and tokens are separate measurements; neither is converted into the other.
 They are enabled, Always Visible, and unpinned by default. QuotaBar reads only the measured usage
 column in `~/.config/freebuff-desktop/projects/*/desktop-v2.db`, not conversation text. Unchanged
 database and WAL files reuse the previous read; changed turns replace their latest measurement.
-Cached input tokens are already in input, and reasoning tokens are already in output, so neither is
-added again. Incomplete receipts keep their coverage flags in details. Missing history stays No Data.
+A row that carries no identifier or timestamp is skipped — and logged — instead of making the whole
+history unreadable. Cached input tokens are already in input, and reasoning tokens are already in
+output, so neither is added again. Incomplete receipts keep their coverage flags in details. Missing
+history stays No Data.
 
 Dollar values are **OpenRouter API price estimates**, not Freebuff's recorded charges. Models
 recorded on receipts take priority. For older receipts, estimates use each thread's saved model
