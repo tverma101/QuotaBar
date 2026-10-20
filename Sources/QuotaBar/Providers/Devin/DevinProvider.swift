@@ -154,7 +154,7 @@ final class DevinProvider: ProviderRuntime {
                 return .failed(.requestFailed(response.statusCode))
             }
             do {
-                let mapped = try DevinUsageMapper.mapUserStatusResponse(response)
+                let mapped = try DevinUsageMapper.mapUserStatusResponse(response, now: now())
                 DiagnosticGate.clearFailures(prefix: "devin.usage.")
                 return .success(mapped)
             } catch let error as DevinUsageError {

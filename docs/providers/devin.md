@@ -32,4 +32,4 @@ If the CLI credentials fail but the app is signed in with a different account, t
 
 ## Under the hood
 
-Connect RPC `GetUserStatus` on the configured API server (default `server.codeium.com`). Quota percentages arrive as "remaining" and are flipped to "used". No token refresh — a 401/403 switches to the next auth source instead.
+Connect RPC `GetUserStatus` on the configured API server (default `server.codeium.com`). Quota percentages arrive as "remaining" and are flipped to "used". No token refresh — a 401/403 switches to the next auth source instead. A reported reset time that is zero, stale, or outside a believable window is ignored, so the row falls back to its own cadence ("Resets in 24h") instead of reading "Resets soon" forever.

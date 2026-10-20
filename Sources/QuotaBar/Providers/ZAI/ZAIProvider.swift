@@ -84,7 +84,7 @@ final class ZAIProvider: ProviderRuntime {
                 )
             }
             do {
-                let mapped = try ZAIUsageMapper.map(quotaBody: body, subscriptionBody: subscription)
+                let mapped = try ZAIUsageMapper.map(quotaBody: body, subscriptionBody: subscription, now: now())
                 return ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines, refreshedAt: now())
             } catch {
                 return ProviderSnapshot.error(provider: provider, error: error)

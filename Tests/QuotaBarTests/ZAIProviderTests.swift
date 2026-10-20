@@ -152,8 +152,12 @@ final class ZAIAuthStoreTests: XCTestCase {
 // MARK: - ZAIUsageMapperTests
 
 final class ZAIUsageMapperTests: XCTestCase {
+    /// The mapper only accepts a reset that is still ahead of the reference time, so the fixtures'
+    /// reset instants are read against a fixed "now" that sits before them.
+    private let now = Date(timeIntervalSince1970: 1_770_000_000)
+
     func testMapsBothLimitsToSessionAndWebSearches() throws {
-        let mapped = try ZAIUsageMapper.map(quotaBody: data(quotaBothLimitsJSON), subscriptionBody: data(subscriptionJSON))
+        let mapped = try ZAIUsageMapper.map(quotaBody: data(quotaBothLimitsJSON), subscriptionBody: data(subscriptionJSON), now: now)
 
         XCTAssertEqual(mapped.plan, "GLM Coding Max")
 
@@ -246,6 +250,44 @@ final class ZAIUsageMapperTests: XCTestCase {
         XCTAssertNil(progress(lines, "Session"))
         let weekly = try XCTUnwrap(progress(lines, "Weekly"))
         XCTAssertEqual(weekly.used, 25, accuracy: 0.001)
+    }
+
+    func testStaleResetTimestampIsDroppedSoTheCadenceAnswers() throws {
+        // A zero reset instant becomes 1 Jan 1970, which renders as "Resets soon" on every refresh.
+        let body = data(#"""
+        {"data":{"limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":15,"nextResetTime":0}]}}
+        """#)
+        let mapped = try ZAIUsageMapper.map(quotaBody: body, subscriptionBody: nil, now: now)
+
+        let session = try XCTUnwrap(progress(mapped.lines, "Session"))
+        XCTAssertNil(session.resetsAt)
+        XCTAssertEqual(session.periodDurationMs, 5 * 60 * 60 * 1000,
+                       "the meter's own cadence still answers when the reset instant is unusable")
+    }
+
+    func testZeroWebSearchCapProducesNoMeter() throws {
+        // A zero cap means the plan carries no web-search allowance; an empty meter would read as
+        // "0 searches used" against an allowance that does not exist.
+        let body = data(#"""
+        {"data":{"limits":[{"type":"TIME_LIMIT","unit":5,"number":1,"usage":0,"currentValue":0}]}}
+        """#)
+        let lines = try ZAIUsageMapper.mapQuota(body, now: now)
+
+        XCTAssertNil(lines.first { $0.label == "Web Searches" })
+        XCTAssertFalse(lines.contains { line in
+            guard case .progress(_, _, let limit, _, _, _, _, _) = line else { return false }
+            return limit == 0
+        }, "a meter with a zero limit would read as an untouched allowance")
+    }
+
+    func testZeroWebSearchCapIsNotReportedAsABrokenResponse() throws {
+        let body = data(#"""
+        {"data":{"limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":15},{"type":"TIME_LIMIT","unit":5,"number":1,"usage":0,"currentValue":0}]}}
+        """#)
+        let lines = try ZAIUsageMapper.mapQuota(body, now: now)
+
+        XCTAssertNotNil(lines.first { $0.label == "Session" })
+        XCTAssertNil(lines.first { $0.label == "Web Searches" })
     }
 
     private func progress(_ lines: [MetricLine], _ label: String) -> (used: Double, limit: Double, format: ProgressFormat, resetsAt: Date?, periodDurationMs: Int?)? {
