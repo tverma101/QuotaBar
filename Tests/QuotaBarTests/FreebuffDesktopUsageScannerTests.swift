@@ -4,8 +4,8 @@ import XCTest
 
 final class FreebuffDesktopUsageScannerTests: XCTestCase {
     private final class SQLite: SQLiteAccessing, @unchecked Sendable {
-        var rows: [[String: String]] = []
-        var rowsByPath: [String: [[String: String]]] = [:]
+        var rows: [[String: Any]] = []
+        var rowsByPath: [String: [[String: Any]]] = [:]
         var calls = 0
         func queryValue(path: String, sql: String) throws -> String? {
             calls += 1
@@ -18,7 +18,7 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
 
     private let now = TestLocalInstant.date(2026, 10, 18, 12)
 
-    private func row(_ id: String, total: Int = 150, model: String? = nil, incomplete: Bool = false) throws -> [String: String] {
+    private func row(_ id: String, total: Int = 150, model: String? = nil, incomplete: Bool = false) throws -> [String: Any] {
         var usage: [String: Any] = ["inputTokens": 100, "cachedInputTokens": 80,
                                     "outputTokens": 50, "reasoningOutputTokens": 20, "totalTokens": total]
         if let model { usage["model"] = model }
@@ -87,6 +87,33 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         let scan = try await scanner.scan(now: now)
         XCTAssertNil(scan)
         XCTAssertEqual(sqlite.calls, 0)
+    }
+
+    func testOneUnreadableRowDoesNotFailTheWholeHistory() async throws {
+        // A NULL column used to fail the JSON cast for the entire array, so a single odd row took
+        // the whole measured history with it.
+        let sqlite = SQLite()
+        var broken = try row("turn:2")
+        broken["timestamp"] = NSNull()
+        sqlite.rows = [try row("turn:1"), broken, try row("turn:3")]
+        let scanner = FreebuffDesktopUsageScanner(sqlite: sqlite, databasePaths: { ["/fixture/not-a-real.db"] })
+
+        let result = try await scanner.scan(now: now)
+
+        XCTAssertEqual(result?.usage.series.daily.first?.totalTokens, 300,
+                       "the readable rows still aggregate")
+    }
+
+    func testRowWithoutAnIdentifierIsSkippedInsteadOfFailingTheFold() async throws {
+        let sqlite = SQLite()
+        var broken = try row("turn:2")
+        broken["id"] = NSNull()
+        sqlite.rows = [try row("turn:1"), broken]
+        let scanner = FreebuffDesktopUsageScanner(sqlite: sqlite, databasePaths: { ["/fixture/not-a-real.db"] })
+
+        let result = try await scanner.scan(now: now)
+
+        XCTAssertEqual(result?.usage.series.daily.first?.totalTokens, 150)
     }
 
     func testWALChangeInvalidatesOnlyChangedProjectAndReplacesLatestTurnTotal() async throws {
