@@ -3,7 +3,8 @@ import Foundation
 
 /// Freebuff Desktop persists the latest measured usage on each assistant message. Read only that
 /// narrow JSON column, never transcripts or harness state. A database+WAL revision cache avoids
-/// starting sqlite3 or decoding unchanged history on each fold.
+/// starting sqlite3 on each fold, and the cache holds the *derived* numbers rather than the raw
+/// JSON, so an unchanged history is not decoded again on every fold.
 actor FreebuffDesktopUsageScanner {
     struct Scan: Sendable {
         var usage: LogUsageScan
@@ -19,22 +20,49 @@ actor FreebuffDesktopUsageScanner {
 
     private struct CachedDatabase {
         var revision: [Revision]
-        var rows: [RawRow]
+        var rows: [DerivedTurn]
+        var unreadableRows: Int
     }
 
     /// How long the resolved project database list stays fresh.
     static let pathCacheInterval: TimeInterval = 300
 
-    /// One message row as SQLite returned it. A column that was NULL arrives as an empty string, so
-    /// an unusable row is skipped instead of taking the whole history with it.
-    private struct RawRow {
+    /// The most turns kept in memory across every project database. Freebuff Desktop writes one row
+    /// per assistant message, so a long-lived install accumulates tens of thousands of them; the
+    /// oldest project's cache is dropped when the cap is reached, and it is read again on the next
+    /// fold.
+    static let maximumRetainedTurns = 200_000
+
+    /// One assistant message reduced to what the fold needs: the receipt's JSON is parsed once, when
+    /// the database changes, instead of on every fold.
+    private struct DerivedTurn {
         var id: String
-        var timestamp: String
-        var metrics: String
-        var selectedModel: String
+        var timestampMs: Double
+        /// `nil` when the receipt carries no usage object at all.
+        var usage: DerivedUsage?
+        /// The model the receipt named, or the thread's saved selection.
+        var savedModel: String?
+        /// Whether the model came from the receipt rather than the thread's saved selection.
+        var fromReceipt: Bool
+        var partial: Bool
+    }
+
+    /// The counts of one receipt. `invalid` keeps "the field was there but was not a number" apart
+    /// from "the field was not there", because the two are reported differently.
+    private enum Count {
+        case absent
+        case value(Int)
+        case invalid
+    }
+
+    private enum DerivedUsage {
+        case counts(input: Count, output: Count, cached: Count, reasoning: Count, reportedTotal: Count)
     }
 
     private var databases: [String: CachedDatabase] = [:]
+    /// The project databases in the order they were read, so the oldest can be dropped first.
+    private var databaseOrder: [String] = []
+    private var retainedTurns = 0
     private var routePricing: ModelPricing?
     private var routeCatalogNames: [String: String] = [:]
     private var cachedPaths: [String]?
@@ -42,13 +70,22 @@ actor FreebuffDesktopUsageScanner {
     private var modelRoutes: [String: String] = [:]
     private let sqlite: any SQLiteAccessing
     private let databasePaths: @Sendable () throws -> [String]
+    /// Decodes one receipt's metrics JSON. Injectable so a test can count how often the history is
+    /// decoded.
+    private let parseMetrics: @Sendable (String) -> [String: Any]?
+    /// The most turns kept in memory across every project database.
+    private let maximumRetainedTurns: Int
 
     init(
         sqlite: any SQLiteAccessing = SQLiteCLIAccessor(),
-        databasePaths: @escaping @Sendable () throws -> [String] = FreebuffDesktopUsageScanner.defaultDatabasePaths
+        databasePaths: @escaping @Sendable () throws -> [String] = FreebuffDesktopUsageScanner.defaultDatabasePaths,
+        parseMetrics: @escaping @Sendable (String) -> [String: Any]? = { ProviderParse.jsonObject(Data($0.utf8)) },
+        maximumRetainedTurns: Int = FreebuffDesktopUsageScanner.maximumRetainedTurns
     ) {
         self.sqlite = sqlite
         self.databasePaths = databasePaths
+        self.parseMetrics = parseMetrics
+        self.maximumRetainedTurns = maximumRetainedTurns
     }
 
     static func defaultDatabasePaths() throws -> [String] {
@@ -99,12 +136,15 @@ actor FreebuffDesktopUsageScanner {
             routePricing = pricing
             routeCatalogNames = catalogNames
         }
-        databases = databases.filter { paths.contains($0.key) }
-        var rows: [RawRow] = []
+        dropRemovedDatabases(paths)
+        trimRetainedTurns()
+        var turns: [DerivedTurn] = []
+        var unreadableRows = 0
         for path in paths {
             let before = try revisions([path])
             if let cached = databases[path], cached.revision == before {
-                rows.append(contentsOf: cached.rows)
+                turns.append(contentsOf: cached.rows)
+                unreadableRows += cached.unreadableRows
             } else {
                 try Task.checkCancellation()
                 // Saved selection is used only for the owner's explicitly requested estimate when
@@ -126,57 +166,49 @@ actor FreebuffDesktopUsageScanner {
                 guard let text = try sqlite.queryValue(path: path, sql: sql),
                       let data = text.data(using: .utf8)
                 else { throw FreebuffUsageError.localHistoryUnreadable }
-                let decoded = try Self.rawRows(from: data)
-                rows.append(contentsOf: decoded)
+                let derived = try Self.deriveTurns(from: data, parseMetrics: parseMetrics)
+                turns.append(contentsOf: derived.turns)
+                unreadableRows += derived.unreadable
                 // One query is a consistent SQLite snapshot. If another turn commits while it is
                 // running, keep that result for this pass and re-read the changed DB on the next.
                 if try revisions([path]) == before {
-                    databases[path] = CachedDatabase(revision: before, rows: decoded)
+                    store(path: path, revision: before, derived: derived)
                 }
             }
         }
         var accumulator = DailyUsageAccumulator()
         var partialDays: Set<String> = []
         var seen: Set<String> = []
-        var unreadableRows = 0
-        for row in rows {
+        for turn in turns {
             try Task.checkCancellation()
-            // A row without an identifier or a timestamp cannot be measured or deduplicated. Skip
-            // it and keep the rest of the history, instead of failing every day the row is in.
-            guard !row.id.isEmpty,
-                  let stamp = Double(row.timestamp), stamp.isFinite
-            else {
-                unreadableRows += 1
-                continue
-            }
-            guard let metrics = ProviderParse.jsonObject(Data(row.metrics.utf8))
-            else { throw FreebuffUsageError.localHistoryUnreadable }
-            guard seen.insert(row.id).inserted else { continue }
-            let date = Date(timeIntervalSince1970: stamp / 1000)
+            guard seen.insert(turn.id).inserted else { continue }
+            let date = Date(timeIntervalSince1970: turn.timestampMs / 1000)
             guard date <= now else { continue }
             let day = DailyUsageAccumulator.dayKey(from: date)
-            guard let usage = metrics["usage"] as? [String: Any] else {
-                if metrics["usageIncomplete"] as? Bool == true { partialDays.insert(day) }
+            guard let usage = turn.usage else {
+                if turn.partial { partialDays.insert(day) }
                 continue
             }
-            guard let input = Self.count(usage["inputTokens"]),
-                  let output = Self.count(usage["outputTokens"])
-            else { throw FreebuffUsageError.localHistoryUnreadable }
+            guard case .counts(let inputCount, let outputCount, let cachedCount,
+                              let reasoningCount, let reportedTotal) = usage else { continue }
+            let input = try Self.required(inputCount)
+            let output = try Self.required(outputCount)
             let sum = input.addingReportingOverflow(output)
             guard !sum.overflow else { throw FreebuffUsageError.localHistoryUnreadable }
             let total = sum.partialValue
-            if let reported = usage["totalTokens"], Self.count(reported) != total {
-                throw FreebuffUsageError.localHistoryUnreadable
+            switch reportedTotal {
+            case .absent: break
+            case .value(let reported): if reported != total { throw FreebuffUsageError.localHistoryUnreadable }
+            case .invalid: throw FreebuffUsageError.localHistoryUnreadable
             }
             guard total > 0 else { continue }
-            let cached = try Self.optionalCount(usage["cachedInputTokens"])
-            let reasoning = try Self.optionalCount(usage["reasoningOutputTokens"])
+            let cached = try Self.optional(cachedCount)
+            let reasoning = try Self.optional(reasoningCount)
             guard cached <= input, reasoning <= output else { throw FreebuffUsageError.localHistoryUnreadable }
-            let recordedModel = (usage["model"] as? String)?.nilIfEmpty
-            let saved = recordedModel ?? row.selectedModel.nilIfEmpty
+            let saved = turn.savedModel
             let route = saved.flatMap { pricing.openRouter.entries[$0] != nil ? $0 : modelRoutes[$0] }
             let model = route ?? saved.flatMap { modelCatalog[$0]?.displayName }
-                ?? saved.flatMap { (recordedModel != nil || $0.contains("/")) && !$0.hasPrefix("fbm1.") ? $0 : nil }
+                ?? saved.flatMap { (turn.fromReceipt || $0.contains("/")) && !$0.hasPrefix("fbm1.") ? $0 : nil }
                 ?? ModelUsageEntry.unattributedModelName
             // A turn aggregates multiple requests, so do not apply single-request context tiers.
             // Cached input is already in input; reasoning is already in output.
@@ -191,7 +223,7 @@ actor FreebuffDesktopUsageScanner {
             } else {
                 accumulator.addUnknownModel(day: day, model: model)
             }
-            if metrics["usageIncomplete"] as? Bool == true { partialDays.insert(day) }
+            if turn.partial { partialDays.insert(day) }
         }
         if unreadableRows > 0 {
             DiagnosticGate.logOnce(for: "auth.freebuff.history.unreadable-rows") {
@@ -204,21 +236,100 @@ actor FreebuffDesktopUsageScanner {
         return Scan(usage: accumulator.build(), partialDays: partialDays)
     }
 
-    /// Decode the rows SQLite returned. The payload is decoded as `[[String: Any]]` rather than
-    /// `[[String: String]]` because a JSON `null` — which is what a NULL column becomes — fails the
-    /// whole array cast instead of just the one row that carries it.
-    private static func rawRows(from data: Data) throws -> [RawRow] {
+    /// Forget the databases whose project directory is gone.
+    private func dropRemovedDatabases(_ paths: [String]) {
+        let known = Set(paths)
+        let removed = databases.keys.filter { !known.contains($0) }
+        guard !removed.isEmpty else { return }
+        for path in removed {
+            if let dropped = databases.removeValue(forKey: path) { retainedTurns -= dropped.rows.count }
+            databaseOrder.removeAll { $0 == path }
+        }
+    }
+
+    /// Keep a database's derived turns. The retained history is trimmed at the start of the next
+    /// fold, so the projects read in this pass are not dropped while they are still in use.
+    private func store(path: String, revision: [Revision], derived: DerivedTurns) {
+        if let existing = databases[path] { retainedTurns -= existing.rows.count }
+        databaseOrder.removeAll { $0 == path }
+        databaseOrder.append(path)
+        databases[path] = CachedDatabase(revision: revision, rows: derived.turns, unreadableRows: derived.unreadable)
+        retainedTurns += derived.turns.count
+    }
+
+    /// Drop the oldest projects' caches until the retained history fits the cap. Only the projects
+    /// beyond the cap are read again on the next fold.
+    private func trimRetainedTurns() {
+        while retainedTurns > maximumRetainedTurns, let oldest = databaseOrder.first {
+            databaseOrder.removeFirst()
+            if let dropped = databases.removeValue(forKey: oldest) { retainedTurns -= dropped.rows.count }
+        }
+    }
+
+    // MARK: - Derivation
+
+    private struct DerivedTurns {
+        var turns: [DerivedTurn]
+        var unreadable: Int
+    }
+
+    /// Reduce the rows SQLite returned to the numbers the fold needs.
+    ///
+    /// The payload is decoded as `[[String: Any]]` rather than `[[String: String]]` because a JSON
+    /// `null` — which is what a NULL column becomes — fails the whole array cast instead of just the
+    /// one row that carries it.
+    private static func deriveTurns(
+        from data: Data,
+        parseMetrics: @Sendable (String) -> [String: Any]?
+    ) throws -> DerivedTurns {
         guard let decoded = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             throw FreebuffUsageError.localHistoryUnreadable
         }
-        return decoded.map { row in
-            RawRow(
-                id: text(row["id"]),
-                timestamp: text(row["timestamp"]),
-                metrics: text(row["metrics"]),
-                selectedModel: text(row["selectedModel"])
+        var turns: [DerivedTurn] = []
+        turns.reserveCapacity(decoded.count)
+        var unreadable = 0
+        for row in decoded {
+            // A row without an identifier or a timestamp cannot be measured or deduplicated. Skip
+            // it and keep the rest of the history, instead of failing every day the row is in.
+            guard let turn = try deriveTurn(row, parseMetrics: parseMetrics) else {
+                unreadable += 1
+                continue
+            }
+            turns.append(turn)
+        }
+        return DerivedTurns(turns: turns, unreadable: unreadable)
+    }
+
+    private static func deriveTurn(
+        _ row: [String: Any],
+        parseMetrics: @Sendable (String) -> [String: Any]?
+    ) throws -> DerivedTurn? {
+        let id = text(row["id"])
+        guard !id.isEmpty, let stamp = Double(text(row["timestamp"])), stamp.isFinite else { return nil }
+        guard let metrics = parseMetrics(text(row["metrics"])) else {
+            throw FreebuffUsageError.localHistoryUnreadable
+        }
+        let usage = metrics["usage"] as? [String: Any]
+        let recordedModel = (usage?["model"] as? String)?.nilIfEmpty
+        let savedModel = recordedModel ?? text(row["selectedModel"]).nilIfEmpty
+        var derived = DerivedTurn(
+            id: id,
+            timestampMs: stamp,
+            usage: nil,
+            savedModel: savedModel,
+            fromReceipt: recordedModel != nil,
+            partial: metrics["usageIncomplete"] as? Bool == true
+        )
+        if let usage {
+            derived.usage = .counts(
+                input: count(usage["inputTokens"]),
+                output: count(usage["outputTokens"]),
+                cached: count(usage["cachedInputTokens"]),
+                reasoning: count(usage["reasoningOutputTokens"]),
+                reportedTotal: count(usage["totalTokens"])
             )
         }
+        return derived
     }
 
     /// A column's text, with a JSON null (or a non-string) read as empty.
@@ -227,20 +338,33 @@ actor FreebuffDesktopUsageScanner {
         return (value as? String) ?? ""
     }
 
-    private static func optionalCount(_ value: Any?) throws -> Int {
-        guard let value else { return 0 }
-        guard let count = count(value) else { throw FreebuffUsageError.localHistoryUnreadable }
-        return count
-    }
-
-    private static func count(_ value: Any?) -> Int? {
+    /// A required count: absent and invalid are both "no usable number".
+    private static func count(_ value: Any?) -> Count {
+        guard let value else { return .absent }
         guard let number = value as? NSNumber,
               CFGetTypeID(number) != CFBooleanGetTypeID(),
               number.doubleValue.isFinite, number.doubleValue >= 0,
               number.doubleValue < Double(Int.max),
               number.doubleValue.rounded(.towardZero) == number.doubleValue
-        else { return nil }
-        return number.intValue
+        else { return .invalid }
+        return .value(number.intValue)
+    }
+
+    /// A count the receipt must carry.
+    private static func required(_ count: Count) throws -> Int {
+        switch count {
+        case .value(let value): return value
+        case .absent, .invalid: throw FreebuffUsageError.localHistoryUnreadable
+        }
+    }
+
+    /// An optional count: absent counts as zero, invalid is a broken receipt.
+    private static func optional(_ count: Count) throws -> Int {
+        switch count {
+        case .absent: return 0
+        case .value(let value): return value
+        case .invalid: throw FreebuffUsageError.localHistoryUnreadable
+        }
     }
 
     private func revisions(_ paths: [String]) throws -> [Revision] {
