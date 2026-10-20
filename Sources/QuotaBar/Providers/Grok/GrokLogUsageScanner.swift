@@ -21,6 +21,31 @@ actor GrokLogUsageScanner {
         var carriedCost: Double?
     }
 
+    /// The revision of a session's `summary.json`: its size and modification time.
+    private struct SummaryRevision: Equatable {
+        var path: String
+        var size: UInt64
+        var modifiedNanos: Int64
+
+        init(path: String, metadata: stat) {
+            self.path = path
+            self.size = UInt64(metadata.st_size)
+            self.modifiedNanos = Int64(metadata.st_mtimespec.tv_sec) * 1_000_000_000
+                + Int64(metadata.st_mtimespec.tv_nsec)
+        }
+    }
+
+    private struct SummaryClassification {
+        var revision: SummaryRevision
+        var isCoordinator: Bool
+    }
+
+    /// How many session summaries stay classified in memory. A session folder that disappears leaves
+    /// its entry behind, and sessions only accumulate, so the cache is capped.
+    private static let maximumCachedSummaries = 4096
+
+    private var summaryClassifications: [String: SummaryClassification] = [:]
+
     private static let sharedScanner = IncrementalJSONLScanner<Entry>(
         retainResidentItems: false,
         logTag: LogTag.plugin("grok"),
@@ -56,7 +81,7 @@ actor GrokLogUsageScanner {
         DiagnosticGate.clearFailure("grok.sessions.enumeration")
         var files: [JSONLScanning.DiscoveredFile] = []
         for file in discoveredFiles where URL(fileURLWithPath: file.path).lastPathComponent == "updates.jsonl" {
-            guard let isCoordinator = Self.isCoordinatorSession(file) else { return nil }
+            guard let isCoordinator = isCoordinatorSession(file) else { return nil }
             if isCoordinator { files.append(file) }
         }
 
@@ -123,46 +148,70 @@ actor GrokLogUsageScanner {
 
     /// Coordinator turns already include their subagents, so reading both ledgers would charge every
     /// child task twice. Older sessions without a summary remain eligible because their kind is unknown.
-    private static func isCoordinatorSession(_ file: JSONLScanning.DiscoveredFile) -> Bool? {
+    ///
+    /// The summary of a finished session never changes, so its classification is cached against the
+    /// file's revision. Without the cache every fold re-opened and re-parsed one `summary.json` per
+    /// session — hundreds of file reads per fold for a boolean that was already known.
+    private func isCoordinatorSession(_ file: JSONLScanning.DiscoveredFile) -> Bool? {
         let fileURL = URL(fileURLWithPath: file.path)
         let summaryURL = fileURL.deletingLastPathComponent().appendingPathComponent("summary.json")
         var metadata = stat()
         guard Darwin.lstat(summaryURL.path, &metadata) == 0 else {
             if errno == ENOENT {
-                DiagnosticGate.clearFailure(summaryDiagnosticKey(for: file.path))
+                DiagnosticGate.clearFailure(Self.summaryDiagnosticKey(for: file.path))
                 return true
             }
-            logSummaryFailure(file: file.path, message: "Could not inspect Grok session summary")
+            Self.logSummaryFailure(file: file.path, message: "Could not inspect Grok session summary")
             return nil
+        }
+
+        let revision = SummaryRevision(path: summaryURL.path, metadata: metadata)
+        if let cached = summaryClassifications[summaryURL.path], cached.revision == revision {
+            return cached.isCoordinator
         }
 
         do {
             guard FileManager.default.isReadableFile(atPath: summaryURL.path) else {
-                logSummaryFailure(file: file.path, message: "Could not read Grok session summary")
+                Self.logSummaryFailure(file: file.path, message: "Could not read Grok session summary")
                 return nil
             }
             let data = try Data(contentsOf: summaryURL)
             guard let summary = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                logSummaryFailure(file: file.path, message: "Grok session summary is not a JSON object")
+                Self.logSummaryFailure(file: file.path, message: "Grok session summary is not a JSON object")
                 return nil
             }
             if let rawKind = summary["session_kind"] {
                 guard let kind = rawKind as? String else {
-                    logSummaryFailure(file: file.path, message: "Grok session summary has an invalid session kind")
+                    Self.logSummaryFailure(file: file.path, message: "Grok session summary has an invalid session kind")
                     return nil
                 }
-                DiagnosticGate.clearFailure(summaryDiagnosticKey(for: file.path))
-                return !kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("subagent")
+                DiagnosticGate.clearFailure(Self.summaryDiagnosticKey(for: file.path))
+                let isCoordinator = !kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("subagent")
+                remember(revision: revision, isCoordinator: isCoordinator)
+                return isCoordinator
             }
-            DiagnosticGate.clearFailure(summaryDiagnosticKey(for: file.path))
+            DiagnosticGate.clearFailure(Self.summaryDiagnosticKey(for: file.path))
+            remember(revision: revision, isCoordinator: true)
             return true
         } catch {
-            logSummaryFailure(
+            Self.logSummaryFailure(
                 file: file.path,
                 message: "Could not read Grok session summary: \(error.localizedDescription)"
             )
             return nil
         }
+    }
+
+    /// Remember a summary's classification. The cache is bounded: a session folder that disappears
+    /// leaves its entry behind, and the number of sessions only grows.
+    private func remember(revision: SummaryRevision, isCoordinator: Bool) {
+        if summaryClassifications.count >= Self.maximumCachedSummaries {
+            summaryClassifications.removeAll(keepingCapacity: true)
+        }
+        summaryClassifications[revision.path] = SummaryClassification(
+            revision: revision,
+            isCoordinator: isCoordinator
+        )
     }
 
     private static func summaryDiagnosticKey(for path: String) -> String {
@@ -365,11 +414,14 @@ actor GrokLogUsageScanner {
         JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
             guard entry.timestamp >= since else { return }
             let day = DailyUsageAccumulator.dayKey(from: entry.timestamp)
-            let cost = entry.carriedCost
-                ?? pricing.estimatedCostDollars(model: entry.model, tokens: entry.tokens)
+            // One price resolution per entry: the same estimate feeds the day's cost and the
+            // API-rate comparison. Resolving it twice per entry doubled the pricing work on every
+            // fold, and the two numbers were always the same.
+            let estimate = pricing.estimatedCostDollars(model: entry.model, tokens: entry.tokens)
+            let cost = entry.carriedCost ?? estimate
             accumulator.recordApiEstimate(
                 day: day,
-                cost: pricing.estimatedCostDollars(model: entry.model, tokens: entry.tokens),
+                cost: estimate,
                 tokens: entry.tokens.totalTokens
             )
             if cost == nil, entry.tokens.totalTokens > 0 {
