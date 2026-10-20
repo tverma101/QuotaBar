@@ -17,6 +17,14 @@ final class GrokProvider: ProviderRuntime {
     let now: @Sendable () -> Date
     let pricing: @Sendable () async -> ModelPricing
 
+    /// The plan label changes about once a month, so re-reading it on every refresh doubled the
+    /// provider's request count for a near-constant value.
+    static let planCacheInterval: TimeInterval = 3600
+    static let planFailureDiagnosticKey = "grok.plan.request-failed"
+    private var cachedPlan: String?
+    private var cachedPlanAccount: String?
+    private var cachedPlanAt: Date?
+
     init(
         authStore: GrokAuthStore = GrokAuthStore(),
         usageClient: GrokUsageClient = GrokUsageClient(),
@@ -131,7 +139,7 @@ final class GrokProvider: ProviderRuntime {
         if ProviderRefreshContext.scope.suppressesLiveQuota {
             plan = nil
         } else {
-            plan = try await fetchPlanName(accessToken: state.token)
+            plan = try await fetchPlanName(accessToken: state.token, account: state.entryKey)
         }
 
         // Menu-bar and panel-meter passes only need the weekly / Extra Usage meters from the
@@ -314,15 +322,45 @@ final class GrokProvider: ProviderRuntime {
         return now().addingTimeInterval(60 * 60)
     }
 
-    private func fetchPlanName(accessToken: String) async throws -> String? {
+    /// The subscription tier, read from the settings endpoint.
+    ///
+    /// The label is kept for an hour (a manual refresh re-reads it right away) and the last good
+    /// value survives a failed request, so a transient blip no longer drops the plan from the card.
+    private func fetchPlanName(accessToken: String, account: String) async throws -> String? {
         try Task.checkCancellation()
+        if !ProviderRefreshContext.isManual,
+           let cachedPlanAt, cachedPlanAccount == account,
+           now().timeIntervalSince(cachedPlanAt) < Self.planCacheInterval {
+            return cachedPlan
+        }
         do {
             let response = try await usageClient.fetchSettings(accessToken: accessToken)
             try Task.checkCancellation()
-            return GrokUsageMapper.planName(from: response)
+            guard (200..<300).contains(response.statusCode) else {
+                // A failed request keeps the last good label instead of dropping the plan.
+                DiagnosticGate.logOnce(for: Self.planFailureDiagnosticKey) {
+                    AppLog.warn(
+                        LogTag.plugin("grok"),
+                        "plan label request failed (HTTP \(response.statusCode))"
+                    )
+                }
+                return cachedPlan
+            }
+            let plan = GrokUsageMapper.planName(from: response)
+            DiagnosticGate.clearFailure(Self.planFailureDiagnosticKey)
+            cachedPlan = plan
+            cachedPlanAccount = account
+            cachedPlanAt = now()
+            return plan
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            return nil
+            DiagnosticGate.logOnce(for: Self.planFailureDiagnosticKey) {
+                AppLog.warn(
+                    LogTag.plugin("grok"),
+                    "plan label request failed (transport): \(error.localizedDescription)"
+                )
+            }
+            return cachedPlan
         }
     }
 }
