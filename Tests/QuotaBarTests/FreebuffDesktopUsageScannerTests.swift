@@ -116,6 +116,31 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         XCTAssertEqual(result?.usage.series.daily.first?.totalTokens, 150)
     }
 
+    func testPricingChangeRecomputesTheModelRoutes() async throws {
+        // The scanner keys its route table on the pricing snapshot's identity, so a new snapshot
+        // must still be picked up.
+        let sqlite = SQLite()
+        var turn = try row("turn:1")
+        turn["selectedModel"] = "m-known"
+        sqlite.rows = [turn]
+        let scanner = FreebuffDesktopUsageScanner(sqlite: sqlite, databasePaths: { ["/fixture/not-a-real.db"] })
+        let catalog: [String: FreebuffModelCatalog.Entry] = [
+            "m-known": FreebuffModelCatalog.Entry(key: "m-known", displayName: "Model 1")
+        ]
+
+        let withoutRoute = try await scanner.scan(now: now, pricing: .empty, modelCatalog: catalog)
+        XCTAssertEqual(withoutRoute?.usage.modelUsage?.daily.first?.models.map(\.model), ["Model 1"])
+
+        let rates = ModelRates(inputPerMillion: 2, outputPerMillion: 10,
+                               cacheWritePerMillion: 2, cacheReadPerMillion: 0.2)
+        let pricing = ModelPricing(supplement: PricingSupplement(), primary: PricingCatalog(),
+                                   secondary: PricingCatalog(), openRouter: PricingCatalog(entries: [
+                                    "vendor/model-1": rates
+                                   ]))
+        let withRoute = try await scanner.scan(now: now, pricing: pricing, modelCatalog: catalog)
+        XCTAssertEqual(withRoute?.usage.modelUsage?.daily.first?.models.map(\.model), ["vendor/model-1"])
+    }
+
     func testProjectDatabaseListIsResolvedOncePerInterval() async throws {
         // The live-quota refresh and the history fold both need the project list, and resolving it
         // reads the projects directory and stats every project.

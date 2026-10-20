@@ -35,9 +35,10 @@ actor FreebuffDesktopUsageScanner {
     }
 
     private var databases: [String: CachedDatabase] = [:]
+    private var routePricing: ModelPricing?
+    private var routeCatalogNames: [String: String] = [:]
     private var cachedPaths: [String]?
     private var cachedPathsAt: Date?
-    private var routeRevision = ""
     private var modelRoutes: [String: String] = [:]
     private let sqlite: any SQLiteAccessing
     private let databasePaths: @Sendable () throws -> [String]
@@ -89,12 +90,14 @@ actor FreebuffDesktopUsageScanner {
         try Task.checkCancellation()
         let paths = try resolvedPaths(now: now)
         guard !paths.isEmpty else { return nil }
-        let routeRevision = pricing.aggregateCacheToken + modelCatalog.keys.sorted().map {
-            "\($0):\(modelCatalog[$0]!.displayName)"
-        }.joined(separator: "\n")
-        if self.routeRevision != routeRevision {
+        let catalogNames = modelCatalog.mapValues(\.displayName)
+        // The pricing snapshot's identity stands in for its content: its aggregate token is hundreds
+        // of kilobytes of rate text, and copying it on every fold to compare it was pure overhead.
+        // The snapshot instance only changes when the pricing catalogues do.
+        if routePricing !== pricing || routeCatalogNames != catalogNames {
             modelRoutes = FreebuffModelCatalog.openRouterRoutes(entries: modelCatalog, pricing: pricing)
-            self.routeRevision = routeRevision
+            routePricing = pricing
+            routeCatalogNames = catalogNames
         }
         databases = databases.filter { paths.contains($0.key) }
         var rows: [RawRow] = []
