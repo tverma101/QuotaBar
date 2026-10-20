@@ -116,6 +116,25 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         XCTAssertEqual(result?.usage.series.daily.first?.totalTokens, 150)
     }
 
+    func testProjectDatabaseListIsResolvedOncePerInterval() async throws {
+        // The live-quota refresh and the history fold both need the project list, and resolving it
+        // reads the projects directory and stats every project.
+        let enumerations = Counter()
+        let scanner = FreebuffDesktopUsageScanner(sqlite: SQLite(), databasePaths: {
+            enumerations.value += 1
+            return ["/fixture/not-a-real.db"]
+        })
+
+        _ = try await scanner.scan(now: now)
+        _ = try await scanner.hasHistory(now: now.addingTimeInterval(60))
+
+        XCTAssertEqual(enumerations.value, 1, "the projects directory must not be enumerated twice per tick")
+    }
+
+    private final class Counter: @unchecked Sendable {
+        var value = 0
+    }
+
     func testWALChangeInvalidatesOnlyChangedProjectAndReplacesLatestTurnTotal() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

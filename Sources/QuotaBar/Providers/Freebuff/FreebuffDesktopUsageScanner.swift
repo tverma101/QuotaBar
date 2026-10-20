@@ -22,6 +22,9 @@ actor FreebuffDesktopUsageScanner {
         var rows: [RawRow]
     }
 
+    /// How long the resolved project database list stays fresh.
+    static let pathCacheInterval: TimeInterval = 300
+
     /// One message row as SQLite returned it. A column that was NULL arrives as an empty string, so
     /// an unusable row is skipped instead of taking the whole history with it.
     private struct RawRow {
@@ -32,6 +35,8 @@ actor FreebuffDesktopUsageScanner {
     }
 
     private var databases: [String: CachedDatabase] = [:]
+    private var cachedPaths: [String]?
+    private var cachedPathsAt: Date?
     private var routeRevision = ""
     private var modelRoutes: [String: String] = [:]
     private let sqlite: any SQLiteAccessing
@@ -60,12 +65,29 @@ actor FreebuffDesktopUsageScanner {
             .sorted()
     }
 
-    func hasHistory() throws -> Bool { try !databasePaths().isEmpty }
+    func hasHistory(now: Date = Date()) throws -> Bool { try !resolvedPaths(now: now).isEmpty }
+
+    /// The project databases, resolved at most once per interval.
+    ///
+    /// Both the live-quota refresh (which asks whether any Desktop history exists) and the history
+    /// fold need this list, and resolving it means a directory read plus a stat per project. A
+    /// manual refresh re-resolves it right away; a scheduled refresh reuses the recent answer.
+    private func resolvedPaths(now: Date) throws -> [String] {
+        if !ProviderRefreshContext.isManual,
+           let cachedPaths, let cachedPathsAt,
+           now.timeIntervalSince(cachedPathsAt) < Self.pathCacheInterval {
+            return cachedPaths
+        }
+        let paths = try databasePaths().sorted()
+        cachedPaths = paths
+        cachedPathsAt = now
+        return paths
+    }
 
     func scan(now: Date, pricing: ModelPricing = .empty,
               modelCatalog: [String: FreebuffModelCatalog.Entry] = [:]) throws -> Scan? {
         try Task.checkCancellation()
-        let paths = try databasePaths().sorted()
+        let paths = try resolvedPaths(now: now)
         guard !paths.isEmpty else { return nil }
         let routeRevision = pricing.aggregateCacheToken + modelCatalog.keys.sorted().map {
             "\($0):\(modelCatalog[$0]!.displayName)"
