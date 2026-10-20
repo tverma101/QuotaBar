@@ -301,6 +301,20 @@ final class FreebuffUsageMapperTests: XCTestCase {
         XCTAssertEqual(progress(mapped.lines, "Monthly Spend")?.limit, 12)
     }
 
+    func testFractionalSecondResetTimestampsStillParse() throws {
+        // The payload sometimes carries fractional seconds; both forms must resolve.
+        let mapped = try FreebuffUsageMapper.map(response: response([
+            "status": "none",
+            "freebucks": [
+                "balance": 75,
+                "daily": ["limit": 100, "spent": 25, "remaining": 75, "resetAt": "2026-10-14T07:00:00.500Z"]
+            ]
+        ]))
+
+        XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.resetsAt?.timeIntervalSince1970 ?? 0,
+                       1_791_961_200.5, accuracy: 0.001)
+    }
+
     func testMapsSubscriberFiveDayAndMonthlyMetersAndActualUsdSpend() throws {
         let mapped = try FreebuffUsageMapper.map(response: response([
             "status": "none",
