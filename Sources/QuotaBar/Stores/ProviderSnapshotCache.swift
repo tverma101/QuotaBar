@@ -2,6 +2,29 @@ import Darwin
 import Foundation
 import os
 
+/// Counts the whole-blob work a cache instance does, so a regression test can assert that a refresh
+/// pass reuses the decoded mirror instead of re-parsing the payload for every provider.
+final class ProviderSnapshotCacheMetrics: @unchecked Sendable {
+    private struct Counters {
+        var reads = 0
+        var decodes = 0
+        var writes = 0
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: Counters())
+
+    /// Whole-payload reads from `UserDefaults`.
+    var reads: Int { state.withLock { $0.reads } }
+    /// Whole-payload JSON decodes performed.
+    var decodes: Int { state.withLock { $0.decodes } }
+    /// Whole-payload writes performed.
+    var writes: Int { state.withLock { $0.writes } }
+
+    func recordRead() { state.withLock { $0.reads += 1 } }
+    func recordDecode() { state.withLock { $0.decodes += 1 } }
+    func recordWrite() { state.withLock { $0.writes += 1 } }
+}
+
 struct ProviderSnapshotCache {
     private static let processStoreLock = NSLock()
 
@@ -80,12 +103,13 @@ struct ProviderSnapshotCache {
         case unavailable
     }
 
-    /// In-memory mirror of the persisted blob. Reads (`snapshot`, `loadSnapshots`, and the read inside
-    /// `store`) hit this instead of re-decoding the whole all-providers JSON from `UserDefaults` on
-    /// every call — a refresh pass otherwise paid O(N) full decodes (plus O(N) encodes) per pass on the
-    /// MainActor. The blob is decoded at most once per cache instance (first access); writes update the
-    /// mirror and persist through. Lock-backed so the value-type cache memoizes across calls and stays
-    /// safe to share.
+    /// In-memory mirror of the persisted blob. Reads (`snapshot`, `loadSnapshots`) and *every write
+    /// path* (`store`, `beginRefreshOrder`, `isCurrentRefresh`, the compaction and removal helpers)
+    /// resolve the payload through it instead of re-decoding the whole all-providers JSON from
+    /// `UserDefaults` on every call — a refresh pass otherwise paid O(N) full decodes (plus O(N)
+    /// encodes) per pass on the MainActor. The mirror is rebuilt only when the blob's bytes change,
+    /// i.e. when another process wrote. Lock-backed so the value-type cache memoizes across calls
+    /// and stays safe to share.
     private let memo = OSAllocatedUnfairLock<Payload?>(initialState: nil)
 
     /// The raw persisted bytes the mirror in `memo` was built from, or the bytes last written.
@@ -111,6 +135,11 @@ struct ProviderSnapshotCache {
 
     private let userDefaults: UserDefaults
     private let storageKey: String
+    /// The process-shared refresh-order allocator. It lives in its own small key so that allocating
+    /// an order never rewrites the snapshot blob.
+    private let orderAllocator: RefreshOrderAllocator
+    /// Optional test instrumentation. `nil` in production.
+    private let metrics: ProviderSnapshotCacheMetrics?
     /// A snapshot written this session stays fresh for exactly one refresh interval, then expires so the
     /// periodic loop refetches on schedule. A snapshot loaded from a *previous* session (off disk) is never
     /// fresh regardless of its `refreshedAt` — see `sessionWrites`. Tests inject a fixed TTL for a
@@ -147,10 +176,16 @@ struct ProviderSnapshotCache {
         storageKey: String = "openusage.providerSnapshots.v9",
         ttl: TimeInterval = RefreshSetting.interval,
         allowsPersistedFreshness: Bool = false,
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        metrics: ProviderSnapshotCacheMetrics? = nil
     ) {
         self.userDefaults = userDefaults
         self.storageKey = storageKey
+        self.orderAllocator = RefreshOrderAllocator(
+            defaults: userDefaults,
+            key: "\(storageKey).issuedRefreshOrders"
+        )
+        self.metrics = metrics
         self.ttl = ttl
         self.allowsPersistedFreshness = allowsPersistedFreshness
         self.now = now
@@ -181,7 +216,7 @@ struct ProviderSnapshotCache {
         withPersistentStoreLock {
             // The app and CLI share one UserDefaults blob. Re-read it while holding the process lock
             // so compaction cannot erase a provider another process stored after our last read.
-            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            var payload = loadPayload()
             var changed = false
             for providerID in Array(payload.snapshots.keys) {
                 guard var snapshot = payload.snapshots[providerID],
@@ -202,25 +237,24 @@ struct ProviderSnapshotCache {
 
     /// Allocate a process-shared sequence before provider work starts. A later request gets a larger
     /// value even when the earlier request takes longer to finish.
+    ///
+    /// The counter lives outside the snapshot blob: bumping it used to re-encode and rewrite the whole
+    /// payload, doubling the write volume of every refresh pass. It is still process-shared, so the
+    /// cross-process fence keeps working.
     func beginRefreshOrder(providerID: String) -> UInt64? {
         var order: UInt64?
-        var saved = false
         let locked = withPersistentStoreLock {
-            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
-            let previous = max(
-                payload.issuedRefreshOrders[providerID, default: 0],
-                payload.storedRefreshOrders[providerID, default: 0]
-            )
-            guard previous < UInt64.max else {
+            let payload = loadPayload()
+            // Stay ahead of every order the blob already committed, so a cleared allocator key cannot
+            // hand out an order the cross-process fence would reject.
+            let floor = Self.committedOrder(providerID: providerID, payload: payload)
+            guard let next = orderAllocator.reserve(providerID: providerID, floor: floor) else {
                 AppLog.warn(.cache, "refresh order exhausted for \(providerID)")
                 return
             }
-            let next = previous + 1
-            payload.issuedRefreshOrders[providerID] = next
-            saved = save(payload)
-            if saved { order = next }
+            order = next
         }
-        return locked && saved ? order : nil
+        return locked ? order : nil
     }
 
     /// Discard provider results older than a committed write in a domain they update. An in-flight
@@ -235,7 +269,7 @@ struct ProviderSnapshotCache {
     ) -> Bool {
         var current = true
         let locked = withPersistentStoreLock {
-            let payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            let payload = loadPayload()
             let quotaCurrent = scope.refreshesQuotaDomain
                 && order >= payload.storedQuotaOrders[providerID, default: 0]
             let historyCurrent = hasHistoryDomain
@@ -250,7 +284,7 @@ struct ProviderSnapshotCache {
     /// so it must not replace the entry from a process-local snapshot or change its freshness stamp.
     func compactHistory(providerID: String, through date: Date) {
         withPersistentStoreLock {
-            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            var payload = loadPayload()
             guard var snapshot = payload.snapshots[providerID],
                   let history = snapshot.usageHistory
             else { return }
@@ -316,16 +350,25 @@ struct ProviderSnapshotCache {
             AppLog.debug(.cache, "skip write \(snapshot.providerID) (error snapshot)")
             return .unavailable
         }
-        guard scope == nil || refreshOrder != nil else {
-            // Production refresh writes always carry their cross-process sequence. An unordered
-            // fallback after sequence allocation failed could let an older result win the race.
-            return .unavailable
-        }
         AppLog.debug(.cache, "write \(snapshot.providerID)")
         var result: StoreResult = .unavailable
         let locked = withPersistentStoreLock {
-            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            var payload = loadPayload()
             let providerID = snapshot.providerID
+            // A refresh order is normally allocated before the provider work starts, so this write can
+            // be fenced against a newer result. When that allocation failed (the shared lock could
+            // not be taken) the snapshot must still be persisted: refusing it silently dropped the
+            // provider's fresh meters, plan and history while the store kept showing them. Fall back
+            // to the order the blob already committed, so the cross-process fence still rejects
+            // older results and the write does not advance the fence.
+            let committed = Self.committedOrder(providerID: providerID, payload: payload)
+            let effectiveOrder = refreshOrder ?? committed
+            if refreshOrder == nil, scope != nil {
+                AppLog.warn(
+                    .cache,
+                    "\(providerID) refreshed without a cross-process order; persisting against the committed order \(committed)"
+                )
+            }
             let quotaOrder = payload.storedQuotaOrders[providerID, default: 0]
             let historyOrder = payload.storedHistoryOrders[providerID, default: 0]
             let quotaCandidate = scope?.refreshesQuotaDomain ?? true
@@ -341,15 +384,18 @@ struct ProviderSnapshotCache {
                 historyCandidate = true
             }
             let quotaAccepted = quotaCandidate
-                && (refreshOrder.map { $0 >= quotaOrder } ?? true)
+                && (effectiveOrder >= quotaOrder)
             let historyAccepted = historyCandidate
-                && (refreshOrder.map { $0 >= historyOrder } ?? true)
+                && (effectiveOrder >= historyOrder)
             let hasFreshDomain = quotaAccepted || historyAccepted
             if !hasFreshDomain {
                 if quotaCandidate || historyCandidate {
                     result = .superseded(payload.snapshots[providerID])
                 } else if let historyWarning = snapshot.historyWarning {
-                    let latestIssuedOrder = payload.issuedRefreshOrders[providerID, default: 0]
+                    let latestIssuedOrder = max(
+                        payload.issuedRefreshOrders[providerID, default: 0],
+                        orderAllocator.issuedOrder(providerID: providerID, floor: 0)
+                    )
                     guard refreshOrder.map({ $0 >= latestIssuedOrder }) ?? true else {
                         result = .superseded(payload.snapshots[providerID])
                         return
@@ -578,10 +624,11 @@ struct ProviderSnapshotCache {
         var didStore = false
         var accepted = false
         let stored = withPersistentStoreLock {
-            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            var payload = loadPayload()
             let newestOrder = max(
                 payload.issuedRefreshOrders[providerID, default: 0],
-                payload.storedRefreshOrders[providerID, default: 0]
+                payload.storedRefreshOrders[providerID, default: 0],
+                orderAllocator.issuedOrder(providerID: providerID, floor: 0)
             )
             let newestCommittedDomainOrder = max(
                 payload.storedQuotaOrders[providerID, default: 0],
@@ -613,10 +660,11 @@ struct ProviderSnapshotCache {
     func clearQuotaState(providerID: String, refreshOrder: UInt64? = nil) -> StoreResult {
         var result: StoreResult = .unavailable
         let locked = withPersistentStoreLock {
-            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            var payload = loadPayload()
             let newestOrder = max(
                 payload.issuedRefreshOrders[providerID, default: 0],
-                payload.storedRefreshOrders[providerID, default: 0]
+                payload.storedRefreshOrders[providerID, default: 0],
+                orderAllocator.issuedOrder(providerID: providerID, floor: 0)
             )
             let newestQuotaOrder = payload.storedQuotaOrders[providerID, default: 0]
             if let refreshOrder, refreshOrder < newestQuotaOrder {
@@ -644,6 +692,17 @@ struct ProviderSnapshotCache {
 
     private static func nextOrder(after current: UInt64) -> UInt64 {
         current == UInt64.max ? current : current + 1
+    }
+
+    /// The highest order the blob has committed for a provider. A write that carries no order of its
+    /// own falls back to it, so it never has to be dropped and never advances the fence.
+    private static func committedOrder(providerID: String, payload: Payload) -> UInt64 {
+        max(
+            payload.issuedRefreshOrders[providerID, default: 0],
+            payload.storedRefreshOrders[providerID, default: 0],
+            payload.storedQuotaOrders[providerID, default: 0],
+            payload.storedHistoryOrders[providerID, default: 0]
+        )
     }
 
     private static func clearingQuotaState(_ snapshot: ProviderSnapshot) -> ProviderSnapshot {
@@ -697,7 +756,14 @@ struct ProviderSnapshotCache {
         }
     }
 
+    /// The persisted payload, decoded at most once per observed version of the blob.
+    ///
+    /// The blob is shared with `quotabar-cli`, so the bytes on disk are compared with the ones the
+    /// mirror was built from before the mirror is trusted: an unchanged blob means no other process
+    /// wrote, and the mirror is still current. A changed blob is decoded again, so a write from the
+    /// other process is never overwritten by a stale mirror.
     private func loadPayload() -> Payload {
+        metrics?.recordRead()
         let currentBytes = userDefaults.data(forKey: storageKey)
         let knownBytes = persistedBytes.withLock { $0 }
         // Only trust the mirror if the blob on disk is byte-identical to what produced it. Any
@@ -716,11 +782,12 @@ struct ProviderSnapshotCache {
         // silently. Data present but undecodable is a real problem (post-upgrade schema drift, a
         // half-written blob, a manual `defaults` edit): fail loudly, then recover to empty. A silent
         // drop here empties ALL providers' caches at once and feeds the refresh storm. Mirrors the
-        // loud `save` path above. Runs at most once per cache instance (then memoized).
+        // loud `save` path above. Runs at most once per observed blob version (then memoized).
         guard let data else {
             return Payload(snapshots: [:], producedByIdentityKeys: [:])
         }
         do {
+            metrics?.recordDecode()
             return try decoder.decode(Payload.self, from: data)
         } catch {
             AppLog.warn(.cache, "cache decode failed, dropping stored snapshots: \(error.localizedDescription)")
@@ -732,6 +799,7 @@ struct ProviderSnapshotCache {
     private func save(_ payload: Payload) -> Bool {
         do {
             let data = try encoder.encode(payload)
+            metrics?.recordWrite()
             userDefaults.set(data, forKey: storageKey)
             memo.withLock { $0 = payload }
             persistedBytes.withLock { $0 = data }
@@ -751,12 +819,55 @@ struct ProviderSnapshotCache {
         Self.processStoreLock.lock()
         defer { Self.processStoreLock.unlock() }
 
+        let descriptor = Self.persistentLockDescriptor()
+        guard descriptor >= 0 else { return false }
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            Self.logPersistentStoreLockFailure(String(cString: strerror(errno)))
+            return false
+        }
+        defer { flock(descriptor, LOCK_UN) }
+        DiagnosticGate.clearFailure("cache.providerSnapshots.lock")
+        body()
+        return true
+    }
+
+    /// The cross-process lock file, opened once per process.
+    ///
+    /// The lock is taken three times per provider refresh (order allocation, freshness check, write).
+    /// Re-creating the directory, re-applying its permissions and re-opening the file on every
+    /// acquisition cost three syscalls per take, all on the MainActor inside the refresh path. The
+    /// descriptor is cached instead and re-validated against the file on disk, so a deleted or
+    /// replaced lock file cannot silently disable the cross-process exclusion.
+    private struct PersistentLock {
+        var url: URL
+        var descriptor: Int32
+    }
+
+    private static let persistentLock = OSAllocatedUnfairLock<PersistentLock?>(initialState: nil)
+
+    /// Test instrumentation: how many times this process opened the lock file. The lock is opened
+    /// once and reused, so the count must not grow with the number of cache operations.
+    static let persistentLockOpenCount = OSAllocatedUnfairLock(initialState: 0)
+
+    /// The cached descriptor, re-opened when it no longer refers to the lock file on disk.
+    private static func persistentLockDescriptor() -> Int32 {
+        let cached = persistentLock.withLock { $0 }
+        if let cached, cached.descriptor >= 0, lockDescriptorMatchesFile(cached.descriptor, path: cached.url) {
+            return cached.descriptor
+        }
+        guard let opened = openPersistentLockFile() else { return -1 }
+        if let cached, cached.descriptor >= 0 { Darwin.close(cached.descriptor) }
+        persistentLock.withLock { $0 = opened }
+        return opened.descriptor
+    }
+
+    private static func openPersistentLockFile() -> PersistentLock? {
         guard let applicationSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first else {
             logPersistentStoreLockFailure("Application Support directory unavailable")
-            return false
+            return nil
         }
         let directory = applicationSupport.appendingPathComponent("QuotaBar", isDirectory: true)
         let lockURL = directory.appendingPathComponent("provider-snapshot-cache.lock")
@@ -765,7 +876,7 @@ struct ProviderSnapshotCache {
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         } catch {
             logPersistentStoreLockFailure(error.localizedDescription)
-            return false
+            return nil
         }
         var fd = Darwin.open(lockURL.path, O_RDWR | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR))
         if fd < 0, errno == ENOENT {
@@ -774,22 +885,24 @@ struct ProviderSnapshotCache {
         }
         guard fd >= 0 else {
             logPersistentStoreLockFailure(String(cString: strerror(errno)))
-            return false
+            return nil
         }
-        defer {
-            flock(fd, LOCK_UN)
-            Darwin.close(fd)
-        }
-        guard flock(fd, LOCK_EX) == 0 else {
-            logPersistentStoreLockFailure(String(cString: strerror(errno)))
-            return false
-        }
-        DiagnosticGate.clearFailure("cache.providerSnapshots.lock")
-        body()
-        return true
+        persistentLockOpenCount.withLock { $0 += 1 }
+        return PersistentLock(url: lockURL, descriptor: fd)
     }
 
-    private func logPersistentStoreLockFailure(_ message: String) {
+    /// Whether the cached descriptor still refers to the lock file on disk. A deleted or replaced file
+    /// would otherwise leave the process locking a private inode — the other process would lock a
+    /// different one and the two writes would no longer exclude each other.
+    private static func lockDescriptorMatchesFile(_ descriptor: Int32, path: URL) -> Bool {
+        var descriptorInfo = stat()
+        guard fstat(descriptor, &descriptorInfo) == 0 else { return false }
+        var pathInfo = stat()
+        guard stat(path.path, &pathInfo) == 0 else { return false }
+        return descriptorInfo.st_dev == pathInfo.st_dev && descriptorInfo.st_ino == pathInfo.st_ino
+    }
+
+    private static func logPersistentStoreLockFailure(_ message: String) {
         DiagnosticGate.logOnce(for: "cache.providerSnapshots.lock") {
             AppLog.warn(.cache, "snapshot cache write lock unavailable: \(message)")
         }
