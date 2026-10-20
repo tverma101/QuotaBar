@@ -269,6 +269,78 @@ final class DevinProviderTests: XCTestCase {
         }
         return text
     }
+
+    func testServerErrorIsReportedWithItsStatusAndLogged() async throws {
+        DiagnosticGate.clearFailure(DevinProvider.httpFailureDiagnosticKeyPrefix + "503")
+        let http = QueueHTTPClient(responses: [
+            HTTPResponse(statusCode: 503, headers: [:], body: Data("{}".utf8))
+        ])
+        let provider = DevinProvider(
+            authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)),
+            usageClient: DevinUsageClient(http: http)
+        )
+
+        let (snapshot, logs) = try await captureLogs { await provider.refresh() }
+
+        XCTAssertEqual(snapshot.errorCategory, .http5xx)
+        XCTAssertTrue(errorText(snapshot.lines)?.contains("503") == true, errorText(snapshot.lines) ?? "no message")
+        XCTAssertTrue(logs.contains("HTTP 503"), "a server failure must leave a log line: \(logs)")
+    }
+
+    func testUnreadableResponseIsReportedAsADecodingProblemAndLogged() async throws {
+        DiagnosticGate.clearFailure(DevinProvider.invalidResponseDiagnosticKey)
+        let http = QueueHTTPClient(responses: [
+            HTTPResponse(statusCode: 200, headers: [:], body: Data("{\"unexpected\":true}".utf8))
+        ])
+        let provider = DevinProvider(
+            authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)),
+            usageClient: DevinUsageClient(http: http)
+        )
+
+        let (snapshot, logs) = try await captureLogs { await provider.refresh() }
+
+        XCTAssertEqual(snapshot.errorCategory, .decoding)
+        XCTAssertNotEqual(errorText(snapshot.lines), DevinUsageError.quotaUnavailable.localizedDescription,
+                          "a schema change must not read like a missing quota")
+        XCTAssertTrue(logs.contains("could not be read"), "an unreadable payload must leave a log line: \(logs)")
+    }
+
+    func testTransportFailureIsReportedAsAConnectionProblemAndLogged() async throws {
+        DiagnosticGate.clearFailure(DevinProvider.transportFailureDiagnosticKey)
+        let provider = DevinProvider(
+            authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)),
+            usageClient: DevinUsageClient(http: ThrowingDevinHTTPClient())
+        )
+
+        let (snapshot, logs) = try await captureLogs { await provider.refresh() }
+
+        XCTAssertEqual(snapshot.errorCategory, .network)
+        XCTAssertTrue(errorText(snapshot.lines)?.contains("reach Devin") == true, errorText(snapshot.lines) ?? "no message")
+        XCTAssertTrue(logs.contains("transport"), "a transport failure must leave a log line: \(logs)")
+    }
+
+    /// Run a refresh with the log sink pointed at a temporary file so the diagnostics it writes can
+    /// be asserted.
+    private func captureLogs(
+        _ operation: () async -> ProviderSnapshot
+    ) async throws -> (ProviderSnapshot, String) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenUsageTests.Devin.\(UUID().uuidString)", isDirectory: true)
+        let sink = LogFile(directory: directory, fileName: "OpenUsage.log")
+        sink.open()
+        let originalSink = AppLog.sink
+        AppLog.sink = sink
+        AppLog.reloadLevel(.warn)
+        defer {
+            AppLog.sink = originalSink
+            AppLog.reloadLevel()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let snapshot = await operation()
+        let logs = try String(contentsOf: sink.fileURL, encoding: .utf8)
+        return (snapshot, logs)
+    }
 }
 
 private func makeUserStatus(planName: String = "Max") -> [String: Any] {
@@ -342,8 +414,7 @@ private struct UnreadableDevinFiles: TextFileAccessing {
     func remove(_ path: String) throws {}
 }
 
-private final class QueueHTTPClient: HTTPClient, @unchecked Sendable {
-    var responses: [HTTPResponse]
+private final class QueueHTTPClient: HTTPClient, @unchecked Sendable {    var responses: [HTTPResponse]
     var requests: [HTTPRequest] = []
 
     init(responses: [HTTPResponse] = []) {
@@ -356,5 +427,11 @@ private final class QueueHTTPClient: HTTPClient, @unchecked Sendable {
             return HTTPResponse(statusCode: 500, headers: [:], body: Data("{}".utf8))
         }
         return responses.removeFirst()
+    }
+}
+
+private struct ThrowingDevinHTTPClient: HTTPClient {
+    func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        throw URLError(.notConnectedToInternet)
     }
 }

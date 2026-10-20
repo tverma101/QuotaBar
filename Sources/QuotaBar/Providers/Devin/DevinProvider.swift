@@ -2,6 +2,12 @@ import Foundation
 
 @MainActor
 final class DevinProvider: ProviderRuntime {
+    /// Diagnostic keys for the three ways a quota request can fail. Each kind is logged on its own
+    /// line so a server outage, a schema change, and a broken network stay distinguishable in the log.
+    static let httpFailureDiagnosticKeyPrefix = "devin.usage.http."
+    static let invalidResponseDiagnosticKey = "devin.usage.invalid-response"
+    static let transportFailureDiagnosticKey = "devin.usage.transport"
+
     let provider = Provider(
         id: "devin",
         displayName: "Devin",
@@ -57,6 +63,7 @@ final class DevinProvider: ProviderRuntime {
         var sawAPIKey = false
         var sawAuthFailure = false
         var credentialSourceUnreadable = false
+        var requestFailure: DevinAttemptFailure?
         let credentials: DevinAuth?
         do {
             credentials = try await loadOffMainActor { [authStore] in try authStore.loadCredentialsFile() }
@@ -78,8 +85,8 @@ final class DevinProvider: ProviderRuntime {
                 return snapshot(from: mapped)
             case .authFailure:
                 sawAuthFailure = true
-            case .unavailable:
-                break
+            case .failed(let failure):
+                requestFailure = requestFailure ?? failure
             case .cancelled:
                 return cancelledRefreshSnapshot(provider: provider)
             }
@@ -103,8 +110,8 @@ final class DevinProvider: ProviderRuntime {
                 return snapshot(from: mapped)
             case .authFailure:
                 sawAuthFailure = true
-            case .unavailable:
-                break
+            case .failed(let failure):
+                requestFailure = requestFailure ?? failure
             case .cancelled:
                 return cancelledRefreshSnapshot(provider: provider)
             }
@@ -115,6 +122,15 @@ final class DevinProvider: ProviderRuntime {
         }
         if sawAuthFailure {
             return ProviderSnapshot.error(provider: provider, error: DevinAuthError.notLoggedIn)
+        }
+        // A failed request keeps its own message and telemetry bucket: "the service is down", "the
+        // payload changed", and "the network is broken" are different problems with different fixes.
+        if let requestFailure {
+            return ProviderSnapshot.error(
+                provider: provider,
+                message: requestFailure.message,
+                category: requestFailure.category
+            )
         }
         if sawAPIKey {
             return ProviderSnapshot.error(provider: provider, error: DevinUsageError.quotaUnavailable)
@@ -132,12 +148,44 @@ final class DevinProvider: ProviderRuntime {
                 return .authFailure
             }
             guard (200..<300).contains(response.statusCode) else {
-                return .unavailable
+                DiagnosticGate.logOnce(for: Self.httpFailureDiagnosticKeyPrefix + String(response.statusCode)) {
+                    AppLog.warn(LogTag.plugin("devin"), "quota request failed (HTTP \(response.statusCode))")
+                }
+                return .failed(.requestFailed(response.statusCode))
             }
-            return .success(try DevinUsageMapper.mapUserStatusResponse(response))
+            do {
+                let mapped = try DevinUsageMapper.mapUserStatusResponse(response)
+                DiagnosticGate.clearFailures(prefix: "devin.usage.")
+                return .success(mapped)
+            } catch let error as DevinUsageError {
+                switch error {
+                case .quotaUnavailable:
+                    // The response was readable; the account simply has no quota meters to show.
+                    return .failed(.quotaUnavailable)
+                case .invalidResponse:
+                    DiagnosticGate.logOnce(for: Self.invalidResponseDiagnosticKey) {
+                        AppLog.warn(LogTag.plugin("devin"), "quota response could not be read")
+                    }
+                    return .failed(.invalidResponse)
+                }
+            } catch {
+                DiagnosticGate.logOnce(for: Self.invalidResponseDiagnosticKey) {
+                    AppLog.warn(
+                        LogTag.plugin("devin"),
+                        "quota response could not be read: \(error.localizedDescription)"
+                    )
+                }
+                return .failed(.invalidResponse)
+            }
         } catch {
             if ProviderCancellation.isCancellation(error) { return .cancelled }
-            return .unavailable
+            DiagnosticGate.logOnce(for: Self.transportFailureDiagnosticKey) {
+                AppLog.warn(
+                    LogTag.plugin("devin"),
+                    "quota request failed (transport): \(error.localizedDescription)"
+                )
+            }
+            return .failed(.connectionFailed)
         }
     }
 
@@ -155,6 +203,37 @@ final class DevinProvider: ProviderRuntime {
 private enum DevinAuthAttempt {
     case success(DevinMappedUsage)
     case authFailure
-    case unavailable
+    case failed(DevinAttemptFailure)
     case cancelled
+}
+
+/// Why a Devin quota request produced no meters. Each kind keeps its own user-facing advice and its
+/// own telemetry bucket instead of collapsing into one "unavailable" message.
+private enum DevinAttemptFailure {
+    case requestFailed(Int)
+    case invalidResponse
+    case connectionFailed
+    case quotaUnavailable
+
+    var message: String {
+        switch self {
+        case .requestFailed(let status):
+            return "Devin's service returned an error (HTTP \(status)). Try again later."
+        case .invalidResponse:
+            return "Devin returned quota data QuotaBar couldn't read. Try again later."
+        case .connectionFailed:
+            return "QuotaBar couldn't reach Devin. Check your connection and try again."
+        case .quotaUnavailable:
+            return DevinUsageError.quotaUnavailable.localizedDescription
+        }
+    }
+
+    var category: ErrorCategory {
+        switch self {
+        case .requestFailed(let status): ErrorCategory.http(status)
+        case .invalidResponse: .decoding
+        case .connectionFailed: .network
+        case .quotaUnavailable: .notAvailable
+        }
+    }
 }
