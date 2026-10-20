@@ -85,6 +85,46 @@ final class CodexRouterLedgerWatcherTests: XCTestCase {
         XCTAssertEqual(flag.wakeCount, 2)
     }
 
+    func testPanelOpenAppendHasCooldownGate() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ou-ledger-watch-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ledger = dir.appendingPathComponent("usage-events.jsonl")
+        try Data().write(to: ledger)
+
+        let center = NotificationCenter()
+        let name = CodexRouterLedgerWatcher.didChangeNotification
+        final class Flag: @unchecked Sendable {
+            var wakeCount = 0
+        }
+        let flag = Flag()
+        let watcher = CodexRouterLedgerWatcher(
+            ledgerPaths: { [ledger.path] },
+            isPanelOpen: { true },
+            center: center,
+            debounceNanoseconds: 50_000_000,
+            panelOpenWakeGate: BackgroundRefreshGate(minimumInterval: 60)
+        )
+        watcher.start()
+        defer { watcher.stop() }
+        try await Task.sleep(for: .milliseconds(100))
+
+        let obs = center.addObserver(forName: name, object: nil, queue: nil) { _ in
+            flag.wakeCount += 1
+        }
+        defer { center.removeObserver(obs) }
+
+        try append(line: #"{"at":"2026-09-24T12:00:00Z"}"#, to: ledger)
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(flag.wakeCount, 1)
+
+        // Rapid streaming append while panel is open inside 60s cooldown is gated.
+        try append(line: #"{"at":"2026-09-24T12:00:01Z"}"#, to: ledger)
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(flag.wakeCount, 1)
+    }
+
     private func append(line: String, to url: URL) throws {
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }

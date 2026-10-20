@@ -69,6 +69,51 @@ final class MenuBarRefreshFilterTests: XCTestCase {
         XCTAssertFalse(relevant.contains("hermes"))
     }
 
+    func testClosedPanelLedgerWakeAffectsVisibleMetrics() {
+        let codexSpend = WidgetDescriptor.values(
+            id: "codex.today", provider: codex, title: "Today", isUsagePeriod: true
+        )
+        let map: [String: WidgetDescriptor] = [
+            "codex.session": session,
+            "codex.today": codexSpend,
+            "claude.session": claudeSession,
+            "opencode.session": openSession,
+            "hermes.today": hermesToday
+        ]
+
+        // When only quota meters are pinned (Session), ledger wake does NOT affect visible metrics.
+        XCTAssertFalse(
+            MenuBarRefreshFilter.closedPanelLedgerWakeAffectsVisibleMetrics(
+                pinnedMetricIDs: ["codex.session", "claude.session"],
+                descriptorForMetric: { map[$0] }
+            )
+        )
+
+        // When Codex spend tile is pinned, ledger wake DOES affect visible metrics.
+        XCTAssertTrue(
+            MenuBarRefreshFilter.closedPanelLedgerWakeAffectsVisibleMetrics(
+                pinnedMetricIDs: ["codex.today"],
+                descriptorForMetric: { map[$0] }
+            )
+        )
+
+        // When OpenCode metric is pinned, ledger wake DOES affect visible metrics.
+        XCTAssertTrue(
+            MenuBarRefreshFilter.closedPanelLedgerWakeAffectsVisibleMetrics(
+                pinnedMetricIDs: ["opencode.session"],
+                descriptorForMetric: { map[$0] }
+            )
+        )
+
+        // When unrelated metric is pinned, returns false.
+        XCTAssertFalse(
+            MenuBarRefreshFilter.closedPanelLedgerWakeAffectsVisibleMetrics(
+                pinnedMetricIDs: ["claude.session", "hermes.today"],
+                descriptorForMetric: { map[$0] }
+            )
+        )
+    }
+
     func testFullScopePrioritizesPinnedFirst() {
         let ordered = MenuBarRefreshFilter.prioritize(
             providerIDs: ["opencode", "claude", "codex", "hermes"],

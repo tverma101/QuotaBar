@@ -742,12 +742,18 @@ final class AppContainer {
                     switch name {
                     case CodexRouterLedgerWatcher.didChangeNotification:
                         if dataStore.hasEnabledProviderFamily("codex") {
-                            pendingLocalAccountingPass = true
-                            dataStore.invalidateLocalAccountingFreshness()
-                            if transparency.popoverShown {
-                                AppLog.info(.refresh, "panel ledger wake; scheduling Codex/OpenCode local accounting")
+                            let affectsVisible = transparency.popoverShown
+                                || dataStore.closedPanelLedgerWakeAffectsVisibleMetrics()
+                            if affectsVisible {
+                                pendingLocalAccountingPass = true
+                                dataStore.invalidateLocalAccountingFreshness()
+                                if transparency.popoverShown {
+                                    AppLog.info(.refresh, "panel ledger wake; scheduling Codex/OpenCode local accounting")
+                                } else {
+                                    AppLog.info(.refresh, "closed-panel ledger wake; scheduling local accounting pass")
+                                }
                             } else {
-                                AppLog.info(.refresh, "closed-panel ledger wake; scheduling local accounting pass")
+                                AppLog.debug(.refresh, "ignoring closed-panel ledger wake (no pinned spend or OpenCode metrics)")
                             }
                         } else {
                             AppLog.debug(.refresh, "ignoring CodexRouter ledger wake (no enabled Codex cards)")

@@ -1033,6 +1033,66 @@ final class CodexProviderTests: XCTestCase {
         XCTAssertTrue(httpClient.requests.isEmpty, "localAccounting scope must not re-read live quota APIs")
     }
 
+    func testLocalAccountingReusesPriorNativeScanWhenAvailable() async throws {
+        let now = TestLocalInstant.date(2026, 2, 20, 12)
+        let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data("{}".utf8)))
+        let home = try CodexLogFixture.makeHome(files: [
+            "sessions/rollout-1.jsonl": [
+                CodexLogFixture.turnContext(timestamp: TestLocalInstant.iso(2026, 2, 20, 10), model: "gpt-5.2"),
+                CodexLogFixture.tokenCount(
+                    timestamp: TestLocalInstant.iso(2026, 2, 20, 10, 1),
+                    last: CodexLogFixture.usage(input: 100, output: 50)
+                )
+            ].joined(separator: "\n")
+        ])
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
+                files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
+                keychain: FakeKeychain()
+            ),
+            usageClient: CodexUsageClient(http: httpClient),
+            logUsageScanner: CodexLogFixture.scanner(home: home),
+            proxyUsageScanner: CodexProxyUsageScanner(databasePaths: { [] }),
+            routerUsageScanner: CodexRouterUsageScanner(ledgerPaths: { [] }, identityAliases: { [:] }),
+            initialAccountIdentityKey: "codex-fixture-account",
+            allowsUnattributedPiUsage: false,
+            now: { now },
+            pricing: {
+                ModelPricing(
+                    supplement: PricingSupplement(),
+                    primary: PricingCatalog(entries: ["gpt-5.2": ModelRates(
+                        inputPerMillion: 1000, outputPerMillion: 3000,
+                        cacheWritePerMillion: 1000, cacheReadPerMillion: 100
+                    )]),
+                    secondary: PricingCatalog(entries: [:])
+                )
+            }
+        )
+
+        // First pass in .full scope runs all scans.
+        let first = await ProviderRefreshContext.$scope.withValue(.full) {
+            await provider.refresh()
+        }
+        XCTAssertEqual(values(first.lines, "Today"),
+                       [MetricValue(number: 0.25, kind: .dollars, estimated: true),
+                        MetricValue(number: 150, kind: .count, label: "tokens")])
+
+        // Remove the home directory so that any re-scanning of native sessions would find nothing.
+        try? FileManager.default.removeItem(at: home)
+
+        // Second pass in .localAccounting scope reuses cached native scan.
+        let second = await ProviderRefreshContext.$scope.withValue(.localAccounting) {
+            await provider.refresh()
+        }
+        XCTAssertEqual(values(second.lines, "Today"),
+                       [MetricValue(number: 0.25, kind: .dollars, estimated: true),
+                        MetricValue(number: 150, kind: .count, label: "tokens")],
+                       "localAccounting must reuse prior native scan without re-walking disk")
+    }
+
     func testIncompletePiDiscoveryDoesNotPublishCodexOnlyHistory() async throws {
         let now = TestLocalInstant.date(2026, 2, 20, 12)
         let codexHome = try CodexLogFixture.makeHome(files: [
