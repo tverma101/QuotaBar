@@ -18,8 +18,38 @@ final class FreebuffModelCatalogTests: XCTestCase {
         XCTAssertNil(FreebuffModelCatalog.openRouterRoute(for: "m-other", entries: entries, pricing: pricing))
     }
 
-    func testCatalogueReadUsesCanonicalHostAndCachesWithoutHandles() async throws {
+    func testFailingCatalogueBacksOffInsteadOfRetryingEveryTick() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("identities.json")
+        let http = FakeHTTPClient(response: HTTPResponse(statusCode: 503, headers: [:], body: Data()))
+        let catalog = FreebuffModelCatalog(cacheURL: url)
+        let client = FreebuffUsageClient(http: http)
+        let start = Date()
+
+        for minute in 0..<5 {
+            do {
+                try await catalog.refresh(auth: FreebuffAuth(token: "test-token"), client: client, now: start.addingTimeInterval(Double(minute) * 60))
+                XCTFail("the failing endpoint must keep reporting its failure")
+            } catch {
+                XCTAssertEqual(error as? FreebuffUsageError, .requestFailed(503))
+            }
+        }
+
+        XCTAssertEqual(http.requests.count, 1, "a broken endpoint must not be re-requested on every tick")
+
+        // The backoff expires with the retry interval.
+        do {
+            try await catalog.refresh(auth: FreebuffAuth(token: "test-token"), client: client, now: start.addingTimeInterval(FreebuffModelCatalog.retryInterval + 60))
+            XCTFail("the endpoint is still failing")
+        } catch {
+            XCTAssertEqual(error as? FreebuffUsageError, .requestFailed(503))
+        }
+        XCTAssertEqual(http.requests.count, 2)
+    }
+
+    func testCatalogueReadUsesCanonicalHostAndCachesWithoutHandles() async throws {        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("identities.json")
         let http = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"protocol":1,"rows":[{"key":"m-known","displayName":"Model 1","handle":"must-not-persist"}]}"#.utf8)))
