@@ -1142,12 +1142,18 @@ final class WidgetDataStore {
             return .skipped
         }
         runningProviderRefreshScopes[providerID, default: [:]][taskID] = ProviderRefreshContext.scope
-        refreshingProviderIDs.insert(providerID)
+        // Only write when the membership actually changes: `@Observable` publishes every write, and
+        // `refreshingProviderIDs` is a single slot that every provider card observes.
+        if !refreshingProviderIDs.contains(providerID) {
+            refreshingProviderIDs.insert(providerID)
+        }
         defer {
             runningProviderRefreshScopes[providerID]?[taskID] = nil
             if runningProviderRefreshScopes[providerID]?.isEmpty == true {
                 runningProviderRefreshScopes[providerID] = nil
-                refreshingProviderIDs.remove(providerID)
+                if refreshingProviderIDs.contains(providerID) {
+                    refreshingProviderIDs.remove(providerID)
+                }
             }
         }
         // App and CLI share persisted snapshots but have independent in-process request generations.
@@ -1630,7 +1636,13 @@ final class WidgetDataStore {
 
     private func updateDisplayedProviderError(for providerID: String) {
         let latest = providerFailureStates[providerID]?.values.max { $0.order < $1.order }
-        providerErrors[providerID] = latest?.message
+        let message = latest?.message
+        // `@Observable` publishes every write, even when the value did not change, and
+        // `providerErrors` is read for every provider group — so a no-op assignment re-rendered the
+        // whole dashboard on every successful refresh.
+        if providerErrors[providerID] != message {
+            providerErrors[providerID] = message
+        }
     }
 
 
