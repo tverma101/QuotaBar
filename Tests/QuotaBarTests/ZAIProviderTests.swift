@@ -392,6 +392,42 @@ final class ZAIProviderTests: XCTestCase {
         XCTAssertEqual(subscription.value, 2)
     }
 
+    func testPlanNameIsReReadImmediatelyWhenAPIKeyChanges() async {
+        let clock = ZAIMutableClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let subscription = ZAIRequestCounter()
+        let fakeFiles = FakeFiles([ZAIAuthStore.configPaths[0]: #"{"apiKey":"key-1"}"#])
+        let provider = ZAIProvider(
+            authStore: ZAIAuthStore(files: fakeFiles, environment: FakeEnvironment()),
+            usageClient: ZAIUsageClient(http: RoutingHTTPClient { request in
+                if request.url == ZAIUsageClient.quotaURL {
+                    return jsonResponse(quotaBothLimitsJSON)
+                }
+                subscription.value += 1
+                let authHeader = request.headers["Authorization"] ?? ""
+                if authHeader.contains("key-2") {
+                    return jsonResponse(#"{"data":[{"productName":"GLM Pro"}]}"#)
+                }
+                return jsonResponse(subscriptionJSON)
+            }),
+            now: { clock.value }
+        )
+
+        let first = await provider.refresh()
+        XCTAssertEqual(first.plan, "GLM Coding Max")
+        XCTAssertEqual(subscription.value, 1)
+
+        // Same key within cache interval does not re-read.
+        let second = await provider.refresh()
+        XCTAssertEqual(second.plan, "GLM Coding Max")
+        XCTAssertEqual(subscription.value, 1)
+
+        // Key rotates: must re-read immediately without waiting for planCacheInterval.
+        fakeFiles.files[ZAIAuthStore.configPaths[0]] = #"{"apiKey":"key-2"}"#
+        let rotated = await provider.refresh()
+        XCTAssertEqual(rotated.plan, "GLM Pro")
+        XCTAssertEqual(subscription.value, 2, "a changed API key must bust the plan cache immediately")
+    }
+
     func testRefreshWithoutKeyReportsNotLoggedIn() async {
         let provider = ZAIProvider(
             authStore: ZAIAuthStore(files: FakeFiles(), environment: FakeEnvironment()),

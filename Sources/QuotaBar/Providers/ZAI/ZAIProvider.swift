@@ -20,6 +20,7 @@ final class ZAIProvider: ProviderRuntime {
     /// provider's request count for a near-constant value.
     static let planCacheInterval: TimeInterval = 3600
     private var cachedSubscription: Data?
+    private var cachedSubscriptionApiKey: String?
     private var cachedSubscriptionAt: Date?
 
     init(
@@ -127,12 +128,14 @@ final class ZAIProvider: ProviderRuntime {
     private func subscriptionBody(apiKey: String) async throws -> Data? {
         if !ProviderRefreshContext.isManual,
            let cachedSubscriptionAt,
+           cachedSubscriptionApiKey == apiKey,
            now().timeIntervalSince(cachedSubscriptionAt) < Self.planCacheInterval {
             return cachedSubscription
         }
         let body = try await loadOptional { try await usageClient.fetchSubscription(apiKey: apiKey) }
         guard let body else { return cachedSubscription }
         cachedSubscription = body
+        cachedSubscriptionApiKey = apiKey
         cachedSubscriptionAt = now()
         return body
     }
