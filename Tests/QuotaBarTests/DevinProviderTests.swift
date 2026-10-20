@@ -58,6 +58,28 @@ final class DevinAuthStoreTests: XCTestCase {
         let missing = DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite())
         XCTAssertNil(try missing.loadAppAuth())
     }
+
+    func testAppAuthIsReadOnceUntilTheStateDatabaseChanges() throws {
+        // Reading the app's credential forks sqlite3. The state database only changes when the
+        // Devin app writes to it, so an unchanged file must not spawn the process again.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenUsageTests.DevinState.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let database = directory.appendingPathComponent("state.vscdb")
+        try Data("state".utf8).write(to: database)
+
+        let sqlite = FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)
+        let store = DevinAuthStore(files: FakeFiles(), sqlite: sqlite, stateDatabasePath: database.path)
+
+        XCTAssertEqual(try store.loadAppAuth()?.apiKey, "devin-session-token$app")
+        XCTAssertEqual(try store.loadAppAuth()?.apiKey, "devin-session-token$app")
+        XCTAssertEqual(sqlite.queryCount, 1, "an unchanged state database must not be read again")
+
+        try Data("the app wrote a new credential".utf8).write(to: database)
+        XCTAssertEqual(try store.loadAppAuth()?.apiKey, "devin-session-token$app")
+        XCTAssertEqual(sqlite.queryCount, 2, "a changed state database must be read again")
+    }
 }
 
 final class DevinUsageMapperTests: XCTestCase {
@@ -392,12 +414,14 @@ private final class FakeSQLite: SQLiteAccessing, @unchecked Sendable {
     var value: String?
     var lastPath: String?
     var lastSQL: String?
+    private(set) var queryCount = 0
 
     init(value: String? = nil) {
         self.value = value
     }
 
     func queryValue(path: String, sql: String) throws -> String? {
+        queryCount += 1
         lastPath = path
         lastSQL = sql
         return value
