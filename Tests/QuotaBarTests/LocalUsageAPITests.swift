@@ -241,3 +241,19 @@ final class LocalUsageServerRequestLineTests: XCTestCase {
         XCTAssertEqual(path, "/")
     }
 }
+
+final class LocalUsageServerLifecycleTests: XCTestCase {
+    @MainActor
+    func testServerStartAndStopCleansUpActiveConnections() async throws {
+        let testPort: UInt16 = 19842
+        let server = LocalUsageServer(port: testPort, state: {
+            LocalUsageAPI.State(enabledOrderedIDs: [], knownIDs: [], snapshots: [:])
+        })
+        server.start()
+        defer { server.stop() }
+
+        XCTAssertEqual(server.activeConnectionCount, 0)
+        server.stop()
+        XCTAssertEqual(server.activeConnectionCount, 0)
+    }
+}

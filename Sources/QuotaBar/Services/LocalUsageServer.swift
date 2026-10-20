@@ -11,12 +11,18 @@ final class LocalUsageServer {
     private static let maxConcurrentConnections = 16
     private static let headLimit = 8192
 
+    let port: UInt16
     private let state: @MainActor () -> LocalUsageAPI.State
     private let queue = DispatchQueue(label: "openusage.local-api")
     private var listener: NWListener?
-    private var activeConnections = 0
+    private var activeConnections: [ObjectIdentifier: (connection: NWConnection, timeout: DispatchWorkItem)] = [:]
 
-    init(state: @escaping @MainActor () -> LocalUsageAPI.State) {
+    var activeConnectionCount: Int {
+        activeConnections.count
+    }
+
+    init(port: UInt16 = LocalUsageServer.port, state: @escaping @MainActor () -> LocalUsageAPI.State) {
+        self.port = port
         self.state = state
     }
 
@@ -24,7 +30,7 @@ final class LocalUsageServer {
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
             host: "127.0.0.1",
-            port: NWEndpoint.Port(rawValue: Self.port)!
+            port: NWEndpoint.Port(rawValue: port)!
         )
 
         let listener: NWListener
@@ -50,13 +56,33 @@ final class LocalUsageServer {
         self.listener = listener
     }
 
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        for (_, (conn, timeout)) in activeConnections {
+            timeout.cancel()
+            conn.cancel()
+        }
+        activeConnections.removeAll()
+    }
+
     private func accept(_ connection: NWConnection) {
         connection.start(queue: queue)
-        guard activeConnections < Self.maxConcurrentConnections else {
+        guard activeConnections.count < Self.maxConcurrentConnections else {
             Self.send(LocalUsageAPI.busy, over: connection)
             return
         }
-        activeConnections += 1
+        let connID = ObjectIdentifier(connection)
+        let timeout = DispatchWorkItem { [weak self, weak connection] in
+            Task { @MainActor in
+                guard let self, let connection else { return }
+                guard self.activeConnections[connID] != nil else { return }
+                AppLog.debug(.localAPI, "connection timed out waiting for request head")
+                self.finish(connection, with: nil)
+            }
+        }
+        activeConnections[connID] = (connection, timeout)
+        queue.asyncAfter(deadline: .now() + .seconds(5), execute: timeout)
         receiveHead(connection, buffered: Data())
     }
 
@@ -108,7 +134,9 @@ final class LocalUsageServer {
     }
 
     private func finish(_ connection: NWConnection, with response: LocalUsageAPI.Response?) {
-        activeConnections -= 1
+        let connID = ObjectIdentifier(connection)
+        guard let (_, timeout) = activeConnections.removeValue(forKey: connID) else { return }
+        timeout.cancel()
         if let response {
             Self.send(response, over: connection)
         } else {
