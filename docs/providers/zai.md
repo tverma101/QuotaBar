@@ -42,7 +42,8 @@ export ZAI_API_KEY="YOUR_API_KEY"
 Two undocumented internal endpoints Z.ai's own subscription UI uses (stable in practice):
 
 - `GET https://api.z.ai/api/biz/subscription/list` — plan name (best-effort; a failure here doesn't
-  blank the meters).
+  blank the meters). The plan name changes about once a month, so it is read at most hourly (a manual
+  refresh re-reads it) and the last known name is kept when a request fails.
 - `GET https://api.z.ai/api/monitor/usage/quota/limit` — the quota meters.
 
 The quota response carries a `limits` array. Each `CREDIT_LIMIT` entry (called `TOKENS_LIMIT` in

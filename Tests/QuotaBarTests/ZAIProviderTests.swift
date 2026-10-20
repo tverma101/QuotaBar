@@ -358,6 +358,40 @@ final class ZAIProviderTests: XCTestCase {
         XCTAssertNil(snapshot.plan)
     }
 
+    func testPlanNameIsReadOnceAndKeptWhenTheRequestFails() async {
+        // The plan name changes about once a month; re-reading it on every refresh doubled the
+        // provider's request count, and a failed request used to drop the label from the card.
+        let clock = ZAIMutableClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let subscription = ZAIRequestCounter()
+        let provider = ZAIProvider(
+            authStore: makeAuthStore(key: "zai-test"),
+            usageClient: ZAIUsageClient(http: RoutingHTTPClient { request in
+                if request.url == ZAIUsageClient.quotaURL {
+                    return jsonResponse(quotaBothLimitsJSON)
+                }
+                subscription.value += 1
+                if subscription.failing {
+                    return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+                }
+                return jsonResponse(subscriptionJSON)
+            }),
+            now: { clock.value }
+        )
+
+        let first = await provider.refresh()
+        XCTAssertEqual(first.plan, "GLM Coding Max")
+
+        let second = await provider.refresh()
+        XCTAssertEqual(second.plan, "GLM Coding Max")
+        XCTAssertEqual(subscription.value, 1, "the plan name must not be re-read on every refresh")
+
+        subscription.failing = true
+        clock.value = clock.value.addingTimeInterval(ZAIProvider.planCacheInterval + 60)
+        let third = await provider.refresh()
+        XCTAssertEqual(third.plan, "GLM Coding Max", "a failed plan request must not drop the label")
+        XCTAssertEqual(subscription.value, 2)
+    }
+
     func testRefreshWithoutKeyReportsNotLoggedIn() async {
         let provider = ZAIProvider(
             authStore: ZAIAuthStore(files: FakeFiles(), environment: FakeEnvironment()),
@@ -489,4 +523,19 @@ final class ZAIProviderTests: XCTestCase {
 
 private func jsonResponse(_ jsonString: String) -> HTTPResponse {
     HTTPResponse(statusCode: 200, headers: [:], body: Data(jsonString.utf8))
+}
+
+/// A clock a test can move forward.
+private final class ZAIMutableClock: @unchecked Sendable {
+    var value: Date
+
+    init(_ value: Date) {
+        self.value = value
+    }
+}
+
+/// A request counter a test can also make fail.
+private final class ZAIRequestCounter: @unchecked Sendable {
+    var value = 0
+    var failing = false
 }

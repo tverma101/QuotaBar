@@ -3,6 +3,56 @@ import XCTest
 
 @MainActor
 final class GrokProviderTests: XCTestCase {
+    func testPlanLabelIsReadOnceAndSurvivesAFailedRefresh() async {
+        let clock = MutableClock(OpenUsageISO8601.date(from: "2026-02-02T01:00:00.000Z")!)
+        let files = FakeFiles([
+            GrokAuthStore.authPath: """
+            {
+              "https://auth.x.ai::client": {
+                "key": "valid-token",
+                "oidc_client_id": "client-id",
+                "expires_at": "2026-06-01T00:00:00.000Z"
+              }
+            }
+            """
+        ])
+        let settings = RequestCounter()
+        let httpClient = RecordingHTTPClient { request in
+            if request.url == GrokUsageClient.creditsConfigURL {
+                return HTTPResponse(statusCode: 200, headers: [:], body: GrokCreditsFixtures.capturedResponseBody)
+            }
+            if request.url == GrokUsageClient.settingsURL {
+                settings.value += 1
+                if settings.failing {
+                    return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+                }
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"subscription_tier_display":"SuperGrok Heavy"}"#.utf8))
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+        let provider = GrokProvider(
+            authStore: GrokAuthStore(files: files, now: { clock.value }),
+            usageClient: GrokUsageClient(httpClient: httpClient),
+            logUsageScanner: noLogScanner(),
+            now: { clock.value },
+            pricing: { TestPricing.bundled }
+        )
+
+        let first = await provider.refresh()
+        XCTAssertEqual(first.plan, "SuperGrok Heavy")
+
+        let second = await provider.refresh()
+        XCTAssertEqual(second.plan, "SuperGrok Heavy")
+        XCTAssertEqual(settings.value, 1, "the plan label must not be re-read on every refresh")
+
+        // Once the label is due again, a failed request keeps the last good one.
+        settings.failing = true
+        clock.value = clock.value.addingTimeInterval(GrokProvider.planCacheInterval + 60)
+        let third = await provider.refresh()
+        XCTAssertEqual(third.plan, "SuperGrok Heavy", "a failed plan request must not drop the label")
+        XCTAssertEqual(settings.value, 2)
+    }
+
     func testRefreshFormEncodesReservedCharactersInRequestBody() async throws {
         let httpClient = RecordingHTTPClient { _ in
             HTTPResponse(statusCode: 200, headers: [:], body: Data())
@@ -584,6 +634,21 @@ private final class RecordingHTTPClient: HTTPClient, @unchecked Sendable {
         requests.append(request)
         return try handler(request)
     }
+}
+
+/// A clock a test can move forward.
+private final class MutableClock: @unchecked Sendable {
+    var value: Date
+
+    init(_ value: Date) {
+        self.value = value
+    }
+}
+
+/// A request counter a test can also make fail.
+private final class RequestCounter: @unchecked Sendable {
+    var value = 0
+    var failing = false
 }
 
 private final class ThreadRecordingGrokFiles: TextFileAccessing, @unchecked Sendable {
