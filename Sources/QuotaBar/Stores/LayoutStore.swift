@@ -652,7 +652,13 @@ final class LayoutStore {
         }
         let orderedIDs = Set(ordered.map(\.id))
         ordered.append(contentsOf: placed.filter { !orderedIDs.contains($0.id) })
-        placed = ordered
+        // Only republish when the order actually changed. `placed` is observable and drives the
+        // dashboard grouping and the refresh loop's provider selection, so a no-op layout change
+        // re-rendered every layout observer for nothing. The persist still runs: the *set* of
+        // widgets may have changed even when the order did not.
+        if ordered != placed {
+            placed = ordered
+        }
         if persistChanges { persist() }
     }
 
