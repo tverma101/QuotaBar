@@ -1,6 +1,13 @@
 import Foundation
 import os
 
+/// Test instrumentation: how many cancellation-grace tasks are alive right now.
+///
+/// A grace task used to keep sleeping for the full grace period after the provider answered,
+/// holding the continuation, the claim and — through the work task — the provider's in-flight
+/// snapshot. Every provider refresh left one behind.
+let liveRefreshGraceTaskCount = OSAllocatedUnfairLock(initialState: 0)
+
 /// Runs one provider's `refresh()` under a hard deadline (#1081).
 ///
 /// A provider that never returns — a subprocess that doesn't exit, a credential read that blocks — used
@@ -31,6 +38,7 @@ enum ProviderRefreshDeadline {
             await provider.refresh()
         }
         let claim = ContinuationClaim()
+        let grace = GraceTaskHandle()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<ProviderSnapshot?, Never>) in
                 // Detached, so a busy MainActor can't delay the one thing that bounds the wait.
@@ -43,13 +51,20 @@ enum ProviderRefreshDeadline {
                     Task.detached {
                         _ = await work.value
                         guard claim.finishTimeout() else { return }
+                        // The provider answered: the grace sleep has no reason to outlive it. Without
+                        // this the grace task kept sleeping for the whole grace period, holding the
+                        // continuation and the provider's in-flight snapshot.
+                        grace.cancel()
                         continuation.resume(returning: nil)
                     }
-                    Task.detached {
+                    liveRefreshGraceTaskCount.withLock { $0 += 1 }
+                    let graceTask = Task.detached {
+                        defer { liveRefreshGraceTaskCount.withLock { $0 -= 1 } }
                         try? await Task.sleep(for: .seconds(Self.cancellationGraceSeconds))
                         guard claim.finishTimeout() else { return }
                         continuation.resume(returning: nil)
                     }
+                    grace.store(graceTask)
                 }
                 Task { @MainActor in
                     let snapshot = await work.value
@@ -65,6 +80,35 @@ enum ProviderRefreshDeadline {
             // otherwise a cancelled refresh pass would leave its provider work running.
             work.cancel()
         }
+    }
+}
+
+/// Holds the cancellation-grace task so the winner of the claim can cancel it.
+///
+/// The handle remembers a cancel that arrives before the task exists, so the grace sleep never
+/// outlives the refresh no matter which of the two racers gets there first.
+private final class GraceTaskHandle: @unchecked Sendable {
+    private struct State {
+        var task: Task<Void, Never>?
+        var cancelled = false
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func store(_ task: Task<Void, Never>) {
+        let cancelNow = state.withLock { state -> Bool in
+            state.task = task
+            return state.cancelled
+        }
+        if cancelNow { task.cancel() }
+    }
+
+    func cancel() {
+        let task = state.withLock { state -> Task<Void, Never>? in
+            state.cancelled = true
+            return state.task
+        }
+        task?.cancel()
     }
 }
 
