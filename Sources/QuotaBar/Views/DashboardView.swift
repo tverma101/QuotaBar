@@ -473,8 +473,8 @@ struct DashboardView: View {
                         height: Self.topBarHeight,
                         horizontalPadding: Self.footerHorizontalPadding,
                         onResetAll: {
-                            layout.resetToDefault()
                             container.reseedEnabledProviders()
+                            layout.resetToDefault()
                         },
                         isPresentingResetAllConfirm: $isPresentingResetAllConfirm
                     )

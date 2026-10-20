@@ -2,6 +2,8 @@ import Foundation
 
 @MainActor
 final class FreebuffProvider: ProviderRuntime {
+    private static let usageFailureDiagnosticPrefix = "auth.freebuff.usage.failure."
+
     let provider = Provider(
         id: "freebuff",
         displayName: "Freebuff",
@@ -13,16 +15,25 @@ final class FreebuffProvider: ProviderRuntime {
 
     let authStore: FreebuffAuthStore
     let usageClient: FreebuffUsageClient
+    let historyScanner: FreebuffDesktopUsageScanner
+    let modelCatalog: FreebuffModelCatalog
+    let pricing: @Sendable () async -> ModelPricing
     let now: @Sendable () -> Date
 
     init(
+        historyScanner: FreebuffDesktopUsageScanner = FreebuffDesktopUsageScanner(),
         authStore: FreebuffAuthStore = FreebuffAuthStore(),
         usageClient: FreebuffUsageClient = FreebuffUsageClient(),
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        modelCatalog: FreebuffModelCatalog = FreebuffModelCatalog(),
+        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
     ) {
         self.authStore = authStore
+        self.historyScanner = historyScanner
         self.usageClient = usageClient
         self.now = now
+        self.modelCatalog = modelCatalog
+        self.pricing = pricing
     }
 
     var widgetDescriptors: [WidgetDescriptor] {
@@ -32,7 +43,8 @@ final class FreebuffProvider: ProviderRuntime {
                 .hidingWhenEmpty(),
             .boundedCount(id: "freebuff.daily", provider: provider, title: "Daily",
                           metricLabel: "Daily", limit: 1, suffix: "sessions",
-                          periodDurationMs: MetricPeriod.dayMs),
+                          periodDurationMs: MetricPeriod.dayMs)
+                .hidingWhenEmpty(),
             .boundedCount(id: "freebuff.weekly", provider: provider, title: "Weekly",
                           metricLabel: "Weekly", limit: 1, suffix: "sessions",
                           periodDurationMs: MetricPeriod.weekMs)
@@ -42,7 +54,8 @@ final class FreebuffProvider: ProviderRuntime {
                           periodDurationMs: FreebuffUsageMapper.fiveDayPeriodMs)
                 .hidingWhenEmpty(),
             .boundedCount(id: "freebuff.monthly", provider: provider, title: "Monthly",
-                          metricLabel: "Monthly", limit: 1, suffix: "sessions"),
+                          metricLabel: "Monthly", limit: 1, suffix: "sessions")
+                .hidingWhenEmpty(),
             .boundedCount(id: "freebuff.premiumSessions", provider: provider, title: "Premium Sessions",
                           metricLabel: "Premium Sessions", limit: 1, suffix: "sessions",
                           periodDurationMs: MetricPeriod.dayMs)
@@ -51,17 +64,19 @@ final class FreebuffProvider: ProviderRuntime {
                           metricLabel: "Free Premium Sessions", limit: 1, suffix: "sessions",
                           periodDurationMs: MetricPeriod.dayMs)
                 .hidingWhenEmpty(),
-            .boundedCount(id: "freebuff.freebucksDaily", provider: provider, title: "Freebucks Daily",
-                          metricLabel: "Freebucks Daily", limit: 1, suffix: "Freebucks",
+            .boundedCount(id: "freebuff.freebucksDaily", provider: provider, title: "Daily Hours",
+                          metricLabel: "Daily Hours", limit: 1, suffix: "hours",
                           periodDurationMs: MetricPeriod.dayMs)
                 .hidingWhenEmpty(),
-            .values(id: "freebuff.freebucksBalance", provider: provider, title: "Freebucks Balance",
-                    metricLabel: "Freebucks Balance", selection: .kind(.count))
-                .hidingWhenEmpty(),
+            .values(id: "freebuff.freebucksBalance", provider: provider, title: "Hours Balance",
+                    metricLabel: "Hours Balance", selection: .kind(.count))
+                .hidingWhenEmpty()
+                .exportingHistory(scope: .machineLocal, estimatedCost: true,
+                                  sourceNote: Self.historySourceNote),
             .values(id: "freebuff.monthlySpend", provider: provider, title: "Monthly Spend",
                     metricLabel: "Monthly Spend", selection: .kind(.dollars), valueWord: "spent")
                 .hidingWhenEmpty()
-        ]
+        ] + WidgetDescriptor.spendTiles(provider: provider)
     }
 
     func hasLocalCredentials() async -> Bool {
@@ -69,6 +84,46 @@ final class FreebuffProvider: ProviderRuntime {
     }
 
     func refresh() async -> ProviderSnapshot {
+        let snapshot: ProviderSnapshot
+        if ProviderRefreshContext.scope.suppressesLiveQuota {
+            snapshot = .make(provider: provider, plan: nil, lines: [], refreshedAt: now())
+        } else {
+            snapshot = await refreshQuota()
+        }
+        guard !ProviderRefreshContext.scope.skipsLocalAccounting, !Task.isCancelled else { return snapshot }
+        var result = snapshot
+        do {
+            let scanNow = now()
+            let catalog = await modelCatalog.current()
+            if let scan = try await historyScanner.scan(now: scanNow, pricing: pricing(), modelCatalog: catalog) {
+                DiagnosticGate.clearFailure("auth.freebuff.history.failure")
+                let usage = scan.usage
+                result.usageHistory = ProviderUsageHistory(
+                    series: usage.series, modelUsage: usage.modelUsage,
+                    unknownModelsByDay: usage.unknownModelsByDay, apiEstimateByDay: usage.apiEstimateByDay,
+                    partialDays: scan.partialDays, estimatedCostDays: usage.estimatedCostDays
+                )
+                SpendTileMapper.appendTokenUsage(
+                    usage.series, to: &result.lines, now: scanNow, estimated: true,
+                    unknownModelsByDay: usage.unknownModelsByDay,
+                    modelUsage: usage.modelUsage,
+                    modelSourceNote: Self.historySourceNote,
+                    partialDays: scan.partialDays,
+                    apiEstimateByDay: usage.apiEstimateByDay, estimatedCostDays: usage.estimatedCostDays
+                )
+            }
+        } catch is CancellationError {
+            return cancelledRefreshSnapshot(provider: provider)
+        } catch {
+            DiagnosticGate.logOnce(for: "auth.freebuff.history.failure") {
+                AppLog.warn(LogTag.auth("freebuff"), "local token history read failed: \(error.localizedDescription)")
+            }
+            result.warning = FreebuffUsageError.localHistoryUnreadable.localizedDescription
+        }
+        return result
+    }
+
+    private func refreshQuota() async -> ProviderSnapshot {
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         let auth: FreebuffAuth
         do {
@@ -89,6 +144,7 @@ final class FreebuffProvider: ProviderRuntime {
         do {
             let response = try await usageClient.fetchSession(auth: auth)
             if Task.isCancelled { return cancelledRefreshSnapshot(provider: provider) }
+            DiagnosticGate.clearFailure(Self.usageFailureDiagnosticKey(FreebuffUsageError.connectionFailed))
             if response.statusCode == 401 {
                 return ProviderSnapshot.error(provider: provider, error: FreebuffAuthError.tokenInvalid)
             }
@@ -96,12 +152,37 @@ final class FreebuffProvider: ProviderRuntime {
                 return ProviderSnapshot.error(provider: provider, error: FreebuffUsageError.requestFailed(response.statusCode))
             }
             let mapped = try FreebuffUsageMapper.map(response: response)
-            return ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines, refreshedAt: now())
+            DiagnosticGate.clearFailures(prefix: Self.usageFailureDiagnosticPrefix)
+            var result = ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines,
+                                         refreshedAt: now(), clearsPriorMenuBarQuotaState: true)
+            if try await historyScanner.hasHistory() {
+                do {
+                    try await modelCatalog.refresh(auth: auth, client: usageClient, now: now())
+                    DiagnosticGate.clearFailure("auth.freebuff.catalog.failure")
+                } catch is CancellationError { throw CancellationError() }
+                catch {
+                    DiagnosticGate.logOnce(for: "auth.freebuff.catalog.failure") {
+                        AppLog.warn(LogTag.auth("freebuff"), "model catalogue refresh failed: \(error.localizedDescription)")
+                    }
+                    result.warning = "Freebuff model names couldn't be refreshed. Saved model data is still available."
+                }
+            }
+            return result
         } catch is CancellationError {
             return cancelledRefreshSnapshot(provider: provider)
         } catch {
-            AppLog.warn(LogTag.auth("freebuff"), "usage refresh failed: \(error.localizedDescription)")
+            DiagnosticGate.logOnce(
+                for: Self.usageFailureDiagnosticKey(error)
+            ) {
+                AppLog.warn(LogTag.auth("freebuff"), "usage refresh failed: \(error.localizedDescription)")
+            }
             return ProviderSnapshot.error(provider: provider, error: error)
         }
+    }
+
+    private static let historySourceNote = "Measured Freebuff Desktop tokens on this Mac. Dollars estimate the same tokens at OpenRouter API rates, not Freebuff charges. Older turns use the thread's saved model selection; it can differ from past serving models and subagents. Unresolved models remain Unattributed or unpriced. Cache reads are included in input; aggregate turns do not use single-request context tiers."
+
+    private static func usageFailureDiagnosticKey(_ error: Error) -> String {
+        usageFailureDiagnosticPrefix + String(reflecting: type(of: error))
     }
 }

@@ -51,8 +51,8 @@ final class AppContainer {
     /// while multiple Codex accounts are active because the existing UI has no account selector for
     /// that write; reads remain fully account-scoped.
     let codexResetClaim: CodexResetClaimService?
-    /// The provider runtimes, kept so on-demand credential detection (the Customize "Reset All" reseed)
-    /// can re-probe `hasLocalCredentials()` the same way first-run seeding does.
+    /// Provider runtimes, kept so Customize's Reset All can restore the owner-selected default set and
+    /// register the current provider IDs.
     private let providers: [ProviderRuntime]
     /// Shared with the enablement callback so turning off the final Codex card disarms ledger watches
     /// immediately, without waiting for the periodic refresh loop to consume its buffered wake.
@@ -61,10 +61,9 @@ final class AppContainer {
     private let localAPI: LocalUsageServer
     // A `let` of a `Sendable` `Task` is implicitly nonisolated, so the nonisolated `deinit` can cancel it.
     private let refreshTask: Task<Void, Never>
-    /// The fresh-install credential-detection pass (see `FirstRunSeeder`); `nil` on every later launch.
+    /// Synchronous fresh-install provider seeding (`FirstRunSeeder`); nil when no seeding is needed.
     private let seedTask: Task<Void, Never>?
-    /// The new-provider credential-detection pass (see `NewProviderSeeder`); `nil` unless this launch is
-    /// the first with a provider the install has never seen.
+    /// Synchronous registry bookkeeping (`NewProviderSeeder`); it never starts a credential probe.
     private let newProviderTask: Task<Void, Never>?
     /// Persists a fresh `ShellEnvironmentSnapshot` once the login-shell capture completes, so the next
     /// launch can read shell-exported facts (provider home overrides) even when its own capture is slow.
@@ -74,7 +73,18 @@ final class AppContainer {
 
     /// `isFreshInstall` must be captured by the caller BEFORE `SettingsMigrator.migrate()` runs (the
     /// migrator's schema stamp makes the defaults domain non-empty). See `AppDelegate`.
-    init(isFreshInstall: Bool = false, accountDiscovery: ProviderAccountDiscovery) {
+    init(
+        isFreshInstall: Bool = false,
+        accountDiscovery: ProviderAccountDiscovery,
+        accountAssembly: ProviderAccountAssembly,
+        cursorHistoryIdentityKey: String? = nil,
+        antigravityIdentityKey: String = AntigravityAuthStore.unresolvedCacheIdentityKey,
+        openCodeGoAccountIdentities: [OpenCodeGoAccountIdentity]? = nil,
+        openCodeGoAccountInventory: OpenCodeGoAccountInventory? = nil,
+        onOpenCodeGoKeysChanged: @escaping @MainActor () -> Void = {},
+        onOpenCodeEnablementRequiresCatalogReload: @escaping @MainActor () -> Void = {},
+        onClaudeEnablementRequiresCatalogReload: @escaping @MainActor () -> Void = {}
+    ) {
         // Capture the user's login-shell environment off-main so provider keys exported in a shell
         // profile (e.g. OPENROUTER_API_KEY) resolve in a Finder/Dock-launched build, not only when
         // run from a terminal. Warmed here so the first refresh finds the cache ready.
@@ -88,46 +98,48 @@ final class AppContainer {
             preNormalizedHomes: accountDiscovery.registeredCodexHomes
         )
         let codexAccountRegistration = CodexAccountRegistrationService(accounts: codexAccounts)
-        let accountAssembly = ProviderAccountAssembly.make(
-            observer: DefaultAccountObserver(),
-            accountsStore: ProviderAccountsStore(),
-            precomputedDiscovery: accountDiscovery
-        )
-
         let enablement = ProviderEnablementStore()
+        if !accountAssembly.claudeCards.isEmpty,
+           !accountAssembly.claudeCards.contains(where: { $0.id == "claude" })
+        {
+            _ = enablement.transferEnabledGenericClaudeFamily(
+                to: accountAssembly.claudeCards.map(\.id)
+            )
+        }
+        let hasPreloadedOpenCodeAccountInventory = openCodeGoAccountInventory != nil
+            || openCodeGoAccountIdentities != nil
         let providers = ProviderCatalog.make(
             claudeCards: accountAssembly.claudeCards,
             codexCards: accountAssembly.codexCards,
             claudeIdentityKeys: accountAssembly.identityKeysByCard,
+            claudeDesktopKeyCache: accountAssembly.desktopKeyCache,
+            codexDefaultIdentityKey: accountAssembly.identityKeysByCard["codex"],
+            codexDefaultHome: accountAssembly.defaultCodexHome,
             codexLogHomes: codexAccounts.registeredHomes,
+            openCodeGoAccountIdentities: openCodeGoAccountIdentities,
+            openCodeGoAccountInventory: openCodeGoAccountInventory,
+            openCodeAccountInventoryDeferred: !hasPreloadedOpenCodeAccountInventory,
+            onOpenCodeGoKeysChanged: onOpenCodeGoKeysChanged,
             isProviderEnabled: { [enablement] in enablement.isEnabled($0) }
         )
         let registry = WidgetRegistry.from(providers)
         let apiKeyProviders = providers.compactMap { $0 as? any APIKeyManaging }
         let goKeyProviders = providers.compactMap { $0 as? any GoKeyManaging }
         let notificationSettings = NotificationSettingsStore()
-        let additionalAccountIDsByFamily = Dictionary(grouping: providers.map(\.provider.id).filter { id in
-            let family = ProviderAccountID.family(of: id)
-            return id != family && ProviderAccountID.families.contains(family)
-        }, by: ProviderAccountID.family)
-        let accountDefaults: ([String]) -> [String] = { metricIDs in
-            metricIDs.flatMap { metricID -> [String] in
-                guard let separator = metricID.firstIndex(of: ".") else { return [metricID] }
-                let family = String(metricID[..<separator])
-                guard let additionalIDs = additionalAccountIDsByFamily[family], !additionalIDs.isEmpty else {
-                    return [metricID]
-                }
-                let suffix = metricID[separator...]
-                return [metricID] + additionalIDs.map { "\($0)\(suffix)" }
-            }
-        }
         let layout = LayoutStore(
             registry: registry,
-            defaultMetricIDs: accountDefaults(DefaultLayout.metricIDs),
-            defaultPinnedMetricIDs: accountDefaults(DefaultLayout.pinnedMetricIDs),
-            defaultExpandedMetricIDs: accountDefaults(DefaultLayout.expandedMetricIDs),
+            defaultMetricIDs: Self.accountScopedDefaults(DefaultLayout.metricIDs, registry: registry),
+            defaultPinnedMetricIDs: Self.accountScopedDefaults(DefaultLayout.pinnedMetricIDs, registry: registry),
+            defaultExpandedMetricIDs: Self.accountScopedDefaults(DefaultLayout.expandedMetricIDs, registry: registry),
             isProviderEnabled: { [enablement] in enablement.isEnabled($0) }
         )
+        var providerIdentityKeys = accountAssembly.identityKeysByCard
+        providerIdentityKeys["cursor"] = cursorHistoryIdentityKey
+            ?? "cursor-unresolved-\(UUID().uuidString)"
+        providerIdentityKeys["antigravity"] = antigravityIdentityKey
+        if let openCodeGoAccountInventory {
+            providerIdentityKeys["opencode"] = openCodeGoAccountInventory.cacheIdentityKey
+        }
         let dataStore = WidgetDataStore(
             registry: registry,
             providers: providers,
@@ -135,7 +147,7 @@ final class AppContainer {
             orderedDescriptors: { [layout] in layout.visiblePlaced.compactMap { layout.descriptor(for: $0) } },
             pinnedMetricIDs: { [layout] in layout.pinnedMetricIDs },
             notificationSettings: { notificationSettings },
-            providerIdentityKeys: accountAssembly.identityKeysByCard
+            providerIdentityKeys: providerIdentityKeys
         )
         let iCloudSync = ICloudUsageSyncStore(dataStore: dataStore)
         let ledgerWatcher = CodexRouterLedgerWatcher(
@@ -144,13 +156,26 @@ final class AppContainer {
         // Re-enabling a provider should fetch it promptly, so clear any leftover failure backoff before
         // the enablement wake refreshes. `weak` breaks the cycle (dataStore already captures enablement).
         enablement.onProviderEnabled = { [weak dataStore] id in dataStore?.clearFailureBackoff(for: id) }
-        enablement.onChange = { [weak dataStore, weak iCloudSync, weak ledgerWatcher] changedProviderIDs in
+        enablement.onChange = { [weak dataStore, weak iCloudSync, weak ledgerWatcher, weak enablement] changedProviderIDs in
             dataStore?.providerEnablementDidChange(changedProviderIDs: changedProviderIDs)
             iCloudSync?.scheduleWrite()
             ledgerWatcher?.setEnabled(dataStore?.hasEnabledProviderFamily("codex") ?? false)
+            if !hasPreloadedOpenCodeAccountInventory,
+               changedProviderIDs.contains("opencode"),
+               enablement?.isEnabled("opencode") == true
+            {
+                onOpenCodeEnablementRequiresCatalogReload()
+            }
+            if accountDiscovery.didSkipClaudeDesktopDiscovery,
+               changedProviderIDs.contains(where: {
+                   ProviderAccountID.family(of: $0) == "claude"
+                       && enablement?.isEnabled($0) == true
+               })
+            {
+                onClaudeEnablementRequiresCatalogReload()
+            }
         }
-        // Fresh installs start minimal: seed the enabled-provider list (Claude/Codex/Cursor right away,
-        // then the detected set once the local credential probe finishes). No-op on every later launch.
+        // Fresh installs start with the owner-selected defaults; no provider credential scan is needed.
         let onboarding = OnboardingStore()
         self.seedTask = FirstRunSeeder.seedIfNeeded(
             isFreshInstall: isFreshInstall,
@@ -158,9 +183,8 @@ final class AppContainer {
             enablement: enablement,
             onboarding: onboarding
         )
-        // Providers added by an update get the same credential detection on their first launch — enabled
-        // only when the user actually has the tool. Runs every launch; a no-op unless the registry has a
-        // provider this install has never seen (fresh installs were just baselined by FirstRunSeeder).
+        // Providers added by an update are registered for Customize but remain off. Runs every launch;
+        // fresh installs were just baselined by FirstRunSeeder.
         self.newProviderTask = NewProviderSeeder.reconcileIfNeeded(
             providers: providers,
             enablement: enablement
@@ -188,6 +212,7 @@ final class AppContainer {
             CodexResetClaimService(
                 authStore: codex.authStore,
                 usageClient: codex.usageClient,
+                allowsKeychainFallback: codex.allowsKeychainFallback,
                 refreshAfterClaim: { [weak dataStore] in
                     // The bound must outlast the provider's slowest refresh: usage fetch (10s timeout)
                     // + token refresh (15s) + usage retry (10s) + reset-credit fetch (10s) ≈ 45s. The
@@ -284,6 +309,38 @@ final class AppContainer {
         }
     }
 
+    /// Copies each family metric onto registered account cards and each OpenCode cap onto the
+    /// configured account-specific descriptors. The registry is the single source for the account
+    /// inventory, so new OpenCode keys added during this run become placed by the same default seeder.
+    static func accountScopedDefaults(_ metricIDs: [String], registry: WidgetRegistry) -> [String] {
+        let additionalAccountIDsByFamily = Dictionary(
+            grouping: registry.providers.map(\.id).filter { id in
+                let family = ProviderAccountID.family(of: id)
+                return id != family && ProviderAccountID.families.contains(family)
+            },
+            by: ProviderAccountID.family
+        )
+        let additionalOpenCodeMetricIDsByMetricID = Dictionary(
+            grouping: registry.descriptors.compactMap { descriptor -> (String, String)? in
+                guard let marker = descriptor.id.range(of: ".account.") else { return nil }
+                return (String(descriptor.id[..<marker.lowerBound]), descriptor.id)
+            },
+            by: { $0.0 }
+        ).mapValues { $0.map(\.1) }
+
+        return metricIDs.flatMap { metricID -> [String] in
+            guard let separator = metricID.firstIndex(of: ".") else { return [metricID] }
+            let family = String(metricID[..<separator])
+            var accountMetricIDs = [metricID]
+            if let additionalIDs = additionalAccountIDsByFamily[family], !additionalIDs.isEmpty {
+                let suffix = metricID[separator...]
+                accountMetricIDs += additionalIDs.map { "\($0)\(suffix)" }
+            }
+            accountMetricIDs += additionalOpenCodeMetricIDsByMetricID[metricID] ?? []
+            return accountMetricIDs
+        }
+    }
+
     deinit {
         refreshTask.cancel()
         seedTask?.cancel()
@@ -292,12 +349,22 @@ final class AppContainer {
         memoryPressureSource.cancel()
     }
 
-    /// Re-runs first-launch credential detection on demand — the enablement half of the Customize
-    /// "Reset All" action (`LayoutStore.resetToDefault` handles metrics, order, pins, and expansion).
-    /// Delegates to `FirstRunSeeder.reseed`; returns its detection task so callers can await it.
+    /// Restores the owner-selected default enabled-provider set for Customize's "Reset All" action
+    /// (`LayoutStore.resetToDefault` handles metrics, order, pins, and expansion).
+    /// Delegates to `FirstRunSeeder.reseed`; the returned task is completed after synchronous updates.
     @discardableResult
     func reseedEnabledProviders() -> Task<Void, Never> {
         FirstRunSeeder.reseed(providers: providers, enablement: enablement)
+    }
+
+    /// Stop work owned by the old account registry before a replacement store starts refreshing.
+    /// OpenCode key inventory changes also invalidate its quota meters: the new descriptor label may
+    /// be the same while the credential behind that label has rotated.
+    func prepareForProviderCatalogReload(invalidateOpenCodeQuota: Bool = false) {
+        if invalidateOpenCodeQuota {
+            dataStore.invalidateQuotaStateForCatalogReload(providerID: "opencode")
+        }
+        dataStore.cancelActiveProviderRefreshesForCatalogReload()
     }
 
     /// The Settings "Reset All Settings" action: restores every user preference the container owns to
@@ -309,10 +376,12 @@ final class AppContainer {
     /// Launch at Login lives outside the container (in the system's login-item registry); the
     /// Settings screen resets that alongside this call.
     func resetAllSettings() {
+        // Persist the provider-reset intent before touching any other settings so a crash during this
+        // action cannot leave credential-detected optional providers enabled on the next launch.
+        reseedEnabledProviders()
         layout.resetToDefault()
         // The menu-bar Icon Style is a Settings preference, not part of the Customize layout reset.
         layout.menuBarStyle = .text
-        reseedEnabledProviders()
         // Registered Codex homes are account data, not a presentation setting. Keep them intact when
         // Reset All Settings runs; an account can only be removed through its explicit account action.
         dataStore.resetDisplaySettings()
@@ -345,8 +414,8 @@ final class AppContainer {
     /// Between passes the loop waits via `RefreshWakeSignal` for only the remaining time until the next
     /// quota deadline. It also wakes early for provider enablement, panel visibility, ledger, and external
     /// refresh notifications. The signal subscribes BEFORE the first pass and buffers, so a change that
-    /// lands during a pass (first-run credential detection, `NewProviderSeeder`, or Customize's
-    /// "Reset All" reseed) is never lost. Early passes still honor the cache and per-provider failure
+    /// lands during a pass (a provider toggle, registry bookkeeping, or Customize's "Reset All" reseed)
+    /// is never lost. Early passes still honor the cache and per-provider failure
     /// backoff.
     ///
     /// Wake subscriptions are limited to relevant named changes — not the firehose
@@ -397,7 +466,8 @@ final class AppContainer {
         transparency: PopoverTransparencyStore,
         ledgerWatcher: CodexRouterLedgerWatcher
     ) -> Task<Void, Never> {
-        Task {
+        ProviderRefreshContext.withBackgroundContext {
+            Task {
             let wakeSignal = RefreshWakeSignal(names: [
                 ProviderEnablementStore.didChangeNotification,
                 CodexRouterLedgerWatcher.didChangeNotification,
@@ -738,6 +808,7 @@ final class AppContainer {
                         "resuming deferred provider refresh (\(request.providerID), scope=\(WidgetDataStore.batchScopeLabel(request.scope)))"
                     )
                 }
+            }
             }
         }
     }

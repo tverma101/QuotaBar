@@ -40,8 +40,7 @@ struct ClaudeCredentialState: Hashable, Sendable {
     var inferenceOnly: Bool
 
     /// Whether this candidate carries a non-blank access token — the single definition of "usable"
-    /// shared by `refresh()`'s candidate filter and `hasLocalCredentials()`'s first-run detection, so
-    /// the two can never drift.
+    /// shared by refresh's candidate filter and the optional local credential probe.
     var hasUsableAccessToken: Bool {
         oauth.accessToken?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
@@ -105,8 +104,8 @@ struct ClaudeCredentialLoad: Sendable {
     var keychainReadFailed: Bool
     /// A canceled or superseded Keychain read must stop before fallback sources are probed.
     var keychainReadCancelled: Bool
-    /// A file read failure is distinct from an absent or malformed login. This keeps Claude enabled
-    /// during first-run detection and lets refresh show a repair message instead of "Not logged in."
+    /// A file read failure is distinct from an absent or malformed login. A selected Claude card can
+    /// then show a repair message instead of incorrectly reporting "Not logged in."
     var credentialsFileUnreadable: Bool
     /// A present, readable file did not contain a usable Claude OAuth access token.
     var credentialsFileInvalid: Bool

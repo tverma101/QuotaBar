@@ -41,7 +41,7 @@ enum ProviderRefreshDeadline {
                     // Return as soon as cooperative work stops. Only a provider that ignores
                     // cancellation keeps the store waiting through the bounded grace period.
                     Task.detached {
-                        await work.value
+                        _ = await work.value
                         guard claim.finishTimeout() else { return }
                         continuation.resume(returning: nil)
                     }

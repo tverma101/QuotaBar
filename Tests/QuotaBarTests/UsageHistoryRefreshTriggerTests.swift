@@ -42,7 +42,11 @@ private final class HistoryTriggerRuntime: ProviderRuntime {
 
     init(id: String) {
         provider = Provider(id: id, displayName: id.capitalized, icon: .providerMark(id))
-        widgetDescriptors = []
+        widgetDescriptors = [WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: false,
+            sourceNote: "test"
+        )]
     }
 
     func refresh() async -> ProviderSnapshot {

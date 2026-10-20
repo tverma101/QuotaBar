@@ -7,7 +7,7 @@ Tracks your Devin quota using the login from the Devin CLI or the Devin app.
 | Metric | Meaning |
 |---|---|
 | Weekly | Weekly quota used (falls back to the daily figure when Devin reports no weekly quota) |
-| Daily | Daily quota used (hidden when Devin hides the daily quota) |
+| Daily | Daily quota used (hidden by default when Devin does not return a daily quota; an explicit Customize opt-in keeps the empty state visible) |
 | Extra Balance | Overage/extra-usage balance in dollars |
 
 When Devin reports your plan name, QuotaBar shows it beside the provider name.

@@ -71,6 +71,82 @@ final class LocalUsageAPITests: XCTestCase {
         XCTAssertTrue(text.keys.contains("subtitle"))
     }
 
+    func testLegacyWireKeepsKnownSubtotalAndMarksUnknownModelsPartial() throws {
+        var state = makeState()
+        let refreshedAt = OpenUsageISO8601.date(from: "2026-03-26T11:16:29.000Z")!
+        state.snapshots["claude"] = ProviderSnapshot(
+            providerID: "claude",
+            displayName: "Claude",
+            plan: "Pro",
+            lines: [.values(
+                label: "Today",
+                values: [
+                    MetricValue(number: 5.17, kind: .dollars),
+                    MetricValue(number: 9_200_000, kind: .count, label: "tokens")
+                ],
+                unknownModels: ["opaque-model"]
+            )],
+            refreshedAt: refreshedAt
+        )
+
+        let response = LocalUsageAPI.respond(method: "GET", path: "/v1/usage/claude", state: state)
+        let object = try XCTUnwrap((try json(response.body) as? [[String: Any]])?.first)
+        let line = try XCTUnwrap((object["lines"] as? [[String: Any]])?.first)
+
+        XCTAssertEqual(line["value"] as? String, "$5.17 · 9.2M tokens",
+                       "keep the known priced subtotal while marking the line partial")
+        XCTAssertEqual(line["partial"] as? Bool, true)
+    }
+
+    func testWireMarksAnActiveSessionSpendLinePartial() throws {
+        var state = makeState()
+        let refreshedAt = OpenUsageISO8601.date(from: "2026-03-26T11:16:29.000Z")!
+        state.snapshots["claude"] = ProviderSnapshot(
+            providerID: "claude",
+            displayName: "Claude",
+            plan: "Pro",
+            lines: [.values(label: "Today", values: [
+                MetricValue(number: 5.17, kind: .dollars, isPartial: true),
+                MetricValue(number: 9_200_000, kind: .count, label: "tokens", isPartial: true)
+            ])],
+            refreshedAt: refreshedAt
+        )
+
+        let response = LocalUsageAPI.respond(method: "GET", path: "/v1/usage/claude", state: state)
+        let object = try XCTUnwrap((try json(response.body) as? [[String: Any]])?.first)
+        let line = try XCTUnwrap((object["lines"] as? [[String: Any]])?.first)
+
+        XCTAssertEqual(line["value"] as? String, "$5.17 · 9.2M tokens")
+        XCTAssertEqual(line["partial"] as? Bool, true)
+    }
+
+    func testWireMarksLowerBoundCostAndSaturatedTokensPartial() throws {
+        var state = makeState()
+        let refreshedAt = OpenUsageISO8601.date(from: "2026-03-26T11:16:29.000Z")!
+        state.snapshots["claude"] = ProviderSnapshot(
+            providerID: "claude",
+            displayName: "Claude",
+            plan: "Pro",
+            lines: [.values(label: "Today", values: [
+                MetricValue(number: 5.17, kind: .dollars, isLowerBound: true),
+                MetricValue(
+                    number: 9_200_000,
+                    kind: .count,
+                    label: "tokens",
+                    tokenCountSaturated: true
+                )
+            ])],
+            refreshedAt: refreshedAt
+        )
+
+        let response = LocalUsageAPI.respond(method: "GET", path: "/v1/usage/claude", state: state)
+        let object = try XCTUnwrap((try json(response.body) as? [[String: Any]])?.first)
+        let line = try XCTUnwrap((object["lines"] as? [[String: Any]])?.first)
+
+        XCTAssertEqual(line["value"] as? String, "≥$5.17 · ≥9.2M tokens")
+        XCTAssertEqual(line["partial"] as? Bool, true)
+    }
+
     func testCountFormatCarriesSuffix() throws {
         let response = LocalUsageAPI.respond(method: "GET", path: "/v1/usage/cursor", state: makeState())
         let object = try XCTUnwrap((try json(response.body) as? [[String: Any]])?.first)

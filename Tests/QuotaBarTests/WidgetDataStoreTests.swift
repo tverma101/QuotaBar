@@ -3,6 +3,138 @@ import XCTest
 
 @MainActor
 final class WidgetDataStoreTests: XCTestCase {
+    func testBackgroundTaskCreatedDuringManualRefreshDoesNotInheritKeychainPermission() async {
+        let context = await withManualRefresh {
+            await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+                await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                    await ProviderRefreshContext.$accountingCPUInteractiveBudgetEnabled.withValue(true) {
+                        await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(true) {
+                            let task = ProviderRefreshContext.withBackgroundContext {
+                                Task {
+                                    (
+                                        ProviderRefreshContext.scope,
+                                        ProviderRefreshContext.isManual,
+                                        ProviderRefreshContext.credentialInteractionGate != nil,
+                                        ProviderRefreshContext.manualActionID != nil,
+                                        ProviderRefreshContext.accountingCPUThrottleEnabled,
+                                        ProviderRefreshContext.accountingCPUInteractiveBudgetEnabled,
+                                        ProviderRefreshContext.skipModelCatalogRefresh
+                                    )
+                                }
+                            }
+                            return await task.value
+                        }
+                    }
+                }
+            }
+        }
+
+        XCTAssertEqual(context.0, .full)
+        XCTAssertFalse(context.1)
+        XCTAssertFalse(context.2)
+        XCTAssertFalse(context.3)
+        XCTAssertFalse(context.4)
+        XCTAssertFalse(context.5)
+        XCTAssertFalse(context.6)
+    }
+
+    func testCatalogReloadCancelsEveryProviderRefresh() async {
+        let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
+        let descriptor = WidgetDescriptor.percent(id: "test.session", provider: provider, title: "Session")
+        let runtime = CatalogReloadCancellationRuntime(provider: provider, descriptors: [descriptor])
+        let defaults = makeUserDefaults("catalog-reload-cancel")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600),
+            defaults: defaults
+        )
+        let refresh = Task { await store.refresh(providerID: provider.id, force: true, bypassSnapshotCache: true) }
+        for _ in 0..<1_000 where !runtime.didStart { await Task.yield() }
+        XCTAssertTrue(runtime.didStart)
+
+        store.cancelActiveProviderRefreshesForCatalogReload()
+
+        let outcome = await refresh.value
+        XCTAssertEqual(outcome, .skipped)
+        XCTAssertTrue(runtime.observedCancellation)
+    }
+
+    func testOpenCodeQuotaInvalidationKeepsLocalHistoryAcrossCatalogReload() {
+        let provider = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
+        let session = WidgetDescriptor.percent(id: "opencode.session", provider: provider, title: "Session")
+        let accountSession = WidgetDescriptor.percent(
+            id: "opencode.session.account.work", provider: provider, title: "Session (Work)"
+        )
+        let today = WidgetDescriptor.spendTiles(provider: provider).first { $0.metricLabel == "Today" }!
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let previous = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Go",
+            lines: [
+                .progress(label: "Session", used: 30, limit: 100, format: .percent),
+                .progress(label: "Session (Work)", used: 70, limit: 100, format: .percent),
+                .values(label: "Today", values: [MetricValue(number: 5, kind: .dollars, label: "spend")])
+            ],
+            refreshedAt: now,
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-14", totalTokens: 500, costUSD: 5)
+            ]))
+        )
+        let defaults = makeUserDefaults("catalog-reload-opencode-cache")
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now })
+        cache.store(previous, producedByIdentityKey: nil)
+        let registry = WidgetRegistry(providers: [provider], descriptors: [session, accountSession, today])
+        let runtime = SequenceProviderRuntime(provider: provider, descriptors: [session, accountSession, today], snapshots: [])
+        let store = WidgetDataStore(registry: registry, providers: [runtime], cache: cache, defaults: defaults, now: { now })
+
+        store.invalidateQuotaStateForCatalogReload(providerID: provider.id)
+
+        let replacement = WidgetDataStore(registry: registry, providers: [runtime], cache: cache, defaults: defaults, now: { now })
+        let reloaded = replacement.localSnapshots[provider.id]
+        XCTAssertNil(reloaded?.plan)
+        XCTAssertNil(reloaded?.line(label: "Session"))
+        XCTAssertNil(reloaded?.line(label: "Session (Work)"))
+        XCTAssertNotNil(reloaded?.line(label: "Today"))
+        XCTAssertEqual(reloaded?.usageHistory?.series.daily.first?.totalTokens, 500)
+    }
+
+    func testOpenCodeAccountSelectionInvalidationClearsCachedMetersBeforeSelectionRefresh() {
+        let provider = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
+        let session = WidgetDescriptor.percent(id: "opencode.session", provider: provider, title: "Session")
+        let today = WidgetDescriptor.spendTiles(provider: provider).first { $0.metricLabel == "Today" }!
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let previous = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            plan: "Go",
+            lines: [
+                .progress(label: "Session", used: 65, limit: 100, format: .percent),
+                .values(label: "Today", values: [MetricValue(number: 5, kind: .dollars, label: "spend")])
+            ],
+            refreshedAt: now,
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-14", totalTokens: 500, costUSD: 5)
+            ]))
+        )
+        let defaults = makeUserDefaults("opencode-selection-invalidation")
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now })
+        cache.store(previous)
+        let registry = WidgetRegistry(providers: [provider], descriptors: [session, today])
+        let runtime = SequenceProviderRuntime(provider: provider, descriptors: [session, today], snapshots: [])
+        let store = WidgetDataStore(registry: registry, providers: [runtime], cache: cache, defaults: defaults, now: { now })
+
+        store.invalidateQuotaStateForAccountSelectionChange(providerID: provider.id)
+
+        let replacement = WidgetDataStore(registry: registry, providers: [runtime], cache: cache, defaults: defaults, now: { now })
+        let reloaded = replacement.localSnapshots[provider.id]
+        XCTAssertNil(reloaded?.plan)
+        XCTAssertNil(reloaded?.line(label: "Session"))
+        XCTAssertNotNil(reloaded?.line(label: "Today"))
+        XCTAssertEqual(reloaded?.usageHistory?.series.daily.first?.totalTokens, 500)
+    }
+
     func testInFlightProviderRefreshIsDeferredAndSignaledWhenConflictCompletes() async {
         let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
         let descriptor = WidgetDescriptor.percent(id: "test.session", provider: provider, title: "Session")
@@ -442,7 +574,7 @@ final class WidgetDataStoreTests: XCTestCase {
         }
 
         XCTAssertEqual(firstAttempt, .skipped)
-        for _ in 0..<2_000 where runtime.refreshCount == 0 {
+        for _ in 0..<2_000 where store.localSnapshots[provider.id]?.usageHistory == nil {
             try await Task.sleep(for: .milliseconds(1))
         }
         XCTAssertEqual(runtime.refreshCount, 1, "Hermes' meter pass already includes its SQLite history scan")
@@ -756,6 +888,7 @@ final class WidgetDataStoreTests: XCTestCase {
 
     func testScheduledPanelAccountingBypassesFreshFoldCacheAndKeepsMeters() async throws {
         let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
+        let now = ISO8601DateFormatter().date(from: "2026-10-11T12:00:00Z")!
         var descriptor = WidgetDescriptor.percent(
             id: "test.session", provider: provider, title: "Session"
         )
@@ -772,13 +905,13 @@ final class WidgetDataStoreTests: XCTestCase {
             userDefaults: defaults,
             storageKey: "snapshots",
             ttl: 600,
-            now: { Date() }
+            now: { now }
         )
         cache.store(ProviderSnapshot(
             providerID: provider.id,
             displayName: provider.displayName,
             lines: [.progress(label: "Session", used: 5, limit: 100, format: .percent)],
-            refreshedAt: Date(),
+            refreshedAt: now,
             usageHistory: history
         ))
         let runtime = CountingProviderRuntime(
@@ -790,7 +923,7 @@ final class WidgetDataStoreTests: XCTestCase {
                 lines: [.values(label: "Today", values: [
                     MetricValue(number: 20, kind: .count, label: "tokens")
                 ])],
-                refreshedAt: Date(),
+                refreshedAt: now,
                 usageHistory: history
             )
         )
@@ -798,7 +931,8 @@ final class WidgetDataStoreTests: XCTestCase {
             registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
             providers: [runtime],
             cache: cache,
-            defaults: makeUserDefaults("panel-accounting-scheduled-bypass-store")
+            defaults: makeUserDefaults("panel-accounting-scheduled-bypass-store"),
+            now: { now }
         )
 
         await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
@@ -858,6 +992,11 @@ final class WidgetDataStoreTests: XCTestCase {
 
     func testQuotaOnlyRefreshDoesNotNotifyHistorySync() async {
         let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "test"
+        )
         let history = ProviderUsageHistory(
             series: DailyUsageSeries(daily: [
                 DailyUsageEntry(date: "2026-10-07", totalTokens: 100, costUSD: 1)
@@ -866,7 +1005,7 @@ final class WidgetDataStoreTests: XCTestCase {
         )
         let runtime = SequenceProviderRuntime(
             provider: provider,
-            descriptors: [],
+            descriptors: [historyDescriptor],
             snapshots: [
                 ProviderSnapshot(providerID: provider.id, displayName: provider.displayName,
                                  lines: [.progress(label: "Session", used: 20, limit: 100, format: .percent)],
@@ -876,10 +1015,12 @@ final class WidgetDataStoreTests: XCTestCase {
                                  usageHistory: history)
             ]
         )
+        let defaults = makeUserDefaults("history-change-notification")
         let store = WidgetDataStore(
-            registry: WidgetRegistry(providers: [provider], descriptors: []),
+            registry: WidgetRegistry(providers: [provider], descriptors: [historyDescriptor]),
             providers: [runtime],
-            defaults: makeUserDefaults("history-change-notification")
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots"),
+            defaults: defaults
         )
         var notificationCount = 0
         store.onLocalHistoryChanged = { notificationCount += 1 }
@@ -1772,6 +1913,11 @@ final class WidgetDataStoreTests: XCTestCase {
 
     func testDefinitiveAuthenticationErrorClearsCachedQuotaButKeepsHistory() async throws {
         let provider = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "test"
+        )
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
             DailyUsageEntry(date: "2026-10-13", totalTokens: 135_900_000, costUSD: 1.47)
@@ -1797,7 +1943,7 @@ final class WidgetDataStoreTests: XCTestCase {
         )
         let runtime = SequenceProviderRuntime(
             provider: provider,
-            descriptors: [],
+            descriptors: [historyDescriptor],
             snapshots: [previous, logout]
         )
         let defaults = makeUserDefaults("clear-quota-on-logout")
@@ -1808,7 +1954,7 @@ final class WidgetDataStoreTests: XCTestCase {
             now: { now }
         )
         let store = WidgetDataStore(
-            registry: WidgetRegistry(providers: [provider], descriptors: []),
+            registry: WidgetRegistry(providers: [provider], descriptors: [historyDescriptor]),
             providers: [runtime],
             cache: cache,
             defaults: defaults,
@@ -1867,6 +2013,18 @@ final class WidgetDataStoreTests: XCTestCase {
             )
             XCTAssertEqual(data.boundedSubtitle, expected)
         }
+    }
+
+    func testPartialUnboundedValuesKeepOnlyExplicitSubtitle() {
+        var data = WidgetData(title: "Hermes", icon: .providerMark("hermes"), kind: .dollars, used: 0, limit: nil)
+        data.values = [
+            MetricValue(number: 1.25, kind: .dollars, estimated: true, isPartial: true),
+            MetricValue(number: 100, kind: .count, label: "tokens", isPartial: true)
+        ]
+        XCTAssertNil(data.unboundedSubtitle, "completeness belongs in existing detail views, without another row badge")
+
+        data.subtitleOverride = "From local history"
+        XCTAssertEqual(data.unboundedSubtitle, "From local history")
     }
 
     func testRequestsShowsBillingResetInsteadOfSuffix() {
@@ -2404,6 +2562,29 @@ private final class SuspendedProviderRuntime: ProviderRuntime {
             refreshedAt: Date()
         ))
         continuation = nil
+    }
+}
+
+@MainActor
+private final class CatalogReloadCancellationRuntime: ProviderRuntime {
+    let provider: Provider
+    let widgetDescriptors: [WidgetDescriptor]
+    private(set) var didStart = false
+    private(set) var observedCancellation = false
+
+    init(provider: Provider, descriptors: [WidgetDescriptor]) {
+        self.provider = provider
+        self.widgetDescriptors = descriptors
+    }
+
+    func refresh() async -> ProviderSnapshot {
+        didStart = true
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch {
+            observedCancellation = Task<Never, Never>.isCancelled
+        }
+        return ProviderSnapshot.error(provider: provider, error: CancellationError())
     }
 }
 

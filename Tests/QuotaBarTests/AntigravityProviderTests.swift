@@ -5,6 +5,28 @@ final class AntigravityProviderTests: XCTestCase {
 
     // MARK: - Helpers
 
+    func testCacheIdentityUsesStableRefreshCredentialFingerprint() {
+        let first = AntigravityAuthStore.cacheIdentityKey(for: AntigravityKeychainToken(
+            accessToken: "access-old",
+            refreshToken: "refresh-account-a",
+            expiry: nil
+        ))
+        let rotated = AntigravityAuthStore.cacheIdentityKey(for: AntigravityKeychainToken(
+            accessToken: "access-new",
+            refreshToken: "refresh-account-a",
+            expiry: nil
+        ))
+        let switched = AntigravityAuthStore.cacheIdentityKey(for: AntigravityKeychainToken(
+            accessToken: "access-new",
+            refreshToken: "refresh-account-b",
+            expiry: nil
+        ))
+
+        XCTAssertEqual(first, rotated, "access-token refresh must not look like an account switch")
+        XCTAssertNotEqual(first, switched)
+        XCTAssertFalse(first?.contains("refresh-account-a") ?? true, "the stamp must not expose the credential")
+    }
+
     private func used(_ line: MetricLine?) -> Double? {
         guard case .progress(_, let used, _, _, _, _, _, _)? = line else { return nil }
         return used
@@ -389,6 +411,39 @@ final class AntigravityProviderTests: XCTestCase {
     }
 
     @MainActor
+    func testHasLocalCredentialsReadsProcessTableOnceForBothStrategies() async {
+        let psCalls = Counter()
+        let http = FakeHTTPClient(response: HTTPResponse(statusCode: 503, headers: [:], body: Data()))
+        let provider = AntigravityProvider(
+            authStore: AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles()),
+            usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
+            discovery: LanguageServerDiscovery(processRunner: CountingProcessRunner(psCalls: psCalls)),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let detected = await provider.hasLocalCredentials()
+        XCTAssertFalse(detected)
+        XCTAssertEqual(psCalls.next(), 1, "credential discovery reuses one process-table snapshot")
+    }
+
+    @MainActor
+    func testQuotaRefreshReadsTheProcessTableOnceForBothLocalStrategies() async {
+        let psCalls = Counter()
+        let http = FakeHTTPClient(response: HTTPResponse(statusCode: 503, headers: [:], body: Data()))
+        let provider = AntigravityProvider(
+            authStore: AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles()),
+            usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
+            discovery: LanguageServerDiscovery(processRunner: CountingProcessRunner(psCalls: psCalls)),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        _ = await provider.refresh()
+
+        XCTAssertEqual(psCalls.next(), 1, "the app and agy matching strategies share one process-table snapshot")
+        XCTAssertTrue(http.requests.isEmpty, "a signed-out provider should not issue quota requests")
+    }
+
+    @MainActor
     func testCancelledKeychainProbeDoesNotCountAsCredentials() async {
         let key = KeychainItemKey(
             service: AntigravityAuthStore.keychainService,
@@ -513,6 +568,129 @@ final class AntigravityProviderTests: XCTestCase {
         let snapshot = await provider.refresh()
         XCTAssertTrue(snapshot.lines.contains { $0.isError })
         XCTAssertEqual(snapshot.errorCategory, .network)
+    }
+
+    @MainActor
+    func testUnusableSuccessfulCloudCodeResponsesAreNotReportedAsNetworkOutages() async {
+        let routing = RoutingHTTPClient { request in
+            switch request.url.path {
+            case AntigravityUsageClient.quotaSummaryPath:
+                return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+            case AntigravityUsageClient.fetchModelsPath:
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"models":{}}"#.utf8))
+            case AntigravityUsageClient.loadCodeAssistPath:
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"projectId":"p"}"#.utf8))
+            case AntigravityUsageClient.retrieveQuotaPath:
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"buckets":[]}"#.utf8))
+            default:
+                return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+            }
+        }
+        let provider = makeCloudCodeProvider(routing: routing)
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNotEqual(snapshot.errorCategory, .network)
+        guard case .badge(_, let message, _, _)? = snapshot.lines.first else {
+            return XCTFail("expected an unsupported quota endpoint message")
+        }
+        XCTAssertTrue(message.contains("supported usage endpoint"))
+    }
+
+    @MainActor
+    func testCloudCode404FromOneTokenDoesNotHideTransientFailureFromAnother() async throws {
+        let wrapped = #"{"token":{"access_token":"ya29.kc","expiry":"2099-01-01T00:00:00Z","refresh_token":"1//r"}}"#
+        let files = FakeFiles()
+        let authStore = AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: files)
+        guard let source = try authStore.loadKeychainToken() else {
+            return XCTFail("expected a keychain credential")
+        }
+        XCTAssertTrue(try authStore.cacheToken("ya29.cached", expiresIn: 3_600, matching: source))
+
+        let routing = RoutingHTTPClient { request in
+            let token = request.headers["Authorization"]?.replacingOccurrences(of: "Bearer ", with: "")
+            if token == "ya29.cached", request.url.path == AntigravityUsageClient.quotaSummaryPath {
+                return HTTPResponse(statusCode: 503, headers: [:], body: Data())
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: authStore,
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let snapshot = await provider.refresh()
+        let text = snapshot.lines.compactMap { line -> String? in
+            guard case .badge(_, let text, _, _) = line else { return nil }
+            return text
+        }.first
+        XCTAssertEqual(snapshot.errorCategory, .network)
+        XCTAssertTrue(text?.contains("temporarily unavailable") == true)
+        XCTAssertTrue(Set(routing.requests.compactMap { $0.headers["Authorization"] }).contains("Bearer ya29.kc"))
+        XCTAssertTrue(Set(routing.requests.compactMap { $0.headers["Authorization"] }).contains("Bearer ya29.cached"))
+    }
+
+    @MainActor
+    func testCloudCodeForbiddenTokenDoesNotPreventTryingAnotherCachedToken() async throws {
+        let wrapped = #"{"token":{"access_token":"ya29.kc","expiry":"2099-01-01T00:00:00Z","refresh_token":"1//r"}}"#
+        let files = FakeFiles()
+        let authStore = AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: files)
+        let source = try XCTUnwrap(authStore.loadKeychainToken())
+        XCTAssertTrue(try authStore.cacheToken("ya29.cached", expiresIn: 3_600, matching: source))
+        let routing = RoutingHTTPClient { request in
+            let token = request.headers["Authorization"]?.replacingOccurrences(of: "Bearer ", with: "")
+            if request.url.path == AntigravityUsageClient.quotaSummaryPath {
+                if token == "ya29.kc" { return HTTPResponse(statusCode: 403, headers: [:], body: Data()) }
+                if token == "ya29.cached" {
+                    let body = #"{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8}]}]}"#
+                    return HTTPResponse(statusCode: 200, headers: [:], body: Data(body.utf8))
+                }
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: authStore,
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertEqual(used(snapshot.line(label: "Session")), 20)
+        let summaryTokens = routing.requests
+            .filter { $0.url.path == AntigravityUsageClient.quotaSummaryPath }
+            .compactMap { $0.headers["Authorization"] }
+        XCTAssertTrue(summaryTokens.contains("Bearer ya29.kc"))
+        XCTAssertTrue(summaryTokens.contains("Bearer ya29.cached"))
+    }
+
+    @MainActor
+    func testRejectedDerivedTokenIsRemovedFromCache() async throws {
+        let wrapped = #"{"token":{"access_token":"ya29.kc","expiry":"2099-01-01T00:00:00Z","refresh_token":"1//r"}}"#
+        let files = FakeFiles()
+        let authStore = AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: files)
+        let source = try XCTUnwrap(authStore.loadKeychainToken())
+        XCTAssertTrue(try authStore.cacheToken("ya29.cached", expiresIn: 3_600, matching: source))
+        let routing = RoutingHTTPClient { request in
+            if request.url.host == "oauth2.googleapis.com" {
+                return HTTPResponse(statusCode: 503, headers: [:], body: Data())
+            }
+            return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: authStore,
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        _ = await provider.refresh()
+
+        XCTAssertNil(files.files[AntigravityAuthStore.cachePath])
     }
 
     @MainActor
@@ -687,11 +865,14 @@ final class AntigravityProviderTests: XCTestCase {
         let snapshot = await provider.refresh()
 
         XCTAssertEqual(snapshot.errorCategory, .cancelled)
-        // The plan lookup starts in parallel with the first quota request. Cancellation must stop
-        // after that pair and the single OAuth exchange; it must not retry the quota request.
-        XCTAssertEqual(routing.requests.count, 3, "parallel plan + quota lookup, then one canceled OAuth exchange; no quota retry")
-        XCTAssertEqual(routing.requests.last?.url.host, "oauth2.googleapis.com")
-        XCTAssertEqual(routing.requests.filter { $0.url.path.contains("retrieveUserQuotaSummary") }.count, 1)
+        // The plan lookup is launched alongside the first quota request, but the auth-failure branch
+        // can cancel it before the mock records its request. The OAuth exchange itself is required;
+        // after it is cancelled, quota/models fallback requests must not be retried.
+        let requests = routing.requests
+        XCTAssertEqual(requests.filter { $0.url.host == "oauth2.googleapis.com" }.count, 1)
+        XCTAssertEqual(requests.filter { $0.url.path == AntigravityUsageClient.quotaSummaryPath }.count, 1)
+        XCTAssertFalse(requests.contains { $0.url.path == AntigravityUsageClient.fetchModelsPath })
+        XCTAssertFalse(requests.contains { $0.url.path == AntigravityUsageClient.retrieveQuotaPath })
     }
 
     @MainActor
@@ -789,6 +970,22 @@ final class AntigravityProviderTests: XCTestCase {
         let provider = makeCloudCodeProvider(routing: routing, keychainExpiry: "2000-01-01T00:00:00Z")
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.errorCategory, .authExpired)
+    }
+
+    @MainActor
+    func testUnrecognizedOAuthClientErrorIsReportedAsExpiredAuth() async {
+        let routing = RoutingHTTPClient { request in
+            if request.url.host == "oauth2.googleapis.com" {
+                return HTTPResponse(statusCode: 400, headers: [:], body: Data("not JSON".utf8))
+            }
+            return HTTPResponse(statusCode: 503, headers: [:], body: Data())
+        }
+        let provider = makeCloudCodeProvider(routing: routing, keychainExpiry: "2000-01-01T00:00:00Z")
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .authExpired)
+        XCTAssertFalse(routing.requests.contains { $0.url.path == AntigravityUsageClient.quotaSummaryPath })
     }
 
     @MainActor
@@ -911,6 +1108,15 @@ private struct LocalCredentialProcessRunner: ProcessRunning {
         }
         let lsof = "language_ 4276 user 6u IPv4 0x0 0t0 TCP 127.0.0.1:52168 (LISTEN)\n"
         return ProcessResult(exitCode: 0, stdout: lsof, stderr: "")
+    }
+}
+
+private struct CountingProcessRunner: ProcessRunning {
+    let psCalls: Counter
+
+    func run(executable: String, arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> ProcessResult {
+        if executable == "/bin/ps" { _ = psCalls.next() }
+        return ProcessResult(exitCode: 0, stdout: "", stderr: "")
     }
 }
 

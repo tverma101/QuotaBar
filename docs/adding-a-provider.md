@@ -15,13 +15,11 @@ A provider is a small Swift module under `Sources/QuotaBar/Providers/<Name>/` th
 QuotaBar never asks the user to paste a token — if the provider's own CLI or app has already logged in,
 QuotaBar reads those existing credentials.
 
-Besides `refresh()`, every provider implements `hasLocalCredentials()` — a cheap, local-only check
-(files, keychain; never the network) for whether those credentials exist at all. A fresh install probes
-it once to turn on exactly the providers the user actually has (see `FirstRunSeeder`), and existing
-installs probe it once on the first launch after your provider ships (see `NewProviderSeeder`) — so
-implementing it correctly is what gets the new provider auto-enabled for the users who actually have
-the tool (see [Which Providers Are On](provider-enablement.md)). Mirror the same credential sources
-`refresh()` reads, and run blocking loads via `loadOffMainActor`.
+Besides `refresh()`, every provider implements `hasLocalCredentials()` — a local-only check of whether
+its credentials exist, without contacting the provider. Startup and provider discovery do not call this
+method to enable cards: optional providers stay off until the user selects them in Customize. Keep the
+probe silent and mirror the credential sources `refresh()` reads if a future explicit setup flow uses it.
+Run blocking loads via `loadOffMainActor`. See [Which Providers Are On](provider-enablement.md).
 
 ## The metric contract
 

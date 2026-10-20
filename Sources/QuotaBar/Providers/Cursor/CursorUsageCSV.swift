@@ -14,14 +14,14 @@ struct CursorUsageCSVRow: Sendable, Equatable {
 struct CursorUsageCSVParseResult: Sendable, Equatable {
     var rows: [CursorUsageCSVRow]
     var rejectedRowCount: Int
-    /// Rows whose product label names Grok Bot work rather than a serving model. Their measured
-    /// tokens are kept (unattributed, nil cost); this count only reports how many could not be priced.
+    /// Product-labeled Grok Bot rows whose measured tokens are kept without a serving-model price.
     var unpricedGrokBotRowCount: Int = 0
 }
 
 enum CursorUsageCSVError: Error, Equatable {
     case missingColumns([String])
     case malformedCSV
+    case futureTimestamp
 }
 
 enum CursorUsageCSV {
@@ -36,8 +36,8 @@ enum CursorUsageCSV {
     }
 
     /// Cursor uses product labels such as `grok-bot-cua` and the legacy `sand-*` names in its
-    /// usage export. They identify Grok Bot work, not the serving model, so those rows must not be
-    /// turned into model-attributed token or price history.
+    /// usage export. They identify Grok Bot work, not the serving model, so keep their measured tokens
+    /// under the product label and do not infer a model or price.
     static func isOpaqueGrokBotProductLabel(_ rawModel: String) -> Bool {
         let slug = rawModel
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -73,16 +73,21 @@ enum CursorUsageCSV {
         return f
     }()
 
-    /// Pure boundary parser: maps Cursor's exported CSV text into priced rows, rejects malformed rows,
-    /// and fails when the export schema itself is unusable. Empty numeric cells are valid zeroes; a
+    /// Pure boundary parser: maps Cursor's exported CSV text into priced and unpriced usage rows,
+    /// rejects malformed rows, and fails when the export schema itself is unusable. Empty numeric cells are valid zeroes; a
     /// non-empty non-integer or negative token count rejects that row instead of silently becoming zero.
     ///
     /// Cursor's CSV rows are aggregates, not individual requests, so long-context thresholds and Max
     /// Mode uplift cannot be applied reliably from row totals; rows bill at the base model API rate.
-    static func parse(csv: String, pricing: ModelPricing) throws -> CursorUsageCSVParseResult {
+    static func parse(
+        csv: String,
+        pricing: ModelPricing,
+        maximumTimestamp: Date = JSONLScanning.maximumTimestamp(now: Date())
+    ) throws -> CursorUsageCSVParseResult {
         var rows: [CursorUsageCSVRow] = []
         var rejectedRowCount = 0
         var unpricedGrokBotRowCount = 0
+        var hasFutureTimestamp = false
         var missingColumns = Column.required
         var hasDuplicateColumns = false
         let summary = CursorCSVParser.forEachRecord(in: csv, header: { header in
@@ -112,6 +117,10 @@ enum CursorUsageCSV {
             // A zero-token row is valid export structure but carries no usage. Keeping it would let
             // a $0 mapped row falsely move a provider's lifetime "since" date backward.
             guard rowTokenCount > 0 else { return }
+            guard date <= maximumTimestamp else {
+                hasFutureTimestamp = true
+                return
+            }
 
             // The CSV's "Input (w/ Cache Write)" tokens were written to the prompt cache; Anthropic
             // bills those at the 5-minute cache-write rate, other providers at the input rate (their
@@ -124,9 +133,8 @@ enum CursorUsageCSV {
             )
 
             // Cursor reports these rows by product (`grok-bot-cua`, legacy `sand-*`), not by the model
-            // that served them, so no rate can price them. The token counts are still measured usage:
-            // keep them in an unattributed nil-cost bucket instead of dropping known tokens. No
-            // serving model is inferred, so the cost stays incomplete rather than guessed at.
+            // that served them. Preserve the measured tokens under that product label, but do not
+            // assign a serving model or estimate a price we cannot verify.
             if isOpaqueGrokBotProductLabel(model) {
                 unpricedGrokBotRowCount += 1
                 rows.append(CursorUsageCSVRow(
@@ -154,6 +162,7 @@ enum CursorUsageCSV {
             throw CursorUsageCSVError.malformedCSV
         }
         guard missingColumns.isEmpty else { throw CursorUsageCSVError.missingColumns(missingColumns) }
+        guard !hasFutureTimestamp else { throw CursorUsageCSVError.futureTimestamp }
         rejectedRowCount += summary.rejectedRecordCount
         return CursorUsageCSVParseResult(
             rows: rows,

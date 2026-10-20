@@ -62,11 +62,13 @@ final class WidgetUsagePeriodTests: XCTestCase {
                                 values: [MetricValue(number: 1.0, kind: .dollars)])
         single.unknownModels = ["GLM 5.2"]
         XCTAssertTrue(single.hasUnknownModels)
-        XCTAssertEqual(single.unknownModelTooltip, "Unknown model found\n- GLM 5.2")
+        XCTAssertEqual(single.unknownModelTooltip,
+                       "Unknown model found\n- GLM 5.2\nDisplayed cost includes priced usage only.")
 
         var many = single
         many.unknownModels = ["GLM 5.2", "Some Other Model"]
-        XCTAssertEqual(many.unknownModelTooltip, "Unknown models found\n- GLM 5.2\n- Some Other Model")
+        XCTAssertEqual(many.unknownModelTooltip,
+                       "Unknown models found\n- GLM 5.2\n- Some Other Model\nDisplayed cost includes priced usage only.")
     }
 
     func testNoUnknownModelsLeavesTriangleOff() {

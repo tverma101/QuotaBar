@@ -47,7 +47,14 @@ struct WidgetGroupedListView: View {
         // the panel's initial mount. One resolution now drives both the visibility decision and the
         // rendered card.
         let resolved = resolveRows(for: group)
-        if resolved.hasVisibleRow {
+        let showSection = ProviderSectionVisibility.shouldRender(
+            hasVisibleMetric: resolved.hasVisibleRow,
+            hasPlan: dataStore.plan(for: group.provider.id) != nil,
+            hasNotice: dataStore.headerNotice(for: group.provider.id) != nil,
+            isRefreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
+            hasStaleness: dataStore.stalenessHint(for: group.provider.id) != nil
+        )
+        if showSection {
             sectionBody(group, resolved: resolved)
         }
     }
@@ -55,14 +62,17 @@ struct WidgetGroupedListView: View {
     private func sectionBody(_ group: ProviderGroup, resolved: ResolvedCard) -> some View {
         VStack(alignment: .leading, spacing: density.headerToCardSpacing) {
             header(group)
-            card(
-                for: group,
-                cardRows: resolved.cardRows,
-                condensedIDs: resolved.condensedIDs,
-                providerID: group.provider.id,
-                isExpanded: layout.isProviderExpanded(group.provider.id)
-            )
+            if resolved.hasVisibleRow {
+                card(
+                    for: group,
+                    cardRows: resolved.cardRows,
+                    condensedIDs: resolved.condensedIDs,
+                    providerID: group.provider.id,
+                    isExpanded: layout.isProviderExpanded(group.provider.id)
+                )
+            }
         }
+        .background(DiagnosticProviderAnchor(providerID: group.provider.id))
         .opacity(activeProviderID == group.provider.id ? 0 : 1)
         .reorderFrame(id: group.provider.id, in: .named(reorderSpaceName))
     }
@@ -223,6 +233,15 @@ struct WidgetGroupedListView: View {
         widgets.compactMap { widget -> ResolvedRow? in
             guard let descriptor = layout.descriptor(for: widget) else { return nil }
             let data = dataStore.data(for: descriptor)
+            if !ProviderSectionVisibility.shouldRenderMetricRow(
+                providerID: descriptor.providerID,
+                descriptorID: descriptor.id,
+                hasData: data.hasData,
+                errorCategory: dataStore.errorCategory(for: descriptor.providerID),
+                explicitlyEnabled: layout.explicitlyEnabledMetricIDs.contains(descriptor.id)
+            ) {
+                return nil
+            }
             guard layout.showsRow(descriptor, hasData: data.hasData) else { return nil }
             return ResolvedRow(
                 widget: widget,

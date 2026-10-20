@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 /// The three token-count periods the Hermes card renders. Boundaries are the user's local calendar
@@ -36,6 +37,7 @@ struct HermesPeriodUsage: Sendable, Equatable {
     var counts: HermesTokenCounts
     var costUSD: Double?
     var apiCallCount: Int
+    var isPartial: Bool = false
 }
 
 /// One model's usage inside a period, from Hermes' per-model attribution rows
@@ -44,6 +46,7 @@ struct HermesModelUsage: Sendable, Equatable {
     var model: String
     var tokens: Int
     var costUSD: Double?
+    var isPartial: Bool = false
 }
 
 /// The result of a Hermes scan: the three period rows, a daily token/cost series for the trend chart,
@@ -53,6 +56,7 @@ struct HermesUsageScan: Sendable, Equatable {
     var periods: [HermesPeriodUsage]
     var daily: DailyUsageSeries
     var modelUsageByPeriod: [HermesPeriod: [HermesModelUsage]]
+    var partialDays: Set<String> = []
 }
 
 /// Reads Hermes' local SQLite session database (`~/.hermes/state.db`, or `$HERMES_HOME/state.db`) and
@@ -115,27 +119,42 @@ struct HermesUsageScanner: Sendable {
         for (period, start) in starts {
             guard !Task.isCancelled else { return nil }
             guard let sumJSON = try JSONLAccountingWorkPacer.shared.perform({
-                try sqlite.queryValue(path: path, sql: Self.periodSQL(start: start))
+                try sqlite.queryValue(
+                    path: path,
+                    sql: Self.periodSQL(start: start, maximumTimestamp: JSONLScanning.maximumTimestamp(now: now))
+                )
             }) else {
-                continue
+                throw HermesUsageError.databaseUnreadable(detail: "period query returned no result")
             }
             guard !Task.isCancelled else { return nil }
             guard let counts = JSONLAccountingWorkPacer.shared.perform({ Self.parsePeriod(sumJSON) }) else {
-                continue
+                throw HermesUsageError.databaseUnreadable(detail: "period query returned malformed accounting data")
             }
             periods.append(HermesPeriodUsage(
                 period: period,
                 counts: counts.counts,
                 costUSD: counts.costUSD,
-                apiCallCount: counts.apiCallCount
+                apiCallCount: counts.apiCallCount,
+                isPartial: counts.isPartial
             ))
             guard !Task.isCancelled else { return nil }
-            if let modelJSON = try? JSONLAccountingWorkPacer.shared.perform({
-                try sqlite.queryValue(path: path, sql: Self.modelsSQL(start: start, detailed: hasModelTable == true))
-            }) {
-                guard !Task.isCancelled else { return nil }
-                modelUsage[period] = JSONLAccountingWorkPacer.shared.perform { Self.parseModels(modelJSON) }
+            guard let modelJSON = try JSONLAccountingWorkPacer.shared.perform({
+                try sqlite.queryValue(
+                    path: path,
+                    sql: Self.modelsSQL(
+                        start: start,
+                        detailed: hasModelTable == true,
+                        maximumTimestamp: JSONLScanning.maximumTimestamp(now: now)
+                    )
+                )
+            }) else {
+                throw HermesUsageError.databaseUnreadable(detail: "model query returned no result")
             }
+            guard !Task.isCancelled else { return nil }
+            guard let parsedModels = JSONLAccountingWorkPacer.shared.perform({ Self.parseModels(modelJSON) }) else {
+                throw HermesUsageError.databaseUnreadable(detail: "model query returned malformed accounting data")
+            }
+            modelUsage[period] = parsedModels
         }
 
         // Keep the history screen on the same calendar-year boundary as the other local scanners.
@@ -144,18 +163,29 @@ struct HermesUsageScanner: Sendable {
         let dailyCutoff = calendar.date(byAdding: .year, value: -10, to: today)
             ?? calendar.date(byAdding: .day, value: -3_650, to: today)
             ?? calendar.startOfDay(for: now)
-        let daily: DailyUsageSeries
+        let parsedDaily: ParsedDaily
         guard !Task.isCancelled else { return nil }
         if let dailyJSON = try JSONLAccountingWorkPacer.shared.perform({
-            try sqlite.queryValue(path: path, sql: Self.dailySQL(cutoff: dailyCutoff))
+            try sqlite.queryValue(
+                path: path,
+                sql: Self.dailySQL(cutoff: dailyCutoff, maximumTimestamp: JSONLScanning.maximumTimestamp(now: now))
+            )
         }) {
             guard !Task.isCancelled else { return nil }
-            daily = JSONLAccountingWorkPacer.shared.perform { Self.parseDaily(dailyJSON) }
+            guard let parsed = JSONLAccountingWorkPacer.shared.perform({ Self.parseDaily(dailyJSON) }) else {
+                throw HermesUsageError.databaseUnreadable(detail: "daily query returned malformed accounting data")
+            }
+            parsedDaily = parsed
         } else {
-            daily = DailyUsageSeries(daily: [])
+            throw HermesUsageError.databaseUnreadable(detail: "daily query returned no result")
         }
 
-        return HermesUsageScan(periods: periods, daily: daily, modelUsageByPeriod: modelUsage)
+        return HermesUsageScan(
+            periods: periods,
+            daily: parsedDaily.series,
+            modelUsageByPeriod: modelUsage,
+            partialDays: parsedDaily.partialDays
+        )
     }
 
     // MARK: - Period boundaries (local calendar)
@@ -177,57 +207,74 @@ struct HermesUsageScanner: Sendable {
 
     // MARK: - Parsing
 
-    /// Period row shape: `[input, output, cacheRead, cacheWrite, reasoning, apiCallCount, costUSD, costIsComplete]`.
+    /// Period row shape: `[input, output, cacheRead, cacheWrite, reasoning, apiCallCount, costUSD, costIsComplete, invalidRows, hasActiveSession]`.
     private struct ParsedPeriod {
         var counts: HermesTokenCounts
         var costUSD: Double?
         var apiCallCount: Int
+        var isPartial: Bool
     }
 
     private static func parsePeriod(_ json: String) -> ParsedPeriod? {
         guard let data = json.data(using: .utf8),
               let array = (try? JSONSerialization.jsonObject(with: data)) as? [Any],
-              array.count >= 8 else {
+              array.count == 10,
+              let input = nonnegativeTokenCount(array[0]),
+              let output = nonnegativeTokenCount(array[1]),
+              let cacheRead = nonnegativeTokenCount(array[2]),
+              let cacheWrite = nonnegativeTokenCount(array[3]),
+              let reasoning = nonnegativeTokenCount(array[4]),
+              let apiCallCount = nonnegativeTokenCount(array[5]),
+              let costValue = nonnegativeCost(array[6]),
+              let costCompleteFlag = nonnegativeTokenCount(array[7]),
+              costCompleteFlag <= 1,
+              let invalidRows = nonnegativeTokenCount(array[8]),
+              invalidRows == 0,
+              let activeSessions = nonnegativeTokenCount(array[9]),
+              activeSessions <= 1 else {
             return nil
         }
-        func int(_ index: Int) -> Int {
-            Int(min(max(ProviderParse.number(array[index]) ?? 0, 0), 1e15))
-        }
-        let costIsComplete = (ProviderParse.number(array[7]) ?? 0) > 0
-        let cost = costIsComplete
-            ? ProviderParse.number(array[6]).flatMap { $0 > 0 ? $0 : nil }
+        let costIsComplete = costCompleteFlag == 1
+        let usableCost = costIsComplete
+            ? (costValue > 0 ? costValue : nil)
             : nil
         return ParsedPeriod(
             counts: HermesTokenCounts(
-                input: int(0), output: int(1), cacheRead: int(2), cacheWrite: int(3), reasoning: int(4)
+                input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite, reasoning: reasoning
             ),
-            costUSD: cost,
-            apiCallCount: int(5)
+            costUSD: usableCost,
+            apiCallCount: apiCallCount,
+            isPartial: activeSessions == 1
         )
     }
 
-    /// Model row shape: `[model, tokens, costUSD, costIsComplete]`; a missing or non-string model reads as
-    /// "Unattributed" (mirrors the spend tiles' handling of models the source can't name).
-    private static func parseModels(_ json: String) -> [HermesModelUsage] {
+    /// Model row shape: `[model, tokens, costUSD, costIsComplete, invalidRows, hasActiveSession]`;
+    /// a missing or non-string model reads as "Unattributed" (mirrors the spend tiles' handling of
+    /// models the source can't name).
+    private static func parseModels(_ json: String) -> [HermesModelUsage]? {
         guard let data = json.data(using: .utf8),
               let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [Any] else {
-            return []
+            return nil
         }
         var rows: [HermesModelUsage] = []
         rows.reserveCapacity(parsed.count)
         for element in parsed {
-            guard let entry = element as? [Any], entry.count >= 4,
-                  let tokens = ProviderParse.number(entry[1]) else {
-                continue
-            }
+            guard let entry = element as? [Any], entry.count == 6,
+                  let tokens = nonnegativeTokenCount(entry[1]),
+                  let cost = nonnegativeCost(entry[2]),
+                  let costCompleteFlag = nonnegativeTokenCount(entry[3]), costCompleteFlag <= 1,
+                  let invalidRows = nonnegativeTokenCount(entry[4]), invalidRows == 0,
+                  let activeSessions = nonnegativeTokenCount(entry[5]), activeSessions <= 1
+            else { return nil }
             let model = (entry[0] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let costIsComplete = (ProviderParse.number(entry[3]) ?? 0) > 0
+            let costIsComplete = costCompleteFlag == 1
             rows.append(HermesModelUsage(
                 model: (model?.nilIfEmpty ?? ""),
-                tokens: Int(min(max(tokens, 0), 1e15)),
+                tokens: tokens,
                 costUSD: costIsComplete
-                    ? ProviderParse.number(entry[2]).flatMap { $0 > 0 ? $0 : nil }
-                    : nil
+                    ? (cost > 0 ? cost : nil)
+                    : nil,
+                isPartial: activeSessions == 1
             ))
         }
         return rows.sorted { lhs, rhs in
@@ -236,36 +283,65 @@ struct HermesUsageScanner: Sendable {
         }
     }
 
-    /// Daily row shape: `[yyyy-MM-dd, tokens, costUSD, costIsComplete]`.
-    private static func parseDaily(_ json: String) -> DailyUsageSeries {
+    /// Daily row shape: `[yyyy-MM-dd, tokens, costUSD, costIsComplete, invalidRows, hasActiveSession]`.
+    private struct ParsedDaily {
+        var series: DailyUsageSeries
+        var partialDays: Set<String>
+    }
+
+    private static func parseDaily(_ json: String) -> ParsedDaily? {
         guard let data = json.data(using: .utf8),
               let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [Any] else {
-            return DailyUsageSeries(daily: [])
+            return nil
         }
         var daily: [DailyUsageEntry] = []
+        var partialDays: Set<String> = []
         daily.reserveCapacity(parsed.count)
         for element in parsed {
-            guard let entry = element as? [Any], entry.count >= 4,
+            guard let entry = element as? [Any], entry.count == 6,
                   let day = entry[0] as? String,
-                  let tokens = ProviderParse.number(entry[1]) else {
-                continue
-            }
-            let costIsComplete = (ProviderParse.number(entry[3]) ?? 0) > 0
-            let cost = ProviderParse.number(entry[2])
+                  let tokens = nonnegativeTokenCount(entry[1]),
+                  let cost = nonnegativeCost(entry[2]),
+                  let costCompleteFlag = nonnegativeTokenCount(entry[3]), costCompleteFlag <= 1,
+                  let invalidRows = nonnegativeTokenCount(entry[4]), invalidRows == 0,
+                  let activeSessions = nonnegativeTokenCount(entry[5]), activeSessions <= 1
+            else { return nil }
+            if activeSessions == 1 { partialDays.insert(day) }
+            let costIsComplete = costCompleteFlag == 1
             // A session can carry a recorded cost even if its token buckets are empty or unavailable.
             // Keep that day in history so the lifetime report agrees with the Hermes period total.
-            let totalTokens = Int(min(max(tokens, 0), 1e15))
-            guard totalTokens > 0 || (costIsComplete && (cost ?? 0) > 0) else { continue }
+            let totalTokens = tokens
+            guard totalTokens > 0 || (costIsComplete && cost > 0) else { continue }
             daily.append(DailyUsageEntry(
                 date: day,
                 totalTokens: totalTokens,
                 costUSD: costIsComplete
-                    ? cost.flatMap { $0 > 0 ? $0 : nil }
+                    ? (cost > 0 ? cost : nil)
                     : nil,
                 costIsComplete: costIsComplete
             ))
         }
-        return DailyUsageSeries(daily: daily)
+        return ParsedDaily(series: DailyUsageSeries(daily: daily), partialDays: partialDays)
+    }
+
+    private static func nonnegativeTokenCount(_ value: Any) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return nil }
+        let count = number.doubleValue
+        guard count.isFinite, count >= 0, count <= 1e15, count.rounded(.towardZero) == count else {
+            return nil
+        }
+        return Int(count)
+    }
+
+    private static func nonnegativeCost(_ value: Any) -> Double? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return nil }
+        let cost = number.doubleValue
+        guard cost.isFinite, cost >= 0, cost <= 1e12 else { return nil }
+        return cost
     }
 
     // MARK: - SQL
@@ -281,12 +357,13 @@ struct HermesUsageScanner: Sendable {
         String(format: "%.3f", date.timeIntervalSince1970)
     }
 
-    static func periodSQL(start: Date) -> String {
+    static func periodSQL(start: Date, maximumTimestamp: Date? = nil) -> String {
         let tokenExpression = tokenSumExpression(alias: nil)
         let costCompleteness = costCompletenessExpression(
             tokenExpression: tokenExpression,
             costExpression: "estimated_cost_usd"
         )
+        let invalidRows = invalidRowsExpression(alias: nil, maximumTimestamp: maximumTimestamp)
         return """
         SELECT json_array(
                  COALESCE(SUM(input_tokens),0),
@@ -296,14 +373,16 @@ struct HermesUsageScanner: Sendable {
                  COALESCE(SUM(reasoning_tokens),0),
                  COALESCE(SUM(api_call_count),0),
                  COALESCE(SUM(estimated_cost_usd),0),
-                 \(costCompleteness))
+                 \(costCompleteness),
+                 \(invalidRows),
+                 CASE WHEN COALESCE(SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END),0) > 0 THEN 1 ELSE 0 END)
         FROM sessions
         WHERE started_at >= \(literal(start))
           AND \(nonOpenCodeBillingPredicate(sessionAlias: nil));
         """
     }
 
-    static func modelsSQL(start: Date, detailed: Bool) -> String {
+    static func modelsSQL(start: Date, detailed: Bool, maximumTimestamp: Date? = nil) -> String {
         // `json_group_array` is itself an aggregate, so SUM() must live in an inner subquery — nesting
         // aggregates directly is a SQLite error. In the detailed case the token columns are qualified
         // with `smu.` because `sessions` carries the same column names (ambiguous without it).
@@ -314,6 +393,14 @@ struct HermesUsageScanner: Sendable {
             tokenExpression: tokensExpr,
             costExpression: costExpr
         )
+        let invalidRows = invalidRowsExpression(
+            alias: detailed ? "smu" : nil,
+            sessionAlias: detailed ? "s" : nil,
+            maximumTimestamp: maximumTimestamp
+        )
+        let activeSessions = detailed
+            ? "CASE WHEN SUM(CASE WHEN s.ended_at IS NULL THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END"
+            : "CASE WHEN SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END"
         let source: String
         if detailed {
             source = """
@@ -330,29 +417,34 @@ struct HermesUsageScanner: Sendable {
                 """
         }
         return """
-            SELECT json_group_array(json_array(model, tokens, cost, cost_is_complete)) FROM (
+            SELECT json_group_array(json_array(model, tokens, cost, cost_is_complete, invalid_rows, active_sessions)) FROM (
                 SELECT \(modelExpr) AS model,
                        CAST(SUM(\(tokensExpr)) AS REAL) AS tokens,
                        COALESCE(SUM(\(costExpr)),0) AS cost,
-                       \(costCompleteness) AS cost_is_complete
+                       \(costCompleteness) AS cost_is_complete,
+                       \(invalidRows) AS invalid_rows,
+                       \(activeSessions) AS active_sessions
                 \(source)
                 GROUP BY \(modelExpr)
             );
             """
     }
 
-    static func dailySQL(cutoff: Date) -> String {
+    static func dailySQL(cutoff: Date, maximumTimestamp: Date? = nil) -> String {
         let tokenExpression = tokenSumExpression(alias: nil)
         let costCompleteness = costCompletenessExpression(
             tokenExpression: tokenExpression,
             costExpression: "estimated_cost_usd"
         )
+        let invalidRows = invalidRowsExpression(alias: nil, maximumTimestamp: maximumTimestamp)
         return """
-        SELECT json_group_array(json_array(day, tokens, cost, cost_is_complete)) FROM (
+        SELECT json_group_array(json_array(day, tokens, cost, cost_is_complete, invalid_rows, active_sessions)) FROM (
             SELECT date(CAST(started_at AS INTEGER),'unixepoch','localtime') AS day,
                    CAST(SUM(\(tokenExpression)) AS REAL) AS tokens,
                    COALESCE(SUM(estimated_cost_usd),0) AS cost,
-                   \(costCompleteness) AS cost_is_complete
+                   \(costCompleteness) AS cost_is_complete,
+                   \(invalidRows) AS invalid_rows,
+                   CASE WHEN SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END AS active_sessions
             FROM sessions
             WHERE started_at >= \(literal(cutoff))
               AND \(nonOpenCodeBillingPredicate(sessionAlias: nil))
@@ -367,7 +459,43 @@ struct HermesUsageScanner: Sendable {
     }
 
     private static func costCompletenessExpression(tokenExpression: String, costExpression: String) -> String {
-        "CASE WHEN SUM(CASE WHEN \(tokenExpression) > 0 AND \(costExpression) IS NULL THEN 1 ELSE 0 END) = 0 THEN 1 ELSE 0 END"
+        // Hermes declares estimated_cost_usd REAL DEFAULT 0, so a token-bearing row whose importer
+        // omitted the field is indistinguishable from an explicit zero after SQLite inserts it.
+        // Treat zero as missing coverage; showing another session's subtotal as complete would be false.
+        "CASE WHEN SUM(CASE WHEN \(tokenExpression) > 0 AND (\(costExpression) IS NULL OR \(costExpression) <= 0) THEN 1 ELSE 0 END) = 0 THEN 1 ELSE 0 END"
+    }
+
+    /// SQLite coerces malformed text values to zero inside SUM(), which otherwise turns one corrupt
+    /// Hermes row into a plausible smaller total. Carry an invalid-row flag through every aggregate
+    /// and reject the whole scan if any source counter or recorded cost has the wrong shape.
+    private static func invalidRowsExpression(
+        alias: String?,
+        sessionAlias: String? = nil,
+        maximumTimestamp: Date? = nil
+    ) -> String {
+        let prefix = alias.map { $0 + "." } ?? ""
+        var counterNames = [
+            "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"
+        ]
+        // `api_call_count` is on `sessions`, not the optional per-model attribution table.
+        if alias == nil { counterNames.append("api_call_count") }
+        let counters = counterNames.map { name -> String in
+            let column = prefix + name
+            return "(\(column) IS NOT NULL AND (typeof(\(column)) NOT IN ('integer','real') OR \(column) < 0 OR \(column) > 1000000000000000 OR \(column) != CAST(\(column) AS INTEGER)))"
+        }
+        let cost = prefix + "estimated_cost_usd"
+        let invalidCost = "(\(cost) IS NOT NULL AND (typeof(\(cost)) NOT IN ('integer','real') OR \(cost) < 0 OR \(cost) > 1000000000000))"
+        let timestampPrefix = sessionAlias.map { $0 + "." } ?? ""
+        let timestamp = timestampPrefix + "started_at"
+        let apiCallCount = sessionAlias.map { $0 + ".api_call_count" } ?? "api_call_count"
+        let hasUsage = "(\(tokenSumExpression(alias: alias)) > 0 OR COALESCE(\(apiCallCount),0) > 0 OR COALESCE(\(cost),0) > 0)"
+        let invalidTimestamp = maximumTimestamp.map {
+            "(\(hasUsage) AND (typeof(\(timestamp)) NOT IN ('integer','real') OR \(timestamp) > \(literal($0))))"
+        }
+        var invalidExpressions = counters + [invalidCost]
+        if let invalidTimestamp { invalidExpressions.append(invalidTimestamp) }
+        let invalid = invalidExpressions.joined(separator: " OR ")
+        return "CASE WHEN SUM(CASE WHEN \(invalid) THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END"
     }
 
     /// OpenCode-billed Hermes sessions are folded onto the OpenCode card, where their cost is

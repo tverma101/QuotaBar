@@ -133,6 +133,31 @@ final class ProviderAccountAssemblyTests: XCTestCase {
 
         XCTAssertEqual(families, ["codex"])
     }
+
+    func testExplicitClaudeEnableRetriesDiscoveryWhenShellFactsAreUnavailable() {
+        let families = ProviderAccountAssembly.familiesForAccountPass(
+            shellFactsReadable: false,
+            processEnvironment: [:],
+            registeredCodexHomes: [],
+            forceClaudeAccountDiscovery: true
+        )
+
+        XCTAssertTrue(families.contains("claude"))
+    }
+
+    func testClaudeOmittedFromLaunchPassIsMarkedForRetryOnEnable() {
+        let discovery = ProviderAccountAssembly.scan(
+            observer: DefaultAccountObserver(
+                environment: FakeEnvironment([:]),
+                files: FakeFiles([:]),
+                keychain: FakeKeychain(nil),
+                homeDirectory: { URL(fileURLWithPath: "/Users/dev") }
+            ),
+            families: ["codex"]
+        )
+
+        XCTAssertTrue(discovery.didSkipClaudeDesktopDiscovery)
+    }
 }
 
 private final class ThreadRecordingAccountFiles: TextFileAccessing, @unchecked Sendable {

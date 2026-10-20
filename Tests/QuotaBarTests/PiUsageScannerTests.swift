@@ -48,7 +48,7 @@ final class PiUsageScannerTests: XCTestCase {
     }
 
     func testSplitsCacheWriteBucketsBy1hPortion() {
-        let entry = PiUsageScanner.parseLine(line(cacheWrite: 1000, cacheWrite1h: 400))
+        let entry = PiUsageScanner.parseLine(line(cacheWrite: 1000, cacheWrite1h: 400, total: 1150))
         XCTAssertEqual(entry?.tokens.cacheWrite1h, 400)
         XCTAssertEqual(entry?.tokens.cacheWrite5m, 600)
     }

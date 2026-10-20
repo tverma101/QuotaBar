@@ -20,6 +20,17 @@ struct AntigravityModelConfig: Sendable, Equatable {
 /// worst (lowest) remaining fraction in its pool; the legacy data is 5h-only, so the weekly meters
 /// read "No data" there.
 enum AntigravityUsageMapper {
+    struct QuotaSummaryResult: Sendable {
+        let lines: [MetricLine]
+        let isComplete: Bool
+    }
+
+    private static let malformedSummaryDiagnosticKey = "provider.antigravity.summary.schema"
+    private static let unknownSummaryBucketDiagnosticKey = "provider.antigravity.summary.unknown-bucket"
+    private static let missingSummaryFractionDiagnosticKey = "provider.antigravity.summary.missing-fraction"
+    private static let missingSummaryBucketsDiagnosticKey = "provider.antigravity.summary.missing-buckets"
+    private static let duplicateSummaryBucketDiagnosticKey = "provider.antigravity.summary.duplicate-bucket"
+
     /// Internal/duplicate model IDs that should never surface as a meter. Matched against the model ID
     /// (LS `modelOrAlias.model`, Cloud Code `model`/key); the Cloud Code path also drops `isInternal`.
     static let modelBlacklist: Set<String> = [
@@ -45,39 +56,108 @@ enum AntigravityUsageMapper {
     /// Claude Weekly. Accepts both the LS envelope (`{"response": {"groups": …}}`) and the bare remote
     /// payload (`{"groups": …}`).
     ///
-    /// Nil means "not a summary" (undecodable body / no `groups` anywhere) and the caller may fall back
-    /// to the legacy endpoints. A non-nil result — even an empty one — is authoritative: the legacy
-    /// path fabricates "fully used" from missing quota info, so a parsed summary must never fall
-    /// through to it. Buckets decode leniently (one malformed bucket never voids the envelope); a
-    /// bucket with a missing/unusable `remainingFraction` drops its line (the row reads "No data")
-    /// rather than fabricating 0% or 100%.
-    static func parseQuotaSummary(_ data: Data) -> [MetricLine]? {
+    /// A decoded result can contain usable rows and still be incomplete. Unknown bucket IDs or known
+    /// buckets without a usable fraction keep the old omitted meters until a complete response arrives.
+    /// Duplicate IDs use the most depleted valid fraction and remain incomplete until the schema is clear.
+    /// An empty, well-formed groups list is complete and can authoritatively clear old meters.
+    static func parseQuotaSummary(_ data: Data, sourceID: String = "default") -> [MetricLine]? {
+        parseQuotaSummaryResult(data, sourceID: sourceID)?.lines
+    }
+
+    static func parseQuotaSummaryResult(_ data: Data, sourceID: String = "default") -> QuotaSummaryResult? {
+        let malformedDiagnosticKey = summaryDiagnosticKey(malformedSummaryDiagnosticKey, sourceID: sourceID)
+        let unknownBucketDiagnosticKey = summaryDiagnosticKey(unknownSummaryBucketDiagnosticKey, sourceID: sourceID)
+        let missingFractionDiagnosticKey = summaryDiagnosticKey(missingSummaryFractionDiagnosticKey, sourceID: sourceID)
+        let duplicateBucketDiagnosticKey = summaryDiagnosticKey(duplicateSummaryBucketDiagnosticKey, sourceID: sourceID)
         guard let envelope = try? JSONDecoder().decode(QuotaSummaryEnvelope.self, from: data),
               let groups = envelope.response?.groups ?? envelope.groups
         else {
             // Callers only parse 2xx bodies, so an undecodable one is schema drift — say so loudly.
-            AppLog.warn(LogTag.plugin("antigravity"), "quota summary response has no decodable groups; treating as not-a-summary")
+            DiagnosticGate.logOnce(for: malformedDiagnosticKey) {
+                AppLog.warn(LogTag.plugin("antigravity"), "quota summary response has no decodable groups; treating as not-a-summary")
+            }
             return nil
         }
+        DiagnosticGate.clearFailure(malformedDiagnosticKey)
 
         var pooled: [String: (fraction: Double, resetTime: Date?)] = [:]
+        var sawUnknownBucket = false
+        var sawMissingFraction = false
+        var sawDuplicateBucket = false
+        let sawMissingBuckets = groups.contains { !$0.hasBuckets }
         for bucket in groups.flatMap({ $0.buckets ?? [] }) {
             guard let id = bucket.bucketId, summaryBuckets.contains(where: { $0.bucketID == id }) else {
-                AppLog.warn(LogTag.plugin("antigravity"), "quota summary: skipping unrecognized bucket id '\(bucket.bucketId ?? "<absent>")'")
+                sawUnknownBucket = true
                 continue
             }
-            guard pooled[id] == nil else { continue } // duplicate bucket id — first one wins
             guard let fraction = bucket.remainingFraction, fraction.isFinite else {
-                AppLog.warn(LogTag.plugin("antigravity"), "quota summary: bucket '\(id)' has no usable remainingFraction; dropping its line")
+                sawMissingFraction = true
                 continue
             }
-            pooled[id] = (fraction, bucket.resetTime.flatMap { OpenUsageISO8601.date(from: $0) })
+            let resetTime = bucket.resetTime.flatMap { OpenUsageISO8601.date(from: $0) }
+            if let existing = pooled[id] {
+                sawDuplicateBucket = true
+                if fraction < existing.fraction {
+                    pooled[id] = (fraction, resetTime)
+                }
+            } else {
+                pooled[id] = (fraction, resetTime)
+            }
         }
 
-        return summaryBuckets.compactMap { spec in
+        if sawUnknownBucket {
+            DiagnosticGate.logOnce(for: unknownBucketDiagnosticKey) {
+                AppLog.warn(LogTag.plugin("antigravity"), "quota summary contains unrecognized bucket IDs; skipping them")
+            }
+        } else {
+            DiagnosticGate.clearFailure(unknownBucketDiagnosticKey)
+        }
+        if sawMissingFraction {
+            DiagnosticGate.logOnce(for: missingFractionDiagnosticKey) {
+                AppLog.warn(LogTag.plugin("antigravity"), "quota summary bucket has no usable remainingFraction; dropping its line")
+            }
+        } else {
+            DiagnosticGate.clearFailure(missingFractionDiagnosticKey)
+        }
+        if sawMissingBuckets {
+            DiagnosticGate.logOnce(for: summaryDiagnosticKey(missingSummaryBucketsDiagnosticKey, sourceID: sourceID)) {
+                AppLog.warn(LogTag.plugin("antigravity"), "quota summary group has no buckets array; retaining omitted meters until a complete response arrives")
+            }
+        } else {
+            DiagnosticGate.clearFailure(summaryDiagnosticKey(missingSummaryBucketsDiagnosticKey, sourceID: sourceID))
+        }
+        if sawDuplicateBucket {
+            DiagnosticGate.logOnce(for: duplicateBucketDiagnosticKey) {
+                AppLog.warn(LogTag.plugin("antigravity"), "quota summary contains duplicate bucket IDs; keeping the most depleted value")
+            }
+        } else {
+            DiagnosticGate.clearFailure(duplicateBucketDiagnosticKey)
+        }
+
+        let lines: [MetricLine] = summaryBuckets.compactMap { spec -> MetricLine? in
             guard let entry = pooled[spec.bucketID] else { return nil }
             return line(pool: spec.label, fraction: entry.fraction, resetTime: entry.resetTime, periodMs: spec.periodMs)
         }
+        return QuotaSummaryResult(
+            lines: lines,
+            isComplete: !sawUnknownBucket && !sawMissingFraction && !sawMissingBuckets && !sawDuplicateBucket
+        )
+    }
+
+    static func clearQuotaSummaryDiagnostics(sourceID: String) {
+        for key in [
+            malformedSummaryDiagnosticKey,
+            unknownSummaryBucketDiagnosticKey,
+            missingSummaryFractionDiagnosticKey,
+            missingSummaryBucketsDiagnosticKey,
+            duplicateSummaryBucketDiagnosticKey
+        ] {
+            DiagnosticGate.clearFailure(summaryDiagnosticKey(key, sourceID: sourceID))
+        }
+    }
+
+    private static func summaryDiagnosticKey(_ key: String, sourceID: String) -> String {
+        "\(key).\(JSONLScanCachePaths.stableFingerprint(sourceID))"
     }
 
     // MARK: - Response parsing (legacy per-model endpoints)
@@ -254,6 +334,27 @@ private struct QuotaSummaryRoot: Decodable {
 
 private struct QuotaSummaryGroup: Decodable {
     let buckets: [QuotaSummaryBucket]?
+
+    /// Missing and explicit-null are schema gaps; an explicit empty array is an authoritative answer.
+    let hasBuckets: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case buckets
+    }
+
+    init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self),
+              container.contains(.buckets),
+              (try? container.decodeNil(forKey: .buckets)) != true,
+              let decodedBuckets = try? container.decode([QuotaSummaryBucket].self, forKey: .buckets)
+        else {
+            buckets = nil
+            hasBuckets = false
+            return
+        }
+        buckets = decodedBuckets
+        hasBuckets = true
+    }
 }
 
 /// A bucket that never fails its containing array: a malformed element (not an object, or a field of

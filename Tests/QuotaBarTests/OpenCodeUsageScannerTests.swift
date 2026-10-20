@@ -13,8 +13,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
             openCodeRow("2026-07-12T11:00:00.000Z", "2.0", 1000, "glm-5.2", "opencode-go"),
             openCodeRow("2026-07-12T10:00:00.000Z", "1.0", 500, "gpt-5.5", "opencode"),
             openCodeRow("2026-07-11T10:00:00.000Z", "3.0", 2000, "kimi-k2.6", "opencode-go"),
-            openCodeRow("2026-07-12T11:00:00.000Z", "null", 100, "x", "opencode-go"),
-            "\"garbage\""
+            openCodeRow("2026-07-12T11:00:00.000Z", "null", 100, "future-model", "opencode-go")
         ].joined(separator: ",") + "]"
     }
     private var db2: String {
@@ -29,13 +28,29 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         return OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] })
     }
 
-    func testCombinedHostedSeriesUnionsDatabasesAndSkipsGarbage() async throws {
+    func testCombinedHostedSeriesKeepsTokensWhenReportedCostIsMissing() async throws {
         guard let scan = try await standardScanner().scan(now: now) else { return XCTFail("expected a scan") }
         let totalCost = scan.logScan.series.daily.compactMap(\.costUSD).reduce(0, +)
         let totalTokens = scan.logScan.series.daily.reduce(0) { $0 + $1.totalTokens }
-        // opencode-go 2+3+4 plus Zen 1 = 10; the null-cost and "garbage" rows are dropped.
+        // The missing-cost row still contributes its measured tokens; all other source costs remain.
         XCTAssertEqual(totalCost, 10.0, accuracy: 0.0001)
-        XCTAssertEqual(totalTokens, 4300) // 1000 + 500 + 2000 + 800
+        XCTAssertEqual(totalTokens, 4400) // 1000 + 500 + 2000 + 800 + 100
+        let today = try XCTUnwrap(scan.logScan.series.daily.first { $0.date == "2026-07-12" })
+        XCTAssertFalse(today.costIsComplete)
+        XCTAssertTrue(today.hasUnexplainedIncompleteCost == true)
+    }
+
+    func testMalformedNativeRowFailsClosedInsteadOfPublishingASmallerTotal() async {
+        let scanner = OpenCodeUsageScanner(
+            sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": "[\"malformed-row\"]"]),
+            databasePaths: { ["/oc/opencode.db"] }
+        )
+        do {
+            _ = try await scanner.scan(now: now)
+            XCTFail("a row with no timestamp or token count must keep last-good history")
+        } catch {
+            XCTAssertEqual(error as? OpenCodeUsageError, .databaseUnreadable)
+        }
     }
 
     func testMissingDatabaseReturnsNil() async throws {
@@ -179,6 +194,29 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         guard let scan = try await scanner.scan(now: now) else { return XCTFail("expected a scan") }
         let tokens = scan.logScan.series.daily.reduce(0) { $0 + $1.totalTokens }
         XCTAssertEqual(tokens, 1_000_000_000_000_000)
+        XCTAssertTrue(scan.logScan.series.daily.first?.tokenCountSaturated == true)
+    }
+
+    func testFiniteCostsThatOverflowDailySumKeepSubtotalAndRemainEncodable() async throws {
+        let db = "[" + [
+            openCodeRow("2026-07-12T10:00:00.000Z", "1e308", 1, "model-a", "opencode-go"),
+            openCodeRow("2026-07-12T11:00:00.000Z", "1e308", 1, "model-b", "opencode-go")
+        ].joined(separator: ",") + "]"
+        let scanner = OpenCodeUsageScanner(
+            sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": db]),
+            databasePaths: { ["/oc/opencode.db"] }
+        )
+
+        let maybeScan = try await scanner.scan(now: now)
+        let scan = try XCTUnwrap(maybeScan)
+        let day = try XCTUnwrap(scan.logScan.series.daily.first)
+        XCTAssertEqual(day.totalTokens, 2, "overflowing dollars do not discard measured tokens")
+        XCTAssertEqual(day.costUSD, 1e308, "retain the finite known subtotal as a lower bound")
+        XCTAssertFalse(day.costIsComplete)
+        XCTAssertFalse(day.hasUnexplainedIncompleteCost == true)
+        XCTAssertTrue(day.hasUnexplainedIncompleteCost == false)
+        XCTAssertNoThrow(try JSONEncoder().encode(scan.logScan),
+                         "finite source rows must not create an unencodable infinite aggregate")
     }
 
     func testPartitionCodexHomesSplitsDefaultAndManaged() {
@@ -271,7 +309,7 @@ final class OpenCodeFakeSQLite: SQLiteAccessing, @unchecked Sendable {
         if failing.contains(path) { throw SQLiteError.queryFailed("boom") }
         if sql.contains("json_group_array") {
             lastDataSQL = sql
-            return data[path]
+            return data[path] ?? "[]"
         }
         if sql.contains("SELECT 1") {
             let payload = data[path]

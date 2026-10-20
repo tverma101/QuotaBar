@@ -119,18 +119,24 @@ final class AppLogTests: XCTestCase {
     }
 
     @MainActor
-    func testRepeatedScheduledProviderFailureLogIsDeduplicatedUntilForcedRetry() async throws {
+    func testRepeatedCredentialAccessFailureLogIsDeduplicatedEvenOnForcedRetry() async throws {
         AppLog.reloadLevel(.info)
         let provider = Provider(id: "keychain-spam-test", displayName: "Keychain Spam Test", icon: .providerMark("codex"))
         let message = "macOS needs permission to read this Keychain item."
-        let runtime = TestProviderRuntime(
+        let failure = ProviderSnapshot.error(
+            provider: provider,
+            message: message,
+            category: .credentialAccess
+        )
+        let recovered = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: []
+        )
+        let runtime = SequenceProviderRuntime(
             provider: provider,
             descriptors: [],
-            snapshot: ProviderSnapshot.error(
-                provider: provider,
-                message: message,
-                category: .credentialAccess
-            )
+            snapshots: [failure, failure, failure, recovered, failure]
         )
         let suiteName = "OpenUsageTests.AppLog.keychainSpam.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -150,10 +156,135 @@ final class AppLogTests: XCTestCase {
         now.addTimeInterval(61)
         _ = await store.refresh(providerID: provider.id, force: false)
         _ = await store.refresh(providerID: provider.id, force: true)
+        _ = await store.refresh(providerID: provider.id, force: true)
+        _ = await store.refresh(providerID: provider.id, force: true)
 
         let failureLines = try fileContents().components(separatedBy: .newlines).filter {
             $0.contains("[WARN] [refresh] keychain-spam-test failed: \(message)")
         }
-        XCTAssertEqual(failureLines.count, 2, "scheduled retries dedupe; an explicit force retry is logged")
+        XCTAssertEqual(failureLines.count, 2, "the blocked Keychain item is deduplicated until a successful recovery")
+    }
+
+    @MainActor
+    func testForcedNonCredentialFailureIsLoggedForEachRetry() async throws {
+        AppLog.reloadLevel(.info)
+        let provider = Provider(id: "network-retry-test", displayName: "Network Retry Test", icon: .providerMark("codex"))
+        let message = "The request could not connect."
+        let runtime = TestProviderRuntime(
+            provider: provider,
+            descriptors: [],
+            snapshot: ProviderSnapshot.error(provider: provider, message: message, category: .network)
+        )
+        let suiteName = "OpenUsageTests.AppLog.networkRetry.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: []),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots"),
+            defaults: defaults,
+            monotonicNow: { 0 }
+        )
+
+        _ = await store.refresh(providerID: provider.id, force: true)
+        _ = await store.refresh(providerID: provider.id, force: true)
+
+        let failureLines = try fileContents().components(separatedBy: .newlines).filter {
+            $0.contains("[WARN] [refresh] network-retry-test failed: \(message)")
+        }
+        XCTAssertEqual(failureLines.count, 2, "forced transport retries remain individually diagnosable")
+    }
+
+    @MainActor
+    func testRepeatedNotLoggedInFailureLogIsDeduplicatedOnForcedRetry() async throws {
+        AppLog.reloadLevel(.info)
+        let provider = Provider(id: "not-logged-in-spam-test", displayName: "Not Logged In", icon: .providerMark("freebuff"))
+        let message = "No Freebuff login was found."
+        let failure = ProviderSnapshot.error(
+            provider: provider,
+            message: message,
+            category: .notLoggedIn
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [],
+            snapshots: [failure, failure, failure]
+        )
+        let suiteName = "OpenUsageTests.AppLog.notLoggedInSpam.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: []),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots"),
+            defaults: defaults,
+            monotonicNow: { 0 }
+        )
+
+        _ = await store.refresh(providerID: provider.id, force: true)
+        _ = await store.refresh(providerID: provider.id, force: true)
+        _ = await store.refresh(providerID: provider.id, force: true)
+
+        let failureLines = try fileContents().components(separatedBy: .newlines).filter {
+            $0.contains("[WARN] [refresh] not-logged-in-spam-test failed: \(message)")
+        }
+        XCTAssertEqual(failureLines.count, 1, "expected unauthenticated providers should not spam forced-refresh logs")
+    }
+
+    @MainActor
+    func testRecoveredDomainLogsTheSameCredentialFailureAgain() async throws {
+        AppLog.reloadLevel(.info)
+        let provider = Provider(id: "domain-log-latch-test", displayName: "Domain Log Latch", icon: .providerMark("claude"))
+        let meter = WidgetDescriptor.percent(id: "domain-log-latch.session", provider: provider, title: "Session")
+        let history = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "local"
+        )
+        let accountingFailure = ProviderSnapshot.error(
+            provider: provider,
+            message: "History scan failed.",
+            category: .network
+        )
+        let credentialFailure = ProviderSnapshot.error(
+            provider: provider,
+            message: "Keychain access blocked.",
+            category: .credentialAccess
+        )
+        let recoveredMeters = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.progress(label: "Session", used: 10, limit: 100, format: .percent)]
+        )
+        let runtime = SequenceProviderRuntime(
+            provider: provider,
+            descriptors: [meter, history],
+            snapshots: [accountingFailure, credentialFailure, recoveredMeters, credentialFailure]
+        )
+        let suiteName = "OpenUsageTests.AppLog.domainLogLatch.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [meter, history]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots"),
+            defaults: defaults,
+            now: { Date(timeIntervalSince1970: 1_800_000_000) },
+            monotonicNow: { 0 }
+        )
+
+        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            _ = await store.refresh(providerID: provider.id, force: true)
+        }
+        await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            _ = await store.refresh(providerID: provider.id, force: true)
+            _ = await store.refresh(providerID: provider.id, force: true)
+            _ = await store.refresh(providerID: provider.id, force: true)
+        }
+
+        let failureLines = try fileContents().components(separatedBy: .newlines).filter {
+            $0.contains("[WARN] [refresh] domain-log-latch-test failed: Keychain access blocked.")
+        }
+        XCTAssertEqual(failureLines.count, 2, "a successful quota pass clears the log latch for that domain")
     }
 }

@@ -81,7 +81,7 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
         var data: [String: String]
         init(data: [String: String] = [:]) { self.data = data }
         func queryValue(path: String, sql: String) throws -> String? {
-            if sql.contains("json_group_array") { return data[path] }
+            if sql.contains("json_group_array") { return data[path] ?? "[]" }
             if sql.contains("SELECT 1") { return data[path] == nil ? nil : "1" }
             return nil
         }

@@ -5,7 +5,7 @@ extension CodexLogUsageScanner {
         maxResidentIdentities: 2,
         maxResidentItems: 16_000,
         logTag: LogTag.plugin("opencode"),
-        persistence: JSONLScanCachePersistence(namespace: "codex-opencode-gateway", schemaVersion: 1)
+        persistence: JSONLScanCachePersistence(namespace: "codex-opencode-gateway", schemaVersion: 4)
     )
 }
 
@@ -40,6 +40,7 @@ struct CodexGatewayCacheProjection: Sendable {
     static func load(persistence: JSONLScanCachePersistence, identity: String,
                      files: [JSONLScanning.DiscoveredFile]) -> Self {
         var matching: [String: JSONLScanCacheFileMetadata] = [:]
+        let diagnosticPrefix = Self.diagnosticPrefix(persistence: persistence, identity: identity)
         do {
             if let manifest = try JSONLScanCacheWriter.shared.loadManifest(
                 persistence: persistence, identity: identity
@@ -49,29 +50,70 @@ struct CodexGatewayCacheProjection: Sendable {
                     if let cached = manifest.files[file.path], cached.size == file.size,
                        cached.mtime == file.mtime, cached.attributeMtime == file.attributeMtime {
                         matching[file.path] = cached
+                    } else {
+                        DiagnosticGate.clearFailures(prefix: Self.recordDiagnosticPrefix(
+                            persistence: persistence,
+                            identity: identity,
+                            path: file.path
+                        ))
                     }
                 }
             }
+            DiagnosticGate.clearFailure(diagnosticPrefix + "manifest")
         } catch {
-            AppLog.warn(LogTag.plugin("opencode"), "native gateway parse manifest unreadable; reparsing source")
+            DiagnosticGate.logOnce(for: diagnosticPrefix + "manifest") {
+                AppLog.warn(LogTag.plugin("opencode"), "native gateway parse manifest unreadable; reparsing source")
+            }
         }
         return Self(persistence: persistence, identity: identity, metadata: matching)
     }
 
     func read(at url: URL) -> [CodexLogUsageScanner.Event]? {
         guard let expected = metadata[url.path] else { return nil }
+        let failurePrefix = Self.recordDiagnosticPrefix(
+            persistence: persistence, identity: identity, path: url.path
+        )
+        let diagnosticKey = failurePrefix + JSONLScanCachePaths.stableFingerprint([
+            String(expected.size),
+            String(expected.mtime.timeIntervalSinceReferenceDate),
+            expected.attributeMtime.map { String($0.timeIntervalSinceReferenceDate) } ?? "no-attribute-mtime",
+            expected.recordFileName
+        ].joined(separator: "|"))
         do {
             guard let record = try JSONLScanCacheWriter.shared.loadRecord(
                 persistence: persistence, identity: identity, path: url.path,
                 metadata: expected, itemType: ProjectedEvent.self
             ) else {
-                AppLog.warn(LogTag.plugin("opencode"), "native gateway parse record unreadable; reparsing source")
+                DiagnosticGate.logOnce(for: diagnosticKey) {
+                    AppLog.warn(LogTag.plugin("opencode"), "native gateway parse record unreadable; reparsing source")
+                }
                 return nil
             }
+            DiagnosticGate.clearFailures(prefix: failurePrefix)
             return record.items.compactMap(\.event)
         } catch {
-            AppLog.warn(LogTag.plugin("opencode"), "native gateway parse record read failed; reparsing source")
+            DiagnosticGate.logOnce(for: diagnosticKey) {
+                AppLog.warn(LogTag.plugin("opencode"), "native gateway parse record read failed; reparsing source")
+            }
             return nil
         }
+    }
+
+    private static func diagnosticPrefix(
+        persistence: JSONLScanCachePersistence,
+        identity: String
+    ) -> String {
+        let scope = [persistence.directory.standardizedFileURL.path, persistence.namespace, identity]
+            .joined(separator: "|")
+        return "codex.gateway.cache-projection.\(JSONLScanCachePaths.stableFingerprint(scope))."
+    }
+
+    private static func recordDiagnosticPrefix(
+        persistence: JSONLScanCachePersistence,
+        identity: String,
+        path: String
+    ) -> String {
+        diagnosticPrefix(persistence: persistence, identity: identity)
+            + "record.\(JSONLScanCachePaths.stableFingerprint(path))."
     }
 }

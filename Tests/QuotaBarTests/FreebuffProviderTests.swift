@@ -54,6 +54,43 @@ final class FreebuffAuthStoreTests: XCTestCase {
         XCTAssertEqual(try environmentStore.loadAuth()?.token, "env-token")
     }
 
+    func testMalformedCredentialsFallBackToEnvironmentToken() throws {
+        let path = "/Users/tester/.config/manicode/credentials.json"
+        let store = FreebuffAuthStore(
+            files: FakeFiles([path: "not-json"]),
+            keychain: FakeKeychain(),
+            environment: FakeEnvironment(["CODEBUFF_API_KEY": "env-token"]),
+            homeDirectory: { URL(fileURLWithPath: "/Users/tester") }
+        )
+
+        XCTAssertEqual(try store.loadAuth()?.token, "env-token")
+    }
+
+    func testUnreadableCredentialsFallBackToEnvironmentToken() throws {
+        let store = FreebuffAuthStore(
+            files: UnreadableFreebuffFiles(),
+            keychain: FakeKeychain(),
+            environment: FakeEnvironment(["CODEBUFF_API_KEY": "env-token"]),
+            homeDirectory: { URL(fileURLWithPath: "/Users/tester") }
+        )
+
+        XCTAssertEqual(try store.loadAuth()?.token, "env-token")
+    }
+
+    func testMalformedCredentialsWithoutEnvironmentFallbackRemainActionable() {
+        let path = "/Users/tester/.config/manicode/credentials.json"
+        let store = FreebuffAuthStore(
+            files: FakeFiles([path: "not-json"]),
+            keychain: FakeKeychain(),
+            environment: FakeEnvironment(),
+            homeDirectory: { URL(fileURLWithPath: "/Users/tester") }
+        )
+
+        XCTAssertThrowsError(try store.loadAuth()) {
+            XCTAssertEqual($0 as? FreebuffAuthError, .invalidCredentials)
+        }
+    }
+
     func testReadsKeychainPointerScopedToCredentialFilePath() throws {
         let path = "/Users/tester/.config/manicode/credentials.json"
         let keychain = AccountScopedFreebuffKeychain(token: "keychain-token")
@@ -85,6 +122,56 @@ final class FreebuffAuthStoreTests: XCTestCase {
             XCTAssertEqual(keychain.readCount, 1)
         }
         KeychainPermissionGate.shared.reset(key)
+    }
+
+    func testManualRefreshWithEnvironmentFallbackKeepsKeychainReadSilent() throws {
+        let path = "/Users/tester/.config/manicode/credentials.json"
+        let key = KeychainItemKey(service: FreebuffAuthStore.keychainService, account: path)
+        KeychainPermissionGate.shared.reset(key)
+        defer { KeychainPermissionGate.shared.reset(key) }
+        let keychain = AccountScopedFreebuffKeychain(
+            token: nil,
+            readError: .interactionNotAllowed
+        )
+        let store = FreebuffAuthStore(
+            files: FakeFiles([path: #"{"default":{"tokenStore":"keychain"}}"#]),
+            keychain: keychain,
+            environment: FakeEnvironment(["CODEBUFF_API_KEY": "env-token"]),
+            homeDirectory: { URL(fileURLWithPath: "/Users/tester") }
+        )
+        let interactionGate = CredentialInteractionGate()
+
+        for _ in 0..<2 {
+            let manualActionID = KeychainPermissionGate.shared.beginManualAction()
+            let auth = try ProviderRefreshContext.$isManual.withValue(true) {
+                try ProviderRefreshContext.$manualActionID.withValue(manualActionID) {
+                    try ProviderRefreshContext.$credentialInteractionGate.withValue(interactionGate) {
+                        try store.loadAuth()
+                    }
+                }
+            }
+            XCTAssertEqual(auth?.token, "env-token")
+        }
+        XCTAssertEqual(keychain.readCount, 2,
+                       "each new manual action silently checks whether Keychain access has recovered")
+        XCTAssertEqual(keychain.readInteractionValues, [false, false])
+
+        keychain.readError = nil
+        keychain.token = "restored-keychain-token"
+        let recoveredActionID = KeychainPermissionGate.shared.beginManualAction()
+        let recovered = try ProviderRefreshContext.$isManual.withValue(true) {
+            try ProviderRefreshContext.$manualActionID.withValue(recoveredActionID) {
+                try ProviderRefreshContext.$credentialInteractionGate.withValue(interactionGate) {
+                    try store.loadAuth()
+                }
+            }
+        }
+        XCTAssertEqual(recovered?.token, "restored-keychain-token",
+                       "a recovered Keychain item must take precedence over a stale environment token")
+        XCTAssertEqual(keychain.readInteractionValues, [false, false, false])
+        XCTAssertFalse(KeychainPermissionGate.shared.isBlocked(key))
+        XCTAssertEqual(keychain.lastAllowInteraction, false,
+                       "a working environment fallback must prevent repeated manual Keychain prompts")
     }
 
     func testKeychainPermissionWithoutEnvironmentFallbackRemainsActionable() throws {
@@ -134,6 +221,28 @@ final class FreebuffAuthStoreTests: XCTestCase {
 }
 
 final class FreebuffUsageMapperTests: XCTestCase {
+    func testCurrentHoursMeterUsesProviderConversionAndSuppressesLegacyCaps() throws {
+        let mapped = try FreebuffUsageMapper.map(response: response([
+            "status": "none", "accessTier": "full",
+            "freeWindows": ["dayUsed": 0, "dayLimit": 7, "weekUsed": 1, "weekLimit": 14],
+            "freebucks": ["balance": 228, "daily": ["limit": 165, "spent": 15, "remaining": 150]]
+        ]))
+        XCTAssertNil(progress(mapped.lines, "Daily"))
+        XCTAssertNil(progress(mapped.lines, "Weekly"))
+        XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.used, 3)
+        XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.limit, 33)
+        XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.number, 45)
+    }
+
+    func testUnavailableCurrentMeterDoesNotReviveLegacyCaps() throws {
+        let mapped = try FreebuffUsageMapper.map(response: response([
+            "status": "none", "freebucks": NSNull(),
+            "freeWindows": ["dayUsed": 0, "dayLimit": 7]
+        ]))
+        XCTAssertNil(progress(mapped.lines, "Daily"))
+        XCTAssertNil(progress(mapped.lines, "Daily Hours"))
+    }
+
     func testMapsFreeSessionWindowsCreditsAndReportedMonthlyDollars() throws {
         let mapped = try FreebuffUsageMapper.map(response: response([
             "status": "none",
@@ -152,12 +261,12 @@ final class FreebuffUsageMapperTests: XCTestCase {
         ]))
 
         XCTAssertEqual(mapped.plan, "Full")
-        XCTAssertEqual(progress(mapped.lines, "Daily")?.used, 2)
-        XCTAssertEqual(progress(mapped.lines, "Weekly")?.used, 7)
-        XCTAssertEqual(progress(mapped.lines, "Monthly")?.used, 21)
-        XCTAssertEqual(progress(mapped.lines, "Freebucks Daily")?.used, 25)
-        XCTAssertEqual(progress(mapped.lines, "Freebucks Daily")?.limit, 100)
-        XCTAssertEqual(values(mapped.lines, "Freebucks Balance")?.first?.number, 75)
+        XCTAssertNil(progress(mapped.lines, "Daily"))
+        XCTAssertNil(progress(mapped.lines, "Weekly"))
+        XCTAssertNil(progress(mapped.lines, "Monthly"))
+        XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.used, 5)
+        XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.limit, 20)
+        XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.number, 15)
         XCTAssertEqual(progress(mapped.lines, "Monthly Spend")?.used, 3.5)
         XCTAssertEqual(progress(mapped.lines, "Monthly Spend")?.limit, 12)
     }
@@ -212,7 +321,7 @@ final class FreebuffUsageMapperTests: XCTestCase {
         ]))
 
         XCTAssertNil(mapped.lines.first { $0.label == "Monthly Spend" })
-        XCTAssertEqual(values(mapped.lines, "Freebucks Balance")?.first?.kind, .count)
+        XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.kind, .count)
     }
 
     func testDeduplicatesModelsByOpaquePoolAndUsesMostDepletedPool() throws {
@@ -231,6 +340,8 @@ final class FreebuffUsageMapperTests: XCTestCase {
         let pool = try XCTUnwrap(progress(mapped.lines, "Session Pool"))
         XCTAssertEqual(pool.used, 4)
         XCTAssertEqual(pool.limit, 5)
+        XCTAssertNil(mapped.lines.first { $0.label == "Daily" })
+        XCTAssertNil(mapped.lines.first { $0.label == "Monthly" })
     }
 
     func testRejectsResponseWithoutStatus() {
@@ -267,7 +378,8 @@ final class FreebuffProviderTests: XCTestCase {
 
         let request = try XCTUnwrap(http.requests.first)
         XCTAssertEqual(request.method, "GET")
-        XCTAssertEqual(request.url.absoluteString, FreebuffUsageClient.sessionURL)
+        XCTAssertEqual(request.url.absoluteString, "https://www.codebuff.com/api/v1/freebuff/session",
+                       "use the canonical host directly so a redirect cannot strip Authorization")
         XCTAssertEqual(request.headers["Authorization"], "Bearer test-token")
         XCTAssertEqual(request.headers["x-fb-timezone"], "America/New_York")
         XCTAssertNil(request.body)
@@ -276,6 +388,7 @@ final class FreebuffProviderTests: XCTestCase {
     func testUsageTransportFailureMapsToFriendlyNetworkError() async {
         let path = "/Users/tester/.config/manicode/credentials.json"
         let provider = FreebuffProvider(
+            historyScanner: FreebuffDesktopUsageScanner(databasePaths: { [] }),
             authStore: FreebuffAuthStore(
                 files: FakeFiles([path: #"{"default":{"authToken":"test-token"}}"#]),
                 keychain: FakeKeychain(), environment: FakeEnvironment(),
@@ -311,6 +424,7 @@ final class FreebuffProviderTests: XCTestCase {
         let files = FakeFiles([path: #"{"default":{"authToken":"test-token"}}"#])
         let http = FakeHTTPClient(response: HTTPResponse(statusCode: 404, headers: [:], body: Data()))
         let provider = FreebuffProvider(
+            historyScanner: FreebuffDesktopUsageScanner(databasePaths: { [] }),
             authStore: FreebuffAuthStore(
                 files: files, keychain: FakeKeychain(), environment: FakeEnvironment(),
                 homeDirectory: { URL(fileURLWithPath: "/Users/tester") }
@@ -329,6 +443,7 @@ final class FreebuffProviderTests: XCTestCase {
         let path = "/Users/tester/.config/manicode/credentials.json"
         let http = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data()))
         let provider = FreebuffProvider(
+            historyScanner: FreebuffDesktopUsageScanner(databasePaths: { [] }),
             authStore: FreebuffAuthStore(
                 files: FakeFiles([path: #"{"default":{"authToken":"test-token"}}"#]),
                 keychain: FakeKeychain(), environment: FakeEnvironment(),
@@ -345,6 +460,7 @@ final class FreebuffProviderTests: XCTestCase {
     func testInvalidConfiguredDirectoryRemainsDetectedAndSurfacesTypedError() async {
         let http = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data()))
         let provider = FreebuffProvider(
+            historyScanner: FreebuffDesktopUsageScanner(databasePaths: { [] }),
             authStore: FreebuffAuthStore(
                 files: FakeFiles(),
                 keychain: FakeKeychain(),
@@ -398,8 +514,9 @@ private func captureFreebuffAuthStoreLogs(
 
 private final class AccountScopedFreebuffKeychain: KeychainAccessing, @unchecked Sendable {
     var token: String?
-    let readError: KeychainError?
+    var readError: KeychainError?
     private(set) var readCount = 0
+    private(set) var readInteractionValues: [Bool] = []
     var lastService: String?
     var lastAccount: String?
     var lastAllowInteraction: Bool?
@@ -430,6 +547,19 @@ private final class AccountScopedFreebuffKeychain: KeychainAccessing, @unchecked
         lastService = service
         lastAccount = account
         lastAllowInteraction = allowInteraction
+        readInteractionValues.append(allowInteraction)
         return try read()
     }
+}
+
+private struct UnreadableFreebuffFiles: TextFileAccessing {
+    func exists(_ path: String) -> Bool { true }
+
+    func readText(_ path: String) throws -> String {
+        throw CocoaError(.fileReadNoPermission)
+    }
+
+    func writeText(_ path: String, _ text: String) throws {}
+
+    func remove(_ path: String) throws {}
 }

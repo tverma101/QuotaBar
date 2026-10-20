@@ -300,13 +300,21 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
 
         let scan = ClaudeLogUsageScanner.aggregate(entries: [unknown, priced], since: .distantPast, pricing: pricing)
 
-        // Unpriced usage keeps counting tokens (the history screen shows them) but contributes no
-        // cost — its day stays backed by the priced rows so the reveal can backfill dollars later.
-        XCTAssertEqual(scan.series.daily, [DailyUsageEntry(date: day, totalTokens: 1515, costUSD: 0.02, costIsComplete: false)])
+        // Unpriced usage keeps counting tokens; the priced model subtotal stays visible with an
+        // incomplete-cost marker because the unknown model could add more cost after pricing lands.
+        XCTAssertEqual(scan.series.daily, [
+            DailyUsageEntry(
+                date: day,
+                totalTokens: 1515,
+                costUSD: 0.02,
+                costIsComplete: false,
+                hasUnexplainedIncompleteCost: false
+            )
+        ])
         XCTAssertEqual(scan.unknownModelsByDay[day], ["mystery-model"])
         XCTAssertEqual(scan.modelUsage?.daily.first?.models, [
             ModelUsageEntry(model: "claude-test-model", totalTokens: 1500, costUSD: 0.02),
-            ModelUsageEntry(model: "mystery-model", totalTokens: 15, costUSD: nil)
+            ModelUsageEntry(model: "mystery-model", totalTokens: 15, costUSD: nil, costIsComplete: false)
         ])
     }
 
@@ -328,7 +336,7 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
             XCTAssertNil(scan.series.daily[0].costUSD)
             XCTAssertEqual(scan.unknownModelsByDay[day], [foldedName])
             XCTAssertEqual(scan.modelUsage?.daily.first?.models, [
-                ModelUsageEntry(model: foldedName, totalTokens: 15, costUSD: nil)
+                ModelUsageEntry(model: foldedName, totalTokens: 15, costUSD: nil, costIsComplete: false)
             ])
         }
     }

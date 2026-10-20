@@ -22,6 +22,7 @@ final class CodexProvider: ProviderRuntime {
     let routerUsageScanner: CodexRouterUsageScanner
     let piUsageScanner: PiUsageScanner
     let expectedIdentityKey: String?
+    private var lastResolvedAccountIdentityKey: String?
     let allowsKeychainFallback: Bool
     let allowsUnattributedPiUsage: Bool
     /// Higher-priority peer homes are identity-only sources for excluding shared rollouts. They are
@@ -39,6 +40,7 @@ final class CodexProvider: ProviderRuntime {
         routerUsageScanner: CodexRouterUsageScanner = CodexRouterUsageScanner(),
         piUsageScanner: PiUsageScanner = .shared,
         expectedIdentityKey: String? = nil,
+        initialAccountIdentityKey: String? = nil,
         allowsKeychainFallback: Bool = true,
         allowsUnattributedPiUsage: Bool = true,
         peerHomes: @escaping @MainActor () -> [URL] = { [] },
@@ -54,6 +56,8 @@ final class CodexProvider: ProviderRuntime {
         self.routerUsageScanner = routerUsageScanner
         self.piUsageScanner = piUsageScanner
         self.expectedIdentityKey = normalizedIdentity
+        self.lastResolvedAccountIdentityKey = normalizedIdentity
+            ?? CodexAuthStore.normalizedIdentityKey(initialAccountIdentityKey)
         self.allowsKeychainFallback = allowsKeychainFallback
         self.allowsUnattributedPiUsage = allowsUnattributedPiUsage
         self.peerHomes = peerHomes
@@ -68,12 +72,15 @@ final class CodexProvider: ProviderRuntime {
             .percent(id: "\(provider.id).weekly", provider: provider, title: "Weekly")
                 .exportingLimit("weekly", unit: "percent"),
             .percent(id: "\(provider.id).spark", provider: provider, title: "Spark")
-                .exportingLimit("spark", unit: "percent"),
+                .exportingLimit("spark", unit: "percent")
+                .hidingWhenEmpty(),
             .percent(id: "\(provider.id).sparkWeekly", provider: provider, title: "Spark Weekly")
-                .exportingLimit("sparkWeekly", unit: "percent"),
+                .exportingLimit("sparkWeekly", unit: "percent")
+                .hidingWhenEmpty(),
             .combined(id: "\(provider.id).credits", provider: provider, title: "Extra Usage", metricLabel: "Credits")
                 .exportingLimit("credits", kind: .balance, unit: "credits", source: .value(kind: .count, label: "credits"))
-                .exportingLimit("creditValue", kind: .balance, unit: "usd", source: .value(kind: .dollars)),
+                .exportingLimit("creditValue", kind: .balance, unit: "usd", source: .value(kind: .dollars))
+                .hidingWhenEmpty(),
             .values(id: "\(provider.id).rateLimitResets", provider: provider, title: "Rate Limit Resets", metricLabel: "Rate Limit Resets", traySuffix: "resets", showsResetExpiries: true)
                 .exportingLimit("rateLimitResets", kind: .balance, unit: "resets", source: .value(kind: .count, label: "available"))
                 .hidingWhenEmpty(),
@@ -132,14 +139,22 @@ final class CodexProvider: ProviderRuntime {
         // meters from the prior snapshot and carries their freshness stamp.
         if ProviderRefreshContext.scope.suppressesLiveQuota {
             var lines: [MetricLine] = []
-            let modelPricing = await pricing()
-            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-            let usageHistory = await appendLocalUsage(
-                to: &lines,
-                now: now(),
-                pricing: modelPricing,
-                accountIdentityKey: expectedIdentityKey
-            )
+            let accountIdentityKey = expectedIdentityKey ?? lastResolvedAccountIdentityKey
+            let usageHistory: ProviderUsageHistory?
+            if let accountIdentityKey {
+                let modelPricing = await pricing()
+                guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+                usageHistory = await appendLocalUsage(
+                    to: &lines,
+                    now: now(),
+                    pricing: modelPricing,
+                    accountIdentityKey: accountIdentityKey
+                )
+            } else {
+                // A fold-only wake cannot prove which account stamped the shared Router ledger yet.
+                // Keep the stored history until the first authenticated probe establishes identity.
+                usageHistory = nil
+            }
             guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
             MetricLine.appendNoDataIfNeeded(&lines)
             return ProviderSnapshot.make(
@@ -237,6 +252,7 @@ final class CodexProvider: ProviderRuntime {
         try Task.checkCancellation()
         var authState = initialState
         guard isExpectedAccount(authState) else { throw CodexAuthError.tokenConflict }
+        lastResolvedAccountIdentityKey = Self.accountIdentity(in: authState.auth) ?? lastResolvedAccountIdentityKey
         guard var accessToken = authState.auth.tokens?.accessToken, !accessToken.isEmpty else {
             if authState.auth.apiKey?.isEmpty == false {
                 throw CodexAuthError.usageAPIKey
@@ -261,6 +277,7 @@ final class CodexProvider: ProviderRuntime {
 
         try Task.checkCancellation()
         guard isExpectedAccount(authState) else { throw CodexAuthError.tokenConflict }
+        lastResolvedAccountIdentityKey = Self.accountIdentity(in: authState.auth) ?? lastResolvedAccountIdentityKey
         let response = try await fetchUsageWithRetry(accessToken: accessToken, authState: &authState)
         try Task.checkCancellation()
         let currentToken = authState.auth.tokens?.accessToken ?? accessToken
@@ -310,14 +327,18 @@ final class CodexProvider: ProviderRuntime {
             // prior spend/history via the data-store merge.
             usageHistory = nil
         } else {
-            let modelPricing = await pricing()
-            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-            usageHistory = await appendLocalUsage(
-                to: &lines,
-                now: now(),
-                pricing: modelPricing,
-                accountIdentityKey: expectedIdentityKey
-            )
+            if let accountIdentityKey = expectedIdentityKey ?? lastResolvedAccountIdentityKey {
+                let modelPricing = await pricing()
+                guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+                usageHistory = await appendLocalUsage(
+                    to: &lines,
+                    now: now(),
+                    pricing: modelPricing,
+                    accountIdentityKey: accountIdentityKey
+                )
+            } else {
+                usageHistory = nil
+            }
         }
         MetricLine.appendNoDataIfNeeded(&lines)
         return ProviderSnapshot.make(
@@ -344,7 +365,15 @@ final class CodexProvider: ProviderRuntime {
         // homes (CodexRouter pool), dumping ~tens of thousands of unstamped events onto
         // the "default" card inflates token/spend by billions of tokens. Stamped rows
         // still match via fingerprint / accountId / pool alias.
-        let routerScan = await routerUsageScanner.scan(
+        let routerIdentity = accountIdentityKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .nilIfEmpty ?? "default"
+        let routerIncompleteDiagnosticKey = "codex.router.scan.incomplete.\(JSONLScanCachePaths.stableFingerprint(routerIdentity))"
+        let localHistoryIdentity = accountIdentityKey ?? provider.id
+        let nativeIncompleteDiagnosticKey = "codex.native.scan.incomplete.\(JSONLScanCachePaths.stableFingerprint(localHistoryIdentity))"
+        let piIncompleteDiagnosticKey = "codex.pi.scan.incomplete.\(JSONLScanCachePaths.stableFingerprint(provider.id))"
+        let routerResult = await routerUsageScanner.scanResult(
             accountIdentityKey: accountIdentityKey,
             allowsUnscopedEvents: false,
             daysBack: UsageHistoryWindow.lifetimeDays(through: now),
@@ -352,6 +381,20 @@ final class CodexProvider: ProviderRuntime {
             pricing: pricing
         )
         guard !Task.isCancelled else { return nil }
+        let routerScan: LogUsageScan?
+        switch routerResult {
+        case .complete(let scan):
+            routerScan = scan
+            DiagnosticGate.clearFailure(routerIncompleteDiagnosticKey)
+        case .incomplete:
+            DiagnosticGate.logOnce(for: routerIncompleteDiagnosticKey) {
+                AppLog.warn(
+                    LogTag.plugin("codex"),
+                    "Codex Router scan was incomplete; keeping the previous combined usage history"
+                )
+            }
+            return nil
+        }
         // Native sessions may contain days that never passed through Codex Router. Their per-file
         // aggregates skip unchanged events, so preserving gap-fill history needs no repeated fold.
         let nativeResult = await logUsageScanner.scanResult(
@@ -365,20 +408,30 @@ final class CodexProvider: ProviderRuntime {
         switch nativeResult {
         case .complete(let scan):
             nativeScan = scan
+            DiagnosticGate.clearFailure(nativeIncompleteDiagnosticKey)
         case .incomplete:
-            AppLog.warn(
-                LogTag.plugin("codex"),
-                "Codex session discovery or fold was incomplete; keeping the previous combined usage history"
-            )
+            DiagnosticGate.logOnce(for: nativeIncompleteDiagnosticKey) {
+                AppLog.warn(
+                    LogTag.plugin("codex"),
+                    "Codex session discovery or fold was incomplete; keeping the previous combined usage history"
+                )
+            }
             return nil
         }
-        let proxyScan = await proxyUsageScanner.scan(
+        let proxyResult = await proxyUsageScanner.scanResult(
             accountIdentityKey: accountIdentityKey,
             daysBack: UsageHistoryWindow.lifetimeDays(through: now),
             now: now,
             pricing: pricing
         )
         guard !Task.isCancelled else { return nil }
+        let proxyScan: LogUsageScan?
+        switch proxyResult {
+        case .complete(let scan):
+            proxyScan = scan
+        case .incomplete:
+            return nil
+        }
         let piResult: PiUsageScanResult = allowsUnattributedPiUsage
             ? await piUsageScanner.scanResult(
                 cardID: provider.id,
@@ -392,11 +445,14 @@ final class CodexProvider: ProviderRuntime {
         switch piResult {
         case .complete(let scan):
             piScan = scan
+            DiagnosticGate.clearFailure(piIncompleteDiagnosticKey)
         case .incomplete:
-            AppLog.warn(
-                LogTag.plugin("codex"),
-                "Pi session discovery was incomplete; keeping the previous combined usage history"
-            )
+            DiagnosticGate.logOnce(for: piIncompleteDiagnosticKey) {
+                AppLog.warn(
+                    LogTag.plugin("codex"),
+                    "Pi session discovery was incomplete; keeping the previous combined usage history"
+                )
+            }
             return nil
         }
         // Multi-account cards (expectedIdentityKey set): prefer CodexRouter stamped metering as
@@ -407,27 +463,34 @@ final class CodexProvider: ProviderRuntime {
         let usedProxy: Bool
         let usedRouter: Bool
         let coreScan: LogUsageScan?
+        let modelIdentity: (String) -> String = {
+            DailyUsageAccumulator.codexCrossSourceModelIdentity($0, pricing: pricing)
+        }
         if expectedIdentityKey != nil {
-            let routerThenLogs = DailyUsageAccumulator.mergedPreferringPrimary(
+            let routerThenLogs = DailyUsageAccumulator.mergedPreferringPrimaryByModel(
                 routerScan,
-                fillingGapsFrom: [nativeScan]
+                fillingGapsFrom: [nativeScan],
+                modelIdentity: modelIdentity
             )
-            let withProxy = DailyUsageAccumulator.mergedPreferringPrimary(
+            let withProxy = DailyUsageAccumulator.mergedPreferringPrimaryByModel(
                 routerThenLogs.scan,
-                fillingGapsFrom: [proxyScan]
+                fillingGapsFrom: [proxyScan],
+                modelIdentity: modelIdentity
             )
             coreScan = withProxy.scan
             usedRouter = routerScan != nil
             usedLogs = routerThenLogs.usedSupplement
             usedProxy = withProxy.usedSupplement
         } else {
-            let logsAndProxy = DailyUsageAccumulator.mergedPreferringPrimary(
+            let logsAndProxy = DailyUsageAccumulator.mergedPreferringPrimaryByModel(
                 nativeScan,
-                fillingGapsFrom: [proxyScan]
+                fillingGapsFrom: [proxyScan],
+                modelIdentity: modelIdentity
             )
-            let logsProxyAndRouter = DailyUsageAccumulator.mergedPreferringPrimary(
+            let logsProxyAndRouter = DailyUsageAccumulator.mergedPreferringPrimaryByModel(
                 logsAndProxy.scan,
-                fillingGapsFrom: [routerScan]
+                fillingGapsFrom: [routerScan],
+                modelIdentity: modelIdentity
             )
             coreScan = logsProxyAndRouter.scan
             usedLogs = nativeScan != nil
@@ -444,13 +507,21 @@ final class CodexProvider: ProviderRuntime {
             usedRouter ? "Codex Router" : nil,
             piScan.map { _ in "pi" }
         ].compactMap { $0 }
+        let unmeasuredDays = routerScan?.unmeasuredUsageDays ?? []
         let note = "From your \(sourceNames.joined(separator: ", ")) (estimated)"
+            + (unmeasuredDays.isEmpty ? "" : ". Some routed requests have no token measurements; totals include measured requests only.")
+        if !unmeasuredDays.isEmpty {
+            DiagnosticGate.logOnce(for: "codex.router.unmeasured.\(provider.id)") {
+                AppLog.warn(LogTag.plugin("codex"), "Some Router requests have no token measurements; affected daily totals are partial")
+            }
+        }
         let usageHistory = ProviderUsageHistory(
             series: scan.series,
             modelUsage: scan.modelUsage,
             unknownModelsByDay: scan.unknownModelsByDay,
             apiEstimateByDay: scan.apiEstimateByDay,
-            apiEstimateIncompleteDays: scan.apiEstimateIncompleteDays
+            apiEstimateIncompleteDays: scan.apiEstimateIncompleteDays,
+            partialDays: unmeasuredDays
         )
         SpendTileMapper.appendTokenUsage(
             scan.series,
@@ -459,6 +530,7 @@ final class CodexProvider: ProviderRuntime {
             unknownModelsByDay: scan.unknownModelsByDay,
             modelUsage: scan.modelUsage,
             modelSourceNote: note,
+            partialDays: unmeasuredDays,
             apiEstimateByDay: scan.apiEstimateByDay
         )
         SpendTileMapper.appendUsageTrend(scan.series, to: &lines, now: now, note: note)
@@ -467,11 +539,17 @@ final class CodexProvider: ProviderRuntime {
 
     private func fetchResetCreditsBestEffort(accessToken: String, accountID: String?) async throws -> HTTPResponse? {
         guard !Task.isCancelled else { return nil }
+        let accountIdentity = accountID ?? accessToken
+        let diagnosticKey = "codex.reset-credits.transport.\(JSONLScanCachePaths.stableFingerprint(accountIdentity))"
         do {
-            return try await usageClient.fetchResetCredits(accessToken: accessToken, accountID: accountID)
+            let response = try await usageClient.fetchResetCredits(accessToken: accessToken, accountID: accountID)
+            DiagnosticGate.clearFailure(diagnosticKey)
+            return response
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.warn(LogTag.plugin("codex"), "reset-credit fetch failed; using usage-body count: \(error.localizedDescription)")
+            DiagnosticGate.logOnce(for: diagnosticKey) {
+                AppLog.warn(LogTag.plugin("codex"), "reset-credit fetch failed; using usage-body count: \(error.localizedDescription)")
+            }
             return nil
         }
     }
@@ -481,6 +559,8 @@ final class CodexProvider: ProviderRuntime {
         var working = authState
         defer { authState = working }
         return try await ProviderAuthRetry.fetch(
+            providerID: provider.id,
+            diagnosticSourceID: Self.authRetrySourceID(for: working),
             token: accessToken,
             attempt: {
                 try Task.checkCancellation()
@@ -508,6 +588,18 @@ final class CodexProvider: ProviderRuntime {
         )
     }
 
+    private static func authRetrySourceID(for state: CodexAuthState) -> String {
+        let source: String
+        switch state.source {
+        case .file(let path): source = "file:\(path)"
+        case .keychain(let account): source = "keychain:\(account)"
+        }
+        let accountID = state.auth.tokens?.accountID
+            ?? state.auth.tokens?.idToken.flatMap { ProviderParse.jwtPayload($0)?["sub"] as? String }
+            ?? ""
+        return source + "\n" + accountID
+    }
+
     private func reloadLiveAuth(source: CodexAuthState.Source) async throws -> CodexAuthState? {
         let candidate: CodexAuthState?
         switch source {
@@ -528,7 +620,6 @@ final class CodexProvider: ProviderRuntime {
                 }
             } catch {
                 try ProviderCancellation.rethrowIfCancellation(error)
-                AppLog.info(LogTag.auth("codex"), "keychain credential unavailable: \(error)")
                 return nil
             }
         }
@@ -555,6 +646,7 @@ final class CodexProvider: ProviderRuntime {
         }
         authState.auth.lastRefresh = OpenUsageISO8601.string(from: now())
         guard isExpectedAccount(authState) else { throw CodexAuthError.tokenConflict }
+        let persistenceDiagnosticKey = Self.credentialPersistenceDiagnosticKey(for: authState.source)
         do {
             let persistedState = authState
             let authStore = self.authStore
@@ -566,6 +658,7 @@ final class CodexProvider: ProviderRuntime {
                 try refreshContext.withValue {
                     try authStore.save(persistedState, replacing: originalState)
                 }
+                DiagnosticGate.clearFailure(persistenceDiagnosticKey)
             }.value
         } catch let error as CodexAuthError {
             switch error {
@@ -574,14 +667,27 @@ final class CodexProvider: ProviderRuntime {
                 // indeterminate live-source check. Only ordinary write failures may use it in-memory.
                 throw error
             default:
-                AppLog.error(LogTag.auth("codex"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
+                DiagnosticGate.logOnce(for: persistenceDiagnosticKey) {
+                    AppLog.error(LogTag.auth("codex"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
+                }
             }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            AppLog.error(LogTag.auth("codex"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
+            DiagnosticGate.logOnce(for: persistenceDiagnosticKey) {
+                AppLog.error(LogTag.auth("codex"), "failed to persist rotated credentials; using the refreshed token for this session only: \(error.localizedDescription)")
+            }
         }
         try Task.checkCancellation()
         return response.accessToken
+    }
+
+    private static func credentialPersistenceDiagnosticKey(for source: CodexAuthState.Source) -> String {
+        let identity: String
+        switch source {
+        case .file(let path): identity = "file.\(path)"
+        case .keychain(let account): identity = "keychain.\(account)"
+        }
+        return "auth.codex.token-persist.\(JSONLScanCachePaths.stableFingerprint(identity))"
     }
 }

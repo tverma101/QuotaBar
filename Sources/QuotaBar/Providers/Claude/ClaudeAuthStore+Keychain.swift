@@ -52,7 +52,6 @@ extension ClaudeAuthStore {
             } catch {
                 readFailed = true
             }
-            AppLog.debug(.keychain, "read miss service=\(service)")
         }
         return (nil, permissionRequired, readFailed, false)
     }
@@ -90,7 +89,6 @@ extension ClaudeAuthStore {
         else {
             return nil
         }
-        AppLog.debug(.keychain, "read hit service=\(service)")
         return ClaudeCredentialState(oauth: oauth, source: source, fullData: parsed, inferenceOnly: false)
     }
 }

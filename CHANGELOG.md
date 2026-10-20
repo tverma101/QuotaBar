@@ -2,16 +2,32 @@
 
 ## Unreleased
 
+- Page the full OpenRouter model catalog, recheck fallback-priced names so new exact routes replace stale estimates, and stop per-model checks after three misses.
+- Keep optional provider cards off until selected in Customize, preserve Freebuff in the default set, and reset to those explicit defaults.
+- Resume first-run provider defaults and manual provider choices safely after an interrupted launch.
+- Replay Reset All's default provider set after a crash between clearing old choices and writing defaults.
+- Rebuild OpenCode account descriptors after native auth.json changes, and queue concurrent Codex/OpenCode catalog reloads instead of dropping either update.
+- Keep OpenCode multi-account quotas hidden during partial credential reads and recover malformed provider-reset intents to safe defaults.
+- Fingerprint the complete OpenCode Go-key inventory so rotated or unreadable credentials cannot inherit cached caps, while preserving local history.
+- Continue OpenCode local accounting through unreadable Go-key files, clear rotated account caps on catalog replacement, and isolate replacement schedulers from manual Keychain permission.
+- Hide Cursor's missing aggregate meter and require both OpenRouter credit totals before showing a balance; preserve Z.ai's active-plan no-data rows while clearing stale quotas when the plan disappears.
+- Hide plan-dependent and absent Freebuff meter rows when a provider omits that quota, while preserving an empty row when the user explicitly enables it.
+- Make Freebuff's signed-out warning actionable with the local CLI login command and a refresh step.
+- Restore Antigravity history for newer conversation databases by reading timestamps from correlated step metadata.
 - Reuse a Keychain prompt that is already on screen for the same item instead of probing the item again: sibling cards wait for that one dialog and retry silently from its grant, and a newer explicit refresh still fails closed rather than waiting behind the prompt it superseded.
 - Keep freshly fetched OpenCode Go meters when the panel's second (history) pass fails its local scan — a fold-only pass never asks the account endpoint, so it has no evidence that those meters are stale.
 - Clear the catch-all provider failure once any later pass succeeds, so a provider whose scopes all resolve to that bucket does not keep an error row and a Retry affordance forever.
 - Fail the whole OpenCode fold closed when Hermes can't be read, instead of publishing the readable subset as if it were the complete card.
+- Preserve cache freshness for history-only providers, collapse Antigravity append verification into one SQLite digest, and keep source revision fixtures aligned with production discovery.
+- Resolve multi-account OpenCode meters, keep plan-only Copilot headers visible, hide missing optional balances, and show an immediate loading item during account discovery.
 
 - Apply GPT-6.1 Sol's published Codex service-tier multipliers and exact models.dev context thresholds; refresh offline model-price snapshots.
 - Preserve estimated-input flags in compact OpenCode router history, fold older Go events by day/model, and reject partial router-ledger reads.
 - Keep OpenCode-billed Hermes usage on the OpenCode card so Total Spend does not count its tokens twice.
 - Reconcile router rows only against measured Claude/Codex pairs; preserve independent Hermes/Muse sessions and prefer native counts when router input is estimated.
-- Keep incomplete model and folded Other dollar rows blank instead of showing partial subtotals; retain public-rate estimate completeness through the lifetime history window.
+- Keep known model and folded Other subtotals visible as partial when named unknown models explain the gap; hide dollars for separate accounting gaps or legacy history that cannot verify the cause, while retaining public-rate estimate completeness through the lifetime history window.
+- Mark active native Hermes sessions and only their affected model rows partial, retain that status through lifetime history, preserve known cost subtotals in `/v1/usage`, and cache absent or empty Keychain items briefly without losing the cache on a canceled recheck.
+- Track estimated OpenCode costs per day so only periods and lifetime totals that contain imputed gateway dollars carry the estimate marker.
 - Mark Hermes public-rate estimates incomplete for token days, hide incomplete Hermes cost subtotals, and withhold Cursor spend exports containing malformed rows.
 - Load OpenCode local usage through the ten-year History window while spend tiles remain limited to their labeled period.
 - Keep valid Cursor CSV rows when the whole export token sum exceeds Int.max, and omit zero-token rows from usage history.
@@ -19,8 +35,13 @@
 - Rebind Antigravity's cached database when its file is renamed, avoiding duplicate history for the moved store.
 - Show a provider-level **Refresh** action beside errors; keep forced meter retries meter-only through the provider deadline, publish quota before history folding, run retry folds only for local-history providers that need a second scan, and preserve retry ownership and recovered meters. Antigravity now overlaps quota and plan lookups and reuses its plan/project request across fallback paths.
 - Separate quota and accounting failure backoff, map full-refresh failures onto their component retry windows, preserve the responsible error until its own refresh succeeds, keep deferred and superseded retry folds, and stop Hermes local scans from postponing quota deadlines.
-- Keep Cursor Grok Bot/Sand product-labeled export rows in token totals as unpriced usage instead of dropping their tokens: Cursor never names the serving model, so the day's cost stays incomplete rather than guessed at, while genuine model rows and the separate Grok Bot quota meter are unchanged.
+- Exclude Cursor Grok Bot/Sand product-labeled export rows from token totals until Cursor reports the serving model; genuine model rows and the separate Grok Bot quota meter remain unchanged.
 - Keep cached Antigravity history when a conversation root is retired from discovery, while remaining roots continue to update.
+- Clear Antigravity quota pools omitted by a successful response instead of presenting the previous value as current.
+- Keep Antigravity usage history current through partial/oversized rows and unreadable sibling stores, preserve prior history on empty listings, and bound SQLite lock retries. Cached daily aggregates trim at midnight without repricing unchanged events.
+- Track quota and local-history freshness separately so a successful meter poll cannot hide a stalled Antigravity history scan.
+- Retain omitted Antigravity quota meters during incomplete summaries, including full refreshes; treat missing bucket arrays as incomplete and distinguish mixed endpoint 404/outage results.
+- Report Antigravity quota endpoints missing from an account or app version as unavailable only when all probes support that conclusion.
 - Add the locally authenticated Freebuff usage card with daily, weekly, monthly, Freebucks, free and plan premium-session pools, reset, and provider-reported dollar metrics.
 - Stop provider API and fallback work promptly after cancellation, while persisting a successful Codex refresh-token rotation before discarding its canceled usage refresh.
 - Follow GitHub Copilot org pagination, preserve completed pages after later-page failures, and stop the org scan on rate limits while honoring server cooldowns.

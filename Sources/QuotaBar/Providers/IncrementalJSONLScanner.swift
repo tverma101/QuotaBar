@@ -20,6 +20,12 @@ enum JSONLScanning {
         return Calendar.current.startOfDay(for: shifted)
     }
 
+    /// Local usage records may be a little ahead of wall time, but larger skew can create future-day
+    /// history and should keep the source incomplete until its timestamp is trustworthy.
+    static func maximumTimestamp(now: Date) -> Date {
+        now.addingTimeInterval(5 * 60)
+    }
+
     /// Every `*.jsonl` regular file under `dir` (recursively), path-sorted so a keep-first dedup is
     /// deterministic. A missing optional root is a complete empty result; an existing root that cannot
     /// be read or fully enumerated returns nil so a multi-root caller cannot publish partial history.
@@ -124,6 +130,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
     private let parsePermitPool: JSONLParsePermitPool
     private let readFailureReporter: UsageLogReadFailureReporter
     private let persistence: JSONLScanCachePersistence?
+    private let logTag: String
 
     init(
         maxConcurrentParses: Int = 2,
@@ -146,6 +153,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         self.parsePermitPool = JSONLParsePermitPool(limit: maxConcurrentParses)
         self.readFailureReporter = UsageLogReadFailureReporter(logTag: logTag, warning: readFailureWarning)
         self.persistence = persistence
+        self.logTag = logTag
         if let persistence {
             let cutoff = Date().addingTimeInterval(-JSONLScanCachePaths.staleIdentityRetention)
             Task.detached(priority: .utility) {
@@ -241,6 +249,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         // result and leave the last-good cache untouched; publishing the readable subset made a
         // transient filesystem error look like usage had disappeared from the failed file.
         guard parseResults.allSatisfy({ $0.items != nil }) else { return nil }
+        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return nil }
         var newlyCached: [(path: String, cached: CachedFile)] = []
         for result in parseResults {
             let (file, parsed) = (result.file, result.items)
@@ -304,12 +313,14 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         }
         caches[cacheIdentity] = nextCache
         trimResidentItems(protecting: cacheIdentity)
+        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return nil }
         return Task.isCancelled ? nil : items
     }
 
     /// Same scan/cache contract as `items`, but visits each file's rows and never builds a concatenated
     /// mega-array. Production Codex/Claude/OpenCode folds use this so a 13 GB session corpus cannot
-    /// force a multi-hundred-MB `[Event]` spike on every refresh. Returns `false` on cancellation.
+    /// force a multi-hundred-MB `[Event]` spike on every refresh. Returns `false` on cancellation,
+    /// read failure, or when a source revision changes during the scan.
     @discardableResult
     func foldItems(
         from files: [JSONLScanning.DiscoveredFile],
@@ -352,6 +363,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         // Do not publish a partial fold or replace stale cache records until every changed file has
         // been read and parsed. Callers treat false as an incomplete source and keep last-good data.
         guard parseResults.allSatisfy({ $0.items != nil }) else { return false }
+        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return false }
         var newlyCached: [(path: String, cached: CachedFile)] = []
         for result in parseResults {
             let (file, parsed) = (result.file, result.items)
@@ -443,9 +455,39 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
                 }
             }
         }
+        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return false }
         caches[cacheIdentity] = nextCache
         trimResidentItems(protecting: cacheIdentity)
         return !Task.isCancelled
+    }
+
+    private func discoveredFilesStillMatch(
+        _ files: [JSONLScanning.DiscoveredFile],
+        cacheIdentity: String
+    ) -> Bool {
+        let changed = files.contains { file in
+            let url = URL(fileURLWithPath: file.path)
+            guard let revision = AppendOnlyFileProbe.revision(at: url),
+                  file.size >= 0,
+                  revision.size == UInt64(file.size),
+                  let values = try? url.resourceValues(forKeys: Set([
+                      .fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey
+                  ]))
+            else { return true }
+            return values.fileSize != file.size
+                || values.contentModificationDate != file.mtime
+                || values.attributeModificationDate != file.attributeMtime
+                || AppendOnlyFileProbe.revision(at: url) != revision
+        }
+        let diagnosticKey = "jsonl.scan.source-changed.\(JSONLScanCachePaths.stableFingerprint(logTag + "|" + cacheIdentity))"
+        guard changed else {
+            DiagnosticGate.clearFailure(diagnosticKey)
+            return true
+        }
+        DiagnosticGate.logOnce(for: diagnosticKey) {
+            AppLog.warn(logTag, "session source changed during its scan; preserving last-good history")
+        }
+        return false
     }
 
     /// Wait for the real debounced tasks rather than bypassing them. Tests configure a tiny debounce,
@@ -812,6 +854,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
                 dirtyRemovals[identity]?[path] = nil
             }
             invalidPersistenceIdentities.remove(identity)
+            DiagnosticGate.clearFailure(cacheWriteDiagnosticKey(persistence: persistence, identity: identity))
             AppLog.debug(
                 .cache,
                 "persisted \(result.acceptedUpsertPaths.count) changed / \(result.manifest.files.count) retained \(persistence.namespace) log files"
@@ -819,11 +862,23 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         } catch is CancellationError {
             return
         } catch {
-            AppLog.warn(
-                .cache,
-                "could not persist \(persistence.namespace) log parse cache: \(error.localizedDescription)"
-            )
+            let key = cacheWriteDiagnosticKey(persistence: persistence, identity: identity)
+            DiagnosticGate.logOnce(for: key) {
+                AppLog.warn(
+                    .cache,
+                    "could not persist \(persistence.namespace) log parse cache: \(error.localizedDescription)"
+                )
+            }
         }
+    }
+
+    private func cacheWriteDiagnosticKey(
+        persistence: JSONLScanCachePersistence,
+        identity: String
+    ) -> String {
+        let scope = [persistence.directory.standardizedFileURL.path, persistence.namespace, identity]
+            .joined(separator: "|")
+        return "jsonl.cache.write.\(JSONLScanCachePaths.stableFingerprint(scope))"
     }
 
     /// Encode dirty file payloads immediately so unload-after-return cannot persist empty records.

@@ -15,7 +15,7 @@ enum FreebuffAuthError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .notLoggedIn:
-            return "Sign in to Freebuff with its CLI, then refresh QuotaBar."
+            return "No Freebuff login was found. Run ~/.config/manicode/freebuff login (or freebuff login if available), then refresh QuotaBar."
         case .invalidConfigDirectory:
             return "Freebuff's FREEBUFF_CONFIG_DIR must be an absolute path."
         case .invalidCredentials:
@@ -37,6 +37,8 @@ enum FreebuffAuthError: Error, LocalizedError, Equatable {
 struct FreebuffAuthStore: Sendable {
     static let keychainService = "freebuff-cli"
     static let credentialsFileName = "credentials.json"
+    private static let credentialsReadDiagnosticKey = "auth.freebuff.credentials-read"
+    private static let invalidCredentialsDiagnosticKey = "auth.freebuff.credentials-invalid"
 
     var files: TextFileAccessing
     var keychain: KeychainAccessing
@@ -82,14 +84,23 @@ struct FreebuffAuthStore: Sendable {
             contents = try files.readTextIfPresent(path)
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.error(LogTag.auth("freebuff"), "credentials file read failed")
+            DiagnosticGate.logOnce(for: Self.credentialsReadDiagnosticKey) {
+                AppLog.error(LogTag.auth("freebuff"), "credentials file read failed")
+            }
+            if let fallback = environmentToken() { return fallback }
             throw FreebuffAuthError.credentialsUnreadable
         }
+        DiagnosticGate.clearFailure(Self.credentialsReadDiagnosticKey)
 
         if let contents, !contents.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             guard let object = ProviderParse.jsonObject(Data(contents.utf8)) else {
+                DiagnosticGate.logOnce(for: Self.invalidCredentialsDiagnosticKey) {
+                    AppLog.error(LogTag.auth("freebuff"), "credentials file contained invalid JSON")
+                }
+                if let fallback = environmentToken() { return fallback }
                 throw FreebuffAuthError.invalidCredentials
             }
+            DiagnosticGate.clearFailure(Self.invalidCredentialsDiagnosticKey)
             guard let profile = object["default"] as? [String: Any] else {
                 return environmentToken()
             }
@@ -99,25 +110,35 @@ struct FreebuffAuthStore: Sendable {
                 return FreebuffAuth(token: fileToken)
             }
             if profile["tokenStore"] as? String == "keychain" {
+                let fallback = environmentToken()
                 do {
                     if let token = try keychain.readGenericPasswordForRefresh(
                         service: Self.keychainService,
-                        account: path
+                        account: path,
+                        // A usable CLI environment token is already available. Still prefer the
+                        // Keychain value when it can be read silently, but do not open a prompt
+                        // that repeated manual refreshes would show again after fallback. A new
+                        // manual action may retry an earlier blocked item silently so restored
+                        // Keychain access can replace a stale environment token.
+                        allowInteraction: fallback == nil ? nil : false,
+                        recheckBlockedSilently: fallback != nil
                     )?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
                         return FreebuffAuth(token: token)
                     }
                 } catch KeychainError.interactionNotAllowed {
-                    if let fallback = environmentToken() { return fallback }
+                    if let fallback { return fallback }
                     throw FreebuffAuthError.credentialPermissionRequired
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
                     try ProviderCancellation.rethrowIfCancellation(error)
-                    if let fallback = environmentToken() { return fallback }
-                    AppLog.error(LogTag.auth("freebuff"), "Keychain credential read failed")
+                    if let fallback { return fallback }
                     throw FreebuffAuthError.credentialsUnreadable
                 }
+                if let fallback { return fallback }
             }
+        } else {
+            DiagnosticGate.clearFailure(Self.invalidCredentialsDiagnosticKey)
         }
 
         return environmentToken()

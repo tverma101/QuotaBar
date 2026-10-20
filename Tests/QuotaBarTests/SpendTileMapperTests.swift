@@ -52,6 +52,116 @@ final class SpendTileMapperTests: XCTestCase {
                         MetricValue(number: 12_000, kind: .count, label: "tokens")])
     }
 
+    func testEstimatedCostMarkerFollowsTheDaysInEachPeriod() {
+        let now = day(2026, 6, 26)
+        var lines: [MetricLine] = []
+        SpendTileMapper.appendTokenUsage(
+            DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-06-26", totalTokens: 100, costUSD: 1),
+                DailyUsageEntry(date: "2026-06-25", totalTokens: 200, costUSD: 2)
+            ]),
+            to: &lines,
+            now: now,
+            estimated: true,
+            estimatedCostDays: ["2026-06-25"]
+        )
+
+        XCTAssertEqual(values(lines, "Today")?.first?.estimated, false,
+                       "an older estimate must not mark today's authoritative amount")
+        XCTAssertEqual(values(lines, "Yesterday")?.first?.estimated, true)
+        XCTAssertEqual(values(lines, "Last 30 Days")?.first?.estimated, true,
+                       "the combined window is estimated when any included day contains an estimate")
+    }
+
+    func testKnownCostSubtotalStaysVisibleBesideUnknownModelWarning() throws {
+        let lines = mappedLines(
+            [
+                DailyUsageEntry(date: "2026-06-26", totalTokens: 1_000, costUSD: 1.25, costIsComplete: false,
+                                hasUnexplainedIncompleteCost: false),
+                DailyUsageEntry(date: "2026-06-25", totalTokens: 500, costUSD: 0.75, costIsComplete: false,
+                                hasUnexplainedIncompleteCost: false)
+            ],
+            unknownModelsByDay: [
+                "2026-06-26": ["mystery-today"],
+                "2026-06-25": ["mystery-yesterday"]
+            ]
+        )
+
+        XCTAssertEqual(values(lines, "Today"), [
+            MetricValue(number: 1.25, kind: .dollars, estimated: true, isLowerBound: true),
+            MetricValue(number: 1_000, kind: .count, label: "tokens")
+        ])
+        XCTAssertEqual(values(lines, "Yesterday"), [
+            MetricValue(number: 0.75, kind: .dollars, estimated: true, isLowerBound: true),
+            MetricValue(number: 500, kind: .count, label: "tokens")
+        ])
+        XCTAssertEqual(values(lines, "Last 30 Days"), [
+            MetricValue(number: 2, kind: .dollars, estimated: true, isLowerBound: true),
+            MetricValue(number: 1_500, kind: .count, label: "tokens")
+        ])
+        guard case .values(_, _, _, _, let unknownModels, _) = line(lines, "Yesterday") else {
+            return XCTFail("expected the Yesterday spend tile")
+        }
+        XCTAssertEqual(unknownModels, ["mystery-yesterday"])
+    }
+
+    func testUnexplainedIncompleteCostStaysHidden() {
+        let lines = mappedLines([
+            DailyUsageEntry(date: "2026-06-26", totalTokens: 1_000, costUSD: 1.25, costIsComplete: false)
+        ])
+
+        XCTAssertEqual(values(lines, "Today"), [MetricValue(number: 1_000, kind: .count, label: "tokens")])
+        XCTAssertEqual(values(lines, "Last 30 Days"), [MetricValue(number: 1_000, kind: .count, label: "tokens")])
+    }
+
+    func testUnknownModelDoesNotExplainSeparateStructuralCostGap() throws {
+        let lines = mappedLines(
+            [DailyUsageEntry(
+                date: "2026-06-26",
+                totalTokens: 1_000,
+                costUSD: 1.25,
+                costIsComplete: false,
+                hasUnexplainedIncompleteCost: true
+            )],
+            models: [DailyModelUsageEntry(date: "2026-06-26", models: [
+                ModelUsageEntry(model: "known-model", totalTokens: 900, costUSD: 1.25),
+                ModelUsageEntry(model: "mystery-model", totalTokens: 100, costUSD: nil)
+            ])],
+            unknownModelsByDay: ["2026-06-26": ["mystery-model"]]
+        )
+
+        XCTAssertEqual(values(lines, "Today"), [MetricValue(number: 1_000, kind: .count, label: "tokens")])
+        XCTAssertEqual(values(lines, "Last 30 Days"), [MetricValue(number: 1_000, kind: .count, label: "tokens")])
+        let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
+        XCTAssertTrue(breakdown.models.allSatisfy { $0.costUSD == nil })
+    }
+
+    func testSaturatedTokenCountsStayLowerBoundsAcrossThirtyDayBreakdown() throws {
+        let lines = mappedLines(
+            [
+                DailyUsageEntry(date: "2026-06-26", totalTokens: .max, costUSD: 1, tokenCountSaturated: true),
+                DailyUsageEntry(date: "2026-06-25", totalTokens: 1, costUSD: 0.1)
+            ],
+            models: [
+                DailyModelUsageEntry(date: "2026-06-26", models: [
+                    ModelUsageEntry(model: "large-model", totalTokens: .max, costUSD: 1, tokenCountSaturated: true)
+                ]),
+                DailyModelUsageEntry(date: "2026-06-25", models: [
+                    ModelUsageEntry(model: "large-model", totalTokens: 1, costUSD: 0.1)
+                ])
+            ]
+        )
+
+        guard case .values(_, let values, _, _, _, let breakdown) = line(lines, "Last 30 Days") else {
+            return XCTFail("the 30-day spend row must survive saturated token values")
+        }
+        XCTAssertEqual(values.first?.number, 1.1)
+        XCTAssertEqual(values.last?.number, Double(Int.max))
+        XCTAssertEqual(values.last?.tokenCountSaturated, true)
+        XCTAssertEqual(breakdown?.models.first?.costUSD, 1.1)
+        XCTAssertEqual(breakdown?.models.first?.tokenCountSaturated, true)
+    }
+
     func testSingleModelPeriodStillGetsModelBreakdown() throws {
         let model = ModelUsageEntry(model: "gpt-5.5", totalTokens: 300, costUSD: 3)
         let lines = mappedLines(
@@ -118,7 +228,7 @@ final class SpendTileMapperTests: XCTestCase {
         ])
     }
 
-    func testModelAndOtherCostsStayBlankWhenAnyContributingUsageIsUnpriced() throws {
+    func testModelAndOtherRowsKeepKnownSubtotalsAndMarkThemPartial() throws {
         let models = [
             DailyModelUsageEntry(date: "2026-06-26", models: [
                 ModelUsageEntry(model: "heavy", totalTokens: 890, costUSD: 89),
@@ -133,19 +243,22 @@ final class SpendTileMapperTests: XCTestCase {
         ]
         let lines = mappedLines(
             [
-                DailyUsageEntry(date: "2026-06-26", totalTokens: 1_000, costUSD: nil, costIsComplete: false),
-                DailyUsageEntry(date: "2026-06-25", totalTokens: 1_000, costUSD: nil, costIsComplete: false)
+                DailyUsageEntry(date: "2026-06-26", totalTokens: 1_000, costUSD: 100),
+                DailyUsageEntry(date: "2026-06-25", totalTokens: 1_000, costUSD: 89, costIsComplete: false)
             ],
-            models: models
+            models: models,
+            unknownModelsByDay: ["2026-06-25": ["shared", "tiny-unpriced"]]
         )
 
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Last 30 Days"))
         XCTAssertEqual(breakdown.models.map(\.model), ["heavy", "shared", "Other"])
         XCTAssertEqual(breakdown.models.first { $0.model == "heavy" }?.costUSD, 178)
-        XCTAssertNil(breakdown.models.first { $0.model == "shared" }?.costUSD,
-                     "a same-model partial subtotal must not look like its full period cost")
+        let shared = try XCTUnwrap(breakdown.models.first { $0.model == "shared" })
+        XCTAssertEqual(shared.costUSD, 10)
+        XCTAssertTrue(shared.hasIncompleteCost)
         let other = try XCTUnwrap(breakdown.models.first { $0.model == "Other" })
-        XCTAssertNil(other.costUSD, "folded Other rows also hide partial dollar subtotals")
+        XCTAssertEqual(other.costUSD, 1)
+        XCTAssertTrue(other.hasIncompleteCost)
         XCTAssertEqual(other.variants?.first { $0.model == "tiny-priced" }?.costUSD, 1)
         XCTAssertNil(other.variants?.first { $0.model == "tiny-unpriced" }?.costUSD)
     }
@@ -323,6 +436,58 @@ final class SpendTileMapperTests: XCTestCase {
         XCTAssertEqual(opus.variants?.map(\.totalTokens), [400, 300])
     }
 
+    func testModelAndVariantCostOverflowRetainsMarkedKnownSubtotal() throws {
+        let lines = mappedLines(
+            [
+                DailyUsageEntry(date: "2026-06-26", totalTokens: 1, costUSD: 1e308),
+                DailyUsageEntry(date: "2026-06-25", totalTokens: 1, costUSD: 1e308)
+            ],
+            models: [
+                DailyModelUsageEntry(date: "2026-06-26", models: [
+                    ModelUsageEntry(model: "opus", totalTokens: 1, costUSD: 1e308, variants: [
+                        ModelUsageVariant(model: "opus-thinking", totalTokens: 1, costUSD: 1e308)
+                    ])
+                ]),
+                DailyModelUsageEntry(date: "2026-06-25", models: [
+                    ModelUsageEntry(model: "opus", totalTokens: 1, costUSD: 1e308, variants: [
+                        ModelUsageVariant(model: "opus-thinking", totalTokens: 1, costUSD: 1e308)
+                    ])
+                ])
+            ]
+        )
+
+        let opus = try XCTUnwrap(modelBreakdown(lines, "Last 30 Days")?.models.first { $0.model == "opus" })
+        let variant = try XCTUnwrap(opus.variants?.first { $0.model == "opus-thinking" })
+        XCTAssertEqual(opus.costUSD, 1e308)
+        XCTAssertTrue(opus.hasIncompleteCost)
+        XCTAssertEqual(variant.costUSD, 1e308)
+        XCTAssertTrue(variant.hasIncompleteCost)
+    }
+
+    func testCostShareFoldingNormalizesBeforeSummingHugeFiniteModels() throws {
+        let models = (0..<21).map { index in
+            ModelUsageEntry(
+                model: index == 0 ? "dominant" : "minor-\(index)",
+                totalTokens: 1,
+                costUSD: index == 0 ? 1e308 : 1e307
+            )
+        }
+        let lines = mappedLines(
+            [DailyUsageEntry(
+                date: "2026-06-26",
+                totalTokens: 21,
+                costUSD: nil,
+                costIsComplete: false,
+                hasUnexplainedIncompleteCost: false
+            )],
+            models: [DailyModelUsageEntry(date: "2026-06-26", models: models)]
+        )
+
+        let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
+        XCTAssertEqual(breakdown.models.map(\.model), ["dominant", "Other"])
+        XCTAssertEqual(breakdown.models.first?.costUSD, 1e308)
+    }
+
     // MARK: - Helpers
 
     private func series(_ days: [(String, Int)]) -> [DailyUsageEntry] {
@@ -332,6 +497,7 @@ final class SpendTileMapperTests: XCTestCase {
     private func mappedLines(
         _ daily: [DailyUsageEntry],
         models: [DailyModelUsageEntry] = [],
+        unknownModelsByDay: [String: Set<String>] = [:],
         now: Date? = nil
     ) -> [MetricLine] {
         var lines: [MetricLine] = []
@@ -339,6 +505,7 @@ final class SpendTileMapperTests: XCTestCase {
             DailyUsageSeries(daily: daily),
             to: &lines,
             now: now ?? day(2026, 6, 26),
+            unknownModelsByDay: unknownModelsByDay,
             modelUsage: models.isEmpty ? nil : ModelUsageSeries(daily: models),
             modelSourceNote: "From test logs"
         )

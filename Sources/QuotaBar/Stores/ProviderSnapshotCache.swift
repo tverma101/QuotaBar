@@ -1,14 +1,83 @@
+import Darwin
 import Foundation
 import os
 
 struct ProviderSnapshotCache {
+    private static let processStoreLock = NSLock()
+
     private struct Payload: Codable {
         var snapshots: [String: ProviderSnapshot]
         /// Card id → the account identity key that produced the stored snapshot. A sidecar map rather
         /// than a field on `ProviderSnapshot` because that model is serialized verbatim to the local
         /// HTTP API (`LocalUsageAPI`) — the stamp is cache bookkeeping, not wire data. Absent for
-        /// providers without an account identity (everything outside the claude/codex families).
+        /// providers without an account identity. Claude/Codex/Cursor use their account identity;
+        /// OpenCode uses a complete fingerprint of its distinct Go credential inventory.
         var producedByIdentityKeys: [String: String]
+        /// Cross-process refresh ordering. `issued` orders work when it starts; `stored` fences late
+        /// completions and removal/clear mutations. Missing maps decode as empty for older payloads.
+        var issuedRefreshOrders: [String: UInt64]
+        var storedRefreshOrders: [String: UInt64]
+        /// A refresh only supersedes data in the domain it actually wrote. Meter and history scopes
+        /// can overlap without fencing the other domain's still-running result.
+        var storedQuotaOrders: [String: UInt64]
+        var storedHistoryOrders: [String: UInt64]
+
+        private enum CodingKeys: String, CodingKey {
+            case snapshots
+            case producedByIdentityKeys
+            case issuedRefreshOrders
+            case storedRefreshOrders
+            case storedQuotaOrders
+            case storedHistoryOrders
+        }
+
+        init(
+            snapshots: [String: ProviderSnapshot],
+            producedByIdentityKeys: [String: String],
+            issuedRefreshOrders: [String: UInt64] = [:],
+            storedRefreshOrders: [String: UInt64] = [:],
+            storedQuotaOrders: [String: UInt64] = [:],
+            storedHistoryOrders: [String: UInt64] = [:]
+        ) {
+            self.snapshots = snapshots
+            self.producedByIdentityKeys = producedByIdentityKeys
+            self.issuedRefreshOrders = issuedRefreshOrders
+            self.storedRefreshOrders = storedRefreshOrders
+            self.storedQuotaOrders = storedQuotaOrders
+            self.storedHistoryOrders = storedHistoryOrders
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            snapshots = try values.decode([String: ProviderSnapshot].self, forKey: .snapshots)
+            producedByIdentityKeys = try values.decodeIfPresent(
+                [String: String].self,
+                forKey: .producedByIdentityKeys
+            ) ?? [:]
+            issuedRefreshOrders = try values.decodeIfPresent(
+                [String: UInt64].self,
+                forKey: .issuedRefreshOrders
+            ) ?? [:]
+            storedRefreshOrders = try values.decodeIfPresent(
+                [String: UInt64].self,
+                forKey: .storedRefreshOrders
+            ) ?? [:]
+            storedQuotaOrders = try values.decodeIfPresent(
+                [String: UInt64].self,
+                forKey: .storedQuotaOrders
+            ) ?? [:]
+            storedHistoryOrders = try values.decodeIfPresent(
+                [String: UInt64].self,
+                forKey: .storedHistoryOrders
+            ) ?? [:]
+        }
+    }
+
+    enum StoreResult {
+        case stored(ProviderSnapshot?)
+        case superseded(ProviderSnapshot?)
+        case unchanged(ProviderSnapshot?)
+        case unavailable
     }
 
     /// In-memory mirror of the persisted blob. Reads (`snapshot`, `loadSnapshots`, and the read inside
@@ -72,9 +141,9 @@ struct ProviderSnapshotCache {
         // v8: provider snapshots gained normalized daily history for iCloud aggregation. Refetch on
         // upgrade so enabling sync can publish a complete first document immediately.
         // v9: entries gained a `producedByIdentityKeys` sidecar (which account produced each snapshot),
-        // so a launch after an account swap at the same home can discard the previous account's cached
-        // limits/plan instead of painting them under the new account's card. Refetch on upgrade so every
-        // retained entry carries a stamp from its first write.
+        // so a launch after an account swap at the same home can discard previous-account values instead
+        // of painting them under the new account's card. Refetch on upgrade so every retained entry
+        // carries a stamp from its first write.
         storageKey: String = "openusage.providerSnapshots.v9",
         ttl: TimeInterval = RefreshSetting.interval,
         allowsPersistedFreshness: Bool = false,
@@ -109,22 +178,88 @@ struct ProviderSnapshotCache {
     /// Startup uses one bulk rewrite so years of stale model detail do not remain in the shared
     /// UserDefaults blob or get re-decoded on every later launch.
     func compactHistories(lifetimeDayKeys: Set<String>, detailDayKeys: Set<String>) {
-        var payload = loadPayload()
-        var changed = false
-        for providerID in Array(payload.snapshots.keys) {
+        withPersistentStoreLock {
+            // The app and CLI share one UserDefaults blob. Re-read it while holding the process lock
+            // so compaction cannot erase a provider another process stored after our last read.
+            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            var changed = false
+            for providerID in Array(payload.snapshots.keys) {
+                guard var snapshot = payload.snapshots[providerID],
+                      let history = snapshot.usageHistory
+                else { continue }
+                let compacted = history.retainingHistory(
+                    lifetimeDayKeys: lifetimeDayKeys,
+                    detailDayKeys: detailDayKeys
+                )
+                guard compacted != history else { continue }
+                snapshot.usageHistory = compacted
+                payload.snapshots[providerID] = snapshot
+                changed = true
+            }
+            if changed { save(payload) }
+        }
+    }
+
+    /// Allocate a process-shared sequence before provider work starts. A later request gets a larger
+    /// value even when the earlier request takes longer to finish.
+    func beginRefreshOrder(providerID: String) -> UInt64? {
+        var order: UInt64?
+        var saved = false
+        let locked = withPersistentStoreLock {
+            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            let previous = max(
+                payload.issuedRefreshOrders[providerID, default: 0],
+                payload.storedRefreshOrders[providerID, default: 0]
+            )
+            guard previous < UInt64.max else {
+                AppLog.warn(.cache, "refresh order exhausted for \(providerID)")
+                return
+            }
+            let next = previous + 1
+            payload.issuedRefreshOrders[providerID] = next
+            saved = save(payload)
+            if saved { order = next }
+        }
+        return locked && saved ? order : nil
+    }
+
+    /// Discard provider results older than a committed write in a domain they update. An in-flight
+    /// newer request does not fence useful data if that request later fails; the final write repeats
+    /// this check under the same lock to close the commit race.
+    func isCurrentRefresh(
+        providerID: String,
+        order: UInt64,
+        scope: ProviderRefreshContext.Scope,
+        hasHistoryDomain: Bool,
+        panelMetersIncludesHistory: Bool = false
+    ) -> Bool {
+        var current = true
+        let locked = withPersistentStoreLock {
+            let payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            let quotaCurrent = scope.refreshesQuotaDomain
+                && order >= payload.storedQuotaOrders[providerID, default: 0]
+            let historyCurrent = hasHistoryDomain
+                && scope.refreshesHistoryDomain(panelMetersIncludesHistory: panelMetersIncludesHistory)
+                && order >= payload.storedHistoryOrders[providerID, default: 0]
+            current = quotaCurrent || historyCurrent
+        }
+        return locked ? current : true
+    }
+
+    /// Compact the newest persisted history in place. This is maintenance, not a provider refresh,
+    /// so it must not replace the entry from a process-local snapshot or change its freshness stamp.
+    func compactHistory(providerID: String, through date: Date) {
+        withPersistentStoreLock {
+            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
             guard var snapshot = payload.snapshots[providerID],
                   let history = snapshot.usageHistory
-            else { continue }
-            let compacted = history.retainingHistory(
-                lifetimeDayKeys: lifetimeDayKeys,
-                detailDayKeys: detailDayKeys
-            )
-            guard compacted != history else { continue }
+            else { return }
+            let compacted = history.retainingHistory(through: date)
+            guard compacted != history else { return }
             snapshot.usageHistory = compacted
             payload.snapshots[providerID] = snapshot
-            changed = true
+            _ = save(payload)
         }
-        if changed { save(payload) }
     }
 
     func snapshot(providerID: String, freshnessInterval: TimeInterval? = nil) -> ProviderSnapshot? {
@@ -143,8 +278,19 @@ struct ProviderSnapshotCache {
         // the subscription usage meters never updated. `quotaRefreshedAt` is nil on legacy
         // payloads and falls back to `refreshedAt` (today's behavior).
         let meterStamp = snapshot.quotaRefreshedAt ?? snapshot.refreshedAt
-        let oldestStamp = min(snapshot.refreshedAt, meterStamp)
-        let age = now().timeIntervalSince(oldestStamp)
+        // Meter-only callers ask about quota freshness. Full and fold callers ask whether the
+        // whole snapshot is fresh, so stale history must still trigger a new accounting pass there.
+        let historyStamp: Date
+        if snapshot.usageHistory != nil || snapshot.historyWarning != nil {
+            historyStamp = snapshot.historyRefreshedAt
+                ?? (snapshot.historyWarning == nil ? snapshot.refreshedAt : .distantPast)
+        } else {
+            historyStamp = snapshot.refreshedAt
+        }
+        let freshnessStamp = freshnessInterval == nil
+            ? min(snapshot.refreshedAt, min(meterStamp, historyStamp))
+            : meterStamp
+        let age = now().timeIntervalSince(freshnessStamp)
         let trusted = allowsPersistedFreshness || writtenThisSession
         let effectiveTTL = freshnessInterval ?? ttl
         let fresh = trusted && age < effectiveTTL
@@ -156,22 +302,363 @@ struct ProviderSnapshotCache {
 
     /// `producedByIdentityKey` is the account identity that produced this snapshot (the card's identity
     /// at write time); `nil` for providers without account identity, or when the identity is unresolved.
-    func store(_ snapshot: ProviderSnapshot, producedByIdentityKey: String? = nil) {
+    @discardableResult
+    func store(
+        _ snapshot: ProviderSnapshot,
+        producedByIdentityKey: String? = nil,
+        refreshOrder: UInt64? = nil,
+        scope: ProviderRefreshContext.Scope? = nil,
+        historyDescriptor: UsageHistoryDescriptor? = nil,
+        panelMetersIncludesHistory: Bool = false,
+        now: Date = Date()
+    ) -> StoreResult {
         guard !snapshot.lines.contains(where: \.isError) else {
             AppLog.debug(.cache, "skip write \(snapshot.providerID) (error snapshot)")
-            return
+            return .unavailable
+        }
+        guard scope == nil || refreshOrder != nil else {
+            // Production refresh writes always carry their cross-process sequence. An unordered
+            // fallback after sequence allocation failed could let an older result win the race.
+            return .unavailable
         }
         AppLog.debug(.cache, "write \(snapshot.providerID)")
-        // Mark this provider as written *this session* so its snapshot now satisfies the freshness gate
-        // (a launch-loaded snapshot never does — see `sessionWrites`).
-        sessionWrites.withLock { _ = $0.insert(snapshot.providerID) }
-        var payload = loadPayload()
-        payload.snapshots[snapshot.providerID] = snapshot
-        // Stamp (or clear) the producing account alongside the entry. A nil identity must *clear* any
-        // prior stamp rather than keep it: the new snapshot is unattributable, and leaving the old
-        // account's stamp would falsely bless it at the next launch's identity check.
-        payload.producedByIdentityKeys[snapshot.providerID] = producedByIdentityKey
-        save(payload)
+        var result: StoreResult = .unavailable
+        let locked = withPersistentStoreLock {
+            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            let providerID = snapshot.providerID
+            let quotaOrder = payload.storedQuotaOrders[providerID, default: 0]
+            let historyOrder = payload.storedHistoryOrders[providerID, default: 0]
+            let quotaCandidate = scope?.refreshesQuotaDomain ?? true
+            let historyCandidate: Bool
+            if let scope {
+                historyCandidate = scope.refreshesHistoryDomain(
+                    panelMetersIncludesHistory: panelMetersIncludesHistory
+                )
+                    && (historyDescriptor != nil)
+                    && snapshot.usageHistory != nil
+                    && snapshot.carriesPriorHistory != true
+            } else {
+                historyCandidate = true
+            }
+            let quotaAccepted = quotaCandidate
+                && (refreshOrder.map { $0 >= quotaOrder } ?? true)
+            let historyAccepted = historyCandidate
+                && (refreshOrder.map { $0 >= historyOrder } ?? true)
+            let hasFreshDomain = quotaAccepted || historyAccepted
+            if !hasFreshDomain {
+                if quotaCandidate || historyCandidate {
+                    result = .superseded(payload.snapshots[providerID])
+                } else if let historyWarning = snapshot.historyWarning {
+                    let latestIssuedOrder = payload.issuedRefreshOrders[providerID, default: 0]
+                    guard refreshOrder.map({ $0 >= latestIssuedOrder }) ?? true else {
+                        result = .superseded(payload.snapshots[providerID])
+                        return
+                    }
+                    var warningSnapshot = payload.snapshots[providerID] ?? snapshot
+                    guard warningSnapshot.historyWarning != historyWarning else {
+                        result = .unchanged(warningSnapshot)
+                        return
+                    }
+                    warningSnapshot.historyWarning = historyWarning
+                    if payload.snapshots[providerID] == nil {
+                        // A warning-only first fold has no evidence that either data domain is fresh.
+                        warningSnapshot.quotaRefreshedAt = .distantPast
+                        warningSnapshot.historyRefreshedAt = .distantPast
+                        warningSnapshot.refreshedAt = .distantPast
+                        payload.producedByIdentityKeys[providerID] = producedByIdentityKey
+                    }
+                    payload.snapshots[providerID] = warningSnapshot
+                    result = save(payload) ? .stored(warningSnapshot) : .unavailable
+                } else {
+                    // A completed fold with no history is not authoritative. Preserve the previous
+                    // snapshot without making it fresh or fencing an older successful history scan.
+                    result = .unchanged(payload.snapshots[providerID])
+                }
+                return
+            }
+
+            var storedSnapshot = snapshot
+            let identityMatches = payload.producedByIdentityKeys[providerID] == producedByIdentityKey
+            if let scope, identityMatches {
+                storedSnapshot = Self.merge(
+                    snapshot,
+                    over: payload.snapshots[providerID],
+                    scope: scope,
+                    updateQuota: quotaAccepted,
+                    updateHistory: historyAccepted,
+                    historyDescriptor: historyDescriptor,
+                    panelMetersIncludesHistory: panelMetersIncludesHistory,
+                    now: now
+                )
+            } else if let scope, providerID == "antigravity", let previous = payload.snapshots[providerID] {
+                // Antigravity quota belongs to the Google account, but its conversation database is
+                // machine-local. An account switch clears plan/meters and can safely carry the local
+                // history into the newly attributed snapshot.
+                storedSnapshot = Self.merge(
+                    snapshot,
+                    over: Self.clearingQuotaState(previous),
+                    scope: scope,
+                    updateQuota: quotaAccepted,
+                    updateHistory: historyAccepted,
+                    historyDescriptor: historyDescriptor,
+                    panelMetersIncludesHistory: panelMetersIncludesHistory,
+                    now: now
+                )
+            }
+            payload.snapshots[providerID] = storedSnapshot
+            // Stamp (or clear) the producing account alongside the entry. A nil identity must clear
+            // any prior stamp rather than falsely bless an unattributable snapshot at next launch.
+            payload.producedByIdentityKeys[providerID] = producedByIdentityKey
+            if let refreshOrder {
+                payload.issuedRefreshOrders[providerID] = max(
+                    payload.issuedRefreshOrders[providerID, default: 0],
+                    refreshOrder
+                )
+                payload.storedRefreshOrders[providerID] = max(
+                    payload.storedRefreshOrders[providerID, default: 0],
+                    refreshOrder
+                )
+                if quotaAccepted { payload.storedQuotaOrders[providerID] = refreshOrder }
+                if historyAccepted { payload.storedHistoryOrders[providerID] = refreshOrder }
+            }
+            result = save(payload) ? .stored(storedSnapshot) : .unavailable
+        }
+        guard locked else { return .unavailable }
+        // Mark this provider as written this session only after the shared payload write completed.
+        if case .stored = result {
+            sessionWrites.withLock { _ = $0.insert(snapshot.providerID) }
+        }
+        return result
+    }
+
+    private static func merge(
+        _ incoming: ProviderSnapshot,
+        over previous: ProviderSnapshot?,
+        scope: ProviderRefreshContext.Scope,
+        updateQuota: Bool,
+        updateHistory: Bool,
+        historyDescriptor: UsageHistoryDescriptor?,
+        panelMetersIncludesHistory: Bool,
+        now: Date
+    ) -> ProviderSnapshot {
+        guard let previous else {
+            var initial = incoming
+            initial.replacesPriorQuotaProgress = nil
+            if !updateQuota {
+                initial.plan = nil
+                initial.lines.removeAll { if case .progress = $0 { return true }; return false }
+                initial.warning = nil
+                // WidgetDataStore stamps this as stale when the provider declares quota meters.
+                // Preserve that decision: a history-only provider must not get an artificial stale
+                // meter stamp, since cache freshness falls back to `refreshedAt` when this is nil.
+            }
+            if !updateHistory {
+                initial.usageHistory = nil
+                initial.carriesPriorHistory = nil
+                initial.historyRefreshedAt = nil
+            }
+            return initial
+        }
+
+        if !scope.isFull {
+            if panelMetersIncludesHistory && !updateHistory {
+                // Hermes's meter pass is also its history pass. Those rows share one computation and
+                // cannot be safely refreshed independently if a newer fold has already committed.
+                return previous
+            }
+            var merged = scope.refreshesQuotaDomain && updateQuota
+                ? incoming.mergingMenuBarUpdate(over: previous)
+                : previous
+            if updateHistory, let history = incoming.usageHistory, let historyDescriptor {
+                merged = renderingHistory(
+                    history,
+                    from: incoming,
+                    over: merged,
+                    descriptor: historyDescriptor,
+                    now: now
+                )
+            } else if let history = previous.usageHistory {
+                if let historyDescriptor {
+                    merged = renderingHistory(
+                        history,
+                        from: previous,
+                        over: merged,
+                        descriptor: historyDescriptor,
+                        now: now
+                    )
+                } else {
+                    merged.usageHistory = history
+                    merged.historyRefreshedAt = previous.historyRefreshedAt ?? previous.refreshedAt
+                }
+                // The incoming non-full result carried this history forward; the renderer copies
+                // the source marker, so set it after rendering just as the full-scope merge does.
+                // Without this marker, panel-accounting refreshes can cache-hit forever after a
+                // meters-only pass re-stamps the quota domain.
+                merged.carriesPriorHistory = true
+                // Re-rendering preserved history uses its original stamp. A successful quota update
+                // must retain its own newer stamp so meter-only cache hits do not refetch immediately.
+                if updateQuota { merged.refreshedAt = incoming.refreshedAt }
+            } else if !updateHistory {
+                merged.usageHistory = nil
+                merged.carriesPriorHistory = nil
+            }
+            if incoming.historyWarning != nil {
+                merged.historyWarning = incoming.historyWarning
+            } else if updateHistory, incoming.usageHistory != nil {
+                merged.historyWarning = nil
+            }
+            return merged
+        }
+
+        var merged = updateQuota
+            ? incoming.preservingOmittedQuotaProgress(over: previous)
+            : previous
+        if updateHistory, let history = incoming.usageHistory, let historyDescriptor {
+            merged = renderingHistory(
+                history,
+                from: incoming,
+                over: merged,
+                descriptor: historyDescriptor,
+                now: now
+            )
+        } else if let history = previous.usageHistory {
+            if let historyDescriptor {
+                merged = renderingHistory(
+                    history,
+                    from: previous,
+                    over: merged,
+                    descriptor: historyDescriptor,
+                    now: now
+                )
+            } else {
+                merged.usageHistory = history
+                merged.historyRefreshedAt = previous.historyRefreshedAt ?? previous.refreshedAt
+            }
+            merged.carriesPriorHistory = true
+            // The preserved history keeps its own stamp. A successful full quota refresh still
+            // owns the snapshot-level stamp and must not roll it back to the older history scan.
+            if updateQuota { merged.refreshedAt = incoming.refreshedAt }
+        }
+        if incoming.historyWarning != nil {
+            merged.historyWarning = incoming.historyWarning
+        } else if updateHistory, incoming.usageHistory != nil {
+            merged.historyWarning = nil
+        }
+        return merged
+    }
+
+    private static func renderingHistory(
+        _ history: ProviderUsageHistory,
+        from source: ProviderSnapshot,
+        over base: ProviderSnapshot,
+        descriptor: UsageHistoryDescriptor,
+        now: Date
+    ) -> ProviderSnapshot {
+        var merged = base
+        merged.refreshedAt = source.refreshedAt
+        merged = UsageHistorySnapshotRenderer.render(
+            local: merged,
+            history: history,
+            descriptor: descriptor,
+            now: now,
+            combined: false
+        )
+        merged.carriesPriorHistory = source.carriesPriorHistory
+        merged.historyRefreshedAt = source.historyRefreshedAt ?? source.refreshedAt
+        if source.usageHistory != nil || source.historyWarning != nil {
+            merged.historyWarning = source.historyWarning
+        }
+        return merged
+    }
+
+    /// Remove a provider snapshot and its account stamp after the provider proves a different account
+    /// is active. Keeping the old row on disk would let a later unresolved startup repaint it.
+    @discardableResult
+    func removeSnapshot(providerID: String, refreshOrder: UInt64? = nil) -> Bool {
+        var didStore = false
+        var accepted = false
+        let stored = withPersistentStoreLock {
+            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            let newestOrder = max(
+                payload.issuedRefreshOrders[providerID, default: 0],
+                payload.storedRefreshOrders[providerID, default: 0]
+            )
+            let newestCommittedDomainOrder = max(
+                payload.storedQuotaOrders[providerID, default: 0],
+                payload.storedHistoryOrders[providerID, default: 0]
+            )
+            if let refreshOrder, refreshOrder < newestCommittedDomainOrder { return }
+            let order = refreshOrder ?? Self.nextOrder(after: newestOrder)
+            payload.snapshots.removeValue(forKey: providerID)
+            payload.producedByIdentityKeys.removeValue(forKey: providerID)
+            payload.issuedRefreshOrders[providerID] = max(
+                payload.issuedRefreshOrders[providerID, default: 0], order
+            )
+            payload.storedRefreshOrders[providerID] = max(
+                payload.storedRefreshOrders[providerID, default: 0], order
+            )
+            payload.storedQuotaOrders[providerID] = order
+            payload.storedHistoryOrders[providerID] = order
+            accepted = true
+            didStore = save(payload)
+        }
+        guard stored, didStore, accepted else { return false }
+        sessionWrites.withLock { _ = $0.remove(providerID) }
+        return true
+    }
+
+    /// Clear account-bound quota values from the latest persisted snapshot while retaining its local
+    /// history. A standalone invalidation gets a fresh order and fences any older in-flight refresh.
+    @discardableResult
+    func clearQuotaState(providerID: String, refreshOrder: UInt64? = nil) -> StoreResult {
+        var result: StoreResult = .unavailable
+        let locked = withPersistentStoreLock {
+            var payload = decodeStoredPayload(userDefaults.data(forKey: storageKey))
+            let newestOrder = max(
+                payload.issuedRefreshOrders[providerID, default: 0],
+                payload.storedRefreshOrders[providerID, default: 0]
+            )
+            let newestQuotaOrder = payload.storedQuotaOrders[providerID, default: 0]
+            if let refreshOrder, refreshOrder < newestQuotaOrder {
+                result = .superseded(payload.snapshots[providerID])
+                return
+            }
+            let order = refreshOrder ?? Self.nextOrder(after: newestOrder)
+            let cleared = payload.snapshots[providerID].map(Self.clearingQuotaState)
+            if let cleared { payload.snapshots[providerID] = cleared }
+            payload.issuedRefreshOrders[providerID] = max(
+                payload.issuedRefreshOrders[providerID, default: 0], order
+            )
+            payload.storedRefreshOrders[providerID] = max(
+                payload.storedRefreshOrders[providerID, default: 0], order
+            )
+            payload.storedQuotaOrders[providerID] = order
+            result = save(payload) ? .stored(cleared) : .unavailable
+        }
+        guard locked else { return .unavailable }
+        if case .stored = result {
+            sessionWrites.withLock { _ = $0.remove(providerID) }
+        }
+        return result
+    }
+
+    private static func nextOrder(after current: UInt64) -> UInt64 {
+        current == UInt64.max ? current : current + 1
+    }
+
+    private static func clearingQuotaState(_ snapshot: ProviderSnapshot) -> ProviderSnapshot {
+        var cleared = snapshot
+        cleared.plan = nil
+        cleared.lines.removeAll { line in
+            if case .progress = line { return true }
+            return false
+        }
+        cleared.warning = nil
+        cleared.clearsPriorMenuBarQuotaState = nil
+        cleared.replacesPriorQuotaProgress = nil
+        cleared.invalidatesQuotaIdentity = nil
+        cleared.quotaRefreshedAt = nil
+        return cleared
     }
 
     /// The account identity stamped when this provider's entry was stored, or `nil` when the entry is
@@ -183,10 +670,11 @@ struct ProviderSnapshotCache {
 
     /// Whether this provider's stored entry cannot be attributed to `currentIdentityKey`: the entry
     /// exists, the card's current identity is known, and the stamp is missing or names another
-    /// account. Every read path must treat such an entry as absent — the launch paint filter
+    /// account. Every read path must reject its stale quota data — the launch paint filter
     /// (`WidgetDataStore.init`), the refresh cache-hit gate (`WidgetDataStore.refresh`), and the
     /// one-shot CLI's persisted-freshness reads (`UsageReader`) — or a swap at the same home would
-    /// serve the previous account's data. `false` when the identity is unresolved (`nil`): an
+    /// serve the previous account's data. OpenCode retains only its machine-local history. `false`
+    /// when the identity is unresolved (`nil`): an
     /// unverifiable entry keeps painting exactly as it did before account stamps existed.
     func hasStaleAccountStamp(providerID: String, currentIdentityKey: String?) -> Bool {
         guard let currentIdentityKey else { return false }
@@ -215,22 +703,21 @@ struct ProviderSnapshotCache {
         // Only trust the mirror if the blob on disk is byte-identical to what produced it. Any
         // difference means another process wrote, so the mirror is stale and must be rebuilt.
         if currentBytes == knownBytes, let mirror = memo.withLock({ $0 }) { return mirror }
-        // First access only: decode the persisted blob once, then mirror it. (Decoding outside the
-        // lock keeps `self` out of the `@Sendable` closure; cache access is MainActor-serialized in
-        // production, so the worst a race could do is decode twice into the same value — harmless.)
-        let loaded = decodeStoredPayload()
+        // Decode the exact bytes observed above. Re-reading UserDefaults here could pair one writer's
+        // blob with another writer's byte stamp and bless a stale mirror as current.
+        let loaded = decodeStoredPayload(currentBytes)
         memo.withLock { $0 = loaded }
         persistedBytes.withLock { $0 = currentBytes }
         return loaded
     }
 
-    private func decodeStoredPayload() -> Payload {
+    private func decodeStoredPayload(_ data: Data?) -> Payload {
         // No stored data is the legitimate first-launch / cleared-cache case — recover to empty
         // silently. Data present but undecodable is a real problem (post-upgrade schema drift, a
         // half-written blob, a manual `defaults` edit): fail loudly, then recover to empty. A silent
         // drop here empties ALL providers' caches at once and feeds the refresh storm. Mirrors the
         // loud `save` path above. Runs at most once per cache instance (then memoized).
-        guard let data = userDefaults.data(forKey: storageKey) else {
+        guard let data else {
             return Payload(snapshots: [:], producedByIdentityKeys: [:])
         }
         do {
@@ -241,18 +728,70 @@ struct ProviderSnapshotCache {
         }
     }
 
-    private func save(_ payload: Payload) {
-        // Update the in-memory mirror first so subsequent reads see this write even if the encode
-        // below fails (the running session stays correct; only persistence is best-effort).
-        memo.withLock { $0 = payload }
-        // Fail loudly: a swallowed encode error would silently drop a snapshot from the persisted
-        // cache. No behavior change (the write is still best-effort), but the failure is now visible.
+    @discardableResult
+    private func save(_ payload: Payload) -> Bool {
         do {
             let data = try encoder.encode(payload)
             userDefaults.set(data, forKey: storageKey)
+            memo.withLock { $0 = payload }
             persistedBytes.withLock { $0 = data }
+            return true
         } catch {
             AppLog.warn(.cache, "encode failed, snapshot not persisted: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// UserDefaults has no atomic read–modify–write operation. The app and `quotabar-cli` both store a
+    /// whole-provider payload, so serialize their writes and merge from the newest blob under one
+    /// kernel lock. A failed lock acquisition skips the write instead of risking another process's
+    /// last-good snapshots.
+    @discardableResult
+    private func withPersistentStoreLock(_ body: () -> Void) -> Bool {
+        Self.processStoreLock.lock()
+        defer { Self.processStoreLock.unlock() }
+
+        guard let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            logPersistentStoreLockFailure("Application Support directory unavailable")
+            return false
+        }
+        let directory = applicationSupport.appendingPathComponent("QuotaBar", isDirectory: true)
+        let lockURL = directory.appendingPathComponent("provider-snapshot-cache.lock")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        } catch {
+            logPersistentStoreLockFailure(error.localizedDescription)
+            return false
+        }
+        var fd = Darwin.open(lockURL.path, O_RDWR | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR))
+        if fd < 0, errno == ENOENT {
+            fd = Darwin.open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR))
+            if fd >= 0 { _ = Darwin.fchmod(fd, mode_t(S_IRUSR | S_IWUSR)) }
+        }
+        guard fd >= 0 else {
+            logPersistentStoreLockFailure(String(cString: strerror(errno)))
+            return false
+        }
+        defer {
+            flock(fd, LOCK_UN)
+            Darwin.close(fd)
+        }
+        guard flock(fd, LOCK_EX) == 0 else {
+            logPersistentStoreLockFailure(String(cString: strerror(errno)))
+            return false
+        }
+        DiagnosticGate.clearFailure("cache.providerSnapshots.lock")
+        body()
+        return true
+    }
+
+    private func logPersistentStoreLockFailure(_ message: String) {
+        DiagnosticGate.logOnce(for: "cache.providerSnapshots.lock") {
+            AppLog.warn(.cache, "snapshot cache write lock unavailable: \(message)")
         }
     }
 }

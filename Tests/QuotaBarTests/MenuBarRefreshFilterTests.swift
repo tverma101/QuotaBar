@@ -255,9 +255,15 @@ final class MenuBarRefreshFilterTests: XCTestCase {
     }
 
     func testMenuBarMergeStillPreservesHistoryAfterQuotaOnlyRefresh() async {
+        let now = Date(timeIntervalSince1970: 2_000)
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: codex).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "test"
+        )
         let history = ProviderUsageHistory(
             series: DailyUsageSeries(daily: [
-                DailyUsageEntry(date: "2026-09-22", totalTokens: 42, costUSD: 0.02)
+                DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 42, costUSD: 0.02)
             ])
         )
         let first = ProviderSnapshot(
@@ -281,17 +287,18 @@ final class MenuBarRefreshFilterTests: XCTestCase {
         )
         let runtime = SequenceProviderRuntime(
             provider: codex,
-            descriptors: [session],
+            descriptors: [session, historyDescriptor],
             snapshots: [first, second]
         )
         // ttl: 0 so the menuBar pass (force: false, matching production) is never a cache hit.
         let defaults = makeUserDefaults("menu-bar-merge-store")
         let store = WidgetDataStore(
-            registry: WidgetRegistry(providers: [codex], descriptors: [session]),
+            registry: WidgetRegistry(providers: [codex], descriptors: [session, historyDescriptor]),
             providers: [runtime],
-            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 0),
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 0, now: { now }),
             defaults: defaults,
-            pinnedMetricIDs: { ["codex.session"] }
+            pinnedMetricIDs: { ["codex.session"] },
+            now: { now }
         )
 
         await ProviderRefreshContext.$scope.withValue(.full) {
@@ -304,7 +311,10 @@ final class MenuBarRefreshFilterTests: XCTestCase {
         let snap = store.snapshots["codex"]
         XCTAssertEqual(snap?.line(label: "Session"),
                        .progress(label: "Session", used: 55, limit: 100, format: .percent))
-        XCTAssertEqual(snap?.line(label: "Today"), first.line(label: "Today"))
+        XCTAssertEqual(snap?.line(label: "Today"), .values(label: "Today", values: [
+            MetricValue(number: 0.02, kind: .dollars, estimated: true),
+            MetricValue(number: 42, kind: .count, label: "tokens"),
+        ]))
         XCTAssertEqual(snap?.usageHistory, history)
     }
 
@@ -326,9 +336,15 @@ final class MenuBarRefreshFilterTests: XCTestCase {
     }
 
     func testForceRefreshWaitsForInFlightMenuBarThenAppliesFullSnapshot() async {
+        let now = ISO8601DateFormatter().date(from: "2026-09-24T12:00:00Z")!
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: codex).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "test"
+        )
         let history = ProviderUsageHistory(
             series: DailyUsageSeries(daily: [
-                DailyUsageEntry(date: "2026-09-24", totalTokens: 77, costUSD: 0.07)
+                DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 77, costUSD: 0.07)
             ])
         )
         let seeded = ProviderSnapshot(
@@ -368,16 +384,19 @@ final class MenuBarRefreshFilterTests: XCTestCase {
         )
         let runtime = SeedThenGateProviderRuntime(
             provider: codex,
-            descriptors: [session],
+            descriptors: [session, historyDescriptor],
             seed: seeded,
             menuBarSnapshot: menuBarSnap,
             fullSnapshot: fullSnap
         )
+        let defaults = makeUserDefaults("force-wait-race")
         let store = WidgetDataStore(
-            registry: WidgetRegistry(providers: [codex], descriptors: [session]),
+            registry: WidgetRegistry(providers: [codex], descriptors: [session, historyDescriptor]),
             providers: [runtime],
-            defaults: makeUserDefaults("force-wait-race"),
-            pinnedMetricIDs: { ["codex.session"] }
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 0, now: { now }),
+            defaults: defaults,
+            pinnedMetricIDs: { ["codex.session"] },
+            now: { now }
         )
 
         await ProviderRefreshContext.$scope.withValue(.full) {
@@ -417,7 +436,10 @@ final class MenuBarRefreshFilterTests: XCTestCase {
             .progress(label: "Session", used: 22, limit: 100, format: .percent),
             "force must run after in-flight menuBar and apply full Session"
         )
-        XCTAssertEqual(snap?.line(label: "Today"), fullSnap.line(label: "Today"))
+        XCTAssertEqual(snap?.line(label: "Today"), .values(label: "Today", values: [
+            MetricValue(number: 0.07, kind: .dollars, estimated: true),
+            MetricValue(number: 77, kind: .count, label: "tokens"),
+        ]))
         XCTAssertEqual(
             snap?.usageHistory,
             history,

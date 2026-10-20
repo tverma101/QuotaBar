@@ -149,6 +149,39 @@ final class ModelPricingTests: XCTestCase {
         XCTAssertEqual(pricing.resolve(model: "vendor/gpt-5.6")?.inputPerMillion, 7)
     }
 
+    func testFallbackPricedModelQueuesOneOpenRouterRecheck() {
+        let reports = PricingModelReportRecorder()
+        let model = "gemini-3.8-flash-n"
+        let pricing = ModelPricing(
+            supplement: PricingSupplement(),
+            primary: PricingCatalog(entries: ["gemini-3.8-flash": rates(9, 27)]),
+            secondary: PricingCatalog(),
+            onOpenRouterRecheckModel: { reports.append($0) }
+        )
+
+        XCTAssertTrue(pricing.isPriced(model), "the existing LiteLLM fallback remains usable")
+        XCTAssertFalse(pricing.hasExactOpenRouterRate(model), "fallback pricing is not an OpenRouter match")
+        for _ in 0..<10 {
+            XCTAssertEqual(pricing.resolve(model: model)?.inputPerMillion, 9)
+        }
+        XCTAssertEqual(reports.values, [model], "a repeated ledger row queues one catalog check")
+    }
+
+    func testCuratedAndExactOpenRouterPricesDoNotQueueRechecks() {
+        let reports = PricingModelReportRecorder()
+        let pricing = ModelPricing(
+            supplement: PricingSupplement(pricing: ["curated-model": rates(1, 2)]),
+            primary: PricingCatalog(entries: ["fallback-model": rates(3, 4)]),
+            secondary: PricingCatalog(),
+            openRouter: PricingCatalog(entries: ["router-model": rates(5, 6)]),
+            onOpenRouterRecheckModel: { reports.append($0) }
+        )
+
+        XCTAssertEqual(pricing.resolve(model: "curated-model")?.inputPerMillion, 1)
+        XCTAssertEqual(pricing.resolve(model: "router-model")?.inputPerMillion, 5)
+        XCTAssertTrue(reports.values.isEmpty)
+    }
+
     func testCodenameSpellingVariantsResolveToCatalogEntries() throws {
         // Stealth/codename models reach the logs with spellings the public catalogues never use
         // verbatim: spaces or underscores where the catalogue hyphenates ("space bunny" vs
@@ -680,5 +713,18 @@ final class ModelPricingTests: XCTestCase {
     func testUnknownModelCostIsNil() throws {
         let pricing = try makePricing()
         XCTAssertNil(pricing.estimatedCostDollars(model: "mystery", tokens: TokenBreakdown(input: 100)))
+    }
+}
+
+private final class PricingModelReportRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+
+    func append(_ value: String) {
+        lock.withLock { recorded.append(value) }
+    }
+
+    var values: [String] {
+        lock.withLock { recorded }
     }
 }

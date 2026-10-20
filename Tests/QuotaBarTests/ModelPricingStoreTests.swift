@@ -117,11 +117,21 @@ final class ModelPricingStoreTests: XCTestCase {
         // Second store, network dead: cached fetch results still apply.
         let (revived, http) = makeStore(handler: { _ in throw URLError(.notConnectedToInternet) })
         let pricing = await revived.current()
-        XCTAssertEqual(pricing.resolve(model: "fetched-model")?.inputPerMillion, 5)
-        XCTAssertEqual(pricing.resolve(model: "auto")?.inputPerMillion, 9)
+        XCTAssertEqual(pricing.primary.entries["fetched-model"]?.inputPerMillion, 5)
+        XCTAssertEqual(pricing.supplement.pricing["auto"]?.inputPerMillion, 9)
         // Fresh state file -> nothing due until the TTL elapses.
         await revived.refreshNow()
-        XCTAssertTrue(http.requests.isEmpty, "sources within TTL must not refetch")
+        XCTAssertTrue(
+            http.requests.isEmpty,
+            "sources within TTL must not refetch; got \(http.requests.map { $0.url.absoluteString })"
+        )
+
+        // Resolving a fallback-priced model intentionally triggers an immediate, coalesced OpenRouter
+        // check so a newly published exact route can replace the stale estimate without waiting an hour.
+        _ = pricing.resolve(model: "fetched-model")
+        await revived.runUnresolvedDiscoveryIfNeeded()
+        XCTAssertEqual(http.requests.count, 1)
+        XCTAssertEqual(http.requests.first?.url.host(), "openrouter.ai")
     }
 
     func testOlderCachedCatalogCannotOverrideNewerBundledSnapshot() async throws {
@@ -180,6 +190,10 @@ final class ModelPricingStoreTests: XCTestCase {
         let later = Date().addingTimeInterval(2 * 60 * 60)
         let (aged, http) = makeStore(
             handler: { request in
+                if request.url.host() == "openrouter.ai" {
+                    XCTAssertNil(request.headers["If-None-Match"], "every OpenRouter page must be checked")
+                    return HTTPResponse(statusCode: 200, headers: [:], body: Data(Self.openRouterFeed.utf8))
+                }
                 XCTAssertEqual(request.headers["If-None-Match"], "\"v1\"")
                 return HTTPResponse(statusCode: 304, headers: [:], body: Data())
             },

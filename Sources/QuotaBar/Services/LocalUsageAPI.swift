@@ -123,7 +123,7 @@ enum LocalUsageAPI {
         init(_ line: MetricLine) { self.line = line }
 
         enum CodingKeys: String, CodingKey {
-            case type, label, value, used, limit, format, resetsAt, periodDurationMs, color, subtitle, text, points, note
+            case type, label, value, used, limit, format, resetsAt, periodDurationMs, color, subtitle, text, points, note, partial
         }
 
         func encode(to encoder: Encoder) throws {
@@ -135,17 +135,34 @@ enum LocalUsageAPI {
                 try container.encode(value, forKey: .value)
                 try container.encode(color, forKey: .color)        // explicit null, like the original
                 try container.encode(subtitle, forKey: .subtitle)
-            case .values(let label, let values, let color, let expiriesAt, _, _):
+            case .values(let label, let values, let color, let expiriesAt, let unknownModels, _):
                 // Serialize as the original `text` shape (one combined `value` string) so existing
                 // local-API integrations keep working: dollars in full, counts compact — exactly the
                 // string the mapper used to produce (e.g. "$5.17 · 9.2M tokens").
                 // Per-model hover details are UI-only for now and are intentionally omitted from this
-                // documented public wire shape.
+                // documented public wire shape. Preserve a known priced subtotal and add a partial
+                // flag when unknown models explain missing cost, usage is still changing, or a value
+                // is explicitly a known lower bound.
                 try container.encode("text", forKey: .type)
                 try container.encode(label, forKey: .label)
+                let hasDollarValue = values.contains { $0.kind == .dollars }
                 try container.encode(Self.legacyValueString(values), forKey: .value)
                 try container.encode(color, forKey: .color)
                 try container.encodeNil(forKey: .subtitle)
+                let hasTokenUsage = values.contains {
+                    $0.kind == .count && $0.label == "tokens" && $0.number > 0
+                }
+                let hasLowerBoundValue = values.contains {
+                    $0.isLowerBound == true
+                        || ($0.kind == .count && $0.tokenCountSaturated == true)
+                }
+                if !unknownModels.isEmpty
+                    || values.contains(where: { $0.isPartial == true })
+                    || hasLowerBoundValue
+                    || (hasTokenUsage && !hasDollarValue)
+                {
+                    try container.encode(true, forKey: .partial)
+                }
                 // Expose the soonest expiry (Codex reset credits) as ISO-8601 so consumers get the next
                 // one without us baking a display string — same `resetsAt` field a progress row uses.
                 try container.encodeIfPresent(expiriesAt.min().map(OpenUsageISO8601.string(from:)), forKey: .resetsAt)

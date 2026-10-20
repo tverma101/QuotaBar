@@ -168,11 +168,14 @@ final class JSONLScannerCancellationTests: XCTestCase {
     ) throws -> JSONLScanning.DiscoveredFile {
         let url = directory.appendingPathComponent(name)
         try Data(String(value).utf8).write(to: url)
-        let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let values = try url.resourceValues(forKeys: [
+            .fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey,
+        ])
         return JSONLScanning.DiscoveredFile(
             path: url.path,
             size: try XCTUnwrap(values.fileSize),
-            mtime: try XCTUnwrap(values.contentModificationDate)
+            mtime: try XCTUnwrap(values.contentModificationDate),
+            attributeMtime: values.attributeModificationDate
         )
     }
 }

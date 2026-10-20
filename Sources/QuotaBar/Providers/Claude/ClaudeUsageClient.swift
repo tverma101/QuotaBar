@@ -121,12 +121,17 @@ struct ClaudeUsageClient: Sendable {
         guard let profile = try? JSONDecoder().decode(AccountProfile.self, from: response.body) else {
             throw ClaudeUsageError.invalidResponse
         }
+        let mismatchDiagnosticPrefix = "auth.claude.account-mismatch.\(JSONLScanCachePaths.stableFingerprint(expectedIdentityKey))."
         guard profile.account.uuid.caseInsensitiveCompare(String(expected[0])) == .orderedSame,
               profile.organization?.uuid.caseInsensitiveCompare(String(expected[1])) == .orderedSame
         else {
-            AppLog.warn(LogTag.auth("claude"), "Claude credential does not match its account or organization")
+            let key = mismatchDiagnosticPrefix + JSONLScanCachePaths.stableFingerprint(accessToken)
+            DiagnosticGate.logOnce(for: key) {
+                AppLog.warn(LogTag.auth("claude"), "Claude credential does not match its account or organization")
+            }
             throw ClaudeAuthError.sessionExpired
         }
+        DiagnosticGate.clearFailures(prefix: mismatchDiagnosticPrefix)
         return nil
     }
 }

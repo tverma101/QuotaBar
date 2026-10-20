@@ -105,7 +105,16 @@ struct TotalSpendCard: View {
     /// tooltip lie about what the total reflects.
     private var infoTooltip: String {
         let names = providers.map(\.displayName)
-        return "Only includes \(names.formatted(.list(type: .and))). Unpriced usage is omitted from dollar totals and marked Partial."
+        let coverageNote: String
+        switch metric {
+        case .cost:
+            coverageNote = "Dollar totals show known subtotals when cost data is incomplete; active-session usage can still grow."
+        case .costPerMtok:
+            coverageNote = "Providers with incomplete cost or saturated token totals are excluded from the rate."
+        case .tokens:
+            coverageNote = "Saturated token totals are lower bounds; active-session usage can still grow."
+        }
+        return "Only includes \(names.formatted(.list(type: .and))). \(coverageNote)"
     }
 
     private var shareButton: some View {
@@ -191,9 +200,17 @@ struct TotalSpendCard: View {
     /// A metric/period combination with nothing to show mirrors the spend tiles' "No data" rule —
     /// never a fabricated zero ring.
     private var emptyState: some View {
-        Text(projection.hasIncompleteCost && metric.usesDollarEstimateNote
-             ? "No fully priced usage for this period"
-             : metric.emptyMessage)
+        let message: String
+        if projection.hasIncompleteCost {
+            switch metric {
+            case .cost: message = "No priced usage for this period"
+            case .costPerMtok: message = "No complete cost-per-token data for this period"
+            case .tokens: message = metric.emptyMessage
+            }
+        } else {
+            message = metric.emptyMessage
+        }
+        return Text(message)
             .font(.system(size: density.supportingPointSize))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity)
@@ -252,14 +269,26 @@ struct TotalSpendRingContent: View {
 
     private var accessibilityLabel: String {
         let center = formatValue(projection.centerValue, style: .full)
-        let partial = projection.hasIncompleteCost ? ", partial because unpriced usage is omitted" : ""
+        let displayedCenter = projection.centerValueIsLowerBound ? "≥\(center)" : center
+        var notes: [String] = []
         switch projection.metric {
         case .cost:
-            return "Total cost \(center) across \(projection.slices.count) providers\(partial)"
-        case .tokens:
-            return "Total tokens \(center) across \(projection.slices.count) providers"
+            if projection.hasIncompleteCost { notes.append("some cost data is incomplete; known subtotals are shown") }
+            if projection.hasActiveSessionData { notes.append("active-session usage can still grow") }
         case .costPerMtok:
-            return "Blended cost per megatoken \(center) across \(projection.slices.count) providers\(partial)"
+            if projection.hasIncompleteCost { notes.append("providers with incomplete cost or saturated token counts are excluded") }
+        case .tokens:
+            if projection.hasActiveSessionData { notes.append("active-session usage can still grow") }
+            if projection.hasSaturatedTokenData { notes.append("saturated token totals are lower bounds") }
+        }
+        let partial = notes.isEmpty ? "" : ", " + notes.joined(separator: "; ")
+        switch projection.metric {
+        case .cost:
+            return "Total cost \(displayedCenter) across \(projection.slices.count) providers\(partial)"
+        case .tokens:
+            return "Total tokens \(displayedCenter) across \(projection.slices.count) providers"
+        case .costPerMtok:
+            return "Blended cost per megatoken \(displayedCenter) across \(projection.slices.count) providers\(partial)"
         }
     }
 
@@ -274,11 +303,16 @@ struct TotalSpendRingContent: View {
     /// The ranked slices as cumulative ring fractions, with the minimum-sliver floor applied and the
     /// result renormalized so the ring always closes exactly.
     private var arcs: [RingArc] {
-        let totalDisplay = projection.slices.reduce(0) { $0 + $1.displayAmount }
-        guard totalDisplay > 0 else { return [] }
-        let floored = projection.slices.map { max($0.displayAmount / totalDisplay, Self.minimumSliceShare) }
+        // Normalize before summing so very large, still-finite values cannot make the denominator
+        // infinite and collapse every arc to zero.
+        let largestDisplay = projection.slices.map(\.displayAmount).max() ?? 0
+        guard largestDisplay.isFinite, largestDisplay > 0 else { return [] }
+        let normalized = projection.slices.map { $0.displayAmount / largestDisplay }
+        let totalDisplay = normalized.reduce(0, +)
+        guard totalDisplay.isFinite, totalDisplay > 0 else { return [] }
+        let floored = normalized.map { max($0 / totalDisplay, Self.minimumSliceShare) }
         let sum = floored.reduce(0, +)
-        guard sum > 0 else { return [] }
+        guard sum.isFinite, sum > 0 else { return [] }
 
         var cursor = 0.0
         return zip(projection.slices, floored).map { slice, share in
@@ -293,8 +327,9 @@ struct TotalSpendRingContent: View {
     /// exact one-line forms.
     private var centerLabel: some View {
         let center = MetricFormatter.totalSpendRingCenter(projection.centerValue, metric: projection.metric)
+        let primary = projection.centerValueIsLowerBound ? "≥\(center.primary)" : center.primary
         return VStack(spacing: 1) {
-            Text(center.primary)
+            Text(primary)
                 .font(.system(size: 13, weight: .semibold, design: .rounded))
                 .foregroundStyle(.primary)
                 .monospacedDigit()
@@ -304,25 +339,33 @@ struct TotalSpendRingContent: View {
                 .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
-            if projection.hasIncompleteCost {
-                Text("Partial")
-                    .font(.system(size: 8, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
         }
         .padding(.horizontal, 10)
         .hoverTooltip(centerTooltip)
     }
 
     private var centerTooltip: String {
-        let exact = formatValue(projection.centerValue, style: .full)
+        let center = formatValue(projection.centerValue, style: .full)
+        let exact = projection.centerValueIsLowerBound ? "≥\(center)" : center
         var notes: [String] = []
         if projection.isEstimated, projection.metric.usesDollarEstimateNote {
             notes.append(WidgetData.localEstimateNote)
         }
-        if projection.hasIncompleteCost {
-            notes.append("Partial: unpriced usage is omitted")
+        if projection.hasPartialData {
+            switch projection.metric {
+            case .cost:
+                if projection.hasIncompleteCost {
+                    notes.append("Partial: known dollar subtotals are shown when other cost data is incomplete")
+                }
+                if projection.hasActiveSessionData { notes.append("Active-session usage can still grow") }
+            case .costPerMtok:
+                if projection.hasIncompleteCost {
+                    notes.append("Providers with incomplete cost or saturated token counts are excluded")
+                }
+            case .tokens:
+                if projection.hasActiveSessionData { notes.append("Active-session usage can still grow") }
+                if projection.hasSaturatedTokenData { notes.append("Saturated token totals are lower bounds") }
+            }
         }
         return notes.isEmpty ? exact : "\(exact) · \(notes.joined(separator: " · "))"
     }
@@ -352,7 +395,8 @@ struct TotalSpendRingContent: View {
             Spacer(minLength: 8)
             // Tokens always abbreviate in the legend (12.4M), matching spend rows elsewhere —
             // `.full` would spill every digit. Cost modes keep cents via `.row` / `.full`.
-            Text(formatValue(slice.displayAmount, style: legendValueStyle))
+            let value = formatValue(slice.displayAmount, style: legendValueStyle)
+            Text(slice.displayAmountIsLowerBound ? "≥\(value)" : value)
                 .font(.system(size: density.supportingPointSize, weight: .medium))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()

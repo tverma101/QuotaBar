@@ -71,7 +71,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         var data: [String: String]
         init(data: [String: String] = [:]) { self.data = data }
         func queryValue(path: String, sql: String) throws -> String? {
-            if sql.contains("json_group_array") { return data[path] }
+            if sql.contains("json_group_array") { return data[path] ?? "[]" }
             if sql.contains("SELECT 1") { return data[path] == nil ? nil : "1" }
             return nil
         }
@@ -149,6 +149,30 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // DB row's recorded $0.005 + fold at $0.50/M × 9200 tokens = $0.0046.
         let dollars = values.first(where: { $0.kind == .dollars })?.number ?? 0
         XCTAssertEqual(dollars, 0.0096, accuracy: 1e-9)
+    }
+
+    func testSaturatedDatabaseCountsDoNotCalibrateGatewayRates() async throws {
+        let claudeHome = try fixtureClaudeHome(files: [
+            ".claude/projects/-Users-tejas-Gaming/session.jsonl":
+                line(TestLocalInstant.iso(2026, 7, 12, 11),
+                     "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000) + "\n",
+        ])
+        let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
+        // This row's raw count exceeds the safe parser range. Its $2 charge remains part of history,
+        // but the clamped denominator must not be used to price other gateway sessions.
+        let db = "[[\(ms),2.0,2000000000000000,\"deepseek-v4-flash\",\"opencode-go\"]]"
+        let scanner = OpenCodeUsageScanner(
+            sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databasePaths: { ["/oc/opencode.db"] },
+            claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
+        )
+
+        let maybeScan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
+        let scan = try XCTUnwrap(maybeScan)
+        let day = try XCTUnwrap(scan.logScan.series.daily.first)
+        XCTAssertTrue(day.tokenCountSaturated)
+        XCTAssertEqual(day.costUSD ?? -1, 2.0002184, accuracy: 1e-9,
+                       "the saturated amount is retained; gateway cost falls back to catalog rates")
     }
 
     func testGatewayFoldPricedAtZeroWhenRecordedCostIsZero() async throws {

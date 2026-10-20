@@ -22,14 +22,27 @@ final class TotalSpendAggregatorTests: XCTestCase {
         dollars: Double? = nil,
         tokens: Double? = 1_000_000,
         estimated: Bool = false,
-        unknownModels: [String] = []
+        unknownModels: [String] = [],
+        isPartial: Bool = false,
+        tokenCountSaturated: Bool = false
     ) -> MetricLine {
         var values: [MetricValue] = []
         if let dollars {
-            values.append(MetricValue(number: dollars, kind: .dollars, estimated: estimated))
+            values.append(MetricValue(
+                number: dollars,
+                kind: .dollars,
+                estimated: estimated,
+                isPartial: isPartial
+            ))
         }
         if let tokens {
-            values.append(MetricValue(number: tokens, kind: .count, label: "tokens"))
+            values.append(MetricValue(
+                number: tokens,
+                kind: .count,
+                label: "tokens",
+                tokenCountSaturated: tokenCountSaturated ? true : nil,
+                isPartial: isPartial
+            ))
         }
         return .values(label: label, values: values, unknownModels: unknownModels)
     }
@@ -138,7 +151,7 @@ final class TotalSpendAggregatorTests: XCTestCase {
         XCTAssertEqual(rates.centerValue, 10, accuracy: 0.0001)
     }
 
-    func testMixedPricedAndUnpricedUsageIsOmittedFromDollarRatesAndMarkedPartial() {
+    func testMixedPricedAndUnpricedUsageShowsPricedSubtotalAndMarksPartial() {
         let snapshots = [
             "claude": snapshot(claude, lines: [spendLine(
                 "Today", dollars: 1, tokens: 1_000, unknownModels: ["opaque-model"]
@@ -148,9 +161,13 @@ final class TotalSpendAggregatorTests: XCTestCase {
         let total = TotalSpendAggregator.total(for: .today, providers: [claude, codex], snapshots: snapshots)
 
         let cost = total.projection(for: .cost)
-        XCTAssertEqual(cost.centerValue, 2, accuracy: 0.0001)
-        XCTAssertEqual(cost.slices.map(\.provider.id), ["codex"])
+        XCTAssertEqual(cost.centerValue, 3, accuracy: 0.0001)
+        XCTAssertEqual(cost.slices.map(\.provider.id), ["codex", "claude"])
         XCTAssertTrue(cost.hasIncompleteCost)
+        XCTAssertTrue(cost.centerValueIsLowerBound)
+        XCTAssertFalse(try XCTUnwrap(cost.slices.first { $0.provider.id == "codex" }).displayAmountIsLowerBound)
+        XCTAssertTrue(try XCTUnwrap(cost.slices.first { $0.provider.id == "claude" }).displayAmountIsLowerBound)
+        XCTAssertFalse(cost.hasActiveSessionData, "unknown models do not imply an active session")
 
         let rate = total.projection(for: .costPerMtok)
         XCTAssertEqual(rate.centerValue, 2_000, accuracy: 0.0001)
@@ -160,6 +177,146 @@ final class TotalSpendAggregatorTests: XCTestCase {
         let tokens = total.projection(for: .tokens)
         XCTAssertEqual(tokens.centerValue, 2_000, accuracy: 0.0001)
         XCTAssertFalse(tokens.hasIncompleteCost)
+    }
+
+    func testActiveSessionIsPartialAndExcludedFromCostPerMtok() throws {
+        let opencode = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
+        let snapshots = [
+            "opencode": snapshot(opencode, lines: [spendLine(
+                "Today", dollars: 2, tokens: 500, isPartial: true
+            )])
+        ]
+        let total = TotalSpendAggregator.total(for: .today, providers: [opencode], snapshots: snapshots)
+        let slice = try XCTUnwrap(total.slices.first)
+
+        XCTAssertTrue(slice.isPartial)
+        XCTAssertTrue(slice.hasIncompleteCost)
+        XCTAssertEqual(total.projection(for: .cost).centerValue, 2, accuracy: 0.0001)
+        XCTAssertTrue(total.projection(for: .cost).hasPartialData)
+        XCTAssertTrue(total.projection(for: .cost).centerValueIsLowerBound)
+        XCTAssertTrue(total.projection(for: .cost).slices.first?.displayAmountIsLowerBound == true)
+
+        let rate = total.projection(for: .costPerMtok)
+        XCTAssertTrue(rate.slices.isEmpty)
+        XCTAssertTrue(rate.hasPartialData)
+
+        let tokens = total.projection(for: .tokens)
+        XCTAssertEqual(tokens.centerValue, 500, accuracy: 0.0001)
+        XCTAssertTrue(tokens.hasPartialData)
+        XCTAssertTrue(tokens.hasActiveSessionData)
+        XCTAssertTrue(tokens.centerValueIsLowerBound)
+        XCTAssertTrue(tokens.slices.first?.displayAmountIsLowerBound == true)
+        XCTAssertFalse(tokens.hasIncompleteCost)
+    }
+
+    func testSaturatedTokenTotalsAreLowerBoundsAndExcludedFromCostPerMtok() {
+        let snapshots = [
+            "claude": snapshot(claude, lines: [spendLine(
+                "Today", dollars: 2, tokens: Double(Int.max), tokenCountSaturated: true
+            )])
+        ]
+        let total = TotalSpendAggregator.total(for: .today, providers: [claude], snapshots: snapshots)
+
+        let cost = total.projection(for: .cost)
+        XCTAssertEqual(cost.centerValue, 2, accuracy: 0.0001)
+        XCTAssertEqual(cost.slices.map(\.provider.id), ["claude"])
+
+        let rate = total.projection(for: .costPerMtok)
+        XCTAssertTrue(rate.slices.isEmpty)
+        XCTAssertTrue(rate.hasIncompleteCost)
+        XCTAssertFalse(rate.hasActiveSessionData)
+        XCTAssertTrue(rate.hasSaturatedTokenData)
+
+        let tokens = total.projection(for: .tokens)
+        XCTAssertTrue(tokens.centerValueIsLowerBound)
+        XCTAssertTrue(tokens.slices.first?.displayAmountIsLowerBound == true)
+    }
+
+    func testFiniteDollarSumsThatOverflowRemainFiniteAndPartial() throws {
+        let overflowingLine = MetricLine.values(
+            label: "Today",
+            values: [
+                MetricValue(number: 1e308, kind: .dollars),
+                MetricValue(number: 1e308, kind: .dollars),
+                MetricValue(number: 100, kind: .count, label: "tokens")
+            ]
+        )
+        let snapshots = [
+            "claude": snapshot(claude, lines: [overflowingLine]),
+            "cursor": snapshot(cursor, lines: [spendLine("Today", dollars: 1e308, tokens: 100)])
+        ]
+        let total = TotalSpendAggregator.total(for: .today, providers: [claude, cursor], snapshots: snapshots)
+
+        let claudeSlice = try XCTUnwrap(total.slices.first { $0.provider.id == "claude" })
+        XCTAssertTrue(claudeSlice.amountUSD.isFinite)
+        XCTAssertEqual(claudeSlice.amountUSD, 1e308)
+        XCTAssertTrue(claudeSlice.hasIncompleteCost)
+        XCTAssertTrue(total.totalUSD.isFinite)
+
+        let projection = total.projection(for: .cost)
+        XCTAssertTrue(projection.centerValue.isFinite)
+        XCTAssertEqual(projection.centerValue, 1e308)
+        XCTAssertTrue(projection.centerValueIsLowerBound)
+        XCTAssertTrue(projection.hasPartialData)
+        XCTAssertTrue(try XCTUnwrap(projection.slices.first { $0.provider.id == "claude" }).displayAmountIsLowerBound)
+    }
+
+    func testSourceMarkedDollarSubtotalStaysLowerBoundAndIsExcludedFromCostRate() throws {
+        let line = MetricLine.values(label: "Last 30 Days", values: [
+            MetricValue(number: 1e308, kind: .dollars, isLowerBound: true),
+            MetricValue(number: 1_000, kind: .count, label: "tokens")
+        ])
+        let total = TotalSpendAggregator.total(
+            for: .last30,
+            providers: [claude],
+            snapshots: ["claude": snapshot(claude, lines: [line])]
+        )
+
+        let cost = total.projection(for: .cost)
+        XCTAssertEqual(cost.centerValue, 1e308)
+        XCTAssertTrue(cost.hasIncompleteCost)
+        XCTAssertTrue(cost.centerValueIsLowerBound)
+        XCTAssertTrue(try XCTUnwrap(cost.slices.first).displayAmountIsLowerBound)
+
+        let rate = total.projection(for: .costPerMtok)
+        XCTAssertTrue(rate.slices.isEmpty)
+        XCTAssertTrue(rate.hasIncompleteCost)
+    }
+
+    func testFiniteTokenSumsThatOverflowRemainFiniteLowerBounds() {
+        let snapshots = [
+            "claude": snapshot(claude, lines: [spendLine(
+                "Today", dollars: nil, tokens: Double.greatestFiniteMagnitude
+            )]),
+            "cursor": snapshot(cursor, lines: [spendLine(
+                "Today", dollars: nil, tokens: Double.greatestFiniteMagnitude
+            )])
+        ]
+        let total = TotalSpendAggregator.total(for: .today, providers: [claude, cursor], snapshots: snapshots)
+        let projection = total.projection(for: .tokens)
+
+        XCTAssertTrue(projection.centerValue.isFinite)
+        XCTAssertEqual(projection.centerValue, Double.greatestFiniteMagnitude)
+        XCTAssertTrue(projection.centerValueIsLowerBound)
+        XCTAssertTrue(projection.hasPartialData)
+    }
+
+    func testCostPerMtokBlendsVeryLargeFiniteTokenCountsWithoutOverflow() {
+        let largeTokenCount = Double.greatestFiniteMagnitude
+        let snapshots = [
+            "claude": snapshot(claude, lines: [spendLine(
+                "Today", dollars: 1e308, tokens: largeTokenCount
+            )]),
+            "cursor": snapshot(cursor, lines: [spendLine(
+                "Today", dollars: 1e308, tokens: largeTokenCount
+            )])
+        ]
+        let total = TotalSpendAggregator.total(for: .today, providers: [claude, cursor], snapshots: snapshots)
+        let rates = total.projection(for: .costPerMtok)
+
+        XCTAssertTrue(rates.centerValue.isFinite)
+        XCTAssertEqual(rates.centerValue, (1e308 / largeTokenCount) * 1_000_000, accuracy: 0.0001)
+        XCTAssertEqual(rates.slices.count, 2)
     }
 
     func testVerifiedZeroCostUsageContributesTokensToBlendedCostRate() {

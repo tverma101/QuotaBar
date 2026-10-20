@@ -1,19 +1,22 @@
 import XCTest
 @testable import QuotaBar
 
-/// Covers the fresh-install seeding flow: only fresh installs are seeded (existing installs keep the
-/// legacy all-on default untouched), the fallback set lands synchronously, the detected set replaces it
-/// once the local credential probe finishes, and a user's toggle during the probe wins over detection.
+/// Provider activation is manual except for the owner-selected first-run defaults. These tests also
+/// prove startup seeding does not inspect provider credentials or wait for local/keychain reads.
 @MainActor
 final class FirstRunSeederTests: XCTestCase {
-    func testFreshInstallSeedsFallbackSynchronouslyThenDetectedSet() async {
-        let enablement = ProviderEnablementStore(defaults: makeDefaults("detect"))
-        let onboarding = OnboardingStore(defaults: makeDefaults("detect-onboarding"))
+    func testFreshInstallSeedsOnlyDefaultsAndDoesNotProbeCredentials() {
+        let enablement = ProviderEnablementStore(defaults: makeDefaults("manual-defaults"))
+        let onboarding = OnboardingStore(defaults: makeDefaults("manual-defaults-onboarding"))
         let providers = [
-            stub("claude", hasCredentials: true),
-            stub("codex", hasCredentials: false),
+            stub("claude", hasCredentials: false),
+            stub("codex", hasCredentials: true),
+            stub("codex@account-a", hasCredentials: true),
             stub("cursor", hasCredentials: false),
-            stub("grok", hasCredentials: true)
+            stub("freebuff", hasCredentials: false),
+            stub("antigravity", hasCredentials: true),
+            stub("grok", hasCredentials: true),
+            stub("opencode", hasCredentials: true)
         ]
 
         let task = FirstRunSeeder.seedIfNeeded(
@@ -21,318 +24,175 @@ final class FirstRunSeederTests: XCTestCase {
             enablement: enablement, onboarding: onboarding
         )
 
-        // Before the probe finishes: the fallback set, synchronously — never a flash of all providers.
-        XCTAssertEqual(enablement.enabledIDs, ["claude", "codex", "cursor"])
+        XCTAssertNil(task, "first-run defaults are committed synchronously")
+        XCTAssertEqual(enablement.enabledIDs, ["claude", "codex", "codex@account-a", "cursor", "freebuff"])
+        XCTAssertEqual(enablement.knownIDs, Set(providers.map(\.provider.id)))
         XCTAssertTrue(onboarding.isCustomizeHintPending)
-        // Every provider shipping today is baselined as "seen", so `NewProviderSeeder` only ever
-        // probes providers added in a later release.
-        XCTAssertEqual(enablement.knownIDs, ["claude", "codex", "cursor", "grok"])
-
-        await task?.value
-        XCTAssertEqual(enablement.enabledIDs, ["claude", "grok"])
+        XCTAssertTrue(providers.allSatisfy { ($0 as? ProbeCountingProvider)?.probeCount == 0 })
     }
 
-    func testNothingDetectedKeepsFallback() async {
-        let enablement = ProviderEnablementStore(defaults: makeDefaults("none"))
-        let onboarding = OnboardingStore(defaults: makeDefaults("none-onboarding"))
-        let providers = ["claude", "codex", "cursor", "grok"].map { stub($0, hasCredentials: false) }
-
-        let task = FirstRunSeeder.seedIfNeeded(
-            isFreshInstall: true, providers: providers,
-            enablement: enablement, onboarding: onboarding
-        )
-        await task?.value
-
-        XCTAssertEqual(enablement.enabledIDs, ["claude", "codex", "cursor"])
-    }
-
-    func testExistingInstallIsNeverSeeded() async {
+    func testExistingInstallIsNeverReseeded() {
         let enablement = ProviderEnablementStore(defaults: makeDefaults("existing"))
         let onboarding = OnboardingStore(defaults: makeDefaults("existing-onboarding"))
+        let grok = stub("grok", hasCredentials: true)
 
         let task = FirstRunSeeder.seedIfNeeded(
-            isFreshInstall: false, providers: [stub("claude", hasCredentials: true)],
+            isFreshInstall: false, providers: [grok],
             enablement: enablement, onboarding: onboarding
         )
 
         XCTAssertNil(task)
-        XCTAssertNil(enablement.enabledIDs, "an existing install keeps legacy all-on semantics")
+        XCTAssertNil(enablement.enabledIDs, "existing legacy state must not be converted by first-run seeding")
         XCTAssertTrue(enablement.isEnabled("grok"))
-        XCTAssertFalse(onboarding.isCustomizeHintPending, "existing installs never see the hint card")
+        XCTAssertFalse(onboarding.isCustomizeHintPending)
+        XCTAssertEqual(grok.probeCount, 0)
+    }
+
+    func testInterruptedFreshInstallSeedResumesOnNextLaunchAndKeepsOptionalProvidersOff() {
+        let defaults = makeDefaults("resume-fresh-seed")
+        defaults.set(true, forKey: ProviderEnablementPersistence.firstRunSeedPendingKey)
+        let enablement = ProviderEnablementStore(defaults: defaults)
+        let onboardingDefaults = makeDefaults("resume-fresh-seed-onboarding")
+        let onboarding = OnboardingStore(defaults: onboardingDefaults)
+        let providers = [
+            stub("claude", hasCredentials: false),
+            stub("codex", hasCredentials: false),
+            stub("codex@account-a", hasCredentials: true),
+            stub("cursor", hasCredentials: false),
+            stub("freebuff", hasCredentials: false),
+            stub("grok", hasCredentials: true),
+            stub("opencode", hasCredentials: true)
+        ]
+
+        XCTAssertTrue(enablement.isEnabled("claude"))
+        XCTAssertFalse(enablement.isEnabled("grok"), "pending first-run state must never fall back to legacy all-on")
+        XCTAssertNil(enablement.enabledIDs, "this models a crash before the first enabled-list write")
+
+        FirstRunSeeder.seedIfNeeded(
+            isFreshInstall: false,
+            providers: providers,
+            enablement: enablement,
+            onboarding: onboarding
+        )
+
+        XCTAssertEqual(enablement.enabledIDs, ["claude", "codex", "codex@account-a", "cursor", "freebuff"])
+        XCTAssertTrue(enablement.knownIDs.isSuperset(of: Set(providers.map(\.provider.id))))
+        XCTAssertFalse(enablement.hasPendingFirstRunSeed)
+        XCTAssertTrue(onboarding.isCustomizeHintPending)
+        XCTAssertTrue(providers.allSatisfy { ($0 as? ProbeCountingProvider)?.probeCount == 0 })
     }
 
     func testAlreadySeededStoreIsNotReseeded() {
-        // An unbundled `swift run` reports fresh on every launch; the enabled-list guard keeps a
-        // second pass from overwriting the user's choices.
         let defaults = makeDefaults("idempotent")
         let enablement = ProviderEnablementStore(defaults: defaults)
         enablement.seedEnabledProviders(["grok"])
         let onboarding = OnboardingStore(defaults: makeDefaults("idempotent-onboarding"))
+        let grok = stub("grok", hasCredentials: true)
 
         let task = FirstRunSeeder.seedIfNeeded(
-            isFreshInstall: true, providers: [stub("claude", hasCredentials: true)],
+            isFreshInstall: true, providers: [grok],
             enablement: enablement, onboarding: onboarding
         )
 
         XCTAssertNil(task)
         XCTAssertEqual(enablement.enabledIDs, ["grok"])
+        XCTAssertEqual(grok.probeCount, 0)
     }
 
-    func testUserToggleDuringDetectionWins() async {
-        let enablement = ProviderEnablementStore(defaults: makeDefaults("toggle-wins"))
-        let onboarding = OnboardingStore(defaults: makeDefaults("toggle-wins-onboarding"))
-        let providers = [stub("claude", hasCredentials: true), stub("codex", hasCredentials: false),
-                         stub("cursor", hasCredentials: false), stub("devin", hasCredentials: true)]
-
-        let task = FirstRunSeeder.seedIfNeeded(
-            isFreshInstall: true, providers: providers,
-            enablement: enablement, onboarding: onboarding
-        )
-        // The user flips a toggle while the probe is still running: their arrangement must survive.
-        enablement.setEnabled(false, for: "codex")
-        await task?.value
-
-        XCTAssertEqual(enablement.enabledIDs, ["claude", "cursor"])
-    }
-
-    func testInterruptedFirstRunProbeResumesAfterStoreReload() async {
-        let defaults = makeDefaults("resume-after-reload")
-        let enablement = ProviderEnablementStore(defaults: defaults)
-        let gate = ManualCredentialProbe()
-        let providers = [stub("claude", probe: { await gate.probe() })]
-        let onboarding = OnboardingStore(defaults: makeDefaults("resume-onboarding"))
-
-        let firstAttempt = FirstRunSeeder.seedIfNeeded(
-            isFreshInstall: true, providers: providers, enablement: enablement, onboarding: onboarding
-        )
-        await gate.waitForArrivals(1)
-        XCTAssertTrue(enablement.hasPendingFirstRunCredentialProbe)
-
-        // Simulates a relaunch while the first process is still suspended in a local credential probe.
-        let relaunchedEnablement = ProviderEnablementStore(defaults: defaults)
-        let resumedAttempt = FirstRunSeeder.seedIfNeeded(
-            isFreshInstall: false,
-            providers: providers,
-            enablement: relaunchedEnablement,
-            onboarding: OnboardingStore(defaults: makeDefaults("resume-onboarding-reloaded"))
-        )
-        XCTAssertNotNil(resumedAttempt)
-        await gate.waitForArrivals(2)
-        gate.resumeAll(true)
-
-        await firstAttempt?.value
-        await resumedAttempt?.value
-        XCTAssertEqual(relaunchedEnablement.enabledIDs, ["claude"])
-        XCTAssertFalse(relaunchedEnablement.hasPendingFirstRunCredentialProbe)
-    }
-
-    func testInterruptedFirstRunProbeNeverOverwritesChoiceMadeBeforeRelaunch() async {
-        let defaults = makeDefaults("resume-preserves-choice")
-        let enablement = ProviderEnablementStore(defaults: defaults)
-        let gate = ManualCredentialProbe()
-        let providers = [stub("claude", probe: { await gate.probe() })]
-        let firstAttempt = FirstRunSeeder.seedIfNeeded(
-            isFreshInstall: true,
-            providers: providers,
-            enablement: enablement,
-            onboarding: OnboardingStore(defaults: makeDefaults("preserve-choice-onboarding"))
-        )
-        await gate.waitForArrivals(1)
-
-        enablement.setEnabled(false, for: "claude")
-        let relaunchedEnablement = ProviderEnablementStore(defaults: defaults)
-        let resumedAttempt = FirstRunSeeder.seedIfNeeded(
-            isFreshInstall: false,
-            providers: providers,
-            enablement: relaunchedEnablement,
-            onboarding: OnboardingStore(defaults: makeDefaults("preserve-choice-onboarding-reloaded"))
-        )
-
-        XCTAssertNil(resumedAttempt, "a persisted user-choice revision cancels stale first-run detection")
-        XCTAssertFalse(relaunchedEnablement.hasPendingFirstRunCredentialProbe)
-        gate.resumeAll(true)
-        await firstAttempt?.value
-        XCTAssertEqual(relaunchedEnablement.enabledIDs, [])
-    }
-
-    // MARK: - Reset All reseed
-
-    func testReseedOverwritesCurrentChoicesWithDetectedSet() async {
-        // The user had a hand-tuned set on; Reset All must re-detect and switch to exactly what's
-        // installed — even turning off a provider they had enabled that has no local credentials.
-        let enablement = ProviderEnablementStore(defaults: makeDefaults("reseed"))
-        enablement.seedEnabledProviders(["codex", "grok"])
+    func testResetAllRestoresManualDefaultsWithoutProbingOptionalProviders() async {
+        let enablement = ProviderEnablementStore(defaults: makeDefaults("reset-all"))
+        enablement.seedEnabledProviders(["claude", "grok", "opencode"])
+        enablement.registerKnownProviders(["claude", "grok", "opencode"])
         let providers = [
             stub("claude", hasCredentials: true),
             stub("codex", hasCredentials: false),
+            stub("codex@account-a", hasCredentials: true),
             stub("cursor", hasCredentials: false),
-            stub("grok", hasCredentials: true)
+            stub("freebuff", hasCredentials: false),
+            stub("grok", hasCredentials: true),
+            stub("opencode", hasCredentials: true)
         ]
 
-        let task = FirstRunSeeder.reseed(providers: providers, enablement: enablement)
+        await FirstRunSeeder.reseed(providers: providers, enablement: enablement).value
 
-        // Snaps to the fallback synchronously so the dashboard reflects the reset immediately.
-        XCTAssertEqual(enablement.enabledIDs, ["claude", "codex", "cursor"])
-
-        await task.value
-        XCTAssertEqual(enablement.enabledIDs, ["claude", "grok"])
+        XCTAssertEqual(enablement.enabledIDs, ["claude", "codex", "codex@account-a", "cursor", "freebuff"])
+        XCTAssertEqual(enablement.knownIDs, Set(providers.map(\.provider.id)))
+        XCTAssertTrue(providers.allSatisfy { ($0 as? ProbeCountingProvider)?.probeCount == 0 })
     }
 
-    func testReseedKeepsFallbackWhenNothingDetected() async {
-        let enablement = ProviderEnablementStore(defaults: makeDefaults("reseed-none"))
-        enablement.seedEnabledProviders(["grok"])
-        let providers = ["claude", "codex", "cursor", "grok"].map { stub($0, hasCredentials: false) }
+    func testResetAllClearsOffChoiceForUnregisteredCodexAccountBeforeItReturns() async {
+        let defaults = makeDefaults("reset-all-removed-codex")
+        let enablement = ProviderEnablementStore(defaults: defaults)
+        enablement.seedEnabledProviders(["claude", "codex", "cursor", "codex@removed-account"])
+        enablement.setEnabled(false, for: "codex@removed-account")
+        XCTAssertTrue(enablement.userChoiceProviderIDs.contains("codex@removed-account"))
 
-        let task = FirstRunSeeder.reseed(providers: providers, enablement: enablement)
-        await task.value
+        await FirstRunSeeder.reseed(
+            providers: [stub("claude", hasCredentials: false), stub("codex", hasCredentials: false), stub("cursor", hasCredentials: false)],
+            enablement: enablement
+        ).value
 
-        XCTAssertEqual(enablement.enabledIDs, ["claude", "codex", "cursor"])
+        XCTAssertFalse(enablement.userChoiceProviderIDs.contains("codex@removed-account"))
+        enablement.enableNewlyRegisteredCodexAccounts(
+            discoveredIDs: ["codex@removed-account"],
+            previouslyDiscoveredIDs: []
+        )
+        XCTAssertTrue(enablement.isEnabled("codex@removed-account"))
     }
 
-    func testReseedUserToggleDuringDetectionWins() async {
-        let enablement = ProviderEnablementStore(defaults: makeDefaults("reseed-toggle"))
-        let providers = [stub("claude", hasCredentials: true), stub("codex", hasCredentials: false),
-                         stub("cursor", hasCredentials: false), stub("devin", hasCredentials: true)]
+    func testLegacyPendingFirstRunProbeIsClearedWithoutApplyingItsResult() {
+        let defaults = makeDefaults("clear-old-pending")
+        let original = ProviderEnablementStore(defaults: defaults)
+        original.beginFirstRunCredentialProbe()
+        original.registerKnownProviders(["claude", "grok"])
+        original.seedEnabledProviders(["claude"])
 
-        let task = FirstRunSeeder.reseed(providers: providers, enablement: enablement)
-        // The user flips a toggle while the probe is still running: their arrangement must survive.
-        enablement.setEnabled(false, for: "codex")
-        await task.value
+        let relaunched = ProviderEnablementStore(defaults: defaults)
+        let grok = stub("grok", hasCredentials: true)
+        let task = FirstRunSeeder.seedIfNeeded(
+            isFreshInstall: false,
+            providers: [stub("claude", hasCredentials: true), grok],
+            enablement: relaunched,
+            onboarding: OnboardingStore(defaults: makeDefaults("clear-old-pending-onboarding"))
+        )
 
-        XCTAssertEqual(enablement.enabledIDs, ["claude", "cursor"])
+        XCTAssertNil(task)
+        XCTAssertEqual(relaunched.enabledIDs, ["claude"])
+        XCTAssertFalse(relaunched.hasPendingFirstRunCredentialProbe)
+        XCTAssertEqual(grok.probeCount, 0)
     }
 
-    // MARK: - Concurrent detection
-
-    func testDetectLocalProvidersProbesConcurrently() async {
-        // A single probe can block on a `security`/`sqlite3` subprocess for seconds, so probing
-        // sequentially made first-launch detection take the sum of all providers' waits. Each gated
-        // stub suspends until every probe has *started* (and reports a credential only then), so a
-        // sequential regression — where the first probe would finish before the second begins — fails
-        // the assertion instead of detecting anything.
-        let ids = ["claude", "codex", "cursor", "grok"]
-        let gate = ProbeGate(expected: ids.count)
-        let providers = ids.map { CredentialStubProvider(id: $0, gate: gate) }
-
-        let detected = await FirstRunSeeder.detectLocalProviders(providers)
-
-        XCTAssertEqual(detected, Set(ids), "all probes must be in flight at once, not one after another")
-    }
-
-    // MARK: - OnboardingStore persistence
-
-    func testCustomizeHintFlagPersistsAcrossInstances() {
-        let defaults = makeDefaults("hint-persist")
-        let store = OnboardingStore(defaults: defaults)
-        XCTAssertFalse(store.isCustomizeHintPending)
-
-        store.markCustomizeHintPending()
-        XCTAssertTrue(OnboardingStore(defaults: defaults).isCustomizeHintPending)
-
-        store.dismissCustomizeHint()
-        XCTAssertFalse(store.isCustomizeHintPending)
-        XCTAssertFalse(OnboardingStore(defaults: defaults).isCustomizeHintPending)
-    }
-
-    // MARK: - Helpers
-
-    private func stub(_ id: String, hasCredentials: Bool) -> CredentialStubProvider {
-        CredentialStubProvider(id: id, hasCredentials: hasCredentials)
-    }
-
-    private func stub(_ id: String, probe: @escaping @MainActor () async -> Bool) -> CredentialStubProvider {
-        CredentialStubProvider(id: id, probe: probe)
+    private func stub(_ id: String, hasCredentials: Bool) -> ProbeCountingProvider {
+        ProbeCountingProvider(id: id, hasCredentials: hasCredentials)
     }
 
     private func makeDefaults(_ name: String) -> UserDefaults {
-        let suiteName = "OpenUsageTests.FirstRunSeeder.\(name).\(UUID().uuidString)"
+        let suiteName = "QuotaBarTests.FirstRunSeeder.\(name).\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         return defaults
     }
+
 }
 
 @MainActor
-private final class CredentialStubProvider: ProviderRuntime {
+private final class ProbeCountingProvider: ProviderRuntime {
     let provider: Provider
     let widgetDescriptors: [WidgetDescriptor] = []
-    private let hasCredentials: @MainActor () async -> Bool
+    private let hasCredentials: Bool
+    private(set) var probeCount = 0
 
     init(id: String, hasCredentials: Bool) {
         self.provider = Provider(id: id, displayName: id.capitalized, icon: .providerMark(id))
-        self.hasCredentials = { hasCredentials }
-    }
-
-    init(id: String, gate: ProbeGate) {
-        self.provider = Provider(id: id, displayName: id.capitalized, icon: .providerMark(id))
-        self.hasCredentials = { await gate.arrive() }
-    }
-
-    init(id: String, probe: @escaping @MainActor () async -> Bool) {
-        self.provider = Provider(id: id, displayName: id.capitalized, icon: .providerMark(id))
-        self.hasCredentials = probe
+        self.hasCredentials = hasCredentials
     }
 
     func refresh() async -> ProviderSnapshot {
         ProviderSnapshot.make(provider: provider, plan: nil, lines: [], refreshedAt: Date())
     }
 
-    func hasLocalCredentials() async -> Bool { await hasCredentials() }
-}
-
-@MainActor
-private final class ManualCredentialProbe {
-    private var arrivals = 0
-    private var continuations: [CheckedContinuation<Bool, Never>] = []
-
-    func probe() async -> Bool {
-        arrivals += 1
-        return await withCheckedContinuation { continuations.append($0) }
-    }
-
-    func waitForArrivals(_ count: Int) async {
-        while arrivals < count { await Task.yield() }
-    }
-
-    func resumeAll(_ result: Bool) {
-        let waiting = continuations
-        continuations.removeAll()
-        for continuation in waiting { continuation.resume(returning: result) }
-    }
-}
-
-/// Suspends each arriver until `expected` arrivals are in flight, then resumes them all with `true`.
-/// A safety valve resumes stragglers with `false` after a few seconds, so a sequential-probing
-/// regression fails the test's assertion instead of hanging the suite.
-@MainActor
-private final class ProbeGate {
-    private let expected: Int
-    private var arrived = 0
-    private var nextWaiterID = 0
-    private var waiters: [Int: CheckedContinuation<Bool, Never>] = [:]
-
-    init(expected: Int) {
-        self.expected = expected
-    }
-
-    func arrive() async -> Bool {
-        arrived += 1
-        if arrived == expected {
-            for waiter in waiters.values {
-                waiter.resume(returning: true)
-            }
-            waiters = [:]
-            return true
-        }
-        let id = nextWaiterID
-        nextWaiterID += 1
-        return await withCheckedContinuation { continuation in
-            waiters[id] = continuation
-            Task { [weak self] in
-                try? await Task.sleep(for: .seconds(5))
-                guard let waiter = self?.waiters.removeValue(forKey: id) else { return }
-                waiter.resume(returning: false)
-            }
-        }
+    func hasLocalCredentials() async -> Bool {
+        probeCount += 1
+        return hasCredentials
     }
 }

@@ -1,13 +1,43 @@
 import Foundation
+import Darwin
 
 /// Reads the OpenCode-owned slice of CodexRouter's append-only usage ledger.
 ///
 /// Small ledgers keep individual rows for exact tests and short-lived history. Large ledgers fold
 /// immediately into `OpenCodeRouterLedgerAggregate`, so a tap materializes a few dozen day/model rows
 /// instead of replaying tens of megabytes of JSON. Both modes share one append checkpoint and reject
-/// truncate/regrow or same-size replacement by device/inode plus a prefix anchor.
+/// truncate/regrow or same-size replacement by device/inode, modification stamps, and a prefix anchor.
 final class OpenCodeRouterLedger: @unchecked Sendable {
     static let shared = OpenCodeRouterLedger()
+
+    enum LineResult {
+        case row(OpenCodeUsageScanner.ClaudeGatewayRow)
+        case irrelevant
+        case futureTimestamp(Date)
+        case malformed
+    }
+
+    struct SourceSnapshot: Equatable, Sendable {
+        var revision: AppendOnlyFileRevision
+        var offset: UInt64
+        var anchor: Data
+        var modificationStamp: ModificationStamp
+    }
+
+    struct ModificationStamp: Codable, Equatable, Sendable {
+        var seconds: Int64
+        var nanoseconds: Int64
+        var changeSeconds: Int64
+        var changeNanoseconds: Int64
+
+        /// Fails source validation for synthetic aggregates and unavailable paths.
+        static let unavailable = ModificationStamp(
+            seconds: Int64.min,
+            nanoseconds: Int64.min,
+            changeSeconds: Int64.min,
+            changeNanoseconds: Int64.min
+        )
+    }
 
     /// Keep the compact per-day history for the ten-year Usage History window, including leap days.
     static let retentionDays = 3_660
@@ -22,19 +52,24 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
 
     private static let maxCompactAggregates = 8
 
+    private struct FutureTimestampMarker {
+        var revision: AppendOnlyFileRevision
+        var modificationStamp: ModificationStamp
+        var anchor: Data
+        var accountPolicyFingerprint: String
+        var timestamp: Date
+    }
+
     private let lock = NSLock()
     /// Compact aggregates are tiny; the cap bounds long-running processes that watch rotating ledgers.
     /// Instance-owned and always accessed under `lock` so no shared mutable static state is needed.
     private var aggregates: [String: OpenCodeRouterLedgerAggregate] = [:]
+    /// A verified source revision that contains a row beyond the accepted clock bound.
+    private var futureTimestampMarkers: [String: FutureTimestampMarker] = [:]
     /// Modification stamp captured whenever a small-ledger tail checkpoint is stored. The tail cache entry
     /// itself carries no timestamp, and the sampled prefix anchor cannot prove that bytes before the
     /// offset are unchanged, so an unchanged length with a changed stamp has to be treated as a rewrite.
-    private var tailStamps: [String: Stamp] = [:]
-
-    private struct Stamp: Equatable {
-        var seconds: Int64
-        var nanoseconds: Int64
-    }
+    private var tailStamps: [String: ModificationStamp] = [:]
 
     func rows(atPath path: String, since: Date) -> [OpenCodeUsageScanner.ClaudeGatewayRow] {
         rowsIfComplete(atPath: path, since: since) ?? []
@@ -43,13 +78,58 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
     /// Return `nil` when a discovered ledger could not be read completely. The legacy rows-only
     /// accessor remains for callers that intentionally treat a missing source as empty; the provider
     /// scanner uses this result to avoid publishing a partial history over its last-good snapshot.
-    func rowsIfComplete(atPath path: String, since: Date) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
+    func rowsIfComplete(
+        atPath path: String,
+        since: Date,
+        maximumTimestamp: Date = JSONLScanning.maximumTimestamp(now: Date())
+    ) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
         // Only the ledger read is unpaced. The provider-wide pacer stays on for SQLite, Claude/Codex,
         // Hermes, and Muse work; pacing a cold tens-of-MB read at 7.5% used to exceed the deadline and
         // restart from zero on the next tap.
         ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(false) {
-            lock.withLock { rowsLocked(atPath: path, since: since) }
+            lock.withLock {
+                rowsLocked(
+                    atPath: path,
+                    since: since,
+                    maximumTimestamp: maximumTimestamp,
+                    enabledIdentityKeys: nil,
+                    identifiersToIdentityKeys: [:]
+                )
+            }
         }
+    }
+
+    func rowsWithSourceSnapshotIfComplete(
+        atPath path: String,
+        since: Date,
+        maximumTimestamp: Date = JSONLScanning.maximumTimestamp(now: Date()),
+        enabledIdentityKeys: Set<String>? = nil,
+        identifiersToIdentityKeys: [String: String] = [:]
+    ) -> (rows: [OpenCodeUsageScanner.ClaudeGatewayRow], source: SourceSnapshot)? {
+        ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(false) {
+            lock.withLock {
+                guard let rows = rowsLocked(
+                    atPath: path,
+                    since: since,
+                    maximumTimestamp: maximumTimestamp,
+                    enabledIdentityKeys: enabledIdentityKeys,
+                    identifiersToIdentityKeys: identifiersToIdentityKeys
+                ),
+                      let source = sourceSnapshotLocked(atPath: path)
+                else { return nil }
+                return (rows, source)
+            }
+        }
+    }
+
+    static func sourceSnapshotIsCurrent(_ snapshot: SourceSnapshot, atPath path: String) -> Bool {
+        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+        guard let revision = AppendOnlyFileProbe.revision(at: url),
+              revision == snapshot.revision,
+              AppendOnlyFileProbe.anchor(at: url, endingAt: snapshot.offset) == snapshot.anchor,
+              let stamp = modificationStamp(at: url)
+        else { return false }
+        return stamp == snapshot.modificationStamp
     }
 
     func statistics(path: String) -> (fullParses: Int, tailParses: Int, bytesRead: Int)? {
@@ -64,6 +144,7 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             Self.tailCache.remove(key)
             aggregates[key] = nil
             tailStamps[key] = nil
+            futureTimestampMarkers[key] = nil
         }
         OpenCodeRouterLedgerAggregate.removePersistedAggregate(path: key)
     }
@@ -86,17 +167,140 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
         from line: Data.SubSequence,
         timestampCache: inout CodexRouterEventLineParser.TimestampCache
     ) -> OpenCodeUsageScanner.ClaudeGatewayRow? {
+        guard case .row(let row) = parseRow(from: line, timestampCache: &timestampCache) else { return nil }
+        return row
+    }
+
+    static func parseRow(
+        from line: Data.SubSequence,
+        timestampCache: inout CodexRouterEventLineParser.TimestampCache,
+        maximumTimestamp: Date = JSONLScanning.maximumTimestamp(now: Date()),
+        shouldCheckFuture: (OpenCodeUsageScanner.ClaudeGatewayRow) -> Bool = { _ in true }
+    ) -> LineResult {
         // Cheap reject before the full parse. The router meters every provider it fronts, so most lines
         // in a shared ledger belong to other accounts; skipping them on a byte scan keeps the cold read
         // from decoding timestamp/model/account fields for rows that would be discarded anyway.
         // Case-insensitive because `isOpenCodeServed` lowercases the provider first, so `OpenCode-Go`
         // still has to reach the parser. One-directional on purpose: a false positive costs a wasted
         // parse, a false negative would drop real usage.
-        guard mayNameOpenCodeProvider(line) else { return nil }
-        guard let event = CodexRouterEventLineParser.parse(line, timestampCache: &timestampCache) else {
-            return nil
+        guard mayNameOpenCodeProvider(line) else { return .irrelevant }
+        let event: CodexRouterUsageScanner.Event
+        switch CodexRouterEventLineParser.parseResult(line, timestampCache: &timestampCache) {
+        case .event(let parsed): event = parsed
+        case .malformedEvent(let parsed):
+            guard let malformedRow = disabledMalformedRow(
+                from: parsed,
+                shouldCheckFuture: shouldCheckFuture
+            ) else { return .malformed }
+            return .row(malformedRow)
+        case .irrelevant: return .irrelevant
+        case .malformed: return .malformed
         }
-        return row(from: event)
+        guard CodexRouterUsageScanner.isOpenCodeServed(event),
+              CodexRouterUsageScanner.isSuccessfulStatus(event.status)
+        else { return .irrelevant }
+        guard let measuredTokenTotal = event.measuredTokenTotal else {
+            // A successful routed event can be a metadata-only sentinel while the native Codex log
+            // carries the measured tokens. Retain it as an incomplete zero row so it cannot claim
+            // router coverage and suppress that native record. Partial or invalid count fields still
+            // fail closed below because they may represent lost usage.
+            if !event.hasInputTokensField, !event.hasOutputTokensField, event.totalTokens == nil {
+                let model = OpenCodeUsageScanner.bareRouterModelName(event.model)
+                guard !model.isEmpty else {
+                    guard let malformedRow = disabledMalformedRow(
+                        from: event,
+                        shouldCheckFuture: shouldCheckFuture
+                    ) else { return .malformed }
+                    return .row(malformedRow)
+                }
+                let row = OpenCodeUsageScanner.ClaudeGatewayRow(
+                    date: event.timestamp,
+                    input: 0,
+                    output: 0,
+                    cacheWrite: 0,
+                    cacheRead: 0,
+                    model: model,
+                    totalTokens: 0,
+                    burnsGoQuota: event.provider.lowercased().hasPrefix("opencode-go")
+                        || OpenCodeUsageScanner.isOpenCodeGoGatewayModel(event.model),
+                    isInProgress: false,
+                    accountId: event.accountId,
+                    accountFingerprint: event.accountFingerprint,
+                    routerCostBreakdownIsComplete: false
+                )
+                if event.timestamp > maximumTimestamp, shouldCheckFuture(row) {
+                    return .futureTimestamp(event.timestamp)
+                }
+                return .row(row)
+            }
+            guard let malformedRow = disabledMalformedRow(
+                from: event,
+                shouldCheckFuture: shouldCheckFuture
+            ) else { return .malformed }
+            return .row(malformedRow)
+        }
+        guard measuredTokenTotal > 0 else { return .irrelevant }
+        guard !OpenCodeUsageScanner.bareRouterModelName(event.model).isEmpty else {
+            guard let malformedRow = disabledMalformedRow(
+                from: event,
+                shouldCheckFuture: shouldCheckFuture
+            ) else { return .malformed }
+            return .row(malformedRow)
+        }
+        guard let row = row(from: event) else {
+            guard let malformedRow = disabledMalformedRow(
+                from: event,
+                shouldCheckFuture: shouldCheckFuture
+            ) else { return .malformed }
+            return .row(malformedRow)
+        }
+        if event.timestamp > maximumTimestamp, shouldCheckFuture(row) {
+            return .futureTimestamp(event.timestamp)
+        }
+        return .row(row)
+    }
+
+    /// Keep malformed ownership visible in the shared cache, but only when a valid OpenCode provider
+    /// or hosted-model route, successful status, and every supplied account stamp positively identify
+    /// a disabled account. Unknown, contradictory, or malformed identity fields remain fail-closed.
+    private static func disabledMalformedRow(
+        from event: CodexRouterUsageScanner.Event,
+        shouldCheckFuture: (OpenCodeUsageScanner.ClaudeGatewayRow) -> Bool
+    ) -> OpenCodeUsageScanner.ClaudeGatewayRow? {
+        guard event.hasValidStatusField,
+              event.hasUniqueStatusField,
+              CodexRouterUsageScanner.isSuccessfulStatus(event.status),
+              event.hasUniqueAccountIdentityFields,
+              event.hasValidAccountIdentityFields
+        else { return nil }
+        let providerRouted = event.hasUniqueProviderField
+            && event.hasValidProviderField != false
+            && CodexRouterUsageScanner.isOpenCodeProvider(event.provider)
+        let modelRouted = event.hasUniqueModelField
+            && event.hasValidModelField
+            && OpenCodeUsageScanner.isHostedGatewayModel(event.model)
+        guard providerRouted || modelRouted else { return nil }
+        let row = OpenCodeUsageScanner.ClaudeGatewayRow(
+            date: event.timestamp,
+            input: 0,
+            output: 0,
+            cacheWrite: 0,
+            cacheRead: 0,
+            model: OpenCodeUsageScanner.bareRouterModelName(event.model).nilIfEmpty
+                ?? ModelUsageEntry.unattributedModelName,
+            totalTokens: 0,
+            burnsGoQuota: (event.hasUniqueProviderField
+                && event.hasValidProviderField != false
+                && event.provider.lowercased().hasPrefix("opencode-go"))
+                || (event.hasUniqueModelField
+                    && event.hasValidModelField
+                    && OpenCodeUsageScanner.isOpenCodeGoGatewayModel(event.model)),
+            isInProgress: false,
+            accountId: event.accountId,
+            accountFingerprint: event.accountFingerprint,
+            isMalformed: true
+        )
+        return shouldCheckFuture(row) ? nil : row
     }
 
     /// Whether a ledger line is worth the full parse. A backslash anywhere means the JSON carries escape
@@ -149,55 +353,111 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
     /// assumption is wrong whenever the session log is absent, rotated away, or lives in a home this
     /// scan does not open — the turn then vanishes from every card. Instead the ledger owns ALL
     /// OpenCode-served rows, and `OpenCodeUsageScanner.scan` reads it first. Complete measured pairs can
-    /// replace native Claude/Codex rows; Hermes and Muse are independent sources and always fold
-    /// separately even when their day/model labels match.
+    /// replace matching, identity-resolved native Codex rows; Claude, Hermes, and Muse are independent
+    /// sources and always fold separately even when their day/model labels match.
     static func row(from event: CodexRouterUsageScanner.Event) -> OpenCodeUsageScanner.ClaudeGatewayRow? {
         guard CodexRouterUsageScanner.isOpenCodeServed(event),
-              CodexRouterUsageScanner.isSuccessfulStatus(event.status)
+              CodexRouterUsageScanner.isSuccessfulStatus(event.status),
+              let measuredTokenTotal = event.measuredTokenTotal,
+              measuredTokenTotal > 0
         else { return nil }
 
         let input = max(0, event.inputTokens)
         let cached = min(max(0, event.cachedInputTokens), input)
+        let output = max(0, event.outputTokens)
+        let tokenTotal = measuredTokenTotal
         let model = OpenCodeUsageScanner.bareRouterModelName(event.model)
-        guard !model.isEmpty else { return nil }
+        guard !model.isEmpty, tokenTotal > 0 else { return nil }
         return OpenCodeUsageScanner.ClaudeGatewayRow(
             date: event.timestamp,
             input: input - cached,
-            output: max(0, event.outputTokens),
+            output: output,
             cacheWrite: 0,
             cacheRead: cached,
             model: model,
+            totalTokens: tokenTotal,
             // Only the Go subscription's cap meters are consumed by `opencode-go`; Zen and free tiers
             // are billed outside those caps.
-            burnsGoQuota: event.provider.lowercased().hasPrefix("opencode-go"),
+            burnsGoQuota: event.provider.lowercased().hasPrefix("opencode-go")
+                || OpenCodeUsageScanner.isOpenCodeGoGatewayModel(event.model),
             isInProgress: false,
             accountId: event.accountId,
             accountFingerprint: event.accountFingerprint,
             routerInputWasEstimated: event.hasEstimatedInputTokens,
-            routerCostBreakdownIsComplete: event.hasCompleteMeasuredCostBreakdown
+            routerCostBreakdownIsComplete: event.hasCompleteMeasuredCostBreakdown,
+            tokenCountSaturated: event.tokenCountSaturated == true
         )
     }
 
-    private func rowsLocked(atPath path: String, since: Date) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
+    private func rowsLocked(
+        atPath path: String,
+        since: Date,
+        maximumTimestamp: Date,
+        enabledIdentityKeys: Set<String>?,
+        identifiersToIdentityKeys: [String: String]
+    ) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
         let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         let key = url.path
+        let policyFingerprint = Self.accountPolicyFingerprint(
+            enabledIdentityKeys: enabledIdentityKeys,
+            identifiersToIdentityKeys: identifiersToIdentityKeys
+        )
+        let normalizedEnabledIdentityKeys = enabledIdentityKeys.map { Set($0.map { $0.lowercased() }) }
+        let shouldCheckFuture: (OpenCodeUsageScanner.ClaudeGatewayRow) -> Bool = { row in
+            Self.shouldCheckFuture(
+                accountId: row.accountId,
+                accountFingerprint: row.accountFingerprint,
+                enabledIdentityKeys: normalizedEnabledIdentityKeys,
+                identifiersToIdentityKeys: identifiersToIdentityKeys
+            )
+        }
         guard let current = AppendOnlyFileProbe.revision(at: url) else {
             Self.tailCache.remove(key)
             tailStamps[key] = nil
-            discardAggregate(for: key)
+            futureTimestampMarkers[key] = nil
+            if let aggregate = aggregates[key] {
+                OpenCodeRouterLedgerAggregate.removePersistedAggregate(
+                    path: key,
+                    matching: aggregate.sourceSnapshot
+                )
+            }
+            aggregates[key] = nil
             return nil
+        }
+
+        let initialStamp = Self.modificationStamp(at: url)
+        if let marker = futureTimestampMarkers[key] {
+            let liveAnchor = AppendOnlyFileProbe.anchor(at: url, endingAt: current.size)
+            if marker.revision == current,
+               marker.modificationStamp == initialStamp,
+               marker.anchor == liveAnchor,
+               marker.accountPolicyFingerprint == policyFingerprint,
+               marker.timestamp > maximumTimestamp {
+                return nil
+            }
+            futureTimestampMarkers[key] = nil
         }
 
         let now = Date()
         let retentionCutoff = now.addingTimeInterval(-Self.retentionInterval)
         let detailedGoCutoff = now.addingTimeInterval(-45 * 86_400)
-        let aggregate = aggregates[key] ?? OpenCodeRouterLedgerAggregate.load(path: key)
+        var aggregate = aggregates[key] ?? OpenCodeRouterLedgerAggregate.load(path: key)
+        if let loadedAggregate = aggregate,
+           loadedAggregate.timeZoneIdentifier != Calendar.current.timeZone.identifier {
+            // Day/model buckets are calendar-local. An in-memory aggregate can outlive a system
+            // timezone change even though persisted aggregates are rejected on load; rebuild it
+            // from source so old day labels are never interpreted in the new timezone.
+            discardAggregate(for: key, matching: loadedAggregate.sourceSnapshot)
+            aggregate = nil
+        }
         if aggregate == nil {
-            // Invalid or pre-v6 aggregates cannot preserve router cost-breakdown completeness. Drop the stale
-            // checkpoint and rebuild from the source ledger so an old bucket cannot suppress rows.
-            OpenCodeRouterLedgerAggregate.removePersistedAggregate(path: key)
+            // Invalid or outdated aggregates cannot preserve current token and cost-breakdown fields.
+            // Remove only an invalid cache still present after locking; another process may already
+            // have replaced it with a valid aggregate for the live ledger.
+            OpenCodeRouterLedgerAggregate.removeInvalidPersistedAggregate(path: key)
         }
         if let aggregate {
+            aggregate.refreshFromPersistedIfNewer()
             if aggregate.prune(before: retentionCutoff, detailedGoCutoff: detailedGoCutoff) {
                 aggregate.save()
             }
@@ -206,20 +466,62 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
                 url: url,
                 current: current,
                 since: since,
-                detailedGoCutoff: detailedGoCutoff
+                detailedGoCutoff: detailedGoCutoff,
+                maximumTimestamp: maximumTimestamp,
+                shouldCheckFuture: { accountId, accountFingerprint in
+                    Self.shouldCheckFuture(
+                        accountId: accountId,
+                        accountFingerprint: accountFingerprint,
+                        enabledIdentityKeys: normalizedEnabledIdentityKeys,
+                        identifiersToIdentityKeys: identifiersToIdentityKeys
+                    )
+                }
             ) {
             case .rows(let rows):
-                return rows
+                guard let usableRows = validatedRows(
+                    rows,
+                    since: since,
+                    shouldCheckFuture: shouldCheckFuture
+                ), usableRows.allSatisfy({ row in
+                    guard shouldCheckFuture(row) else { return true }
+                    if row.isAggregated {
+                        return DailyUsageAccumulator.dayKey(from: row.date)
+                            <= DailyUsageAccumulator.dayKey(from: maximumTimestamp)
+                    }
+                    return row.date <= maximumTimestamp
+                }) else {
+                    discardAggregate(for: key, matching: aggregate.sourceSnapshot)
+                    Self.tailCache.remove(key)
+                    tailStamps[key] = nil
+                    return nil
+                }
+                return usableRows
             case .stale:
                 // Rotation, truncate/regrow, or in-place rewrite. Drop the checkpoint AND its compact
                 // file: a persisted aggregate that can never reconcile would otherwise be decoded on
                 // every launch and rejected again on every refresh.
-                discardAggregate(for: key)
+                discardAggregate(for: key, matching: aggregate.sourceSnapshot)
+            case .malformed:
+                // The source remains intact and the row may become irrelevant again if its account
+                // is disabled. Keep the compact checkpoint for that policy change.
+                return nil
             case .aborted:
                 // Deadline cancellation or a transient read failure. The aggregate — in memory and on
                 // disk — is still the best known state; deleting it here turned every timed-out
                 // refresh into a full cold rebuild on the next one. Mark the source incomplete so the
                 // provider keeps the last-good snapshot instead of publishing a partial replacement.
+                return nil
+            case .futureTimestamp(let timestamp):
+                rememberFutureTimestamp(
+                    timestamp,
+                    path: key,
+                    url: url,
+                    revision: current,
+                    modificationStamp: initialStamp,
+                    accountPolicyFingerprint: policyFingerprint
+                )
+                // This source was already parsed, or its append tail was verified, and its future
+                // watermark is known. Keep last-good history without repeating that work.
                 return nil
             }
         }
@@ -233,25 +535,83 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             // same-size rewrite keeps the anchor (the rewrite can land past the sampled positions), so
             // without the stamp check a replaced file would keep serving the previous contents.
             if current.size == cached.offset, cached.itemsAvailable, isUnchanged(at: url, key: key) {
-                return cached.items.filter { $0.date >= since }
+                guard let rows = validatedRows(
+                    cached.items,
+                    since: since,
+                    shouldCheckFuture: shouldCheckFuture
+                ) else { return nil }
+                guard rows.allSatisfy({ !shouldCheckFuture($0) || $0.date <= maximumTimestamp }) else {
+                    Self.tailCache.remove(key)
+                    tailStamps[key] = nil
+                    return nil
+                }
+                return rows
             }
 
-            if current.size > cached.offset, cached.itemsAvailable,
-               let rows = readAppend(
-                at: url,
-                key: key,
-                current: current,
-                cached: cached,
-                retentionCutoff: retentionCutoff
-               ) {
-                return rows.filter { $0.date >= since }
+            if current.size > cached.offset, cached.itemsAvailable {
+                var futureTimestamp: Date?
+                let rows = readAppend(
+                    at: url,
+                    key: key,
+                    current: current,
+                    cached: cached,
+                    initialStamp: initialStamp,
+                    retentionCutoff: retentionCutoff,
+                    maximumTimestamp: maximumTimestamp,
+                    shouldCheckFuture: shouldCheckFuture,
+                    futureTimestamp: &futureTimestamp
+                )
+                if let futureTimestamp {
+                    rememberFutureTimestamp(
+                        futureTimestamp,
+                        path: key,
+                        url: url,
+                        revision: current,
+                        modificationStamp: initialStamp,
+                        accountPolicyFingerprint: policyFingerprint
+                    )
+                    return nil
+                }
+                if let rows {
+                    return validatedRows(rows, since: since, shouldCheckFuture: shouldCheckFuture)
+                }
             }
         }
 
-        guard let rows = readWholeFile(at: url, key: key, retentionCutoff: retentionCutoff) else {
+        var futureTimestamp: Date?
+        guard let rows = readWholeFile(
+            at: url,
+            key: key,
+            retentionCutoff: retentionCutoff,
+            maximumTimestamp: maximumTimestamp,
+            shouldCheckFuture: shouldCheckFuture,
+            futureTimestamp: &futureTimestamp
+        ) else {
+            if let futureTimestamp {
+                rememberFutureTimestamp(
+                    futureTimestamp,
+                    path: key,
+                    url: url,
+                    revision: current,
+                    modificationStamp: initialStamp,
+                    accountPolicyFingerprint: policyFingerprint
+                )
+            }
             return nil
         }
-        return rows.filter { $0.date >= since }
+        return validatedRows(rows, since: since, shouldCheckFuture: shouldCheckFuture)
+    }
+
+    /// A retained malformed sentinel is harmless only while its account still resolves to a
+    /// disabled identity. Recheck it on every cache hit so enabling that account exposes the source
+    /// error instead of silently keeping the previously filtered history.
+    private func validatedRows(
+        _ rows: [OpenCodeUsageScanner.ClaudeGatewayRow],
+        since: Date,
+        shouldCheckFuture: (OpenCodeUsageScanner.ClaudeGatewayRow) -> Bool
+    ) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
+        guard !rows.contains(where: { $0.isMalformed && shouldCheckFuture($0) }) else { return nil }
+        return rows.filter { !$0.isMalformed && $0.date >= since }
     }
 
     /// True when the file still carries the modification stamp recorded with the stored checkpoint.
@@ -262,23 +622,109 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
         return recorded == live
     }
 
-    private func noteTailCheckpoint(at url: URL, for key: String) {
-        tailStamps[key] = Self.modificationStamp(at: url)
+    private func noteTailCheckpoint(
+        for key: String,
+        validatedStamp: ModificationStamp
+    ) {
+        tailStamps[key] = validatedStamp
     }
 
-    private static func modificationStamp(at url: URL) -> Stamp? {
-        var value = stat()
-        let path = url.resolvingSymlinksInPath().path
-        guard Darwin.lstat(path, &value) == 0 else { return nil }
-        return Stamp(
-            seconds: Int64(value.st_mtimespec.tv_sec),
-            nanoseconds: Int64(value.st_mtimespec.tv_nsec)
+    private func rememberFutureTimestamp(
+        _ timestamp: Date,
+        path: String,
+        url: URL,
+        revision: AppendOnlyFileRevision,
+        modificationStamp: ModificationStamp?,
+        accountPolicyFingerprint: String
+    ) {
+        guard let modificationStamp,
+              AppendOnlyFileProbe.revision(at: url) == revision,
+              Self.modificationStamp(at: url) == modificationStamp,
+              let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: revision.size),
+              AppendOnlyFileProbe.revision(at: url) == revision,
+              Self.modificationStamp(at: url) == modificationStamp,
+              AppendOnlyFileProbe.anchor(at: url, endingAt: revision.size) == anchor
+        else { return }
+        futureTimestampMarkers[path] = FutureTimestampMarker(
+            revision: revision,
+            modificationStamp: modificationStamp,
+            anchor: anchor,
+            accountPolicyFingerprint: accountPolicyFingerprint,
+            timestamp: timestamp
+        )
+        if futureTimestampMarkers.count > Self.maxCompactAggregates,
+           let victim = futureTimestampMarkers.keys.first(where: { $0 != path }) {
+            futureTimestampMarkers[victim] = nil
+        }
+    }
+
+    private func sourceSnapshotLocked(atPath path: String) -> SourceSnapshot? {
+        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+        let key = url.path
+        if let aggregate = aggregates[key] {
+            return aggregate.sourceSnapshot
+        }
+        guard let entry = Self.tailCache.entry(for: key),
+              let stamp = tailStamps[key]
+        else { return nil }
+        return SourceSnapshot(
+            revision: entry.revision,
+            offset: entry.offset,
+            anchor: entry.anchor,
+            modificationStamp: stamp
         )
     }
 
-    private func discardAggregate(for key: String) {
+    static func modificationStamp(at url: URL) -> ModificationStamp? {
+        var value = stat()
+        let path = url.resolvingSymlinksInPath().path
+        guard Darwin.lstat(path, &value) == 0 else { return nil }
+        return ModificationStamp(
+            seconds: Int64(value.st_mtimespec.tv_sec),
+            nanoseconds: Int64(value.st_mtimespec.tv_nsec),
+            changeSeconds: Int64(value.st_ctimespec.tv_sec),
+            changeNanoseconds: Int64(value.st_ctimespec.tv_nsec)
+        )
+    }
+
+    private static func accountPolicyFingerprint(
+        enabledIdentityKeys: Set<String>?,
+        identifiersToIdentityKeys: [String: String]
+    ) -> String {
+        let enabled = enabledIdentityKeys.map { $0.map { $0.lowercased() }.sorted().joined(separator: ",") } ?? "all"
+        let identifiers = identifiersToIdentityKeys
+            .map { ($0.key.lowercased(), $0.value.lowercased()) }
+            .sorted { $0.0 < $1.0 }
+            .map { "\($0.0)=\($0.1)" }
+            .joined(separator: ",")
+        return JSONLScanCachePaths.stableFingerprint("enabled=\(enabled)|identifiers=\(identifiers)")
+    }
+
+    private static func shouldCheckFuture(
+        accountId: String?,
+        accountFingerprint: String?,
+        enabledIdentityKeys: Set<String>?,
+        identifiersToIdentityKeys: [String: String]
+    ) -> Bool {
+        guard let enabledIdentityKeys else { return true }
+        guard let identity = OpenCodeUsageScanner.routerAccountIdentityKey(
+            accountId: accountId,
+            accountFingerprint: accountFingerprint,
+            identifiersToIdentityKeys: identifiersToIdentityKeys
+        ) else {
+            // Missing, unknown, or conflicting account identifiers remain additive and must still
+            // pass source completeness checks.
+            return true
+        }
+        return enabledIdentityKeys.contains(identity)
+    }
+
+    private func discardAggregate(
+        for key: String,
+        matching expected: OpenCodeRouterLedger.SourceSnapshot
+    ) {
         aggregates[key] = nil
-        OpenCodeRouterLedgerAggregate.removePersistedAggregate(path: key)
+        OpenCodeRouterLedgerAggregate.removePersistedAggregate(path: key, matching: expected)
     }
 
     private func storeAggregate(
@@ -297,10 +743,16 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
         key: String,
         current: AppendOnlyFileRevision,
         cached: AppendOnlyFileTailCache<OpenCodeUsageScanner.ClaudeGatewayRow, ParserCheckpoint>.Entry,
-        retentionCutoff: Date
+        initialStamp: ModificationStamp?,
+        retentionCutoff: Date,
+        maximumTimestamp: Date,
+        shouldCheckFuture: (OpenCodeUsageScanner.ClaudeGatewayRow) -> Bool,
+        futureTimestamp: inout Date?
     ) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
         var appended: [OpenCodeUsageScanner.ClaudeGatewayRow] = []
+        var rejectedFutureTimestamp: Date?
         var timestampCache = CodexRouterEventLineParser.TimestampCache()
+        var malformedLine = false
         var read = JSONLFileReader.readLines(
             at: url,
             chunkSize: 64 * 1024,
@@ -309,33 +761,65 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             discardingOversizedLine: cached.isDiscardingOversizedLine,
             deliverFinalPartial: false
         ) { line in
-            if let row = Self.row(from: line, timestampCache: &timestampCache), row.date >= retentionCutoff {
-                appended.append(row)
+            switch Self.parseRow(
+                from: line,
+                timestampCache: &timestampCache,
+                maximumTimestamp: maximumTimestamp,
+                shouldCheckFuture: shouldCheckFuture
+            ) {
+            case .row(let row) where row.isMalformed || row.date >= retentionCutoff: appended.append(row)
+            case .row, .irrelevant: break
+            case .futureTimestamp(let timestamp):
+                if rejectedFutureTimestamp.map({ timestamp > $0 }) ?? true {
+                    rejectedFutureTimestamp = timestamp
+                }
+            case .malformed: malformedLine = true
             }
         }
-        guard read.succeeded else { return nil }
+        guard read.isComplete, !malformedLine else { return nil }
 
         // A writer may close a complete final object without a newline. The parser validates the
         // whole `{...}` object before accepting it; an incomplete object stays in `partialLine`.
         if !read.finalPartial.isEmpty,
-           let row = Self.row(
-            from: read.finalPartial[...],
-            timestampCache: &timestampCache
-           ),
-           row.date >= retentionCutoff {
-            appended.append(row)
-            read.finalPartial = Data()
+           CodexRouterEventLineParser.looksLikeCompleteObject(read.finalPartial[...]) {
+            switch Self.parseRow(
+                from: read.finalPartial[...],
+                timestampCache: &timestampCache,
+                maximumTimestamp: maximumTimestamp,
+                shouldCheckFuture: shouldCheckFuture
+            ) {
+            case .row(let row) where row.isMalformed || row.date >= retentionCutoff:
+                appended.append(row)
+                read.finalPartial = Data()
+            case .row, .irrelevant:
+                read.finalPartial = Data()
+            case .futureTimestamp(let timestamp):
+                if rejectedFutureTimestamp.map({ timestamp > $0 }) ?? true {
+                    rejectedFutureTimestamp = timestamp
+                }
+                read.finalPartial = Data()
+            case .malformed:
+                return nil
+            }
         }
 
         let newOffset = cached.offset + UInt64(max(0, read.statistics.bytesRead))
-        guard let after = AppendOnlyFileProbe.revision(at: url),
+        guard let initialStamp,
+              let after = AppendOnlyFileProbe.revision(at: url),
               after.device == current.device,
               after.inode == current.inode,
-              after.size >= newOffset,
+              after.size == newOffset,
+              let afterStamp = Self.modificationStamp(at: url),
+              afterStamp == initialStamp,
               let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: newOffset)
         else { return nil }
 
-        let retained = cached.items.filter { $0.date >= retentionCutoff } + appended
+        if let rejectedFutureTimestamp {
+            futureTimestamp = rejectedFutureTimestamp
+            return nil
+        }
+
+        let retained = cached.items.filter { $0.isMalformed || $0.date >= retentionCutoff } + appended
         Self.tailCache.store(
             AppendOnlyFileTailCache<OpenCodeUsageScanner.ClaudeGatewayRow, ParserCheckpoint>.Entry(
                 revision: after,
@@ -350,14 +834,17 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             parseKind: .tail,
             bytesRead: read.statistics.bytesRead
         )
-        noteTailCheckpoint(at: url, for: key)
+        noteTailCheckpoint(for: key, validatedStamp: afterStamp)
         return retained
     }
 
     private func readWholeFile(
         at url: URL,
         key: String,
-        retentionCutoff: Date
+        retentionCutoff: Date,
+        maximumTimestamp: Date,
+        shouldCheckFuture: (OpenCodeUsageScanner.ClaudeGatewayRow) -> Bool,
+        futureTimestamp: inout Date?
     ) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
         guard let before = AppendOnlyFileProbe.revision(at: url),
               let beforeStamp = Self.modificationStamp(at: url)
@@ -371,39 +858,74 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
                 revision: before,
                 modificationStamp: beforeStamp,
                 retentionCutoff: retentionCutoff,
-                detailedGoCutoff: Date().addingTimeInterval(-45 * 86_400)
+                detailedGoCutoff: Date().addingTimeInterval(-45 * 86_400),
+                maximumTimestamp: maximumTimestamp,
+                shouldCheckFuture: shouldCheckFuture,
+                futureTimestamp: &futureTimestamp
             )
         }
 
         var rows: [OpenCodeUsageScanner.ClaudeGatewayRow] = []
+        var rejectedFutureTimestamp: Date?
         var timestampCache = CodexRouterEventLineParser.TimestampCache()
+        var malformedLine = false
         var read = JSONLFileReader.readLines(
             at: url,
             chunkSize: 64 * 1024,
             deliverFinalPartial: false
         ) { line in
-            if let row = Self.row(from: line, timestampCache: &timestampCache), row.date >= retentionCutoff {
-                rows.append(row)
+            switch Self.parseRow(
+                from: line,
+                timestampCache: &timestampCache,
+                maximumTimestamp: maximumTimestamp,
+                shouldCheckFuture: shouldCheckFuture
+            ) {
+            case .row(let row) where row.isMalformed || row.date >= retentionCutoff: rows.append(row)
+            case .row, .irrelevant: break
+            case .futureTimestamp(let timestamp):
+                if rejectedFutureTimestamp.map({ timestamp > $0 }) ?? true {
+                    rejectedFutureTimestamp = timestamp
+                }
+            case .malformed: malformedLine = true
             }
         }
-        guard read.succeeded else { return nil }
+        guard read.isComplete, !malformedLine else { return nil }
         if !read.finalPartial.isEmpty,
-           let row = Self.row(
-            from: read.finalPartial[...],
-            timestampCache: &timestampCache
-           ),
-           row.date >= retentionCutoff {
-            rows.append(row)
-            read.finalPartial = Data()
+           CodexRouterEventLineParser.looksLikeCompleteObject(read.finalPartial[...]) {
+            switch Self.parseRow(
+                from: read.finalPartial[...],
+                timestampCache: &timestampCache,
+                maximumTimestamp: maximumTimestamp,
+                shouldCheckFuture: shouldCheckFuture
+            ) {
+            case .row(let row) where row.isMalformed || row.date >= retentionCutoff:
+                rows.append(row)
+                read.finalPartial = Data()
+            case .row, .irrelevant:
+                read.finalPartial = Data()
+            case .futureTimestamp(let timestamp):
+                if rejectedFutureTimestamp.map({ timestamp > $0 }) ?? true {
+                    rejectedFutureTimestamp = timestamp
+                }
+                read.finalPartial = Data()
+            case .malformed:
+                return nil
+            }
         }
 
         let offset = UInt64(max(0, read.statistics.bytesRead))
         guard let revision = AppendOnlyFileProbe.revision(at: url),
               revision == before,
               revision.size == offset,
-              Self.modificationStamp(at: url) == beforeStamp,
+              let afterStamp = Self.modificationStamp(at: url),
+              afterStamp == beforeStamp,
               let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: offset)
         else { return nil }
+
+        if let rejectedFutureTimestamp {
+            futureTimestamp = rejectedFutureTimestamp
+            return nil
+        }
 
         Self.tailCache.store(
             AppendOnlyFileTailCache<OpenCodeUsageScanner.ClaudeGatewayRow, ParserCheckpoint>.Entry(
@@ -419,7 +941,7 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             parseKind: .full,
             bytesRead: read.statistics.bytesRead
         )
-        noteTailCheckpoint(at: url, for: key)
+        noteTailCheckpoint(for: key, validatedStamp: afterStamp)
         return rows
     }
 
@@ -427,30 +949,65 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
         at url: URL,
         key: String,
         revision: AppendOnlyFileRevision,
-        modificationStamp: Stamp,
+        modificationStamp: ModificationStamp,
         retentionCutoff: Date,
-        detailedGoCutoff: Date
+        detailedGoCutoff: Date,
+        maximumTimestamp: Date,
+        shouldCheckFuture: (OpenCodeUsageScanner.ClaudeGatewayRow) -> Bool,
+        futureTimestamp: inout Date?
     ) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
-        let aggregate = OpenCodeRouterLedgerAggregate.empty(path: key, revision: revision)
+        let aggregate = OpenCodeRouterLedgerAggregate.empty(
+            path: key,
+            revision: revision,
+            modificationStamp: modificationStamp,
+            detailedGoCutoff: detailedGoCutoff
+        )
         var timestampCache = CodexRouterEventLineParser.TimestampCache()
+        var rejectedFutureTimestamp: Date?
+        var malformedLine = false
         var read = JSONLFileReader.readLines(
             at: url,
             chunkSize: 256 * 1024,
             deliverFinalPartial: false
         ) { line in
-            if let row = Self.row(from: line, timestampCache: &timestampCache), row.date >= retentionCutoff {
+            switch Self.parseRow(
+                from: line,
+                timestampCache: &timestampCache,
+                maximumTimestamp: maximumTimestamp,
+                shouldCheckFuture: shouldCheckFuture
+            ) {
+            case .row(let row) where row.isMalformed || row.date >= retentionCutoff:
                 aggregate.addRow(row, compactGoBefore: detailedGoCutoff)
+            case .row, .irrelevant: break
+            case .futureTimestamp(let timestamp):
+                if rejectedFutureTimestamp.map({ timestamp > $0 }) ?? true {
+                    rejectedFutureTimestamp = timestamp
+                }
+            case .malformed: malformedLine = true
             }
         }
-        guard read.succeeded else { return nil }
+        guard read.isComplete, !malformedLine else { return nil }
         if !read.finalPartial.isEmpty,
-           let row = Self.row(
-            from: read.finalPartial[...],
-            timestampCache: &timestampCache
-           ),
-           row.date >= retentionCutoff {
-            aggregate.addRow(row, compactGoBefore: detailedGoCutoff)
-            read.finalPartial = Data()
+           CodexRouterEventLineParser.looksLikeCompleteObject(read.finalPartial[...]) {
+            switch Self.parseRow(
+                from: read.finalPartial[...],
+                timestampCache: &timestampCache,
+                maximumTimestamp: maximumTimestamp,
+                shouldCheckFuture: shouldCheckFuture
+            ) {
+            case .row(let row) where row.isMalformed || row.date >= retentionCutoff:
+                aggregate.addRow(row, compactGoBefore: detailedGoCutoff)
+                read.finalPartial = Data()
+            case .row, .irrelevant:
+                read.finalPartial = Data()
+            case .futureTimestamp(let timestamp):
+                if rejectedFutureTimestamp.map({ timestamp > $0 }) ?? true {
+                    rejectedFutureTimestamp = timestamp
+                }
+                read.finalPartial = Data()
+            case .malformed:
+                return nil
+            }
         }
 
         let offset = UInt64(max(0, read.statistics.bytesRead))
@@ -461,12 +1018,18 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
               let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: offset)
         else { return nil }
 
+        if let rejectedFutureTimestamp {
+            futureTimestamp = rejectedFutureTimestamp
+            return nil
+        }
+
         aggregate.seal(
             revision: after,
             offset: offset,
             partial: read.finalPartial,
             discarding: read.isDiscardingOversizedLine,
-            anchor: anchor
+            anchor: anchor,
+            modificationStamp: modificationStamp
         )
         _ = aggregate.prune(before: retentionCutoff, detailedGoCutoff: detailedGoCutoff)
         storeAggregate(aggregate, for: key)
@@ -486,7 +1049,7 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
             bytesRead: read.statistics.bytesRead,
             retainItems: false
         )
-        noteTailCheckpoint(at: url, for: key)
-        return aggregate.materialize(since: retentionCutoff)
+        noteTailCheckpoint(for: key, validatedStamp: modificationStamp)
+        return aggregate.materializeLatest(since: retentionCutoff)
     }
 }

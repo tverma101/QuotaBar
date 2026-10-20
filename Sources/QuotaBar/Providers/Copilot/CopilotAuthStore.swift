@@ -157,7 +157,6 @@ struct CopilotAuthStore: Sendable {
                 try ProviderCancellation.rethrowIfCancellation(error)
                 // A miss is returned as nil. A storage error is not evidence that this account has no
                 // item, and retrying a broader query could select a different GitHub account.
-                AppLog.error(LogTag.auth("copilot"), "gh keychain credential read failed")
                 throw CopilotAuthError.credentialsUnreadable
             }
         }
@@ -173,7 +172,6 @@ struct CopilotAuthStore: Sendable {
             throw CancellationError()
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.error(LogTag.auth("copilot"), "gh keychain credential read failed")
             throw CopilotAuthError.credentialsUnreadable
         }
     }
@@ -186,11 +184,16 @@ struct CopilotAuthStore: Sendable {
     /// Missing files are ordinary source misses. A present file that cannot be read is indeterminate,
     /// not a logout; preserve it as an actionable credential-access error for refresh and seeding.
     private func readConfigText(_ path: String) throws -> String? {
+        let diagnosticKey = "auth.copilot.config.\(path)"
         do {
-            return try files.readTextIfPresent(path)
+            let text = try files.readTextIfPresent(path)
+            DiagnosticGate.clearFailure(diagnosticKey)
+            return text
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.error(LogTag.auth("copilot"), "local credential config read failed: \(path)")
+            DiagnosticGate.logOnce(for: diagnosticKey) {
+                AppLog.error(LogTag.auth("copilot"), "local credential config read failed: \(path)")
+            }
             throw CopilotAuthError.credentialsUnreadable
         }
     }

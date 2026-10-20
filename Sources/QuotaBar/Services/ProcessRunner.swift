@@ -102,9 +102,9 @@ struct SystemProcessRunner: ProcessRunning {
         drain(stdoutPipe.fileHandleForReading, into: output, isStdout: true, group: drained)
         drain(stderrPipe.fileHandleForReading, into: output, isStdout: false, group: drained)
 
-        // One kernel-level wait instead of a 50ms poll loop: the termination handler trips the
-        // group (registered before `run()` so an instantly-exiting child can't race it), and
-        // `wait` blocks this thread exactly once until exit or the deadline.
+        // Register before `run()` so an instantly-exiting child can't race the waiter. Check task
+        // cancellation while waiting: local database scans and superseded refreshes must not leave a
+        // sqlite3 subprocess running for its full timeout after their owner has been cancelled.
         let exited = DispatchGroup()
         exited.enter()
         process.terminationHandler = { _ in exited.leave() }
@@ -123,20 +123,34 @@ struct SystemProcessRunner: ProcessRunning {
             }
         }
 
-        if exited.wait(timeout: .now() + timeout) == .timedOut {
-            terminateProcessTree(rootPID: process.processIdentifier)
-            process.terminate()
-            _ = exited.wait(timeout: .now() + 0.1)
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
+        let deadline = DispatchTime.now() + timeout
+        while true {
+            if Task<Never, Never>.isCancelled {
+                terminate(
+                    process,
+                    pipeReaders: [stdoutPipe.fileHandleForReading, stderrPipe.fileHandleForReading],
+                    exited: exited,
+                    drained: drained
+                )
+                throw CancellationError()
             }
-            process.waitUntilExit()
-            drained.wait() // the killed child closed its pipes, so the drains hit EOF and finish
-            throw ProcessRunnerError.timedOut(executable: executable, timeout: timeout)
+            let now = DispatchTime.now()
+            guard now < deadline else {
+                terminate(
+                    process,
+                    pipeReaders: [stdoutPipe.fileHandleForReading, stderrPipe.fileHandleForReading],
+                    exited: exited,
+                    drained: drained
+                )
+                throw ProcessRunnerError.timedOut(executable: executable, timeout: timeout)
+            }
+            let remaining = Double(deadline.uptimeNanoseconds - now.uptimeNanoseconds) / 1_000_000_000
+            if exited.wait(timeout: .now() + min(remaining, 0.1)) == .success { break }
         }
 
         process.waitUntilExit()
         drained.wait()
+        if Task<Never, Never>.isCancelled { throw CancellationError() }
         AppLog.debug(.subprocess, "exit \(process.terminationStatus)")
         return ProcessResult(exitCode: process.terminationStatus, stdout: output.stdoutString, stderr: output.stderrString)
     }
@@ -162,6 +176,28 @@ struct SystemProcessRunner: ProcessRunning {
         kill(rootPID, SIGTERM)
         for child in children {
             kill(child, SIGKILL)
+        }
+    }
+
+    private func terminate(
+        _ process: Process,
+        pipeReaders: [FileHandle],
+        exited: DispatchGroup,
+        drained: DispatchGroup
+    ) {
+        terminateProcessTree(rootPID: process.processIdentifier)
+        if process.isRunning { process.terminate() }
+        if exited.wait(timeout: .now() + 0.1) == .timedOut, process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+        guard drained.wait(timeout: .now() + 1) == .timedOut else { return }
+
+        // A detached descendant can inherit stdout/stderr after the process-tree snapshot. Do not
+        // let its open pipe keep a cancelled refresh blocked forever.
+        for reader in pipeReaders { try? reader.close() }
+        if drained.wait(timeout: .now() + 1) == .timedOut {
+            AppLog.warn(.subprocess, "terminated subprocess left an output pipe open after cancellation")
         }
     }
 

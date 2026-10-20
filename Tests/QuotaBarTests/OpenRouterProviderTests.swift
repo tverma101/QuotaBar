@@ -150,6 +150,12 @@ final class OpenRouterUsageMapperTests: XCTestCase {
         XCTAssertTrue(OpenRouterUsageMapper.creditsLines(from: ["foo": "bar"]).isEmpty)
     }
 
+    func testCreditsLinesDoNotInventZeroBalanceWhenPurchasedTotalIsMissing() {
+        let lines = OpenRouterUsageMapper.creditsLines(from: ["total_usage": 2.5])
+
+        XCTAssertTrue(lines.isEmpty)
+    }
+
     func testNoCreditsMeterWhenNothingPurchased() {
         let lines = OpenRouterUsageMapper.creditsLines(from: ["total_credits": 0, "total_usage": 0])
 

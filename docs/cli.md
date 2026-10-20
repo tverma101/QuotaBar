@@ -14,7 +14,12 @@ quotabar codex --force   # refresh through the shared provider engine, cache, pr
 The command and app import the same providers, authentication stores, pricing, refresh coordinator, and
 snapshot cache. A normal read reuses snapshots less than five minutes old and refreshes missing or stale
 ones. `--force` is the CLI equivalent of the app's manual refresh: it bypasses that freshness gate and
-writes successful results to the same cache. Credentials are used locally and never appear in the output.
+writes successful results to the same cache. The CLI applies the same settings migration and fresh-install
+provider defaults, then honors the saved provider choices. Naming a provider is a one-action request for
+that provider; it does not enable other providers whose local history may feed OpenCode. Credentials are
+used locally and never appear in the output. Refreshes receive a shared per-provider order when they start,
+so a slower older result cannot replace a newer app or CLI result. Meter-only and history-only writes merge
+their updated data into the latest persisted snapshot.
 
 A provider argument names providers by plain string matching, exactly like the
 [local HTTP API](local-http-api.md): an exact provider ID names that provider, and a family ID

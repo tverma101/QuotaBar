@@ -2,7 +2,7 @@ import XCTest
 @testable import QuotaBar
 
 /// The Usage History screen's fold: window clipping (exactly 30 days including today), the
-/// Today/7/30 period buckets, unpriced rows (tokens count, cost dashes), fold-time API-rate
+/// Today/7/30 period buckets, unpriced rows (tokens count, known cost subtotal), fold-time API-rate
 /// estimate totals, section ordering, and the deterministic per-model row order.
 final class HistoryDashboardAggregatorTests: XCTestCase {
     private let calendar = Calendar.current
@@ -19,7 +19,8 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
         daily: [(offset: Int, tokens: Int, cost: Double?)] = [],
         models: [(offset: Int, name: String, tokens: Int, cost: Double?)] = [],
         apiEstimate: [(offset: Int, estimate: Double)] = [],
-        unknownModels: [(offset: Int, name: String)] = []
+        unknownModels: [(offset: Int, name: String)] = [],
+        estimatedCostDays: Set<String> = []
     ) -> ProviderUsageHistory {
         let series = DailyUsageSeries(daily: daily.map { entry in
             DailyUsageEntry(date: dayKey(offsetFromToday: entry.offset), totalTokens: entry.tokens, costUSD: entry.cost)
@@ -41,7 +42,8 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
             series: series,
             modelUsage: modelUsage,
             unknownModelsByDay: unknownByDay,
-            apiEstimateByDay: estimates
+            apiEstimateByDay: estimates,
+            estimatedCostDays: estimatedCostDays.isEmpty ? nil : estimatedCostDays
         )
     }
 
@@ -109,9 +111,26 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
         XCTAssertEqual(report.last30.cost, 7.0)
     }
 
-    func testUnpricedDaysKeepTokensAndDashCost() {
+    func testEstimatedCostMarkersFollowDaysIncludedByEachPeriod() throws {
+        let estimatedDay = dayKey(offsetFromToday: -10)
+        let history = makeHistory(
+            daily: [(0, 100, 1), (-3, 200, 2), (-10, 300, 3)],
+            estimatedCostDays: [estimatedDay]
+        )
+        let report = makeReport(
+            providers: [("opencode", "OpenCode", history)],
+            estimatedCosts: ["opencode": false]
+        )
+
+        XCTAssertFalse(report.today.hasEstimatedCost)
+        XCTAssertFalse(report.last7.hasEstimatedCost)
+        XCTAssertTrue(report.last30.hasEstimatedCost)
+        XCTAssertTrue(try XCTUnwrap(report.sections.first).hasEstimatedCost)
+    }
+
+    func testUnpricedDaysKeepTokensAndShowAnyPricedSubtotalAsPartial() {
         // A day whose rows were all unpriced shows tokens with a nil cost. A period mixing priced
-        // and unpriced days hides its partial subtotal instead of presenting it as complete.
+        // and unpriced days keeps its priced subtotal and marks it incomplete.
         let unpricedOnly = makeHistory(daily: [(0, 100, nil)])
         let report = makeReport(providers: [("claude", "Claude", unpricedOnly)])
         XCTAssertEqual(report.today.tokens, 100)
@@ -125,7 +144,7 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
         ])
         let mixedReport = makeReport(providers: [("claude", "Claude", mixed)])
         XCTAssertEqual(mixedReport.last7.tokens, 300, "unpriced tokens still count")
-        XCTAssertNil(mixedReport.last7.cost, "a period with unpriced usage must not show a partial subtotal")
+        XCTAssertEqual(mixedReport.last7.cost, 2, "the known priced amount stays visible as a subtotal")
         XCTAssertTrue(mixedReport.last7.hasIncompleteCost)
     }
 
@@ -138,33 +157,104 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
         let report = makeReport(providers: [("claude", "Claude", history)])
 
         XCTAssertEqual(report.today.tokens, 300)
-        XCTAssertNil(report.today.cost)
+        XCTAssertEqual(report.today.cost, 1)
         XCTAssertTrue(report.today.hasIncompleteCost)
-        XCTAssertNil(report.last7.cost)
+        XCTAssertEqual(report.last7.cost, 1)
         XCTAssertTrue(report.last7.hasIncompleteCost)
-        XCTAssertNil(report.last30.cost)
+        XCTAssertEqual(report.last30.cost, 1)
         XCTAssertTrue(report.last30.hasIncompleteCost)
-        XCTAssertNil(report.lifetime.cost)
+        XCTAssertEqual(report.lifetime.cost, 1)
         XCTAssertTrue(report.lifetimeHasIncompleteCost)
         XCTAssertNil(report.apiEstimateTotal, "unknown models also make the API-rate comparison incomplete")
         XCTAssertTrue(try XCTUnwrap(report.sections.first).hasIncompleteCost)
+        XCTAssertEqual(report.sections.first?.cost, 1)
         XCTAssertEqual(report.sections.first?.tokens, 300, "measured tokens stay visible")
     }
 
+    func testActiveHermesSessionMarksHistoryTotalsAndModelRowsPartial() throws {
+        let today = dayKey(offsetFromToday: 0)
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: today, totalTokens: 500, costUSD: 2)
+            ]),
+            modelUsage: ModelUsageSeries(daily: [
+                DailyModelUsageEntry(date: today, models: [
+                    ModelUsageEntry(model: "opus", totalTokens: 400, costUSD: 1.6, costIsComplete: false),
+                    ModelUsageEntry(model: "finished-model", totalTokens: 100, costUSD: 0.4)
+                ])
+            ]),
+            apiEstimateByDay: [today: 0.75],
+            partialDays: [today]
+        )
+
+        let report = makeReport(providers: [("opencode", "OpenCode", history)])
+
+        XCTAssertEqual(report.days.first?.cost, 2)
+        XCTAssertTrue(report.days.first?.hasIncompleteCost == true)
+        XCTAssertEqual(report.today.cost, 2)
+        XCTAssertTrue(report.today.hasIncompleteCost)
+        XCTAssertTrue(report.last7.hasIncompleteCost)
+        XCTAssertTrue(report.last30.hasIncompleteCost)
+        XCTAssertEqual(report.lifetime.cost, 2)
+        XCTAssertTrue(report.lifetimeHasIncompleteCost)
+        XCTAssertEqual(report.apiEstimateTotal, 0.75)
+        XCTAssertTrue(report.apiEstimateHasPartialData)
+        let section = try XCTUnwrap(report.sections.first)
+        XCTAssertEqual(section.cost, 2)
+        XCTAssertTrue(section.hasIncompleteCost)
+        XCTAssertTrue(section.rows.first?.hasIncompleteCost == true)
+        XCTAssertFalse(try XCTUnwrap(section.rows.first { $0.slug == "finished-model" }).hasIncompleteCost)
+    }
+
+    func testLifetimeEstimateMarkerUsesPerDayProvenance() {
+        let estimatedDay = dayKey(offsetFromToday: -31)
+        let today = dayKey(offsetFromToday: 0)
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: estimatedDay, totalTokens: 200, costUSD: 2),
+                DailyUsageEntry(date: today, totalTokens: 100, costUSD: 1)
+            ]),
+            estimatedCostDays: [estimatedDay]
+        )
+
+        let report = makeReport(
+            providers: [("opencode", "OpenCode", history)],
+            estimatedCosts: ["opencode": false]
+        )
+
+        XCTAssertTrue(report.lifetimeCostIsEstimated,
+                      "a lifetime total with an older imputed day still needs the estimate marker")
+    }
+
     func testLifetimeCoverageSurvivesPruningOfThirtyDayModelDetails() {
+        let oldDay = dayKey(offsetFromToday: -31)
         let history = ProviderUsageHistory(
             series: DailyUsageSeries(daily: [
                 DailyUsageEntry(date: dayKey(offsetFromToday: 0), totalTokens: 100, costUSD: 1),
-                DailyUsageEntry(date: dayKey(offsetFromToday: -31), totalTokens: 200, costUSD: 2, costIsComplete: false)
+                DailyUsageEntry(date: oldDay, totalTokens: 200, costUSD: 2, costIsComplete: false)
             ]),
-            unknownModelsByDay: [:]
+            modelUsage: ModelUsageSeries(daily: [
+                DailyModelUsageEntry(date: oldDay, models: [
+                    ModelUsageEntry(model: "known-model", totalTokens: 100, costUSD: 2),
+                    ModelUsageEntry(model: "mystery-model", totalTokens: 100, costUSD: nil)
+                ])
+            ]),
+            unknownModelsByDay: [oldDay: ["mystery-model"]],
+            partialDays: [oldDay],
+            estimatedCostDays: [oldDay]
         )
-        let report = makeReport(providers: [("claude", "Claude", history)])
+        let retained = history.retainingHistory(through: now, calendar: calendar)
+        XCTAssertNil(retained.modelUsage?.daily.first(where: { $0.date == oldDay }))
+        XCTAssertNil(retained.unknownModelsByDay[oldDay])
+        XCTAssertEqual(retained.partialDays, [oldDay], "lifetime partial status must survive after 30-day detail expires")
+        XCTAssertEqual(retained.estimatedCostDays, [oldDay], "estimate provenance survives after 30-day detail expires")
+        XCTAssertEqual(retained.series.daily.first(where: { $0.date == oldDay })?.hasUnexplainedIncompleteCost, false)
+        let report = makeReport(providers: [("claude", "Claude", retained)])
 
         XCTAssertEqual(report.last30.tokens, 100)
         XCTAssertEqual(report.last30.cost, 1)
         XCTAssertEqual(report.lifetime.tokens, 300)
-        XCTAssertNil(report.lifetime.cost)
+        XCTAssertEqual(report.lifetime.cost, 3, "lifetime keeps the known subtotal from incomplete days")
         XCTAssertTrue(report.lifetimeHasIncompleteCost)
     }
 
@@ -262,6 +352,28 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
         XCTAssertEqual(report.lifetime.cost, 51.0)
     }
 
+    func testFiniteDailyCostsThatOverflowHistoryTotalsKeepPartialSubtotals() {
+        let history = makeHistory(
+            daily: [(0, 10, 1e308), (-1, 20, 1e308)],
+            models: [(0, "large-model", 10, 1e308), (-1, "large-model", 20, 1e308)],
+            apiEstimate: [(0, 1e308), (-1, 1e308)]
+        )
+        let report = makeReport(providers: [("claude", "Claude", history)])
+
+        XCTAssertEqual(report.lifetime.tokens, 30)
+        XCTAssertEqual(report.lifetime.cost, 1e308)
+        XCTAssertTrue(report.lifetime.hasIncompleteCost)
+        XCTAssertEqual(report.last30.cost, 1e308)
+        XCTAssertTrue(report.last30.hasIncompleteCost)
+        XCTAssertNil(report.last30.apiEstimate)
+        XCTAssertFalse(report.apiEstimateHasPartialData, "overflow does not mean an active session is still growing")
+        XCTAssertEqual(report.sections.first?.cost, 1e308)
+        XCTAssertTrue(report.sections.first?.hasIncompleteCost == true)
+        XCTAssertTrue(report.sections.first?.rows.first?.hasIncompleteCost == true)
+        XCTAssertEqual(report.sections.first?.rows.first?.cost, 1e308)
+        XCTAssertTrue(report.days.allSatisfy { $0.cost?.isFinite != false })
+    }
+
     func testLifetimeOnlyHistoryDoesNotShowTheEmptyState() {
         let history = makeHistory(daily: [(-90, 800, 8.0)])
         let report = makeReport(providers: [("claude", "Claude", history)])
@@ -341,6 +453,103 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
         XCTAssertEqual(bunny?.id, "grok|space-bunny")
     }
 
+    func testModelRowKeepsKnownSubtotalAndMarksPartial() throws {
+        let today = dayKey(offsetFromToday: 0)
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(
+                    date: today,
+                    totalTokens: 300,
+                    costUSD: 2,
+                    costIsComplete: false,
+                    hasUnexplainedIncompleteCost: false
+                )
+            ]),
+            modelUsage: ModelUsageSeries(daily: [
+                DailyModelUsageEntry(date: today, models: [
+                    ModelUsageEntry(model: "shared-model", totalTokens: 300, costUSD: 2, costIsComplete: false)
+                ])
+            ]),
+            unknownModelsByDay: [today: ["shared-model"]]
+        )
+
+        let report = makeReport(providers: [("claude", "Claude", history)])
+        let row = try XCTUnwrap(report.sections.first?.rows.first)
+        XCTAssertEqual(row.cost, 2)
+        XCTAssertTrue(row.hasIncompleteCost)
+    }
+
+    func testSaturatedSourceTokensReachHistorySummaries() throws {
+        let today = dayKey(offsetFromToday: 0)
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: today, totalTokens: 900, costUSD: 2, tokenCountSaturated: true)
+            ]),
+            modelUsage: ModelUsageSeries(daily: [
+                DailyModelUsageEntry(date: today, models: [
+                    ModelUsageEntry(model: "large-model", totalTokens: 900, costUSD: 2, tokenCountSaturated: true)
+                ])
+            ]),
+            unknownModelsByDay: [:]
+        )
+
+        let report = makeReport(providers: [("claude", "Claude", history)])
+        XCTAssertTrue(try XCTUnwrap(report.days.first).tokenCountSaturated)
+        XCTAssertTrue(report.today.tokenCountSaturated)
+        XCTAssertTrue(report.last7.tokenCountSaturated)
+        XCTAssertTrue(report.last30.tokenCountSaturated)
+        XCTAssertTrue(report.lifetime.tokenCountSaturated)
+        XCTAssertTrue(try XCTUnwrap(report.sections.first).tokenCountSaturated)
+        XCTAssertTrue(try XCTUnwrap(report.sections.first?.rows.first).tokenCountSaturated)
+    }
+
+    func testHistoryMarksOverflowAcrossDaysAsLowerBound() throws {
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: dayKey(offsetFromToday: 0), totalTokens: Int.max - 5, costUSD: 1),
+                DailyUsageEntry(date: dayKey(offsetFromToday: -1), totalTokens: 10, costUSD: 1)
+            ]),
+            unknownModelsByDay: [:]
+        )
+
+        let report = makeReport(providers: [("claude", "Claude", history)])
+        XCTAssertFalse(try XCTUnwrap(report.days.first).tokenCountSaturated)
+        XCTAssertTrue(report.last7.tokenCountSaturated)
+        XCTAssertTrue(report.last30.tokenCountSaturated)
+        XCTAssertTrue(report.lifetime.tokenCountSaturated)
+        XCTAssertTrue(try XCTUnwrap(report.sections.first).tokenCountSaturated)
+    }
+
+    func testUnexplainedStructuralGapHidesCostAcrossHistoryTotals() throws {
+        let today = dayKey(offsetFromToday: 0)
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(
+                    date: today,
+                    totalTokens: 300,
+                    costUSD: 2,
+                    costIsComplete: false,
+                    hasUnexplainedIncompleteCost: true
+                )
+            ]),
+            modelUsage: ModelUsageSeries(daily: [
+                DailyModelUsageEntry(date: today, models: [
+                    ModelUsageEntry(model: "known-model", totalTokens: 300, costUSD: 2)
+                ])
+            ]),
+            unknownModelsByDay: [today: ["mystery-model"]]
+        )
+
+        let report = makeReport(providers: [("claude", "Claude", history)])
+        XCTAssertNil(report.today.cost)
+        XCTAssertNil(report.last30.cost)
+        XCTAssertNil(report.lifetime.cost)
+        XCTAssertTrue(report.today.hasIncompleteCost)
+        XCTAssertTrue(try XCTUnwrap(report.sections.first).hasIncompleteCost)
+        XCTAssertNil(report.sections.first?.rows.first?.cost)
+        XCTAssertTrue(report.sections.first?.rows.first?.hasIncompleteCost == true)
+    }
+
     // MARK: - Empty state
 
     func testEmptyReportWhenNoEnabledProviderHasUsage() {
@@ -364,15 +573,32 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
             estimatedCosts: ["claude": true, "codex": true]
         )
         XCTAssertTrue(report.lifetimeCostIsEstimated)
+        XCTAssertTrue(report.lifetime.hasEstimatedCost)
 
         // Recorded billing (OpenCode's authoritative per-message cost) keeps the hero unmarked.
+        let recordedHistory = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: dayKey(offsetFromToday: 0), totalTokens: 100, costUSD: 3.09)
+            ]),
+            estimatedCostDays: []
+        )
         let recorded = makeReport(
+            providers: [
+                (id: "opencode", name: "OpenCode", history: recordedHistory),
+            ],
+            estimatedCosts: ["opencode": false]
+        )
+        XCTAssertFalse(recorded.lifetimeCostIsEstimated)
+
+        let legacy = makeReport(
             providers: [
                 (id: "opencode", name: "OpenCode", history: makeHistory(daily: [(0, 100, 3.09)])),
             ],
             estimatedCosts: ["opencode": false]
         )
-        XCTAssertFalse(recorded.lifetimeCostIsEstimated)
+        XCTAssertTrue(legacy.lifetimeCostIsEstimated)
+        XCTAssertTrue(legacy.today.hasEstimatedCost)
+        XCTAssertTrue(try XCTUnwrap(legacy.sections.first).hasEstimatedCost)
     }
 
     /// The "At Public API Rates (Est.)" card must disappear when it would display the same dollars

@@ -6,8 +6,8 @@ Tracks your [OpenRouter](https://openrouter.ai) credit balance and spend from yo
 
 | Metric | Meaning |
 |---|---|
-| Credits | Lifetime spend against the credits you've purchased (a dollar meter) |
-| Balance | Prepaid credits remaining |
+| Credits | Lifetime spend against the credits you've purchased (a dollar meter); hidden by default when no purchased-credit meter is returned, unless you explicitly enable it in Customize |
+| Balance | Prepaid credits remaining; hidden when `/credits` omits either required total |
 | Today | Spend so far today |
 | This Week | Spend so far this week |
 | This Month | Spend so far this month |
@@ -52,7 +52,8 @@ the saved key falls back to the environment key, or to none.
 Two REST calls with a `Bearer` token against `https://openrouter.ai/api/v1`:
 
 - `GET /credits` — account-wide `total_credits` and `total_usage`; the Credits meter and Balance come
-  from these. Required for a usable snapshot.
+  from these only when both values are present. A partial payload does not invent a zero balance. If
+  this endpoint is gated, usable tier and spend data from `/key` still appears.
 - `GET /key` — best-effort: the tier, daily/weekly/monthly spend, and an optional per-key cap
   (`limit` minus `limit_remaining` for the current window). If this call fails, the balance still
   renders from `/credits`.

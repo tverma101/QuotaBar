@@ -4,9 +4,17 @@ import Foundation
 /// apart from a transient outage (try the next base URL / strategy, don't refresh).
 enum CloudCodeOutcome: Sendable {
     case ok(Data)
+    case notFound
     case authFailed
     case forbidden
     case unavailable
+
+    var isUnavailable: Bool {
+        switch self {
+        case .notFound, .unavailable: return true
+        case .ok, .authFailed, .forbidden: return false
+        }
+    }
 }
 
 /// Result of a Google OAuth token refresh, split so a dead refresh token reads as expired auth while a
@@ -86,6 +94,8 @@ struct AntigravityUsageClient: Sendable {
     /// errors fall through to the next base and finally `.unavailable`.
     func cloudCode(path: String, token: String, userAgent: String, body: [String: String]) async throws -> CloudCodeOutcome {
         let payload = (try? JSONSerialization.data(withJSONObject: body)) ?? Data("{}".utf8)
+        var sawNotFound = false
+        var sawOtherFailure = false
         for base in Self.cloudCodeURLs {
             try Task.checkCancellation()
             guard let url = URL(string: base + path) else { continue }
@@ -109,14 +119,20 @@ struct AntigravityUsageClient: Sendable {
             } catch {
                 try ProviderCancellation.rethrowIfCancellation(error)
                 try Task.checkCancellation()
+                sawOtherFailure = true
                 continue
             }
             try Task.checkCancellation()
             if response.statusCode == 401 { return .authFailed }
             if response.statusCode == 403 { return .forbidden }
             if (200..<300).contains(response.statusCode) { return .ok(response.body) }
+            if response.statusCode == 404 {
+                sawNotFound = true
+            } else {
+                sawOtherFailure = true
+            }
         }
-        return .unavailable
+        return sawNotFound && !sawOtherFailure ? .notFound : .unavailable
     }
 
     /// Exchange a Google refresh token for a fresh access token. Distinguishes a rejected OAuth client
@@ -166,7 +182,10 @@ struct AntigravityUsageClient: Sendable {
             case "invalid_grant":
                 return .authFailed
             default:
-                return .unavailable
+                // A non-transient OAuth 4xx means this authorization was rejected, even when Google
+                // returned an unknown code or a non-JSON body. Keep 408/429 and 5xx in the branches
+                // above/below as transient failures.
+                return .authFailed
             }
         default:
             return .unavailable // 5xx and anything else — transient

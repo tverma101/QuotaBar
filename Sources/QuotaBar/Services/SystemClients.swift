@@ -210,9 +210,14 @@ protocol SQLiteAccessing: Sendable {
 
 struct SQLiteCLIAccessor: SQLiteAccessing {
     var processRunner: ProcessRunning
+    var allowsReadWriteFallback: Bool
 
-    init(processRunner: ProcessRunning = SystemProcessRunner()) {
+    init(
+        processRunner: ProcessRunning = SystemProcessRunner(),
+        allowsReadWriteFallback: Bool = true
+    ) {
         self.processRunner = processRunner
+        self.allowsReadWriteFallback = allowsReadWriteFallback
     }
 
     func queryValue(path: String, sql: String) throws -> String? {
@@ -220,7 +225,7 @@ struct SQLiteCLIAccessor: SQLiteAccessing {
         // side-effect free, so absence returns nil before a process is launched.
         guard try databaseExists(path) else { return nil }
         var result = try run(path: path, sql: sql, readOnly: true)
-        if !result.succeeded {
+        if !result.succeeded, allowsReadWriteFallback {
             // A WAL-mode database under an active writer can refuse a readonly open with
             // SQLITE_CANTOPEN (14) — the shared-memory lock it needs is held. Retry read-write: the
             // query is a SELECT (no side effects), and the existence guard above already prevents
@@ -318,8 +323,8 @@ protocol KeychainAccessing: Sendable {
         allowInteraction: Bool,
         interactiveQueryLease: KeychainInteractiveQueryLease?
     ) throws -> String?
-    /// Attributes-only existence probe for first-run detection. This must dispatch to the real
-    /// Security.framework implementation rather than reading the secret through the mock fallback.
+    /// Attributes-only Keychain existence probe. This must dispatch to the real Security.framework
+    /// implementation rather than reading the secret through the mock fallback.
     func genericPasswordExists(service: String) -> Bool?
 }
 
@@ -508,25 +513,34 @@ extension KeychainAccessing {
     /// Keychain dialog only when the user explicitly asked for a refresh.
     ///
     /// Every provider credential read on a refresh path should use this rather than the flagless
-    /// overload. That overload shells out to `security find-generic-password`, which has no way to
-    /// suppress UI, so a scheduled refresh re-prompts for the life of the app — one dialog every five
-    /// minutes, per item, forever. The in-process path here is silent, and `allowInteraction: false`
+    /// overload, so it participates in per-item permission memory and the manual dialog budget.
+    /// All production reads stay in process; `allowInteraction: false`
     /// fails fast with `KeychainError.interactionNotAllowed` instead of blocking on UI.
     ///
     /// Escalation mirrors `ClaudeAuthStore`: a silent read that proves interaction is *required* may
     /// retry with UI, but only for a manual refresh, and only once per manual action across all
     /// providers via the shared `CredentialInteractionGate` — so ⌘R opens at most one Keychain dialog
     /// no matter how many provider cards are enabled.
+    /// A caller with an independent credential fallback may request a silent recheck of a previously
+    /// blocked item on manual actions, so newly granted access can recover without opening a dialog.
     func readGenericPasswordForRefresh(
         service: String,
         account: String? = nil,
         allowInteraction: Bool? = nil,
-        interactionGate: CredentialInteractionGate? = nil
+        interactionGate: CredentialInteractionGate? = nil,
+        bypassDeferredReadFailure: Bool = false,
+        recheckBlockedSilently: Bool = false
     ) throws -> String? {
         let key = KeychainItemKey(service: service, account: account)
         let mayInteract = allowInteraction ?? ProviderRefreshContext.isManual
         let actionGate = interactionGate ?? ProviderRefreshContext.credentialInteractionGate
-        return try readForRefresh(key, allowInteraction: mayInteract, interactionGate: actionGate) {
+        return try readForRefresh(
+            key,
+            allowInteraction: mayInteract,
+            interactionGate: actionGate,
+            bypassDeferredReadFailure: bypassDeferredReadFailure,
+            recheckBlockedSilently: recheckBlockedSilently && ProviderRefreshContext.isManual
+        ) {
             allowInteraction, interactiveQueryLease in
             if let account {
                 return try readGenericPassword(
@@ -551,12 +565,18 @@ extension KeychainAccessing {
     func readGenericPasswordForRefreshForCurrentUser(
         service: String,
         allowInteraction: Bool? = nil,
-        interactionGate: CredentialInteractionGate? = nil
+        interactionGate: CredentialInteractionGate? = nil,
+        bypassDeferredReadFailure: Bool = false
     ) throws -> String? {
         let key = KeychainItemKey(service: service, account: currentUserKeychainAccount())
         let mayInteract = allowInteraction ?? ProviderRefreshContext.isManual
         let actionGate = interactionGate ?? ProviderRefreshContext.credentialInteractionGate
-        return try readForRefresh(key, allowInteraction: mayInteract, interactionGate: actionGate) {
+        return try readForRefresh(
+            key,
+            allowInteraction: mayInteract,
+            interactionGate: actionGate,
+            bypassDeferredReadFailure: bypassDeferredReadFailure
+        ) {
             allowInteraction, interactiveQueryLease in
             try readGenericPasswordForCurrentUser(
                 service: service,
@@ -578,6 +598,8 @@ extension KeychainAccessing {
         _ key: KeychainItemKey,
         allowInteraction: Bool,
         interactionGate: CredentialInteractionGate?,
+        bypassDeferredReadFailure: Bool = false,
+        recheckBlockedSilently: Bool = false,
         _ read: (Bool, KeychainInteractiveQueryLease?) throws -> String?
     ) throws -> String? {
         guard !ProviderRefreshContext.credentialReadIsCancelled else {
@@ -588,8 +610,12 @@ extension KeychainAccessing {
         guard !permissionGate.isDeclined(key) else {
             throw KeychainError.interactionNotAllowed
         }
-        if permissionGate.isBlocked(key), !allowInteraction {
+        if permissionGate.isBlocked(key), !allowInteraction, !recheckBlockedSilently {
             throw KeychainError.interactionNotAllowed
+        }
+        if !bypassDeferredReadFailure,
+           permissionGate.shouldDeferFailedRead(for: key, manualActionID: manualActionID) {
+            throw KeychainError.readDeferred
         }
 
         let observedGeneration = permissionGate.generation(for: key)
@@ -628,6 +654,34 @@ extension KeychainAccessing {
                     manualActionID: manualActionID
                 )
                 throw KeychainError.interactionNotAllowed
+            } catch {
+                guard !ProviderRefreshContext.credentialReadIsCancelled,
+                      permissionGate.isCurrentManualAction(manualActionID)
+                else { throw CancellationError() }
+                if let keychainError = error as? KeychainError,
+                   case .invalidItemData = keychainError
+                {
+                    if let recoveredGeneration = permissionGate.reset(
+                        key,
+                        ifGenerationIs: generation,
+                        manualActionID: manualActionID
+                    ) {
+                        permissionGate.deferFailedRead(
+                            for: key,
+                            ifGenerationIs: recoveredGeneration,
+                            manualActionID: manualActionID
+                        )
+                    }
+                } else if let keychainError = error as? KeychainError,
+                          case .readFailed = keychainError
+                {
+                    permissionGate.deferFailedRead(
+                        for: key,
+                        ifGenerationIs: generation,
+                        manualActionID: manualActionID
+                    )
+                }
+                throw error
             }
         }
         do {
@@ -763,6 +817,24 @@ extension KeychainAccessing {
                 guard permissionGate.isCurrentManualAction(manualActionID) else {
                     throw CancellationError()
                 }
+                if let keychainError = error as? KeychainError,
+                   case .invalidItemData = keychainError
+                {
+                    guard permissionGate.markInteractiveQuerySucceeded(interactiveQueryLease) else {
+                        throw CancellationError()
+                    }
+                    if let recoveredGeneration = permissionGate.reset(
+                        key,
+                        ifGenerationIs: observedGeneration,
+                        manualActionID: manualActionID
+                    ) {
+                        permissionGate.deferFailedRead(
+                            for: key,
+                            ifGenerationIs: recoveredGeneration,
+                            manualActionID: manualActionID
+                        )
+                    }
+                }
                 throw error
             }
         } catch {
@@ -771,6 +843,28 @@ extension KeychainAccessing {
             }
             guard permissionGate.isCurrentManualAction(manualActionID) else {
                 throw CancellationError()
+            }
+            if let keychainError = error as? KeychainError,
+               case .invalidItemData = keychainError {
+                if let recoveredGeneration = permissionGate.reset(
+                    key,
+                    ifGenerationIs: observedGeneration,
+                    manualActionID: manualActionID
+                ) {
+                    permissionGate.deferFailedRead(
+                        for: key,
+                        ifGenerationIs: recoveredGeneration,
+                        manualActionID: manualActionID
+                    )
+                }
+            } else if let keychainError = error as? KeychainError,
+                      case .readFailed = keychainError
+            {
+                permissionGate.deferFailedRead(
+                    for: key,
+                    ifGenerationIs: observedGeneration,
+                    manualActionID: manualActionID
+                )
             }
             throw error
         }
@@ -791,25 +885,19 @@ extension KeychainAccessing {
 }
 
 struct SecurityKeychainAccessor: KeychainAccessing {
-    let processRunner: ProcessRunning
+    let itemReader: SecurityKeychainItemReading
     let itemWriter: SecurityKeychainItemWriting
 
     init(
-        processRunner: ProcessRunning = SystemProcessRunner(),
+        itemReader: SecurityKeychainItemReading = SecurityFrameworkKeychainReader(),
         itemWriter: SecurityKeychainItemWriting = SecurityFrameworkKeychainWriter()
     ) {
-        self.processRunner = processRunner
+        self.itemReader = itemReader
         self.itemWriter = itemWriter
     }
 
-    // `security find-generic-password` exits 44 (errSecItemNotFound) when no item matches — the
-    // legitimate "no credential stored" case. Any OTHER non-zero exit means a real failure (keychain
-    // locked or access denied, a cancelled unlock prompt) that must not be silently rendered as
-    // "not signed in".
-    private static let itemNotFoundExitCode: Int32 = 44
-
     func readGenericPassword(service: String) throws -> String? {
-        try readPassword(["find-generic-password", "-s", service, "-w"], service: service)
+        try readGenericPassword(service: service, allowInteraction: false)
     }
 
     /// Attributes-only existence probe used on the launch path: an in-process Security-framework
@@ -826,7 +914,10 @@ struct SecurityKeychainAccessor: KeychainAccessing {
             kSecMatchLimit as String: kSecMatchLimitOne,
             kSecUseAuthenticationContext as String: context,
         ]
-        switch SecItemCopyMatching(query as CFDictionary, nil) {
+        let status = KeychainUserInteraction.shared.perform(allowInteraction: false) {
+            itemReader.copyMatching(query, result: nil)
+        }
+        switch status {
         case errSecSuccess: return true
         case errSecItemNotFound: return false
         default: return nil
@@ -834,7 +925,7 @@ struct SecurityKeychainAccessor: KeychainAccessing {
     }
 
     func readGenericPasswordForCurrentUser(service: String) throws -> String? {
-        try readPassword(["find-generic-password", "-a", currentUserKeychainAccount(), "-s", service, "-w"], service: service)
+        try readGenericPasswordForCurrentUser(service: service, allowInteraction: false)
     }
 
     /// Claude uses this overload so background refreshes can read an already-authorized login while
@@ -885,7 +976,7 @@ struct SecurityKeychainAccessor: KeychainAccessing {
     }
 
     func readGenericPassword(service: String, account: String) throws -> String? {
-        try readPassword(["find-generic-password", "-a", account, "-s", service, "-w"], service: service)
+        try readGenericPassword(service: service, account: account, allowInteraction: false)
     }
 
     /// Account-scoped read that can suppress UI, matching the two service-scoped overloads. Without
@@ -914,31 +1005,21 @@ struct SecurityKeychainAccessor: KeychainAccessing {
         )
     }
 
-    private func readPassword(_ arguments: [String], service: String) throws -> String? {
-        let result = try processRunner.run(
-            executable: "/usr/bin/security",
-            arguments: arguments,
-            environment: [:],
-            timeout: 5
-        )
-        guard result.succeeded else {
-            if result.exitCode == Self.itemNotFoundExitCode { return nil }
-            // Log loudly here so a locked/denied keychain is diagnosable even though current callers
-            // `try?` this back to nil ("not signed in"). Surfacing a distinct user-facing "keychain
-            // locked" message needs the auth-load chains to propagate the throw (folded into H1).
-            AppLog.warn(.keychain, "read failed for service '\(service)' (exit \(result.exitCode))")
-            throw KeychainError.readFailed(result.stderr)
-        }
-        let value = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? nil : value
-    }
-
     private func readPassword(
         service: String,
         account: String?,
         allowInteraction: Bool,
         interactiveQueryLease: KeychainInteractiveQueryLease?
     ) throws -> String? {
+        let itemKey = KeychainItemKey(service: service, account: account)
+        let missingItems = KeychainMissingItemCache.shared
+        if missingItems.shouldSkipRead(
+            for: itemKey,
+            manualActionID: ProviderRefreshContext.manualActionID,
+            allowsInteraction: allowInteraction
+        ) {
+            return nil
+        }
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -964,34 +1045,50 @@ struct SecurityKeychainAccessor: KeychainAccessing {
             throw CancellationError()
         }
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        let status = KeychainUserInteraction.shared.perform(allowInteraction: allowInteraction) {
+            // A query may have waited behind another provider's prompt; cancellation must be
+            // checked again after acquiring the process-wide interaction lock.
+            guard authenticationContext.mayBeginQuery else { return errSecUserCanceled }
+            return itemReader.copyMatching(query, result: &result)
+        }
         guard authenticationContext.finish() else { throw CancellationError() }
+        let permissionGate = KeychainPermissionGate.shared
         switch status {
         case errSecSuccess:
             guard let data = result as? Data,
                   let value = String(data: data, encoding: .utf8)
             else {
-                throw KeychainError.readFailed("Keychain item is not UTF-8 text.")
+                throw KeychainError.invalidItemData("Keychain item is not UTF-8 text.")
             }
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+            guard !trimmed.isEmpty else {
+                missingItems.markMissing(for: itemKey)
+                return nil
+            }
+            missingItems.markPresent(itemKey)
+            return trimmed
         case errSecItemNotFound:
+            missingItems.markMissing(for: itemKey)
             return nil
-        case errSecInteractionNotAllowed, errSecAuthFailed, errSecUserCanceled:
+        case errSecInteractionNotAllowed, errSecInteractionRequired, errSecAuthFailed, errSecUserCanceled:
             // Previously silent. This is the single most important Keychain diagnostic: it is what a
             // provider needs to say "macOS needs permission" instead of "not logged in", and with no
             // line here a misclassified provider left no trace anywhere except the in-memory gate.
             // Not a warning: refusing to release an item the app does not own is an expected answer,
             // and the user is the one who has to act on it.
-            AppLog.info(
-                .keychain,
-                "silent read needs user interaction; Refresh will ask (service \(service.debugDescription), OSStatus \(status))"
-            )
+            if permissionGate.shouldLogInteractionRefusal(for: itemKey) {
+                AppLog.info(
+                    .keychain,
+                    "silent read needs user interaction (service \(service.debugDescription), OSStatus \(status))"
+                )
+            }
             throw KeychainError.interactionNotAllowed
         default:
             // Provider-agnostic on purpose: this accessor is shared, so naming one provider here
             // misattributed every other provider's failure to Claude.
-            AppLog.warn(.keychain, "credential read failed (Security.framework OSStatus \(status))")
+            if permissionGate.shouldLogReadFailure(for: itemKey, status: status) {
+                AppLog.warn(.keychain, "credential read failed (Security.framework OSStatus \(status))")
+            }
             throw KeychainError.readFailed("Security.framework OSStatus \(status)")
         }
     }
@@ -1019,17 +1116,23 @@ struct SecurityKeychainAccessor: KeychainAccessing {
         var attributes = identity.merging(scope.addAttributes) { _, scoped in scoped }
         attributes[kSecValueData as String] = secret
 
-        let addStatus = itemWriter.addGenericPassword(attributes: attributes)
+        let addStatus = KeychainUserInteraction.shared.perform(allowInteraction: false) {
+            itemWriter.addGenericPassword(attributes: attributes)
+        }
         guard addStatus != errSecDuplicateItem else {
             let updateQuery = identity.merging(scope.updateQueryAttributes) { _, scoped in scoped }
-            let updateStatus = itemWriter.updateGenericPassword(
-                matching: updateQuery,
-                attributes: [kSecValueData as String: secret]
-            )
+            let updateStatus = KeychainUserInteraction.shared.perform(allowInteraction: false) {
+                itemWriter.updateGenericPassword(
+                    matching: updateQuery,
+                    attributes: [kSecValueData as String: secret]
+                )
+            }
             guard updateStatus == errSecSuccess else { throw writeError(status: updateStatus) }
+            KeychainMissingItemCache.shared.markPresent(KeychainItemKey(service: service, account: account))
             return
         }
         guard addStatus == errSecSuccess else { throw writeError(status: addStatus) }
+        KeychainMissingItemCache.shared.markPresent(KeychainItemKey(service: service, account: account))
     }
 
     private func writeError(status: OSStatus) -> KeychainError {
@@ -1049,6 +1152,8 @@ enum KeychainError: Error, LocalizedError {
     case interactionNotAllowed
     case writeFailed(String)
     case readFailed(String)
+    case invalidItemData(String)
+    case readDeferred
 
     var errorDescription: String? {
         switch self {
@@ -1058,6 +1163,10 @@ enum KeychainError: Error, LocalizedError {
             return message.isEmpty ? "Keychain write failed." : message
         case .readFailed(let message):
             return message.isEmpty ? "Keychain read failed." : message
+        case .invalidItemData(let message):
+            return message.isEmpty ? "Keychain item data is invalid." : message
+        case .readDeferred:
+            return "A recent Keychain read failed; retry manually or wait before trying again."
         }
     }
 }
@@ -1082,6 +1191,60 @@ struct KeychainItemKey: Hashable, Sendable {
     init(service: String, account: String? = nil) {
         self.service = service
         self.account = account
+    }
+}
+
+/// Avoid repeating Security queries for absent optional credentials on every background refresh.
+/// Absence is cached briefly; explicit manual refreshes and interactive reads always recheck it.
+final class KeychainMissingItemCache: @unchecked Sendable {
+    static let shared = KeychainMissingItemCache()
+
+    private let lock = NSLock()
+    private let ttl: TimeInterval
+    private var expirationByKey: [KeychainItemKey: TimeInterval] = [:]
+
+    init(ttl: TimeInterval = 30) {
+        self.ttl = max(ttl, 0)
+    }
+
+    func shouldSkipRead(
+        for key: KeychainItemKey,
+        manualActionID: UInt64? = nil,
+        allowsInteraction: Bool = false,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let expiration = expirationByKey[key], expiration <= now {
+            expirationByKey.removeValue(forKey: key)
+            return false
+        }
+        // Bypassing a cached miss starts a real recheck, but does not erase the old result before
+        // that query returns. If cancellation wins before a result, the next background refresh
+        // should still be able to use the negative entry.
+        if manualActionID != nil || allowsInteraction { return false }
+        return expirationByKey[key] != nil
+    }
+
+    func markMissing(
+        for key: KeychainItemKey,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        lock.lock()
+        expirationByKey[key] = now + ttl
+        lock.unlock()
+    }
+
+    func markPresent(_ key: KeychainItemKey) {
+        lock.lock()
+        expirationByKey.removeValue(forKey: key)
+        lock.unlock()
+    }
+
+    func resetAll() {
+        lock.lock()
+        expirationByKey.removeAll()
+        lock.unlock()
     }
 }
 
@@ -1129,6 +1292,16 @@ enum KeychainInteractiveQueryClaim {
 final class KeychainPermissionGate: @unchecked Sendable {
     static let shared = KeychainPermissionGate()
 
+    private struct ReadFailure: Hashable {
+        let key: KeychainItemKey
+        let status: OSStatus
+    }
+
+    private struct DeferredReadFailure {
+        let retryAfter: Date
+        let manualActionID: UInt64?
+    }
+
     private let invalidateContext: @Sendable (LAContext) -> Void
 
     init(invalidateContext: @escaping @Sendable (LAContext) -> Void = { $0.invalidate() }) {
@@ -1159,6 +1332,64 @@ final class KeychainPermissionGate: @unchecked Sendable {
     /// remain blocked until a later explicit action, which clears this set once and grants one new
     /// shared prompt budget.
     private var declined: Set<KeychainItemKey> = []
+    /// Keep repeated refresh attempts from filling the diagnostic log with the same persistent
+    /// Security.framework answer. A successful or missing-item result clears the entry so a later
+    /// regression is visible again.
+    private var loggedInteractionRefusals: Set<KeychainItemKey> = []
+    private var loggedReadFailures: Set<ReadFailure> = []
+    /// Generic Security failures remain retryable, but are not queried on every background tick or
+    /// repeated in another phase of the same manual action when a provider has another credential source.
+    private var deferredReadFailures: [KeychainItemKey: DeferredReadFailure] = [:]
+    private static let failedReadRetryDelay: TimeInterval = 15 * 60
+
+    func shouldLogInteractionRefusal(for key: KeychainItemKey) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return loggedInteractionRefusals.insert(key).inserted
+    }
+
+    func shouldLogReadFailure(for key: KeychainItemKey, status: OSStatus) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return loggedReadFailures.insert(ReadFailure(key: key, status: status)).inserted
+    }
+
+    func shouldDeferFailedRead(
+        for key: KeychainItemKey,
+        manualActionID: UInt64?,
+        now: Date = Date()
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let failure = deferredReadFailures[key] else { return false }
+        guard failure.retryAfter > now else {
+            deferredReadFailures.removeValue(forKey: key)
+            return false
+        }
+        // A deliberate new action retries an older failure, but a multi-phase refresh must not
+        // immediately repeat the same failed Security query in its history follow-up.
+        if let manualActionID {
+            return failure.manualActionID == manualActionID
+        }
+        return true
+    }
+
+    func deferFailedRead(
+        for key: KeychainItemKey,
+        ifGenerationIs expected: UInt64,
+        manualActionID: UInt64?,
+        now: Date = Date()
+    ) {
+        lock.lock()
+        let actionIsCurrent = manualActionID == nil || latestManualActionID == manualActionID
+        if actionIsCurrent, generations[key, default: 0] == expected {
+            deferredReadFailures[key] = DeferredReadFailure(
+                retryAfter: now.addingTimeInterval(Self.failedReadRetryDelay),
+                manualActionID: manualActionID
+            )
+        }
+        lock.unlock()
+    }
 
     /// Whether this manual action has already failed to obtain the item.
     func isDeclined(_ key: KeychainItemKey) -> Bool {
@@ -1493,25 +1724,35 @@ final class KeychainPermissionGate: @unchecked Sendable {
         lock.lock()
         blocked.remove(key)
         declined.remove(key)
+        deferredReadFailures.removeValue(forKey: key)
+        loggedInteractionRefusals.remove(key)
+        loggedReadFailures = Set(loggedReadFailures.filter { $0.key != key })
         generations[key, default: 0] &+= 1
         lock.unlock()
     }
 
     /// Reset only when this read still owns the generation and manual action it observed. A late
     /// result from an older load cannot erase a newer action's blocked/declined state.
+    @discardableResult
     func reset(
         _ key: KeychainItemKey,
         ifGenerationIs expected: UInt64,
         manualActionID: UInt64?
-    ) {
+    ) -> UInt64? {
         lock.lock()
         let actionIsCurrent = manualActionID == nil || latestManualActionID == manualActionID
+        var resetGeneration: UInt64?
         if actionIsCurrent, generations[key, default: 0] == expected {
             blocked.remove(key)
             declined.remove(key)
+            deferredReadFailures.removeValue(forKey: key)
+            loggedInteractionRefusals.remove(key)
+            loggedReadFailures = Set(loggedReadFailures.filter { $0.key != key })
             generations[key, default: 0] &+= 1
+            resetGeneration = generations[key]
         }
         lock.unlock()
+        return resetGeneration
     }
 
     func markDeclined(_ key: KeychainItemKey, ifGenerationIs expected: UInt64) {
@@ -1529,6 +1770,9 @@ final class KeychainPermissionGate: @unchecked Sendable {
         blocked.removeAll()
         generations.removeAll()
         declined.removeAll()
+        deferredReadFailures.removeAll()
+        loggedInteractionRefusals.removeAll()
+        loggedReadFailures.removeAll()
         registeredInteractiveWaiters.removeAll()
         completedInteractiveQueryResults.removeAll()
         successfulInteractiveItems.removeAll()

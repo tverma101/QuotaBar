@@ -55,6 +55,24 @@ enum ProviderRefreshContext {
             case .menuBar, .panelMeters, .full: return false
             }
         }
+
+        /// Independent cache domains let a newer meter pass and an older still-running full pass
+        /// publish the parts each actually recomputed without discarding one another's results.
+        var refreshesQuotaDomain: Bool {
+            switch self {
+            case .menuBar, .panelMeters, .full: return true
+            case .localAccounting, .panelAccounting: return false
+            }
+        }
+
+        /// Some providers compute local history as part of the same work as either meter pass.
+        func refreshesHistoryDomain(panelMetersIncludesHistory: Bool = false) -> Bool {
+            switch self {
+            case .localAccounting, .panelAccounting, .full: return true
+            case .menuBar: return panelMetersIncludesHistory
+            case .panelMeters: return panelMetersIncludesHistory
+            }
+        }
     }
 
     /// True only for the user's explicit Refresh Now action. Snapshot-only panel presentation
@@ -71,6 +89,9 @@ enum ProviderRefreshContext {
     /// creates its own token so canceling one provider or a Safe Storage cache waiter cannot cancel a
     /// sibling load's authentication context.
     @TaskLocal static var keychainReadCancellationToken: KeychainReadCancellationToken? = nil
+    /// Per-refresh cache identity result. Providers set this after selecting their credential source;
+    /// the request-scoped sink remains safe when compatible refresh scopes overlap.
+    @TaskLocal static var cacheIdentityResult: ProviderCacheIdentityResult? = nil
     /// Defaults to `.full` so tests, CLI, and any unscoped call site keep today's behavior.
     @TaskLocal static var scope: Scope = .full
     /// Refresh entry points opt into the process-wide CPU allowance when appropriate: background
@@ -84,6 +105,31 @@ enum ProviderRefreshContext {
     /// Lightweight background menu-bar scope keeps existing catalogues on disk; missing catalogues
     /// may still download. Full accounting refreshes perform due catalogue discovery.
     @TaskLocal static var skipModelCatalogRefresh = false
+
+    /// Create app-lifetime/background tasks without inheriting a caller's manual-refresh permission.
+    /// Catalog reloads can be requested from inside ⌘R; Swift unstructured tasks inherit TaskLocal
+    /// values at creation, so a replacement scheduler must not inherit that action's Keychain budget.
+    static func withBackgroundContext<T>(_ operation: () throws -> T) rethrows -> T {
+        try $scope.withValue(.full) {
+            try $isManual.withValue(false) {
+                try $credentialInteractionGate.withValue(nil) {
+                    try $manualActionID.withValue(nil) {
+                        try $keychainReadCancellationToken.withValue(nil) {
+                            try $cacheIdentityResult.withValue(nil) {
+                                try $accountingCPUThrottleEnabled.withValue(false) {
+                                    try $accountingCPUInteractiveBudgetEnabled.withValue(false) {
+                                        try $skipModelCatalogRefresh.withValue(false) {
+                                            try operation()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Re-read the live credential before persisting a successful token rotation. A newer manual
     /// refresh must fence stale prompts, but it must not make a silent source check fail merely
@@ -304,11 +350,30 @@ protocol ProviderRuntime: AnyObject {
 
     func refresh() async -> ProviderSnapshot
 
-    /// Whether credentials for this provider already exist on this machine — a cheap, local-only probe
-    /// (files, keychain, SQLite; never the network). Used once, on a fresh install's first launch, by
-    /// `FirstRunSeeder` to enable exactly the providers the user actually has. Mirror the credential
-    /// sources `refresh()` reads, and run blocking loads via `loadOffMainActor`.
+    /// Whether credentials for this provider already exist on this machine — a local-only probe
+    /// (files, keychain, SQLite; never the network). Startup and provider discovery do not call this to
+    /// change provider enablement. If an explicit setup flow uses it, mirror the credential sources
+    /// `refresh()` reads and run blocking loads via `loadOffMainActor`.
     func hasLocalCredentials() async -> Bool
+}
+
+/// Request-scoped identity output for providers that can switch accounts while the app is running.
+/// This is separate from provider state because meter and accounting scopes may overlap.
+final class ProviderCacheIdentityResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: String?
+
+    func set(_ value: String) {
+        lock.lock()
+        storedValue = value
+        lock.unlock()
+    }
+
+    var value: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
 }
 
 extension ProviderRuntime {

@@ -55,6 +55,23 @@ final class UsageTrendTests: XCTestCase {
         XCTAssertEqual(points[0].valueLabel, "0 tokens")
     }
 
+    func testSaturatedTrendReadoutUsesLowerBoundMarker() throws {
+        var lines: [MetricLine] = []
+        SpendTileMapper.appendUsageTrend(
+            DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-06-21", totalTokens: Int.max, costUSD: nil, tokenCountSaturated: true)
+            ]),
+            to: &lines,
+            now: date(2026, 6, 21),
+            note: "n"
+        )
+
+        guard case .chart(_, let points, _) = try XCTUnwrap(lines.first) else {
+            return XCTFail("expected the Usage Trend chart")
+        }
+        XCTAssertTrue(try XCTUnwrap(points.last?.valueLabel).hasPrefix("≥"))
+    }
+
     func testTrendZeroFillsGapsBetweenActiveDays() {
         // Usage on 6/19 and 6/21 but none on 6/20: the gap stays in place as a zero bar rather than
         // collapsing the two active days into neighbors.

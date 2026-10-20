@@ -90,7 +90,8 @@ final class HermesProvider: ProviderRuntime {
             series: scan.daily,
             modelUsage: nil,
             unknownModelsByDay: [:],
-            apiEstimateIncompleteDays: incompleteEstimateDays
+            apiEstimateIncompleteDays: incompleteEstimateDays,
+            partialDays: scan.partialDays
         )
     }
 }

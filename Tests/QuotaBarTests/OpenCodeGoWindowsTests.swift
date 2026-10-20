@@ -82,4 +82,29 @@ final class OpenCodeGoWindowsTests: XCTestCase {
         let windows = OpenCodeGoWindowMath.compute(costs: [], anchorMs: nil, now: now)
         XCTAssertEqual(windows.monthlyResetsAt, d("2026-08-01T00:00:00.000Z"))
     }
+
+    func testFiniteCostsThatOverflowGoWindowsStayFiniteAndEncodable() throws {
+        let now = d("2026-07-12T12:00:00.000Z")
+        let costs: [(ms: Double, cost: Double)] = [
+            (epochMs("2026-07-12T11:00:00.000Z"), 1e308),
+            (epochMs("2026-07-12T11:30:00.000Z"), 1e308)
+        ]
+        let windows = OpenCodeGoWindowMath.compute(costs: costs, anchorMs: nil, now: now)
+
+        XCTAssertEqual(windows.sessionSpend, 1e308)
+        XCTAssertEqual(windows.weeklySpend, 1e308)
+        XCTAssertEqual(windows.monthlySpend, 1e308)
+        XCTAssertTrue(windows.sessionSpend.isFinite)
+        XCTAssertTrue(windows.weeklySpend.isFinite)
+        XCTAssertTrue(windows.monthlySpend.isFinite)
+
+        let lines = OpenCodeUsageMapper.meterLines(windows)
+        for line in lines {
+            guard case .progress(_, let used, _, _, _, _, _, _) = line else {
+                return XCTFail("expected a progress meter")
+            }
+            XCTAssertEqual(used, 100, "over-cap spend must display a finite limit-reached meter")
+        }
+        XCTAssertNoThrow(try JSONEncoder().encode(lines))
+    }
 }

@@ -17,6 +17,12 @@ final class SettingsMigratorTests: XCTestCase {
         XCTAssertEqual(result, 3)
         XCTAssertEqual(defaults.integer(forKey: SettingsMigrator.schemaVersionKey), 3)
         XCTAssertNil(ranVersions(defaults), "a fresh install must not run historical migrations")
+        XCTAssertEqual(
+            Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []),
+            ProviderEnablementPersistence.initiallyEnabledProviderIDs,
+            "seed a safe enabled-list before the app waits for launch discovery"
+        )
+        XCTAssertTrue(defaults.bool(forKey: ProviderEnablementPersistence.firstRunSeedPendingKey))
     }
 
     /// An install that predates the schema-version key (settings present, no version) is migrated forward
@@ -144,8 +150,7 @@ final class SettingsMigratorTests: XCTestCase {
         XCTAssertEqual(defaults.double(forKey: "openusage.panelHeight"), 720.0)
     }
 
-    /// A legacy install (no schema version) running the real, shipped schema keeps its settings while
-    /// being stamped forward — today's schema ships zero migrations, so nothing is transformed or lost.
+    /// A legacy install (no schema version) running the real shipped schema keeps unrelated settings.
     func testLegacyInstallKeepsSettingsUnderShippedSchema() {
         let (defaults, domain) = makeDefaults("LegacyReal")
         defer { defaults.removePersistentDomain(forName: domain) }
@@ -169,14 +174,15 @@ final class SettingsMigratorTests: XCTestCase {
         defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
         defaults.set(["devin", "grok"], forKey: "openusage.disabledProviders.v1")
 
-        let result = SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        let result = SettingsMigrator.migrate(defaults: defaults, domainName: domain, current: 3)
 
-        XCTAssertEqual(result, SettingsSchema.current)
+        XCTAssertEqual(result, 3)
         let enabled = Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? [])
         XCTAssertEqual(
             enabled,
             Set(SettingsSchema.v2ProviderIDs)
                 .union(SettingsSchema.v3PreviouslyShippedProviderIDs)
+                .union(["freebuff"])
                 .subtracting(["devin", "grok"])
         )
         XCTAssertNil(defaults.stringArray(forKey: "openusage.disabledProviders.v1"), "legacy key removed")
@@ -201,11 +207,11 @@ final class SettingsMigratorTests: XCTestCase {
         defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
         defaults.set("custom", forKey: "openusage.layout.v1")  // some settings, so not a fresh install
 
-        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain, current: 3)
 
         XCTAssertEqual(
             Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []),
-            Set(SettingsSchema.v2ProviderIDs).union(SettingsSchema.v3PreviouslyShippedProviderIDs)
+            Set(SettingsSchema.v2ProviderIDs).union(SettingsSchema.v3PreviouslyShippedProviderIDs).union(["freebuff"])
         )
     }
 
@@ -218,7 +224,7 @@ final class SettingsMigratorTests: XCTestCase {
         defaults.set(["claude", "cursor"], forKey: "openusage.enabledProviders.v1")
         defaults.set(["claude", "cursor"], forKey: "openusage.knownProviders.v1")
 
-        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain, current: 3)
 
         XCTAssertEqual(
             Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []),
@@ -243,7 +249,7 @@ final class SettingsMigratorTests: XCTestCase {
         let disabled = ["opencode", "hermes", "codex@account-a"]
         defaults.set(disabled, forKey: "openusage.disabledProviders.v1")
 
-        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain, current: 3)
         let enablement = ProviderEnablementStore(defaults: defaults)
         let probes = disabled.map(MigrationCredentialProvider.init)
         let task = NewProviderSeeder.reconcileIfNeeded(providers: probes, enablement: enablement)
@@ -258,9 +264,9 @@ final class SettingsMigratorTests: XCTestCase {
             .union(disabled))
     }
 
-    /// The old disabled-list format meant every omitted provider was enabled. OpenCode and Hermes were
-    /// already shipped but absent from v2's frozen list, so migrating an install that disabled another
-    /// provider must preserve those two enabled choices.
+    /// Through v3, the old disabled-list format meant every omitted provider was enabled. OpenCode and
+    /// Hermes were already shipped but absent from v2's frozen list, so v3 must preserve that state;
+    /// v4 later applies the requested manual-provider defaults.
     @MainActor
     func testLegacyDisabledListKeepsPreviouslyShippedOmittedProvidersEnabled() {
         let (defaults, domain) = makeDefaults("preserve-omitted-enabled")
@@ -268,7 +274,7 @@ final class SettingsMigratorTests: XCTestCase {
         defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
         defaults.set(["devin"], forKey: "openusage.disabledProviders.v1")
 
-        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain, current: 3)
         let enablement = ProviderEnablementStore(defaults: defaults)
 
         XCTAssertTrue(enablement.isEnabled("opencode"))
@@ -287,7 +293,7 @@ final class SettingsMigratorTests: XCTestCase {
         defaults.set(["cursor"], forKey: "openusage.enabledProviders.v1")
         defaults.set([String](), forKey: "openusage.knownProviders.v1")
 
-        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain, current: 3)
         let enablement = ProviderEnablementStore(defaults: defaults)
         let omitted = ["claude", "opencode", "hermes", "grok"]
         let currentRegistryIDs = omitted + ["cursor"]
@@ -310,7 +316,7 @@ final class SettingsMigratorTests: XCTestCase {
         defaults.set(["cursor"], forKey: "openusage.enabledProviders.v1")
         defaults.set([String](), forKey: "openusage.knownProviders.v1")
 
-        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain, current: 3)
         let enablement = ProviderEnablementStore(defaults: defaults)
         let registryIDs = ["claude", "cursor", "codex", "codex@account-a", "hermes", "opencode"]
         let probes = registryIDs.map(MigrationCredentialProvider.init)
@@ -329,12 +335,259 @@ final class SettingsMigratorTests: XCTestCase {
         defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
         defaults.set(["codex"], forKey: "openusage.disabledProviders.v1")
 
-        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain, current: 2)
         let enabledAfterFirst = defaults.stringArray(forKey: "openusage.enabledProviders.v1")
         defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)  // simulate an interrupted upgrade
-        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain, current: 2)
 
         XCTAssertEqual(defaults.stringArray(forKey: "openusage.enabledProviders.v1"), enabledAfterFirst)
+    }
+
+    func testLegacyDisabledChoicesSurviveRetryAfterEnabledListWasWritten() {
+        let (defaults, domain) = makeDefaults("V2InterruptedAfterEnabledWrite")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
+        let disabled = ["antigravity", "freebuff"]
+        defaults.set(
+            (Set(SettingsSchema.v2ProviderIDs).union(SettingsSchema.v3PreviouslyShippedProviderIDs)
+                .subtracting(disabled)).sorted(),
+            forKey: "openusage.enabledProviders.v1"
+        )
+        defaults.set(disabled, forKey: "openusage.disabledProviders.v1")
+        defaults.set([String](), forKey: "openusage.knownProviders.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+        let enabled = Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? [])
+        XCTAssertFalse(enabled.contains("antigravity"))
+        XCTAssertFalse(enabled.contains("freebuff"), "legacy explicit-off state must not be revived by v4 defaults")
+        XCTAssertTrue(Set(defaults.stringArray(forKey: "openusage.providerUserChoiceIDs.v1") ?? []).isSuperset(of: disabled))
+        XCTAssertNil(defaults.object(forKey: "openusage.disabledProviders.v1"), "retry should finish cleaning legacy state")
+    }
+
+    func testInterruptedLegacyConversionAddsFreebuffWhenOnlyAnotherProviderWasDisabled() {
+        let (defaults, domain) = makeDefaults("V2InterruptedWithUnrelatedDisabledProvider")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(
+            Set(SettingsSchema.v2ProviderIDs).union(SettingsSchema.v3PreviouslyShippedProviderIDs)
+                .subtracting(["devin"]).sorted(),
+            forKey: "openusage.enabledProviders.v1"
+        )
+        defaults.set(["devin"], forKey: "openusage.disabledProviders.v1")
+        defaults.set([String](), forKey: "openusage.knownProviders.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+        let enabled = Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? [])
+        XCTAssertTrue(enabled.contains("freebuff"), "the surviving legacy list means Freebuff was not explicitly off")
+        XCTAssertFalse(enabled.contains("devin"))
+        XCTAssertFalse(enabled.contains("antigravity"), "auto-detected optional providers still require a manual choice")
+        XCTAssertTrue((defaults.stringArray(forKey: "openusage.providerUserChoiceIDs.v1") ?? []).contains("devin"))
+    }
+
+    func testInterruptedLegacyConversionRecoversRegisteredCodexCardsAndKeepsExplicitOff() throws {
+        let (defaults, domain) = makeDefaults("V2InterruptedCodexRecovery")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(
+            Set(SettingsSchema.v2ProviderIDs).union(SettingsSchema.v3PreviouslyShippedProviderIDs)
+                .subtracting(["devin"])
+                .sorted(),
+            forKey: "openusage.enabledProviders.v1"
+        )
+        defaults.set(["devin", "codex@manual-off"], forKey: "openusage.disabledProviders.v1")
+        defaults.set(try JSONSerialization.data(withJSONObject: [
+            ["id": "codex@previously-enabled", "family": "codex", "removedTombstone": false],
+            ["id": "codex@manual-off", "family": "codex", "removedTombstone": false],
+            ["id": "codex@removed", "family": "codex", "removedTombstone": true]
+        ]), forKey: "openusage.providerAccounts.v1")
+        defaults.set([String](), forKey: "openusage.knownProviders.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+        let enabled = Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? [])
+        XCTAssertTrue(enabled.contains("codex@previously-enabled"))
+        XCTAssertFalse(enabled.contains("codex@manual-off"))
+        XCTAssertFalse(enabled.contains("codex@removed"))
+        XCTAssertTrue(enabled.contains("freebuff"))
+        XCTAssertTrue((defaults.stringArray(forKey: "openusage.providerUserChoiceIDs.v1") ?? []).contains("codex@manual-off"))
+    }
+
+    func testLegacyConversionPreservesFreebuffExplicitlyTurnedBackOn() {
+        let (defaults, domain) = makeDefaults("LegacyFreebuffOn")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(["devin"], forKey: "openusage.disabledProviders.v1")
+        // The old store records an ID after either toggle direction. The disabled-list is authoritative.
+        defaults.set(["freebuff", "devin"], forKey: "openusage.providerUserChoiceIDs.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+        let enabled = Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? [])
+        XCTAssertTrue(enabled.contains("freebuff"))
+        XCTAssertFalse(enabled.contains("devin"))
+        XCTAssertFalse(enabled.contains("grok"), "credential-detected optional providers become manual")
+    }
+
+    func testInterruptedLegacyRetryUsesDisabledListForCodexDirection() throws {
+        let (defaults, domain) = makeDefaults("V2InterruptedCodexDirection")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(
+            Set(SettingsSchema.v2ProviderIDs).union(SettingsSchema.v3PreviouslyShippedProviderIDs)
+                .subtracting(["devin"]).sorted(),
+            forKey: "openusage.enabledProviders.v1"
+        )
+        defaults.set(["devin", "codex@manual-off"], forKey: "openusage.disabledProviders.v1")
+        defaults.set(["codex@previously-enabled", "codex@manual-off"], forKey: "openusage.providerUserChoiceIDs.v1")
+        defaults.set(try JSONSerialization.data(withJSONObject: [
+            ["id": "codex@previously-enabled", "family": "codex", "removedTombstone": false],
+            ["id": "codex@manual-off", "family": "codex", "removedTombstone": false]
+        ]), forKey: "openusage.providerAccounts.v1")
+        defaults.set([String](), forKey: "openusage.knownProviders.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+        let enabled = Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? [])
+        XCTAssertTrue(enabled.contains("codex@previously-enabled"))
+        XCTAssertFalse(enabled.contains("codex@manual-off"))
+    }
+
+    func testPendingManualEnableIsRecoveredBeforeOptionalProviderMigration() {
+        let (defaults, domain) = makeDefaults("RecoverPendingManualEnable")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(3, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(["claude", "codex", "cursor"], forKey: "openusage.enabledProviders.v1")
+        defaults.set(
+            SettingsSchema.v2ProviderIDs + SettingsSchema.v3PreviouslyShippedProviderIDs,
+            forKey: "openusage.knownProviders.v1"
+        )
+        ProviderEnablementPersistence.writePendingChoiceIntent(
+            providerID: "grok", enabled: true, revision: 1, defaults: defaults
+        )
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+        XCTAssertTrue((defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []).contains("grok"))
+        XCTAssertTrue((defaults.stringArray(forKey: "openusage.providerUserChoiceIDs.v1") ?? []).contains("grok"))
+        XCTAssertNil(defaults.object(forKey: ProviderEnablementPersistence.pendingChoiceIntentKey))
+    }
+
+    @MainActor
+    func testV4PreservesManualChoicesAndDefaultsWhileDisablingDetectedOptionalProviders() {
+        let (defaults, domain) = makeDefaults("V4ManualProviders")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(3, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(
+            ["claude", "cursor", "freebuff", "codex@account-a", "copilot", "antigravity", "grok", "opencode"],
+            forKey: "openusage.enabledProviders.v1"
+        )
+        defaults.set(["freebuff", "copilot", "devin", "codex"], forKey: "openusage.providerUserChoiceIDs.v1")
+        defaults.set(["grok", "opencode"], forKey: "openusage.pendingProviderCredentialProbeIDs.v1")
+        defaults.set(true, forKey: "openusage.firstRunCredentialProbePending.v1")
+        defaults.set(12, forKey: "openusage.firstRunCredentialProbeRevision.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+        XCTAssertEqual(
+            Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []),
+            ["claude", "cursor", "freebuff", "codex@account-a", "copilot"]
+        )
+        XCTAssertTrue(defaults.stringArray(forKey: "openusage.pendingProviderCredentialProbeIDs.v1")?.isEmpty ?? false)
+        XCTAssertNil(defaults.object(forKey: "openusage.firstRunCredentialProbePending.v1"))
+        XCTAssertNil(defaults.object(forKey: "openusage.firstRunCredentialProbeRevision.v1"))
+
+        // An explicit off for a core provider remains off; untouched core defaults keep their current
+        // state rather than being enabled by the migration.
+        defaults.set(3, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(["claude", "cursor"], forKey: "openusage.enabledProviders.v1")
+        defaults.set(["codex", "freebuff"], forKey: "openusage.providerUserChoiceIDs.v1")
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+        XCTAssertEqual(Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []), ["claude", "cursor"])
+    }
+
+    @MainActor
+    func testV4AddsFreebuffAndPreservesRegisteredCodexCardsFromLegacyDisabledList() throws {
+        let (defaults, domain) = makeDefaults("legacy-codex-cards")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(1, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(["devin", "codex@account-b"], forKey: "openusage.disabledProviders.v1")
+        defaults.set(try JSONSerialization.data(withJSONObject: [
+            ["id": "codex@account-a", "family": "codex", "removedTombstone": false],
+            ["id": "codex@account-b", "family": "codex", "removedTombstone": false],
+            ["id": "codex@removed", "family": "codex", "removedTombstone": true],
+            ["id": "claude@account-c", "family": "claude", "removedTombstone": false]
+        ]), forKey: "openusage.providerAccounts.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+        XCTAssertEqual(
+            Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []),
+            ["claude", "codex", "cursor", "freebuff", "codex@account-a"]
+        )
+        XCTAssertEqual(
+            Set(defaults.stringArray(forKey: "openusage.providerUserChoiceIDs.v1") ?? []),
+            ["devin", "codex@account-b"]
+        )
+    }
+
+    func testV4DoesNotReenableAbsentCoreProvidersWithoutRecordedChoice() {
+        let (defaults, domain) = makeDefaults("do-not-reenable-core")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(3, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(["claude"], forKey: "openusage.enabledProviders.v1")
+        defaults.set(["claude", "codex", "cursor"], forKey: "openusage.knownProviders.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+        XCTAssertEqual(Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []), ["claude", "freebuff"])
+    }
+
+    @MainActor
+    func testV4RecoversOnlyUnambiguousCodexCardsFromReleasedMigration() throws {
+        let (defaults, domain) = makeDefaults("recover-codex-account-cards")
+        defer { defaults.removePersistentDomain(forName: domain) }
+        defaults.set(3, forKey: SettingsMigrator.schemaVersionKey)
+        defaults.set(["claude", "codex", "cursor"], forKey: "openusage.enabledProviders.v1")
+        defaults.set(SettingsSchema.v2ProviderIDs + SettingsSchema.v3PreviouslyShippedProviderIDs + ["codex@legacy-off"],
+                     forKey: "openusage.knownProviders.v1")
+        defaults.set(["codex@manual-off"], forKey: "openusage.providerUserChoiceIDs.v1")
+        defaults.set(try JSONSerialization.data(withJSONObject: [
+            ["id": "codex@lost-enabled", "family": "codex", "removedTombstone": false],
+            ["id": "codex@legacy-off", "family": "codex", "removedTombstone": false],
+            ["id": "codex@manual-off", "family": "codex", "removedTombstone": false],
+            ["id": "codex@removed", "family": "codex", "removedTombstone": true]
+        ]), forKey: "openusage.providerAccounts.v1")
+
+        SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+        XCTAssertEqual(
+            Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []),
+            ["claude", "codex", "cursor", "freebuff", "codex@lost-enabled"]
+        )
+    }
+
+    func testV4DoesNotTurnKnownOffFreebuffBackOnOrInferFromUnknownSentinel() {
+        for (label, enabled, known, disabled, expected) in [
+            ("known-off", ["claude"], ["claude", "codex", "cursor", "freebuff"], [String](), ["claude"]),
+            (
+                "empty-known", ["claude", "codex", "cursor", "freebuff", "grok"], [String](), [String](),
+                ["claude", "codex", "cursor", "freebuff"]
+            ),
+            ("legacy-disabled", ["claude"], ["claude", "codex", "cursor"], ["freebuff"], ["claude"])
+        ] {
+            let (defaults, domain) = makeDefaults(label)
+            defaults.set(3, forKey: SettingsMigrator.schemaVersionKey)
+            defaults.set(enabled, forKey: "openusage.enabledProviders.v1")
+            defaults.set(known, forKey: "openusage.knownProviders.v1")
+            defaults.set(disabled, forKey: "openusage.disabledProviders.v1")
+
+            SettingsMigrator.migrate(defaults: defaults, domainName: domain)
+
+            XCTAssertEqual(Set(defaults.stringArray(forKey: "openusage.enabledProviders.v1") ?? []), Set(expected), label)
+            defaults.removePersistentDomain(forName: domain)
+        }
     }
 
 @MainActor

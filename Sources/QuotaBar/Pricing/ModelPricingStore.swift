@@ -11,6 +11,10 @@ actor ModelPricingStore {
     private static let refreshInterval: TimeInterval = 60 * 60
     /// Retry a failed source after this long (keeps failure logs from repeating every provider pass).
     private static let failureRetryInterval: TimeInterval = 30 * 60
+    /// OpenRouter accepts up to 1,000 models per page. Keep paging bounded if its pagination metadata
+    /// becomes malformed or the endpoint unexpectedly reports an extreme model count.
+    private static let openRouterPageLimit = 1_000
+    private static let openRouterMaximumPages = 64
 
     enum SourceID: String, CaseIterable, Codable, Sendable {
         case openRouter = "openrouter"
@@ -38,15 +42,16 @@ actor ModelPricingStore {
     var pricing: ModelPricing = .empty
     private var sourceStates: [SourceID: SourceState] = [:]
     var refreshTask: Task<Void, Never>?
-    /// Unknown-model discovery state. The behavior lives in `ModelPricingStore+Discovery.swift`; an
+    /// OpenRouter route-check state. The behavior lives in `ModelPricingStore+Discovery.swift`; an
     /// extension cannot add stored properties, so the actor owns the fields.
     let unresolvedSink = UnresolvedModelSink()
-    /// Distinct model names a recent pass could not price, awaiting one coalesced OpenRouter
-    /// revalidation. Names are only a hint that the catalogue may be stale; nothing is transmitted.
+    /// Distinct names lacking an exact OpenRouter route, awaiting one coalesced catalog revalidation.
+    /// Names are only a local hint that the public catalog may be stale; nothing is transmitted.
     var pendingUnknownModels: Set<String> = []
     /// Name -> earliest time a discovery round may attempt a fetch for it again.
     var unresolvedBackoff: [String: Date] = [:]
-    /// Consecutive discovery rounds that failed to price each name; drives the give-up cap in `backoff`.
+    /// Consecutive discovery attempts without an exact OpenRouter rate; drives the give-up cap in
+    /// `backoff`.
     var unresolvedMissStreaks: [String: Int] = [:]
     var unresolvedDiscoveryTask: Task<Void, Never>?
     var unresolvedFlushTask: Task<Void, Never>?
@@ -134,11 +139,12 @@ actor ModelPricingStore {
             primary: loadCatalog(.litellm, parse: PricingCatalogCodecs.catalogFromCompact),
             secondary: loadCatalog(.modelsDev, parse: PricingCatalogCodecs.catalogFromCompact),
             openRouter: loadCatalog(.openRouter, parse: PricingCatalogCodecs.catalogFromCompact),
-            onUnresolvedModel: { [weak self] name in self?.unresolvedSink.record(name) }
+            onOpenRouterRecheckModel: { [weak self] name in self?.unresolvedSink.record(name) }
         )
-        // New catalogue data is a fresh discovery epoch: the rebuilt pricing's memo re-reports
-        // unpriced names, so give them a clean miss streak instead of instantly dropping them.
-        unresolvedMissStreaks.removeAll()
+        // A fresh snapshot can report fallback-priced names again. Preserve their miss streaks so
+        // unrelated hourly catalogue rebuilds cannot keep a model in discovery forever; an exact
+        // OpenRouter route clears its own streak and pending work.
+        pruneCompletedOpenRouterChecks()
     }
 
     /// Merged supplement: bundled is the base (ships new pins like mimo-v2.5), cached overlays
@@ -305,14 +311,14 @@ actor ModelPricingStore {
     /// Fetches one source and updates its cache file. Returns true when new data was stored.
     func fetch(_ source: SourceID) async -> Bool {
         guard let url = sourceURLs[source] else { return false }
+        if source == .openRouter {
+            return await fetchOpenRouterCatalog(from: url)
+        }
+
         var state = sourceStates[source] ?? SourceState()
         var request = HTTPRequest(method: "GET", url: url, timeout: 30)
         if let etag = state.etag {
             request.headers["If-None-Match"] = etag
-        }
-        if source == .openRouter {
-            openRouterAttemptCount += 1
-            lastOpenRouterAttemptAt = now()
         }
         do {
             let response = try await http.send(request)
@@ -344,6 +350,99 @@ actor ModelPricingStore {
             AppLog.warn("pricing", "\(source.rawValue) refresh failed, keeping cached data: \(error.localizedDescription)")
             return false
         }
+    }
+
+    /// Fetches every page before writing a new OpenRouter snapshot. A partial page sequence never
+    /// replaces a previously complete catalog. The public response is small, and OpenRouter currently
+    /// does not return an ETag, so requests are unconditional to keep later pages current as well.
+    private func fetchOpenRouterCatalog(from baseURL: URL) async -> Bool {
+        var state = sourceStates[.openRouter] ?? SourceState()
+        openRouterAttemptCount += 1
+        lastOpenRouterAttemptAt = now()
+
+        do {
+            var allModels: [[String: Any]] = []
+            var expectedTotalCount: Int?
+            var offset = 0
+            var complete = false
+
+            for pageIndex in 0..<Self.openRouterMaximumPages {
+                let url = try openRouterPageURL(baseURL, offset: offset)
+                let response = try await http.send(HTTPRequest(method: "GET", url: url, timeout: 30))
+                if response.statusCode == 304, pageIndex == 0 {
+                    state.fetchedAt = now()
+                    state.failedAt = nil
+                    sourceStates[.openRouter] = state
+                    return false
+                }
+                guard response.statusCode == 200 else {
+                    throw PricingFetchError.httpStatus(response.statusCode)
+                }
+
+                let page = try PricingCatalogCodecs.openRouterCatalogPage(from: response.body)
+                guard page.models.count <= Self.openRouterPageLimit,
+                      page.totalCount >= allModels.count + page.models.count,
+                      expectedTotalCount == nil || expectedTotalCount == page.totalCount else {
+                    throw PricingCodecError.incompleteModelList
+                }
+                expectedTotalCount = page.totalCount
+                allModels.append(contentsOf: page.models)
+
+                if allModels.count == page.totalCount {
+                    guard page.nextOffset == nil else { throw PricingCodecError.incompleteModelList }
+                    complete = true
+                    break
+                }
+
+                guard allModels.count < page.totalCount,
+                      let nextOffset = page.nextOffset,
+                      nextOffset == offset + page.models.count,
+                      nextOffset > offset else {
+                    throw PricingCodecError.incompleteModelList
+                }
+                offset = nextOffset
+            }
+
+            guard complete, let expectedTotalCount, allModels.count == expectedTotalCount else {
+                throw PricingCodecError.incompleteModelList
+            }
+            let completeFeed: [String: Any] = [
+                "data": allModels,
+                "total_count": expectedTotalCount,
+                "links": ["next": NSNull()]
+            ]
+            let body = try JSONSerialization.data(withJSONObject: completeFeed)
+            let fetchedAt = now()
+            let cacheData = try validatedCacheData(
+                .openRouter,
+                body: body,
+                retrievedAt: OpenUsageISO8601.string(from: fetchedAt)
+            )
+            try writeCache(.openRouter, data: cacheData)
+            state.etag = nil
+            state.fetchedAt = fetchedAt
+            state.failedAt = nil
+            sourceStates[.openRouter] = state
+            return true
+        } catch {
+            state.failedAt = now()
+            sourceStates[.openRouter] = state
+            AppLog.warn("pricing", "openrouter refresh failed, keeping cached data: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func openRouterPageURL(_ baseURL: URL, offset: Int) throws -> URL {
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw PricingCodecError.incompleteModelList
+        }
+        var queryItems = components.queryItems ?? []
+        queryItems.removeAll { $0.name == "limit" || $0.name == "offset" }
+        queryItems.append(URLQueryItem(name: "limit", value: String(Self.openRouterPageLimit)))
+        queryItems.append(URLQueryItem(name: "offset", value: String(offset)))
+        components.queryItems = queryItems
+        guard let url = components.url else { throw PricingCodecError.incompleteModelList }
+        return url
     }
 
     /// Parses the fetched body (throwing on garbage so it never replaces a good cache) and returns

@@ -237,7 +237,7 @@ struct WidgetData: Hashable {
         // A `.values` row's primary reading is its first selected value; meters fall through to the
         // bounded/`used` formatting.
         if let first = selectedValues.first {
-            return (valuePrefix ?? "") + MetricFormatter.number(first.number, kind: first.kind, style: .row)
+            return (valuePrefix ?? "") + MetricFormatter.number(for: first, style: .row)
         }
         return (valuePrefix ?? "") + format(displayedValue)
     }
@@ -260,7 +260,7 @@ struct WidgetData: Hashable {
         }
         if let first = selectedValues.first {
             if let traySuffix, first.kind == .count {
-                return "\(MetricFormatter.number(first.number, kind: .count, style: .tray)) \(traySuffix)"
+                return "\(MetricFormatter.number(for: first, style: .tray)) \(traySuffix)"
             }
             return MetricFormatter.string(for: first, style: .tray)
         }
@@ -401,13 +401,14 @@ struct WidgetData: Hashable {
         hasData && !unknownModels.isEmpty
     }
 
-    /// Hover copy for the unknown-model warning triangle: a header naming the problem, then each unpriced
-    /// model on its own line. Singular/plural header to read naturally. `nil` when the period priced every
-    /// model it used (the common case), so the triangle and its tooltip stay off.
+    /// Hover copy for the unknown-model warning triangle. Singular/plural header, model names, and a
+    /// note that any displayed dollar subtotal includes priced usage only. `nil` when all models are
+    /// priced, so the triangle and its tooltip stay off.
     var unknownModelTooltip: String? {
         guard hasUnknownModels else { return nil }
         let header = unknownModels.count == 1 ? "Unknown model found" : "Unknown models found"
-        return ([header] + unknownModels.map { "- \($0)" }).joined(separator: "\n")
+        return ([header] + unknownModels.map { "- \($0)" } + ["Displayed cost includes priced usage only."])
+            .joined(separator: "\n")
     }
 
     /// Secondary line under an unbounded row's detail (e.g. "on-device estimate"); nil with no real data.

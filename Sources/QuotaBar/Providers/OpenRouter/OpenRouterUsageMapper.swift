@@ -9,13 +9,16 @@ enum OpenRouterUsageMapper {
         ProviderParse.jsonObject(body)?["data"] as? [String: Any]
     }
 
-    /// Credits meter + Balance from `/credits`. Empty when the payload carries no usable total.
+    /// Credits meter + Balance from `/credits`. Both totals are required: a missing purchased-total
+    /// field cannot be treated as a measured $0 balance just because lifetime usage is present.
     static func creditsLines(from data: [String: Any]) -> [MetricLine] {
-        guard let totalUsage = ProviderParse.number(data["total_usage"]) else { return [] }
+        guard let totalUsage = ProviderParse.number(data["total_usage"]),
+              let reportedCredits = ProviderParse.number(data["total_credits"])
+        else { return [] }
 
         let used = max(0, totalUsage)
         // `total_credits` is the lifetime amount added to the account; balance is what's left of it.
-        let totalCredits = max(0, ProviderParse.number(data["total_credits"]) ?? 0)
+        let totalCredits = max(0, reportedCredits)
 
         var lines: [MetricLine] = []
         // Credits meter: spend against the credits purchased. Only a positive ceiling makes a meter

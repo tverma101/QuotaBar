@@ -35,6 +35,7 @@ final class LoginShellEnvironment: @unchecked Sendable {
     /// off the main thread (see `value(for:)`), so the UI thread can never wait on it.
     private let captureLock = NSLock()
     private var cached: [String: String]?
+    private var didRetryAfterFailure = false
 
     init(runner: ProcessRunning = SystemProcessRunner()) {
         self.runner = runner
@@ -74,6 +75,23 @@ final class LoginShellEnvironment: @unchecked Sendable {
         guard !Thread.isMainThread else { return capturedSuccessfully }
         _ = capturedEnvironment()
         return capturedSuccessfully
+    }
+
+    /// Allow one bounded retry after a failed launch capture. Failed results are cached so normal
+    /// readers never respawn the user's shell on every refresh; startup calls this once before
+    /// composing account-scoped providers.
+    func retryCaptureAfterFailure() -> Bool {
+        guard !Thread.isMainThread else { return capturedSuccessfully }
+        captureLock.lock()
+        defer { captureLock.unlock() }
+        if let cached = cachedSnapshot(), !cached.isEmpty { return true }
+        guard !didRetryAfterFailure else { return false }
+        didRetryAfterFailure = true
+        let retried = capture()
+        stateLock.lock()
+        cached = retried
+        stateLock.unlock()
+        return !retried.isEmpty
     }
 
     private func cachedSnapshot() -> [String: String]? {

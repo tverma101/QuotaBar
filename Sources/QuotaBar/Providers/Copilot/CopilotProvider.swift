@@ -8,6 +8,7 @@ final class CopilotProvider: ProviderRuntime {
     static let billingOrgProbeRetryAfterKey = "copilot.billingOrgProbeRetryAfter"
     static let billingOrgRateLimitRetryAfterKey = "copilot.billingOrgRateLimitRetryAfter"
     static let billingOrgProbeBackoff: TimeInterval = 5 * 60
+    private static let orgListDiagnosticPrefix = "copilot.org-list."
 
     private struct OrgBillingRateLimit: Error {
         let retryAfter: String?
@@ -47,17 +48,22 @@ final class CopilotProvider: ProviderRuntime {
     var widgetDescriptors: [WidgetDescriptor] {
         [
             .percent(id: "copilot.premium", provider: provider, title: "Credits")
-                .exportingLimit("premiumCredits", unit: "credits", source: .progressOrValue(kind: .count)),
+                .exportingLimit("premiumCredits", unit: "credits", source: .progressOrValue(kind: .count))
+                .hidingWhenEmpty(),
             .values(id: "copilot.extra", provider: provider, title: "Extra Usage", selection: .kind(.count)).hidingWhenEmpty()
                 .exportingLimit("extraUsage", unit: "count", source: .value(kind: .count)),
             .values(id: "copilot.orgCredits", provider: provider, title: "Org Credits", selection: .kind(.count))
-                .exportingLimit("orgCredits", unit: "credits", source: .value(kind: .count, label: "credits")),
+                .exportingLimit("orgCredits", unit: "credits", source: .value(kind: .count, label: "credits"))
+                .hidingWhenEmpty(),
             .values(id: "copilot.orgSpend", provider: provider, title: "Org Spend", selection: .kind(.dollars), valueWord: "spent")
-                .exportingLimit("orgSpend", unit: "usd", source: .value(kind: .dollars)),
+                .exportingLimit("orgSpend", unit: "usd", source: .value(kind: .dollars))
+                .hidingWhenEmpty(),
             .percent(id: "copilot.chat", provider: provider, title: "Chat")
-                .exportingLimit("chat", unit: "percent"),
+                .exportingLimit("chat", unit: "percent")
+                .hidingWhenEmpty(),
             .percent(id: "copilot.completions", provider: provider, title: "Completions")
                 .exportingLimit("completions", unit: "percent")
+                .hidingWhenEmpty()
         ]
     }
 
@@ -163,9 +169,11 @@ final class CopilotProvider: ProviderRuntime {
             attemptedOrgs.insert(cached.lowercased())
             do {
                 if let lines = try await usageLines(org: cached, token: token) {
+                    DiagnosticGate.clearFailures(prefix: Self.orgBillingDiagnosticPrefix(org: cached))
                     defaults.removeObject(forKey: Self.billingOrgProbeRetryAfterKey)
                     return lines
                 }
+                DiagnosticGate.clearFailures(prefix: Self.orgBillingDiagnosticPrefix(org: cached))
                 // The cached org answered but no longer shows Copilot usage (left the org, lost the
                 // billing role, org stopped using Copilot) — forget it and re-probe from scratch.
                 defaults.removeObject(forKey: Self.billingOrgDefaultsKey)
@@ -177,7 +185,11 @@ final class CopilotProvider: ProviderRuntime {
                     return []
                 }
                 // Transient failure: log it and keep the cached org for the next refresh.
-                AppLog.warn(LogTag.plugin("copilot"), "org billing lookup failed for the remembered org: \(error.localizedDescription)")
+                DiagnosticGate.logOnce(
+                    for: Self.orgBillingDiagnosticPrefix(org: cached) + String(reflecting: type(of: error))
+                ) {
+                    AppLog.warn(LogTag.plugin("copilot"), "org billing lookup failed for the remembered org: \(error.localizedDescription)")
+                }
                 return []
             }
         }
@@ -204,9 +216,13 @@ final class CopilotProvider: ProviderRuntime {
                         AppLog.info(LogTag.plugin("copilot"), "org list rate limited; pausing org discovery")
                         return []
                     }
-                    AppLog.warn(LogTag.plugin("copilot"), "org list pagination stopped at HTTP \(statusCode); using completed pages")
+                    DiagnosticGate.logOnce(for: Self.orgListDiagnosticPrefix + "partial." + String(statusCode)) {
+                        AppLog.warn(LogTag.plugin("copilot"), "org list pagination stopped at HTTP \(statusCode); using completed pages")
+                    }
                 } else {
-                    AppLog.warn(LogTag.plugin("copilot"), "org list pagination stopped after \(partialStatus); using completed pages")
+                    DiagnosticGate.logOnce(for: Self.orgListDiagnosticPrefix + "partial." + JSONLScanCachePaths.stableFingerprint(partialStatus)) {
+                        AppLog.warn(LogTag.plugin("copilot"), "org list pagination stopped after \(partialStatus); using completed pages")
+                    }
                 }
             }
             if CopilotOrgBillingClient.isRateLimitResponse(response) {
@@ -223,13 +239,20 @@ final class CopilotProvider: ProviderRuntime {
                 if response.statusCode == 403 {
                     recordOrgProbeCooldown()
                 }
-                AppLog.info(LogTag.plugin("copilot"), "org list HTTP \(response.statusCode); skipping org billing lookup")
+                DiagnosticGate.logOnce(for: Self.orgListDiagnosticPrefix + "http." + String(response.statusCode)) {
+                    AppLog.info(LogTag.plugin("copilot"), "org list HTTP \(response.statusCode); skipping org billing lookup")
+                }
                 return []
+            }
+            if !orgListWasPartial {
+                DiagnosticGate.clearFailures(prefix: Self.orgListDiagnosticPrefix)
             }
             orgs = CopilotOrgBillingMapper.orgLogins(response)
         } catch {
             try ProviderCancellation.rethrowIfCancellation(error)
-            AppLog.warn(LogTag.plugin("copilot"), "org list fetch failed: \(error.localizedDescription)")
+            DiagnosticGate.logOnce(for: Self.orgListDiagnosticPrefix + "fetch." + String(reflecting: type(of: error))) {
+                AppLog.warn(LogTag.plugin("copilot"), "org list fetch failed: \(error.localizedDescription)")
+            }
             return []
         }
 
@@ -240,10 +263,12 @@ final class CopilotProvider: ProviderRuntime {
             try Task.checkCancellation()
             do {
                 if let lines = try await usageLines(org: org, token: token) {
+                    DiagnosticGate.clearFailures(prefix: Self.orgBillingDiagnosticPrefix(org: org))
                     defaults.set(org, forKey: Self.billingOrgDefaultsKey)
                     defaults.removeObject(forKey: Self.billingOrgProbeRetryAfterKey)
                     return lines
                 }
+                DiagnosticGate.clearFailures(prefix: Self.orgBillingDiagnosticPrefix(org: org))
             } catch {
                 try ProviderCancellation.rethrowIfCancellation(error)
                 if let rateLimit = error as? OrgBillingRateLimit {
@@ -253,7 +278,11 @@ final class CopilotProvider: ProviderRuntime {
                 }
                 sawTransientFailure = true
                 // One org's billing having an outage must not hide another org's usage — keep probing.
-                AppLog.warn(LogTag.plugin("copilot"), "org billing summary failed for one org; trying the next: \(error.localizedDescription)")
+                DiagnosticGate.logOnce(
+                    for: Self.orgBillingDiagnosticPrefix(org: org) + String(reflecting: type(of: error))
+                ) {
+                    AppLog.warn(LogTag.plugin("copilot"), "org billing summary failed for one org; trying the next: \(error.localizedDescription)")
+                }
             }
         }
         if !sawTransientFailure {
@@ -289,6 +318,10 @@ final class CopilotProvider: ProviderRuntime {
             return nil
         }
         return CopilotOrgBillingMapper.usageLines(response)
+    }
+
+    private static func orgBillingDiagnosticPrefix(org: String) -> String {
+        "copilot.org-billing.\(JSONLScanCachePaths.stableFingerprint(org.lowercased()))."
     }
 
     private func recordOrgProbeCooldown() {
