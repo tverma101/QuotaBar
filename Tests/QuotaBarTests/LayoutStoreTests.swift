@@ -1,3 +1,4 @@
+import os
 import XCTest
 @testable import QuotaBar
 
@@ -1344,6 +1345,46 @@ final class LayoutStoreTests: XCTestCase {
         let store = makeStore("ConditionalNeverHidesCore")
         let core = try conditionalDescriptor(id: "claude.session", hidesWhenEmpty: false)
         XCTAssertTrue(store.showsRow(core, hasData: false))
+    }
+
+    /// `placed` is observable and drives the dashboard grouping and the refresh loop's provider
+    /// selection, so a layout change that does not alter the order must not republish it.
+    func testSyncPlacedOrderDoesNotRepublishAnUnchangedOrder() {
+        let store = makeStore("SyncPlacedOrderNoRepublish")
+        store.syncPlacedOrder()
+
+        let republished = RepublishFlag()
+        withObservationTracking {
+            _ = store.placed
+        } onChange: {
+            republished.set()
+        }
+
+        store.syncPlacedOrder()
+
+        XCTAssertFalse(republished.value, "an unchanged order must not be republished")
+    }
+    /// A metric the user just enabled is appended to `placed`; the sync moves it into place. That
+    /// change *is* published, and the enabled metric must still be persisted.
+    func testSyncPlacedOrderPublishesAChangedOrderAndPersistsIt() {
+        let defaults = makeDefaults("SyncPlacedOrderChanged")
+        let store = LayoutStore(registry: .mock, defaults: defaults, storageKey: "layout")
+        store.setMetricEnabled("claude.weekly", false)
+        store.setMetricEnabled("claude.weekly", true)
+
+        XCTAssertTrue(store.placed.contains { $0.descriptorID == "claude.weekly" })
+        let persisted = LayoutPersistence(defaults: defaults, storageKey: "layout").loadPlaced()
+        XCTAssertTrue(
+            persisted?.contains { $0.descriptorID == "claude.weekly" } == true,
+            "the enabled metric must reach the persisted layout"
+        )
+    }
+
+    /// A flag the observation callback can set from any executor.
+    private final class RepublishFlag: @unchecked Sendable {
+        private let state = OSAllocatedUnfairLock(initialState: false)
+        var value: Bool { state.withLock { $0 } }
+        func set() { state.withLock { $0 = true } }
     }
 
     private func makeStore(_ name: String) -> LayoutStore {
