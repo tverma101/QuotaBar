@@ -13,6 +13,9 @@ import XCTest
 @MainActor
 final class ProviderCatalogWiringTests: XCTestCase {
     private func catalogOpenCode(
+        openUsageEnvironment: EnvironmentReading = FakeEnvironment([
+            "OPENUSAGE_CODEX_ROUTER_USAGE_EVENTS": "/synthetic/router/usage-events.jsonl"
+        ]),
         codexLogHomes: [String] = [],
         openCodeClaudeRoots: @escaping @Sendable () -> [URL] = {
             OpenCodeUsageScanner.discoverClaudeRoots()
@@ -20,6 +23,7 @@ final class ProviderCatalogWiringTests: XCTestCase {
     ) throws -> OpenCodeProvider {
         try XCTUnwrap(
             ProviderCatalog.make(
+                openUsageEnvironment: openUsageEnvironment,
                 codexLogHomes: codexLogHomes,
                 openCodeClaudeRoots: openCodeClaudeRoots
             ).compactMap { $0 as? OpenCodeProvider }.first
@@ -28,8 +32,9 @@ final class ProviderCatalogWiringTests: XCTestCase {
 
     func testTheProductionScannerIsToldAboutTheRouterLedger() throws {
         let paths = try catalogOpenCode().usageScanner.routerLedgerPaths()
-        XCTAssertFalse(
-            paths.isEmpty,
+        XCTAssertEqual(
+            paths,
+            ["/synthetic/router/usage-events.jsonl"],
             "ProviderCatalog builds the scanner itself, so the router ledger must be wired there — " +
             "relying on OpenCodeProvider.init's default leaves it reading nothing in the real app"
         )
