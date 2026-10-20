@@ -206,6 +206,49 @@ final class OpenRouterUsageMapperTests: XCTestCase {
         XCTAssertNil(progress(mapped.lines, "Key Limit"))
     }
 
+    func testKeyLimitIsOmittedWhenTheRemainingAmountIsMissing() throws {
+        // `limit_remaining` is the only evidence of how much of the cap is left. Treating a missing
+        // field as zero published the cap as 100 % spent — a wrong number dressed as a measurement.
+        DiagnosticGate.clearFailure(OpenRouterUsageMapper.missingLimitRemainingDiagnosticKey)
+        let logs = try captureLogs {
+            OpenRouterUsageMapper.keyMetrics(from: ["is_free_tier": false, "usage": 2, "limit": 5])
+        }
+
+        XCTAssertNil(progress(logs.lines, "Key Limit"), "a missing remaining amount is not a measured zero")
+        XCTAssertTrue(logs.text.contains("limit"), "the missing field must leave a diagnostic: \(logs.text)")
+    }
+
+    func testKeyLimitIsOmittedWhenTheRemainingAmountIsNotNumeric() throws {
+        DiagnosticGate.clearFailure(OpenRouterUsageMapper.missingLimitRemainingDiagnosticKey)
+        let logs = try captureLogs {
+            OpenRouterUsageMapper.keyMetrics(from: ["limit": 5, "limit_remaining": "many"])
+        }
+
+        XCTAssertNil(progress(logs.lines, "Key Limit"))
+        XCTAssertFalse(logs.text.isEmpty, "an unparsable remaining amount must leave a diagnostic")
+    }
+
+    private func captureLogs(
+        _ operation: () -> (plan: String?, lines: [MetricLine])
+    ) throws -> (lines: [MetricLine], text: String) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenUsageTests.OpenRouter.\(UUID().uuidString)", isDirectory: true)
+        let sink = LogFile(directory: directory, fileName: "OpenUsage.log")
+        sink.open()
+        let originalSink = AppLog.sink
+        AppLog.sink = sink
+        AppLog.reloadLevel(.warn)
+        defer {
+            AppLog.sink = originalSink
+            AppLog.reloadLevel()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let mapped = operation()
+        let text = try String(contentsOf: sink.fileURL, encoding: .utf8)
+        return (mapped.lines, text)
+    }
+
     private func progress(_ lines: [MetricLine], _ label: String) -> (used: Double, limit: Double)? {
         guard case .progress(_, let used, let limit, _, _, _, _, _) = lines.first(where: { $0.label == label }) else {
             return nil
