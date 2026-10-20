@@ -25,6 +25,9 @@ If the CLI credentials fail but the app is signed in with a different account, t
 
 - **"Not logged in"** — run `devin auth login`, or sign into the Devin app, then refresh.
 - **"Couldn't read Devin's local credentials"** — check read access to `credentials.toml` and Devin's state database, then refresh. An existing but unreadable source is reported separately from a missing login.
+- **"Devin's service returned an error (HTTP …)"** — Devin's API answered with an error status. QuotaBar logs the status; try again in a moment.
+- **"Devin returned quota data QuotaBar couldn't read"** — the response no longer matches the expected shape. QuotaBar logs this so the change can be diagnosed.
+- **"Couldn't reach Devin"** — the request never completed. Check the connection and try again.
 - **Weekly shows the daily figure** — when Devin reports no separate weekly quota, the daily quota is shown in the Weekly row so it stays meaningful.
 
 ## Under the hood
