@@ -358,7 +358,9 @@ enum UsageHistorySnapshotRenderer {
             to: &result.lines,
             now: now,
             note: sourceNote,
-            partialDays: history.partialDays ?? []
+            partialDays: history.partialDays ?? [],
+            partialNote: result.providerID == "antigravity"
+                ? "incomplete Antigravity history is shown as a lower bound" : nil
         )
         return result
     }

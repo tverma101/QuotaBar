@@ -39,8 +39,11 @@ providers refresh only when their normal cache is stale. `notifyutil` uses a dif
 channel and does not trigger this path.
 
 Router accounting keeps compact daily checkpoints. An unchanged ledger reads no event bytes, and
-an append reads its new bytes. Rotation, rewriting existing data, a new accounting window, or changed
-prices can require rebuilding. The initial compact router fold runs without the pacing delay so it
+an append reads its new bytes. CodexRouter keeps the pricing dependencies of its completed fold, so
+changes to unrelated catalogue models reuse the checkpoint. A used rate, alias, or dated fallback
+change rebuilds it. Rotation, rewriting existing data, or a new accounting window can also require
+rebuilding. The app and CLI keep up to two recent priced checkpoints for a fold, so temporarily
+different rates do not repeatedly replace their only saved copy. The initial compact router fold runs without the pacing delay so it
 can finish within the provider deadline; the rest of instrumented automatic accounting remains paced.
 A fold reads only through the EOF captured at its start. A concurrent append keeps the completed
 prefix and leaves its new bytes for the next refresh, instead of discarding the fold and reparsing the
@@ -91,9 +94,15 @@ Same-home cards share parsed data, and changing one source file rewrites only th
 leave the cache as the history window advances, and identities unused for 35 days are removed. App writes
 are debounced until after refresh; the one-shot CLI drains pending writes before it exits.
 
-When macOS reports memory pressure, QuotaBar saves pending parse-cache writes and releases in-memory
-Codex event arrays in the background. This cleanup does not require the main thread and keeps the app
-running without clearing the usage values already on screen.
+QuotaBar keeps the capped native Codex session tail and Claude append cache warm between scans so
+appends do not reparse unchanged history. The larger CodexRouter index stays warm while the panel is
+open. When the process crosses its memory budget or macOS reports memory pressure, QuotaBar saves
+pending parse-cache writes and releases those arrays in the background. This cleanup does not require
+the main thread and keeps the app running without clearing the usage values already on screen.
+Antigravity's database rows and step-date index are evicted together under memory pressure so a later
+scan rebuilds matching rows and dates.
+Freebuff's cached receipts and completed accounting fold are also released; the next history scan
+re-reads its local databases.
 
 ## When a fetch fails
 

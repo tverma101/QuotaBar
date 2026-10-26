@@ -430,7 +430,10 @@ final class AppContainer {
         // Capture the store weakly: unloading mid-refresh races the shared CodexRouter tail / session
         // caches. Prefer waiting until the in-flight provider batch settles, then unload once.
         source.setEventHandler(handler: makeMemoryPressureHandler(
-            unload: PersistentJSONLScanCaches.unloadForMemoryPressure,
+            unload: { [weak dataStore] in
+                await PersistentJSONLScanCaches.unloadForMemoryPressure()
+                await dataStore?.unloadProviderCachesForMemoryPressure()
+            },
             shouldDefer: { [weak dataStore] in
                 await MainActor.run { !(dataStore?.refreshingProviderIDs.isEmpty ?? true) }
             }
@@ -701,9 +704,10 @@ final class AppContainer {
                     }
                     isFirstPass = false
                 }
-                // Keep the bounded CodexRouter index warm while the panel is open so append-triggered
-                // refreshes do not decode its parsed-event cache from disk each time. Hidden cycles and
-                // memory pressure release it; the durable index remains available for the next scan.
+                // Keep the larger CodexRouter index warm while the panel is open so append-triggered
+                // refreshes do not decode its parsed-event cache from disk each time. The smaller
+                // Codex session tail remains warm between cycles under its own row cap; memory pressure
+                // releases both, while the durable indexes remain available for the next scan.
                 let keepRouterIndexWarm = transparency.popoverShown && !ProcessMemoryBudget.isOverSoftLimit
                 if accountingTask == nil {
                     await PersistentJSONLScanCaches.unloadAfterRefreshCycle(

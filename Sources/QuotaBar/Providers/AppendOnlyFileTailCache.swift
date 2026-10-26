@@ -9,6 +9,18 @@ struct AppendOnlyFileRevision: Equatable, Sendable {
     var size: UInt64
 }
 
+struct AppendOnlyFileModificationTimes: Equatable, Sendable {
+    var mtimeSeconds: Int64
+    var mtimeNanoseconds: Int64
+    var ctimeSeconds: Int64
+    var ctimeNanoseconds: Int64
+}
+
+struct AppendOnlyFileStamp: Equatable, Sendable {
+    var revision: AppendOnlyFileRevision
+    var modificationTimes: AppendOnlyFileModificationTimes
+}
+
 enum AppendOnlyFileProbe {
     /// Total prefix bytes sampled when validating a large append checkpoint. Small files up to this
     /// size are compared in full. Large files spread the same tiny budget across the historical prefix.
@@ -16,16 +28,32 @@ enum AppendOnlyFileProbe {
     private static let anchorSamples = 9
 
     static func revision(at url: URL) -> AppendOnlyFileRevision? {
+        stamp(at: url)?.revision
+    }
+
+    static func modificationTimes(at url: URL) -> AppendOnlyFileModificationTimes? {
+        stamp(at: url)?.modificationTimes
+    }
+
+    static func stamp(at url: URL) -> AppendOnlyFileStamp? {
         // Resolve first, then lstat the concrete path. `stat` is imported into Swift as both the C
         // struct and function name; `lstat` avoids that overload ambiguity while resolution keeps
         // symlink aliases tied to the target file's inode rather than the link object.
         let resolved = url.resolvingSymlinksInPath()
         var value = stat()
         guard Darwin.lstat(resolved.path, &value) == 0, value.st_size >= 0 else { return nil }
-        return AppendOnlyFileRevision(
-            device: UInt64(value.st_dev),
-            inode: UInt64(value.st_ino),
-            size: UInt64(value.st_size)
+        return AppendOnlyFileStamp(
+            revision: AppendOnlyFileRevision(
+                device: UInt64(value.st_dev),
+                inode: UInt64(value.st_ino),
+                size: UInt64(value.st_size)
+            ),
+            modificationTimes: AppendOnlyFileModificationTimes(
+                mtimeSeconds: Int64(value.st_mtimespec.tv_sec),
+                mtimeNanoseconds: Int64(value.st_mtimespec.tv_nsec),
+                ctimeSeconds: Int64(value.st_ctimespec.tv_sec),
+                ctimeNanoseconds: Int64(value.st_ctimespec.tv_nsec)
+            )
         )
     }
 
@@ -93,6 +121,9 @@ enum AppendOnlyFileProbe {
 final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unchecked Sendable {
     struct Entry: Sendable {
         var revision: AppendOnlyFileRevision
+        /// Optional extra guard for consumers that must reject same-size rewrites outside sampled
+        /// prefix anchors. Append-only readers may leave this unset and rely on their own stamp.
+        var modificationTimes: AppendOnlyFileModificationTimes? = nil
         var offset: UInt64
         var anchor: Data
         var partialLine: Data
