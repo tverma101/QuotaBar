@@ -76,25 +76,44 @@ actor FreebuffModelCatalog {
         }
     }
 
-    /// Exact normalized names only; preserve every version/variant word. Ambiguous routes remain
-    /// unpriced. No fuzzy rate lookup or opaque-key-to-model guessing.
-    static func openRouterRoute(for model: String, entries: [String: Entry], pricing: ModelPricing) -> String? {
-        if pricing.openRouter.entries[model] != nil { return model }
-        return openRouterRoutes(entries: entries, pricing: pricing)[model]
+    /// Exact normalized names and explicit supplement aliases only; preserve every version/variant
+    /// word. Ambiguous routes remain unpriced. No fuzzy lookup or opaque-key-to-model guessing.
+    static func pricingRoute(for model: String, entries: [String: Entry], pricing: ModelPricing) -> String? {
+        if pricing.openRouter.entries[model] != nil || pricing.supplement.pricing[model] != nil {
+            return model
+        }
+        return pricingRoutes(entries: entries, pricing: pricing)[model]
     }
 
-    static func openRouterRoutes(entries: [String: Entry], pricing: ModelPricing) -> [String: String] {
+    static func pricingRoutes(entries: [String: Entry], pricing: ModelPricing) -> [String: String] {
         let index = Dictionary(grouping: pricing.openRouter.entries.keys.filter { $0.contains("/") }) {
             normalized(String($0.split(separator: "/").last ?? Substring($0)))
         }
-        return entries.compactMapValues { entry in
+        var routes: [String: String] = entries.compactMapValues { entry -> String? in
             guard let matches = index[normalized(entry.displayName)], matches.count == 1 else { return nil }
             return matches.first
         }
+        // OpenRouter has no separate DeepSeek Flash Fast route. A verified model-specific alias
+        // may point to a curated public route rate instead; only consider it after exact OpenRouter
+        // matching, so the public route keeps precedence and unrelated variants stay unpriced.
+        for (model, entry) in entries where routes[model] == nil {
+            guard let canonical = pricing.supplement.canonicalName(for: entry.displayName),
+                  pricing.supplement.pricing[canonical] != nil else { continue }
+            routes[model] = canonical
+        }
+        return routes
     }
 
     private static func normalized(_ name: String) -> String {
-        name.lowercased()
+        // Freebuff labels the same Haiku route once with an extra "100k context" descriptor. It is
+        // a context annotation, not a distinct route; per-request context tiers cannot be applied to
+        // its aggregated turn receipts, so route it to the exact base model entry.
+        let routeName = name.replacingOccurrences(
+            of: #"\s*(?:[·•]\s*)?100k\s+context$"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        return routeName.lowercased()
             .replacingOccurrences(of: #"\bv(?=\d)"#, with: "", options: .regularExpression)
             .filter { $0.isLetter || $0.isNumber }
     }

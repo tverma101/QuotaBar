@@ -77,7 +77,8 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         XCTAssertEqual(day.totalTokens, 300)
         XCTAssertEqual(try XCTUnwrap(day.costUSD), 0.001112, accuracy: 0.000000001)
         XCTAssertEqual(Set(scan?.usage.modelUsage?.daily.first?.models.map(\.model) ?? []),
-                       ["vendor/model-1", "vendor/recorded-model"], "receipt model wins over saved selection")
+                       ["Model 1", "vendor/recorded-model"],
+                       "catalog-named turns title rows with the display name; a receipt model wins over saved selection")
         XCTAssertTrue(day.costIsComplete)
     }
 
@@ -138,7 +139,77 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
                                     "vendor/model-1": rates
                                    ]))
         let withRoute = try await scanner.scan(now: now, pricing: pricing, modelCatalog: catalog)
-        XCTAssertEqual(withRoute?.usage.modelUsage?.daily.first?.models.map(\.model), ["vendor/model-1"])
+        XCTAssertEqual(withRoute?.usage.modelUsage?.daily.first?.models.map(\.model), ["Model 1"],
+                       "the route prices the row but the catalog name still titles it")
+    }
+
+    func testDeepSeekPeakWindowPricesBaseAndDedicatedFastRoute() async throws {
+        let formatter = ISO8601DateFormatter()
+        let peakTimestamp = try XCTUnwrap(formatter.date(from: "2026-10-26T02:00:00Z"))
+        let scanNow = peakTimestamp.addingTimeInterval(3_600)
+        let sqlite = SQLite()
+        var base = try row("turn:base")
+        base["selectedModel"] = "deepseek-base"
+        base["timestamp"] = String(peakTimestamp.timeIntervalSince1970 * 1_000)
+        var fast = try row("turn:fast")
+        fast["selectedModel"] = "deepseek-fast"
+        fast["timestamp"] = String(peakTimestamp.timeIntervalSince1970 * 1_000)
+        sqlite.rows = [base, fast]
+
+        let rates = ModelRates(
+            inputPerMillion: 0.15,
+            outputPerMillion: 0.6,
+            cacheWritePerMillion: 0.15,
+            cacheReadPerMillion: 0.003,
+            utcPriceOverrides: [
+                UTCPriceRateOverride(
+                    utcDays: ["saturday", "sunday"], utcStartMinute: nil, utcEndMinute: nil,
+                    inputPerMillion: 0.15, outputPerMillion: 0.6, cacheWritePerMillion: nil,
+                    cacheReadPerMillion: 0.003, cacheWrite1hPerMillion: nil
+                ),
+                UTCPriceRateOverride(
+                    utcDays: ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                    utcStartMinute: 60, utcEndMinute: 240,
+                    inputPerMillion: 0.3, outputPerMillion: 1.2, cacheWritePerMillion: nil,
+                    cacheReadPerMillion: 0.006, cacheWrite1hPerMillion: nil
+                )
+            ],
+            cacheReadIsExplicit: true
+        )
+        let fastRates = ModelRates(
+            inputPerMillion: 0.6, outputPerMillion: 2.4,
+            cacheWritePerMillion: 0.6, cacheReadPerMillion: 0.01,
+            cacheReadIsExplicit: true
+        )
+        let fastAlias = try NSRegularExpression(
+            pattern: "(?i)^(?:deepseek/)?(?:deepseek[- ]?)?v4(?:\\.1)?[- ]flash[- ]fast(?:[- ]?(?:10/17|1017))?$"
+        )
+        let supplement = PricingSupplement(
+            pricing: ["deepseek-v4.1-flash-fast": fastRates],
+            aliasRules: [.init(pattern: fastAlias, canonical: "deepseek-v4.1-flash-fast")]
+        )
+        let pricing = ModelPricing(
+            supplement: supplement, primary: PricingCatalog(), secondary: PricingCatalog(),
+            openRouter: PricingCatalog(entries: ["deepseek/deepseek-v4.1-flash-1017": rates])
+        )
+        let modelCatalog = [
+            "deepseek-base": FreebuffModelCatalog.Entry(
+                key: "deepseek-base", displayName: "DeepSeek V4.1 Flash 10/17"
+            ),
+            "deepseek-fast": FreebuffModelCatalog.Entry(
+                key: "deepseek-fast", displayName: "DeepSeek V4.1 Flash Fast 10/17"
+            )
+        ]
+        let scanner = FreebuffDesktopUsageScanner(sqlite: sqlite, databasePaths: { ["/fixture/no.db"] })
+
+        let scan = try await scanner.scan(now: scanNow, pricing: pricing, modelCatalog: modelCatalog)
+        let day = DailyUsageAccumulator.dayKey(from: peakTimestamp)
+        let models = try XCTUnwrap(scan?.usage.modelUsage?.daily.first?.models)
+        let fastModel = try XCTUnwrap(models.first { $0.model == "DeepSeek V4.1 Flash Fast 10/17" })
+
+        XCTAssertEqual(scan?.usage.series.daily.first?.totalTokens, 300)
+        XCTAssertEqual(try XCTUnwrap(scan?.usage.apiEstimateByDay?[day]), 0.000_199_28, accuracy: 0.000_000_001)
+        XCTAssertEqual(try XCTUnwrap(fastModel.costUSD), 0.000_132_8, accuracy: 0.000_000_001)
     }
 
     func testUnchangedHistoryIsNotDecodedAgain() async throws {
@@ -165,9 +236,9 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         XCTAssertEqual(decodes.value, 2, "an unchanged history must not be decoded again")
     }
 
-    func testRetainedHistoryStaysWithinItsCap() async throws {
-        // Every project's history used to stay resident for the life of the process. The oldest
-        // project's cache is dropped instead, and it is read again on the next fold.
+    func testAggregateCacheSurvivesTurnEvictionAndAvoidsSQLiteReads() async throws {
+        // Every project's history used to stay resident for the life of the process. Raw turns are
+        // now evicted at the cap while the bounded daily aggregate serves unchanged refreshes.
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -193,10 +264,10 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         XCTAssertEqual(sqlite.calls, 3)
 
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 4, "only the project beyond the cap is read again")
+        XCTAssertEqual(sqlite.calls, 3, "the completed daily fold survives eviction of raw turn rows")
 
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 5, "the trimmed projects rotate; the rest stay cached")
+        XCTAssertEqual(sqlite.calls, 3, "unchanged project revisions reuse the aggregate without SQLite")
     }
 
     func testProjectDatabaseListIsResolvedOncePerInterval() async throws {

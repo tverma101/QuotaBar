@@ -16,6 +16,7 @@ struct DailyUsageAccumulator {
     private var apiEstimateByDay: [String: Double] = [:]
     private var apiEstimateIncompleteDays: Set<String> = []
     private var unknownModelsByDay: [String: Set<String>] = [:]
+    private var namedUnpricedModelsByDay: [String: Set<String>] = [:]
     private var incompleteCostDays: Set<String> = []
     private var structuralIncompleteCostDays: Set<String> = []
     private var incompleteModelCostsByDay: [String: Set<String>] = [:]
@@ -477,16 +478,29 @@ struct DailyUsageAccumulator {
         apiEstimateIncompleteDays.insert(day)
     }
 
+    /// Note a model the source identified by name but no pricing source can price — Freebuff's
+    /// catalogued models with no public route, for example. Unlike `addUnknownModel` this is an
+    /// *explained* cost gap: the day's known priced subtotal stays displayed with a lower-bound
+    /// marker and no unknown-model warning fires, because there is nothing unidentified left to
+    /// name. The model's own row still shows its tokens with a dashed cost.
+    mutating func addNamedUnpricedModel(day: String, model: String) {
+        namedUnpricedModelsByDay[day, default: []].insert(model)
+        incompleteCostDays.insert(day)
+        apiEstimateIncompleteDays.insert(day)
+    }
+
     /// Assemble the scan: per-day tokens/cost (days sorted newest-first), the per-day model breakdown,
     /// and the unknown-model set. Days with unpriced rows carry all tokens and any known priced subtotal;
     /// `apiEstimateByDay` carries the public-API-rate comparison when any row could be priced.
     func build() -> LogUsageScan {
         let days = tokensByDay.keys.sorted(by: >).map { day in
+            let knownModels = unknownModelsByDay[day, default: []]
+                .union(namedUnpricedModelsByDay[day, default: []])
             let hasStructuralGap = structuralIncompleteCostDays.contains(day)
                 || !incompleteModelCostsByDay[day, default: []]
-                    .subtracting(unknownModelsByDay[day, default: []]).isEmpty
+                    .subtracting(knownModels).isEmpty
             let hasKnownCostGap = overflowedCostDays.contains(day)
-                || !unknownModelsByDay[day, default: []].isEmpty
+                || !knownModels.isEmpty
             let hasUnexplainedIncompleteCost: Bool? = hasStructuralGap ? true : (hasKnownCostGap ? false : nil)
             return DailyUsageEntry(
                 date: day,

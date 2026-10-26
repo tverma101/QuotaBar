@@ -13,9 +13,9 @@ final class FreebuffModelCatalogTests: XCTestCase {
                                     "deepseek/deepseek-v4.1-flash:free": rates
                                    ]))
         let entries = ["m-known": FreebuffModelCatalog.Entry(key: "m-known", displayName: "DeepSeek V4.1 Flash")]
-        XCTAssertEqual(FreebuffModelCatalog.openRouterRoute(for: "m-known", entries: entries, pricing: pricing),
+        XCTAssertEqual(FreebuffModelCatalog.pricingRoute(for: "m-known", entries: entries, pricing: pricing),
                        "deepseek/deepseek-v4.1-flash")
-        XCTAssertNil(FreebuffModelCatalog.openRouterRoute(for: "m-other", entries: entries, pricing: pricing))
+        XCTAssertNil(FreebuffModelCatalog.pricingRoute(for: "m-other", entries: entries, pricing: pricing))
     }
 
     func testFailingCatalogueBacksOffInsteadOfRetryingEveryTick() async throws {
