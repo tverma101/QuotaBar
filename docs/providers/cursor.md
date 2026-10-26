@@ -29,7 +29,16 @@ raise a late Keychain dialog or undo the newer action's grant.
 
 ## Spend history
 
-Today, Yesterday, Last 30 Days, and Usage Trend come from Cursor's usage export. QuotaBar requests its current 30-day CSV window, so Usage History can include only the rows Cursor returns in that export. Cached history is stamped with a one-way hash of the selected Cursor account subject or credential; when identity cannot be read without Keychain access, QuotaBar withholds the old cache until a refresh resolves the account. QuotaBar uses exported token counts and shared model pricing to estimate cost locally. Cursor may label Grok Bot work as a product (`grok-bot-*` or legacy `sand-*`) without naming its serving model. QuotaBar keeps those rows in measured token totals under their product labels, but leaves their cost unpriced and does not guess which model ran; the cost stays incomplete and the unknown-model warning lists the products. If a future export names the actual model, that model's row is priced normally. The separate Grok Bot quota meter is unaffected. Genuine model rows such as `grok-4.7` continue to count and price normally. Cursor's export may occasionally arrive late, so the newest figures can lag behind current activity. If any row is malformed or contains a token count above 1 quadrillion, QuotaBar withholds that refresh's spend export rather than publishing a partial subtotal. A failed download, invalid export schema, or broken CSV structure likewise leaves spend history unavailable for that refresh. Each failure is recorded in the diagnostic log without including the exported usage data.
+Today, Yesterday, Last 30 Days, and Usage Trend come from Cursor's usage export. QuotaBar requests its current 30-day CSV window, so Usage History can include only the rows Cursor returns in that export. Cached history is stamped with a one-way hash of the selected Cursor account subject or credential; when identity cannot be read without Keychain access, QuotaBar withholds the old cache until a refresh resolves the account. QuotaBar uses exported token counts and shared model pricing to estimate cost locally. Cursor may label Grok Bot work as a product (`grok-bot-*` or legacy `sand-*`) without naming its serving model. QuotaBar keeps those rows in measured token totals, folds them into one **Grok Bot** row in the model breakdown, and does not guess which model ran: their cost stays unpriced, the period's dollar figure shows a lower-bound (≥) marker, and no unknown-model warning fires because the product name is known — only the price is missing. If a future export names the actual model, that model's row is priced normally. A model row no source can price at all still raises the unknown-model warning. The separate Grok Bot quota meter is unaffected. Genuine model rows such as `grok-4.7` continue to count and price normally. Cursor's export may occasionally arrive late, so the newest figures can lag behind current activity. If any row is malformed or contains a token count above 1 quadrillion, QuotaBar withholds that refresh's spend export rather than publishing a partial subtotal. A failed download, invalid export schema, or broken CSV structure likewise leaves spend history unavailable for that refresh. Each failure is recorded in the diagnostic log without including the exported usage data.
+
+## Enterprise and team plans
+
+An organization seat can report a Pro plan while actually running on the Enterprise or Team
+allowance. QuotaBar prefers the organization membership Cursor reports for your account, so the plan
+badge shows Enterprise or Team instead of Pro. When the dashboard usage response leaves out Extra
+Usage for such a seat, QuotaBar fills that single row from Cursor's usage summary and keeps the live
+model-pool meters. Personal plans are never looked up there, and a failed or rate-limited lookup
+leaves the remaining rows unchanged.
 
 ## Troubleshooting
 
@@ -39,6 +48,10 @@ Today, Yesterday, Last 30 Days, and Usage Trend come from Cursor's usage export.
 - **Optional lookup failed** — Grok Bot, plan, credit-grant, prepaid-balance, and request-fallback failures stay nonfatal when primary usage is available. QuotaBar records fixed, credential-free reasons in the diagnostic log.
 
 ## Under the hood
+
+The CSV reader scans UTF-8 bytes and decodes each field once. Quoted commas, embedded newlines,
+escaped quotes, and Unicode text keep their original values; malformed exports still preserve the
+previous history.
 
 GLM 5.3 and GLM 5.3 Flash exports use both `glm-5.3` and `glm-5p3` spellings with Low, High, or Max effort suffixes. The pricing list resolves these names using [Cursor's published rates](https://cursor.com/docs/models/glm-5-3-flash), including its cache-read prices, so priced usage does not show an unknown-model warning.
 

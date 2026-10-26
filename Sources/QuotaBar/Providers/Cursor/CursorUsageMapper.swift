@@ -146,17 +146,26 @@ enum CursorUsageMapper {
         let isTeamAccount = normalizedPlan == "team" || facts.isTeamByShape
 
         if isTeamAccount {
-            guard let limitCents = facts.limit else {
+            // A Team seat can report only a percentage of the pooled allowance. Keep the legacy
+            // dollar meter whenever a limit exists, and use the percentage for the percent-only
+            // payloads instead of failing the whole provider.
+            if let limitCents = facts.limit {
+                lines.append(.progress(
+                    label: "Total usage",
+                    used: ProviderParse.centsToDollars(planUsedCents),
+                    limit: ProviderParse.centsToDollars(limitCents),
+                    format: .dollars,
+                    resetsAt: cycle.resetsAt,
+                    periodDurationMs: cycle.periodDurationMs
+                ))
+            } else if let percent = facts.totalPercentUsed {
+                lines.append(.progress(
+                    label: "Total usage", used: percent, limit: 100, format: .percent,
+                    resetsAt: cycle.resetsAt, periodDurationMs: cycle.periodDurationMs
+                ))
+            } else {
                 throw CursorUsageError.requestBasedUnavailable("Cursor request-based usage data unavailable. Try again later.")
             }
-            lines.append(.progress(
-                label: "Total usage",
-                used: ProviderParse.centsToDollars(planUsedCents),
-                limit: ProviderParse.centsToDollars(limitCents),
-                format: .dollars,
-                resetsAt: cycle.resetsAt,
-                periodDurationMs: cycle.periodDurationMs
-            ))
         } else {
             lines.append(.progress(
                 label: "Total usage",
@@ -265,17 +274,19 @@ enum CursorUsageMapper {
 
         let normalizedPlan = planName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
 
-        if facts.planUsageUnusable && normalizedPlan == "enterprise" {
+        // A usable total percentage already answers the primary path, so an org seat must not be
+        // pushed onto the request-based fallback (which would drop the live pool meters).
+        if facts.planUsageUnusable && !facts.hasTotalUsagePercent && normalizedPlan == "enterprise" {
             return (true, "Enterprise usage data unavailable. Try again later.")
         }
-        if facts.planUsageUnusable && normalizedPlan == "team" {
+        if facts.planUsageUnusable && !facts.hasTotalUsagePercent && normalizedPlan == "team" {
             return (true, "Team request-based usage data unavailable. Try again later.")
         }
         if facts.planUsageUnusable && !facts.hasTotalUsagePercent && normalizedPlan.isEmpty && planInfoUnavailable {
             return (true, "Cursor request-based usage data unavailable. Try again later.")
         }
 
-        if facts.isTeamByShape && facts.planUsageLimitMissing {
+        if facts.isTeamByShape && facts.planUsageLimitMissing && !facts.hasTotalUsagePercent {
             return (true, "Cursor request-based usage data unavailable. Try again later.")
         }
 
@@ -319,6 +330,11 @@ enum CursorUsageMapper {
         // triangle and the reveal system. Only rows that actually spent tokens flag the day — a
         // 0-token row of an unknown model changes nothing.
         var unknownModelsByDay: [String: Set<String>] = [:]
+        // Days whose incompleteness comes from Grok Bot product-labeled rows: Cursor named the
+        // product, not the serving model, and the parser deliberately keeps those tokens unpriced
+        // rather than guessing a model. That is an explained gap — the day's priced subtotal stays
+        // displayed with its lower-bound marker and no unknown-model warning fires.
+        var productLabeledIncompleteCostDays: Set<String> = []
         for (index, row) in rows.enumerated() {
             if index & 0x7F == 0, Task<Never, Never>.isCancelled { throw CancellationError() }
             let day = DailyUsageAccumulator.dayKey(from: row.date, calendar: calendar)
@@ -349,10 +365,12 @@ enum CursorUsageMapper {
             guard let cost = row.imputedCostDollars else {
                 if row.tokens.totalTokens > 0 {
                     incompleteCostDays.insert(day)
-                    if !model.isEmpty {
-                        unknownModelsByDay[day, default: []].insert(model)
-                    } else {
+                    if model.isEmpty {
                         unexplainedIncompleteCostDays.insert(day)
+                    } else if CursorUsageCSV.isOpaqueGrokBotProductLabel(model) {
+                        productLabeledIncompleteCostDays.insert(day)
+                    } else {
+                        unknownModelsByDay[day, default: []].insert(model)
                     }
                 }
                 let previousTokens = tokensByDay[day, default: 0]
@@ -404,7 +422,8 @@ enum CursorUsageMapper {
                 costUSD: costByDay[day].map(Self.roundToCents),
                 costIsComplete: !incompleteCostDays.contains(day),
                 hasUnexplainedIncompleteCost: unexplainedIncompleteCostDays.contains(day)
-                    ? true : (overflowedCostDays.contains(day) ? false : nil),
+                    ? true : (overflowedCostDays.contains(day) || productLabeledIncompleteCostDays.contains(day)
+                        ? false : nil),
                 tokenCountSaturated: tokenCountSaturatedDays.contains(day)
             )
         }
@@ -437,8 +456,11 @@ enum CursorUsageMapper {
 
     /// The display family for a raw CSV slug: its canonical pricing key with a `-fast` suffix folded
     /// into the base (`gpt-5.5-extra-high-fast` → `gpt-5.5-fast` → `gpt-5.5`). Slugs no alias rule
-    /// knows keep their raw name — a wrong guess would silently merge unrelated models.
+    /// knows keep their raw name — a wrong guess would silently merge unrelated models. Grok Bot
+    /// product labels name the product, not a model, so their family is that product's display name
+    /// (the raw slugs survive as the row's tooltip variants).
     private static func familyName(for model: String, pricing: ModelPricing) -> String {
+        if CursorUsageCSV.isOpaqueGrokBotProductLabel(model) { return "Grok Bot" }
         let canonical = pricing.cursorCanonicalName(for: model) ?? pricing.canonicalName(for: model) ?? model
         guard canonical.hasSuffix("-fast") else { return canonical }
         let base = String(canonical.dropLast("-fast".count))
@@ -565,7 +587,7 @@ enum CursorUsageMapper {
         )
     }
 
-    private static func planLabel(_ value: String?) -> String? {
+    static func planLabel(_ value: String?) -> String? {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }

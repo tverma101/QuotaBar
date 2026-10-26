@@ -93,7 +93,9 @@ final class CursorCSVParserTests: XCTestCase {
     }
 
     /// Cursor names Grok Bot work by product, never by the model that served it. Keep measured tokens
-    /// under the product label while leaving cost unpriced and the serving model unattributed.
+    /// under the product label while leaving cost unpriced and the serving model unattributed — and
+    /// because the product label is a known name (not an unidentified model), the day's gap is
+    /// explained: the priced subtotal keeps its lower-bound marker and no unknown-model warning fires.
     func testOpaqueGrokBotCSVRowsKeepMeasuredTokensWithoutInferringServingModel() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let date = ISO8601DateFormatter().string(from: now)
@@ -119,11 +121,13 @@ final class CursorCSVParserTests: XCTestCase {
             pricing: TestPricing.bundled,
             to: &lines
         )
-        let dayKey = DailyUsageAccumulator.dayKey(from: now)
         XCTAssertEqual(history.series.daily.first?.totalTokens, 50_600,
                        "opaque product rows carry measured tokens even when their serving model is unknown")
         XCTAssertEqual(history.series.daily.first?.costIsComplete, false)
-        XCTAssertEqual(history.unknownModelsByDay[dayKey], Set(["grok-bot-cua", "grok-bot-default", "sand-automation"]))
+        XCTAssertTrue(history.series.daily.first?.hasUnexplainedIncompleteCost == false,
+                      "a product label names the work; the missing price is explained, not unexplained")
+        XCTAssertNil(history.unknownModelsByDay[DailyUsageAccumulator.dayKey(from: now)],
+                     "known product labels are not unknown models and must not raise the warning")
         XCTAssertEqual(history.modelUsage?.daily.first?.models.reduce(0) {
             ProviderParse.addingSaturating($0, $1.totalTokens)
         }, 50_600)
@@ -135,8 +139,10 @@ final class CursorCSVParserTests: XCTestCase {
         XCTAssertEqual(todayValues, [
             MetricValue(number: 0.10, kind: .dollars, estimated: true, isLowerBound: true),
             MetricValue(number: 50_600, kind: .count, label: "tokens")
-        ], "the known Grok subtotal remains visible beside unpriced Bot rows")
-        XCTAssertEqual(unknownModels, ["grok-bot-cua", "grok-bot-default", "sand-automation"])
+        ], "the known Grok subtotal remains visible with its lower-bound marker")
+        XCTAssertTrue(unknownModels.isEmpty, "no warning triangle fires for known product labels")
+        XCTAssertEqual(history.modelUsage?.daily.first?.models.first { $0.model == "Grok Bot" }?.totalTokens, 600,
+                       "the product rows fold into one Grok Bot family row")
     }
 
     func testUsageCSVKeepsLargeNonOverflowingTokenCounts() throws {

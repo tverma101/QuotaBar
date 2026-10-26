@@ -191,16 +191,28 @@ final class CursorProvider: ProviderRuntime {
         // The access token may have rotated during the usage fetch's refresh-and-retry; read the live one.
         let currentToken = authState.accessToken ?? accessToken
 
-        let (planName, planInfoUnavailable) = try await fetchPlanName(accessToken: currentToken)
+        let (planInfoName, planInfoUnavailable) = try await fetchPlanName(accessToken: currentToken)
+        // Three answers that must stay apart:
+        // - the routing plan decides which REST fallback serves the account,
+        // - the display plan is the badge next to the provider name,
+        // - the raw plan info keeps `mapUsage` branching on what Cursor reported.
+        let routingPlanName = CursorUsageMapper.routingPlanName(
+            planInfoName: planInfoName,
+            membershipType: authState.membershipType
+        )
+        let displayPlanName = CursorUsageMapper.resolvedPlanName(
+            planInfoName: planInfoName,
+            membershipType: authState.membershipType
+        )
         let fallback = CursorUsageMapper.shouldUseRequestBasedFallback(
             usage: usage,
-            planName: planName,
+            planName: routingPlanName,
             planInfoUnavailable: planInfoUnavailable
         )
         if fallback.shouldFallback {
             var mapped = try await usageSummaryAndRequestResult(
                 accessToken: currentToken,
-                planName: planName,
+                planName: displayPlanName ?? routingPlanName,
                 unavailableMessage: fallback.message
             )
             try await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
@@ -211,7 +223,7 @@ final class CursorProvider: ProviderRuntime {
             do {
                 var mapped = try await requestBasedResult(
                     accessToken: currentToken,
-                    planName: planName,
+                    planName: displayPlanName ?? routingPlanName,
                     unavailableMessage: "Cursor request-based usage data unavailable. Try again later."
                 )
                 clearOptionalWarnings(kind: "optional", label: "request-based usage")
@@ -235,12 +247,76 @@ final class CursorProvider: ProviderRuntime {
         let stripeBalanceCents = try await fetchStripeBalanceCents(accessToken: currentToken)
         var mapped = try CursorUsageMapper.mapUsage(
             usage: usage,
-            planName: planName,
+            planName: planInfoName,
             creditGrants: creditGrants,
             stripeBalanceCents: stripeBalanceCents
         )
+        mapped.plan = CursorUsageMapper.resolvedPlanLabel(
+            planInfoName: planInfoName,
+            membershipType: authState.membershipType
+        )
+        try await enrichPrimaryUsageFromSummaryIfNeeded(
+            accessToken: currentToken,
+            usage: usage,
+            planInfoName: planInfoName,
+            membershipType: authState.membershipType,
+            mapped: &mapped
+        )
         try await appendGrokBotUsage(to: &mapped.lines, accessToken: currentToken)
         return try await snapshotWithOptionalSpend(mapped, accessToken: currentToken)
+    }
+
+    /// Model-pool Enterprise/team seats often keep a usable primary usage payload but omit
+    /// on-demand there. usage-summary still carries Extra Usage for those accounts.
+    ///
+    /// This is an optional enrichment, never a new failure mode: it does not fail the provider,
+    /// does not retry, and only runs for org-billed seats (a personal Pro pool must not add a
+    /// request to every refresh). A missing, failed, or rate-limited usage-summary response leaves
+    /// the live pool meters exactly as they were.
+    private func enrichPrimaryUsageFromSummaryIfNeeded(
+        accessToken: String,
+        usage: [String: Any],
+        planInfoName: String?,
+        membershipType: String?,
+        mapped: inout CursorMappedUsage
+    ) async throws {
+        let needsOnDemand = !mapped.lines.contains(where: { $0.label == "On-demand" })
+        let facts = CursorPlanUsageFacts(usage: usage)
+        let localIsOrg = membershipType.map { CursorUsageMapper.orgMembershipTypes.contains($0) } ?? false
+        // Only org / team-shaped seats: personal Pro model pools must not trigger usage-summary.
+        guard localIsOrg || facts.isTeamByShape else { return }
+        // The local org membership already fixed the badge; skip the extra call when Extra Usage
+        // is present.
+        if localIsOrg, !needsOnDemand { return }
+
+        guard let summary = try await fetchOptionalJSONObject(label: "usage-summary", request: {
+            try await self.usageClient.fetchUsageSummary(accessToken: accessToken)
+        }) else {
+            return
+        }
+        guard CursorUsageSummaryMapper.hasUsableSummaryPayload(summary) else {
+            logOptionalWarning(
+                kind: "schema",
+                label: "usage-summary",
+                reason: "no-usable-fields",
+                message: "optional usage-summary response contained no usable usage fields"
+            )
+            return
+        }
+        clearOptionalWarnings(kind: "schema", label: "usage-summary")
+        if needsOnDemand {
+            CursorUsageSummaryMapper.appendMissingOnDemand(from: summary, to: &mapped.lines)
+        }
+        let summaryMembership = (summary["membershipType"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        mapped.plan = CursorUsageMapper.resolvedPlanLabel(
+            planInfoName: planInfoName,
+            membershipType: CursorUsageMapper.preferredMembership(
+                local: membershipType,
+                summary: summaryMembership
+            )
+        ) ?? mapped.plan
     }
 
     /// Meters-only passes (menu-bar ticks, panel phase 1) keep Auto/API (and sibling) quota meters;
