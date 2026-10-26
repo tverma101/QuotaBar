@@ -104,7 +104,20 @@ final class ModelPricing: Sendable {
                     tier.cacheWrite1hPerMillion.map { String($0) } ?? "nil"
                 ].joined(separator: ":")
             }
-            return (base + tiers).joined(separator: ":")
+            let utcTiers: [String] = (rates.utcPriceOverrides ?? []).map { tier in
+                var fields: [String] = []
+                fields.reserveCapacity(8)
+                fields.append((tier.utcDays ?? []).joined(separator: ","))
+                fields.append(tier.utcStartMinute.map { String($0) } ?? "nil")
+                fields.append(tier.utcEndMinute.map { String($0) } ?? "nil")
+                fields.append(tier.inputPerMillion.map { String($0) } ?? "nil")
+                fields.append(tier.outputPerMillion.map { String($0) } ?? "nil")
+                fields.append(tier.cacheWritePerMillion.map { String($0) } ?? "nil")
+                fields.append(tier.cacheReadPerMillion.map { String($0) } ?? "nil")
+                fields.append(tier.cacheWrite1hPerMillion.map { String($0) } ?? "nil")
+                return fields.joined(separator: ":")
+            }
+            return (base + tiers + utcTiers).joined(separator: ":")
         }
         func stamp(_ name: String, _ entries: [String: ModelRates]) {
             parts.append(name)

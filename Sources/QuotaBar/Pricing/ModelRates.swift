@@ -53,9 +53,48 @@ struct PromptRateTier: Codable, Sendable, Equatable {
     }
 }
 
+/// OpenRouter price lane selected by UTC weekday and time. These overrides are useful for
+/// per-event histories such as Freebuff receipts; aggregate provider logs without event timestamps
+/// continue using the base rate.
+struct UTCPriceRateOverride: Codable, Sendable, Equatable {
+    var utcDays: [String]?
+    var utcStartMinute: Int?
+    var utcEndMinute: Int?
+    var inputPerMillion: Double?
+    var outputPerMillion: Double?
+    var cacheWritePerMillion: Double?
+    var cacheReadPerMillion: Double?
+    var cacheWrite1hPerMillion: Double?
+
+    func matches(weekday: String, previousWeekday: String, minuteOfDay: Int) -> Bool {
+        let currentDayMatches = utcDays?.contains(weekday) ?? true
+        switch (utcStartMinute, utcEndMinute) {
+        case let (start?, end?):
+            if start < end {
+                return currentDayMatches && minuteOfDay >= start && minuteOfDay < end
+            }
+            if start > end {
+                let previousDayMatches = utcDays?.contains(previousWeekday) ?? true
+                return (currentDayMatches && minuteOfDay >= start)
+                    || (previousDayMatches && minuteOfDay < end)
+            }
+            return false
+        case let (start?, nil):
+            return currentDayMatches && minuteOfDay >= start
+        case let (nil, end?):
+            return currentDayMatches && minuteOfDay < end
+        case (nil, nil):
+            return currentDayMatches
+        }
+    }
+}
+
 /// Per-million-token USD rates for one model, plus optional long-context tiers and a fast-variant
 /// multiplier. All spend imputation (Claude, Codex, Cursor, Grok) prices through these.
-struct ModelRates: Sendable, Equatable {
+///
+/// `Codable` so a fold can persist the exact rates it priced with and compare them against a later
+/// catalogue snapshot, field for field, instead of against a hash of the whole catalogue.
+struct ModelRates: Sendable, Equatable, Codable {
     var inputPerMillion: Double
     var outputPerMillion: Double
     /// 5-minute ephemeral cache writes (Anthropic-style). For providers without a separate
@@ -69,6 +108,9 @@ struct ModelRates: Sendable, Equatable {
     /// Source-published prompt-length tiers. Unlike the legacy single 200k fields below, these can
     /// represent several thresholds and distinct cache lanes.
     var promptRateTiers: [PromptRateTier] = []
+
+    /// Source-published UTC weekday/time pricing lanes. Nil means the source has no timed rates.
+    var utcPriceOverrides: [UTCPriceRateOverride]? = nil
 
     /// Rates for requests whose prompt exceeds the model's long-context threshold, where the
     /// provider prices the whole request at the higher tier. Field names retain the catalog's
@@ -101,6 +143,18 @@ struct ModelRates: Sendable, Equatable {
                 PromptRateTier(
                     thresholdPromptTokens: tier.thresholdPromptTokens,
                     includesThreshold: tier.includesThreshold,
+                    inputPerMillion: tier.inputPerMillion.map { $0 * factor },
+                    outputPerMillion: tier.outputPerMillion.map { $0 * factor },
+                    cacheWritePerMillion: tier.cacheWritePerMillion.map { $0 * factor },
+                    cacheReadPerMillion: tier.cacheReadPerMillion.map { $0 * factor },
+                    cacheWrite1hPerMillion: tier.cacheWrite1hPerMillion.map { $0 * factor }
+                )
+            },
+            utcPriceOverrides: utcPriceOverrides?.map { tier in
+                UTCPriceRateOverride(
+                    utcDays: tier.utcDays,
+                    utcStartMinute: tier.utcStartMinute,
+                    utcEndMinute: tier.utcEndMinute,
                     inputPerMillion: tier.inputPerMillion.map { $0 * factor },
                     outputPerMillion: tier.outputPerMillion.map { $0 * factor },
                     cacheWritePerMillion: tier.cacheWritePerMillion.map { $0 * factor },
@@ -145,10 +199,20 @@ extension ModelRates {
     /// 1-hour cache writes are billed at twice the input rate (ccusage's rule; matches LiteLLM's
     /// explicit `above_1hr` fields where present).
     private static let cacheWrite1hInputMultiplier = 2.0
+    private static let utcWeekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+    private static let utcCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+        return calendar
+    }()
 
     /// Dollar cost of one request at these rates, applying the request-wide long-context tier and
     /// fast multiplier. Aggregated sources can opt out when their totals do not preserve request boundaries.
-    func costDollars(for tokens: TokenBreakdown, applyLongContextRates: Bool = true) -> Double {
+    func costDollars(
+        for tokens: TokenBreakdown,
+        at timestamp: Date? = nil,
+        applyLongContextRates: Bool = true
+    ) -> Double {
         let multiplier = tokens.isFast ? fastMultiplier : 1
         let useLongContextRates = applyLongContextRates && tokens.promptTokens > longContextThresholdTokens
         let selectedPromptTier = applyLongContextRates
@@ -160,23 +224,30 @@ extension ModelRates {
                 }
                 .max { $0.thresholdPromptTokens < $1.thresholdPromptTokens }
             : nil
-        let inputRate = selectedRate(base: inputPerMillion, longContext: inputAbove200kPerMillion,
+        let timedRates = timestamp.flatMap { utcPriceOverride(at: $0) }
+        let inputRate = selectedRate(base: timedRates?.inputPerMillion ?? inputPerMillion,
+                                     longContext: inputAbove200kPerMillion,
                                      promptTier: selectedPromptTier?.inputPerMillion,
                                      useLongContextRates: useLongContextRates)
-        let outputRate = selectedRate(base: outputPerMillion, longContext: outputAbove200kPerMillion,
+        let outputRate = selectedRate(base: timedRates?.outputPerMillion ?? outputPerMillion,
+                                      longContext: outputAbove200kPerMillion,
                                       promptTier: selectedPromptTier?.outputPerMillion,
                                       useLongContextRates: useLongContextRates)
-        let cacheWriteRate = selectedRate(base: cacheWritePerMillion, longContext: cacheWriteAbove200kPerMillion,
+        let cacheWriteRate = selectedRate(base: timedRates?.cacheWritePerMillion ?? cacheWritePerMillion,
+                                          longContext: cacheWriteAbove200kPerMillion,
                                           promptTier: selectedPromptTier?.cacheWritePerMillion,
                                           useLongContextRates: useLongContextRates)
         let cacheReadRate = cacheReadIsExplicit
-            ? selectedRate(base: cacheReadPerMillion, longContext: cacheReadAbove200kPerMillion,
+            ? selectedRate(base: timedRates?.cacheReadPerMillion ?? cacheReadPerMillion,
+                           longContext: cacheReadAbove200kPerMillion,
                            promptTier: selectedPromptTier?.cacheReadPerMillion,
                            useLongContextRates: useLongContextRates)
             : inputRate
         let cacheWrite1hRate = selectedPromptTier?.cacheWrite1hPerMillion
+            ?? timedRates?.cacheWrite1hPerMillion
             ?? cacheWrite1hPerMillion
-            ?? selectedRate(base: inputPerMillion, longContext: inputAbove200kPerMillion,
+            ?? selectedRate(base: timedRates?.inputPerMillion ?? inputPerMillion,
+                            longContext: inputAbove200kPerMillion,
                             promptTier: selectedPromptTier?.inputPerMillion,
                             useLongContextRates: useLongContextRates) * Self.cacheWrite1hInputMultiplier
 
@@ -186,6 +257,24 @@ extension ModelRates {
             + cost(tokens.cacheWrite1h, at: cacheWrite1hRate)
             + cost(tokens.cacheRead, at: cacheReadRate)
         return cost * multiplier
+    }
+
+    private func utcPriceOverride(at timestamp: Date) -> UTCPriceRateOverride? {
+        guard let overrides = utcPriceOverrides, !overrides.isEmpty else { return nil }
+        let components = Self.utcCalendar.dateComponents([.weekday, .hour, .minute], from: timestamp)
+        guard let weekdayIndex = components.weekday,
+              let hour = components.hour,
+              let minute = components.minute,
+              (1...Self.utcWeekdays.count).contains(weekdayIndex) else { return nil }
+        let index = weekdayIndex - 1
+        let previousIndex = (index + Self.utcWeekdays.count - 1) % Self.utcWeekdays.count
+        return overrides.first {
+            $0.matches(
+                weekday: Self.utcWeekdays[index],
+                previousWeekday: Self.utcWeekdays[previousIndex],
+                minuteOfDay: hour * 60 + minute
+            )
+        }
     }
 
     private func selectedRate(
