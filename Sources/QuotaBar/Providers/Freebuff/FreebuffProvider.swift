@@ -20,6 +20,10 @@ final class FreebuffProvider: ProviderRuntime {
     let pricing: @Sendable () async -> ModelPricing
     let now: @Sendable () -> Date
 
+    func unloadLocalAccountingCachesForMemoryPressure() async {
+        await historyScanner.unloadCachesForMemoryPressure()
+    }
+
     init(
         historyScanner: FreebuffDesktopUsageScanner = FreebuffDesktopUsageScanner(),
         authStore: FreebuffAuthStore = FreebuffAuthStore(),
@@ -180,7 +184,7 @@ final class FreebuffProvider: ProviderRuntime {
         }
     }
 
-    private static let historySourceNote = "Measured Freebuff Desktop tokens on this Mac. Dollars estimate the same tokens at OpenRouter API rates, not Freebuff charges. Older turns use the thread's saved model selection; it can differ from past serving models and subagents. Unresolved models remain Unattributed or unpriced. Cache reads are included in input; aggregate turns do not use single-request context tiers."
+    private static let historySourceNote = "Measured Freebuff Desktop tokens on this Mac; dollars estimated at public API rates, not Freebuff charges."
 
     private static func usageFailureDiagnosticKey(_ error: Error) -> String {
         usageFailureDiagnosticPrefix + String(reflecting: type(of: error))

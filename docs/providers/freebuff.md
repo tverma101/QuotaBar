@@ -2,8 +2,9 @@
 
 QuotaBar reads Freebuff's existing CLI login and shows current hours balances and reset times.
 It does not start a Freebuff session. Freebuff is enabled by default even when you have not logged in;
-turn it off in Customize if you do not want its card. Its metrics are always-visible by default, it is
-unpinned, and it appears in the alphabetical provider order.
+turn it off in Customize if you do not want its card. Its metrics are always-visible by default, the
+Daily Hours meter is pinned to the menu bar so live session usage stays visible while you are active,
+and it appears in the alphabetical provider order.
 
 ## Credentials
 
@@ -49,24 +50,49 @@ keep their session windows. Monthly Spend appears only when the server supplies 
 Hours and tokens are separate measurements; neither is converted into the other.
 
 **Today**, **Yesterday**, and **Last 30 Days** show measured tokens from Freebuff Desktop on this Mac.
-They are enabled, Always Visible, and unpinned by default. QuotaBar reads only the measured usage
-column in `~/.config/freebuff-desktop/projects/*/desktop-v2.db`, not conversation text. Unchanged
-database and WAL files reuse the previous read, and the measured numbers are kept rather than the raw
-receipt JSON, so an unchanged history is not decoded again on every refresh; changed turns replace
-their latest measurement. A row that carries no identifier or timestamp is skipped — and logged —
-instead of making the whole history unreadable. Cached input tokens are already in input, and
-reasoning tokens are already in output, so neither is added again. Incomplete receipts keep their
-coverage flags in details. Missing history stays No Data. The remembered history is capped: the
-oldest project is read again when the cap is reached, so long-lived installs stay bounded.
+They are enabled, Always Visible, and unpinned by default. QuotaBar reads usage from assistant-message
+metrics and the separate `auto_run_decision_receipts.manager_json.usage` records in
+`~/.config/freebuff-desktop/projects/*/desktop-v2.db`, never conversation text. The mission manager's
+recorded model and start time are used for its estimate. `outcome_json.usage` is excluded because it
+repeats the completed assistant response; older databases without the manager-receipt table still
+provide assistant-message history. Unchanged database and WAL files reuse the previous read and
+complete daily fold, so an unchanged history is not decoded or re-aggregated on every refresh. If
+pricing changes, cached measured rows are repriced without another SQLite read while their per-turn
+entries remain cached. Changed turns replace their latest measurement. A row that carries no
+identifier or timestamp is skipped — and logged — instead of making the whole history unreadable. The
+per-turn cache is capped; an evicted project is read again only when a source or pricing change
+requires a new fold. Cached input tokens are already in input, and reasoning tokens are already in
+output, so neither is added again. Incomplete receipts keep their coverage flags in details. Missing
+history stays No Data. Both the per-turn cache and completed aggregate stay bounded so long-lived
+installs do not keep every raw receipt in memory.
 
-Dollar values are **OpenRouter API price estimates**, not Freebuff's recorded charges. Models
+Dollar values are **public API price estimates**, not Freebuff's recorded charges. QuotaBar uses
+OpenRouter for exact routes except for Fast's curated Vercel AI Gateway route. Model rows carry the
+catalogue's display name whenever one is known, so priced and unpriced turns of the same model read
+as one row instead of splitting across a routing slug and a friendly name. Models
 recorded on receipts take priority. For older receipts, estimates use each thread's saved model
-selection, resolved through Freebuff's model catalogue and an exact OpenRouter route. That selection
-can differ from past serving models or subagents; the model detail explains this limitation. Opaque
-or ambiguous identities remain Unattributed or unpriced, and all measured tokens still count.
-Cached input is priced separately from uncached input; reasoning stays inside output. Since a turn
-aggregates multiple requests, single-request long-context tiers are not applied. The local rows cover
-Desktop only, not CLI or web traffic. Model identities are cached locally without handles or tokens;
+selection, resolved through Freebuff's model catalogue and an exact OpenRouter route. A
+`100k context` label resolves to the same Claude Haiku 5.5 route; receipts aggregate multiple
+requests, so QuotaBar uses the route's standard rates instead of guessing whether an individual
+request crossed a long-context price tier. That selection can differ from past serving models or
+subagents. A model the catalogue names but no public route prices keeps its tokens and shows a
+dashed cost without raising the unknown-model warning — the
+model is known, only its price is missing. Opaque or ambiguous identities remain Unattributed or
+unpriced and do raise the warning; all measured tokens still count either way.
+Cached input is priced separately from uncached input; reasoning stays inside output. DeepSeek V4.1
+Flash's dated OpenRouter route publishes UTC weekday/time price windows, which QuotaBar applies at
+each stored assistant-message or mission-manager timestamp. A turn can aggregate calls across a
+window boundary, so that estimate is approximate for those turns. The route metadata does not include
+DeepSeek's Chinese-public-holiday exception. Fast mode uses a separate Pareto route in Freebuff, so
+its exact backend cost and Freebucks charge are not available in local receipts. QuotaBar now prices
+persisted Fast-root tokens at the public DeepSeek V4.1 Flash Fast route listed by Vercel AI Gateway:
+$0.60 input, $2.40 output, and $0.01 cached input per million tokens. This is a public API comparison,
+not an estimate of Pareto's internal cost or Freebuff's Freebucks charge. The estimate uses the
+recorded Fast model identity and tokens directly, with no added allowance for hypothetical helper
+calls. Freebuff's actual allowance and charges are server-side Freebucks, not token-priced dollars.
+Since a turn aggregates multiple requests,
+single-request long-context tiers are not applied. The local rows cover Desktop only, not CLI or web
+traffic. Model identities are cached locally without handles or tokens;
 unchanged catalogues refresh at most hourly, and a catalogue endpoint that keeps failing is retried
 at most hourly as well. Public OpenRouter rates use the app's existing pricing cache. A fresh
 installation needs Desktop usage before local history can appear.
@@ -86,3 +112,5 @@ are not presented as connection failures.
 - [Freebuff Keychain token store](https://github.com/CodebuffAI/freebuff/blob/main/cli/src/utils/auth-token-store.ts)
 - [Freebuff config directory](https://github.com/CodebuffAI/freebuff/blob/main/cli/src/utils/config-dir.ts)
 - [Freebuff hours conversion](https://github.com/CodebuffAI/freebuff/blob/main/common/src/util/freebuff-hours.ts)
+- [Freebuff model catalog and Fast-mode pricing notes](https://github.com/CodebuffAI/freebuff/blob/main/common/src/constants/freebuff-models.ts)
+- [DeepSeek model prices and peak-hour schedule](https://api-docs.deepseek.com/quick_start/pricing/)
