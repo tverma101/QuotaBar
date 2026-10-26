@@ -689,37 +689,38 @@ actor CodexRouterUsageScanner {
     /// running supplement alias regexes, formatting every timestamp, and resolving the same model for
     /// each of the ledger's many events.
     private final class RouterModelPricingCache: @unchecked Sendable {
-        fileprivate struct Resolved: Sendable {
-            var pricingModel: String
-            var rates: ModelRates
-            var canonicalModel: String
-            var priorityMultiplier: Double
-        }
-
         private struct FallbackKey: Hashable {
             var model: String
             var utcDay: Int
         }
 
         private enum ModelState {
-            case priced(Resolved)
+            case priced(CodexRouterPricingResolution)
             case datedFallback
             case unpriced
         }
 
         private enum FallbackState {
-            case priced(Resolved)
+            case priced(CodexRouterPricingResolution)
             case unpriced
         }
 
         private let lock = NSLock()
         private var modelStates: [String: ModelState] = [:]
         private var datedFallbacks: [FallbackKey: FallbackState] = [:]
+        /// Every resolution this fold priced, so a later catalogue change can be checked against
+        /// what the fold actually used instead of against the whole catalogue.
+        private var dependencies: [String: CodexRouterPricingDependency] = [:]
 
-        fileprivate func resolve(model: String, at timestamp: Date, pricing: ModelPricing) -> Resolved? {
+        fileprivate func resolve(
+            model: String,
+            at timestamp: Date,
+            pricing: ModelPricing
+        ) -> CodexRouterPricingResolution? {
             let state = lock.withLock { modelStates[model] }
             switch state {
             case .priced(let resolved):
+                // The dependency was recorded when the state was created.
                 return resolved
             case .unpriced:
                 return nil
@@ -729,25 +730,21 @@ actor CodexRouterUsageScanner {
                 break
             }
 
-            let candidates = CodexRouterUsageScanner.pricingModelCandidates(for: model)
-            // Prefer an exact catalog key so gateway-tagged slugs group under the model they route to.
-            let exactIdentity = pricing.canonicalKey(for: candidates)
-            if let pricingModel = exactIdentity
-                ?? candidates.first(where: { pricing.resolve(model: $0) != nil }),
-               let rates = pricing.resolve(model: pricingModel) {
-                let resolved = makeResolved(
-                    model: model,
-                    pricingModel: pricingModel,
-                    rates: rates
-                )
-                lock.withLock { modelStates[model] = .priced(resolved) }
+            if let resolved = CodexRouterPricingResolver.resolveCatalog(model: model, pricing: pricing) {
+                store(CodexRouterPricingDependency(model: model, utcDay: nil, resolution: resolved)) {
+                    self.modelStates[model] = .priced(resolved)
+                }
                 return resolved
             }
 
-            guard CodexLogUsageScanner.pricingFallbackModel(for: model, at: "") != nil else {
-                lock.withLock { modelStates[model] = .unpriced }
+            guard CodexRouterPricingResolver.isDatedFallback(model: model) else {
+                store(CodexRouterPricingDependency(model: model, utcDay: nil, resolution: nil)) {
+                    self.modelStates[model] = .unpriced
+                }
                 return nil
             }
+            // A dated reserve slug is recorded per UTC day, not per model: the day decides which
+            // model prices it.
             lock.withLock { modelStates[model] = .datedFallback }
             return resolveDatedFallback(model: model, at: timestamp, pricing: pricing)
         }
@@ -756,47 +753,51 @@ actor CodexRouterUsageScanner {
             model: String,
             at timestamp: Date,
             pricing: ModelPricing
-        ) -> Resolved? {
+        ) -> CodexRouterPricingResolution? {
             let key = FallbackKey(
                 model: model,
                 utcDay: Int(timestamp.timeIntervalSince1970 / 86_400)
             )
             if let state = lock.withLock({ datedFallbacks[key] }) {
                 switch state {
-                case .priced(let resolved): return resolved
-                case .unpriced: return nil
+                case .priced(let resolved):
+                    // The dependency was recorded when the day was resolved.
+                    return resolved
+                case .unpriced:
+                    return nil
                 }
             }
 
             let timestampString = OpenUsageISO8601.string(from: timestamp)
-            let fallbackModel = CodexLogUsageScanner.pricingFallbackModel(
-                for: model,
-                at: timestampString
+            let utcDay = String(timestampString.prefix(10))
+            let resolved = CodexRouterPricingResolver.resolveDatedFallback(
+                model: model,
+                utcDay: utcDay,
+                pricing: pricing
             )
-            let resolved = fallbackModel.flatMap { fallbackModel in
-                pricing.resolve(model: fallbackModel).map { rates in
-                    makeResolved(model: model, pricingModel: fallbackModel, rates: rates)
-                }
-            }
-            lock.withLock {
-                datedFallbacks[key] = resolved.map(FallbackState.priced) ?? .unpriced
+            store(CodexRouterPricingDependency(model: model, utcDay: utcDay, resolution: resolved)) {
+                self.datedFallbacks[key] = resolved.map { FallbackState.priced($0) } ?? .unpriced
             }
             return resolved
         }
 
-        private func makeResolved(
-            model: String,
-            pricingModel: String,
-            rates: ModelRates
-        ) -> Resolved {
-            Resolved(
-                pricingModel: pricingModel,
-                rates: rates,
-                canonicalModel: GatewaySlug.identity(of: model, resolvedPricingModel: pricingModel),
-                priorityMultiplier: CodexLogUsageScanner.codexPriorityMultiplier(
-                    for: pricingModel,
-                    rates: rates
-                )
+        /// Record what the fold priced and update the memo in one step, so the hot path stays a
+        /// single dictionary read per event.
+        private func store(
+            _ dependency: CodexRouterPricingDependency,
+            _ update: () -> Void
+        ) {
+            lock.withLock {
+                dependencies[dependency.key] = dependency
+                update()
+            }
+        }
+
+        /// The pricing resolutions this fold depended on.
+        fileprivate func dependencySnapshot() -> CodexRouterPricingDependencySet {
+            let recorded = lock.withLock { Array(dependencies.values) }
+            return CodexRouterPricingDependencySet(
+                dependencies: recorded.sorted { $0.key < $1.key }
             )
         }
     }
@@ -1606,20 +1607,6 @@ actor CodexRouterUsageScanner {
         return IdentityAliasSnapshot(aliases: aliases, isComplete: isComplete)
     }
 
-    private static func pricingModelCandidates(for model: String) -> [String] {
-        // FCC / gateway slugs are often multi-segment (`anthropic/openai/gpt-6-luna`).
-        // Emit every suffix after a `/` plus the final path component so supplement pins and
-        // catalog keys resolve even when an intermediate segment does not fuzzy-match.
-        var candidates = [model]
-        var remainder = model
-        while let separator = remainder.firstIndex(of: "/") {
-            remainder = String(remainder[remainder.index(after: separator)...])
-            guard !remainder.isEmpty else { break }
-            candidates.append(remainder)
-        }
-        return unique(candidates)
-    }
-
     private static func splitPaths(_ raw: String?) -> [String] {
         guard let raw else { return [] }
         return raw.split { $0 == "," || $0 == "\n" || $0 == "\r" }
@@ -1684,7 +1671,16 @@ actor CodexRouterUsageScanner {
             pricingToken: pricing.aggregateCacheToken,
             sourcePaths: Array(Set(paths.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })).sorted()
         )
-        let lookup = index.lookup(key: key, paths: paths, now: now)
+        let lookup = index.lookup(
+            key: key,
+            paths: paths,
+            now: now,
+            pricingDependenciesUnchanged: { dependencies in
+                // The catalogue moved. Reuse the saved fold only when every resolution it priced
+                // still holds; anything else falls back to the original full rebuild.
+                dependencies.isEquivalent(under: pricing)
+            }
+        )
         let prior: CodexRouterAggregateIndex.Record?
         switch lookup {
         case .hit(let cached):
@@ -1912,6 +1908,11 @@ actor CodexRouterUsageScanner {
         let latestIncluded = [prior?.latestIncludedEventAt, fold.latestIncludedEventAt]
             .compactMap { $0 }
             .max()
+        // Keep what the whole fold priced, not just what this pass priced: a tail merge re-prices
+        // the new rows only, and the saved fold still has to know what the old rows cost.
+        let foldDependencies = fold.pricingCache.dependencySnapshot()
+        let dependencies = prior?.pricingDependencies.map { $0.merged(with: foldDependencies) }
+            ?? foldDependencies
         index.save(CodexRouterAggregateIndex.Record(
             schema: CodexRouterAggregateIndex.schema,
             key: key,
@@ -1919,7 +1920,8 @@ actor CodexRouterUsageScanner {
             result: result,
             nextFutureEventAt: nextFuture,
             latestIncludedEventAt: latestIncluded,
-            complete: true
+            complete: true,
+            pricingDependencies: dependencies
         ))
         return .complete(result)
     }

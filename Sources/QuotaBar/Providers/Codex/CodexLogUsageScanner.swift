@@ -241,8 +241,9 @@ actor CodexLogUsageScanner {
         await sharedScanner.flushPendingWrites()
     }
 
-    /// After a refresh cycle settles, drop Event arrays from the process-wide tail cache while keeping
-    /// append checkpoints. The next exact-match / append path full-reparses when items were unloaded.
+    /// Drop Event arrays from the process-wide tail cache while keeping append checkpoints. Used only
+    /// when the process crosses its memory budget or macOS reports pressure; routine refreshes keep
+    /// this cache warm so an append does not reparse unchanged history.
     static func unloadSharedTailCacheItems() {
         sharedTailCache.unloadRetainedItems()
     }
@@ -1308,13 +1309,14 @@ actor CodexLogUsageScanner {
         retentionDays: Int
     ) -> [Event]? {
         let key = tailKey(for: url, retentionDays: retentionDays)
-        let currentRevision = AppendOnlyFileProbe.revision(at: url)
+        let currentStamp = AppendOnlyFileProbe.stamp(at: url)
 
-        if let currentRevision,
+        if let currentStamp,
            let cached = sharedTailCache.entry(for: key),
-           currentRevision.device == cached.revision.device,
-           currentRevision.inode == cached.revision.inode,
-           currentRevision.size == cached.offset,
+           cached.modificationTimes == currentStamp.modificationTimes,
+           currentStamp.revision.device == cached.revision.device,
+           currentStamp.revision.inode == cached.revision.inode,
+           currentStamp.revision.size == cached.offset,
            AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor
         {
             // Exact revision match: IncrementalJSONLScanner may re-invoke parse after unloading
@@ -1326,12 +1328,12 @@ actor CodexLogUsageScanner {
             }
         }
 
-        if let currentRevision,
+        if let currentStamp,
            let cached = sharedTailCache.entry(for: key),
            cached.itemsAvailable,
-           currentRevision.device == cached.revision.device,
-           currentRevision.inode == cached.revision.inode,
-           currentRevision.size > cached.offset,
+           currentStamp.revision.device == cached.revision.device,
+           currentStamp.revision.inode == cached.revision.inode,
+           currentStamp.revision.size > cached.offset,
            AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor
         {
             var parser = FileParser(emitSince: emitSince, checkpoint: cached.parserState)
@@ -1364,17 +1366,19 @@ actor CodexLogUsageScanner {
             guard !parser.hasMalformedUsage else { return nil }
 
             let newOffset = cached.offset + UInt64(read.statistics.bytesRead)
-            if let after = AppendOnlyFileProbe.revision(at: url),
-               after.device == currentRevision.device,
-               after.inode == currentRevision.inode,
-               after.size >= newOffset,
+            if let after = AppendOnlyFileProbe.stamp(at: url),
+               after.modificationTimes == currentStamp.modificationTimes,
+               after.revision.device == currentStamp.revision.device,
+               after.revision.inode == currentStamp.revision.inode,
+               after.revision.size >= newOffset,
                let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: newOffset)
             {
                 var merged = cached.items.filter { $0.timestamp >= emitSince }
                 merged.append(contentsOf: parser.finish())
                 sharedTailCache.store(
                     AppendOnlyFileTailCache<Event, ParserCheckpoint>.Entry(
-                        revision: after,
+                        revision: after.revision,
+                        modificationTimes: after.modificationTimes,
                         offset: newOffset,
                         anchor: anchor,
                         partialLine: read.finalPartial,
@@ -1402,7 +1406,7 @@ actor CodexLogUsageScanner {
         key: String
     ) -> [Event]? {
         _ = retentionDays
-        let before = AppendOnlyFileProbe.revision(at: url)
+        let before = AppendOnlyFileProbe.stamp(at: url)
         var parser = FileParser(emitSince: emitSince)
         var read = JSONLFileReader.readLines(
             at: url,
@@ -1424,15 +1428,17 @@ actor CodexLogUsageScanner {
         let offset = UInt64(read.statistics.bytesRead)
 
         if let before,
-           let after = AppendOnlyFileProbe.revision(at: url),
-           before.device == after.device,
-           before.inode == after.inode,
-           after.size >= offset,
+           let after = AppendOnlyFileProbe.stamp(at: url),
+           (before.revision.size != after.revision.size || before.modificationTimes == after.modificationTimes),
+           before.revision.device == after.revision.device,
+           before.revision.inode == after.revision.inode,
+           after.revision.size >= offset,
            let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: offset)
         {
             sharedTailCache.store(
                 AppendOnlyFileTailCache<Event, ParserCheckpoint>.Entry(
-                    revision: after,
+                    revision: after.revision,
+                    modificationTimes: after.modificationTimes,
                     offset: offset,
                     anchor: anchor,
                     partialLine: read.finalPartial,

@@ -10,7 +10,11 @@ import Foundation
 /// matches reads nothing. Growth reads only the new bytes. A new inode or a shorter file rebuilds.
 final class CodexRouterAggregateIndex: @unchecked Sendable {
     static let shared = CodexRouterAggregateIndex()
-    static let schema = 14
+    /// v15 drops the pricing token from the file identity and records what the fold priced, so a
+    /// catalogue change that cannot touch the fold's numbers no longer costs a full ledger read.
+    /// Also bump this when hardcoded Codex pricing rules change; catalogue dependencies cover rates,
+    /// identities and dated resolution, rather than every implementation detail of the cost formula.
+    static let schema = 15
     static let maxResidentRecords = 32
 
     struct Key: Codable, Equatable, Sendable {
@@ -22,6 +26,20 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
         var aliases: [String]
         var pricingToken: String
         var sourcePaths: [String]
+
+        /// Whether two keys describe the same fold apart from the pricing catalogue.
+        ///
+        /// The pricing token is the one field that must not decide the fold's identity: a catalogue
+        /// refresh changes it for every model, including the ones this ledger never used.
+        func matchesIgnoringPricing(_ other: Key) -> Bool {
+            account == other.account
+                && allowsUnscopedEvents == other.allowsUnscopedEvents
+                && days == other.days
+                && since == other.since
+                && timeZoneIdentifier == other.timeZoneIdentifier
+                && aliases == other.aliases
+                && sourcePaths == other.sourcePaths
+        }
     }
 
     struct FileCheckpoint: Codable, Equatable, Sendable {
@@ -47,6 +65,9 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
         var nextFutureEventAt: Date?
         var latestIncludedEventAt: Date?
         var complete: Bool
+        /// What this fold priced. Absent for records written before the dependency snapshot existed;
+        /// those must rebuild rather than be trusted against a changed catalogue.
+        var pricingDependencies: CodexRouterPricingDependencySet?
     }
 
     enum Lookup {
@@ -79,13 +100,37 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
 
     var residentRecordCountForTesting: Int { lock.withLock { memory.count } }
 
-    func lookup(key: Key, paths: [String], now: Date) -> Lookup {
+    /// Look up the saved fold for `key`.
+    ///
+    /// `pricingDependenciesUnchanged` is consulted only when the pricing catalogue moved since the
+    /// fold was written: it answers whether the resolutions the fold actually priced still hold.
+    /// An unrelated catalogue change must not cost another read of the ledger, and a change to a
+    /// priced model must fall back to the original full rebuild.
+    func lookup(
+        key: Key,
+        paths: [String],
+        now: Date,
+        pricingDependenciesUnchanged: (CodexRouterPricingDependencySet) -> Bool
+    ) -> Lookup {
         let live = Self.stats(for: paths)
         let id = Self.fingerprint(key)
-        let record = lock.withLock { memory[id] } ?? load(id: id)
-        guard let record, record.schema == Self.schema, record.key == key, record.complete else {
+        func matches(_ candidate: Record) -> Bool {
+            guard candidate.schema == Self.schema, candidate.key.matchesIgnoringPricing(key),
+                  candidate.complete, let dependencies = candidate.pricingDependencies
+            else { return false }
+            return candidate.key.pricingToken == key.pricingToken || pricingDependenciesUnchanged(dependencies)
+        }
+        let primary = lock.withLock { memory[id] } ?? load(id: id)
+        let loaded: Record
+        if let primary, matches(primary) {
+            loaded = primary
+        } else if let previous = load(id: id + "-previous"), matches(previous) {
+            loaded = previous
+        } else {
             return .rebuild
         }
+        var record = loaded
+        let pricingChanged = record.key.pricingToken != key.pricingToken
         if let future = record.nextFutureEventAt, now >= future {
             return .rebuild
         }
@@ -120,6 +165,12 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
             append = true
         }
         if append { return .append(record) }
+        if pricingChanged {
+            // Adopt the new catalogue token so the next lookup is a plain hit. The fold itself is
+            // unchanged: the dependency check already proved it.
+            record.key.pricingToken = key.pricingToken
+            save(record)
+        }
         return .hit(record.result)
     }
 
@@ -127,16 +178,8 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
         let id = Self.fingerprint(record.key)
         let diagnosticKey = "codex.router.aggregate.save.\(id)"
         remember(record, id: id)
-        let url = Self.fileURL(id: id)
         do {
-            try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .secondsSince1970
-            let data = try encoder.encode(record)
-            try data.write(to: url, options: .atomic)
+            try CodexRouterAggregatePersistence.write(record, id: id)
             DiagnosticGate.clearFailure(diagnosticKey)
         } catch {
             DiagnosticGate.logOnce(for: diagnosticKey) {
@@ -197,6 +240,37 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
             else { continue }
             try? FileManager.default.removeItem(at: url)
         }
+    }
+
+    /// Test hook: drop one record from the resident cache and delete its file.
+    func removeForTesting(key: Key) {
+        let id = Self.fingerprint(key)
+        lock.withLock {
+            memory[id] = nil
+            memory[id + "-previous"] = nil
+        }
+        try? FileManager.default.removeItem(at: Self.fileURL(id: id))
+        try? FileManager.default.removeItem(at: Self.fileURL(id: id + "-previous"))
+    }
+
+    /// Test hook: the aggregate record files that describe `path`.
+    ///
+    /// A pricing change that must not rebuild the fold must also not leave a second record file
+    /// behind, so the tests count these instead of guessing at the cache directory.
+    static func recordURLsForTesting(path: String) -> [URL] {
+        let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        let directory = fileURL(id: "").deletingLastPathComponent()
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        var urls: [URL] = []
+        for url in (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [] {
+            guard url.pathExtension == "json", let data = try? Data(contentsOf: url),
+                  let record = try? decoder.decode(Record.self, from: data),
+                  record.files.contains(where: { $0.path == resolved || $0.path == path })
+            else { continue }
+            urls.append(url)
+        }
+        return urls
     }
 
     func checkpoint(
@@ -277,35 +351,30 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
     }
 
     private func load(id: String) -> Record? {
-        let url = Self.fileURL(id: id)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .secondsSince1970
-        guard let data = try? Data(contentsOf: url),
-              let record = try? decoder.decode(Record.self, from: data),
-              record.schema == Self.schema
-        else { return nil }
+        guard let record = CodexRouterAggregatePersistence.read(id: id) else { return nil }
         remember(record, id: id)
         return record
     }
 
     private static func fingerprint(_ key: Key) -> String {
         let aliases = key.aliases.joined(separator: "\n")
+        // The pricing token is deliberately absent: the aggregate file must keep its identity when
+        // the catalogue changes, so the saved fold can be checked against the new catalogue
+        // instead of being orphaned by a new file name.
         let raw = [
+            "codex-router-aggregate-v2",
             "\(key.account)",
             key.allowsUnscopedEvents ? "1" : "0",
             "\(key.days)",
             String(format: "%.3f", key.since),
             key.timeZoneIdentifier,
             aliases,
-            key.pricingToken,
             key.sourcePaths.joined(separator: "\n")
         ].joined(separator: "\u{1e}")
         return JSONLScanCachePaths.stableFingerprint(raw)
     }
 
     private static func fileURL(id: String) -> URL {
-        JSONLScanCachePaths.defaultDirectory
-            .appendingPathComponent("codex-router-aggregate", isDirectory: true)
-            .appendingPathComponent("\(id).json")
+        CodexRouterAggregatePersistence.fileURL(id: id)
     }
 }
