@@ -23,7 +23,7 @@ final class OptionalMetricVisibilityTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = LayoutStore(registry: registry, defaults: defaults, defaultMetricIDs: [])
         let expectedConditionalIDs: Set<String> = [
-            "antigravity.claude", "antigravity.claudeWeekly",
+            "antigravity.argonWeekly", "antigravity.claude", "antigravity.claudeWeekly",
             "claude.fable", "claude.sonnet", "claude.extra",
             "codex.spark", "codex.sparkWeekly", "codex.credits", "codex.rateLimitResets",
             "copilot.premium", "copilot.extra", "copilot.orgCredits", "copilot.orgSpend", "copilot.chat", "copilot.completions",

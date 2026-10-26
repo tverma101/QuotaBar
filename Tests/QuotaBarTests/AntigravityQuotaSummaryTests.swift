@@ -236,10 +236,11 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
                 .filter { !$0.limitResources.isEmpty }
                 .map(\.metricLabel)
         )
-        XCTAssertEqual(Set(AntigravityUsageMapper.summaryBuckets.map(\.label)), descriptorLabels)
+        let sharedLabels = descriptorLabels.subtracting([AntigravityMetric.argonWeeklyLabel])
+        XCTAssertEqual(Set(AntigravityUsageMapper.summaryBuckets.map(\.label)), sharedLabels)
 
         let summaryLines = AntigravityUsageMapper.parseQuotaSummary(Data("{\(fullGroupsJSON)}".utf8)) ?? []
-        XCTAssertEqual(Set(summaryLines.map(\.label)), descriptorLabels)
+        XCTAssertEqual(Set(summaryLines.map(\.label)), sharedLabels)
 
         // The legacy path emits the two 5h pool labels — a strict subset of the descriptors.
         let legacyLabels = Set(AntigravityUsageMapper.buildLines([

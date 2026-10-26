@@ -74,6 +74,7 @@ private final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable 
     private let lock = NSLock()
     private var rowsByPath: [String: [AntigravityFixtureRow]]
     private var cursors: [Int] = []
+    private var stepTimestampCursors: [Int] = []
     private var queryCounts: [String: Int] = [:]
     private var contentFingerprintQueryCount = 0
     private var maximumIndexQueryCount = 0
@@ -155,6 +156,16 @@ private final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable 
             if unindexedStepMetadataPaths.contains(path) { return nil }
             return rowsByPath[path, default: []].contains { $0.stepMetadata != nil } ? "1" : nil
         }
+        if sql.contains("step_timestamp_digest") {
+            if unsupportedSHA3 { throw SQLiteError.queryFailed("no such function: sha3_agg") }
+            let range = sql.range(of: "idx <= ")!
+            let through = Int(sql[range.upperBound...].split(whereSeparator: \.isWhitespace).first!)!
+            let steps = rowsByPath[path, default: []].filter { $0.stepMetadata != nil }.sorted { $0.index < $1.index }
+            func signature(_ rows: [AntigravityFixtureRow]) -> String {
+                rows.map { "\($0.index):" + $0.stepMetadata!.map { String(format: "%02x", $0) }.joined() }.joined(separator: ";")
+            }
+            return signature(steps.filter { $0.index <= through }) + "|" + signature(steps)
+        }
         if sql.contains("sha3_agg(") {
             contentFingerprintQueryCount += 1
             contentFingerprintSQLs.append(sql)
@@ -210,6 +221,17 @@ private final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable 
         if sql.contains("COALESCE(MAX(idx)") {
             maximumIndexQueryCount += 1
             return rowsByPath[path, default: []].map(\.index).max().map { String($0) } ?? "-1"
+        }
+        if sql.contains("step_timestamp_candidates") {
+            let marker = "WHERE idx > "
+            let range = sql.range(of: marker)!
+            let cursor = Int(sql[range.upperBound...].split(whereSeparator: \.isWhitespace).first!)!
+            stepTimestampCursors.append(cursor)
+            let rows: [[String: Any]] = rowsByPath[path, default: []]
+                .filter { $0.index > cursor && $0.stepMetadata != nil }
+                .sorted { $0.index < $1.index }.prefix(128)
+                .map { row in ["index": row.index, "hex": row.stepMetadata!.map { String(format: "%02x", $0) }.joined()] }
+            return String(decoding: try JSONSerialization.data(withJSONObject: rows), as: UTF8.self)
         }
         let selectedRows: [AntigravityFixtureRow]
         if let markerRange = sql.range(of: "WHERE idx IN ("),
@@ -276,6 +298,8 @@ private final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable 
     var queriedCursors: [Int] {
         lock.withLock { cursors }
     }
+
+    var queriedStepTimestampCursors: [Int] { lock.withLock { stepTimestampCursors } }
 
     var queriedPaths: [String: Int] {
         lock.withLock { queryCounts }
@@ -534,7 +558,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         XCTAssertGreaterThan(sqlite.stepMetadataQueries, 0, "The generation query must include correlated step metadata")
     }
 
-    func testUntrustedStepTimestampPreservesUsageOnFirstObservedDayAsPartial() async throws {
+    func testUntrustedStepTimestampDoesNotInventUsageOnFirstObservedDay() async throws {
         let fixture = try makeDatabaseDirectory()
         let observedTimestamp = Int64(now.timeIntervalSince1970)
         let blob = antigravityGenerationBlob(
@@ -555,8 +579,99 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         let result = await scanner.scan(now: now, pricing: pricing)
         let scan = try XCTUnwrap(result)
 
-        XCTAssertEqual(scan.series.daily.first?.totalTokens, 1_200)
+        XCTAssertTrue(scan.series.daily.isEmpty)
         XCTAssertEqual(scan.unmeasuredUsageDays, [DailyUsageAccumulator.dayKey(from: now)])
+    }
+
+    func testGenerationMatchesStepIdentityAcrossDifferentRowIndicesAndRecoversEditedDates() async throws {
+        let fixture = try makeDatabaseDirectory()
+        let yesterday = now.addingTimeInterval(-86_400)
+        let blob = antigravityGenerationBlob(model: "gemini-3.6-flash", input: 100, output: 20, timestamp: nil)
+        let sqlite = AntigravityFakeSQLite(rowsByPath: [fixture.paths[0]: [
+            .init(index: 0, blob: blob),
+            .init(index: 10, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: UInt64(yesterday.timeIntervalSince1970)))
+        ]])
+        let scanner = AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path })
+        let first = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertEqual(first?.series.daily.first?.date, DailyUsageAccumulator.dayKey(from: yesterday))
+        XCTAssertEqual(first?.series.daily.first?.totalTokens, 120)
+
+        sqlite.replaceRows([
+            .init(index: 0, blob: blob),
+            .init(index: 10, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: UInt64(now.timeIntervalSince1970)))
+        ], at: fixture.paths[0])
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: fixture.paths[0])
+        let updated = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertEqual(updated?.series.daily.first?.date, DailyUsageAccumulator.dayKey(from: now))
+        XCTAssertEqual(updated?.series.daily.first?.totalTokens, 120)
+    }
+
+    func testRepeatedStepIdentityRetainsProvenDayAndRejectsConflictingDays() throws {
+        let timestamp = UInt64(TestLocalInstant.date(2026, 10, 20, 12).timeIntervalSince1970)
+        let generation = antigravityGenerationBlob(model: "gemini-3.6-flash", input: 10, output: 2, timestamp: nil)
+        var index = AntigravityStepTimestampIndex()
+        try index.insert(antigravityStepMetadata(timestamp: timestamp), maximumEstimatedMemoryBytes: 64 * 1024 * 1024)
+        try index.insert(antigravityStepMetadata(timestamp: timestamp + 60), maximumEstimatedMemoryBytes: 64 * 1024 * 1024)
+        XCTAssertEqual(index.timestamp(for: generation), Int64(timestamp))
+        try index.insert(antigravityStepMetadata(timestamp: timestamp + 86_400), maximumEstimatedMemoryBytes: 64 * 1024 * 1024)
+        XCTAssertNil(index.timestamp(for: generation), "conflicting calendar days must not be guessed")
+    }
+
+    func testStepTimestampIndexReadsOnlyAppendedMetadataAfterVerifyingPrefix() throws {
+        let timestamp = UInt64(now.timeIntervalSince1970)
+        let sqlite = AntigravityFakeSQLite(rowsByPath: ["/steps.db": [
+            .init(index: 10, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: timestamp))
+        ]])
+        let first = try AntigravityStepTimestampIndex.load(path: "/steps.db", sqlite: sqlite)
+        sqlite.append(.init(index: 11, blob: nil, stepMetadata:
+            antigravityStepMetadata(timestamp: timestamp, stepUUID: "other-turn", botID: "other-bot")), to: "/steps.db")
+        let next = try AntigravityStepTimestampIndex.load(path: "/steps.db", sqlite: sqlite, previous: first)
+        XCTAssertTrue(next.preserves(first))
+        XCTAssertEqual(sqlite.queriedStepTimestampCursors, [-1, 10, 10, 11])
+    }
+
+    func testUnrelatedStepAppendDoesNotReplayUndatedGenerationsButMatchingStepDoes() async throws {
+        let fixture = try makeDatabaseDirectory()
+        let timestamp = UInt64(now.timeIntervalSince1970)
+        let blob = antigravityGenerationBlob(model: "gemini-3.6-flash", input: 10, output: 2, timestamp: nil)
+        let sqlite = AntigravityFakeSQLite(rowsByPath: [fixture.paths[0]: [
+            .init(index: 0, blob: blob),
+            .init(index: 10, blob: nil, stepMetadata:
+                antigravityStepMetadata(timestamp: timestamp, stepUUID: "other", botID: "other"))
+        ]])
+        let scanner = AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path })
+        _ = await scanner.scan(now: now, pricing: pricing)
+        sqlite.append(.init(index: 11, blob: nil, stepMetadata:
+            antigravityStepMetadata(timestamp: timestamp, stepUUID: "unrelated", botID: "unrelated")), to: fixture.paths[0])
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: fixture.paths[0])
+        _ = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertEqual(sqlite.queriedCursors, [-1, 10], "an unrelated step must not replay the old generations")
+        sqlite.append(.init(index: 12, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: timestamp)), to: fixture.paths[0])
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(4)], ofItemAtPath: fixture.paths[0])
+        let recovered = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertEqual(recovered?.series.daily.first?.totalTokens, 12)
+        XCTAssertEqual(sqlite.queriedCursors.last, -1, "a newly available matching date must recover the old generation")
+    }
+
+    func testStepTimestampIndexPagesRealSQLiteWithoutRelyingOnGenerationIndices() throws {
+        let fixture = try makeDatabaseDirectory()
+        let timestamp = UInt64(now.timeIntervalSince1970)
+        let metadata = antigravityStepMetadata(timestamp: timestamp).map { String(format: "%02x", $0) }.joined()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        process.arguments = [fixture.paths[0], "CREATE TABLE steps(idx INTEGER PRIMARY KEY, metadata BLOB); " +
+            "WITH RECURSIVE rows(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM rows WHERE n<129) " +
+            "INSERT INTO steps SELECT n, X'\(metadata)' FROM rows;"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, String(decoding: data, as: UTF8.self))
+        let index = try AntigravityStepTimestampIndex.load(path: fixture.paths[0], sqlite: SQLiteCLIAccessor())
+        let generation = antigravityGenerationBlob(model: "gemini-3.6-flash", input: 10, output: 2, timestamp: nil)
+        XCTAssertEqual(index.timestamp(for: generation), Int64(timestamp))
     }
 
     func testOversizedBlobWithStepTimestampPublishesLowerBoundHistory() async throws {
@@ -784,8 +899,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         let result = await scanner.scanWithStatus(now: now, pricing: pricing)
 
         XCTAssertFalse(result.hasReadFailures)
-        XCTAssertEqual(result.scan?.series.daily.first?.totalTokens, 15,
-                       "undated rows count on the first-observed day as a partial lower bound")
+        XCTAssertTrue(result.scan?.series.daily.isEmpty == true,
+                      "a missing trusted date must not invent today's usage")
         XCTAssertEqual(result.scan?.unmeasuredUsageDays, [DailyUsageAccumulator.dayKey(from: now)])
         XCTAssertEqual(sqlite.stepMetadataQueries, 0)
     }
@@ -978,8 +1093,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
 
         let legacy = await scanner.scan(now: now, pricing: pricing)
         let incompleteLegacy = try XCTUnwrap(legacy)
-        XCTAssertEqual(incompleteLegacy.series.daily.first?.totalTokens, 15,
-                       "undated rows count on the first-observed day as a partial lower bound")
+        XCTAssertTrue(incompleteLegacy.series.daily.isEmpty,
+                      "a missing trusted date must not invent today's usage")
         XCTAssertTrue(incompleteLegacy.unmeasuredUsageDays?.contains(DailyUsageAccumulator.dayKey(from: now)) == true,
                       "undated usage should be surfaced as incomplete instead of freezing all history")
 

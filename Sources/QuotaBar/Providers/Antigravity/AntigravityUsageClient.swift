@@ -17,6 +17,14 @@ enum CloudCodeOutcome: Sendable {
     }
 }
 
+enum CloudCodeBatchOutcome: Sendable {
+    case ok([Data], allHostsAnswered: Bool)
+    case authFailed
+    case forbidden
+    case notFound
+    case unavailable
+}
+
 /// Result of a Google OAuth token refresh, split so a dead refresh token reads as expired auth while a
 /// 5xx/network failure reads as a transient outage.
 enum TokenRefreshOutcome: Sendable {
@@ -93,9 +101,28 @@ struct AntigravityUsageClient: Sendable {
     /// short-circuit because the same request would fail on the other base. Other non-2xx / transport
     /// errors fall through to the next base and finally `.unavailable`.
     func cloudCode(path: String, token: String, userAgent: String, body: [String: String]) async throws -> CloudCodeOutcome {
+        switch try await cloudCodeResponses(path: path, token: token, userAgent: userAgent, body: body, collectSummaries: false) {
+        case .ok(let bodies, _): return .ok(bodies[0])
+        case .authFailed: return .authFailed
+        case .forbidden: return .forbidden
+        case .notFound: return .notFound
+        case .unavailable: return .unavailable
+        }
+    }
+
+    /// A host can omit an entire quota pool. Consult the other host only when the first usable body
+    /// cannot supply all shared meters; a failed supplemental host never discards measured limits.
+    func cloudCodeSummaries(token: String) async throws -> CloudCodeBatchOutcome {
+        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: "antigravity", body: [:], collectSummaries: true)
+    }
+
+    private func cloudCodeResponses(
+        path: String, token: String, userAgent: String, body: [String: String], collectSummaries: Bool
+    ) async throws -> CloudCodeBatchOutcome {
         let payload = (try? JSONSerialization.data(withJSONObject: body)) ?? Data("{}".utf8)
         var sawNotFound = false
         var sawOtherFailure = false
+        var bodies: [Data] = []
         for base in Self.cloudCodeURLs {
             try Task.checkCancellation()
             guard let url = URL(string: base + path) else { continue }
@@ -123,14 +150,25 @@ struct AntigravityUsageClient: Sendable {
                 continue
             }
             try Task.checkCancellation()
-            if response.statusCode == 401 { return .authFailed }
-            if response.statusCode == 403 { return .forbidden }
-            if (200..<300).contains(response.statusCode) { return .ok(response.body) }
+            if response.statusCode == 401 || response.statusCode == 403 {
+                if !bodies.isEmpty { return .ok(bodies, allHostsAnswered: false) }
+                return response.statusCode == 401 ? .authFailed : .forbidden
+            }
+            if (200..<300).contains(response.statusCode) {
+                bodies.append(response.body)
+                if !collectSummaries || AntigravityUsageMapper.hasAllSharedQuotaMeters(response.body, sourceID: "cloud-code-\(bodies.count - 1)") {
+                    return .ok(bodies, allHostsAnswered: true)
+                }
+                continue
+            }
             if response.statusCode == 404 {
                 sawNotFound = true
             } else {
                 sawOtherFailure = true
             }
+        }
+        if !bodies.isEmpty {
+            return .ok(bodies, allHostsAnswered: !sawNotFound && !sawOtherFailure)
         }
         return sawNotFound && !sawOtherFailure ? .notFound : .unavailable
     }

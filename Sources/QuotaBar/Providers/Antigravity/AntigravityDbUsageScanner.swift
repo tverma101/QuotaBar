@@ -16,6 +16,7 @@ actor AntigravityDbUsageScanner {
     static let maximumBlobBytes = 1_048_576
     static let batchSize = 1_024
     static let maximumBatchSourceBytes = 8_388_608
+    static let maximumRetainedStepIndexBytes = 64 * 1024 * 1024
     private static let changedDuringScanMessage = "Antigravity conversation database changed during scan"
 
     private let sqlite: SQLiteAccessing
@@ -229,8 +230,9 @@ actor AntigravityDbUsageScanner {
             guard !Task.isCancelled else {
                 return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: false)
             }
+            let lastGoodAggregate = scanCache[path]?.aggregate
             do {
-                let cached = try cachedDatabase(path: path, since: since, observedAt: now)
+                let cached = try await cachedDatabase(path: path, since: since, observedAt: now)
                 guard !Task.isCancelled else {
                     return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: false)
                 }
@@ -269,6 +271,15 @@ actor AntigravityDbUsageScanner {
                 {
                     databaseScans.append(staleAggregate.markingUnmeasuredUsage(
                         on: Set(staleAggregate.series.daily.map(\.date)).union([DailyUsageAccumulator.dayKey(from: now)])
+                    ))
+                } else if let lastGoodAggregate {
+                    // An oversized step index evicts its whole database cache. Preserve the last
+                    // completed fold for this scan without keeping generation rows or step IDs alive.
+                    let staleScan = lastGoodAggregate.scan.droppingDays(
+                        before: DailyUsageAccumulator.dayKey(from: since)
+                    )
+                    databaseScans.append(staleScan.markingUnmeasuredUsage(
+                        on: Set(staleScan.series.daily.map(\.date)).union([DailyUsageAccumulator.dayKey(from: now)])
                     ))
                 }
             }
@@ -510,7 +521,7 @@ actor AntigravityDbUsageScanner {
         """
     }
 
-    private func cachedDatabase(path: String, since: Date, observedAt: Date) throws -> CachedDatabase? {
+    private func cachedDatabase(path: String, since: Date, observedAt: Date) async throws -> CachedDatabase? {
         var didRetry = false
         while true {
             do {
@@ -522,6 +533,11 @@ actor AntigravityDbUsageScanner {
                       message == Self.changedDuringScanMessage || Self.isRetryableSQLiteFailure(message)
                 else { throw error }
                 didRetry = true
+                // The retryable failures are races with the client's own writer (a WAL open refused
+                // mid-commit, a lock held, a generation changed under the read). Retrying inside
+                // the same transaction window failed every time; a short yield lets the writer's
+                // commit land before the read is attempted again.
+                try await Task.sleep(nanoseconds: 300_000_000)
             }
         }
     }
@@ -546,7 +562,8 @@ actor AntigravityDbUsageScanner {
         let fingerprint = try DatabaseFingerprint(path: path)
         guard fingerprint.latestModification >= since else { return nil }
 
-        if var cached = scanCache[path], cached.fingerprint == fingerprint, cached.windowStart <= since {
+        if var cached = scanCache[path], cached.fingerprint == fingerprint, cached.windowStart <= since,
+           cached.stepTimestampIndex.map({ $0.timeZoneIdentifier == Calendar.current.timeZone.identifier }) != false {
             if cached.windowStart < since {
                 Self.prune(&cached, before: since)
                 scanCache[path] = cached
@@ -615,7 +632,29 @@ actor AntigravityDbUsageScanner {
         refreshed.windowStart = since
         refreshed.aggregate = nil
         Self.prune(&refreshed, before: since)
-        try readDatabase(path: path, since: since, observedAt: observedAt, into: &refreshed)
+        let availableStepIndexBytes = max(
+            0,
+            Self.maximumRetainedStepIndexBytes - retainedStepTimestampIndexBytes(excluding: path)
+        )
+        do {
+            try readDatabase(
+                path: path,
+                since: since,
+                observedAt: observedAt,
+                maximumStepIndexBytes: availableStepIndexBytes,
+                into: &refreshed
+            )
+        } catch AntigravityStepTimestampIndex.LoadError.memoryLimitExceeded {
+            scanCache.removeValue(forKey: path)
+            let diagnosticKey = "provider.antigravity.step-index-memory-limit.\(JSONLScanCachePaths.stableFingerprint(path))"
+            DiagnosticGate.logOnce(for: diagnosticKey) {
+                AppLog.warn(
+                    LogTag.plugin("antigravity"),
+                    "step timestamp index exceeded the \(Self.maximumRetainedStepIndexBytes / 1_048_576) MB cache budget in \(path); evicted the database cache"
+                )
+            }
+            throw AntigravityStepTimestampIndex.LoadError.memoryLimitExceeded
+        }
         guard !Task.isCancelled else { return nil }
 
         let comparablePrefix = retainedPrefix.flatMap {
@@ -677,7 +716,46 @@ actor AntigravityDbUsageScanner {
         }
 
         scanCache[path] = refreshed
+        if retainedStepTimestampIndexBytes() > Self.maximumRetainedStepIndexBytes {
+            // Keep one source from pushing all prior databases over the cap. The current scan still
+            // uses `refreshed`; only its process-resident cache is evicted.
+            scanCache.removeValue(forKey: path)
+            let diagnosticKey = "provider.antigravity.step-index-cache-overflow.\(JSONLScanCachePaths.stableFingerprint(path))"
+            DiagnosticGate.logOnce(for: diagnosticKey) {
+                AppLog.warn(
+                    LogTag.plugin("antigravity"),
+                    "step timestamp cache exceeded its total memory budget; evicted the database cache at \(path)"
+                )
+            }
+        } else {
+            DiagnosticGate.clearFailure(
+                "provider.antigravity.step-index-memory-limit.\(JSONLScanCachePaths.stableFingerprint(path))"
+            )
+            DiagnosticGate.clearFailure(
+                "provider.antigravity.step-index-cache-overflow.\(JSONLScanCachePaths.stableFingerprint(path))"
+            )
+        }
         return refreshed
+    }
+
+    private func retainedStepTimestampIndexBytes(excluding excludedPath: String? = nil) -> Int {
+        scanCache.reduce(into: 0) { total, entry in
+            guard entry.key != excludedPath else { return }
+            let (next, overflow) = total.addingReportingOverflow(entry.value.stepTimestampIndex?.estimatedMemoryBytes ?? 0)
+            total = overflow ? Int.max : next
+        }
+    }
+
+    /// Step dates and generation rows form one cache unit. Pressure drops the whole unit so a later
+    /// scan rebuilds both together instead of pairing new generations with an old date index.
+    func unloadCachesForMemoryPressure() {
+        guard !scanCache.isEmpty else { return }
+        let releasedIndexBytes = retainedStepTimestampIndexBytes()
+        scanCache.removeAll(keepingCapacity: false)
+        AppLog.info(
+            .refresh,
+            "Antigravity memory-pressure unload released database caches (step index estimate \(releasedIndexBytes / 1_048_576) MB)"
+        )
     }
 
     private static func prune(_ cached: inout CachedDatabase, before since: Date) {
@@ -726,7 +804,13 @@ actor AntigravityDbUsageScanner {
         (try? fileStamp(at: path))?.identity
     }
 
-    private func readDatabase(path: String, since: Date, observedAt: Date, into cached: inout CachedDatabase) throws {
+    private func readDatabase(
+        path: String,
+        since: Date,
+        observedAt: Date,
+        maximumStepIndexBytes: Int,
+        into cached: inout CachedDatabase
+    ) throws {
         // Modern Antigravity stores put generation times in the matching steps.metadata row instead
         // of gen_metadata.data. Recheck legacy databases when their file changes: an app upgrade can
         // add the table while QuotaBar is running. If that happens, replay cached indices so formerly
@@ -754,9 +838,21 @@ actor AntigravityDbUsageScanner {
             }
             hasStepMetadata = false
         }
-        if let previousHasStepMetadata = cached.hasStepMetadata,
-           previousHasStepMetadata != hasStepMetadata
-        {
+        let stepIndex = hasStepMetadata ? try AntigravityStepTimestampIndex.load(
+            path: path,
+            sqlite: sqlite,
+            previous: cached.stepTimestampIndex,
+            maximumEstimatedMemoryBytes: maximumStepIndexBytes
+        ) : nil
+        let priorStepDatesChanged = cached.stepTimestampIndex.map { previous in
+            guard let stepIndex else { return true }
+            return !stepIndex.preserves(previous)
+                || cached.undatedIdentities.contains {
+                    previous.timestamp(for: $0) == nil && stepIndex.timestamp(for: $0) != nil
+                }
+        } ?? false
+        if (cached.hasStepMetadata != nil && cached.hasStepMetadata != hasStepMetadata)
+            || priorStepDatesChanged {
             cached.lastIndex = -1
             cached.rowCount = 0
             cached.tableFingerprint = Self.emptyTableFingerprint
@@ -765,9 +861,11 @@ actor AntigravityDbUsageScanner {
             cached.invalidTokenTimestamps.removeAll()
             cached.malformedUsageTimestamps.removeAll()
             cached.undatedUsageTimestamps.removeAll()
+            cached.undatedIdentities.removeAll()
             cached.oversizedTimestamps.removeAll()
         }
         cached.hasStepMetadata = hasStepMetadata
+        cached.stepTimestampIndex = stepIndex
         let includeStepMetadata = cached.hasStepMetadata ?? false
         let observedTimestamp = Int64(observedAt.timeIntervalSince1970)
 
@@ -802,7 +900,7 @@ actor AntigravityDbUsageScanner {
                     switch AntigravityProtoDecoder.decodeGenerationEvent(
                         from: blob,
                         stepMetadata: row.stepHex.flatMap(Self.bytes(fromHex:)),
-                        observationTimestamp: observedTimestamp
+                        matchedStepTimestamp: stepIndex?.timestamp(for: blob)
                     ) {
                     case .ignored:
                         continue
@@ -818,14 +916,14 @@ actor AntigravityDbUsageScanner {
                         }
                     case .undatedUsage:
                         if observedAt >= since { cached.undatedUsageTimestamps.append(observedTimestamp) }
+                        if let identity = AntigravityProtoDecoder.generationStepIdentity(from: blob) {
+                            cached.undatedIdentities.insert(identity)
+                        }
                     case .event(let event):
                         guard Date(timeIntervalSince1970: TimeInterval(event.timestampSeconds)) >= since else {
                             continue
                         }
                         cached.events.append(event)
-                        if event.timestampIsInferred {
-                            cached.undatedUsageTimestamps.append(event.timestampSeconds)
-                        }
                     }
                 }
             }
@@ -1177,7 +1275,9 @@ actor AntigravityDbUsageScanner {
         var invalidTokenTimestamps: [Int64] = []
         var malformedUsageTimestamps: [Int64] = []
         var undatedUsageTimestamps: [Int64] = []
+        var undatedIdentities: Set<AntigravityProtoDecoder.StepIdentity> = []
         var hasStepMetadata: Bool?
+        var stepTimestampIndex: AntigravityStepTimestampIndex?
         var aggregate: CachedAggregate?
     }
 
