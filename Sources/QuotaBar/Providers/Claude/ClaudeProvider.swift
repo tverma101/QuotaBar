@@ -578,7 +578,8 @@ final class ClaudeProvider: ProviderRuntime {
             lines: mapped.lines,
             refreshedAt: now(),
             usageHistory: nil,
-            warning: warning
+            warning: warning,
+            historyWarning: "Claude usage history could not be completely read. Any displayed totals are last known and may be stale."
         )
     }
 

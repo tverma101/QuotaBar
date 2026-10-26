@@ -80,6 +80,16 @@ Local spend does not require a Claude OAuth login. If Claude Code uses an API-ke
 
 ## Under the hood
 
+After checking source files and account ownership, unchanged local history reuses its completed daily
+totals. A changed file list, file revision, pricing list, day window, time zone, or backwards clock
+rebuilds the fold. Incomplete reads keep the previous history and show a history warning.
+Optional null fields in current Claude logs are treated as absent. Attachment and tool-result
+usage objects do not count as assistant usage or block the scan; invalid token counts still do.
+
+Growing session files keep a small, bounded append cache so the next refresh reads their new bytes.
+Detected replacements, truncations, and rewrites are parsed again. Incomplete final lines are retried
+on the next append. Memory pressure releases the cached rows.
+
 `GET https://api.anthropic.com/api/oauth/usage` with the selected OAuth token. Claude Code tokens refresh via `platform.claude.com/v1/oauth/token`; Claude Desktop tokens are read-only and must be renewed by Desktop itself. If a token is expired or revoked, QuotaBar retries with the next credential source before reporting an error.
 
 When the five-hour session window hasn't begun (the usage API reports no reset time), the Session row shows **Not started** on the trailing label; hover explains that the session begins after your first message. A reported reset time means the window is running, so the row always shows the countdown then — even when Anthropic's whole-percent numbers still read 0% because less than 1% has been used, which matches what Claude Code itself shows.
