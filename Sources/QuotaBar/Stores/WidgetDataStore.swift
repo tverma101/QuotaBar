@@ -249,6 +249,15 @@ final class WidgetDataStore {
         alwaysShowPacing = false
     }
 
+    func unloadProviderCachesForMemoryPressure() async {
+        if let antigravity = providersByID["antigravity"] as? AntigravityProvider {
+            await antigravity.unloadLocalAccountingCachesForMemoryPressure()
+        }
+        if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
+            await freebuff.unloadLocalAccountingCachesForMemoryPressure()
+        }
+    }
+
     init(
         registry: WidgetRegistry,
         providers: [ProviderRuntime],
@@ -1429,8 +1438,8 @@ final class WidgetDataStore {
         if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
         AppLog.info(.refresh, "\(providerID) ok (\(durationMs)ms)")
         onRefreshOutcome?(providerID, .refreshed, nil, force)
-        // Local-log providers can allocate large parse arrays; unload between cards so concurrent
-        // Codex + OpenCode refreshes cannot stack into a multi-GB peak.
+        // Local-log providers can allocate large parse arrays. Their bounded warm caches remain in
+        // place below the process budget and are released when that budget is crossed.
         if Self.isHeavyLocalLogProvider(providerID) {
             await PersistentJSONLScanCaches.unloadAfterHeavyProvider(providerID: providerID)
         } else if ProcessMemoryBudget.isOverSoftLimit {

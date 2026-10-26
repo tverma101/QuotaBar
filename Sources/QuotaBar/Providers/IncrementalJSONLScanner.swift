@@ -7,7 +7,7 @@ enum JSONLScanning {
     /// A discovered log file plus the stat fields the parse cache is keyed on. Attribute modification
     /// time is the metadata-change timestamp (ctime-like on Darwin): it changes on an in-place rewrite
     /// even when a writer restores the old content mtime and byte length.
-    struct DiscoveredFile: Sendable {
+    struct DiscoveredFile: Sendable, Equatable {
         var path: String
         var size: Int
         var mtime: Date
@@ -24,6 +24,24 @@ enum JSONLScanning {
     /// history and should keep the source incomplete until its timestamp is trustworthy.
     static func maximumTimestamp(now: Date) -> Date {
         now.addingTimeInterval(5 * 60)
+    }
+
+    /// Recheck after asynchronous ownership/cache work; a discovered revision can change while its
+    /// caller is suspended. Keep this identical for full folds and compact-result cache hits.
+    static func filesStillMatch(_ files: [DiscoveredFile]) -> Bool {
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey]
+        return files.allSatisfy { file in
+            guard !Task.isCancelled else { return false }
+            let url = URL(fileURLWithPath: file.path)
+            guard let revision = AppendOnlyFileProbe.revision(at: url),
+                  file.size >= 0, revision.size == UInt64(file.size),
+                  let values = try? url.resourceValues(forKeys: keys)
+            else { return false }
+            return values.fileSize == file.size
+                && values.contentModificationDate == file.mtime
+                && values.attributeModificationDate == file.attributeMtime
+                && AppendOnlyFileProbe.revision(at: url) == revision
+        }
     }
 
     /// Every `*.jsonl` regular file under `dir` (recursively), path-sorted so a keep-first dedup is
@@ -465,20 +483,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         _ files: [JSONLScanning.DiscoveredFile],
         cacheIdentity: String
     ) -> Bool {
-        let changed = files.contains { file in
-            let url = URL(fileURLWithPath: file.path)
-            guard let revision = AppendOnlyFileProbe.revision(at: url),
-                  file.size >= 0,
-                  revision.size == UInt64(file.size),
-                  let values = try? url.resourceValues(forKeys: Set([
-                      .fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey
-                  ]))
-            else { return true }
-            return values.fileSize != file.size
-                || values.contentModificationDate != file.mtime
-                || values.attributeModificationDate != file.attributeMtime
-                || AppendOnlyFileProbe.revision(at: url) != revision
-        }
+        let changed = !JSONLScanning.filesStillMatch(files)
         let diagnosticKey = "jsonl.scan.source-changed.\(JSONLScanCachePaths.stableFingerprint(logTag + "|" + cacheIdentity))"
         guard changed else {
             DiagnosticGate.clearFailure(diagnosticKey)

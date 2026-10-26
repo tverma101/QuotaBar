@@ -291,20 +291,22 @@ enum PersistentJSONLScanCaches {
         await PiUsageScanner.flushPersistentCacheWrites()
     }
 
-    /// Bound process-wide RAM after a full provider refresh settles: flush pending disk upserts, then
-    /// drop Codex *session* sharedTailCache Event arrays (checkpoints remain). Keep the bounded
-    /// CodexRouter parsed index warm only while the panel is open, when ledger appends can trigger
-    /// immediate refreshes and repeated plist hydration would otherwise cost CPU.
+    /// Flush pending disk upserts after a full provider refresh settles. Keep the small, capped Codex
+    /// session tail warm across cycles; repeatedly unloading it makes the next append reparse history.
+    /// Keep the larger CodexRouter parsed index warm only while the panel is open, when ledger appends
+    /// can trigger immediate refreshes and repeated plist hydration would otherwise cost CPU.
     ///
-    /// Deliberately does **not** unload `CodexRouterUsageScanner`'s append-only tail items: that
-    /// ledger is append-heavy (~15MB / tens of thousands of rows) and shared by every Codex card.
-    /// Routine unload forced a full reparse on the next panel-open full refresh (itemsAvailable=false
-    /// cannot tail-merge). The router cache is already capped (`maxRetainedItems`); memory-pressure
-    /// still clears it via `unloadForMemoryPressure`.
+    /// The Codex session tail retains at most 8,000 events. The larger Router cache is already capped
+    /// too, but is only kept warm while the panel is open. Memory-budget and OS-pressure paths still
+    /// release both caches.
     static func unloadAfterRefreshCycle(keepRouterItemsResident: Bool = false) async {
         await flushPendingWrites()
-        CodexLogUsageScanner.unloadSharedTailCacheItems()
-        if keepRouterItemsResident {
+        if ProcessMemoryBudget.isOverSoftLimit {
+            CodexLogUsageScanner.unloadSharedTailCacheItems()
+            ClaudeSessionAppendCache.shared.unloadRetainedItems()
+            CodexRouterUsageScanner.unloadSharedTailCacheItems()
+            await CodexRouterUsageScanner.unloadSharedParsedItems()
+        } else if keepRouterItemsResident {
             await CodexRouterUsageScanner.resumeSharedParsedItems()
         } else {
             CodexRouterUsageScanner.unloadSharedTailCacheItems()
@@ -316,13 +318,13 @@ enum PersistentJSONLScanCaches {
     }
 
     /// Call after a heavy local-log provider (Codex / Claude / OpenCode / …) finishes: unload session
-    /// parse arrays immediately so concurrent cards cannot stack multi-home Event buffers into a GB
-    /// spike. Router ledger items stay resident (see `unloadAfterRefreshCycle`).
+    /// caches only when the process crosses its soft memory budget. These append caches are capped,
+    /// and keeping them warm avoids reparsing unchanged session history between provider cards.
     static func unloadAfterHeavyProvider(providerID: String) async {
-        CodexLogUsageScanner.unloadSharedTailCacheItems()
         if ProcessMemoryBudget.isOverSoftLimit {
             await flushPendingWrites()
             CodexLogUsageScanner.unloadSharedTailCacheItems()
+            ClaudeSessionAppendCache.shared.unloadRetainedItems()
             // Soft limit is the one place routine paths may drop the router tail: RSS is already over
             // budget. Prefer this over waiting for a kernel memory-pressure event.
             CodexRouterUsageScanner.unloadSharedTailCacheItems()
@@ -340,6 +342,7 @@ enum PersistentJSONLScanCaches {
     static func unloadForMemoryPressure() async {
         await flushPendingWrites()
         CodexLogUsageScanner.unloadSharedTailCacheItems()
+        ClaudeSessionAppendCache.shared.unloadRetainedItems()
         CodexRouterUsageScanner.unloadSharedTailCacheItems()
         await CodexRouterUsageScanner.unloadSharedParsedItems()
         if let summary = ProcessMemoryBudget.footprintSummary() {
