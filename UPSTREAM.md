@@ -53,6 +53,27 @@ Local changes that matter when syncing shared code:
    rows. CodexRouter and OpenCode keep compact local daily checkpoints; background refreshes read
    appended bytes and preserve the provider ownership split. Review these caches and their regression
    tests when syncing provider scanners or refresh behavior.
+   CodexRouter checkpoints keep their file identity across catalogue changes and validate the rates,
+   aliases, and dated fallbacks actually used before reusing a priced fold.
+   Two priced variants share a cross-process write lock so app/CLI snapshots can both resume.
+   Claude also reuses completed daily totals and a bounded gateway projection for unchanged sources,
+   plus bounded append checkpoints for active session files. Preserve the local source-revision,
+   ownership, cancellation, and memory-pressure checks when adapting upstream's tail scanner.
+   Claude accepts nullable optional usage fields and ignores non-assistant usage objects. Antigravity
+   correlates generation and step identities across row numbers, retaining only proven calendar days;
+   undated records never become today's usage on launch. OpenCode reads both SQLite message layouts
+   and deduplicates migrated IDs. Reasoning-only Router records keep their measured lower bound
+   without blocking independent OpenCode history. Completed Router prefixes remain usable through ordinary appends during the wider fold; rewrites and replacements still invalidate them. Preserve these format-compatibility fixes.
+
+## Selective sync — 2026-10-21
+
+Compared upstream `26132ff48d` (2026-10-18). Adapted these improvements without importing upstream branding, updates, provider activation, or pricing policy:
+
+- `063eb0661ca810905e3f981aaaaff95a7df2e66e` (#1395): Argon Weekly quota, legacy-pool exclusion, and public limit export. Owner defaults: enabled when data exists, On Demand, unpinned, after Weekly; manual off persists. Existing fork Argon pricing already covers the rates and aliases.
+- `9e6d36235263e3b06087be7cafc35395ebd8f5ba` (#1407): complementary Cloud Code quota summaries and paid-tier ID mapping. Retains the fork's host order, cancellation/auth classifications, schema diagnostics, and conservative freshness rules. Stops after a complete shared summary; a failed supplemental host cannot clear old omitted meters.
+- `eab20cfda184b2743c9c9e3ad561abad92abb4f0` (#1409): identity-safe Cursor membership badges, percent-only org totals, and missing Extra Usage enrichment. Optional requests remain limited to org/team-shaped seats and use the fork's rate-limit/error gates.
+
+Deferred the Claude reset-credit/claim dependency chain (new metric and write workflow), Cursor's replacement day-by-day history stack (overlaps the fork's verified CSV accounting), and deferred snapshot persistence (conflicts with cross-process freshness fences). Registry lookup caching is already present. These are fit decisions, not a blanket upstream merge.
 
 ## Update procedure
 
