@@ -14,17 +14,18 @@ struct AntigravityModelConfig: Sendable, Equatable {
 ///
 /// The authoritative source is the `RetrieveUserQuotaSummary` RPC (`parseQuotaSummary`): two pools
 /// (Gemini, shown as "Session"/"Weekly"; Claude = every non-Gemini model incl. GPT-OSS), each with a
-/// rolling 5-hour and a weekly window — up to four meters. Builds without that RPC fall back to the
+/// rolling 5-hour and a weekly window, plus a separate Argon weekly meter for eligible accounts. Builds without that RPC fall back to the
 /// legacy per-model endpoints, whose fine-grained models collapse into the two 5h pool meters
 /// ("Session", "Claude"), each keeping the
 /// worst (lowest) remaining fraction in its pool; the legacy data is 5h-only, so the weekly meters
-/// read "No data" there.
+/// read "No data" there. Argon is excluded from legacy pooling because its period is unavailable.
 enum AntigravityUsageMapper {
     struct QuotaSummaryResult: Sendable {
         let lines: [MetricLine]
         let isComplete: Bool
     }
 
+    private static let argonSummaryDiagnosticKey = "provider.antigravity.summary.argon"
     private static let malformedSummaryDiagnosticKey = "provider.antigravity.summary.schema"
     private static let unknownSummaryBucketDiagnosticKey = "provider.antigravity.summary.unknown-bucket"
     private static let missingSummaryFractionDiagnosticKey = "provider.antigravity.summary.missing-fraction"
@@ -52,7 +53,7 @@ enum AntigravityUsageMapper {
         ("3p-weekly", AntigravityMetric.claudeWeeklyLabel, MetricPeriod.weekMs)
     ]
 
-    /// `RetrieveUserQuotaSummary` → up to four pool meters, ordered Session, Weekly, Claude,
+    /// `RetrieveUserQuotaSummary` → up to five meters, ordered Session, Weekly, Argon Weekly, Claude,
     /// Claude Weekly. Accepts both the LS envelope (`{"response": {"groups": …}}`) and the bare remote
     /// payload (`{"groups": …}`).
     ///
@@ -85,7 +86,7 @@ enum AntigravityUsageMapper {
         var sawMissingFraction = false
         var sawDuplicateBucket = false
         let sawMissingBuckets = groups.contains { !$0.hasBuckets }
-        for bucket in groups.flatMap({ $0.buckets ?? [] }) {
+        for bucket in groups.filter({ $0.displayName != argonGroupName }).flatMap({ $0.buckets ?? [] }) {
             guard let id = bucket.bucketId, summaryBuckets.contains(where: { $0.bucketID == id }) else {
                 sawUnknownBucket = true
                 continue
@@ -134,18 +135,32 @@ enum AntigravityUsageMapper {
             DiagnosticGate.clearFailure(duplicateBucketDiagnosticKey)
         }
 
-        let lines: [MetricLine] = summaryBuckets.compactMap { spec -> MetricLine? in
+        var lines: [MetricLine] = summaryBuckets.compactMap { spec -> MetricLine? in
             guard let entry = pooled[spec.bucketID] else { return nil }
             return line(pool: spec.label, fraction: entry.fraction, resetTime: entry.resetTime, periodMs: spec.periodMs)
         }
+        let argon = argonWeeklyResult(groups)
+        let argonKey = summaryDiagnosticKey(argonSummaryDiagnosticKey, sourceID: sourceID)
+        if argon.isComplete {
+            DiagnosticGate.clearFailure(argonKey)
+        } else {
+            DiagnosticGate.logOnce(for: argonKey) {
+                AppLog.warn(LogTag.plugin("antigravity"), "Argon quota has an ambiguous or unusable weekly bucket; retaining omitted meters")
+            }
+        }
+        if let argonLine = argon.line {
+            let index = lines.firstIndex { $0.label == AntigravityMetric.claudeLabel || $0.label == AntigravityMetric.claudeWeeklyLabel } ?? lines.endIndex
+            lines.insert(argonLine, at: index)
+        }
         return QuotaSummaryResult(
             lines: lines,
-            isComplete: !sawUnknownBucket && !sawMissingFraction && !sawMissingBuckets && !sawDuplicateBucket
+            isComplete: argon.isComplete && !sawUnknownBucket && !sawMissingFraction && !sawMissingBuckets && !sawDuplicateBucket
         )
     }
 
     static func clearQuotaSummaryDiagnostics(sourceID: String) {
         for key in [
+            argonSummaryDiagnosticKey,
             malformedSummaryDiagnosticKey,
             unknownSummaryBucketDiagnosticKey,
             missingSummaryFractionDiagnosticKey,
@@ -221,6 +236,10 @@ enum AntigravityUsageMapper {
     /// Cloud Code `loadCodeAssist` → plan name (paid tier preferred over current tier).
     static func parseLoadCodeAssistPlan(_ data: Data) -> String? {
         guard let envelope = try? JSONDecoder().decode(CCLoadEnvelope.self, from: data) else { return nil }
+        if let id = envelope.paidTier?.id,
+           let plan = ["g1-pro-tier": "Pro", "g1-ultra-tier": "Ultra", "g1-ultra-lite-tier": "Ultra Lite"][id] {
+            return plan
+        }
         return formatPlan(envelope.paidTier?.name ?? envelope.currentTier?.name)
     }
 
@@ -238,6 +257,7 @@ enum AntigravityUsageMapper {
             let label = config.label.trimmingCharacters(in: .whitespaces)
             guard !label.isEmpty else { continue }
             if let id = config.modelID, modelBlacklist.contains(id) { continue }
+            if isArgonModel(label: label, modelID: config.modelID) { continue }
 
             let pool = poolLabel(normalizeLabel(label))
             if let existing = pooled[pool] {
@@ -320,61 +340,6 @@ enum AntigravityUsageMapper {
 
 // MARK: - Wire types (the documented response shapes; validated only at this boundary)
 
-/// `RetrieveUserQuotaSummary`, both envelopes: the LS wraps the payload in `{"response": {...}}`,
-/// the remote Cloud Code endpoint returns it bare. Every field is optional — third-party parsers have
-/// already regressed by assuming absent fields (defaulting a missing `remainingFraction` to "full").
-private struct QuotaSummaryEnvelope: Decodable {
-    let response: QuotaSummaryRoot?
-    let groups: [QuotaSummaryGroup]?
-}
-
-private struct QuotaSummaryRoot: Decodable {
-    let groups: [QuotaSummaryGroup]?
-}
-
-private struct QuotaSummaryGroup: Decodable {
-    let buckets: [QuotaSummaryBucket]?
-
-    /// Missing and explicit-null are schema gaps; an explicit empty array is an authoritative answer.
-    let hasBuckets: Bool
-
-    private enum CodingKeys: String, CodingKey {
-        case buckets
-    }
-
-    init(from decoder: Decoder) throws {
-        guard let container = try? decoder.container(keyedBy: CodingKeys.self),
-              container.contains(.buckets),
-              (try? container.decodeNil(forKey: .buckets)) != true,
-              let decodedBuckets = try? container.decode([QuotaSummaryBucket].self, forKey: .buckets)
-        else {
-            buckets = nil
-            hasBuckets = false
-            return
-        }
-        buckets = decodedBuckets
-        hasBuckets = true
-    }
-}
-
-/// A bucket that never fails its containing array: a malformed element (not an object, or a field of
-/// the wrong type) decodes to nil fields instead of throwing the whole summary into the legacy
-/// fallback. The mapper then drops the unusable bucket with a warning and keeps the rest.
-private struct QuotaSummaryBucket: Decodable {
-    let bucketId: String?
-    let remainingFraction: Double?
-    let resetTime: String?
-
-    private enum CodingKeys: String, CodingKey { case bucketId, remainingFraction, resetTime }
-
-    init(from decoder: Decoder) {
-        let container = try? decoder.container(keyedBy: CodingKeys.self)
-        bucketId = container.flatMap { (try? $0.decodeIfPresent(String.self, forKey: .bucketId)) ?? nil }
-        remainingFraction = container.flatMap { (try? $0.decodeIfPresent(Double.self, forKey: .remainingFraction)) ?? nil }
-        resetTime = container.flatMap { (try? $0.decodeIfPresent(String.self, forKey: .resetTime)) ?? nil }
-    }
-}
-
 private struct AntigravityQuotaInfo: Decodable {
     let remainingFraction: Double?
     let resetTime: String?
@@ -423,7 +388,7 @@ private struct CCLoadEnvelope: Decodable {
     let currentTier: Tier?
     let paidTier: Tier?
 
-    struct Tier: Decodable { let name: String? }
+    struct Tier: Decodable { let id: String?; let name: String? }
 }
 
 private struct CCQuotaEnvelope: Decodable {

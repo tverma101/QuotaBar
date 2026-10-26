@@ -19,7 +19,6 @@ enum AntigravityProtoDecoder {
         var outputTokens: Int
         var cacheReadTokens: Int
         var timestampSeconds: Int64
-        var timestampIsInferred = false
     }
 
     enum GenerationEventDecodeResult: Equatable, Sendable {
@@ -165,6 +164,38 @@ enum AntigravityProtoDecoder {
         case invalid
     }
 
+    struct StepIdentity: Hashable, Sendable {
+        let uuid: String?
+        let botID: String?
+    }
+
+    private static func stepIdentity(_ uuid: IdentifierEvidence, _ bot: IdentifierEvidence) -> StepIdentity? {
+        func value(_ evidence: IdentifierEvidence) -> String? {
+            if case .value(let value) = evidence { return value }
+            return nil
+        }
+        if case .invalid = uuid { return nil }
+        if case .invalid = bot { return nil }
+        let identity = StepIdentity(uuid: value(uuid), botID: value(bot))
+        return identity.uuid == nil && identity.botID == nil ? nil : identity
+    }
+
+    static func generationStepIdentity(from generation: [UInt8]) -> StepIdentity? {
+        guard let wrappers = matchingFields(1, in: generation), wrappers.count == 1,
+              case .bytes(let wrapped) = wrappers[0],
+              let usages = matchingFields(4, in: wrapped), usages.count == 1,
+              case .bytes(let usage) = usages[0] else { return nil }
+        return stepIdentity(identifierEvidence(4, in: generation), identifierEvidence(7, in: usage))
+    }
+
+    static func stepIdentityAndTimestamp(from metadata: [UInt8]) -> (StepIdentity, Int64)? {
+        guard let identity = stepIdentity(
+            identifierEvidence(12, in: metadata),
+            nestedIdentifierEvidence(containerField: 9, identifierField: 7, in: metadata)
+        ), let timestamp = timestamp(fromStepMetadata: metadata) else { return nil }
+        return (identity, timestamp)
+    }
+
     /// Step rows are indexed separately from generation records in newer Antigravity databases.
     /// Reject timestamps when identifiers visibly disagree or appear on only one side. Older
     /// generations omit these auxiliary IDs on both sides, so keep the legacy indexed timestamp
@@ -236,7 +267,7 @@ enum AntigravityProtoDecoder {
     static func decodeGenerationEvent(
         from blob: [UInt8],
         stepMetadata: [UInt8]? = nil,
-        observationTimestamp: Int64? = nil
+        matchedStepTimestamp: Int64? = nil
     ) -> GenerationEventDecodeResult {
         guard let wrappers = matchingFields(1, in: blob) else {
             return .malformedUsage(timestampSeconds: nil)
@@ -246,7 +277,7 @@ enum AntigravityProtoDecoder {
               case .bytes(let wrapped) = wrappers[0]
         else { return .malformedUsage(timestampSeconds: nil) }
 
-        let fallbackTimestamp = stepMetadata.flatMap {
+        let fallbackTimestamp = matchedStepTimestamp ?? stepMetadata.flatMap {
             correlatedStepTimestamp(generation: blob, wrapped: wrapped, stepMetadata: $0)
         }
 
@@ -332,16 +363,14 @@ enum AntigravityProtoDecoder {
         }
         guard total.partialValue > 0 else { return .ignored }
 
-        let timestampIsInferred = timestamp == nil
-        guard let timestamp = timestamp ?? observationTimestamp else { return .undatedUsage }
+        guard let timestamp else { return .undatedUsage }
 
         return .event(GenerationEvent(
             model: model.flatMap { $0.isEmpty ? nil : $0 } ?? GenerationEvent.unknownModel,
             inputTokens: billableInputTokens.partialValue,
             outputTokens: outputTokens,
             cacheReadTokens: cacheReadTokens,
-            timestampSeconds: timestamp,
-            timestampIsInferred: timestampIsInferred
+            timestampSeconds: timestamp
         ))
     }
 

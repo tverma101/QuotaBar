@@ -23,6 +23,10 @@ final class AntigravityProvider: ProviderRuntime {
     let now: @Sendable () -> Date
     let pricing: @Sendable () async -> ModelPricing
 
+    func unloadLocalAccountingCachesForMemoryPressure() async {
+        await dbUsageScanner.unloadCachesForMemoryPressure()
+    }
+
     nonisolated private static let antigravityServerOptions = LanguageServerDiscovery.Options(
         processName: "language_server",
         markers: ["antigravity", "antigravity-ide"],
@@ -60,6 +64,9 @@ final class AntigravityProvider: ProviderRuntime {
                 .exportingLimit("geminiSession", unit: "percent"),
             .percent(id: AntigravityMetric.geminiWeeklyID, provider: provider, title: AntigravityMetric.weeklyLabel)
                 .exportingLimit("geminiWeekly", unit: "percent"),
+            .percent(id: AntigravityMetric.argonWeeklyID, provider: provider, title: AntigravityMetric.argonWeeklyLabel)
+                .exportingLimit("argonWeekly", unit: "percent")
+                .hidingWhenEmpty(),
             .percent(id: AntigravityMetric.claudeID, provider: provider, title: AntigravityMetric.claudeLabel, sessionStartSignal: .zeroUsage)
                 .exportingLimit("nonGeminiSession", unit: "percent")
                 .hidingWhenEmpty(),
@@ -244,7 +251,9 @@ final class AntigravityProvider: ProviderRuntime {
             ? (scanResult.hasReadFailures
                 ? "Some Antigravity conversation stores could not be read. Visible totals are lower bounds."
                 : nil)
-            : "Some Antigravity history could not be counted. Visible totals are lower bounds."
+            : (scanResult.hasReadFailures
+                ? "Some Antigravity conversation stores could not be read, and some history could not be dated or counted. Visible totals are lower bounds."
+                : "Some Antigravity history could not be dated or counted. Visible totals are lower bounds.")
         return LocalHistoryResult(history: history, lines: lines, warning: warning)
     }
 
@@ -517,17 +526,19 @@ final class AntigravityProvider: ProviderRuntime {
             var sawNotFound = false
             var sawTransientFailure = false
             var sawUnusableSuccess = false
-            switch try await usageClient.cloudCode(path: AntigravityUsageClient.quotaSummaryPath, token: token, userAgent: "antigravity", body: [:]) {
+            switch try await usageClient.cloudCodeSummaries(token: token) {
             case .authFailed:
                 return .authFailed
             case .forbidden:
                 return .forbidden
             case .notFound:
                 sawNotFound = true
-                AntigravityUsageMapper.clearQuotaSummaryDiagnostics(sourceID: "cloud-code")
+                for index in AntigravityUsageClient.cloudCodeURLs.indices {
+                    AntigravityUsageMapper.clearQuotaSummaryDiagnostics(sourceID: "cloud-code-\(index)")
+                }
                 break
-            case .ok(let data):
-                if let summary = AntigravityUsageMapper.parseQuotaSummaryResult(data, sourceID: "cloud-code") {
+            case .ok(let bodies, let allHostsAnswered):
+                if let summary = AntigravityUsageMapper.parseQuotaSummariesResult(bodies, allHostsAnswered: allHostsAnswered) {
                     return .success(StrategyResult(
                         plan: try await codeAssistTask.value.plan,
                         lines: summary.lines,
