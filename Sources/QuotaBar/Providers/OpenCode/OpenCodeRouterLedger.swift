@@ -122,14 +122,22 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
         }
     }
 
+    /// The fold represents a verified prefix, not a promise that the writer will stay idle. An
+    /// ordinary append leaves that prefix valid and is consumed next pass. Rotation, truncation,
+    /// changed prefix samples, and same-size rewrites still invalidate it, as in the tail cache.
     static func sourceSnapshotIsCurrent(_ snapshot: SourceSnapshot, atPath path: String) -> Bool {
         let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         guard let revision = AppendOnlyFileProbe.revision(at: url),
-              revision == snapshot.revision,
+              revision.device == snapshot.revision.device,
+              revision.inode == snapshot.revision.inode,
+              revision.size >= snapshot.revision.size,
+              snapshot.offset == snapshot.revision.size,
+              let stamp = modificationStamp(at: url),
               AppendOnlyFileProbe.anchor(at: url, endingAt: snapshot.offset) == snapshot.anchor,
-              let stamp = modificationStamp(at: url)
+              AppendOnlyFileProbe.revision(at: url) == revision,
+              modificationStamp(at: url) == stamp
         else { return false }
-        return stamp == snapshot.modificationStamp
+        return revision.size > snapshot.revision.size || stamp == snapshot.modificationStamp
     }
 
     func statistics(path: String) -> (fullParses: Int, tailParses: Int, bytesRead: Int)? {
@@ -200,6 +208,28 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
               CodexRouterUsageScanner.isSuccessfulStatus(event.status)
         else { return .irrelevant }
         guard let measuredTokenTotal = event.measuredTokenTotal else {
+            // Some router responses report measured reasoning with zero input/output/total and
+            // only an estimated input count. Reasoning is a measured subset of output: retain that
+            // lower bound without promoting estimated input or freezing every other valid record.
+            if event.hasInputTokensField, event.hasOutputTokensField,
+               event.inputTokens == 0, event.outputTokens == 0, event.cachedInputTokens == 0,
+               event.totalTokens == 0, event.reasoningTokens > 0 {
+                let model = OpenCodeUsageScanner.bareRouterModelName(event.model)
+                guard !model.isEmpty else { return .malformed }
+                let row = OpenCodeUsageScanner.ClaudeGatewayRow(
+                    date: event.timestamp, input: 0, output: event.reasoningTokens,
+                    cacheWrite: 0, cacheRead: 0, model: model, totalTokens: event.reasoningTokens,
+                    burnsGoQuota: event.provider.lowercased().hasPrefix("opencode-go")
+                        || OpenCodeUsageScanner.isOpenCodeGoGatewayModel(event.model),
+                    isInProgress: false, accountId: event.accountId, accountFingerprint: event.accountFingerprint,
+                    routerInputWasEstimated: true, routerCostBreakdownIsComplete: false,
+                    tokenCountSaturated: event.tokenCountSaturated == true
+                )
+                if event.timestamp > maximumTimestamp, shouldCheckFuture(row) {
+                    return .futureTimestamp(event.timestamp)
+                }
+                return .row(row)
+            }
             // A successful routed event can be a metadata-only sentinel while the native Codex log
             // carries the measured tokens. Retain it as an incomplete zero row so it cannot claim
             // router coverage and suppress that native record. Partial or invalid count fields still

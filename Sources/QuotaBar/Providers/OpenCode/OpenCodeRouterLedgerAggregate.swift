@@ -9,7 +9,8 @@ import Darwin
 /// needed by rolling cap meters. Non-Go rows materialize as a few dozen aggregated rows; long-context
 /// pricing is disabled for those sums because one bucket is not one request.
 final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
-    private static let schema = 17
+    // Replay old malformed sentinels now that reasoning-only measurements have a partial form.
+    private static let schema = 18
     /// Serialize aggregate-file mutations within the app process as well as across app/CLI processes.
     private static let aggregateFileMutationLock = NSLock()
 

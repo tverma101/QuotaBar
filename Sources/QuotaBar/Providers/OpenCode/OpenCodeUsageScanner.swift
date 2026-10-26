@@ -534,9 +534,25 @@ struct OpenCodeUsageScanner: Sendable {
             // query already running, but this prevents later database/anchor queries from starting.
             guard !Task.isCancelled else { return nil }
             checked.insert(path)
+            let schema: OpenCodeDatabaseSchema
             do {
+                // Which message tables this database holds (OpenCode 1's `message`, OpenCode 2's
+                // `session_message`, or both while the v1→v2 migration runs). The probe is one
+                // `sqlite_master` lookup, memoized per database revision.
+                schema = try JSONLAccountingWorkPacer.shared.perform({
+                    try OpenCodeDatabaseSchemaProbe.detect(sqlite: sqlite, path: path)
+                })
+                if schema.readsV2 {
+                    let layout = schema == .v2 ? "session_message" : "session_message + message"
+                    DiagnosticGate.logOnce(for: "opencode.sqlite.schema.\(JSONLScanCachePaths.stableFingerprint(path))") {
+                        AppLog.info(.refresh, "opencode database \(path) uses the \(layout) layout")
+                    }
+                }
                 guard let json = try JSONLAccountingWorkPacer.shared.perform({
-                    try sqlite.queryValue(path: path, sql: Self.dataSQL(cutoffMs: cutoffMs))
+                    try sqlite.queryValue(
+                        path: path,
+                        sql: OpenCodeDatabaseSQL.dataSQL(cutoffMs: cutoffMs, schema: schema)
+                    )
                 }) else {
                     failures[path] = "usage query returned no result"
                     continue
@@ -562,7 +578,7 @@ struct OpenCodeUsageScanner: Sendable {
             // The anchor is memoized per database revision: it is a full-history MIN() scan that
             // cannot change unless the database file changes (any write moves size/mtime, which the
             // memo key catches, including a deleted oldest session), yet it re-ran on every refresh.
-            let memoKey = Self.goAnchorMemoKey(path: path)
+            let memoKey = Self.goAnchorMemoKey(path: path, schema: schema)
             if let memoKey, let anchor = Self.cachedGoAnchor(key: memoKey) {
                 anchorMs = Swift.min(anchorMs ?? anchor, anchor)
             } else {
@@ -570,7 +586,7 @@ struct OpenCodeUsageScanner: Sendable {
                 do {
                     guard !Task.isCancelled else { return nil }
                     let text = try JSONLAccountingWorkPacer.shared.perform({
-                        try sqlite.queryValue(path: path, sql: Self.anchorSQL)
+                        try sqlite.queryValue(path: path, sql: OpenCodeDatabaseSQL.anchorSQL(schema: schema))
                     })
                     DiagnosticGate.clearFailure(anchorDiagnosticKey)
                     if let text,
@@ -683,7 +699,7 @@ struct OpenCodeUsageScanner: Sendable {
             do {
                 discoveredLedgerPaths = try routerLedgerPaths()
             } catch {
-                throw OpenCodeUsageError.usageSourcesIncomplete
+                throw Self.incompleteSource("Router discovery")
             }
             for path in discoveredLedgerPaths.map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
             where seenLedgerPaths.insert(path).inserted {
@@ -698,7 +714,7 @@ struct OpenCodeUsageScanner: Sendable {
                         identifiersToIdentityKeys: codexAccountIdentityKeys
                       )
                 else {
-                    throw OpenCodeUsageError.usageSourcesIncomplete
+                    throw Self.incompleteSource("Router ledger")
                 }
                 routerRows += result.rows
                 routerSourceSnapshots[path] = result.source
@@ -735,7 +751,7 @@ struct OpenCodeUsageScanner: Sendable {
                 guard !Task.isCancelled else { return nil }
                 let complete = await scanner.foldParsedEntries(
                     daysBack: daysBack, now: now, roots: roots,
-                    cacheIdentityOverride: claudeCacheIdentity()
+                    cacheIdentityOverride: claudeCacheIdentity(), hostedGatewayOnly: true
                 ) { entry in
                     gatewayFold.foldClaude(entry)
                 }
@@ -745,7 +761,7 @@ struct OpenCodeUsageScanner: Sendable {
                             AppLog.warn(LogTag.plugin("opencode"), "local session usage contains a timestamp more than five minutes ahead; preserving last-good history")
                         }
                     }
-                    throw OpenCodeUsageError.usageSourcesIncomplete
+                    throw Self.incompleteSource("Claude sessions")
                 }
             }
         }
@@ -772,9 +788,8 @@ struct OpenCodeUsageScanner: Sendable {
                             AppLog.warn(LogTag.plugin("opencode"), "local session usage contains a timestamp more than five minutes ahead; preserving last-good history")
                         }
                     }
-                    throw OpenCodeUsageError.usageSourcesIncomplete
+                    throw Self.incompleteSource("Codex sessions")
                 }
-                CodexLogUsageScanner.unloadSharedTailCacheItems()
             }
             for home in partitionedCodex.managed {
                 let accountIdentityKey = accountIdentityKey(for: home)
@@ -791,9 +806,8 @@ struct OpenCodeUsageScanner: Sendable {
                             AppLog.warn(LogTag.plugin("opencode"), "local session usage contains a timestamp more than five minutes ahead; preserving last-good history")
                         }
                     }
-                    throw OpenCodeUsageError.usageSourcesIncomplete
+                    throw Self.incompleteSource("Codex sessions")
                 }
-                CodexLogUsageScanner.unloadSharedTailCacheItems()
             }
         }
         accumulator = gatewayFold.accumulator
@@ -809,7 +823,7 @@ struct OpenCodeUsageScanner: Sendable {
         do {
             hermesPath = gatewaySources.contains(.hermes) ? try hermesStateDBPath() : nil
         } catch {
-            throw OpenCodeUsageError.usageSourcesIncomplete
+            throw Self.incompleteSource("Hermes discovery")
         }
         if let hermesPath {
             guard FileManager.default.fileExists(atPath: hermesPath),
@@ -821,7 +835,7 @@ struct OpenCodeUsageScanner: Sendable {
                 if !newlyFailing.isEmpty {
                     AppLog.warn(LogTag.plugin("opencode"), "Hermes session database is missing or unreadable: \(hermesPath) — keeping the last complete history")
                 }
-                throw OpenCodeUsageError.usageSourcesIncomplete
+                throw Self.incompleteSource("Hermes database")
             }
             do {
                 guard !Task.isCancelled else { return nil }
@@ -831,7 +845,7 @@ struct OpenCodeUsageScanner: Sendable {
                         sql: Self.hermesGatewaySQL(cutoffSeconds: Double(cutoffMs) / 1000)
                     )
                 }) else {
-                    throw OpenCodeUsageError.usageSourcesIncomplete
+                    throw Self.incompleteSource("Hermes query")
                 }
                 guard !Task.isCancelled else { return nil }
                 guard let rows = JSONLAccountingWorkPacer.shared.perform({
@@ -840,7 +854,7 @@ struct OpenCodeUsageScanner: Sendable {
                         maximumTimestamp: JSONLScanning.maximumTimestamp(now: now)
                     )
                 }) else {
-                    throw OpenCodeUsageError.usageSourcesIncomplete
+                    throw Self.incompleteSource("Hermes accounting")
                 }
                 Self.foldGatewayRows(
                     rows,
@@ -857,7 +871,7 @@ struct OpenCodeUsageScanner: Sendable {
                 if !newlyFailing.isEmpty {
                     AppLog.warn(LogTag.plugin("opencode"), "Hermes session database \(hermesPath): \(error.localizedDescription) — Hermes usage is not folded into this card until it recovers")
                 }
-                throw OpenCodeUsageError.usageSourcesIncomplete
+                throw Self.incompleteSource("Hermes database")
             }
         }
         // Fold router rows after native Codex discovery. Complete pairs were used instead of their
@@ -890,7 +904,7 @@ struct OpenCodeUsageScanner: Sendable {
                 guard !Task.isCancelled else { return nil }
                 guard let museEntries = await MuseUsageScanner().parsedEntriesIfComplete(
                     daysBack: daysBack, now: now, roots: museRootsValue
-                ) else { throw OpenCodeUsageError.usageSourcesIncomplete }
+                ) else { throw Self.incompleteSource("Muse sessions") }
                 guard !Task.isCancelled else { return nil }
                 Self.foldGatewayRows(
                     Self.museGatewayRows(from: museEntries), since: scanSince, pricing: pricing,
@@ -909,16 +923,17 @@ struct OpenCodeUsageScanner: Sendable {
                     URL(fileURLWithPath: $0).resolvingSymlinksInPath().path
                 })
             } catch {
-                throw OpenCodeUsageError.usageSourcesIncomplete
+                throw Self.incompleteSource("Router discovery")
             }
             guard finalLedgerPaths == seenLedgerPaths,
                   routerSourceSnapshots.count == seenLedgerPaths.count,
                   routerSourceSnapshots.allSatisfy({ source in
                       Self.routerGatewaySourceIsCurrent(source.value, atPath: source.key)
                   })
-            else { throw OpenCodeUsageError.usageSourcesIncomplete }
+            else { throw Self.incompleteSource("Router source changed") }
         }
         let logScan = accumulator.build()
+        DiagnosticGate.clearFailures(prefix: "opencode.incomplete.")
         stageTimer.end("build")
         // Hosted turns can still be present in CodexRouter, Claude, Hermes, or Muse logs when the
         // OpenCode SQLite database is absent. Return those folds; retain the meters-only behavior
@@ -956,7 +971,12 @@ struct OpenCodeUsageScanner: Sendable {
         }
         for path in paths {
             do {
-                if let value = try sqlite.queryValue(path: path, sql: Self.probeSQL), !value.isEmpty {
+                // The probe runs against the layout this database actually holds.
+                let schema = try OpenCodeDatabaseSchemaProbe.detect(sqlite: sqlite, path: path)
+                if let value = try sqlite.queryValue(
+                    path: path,
+                    sql: OpenCodeDatabaseSQL.probeSQL(schema: schema)
+                ), !value.isEmpty {
                     return true
                 }
             } catch {
@@ -1597,6 +1617,13 @@ struct OpenCodeUsageScanner: Sendable {
         return rows
     }
 
+    private static func incompleteSource(_ source: String) -> OpenCodeUsageError {
+        DiagnosticGate.logOnce(for: "opencode.incomplete.\(source)") {
+            AppLog.warn(LogTag.plugin("opencode"), "\(source) could not be read completely; preserving last-good combined usage")
+        }
+        return .usageSourcesIncomplete
+    }
+
     // MARK: - SQL
 
     // MARK: Go anchor memo
@@ -1609,15 +1636,11 @@ struct OpenCodeUsageScanner: Sendable {
     /// panel-open case) then skip the scan entirely.
     private static let goAnchorMemo = OSAllocatedUnfairLock<[String: Double]>(initialState: [:])
 
-    private static func goAnchorMemoKey(path: String) -> String? {
-        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey]
-        func stamp(_ url: URL) -> String {
-            guard let values = try? url.resourceValues(forKeys: keys) else { return "?" }
-            return "\(values.fileSize ?? -1)|\(values.contentModificationDate?.timeIntervalSinceReferenceDate ?? -1)"
-        }
-        let main = URL(fileURLWithPath: path)
-        let wal = URL(fileURLWithPath: path + "-wal")
-        return "\(path)|\(stamp(main))|\(stamp(wal))"
+    private static func goAnchorMemoKey(path: String, schema: OpenCodeDatabaseSchema) -> String? {
+        guard let revision = OpenCodeDatabaseSchemaProbe.revisionStamp(path: path) else { return nil }
+        // The layout is part of the key: the anchor query differs per layout, so a store that
+        // migrates under the same file stamp cannot reuse the other layout's answer.
+        return "\(path)|\(schema)|\(revision)"
     }
 
     private static func cachedGoAnchor(key: String) -> Double? {
@@ -1627,78 +1650,4 @@ struct OpenCodeUsageScanner: Sendable {
     private static func storeGoAnchor(key: String, anchorMs: Double) {
         goAnchorMemo.withLock { $0[key] = anchorMs }
     }
-
-    /// SQL literal built from `hostedProviderIDs`, so the tracked list has one source of truth.
-    private static let providerFilter = "(" + hostedProviderIDs.map { "'\($0)'" }.joined(separator: ",") + ")"
-
-    static func dataSQL(cutoffMs: Int) -> String {
-        """
-        WITH source AS (
-            SELECT time_created,
-                   json_type(data,'$.cost') AS cost_type,
-                   json_extract(data,'$.cost') AS cost,
-                   json_type(data,'$.tokens') AS tokens_type,
-                   json_type(data,'$.tokens.total') AS total_type,
-                   json_extract(data,'$.tokens.total') AS total,
-                   json_type(data,'$.tokens.input') AS input_type,
-                   json_extract(data,'$.tokens.input') AS input_tokens,
-                   json_type(data,'$.tokens.output') AS output_type,
-                   json_extract(data,'$.tokens.output') AS output_tokens,
-                   json_type(data,'$.tokens.reasoning') AS reasoning_type,
-                   json_extract(data,'$.tokens.reasoning') AS reasoning_tokens,
-                   json_type(data,'$.tokens.cache') AS cache_type,
-                   json_type(data,'$.tokens.cache.read') AS cache_read_type,
-                   json_extract(data,'$.tokens.cache.read') AS cache_read_tokens,
-                   json_type(data,'$.tokens.cache.write') AS cache_write_type,
-                   json_extract(data,'$.tokens.cache.write') AS cache_write_tokens,
-                   json_extract(data,'$.modelID') AS model_id,
-                   json_extract(data,'$.providerID') AS provider_id
-            FROM message
-            WHERE time_created >= \(cutoffMs)
-              AND json_valid(data)
-              AND json_extract(data,'$.role') = 'assistant'
-              AND json_extract(data,'$.providerID') IN \(providerFilter)
-        )
-        SELECT json_group_array(json_array(
-                 time_created,
-                 CASE WHEN cost_type IN ('integer','real') AND cost >= 0 THEN cost ELSE -1 END,
-                 CASE
-                     WHEN total_type IN ('integer','real') AND total > 0 THEN total
-                     WHEN tokens_type = 'object'
-                       AND (total_type IS NULL OR total_type = 'null' OR (total_type IN ('integer','real') AND total = 0))
-                       AND input_type IN ('integer','real') AND input_tokens >= 0
-                       AND output_type IN ('integer','real') AND output_tokens >= 0
-                       AND (reasoning_type IS NULL OR reasoning_type = 'null' OR (reasoning_type IN ('integer','real') AND reasoning_tokens >= 0))
-                       AND (cache_type IS NULL OR cache_type IN ('null','object'))
-                       AND (cache_read_type IS NULL OR cache_read_type = 'null' OR (cache_read_type IN ('integer','real') AND cache_read_tokens >= 0))
-                       AND (cache_write_type IS NULL OR cache_write_type = 'null' OR (cache_write_type IN ('integer','real') AND cache_write_tokens >= 0))
-                     THEN COALESCE(input_tokens,0)
-                        + COALESCE(output_tokens,0)
-                        + COALESCE(reasoning_tokens,0)
-                        + COALESCE(cache_read_tokens,0)
-                        + COALESCE(cache_write_tokens,0)
-                     ELSE -1
-                END,
-                 model_id,
-                 provider_id))
-        FROM source;
-        """
-    }
-
-    static let anchorSQL = """
-        SELECT MIN(time_created) FROM message
-        WHERE json_valid(data)
-          AND json_extract(data,'$.role') = 'assistant'
-          AND json_extract(data,'$.providerID') = '\(goProviderID)'
-          AND json_type(data,'$.cost') IN ('integer','real');
-        """
-
-    static let probeSQL = """
-        SELECT 1 FROM message
-        WHERE json_valid(data)
-          AND json_extract(data,'$.role') = 'assistant'
-          AND json_extract(data,'$.providerID') IN \(providerFilter)
-          AND json_type(data,'$.cost') IN ('integer','real')
-        LIMIT 1;
-        """
 }
