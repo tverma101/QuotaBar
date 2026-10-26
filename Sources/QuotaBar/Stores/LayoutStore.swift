@@ -147,6 +147,7 @@ final class LayoutStore {
         defaultMetricIDs: [String] = DefaultLayout.metricIDs,
         migrationBaselineMetricIDs: [String] = DefaultLayout.migrationBaselineMetricIDs,
         defaultPinnedMetricIDs: [String] = DefaultLayout.pinnedMetricIDs,
+        migrationBaselinePinnedMetricIDs: [String] = DefaultLayout.migrationBaselinePinnedMetricIDs,
         defaultExpandedMetricIDs: [String] = DefaultLayout.expandedMetricIDs,
         isProviderEnabled: @escaping @MainActor (String) -> Bool = { _ in true }
     ) {
@@ -165,6 +166,7 @@ final class LayoutStore {
                 metricIDs: defaultMetricIDs,
                 migrationBaselineMetricIDs: migrationBaselineMetricIDs,
                 pinnedMetricIDs: defaultPinnedMetricIDs,
+                migrationBaselinePinnedMetricIDs: migrationBaselinePinnedMetricIDs,
                 expandedMetricIDs: defaultExpandedMetricIDs
             )
         )
@@ -219,6 +221,9 @@ final class LayoutStore {
         if initial.shouldPersistPins { persistPins() }
         if let seededAccountPins = initial.seededAccountPinsToPersist {
             persistSeededAccountPins(seededAccountPins)
+        }
+        if let seededDefaultPins = initial.seededDefaultPinsToPersist {
+            persistence.saveSeededDefaultPins(seededDefaultPins)
         }
         syncPlacedOrder(persistChanges: initial.shouldPersistPlaced)
     }

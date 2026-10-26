@@ -11,7 +11,7 @@ final class AntigravityLayoutTests: XCTestCase {
 
         // Every quota, trend, and spend metric is enabled in provider declaration order.
         XCTAssertEqual(store.placed.map(\.descriptorID), [
-            "antigravity.geminiPro", "antigravity.geminiWeekly",
+            "antigravity.geminiPro", "antigravity.geminiWeekly", "antigravity.argonWeekly",
             "antigravity.claude", "antigravity.claudeWeekly", "antigravity.trend",
             "antigravity.today", "antigravity.yesterday", "antigravity.last30"
         ])
@@ -25,7 +25,7 @@ final class AntigravityLayoutTests: XCTestCase {
             "antigravity.geminiPro", "antigravity.geminiWeekly", "antigravity.trend"
         ])
         XCTAssertEqual(group?.expandedMetrics.map(\.id), [
-            "antigravity.claude", "antigravity.claudeWeekly",
+            "antigravity.argonWeekly", "antigravity.claude", "antigravity.claudeWeekly",
             "antigravity.today", "antigravity.yesterday", "antigravity.last30"
         ])
         XCTAssertEqual(store.spendCapableProviders.map(\.id), ["antigravity"])
@@ -100,6 +100,31 @@ final class AntigravityLayoutTests: XCTestCase {
 
     // A saved pins key never gains new default pins — asserted above in
     // testSavedGeminiFlashStateIsFilteredEverywhere (the exact-pin-set check).
+
+    func testArgonAutoSeedsOnceBelowCaretAndPreservesManualOff() {
+        let defaults = makeDefaults("ArgonUpgrade")
+        let priorDefaults = DefaultLayout.metricIDs.filter { $0 != AntigravityMetric.argonWeeklyID }
+        let registry = WidgetRegistry.antigravityOnly
+        let old = LayoutStore(registry: registry, defaults: defaults, storageKey: "layout",
+                              defaultMetricIDs: priorDefaults)
+        XCTAssertFalse(old.isMetricEnabled(AntigravityMetric.argonWeeklyID))
+
+        let upgraded = LayoutStore(registry: registry, defaults: defaults, storageKey: "layout")
+        XCTAssertTrue(upgraded.isMetricEnabled(AntigravityMetric.argonWeeklyID))
+        XCTAssertTrue(upgraded.expandedMetricIDs.contains(AntigravityMetric.argonWeeklyID))
+        XCTAssertFalse(upgraded.pinnedMetricIDs.contains(AntigravityMetric.argonWeeklyID))
+        XCTAssertEqual(upgraded.orderedSupportedMetrics(for: "antigravity").prefix(3).map(\.id), [
+            AntigravityMetric.geminiID, AntigravityMetric.geminiWeeklyID, AntigravityMetric.argonWeeklyID
+        ])
+        let descriptor = registry.descriptor(id: AntigravityMetric.argonWeeklyID)!
+        XCTAssertEqual(descriptor.metricLabel, AntigravityMetric.argonWeeklyLabel)
+        XCTAssertFalse(upgraded.showsRow(descriptor, hasData: false))
+        XCTAssertTrue(upgraded.showsRow(descriptor, hasData: true))
+
+        upgraded.setMetricEnabled(AntigravityMetric.argonWeeklyID, false)
+        let reloaded = LayoutStore(registry: registry, defaults: defaults, storageKey: "layout")
+        XCTAssertFalse(reloaded.isMetricEnabled(AntigravityMetric.argonWeeklyID))
+    }
 
     // MARK: - Fixtures
 

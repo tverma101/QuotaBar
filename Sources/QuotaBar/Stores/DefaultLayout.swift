@@ -2,13 +2,13 @@ import Foundation
 
 /// Metrics enabled on first launch. Core quota meters and trends stay visible above the fold, while
 /// optional balance and spend-history rows are usually tucked behind each provider's caret. Freebuff's
-/// rows are always visible by owner choice; the provider has no menu-bar pins by default.
-/// `LayoutStore` filters this to whatever the active registry actually knows, so registries that don't
-/// define an ID (e.g. the test fixtures) silently ignore it. The provider-section order isn't seeded
-/// here: an empty saved order reconciles to plain registry order in `LayoutStore`.
+/// rows are always visible by owner choice, and its Daily Hours meter carries the owner-requested
+/// menu-bar pin. `LayoutStore` filters this to whatever the active registry actually knows, so
+/// registries that don't define an ID (e.g. the test fixtures) silently ignore it. The provider-section
+/// order isn't seeded here: an empty saved order reconciles to plain registry order in `LayoutStore`.
 enum DefaultLayout {
     static let metricIDs: [String] = [
-        "antigravity.geminiPro", "antigravity.geminiWeekly", "antigravity.claude", "antigravity.claudeWeekly",
+        "antigravity.geminiPro", "antigravity.geminiWeekly", "antigravity.argonWeekly", "antigravity.claude", "antigravity.claudeWeekly",
         "antigravity.trend", "antigravity.today", "antigravity.yesterday", "antigravity.last30",
 
         "claude.session", "claude.weekly", "claude.fable", "claude.trend",
@@ -65,9 +65,24 @@ enum DefaultLayout {
 
     /// Metrics pinned to the menu bar on first launch, so the app shows real numbers out of the box
     /// instead of a lone icon. Two per provider for Antigravity, Claude, Codex, and Cursor — the
-    /// per-provider cap (`LayoutStore.maxPinsPerProvider`). Filtered to the active registry by
-    /// `LayoutStore`, like `metricIDs`.
+    /// per-provider cap (`LayoutStore.maxPinsPerProvider`). Freebuff's Daily Hours meter is pinned by
+    /// owner request so live session usage is visible in the menu bar whenever the account is active.
+    /// Filtered to the active registry by `LayoutStore`, like `metricIDs`.
     static let pinnedMetricIDs: [String] = [
+        "antigravity.geminiPro", "antigravity.geminiWeekly",
+        "claude.session", "claude.weekly",
+        "codex.session", "codex.weekly",
+        "cursor.auto", "cursor.api",
+        "freebuff.freebucksDaily",
+        "copilot.premium",
+        "openrouter.credits",
+        "zai.session", "zai.weekly"
+    ]
+
+    /// Pins shipped before the first default-pin seed ran. An existing user without the seed marker
+    /// has already seen these — a fresh install pinned them and an existing install saved or unpinned
+    /// them — so they start the marker instead of being re-pinned by a later default addition.
+    static let migrationBaselinePinnedMetricIDs: [String] = [
         "antigravity.geminiPro", "antigravity.geminiWeekly",
         "claude.session", "claude.weekly",
         "codex.session", "codex.weekly",
@@ -85,7 +100,7 @@ enum DefaultLayout {
     static let expandedMetricIDs: [String] = [
         // Antigravity: the Gemini pool pair and usage trend stay above the fold; the non-Gemini
         // pool pair and spend-history rows sit below the caret, matching the other local scanners.
-        "antigravity.claude", "antigravity.claudeWeekly",
+        "antigravity.argonWeekly", "antigravity.claude", "antigravity.claudeWeekly",
         "antigravity.today", "antigravity.yesterday", "antigravity.last30",
         // Claude's core meters (Session, Weekly, Fable, Extra, Usage Trend) stay above the fold;
         // optional Sonnet and spend-history rows sit below the caret.

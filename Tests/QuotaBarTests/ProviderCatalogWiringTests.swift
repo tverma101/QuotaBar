@@ -86,7 +86,8 @@ final class ProviderCatalogWiringTests: XCTestCase {
         XCTAssertEqual(ids[ids.firstIndex(of: "freebuff")! - 1], "devin")
         XCTAssertEqual(ids[ids.firstIndex(of: "freebuff")! + 1], "grok")
         XCTAssertTrue(metrics.isSubset(of: Set(DefaultLayout.metricIDs)))
-        XCTAssertTrue(metrics.isDisjoint(with: Set(DefaultLayout.pinnedMetricIDs)))
+        // Daily Hours is the owner-requested menu-bar pin (live session usage); nothing else pins.
+        XCTAssertEqual(metrics.intersection(Set(DefaultLayout.pinnedMetricIDs)), ["freebuff.freebucksDaily"])
         XCTAssertTrue(metrics.isDisjoint(with: Set(DefaultLayout.expandedMetricIDs)))
         let metricOrder = freebuff.widgetDescriptors.map(\.id)
         XCTAssertEqual(metricOrder[metricOrder.firstIndex(of: "freebuff.premiumSessions")! + 1], "freebuff.freePremiumSessions")
