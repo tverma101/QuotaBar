@@ -98,9 +98,9 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
         }
     }
 
-    func testLogParsingRejectsNullSchemaFieldsButAllowsNullContent() {
+    func testLogParsingAcceptsOptionalNullSpeedButRejectsNullIdentity() {
         let cases: [(line: String, accepted: Bool)] = [
-            (#"{"timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":1,"output_tokens":2,"speed":null}}}"#, false),
+            (#"{"timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":1,"output_tokens":2,"speed":null}}}"#, true),
             (#"{"timestamp":"2026-02-20T12:00:00Z","message":{"model":null,"usage":{"input_tokens":1,"output_tokens":2}}}"#, false),
             (#"{"timestamp":"2026-02-20T12:00:00Z","sessionId":null,"message":{"usage":{"input_tokens":1,"output_tokens":2}}}"#, false),
             (#"{"timestamp":"2026-02-20T12:00:00Z","message":{"content":null,"usage":{"input_tokens":1,"output_tokens":2}}}"#, true)
@@ -109,6 +109,28 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
         for entry in cases {
             XCTAssertEqual(!ClaudeLogUsageScanner.parseFile(Data(entry.line.utf8)).isEmpty, entry.accepted, entry.line)
         }
+    }
+
+    func testModernNullableUsageAndAttachmentDoNotFreezeHistory() async throws {
+        let usage = #"{"type":"assistant","timestamp":"2026-02-20T12:00:00Z","message":{"id":"modern","model":"claude-test-model","usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":null,"cache_creation_input_tokens":null,"speed":null,"iterations":null}}}"#
+        let attachment = #"{"type":"attachment","attachment":{"usage":{"input_tokens":999,"output_tokens":999}}}"#
+        let toolResult = #"{"type":"user","timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":999,"output_tokens":999}}}"#
+        let home = try ClaudeLogFixture.makeHome(files: ["project/session.jsonl": usage + "\n" + attachment + "\n" + toolResult + "\n"])
+        defer { try? FileManager.default.trashItem(at: home, resultingItemURL: nil) }
+        let scanner = ClaudeLogFixture.scanner(home: home)
+        let now = OpenUsageISO8601.date(from: "2026-02-20T15:00:00Z")!
+        let first = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertEqual(first?.series.daily.first?.totalTokens, 12)
+        let source = home.appendingPathComponent("projects/project/session.jsonl")
+        let handle = try FileHandle(forWritingTo: source)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((ClaudeLogFixture.usageLine(
+            timestamp: "2026-02-20T13:00:00Z", input: 20, output: 3,
+            messageID: "appended", requestID: "appended"
+        ) + "\n").utf8))
+        try handle.close()
+        let updated = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertEqual(updated?.series.daily.first?.totalTokens, 35)
     }
 
     func testParseFileSkipsNonUsageAndMalformedLines() {

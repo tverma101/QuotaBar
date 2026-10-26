@@ -178,6 +178,11 @@ actor ClaudeLogUsageScanner {
     private let accountID: String?
     private let allowsUnattributedSessions: Bool
     private let ownershipLookup: @Sendable (JSONLScanning.DiscoveredFile) async -> ClaudeSessionOwnershipLookupResult
+    private var aggregateCache: ClaudeUsageFoldCache<LogUsageScan>?
+    /// OpenCode needs only hosted gateway entries. Bound that projection independently of the much
+    /// larger native history; oversized projections keep using the streaming fold.
+    private var gatewayCache: ClaudeUsageFoldCache<[Entry]>?
+    private static let maximumCachedGatewayEntries = 4_096
 
     /// One parsed usage line. Token buckets are pre-normalized into `TokenBreakdown`; dedup fields
     /// ride along so the global dedup pass can run over cached entries.
@@ -201,7 +206,8 @@ actor ClaudeLogUsageScanner {
     private static let sharedScanner = IncrementalJSONLScanner<Entry>(
         retainResidentItems: false,
         logTag: LogTag.plugin("claude"),
-        persistence: JSONLScanCachePersistence(namespace: "claude", schemaVersion: 5)
+        // Reparse records classified by the old byte-wide null/usage checks.
+        persistence: JSONLScanCachePersistence(namespace: "claude", schemaVersion: 6)
     )
 
     static func flushPersistentCacheWrites() async {
@@ -255,6 +261,7 @@ actor ClaudeLogUsageScanner {
         let futureIdentity = futureGateIdentity(kind: "sessions", cacheIdentity: cacheIdentity)
         let roots = claudeRoots()
         guard !roots.isEmpty else {
+            aggregateCache = nil
             FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: [])
             _ = await scanner.items(
                 from: [], since: since, cacheIdentity: cacheIdentity, parseFile: { url in Self.parseFile(at: url) }
@@ -272,6 +279,7 @@ actor ClaudeLogUsageScanner {
         }
         guard !Task.isCancelled else { return .incomplete }
         guard !files.isEmpty else {
+            aggregateCache = nil
             FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: [])
             _ = await scanner.items(
                 from: [], since: since, cacheIdentity: cacheIdentity, parseFile: { url in Self.parseFile(at: url) }
@@ -288,6 +296,15 @@ actor ClaudeLogUsageScanner {
             Self.logFutureTimestamp(identity: futureIdentity)
             return .incomplete
         }
+        let aggregateKey = ClaudeUsageFoldCache<LogUsageScan>.Key(
+            files: files, identity: cacheIdentity, since: since,
+            pricingToken: pricing.aggregateCacheToken
+        )
+        if let cached = aggregateCache?.lookup(aggregateKey, now: now) {
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
+            return .complete(cached)
+        }
+        aggregateCache = nil
         let bucket = FutureTimestampFoldBucket<Entry>()
         let complete = await scanner.foldItems(
             from: files,
@@ -316,6 +333,7 @@ actor ClaudeLogUsageScanner {
         guard !Task.isCancelled else { return .incomplete }
         let result = Self.aggregate(entries: deduped, since: since, pricing: pricing)
         guard !Task.isCancelled else { return .incomplete }
+        aggregateCache = ClaudeUsageFoldCache(key: aggregateKey, observedAt: now, value: result)
         return .complete(result)
     }
 
@@ -381,6 +399,7 @@ actor ClaudeLogUsageScanner {
         now: Date = Date(),
         roots: [URL],
         cacheIdentityOverride: String? = nil,
+        hostedGatewayOnly: Bool = false,
         visit: @Sendable (Entry) -> Void
     ) async -> Bool {
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
@@ -396,6 +415,7 @@ actor ClaudeLogUsageScanner {
         guard !Task.isCancelled else { return false }
         let futureIdentity = futureGateIdentity(kind: "gateway", cacheIdentity: cacheIdentity)
         guard !files.isEmpty else {
+            gatewayCache = nil
             FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: [])
             DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
             return true
@@ -408,6 +428,18 @@ actor ClaudeLogUsageScanner {
             Self.logFutureTimestamp(identity: futureIdentity)
             return false
         }
+        let gatewayKey = ClaudeUsageFoldCache<[Entry]>.Key(
+            files: files, identity: cacheIdentity, since: since
+        )
+        if hostedGatewayOnly, let cached = gatewayCache?.lookup(gatewayKey, now: now) {
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
+            for entry in cached {
+                guard !Task.isCancelled else { return false }
+                visit(entry)
+            }
+            return !Task.isCancelled
+        }
+        if hostedGatewayOnly { gatewayCache = nil }
         let deduplication = ClaudeEntryDeduplication()
         let bucket = FutureTimestampFoldBucket<Entry>()
         let complete = await scanner.foldItems(
@@ -432,9 +464,17 @@ actor ClaudeLogUsageScanner {
             return false
         }
         DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
-        for entry in deduplication.entries {
+        // Deduplicate the complete source before selecting gateway entries: a native replay may win
+        // a cross-file collision, so filtering first could count a turn owned by the Claude card.
+        let entries = hostedGatewayOnly ? deduplication.entries.filter {
+            $0.model.map { OpenCodeUsageScanner.isHostedGatewayModel($0.trimmingCharacters(in: .whitespacesAndNewlines)) } == true
+        } : deduplication.entries
+        for entry in entries {
             guard !Task.isCancelled else { return false }
             visit(entry)
+        }
+        if hostedGatewayOnly, !Task.isCancelled, entries.count <= Self.maximumCachedGatewayEntries {
+            gatewayCache = ClaudeUsageFoldCache(key: gatewayKey, observedAt: now, value: entries)
         }
         return !Task.isCancelled
     }
@@ -773,16 +813,15 @@ actor ClaudeLogUsageScanner {
     /// Streaming counterpart used by the incremental scanner so a large session file never becomes
     /// one giant Data allocation.
     nonisolated static func parseFile(at url: URL) -> [Entry]? {
-        var entries: [Entry] = []
-        var malformedTokenCounts = false
-        let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
+        ClaudeSessionAppendCache.shared.parse(at: url) { line in
+            var entries: [Entry] = []
+            var malformedTokenCounts = false
             appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
+            return malformedTokenCounts ? nil : entries
         }
-        guard readSucceeded, !malformedTokenCounts else { return nil }
-        return entries
     }
 
-    private static let usageMarker = Data(#""usage":{"#.utf8)
+    private static let usageMarker = Data(#""usage""#.utf8)
 
     private static func appendEntries(
         from line: Data.SubSequence,
@@ -790,10 +829,6 @@ actor ClaudeLogUsageScanner {
         malformedTokenCounts: inout Bool
     ) {
         guard line.range(of: usageMarker) != nil else { return }
-        if hasUnsupportedNullField(line) {
-            malformedTokenCounts = true
-            return
-        }
         entries.append(contentsOf: parseEntries(Data(line), malformedTokenCounts: &malformedTokenCounts))
     }
 
@@ -809,10 +844,23 @@ actor ClaudeLogUsageScanner {
     /// remains the main-model entry; only advisor-message iterations become additional entries,
     /// matching ccusage without recounting the ordinary message iterations that feed that total.
     private static func parseEntries(_ data: Data, malformedTokenCounts: inout Bool) -> [Entry] {
-        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let message = object["message"] as? [String: Any],
-              let usage = message["usage"] as? [String: Any]
-        else {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            malformedTokenCounts = true
+            return []
+        }
+        // Attachments and tool results can contain unrelated usage objects. Only the assistant
+        // message's accounting belongs to this source; a byte marker alone cannot classify it.
+        if let type = object["type"], type as? String != "assistant" { return [] }
+        guard let message = object["message"] as? [String: Any],
+              let rawUsage = message["usage"] else {
+            // A claimed assistant accounting record in an unfamiliar shape must stay observable.
+            // Other rows may legitimately carry a usage key inside unrelated payloads.
+            if object["type"] as? String == "assistant", object["usage"] != nil {
+                malformedTokenCounts = true
+            }
+            return []
+        }
+        guard let usage = rawUsage as? [String: Any] else {
             malformedTokenCounts = true
             return []
         }
@@ -857,7 +905,7 @@ actor ClaudeLogUsageScanner {
             model: model
         )
 
-        guard let rawIterations = usage["iterations"] else { return [parent] }
+        guard let rawIterations = usage["iterations"], !(rawIterations is NSNull) else { return [parent] }
         guard let iterations = rawIterations as? [Any] else {
             malformedTokenCounts = true
             return [parent]
@@ -1056,37 +1104,6 @@ actor ClaudeLogUsageScanner {
             return true
         }
     }
-
-    /// Claude never writes `null` into these fields; a line that does is a foreign/corrupt shape that
-    /// ccusage skips before JSON parsing, and we match it byte-for-byte.
-    static func hasUnsupportedNullField(_ line: Data.SubSequence) -> Bool {
-        let nullMarker = Data(":null".utf8)
-        let quote = UInt8(ascii: "\"")
-        let bytes = Data(line) // fresh copy → indices are 0-based
-        var offset = bytes.startIndex
-        while let markerRange = bytes.range(of: nullMarker, in: offset..<bytes.endIndex) {
-            let start = markerRange.lowerBound
-            var fieldEnd = start > 0 ? start - 1 : 0
-            if bytes[fieldEnd] != quote {
-                while fieldEnd > 0, bytes[fieldEnd] != quote { fieldEnd -= 1 }
-            }
-            if bytes[fieldEnd] == quote, fieldEnd > 0 {
-                var fieldStart = fieldEnd - 1
-                while fieldStart > 0, bytes[fieldStart] != quote { fieldStart -= 1 }
-                if bytes[fieldStart] == quote {
-                    let field = String(decoding: bytes[(fieldStart + 1)..<fieldEnd], as: UTF8.self)
-                    if Self.unsupportedNullableFields.contains(field) { return true }
-                }
-            }
-            offset = markerRange.upperBound
-        }
-        return false
-    }
-
-    private static let unsupportedNullableFields: Set<String> = [
-        "id", "cwd", "model", "speed", "costUSD", "version", "sessionId", "requestId",
-        "isApiErrorMessage", "isSidechain", "cache_read_input_tokens", "cache_creation_input_tokens"
-    ]
 
     // MARK: - Deduplication
 

@@ -391,6 +391,33 @@ final class ClaudeProviderTests: XCTestCase {
         XCTAssertTrue(httpClient.requests.contains { $0.url.absoluteString == "https://api.anthropic.com/api/oauth/usage" })
     }
 
+    func testFailedHistoryScanIsVisibleAndWarningClearsOnRecovery() async throws {
+        let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00Z")!
+        let home = try ClaudeLogFixture.makeHome(files: ["project/session.jsonl":
+            #"{"timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":-1,"output_tokens":2}}}"#
+        ])
+        defer { try? FileManager.default.trashItem(at: home, resultingItemURL: nil) }
+        let provider = ClaudeProvider(
+            authStore: configuredAuthStore(files: FakeFiles([
+                "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","scopes":["user:profile"]}}"#
+            ]), now: { now }),
+            usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
+                statusCode: 200, headers: [:], body: Data(#"{"five_hour":{"utilization":25}}"#.utf8)
+            ))),
+            logUsageScanner: ClaudeLogFixture.scanner(home: home),
+            now: { now }, pricing: { TestPricing.bundled }
+        )
+        let failed = await provider.refresh()
+        XCTAssertNotNil(failed.lines.first { $0.label == "Session" })
+        XCTAssertNil(failed.usageHistory)
+        XCTAssertTrue(failed.historyWarning?.contains("stale") == true)
+        try ClaudeLogFixture.usageLine(timestamp: "2026-02-20T12:00:00Z", input: 10, output: 2)
+            .write(to: home.appendingPathComponent("projects/project/session.jsonl"), atomically: true, encoding: .utf8)
+        let recovered = await provider.refresh()
+        XCTAssertEqual(recovered.usageHistory?.series.daily.first?.totalTokens, 12)
+        XCTAssertNil(recovered.historyWarning)
+    }
+
     func testNoCredentialsStillScansLocalSpendAndPreservesNotLoggedInWarning() async throws {
         let now = OpenUsageISO8601.date(from: "2026-02-20T16:00:00.000Z")!
         let home = try ClaudeLogFixture.makeHome(files: [
