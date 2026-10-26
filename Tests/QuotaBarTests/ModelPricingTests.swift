@@ -536,6 +536,7 @@ final class ModelPricingTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(original.cacheWrite1hPerMillion), 0.06, accuracy: 0.000_001)
         XCTAssertTrue(original.cacheReadIsExplicit)
         XCTAssertEqual(original.promptRateTiers.count, 2, "time-of-day overrides are not prompt-length tiers")
+        XCTAssertEqual(original.utcPriceOverrides?.count, 1, "UTC-day rates are retained separately from prompt tiers")
         XCTAssertTrue(original.promptRateTiers[0].includesThreshold)
 
         let cached = try PricingCatalogCodecs.catalogFromCompact(
@@ -565,6 +566,45 @@ final class ModelPricingTests: XCTestCase {
         XCTAssertEqual(original.costDollars(for: allBuckets), 1.79, accuracy: 0.000_001)
         allBuckets.isFast = true
         XCTAssertEqual(original.costDollars(for: allBuckets), 1.79, accuracy: 0.000_001)
+    }
+
+    func testOpenRouterUTCPriceWindowsApplyByEventTimestampAndSurviveCache() throws {
+        let source = Data(#"""
+        {
+          "data": [{
+            "id": "deepseek/deepseek-v4.1-flash-1017",
+            "pricing": {
+              "prompt": "0.00000015",
+              "completion": "0.0000006",
+              "input_cache_read": "0.000000003",
+              "overrides": [
+                {"utc_days":["saturday","sunday"],"prompt":"0.00000015","completion":"0.0000006","input_cache_read":"0.000000003"},
+                {"utc_days":["monday","tuesday","wednesday","thursday","friday"],"utc_start":100,"utc_end":400,"prompt":"0.0000003","completion":"0.0000012","input_cache_read":"0.000000006"},
+                {"utc_days":["monday","tuesday","wednesday","thursday","friday"],"utc_start":400,"utc_end":600,"prompt":"0.00000015","completion":"0.0000006","input_cache_read":"0.000000003"},
+                {"utc_days":["monday","tuesday","wednesday","thursday","friday"],"utc_start":600,"utc_end":1000,"prompt":"0.0000003","completion":"0.0000012","input_cache_read":"0.000000006"},
+                {"utc_days":["monday","tuesday","wednesday","thursday","friday"],"utc_start":1000,"utc_end":0,"prompt":"0.00000015","completion":"0.0000006","input_cache_read":"0.000000003"}
+              ]
+            }
+          }],
+          "total_count": 1,
+          "links": {"next": null}
+        }
+        """#.utf8)
+
+        let catalog = try PricingCatalogCodecs.catalogFromOpenRouter(source)
+        let cached = try PricingCatalogCodecs.catalogFromCompact(PricingCatalogCodecs.compactData(from: catalog))
+        let rates = try XCTUnwrap(cached.findExact("deepseek/deepseek-v4.1-flash-1017")?.rates)
+        let tokens = TokenBreakdown(input: 1_000_000, cacheRead: 1_000_000, output: 1_000_000)
+        let formatter = ISO8601DateFormatter()
+        let peak = try XCTUnwrap(formatter.date(from: "2026-10-26T02:00:00Z"))
+        let offPeak = try XCTUnwrap(formatter.date(from: "2026-10-26T04:00:00Z"))
+        let weekend = try XCTUnwrap(formatter.date(from: "2026-10-25T02:00:00Z"))
+
+        XCTAssertEqual(rates.costDollars(for: tokens, at: peak), 1.506, accuracy: 0.000_001)
+        XCTAssertEqual(rates.costDollars(for: tokens, at: offPeak), 0.753, accuracy: 0.000_001)
+        XCTAssertEqual(rates.costDollars(for: tokens, at: weekend), 0.753, accuracy: 0.000_001)
+        XCTAssertEqual(rates.utcPriceOverrides?.last?.utcEndMinute, 1_440,
+                       "an end of 00:00 after a daytime start denotes midnight at the end of that day")
     }
 
     func testOpenRouterGPT61Sol272KBoundaryIsExclusiveForStandardAndBatch() throws {

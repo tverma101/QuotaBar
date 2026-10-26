@@ -39,10 +39,9 @@ enum PricingCatalogCodecs {
     }
 
     /// Builds an exact-match estimate catalog from OpenRouter's public model list. Prices are USD
-    /// per token in the API; QuotaBar stores per-million rates. Retain published cache prices and
-    /// prompt-length overrides, while ignoring time/day overrides that cannot be resolved for
-    /// historical usage without event timestamps. Bare aliases are added only when exactly one
-    /// non-variant route owns them.
+    /// per token in the API; QuotaBar stores per-million rates. Retain published cache prices,
+    /// prompt-length tiers, and UTC time/day rates for event-level callers. Bare aliases are added
+    /// only when exactly one non-variant route owns them.
     static func catalogFromOpenRouter(_ data: Data) throws -> PricingCatalog {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let models = root["data"] as? [[String: Any]] else {
@@ -73,6 +72,7 @@ enum PricingCatalogCodecs {
             let cacheWrite = perMillionRate(pricing["input_cache_write"])
             let cacheRead = perMillionRate(pricing["input_cache_read"])
             let promptTiers = openRouterPromptRateTiers(pricing["overrides"], modelID: key)
+            let utcOverrides = openRouterUTCTimeRateOverrides(pricing["overrides"])
             routes[key] = ModelRates(
                 inputPerMillion: input,
                 outputPerMillion: completion * 1_000_000,
@@ -80,7 +80,10 @@ enum PricingCatalogCodecs {
                 cacheReadPerMillion: cacheRead ?? input,
                 cacheWrite1hPerMillion: perMillionRate(pricing["input_cache_write_1h"]),
                 promptRateTiers: promptTiers,
-                cacheReadIsExplicit: cacheRead != nil || promptTiers.contains { $0.cacheReadPerMillion != nil }
+                utcPriceOverrides: utcOverrides.isEmpty ? nil : utcOverrides,
+                cacheReadIsExplicit: cacheRead != nil
+                    || promptTiers.contains { $0.cacheReadPerMillion != nil }
+                    || utcOverrides.contains { $0.cacheReadPerMillion != nil }
             )
 
             let components = key.split(separator: "/", omittingEmptySubsequences: false)
@@ -314,6 +317,72 @@ enum PricingCatalogCodecs {
         }.sorted { $0.thresholdPromptTokens < $1.thresholdPromptTokens }
     }
 
+    /// OpenRouter's UTC schedule uses `utc_days` plus HHMM integer boundaries. An end of `0`
+    /// with a positive start denotes midnight at the end of that UTC day (for example 1000–0 is
+    /// 10:00–24:00). Prompt-length overrides are handled separately above.
+    private static func openRouterUTCTimeRateOverrides(_ value: Any?) -> [UTCPriceRateOverride] {
+        guard let overrides = value as? [[String: Any]] else { return [] }
+        let validDays: Set<String> = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        return overrides.compactMap { override in
+            guard override["min_prompt_tokens"] == nil else { return nil }
+
+            let days: [String]?
+            if let value = override["utc_days"], !(value is NSNull) {
+                guard let rawDays = value as? [String], !rawDays.isEmpty else { return nil }
+                let normalized = rawDays.map { $0.lowercased() }
+                guard normalized.allSatisfy(validDays.contains) else { return nil }
+                days = normalized
+            } else {
+                days = nil
+            }
+
+            let rawStart: Int?
+            if let value = override["utc_start"], !(value is NSNull) {
+                guard let parsed = integerValue(value) else { return nil }
+                rawStart = parsed
+            } else {
+                rawStart = nil
+            }
+            let rawEnd: Int?
+            if let value = override["utc_end"], !(value is NSNull) {
+                guard let parsed = integerValue(value) else { return nil }
+                rawEnd = parsed
+            } else {
+                rawEnd = nil
+            }
+            guard days != nil || rawStart != nil || rawEnd != nil else { return nil }
+
+            let startMinute = rawStart.flatMap(openRouterUTCMinute)
+            guard rawStart == nil || startMinute != nil else { return nil }
+            var endMinute = rawEnd.flatMap(openRouterUTCMinute)
+            guard rawEnd == nil || endMinute != nil else { return nil }
+            if rawEnd == 0, let startMinute, startMinute > 0 { endMinute = 1_440 }
+
+            let tier = UTCPriceRateOverride(
+                utcDays: days,
+                utcStartMinute: startMinute,
+                utcEndMinute: endMinute,
+                inputPerMillion: perMillionRate(override["prompt"]),
+                outputPerMillion: perMillionRate(override["completion"]),
+                cacheWritePerMillion: perMillionRate(override["input_cache_write"]),
+                cacheReadPerMillion: perMillionRate(override["input_cache_read"]),
+                cacheWrite1hPerMillion: perMillionRate(override["input_cache_write_1h"])
+            )
+            guard tier.inputPerMillion != nil || tier.outputPerMillion != nil
+                    || tier.cacheWritePerMillion != nil || tier.cacheReadPerMillion != nil
+                    || tier.cacheWrite1hPerMillion != nil else { return nil }
+            return tier
+        }
+    }
+
+    private static func openRouterUTCMinute(_ hhmm: Int) -> Int? {
+        guard hhmm >= 0, hhmm <= 2_400 else { return nil }
+        let hour = hhmm / 100
+        let minute = hhmm % 100
+        guard hour <= 24, minute < 60, hour < 24 || minute == 0 else { return nil }
+        return hour * 60 + minute
+    }
+
     private static func integerValue(_ value: Any?) -> Int? {
         guard let number = value as? NSNumber,
               CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
@@ -337,6 +406,7 @@ enum PricingCatalogCodecs {
                 cacheReadPerMillion: model.cr,
                 cacheWrite1hPerMillion: model.cw1,
                 promptRateTiers: model.tiers ?? [],
+                utcPriceOverrides: model.utc,
                 inputAbove200kPerMillion: model.ia,
                 outputAbove200kPerMillion: model.oa,
                 cacheWriteAbove200kPerMillion: model.cwa,
@@ -364,6 +434,7 @@ enum PricingCatalogCodecs {
                 cr: rates.cacheReadPerMillion,
                 cw1: rates.cacheWrite1hPerMillion,
                 tiers: rates.promptRateTiers.isEmpty ? nil : rates.promptRateTiers,
+                utc: rates.utcPriceOverrides?.isEmpty == false ? rates.utcPriceOverrides : nil,
                 ia: rates.inputAbove200kPerMillion,
                 oa: rates.outputAbove200kPerMillion,
                 cwa: rates.cacheWriteAbove200kPerMillion,
@@ -396,6 +467,7 @@ enum PricingCatalogCodecs {
             var cr: Double
             var cw1: Double?
             var tiers: [PromptRateTier]?
+            var utc: [UTCPriceRateOverride]?
             var ia: Double?
             var oa: Double?
             var cwa: Double?
