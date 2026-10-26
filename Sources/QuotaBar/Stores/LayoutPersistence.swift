@@ -26,6 +26,7 @@ final class LayoutPersistence {
     }
     func loadSeededDefaults() -> [String]? { decode([String].self, forKey: keys.seededDefaults) }
     func loadSeededAccountPins() -> [String]? { decode([String].self, forKey: keys.seededAccountPins) }
+    func loadSeededDefaultPins() -> [String]? { decode([String].self, forKey: keys.seededDefaultPins) }
 
     func loadPins() -> [String]? { defaults.stringArray(forKey: keys.pins) }
     func loadExpandedMetrics() -> [String]? { defaults.stringArray(forKey: keys.expandedMetrics) }
@@ -54,6 +55,9 @@ final class LayoutPersistence {
     }
     func saveSeededAccountPins(_ value: Set<String>) {
         encode(Array(value).sorted(), forKey: keys.seededAccountPins)
+    }
+    func saveSeededDefaultPins(_ value: Set<String>) {
+        encode(Array(value).sorted(), forKey: keys.seededDefaultPins)
     }
 
     func savePins(_ value: Set<String>) { defaults.set(Array(value), forKey: keys.pins) }
@@ -103,6 +107,7 @@ final class LayoutPersistence {
         let metricOrder: String
         let seededDefaults: String
         let seededAccountPins: String
+        let seededDefaultPins: String
         let pins: String
         let expandedMetrics: String
         let expandOnEnable: String
@@ -118,6 +123,7 @@ final class LayoutPersistence {
             metricOrder = "\(storageKey).metricOrderByProvider"
             seededDefaults = "\(storageKey).seededDefaults"
             seededAccountPins = "\(storageKey).seededAccountPins"
+            seededDefaultPins = "\(storageKey).seededDefaultPins"
             pins = "\(storageKey).menuBarPins"
             expandedMetrics = "\(storageKey).expandedMetrics"
             expandOnEnable = "\(storageKey).expandOnEnable"
