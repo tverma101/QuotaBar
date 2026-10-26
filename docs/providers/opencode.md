@@ -94,13 +94,17 @@ contains an estimate. The lifetime History total keeps the marker when any inclu
 dollars.
 
 If any configured usage source cannot be read completely, QuotaBar keeps the last complete spend
-history instead of publishing a partial subtotal; it records the source failure in the diagnostic log.
-The Router source list and revisions are checked again after the wider fold, so a malformed event or
-mid-scan append also keeps the prior history until a complete scan is available.
+history instead of publishing a partial subtotal; it records which source failed in the diagnostic log.
+The Router source list and verified prefix are checked again after the wider fold. Malformed events,
+rotation, truncation, changed prefix samples, and same-size rewrites retain the prior history. Ordinary
+appends leave the measured prefix valid; the next refresh consumes the new tail.
 For CodexRouter rows, QuotaBar keeps the reported token total when it disagrees with the measured
 components, but marks the spend and public-rate estimate incomplete. A zero-token row never suppresses
 matching native usage. If a Router reports a zero total with positive input or output but omits the other
 measured component, OpenCode keeps the last-good history until the row has a complete breakdown.
+A router row with zero input/output/total but measured reasoning keeps that reasoning as an output
+lower bound. Its input remains unknown, its cost stays incomplete, and it never replaces complete
+native usage. A single such row does not stop other local history from updating.
 Router `estimatedInputTokens` never contributes to measured usage, even when the estimate itself exceeds
 the safe integer range. If finite SQLite costs overflow when they are combined, QuotaBar keeps the finite
 priced subtotal as a lower bound and marks it Partial. The local Go fallback meter clamps over-cap spend
@@ -118,7 +122,9 @@ fields are malformed. Unknown, conflicting, or malformed account stamps still fa
 rebuild local-day Router buckets from the source ledger.
 
 The Claude gateway fold shares the native Claude card's incremental parse cache and deduplicates
-overlapping Claude roots. The Codex gateway fold includes app-registered Codex homes and visits each
+overlapping Claude roots. Unchanged sources reuse a bounded gateway-only projection after checking
+ownership and timestamps, avoiding another fold through unrelated Claude history. The Codex gateway
+fold includes app-registered Codex homes and visits each
 canonical home separately, sharing the per-home cache with its account card. This keeps multi-session
 and multi-config setups from omitting or re-reading the same terminal session during a cold refresh
 without changing the usage sources or ownership filtering.
@@ -200,6 +206,11 @@ beneath that row's label, led by the model with the most tokens.
   you want it counted.
 
 ## Under the hood
+
+QuotaBar reads both the legacy `message` table and the newer `session_message` table. During
+migration it combines them by message ID, preferring the newer copy so a turn counts once. The
+usage probe and Go cycle anchor use the same schema detection. Provider-reported zero cost stays
+zero, including free models; missing costs keep measured tokens with incomplete cost.
 
 QuotaBar reads the assistant-message `cost` and token fields from every `opencode*.db` in the data
 directory (stable is `opencode.db`, the preview line is `opencode-next.db` — all channels are unioned).
