@@ -347,7 +347,145 @@ final class TotalSpendAggregatorTests: XCTestCase {
         let total = TotalSpendAggregator.total(for: .today, providers: [claude], snapshots: [:])
         XCTAssertTrue(total.isEmpty)
         XCTAssertTrue(total.projection(for: .cost).isEmpty)
-        XCTAssertTrue(total.projection(for: .tokens).isEmpty)
         XCTAssertTrue(total.projection(for: .costPerMtok).isEmpty)
+        XCTAssertTrue(total.projection(for: .tokens).isEmpty)
+    }
+
+    // MARK: - Dormant (disabled) contributors
+
+    /// A turned-off provider keeps the history it already recorded, and that usage still happened.
+    /// Leaving it out made the combined figure understate real spend, most visibly when a heavily
+    /// used provider was switched off.
+    func testDisabledProviderContributesFromItsRetainedHistory() throws {
+        let now = try date("2026-10-27T18:00:00Z")
+        let history = history(days: [
+            ("2026-10-27", 2_000_000, 40.0),
+            ("2026-10-26", 1_000_000, 20.0)
+        ])
+
+        let total = TotalSpendAggregator.total(
+            for: .today,
+            providers: [claude],
+            snapshots: [:],
+            dormantHistories: ["claude": history],
+            now: now
+        )
+
+        let slice = try XCTUnwrap(total.slices.first)
+        XCTAssertEqual(slice.provider.id, "claude")
+        XCTAssertEqual(slice.amountUSD, 40.0, accuracy: 0.0001)
+        XCTAssertEqual(slice.tokenCount, 2_000_000, accuracy: 0.0001)
+        XCTAssertEqual(total.projection(for: .cost).centerValue, 40.0, accuracy: 0.0001)
+    }
+
+    /// The frozen spend tiles cannot be trusted for a dormant provider: their "Today" was computed
+    /// whenever the provider was last refreshed, which may be weeks ago. The dated history is what
+    /// places usage on the right day.
+    func testDormantPeriodsFollowTheCalendarNotTheFrozenTiles() throws {
+        let now = try date("2026-10-27T18:00:00Z")
+        let history = history(days: [
+            ("2026-10-27", 2_000_000, 40.0),
+            ("2026-10-26", 1_000_000, 20.0),
+            ("2026-10-25", 500_000, 10.0)
+        ])
+        // A stale snapshot whose Today tile still describes an old day.
+        let stale = snapshot(claude, lines: [spendLine("Today", dollars: 999, tokens: 5_000_000)])
+
+        let today = TotalSpendAggregator.total(
+            for: .today, providers: [claude], snapshots: ["claude": stale],
+            dormantHistories: [:], now: now
+        )
+        XCTAssertEqual(today.slices.first?.amountUSD ?? 0, 999, "an enabled provider keeps using its tiles")
+
+        // Dormant: no snapshot at all, so the history decides — and only today's row counts.
+        let dormantToday = TotalSpendAggregator.total(
+            for: .today, providers: [claude], snapshots: [:],
+            dormantHistories: ["claude": history], now: now
+        )
+        XCTAssertEqual(dormantToday.slices.first?.amountUSD ?? 0, 40.0, accuracy: 0.0001)
+
+        let dormantYesterday = TotalSpendAggregator.total(
+            for: .yesterday, providers: [claude], snapshots: [:],
+            dormantHistories: ["claude": history], now: now
+        )
+        XCTAssertEqual(dormantYesterday.slices.first?.amountUSD ?? 0, 20.0, accuracy: 0.0001)
+
+        let dormantLast30 = TotalSpendAggregator.total(
+            for: .last30, providers: [claude], snapshots: [:],
+            dormantHistories: ["claude": history], now: now
+        )
+        XCTAssertEqual(dormantLast30.slices.first?.amountUSD ?? 0, 70.0, accuracy: 0.0001)
+    }
+
+    /// A dormant provider with nothing in the selected window contributes nothing — it is not a
+    /// fabricated zero slice, and it does not block other providers from appearing.
+    func testDormantProviderWithNoUsageInTheWindowIsExcluded() throws {
+        let now = try date("2026-10-27T18:00:00Z")
+        let history = history(days: [("2026-09-01", 1_000_000, 25.0)])
+
+        let total = TotalSpendAggregator.total(
+            for: .today,
+            providers: [claude, cursor],
+            snapshots: ["cursor": snapshot(cursor, lines: [spendLine("Today", dollars: 3, tokens: 1_000)])],
+            dormantHistories: ["claude": history],
+            now: now
+        )
+
+        XCTAssertEqual(total.slices.map(\.provider.id), ["cursor"])
+        XCTAssertEqual(total.projection(for: .cost).centerValue, 3, accuracy: 0.0001)
+    }
+
+    /// A dormant day whose dollars are a partial subtotal keeps its known amount but still marks the
+    /// combined figure as a lower bound, exactly like a live provider with unpriced models.
+    func testDormantIncompleteCostKeepsSubtotalAndMarksItPartial() throws {
+        let now = try date("2026-10-27T18:00:00Z")
+        var history = history(days: [("2026-10-27", 1_000_000, 12.0)])
+        history.series.daily[0].costIsComplete = false
+        history.series.daily[0].hasUnexplainedIncompleteCost = false
+        history.unknownModelsByDay = ["2026-10-27": ["some-unpriced-model"]]
+
+        let total = TotalSpendAggregator.total(
+            for: .today, providers: [claude], snapshots: [:],
+            dormantHistories: ["claude": history], now: now
+        )
+
+        let cost = total.projection(for: .cost)
+        XCTAssertEqual(cost.centerValue, 12.0, accuracy: 0.0001)
+        XCTAssertTrue(cost.hasIncompleteCost)
+        XCTAssertTrue(cost.centerValueIsLowerBound)
+        XCTAssertTrue(try XCTUnwrap(cost.slices.first).displayAmountIsLowerBound)
+    }
+
+    /// The dangerous case: a dormant provider still has a retained snapshot, so a naive "use history
+    /// only when there is no snapshot" rule would fall back to its frozen tiles and report weeks-old
+    /// spend as today. Presence in `dormantHistories` alone must route to the dated history.
+    func testDormantProviderWithARetainedSnapshotStillNeverUsesItsFrozenTiles() throws {
+        let now = try date("2026-10-27T18:00:00Z")
+        let stale = snapshot(claude, lines: [spendLine("Today", dollars: 500, tokens: 9_000_000)])
+
+        // Turned off, with history for yesterday only — today has nothing.
+        let history = history(days: [("2026-10-26", 1_000_000, 20.0)])
+        let total = TotalSpendAggregator.total(
+            for: .today,
+            providers: [claude],
+            snapshots: ["claude": stale],
+            dormantHistories: ["claude": history],
+            now: now
+        )
+
+        XCTAssertTrue(
+            total.slices.isEmpty,
+            "a turned-off provider's frozen Today tile must not be reported as today's spend"
+        )
+    }
+
+    private func history(days: [(String, Int, Double?)]) -> ProviderUsageHistory {
+        ProviderUsageHistory(series: DailyUsageSeries(daily: days.map { date, tokens, cost in
+            DailyUsageEntry(date: date, totalTokens: tokens, costUSD: cost, costIsComplete: cost != nil)
+        }))
+    }
+
+    private func date(_ iso: String) throws -> Date {
+        try XCTUnwrap(ISO8601DateFormatter().date(from: iso))
     }
 }

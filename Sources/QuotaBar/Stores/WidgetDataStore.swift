@@ -22,6 +22,10 @@ final class WidgetDataStore {
     /// The user's widget order (already enablement-filtered) that drives the menu-bar value. Injected
     /// so the store reads `LayoutStore.visiblePlaced` without owning it; defaults to registry order.
     private let orderedDescriptors: @MainActor () -> [WidgetDescriptor]
+    /// Provider IDs the user hid from the menu-bar strip ("Show in menu bar" off). A closed-panel
+    /// strip pass has nothing to paint for them, so refreshing their live meters every tick is pure
+    /// waste — injected from `LayoutStore` like `orderedDescriptors`; empty in tests that don't care.
+    private let hiddenMenuBarProviderIDs: @MainActor () -> Set<String>
     /// Metric IDs currently pinned to the status-item strip. Injected from `LayoutStore`; empty in
     /// tests that don't care about menu-bar filtering (menuBar passes then refresh nothing unless
     /// notifications pull providers in).
@@ -266,6 +270,7 @@ final class WidgetDataStore {
         isProviderEnabled: @escaping @MainActor (String) -> Bool = { _ in true },
         orderedDescriptors: (@MainActor () -> [WidgetDescriptor])? = nil,
         pinnedMetricIDs: (@MainActor () -> Set<String>)? = nil,
+        hiddenMenuBarProviderIDs: (@MainActor () -> Set<String>)? = nil,
         now: @escaping () -> Date = Date.init,
         monotonicNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         slowProviderRefreshThreshold: TimeInterval = WidgetDataStore.defaultSlowProviderRefreshThreshold,
@@ -283,6 +288,7 @@ final class WidgetDataStore {
         self.isProviderEnabled = isProviderEnabled
         self.orderedDescriptors = orderedDescriptors ?? { registry.descriptors }
         self.pinnedMetricIDs = pinnedMetricIDs ?? { [] }
+        self.hiddenMenuBarProviderIDs = hiddenMenuBarProviderIDs ?? { [] }
         self.now = now
         self.monotonicNow = monotonicNow
         self.slowProviderRefreshThreshold = slowProviderRefreshThreshold
@@ -466,7 +472,8 @@ final class WidgetDataStore {
             pinnedMetricIDs: pinnedMetricIDs(),
             providerIDForMetric: { [registry] id in registry.descriptor(id: id)?.providerID },
             orderedDescriptors: orderedDescriptors(),
-            notificationsEnabled: notificationSettings?().anyEnabled ?? false
+            notificationsEnabled: notificationSettings?().anyEnabled ?? false,
+            hiddenMenuBarProviderIDs: hiddenMenuBarProviderIDs()
         )
         // The panel fold phase only needs providers whose snapshot carries local accounting (the
         // history exporters). Pure-API providers (Z.ai, OpenRouter, Devin, …) have no local fold;
@@ -651,7 +658,8 @@ final class WidgetDataStore {
         pinnedMetricIDs: Set<String>,
         providerIDForMetric: (String) -> String?,
         orderedDescriptors: [WidgetDescriptor],
-        notificationsEnabled: Bool
+        notificationsEnabled: Bool,
+        hiddenMenuBarProviderIDs: Set<String> = []
     ) -> [String] {
         let notificationRelevant = MenuBarRefreshFilter.notificationRelevantProviderIDs(
             descriptors: orderedDescriptors
@@ -682,7 +690,8 @@ final class WidgetDataStore {
                 pinnedMetricIDs: pinnedMetricIDs,
                 providerIDForMetric: providerIDForMetric,
                 notificationRelevantProviderIDs: notificationRelevant,
-                notificationsEnabled: notificationsEnabled
+                notificationsEnabled: notificationsEnabled,
+                hiddenProviderIDs: hiddenMenuBarProviderIDs
             )
         }
     }
@@ -2032,6 +2041,28 @@ final class WidgetDataStore {
         result.displayMode = meterStyle
         result.resetDisplayMode = resetDisplayMode
         result.alwaysShowPacing = alwaysShowPacing
+        return result
+    }
+
+    /// The retained local history of providers the user has turned off, keyed by provider ID — the
+    /// dormant half of the Total Spend card's input.
+    ///
+    /// Disabling a provider stops its refreshes and hides its card; it deliberately keeps the
+    /// already-computed history on disk, because the same records should still count as usage that
+    /// happened. The card re-windows that history for the selected period instead of trusting the
+    /// frozen spend tiles, which still describe the day they were last computed.
+    ///
+    /// Every requested provider that is off gets an entry, even when no history is retained yet: the
+    /// key's presence is what tells the aggregator "this provider is dormant, do not read its frozen
+    /// tiles". A missing entry would let a turned-off provider's stale "Today" tile count as today.
+    func dormantUsageHistories(for providerIDs: [String]) -> [String: ProviderUsageHistory] {
+        var result: [String: ProviderUsageHistory] = [:]
+        result.reserveCapacity(providerIDs.count)
+        for providerID in providerIDs where !isProviderEnabled(providerID) {
+            result[providerID] = snapshots[providerID]?.usageHistory ?? ProviderUsageHistory(
+                series: DailyUsageSeries(daily: [])
+            )
+        }
         return result
     }
 

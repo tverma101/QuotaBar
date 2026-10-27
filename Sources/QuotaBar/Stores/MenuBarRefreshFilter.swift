@@ -9,15 +9,28 @@ enum MenuBarRefreshFilter {
     /// Returns the subset of `enabledProviderIDs` that a menu-bar pass should refresh, preserving
     /// the incoming order. An empty result means the pass can no-op (empty pin strip and nothing
     /// notification-relevant).
+    ///
+    /// `hiddenProviderIDs` are providers the user removed from the strip ("Show in menu bar" off).
+    /// The strip cannot paint them, so a closed-panel pass has nothing to update on their behalf: a
+    /// pin they still carry is invisible, and refreshing them every tick burned network, CPU, and
+    /// Keychain probes for a value nobody sees. Their metrics come back the moment the provider is
+    /// shown again, because a full pass (panel open) refreshes every enabled provider.
     static func providerIDs(
         enabledProviderIDs: [String],
         pinnedMetricIDs: Set<String>,
         providerIDForMetric: (String) -> String?,
         notificationRelevantProviderIDs: Set<String>,
-        notificationsEnabled: Bool
+        notificationsEnabled: Bool,
+        hiddenProviderIDs: Set<String> = []
     ) -> [String] {
-        var needed = Set(pinnedMetricIDs.compactMap(providerIDForMetric))
+        var needed = Set(
+            pinnedMetricIDs
+                .compactMap(providerIDForMetric)
+                .filter { !hiddenProviderIDs.contains($0) }
+        )
         if notificationsEnabled {
+            // Notifications read the layout, not the strip, so a hidden provider still needs fresh
+            // meters to alert on.
             needed.formUnion(notificationRelevantProviderIDs)
         }
         guard !needed.isEmpty else { return [] }

@@ -20,7 +20,7 @@ The dashboard footer's **Options** menu → **Usage History** opens a read-only 
 
 Star a metric from any row's right-click menu, or from the always-visible star beside a metric in Customize.
 
-- On first launch the app ships with a default set of stars (Antigravity Session/Weekly, Claude Session/Weekly, Codex Session/Weekly, Cursor Models/Other Models, Copilot Credits, OpenRouter Credits, Z.ai Session/Weekly) so the strip shows numbers right away. Change them anytime; a provider's Reset restores its defaults, and Reset All restores the full set. Only providers that are turned on render in the strip; new installs start with Claude, Codex, Cursor, and Freebuff on, while other providers stay off until you enable them in Customize.
+- On first launch the app ships with a default set of stars (Antigravity Session/Weekly, Claude Session/Weekly, Codex Session/Weekly, Cursor Models/Other Models, Freebuff Daily Hours/Hours Balance, Copilot Credits, OpenRouter Credits, Z.ai Session/Weekly) so the strip shows numbers right away. Change them anytime; a provider's Reset restores its defaults, and Reset All restores the full set. Only providers that are turned on render in the strip; new installs start with Claude, Codex, Cursor, and Freebuff on, while other providers stay off until you enable them in Customize.
 - At most **2 stars per provider**.
 - When a star isn't allowed, the star button stays clickable — clicking it shakes and shows the reason in a temporary pill over the bottom of Customize (for example, "Up to 2 stars per provider").
 
@@ -28,9 +28,9 @@ Star a metric from any row's right-click menu, or from the always-visible star b
 
 Settings → Appearance → Icon Style:
 
-- **Text** — provider icon plus values; two starred metrics from the same provider stack as a labeled pair.
+- **Text** — provider icon plus values. One starred metric renders as a single number; two from the same provider stack as a short labeled pair (for example `Day 13h` over `Bal 35h`), because two bare numbers give no way to tell which window each belongs to.
 - **Bars** — a compact glyph containing the first four starred metrics that have a limit (metrics without limits only appear in Text style).
-- In each provider or account's Customize detail, **Show in menu bar** controls the whole entry: both its icon and pinned usage values. New providers and accounts default to on. Turning it off removes that provider/account from both Text and Bars styles.
+- In each provider or account's Customize detail, **Show in menu bar** controls the whole entry: both its icon and pinned usage values. New providers and accounts default to on. Turning it off removes that provider/account from both Text and Bars styles — and it also stops that provider's live menu-bar refreshes while the panel stays closed, since nothing it produces can be drawn there. Meters refresh again as soon as you show it, because opening the panel refreshes every enabled provider.
 
 ## Hiding usage while screen sharing
 
@@ -41,3 +41,5 @@ Detection rides the system's own "an app is capturing the screen" signal — the
 ## What the strip shows
 
 The strip only renders real data. A starred metric with nothing fetched yet is skipped; a provider whose stars all lack data disappears entirely (icon included). When nothing has data, the strip falls back to the app icon, but the single status item remains clickable and opens the aggregate dashboard. Stars follow your Customize order — Always Visible metrics first, then On Demand ones. A metric can be starred whether it's Always Visible or On Demand. Multiple Claude and Codex accounts remain separate provider cards inside the same panel. When an account moves from a family ID to an account-specific ID, its existing family pins carry over once, even when the old family card is no longer active; later explicit unpins are preserved.
+
+A bounded count meter carries a compact unit in the strip when the unit is the only thing that makes the number meaningful — Freebuff's hours read `13h`, not a bare `13` — while percent and dollar meters stay as they are. Units that would abbreviate ambiguously (sessions would collapse to `s`, which reads as seconds) keep their bare number instead.

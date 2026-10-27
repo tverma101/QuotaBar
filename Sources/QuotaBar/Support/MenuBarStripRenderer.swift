@@ -172,20 +172,26 @@ private struct MenuBarTextStrip: View {
         .fixedSize()
     }
 
-    /// A provider's pinned values, no labels: one metric as a single large number, two stacked on two
-    /// tight lines (much narrower than side-by-side), read positionally.
+    /// A provider's pinned values. One metric renders as a single large number. Two stack on two tight
+    /// lines with their (shortened) labels, because two bare numbers give no way to tell which window
+    /// each belongs to — "13h / 20h" is unreadable, "Daily 13h / Weekly 20h" is not.
     @ViewBuilder
     private func metricsView(_ metrics: [MenuBarContent.Metric]) -> some View {
         if metrics.count <= 1 {
             Text(metrics.first?.value ?? "")
                 .font(.system(size: 12, weight: .bold))
         } else {
-            VStack(alignment: .trailing, spacing: -2) {
+            VStack(alignment: .leading, spacing: -2) {
                 ForEach(metrics, id: \.id) { metric in
-                    Text(metric.value)
+                    HStack(spacing: 3) {
+                        Text(metric.trayLabel)
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundStyle(Color.black.opacity(0.55))
+                        Text(metric.value)
+                            .font(.system(size: 9, weight: .semibold))
+                    }
                 }
             }
-            .font(.system(size: 9, weight: .semibold))
             .fixedSize()
         }
     }
@@ -203,7 +209,15 @@ private struct MenuBarTextStrip: View {
                 .fill(Color.black)
                 .frame(width: Self.glyphSide, height: Self.glyphSide)
         } else {
-            Circle().fill(Color.black).frame(width: Self.glyphSide - 1, height: Self.glyphSide - 1)
+            // A provider with no vector mark (Freebuff ships none) used to draw a bare filled
+            // circle, which reads as an unlabeled dot with no connection to the provider — the
+            // strip looked like it was reporting an anonymous value. Fall back to the provider's
+            // SF Symbol, the same stand-in the popover's icon uses, so the strip still identifies
+            // whose numbers these are.
+            Image(systemName: ProviderMarks.symbolFallback(for: icon.providerID))
+                .font(.system(size: Self.glyphSide - 3, weight: .semibold))
+                .foregroundStyle(Color.black)
+                .frame(width: Self.glyphSide, height: Self.glyphSide)
         }
     }
 }

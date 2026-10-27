@@ -146,6 +146,7 @@ final class AppContainer {
             isProviderEnabled: { [enablement] in enablement.isEnabled($0) },
             orderedDescriptors: { [layout] in layout.visiblePlaced.compactMap { layout.descriptor(for: $0) } },
             pinnedMetricIDs: { [layout] in layout.pinnedMetricIDs },
+            hiddenMenuBarProviderIDs: { [layout] in layout.hiddenMenuBarProviderIDs },
             notificationSettings: { notificationSettings },
             providerIdentityKeys: providerIdentityKeys
         )

@@ -31,12 +31,25 @@ struct TotalSpendCard: View {
     /// The spend-tile providers the card may aggregate — capability-based (see
     /// `LayoutStore.spendCapableProviders`), so a provider stays counted even when its own rows are
     /// hidden in Customize, and providers with merely similar-looking dollar rows never leak in.
+    /// Turned-off providers are included too: they still recorded the usage being totalled, and are
+    /// folded in from their retained history (see `dormantHistories`).
     private var providers: [Provider] {
-        layout.spendCapableProviders
+        layout.spendCapableProviders + layout.dormantSpendCapableProviders
+    }
+
+    /// Dated history for the turned-off contributors, so their periods follow the calendar instead of
+    /// the frozen spend tiles they were left with.
+    private var dormantHistories: [String: ProviderUsageHistory] {
+        dataStore.dormantUsageHistories(for: layout.dormantSpendCapableProviders.map(\.id))
     }
 
     private var total: TotalSpend {
-        TotalSpendAggregator.total(for: period, providers: providers, snapshots: dataStore.snapshots)
+        TotalSpendAggregator.total(
+            for: period,
+            providers: providers,
+            snapshots: dataStore.snapshots,
+            dormantHistories: dormantHistories
+        )
     }
 
     private var projection: TotalSpendProjection {

@@ -33,8 +33,26 @@ extension LayoutStore {
     /// must still count, and look-alike dollar rows from other providers (OpenRouter's API-spend
     /// "Today") must not.
     var spendCapableProviders: [Provider] {
+        spendCapableProviders(where: isProviderEnabled)
+    }
+
+    /// Turned-off providers that still ship the local spend tiles, in the user's provider order.
+    ///
+    /// The Total Spend card counts these from their retained history. Disabling a provider only hides
+    /// its card and stops its refreshes — it does not erase the usage it already recorded — so leaving
+    /// them out of the combined figure understated real spend (a heavily used provider that was turned
+    /// off simply vanished from every period). Their live spend tiles are frozen at the last refresh
+    /// and cannot be trusted as "today", so the card re-windows their dated history instead; see
+    /// `TotalSpendAggregator.slice(for:period:history:)`.
+    var dormantSpendCapableProviders: [Provider] {
+        spendCapableProviders { !isProviderEnabled($0) }
+    }
+
+    private func spendCapableProviders(
+        where included: (String) -> Bool
+    ) -> [Provider] {
         let capableIDs = Set(registry.descriptors.filter(\.isSpendTile).map(\.providerID))
-        return orderedProviders().filter { capableIDs.contains($0.id) && isProviderEnabled($0.id) }
+        return orderedProviders().filter { capableIDs.contains($0.id) && included($0.id) }
     }
 
     // MARK: - Provider grouping

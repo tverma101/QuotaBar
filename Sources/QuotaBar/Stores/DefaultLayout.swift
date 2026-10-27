@@ -65,15 +65,16 @@ enum DefaultLayout {
 
     /// Metrics pinned to the menu bar on first launch, so the app shows real numbers out of the box
     /// instead of a lone icon. Two per provider for Antigravity, Claude, Codex, and Cursor — the
-    /// per-provider cap (`LayoutStore.maxPinsPerProvider`). Freebuff's Daily Hours meter is pinned by
-    /// owner request so live session usage is visible in the menu bar whenever the account is active.
+    /// per-provider cap (`LayoutStore.maxPinsPerProvider`). Freebuff gets both of its hour meters
+    /// (owner request): the daily allowance and the standing balance read together as "what I can
+    /// spend today / what I have left", which is the only useful pair for an account billed in hours.
     /// Filtered to the active registry by `LayoutStore`, like `metricIDs`.
     static let pinnedMetricIDs: [String] = [
         "antigravity.geminiPro", "antigravity.geminiWeekly",
         "claude.session", "claude.weekly",
         "codex.session", "codex.weekly",
         "cursor.auto", "cursor.api",
-        "freebuff.freebucksDaily",
+        "freebuff.freebucksDaily", "freebuff.freebucksBalance",
         "copilot.premium",
         "openrouter.credits",
         "zai.session", "zai.weekly"

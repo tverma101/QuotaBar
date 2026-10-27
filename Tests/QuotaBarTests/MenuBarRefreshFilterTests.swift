@@ -114,6 +114,35 @@ final class MenuBarRefreshFilterTests: XCTestCase {
         )
     }
 
+    func testMenuBarSkipsProvidersHiddenFromTheStrip() {
+        // A provider the user removed from the strip still needs no live menu-bar refresh: nothing
+        // it produces can be painted there. Refreshing it every tick burned network, CPU, and
+        // Keychain probes for an invisible value.
+        let ids = MenuBarRefreshFilter.providerIDs(
+            enabledProviderIDs: ["codex", "claude", "cursor", "freebuff"],
+            pinnedMetricIDs: ["codex.session", "cursor.auto", "freebuff.freebucksDaily"],
+            providerIDForMetric: providerID(for:),
+            notificationRelevantProviderIDs: ["codex", "claude", "cursor", "freebuff"],
+            notificationsEnabled: false,
+            hiddenProviderIDs: ["cursor", "freebuff"]
+        )
+        XCTAssertEqual(ids, ["codex"])
+    }
+
+    /// Notifications read the layout rather than the strip, so a hidden provider with bounded metrics
+    /// must still refresh when a pace trigger is on — otherwise a hidden card's alert goes stale.
+    func testHiddenProviderStillRefreshesForNotifications() {
+        let ids = MenuBarRefreshFilter.providerIDs(
+            enabledProviderIDs: ["codex", "claude", "cursor"],
+            pinnedMetricIDs: ["codex.session"],
+            providerIDForMetric: providerID(for:),
+            notificationRelevantProviderIDs: ["codex", "claude", "cursor"],
+            notificationsEnabled: true,
+            hiddenProviderIDs: ["cursor"]
+        )
+        XCTAssertEqual(ids, ["codex", "claude", "cursor"])
+    }
+
     func testFullScopePrioritizesPinnedFirst() {
         let ordered = MenuBarRefreshFilter.prioritize(
             providerIDs: ["opencode", "claude", "codex", "hermes"],

@@ -628,6 +628,16 @@
     {
       "canonical": "deepseek-v4.1-flash-fast",
       "pattern": "(?i)^(?:deepseek/)?(?:deepseek[- ]?)?v4(?:\\.1)?[- ]flash[- ]fast(?:[- ]?(?:10/17|1017))?$"
+    },
+    {
+      "canonical": "deepseek-v4.1-flash-1017",
+      "pattern": "(?i)^(?:cursor-|deepseek/)?deepseek[- ]?v4[.-]?1[- ]?flash[- ]?(?:10/17|1017)(?:-(?:minimal|low|medium|high|xhigh|max))?$",
+      "$comment": "Cursor exports one slug per thinking effort for DeepSeek V4.1 Flash 10/17 (`deepseek-v41-flash-1017-high`). Collapse the effort suffix onto the base route so those rows price and group as one model instead of splitting or going unpriced."
+    },
+    {
+      "canonical": "deepseek-v4.1-flash",
+      "pattern": "(?i)^(?:cursor-|deepseek/)?deepseek[- ]?v4[.-]?1[- ]?flash(?:-(?:minimal|low|medium|high|xhigh|max))?$",
+      "$comment": "Effort-suffixed DeepSeek V4.1 Flash slugs without the 10/17 snapshot marker. Ordered after the dated rule above so the dated spelling wins its own identity."
     }
   ],
   "cursor_alias_rules": [
@@ -859,6 +869,20 @@
       "cache_write_per_million": 3.0,
       "input_per_million": 3.0,
       "output_per_million": 15.0
+    },
+    "deepseek-v4.1-flash-1017": {
+      "$comment": "DeepSeek V4.1 Flash 10/17 snapshot. Neither bundled snapshot carries this id, so without a curated entry a Cursor row on this model showed its tokens and no dollars at all until the live OpenRouter catalogue revalidated. Base rates follow OpenRouter's published route (deepseek/deepseek-v4.1-flash-1017): $0.15 input / $0.60 output / $0.003 cache read. OpenRouter also publishes weekday UTC windows that raise weekday rates; Cursor's CSV rows are day-granular aggregates with no per-turn timestamps, so the base rate applies, matching every other Cursor spend row.",
+      "cache_read_per_million": 0.003,
+      "cache_write_per_million": 0.15,
+      "input_per_million": 0.15,
+      "output_per_million": 0.6
+    },
+    "deepseek-v4.1-flash": {
+      "$comment": "DeepSeek V4.1 Flash base route (no snapshot marker). Curated for the same reason as the 10/17 entry: absent from both bundled snapshots, so the canonical an effort-suffixed slug collapses onto would otherwise price at nothing offline. Rates follow OpenRouter's deepseek/deepseek-v4.1-flash route.",
+      "cache_read_per_million": 0.0042,
+      "cache_write_per_million": 0.14,
+      "input_per_million": 0.14,
+      "output_per_million": 0.42
     },
     "deepseek-v4-flash": {
       "$comment": "DeepSeek V4 Flash official API rates (api-docs.deepseek.com/quick_start/pricing, verified 2026-08-11 vs OpenRouter/Requesty/BenchLM). Pinned here because the LiteLLM snapshot omits the cache-write lane (resolves 0.0); DeepSeek bills cache-creation at the input rate, matching models.dev's 0.14.",
