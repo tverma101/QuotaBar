@@ -262,14 +262,148 @@ struct TotalSpend: Equatable {
 /// never fetches. A provider contributes when its snapshot carries a `.values` line with the period's
 /// label *and* that line has dollars and/or tokens — idle periods (no line) are excluded, never zero.
 enum TotalSpendAggregator {
+    /// Build a period's slice from a provider's retained daily history instead of its spend tiles.
+    ///
+    /// Used for **dormant** providers — spend-capable providers the user has turned off. Their last
+    /// snapshot is never refreshed, so its "Today" tile describes whatever day it was last computed
+    /// (possibly weeks ago) and must never be summed as today's spend. The dated series can be
+    /// re-windowed against `now` however, so historical usage still lands on the days it happened.
+    /// Without this, disabling a heavily used provider silently dropped it out of the total, so the
+    /// combined figure understated real spend.
+    ///
+    /// `history.series` is filtered to the window here rather than trusting the caller, mirroring
+    /// `SpendTileMapper`: a persisted series can outlive a window change.
+    static func slice(
+        for provider: Provider,
+        period: TotalSpendPeriod,
+        history: ProviderUsageHistory,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> TotalSpendSlice? {
+        let days = windowDayKeys(for: period, now: now, calendar: calendar)
+        guard !days.isEmpty else { return nil }
+
+        var amount = 0.0
+        var hasValidDollarAmount = false
+        var dollarsOverflowed = false
+        var tokens = 0.0
+        var tokenCountSaturated = false
+        var estimated = false
+        var hasIncompleteCost = false
+
+        for entry in history.series.daily {
+            guard let day = dayKey(fromUsageDate: entry.date, calendar: calendar), days.contains(day)
+            else { continue }
+            if entry.tokenCountSaturated { tokenCountSaturated = true }
+            if entry.totalTokens > 0 {
+                let next = tokens + Double(entry.totalTokens)
+                if next.isFinite { tokens = next } else { tokenCountSaturated = true }
+            }
+            // A day whose cost is incomplete but unexplained (and not a running local session) has no
+            // trustworthy subtotal; keep its tokens and mark the period's dollars incomplete.
+            let dayCostIsTrustworthy = entry.costIsComplete
+                || entry.hasUnexplainedIncompleteCost == false
+                || history.partialDays?.contains(day) == true
+                || history.unknownModelsByDay[day]?.isEmpty == false
+            guard let cost = entry.costUSD, cost.isFinite, cost >= 0 else {
+                if entry.totalTokens > 0 { hasIncompleteCost = true }
+                continue
+            }
+            guard dayCostIsTrustworthy else {
+                hasIncompleteCost = true
+                continue
+            }
+            guard !dollarsOverflowed else { continue }
+            let next = amount + cost
+            if next.isFinite {
+                amount = next
+                hasValidDollarAmount = true
+            } else {
+                dollarsOverflowed = true
+                hasIncompleteCost = true
+            }
+            if !entry.costIsComplete { hasIncompleteCost = true }
+            if history.estimatedCostDays?.contains(day) == true { estimated = true }
+        }
+
+        // A partial (still-running) day inside the window makes the period's figures lower bounds.
+        let windowIsPartial = days.contains { history.partialDays?.contains($0) == true }
+        if windowIsPartial { hasIncompleteCost = true }
+        guard hasValidDollarAmount || tokens > 0 || tokenCountSaturated else { return nil }
+
+        return TotalSpendSlice(
+            provider: provider,
+            amountUSD: amount,
+            hasDollarAmount: hasValidDollarAmount,
+            tokenCount: tokens,
+            tokenCountSaturated: tokenCountSaturated,
+            estimated: estimated,
+            isPartial: windowIsPartial,
+            hasIncompleteCost: hasIncompleteCost || (tokens > 0 && !hasValidDollarAmount)
+        )
+    }
+
+    /// The `yyyy-MM-dd` keys one Total Spend period covers, including today: `today` and `yesterday`
+    /// are single days, `last30` matches `UsageHistoryWindow.totalDays` so the ring and the per-provider
+    /// "Last 30 Days" tile cannot disagree.
+    static func windowDayKeys(
+        for period: TotalSpendPeriod,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> Set<String> {
+        switch period {
+        case .today:
+            return [DailyUsageAccumulator.dayKey(from: now, calendar: calendar)]
+        case .yesterday:
+            guard let yesterday = calendar.date(byAdding: .day, value: -1, to: now) else { return [] }
+            return [DailyUsageAccumulator.dayKey(from: yesterday, calendar: calendar)]
+        case .last30:
+            return UsageHistoryWindow.dayKeys(through: now, calendar: calendar)
+        }
+    }
+
+    /// A history entry's `yyyy-MM-dd` key, accepting the bare, ISO-8601, and 8-digit shapes the
+    /// scanners emit. Mirrors `SpendTileMapper`'s normalization so a dormant provider's day lands on
+    /// the same key its live tiles would have used.
+    private static func dayKey(fromUsageDate rawDate: String, calendar: Calendar) -> String? {
+        let value = rawDate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        if value.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil { return value }
+        if let date = OpenUsageISO8601.date(from: value) {
+            return DailyUsageAccumulator.dayKey(from: date, calendar: calendar)
+        }
+        if let match = value.range(of: #"^\d{4}-\d{2}-\d{2}"#, options: .regularExpression) {
+            return String(value[match])
+        }
+        if value.range(of: #"^\d{8}$"#, options: .regularExpression) != nil {
+            return "\(value.prefix(4))-\(value.dropFirst(4).prefix(2))-\(value.suffix(2))"
+        }
+        return nil
+    }
+
     /// The total for one period across `providers` (pass them in display order; ties keep it).
     /// Slices keep provider display order input only as a stable traversal; metric projection re-ranks.
+    ///
+    /// `dormantHistories` carries the retained history of spend-capable providers the user has turned
+    /// off, keyed by provider ID. A dormant provider has no fresh spend tiles (its snapshot is frozen
+    /// at whenever it was last refreshed), so its period is rebuilt from those dated rows instead —
+    /// see `slice(for:period:history:)`. A dormant provider whose history has nothing in the window
+    /// simply contributes nothing, exactly like an idle enabled one.
     static func total(
         for period: TotalSpendPeriod,
         providers: [Provider],
-        snapshots: [String: ProviderSnapshot]
+        snapshots: [String: ProviderSnapshot],
+        dormantHistories: [String: ProviderUsageHistory] = [:],
+        now: Date = Date(),
+        calendar: Calendar = .current
     ) -> TotalSpend {
         let slices = providers.compactMap { provider -> TotalSpendSlice? in
+            // Dormant providers are keyed in `dormantHistories` whether or not they have a retained
+            // history — presence is what marks them as turned off, so their frozen spend tiles are
+            // never trusted for a period. An empty history contributes nothing.
+            if let history = dormantHistories[provider.id] {
+                return slice(for: provider, period: period, history: history, now: now, calendar: calendar)
+            }
             guard let snapshot = snapshots[provider.id],
                   let line = snapshot.line(label: period.lineLabel),
                   case .values(_, let values, _, _, let unknownModels, _) = line else { return nil }

@@ -55,6 +55,41 @@ final class MenuBarStripTrimTests: XCTestCase {
         XCTAssertEqual(image.accessibilityDescription, content.accessibilityText)
     }
 
+    /// Freebuff ships no vector mark, so the strip used to draw a bare filled circle — an anonymous
+    /// dot beside the numbers. It now falls back to the provider's SF Symbol. This pins that the
+    /// segment still renders real, non-blank artwork with the label and hour unit visible.
+    func testProviderWithoutVectorMarkRendersItsSymbolGlyphAndHourUnit() throws {
+        let content = MenuBarContent(
+            groups: [
+                MenuBarContent.Group(
+                    providerID: "freebuff",
+                    displayName: "Freebuff",
+                    icon: .providerMark("freebuff"),
+                    metrics: [
+                        MenuBarContent.Metric(id: "freebuff.freebucksDaily", label: "Daily Hours",
+                                              trayLabel: "Day", value: "13h",
+                                              fraction: 0.39, isBounded: true, hasData: true),
+                        MenuBarContent.Metric(id: "freebuff.freebucksBalance", label: "Hours Balance",
+                                              trayLabel: "Bal", value: "35h",
+                                              fraction: 0, isBounded: false, hasData: true)
+                    ]
+                )
+            ],
+            bars: []
+        )
+
+        let image = try XCTUnwrap(MenuBarStripRenderer.textImage(for: content))
+        var rect = CGRect(origin: .zero, size: image.size)
+        let cgImage = try XCTUnwrap(image.cgImage(forProposedRect: &rect, context: nil, hints: nil))
+        let bounds = try XCTUnwrap(MenuBarStripRenderer.visibleBounds(of: cgImage))
+
+        // The stacked pair is taller than one line, so the strip must be taller than a single row.
+        XCTAssertGreaterThan(image.size.height, 12)
+        XCTAssertGreaterThan(image.size.width, 20)
+        XCTAssertEqual(bounds, CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+        XCTAssertEqual(image.accessibilityDescription, "Freebuff Daily Hours 13h, Hours Balance 35h")
+    }
+
     /// Draws an optional opaque rect (given in top-left-origin pixel coordinates) on a transparent
     /// canvas. The fill converts to the context's bottom-left-origin user space, so the produced
     /// `CGImage` has the block exactly where the test expects it.

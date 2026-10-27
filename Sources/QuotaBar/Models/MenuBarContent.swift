@@ -8,11 +8,37 @@ struct MenuBarContent: Equatable {
     /// One resolved pinned metric.
     struct Metric: Equatable {
         let id: String          // descriptor id
-        let label: String       // metric label, e.g. "Session" (shown when a provider has two metrics)
+        /// The metric's full name, e.g. "Weekly". Used for accessibility and anywhere the strip has
+        /// room; never shortened, because a screen reader announcing "Wk 12%" is worse than useless.
+        let label: String
+        /// Strip-only abbreviation of `label` (e.g. "Wk"), drawn beside the value in a stacked pair
+        /// where width is scarce. Falls back to `label` for names that need no shortening.
+        let trayLabel: String
         let value: String       // tray display: a "%" for bounded metrics, the raw value (e.g. "$5.23") for unbounded, or the no-data marker
         let fraction: Double     // 0...1 fill, meaningful for bounded metrics (drives the bars)
         let isBounded: Bool      // has a limit → has a fill, so it can render as a bar
         let hasData: Bool
+
+        /// `trayLabel` defaults to the full `label`, so a caller that has no abbreviation to offer
+        /// (tests, fixtures, simple descriptors) cannot accidentally ship an empty or mismatched
+        /// strip label.
+        init(
+            id: String,
+            label: String,
+            trayLabel: String? = nil,
+            value: String,
+            fraction: Double,
+            isBounded: Bool,
+            hasData: Bool
+        ) {
+            self.id = id
+            self.label = label
+            self.trayLabel = trayLabel ?? label
+            self.value = value
+            self.fraction = fraction
+            self.isBounded = isBounded
+            self.hasData = hasData
+        }
     }
 
     /// A provider and its pinned metrics, in order. One segment of the Text strip.
@@ -86,7 +112,8 @@ enum MenuBarContentBuilder {
     private static func resolve(_ descriptor: WidgetDescriptor, _ data: WidgetData) -> MenuBarContent.Metric {
         MenuBarContent.Metric(
             id: descriptor.id,
-            label: trayLabel(descriptor.metricLabel),
+            label: descriptor.metricLabel,
+            trayLabel: trayLabel(descriptor.metricLabel),
             value: data.menuBarValue,
             fraction: data.fraction,
             isBounded: data.isBounded,
@@ -94,13 +121,23 @@ enum MenuBarContentBuilder {
         )
     }
 
-    /// Tray-only label shortening (the dashboard keeps the full names): the long time-window metrics
-    /// collapse to a single letter so a two-metric stack stays narrow. Unknown labels pass through.
+    /// Tray-only label shortening (the dashboard keeps the full names). A stacked pair of metrics puts
+    /// these beside each value, so each has to stay to a few characters while still distinguishing the
+    /// windows. Long spend windows collapse to one letter; Freebuff's hour budgets shorten to their
+    /// window name; anything unrecognized passes through unchanged.
     private static func trayLabel(_ metricLabel: String) -> String {
         switch metricLabel.lowercased() {
         case "today": return "T"
         case "yesterday": return "Y"
         case "last 30 days": return "M"
+        case "daily hours": return "Day"
+        case "hours balance": return "Bal"
+        case "weekly": return "Wk"
+        case "5-day": return "5d"
+        case "monthly": return "Mo"
+        case "session pool": return "Pool"
+        case "premium sessions": return "Prem"
+        case "free premium sessions": return "Free"
         default: return metricLabel
         }
     }

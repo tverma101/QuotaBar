@@ -111,7 +111,63 @@ final class MenuBarContentTests: XCTestCase {
             groups: [group("a", percent("a.today", "Today", 5), percent("a.month", "Last 30 Days", 80))],
             data: { $0.sample }
         )
-        XCTAssertEqual(content.groups[0].metrics.map(\.label), ["T", "M"])
+        XCTAssertEqual(content.groups[0].metrics.map(\.trayLabel), ["T", "M"])
+        // The full name survives for accessibility — a screen reader must not read out "M 80%".
+        XCTAssertEqual(content.groups[0].metrics.map(\.label), ["Today", "Last 30 Days"])
+    }
+
+    /// Freebuff's hour meters are the pair that exposed the unreadable strip: a bare "13" beside a
+    /// bare "20" with a dot for a provider mark. Each metric now carries a short window label, and
+    /// the hour unit rides the value so "20" cannot be mistaken for tokens, a percent, or a session.
+    func testFreebuffHoursPairReadsAsLabeledHourBudgets() {
+        let provider = Provider(
+            id: "freebuff", displayName: "Freebuff", icon: .providerMark("freebuff")
+        )
+        let daily = WidgetDescriptor.boundedCount(
+            id: "freebuff.freebucksDaily", provider: provider, title: "Daily Hours",
+            limit: 1, suffix: "hours"
+        )
+        let balance = WidgetDescriptor.values(
+            id: "freebuff.freebucksBalance", provider: provider, title: "Hours Balance",
+            selection: .kind(.count)
+        )
+        let content = MenuBarContentBuilder.build(
+            groups: [group("freebuff", daily, balance)],
+            data: { descriptor in
+                if descriptor.id == "freebuff.freebucksDaily" {
+                    // 13 of 33 hours left, matching the meter style this build defaults to.
+                    return WidgetData(
+                        title: "Daily Hours", icon: provider.icon, kind: .count,
+                        used: 20, limit: 33, countSuffix: "hours", displayMode: .remaining
+                    )
+                }
+                var sample = descriptor.sample
+                sample.values = [MetricValue(number: 35, kind: .count, label: "hours")]
+                return sample
+            }
+        )
+
+        let metrics = content.groups.first?.metrics ?? []
+        XCTAssertEqual(metrics.count, 2, "both hour meters render, so the strip stacks the pair")
+        XCTAssertEqual(metrics.map(\.trayLabel), ["Day", "Bal"])
+        XCTAssertEqual(metrics.map(\.value), ["13h", "35h"])
+    }
+
+    func testUnboundedCountKeepsItsUnitInTheTray() {
+        let balance = WidgetData(
+            title: "Hours Balance", icon: .providerMark("freebuff"), kind: .count, used: 0, limit: nil,
+            values: [MetricValue(number: 35, kind: .count, label: "hours")]
+        )
+        XCTAssertEqual(balance.menuBarValue, "35h")
+
+        // Units that would abbreviate ambiguously stay bare: "sessions" must never read as "s".
+        let sessions = WidgetData(
+            title: "Sessions", icon: .providerMark("freebuff"), kind: .count, used: 3, limit: 5,
+            countSuffix: "sessions"
+        )
+        XCTAssertEqual(sessions.menuBarValue, "3")
+        XCTAssertNil(WidgetData.trayUnit("sessions"))
+        XCTAssertEqual(WidgetData.trayUnit("hours"), "h")
     }
 
     func testBoundedTrayValuesStayUnitAware() {
@@ -128,7 +184,6 @@ final class MenuBarContentTests: XCTestCase {
 
     // Compact-notation rules for tray values (abbreviation, decimal rounding) are pinned exactly in
     // MetricFormatterTests — the strip only relays MetricFormatter output.
-
     // MARK: - Fixtures
 
     private func group(_ providerID: String, _ metrics: WidgetDescriptor...) -> ProviderMetrics {
@@ -139,7 +194,6 @@ final class MenuBarContentTests: XCTestCase {
         )
         return ProviderMetrics(provider: provider, metrics: metrics)
     }
-
     private func percent(_ id: String, _ label: String, _ used: Double) -> WidgetDescriptor {
         descriptor(id, label, WidgetData(title: label, icon: .providerMark("cursor"), kind: .percent, used: used, limit: 100))
     }

@@ -256,11 +256,25 @@ struct WidgetData: Hashable {
                 let percent = min(100, max(0, Int((displayedValue / limit * 100).rounded())))
                 return "\(percent)%"
             }
-            return MetricFormatter.number(displayedValue, kind: kind, style: .tray)
+            let number = MetricFormatter.number(displayedValue, kind: kind, style: .tray)
+            // Carry the unit: a bounded count meter (Freebuff's hours, Cursor's requests) otherwise
+            // reads as a bare number in the strip, so "20" is indistinguishable from a token count,
+            // a percent, or a session total. Percent and dollar meters are self-describing and stay
+            // as they are.
+            if kind == .count, let unit = Self.trayUnit(countSuffix) {
+                return "\(number)\(unit)"
+            }
+            return number
         }
         if let first = selectedValues.first {
             if let traySuffix, first.kind == .count {
                 return "\(MetricFormatter.number(for: first, style: .tray)) \(traySuffix)"
+            }
+            // A `.values` count often carries a unit word in its label (`hours`), which the tray used
+            // to drop entirely — an hours balance showed as a bare number. Use the compact tray unit
+            // when the value's own label names one.
+            if first.kind == .count, let unit = Self.trayUnit(first.label) {
+                return "\(MetricFormatter.number(for: first, style: .tray))\(unit)"
             }
             return MetricFormatter.string(for: first, style: .tray)
         }
@@ -268,6 +282,19 @@ struct WidgetData: Hashable {
         let number = MetricFormatter.number(displayedValue, kind: kind, style: .tray)
         if kind == .count, let countSuffix { return "\(number) \(countSuffix)" }
         return number
+    }
+
+    /// Compact tray-only unit for a bounded count meter, or `nil` when the bare number is the better
+    /// reading. The menu bar is width-constrained, so a unit has to be very short to earn its place —
+    /// and it must not be ambiguous. Only hours qualify today: "20h" is unambiguous and turns a
+    /// meaningless bare "20" into "20 hours left", while "sessions" would collapse to "s" and read as
+    /// seconds. Everything else keeps its existing bare-number reading.
+    static func trayUnit(_ countSuffix: String?) -> String? {
+        guard let suffix = countSuffix?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        switch suffix.lowercased() {
+        case "hours", "hour": return "h"
+        default: return nil
+        }
     }
 
     /// Large headline on bounded tiles (e.g. `95% left`, `5% used`).
