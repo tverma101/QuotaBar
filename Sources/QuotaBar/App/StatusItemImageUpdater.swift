@@ -125,6 +125,7 @@ final class StatusItemImageUpdater {
         let content = MenuBarContentBuilder.build(
             groups: container.layout.pinnedGroups,
             hiddenProviderIDs: container.layout.hiddenMenuBarProviderIDs,
+            now: Date(),
             data: { container.dataStore.data(for: $0) }
         )
         return MenuBarStripRenderer.image(for: content, style: container.layout.menuBarStyle)

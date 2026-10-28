@@ -28,7 +28,7 @@ Star a metric from any row's right-click menu, or from the always-visible star b
 
 Settings → Appearance → Icon Style:
 
-- **Text** — provider icon plus values. One starred metric renders as a single number; two from the same provider stack as two tight lines, read positionally (`87%` over `32%`) with no label words, so the strip stays as narrow as a percentage-only reading.
+- **Text** — provider icon plus values. One starred metric renders as a single number; two from the same provider stack as two tight lines, read positionally (`87%` over `32%`) with no label words, so the strip stays as narrow as a percentage-only reading. The mark is kept small so it identifies the provider without eating menu-bar width.
 - **Bars** — a compact glyph containing the first four starred metrics that have a limit (metrics without limits only appear in Text style).
 - In each provider or account's Customize detail, **Show in menu bar** controls the whole entry: both its icon and pinned usage values. New providers and accounts default to on. Turning it off removes that provider/account from both Text and Bars styles — and it also stops that provider's live menu-bar refreshes while the panel stays closed, since nothing it produces can be drawn there. Meters refresh again as soon as you show it, because opening the panel refreshes every enabled provider.
 
@@ -44,4 +44,4 @@ The strip only renders real data. A starred metric with nothing fetched yet is s
 
 A bounded count meter carries a compact unit in the strip when the unit is the only thing that makes the number meaningful — an hours balance reads `30h`, not a bare `30` — while percent and dollar meters stay as they are. Units that would abbreviate ambiguously (sessions would collapse to `s`, which reads as seconds) keep their bare number instead.
 
-Freebuff's pinned segment is a **session timer**: the provider mark followed by the hours and minutes left in the active window (`2h 14m`), not the remaining allowance. It updates on the minute, and falls back to the allowance reading when the server reports no reset time.
+Freebuff's pinned segment is a **session timer**: a small provider mark followed by the hours and minutes left in the active window (`3h 56m`), not the remaining allowance. It updates on the minute. When no session is running — nothing spent in the current window — the segment disappears entirely, icon included, so an idle provider takes no menu-bar space; it returns as soon as you start using it.

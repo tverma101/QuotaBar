@@ -102,6 +102,19 @@ struct WidgetData: Hashable {
         case resetCountdown
     }
 
+    /// Whether this row should render in the menu-bar strip at all right now.
+    ///
+    /// A session timer answers "how long is left *in this session*", so with no session running it has
+    /// nothing to say — and the strip is precious space. The window counts as idle while nothing has
+    /// been spent in it (`used <= 0`), the same signal session meters use to read "Not started". Every
+    /// other row is unaffected: its value is meaningful whether or not anything is happening.
+    func showsInMenuBar(now: Date = Date()) -> Bool {
+        guard hasData else { return false }
+        guard trayStyle == .resetCountdown else { return true }
+        guard let resetsAt, resetsAt > now else { return false }
+        return used > 0
+    }
+
     /// How a session-window meter tells a not-yet-started window from an in-flight one.
     enum SessionStartSignal: Hashable {
         /// Zero usage is the fresh signal. These providers report a reset instant even for an

@@ -157,9 +157,9 @@ private struct MenuBarTextStrip: View {
     let content: MenuBarContent
 
     var body: some View {
-        HStack(spacing: 11) {
+        HStack(spacing: 8) {
             ForEach(content.groups, id: \.providerID) { group in
-                HStack(spacing: 4) {
+                HStack(spacing: 3) {
                     glyph(group.icon)
                     metricsView(group.metrics)
                 }
@@ -195,11 +195,11 @@ private struct MenuBarTextStrip: View {
         }
     }
 
-    /// Side length of the glyph box. Sized to fill the strip's height so the mark reads at the same
-    /// scale as the dual-line metric block beside it (the single number is shorter), instead of
-    /// floating small in the middle. `ProviderIconShape` already normalizes every mark to its true
-    /// bounding box, so a near-zero `inset` here makes each provider fill this box uniformly.
-    private static let glyphSide: CGFloat = 16
+    /// Side length of the glyph box. Kept small deliberately: the strip is competing with every other
+    /// menu-bar item, and a provider mark only has to be recognisable, not dominant. It is sized just
+    /// under the stacked pair's height so the mark reads level with the numbers instead of setting the
+    /// strip's width.
+    private static let glyphSide: CGFloat = 12
 
     @ViewBuilder
     private func glyph(_ icon: IconSource) -> some View {
@@ -214,7 +214,7 @@ private struct MenuBarTextStrip: View {
             // SF Symbol, the same stand-in the popover's icon uses, so the strip still identifies
             // whose numbers these are.
             Image(systemName: ProviderMarks.symbolFallback(for: icon.providerID))
-                .font(.system(size: Self.glyphSide - 3, weight: .semibold))
+                .font(.system(size: Self.glyphSide - 2, weight: .semibold))
                 .foregroundStyle(Color.black)
                 .frame(width: Self.glyphSide, height: Self.glyphSide)
         }
