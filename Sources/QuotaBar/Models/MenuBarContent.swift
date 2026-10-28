@@ -64,11 +64,17 @@ enum MenuBarContentBuilder {
     static func build(
         groups: [ProviderMetrics],
         hiddenProviderIDs: Set<String> = [],
+        now: Date = Date(),
         data: (WidgetDescriptor) -> WidgetData
     ) -> MenuBarContent {
         let resolvedGroups = groups.compactMap { group -> MenuBarContent.Group? in
             guard !hiddenProviderIDs.contains(group.provider.id) else { return nil }
-            let metrics = group.metrics.map { resolve($0, data($0)) }.filter(\.hasData)
+            // A row can opt out of the strip while it has nothing worth showing — a session timer with
+            // no session running drops out along with its provider's icon, so an idle provider costs
+            // no menu-bar space at all.
+            let metrics = group.metrics
+                .map { resolve($0, data($0), now: now) }
+                .filter(\.hasData)
             guard !metrics.isEmpty else { return nil }
             return MenuBarContent.Group(
                 providerID: group.provider.id,
@@ -86,14 +92,18 @@ enum MenuBarContentBuilder {
         return MenuBarContent(groups: resolvedGroups, bars: Array(bars))
     }
 
-    private static func resolve(_ descriptor: WidgetDescriptor, _ data: WidgetData) -> MenuBarContent.Metric {
+    private static func resolve(
+        _ descriptor: WidgetDescriptor,
+        _ data: WidgetData,
+        now: Date
+    ) -> MenuBarContent.Metric {
         MenuBarContent.Metric(
             id: descriptor.id,
             label: descriptor.metricLabel,
             value: data.menuBarValue,
             fraction: data.fraction,
             isBounded: data.isBounded,
-            hasData: data.hasData
+            hasData: data.showsInMenuBar(now: now)
         )
     }
 }

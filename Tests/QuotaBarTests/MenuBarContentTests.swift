@@ -210,6 +210,60 @@ final class MenuBarContentTests: XCTestCase {
         XCTAssertEqual(data.menuBarValue, "15h")
     }
 
+    /// A session timer has nothing to say when no session is running, and the strip is contested
+    /// space: with no usage in the window the Freebuff segment drops out entirely, icon included.
+    /// Any usage brings it back, so the timer is a live session clock rather than a permanent label.
+    func testIdleSessionTimerDropsOutOfTheStripEntirely() {
+        let provider = Provider(id: "freebuff", displayName: "Freebuff", icon: .providerMark("freebuff"))
+        let daily = WidgetDescriptor.boundedCount(
+            id: "freebuff.freebucksDaily", provider: provider, title: "Daily Hours",
+            limit: 1, suffix: "hours", periodDurationMs: MetricPeriod.dayMs
+        ).showingResetTimerInMenuBar()
+
+        func timer(used: Double, resetsAt: Date?) -> WidgetData {
+            var data = WidgetData(
+                title: "Daily Hours", icon: provider.icon, kind: .count,
+                used: used, limit: 33, countSuffix: "hours", displayMode: .remaining,
+                resetsAt: resetsAt
+            )
+            data.trayStyle = .resetCountdown
+            return data
+        }
+        let future = Date().addingTimeInterval(3 * 3600 + 14 * 60)
+
+        // Idle window: nothing spent, so nothing to count down.
+        let idle = MenuBarContentBuilder.build(
+            groups: [group("freebuff", daily)],
+            data: { _ in timer(used: 0, resetsAt: future) }
+        )
+        XCTAssertTrue(idle.isEmpty, "an idle session must not occupy menu-bar space")
+        XCTAssertNil(MenuBarStripRenderer.image(for: idle, style: .text))
+
+        // Active window: the timer returns.
+        let active = MenuBarContentBuilder.build(
+            groups: [group("freebuff", daily)],
+            data: { _ in timer(used: 4, resetsAt: future) }
+        )
+        XCTAssertEqual(active.groups.count, 1)
+        XCTAssertTrue(active.groups[0].metrics[0].value.hasSuffix("m"))
+    }
+
+    /// A non-timer row keeps showing whatever its value is — a zero balance or an exhausted meter is
+    /// information, and only a session clock is meaningless while idle.
+    func testNonTimerRowsStillShowAtZero() {
+        let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
+        let credits = WidgetDescriptor.values(
+            id: "codex.credits", provider: provider, title: "Credits"
+        )
+        var data = credits.sample
+        data.values = [MetricValue(number: 0, kind: .dollars)]
+        let content = MenuBarContentBuilder.build(
+            groups: [group("codex", credits)],
+            data: { _ in data }
+        )
+        XCTAssertEqual(content.groups.count, 1, "a zero balance is still worth showing")
+    }
+
     func testUnboundedCountKeepsItsUnitInTheTray() {
         let balance = WidgetData(
             title: "Hours Balance", icon: .providerMark("freebuff"), kind: .count, used: 0, limit: nil,
