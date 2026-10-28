@@ -88,6 +88,20 @@ struct WidgetData: Hashable {
     /// than a hardcoded widget-ID list in the model. `nil` for every other row.
     var sessionStartSignal: SessionStartSignal?
 
+    /// How this row reads in the menu bar. `.value` (the default) is the ordinary used/left figure;
+    /// `.resetCountdown` makes the strip show the time left in the window as a session clock instead.
+    /// Set by a descriptor opt-in and carried through `WidgetDataStore.resolve`, exactly like
+    /// `sessionStartSignal`.
+    var trayStyle: TrayStyle = .value
+
+    /// Menu-bar reading styles. `value` is the established behavior — a percent, a compact count, or a
+    /// compact dollar amount. `resetCountdown` renders the window's remaining time (`2h 14m`) and is
+    /// only for segments whose number *is* the session clock.
+    enum TrayStyle: String, Hashable, Sendable {
+        case value
+        case resetCountdown
+    }
+
     /// How a session-window meter tells a not-yet-started window from an in-flight one.
     enum SessionStartSignal: Hashable {
         /// Zero usage is the fresh signal. These providers report a reset instant even for an
@@ -249,6 +263,11 @@ struct WidgetData: Hashable {
     /// rather than a misleading "0".
     var menuBarValue: String {
         guard hasData else { return valueText }
+        // A timer row reads the window's session clock instead of the allowance. Checked up front so
+        // the countdown wins for both meter and `.values` rows.
+        if trayStyle == .resetCountdown, let countdown = resetCountdownText() {
+            return countdown
+        }
         if let limit, limit > 0 {
             if kind == .percent {
                 // Percent is the only bounded unit that should collapse to a tray percentage. Clamp both
@@ -295,6 +314,17 @@ struct WidgetData: Hashable {
         case "hours", "hour": return "h"
         default: return nil
         }
+    }
+
+    /// The tray reading for a timer row: hours and minutes left in the current window ("2h 14m"),
+    /// or minutes alone in the last hour ("41m"). `nil` when the row has no reset instant to count
+    /// down to — the caller then falls back to the ordinary value rather than showing nothing.
+    ///
+    /// Recomputed on every render (the strip re-renders on each snapshot write and the app's clock
+    /// tick), so the segment stays a live clock instead of a number frozen at the last refresh.
+    private func resetCountdownText(now: Date = Date()) -> String? {
+        guard let resetsAt, resetsAt > now else { return nil }
+        return Formatters.compactDuration(resetsAt.timeIntervalSince(now))
     }
 
     /// Large headline on bounded tiles (e.g. `95% left`, `5% used`).

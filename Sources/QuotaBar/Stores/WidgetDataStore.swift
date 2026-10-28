@@ -2131,6 +2131,8 @@ final class WidgetDataStore {
             // Descriptor opt-in (session-window meters read "Not started" when unused); the fresh
             // `.progress` result doesn't start from the sample, so carry the signal explicitly.
             result.sessionStartSignal = descriptor.sample.sessionStartSignal
+            // Same reason: a timer segment is a descriptor opt-in, and `.progress` rebuilds the row.
+            result.trayStyle = descriptor.sample.trayStyle
             result.boundedDetail = detail
             return result
         case .text:
