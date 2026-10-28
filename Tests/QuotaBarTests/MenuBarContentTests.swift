@@ -106,20 +106,22 @@ final class MenuBarContentTests: XCTestCase {
         XCTAssertEqual(content.accessibilityText, "A Session 41%, Weekly 12%")
     }
 
-    func testTrayLabelsShortenLongTimeWindows() {
+    func testTrayLabelsAreNotDrawnBesideStackedValues() {
         let content = MenuBarContentBuilder.build(
             groups: [group("a", percent("a.today", "Today", 5), percent("a.month", "Last 30 Days", 80))],
             data: { $0.sample }
         )
-        XCTAssertEqual(content.groups[0].metrics.map(\.trayLabel), ["T", "M"])
-        // The full name survives for accessibility — a screen reader must not read out "M 80%".
+        // The strip shows values only and reads positionally — adding a word to every stacked pair
+        // made an always-clear "87% / 32%" read "Session 87% / Wk 32%". The full name still survives
+        // for accessibility, because a screen reader has no positional context to fall back on.
         XCTAssertEqual(content.groups[0].metrics.map(\.label), ["Today", "Last 30 Days"])
+        XCTAssertEqual(content.groups[0].metrics.map(\.value), ["5%", "80%"])
     }
 
     /// Freebuff's hour meters are the pair that exposed the unreadable strip: a bare "13" beside a
-    /// bare "20" with a dot for a provider mark. Each metric now carries a short window label, and
-    /// the hour unit rides the value so "20" cannot be mistaken for tokens, a percent, or a session.
-    func testFreebuffHoursPairReadsAsLabeledHourBudgets() {
+    /// bare "20" with a dot for a provider mark. The fix is the hour unit on each value, not a label —
+    /// "13h / 35h" is unambiguous on its own, so the strip stays as terse as it is for percentages.
+    func testFreebuffHoursPairReadsAsHourBudgetsWithoutLabels() {
         let provider = Provider(
             id: "freebuff", displayName: "Freebuff", icon: .providerMark("freebuff")
         )
@@ -149,8 +151,63 @@ final class MenuBarContentTests: XCTestCase {
 
         let metrics = content.groups.first?.metrics ?? []
         XCTAssertEqual(metrics.count, 2, "both hour meters render, so the strip stacks the pair")
-        XCTAssertEqual(metrics.map(\.trayLabel), ["Day", "Bal"])
         XCTAssertEqual(metrics.map(\.value), ["13h", "35h"])
+    }
+
+    /// Freebuff's pinned segment is the active session clock, not an allowance figure: hours and
+    /// minutes until the window resets. The hour unit still rides a non-timer hour row so a count is
+    /// never an unlabeled number, but the timer segment itself is a duration.
+    func testFreebuffDailyHoursReadsAsASessionCountdownInTheStrip() {
+        let provider = Provider(
+            id: "freebuff", displayName: "Freebuff", icon: .providerMark("freebuff")
+        )
+        let daily = WidgetDescriptor.boundedCount(
+            id: "freebuff.freebucksDaily", provider: provider, title: "Daily Hours",
+            limit: 1, suffix: "hours", periodDurationMs: MetricPeriod.dayMs
+        ).showingResetTimerInMenuBar()
+
+        // Built through the descriptor, exactly as the store does after a `.progress` line resolves.
+        var timer = WidgetData(
+            title: "Daily Hours", icon: provider.icon, kind: .count,
+            used: 18, limit: 33, countSuffix: "hours", displayMode: .remaining,
+            resetsAt: Date().addingTimeInterval(2 * 3600 + 14 * 60)
+        )
+        timer.trayStyle = daily.sample.trayStyle
+        XCTAssertEqual(daily.sample.trayStyle, .resetCountdown, "the opt-in must reach the sample")
+
+        let balance = WidgetDescriptor.values(
+            id: "freebuff.freebucksBalance", provider: provider, title: "Hours Balance",
+            selection: .kind(.count)
+        )
+        var balanceData = balance.sample
+        balanceData.values = [MetricValue(number: 30, kind: .count, label: "hours")]
+
+        let content = MenuBarContentBuilder.build(
+            groups: [group("freebuff", daily, balance)],
+            data: { $0.id == daily.id ? timer : balanceData }
+        )
+
+        let metrics = content.groups.first?.metrics ?? []
+        XCTAssertEqual(metrics.count, 2)
+        // Timer: hours and minutes, no allowance unit, no label word.
+        XCTAssertTrue(metrics[0].value.hasSuffix("m"), "expected a minute-granular countdown, got \(metrics[0].value)")
+        XCTAssertTrue(metrics[0].value.contains("h"), "expected hours in the countdown, got \(metrics[0].value)")
+        XCTAssertFalse(metrics[0].value.hasSuffix("h"), "a bare hour count is the allowance, not a timer")
+        // Non-timer hour row keeps its unit.
+        XCTAssertEqual(metrics[1].value, "30h")
+    }
+
+    /// A timer row with no reset instant (a stale snapshot, or a server that reported no window) must
+    /// fall back to its ordinary value rather than rendering an empty segment.
+    func testTimerRowWithoutAResetInstantFallsBackToItsValue() {
+        var data = WidgetData(
+            title: "Daily Hours", icon: .providerMark("freebuff"), kind: .count,
+            used: 18, limit: 33, countSuffix: "hours", displayMode: .remaining
+        )
+        data.trayStyle = .resetCountdown
+
+        XCTAssertNil(data.resetsAt)
+        XCTAssertEqual(data.menuBarValue, "15h")
     }
 
     func testUnboundedCountKeepsItsUnitInTheTray() {

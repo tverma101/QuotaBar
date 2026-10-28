@@ -31,6 +31,9 @@ final class StatusItemImageUpdater {
     /// delayed render queued so a multi-account batch does not turn every field write into a separate
     /// ImageRenderer + WindowServer update.
     private var pendingUpdateTask: Task<Void, Never>?
+    /// Minute-boundary repaint for timer segments (see `scheduleTimerTickIfNeeded`). Idle (`nil`) for
+    /// a strip with no countdown pinned, so ordinary setups keep their event-driven renders.
+    private var timerTickTask: Task<Void, Never>?
 
     /// - Parameters:
     ///   - apply: sets the rendered image onto the status-item button.
@@ -41,6 +44,7 @@ final class StatusItemImageUpdater {
 
     deinit {
         pendingUpdateTask?.cancel()
+        timerTickTask?.cancel()
     }
 
     /// Render now and re-arm on the next observable change.
@@ -53,6 +57,7 @@ final class StatusItemImageUpdater {
             }
         }
         applyGate.apply(image, using: apply)
+        scheduleTimerTickIfNeeded()
     }
 
     /// The observation callback fires only once until `update()` reads and re-arms it. Waiting here lets
@@ -68,6 +73,42 @@ final class StatusItemImageUpdater {
             }
             guard !Task.isCancelled else { return }
             self?.update()
+        }
+    }
+
+    /// Re-render on the top of each minute while a timer segment is pinned.
+    ///
+    /// A countdown is the one strip value that goes stale simply by time passing: a refresh may be up
+    /// to a minute away, so without this the segment would sit on "2h 14m" well past 2h 13m. The tick
+    /// is a plain minute boundary (not a per-second loop) because the reading is minute-granular, and
+    /// it only runs while at least one pinned metric actually requests a countdown — every other strip
+    /// keeps its existing event-driven renders and costs nothing.
+    private func scheduleTimerTickIfNeeded() {
+        guard container.layout.pinnedGroups.contains(where: { group in
+            group.metrics.contains { $0.sample.trayStyle == .resetCountdown }
+        }) else {
+            timerTickTask?.cancel()
+            timerTickTask = nil
+            return
+        }
+        guard timerTickTask == nil else { return }
+        timerTickTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                // Sleep to just past the next minute boundary, so the redraw lands when the text
+                // actually changes rather than up to 60s late.
+                let now = Date()
+                let secondsToBoundary = 60 - (now.timeIntervalSince1970.truncatingRemainder(dividingBy: 60))
+                do {
+                    try await Task.sleep(for: .seconds(max(1, secondsToBoundary)))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                // `self` is read fresh each pass (never captured across the sleep), so the updater can
+                // still deallocate and end the loop instead of being pinned alive by its own task.
+                guard let self else { return }
+                self.update()
+            }
         }
     }
 

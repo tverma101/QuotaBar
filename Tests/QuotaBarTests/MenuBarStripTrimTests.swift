@@ -57,9 +57,10 @@ final class MenuBarStripTrimTests: XCTestCase {
 
     /// Freebuff ships no vector mark, so the strip used to draw a bare filled circle — an anonymous
     /// dot beside the numbers. It now falls back to the provider's SF Symbol. This pins that the
-    /// segment still renders real, non-blank artwork with the label and hour unit visible.
-    func testProviderWithoutVectorMarkRendersItsSymbolGlyphAndHourUnit() throws {
-        let content = MenuBarContent(
+    /// segment still renders real, non-blank artwork for both a single timer segment and a stacked
+    /// pair, and that a countdown is drawn without any label word beside it.
+    func testProviderWithoutVectorMarkRendersItsSymbolGlyph() throws {
+        let single = MenuBarContent(
             groups: [
                 MenuBarContent.Group(
                     providerID: "freebuff",
@@ -67,27 +68,42 @@ final class MenuBarStripTrimTests: XCTestCase {
                     icon: .providerMark("freebuff"),
                     metrics: [
                         MenuBarContent.Metric(id: "freebuff.freebucksDaily", label: "Daily Hours",
-                                              trayLabel: "Day", value: "13h",
-                                              fraction: 0.39, isBounded: true, hasData: true),
-                        MenuBarContent.Metric(id: "freebuff.freebucksBalance", label: "Hours Balance",
-                                              trayLabel: "Bal", value: "35h",
-                                              fraction: 0, isBounded: false, hasData: true)
+                                              value: "2h 14m",
+                                              fraction: 0.45, isBounded: true, hasData: true)
                     ]
                 )
             ],
             bars: []
         )
-
-        let image = try XCTUnwrap(MenuBarStripRenderer.textImage(for: content))
+        let image = try XCTUnwrap(MenuBarStripRenderer.textImage(for: single))
         var rect = CGRect(origin: .zero, size: image.size)
         let cgImage = try XCTUnwrap(image.cgImage(forProposedRect: &rect, context: nil, hints: nil))
         let bounds = try XCTUnwrap(MenuBarStripRenderer.visibleBounds(of: cgImage))
 
-        // The stacked pair is taller than one line, so the strip must be taller than a single row.
-        XCTAssertGreaterThan(image.size.height, 12)
         XCTAssertGreaterThan(image.size.width, 20)
         XCTAssertEqual(bounds, CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
-        XCTAssertEqual(image.accessibilityDescription, "Freebuff Daily Hours 13h, Hours Balance 35h")
+        XCTAssertEqual(image.accessibilityDescription, "Freebuff Daily Hours 2h 14m")
+
+        // A stacked pair is taller than one line, and carries no label text — just the values.
+        let pair = MenuBarContent(
+            groups: [
+                MenuBarContent.Group(
+                    providerID: "codex",
+                    displayName: "Codex",
+                    icon: .providerMark("codex"),
+                    metrics: [
+                        MenuBarContent.Metric(id: "codex.session", label: "Session", value: "87%",
+                                              fraction: 0.13, isBounded: true, hasData: true),
+                        MenuBarContent.Metric(id: "codex.weekly", label: "Weekly", value: "32%",
+                                              fraction: 0.68, isBounded: true, hasData: true)
+                    ]
+                )
+            ],
+            bars: []
+        )
+        let pairImage = try XCTUnwrap(MenuBarStripRenderer.textImage(for: pair))
+        XCTAssertGreaterThan(pairImage.size.height, 12)
+        XCTAssertEqual(pairImage.accessibilityDescription, "Codex Session 87%, Weekly 32%")
     }
 
     /// Draws an optional opaque rect (given in top-left-origin pixel coordinates) on a transparent

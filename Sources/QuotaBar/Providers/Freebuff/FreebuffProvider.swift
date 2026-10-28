@@ -71,7 +71,10 @@ final class FreebuffProvider: ProviderRuntime {
             .boundedCount(id: "freebuff.freebucksDaily", provider: provider, title: "Daily Hours",
                           metricLabel: "Daily Hours", limit: 1, suffix: "hours",
                           periodDurationMs: MetricPeriod.dayMs)
-                .hidingWhenEmpty(),
+                .hidingWhenEmpty()
+                // The owner asked for this segment to read as the active session clock — hours and
+                // minutes until the window resets — rather than the remaining allowance.
+                .showingResetTimerInMenuBar(),
             .values(id: "freebuff.freebucksBalance", provider: provider, title: "Hours Balance",
                     metricLabel: "Hours Balance", selection: .kind(.count))
                 .hidingWhenEmpty()

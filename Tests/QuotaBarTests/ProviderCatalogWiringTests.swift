@@ -86,11 +86,15 @@ final class ProviderCatalogWiringTests: XCTestCase {
         XCTAssertEqual(ids[ids.firstIndex(of: "freebuff")! - 1], "devin")
         XCTAssertEqual(ids[ids.firstIndex(of: "freebuff")! + 1], "grok")
         XCTAssertTrue(metrics.isSubset(of: Set(DefaultLayout.metricIDs)))
-        // Freebuff's two hour meters are the owner-requested menu-bar pair — a stacked "daily
-        // allowance / standing balance" reading. Nothing else pins.
+        // Freebuff's Daily Hours meter is the owner-requested menu-bar pin, and it reads as the
+        // active session clock in the strip rather than an allowance figure.
         XCTAssertEqual(
             metrics.intersection(Set(DefaultLayout.pinnedMetricIDs)),
-            ["freebuff.freebucksDaily", "freebuff.freebucksBalance"]
+            ["freebuff.freebucksDaily"]
+        )
+        XCTAssertEqual(
+            freebuff.widgetDescriptors.first { $0.id == "freebuff.freebucksDaily" }?.sample.trayStyle,
+            .resetCountdown
         )
         XCTAssertTrue(metrics.isDisjoint(with: Set(DefaultLayout.expandedMetricIDs)))
         let metricOrder = freebuff.widgetDescriptors.map(\.id)

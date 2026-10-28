@@ -172,26 +172,25 @@ private struct MenuBarTextStrip: View {
         .fixedSize()
     }
 
-    /// A provider's pinned values. One metric renders as a single large number. Two stack on two tight
-    /// lines with their (shortened) labels, because two bare numbers give no way to tell which window
-    /// each belongs to — "13h / 20h" is unreadable, "Daily 13h / Weekly 20h" is not.
+    /// A provider's pinned values, no labels: one metric as a single large number, two stacked on two
+    /// tight lines (much narrower than side-by-side), read positionally.
+    ///
+    /// The stack deliberately carries no label text. Adding one for every pair made every provider
+    /// wordy — a Claude/Codex pair read "Session 87% / Wk 32%" where "87% / 32%" was already clear.
+    /// Values that could be read ambiguously carry their own unit instead (`13h`, `$12`), so a bare
+    /// number is the only thing that ever needed a word and those are the exception, not the rule.
     @ViewBuilder
     private func metricsView(_ metrics: [MenuBarContent.Metric]) -> some View {
         if metrics.count <= 1 {
             Text(metrics.first?.value ?? "")
                 .font(.system(size: 12, weight: .bold))
         } else {
-            VStack(alignment: .leading, spacing: -2) {
+            VStack(alignment: .trailing, spacing: -2) {
                 ForEach(metrics, id: \.id) { metric in
-                    HStack(spacing: 3) {
-                        Text(metric.trayLabel)
-                            .font(.system(size: 8, weight: .medium))
-                            .foregroundStyle(Color.black.opacity(0.55))
-                        Text(metric.value)
-                            .font(.system(size: 9, weight: .semibold))
-                    }
+                    Text(metric.value)
                 }
             }
+            .font(.system(size: 9, weight: .semibold))
             .fixedSize()
         }
     }
