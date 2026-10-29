@@ -234,7 +234,8 @@ final class AppContainer {
         // background write targets. Manual claims remain available where already supported.
         let verifiedCodexIDs = Set(codexIdentityByProviderID.keys)
         self.codexAutoReset = CodexAutoResetCoordinator(
-            services: codexClaimServices.filter { verifiedCodexIDs.contains($0.key) }
+            services: codexClaimServices.filter { verifiedCodexIDs.contains($0.key) },
+            verifiedAccountIdentityByProviderID: codexIdentityByProviderID
         )
 
         // Anonymous usage telemetry (mandatory daily activity and crashes, optional provider rollups).

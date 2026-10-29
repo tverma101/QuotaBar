@@ -35,6 +35,56 @@ final class CodexAutoResetCoordinatorTests: XCTestCase {
         ))
     }
 
+    func testPendingRetryCannotCrossAccountAfterDefaultLoginSwitch() async {
+        let defaults = defaults()
+        let due = credit("pending-credit", 45)
+        var requests: [String] = []
+        let original = CodexAutoResetCoordinator(accounts: ["codex": .init(
+            availableCredits: { [due] },
+            claim: { _, id, _ in requests.append("first:\(id)"); return .failed }
+        )], defaults: defaults, now: { self.base },
+           verifiedAccountIdentityByProviderID: ["codex": "account-A"])
+        await original.runOnce(for: "codex")
+        XCTAssertEqual(requests.count, 1)
+
+        let afterSwitch = CodexAutoResetCoordinator(accounts: ["codex": .init(
+            availableCredits: { [] },
+            claim: { _, id, _ in requests.append("wrong-account:\(id)"); return .success }
+        )], defaults: defaults, now: { self.base.addingTimeInterval(15) },
+           verifiedAccountIdentityByProviderID: ["codex": "account-B"])
+        await afterSwitch.runOnce(for: "codex")
+        XCTAssertEqual(requests.count, 1, "A pending claim must not post under account B")
+
+        let restored = CodexAutoResetCoordinator(accounts: ["codex": .init(
+            availableCredits: { [] },
+            claim: { _, id, _ in requests.append("retry:\(id)"); return .success }
+        )], defaults: defaults, now: { self.base.addingTimeInterval(15) },
+           verifiedAccountIdentityByProviderID: ["codex": "account-A"])
+        await restored.runOnce(for: "codex")
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].replacingOccurrences(of: "first:", with: ""),
+                       requests[1].replacingOccurrences(of: "retry:", with: ""))
+    }
+
+    func testProviderSlotCreditIDCanBeReusedByAnotherVerifiedAccount() async {
+        let defaults = defaults()
+        let due = credit("same-credit-id", 45)
+        var count = 0
+        let account = CodexAutoResetCoordinator.Account(
+            availableCredits: { [due] },
+            claim: { _, _, _ in count += 1; return .success }
+        )
+        let first = CodexAutoResetCoordinator(accounts: ["codex": account],
+            defaults: defaults, now: { self.base },
+            verifiedAccountIdentityByProviderID: ["codex": "account-A"])
+        await first.runOnce(for: "codex")
+        let second = CodexAutoResetCoordinator(accounts: ["codex": account],
+            defaults: defaults, now: { self.base },
+            verifiedAccountIdentityByProviderID: ["codex": "account-B"])
+        await second.runOnce(for: "codex")
+        XCTAssertEqual(count, 2, "A's successful claim cannot suppress B's credit")
+    }
+
     private func defaults(enabled: Bool = true) -> UserDefaults {
         let defaults = UserDefaults(suiteName: "CodexAutoResetTests-\(UUID().uuidString)")!
         defaults.set(enabled, forKey: CodexAutoResetCoordinator.enabledKey)
