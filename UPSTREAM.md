@@ -39,8 +39,9 @@ git --no-pager diff --stat 3866cd1 -- /tmp/openusage-upstream   # compare trees
 Only two, both deliberate and both traceable to a decision:
 
 1. **Sparkle auto-updates removed** (`5818ab1`). Sparkle fetches its appcast and DMGs anonymously,
-   which requires a public repository. This one is private, so the updater, its Settings section, the
-   dashboard banner, the release workflow and the GitHub Pages workflows are gone. Releases are manual.
+   through an upstream-owned, signed update feed. QuotaBar now has a public repository but no
+   QuotaBar-owned feed or release-signing pipeline, so its updater, Settings section, dashboard banner,
+   release workflow and GitHub Pages workflows remain removed. Releases are manual.
 2. **Rebrand to QuotaBar** (`17776c5`). Required by `TRADEMARK.md`. Build identity, user-facing
    strings, on-disk paths and the bundle id all changed. Internal symbols (`OpenUsageISO8601`,
    `Bundle.openUsageResources`) were left alone deliberately, to keep the upstream diff small.
