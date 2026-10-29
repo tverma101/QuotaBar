@@ -12,6 +12,7 @@ import SwiftUI
 /// Rows size to their own content (variable height). Same `WidgetData` the menu bar uses — only layout differs.
 struct WidgetRowView: View {
     let data: WidgetData
+    var providerID: String? = nil
     /// Flips the global relative/absolute reset display. Supplied where the row has the data store
     /// (the dashboard list); `nil` in static contexts like the drag-reorder preview, where the reset
     /// label stays plain text.
@@ -30,6 +31,7 @@ struct WidgetRowView: View {
     /// Backs the resets popover's claim flow; `nil` outside the live dashboard (previews, share
     /// renders), which renders the timeline read-only.
     @Environment(\.codexResetClaim) private var codexResetClaim
+    @Environment(\.codexResetClaimRouter) private var codexResetClaimRouter
     /// Party easter egg: fill meter bars with the party gradient instead of the severity color. Off by
     /// default everywhere else.
     @Environment(\.popoverPartyMode) private var partyMode
@@ -392,7 +394,8 @@ struct WidgetRowView: View {
                         // Rows with reset expiries are Codex-only today, so the Codex claim service is
                         // the right backing; absent from the environment (previews, share renders) the
                         // timeline is read-only.
-                        claim: codexResetClaim.map { service in
+                        claim: (providerID.flatMap { codexResetClaimRouter?.service(for: $0) }
+                            ?? (providerID == nil ? codexResetClaim : nil)).map { service in
                             { expiry, redeemRequestID in
                                 await service.claim(creditExpiringAt: expiry, redeemRequestID: redeemRequestID)
                             }

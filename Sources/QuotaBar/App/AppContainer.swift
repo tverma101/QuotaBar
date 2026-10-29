@@ -48,9 +48,10 @@ final class AppContainer {
     let onboarding: OnboardingStore
     /// Claims Codex rate-limit reset credits from the resets popover (the app's only provider-API
     /// write). Shares the Codex provider's auth store and usage client. This is deliberately `nil`
-    /// while multiple Codex accounts are active because the existing UI has no account selector for
-    /// that write; reads remain fully account-scoped.
+    /// for compatibility. The dashboard routes manual redemption through account-specific services.
     let codexResetClaim: CodexResetClaimService?
+    let codexResetClaims: CodexResetClaimRouter
+    let codexAutoReset: CodexAutoResetCoordinator
     /// The provider runtimes, kept so on-demand credential detection (the Customize "Reset All" reseed)
     /// can re-probe `hasLocalCredentials()` the same way first-run seeding does.
     private let providers: [ProviderRuntime]
@@ -170,15 +171,14 @@ final class AppContainer {
         self.dataStore = dataStore
         self.iCloudSync = iCloudSync
 
-        // The resets popover's claim service shares a Codex provider's credential loading and HTTP
-        // client so the claim's auth can't drift from the provider's. With more than one Codex account,
-        // disable this write until the UI can explicitly choose a target account rather than guessing.
+        // Create one claim service per Codex account; both manual and background calls use only
+        // the credential-scoped runtime for that specific account.
         let codexProviders = providers.compactMap { $0 as? CodexProvider }
-        let writableCodex = codexProviders.count == 1 ? codexProviders[0] : nil
-        self.codexResetClaim = writableCodex.map { codex in
-            CodexResetClaimService(
+        let codexClaimServices = Dictionary(uniqueKeysWithValues: codexProviders.map { codex in
+            let service = CodexResetClaimService(
                 authStore: codex.authStore,
                 usageClient: codex.usageClient,
+                allowsKeychainFallback: codex.allowsKeychainFallback,
                 refreshAfterClaim: { [weak dataStore] in
                     // The bound must outlast the provider's slowest refresh: usage fetch (10s timeout)
                     // + token refresh (15s) + usage retry (10s) + reset-credit fetch (10s) ≈ 45s. The
@@ -202,6 +202,12 @@ final class AppContainer {
                             }
                             try? await Task.sleep(for: .seconds(2))
                         case .skipped:
+                            // A hidden/disabled account still needs its OAuth token rotated so
+                            // the global opt-in covers *all* connected Codex accounts.
+                            if !enablement.isEnabled(codex.provider.id) {
+                                _ = await codex.refresh()
+                                return
+                            }
                             AppLog.info(LogTag.plugin("codex"), "post-claim refresh waiting out an in-flight refresh (attempt \(attempt + 1))")
                             try? await Task.sleep(for: .seconds(1))
                         }
@@ -209,7 +215,19 @@ final class AppContainer {
                     AppLog.error(LogTag.plugin("codex"), "post-claim refresh kept being skipped; meters may lag until the next cycle")
                 }
             )
-        }
+            return (codex.provider.id, service)
+        })
+        self.codexResetClaims = CodexResetClaimRouter(services: codexClaimServices)
+        self.codexResetClaim = codexProviders.count == 1
+            ? codexClaimServices[codexProviders[0].provider.id] : nil
+        // Fail closed for unknown account identities: only verified account cards can be
+        // background write targets. Manual claims remain available where already supported.
+        let verifiedCodexIDs = Set(codexProviders.compactMap { provider in
+            provider.expectedIdentityKey == nil ? nil : provider.provider.id
+        })
+        self.codexAutoReset = CodexAutoResetCoordinator(
+            services: codexClaimServices.filter { verifiedCodexIDs.contains($0.key) }
+        )
 
         // Anonymous usage telemetry (mandatory daily activity and crashes, optional provider rollups).
         // Its state lives in a dedicated UserDefaults suite, kept separate from app settings so the user's
@@ -264,6 +282,7 @@ final class AppContainer {
         })
         self.memoryPressureSource = Self.makeMemoryPressureSource(dataStore: dataStore)
         self.refreshTask = Self.startPeriodicRefresh(dataStore: dataStore, telemetry: telemetry, transparency: self.transparency)
+        self.codexAutoReset.start()
         localAPI.start()
         // Become the notification-center delegate so banners show while frontmost — a menu-bar accessory
         // effectively always is. Notification authorization is requested the first time a trigger is
@@ -309,6 +328,7 @@ final class AppContainer {
         // Registered Codex homes are account data, not a presentation setting. Keep them intact when
         // Reset All Settings runs; an account can only be removed through its explicit account action.
         dataStore.resetDisplaySettings()
+        UserDefaults.standard.removeObject(forKey: CodexAutoResetCoordinator.enabledKey)
         notificationSettings.resetToDefaults()
         transparency.resetToDefaults()
         privacy.hideUsageWhileScreenSharing = false
