@@ -56,6 +56,9 @@ final class CodexAutoResetCoordinator {
     }
 
     private let accounts: [String: Account]
+    /// A provider slot may be reused by a different ChatGPT login after restarting.
+    /// Persisted redemption requests must be bound to the verified *account*, not the slot.
+    private let verifiedAccountIdentityByProviderID: [String: String]
     /// The number of verified Codex accounts eligible for this global opt-in.
     var monitoredAccountCount: Int { accounts.count }
     private let defaults: UserDefaults
@@ -67,8 +70,16 @@ final class CodexAutoResetCoordinator {
     @ObservationIgnored private var inFlight: Set<String> = []
     @ObservationIgnored private var workers: [String: Task<Void, Never>] = [:]
 
-    init(accounts: [String: Account], defaults: UserDefaults = .standard, now: @escaping () -> Date = Date.init) {
+    init(
+        accounts: [String: Account],
+        defaults: UserDefaults = .standard,
+        now: @escaping () -> Date = Date.init,
+        verifiedAccountIdentityByProviderID: [String: String] = [:]
+    ) {
         self.accounts = accounts
+        self.verifiedAccountIdentityByProviderID = verifiedAccountIdentityByProviderID.compactMapValues {
+            CodexAuthStore.normalizedIdentityKey($0)
+        }
         self.defaults = defaults
         self.now = now
         if let saved = defaults.data(forKey: Self.storageKey),
@@ -81,15 +92,23 @@ final class CodexAutoResetCoordinator {
         attempts = attempts.filter { $0.value.expiry >= cutoff }
     }
 
-    convenience init(services: [String: CodexResetClaimService], defaults: UserDefaults = .standard) {
-        self.init(accounts: services.mapValues { service in
+    convenience init(
+        services: [String: CodexResetClaimService],
+        verifiedAccountIdentityByProviderID: [String: String],
+        defaults: UserDefaults = .standard
+    ) {
+        // Fail closed for an unknown identity: no automatic provider API writes.
+        let verifiedServices = services.filter {
+            CodexAuthStore.normalizedIdentityKey(verifiedAccountIdentityByProviderID[$0.key]) != nil
+        }
+        self.init(accounts: verifiedServices.mapValues { service in
             Account(
                 availableCredits: { await service.availableCredits() },
                 claim: { credit, requestID, isEnabled in
                     await service.claimAuto(credit: credit, redeemRequestID: requestID, canRedeem: isEnabled)
                 }
             )
-        }, defaults: defaults)
+        }, defaults: defaults, verifiedAccountIdentityByProviderID: verifiedAccountIdentityByProviderID)
     }
 
     func start() {
@@ -132,6 +151,7 @@ final class CodexAutoResetCoordinator {
         // five seconds forever (and don't touch the network).
         guard defaults.bool(forKey: Self.enabledKey) else { return 3_600 }
         guard let account = accounts[accountID] else { return Self.patrolInterval }
+        let ledgerAccountID = attemptOwner(for: accountID)
         guard let credits = await account.availableCredits() else {
             let close = lastKnownCredits[accountID]?.contains {
                 $0.expiresAt > now() && $0.expiresAt.timeIntervalSince(now()) <= 300
@@ -152,7 +172,7 @@ final class CodexAutoResetCoordinator {
         // In the lost-response case the server may already have removed the credit from GET.
         // Keep the original UUID + exact credit ID eligible for a bounded idempotent replay.
         let outstanding = attempts.values.compactMap { record -> CodexResetCredit? in
-            guard record.accountID == accountID, record.result == .pending,
+            guard record.accountID == ledgerAccountID, record.result == .pending,
                   record.attempts > 0, record.expiry > current else { return nil }
             return CodexResetCredit(id: record.creditID, expiresAt: record.expiry, isRetry: true)
         }
@@ -163,11 +183,11 @@ final class CodexAutoResetCoordinator {
         // failed and is cooling down for 15 s, a different due-now credit must not starve.
         let eligible = candidates.filter { candidate in
             Self.secondsUntilTrigger(expiresAt: candidate.expiresAt, now: current) != nil
-                && attempts[Self.key(accountID: accountID, creditID: candidate.id)]?.result.isTerminal != true
+                && attempts[Self.key(accountID: ledgerAccountID, creditID: candidate.id)]?.result.isTerminal != true
         }
         func readyAt(_ credit: CodexResetCredit) -> Date {
             let trigger = credit.expiresAt.addingTimeInterval(-Self.leadTime)
-            guard let prior = attempts[Self.key(accountID: accountID, creditID: credit.id)]?.lastAttemptAt else {
+            guard let prior = attempts[Self.key(accountID: ledgerAccountID, creditID: credit.id)]?.lastAttemptAt else {
                 return trigger
             }
             return max(trigger, prior.addingTimeInterval(Self.retryInterval))
@@ -179,7 +199,7 @@ final class CodexAutoResetCoordinator {
         let delay = readyAt(credit).timeIntervalSince(now())
         if delay > 0 { return min(Self.patrolInterval, delay) }
 
-        let key = Self.key(accountID: accountID, creditID: credit.id)
+        let key = Self.key(accountID: ledgerAccountID, creditID: credit.id)
         // Actor reentrancy: another caller can arrive while the first POST is suspended.
         // Claim ownership before the first await and release it on every return path.
         guard inFlight.insert(key).inserted else { return 1 }
@@ -187,7 +207,7 @@ final class CodexAutoResetCoordinator {
         var record = attempts[key] ?? Attempt(
             requestID: UUID().uuidString, attempts: 0, lastAttemptAt: nil,
             result: .pending, expiry: credit.expiresAt,
-            creditID: credit.id, accountID: accountID
+            creditID: credit.id, accountID: ledgerAccountID
         )
         guard !record.result.isTerminal else { return Self.patrolInterval }
         if let lastAttempt = record.lastAttemptAt {
@@ -249,6 +269,16 @@ final class CodexAutoResetCoordinator {
         let remaining = expiresAt.timeIntervalSince(now)
         guard remaining > 0 else { return nil }
         return max(0, remaining - leadTime)
+    }
+
+    /// Old unscoped v3 attempts remain on disk until expiration but are never replayed
+    /// against a newly selected account. Reattribution without the old identity is unsafe.
+    private func attemptOwner(for providerID: String) -> String {
+        guard let identity = verifiedAccountIdentityByProviderID[providerID] else {
+            // Tests can inject isolated accounts without production identity wiring.
+            return providerID
+        }
+        return "verified:\(providerID.utf8.count):\(providerID)\(identity.utf8.count):\(identity)"
     }
 
     private static func key(accountID: String, creditID: String) -> String {
