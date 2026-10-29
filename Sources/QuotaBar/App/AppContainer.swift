@@ -51,20 +51,19 @@ final class AppContainer {
     /// while multiple Codex accounts are active because the existing UI has no account selector for
     /// that write; reads remain fully account-scoped.
     let codexResetClaim: CodexResetClaimService?
-    /// The provider runtimes, kept so on-demand credential detection (the Customize "Reset All" reseed)
-    /// can re-probe `hasLocalCredentials()` the same way first-run seeding does.
+    /// Provider runtimes, kept so Customize's Reset All can restore the owner-selected default set and
+    /// register the current provider IDs.
     private let providers: [ProviderRuntime]
+    /// Shared with the enablement callback so turning off the final Codex card disarms ledger watches
+    /// immediately, without waiting for the periodic refresh loop to consume its buffered wake.
+    @ObservationIgnored private let ledgerWatcher: CodexRouterLedgerWatcher
     /// Read-only usage API on 127.0.0.1:6736 for other local apps (silently off when the port is taken).
     private let localAPI: LocalUsageServer
-    /// Separate Kaggle TPU GLM-5.3 control plane. It is read-only until the dashboard card's explicit
-    /// Turn On action is used; it never shares the T4/Ollama or Z-Image worker lifecycle.
-    let kaggleCompute: KaggleComputeService
     // A `let` of a `Sendable` `Task` is implicitly nonisolated, so the nonisolated `deinit` can cancel it.
     private let refreshTask: Task<Void, Never>
-    /// The fresh-install credential-detection pass (see `FirstRunSeeder`); `nil` on every later launch.
+    /// Synchronous fresh-install provider seeding (`FirstRunSeeder`); nil when no seeding is needed.
     private let seedTask: Task<Void, Never>?
-    /// The new-provider credential-detection pass (see `NewProviderSeeder`); `nil` unless this launch is
-    /// the first with a provider the install has never seen.
+    /// Synchronous registry bookkeeping (`NewProviderSeeder`); it never starts a credential probe.
     private let newProviderTask: Task<Void, Never>?
     /// Persists a fresh `ShellEnvironmentSnapshot` once the login-shell capture completes, so the next
     /// launch can read shell-exported facts (provider home overrides) even when its own capture is slow.
@@ -74,7 +73,18 @@ final class AppContainer {
 
     /// `isFreshInstall` must be captured by the caller BEFORE `SettingsMigrator.migrate()` runs (the
     /// migrator's schema stamp makes the defaults domain non-empty). See `AppDelegate`.
-    init(isFreshInstall: Bool = false) {
+    init(
+        isFreshInstall: Bool = false,
+        accountDiscovery: ProviderAccountDiscovery,
+        accountAssembly: ProviderAccountAssembly,
+        cursorHistoryIdentityKey: String? = nil,
+        antigravityIdentityKey: String = AntigravityAuthStore.unresolvedCacheIdentityKey,
+        openCodeGoAccountIdentities: [OpenCodeGoAccountIdentity]? = nil,
+        openCodeGoAccountInventory: OpenCodeGoAccountInventory? = nil,
+        onOpenCodeGoKeysChanged: @escaping @MainActor () -> Void = {},
+        onOpenCodeEnablementRequiresCatalogReload: @escaping @MainActor () -> Void = {},
+        onClaudeEnablementRequiresCatalogReload: @escaping @MainActor () -> Void = {}
+    ) {
         // Capture the user's login-shell environment off-main so provider keys exported in a shell
         // profile (e.g. OPENROUTER_API_KEY) resolve in a Finder/Dock-launched build, not only when
         // run from a terminal. Warmed here so the first refresh finds the cache ready.
@@ -84,65 +94,89 @@ final class AppContainer {
         self.shellEnvironmentSnapshotTask = ShellEnvironmentSnapshotStore(defaults: .standard).startRefreshTask()
         // The launch account pass: which account is signed in at each family's default home. Feeds
         // the snapshot cache's account stamp and reconciles the account registry.
-        let codexAccounts = CodexAccountRegistrationStore()
-        let codexAccountRegistration = CodexAccountRegistrationService(accounts: codexAccounts)
-        let accountAssembly = ProviderAccountAssembly.make(
-            waitsForLoginShell: true,
-            registeredCodexHomes: codexAccounts.registeredHomes
+        let codexAccounts = CodexAccountRegistrationStore(
+            preNormalizedHomes: accountDiscovery.registeredCodexHomes
         )
-
+        let codexAccountRegistration = CodexAccountRegistrationService(accounts: codexAccounts)
+        let enablement = ProviderEnablementStore()
+        if !accountAssembly.claudeCards.isEmpty,
+           !accountAssembly.claudeCards.contains(where: { $0.id == "claude" })
+        {
+            _ = enablement.transferEnabledGenericClaudeFamily(
+                to: accountAssembly.claudeCards.map(\.id)
+            )
+        }
+        let hasPreloadedOpenCodeAccountInventory = openCodeGoAccountInventory != nil
+            || openCodeGoAccountIdentities != nil
         let providers = ProviderCatalog.make(
             claudeCards: accountAssembly.claudeCards,
             codexCards: accountAssembly.codexCards,
             claudeIdentityKeys: accountAssembly.identityKeysByCard,
-            codexLogHomes: codexAccounts.registeredHomes
+            claudeDesktopKeyCache: accountAssembly.desktopKeyCache,
+            codexDefaultIdentityKey: accountAssembly.identityKeysByCard["codex"],
+            codexDefaultHome: accountAssembly.defaultCodexHome,
+            codexLogHomes: codexAccounts.registeredHomes,
+            openCodeGoAccountIdentities: openCodeGoAccountIdentities,
+            openCodeGoAccountInventory: openCodeGoAccountInventory,
+            openCodeAccountInventoryDeferred: !hasPreloadedOpenCodeAccountInventory,
+            onOpenCodeGoKeysChanged: onOpenCodeGoKeysChanged,
+            isProviderEnabled: { [enablement] in enablement.isEnabled($0) }
         )
         let registry = WidgetRegistry.from(providers)
         let apiKeyProviders = providers.compactMap { $0 as? any APIKeyManaging }
         let goKeyProviders = providers.compactMap { $0 as? any GoKeyManaging }
-        let enablement = ProviderEnablementStore()
         let notificationSettings = NotificationSettingsStore()
-        let additionalAccountIDsByFamily = Dictionary(grouping: providers.map(\.provider.id).filter { id in
-            let family = ProviderAccountID.family(of: id)
-            return id != family && ProviderAccountID.families.contains(family)
-        }, by: ProviderAccountID.family)
-        let accountDefaults: ([String]) -> [String] = { metricIDs in
-            metricIDs.flatMap { metricID -> [String] in
-                guard let separator = metricID.firstIndex(of: ".") else { return [metricID] }
-                let family = String(metricID[..<separator])
-                guard let additionalIDs = additionalAccountIDsByFamily[family], !additionalIDs.isEmpty else {
-                    return [metricID]
-                }
-                let suffix = metricID[separator...]
-                return [metricID] + additionalIDs.map { "\($0)\(suffix)" }
-            }
-        }
         let layout = LayoutStore(
             registry: registry,
-            defaultMetricIDs: accountDefaults(DefaultLayout.metricIDs),
-            defaultPinnedMetricIDs: accountDefaults(DefaultLayout.pinnedMetricIDs),
-            defaultExpandedMetricIDs: accountDefaults(DefaultLayout.expandedMetricIDs),
+            defaultMetricIDs: Self.accountScopedDefaults(DefaultLayout.metricIDs, registry: registry),
+            defaultPinnedMetricIDs: Self.accountScopedDefaults(DefaultLayout.pinnedMetricIDs, registry: registry),
+            defaultExpandedMetricIDs: Self.accountScopedDefaults(DefaultLayout.expandedMetricIDs, registry: registry),
             isProviderEnabled: { [enablement] in enablement.isEnabled($0) }
         )
+        var providerIdentityKeys = accountAssembly.identityKeysByCard
+        providerIdentityKeys["cursor"] = cursorHistoryIdentityKey
+            ?? "cursor-unresolved-\(UUID().uuidString)"
+        providerIdentityKeys["antigravity"] = antigravityIdentityKey
+        if let openCodeGoAccountInventory {
+            providerIdentityKeys["opencode"] = openCodeGoAccountInventory.cacheIdentityKey
+        }
         let dataStore = WidgetDataStore(
             registry: registry,
             providers: providers,
             isProviderEnabled: { [enablement] in enablement.isEnabled($0) },
             orderedDescriptors: { [layout] in layout.visiblePlaced.compactMap { layout.descriptor(for: $0) } },
             pinnedMetricIDs: { [layout] in layout.pinnedMetricIDs },
+            hiddenMenuBarProviderIDs: { [layout] in layout.hiddenMenuBarProviderIDs },
             notificationSettings: { notificationSettings },
-            providerIdentityKeys: accountAssembly.identityKeysByCard
+            providerIdentityKeys: providerIdentityKeys
         )
         let iCloudSync = ICloudUsageSyncStore(dataStore: dataStore)
+        let ledgerWatcher = CodexRouterLedgerWatcher(
+            isPanelOpen: { PopoverTransparencyStore.isPopoverShownUnlocked }
+        )
         // Re-enabling a provider should fetch it promptly, so clear any leftover failure backoff before
         // the enablement wake refreshes. `weak` breaks the cycle (dataStore already captures enablement).
         enablement.onProviderEnabled = { [weak dataStore] id in dataStore?.clearFailureBackoff(for: id) }
-        enablement.onChange = { [weak dataStore, weak iCloudSync] in
-            dataStore?.providerEnablementDidChange()
+        enablement.onChange = { [weak dataStore, weak iCloudSync, weak ledgerWatcher, weak enablement] changedProviderIDs in
+            dataStore?.providerEnablementDidChange(changedProviderIDs: changedProviderIDs)
             iCloudSync?.scheduleWrite()
+            ledgerWatcher?.setEnabled(dataStore?.hasEnabledProviderFamily("codex") ?? false)
+            if !hasPreloadedOpenCodeAccountInventory,
+               changedProviderIDs.contains("opencode"),
+               enablement?.isEnabled("opencode") == true
+            {
+                onOpenCodeEnablementRequiresCatalogReload()
+            }
+            if accountDiscovery.didSkipClaudeDesktopDiscovery,
+               changedProviderIDs.contains(where: {
+                   ProviderAccountID.family(of: $0) == "claude"
+                       && enablement?.isEnabled($0) == true
+               })
+            {
+                onClaudeEnablementRequiresCatalogReload()
+            }
         }
-        // Fresh installs start minimal: seed the enabled-provider list (Claude/Codex/Cursor right away,
-        // then the detected set once the local credential probe finishes). No-op on every later launch.
+        // Fresh installs start with the owner-selected defaults; no provider credential scan is needed.
         let onboarding = OnboardingStore()
         self.seedTask = FirstRunSeeder.seedIfNeeded(
             isFreshInstall: isFreshInstall,
@@ -150,9 +184,8 @@ final class AppContainer {
             enablement: enablement,
             onboarding: onboarding
         )
-        // Providers added by an update get the same credential detection on their first launch — enabled
-        // only when the user actually has the tool. Runs every launch; a no-op unless the registry has a
-        // provider this install has never seen (fresh installs were just baselined by FirstRunSeeder).
+        // Providers added by an update are registered for Customize but remain off. Runs every launch;
+        // fresh installs were just baselined by FirstRunSeeder.
         self.newProviderTask = NewProviderSeeder.reconcileIfNeeded(
             providers: providers,
             enablement: enablement
@@ -169,6 +202,7 @@ final class AppContainer {
         self.layout = layout
         self.dataStore = dataStore
         self.iCloudSync = iCloudSync
+        self.ledgerWatcher = ledgerWatcher
 
         // The resets popover's claim service shares a Codex provider's credential loading and HTTP
         // client so the claim's auth can't drift from the provider's. With more than one Codex account,
@@ -179,6 +213,7 @@ final class AppContainer {
             CodexResetClaimService(
                 authStore: codex.authStore,
                 usageClient: codex.usageClient,
+                allowsKeychainFallback: codex.allowsKeychainFallback,
                 refreshAfterClaim: { [weak dataStore] in
                     // The bound must outlast the provider's slowest refresh: usage fetch (10s timeout)
                     // + token refresh (15s) + usage retry (10s) + reset-credit fetch (10s) ≈ 45s. The
@@ -191,7 +226,10 @@ final class AppContainer {
                     var failures = 0
                     for attempt in 0..<45 {
                         guard let dataStore else { return }
-                        switch await dataStore.refresh(providerID: codex.provider.id, force: true) {
+                        let outcome = await withThrottledFullAccounting {
+                            await dataStore.refresh(providerID: codex.provider.id, force: true)
+                        }
+                        switch outcome {
                         case .refreshed, .cacheHit, .backedOff:
                             return
                         case .failed:
@@ -201,7 +239,7 @@ final class AppContainer {
                                 return
                             }
                             try? await Task.sleep(for: .seconds(2))
-                        case .skipped:
+                        case .skipped, .inFlight:
                             AppLog.info(LogTag.plugin("codex"), "post-claim refresh waiting out an in-flight refresh (attempt \(attempt + 1))")
                             try? await Task.sleep(for: .seconds(1))
                         }
@@ -243,16 +281,6 @@ final class AppContainer {
         self.telemetry = telemetry
         self.transparency = PopoverTransparencyStore()
         self.privacy = MenuBarPrivacyStore()
-        self.kaggleCompute = KaggleComputeService()
-        // Polling is read-only and starts with a bounded local status command. Starting it here keeps
-        // the card accurate before the user scrolls to it; no Kaggle notebook is started automatically.
-        //
-        // Skipped when the bridge is absent. The loop spawns a status subprocess every 30 seconds for the
-        // life of the app, so without this guard an install that can never use the feature still paid for
-        // a poll a minute, indefinitely, in exchange for a red error card nobody asked for.
-        if self.kaggleCompute.isBridgeAvailable {
-            self.kaggleCompute.startPolling()
-        }
         self.localAPI = LocalUsageServer(state: { [layout, enablement, dataStore] in
             LocalUsageAPI.State(
                 enabledOrderedIDs: layout.orderedProviderIDs().filter { enablement.isEnabled($0) },
@@ -263,7 +291,12 @@ final class AppContainer {
             )
         })
         self.memoryPressureSource = Self.makeMemoryPressureSource(dataStore: dataStore)
-        self.refreshTask = Self.startPeriodicRefresh(dataStore: dataStore, telemetry: telemetry, transparency: self.transparency)
+        self.refreshTask = Self.startPeriodicRefresh(
+            dataStore: dataStore,
+            telemetry: telemetry,
+            transparency: self.transparency,
+            ledgerWatcher: ledgerWatcher
+        )
         localAPI.start()
         // Become the notification-center delegate so banners show while frontmost — a menu-bar accessory
         // effectively always is. Notification authorization is requested the first time a trigger is
@@ -277,6 +310,38 @@ final class AppContainer {
         }
     }
 
+    /// Copies each family metric onto registered account cards and each OpenCode cap onto the
+    /// configured account-specific descriptors. The registry is the single source for the account
+    /// inventory, so new OpenCode keys added during this run become placed by the same default seeder.
+    static func accountScopedDefaults(_ metricIDs: [String], registry: WidgetRegistry) -> [String] {
+        let additionalAccountIDsByFamily = Dictionary(
+            grouping: registry.providers.map(\.id).filter { id in
+                let family = ProviderAccountID.family(of: id)
+                return id != family && ProviderAccountID.families.contains(family)
+            },
+            by: ProviderAccountID.family
+        )
+        let additionalOpenCodeMetricIDsByMetricID = Dictionary(
+            grouping: registry.descriptors.compactMap { descriptor -> (String, String)? in
+                guard let marker = descriptor.id.range(of: ".account.") else { return nil }
+                return (String(descriptor.id[..<marker.lowerBound]), descriptor.id)
+            },
+            by: { $0.0 }
+        ).mapValues { $0.map(\.1) }
+
+        return metricIDs.flatMap { metricID -> [String] in
+            guard let separator = metricID.firstIndex(of: ".") else { return [metricID] }
+            let family = String(metricID[..<separator])
+            var accountMetricIDs = [metricID]
+            if let additionalIDs = additionalAccountIDsByFamily[family], !additionalIDs.isEmpty {
+                let suffix = metricID[separator...]
+                accountMetricIDs += additionalIDs.map { "\($0)\(suffix)" }
+            }
+            accountMetricIDs += additionalOpenCodeMetricIDsByMetricID[metricID] ?? []
+            return accountMetricIDs
+        }
+    }
+
     deinit {
         refreshTask.cancel()
         seedTask?.cancel()
@@ -285,12 +350,22 @@ final class AppContainer {
         memoryPressureSource.cancel()
     }
 
-    /// Re-runs first-launch credential detection on demand — the enablement half of the Customize
-    /// "Reset All" action (`LayoutStore.resetToDefault` handles metrics, order, pins, and expansion).
-    /// Delegates to `FirstRunSeeder.reseed`; returns its detection task so callers can await it.
+    /// Restores the owner-selected default enabled-provider set for Customize's "Reset All" action
+    /// (`LayoutStore.resetToDefault` handles metrics, order, pins, and expansion).
+    /// Delegates to `FirstRunSeeder.reseed`; the returned task is completed after synchronous updates.
     @discardableResult
     func reseedEnabledProviders() -> Task<Void, Never> {
         FirstRunSeeder.reseed(providers: providers, enablement: enablement)
+    }
+
+    /// Stop work owned by the old account registry before a replacement store starts refreshing.
+    /// OpenCode key inventory changes also invalidate its quota meters: the new descriptor label may
+    /// be the same while the credential behind that label has rotated.
+    func prepareForProviderCatalogReload(invalidateOpenCodeQuota: Bool = false) {
+        if invalidateOpenCodeQuota {
+            dataStore.invalidateQuotaStateForCatalogReload(providerID: "opencode")
+        }
+        dataStore.cancelActiveProviderRefreshesForCatalogReload()
     }
 
     /// The Settings "Reset All Settings" action: restores every user preference the container owns to
@@ -302,10 +377,12 @@ final class AppContainer {
     /// Launch at Login lives outside the container (in the system's login-item registry); the
     /// Settings screen resets that alongside this call.
     func resetAllSettings() {
+        // Persist the provider-reset intent before touching any other settings so a crash during this
+        // action cannot leave credential-detected optional providers enabled on the next launch.
+        reseedEnabledProviders()
         layout.resetToDefault()
         // The menu-bar Icon Style is a Settings preference, not part of the Customize layout reset.
         layout.menuBarStyle = .text
-        reseedEnabledProviders()
         // Registered Codex homes are account data, not a presentation setting. Keep them intact when
         // Reset All Settings runs; an account can only be removed through its explicit account action.
         dataStore.resetDisplaySettings()
@@ -330,24 +407,22 @@ final class AppContainer {
         AppLog.info(.config, "All settings reset to defaults")
     }
 
-    /// Drives live updates: refresh on launch, then again every refresh interval. Each pass honors the
+    /// Drives live updates: refresh on launch, then again at each quota deadline. Each pass honors the
     /// cache, so it only hits the network once a snapshot has actually expired. `@Observable` propagates
-    /// the resulting snapshot changes to the menu-bar label and any open widgets, so the UI refreshes on
-    /// its own instead of only when the popover opens.
+    /// the resulting snapshot changes to the menu-bar label and any open widgets. Fold-only accounting
+    /// wakes can run between quota passes, but do not restart that deadline.
     ///
-    /// Between passes the loop sleeps via `RefreshWakeSignal`, which wakes it early when the user
-    /// enables/disables a provider so a newly-enabled provider is fetched promptly instead of waiting out
-    /// the full interval. The signal subscribes BEFORE the first pass and buffers, so an enablement change
-    /// landing while a pass is still running (first-run credential detection, `NewProviderSeeder`, the
-    /// Customize "Reset All" reseed — all of which typically finish faster than the network fetches) is
-    /// never lost. Each pass still honors the cache (and the per-provider failure backoff), so an early
-    /// wake only hits the network for a provider whose snapshot has actually expired.
+    /// Between passes the loop waits via `RefreshWakeSignal` for only the remaining time until the next
+    /// quota deadline. It also wakes early for provider enablement, panel visibility, ledger, and external
+    /// refresh notifications. The signal subscribes BEFORE the first pass and buffers, so a change that
+    /// lands during a pass (a provider toggle, registry bookkeeping, or Customize's "Reset All" reseed)
+    /// is never lost. Early passes still honor the cache and per-provider failure
+    /// backoff.
     ///
-    /// The wake is deliberately scoped to `ProviderEnablementStore.didChangeNotification` — NOT the
-    /// firehose `UserDefaults.didChangeNotification`, which fires for the app's own snapshot-cache writes,
-    /// and unrelated global-domain changes from other processes. Waking on
-    /// that, with no minimum interval before re-refreshing, collapsed the fixed 5-minute cadence into a
-    /// refresh storm.
+    /// Wake subscriptions are limited to relevant named changes — not the firehose
+    /// `UserDefaults.didChangeNotification`, which fires for the app's own snapshot-cache writes and
+    /// unrelated global-domain changes from other processes. Those writes previously collapsed the
+    /// fixed cadence into a refresh storm.
     private static func makeMemoryPressureSource(dataStore: WidgetDataStore) -> DispatchSourceMemoryPressure {
         let source = DispatchSource.makeMemoryPressureSource(
             eventMask: [.warning, .critical],
@@ -356,7 +431,10 @@ final class AppContainer {
         // Capture the store weakly: unloading mid-refresh races the shared CodexRouter tail / session
         // caches. Prefer waiting until the in-flight provider batch settles, then unload once.
         source.setEventHandler(handler: makeMemoryPressureHandler(
-            unload: PersistentJSONLScanCaches.unloadForMemoryPressure,
+            unload: { [weak dataStore] in
+                await PersistentJSONLScanCaches.unloadForMemoryPressure()
+                await dataStore?.unloadProviderCachesForMemoryPressure()
+            },
             shouldDefer: { [weak dataStore] in
                 await MainActor.run { !(dataStore?.refreshingProviderIDs.isEmpty ?? true) }
             }
@@ -386,44 +464,257 @@ final class AppContainer {
         }
     }
 
-    private static func startPeriodicRefresh(dataStore: WidgetDataStore, telemetry: TelemetryRecorder, transparency: PopoverTransparencyStore) -> Task<Void, Never> {
-        Task {
+    private static func startPeriodicRefresh(
+        dataStore: WidgetDataStore,
+        telemetry: TelemetryRecorder,
+        transparency: PopoverTransparencyStore,
+        ledgerWatcher: CodexRouterLedgerWatcher
+    ) -> Task<Void, Never> {
+        ProviderRefreshContext.withBackgroundContext {
+            Task {
             let wakeSignal = RefreshWakeSignal(names: [
                 ProviderEnablementStore.didChangeNotification,
-                CodexRouterLedgerWatcher.didChangeNotification
+                CodexRouterLedgerWatcher.didChangeNotification,
+                BackgroundRefreshTrigger.didChangeNotification,
+                PopoverTransparencyStore.panelVisibilityDidChangeNotification
             ])
-            // Arm vnode watch on the CodexRouter ledger so panel-open spend updates within ~1s of a
-            // routed turn (incremental tail parse). Closed-panel wakes are suppressed inside the watcher.
-            let ledgerWatcher = CodexRouterLedgerWatcher(
-                isPanelOpen: { PopoverTransparencyStore.isPopoverShownUnlocked }
-            )
-            ledgerWatcher.start()
-            defer { ledgerWatcher.stop() }
+            dataStore.onDeferredRefreshReady = { [weak wakeSignal] request in
+                wakeSignal?.signalDeferredRefreshReady(request)
+            }
+            dataStore.onDeferredRefreshesInvalidated = { [weak wakeSignal] providerIDs in
+                wakeSignal?.cancelDeferredRefreshes(forProviderIDs: providerIDs)
+            }
+            // Tap-free external trigger (see `BackgroundRefreshTrigger`). Armed here, outside the
+            // loop body, so a request landing mid-pass is still observed and applied to the *next*
+            // pass rather than being lost.
+            let backgroundTrigger = BackgroundRefreshTrigger()
+            backgroundTrigger.start()
+            // Arm vnode watch on the CodexRouter ledger so routed-turn spend updates within ~1s
+            // (incremental tail parse). Open and closed panel turns run the same narrow
+            // `localAccounting` scope—Codex/OpenCode folds only, without quota API re-reads.
+            ledgerWatcher.setEnabled(dataStore.hasEnabledProviderFamily("codex"))
+            defer {
+                backgroundTrigger.stop()
+                ledgerWatcher.stop()
+            }
             var isFirstPass = true
+            /// `.localAccounting` wakes do not reset this deadline. The closed-panel ledger watcher
+            /// can wake faster than its local folds finish; measuring the next wait from every fold
+            /// let a buffered ledger wake keep postponing menu-bar quota refreshes indefinitely.
+            var lastQuotaRefreshUptime: TimeInterval?
+            /// Detect manual/panel meter attempts made outside this loop so their already-fresh cache
+            /// does not make the next due tick postpone the real fetch by another full interval.
+            var lastObservedLiveQuotaRefreshUptime = dataStore.lastLiveQuotaRefreshUptime
+            /// Full history folds have a separate cadence from live meters. While the panel remains
+            /// open, quota meters can update every minute without re-folding every local corpus too.
+            var lastHistoryRefreshUptime: TimeInterval?
+            /// Latched by an external trigger; all enabled meters refresh first, followed by a fold.
+            var pendingFullScopePass = false
+            /// A due `.menuBar` request skipped behind a conflicting provider task. Retry just the
+            /// pinned meter scope as soon as that task completes; this does not widen into history work.
+            var pendingMenuBarMeterRetry = false
+            /// Latched by a closed-panel ledger wake and consumed by the next pass, which then runs
+            /// `.localAccounting` scope: the codex/opencode local folds recompute without re-reading
+            /// live quota APIs, so Today tracks routed turns even while the panel is closed.
+            var pendingLocalAccountingPass = false
+            /// Latched by the panel-open edge and consumed by the next pass, which runs the
+            /// two-phase panel sequence (`.panelMeters` then `.panelAccounting`). Unlike the old
+            /// `.full` latch this one never widens to a full pass: the panel's own two phases cover
+            /// both the meters and the local accounting. Set when the panel closes again before the
+            /// pass starts, the phases still run — the meter stamps they produce stay fresh for the
+            /// next open.
+            var pendingPanelPass = false
+            /// Accounting folds run in a tracked task so they cannot block the next meter deadline.
+            var pendingHistoryAccountingPass = false
+            /// A scheduled history deadline must perform a new fold even when its cached snapshot has
+            /// no carry marker. This is separate from `force`, which changes merge and backoff rules.
+            var pendingForcedHistoryAccountingPass = false
+            /// A visible retry can queue its history fold behind a meters pass; retain the retry's
+            /// explicit backoff bypass when that deferred request is routed through this loop.
+            var pendingHistoryFailureBackoffBypass = false
+            var accountingTask: Task<Void, Never>?
+            /// Rate limit for trigger-caused passes, and whether a pass must be dropped because the
+            /// previous one has not cleared the cooldown yet.
+            var triggerGate = BackgroundRefreshGate()
+            var dropNextRefreshPass = false
+            // Local day the last pass ran in. Crossing midnight while the app runs must widen the
+            // next pass to full scope: menuBar passes skip local accounting and re-stamp yesterday's
+            // "Today" tile with a fresh timestamp, so without this trigger the menu bar kept showing
+            // yesterday's spend until the user opened the panel (or an external trigger landed).
+            var lastRefreshDay = DailyUsageAccumulator.dayKey(from: Date())
+            defer {
+                accountingTask?.cancel()
+                dataStore.cancelProviderRefreshes(scopes: [.localAccounting, .panelAccounting])
+            }
             while !Task.isCancelled {
-                // The first pass is the only refresh that can simultaneously cold-load every enabled
-                // local index after launch. Serialize provider starts once so a multi-account Codex
-                // corpus and the OpenCode gateway fold do not compete with each other and with remote
-                // providers for all cores; stale snapshots are already painted by the store. Return to
-                // the normal concurrent cadence after that initial burst.
-                //
-                // Serialize whenever we are *over the soft limit*, not just the hard one. The
-                // per-provider unload in `WidgetDataStore` only runs once a provider finishes, so
-                // concurrent folds each allocate their parse arrays unchecked and the peak is the sum
-                // of all of them. Measured on a 9.8 GB Codex corpus: five concurrent providers reached
-                // 982 MB with the soft-limit guard firing four times *after the fact*. One at a time
-                // caps the peak at a single provider's footprint. `WidgetDataStore.refreshAll` also
-                // re-checks between chunks, so this covers the first batch after a spike too.
-                let serializeProviders = isFirstPass || ProcessMemoryBudget.isOverSoftLimit
                 let panelOpen = transparency.popoverShown
-                let scope: ProviderRefreshContext.Scope = panelOpen ? .full : .menuBar
-                await ProviderRefreshContext.$scope.withValue(scope) {
-                    await dataStore.refreshAll(maxConcurrentProviders: serializeProviders ? 1 : nil)
+                let quotaRefreshInterval = panelOpen
+                    ? RefreshSetting.quotaInterval
+                    : RefreshSetting.backgroundInterval
+                let nowUptime = ProcessInfo.processInfo.systemUptime
+                let quotaRefreshDue = lastQuotaRefreshUptime.map {
+                    nowUptime - $0 >= quotaRefreshInterval
+                } ?? true
+                let historyRefreshDue = lastHistoryRefreshUptime.map {
+                    nowUptime - $0 >= RefreshSetting.interval
+                } ?? true
+                let newlyDueHistoryPass = historyRefreshDue && !pendingHistoryAccountingPass
+                if historyRefreshDue {
+                    // Latch the cache bypass even when another panel/full pass already queued the
+                    // accounting work. That queued fold may not begin until after the deadline, and
+                    // must then still perform a fresh scan instead of hitting its recent cache.
+                    pendingForcedHistoryAccountingPass = true
+                    if newlyDueHistoryPass {
+                        pendingHistoryAccountingPass = true
+                        // Anchor when requested: a long or queued fold must not keep retriggering itself.
+                        lastHistoryRefreshUptime = nowUptime
+                    }
                 }
-                isFirstPass = false
-                // Drop parse-cache Event arrays once the cycle settles so idle hours do not keep tens of
-                // thousands of JSONL rows resident. Checkpoints stay for cheap appends on the next pass.
-                await PersistentJSONLScanCaches.unloadAfterRefreshCycle()
+                let hasPriorityPass = Self.hasPriorityRefreshPass(
+                    quotaRefreshDue: quotaRefreshDue,
+                    panelPassPending: pendingPanelPass,
+                    fullScopePassPending: pendingFullScopePass,
+                    historyAccountingPassPending: pendingHistoryAccountingPass,
+                    localAccountingPassPending: pendingLocalAccountingPass,
+                    menuBarMeterRetryPending: pendingMenuBarMeterRetry
+                )
+                if dropNextRefreshPass && !hasPriorityPass {
+                    // A trigger arrived inside the gate's cooldown. The trigger's own debounce
+                    // already collapsed the burst; this drops the one redundant pass that would
+                    // otherwise be released the moment the prior pass ends. Notifications, telemetry,
+                    // and the timer cadence below still run. A latched ledger wake is preserved:
+                    // the cooldown drop is about the trigger's redundant full pass, and dropping
+                    // Today's freshness with it would stall local accounting until the next wake.
+                    dropNextRefreshPass = false
+                    AppLog.info(.refresh, "background refresh pass skipped (inside trigger cooldown)")
+                } else if !quotaRefreshDue && !pendingPanelPass && !pendingFullScopePass
+                    && !pendingHistoryAccountingPass && !pendingLocalAccountingPass
+                    && !pendingMenuBarMeterRetry {
+                    // A timeout/notification race can leave a stale wake token in the shared stream
+                    // after its cause has already been drained. With no deadline or latched work,
+                    // consume the token without starting an early/default menu-bar pass.
+                    AppLog.debug(.refresh, "ignoring wake with no pending refresh work")
+                } else {
+                    if dropNextRefreshPass {
+                        // Discard the redundant full trigger, but never let it suppress a quota
+                        // deadline or a panel-open refresh that is independently due.
+                        dropNextRefreshPass = false
+                        AppLog.info(
+                            .refresh,
+                            "background trigger pass skipped; servicing due quota or panel refresh"
+                        )
+                    }
+                    // The first accounting pass can cold-load local indexes. Serialize those folds so
+                    // large Codex and OpenCode corpora do not stack their parse arrays in memory. A
+                    // closed-panel launch starts with quota-only menu-bar work instead; those independent
+                    // provider requests stay concurrent so one slow endpoint cannot hold other pinned
+                    // meters in line. Stale snapshots are already painted by the store.
+                    let overSoftMemoryLimit = ProcessMemoryBudget.isOverSoftLimit
+                    let serializeAccountingProviders = isFirstPass || overSoftMemoryLimit
+                    let currentDay = DailyUsageAccumulator.dayKey(from: Date())
+                    if currentDay != lastRefreshDay {
+                        lastRefreshDay = currentDay
+                        if !isFirstPass {
+                            pendingFullScopePass = true
+                            dataStore.invalidateLocalAccountingFreshness()
+                            AppLog.info(.refresh, "local day rolled over; scheduling full accounting pass")
+                        }
+                    }
+                    if panelOpen && !ProcessMemoryBudget.isOverSoftLimit {
+                        await CodexRouterUsageScanner.resumeSharedParsedItems()
+                    }
+                    // All-enabled meter work runs before history folds, whether caused by a panel open,
+                    // external refresh, daily rollover, or the five-minute history cadence. Closed-panel
+                    // minute ticks stay pinned-only. Every fold then runs asynchronously so a slow local
+                    // corpus cannot hold later subscription meter deadlines.
+                    let runAllMeters = pendingFullScopePass || pendingPanelPass
+                        || (panelOpen && quotaRefreshDue)
+                    if runAllMeters || quotaRefreshDue || pendingMenuBarMeterRetry {
+                        let requestsHistoryFold = pendingFullScopePass || pendingPanelPass || newlyDueHistoryPass
+                        let meterScope: ProviderRefreshContext.Scope = runAllMeters ? .panelMeters : .menuBar
+                        await ProviderRefreshContext.$scope.withValue(meterScope) {
+                            await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(true) {
+                                await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                                    await dataStore.refreshAll(
+                                        maxConcurrentProviders: overSoftMemoryLimit ? 1 : nil
+                                    )
+                                }
+                            }
+                        }
+                        // Only a live provider attempt can move an early pass's deadline. A cache-hit
+                        // panel open at 49s must not move the 60s tick to 109s. A due pass still
+                        // advances when every provider is disabled, backed off, or otherwise skipped,
+                        // preventing an immediate no-work loop.
+                        if let liveRefreshUptime = dataStore.lastLiveQuotaRefreshUptime,
+                           liveRefreshUptime != lastObservedLiveQuotaRefreshUptime {
+                            lastObservedLiveQuotaRefreshUptime = liveRefreshUptime
+                            lastQuotaRefreshUptime = liveRefreshUptime
+                        } else if quotaRefreshDue {
+                            lastQuotaRefreshUptime = ProcessInfo.processInfo.systemUptime
+                            dataStore.markQuotaRefreshCheckCompleted()
+                        }
+                        if runAllMeters {
+                            pendingFullScopePass = false
+                            pendingPanelPass = false
+                            if requestsHistoryFold {
+                                pendingHistoryAccountingPass = true
+                                pendingLocalAccountingPass = false
+                            }
+                        }
+                        pendingMenuBarMeterRetry = false
+                    }
+
+                    if accountingTask == nil,
+                       pendingHistoryAccountingPass || pendingLocalAccountingPass {
+                        let accountingScope: ProviderRefreshContext.Scope = pendingHistoryAccountingPass
+                            ? .panelAccounting
+                            : .localAccounting
+                        let bypassSnapshotCache = accountingScope == .panelAccounting
+                            && pendingForcedHistoryAccountingPass
+                        let bypassFailureBackoff = accountingScope == .panelAccounting
+                            && pendingHistoryFailureBackoffBypass
+                        pendingHistoryAccountingPass = false
+                        pendingLocalAccountingPass = false
+                        pendingForcedHistoryAccountingPass = false
+                        pendingHistoryFailureBackoffBypass = false
+                        if accountingScope == .panelAccounting {
+                            lastHistoryRefreshUptime = ProcessInfo.processInfo.systemUptime
+                        }
+                        let maxConcurrentProviders = accountingScope == .panelAccounting
+                            ? (serializeAccountingProviders ? 1 : nil)
+                            : (overSoftMemoryLimit ? 1 : nil)
+                        accountingTask = Task { @MainActor in
+                            await ProviderRefreshContext.$scope.withValue(accountingScope) {
+                                await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(
+                                    accountingScope == .localAccounting
+                                ) {
+                                    await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(
+                                        accountingScope == .localAccounting
+                                    ) {
+                                        await dataStore.refreshAll(
+                                            bypassSnapshotCache: bypassSnapshotCache,
+                                            bypassFailureBackoff: bypassFailureBackoff,
+                                            maxConcurrentProviders: maxConcurrentProviders
+                                        )
+                                    }
+                                }
+                            }
+                            accountingTask = nil
+                            wakeSignal.signalWorkCompletion()
+                        }
+                    }
+                    isFirstPass = false
+                }
+                // Keep the larger CodexRouter index warm while the panel is open so append-triggered
+                // refreshes do not decode its parsed-event cache from disk each time. The smaller
+                // Codex session tail remains warm between cycles under its own row cap; memory pressure
+                // releases both, while the durable indexes remain available for the next scan.
+                let keepRouterIndexWarm = transparency.popoverShown && !ProcessMemoryBudget.isOverSoftLimit
+                if accountingTask == nil {
+                    await PersistentJSONLScanCaches.unloadAfterRefreshCycle(
+                        keepRouterItemsResident: keepRouterIndexWarm
+                    )
+                }
                 // Re-evaluate quota pace milestones every tick — after the refresh so it sees fresh data,
                 // and on every loop (not just on a fetch) so pace worsening from elapsed time alone still
                 // alerts even with the popover closed.
@@ -432,21 +723,116 @@ final class AppContainer {
                 // prior-day provider rollups only while optional analytics are on. Runs on launch
                 // and every interval, so always-running instances still produce a daily-active signal.
                 telemetry.tick()
-                // Panel closed → icons-only cadence (may stretch on battery). Panel open → keep
-                // the fixed 5-minute full cadence so meters stay live in the panel.
+                // Live quota meters and full history folds have separate cadences while the panel is
+                // open. Closed-panel quota cadence still follows the power source.
                 let sleepInterval = transparency.popoverShown
-                    ? RefreshSetting.interval
+                    ? RefreshSetting.quotaInterval
                     : RefreshSetting.backgroundInterval
-                let wake = await wakeSignal.waitForWake(timeout: sleepInterval)
-                // Ledger appends while the panel is open must bypass the snapshot TTL; otherwise the
-                // wake resumes the loop into an all-cache-hit pass and Today/charts stay stale for up
-                // to ~5 minutes despite the vnode watcher. Only Codex cards need the miss — Cursor
-                // keeps its cache.
-                if case .notification(let name) = wake,
-                   name == CodexRouterLedgerWatcher.didChangeNotification {
-                    dataStore.invalidateSessionFreshnessForCodexSpend()
+                let waitNow = ProcessInfo.processInfo.systemUptime
+                let quotaElapsed = lastQuotaRefreshUptime.map { waitNow - $0 } ?? 0
+                let quotaWaitRemaining = max(0, sleepInterval - quotaElapsed)
+                let historyElapsed = lastHistoryRefreshUptime.map { waitNow - $0 } ?? 0
+                let historyWaitRemaining = max(0, RefreshSetting.interval - historyElapsed)
+                let hasRunnableAccounting = accountingTask == nil
+                    && (pendingHistoryAccountingPass || pendingLocalAccountingPass)
+                let hasRunnableMeters = pendingFullScopePass || pendingPanelPass || pendingMenuBarMeterRetry
+                let wakeTimeout = hasRunnableAccounting || hasRunnableMeters
+                    ? 0
+                    : min(quotaWaitRemaining, historyWaitRemaining)
+                _ = await wakeSignal.waitForWake(timeout: wakeTimeout)
+                // Ledger appends invalidate only the enabled Codex/OpenCode accounting snapshots and
+                // schedule their narrow local fold. Meter snapshots and unrelated history providers
+                // keep their cache state; this wake never re-reads live quota APIs.
+                for name in wakeSignal.takePendingNotifications() {
+                    switch name {
+                    case CodexRouterLedgerWatcher.didChangeNotification:
+                        if dataStore.hasEnabledProviderFamily("codex") {
+                            let affectsVisible = transparency.popoverShown
+                                || dataStore.closedPanelLedgerWakeAffectsVisibleMetrics()
+                            if affectsVisible {
+                                pendingLocalAccountingPass = true
+                                dataStore.invalidateLocalAccountingFreshness()
+                                if transparency.popoverShown {
+                                    AppLog.info(.refresh, "panel ledger wake; scheduling Codex/OpenCode local accounting")
+                                } else {
+                                    AppLog.info(.refresh, "closed-panel ledger wake; scheduling local accounting pass")
+                                }
+                            } else {
+                                AppLog.debug(.refresh, "ignoring closed-panel ledger wake (no pinned spend or OpenCode metrics)")
+                            }
+                        } else {
+                            AppLog.debug(.refresh, "ignoring CodexRouter ledger wake (no enabled Codex cards)")
+                        }
+                    case PopoverTransparencyStore.panelVisibilityDidChangeNotification:
+                        // The store posts on the open edge only. Latch the two-phase panel pass so
+                        // the panel's first paint is followed by fresh meters and folds even if the
+                        // user closes it again before the pass starts.
+                        pendingPanelPass = true
+                    case ProviderEnablementStore.didChangeNotification:
+                        // A full pass covers the newly-enabled provider and runs alongside any distinct
+                        // ledger wake retained by RefreshWakeSignal. Its cache keeps unrelated providers cheap.
+                        // Only keep the CodexRouter vnode sources armed while a Codex card is enabled.
+                        ledgerWatcher.setEnabled(dataStore.hasEnabledProviderFamily("codex"))
+                        pendingFullScopePass = true
+                    case BackgroundRefreshTrigger.didChangeNotification:
+                        if triggerGate.shouldAccept(at: Date()) {
+                            pendingFullScopePass = true
+                            dataStore.invalidateLocalAccountingFreshness()
+                        } else {
+                            dropNextRefreshPass = true
+                        }
+                    default:
+                        break
+                    }
+                }
+                for request in wakeSignal.takePendingDeferredRefreshes() {
+                    switch request.scope {
+                    case .menuBar:
+                        pendingMenuBarMeterRetry = true
+                    case .panelMeters:
+                        pendingPanelPass = true
+                    case .localAccounting:
+                        pendingLocalAccountingPass = true
+                    case .panelAccounting:
+                        if request.manualActionID != nil {
+                            // A visible retry may have deferred its provider-local fold behind
+                            // conflicting work. Resume that exact request with its original Keychain
+                            // action context; a global scheduled pass would be silent and lose the
+                            // one-dialog budget that phase one established.
+                            Task { @MainActor in
+                                _ = await dataStore.resumeDeferredManualHistoryRetry(request)
+                            }
+                        } else {
+                            pendingHistoryAccountingPass = true
+                            if request.bypassSnapshotCache {
+                                pendingForcedHistoryAccountingPass = true
+                            }
+                            if request.bypassFailureBackoff {
+                                pendingHistoryFailureBackoffBypass = true
+                            }
+                        }
+                    case .full:
+                        pendingFullScopePass = true
+                    }
+                    AppLog.info(
+                        .refresh,
+                        "resuming deferred provider refresh (\(request.providerID), scope=\(WidgetDataStore.batchScopeLabel(request.scope)))"
+                    )
                 }
             }
+            }
         }
+    }
+
+    nonisolated static func hasPriorityRefreshPass(
+        quotaRefreshDue: Bool,
+        panelPassPending: Bool,
+        fullScopePassPending: Bool,
+        historyAccountingPassPending: Bool,
+        localAccountingPassPending: Bool,
+        menuBarMeterRetryPending: Bool = false
+    ) -> Bool {
+        quotaRefreshDue || panelPassPending || fullScopePassPending
+            || historyAccountingPassPending || localAccountingPassPending || menuBarMeterRetryPending
     }
 }

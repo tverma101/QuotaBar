@@ -30,10 +30,12 @@ final class OpenRouterProvider: ProviderRuntime {
         [
             .boundedDollars(id: "openrouter.credits", provider: provider, title: "Credits",
                             metricLabel: "Credits", limit: 100, limitNoun: "purchased")
-                .exportingLimit("credits", unit: "usd"),
+                .exportingLimit("credits", unit: "usd")
+                .hidingWhenEmpty(),
             .dollarBalance(id: "openrouter.balance", provider: provider, title: "Balance",
                            metricLabel: "Balance", valueWord: "left")
-                .exportingLimit("balance", kind: .balance, unit: "usd", source: .value(kind: .dollars)),
+                .exportingLimit("balance", kind: .balance, unit: "usd", source: .value(kind: .dollars))
+                .hidingWhenEmpty(),
             .values(id: "openrouter.today", provider: provider, title: "Today",
                     metricLabel: "Today", selection: .kind(.dollars), isUsagePeriod: true),
             .values(id: "openrouter.week", provider: provider, title: "This Week",
@@ -48,20 +50,37 @@ final class OpenRouterProvider: ProviderRuntime {
     }
 
     func hasLocalCredentials() async -> Bool {
-        // Same source as `refresh()`: a stored or environment-exported API key.
-        await loadOffMainActor { [authStore] in authStore.loadAPIKey() } != nil
+        // Same source as `refresh()`: a stored or environment-exported API key. A present but
+        // unreadable config still counts so refresh can surface its repair message.
+        await loadOffMainActor { [authStore] in authStore.hasKeyOrUnreadableConfig() }
     }
 
     func refresh() async -> ProviderSnapshot {
-        guard let auth = await loadOffMainActor({ [authStore] in authStore.loadAPIKey() }) else {
+        let auth: OpenRouterAuth?
+        do {
+            auth = try await loadOffMainActor { [authStore] in try authStore.loadAPIKeyForRefresh() }
+        } catch {
+            return ProviderSnapshot.error(provider: provider, error: error)
+        }
+        guard let auth else {
             return ProviderSnapshot.error(provider: provider, error: OpenRouterAuthError.missingKey)
         }
 
         // Both endpoints are fetched independently and mapped from whatever succeeds. `/credits` carries
         // the balance and `/key` the tier + period spend; OpenRouter gates some endpoints to specific key
         // types, so one returning 403 must not blank out the data the other returned.
-        let credits = await load { try await usageClient.fetchCredits(apiKey: auth.apiKey) }
-        let key = await load { try await usageClient.fetchKey(apiKey: auth.apiKey) }
+        let credits: EndpointResult
+        do {
+            credits = try await load { try await usageClient.fetchCredits(apiKey: auth.apiKey) }
+        } catch {
+            return ProviderSnapshot.error(provider: provider, error: error)
+        }
+        let key: EndpointResult
+        do {
+            key = try await load { try await usageClient.fetchKey(apiKey: auth.apiKey) }
+        } catch {
+            return ProviderSnapshot.error(provider: provider, error: error)
+        }
 
         var lines: [MetricLine] = []
         var plan: String?
@@ -90,9 +109,11 @@ final class OpenRouterProvider: ProviderRuntime {
 
     /// Run one endpoint call and classify the outcome: a parsed data object on 2xx, an auth failure on
     /// 401/403, or a typed failure for any other non-2xx, transport error, or unparsable body.
-    private func load(_ call: () async throws -> HTTPResponse) async -> EndpointResult {
+    private func load(_ call: () async throws -> HTTPResponse) async throws -> EndpointResult {
+        try Task.checkCancellation()
         do {
             let response = try await call()
+            try Task.checkCancellation()
             if response.statusCode == 401 || response.statusCode == 403 { return .authFailure }
             guard (200..<300).contains(response.statusCode) else {
                 return .failed(.requestFailed(response.statusCode))
@@ -102,6 +123,7 @@ final class OpenRouterProvider: ProviderRuntime {
             }
             return .success(data)
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             return .failed(.connectionFailed)
         }
     }

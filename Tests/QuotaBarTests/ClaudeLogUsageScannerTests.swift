@@ -98,9 +98,9 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
         }
     }
 
-    func testLogParsingRejectsNullSchemaFieldsButAllowsNullContent() {
+    func testLogParsingAcceptsOptionalNullSpeedButRejectsNullIdentity() {
         let cases: [(line: String, accepted: Bool)] = [
-            (#"{"timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":1,"output_tokens":2,"speed":null}}}"#, false),
+            (#"{"timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":1,"output_tokens":2,"speed":null}}}"#, true),
             (#"{"timestamp":"2026-02-20T12:00:00Z","message":{"model":null,"usage":{"input_tokens":1,"output_tokens":2}}}"#, false),
             (#"{"timestamp":"2026-02-20T12:00:00Z","sessionId":null,"message":{"usage":{"input_tokens":1,"output_tokens":2}}}"#, false),
             (#"{"timestamp":"2026-02-20T12:00:00Z","message":{"content":null,"usage":{"input_tokens":1,"output_tokens":2}}}"#, true)
@@ -109,6 +109,28 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
         for entry in cases {
             XCTAssertEqual(!ClaudeLogUsageScanner.parseFile(Data(entry.line.utf8)).isEmpty, entry.accepted, entry.line)
         }
+    }
+
+    func testModernNullableUsageAndAttachmentDoNotFreezeHistory() async throws {
+        let usage = #"{"type":"assistant","timestamp":"2026-02-20T12:00:00Z","message":{"id":"modern","model":"claude-test-model","usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":null,"cache_creation_input_tokens":null,"speed":null,"iterations":null}}}"#
+        let attachment = #"{"type":"attachment","attachment":{"usage":{"input_tokens":999,"output_tokens":999}}}"#
+        let toolResult = #"{"type":"user","timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":999,"output_tokens":999}}}"#
+        let home = try ClaudeLogFixture.makeHome(files: ["project/session.jsonl": usage + "\n" + attachment + "\n" + toolResult + "\n"])
+        defer { try? FileManager.default.trashItem(at: home, resultingItemURL: nil) }
+        let scanner = ClaudeLogFixture.scanner(home: home)
+        let now = OpenUsageISO8601.date(from: "2026-02-20T15:00:00Z")!
+        let first = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertEqual(first?.series.daily.first?.totalTokens, 12)
+        let source = home.appendingPathComponent("projects/project/session.jsonl")
+        let handle = try FileHandle(forWritingTo: source)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((ClaudeLogFixture.usageLine(
+            timestamp: "2026-02-20T13:00:00Z", input: 20, output: 3,
+            messageID: "appended", requestID: "appended"
+        ) + "\n").utf8))
+        try handle.close()
+        let updated = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertEqual(updated?.series.daily.first?.totalTokens, 35)
     }
 
     func testParseFileSkipsNonUsageAndMalformedLines() {
@@ -290,7 +312,7 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
         XCTAssertEqual(scan.series.daily[0].costUSD ?? 0, 0.04, accuracy: 1e-9)
     }
 
-    func testAggregateUnknownModelIsExcludedFromTotalsButWarns() {
+    func testAggregateUnknownModelCountsTokensButDashesCost() {
         let day = localDay("2026-02-20T12:00:00.000Z")
         var unknown = entry(messageID: "m1", requestID: "r1", isSidechain: false, cacheRead: 0, output: 0)
         unknown.model = "mystery-model"
@@ -300,16 +322,25 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
 
         let scan = ClaudeLogUsageScanner.aggregate(entries: [unknown, priced], since: .distantPast, pricing: pricing)
 
-        // Unpriceable tokens never enter the displayed totals — they surface only through the
-        // warning triangle, so the tile's tokens and dollars stay coherent.
-        XCTAssertEqual(scan.series.daily, [DailyUsageEntry(date: day, totalTokens: 1500, costUSD: 0.02)])
+        // Unpriced usage keeps counting tokens; the priced model subtotal stays visible with an
+        // incomplete-cost marker because the unknown model could add more cost after pricing lands.
+        XCTAssertEqual(scan.series.daily, [
+            DailyUsageEntry(
+                date: day,
+                totalTokens: 1515,
+                costUSD: 0.02,
+                costIsComplete: false,
+                hasUnexplainedIncompleteCost: false
+            )
+        ])
         XCTAssertEqual(scan.unknownModelsByDay[day], ["mystery-model"])
         XCTAssertEqual(scan.modelUsage?.daily.first?.models, [
-            ModelUsageEntry(model: "claude-test-model", totalTokens: 1500, costUSD: 0.02)
+            ModelUsageEntry(model: "claude-test-model", totalTokens: 1500, costUSD: 0.02),
+            ModelUsageEntry(model: "mystery-model", totalTokens: 15, costUSD: nil, costIsComplete: false)
         ])
     }
 
-    func testUnpriceableModelsStayUnbackedAndOnlyNamedModelsWarn() {
+    func testUnpricedModelsCountTokensAndStayUnpricedWithoutCostWarning() {
         let day = localDay("2026-02-20T12:00:00.000Z")
 
         for model in ["mystery-model", nil] as [String?] {
@@ -319,9 +350,16 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
 
             let scan = ClaudeLogUsageScanner.aggregate(entries: [unpriced], since: .distantPast, pricing: pricing)
 
-            XCTAssertTrue(scan.series.daily.isEmpty)
-            XCTAssertEqual(scan.unknownModelsByDay[day], model.map { [$0] })
-            XCTAssertEqual(scan.modelUsage?.daily ?? [], [])
+            // Tokens still count (owner decision: never hide volume); cost stays unbacked so the
+            // tile reads a dash until the model is priced or revealed. A missing name folds to the
+            // synthetic "Unattributed" entry, which is also what the warning set records.
+            let foldedName = model ?? ModelUsageEntry.unattributedModelName
+            XCTAssertEqual(scan.series.daily.map(\.totalTokens), [15])
+            XCTAssertNil(scan.series.daily[0].costUSD)
+            XCTAssertEqual(scan.unknownModelsByDay[day], [foldedName])
+            XCTAssertEqual(scan.modelUsage?.daily.first?.models, [
+                ModelUsageEntry(model: foldedName, totalTokens: 15, costUSD: nil, costIsComplete: false)
+            ])
         }
     }
 
@@ -562,6 +600,41 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
         XCTAssertEqual(second.series.daily.first?.costUSD ?? 0, 0.25, accuracy: 1e-9)
     }
 
+    func testOrganizationScanFailsWhenAnySessionOwnershipPreambleCannotBeRead() async throws {
+        let now = Date()
+        let timestamp = OpenUsageISO8601.string(from: now)
+        let usage = ClaudeLogFixture.usageLine(
+            timestamp: timestamp, input: 100, output: 50, costUSD: 0.25
+        )
+        let home = try ClaudeLogFixture.makeUserHome(claudeFiles: [
+            "workspace/a-owned.jsonl": #"{"ownerOrganizationUuid":"org-a","ownerAccountUuid":"user-a"}"# + "\n" + usage,
+            "workspace/z-unreadable.jsonl": #"{"ownerOrganizationUuid":"org-a","ownerAccountUuid":"user-a"}"# + "\n" + usage
+        ])
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let scanner = ClaudeLogUsageScanner(
+            environment: FakeEnvironment([:]),
+            homeDirectory: { home },
+            incrementalScanner: IncrementalJSONLScanner<Entry>(),
+            accountUUID: "user-a",
+            organizationUUID: "org-a",
+            ownershipLookup: { file in
+                if file.path.hasSuffix("z-unreadable.jsonl") { return .unreadable }
+                return .readable(organizationID: "org-a", accountID: "user-a", isAmbiguous: false)
+            }
+        )
+        let result = await scanner.scanResult(now: now, pricing: pricing)
+        guard case .incomplete = result else {
+            return XCTFail("one unreadable owner preamble must invalidate the account-scoped fold")
+        }
+
+        let folded = await scanner.foldParsedEntries(
+            now: now,
+            roots: [home.appendingPathComponent(".claude")]
+        ) { _ in }
+        XCTAssertFalse(folded, "OpenCode must also reject the incomplete Claude source")
+    }
+
     func testOrganizationScanRecoversOnlyMatchingIndexedDesktopSessionsAndSubagents() async throws {
         let now = Date()
         let timestamp = OpenUsageISO8601.string(from: now)
@@ -628,6 +701,39 @@ final class ClaudeLogUsageScannerTests: XCTestCase {
 
         XCTAssertEqual(scan.series.daily.first?.totalTokens, 165)
         XCTAssertEqual(scan.series.daily.first?.costUSD ?? 0, 0.30, accuracy: 1e-9)
+    }
+
+    func testOrganizationScanFailsClosedWhenDesktopSessionIndexCannotBeParsed() async throws {
+        let now = Date()
+        let sessionID = "88888888-8888-4888-8888-888888888888"
+        let home = try ClaudeLogFixture.makeUserHome(claudeFiles: [
+            "workspace/\(sessionID).jsonl": ClaudeLogFixture.usageLine(
+                timestamp: OpenUsageISO8601.string(from: now), input: 100, output: 50
+            )
+        ])
+        defer { try? FileManager.default.removeItem(at: home) }
+        let indexDirectory = home.appendingPathComponent(
+            "Library/Application Support/Claude/claude-code-sessions/user-a/org-a"
+        )
+        try FileManager.default.createDirectory(at: indexDirectory, withIntermediateDirectories: true)
+        try "{ malformed index".write(
+            to: indexDirectory.appendingPathComponent("local_session.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let scanner = ClaudeLogUsageScanner(
+            environment: FakeEnvironment([:]),
+            homeDirectory: { home },
+            incrementalScanner: IncrementalJSONLScanner<Entry>(),
+            accountUUID: "user-a",
+            organizationUUID: "org-a",
+            ownershipLookup: { _ in .readable(organizationID: nil, accountID: nil, isAmbiguous: false) }
+        )
+
+        guard case .incomplete = await scanner.scanResult(now: now, pricing: pricing) else {
+            return XCTFail("malformed account-scoped session index must not turn into an empty ownership set")
+        }
     }
 
     func testOrganizationScanDoesNotRecoverIndexedDesktopSessionsWithoutAccount() async throws {

@@ -23,6 +23,23 @@ final class RefreshTimeoutTests: XCTestCase {
         XCTAssertEqual(next, .backedOff)
     }
 
+    func testCancellationAwareProviderStopsSpinnerWithoutWaitingFullGracePeriod() async {
+        let (provider, descriptor) = makeProvider()
+        let runtime = HangingProviderRuntime(provider: provider, descriptors: [descriptor])
+        let store = makeStore(provider: provider, descriptor: descriptor, runtime: runtime, timeout: 0.05)
+        let startedAt = ContinuousClock.now
+
+        let outcome = await store.refresh(providerID: provider.id, force: true)
+
+        XCTAssertEqual(outcome, .failed)
+        XCTAssertLessThan(
+            startedAt.duration(to: .now),
+            .seconds(1),
+            "a provider that observes cancellation should not pay the full five-second zombie grace"
+        )
+        XCTAssertTrue(store.refreshingProviderIDs.isEmpty)
+    }
+
     func testHungProviderRefreshIsCancelledWhenTheDeadlineWins() async {
         let (provider, descriptor) = makeProvider()
         let runtime = HangingProviderRuntime(provider: provider, descriptors: [descriptor])

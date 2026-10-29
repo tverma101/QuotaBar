@@ -16,6 +16,36 @@ protocol ProcessRunning: Sendable {
         environment: [String: String],
         timeout: TimeInterval
     ) throws -> ProcessResult
+
+    /// Runs a child with a private stdin payload. Implementations that do not support stdin may
+    /// continue to handle nil input through the default implementation.
+    func run(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        standardInput: Data?,
+        timeout: TimeInterval
+    ) throws -> ProcessResult
+}
+
+extension ProcessRunning {
+    func run(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        standardInput: Data?,
+        timeout: TimeInterval
+    ) throws -> ProcessResult {
+        guard standardInput == nil else {
+            throw ProcessRunnerError.standardInputUnsupported
+        }
+        return try run(
+            executable: executable,
+            arguments: arguments,
+            environment: environment,
+            timeout: timeout
+        )
+    }
 }
 
 struct SystemProcessRunner: ProcessRunning {
@@ -23,6 +53,22 @@ struct SystemProcessRunner: ProcessRunning {
         executable: String,
         arguments: [String],
         environment: [String: String],
+        timeout: TimeInterval
+    ) throws -> ProcessResult {
+        try run(
+            executable: executable,
+            arguments: arguments,
+            environment: environment,
+            standardInput: nil,
+            timeout: timeout
+        )
+    }
+
+    func run(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        standardInput: Data?,
         timeout: TimeInterval
     ) throws -> ProcessResult {
         let process = Process()
@@ -43,8 +89,10 @@ struct SystemProcessRunner: ProcessRunning {
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
+        let inputPipe = standardInput.map { _ in Pipe() }
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        process.standardInput = inputPipe
 
         // Drain both pipes on background queues, started BEFORE the child runs. A child that writes
         // more than the OS pipe buffer (~64KB) would otherwise block on write, never exit, and trip the
@@ -54,29 +102,55 @@ struct SystemProcessRunner: ProcessRunning {
         drain(stdoutPipe.fileHandleForReading, into: output, isStdout: true, group: drained)
         drain(stderrPipe.fileHandleForReading, into: output, isStdout: false, group: drained)
 
-        // One kernel-level wait instead of a 50ms poll loop: the termination handler trips the
-        // group (registered before `run()` so an instantly-exiting child can't race it), and
-        // `wait` blocks this thread exactly once until exit or the deadline.
+        // Register before `run()` so an instantly-exiting child can't race the waiter. Check task
+        // cancellation while waiting: local database scans and superseded refreshes must not leave a
+        // sqlite3 subprocess running for its full timeout after their owner has been cancelled.
         let exited = DispatchGroup()
         exited.enter()
         process.terminationHandler = { _ in exited.leave() }
 
         try process.run()
 
-        if exited.wait(timeout: .now() + timeout) == .timedOut {
-            terminateProcessTree(rootPID: process.processIdentifier)
-            process.terminate()
-            _ = exited.wait(timeout: .now() + 0.1)
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
+        if let standardInput, let inputPipe {
+            do {
+                try inputPipe.fileHandleForWriting.write(contentsOf: standardInput)
+                try inputPipe.fileHandleForWriting.close()
+            } catch {
+                if process.isRunning { process.terminate() }
+                process.waitUntilExit()
+                drained.wait()
+                throw error
             }
-            process.waitUntilExit()
-            drained.wait() // the killed child closed its pipes, so the drains hit EOF and finish
-            throw ProcessRunnerError.timedOut(executable: executable, timeout: timeout)
+        }
+
+        let deadline = DispatchTime.now() + timeout
+        while true {
+            if Task<Never, Never>.isCancelled {
+                terminate(
+                    process,
+                    pipeReaders: [stdoutPipe.fileHandleForReading, stderrPipe.fileHandleForReading],
+                    exited: exited,
+                    drained: drained
+                )
+                throw CancellationError()
+            }
+            let now = DispatchTime.now()
+            guard now < deadline else {
+                terminate(
+                    process,
+                    pipeReaders: [stdoutPipe.fileHandleForReading, stderrPipe.fileHandleForReading],
+                    exited: exited,
+                    drained: drained
+                )
+                throw ProcessRunnerError.timedOut(executable: executable, timeout: timeout)
+            }
+            let remaining = Double(deadline.uptimeNanoseconds - now.uptimeNanoseconds) / 1_000_000_000
+            if exited.wait(timeout: .now() + min(remaining, 0.1)) == .success { break }
         }
 
         process.waitUntilExit()
         drained.wait()
+        if Task<Never, Never>.isCancelled { throw CancellationError() }
         AppLog.debug(.subprocess, "exit \(process.terminationStatus)")
         return ProcessResult(exitCode: process.terminationStatus, stdout: output.stdoutString, stderr: output.stderrString)
     }
@@ -105,6 +179,28 @@ struct SystemProcessRunner: ProcessRunning {
         }
     }
 
+    private func terminate(
+        _ process: Process,
+        pipeReaders: [FileHandle],
+        exited: DispatchGroup,
+        drained: DispatchGroup
+    ) {
+        terminateProcessTree(rootPID: process.processIdentifier)
+        if process.isRunning { process.terminate() }
+        if exited.wait(timeout: .now() + 0.1) == .timedOut, process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+        guard drained.wait(timeout: .now() + 1) == .timedOut else { return }
+
+        // A detached descendant can inherit stdout/stderr after the process-tree snapshot. Do not
+        // let its open pipe keep a cancelled refresh blocked forever.
+        for reader in pipeReaders { try? reader.close() }
+        if drained.wait(timeout: .now() + 1) == .timedOut {
+            AppLog.warn(.subprocess, "terminated subprocess left an output pipe open after cancellation")
+        }
+    }
+
     private func childPIDs(of pid: Int32) -> [Int32] {
         let pgrep = Process()
         pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
@@ -128,11 +224,14 @@ struct SystemProcessRunner: ProcessRunning {
 
 enum ProcessRunnerError: Error, LocalizedError, Equatable {
     case timedOut(executable: String, timeout: TimeInterval)
+    case standardInputUnsupported
 
     var errorDescription: String? {
         switch self {
         case .timedOut(let executable, let timeout):
             return "\(executable) timed out after \(Int(timeout))s."
+        case .standardInputUnsupported:
+            return "This process runner does not support standard input."
         }
     }
 }

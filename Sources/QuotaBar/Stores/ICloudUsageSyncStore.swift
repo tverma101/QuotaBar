@@ -30,12 +30,19 @@ struct KeychainICloudDeviceIDStore: ICloudDeviceIDStoring {
     }
 
     func readDeviceID() throws -> String? {
-        try keychain.readGenericPasswordForRefreshForCurrentUser(service: service)
+        // This app-owned sync marker is never worth presenting a Keychain dialog for. A failed
+        // silent read falls back to the persisted preference or a fresh local identifier.
+        try keychain.readGenericPasswordForRefreshForCurrentUser(service: service, allowInteraction: false)
     }
 
     func writeDeviceID(_ deviceID: String) throws {
         try keychain.writeGenericPasswordForCurrentUser(service: service, value: deviceID)
     }
+}
+
+private struct ResolvedICloudDeviceIdentity: Sendable {
+    let id: String
+    let error: String?
 }
 
 enum ICloudUsageSyncError: Error, LocalizedError {
@@ -155,7 +162,13 @@ final class ICloudUsageSyncStore {
 
     private let defaults: UserDefaults
     private let fileStore: any UsageHistoryFileStoring
-    private let identityError: String?
+    private let deviceIDStore: any ICloudDeviceIDStoring
+    private var identityError: String?
+    private var identityReady = false
+    private var identityResolutionTask: Task<ResolvedICloudDeviceIdentity, Never>?
+    private var pendingEnablementReconciliation = false
+    private var enablementReconciliationInProgress = false
+    private var disablementReconciliationInProgress = false
     private let dataStore: WidgetDataStore
     private let writeDebounce: Duration
     private let observesMetadataChanges: Bool
@@ -164,13 +177,17 @@ final class ICloudUsageSyncStore {
     private var notificationTokens: [NSObjectProtocol] = []
     private var syncActivityCount = 0
 
-    let deviceID: String
+    private(set) var deviceID: String
     let deviceName: String
     var enabled: Bool {
         didSet {
             guard enabled != oldValue else { return }
             defaults.set(enabled, forKey: Self.enabledKey)
-            Task { await applyEnabledChange() }
+            pendingEnablementReconciliation = true
+            Task {
+                if enabled { await resolveDeviceIdentityIfNeeded() }
+                await applyEnabledChange()
+            }
         }
     }
     private(set) var isSyncing = false
@@ -190,16 +207,25 @@ final class ICloudUsageSyncStore {
         self.dataStore = dataStore
         self.defaults = defaults
         self.fileStore = fileStore
+        self.deviceIDStore = deviceIDStore
         self.writeDebounce = writeDebounce
         self.observesMetadataChanges = observesMetadataChanges
-        let identity = Self.resolveDeviceID(defaults: defaults, store: deviceIDStore)
-        self.deviceID = identity.id
-        self.identityError = identity.error
+        let savedDeviceID = Self.normalizedDeviceID(defaults.string(forKey: Self.deviceIDKey))
+        self.deviceID = savedDeviceID
+            ?? UUID().uuidString.lowercased()
+        self.identityError = nil
         self.deviceName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
         self.enabled = defaults.bool(forKey: Self.enabledKey)
+        self.pendingEnablementReconciliation = self.enabled
         dataStore.onLocalHistoryChanged = { [weak self] in self?.scheduleWrite() }
-        if enabled {
-            Task { await applyEnabledChange() }
+        // Sync is off by default and inert until its iCloud container is provisioned. Don't touch the
+        // Keychain for an unused feature; resolve the stable ID only for an enabled sync session.
+        if self.enabled {
+            Task { [weak self] in
+                guard let self else { return }
+                await self.resolveDeviceIdentityIfNeeded()
+                await self.applyEnabledChange()
+            }
         }
     }
 
@@ -212,7 +238,7 @@ final class ICloudUsageSyncStore {
     }
 
     func scheduleWrite() {
-        guard enabled else { return }
+        guard enabled, identityReady else { return }
         writeTask?.cancel()
         writeTask = Task { [weak self] in
             guard let self else { return }
@@ -223,11 +249,33 @@ final class ICloudUsageSyncStore {
     }
 
     private func applyEnabledChange() async {
-        if enabled {
+        guard identityReady, pendingEnablementReconciliation else { return }
+        let shouldEnable = enabled
+        if shouldEnable {
+            // Enable work is single-flight so the identity-completion callback and a queued toggle
+            // cannot both perform the initial reload/write.
+            guard !enablementReconciliationInProgress,
+                  !disablementReconciliationInProgress
+            else { return }
+            enablementReconciliationInProgress = true
+            pendingEnablementReconciliation = false
+            defer {
+                enablementReconciliationInProgress = false
+                schedulePendingEnablementReconciliation(after: true)
+            }
             startObserving()
             await reload()
             await writeNow()
         } else {
+            // Disabling must run while an enable write is in flight: it removes any existing copy,
+            // and writeNow removes the just-finished write if the coordinated write returns later.
+            guard !disablementReconciliationInProgress else { return }
+            disablementReconciliationInProgress = true
+            pendingEnablementReconciliation = false
+            defer {
+                disablementReconciliationInProgress = false
+                schedulePendingEnablementReconciliation(after: false)
+            }
             writeTask?.cancel()
             stopObserving()
             dataStore.clearPeerHistoryDocuments()
@@ -242,8 +290,41 @@ final class ICloudUsageSyncStore {
         }
     }
 
+    private func resolveDeviceIdentityIfNeeded() async {
+        guard !identityReady else { return }
+        let resolutionTask: Task<ResolvedICloudDeviceIdentity, Never>
+        if let identityResolutionTask {
+            resolutionTask = identityResolutionTask
+        } else {
+            let savedID = Self.normalizedDeviceID(defaults.string(forKey: Self.deviceIDKey))
+            let store = deviceIDStore
+            let task = Task.detached(priority: .utility) {
+                Self.resolveDeviceID(savedID: savedID, store: store)
+            }
+            identityResolutionTask = task
+            resolutionTask = task
+        }
+
+        let identity = await resolutionTask.value
+        guard !identityReady else { return }
+        defaults.set(identity.id, forKey: Self.deviceIDKey)
+        deviceID = identity.id
+        identityError = identity.error
+        identityReady = true
+        identityResolutionTask = nil
+    }
+
+    private func schedulePendingEnablementReconciliation(after reconciledState: Bool) {
+        guard identityReady, pendingEnablementReconciliation else { return }
+        if enabled == reconciledState, !disablementReconciliationInProgress {
+            pendingEnablementReconciliation = false
+            return
+        }
+        Task { [weak self] in await self?.applyEnabledChange() }
+    }
+
     private func writeNow() async {
-        guard enabled else { return }
+        guard enabled, identityReady else { return }
         await withSyncActivity {
             let document = dataStore.localHistoryDocument(
                 deviceID: deviceID,
@@ -266,7 +347,7 @@ final class ICloudUsageSyncStore {
     }
 
     private func reload() async {
-        guard enabled else { return }
+        guard enabled, identityReady else { return }
         await withSyncActivity {
             do {
                 let result = try await fileStore.loadDocuments()
@@ -297,32 +378,28 @@ final class ICloudUsageSyncStore {
         AppLog.warn(.config, "iCloud history \(context) failed: \(error.localizedDescription)")
     }
 
-    private static func resolveDeviceID(
-        defaults: UserDefaults,
+    nonisolated private static func resolveDeviceID(
+        savedID: String?,
         store: any ICloudDeviceIDStoring
-    ) -> (id: String, error: String?) {
-        let saved = normalizedDeviceID(defaults.string(forKey: deviceIDKey))
+    ) -> ResolvedICloudDeviceIdentity {
         do {
             if let stored = normalizedDeviceID(try store.readDeviceID()) {
-                defaults.set(stored, forKey: deviceIDKey)
-                return (stored, nil)
+                return ResolvedICloudDeviceIdentity(id: stored, error: nil)
             }
 
-            let id = saved ?? UUID().uuidString.lowercased()
+            let id = savedID ?? UUID().uuidString.lowercased()
             try store.writeDeviceID(id)
-            defaults.set(id, forKey: deviceIDKey)
-            return (id, nil)
+            return ResolvedICloudDeviceIdentity(id: id, error: nil)
         } catch {
-            let id = saved ?? UUID().uuidString.lowercased()
-            defaults.set(id, forKey: deviceIDKey)
+            let id = savedID ?? UUID().uuidString.lowercased()
             let message = "QuotaBar couldn’t save this Mac’s sync identity in Keychain. "
                 + "Sync may create a duplicate device if app preferences are reset."
             AppLog.warn(.keychain, "iCloud device identity failed: \(error.localizedDescription)")
-            return (id, message)
+            return ResolvedICloudDeviceIdentity(id: id, error: message)
         }
     }
 
-    private static func normalizedDeviceID(_ value: String?) -> String? {
+    nonisolated private static func normalizedDeviceID(_ value: String?) -> String? {
         guard let value, UUID(uuidString: value) != nil else { return nil }
         return value.lowercased()
     }

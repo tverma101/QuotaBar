@@ -4,6 +4,38 @@ import XCTest
 final class CursorCSVBoundaryTests: XCTestCase {
     private let header = "Date,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens"
 
+    func testUTF8FieldsKeepUnicodeEscapedQuotesAndEmbeddedCRLF() {
+        let second = "second," + String(repeating: "\"", count: 6) + ",\"\""
+        let csv = "\u{FEFF}Name,Notes,Empty\r\n👩🏽‍💻 café,\"東京, e\u{301}\r\n\"\"quoted\"\"\",\r\n" + second
+        var rows: [[String: String]] = []
+        let summary = CursorCSVParser.forEachRecord(in: csv) { rows.append($0) }
+        XCTAssertTrue(summary.isStructurallyComplete)
+        XCTAssertEqual(summary.rejectedRecordCount, 0)
+        XCTAssertEqual(rows, [
+            ["Name": "👩🏽‍💻 café", "Notes": "東京, e\u{301}\r\n\"quoted\"", "Empty": ""],
+            ["Name": "second", "Notes": "\"\"", "Empty": ""]
+        ])
+    }
+
+    func testASCIISeparatorsStillDelimitAdjacentCombiningMarks() {
+        var rows: [[String: String]] = []
+        let summary = CursorCSVParser.forEachRecord(in: "A,B\nvalue,\u{301}mark\n") { rows.append($0) }
+        XCTAssertTrue(summary.isStructurallyComplete)
+        XCTAssertEqual(rows, [["A": "value", "B": "\u{301}mark"]])
+    }
+
+    func testCancelledCSVScanDoesNotEmitRecords() async {
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return CursorCSVParser.forEachRecord(in: "A,B\n" + String(repeating: "\"\"", count: 10_000)) { _ in
+                XCTFail("cancelled parsing must not emit records")
+            }
+        }
+        let summary = await task.value
+        XCTAssertTrue(summary.wasCancelled)
+        XCTAssertFalse(summary.isStructurallyComplete)
+    }
+
     func testParserRejectsIllegalQuotePlacement() {
         let malformed = [
             "Date,Model\n2026-01-01T00:00:00Z,\"composer-1\"suffix",
@@ -35,7 +67,7 @@ final class CursorCSVBoundaryTests: XCTestCase {
 
         let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
 
-        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [0, 1_234])
+        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [1_234])
         XCTAssertEqual(parsed.rejectedRowCount, 8)
     }
 
@@ -52,7 +84,7 @@ final class CursorCSVBoundaryTests: XCTestCase {
         XCTAssertEqual(parsed.rejectedRowCount, 1)
     }
 
-    func testUsageCSVRejectsAggregateOverflowWithoutDiscardingSafeRows() throws {
+    func testUsageCSVKeepsRowsWhenCombinedExportTokensExceedIntMax() throws {
         let firstRowTokens = Int.max - 1
         let csv = """
         \(header)
@@ -62,8 +94,8 @@ final class CursorCSVBoundaryTests: XCTestCase {
 
         let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
 
-        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [firstRowTokens])
-        XCTAssertEqual(parsed.rejectedRowCount, 1)
+        XCTAssertEqual(parsed.rows.map(\.tokens.totalTokens), [firstRowTokens, 2])
+        XCTAssertEqual(parsed.rejectedRowCount, 0)
     }
 
     func testUsageCSVAcceptsLargeNonOverflowingValues() throws {
@@ -101,7 +133,7 @@ final class CursorCSVBoundaryTests: XCTestCase {
 
         let parsed = try CursorUsageCSV.parse(csv: csv, pricing: TestPricing.bundled)
 
-        XCTAssertEqual(parsed.rows.first?.tokens.totalTokens, 0)
+        XCTAssertTrue(parsed.rows.isEmpty)
         XCTAssertEqual(parsed.rejectedRowCount, 0)
     }
 

@@ -94,7 +94,14 @@ enum ShareCardRenderer {
         }
         let kept = group.visibleRows {
             guard let descriptor = layout.descriptor(for: $0) else { return false }
-            return layout.showsRow(descriptor, hasData: dataStore.data(for: descriptor).hasData)
+            let widgetData = dataStore.data(for: descriptor)
+            return ProviderSectionVisibility.shouldRenderMetricRow(
+                providerID: descriptor.providerID,
+                descriptorID: descriptor.id,
+                hasData: widgetData.hasData,
+                errorCategory: dataStore.errorCategory(for: descriptor.providerID),
+                explicitlyEnabled: layout.explicitlyEnabledMetricIDs.contains(descriptor.id)
+            ) && layout.showsRow(descriptor, hasData: widgetData.hasData)
         }
         let alwaysRows = kept.alwaysShown.compactMap(data)
         let expandedRows = kept.expanded.compactMap(data)

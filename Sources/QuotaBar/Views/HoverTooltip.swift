@@ -112,9 +112,12 @@ private struct HoverTooltipModifier: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if disabled {
+        if disabled || resolved == nil {
             // Off-screen renders (share cards): no anchor view, no hover tracking — an AppKit-backed
-            // anchor would rasterize as a placeholder artifact in the exported PNG.
+            // anchor would rasterize as a placeholder artifact in the exported PNG. A nil/empty tooltip
+            // skips the same machinery for a different reason: there is nothing to show, and the anchor
+            // is a real NSView per application — the most expensive part of a fresh dashboard mount.
+            // Switching branches later (text arriving/vanishing) still cleans up via `onDisappear`.
             content
         } else {
             decorated(content)

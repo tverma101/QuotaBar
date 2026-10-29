@@ -8,7 +8,10 @@ struct MenuBarContent: Equatable {
     /// One resolved pinned metric.
     struct Metric: Equatable {
         let id: String          // descriptor id
-        let label: String       // metric label, e.g. "Session" (shown when a provider has two metrics)
+        /// The metric's full name, e.g. "Weekly". Used for accessibility, and never shortened —
+        /// a screen reader announcing "Wk 12%" is worse than useless. The strip itself shows values
+        /// only, read positionally.
+        let label: String
         let value: String       // tray display: a "%" for bounded metrics, the raw value (e.g. "$5.23") for unbounded, or the no-data marker
         let fraction: Double     // 0...1 fill, meaningful for bounded metrics (drives the bars)
         let isBounded: Bool      // has a limit → has a fill, so it can render as a bar
@@ -61,11 +64,17 @@ enum MenuBarContentBuilder {
     static func build(
         groups: [ProviderMetrics],
         hiddenProviderIDs: Set<String> = [],
+        now: Date = Date(),
         data: (WidgetDescriptor) -> WidgetData
     ) -> MenuBarContent {
         let resolvedGroups = groups.compactMap { group -> MenuBarContent.Group? in
             guard !hiddenProviderIDs.contains(group.provider.id) else { return nil }
-            let metrics = group.metrics.map { resolve($0, data($0)) }.filter(\.hasData)
+            // A row can opt out of the strip while it has nothing worth showing — a session timer with
+            // no session running drops out along with its provider's icon, so an idle provider costs
+            // no menu-bar space at all.
+            let metrics = group.metrics
+                .map { resolve($0, data($0), now: now) }
+                .filter(\.hasData)
             guard !metrics.isEmpty else { return nil }
             return MenuBarContent.Group(
                 providerID: group.provider.id,
@@ -83,25 +92,18 @@ enum MenuBarContentBuilder {
         return MenuBarContent(groups: resolvedGroups, bars: Array(bars))
     }
 
-    private static func resolve(_ descriptor: WidgetDescriptor, _ data: WidgetData) -> MenuBarContent.Metric {
+    private static func resolve(
+        _ descriptor: WidgetDescriptor,
+        _ data: WidgetData,
+        now: Date
+    ) -> MenuBarContent.Metric {
         MenuBarContent.Metric(
             id: descriptor.id,
-            label: trayLabel(descriptor.metricLabel),
+            label: descriptor.metricLabel,
             value: data.menuBarValue,
             fraction: data.fraction,
             isBounded: data.isBounded,
-            hasData: data.hasData
+            hasData: data.showsInMenuBar(now: now)
         )
-    }
-
-    /// Tray-only label shortening (the dashboard keeps the full names): the long time-window metrics
-    /// collapse to a single letter so a two-metric stack stays narrow. Unknown labels pass through.
-    private static func trayLabel(_ metricLabel: String) -> String {
-        switch metricLabel.lowercased() {
-        case "today": return "T"
-        case "yesterday": return "Y"
-        case "last 30 days": return "M"
-        default: return metricLabel
-        }
     }
 }

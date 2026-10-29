@@ -7,7 +7,7 @@ import Foundation
 struct WidgetData: Hashable {
     /// Hover note for locally-estimated spend tiles (Codex/Claude/Grok Today / Yesterday / Last 30
     /// Days), whose dollars are imputed from token counts rather than billed.
-    static let localEstimateNote = "Estimated locally, so it may be off"
+    static let localEstimateNote = "Public model-rate estimate, including OpenRouter rates where matched; provider billing may differ"
     /// Hover note for Cursor spend tiles, whose spend comes from Cursor's usage-history export.
     static let cursorUsageHistoryNote = "From your Cursor usage history."
     /// Headline shown on a placed tile with no real backing metric (em dash, U+2014).
@@ -87,6 +87,33 @@ struct WidgetData: Hashable {
     /// and carried through `WidgetDataStore.resolve`, so the treatment is a descriptor opt-in rather
     /// than a hardcoded widget-ID list in the model. `nil` for every other row.
     var sessionStartSignal: SessionStartSignal?
+
+    /// How this row reads in the menu bar. `.value` (the default) is the ordinary used/left figure;
+    /// `.resetCountdown` makes the strip show the time left in the window as a session clock instead.
+    /// Set by a descriptor opt-in and carried through `WidgetDataStore.resolve`, exactly like
+    /// `sessionStartSignal`.
+    var trayStyle: TrayStyle = .value
+
+    /// Menu-bar reading styles. `value` is the established behavior — a percent, a compact count, or a
+    /// compact dollar amount. `resetCountdown` renders the window's remaining time (`2h 14m`) and is
+    /// only for segments whose number *is* the session clock.
+    enum TrayStyle: String, Hashable, Sendable {
+        case value
+        case resetCountdown
+    }
+
+    /// Whether this row should render in the menu-bar strip at all right now.
+    ///
+    /// A session timer answers "how long is left *in this session*", so with no session running it has
+    /// nothing to say — and the strip is precious space. The window counts as idle while nothing has
+    /// been spent in it (`used <= 0`), the same signal session meters use to read "Not started". Every
+    /// other row is unaffected: its value is meaningful whether or not anything is happening.
+    func showsInMenuBar(now: Date = Date()) -> Bool {
+        guard hasData else { return false }
+        guard trayStyle == .resetCountdown else { return true }
+        guard let resetsAt, resetsAt > now else { return false }
+        return used > 0
+    }
 
     /// How a session-window meter tells a not-yet-started window from an in-flight one.
     enum SessionStartSignal: Hashable {
@@ -237,7 +264,7 @@ struct WidgetData: Hashable {
         // A `.values` row's primary reading is its first selected value; meters fall through to the
         // bounded/`used` formatting.
         if let first = selectedValues.first {
-            return (valuePrefix ?? "") + MetricFormatter.number(first.number, kind: first.kind, style: .row)
+            return (valuePrefix ?? "") + MetricFormatter.number(for: first, style: .row)
         }
         return (valuePrefix ?? "") + format(displayedValue)
     }
@@ -249,6 +276,11 @@ struct WidgetData: Hashable {
     /// rather than a misleading "0".
     var menuBarValue: String {
         guard hasData else { return valueText }
+        // A timer row reads the window's session clock instead of the allowance. Checked up front so
+        // the countdown wins for both meter and `.values` rows.
+        if trayStyle == .resetCountdown, let countdown = resetCountdownText() {
+            return countdown
+        }
         if let limit, limit > 0 {
             if kind == .percent {
                 // Percent is the only bounded unit that should collapse to a tray percentage. Clamp both
@@ -256,11 +288,25 @@ struct WidgetData: Hashable {
                 let percent = min(100, max(0, Int((displayedValue / limit * 100).rounded())))
                 return "\(percent)%"
             }
-            return MetricFormatter.number(displayedValue, kind: kind, style: .tray)
+            let number = MetricFormatter.number(displayedValue, kind: kind, style: .tray)
+            // Carry the unit: a bounded count meter (Freebuff's hours, Cursor's requests) otherwise
+            // reads as a bare number in the strip, so "20" is indistinguishable from a token count,
+            // a percent, or a session total. Percent and dollar meters are self-describing and stay
+            // as they are.
+            if kind == .count, let unit = Self.trayUnit(countSuffix) {
+                return "\(number)\(unit)"
+            }
+            return number
         }
         if let first = selectedValues.first {
             if let traySuffix, first.kind == .count {
-                return "\(MetricFormatter.number(first.number, kind: .count, style: .tray)) \(traySuffix)"
+                return "\(MetricFormatter.number(for: first, style: .tray)) \(traySuffix)"
+            }
+            // A `.values` count often carries a unit word in its label (`hours`), which the tray used
+            // to drop entirely — an hours balance showed as a bare number. Use the compact tray unit
+            // when the value's own label names one.
+            if first.kind == .count, let unit = Self.trayUnit(first.label) {
+                return "\(MetricFormatter.number(for: first, style: .tray))\(unit)"
             }
             return MetricFormatter.string(for: first, style: .tray)
         }
@@ -268,6 +314,30 @@ struct WidgetData: Hashable {
         let number = MetricFormatter.number(displayedValue, kind: kind, style: .tray)
         if kind == .count, let countSuffix { return "\(number) \(countSuffix)" }
         return number
+    }
+
+    /// Compact tray-only unit for a bounded count meter, or `nil` when the bare number is the better
+    /// reading. The menu bar is width-constrained, so a unit has to be very short to earn its place —
+    /// and it must not be ambiguous. Only hours qualify today: "20h" is unambiguous and turns a
+    /// meaningless bare "20" into "20 hours left", while "sessions" would collapse to "s" and read as
+    /// seconds. Everything else keeps its existing bare-number reading.
+    static func trayUnit(_ countSuffix: String?) -> String? {
+        guard let suffix = countSuffix?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        switch suffix.lowercased() {
+        case "hours", "hour": return "h"
+        default: return nil
+        }
+    }
+
+    /// The tray reading for a timer row: hours and minutes left in the current window ("2h 14m"),
+    /// or minutes alone in the last hour ("41m"). `nil` when the row has no reset instant to count
+    /// down to — the caller then falls back to the ordinary value rather than showing nothing.
+    ///
+    /// Recomputed on every render (the strip re-renders on each snapshot write and the app's clock
+    /// tick), so the segment stays a live clock instead of a number frozen at the last refresh.
+    private func resetCountdownText(now: Date = Date()) -> String? {
+        guard let resetsAt, resetsAt > now else { return nil }
+        return Formatters.compactDuration(resetsAt.timeIntervalSince(now))
     }
 
     /// Large headline on bounded tiles (e.g. `95% left`, `5% used`).
@@ -401,13 +471,14 @@ struct WidgetData: Hashable {
         hasData && !unknownModels.isEmpty
     }
 
-    /// Hover copy for the unknown-model warning triangle: a header naming the problem, then each unpriced
-    /// model on its own line. Singular/plural header to read naturally. `nil` when the period priced every
-    /// model it used (the common case), so the triangle and its tooltip stay off.
+    /// Hover copy for the unknown-model warning triangle. Singular/plural header, model names, and a
+    /// note that any displayed dollar subtotal includes priced usage only. `nil` when all models are
+    /// priced, so the triangle and its tooltip stay off.
     var unknownModelTooltip: String? {
         guard hasUnknownModels else { return nil }
         let header = unknownModels.count == 1 ? "Unknown model found" : "Unknown models found"
-        return ([header] + unknownModels.map { "- \($0)" }).joined(separator: "\n")
+        return ([header] + unknownModels.map { "- \($0)" } + ["Displayed cost includes priced usage only."])
+            .joined(separator: "\n")
     }
 
     /// Secondary line under an unbounded row's detail (e.g. "on-device estimate"); nil with no real data.

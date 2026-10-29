@@ -3,6 +3,13 @@ import XCTest
 
 @MainActor
 final class CursorOptionalEndpointTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        // Optional endpoint warnings are process-wide edge-triggered; reset them so each test
+        // verifies its own diagnostics independently of suite order.
+        DiagnosticGate.clearFailures(prefix: "auth.cursor.")
+    }
+
     func testOptionalSchemaAndHTTPFailuresAreLoggedWithoutDiscardingPrimaryUsage() async throws {
         let accessToken = makeCursorJWT()
         let provider = makeProvider(accessToken: accessToken) { request in

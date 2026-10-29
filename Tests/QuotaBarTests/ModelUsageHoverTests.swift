@@ -95,6 +95,40 @@ final class ModelUsageHoverTests: XCTestCase {
         XCTAssertEqual(ModelUsageDetail.shares(for: models), [0, 0])
     }
 
+    func testSaturatedModelCountsDoNotClaimPreciseShares() {
+        let models = [
+            ModelUsageEntry(model: "alpha", totalTokens: .max, costUSD: nil, tokenCountSaturated: true),
+            ModelUsageEntry(model: "beta", totalTokens: .max, costUSD: nil, tokenCountSaturated: true)
+        ]
+
+        XCTAssertFalse(ModelUsageDetail.sharesAreReliable(for: models))
+        XCTAssertEqual(ModelUsageDetail.shares(for: models), [0, 0])
+        XCTAssertEqual(ModelUsageDetail.wholePercents(ModelUsageDetail.shares(for: models)), [0, 0])
+    }
+
+    func testSaturatedPeriodTotalSuppressesSharesWhenEachModelIsIndividuallyExact() {
+        let models = [
+            ModelUsageEntry(model: "alpha", totalTokens: 6_000_000_000_000_000_000, costUSD: nil),
+            ModelUsageEntry(model: "beta", totalTokens: 6_000_000_000_000_000_000, costUSD: nil)
+        ]
+
+        XCTAssertFalse(ModelUsageDetail.sharesAreReliable(for: models),
+                       "the sum of exact model counts can still overflow Int.max")
+        XCTAssertEqual(ModelUsageDetail.shares(for: models), [0, 0])
+    }
+
+    func testOtherRowSummaryNamesItsLargestFoldedModel() {
+        let other = ModelUsageEntry(model: "Other", totalTokens: 10_500_000_100, costUSD: 0, variants: [
+            ModelUsageVariant(model: "small-tail", totalTokens: 100, costUSD: 0),
+            ModelUsageVariant(model: "space-bunny-free", totalTokens: 10_500_000_000, costUSD: 0)
+        ])
+
+        XCTAssertEqual(ModelUsageDetail.otherVariantSummary(for: other), "space-bunny-free + 1 more")
+        XCTAssertNil(ModelUsageDetail.otherVariantSummary(for: ModelUsageEntry(
+            model: "space-bunny-free", totalTokens: 10, costUSD: 0
+        )))
+    }
+
     func testHoverPopoverStateOpensThenClosesAroundBothRegions() async {
         let state = HoverPopoverState(revealDelay: .milliseconds(1), hideGrace: .milliseconds(1))
         XCTAssertFalse(state.isPresented)

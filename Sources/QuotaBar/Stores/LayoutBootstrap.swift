@@ -5,6 +5,7 @@ struct LayoutDefaultSet {
     let metricIDs: [String]
     let migrationBaselineMetricIDs: [String]
     let pinnedMetricIDs: [String]
+    let migrationBaselinePinnedMetricIDs: [String]
     let expandedMetricIDs: [String]
 }
 
@@ -26,6 +27,7 @@ struct LayoutInitialState {
     let shouldPersistExpandOnEnable: Bool
     let seededDefaultsToPersist: Set<String>?
     let seededAccountPinsToPersist: Set<String>?
+    let seededDefaultPinsToPersist: Set<String>?
 }
 
 /// Loads a layout for a fresh install or an existing user. This keeps startup/default-upgrade policy in
@@ -68,6 +70,14 @@ enum LayoutBootstrap {
             persistence: persistence
         )
         pinnedMetricIDs = accountPinMigration.pinnedMetricIDs
+        let defaultPinSeed = seedNewDefaultPins(
+            pinnedMetricIDs: pinnedMetricIDs,
+            persistence: persistence,
+            hasStoredLayout: hasStoredLayout,
+            registry: registry,
+            defaults: defaults
+        )
+        pinnedMetricIDs = defaultPinSeed.pinnedMetricIDs
 
         // Expanded membership is a fresh-install default only. Existing layouts that predate the feature
         // keep every familiar metric above the caret unless the user later moves one.
@@ -128,14 +138,55 @@ enum LayoutBootstrap {
             defaultExpandedOnEnableIDs: defaultExpandedOnEnableIDs,
             menuBarStyle: persistence.loadMenuBarStyle(),
             shouldPersistPlaced: seededResult.shouldPersistPlaced,
-            shouldPersistPins: accountPinMigration.shouldPersistPins,
+            shouldPersistPins: accountPinMigration.shouldPersistPins || defaultPinSeed.shouldPersistPins,
             shouldPersistExpanded: shouldPersistExpanded,
             shouldPersistExpandOnEnable: savedOnEnable == nil || !promotedQueuedIDs.isEmpty,
             seededDefaultsToPersist: seededResult.shouldPersistSeededDefaults
                 ? seededResult.seededDefaults
                 : nil,
-            seededAccountPinsToPersist: accountPinMigration.seededAccountPinsToPersist
+            seededAccountPinsToPersist: accountPinMigration.seededAccountPinsToPersist,
+            seededDefaultPinsToPersist: defaultPinSeed.seededDefaultPinsToPersist
         )
+    }
+
+    /// Ship a newly added default menu-bar pin to existing layouts once. A fresh install already pins
+    /// the defaults (`loadPins() ?? defaults.pinnedMetricIDs`); an existing user's saved pins predate
+    /// the new metric, so it joins them exactly one time and the marker records it — an explicit
+    /// unpin is then an ordinary user choice and is never re-seeded.
+    private static func seedNewDefaultPins(
+        pinnedMetricIDs: Set<String>,
+        persistence: LayoutPersistence,
+        hasStoredLayout: Bool,
+        registry: WidgetRegistry,
+        defaults: LayoutDefaultSet
+    ) -> DefaultPinSeedResult {
+        let loaded = persistence.loadSeededDefaultPins()
+        // Without a marker the user predates pin seeding entirely: every baseline pin was already
+        // offered (a fresh install pinned it, an existing install saved or unpinned it), so the
+        // marker starts there and only later default additions are seeded.
+        var seeded = Set((loaded ?? defaults.migrationBaselinePinnedMetricIDs)
+            .filter { registry.descriptor(id: $0) != nil })
+        var shouldPersistSeeded = loaded == nil
+        var nextPins = pinnedMetricIDs
+        var addedPin = false
+        for id in defaults.pinnedMetricIDs where registry.descriptor(id: id) != nil {
+            guard seeded.insert(id).inserted else { continue }
+            shouldPersistSeeded = true
+            if hasStoredLayout, nextPins.insert(id).inserted {
+                addedPin = true
+            }
+        }
+        return DefaultPinSeedResult(
+            pinnedMetricIDs: nextPins,
+            shouldPersistPins: addedPin,
+            seededDefaultPinsToPersist: shouldPersistSeeded ? seeded : nil
+        )
+    }
+
+    private struct DefaultPinSeedResult {
+        let pinnedMetricIDs: Set<String>
+        let shouldPersistPins: Bool
+        let seededDefaultPinsToPersist: Set<String>?
     }
 
     private struct AccountPinMigrationResult {

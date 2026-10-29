@@ -1,7 +1,7 @@
 import XCTest
 @testable import QuotaBar
 
-/// Covers the launch-time account guard on the snapshot cache (v9): when a claude/codex card's
+/// Covers the launch-time account guard on the snapshot cache (v9): when an account-aware card's
 /// CURRENT account identity is known, a cached entry only paints if the account that produced it
 /// (`producedByIdentityKey` stamp) matches. After an account swap at the same home the card id still
 /// matches, so without the stamp check the previous account's limits/plan would show under the new
@@ -61,6 +61,172 @@ final class WidgetDataStoreAccountCacheTests: XCTestCase {
         )
         XCTAssertNil(store.snapshots["claude"], "swapped account's cached snapshot must not paint")
         XCTAssertNotNil(store.snapshots["codex"], "unswapped card must keep its cache")
+    }
+
+    /// OpenCode's Go caps belong to its credential inventory, while its local spend history belongs
+    /// to this machine. Rotating the only Go key must clear the account quota but keep local history.
+    func testOpenCodeCredentialMismatchClearsQuotaAndRetainsHistory() {
+        let defaults = makeUserDefaults("opencode-mismatch")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now })
+        var previous = snapshot("opencode", used: 70)
+        previous.plan = "Go"
+        previous.usageHistory = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: "2026-10-14", totalTokens: 500, costUSD: 5)
+        ]))
+        cache.store(previous, producedByIdentityKey: "opencode-key-K1")
+
+        let changedAccount = makeStore(
+            providers: [provider("opencode")],
+            cache: cache,
+            defaults: defaults,
+            identityKeys: ["opencode": "opencode-key-K2"]
+        )
+        let reloaded = changedAccount.snapshots["opencode"]
+        XCTAssertNotNil(reloaded, "OpenCode history remains available while the replacement key refreshes")
+        XCTAssertNil(reloaded?.plan)
+        XCTAssertNil(reloaded?.line(label: "Session"))
+        XCTAssertEqual(reloaded?.usageHistory?.series.daily.first?.totalTokens, 500)
+
+        let unknownInventory = makeStore(
+            providers: [provider("opencode")],
+            cache: cache,
+            defaults: defaults,
+            identityKeys: ["opencode": OpenCodeGoAccountInventory.incompleteCacheIdentityKey]
+        )
+        XCTAssertNil(unknownInventory.snapshots["opencode"]?.plan)
+        XCTAssertNil(unknownInventory.snapshots["opencode"]?.line(label: "Session"))
+        XCTAssertEqual(unknownInventory.snapshots["opencode"]?.usageHistory?.series.daily.first?.totalTokens, 500)
+
+        let sameAccount = makeStore(
+            providers: [provider("opencode")],
+            cache: cache,
+            defaults: defaults,
+            identityKeys: ["opencode": "opencode-key-K1"]
+        )
+        XCTAssertEqual(sameAccount.snapshots["opencode"]?.plan, "Go")
+        XCTAssertNotNil(sameAccount.snapshots["opencode"]?.line(label: "Session"))
+    }
+
+    func testAntigravityCredentialMismatchClearsQuotaAndRetainsMachineHistory() {
+        let defaults = makeUserDefaults("antigravity-mismatch")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now })
+        var previous = snapshot("antigravity", used: 70)
+        previous.plan = "Old Plan"
+        previous.warning = "Old quota warning"
+        previous.historyWarning = "Machine history is partial"
+        previous.usageHistory = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: "2026-10-14", totalTokens: 500, costUSD: 5)
+        ]))
+        cache.store(previous, producedByIdentityKey: "antigravity-account-old")
+
+        let store = makeStore(
+            providers: [provider("antigravity")],
+            cache: cache,
+            defaults: defaults,
+            identityKeys: ["antigravity": "antigravity-account-new"]
+        )
+
+        let reloaded = store.snapshots["antigravity"]
+        XCTAssertNotNil(reloaded)
+        XCTAssertNil(reloaded?.plan)
+        XCTAssertNil(reloaded?.line(label: "Session"))
+        XCTAssertNil(reloaded?.warning)
+        XCTAssertEqual(reloaded?.historyWarning, "Machine history is partial")
+        XCTAssertEqual(reloaded?.usageHistory?.series.daily.first?.totalTokens, 500)
+        XCTAssertEqual(store.warningMessage(for: "antigravity"), "Machine history is partial")
+    }
+
+    func testExternalRefreshInvalidatesAntigravityLocalHistoryFreshness() {
+        let defaults = makeUserDefaults("antigravity-history-trigger")
+        let now = Date(timeIntervalSince1970: 1_900_000_000)
+        let provider = provider("antigravity")
+        let historyDescriptors = WidgetDescriptor.spendTiles(provider: provider).map {
+            $0.exportingHistory(scope: .machineLocal, estimatedCost: true, sourceNote: "local")
+        }
+        let descriptors = [WidgetDescriptor.percent(id: "antigravity.session", provider: provider, title: "Session")]
+            + historyDescriptors
+        let registry = WidgetRegistry(providers: [provider], descriptors: descriptors)
+        let runtime = SequenceProviderRuntime(provider: provider, descriptors: descriptors, snapshots: [snapshot("antigravity", used: 40)])
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now })
+        var fresh = snapshot("antigravity", used: 40)
+        fresh.refreshedAt = now
+        fresh.quotaRefreshedAt = now
+        fresh.usageHistory = ProviderUsageHistory(series: DailyUsageSeries(daily: []))
+        fresh.historyRefreshedAt = now
+        cache.store(fresh, now: now)
+        let store = WidgetDataStore(
+            registry: registry,
+            providers: [runtime],
+            cache: cache,
+            defaults: defaults,
+            now: { now }
+        )
+
+        XCTAssertNotNil(cache.snapshot(providerID: provider.id))
+        store.invalidateLocalAccountingFreshness()
+        XCTAssertNil(cache.snapshot(providerID: provider.id), "external refresh must force Antigravity's local DB fold")
+    }
+
+    func testOpenCodeLabelReassignmentCannotReuseAnotherAccountCaps() {
+        let defaults = makeUserDefaults("opencode-label-reassignment")
+        let firstKey = OpenCodeGoAccountIdentity(
+            credentialID: "credential-a",
+            descriptorKey: "source-a",
+            displayName: "Work"
+        )
+        let secondKey = OpenCodeGoAccountIdentity(
+            credentialID: "credential-b",
+            descriptorKey: "source-b",
+            displayName: "Personal"
+        )
+        let originalInventory = OpenCodeGoAccountInventory(
+            accountIdentities: [firstKey, secondKey],
+            isComplete: true
+        )
+        let reassignedInventory = OpenCodeGoAccountInventory(
+            accountIdentities: [
+                OpenCodeGoAccountIdentity(
+                    credentialID: "credential-a",
+                    descriptorKey: "source-a",
+                    displayName: "Personal"
+                ),
+                OpenCodeGoAccountIdentity(
+                    credentialID: "credential-b",
+                    descriptorKey: "source-b",
+                    displayName: "Work"
+                )
+            ],
+            isComplete: true
+        )
+        XCTAssertEqual(originalInventory.credentialIDs, reassignedInventory.credentialIDs)
+        XCTAssertNotEqual(originalInventory.cacheIdentityKey, reassignedInventory.cacheIdentityKey)
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { now })
+        var previous = snapshot("opencode", used: 35)
+        previous.plan = "Go"
+        previous.lines = [
+            .progress(label: "Session (Work)", used: 35, limit: 100, format: .percent),
+            .progress(label: "Session (Personal)", used: 65, limit: 100, format: .percent)
+        ]
+        previous.usageHistory = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: "2026-10-14", totalTokens: 500, costUSD: 5)
+        ]))
+        cache.store(previous, producedByIdentityKey: originalInventory.cacheIdentityKey)
+
+        let store = makeStore(
+            providers: [provider("opencode")],
+            cache: cache,
+            defaults: defaults,
+            identityKeys: ["opencode": reassignedInventory.cacheIdentityKey]
+        )
+
+        XCTAssertNil(store.snapshots["opencode"]?.plan)
+        XCTAssertNil(store.snapshots["opencode"]?.line(label: "Session (Work)"))
+        XCTAssertNil(store.snapshots["opencode"]?.line(label: "Session (Personal)"))
+        XCTAssertEqual(store.snapshots["opencode"]?.usageHistory?.series.daily.first?.totalTokens, 500)
     }
 
     /// An unstamped entry on an account-aware card whose current identity IS known was written while

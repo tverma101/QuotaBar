@@ -280,9 +280,7 @@ final class IncrementalJSONLScannerTests: XCTestCase {
         let now = Date()
         let files = try (0..<6).map { index in
             let url = directory.appendingPathComponent(String(format: "%02d.jsonl", index))
-            let data = Data("\(index)".utf8)
-            try data.write(to: url)
-            return JSONLScanning.DiscoveredFile(path: url.path, size: data.count, mtime: now)
+            return try makeFile(named: url.lastPathComponent, contents: "\(index)", in: directory, mtime: now)
         }
         let probe = ConcurrencyProbe()
         let scanner = IncrementalJSONLScanner<Int>(maxConcurrentParses: 3)
@@ -346,7 +344,7 @@ final class IncrementalJSONLScannerTests: XCTestCase {
 
         let path = directory.appendingPathComponent("unreadable.jsonl")
         try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
-        let file = JSONLScanning.DiscoveredFile(path: path.path, size: 0, mtime: Date())
+        let file = try discovered(path)
         let warnings = WarningRecorder()
         let scanner = IncrementalJSONLScanner<Int>(readFailureWarning: warnings.record)
         let parse: @Sendable (Data) -> [Int]? = { data in
@@ -358,22 +356,18 @@ final class IncrementalJSONLScannerTests: XCTestCase {
         XCTAssertEqual(warnings.counts, [1])
 
         try FileManager.default.removeItem(at: path)
-        try Data("7".utf8).write(to: path)
-        let recoveredFile = JSONLScanning.DiscoveredFile(
-            path: path.path,
-            size: 1,
-            mtime: file.mtime.addingTimeInterval(1)
+        let recoveredFile = try makeFile(
+            named: path.lastPathComponent,
+            contents: "7",
+            in: directory,
+            mtime: Date()
         )
         let recovered = await scanner.items(from: [recoveredFile], since: .distantPast, parse: parse)
         XCTAssertEqual(recovered, [7])
 
         try FileManager.default.removeItem(at: path)
         try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
-        let failedAgainFile = JSONLScanning.DiscoveredFile(
-            path: path.path,
-            size: 0,
-            mtime: file.mtime.addingTimeInterval(2)
-        )
+        let failedAgainFile = try discovered(path)
         _ = await scanner.items(from: [failedAgainFile], since: .distantPast, parse: parse)
         XCTAssertEqual(warnings.counts, [1, 1])
     }
@@ -539,6 +533,19 @@ final class IncrementalJSONLScannerTests: XCTestCase {
             path: url.path,
             size: try XCTUnwrap(values.fileSize),
             mtime: try XCTUnwrap(values.contentModificationDate),
+            attributeMtime: values.attributeModificationDate
+        )
+    }
+
+    private func discovered(_ url: URL) throws -> JSONLScanning.DiscoveredFile {
+        let values = try url.resourceValues(forKeys: [
+            .fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey,
+        ])
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return JSONLScanning.DiscoveredFile(
+            path: url.path,
+            size: values.fileSize ?? (attributes[.size] as? Int ?? 0),
+            mtime: values.contentModificationDate ?? (attributes[.modificationDate] as? Date ?? .distantPast),
             attributeMtime: values.attributeModificationDate
         )
     }

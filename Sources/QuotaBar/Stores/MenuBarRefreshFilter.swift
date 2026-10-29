@@ -9,15 +9,28 @@ enum MenuBarRefreshFilter {
     /// Returns the subset of `enabledProviderIDs` that a menu-bar pass should refresh, preserving
     /// the incoming order. An empty result means the pass can no-op (empty pin strip and nothing
     /// notification-relevant).
+    ///
+    /// `hiddenProviderIDs` are providers the user removed from the strip ("Show in menu bar" off).
+    /// The strip cannot paint them, so a closed-panel pass has nothing to update on their behalf: a
+    /// pin they still carry is invisible, and refreshing them every tick burned network, CPU, and
+    /// Keychain probes for a value nobody sees. Their metrics come back the moment the provider is
+    /// shown again, because a full pass (panel open) refreshes every enabled provider.
     static func providerIDs(
         enabledProviderIDs: [String],
         pinnedMetricIDs: Set<String>,
         providerIDForMetric: (String) -> String?,
         notificationRelevantProviderIDs: Set<String>,
-        notificationsEnabled: Bool
+        notificationsEnabled: Bool,
+        hiddenProviderIDs: Set<String> = []
     ) -> [String] {
-        var needed = Set(pinnedMetricIDs.compactMap(providerIDForMetric))
+        var needed = Set(
+            pinnedMetricIDs
+                .compactMap(providerIDForMetric)
+                .filter { !hiddenProviderIDs.contains($0) }
+        )
         if notificationsEnabled {
+            // Notifications read the layout, not the strip, so a hidden provider still needs fresh
+            // meters to alert on.
             needed.formUnion(notificationRelevantProviderIDs)
         }
         guard !needed.isEmpty else { return [] }
@@ -51,5 +64,28 @@ enum MenuBarRefreshFilter {
         let head = providerIDs.filter { priority.contains($0) }
         let tail = providerIDs.filter { !priority.contains($0) }
         return head + tail
+    }
+
+    /// Decides whether a ledger append can produce any visible change while the panel is closed.
+    ///
+    /// When the panel is closed, only pinned metrics are visible to the user. Quota meters
+    /// (Session, Weekly, Spark) are API-driven, so ledger appends do not affect them.
+    /// Only pinned spend tiles (Codex unbounded/usagePeriod metrics) or OpenCode metrics
+    /// (which can fold router events) require a ledger-driven fold while closed.
+    static func closedPanelLedgerWakeAffectsVisibleMetrics(
+        pinnedMetricIDs: Set<String>,
+        descriptorForMetric: (String) -> WidgetDescriptor?
+    ) -> Bool {
+        for id in pinnedMetricIDs {
+            guard let descriptor = descriptorForMetric(id) else { continue }
+            let family = ProviderAccountID.family(of: descriptor.providerID)
+            if family == "opencode" {
+                return true
+            }
+            if family == "codex" && (!descriptor.sample.isBounded || descriptor.sample.isUsagePeriod) {
+                return true
+            }
+        }
+        return false
     }
 }

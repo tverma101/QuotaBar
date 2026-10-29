@@ -47,6 +47,12 @@ private final class MenuBarStatusItem {
 /// window and a real show/hide pair the global shortcut can call directly.
 @MainActor
 final class StatusItemController: NSObject {
+    struct ReplacementPresentationState {
+        var wasVisible: Bool
+        var screen: PopoverScreen
+        var customizeProviderID: String?
+    }
+
     private let container: AppContainer
     private let statusItems: [MenuBarStatusItem]
     private let panel: MenuBarPanel
@@ -64,9 +70,7 @@ final class StatusItemController: NSObject {
     private let backdrop = PopoverBackdropView(cornerRadius: StatusItemController.cornerRadius)
     /// Token for the appearance-change observer; held to follow the documented removal pattern.
     private var appearanceObserver: NSObjectProtocol?
-    /// The refresh fired by the most recent popover open, so a close can cancel it and a reopen can
-    /// supersede it instead of leaving a trail of un-cancellable batches.
-    private var popoverRefreshTask: Task<Void, Never>?
+    private var diagnosticControl: DiagnosticDashboardController?
     /// Corner radius of the panel surface; tuned to read like a system menu-bar popover.
     private static let cornerRadius: CGFloat = 13
 
@@ -136,6 +140,14 @@ final class StatusItemController: NSObject {
         }
 
         heightController.installBridge()
+        diagnosticControl = DiagnosticDashboardController(
+            dataStore: container.dataStore,
+            show: { [weak self] in
+                self?.container.layout.presentWithoutSlide(.dashboard)
+                self?.showPopover()
+            },
+            close: { [weak self] in self?.hidePanel() }
+        )
 
         AppLog.info(
             .statusItem,
@@ -146,6 +158,23 @@ final class StatusItemController: NSObject {
     /// There is exactly one QuotaBar status item. Provider/account multiplicity belongs inside the
     /// aggregate strip and dashboard, not in the macOS status-bar item graph.
     static func statusItemScopes() -> [String?] { [nil] }
+
+    func replacementPresentationState() -> ReplacementPresentationState {
+        ReplacementPresentationState(
+            wasVisible: panel.isVisible,
+            screen: container.layout.screen,
+            customizeProviderID: container.layout.customizeProviderID
+        )
+    }
+
+    func restorePresentation(_ state: ReplacementPresentationState) {
+        guard state.wasVisible else { return }
+        container.layout.presentWithoutSlide(state.screen)
+        if state.screen == .customize {
+            container.layout.customizeProviderID = state.customizeProviderID
+        }
+        showPopover()
+    }
 
     /// Tears down the current status-item graph before AppContainer is rebuilt after a newly added
     /// Codex account. Explicit cleanup prevents a transient duplicate menu-bar item and leaves no
@@ -159,6 +188,8 @@ final class StatusItemController: NSObject {
         }
         appearanceObserver.map(NotificationCenter.default.removeObserver)
         appearanceObserver = nil
+        diagnosticControl?.stop()
+        diagnosticControl = nil
         // The account-registration reload creates a new controller in the same process. Remove the
         // old callback before the replacement registers, otherwise one shortcut press toggles twice.
         KeyboardShortcuts.removeHandler(for: .togglePopover)
@@ -395,29 +426,35 @@ final class StatusItemController: NSObject {
         // the fixed opening guess, making large and small displays open at the same height.
         heightController.prepareForOpening(below: buttonRectOnScreen)
 
-        // Rebuild the dashboard tree only while visible. A closed panel keeps EmptyView so Observation
-        // objects cannot accumulate off-screen for hours. Attach the host *before* flipping
-        // `popoverShown` so DashboardView's onChange/onAppear observers are subscribed when the
-        // visibility signal rises (otherwise a same-runloop flip is missed and height/egg seeding
-        // depends only on later geometry).
-        hostingController.rootView = makeDashboardRootView()
-
-        // Mark the popover on-screen after the dashboard mounts, so the egg's animation loops and the
-        // height re-seed path see the rising edge. Read by the SwiftUI egg via `\.popoverIsVisible`;
-        // a closed popover keeps the loops unmounted, so a left-on egg costs no CPU.
+        // Mark the popover on-screen BEFORE mounting the dashboard: the first render then mounts
+        // the live `\.popoverIsVisible` branches (egg `TimelineView` clocks, footer countdown)
+        // directly, instead of mounting the static branch and structurally swapping every gated
+        // view one render later — a second full-tree pass on every tap. The old attach-before-flip
+        // order relied on `onChange` catching a same-runloop rising edge; `DashboardView.onAppear`
+        // covers that same edge (it seeds height and adopts slide state when it mounts with
+        // `popoverShown` already true).
         container.transparency.setPopoverShown(true)
 
-        // Opening the panel: pull full token/spend/history immediately so the user never waits
-        // up to the background interval (or a menuBar-only pass) to see spend rows.
+        // Rebuild the dashboard tree only while visible. A closed panel keeps EmptyView so Observation
+        // objects cannot accumulate off-screen for hours.
+        hostingController.rootView = makeDashboardRootView()
+
+        // Presentation is deliberately snapshot-only. Opening used to force a full, uncached
+        // provider batch, so every menu-bar tap fanned out across all provider accounting and
+        // could drive the app across a core while SwiftUI was still mounting the dashboard.
+        // `AppContainer`'s periodic loop owns freshness (launch, enablement/ledger wakes, and the
+        // five-minute cadence); the footer's Refresh Now action remains the explicit full refresh.
         //
-        // Held so `hidePanel` can cancel it. It was previously fire-and-forget, so a user opening and
-        // closing the panel repeatedly left one un-cancellable batch per open behind — the tasks the
-        // per-provider forced-wait path then piled onto. Reopening supersedes the previous open anyway.
-        popoverRefreshTask?.cancel()
-        popoverRefreshTask = Task {
-            await ProviderRefreshContext.$scope.withValue(.full) {
-                await container.dataStore.refreshAll(force: true)
-            }
+        // The policy is consulted rather than assumed: if a future edit makes a tap able to request
+        // a forced refresh, this fails loudly instead of silently reintroducing the spike.
+        switch PopoverRefreshPolicy.decision(for: .panelPresentation) {
+        case .presentSnapshot:
+            break
+        case .forceFullRefresh:
+            AppLog.error(
+                .statusItem,
+                "Panel presentation resolved to a forced refresh; PopoverRefreshPolicy was changed without updating the open path"
+            )
         }
 
         // Lay the content out first so the panel opens at the right size (no first-frame flash).
@@ -442,10 +479,6 @@ final class StatusItemController: NSObject {
     }
 
     private func hidePanel() {
-        // Stop the open's refresh: nobody is looking at the result any more, and leaving it running
-        // meant every open/close cycle added another un-cancellable batch.
-        popoverRefreshTask?.cancel()
-        popoverRefreshTask = nil
         // Dismiss hover surfaces before tearing the dashboard host down to EmptyView — a tooltip the
         // cursor was resting on otherwise gets no hover-exit and can orphan on screen. Same for the
         // Usage Trend AppKit hover popover.

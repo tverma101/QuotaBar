@@ -55,6 +55,32 @@ final class CodexResetClaimTests: XCTestCase {
         return (service, http)
     }
 
+    private func makeProductionService(
+        authStore: CodexAuthStore,
+        expectedAccessToken: String?
+    ) -> (CodexResetClaimService, RoutingHTTPClient) {
+        let http = RoutingHTTPClient { request in
+            if let expectedAccessToken {
+                XCTAssertEqual(request.headers["Authorization"], "Bearer \(expectedAccessToken)")
+            }
+            switch request.url {
+            case CodexUsageClient.resetCreditsURL:
+                return HTTPResponse(statusCode: 200, headers: [:], body: Self.listBody())
+            case CodexUsageClient.consumeResetCreditURL:
+                return HTTPResponse(statusCode: 200, headers: [:], body: Self.consumeBody(code: "reset"))
+            default:
+                XCTFail("unexpected request: \(request.url)")
+                return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+            }
+        }
+        let service = CodexResetClaimService(
+            authStore: authStore,
+            usageClient: CodexUsageClient(http: http),
+            refreshAfterClaim: {}
+        )
+        return (service, http)
+    }
+
     // MARK: - Consume request shape
 
     func testConsumeRequestShape() async throws {
@@ -166,6 +192,41 @@ final class CodexResetClaimTests: XCTestCase {
         XCTAssertEqual(refreshes.count, 1, "the raced-away credit triggers a refresh to reconcile the timeline")
     }
 
+    func testCancellationDuringLateSuccessfulCreditListPreventsConsumePost() async {
+        let gate = ClaimListResponseGate()
+        let refreshes = RefreshCounter()
+        let http = RoutingHTTPClient { request in
+            switch request.url {
+            case CodexUsageClient.resetCreditsURL:
+                await gate.pause()
+                return HTTPResponse(statusCode: 200, headers: [:], body: Self.listBody())
+            case CodexUsageClient.consumeResetCreditURL:
+                XCTFail("a canceled list response must not start the consume POST")
+                return HTTPResponse(statusCode: 200, headers: [:], body: Self.consumeBody(code: "reset"))
+            default:
+                XCTFail("unexpected request: \(request.url)")
+                return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+            }
+        }
+        let service = CodexResetClaimService(
+            usageClient: CodexUsageClient(http: http),
+            credentialCandidates: { [("token", "account")] },
+            refreshAfterClaim: { refreshes.count += 1 }
+        )
+        let claim = Task {
+            await service.claim(creditExpiringAt: Self.expiry, redeemRequestID: "cancel-during-list")
+        }
+
+        await gate.waitUntilPaused()
+        claim.cancel()
+        await gate.open()
+
+        let outcome = await claim.value
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(http.requests.map(\.url), [CodexUsageClient.resetCreditsURL])
+        XCTAssertEqual(refreshes.count, 0)
+    }
+
     func testClaimFailuresNeverRefreshAndNeverThrow() async {
         let refreshes = RefreshCounter()
 
@@ -194,6 +255,86 @@ final class CodexResetClaimTests: XCTestCase {
         XCTAssertEqual(credentialOutcome, .failed)
 
         XCTAssertEqual(refreshes.count, 0, "failures leave the snapshot alone")
+    }
+
+    func testProductionClaimUsesManualKeychainPromptForCredentialLoad() async {
+        let home = "/tmp/reset-claim-\(UUID().uuidString)"
+        let keychain = ResetClaimTestKeychain(
+            value: #"{"tokens":{"access_token":"keychain-token"}}"#
+        )
+        let authStore = CodexAuthStore(
+            environment: FakeEnvironment(["CODEX_HOME": home]),
+            files: FakeFiles(),
+            keychain: keychain
+        )
+        let (service, http) = makeProductionService(authStore: authStore, expectedAccessToken: "keychain-token")
+
+        let outcome = await withManualRefresh {
+            await service.claim(creditExpiringAt: Self.expiry, redeemRequestID: "manual-keychain")
+        }
+
+        XCTAssertEqual(outcome, .success)
+        XCTAssertEqual(keychain.interactionFlags, [false, true], "one manual claim may raise one Keychain prompt")
+        XCTAssertEqual(http.requests.map(\.url), [CodexUsageClient.resetCreditsURL, CodexUsageClient.consumeResetCreditURL])
+    }
+
+    func testKeychainAccessFailureWithoutUsableFileHasCredentialAccessOutcome() async {
+        let home = "/tmp/reset-claim-\(UUID().uuidString)"
+        let keychain = ResetClaimTestKeychain(value: nil, refusesInteractiveRead: true)
+        let authStore = CodexAuthStore(
+            environment: FakeEnvironment(["CODEX_HOME": home]),
+            files: FakeFiles(),
+            keychain: keychain
+        )
+        let (service, http) = makeProductionService(authStore: authStore, expectedAccessToken: nil)
+
+        let outcome = await withManualRefresh {
+            await service.claim(creditExpiringAt: Self.expiry, redeemRequestID: "denied-keychain")
+        }
+
+        XCTAssertEqual(outcome, .credentialAccess)
+        XCTAssertEqual(keychain.interactionFlags, [false, true], "the explicit action attempts Keychain once")
+        XCTAssertTrue(http.requests.isEmpty, "credential access failure must stop before any claim request")
+    }
+
+    func testCancelledKeychainReadDoesNotBecomeCredentialAccessFailure() async {
+        let home = "/tmp/reset-claim-\(UUID().uuidString)"
+        let keychain = ResetClaimTestKeychain(value: nil, cancelsRead: true)
+        let authStore = CodexAuthStore(
+            environment: FakeEnvironment(["CODEX_HOME": home]),
+            files: FakeFiles(),
+            keychain: keychain
+        )
+        let (service, http) = makeProductionService(authStore: authStore, expectedAccessToken: nil)
+
+        let outcome = await withManualRefresh {
+            await service.claim(creditExpiringAt: Self.expiry, redeemRequestID: "cancelled-keychain")
+        }
+
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(keychain.interactionFlags, [false], "cancellation must not trigger an interactive retry")
+        XCTAssertTrue(http.requests.isEmpty, "a cancelled credential load must stop before claim requests")
+    }
+
+    func testReadableFileCredentialStillClaimsWhenKeychainAccessFails() async {
+        let home = "/tmp/reset-claim-\(UUID().uuidString)"
+        let keychain = ResetClaimTestKeychain(value: nil, refusesInteractiveRead: true)
+        let authStore = CodexAuthStore(
+            environment: FakeEnvironment(["CODEX_HOME": home]),
+            files: FakeFiles([
+                "\(home)/auth.json": #"{"tokens":{"access_token":"file-token"}}"#
+            ]),
+            keychain: keychain
+        )
+        let (service, http) = makeProductionService(authStore: authStore, expectedAccessToken: "file-token")
+
+        let outcome = await withManualRefresh {
+            await service.claim(creditExpiringAt: Self.expiry, redeemRequestID: "file-fallback")
+        }
+
+        XCTAssertEqual(outcome, .success, "a readable file candidate remains available if Keychain fails")
+        XCTAssertEqual(keychain.interactionFlags, [])
+        XCTAssertEqual(http.requests.count, 2)
     }
 
     func testClaimNothingToResetKeepsCreditAndRefreshes() async {
@@ -323,5 +464,93 @@ final class CodexResetClaimTests: XCTestCase {
 
         XCTAssertEqual(outcome, .failed)
         XCTAssertEqual(http.requests.count, 2, "every candidate is tried once, then the claim fails loudly")
+    }
+}
+
+private final class ResetClaimTestKeychain: KeychainAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private let value: String?
+    private let requiresInteraction: Bool
+    private let refusesInteractiveRead: Bool
+    private let cancelsRead: Bool
+    private var recordedInteractionFlags: [Bool] = []
+
+    var interactionFlags: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedInteractionFlags
+    }
+
+    init(
+        value: String?,
+        requiresInteraction: Bool = true,
+        refusesInteractiveRead: Bool = false,
+        cancelsRead: Bool = false
+    ) {
+        self.value = value
+        self.requiresInteraction = requiresInteraction
+        self.refusesInteractiveRead = refusesInteractiveRead
+        self.cancelsRead = cancelsRead
+    }
+
+    private func read(allowInteraction: Bool) throws -> String? {
+        lock.lock()
+        recordedInteractionFlags.append(allowInteraction)
+        lock.unlock()
+        if cancelsRead {
+            throw CancellationError()
+        }
+        guard allowInteraction || !requiresInteraction else {
+            throw KeychainError.interactionNotAllowed
+        }
+        if allowInteraction && refusesInteractiveRead {
+            throw KeychainError.interactionNotAllowed
+        }
+        return value
+    }
+
+    func readGenericPassword(service: String) throws -> String? {
+        try read(allowInteraction: true)
+    }
+
+    func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? {
+        try read(allowInteraction: allowInteraction)
+    }
+
+    func readGenericPassword(service: String, account: String) throws -> String? {
+        try read(allowInteraction: true)
+    }
+
+    func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? {
+        try read(allowInteraction: allowInteraction)
+    }
+
+    func writeGenericPassword(service: String, value: String) throws {}
+    func writeGenericPassword(service: String, account: String, value: String) throws {}
+}
+
+private actor ClaimListResponseGate {
+    private var paused = false
+    private var released = false
+    private var pauseContinuation: CheckedContinuation<Void, Never>?
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        paused = true
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        guard !released else { return }
+        await withCheckedContinuation { pauseContinuation = $0 }
+    }
+
+    func waitUntilPaused() async {
+        guard !paused else { return }
+        await withCheckedContinuation { enteredContinuation = $0 }
+    }
+
+    func open() {
+        released = true
+        pauseContinuation?.resume()
+        pauseContinuation = nil
     }
 }

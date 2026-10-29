@@ -358,7 +358,7 @@ struct SettingsScreen: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Text("Adds a global `openusage` command agents can use to monitor limits.")
+            Text("Adds a global `quotabar` command agents can use to monitor limits.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
@@ -426,7 +426,7 @@ struct SettingsScreen: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Restores every setting and customization to its default and turns providers back on for the tools you have installed. If iCloud sync is on, it turns off and this Mac's synced history is removed. This cannot be undone.")
+                Text("Restores settings and customization to their defaults, including Claude, Codex, Cursor, Freebuff, and registered Codex accounts. Other providers turn off. If iCloud sync is on, it turns off and this Mac's synced history is removed. This cannot be undone.")
             }
         }
     }

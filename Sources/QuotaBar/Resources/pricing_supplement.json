@@ -1,5 +1,5 @@
 {
-  "$comment": "OpenUsage pricing supplement. Prices Cursor-native models that no public catalog carries, supplies fast-variant multipliers the catalogs omit, and maps provider log/CSV model slugs to canonical pricing keys (LiteLLM keys, models.dev ids, or entries in this file). Cursor Router rows name the routed model in prose instead of a slug ('Opus 5 (Auto Balanced)'), so those labels get alias rules too. Published to gh-pages by .github/workflows/pricing-supplement.yml on every change, so installed apps pick edits up within about an hour - no release needed. Rates are USD per million tokens. Sources: https://cursor.com/docs/models-and-pricing.md for Cursor-native entries; https://developers.openai.com/api/docs/models/daybreak-blue-latest and https://developers.openai.com/api/docs/pricing for Daybreak aliases and rates.",
+  "$comment": "Pricing supplement. Prices models whose public catalogs need verified overrides, supplies fast-variant multipliers the catalogs omit, and maps provider log/CSV model slugs to canonical pricing keys (LiteLLM keys, models.dev ids, or entries in this file). Cursor Router rows name the routed model in prose instead of a slug ('Opus 5 (Auto Balanced)'), so those labels get alias rules too. Published to gh-pages by .github/workflows/pricing-supplement.yml on every change, so installed apps pick edits up within about an hour - no release needed. Rates are USD per million tokens. Sources: https://cursor.com/docs/models-and-pricing.md; https://www.anthropic.com/claude-haiku-5-5; https://dev.meta.ai/docs/pricing-rate-limits; https://developers.openai.com/api/docs/models/daybreak-blue-latest and https://developers.openai.com/api/docs/pricing.",
   "alias_rules": [
     {
       "pattern": "^gpt-reserve$",
@@ -50,6 +50,54 @@
       "pattern": "^github_bugbot$"
     },
     {
+      "canonical": "grok-4.7-500k-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]7-500k-fast(?:-(?:low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.7-500k-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]7-500k-(?:low|medium|high|xhigh)-fast$"
+    },
+    {
+      "canonical": "grok-4.7-500k",
+      "pattern": "^(?:cursor-)?grok-4[.-]7-500k(?:-(?:build|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "claude-fable-5-1",
+      "pattern": "^claude-fable-5[.-]1(?:-thinking)?$"
+    },
+    {
+      "canonical": "claude-haiku-5-5",
+      "pattern": "^(?:claude-haiku-5[.-]5|claude-5[.-]5-haiku)(?:-(?:low|medium|high|xhigh|thinking))?$"
+    },
+    {
+      "canonical": "claude-opus-5-5",
+      "pattern": "^claude-opus-5[.-]5(?:-(?:low|medium|high|xhigh|max|thinking))?$"
+    },
+    {
+      "canonical": "claude-opus-5-5-fast",
+      "pattern": "^claude-opus-5[.-]5(?:-(?:low|medium|high|xhigh|max|thinking))?-fast$"
+    },
+    {
+      "canonical": "claude-sonnet-5-5",
+      "pattern": "^claude-sonnet-5[.-]5(?:-(?:low|medium|high|xhigh|max|thinking))?$"
+    },
+    {
+      "canonical": "gemini-4-argon",
+      "pattern": "^gemini-4-argon(?:-(?:none|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "muse-spark-1.3",
+      "pattern": "^(?:meta/)?muse-spark-1[.-]3$"
+    },
+    {
+      "canonical": "muse-spark-1.3-contributor",
+      "pattern": "^(?:meta/)?muse-spark-1[.-]3-contributor$"
+    },
+    {
+      "canonical": "grok-4.7",
+      "pattern": "^(?:cursor-)?grok-4[.-]7(?:-(?:build|low|medium|high|xhigh))?$"
+    },
+    {
       "canonical": "grok-4.6-fast",
       "pattern": "^(?:cursor-)?grok-4[.-]6-fast(?:-(?:low|medium|high|xhigh))?$"
     },
@@ -62,6 +110,10 @@
       "pattern": "^(?:cursor-)?grok-4[.-]6(?:-(?:build|low|medium|high|xhigh))?$"
     },
     {
+      "canonical": "grok-4.6",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.6 \\(Auto[^)]*\\)$"
+    },
+    {
       "canonical": "grok-4.5-fast",
       "pattern": "^(?:cursor-)?grok-4[.-]5-fast(?:-(?:low|medium|high|xhigh))?$"
     },
@@ -72,6 +124,14 @@
     {
       "canonical": "grok-4.5",
       "pattern": "^(?:cursor-)?grok-4[.-]5(?:-(?:build|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.5",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.5 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "grok-4.5-fast",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.5 Fast \\(Auto[^)]*\\)$"
     },
     {
       "canonical": "kimi-k2.7-code",
@@ -350,6 +410,14 @@
       "pattern": "^glm-5\\.2(?:-(?:high|max))?$"
     },
     {
+      "canonical": "glm-5.3-flash",
+      "pattern": "^glm-5(?:p|[.-])3-flash(?:-(?:low|high|max))?$"
+    },
+    {
+      "canonical": "glm-5.3",
+      "pattern": "^glm-5(?:p|[.-])3(?:-(?:low|high|max))?$"
+    },
+    {
       "canonical": "gpt-5.3-codex",
       "pattern": "^[Pp]remium \\((?:[Gg][Pp][Tt]-5\\.3-[Cc]odex|[Cc]odex 5\\.3)\\)$"
     },
@@ -374,16 +442,48 @@
       "pattern": "(?i)^(?:Cursor )?Grok 4\\.6 Fast \\(Auto[^)]*\\)$"
     },
     {
-      "canonical": "grok-4.6",
-      "pattern": "(?i)^(?:Cursor )?Grok 4\\.6 \\(Auto[^)]*\\)$"
+      "canonical": "grok-4.7-500k-fast",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.7 500k(?: Fast)? \\(Fast\\)(?: \\(Auto[^)]*\\))?$"
     },
     {
-      "canonical": "grok-4.5-fast",
-      "pattern": "(?i)^(?:Cursor )?Grok 4\\.5 Fast \\(Auto[^)]*\\)$"
+      "canonical": "grok-4.7-500k",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.7 500k(?: \\(Auto[^)]*\\))?$"
     },
     {
-      "canonical": "grok-4.5",
-      "pattern": "(?i)^(?:Cursor )?Grok 4\\.5 \\(Auto[^)]*\\)$"
+      "canonical": "grok-4.7",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.7 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "claude-fable-5-1",
+      "pattern": "(?i)^(?:Claude )?Fable 5\\.1(?: \\(Auto[^)]*\\))?$"
+    },
+    {
+      "canonical": "claude-haiku-5-5",
+      "pattern": "(?i)^(?:Claude )?Haiku 5\\.5(?: \\(Auto[^)]*\\))?$"
+    },
+    {
+      "canonical": "claude-opus-5-5",
+      "pattern": "(?i)^(?:Claude )?Opus 5\\.5(?: \\(Auto[^)]*\\))?$"
+    },
+    {
+      "canonical": "claude-opus-5-5-fast",
+      "pattern": "(?i)^(?:Claude )?Opus 5\\.5 Fast \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "claude-sonnet-5-5",
+      "pattern": "(?i)^(?:Claude )?Sonnet 5\\.5(?: \\(Auto[^)]*\\))?$"
+    },
+    {
+      "canonical": "gemini-4-argon",
+      "pattern": "(?i)^Gemini 4 Argon(?: \\(Auto[^)]*\\))?$"
+    },
+    {
+      "canonical": "gemini-3.8-flash",
+      "pattern": "(?i)^Gemini 3\\.8 Flash(?: \\(Auto[^)]*\\))?$"
+    },
+    {
+      "canonical": "muse-spark-1.3",
+      "pattern": "(?i)^Muse Spark 1\\.3(?: \\(Auto[^)]*\\))?$"
     },
     {
       "canonical": "claude-haiku-4-5",
@@ -524,10 +624,105 @@
     {
       "pattern": "^(?:anthropic/)?openai/gpt-5\\.4$",
       "canonical": "gpt-5.4"
+    },
+    {
+      "canonical": "deepseek-v4.1-flash-fast",
+      "pattern": "(?i)^(?:deepseek/)?(?:deepseek[- ]?)?v4(?:\\.1)?[- ]flash[- ]fast(?:[- ]?(?:10/17|1017))?$"
+    },
+    {
+      "canonical": "deepseek-v4.1-flash-1017",
+      "pattern": "(?i)^(?:cursor-|deepseek/)?deepseek[- ]?v4[.-]?1[- ]?flash[- ]?(?:10/17|1017)(?:-(?:minimal|low|medium|high|xhigh|max))?$",
+      "$comment": "Cursor exports one slug per thinking effort for DeepSeek V4.1 Flash 10/17 (`deepseek-v41-flash-1017-high`). Collapse the effort suffix onto the base route so those rows price and group as one model instead of splitting or going unpriced."
+    },
+    {
+      "canonical": "deepseek-v4.1-flash",
+      "pattern": "(?i)^(?:cursor-|deepseek/)?deepseek[- ]?v4[.-]?1[- ]?flash(?:-(?:minimal|low|medium|high|xhigh|max))?$",
+      "$comment": "Effort-suffixed DeepSeek V4.1 Flash slugs without the 10/17 snapshot marker. Ordered after the dated rule above so the dated spelling wins its own identity."
     }
   ],
+  "cursor_alias_rules": [
+    {
+      "canonical": "grok-4.7-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]7-fast(?:-(?:low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.7-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]7(?:-(?:low|medium|high|xhigh))?-fast$"
+    },
+    {
+      "canonical": "grok-4.7",
+      "pattern": "^(?:cursor-)?grok-4[.-]7(?:-(?:build|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.7-fast",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.7 Fast \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "grok-4.7",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.7 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "grok-4.6-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]6-fast(?:-(?:low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.6-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]6-(?:low|medium|high|xhigh)-fast$"
+    },
+    {
+      "canonical": "grok-4.6",
+      "pattern": "^(?:cursor-)?grok-4[.-]6(?:-(?:build|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.6-fast",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.6 Fast \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "grok-4.6",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.6 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "grok-4.5-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]5-fast(?:-(?:low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.5-fast",
+      "pattern": "^(?:cursor-)?grok-4[.-]5-(?:low|medium|high|xhigh)-fast$"
+    },
+    {
+      "canonical": "grok-4.5",
+      "pattern": "^(?:cursor-)?grok-4[.-]5(?:-(?:build|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "grok-4.5-fast",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.5 Fast \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "grok-4.5",
+      "pattern": "(?i)^(?:Cursor )?Grok 4\\.5 \\(Auto[^)]*\\)$"
+    },
+    {
+      "canonical": "gemini-4-argon",
+      "pattern": "^gemini-4-argon(?:-(?:none|low|medium|high|xhigh))?$"
+    },
+    {
+      "canonical": "gemini-4-argon",
+      "pattern": "(?i)^Gemini 4 Argon(?: \\(Auto[^)]*\\))?$"
+    }
+  ],
+  "retired_pricing_keys": [
+    "grok-4.7",
+    "grok-4.7-fast",
+    "gemini-4-argon"
+  ],
+  "retired_alias_patterns": [
+    "^grok-bot-cua$"
+  ],
   "fast_multipliers": {
+    "claude-opus-4-6": 6.0,
+    "claude-opus-4-7": 6.0,
     "claude-opus-5": 2.0,
+    "claude-opus-5-5": 2.0,
     "gpt-5": 2.0,
     "gpt-5.1-codex": 2.0,
     "gpt-5.1-codex-max": 2.0,
@@ -571,6 +766,45 @@
       "cache_write_per_million": 7.5,
       "input_per_million": 6.0,
       "output_per_million": 22.5
+    },
+    "claude-fable-5-1": {
+      "$comment": "Anthropic and Cursor list Fable 5.1 at $10/$50 per million, with its distinct $0.25 cache-read rate. Pin it so models.dev's $1.00 cache-read value cannot win offline.",
+      "cache_read_per_million": 0.25,
+      "cache_write_per_million": 12.5,
+      "input_per_million": 10.0,
+      "output_per_million": 50.0
+    },
+    "claude-haiku-5-5": {
+      "$comment": "Anthropic Haiku 5.5 standard pricing; prompts over 100k tokens use the published 5x tier. Source: https://www.anthropic.com/claude-haiku-5-5.",
+      "cache_read_per_million": 0.01,
+      "cache_write_per_million": 0.125,
+      "cache_write_1h_per_million": 0.2,
+      "input_per_million": 0.1,
+      "output_per_million": 0.5,
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 100000,
+          "input_per_million": 0.5,
+          "output_per_million": 2.5,
+          "cache_write_per_million": 0.625,
+          "cache_read_per_million": 0.05,
+          "cache_write_1h_per_million": 1.0
+        }
+      ]
+    },
+    "claude-opus-5-5": {
+      "$comment": "Anthropic Opus 5.5 pricing: $4/$20 input/output per million with $5 cache writes and $0.20 cache reads. Source: https://www.anthropic.com/claude-opus-5-5.",
+      "cache_read_per_million": 0.2,
+      "cache_write_per_million": 5.0,
+      "input_per_million": 4.0,
+      "output_per_million": 20.0
+    },
+    "claude-sonnet-5-5": {
+      "$comment": "Cursor's current published Sonnet 5.5 rate lists cache reads at $0.10 per million; the original Anthropic announcement listed $0.20 before its October 2026 update. Source: https://cursor.com/docs/models-and-pricing.md.",
+      "cache_read_per_million": 0.1,
+      "cache_write_per_million": 2.5,
+      "input_per_million": 2.0,
+      "output_per_million": 10.0
     },
     "claude-opus-4-7-fast": {
       "$comment": "Cursor bills Opus 4.7 fast mode at these rates; the models.dev entry carries higher (stale) numbers, so this override wins.",
@@ -636,12 +870,32 @@
       "input_per_million": 3.0,
       "output_per_million": 15.0
     },
+    "deepseek-v4.1-flash-1017": {
+      "$comment": "DeepSeek V4.1 Flash 10/17 snapshot. Neither bundled snapshot carries this id, so without a curated entry a Cursor row on this model showed its tokens and no dollars at all until the live OpenRouter catalogue revalidated. Base rates follow OpenRouter's published route (deepseek/deepseek-v4.1-flash-1017): $0.15 input / $0.60 output / $0.003 cache read. OpenRouter also publishes weekday UTC windows that raise weekday rates; Cursor's CSV rows are day-granular aggregates with no per-turn timestamps, so the base rate applies, matching every other Cursor spend row.",
+      "cache_read_per_million": 0.003,
+      "cache_write_per_million": 0.15,
+      "input_per_million": 0.15,
+      "output_per_million": 0.6
+    },
+    "deepseek-v4.1-flash": {
+      "$comment": "DeepSeek V4.1 Flash base route (no snapshot marker). Curated for the same reason as the 10/17 entry: absent from both bundled snapshots, so the canonical an effort-suffixed slug collapses onto would otherwise price at nothing offline. Rates follow OpenRouter's deepseek/deepseek-v4.1-flash route.",
+      "cache_read_per_million": 0.0042,
+      "cache_write_per_million": 0.14,
+      "input_per_million": 0.14,
+      "output_per_million": 0.42
+    },
     "deepseek-v4-flash": {
       "$comment": "DeepSeek V4 Flash official API rates (api-docs.deepseek.com/quick_start/pricing, verified 2026-08-11 vs OpenRouter/Requesty/BenchLM). Pinned here because the LiteLLM snapshot omits the cache-write lane (resolves 0.0); DeepSeek bills cache-creation at the input rate, matching models.dev's 0.14.",
       "cache_read_per_million": 0.0028,
       "cache_write_per_million": 0.14,
       "input_per_million": 0.14,
       "output_per_million": 0.28
+    },
+    "deepseek-v4.1-flash-fast": {
+      "$comment": "Exact public DeepSeek V4.1 Flash Fast route on Vercel AI Gateway (vercel.com/ai-gateway/models/deepseek-v4.1-flash-fast, checked 2026-10-25): $0.60 input, $2.40 output, $0.01 cache read per 1M. Used as a public API estimate for persisted Fast-root tokens only; it is not Freebuff's Pareto bill or Freebucks charge.",
+      "cache_read_per_million": 0.01,
+      "input_per_million": 0.6,
+      "output_per_million": 2.4
     },
     "deepseek-v4-flash-free": {
       "$comment": "Free tier: real $0 model. Pinned because the primary catalog fuzzy-matches 'deepseek-v4-flash-free' onto the paid 'deepseek-v4-flash' entry before the models.dev exact $0 entry is reached.",
@@ -685,6 +939,13 @@
       "input_per_million": 0.75,
       "output_per_million": 3.75
     },
+    "cursor-gemini-4-argon": {
+      "$comment": "Cursor's published Gemini 4 Argon API card ($2 input / $10 output / $0.10 cached input per million); kept separate from Google's public route cache-write rate.",
+      "cache_read_per_million": 0.1,
+      "cache_write_per_million": 2.0,
+      "input_per_million": 2.0,
+      "output_per_million": 10.0
+    },
     "github_bugbot": {
       "cache_read_per_million": 0.5,
       "cache_write_per_million": 5.0,
@@ -692,49 +953,138 @@
       "output_per_million": 30.0
     },
     "gpt-5.6-luna": {
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 272000,
+          "input_per_million": 0.4,
+          "output_per_million": 1.8,
+          "cache_write_per_million": 0.5,
+          "cache_read_per_million": 0.04
+        }
+      ],
       "cache_read_per_million": 0.02,
       "cache_write_per_million": 0.25,
       "input_per_million": 0.2,
       "output_per_million": 1.2
     },
     "gpt-5.6-sol": {
-      "$comment": "OpenAI GPT-5.6 Sol official Standard rates (developers.openai.com/api/docs/pricing).",
+      "$comment": "OpenAI GPT-5.6 Sol official Standard rates; promotional pricing available at least through 2026-11-21. Long context (>272k) uses 2x input/cache and 1.5x output (developers.openai.com/api/docs/models/gpt-5.6-sol).",
       "input_per_million": 4.0,
       "cache_write_per_million": 5.0,
       "cache_read_per_million": 0.4,
-      "output_per_million": 20.0
+      "output_per_million": 20.0,
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 272000,
+          "input_per_million": 8.0,
+          "output_per_million": 30.0,
+          "cache_write_per_million": 10.0,
+          "cache_read_per_million": 0.8
+        }
+      ]
     },
     "gpt-5.6-terra": {
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 272000,
+          "input_per_million": 4.0,
+          "output_per_million": 18.0,
+          "cache_write_per_million": 5.0,
+          "cache_read_per_million": 0.4
+        }
+      ],
       "cache_read_per_million": 0.2,
       "cache_write_per_million": 2.5,
       "input_per_million": 2.0,
       "output_per_million": 12.0
     },
     "grok-4.5": {
-      "$comment": "Cursor + SpaceXAI first-party model. Cache write not published separately; defaults to input.",
-      "cache_read_per_million": 0.5,
+      "$comment": "SpaceXAI Grok 4.5 API list price (docs.x.ai/developers/pricing). Long-context requests at or above 200K use the published xAI tier; Cursor's distinct rate is under cursor-grok-4.5.",
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 200000,
+          "includes_threshold": true,
+          "input_per_million": 4.0,
+          "output_per_million": 12.0,
+          "cache_write_per_million": 4.0,
+          "cache_read_per_million": 0.6
+        }
+      ],
+      "cache_read_per_million": 0.3,
       "cache_write_per_million": 2.0,
       "input_per_million": 2.0,
       "output_per_million": 6.0
     },
     "grok-4.5-fast": {
+      "$comment": "SpaceXAI Grok 4.5 Fast (docs.x.ai/developers/pricing). Fast bills 2x the input and cache lanes and 3x output versus grok-4.5; Cursor's distinct rate is cursor-grok-4.5-fast.",
       "cache_read_per_million": 1.0,
       "cache_write_per_million": 4.0,
       "input_per_million": 4.0,
-      "output_per_million": 12.0
+      "output_per_million": 18.0
     },
     "grok-4.6": {
-      "$comment": "Cursor + SpaceXAI first-party model. Cache write not published separately; defaults to input. Cursor lists a 50% launch discount for one week starting 2026-08-12; rates below are the numbers on the pricing table as of 2026-08-13.",
+      "$comment": "SpaceXAI Grok 4.6 API list price (docs.x.ai/developers/pricing). Long-context requests at or above 200K use the published xAI tier; Cursor's distinct rate is under cursor-grok-4.6.",
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 200000,
+          "includes_threshold": true,
+          "input_per_million": 4.0,
+          "output_per_million": 12.0,
+          "cache_write_per_million": 4.0,
+          "cache_read_per_million": 1.0
+        }
+      ],
       "cache_read_per_million": 0.5,
       "cache_write_per_million": 2.0,
       "input_per_million": 2.0,
       "output_per_million": 6.0
     },
     "grok-4.6-fast": {
+      "$comment": "SpaceXAI Grok 4.6 Fast (docs.x.ai/developers/pricing). Fast bills 2x every lane versus grok-4.6; Cursor's distinct rate is cursor-grok-4.6-fast.",
       "cache_read_per_million": 1.0,
       "cache_write_per_million": 4.0,
       "input_per_million": 4.0,
       "output_per_million": 12.0
+    },
+    "cursor-grok-4.5": {
+      "$comment": "Cursor's Grok 4.5 rates (cursor.com/docs/models-and-pricing). Cached input is $0.50/M, unlike xAI's API rate. Cursor has no long-context tier for this 256k model.",
+      "cache_read_per_million": 0.5,
+      "cache_write_per_million": 2.0,
+      "input_per_million": 2.0,
+      "output_per_million": 6.0
+    },
+    "cursor-grok-4.5-fast": {
+      "$comment": "Cursor Grok 4.5 Fast pricing (cursor.com/docs/models-and-pricing). Cursor's export aggregates requests, so no request-length tier is inferred.",
+      "cache_read_per_million": 1.0,
+      "cache_write_per_million": 4.0,
+      "input_per_million": 4.0,
+      "output_per_million": 18.0
+    },
+    "cursor-grok-4.6": {
+      "$comment": "Cursor's Grok 4.6 rates (cursor.com/docs/models-and-pricing); Cursor's supported context is 256k with no long-context tier.",
+      "cache_read_per_million": 0.5,
+      "cache_write_per_million": 2.0,
+      "input_per_million": 2.0,
+      "output_per_million": 6.0
+    },
+    "cursor-grok-4.6-fast": {
+      "$comment": "Cursor Grok 4.6 Fast pricing (cursor.com/docs/models-and-pricing). Cursor's export aggregates requests, so no request-length tier is inferred.",
+      "cache_read_per_million": 1.0,
+      "cache_write_per_million": 4.0,
+      "input_per_million": 4.0,
+      "output_per_million": 12.0
+    },
+    "glm-5.3": {
+      "$comment": "Cursor rates verified 2026-10-04 at https://cursor.com/docs/models/glm-5-3. Cache reads differ from the OpenRouter route; cache writes have no separate fee and default to input.",
+      "cache_read_per_million": 0.26,
+      "input_per_million": 1.4,
+      "output_per_million": 4.4
+    },
+    "glm-5.3-flash": {
+      "$comment": "Cursor rates verified 2026-10-04 at https://cursor.com/docs/models/glm-5-3-flash. Cursor CSV uses glm-5p3-flash with effort suffixes. Cache reads differ from the OpenRouter route; cache writes have no separate fee and default to input.",
+      "cache_read_per_million": 0.029,
+      "input_per_million": 0.15,
+      "output_per_million": 0.5
     },
     "kimi-k2.7-code": {
       "$comment": "Cursor's published Kimi K2.7 Code rates. Public catalogs disagree (some bare keys are $0), so this override wins.",
@@ -759,6 +1109,20 @@
     },
     "meta/muse-spark-1.2-contributor": {
       "$comment": "Provider-prefixed Muse Spark 1.2 Contributor; same discounted $0.10/$0.002/$0.20 card as bare contributor.",
+      "cache_read_per_million": 0.002,
+      "cache_write_per_million": 0.1,
+      "input_per_million": 0.1,
+      "output_per_million": 0.2
+    },
+    "meta/muse-spark-1.3": {
+      "$comment": "Meta Muse Spark 1.3 standard API rates from https://dev.meta.ai/docs/pricing-rate-limits; pinned to the published $1.25/$0.15/$4.25 rates instead of models.dev's 10% regional uplift.",
+      "cache_read_per_million": 0.15,
+      "cache_write_per_million": 1.25,
+      "input_per_million": 1.25,
+      "output_per_million": 4.25
+    },
+    "meta/muse-spark-1.3-contributor": {
+      "$comment": "Meta Muse Spark 1.3 Contributor API rates from https://dev.meta.ai/docs/pricing-rate-limits; this is a distinct discounted SKU, not the standard $1.25/$4.25 model.",
       "cache_read_per_million": 0.002,
       "cache_write_per_million": 0.1,
       "input_per_million": 0.1,
@@ -834,6 +1198,20 @@
       "input_per_million": 0.1,
       "output_per_million": 0.2
     },
+    "muse-spark-1.3": {
+      "$comment": "Meta Muse Spark 1.3 standard API card from https://dev.meta.ai/docs/pricing-rate-limits, pinned for offline installs and models.dev's 10% regional-rate variant; current OpenRouter shows the same $1.25/$0.15/$4.25 card.",
+      "cache_read_per_million": 0.15,
+      "cache_write_per_million": 1.25,
+      "input_per_million": 1.25,
+      "output_per_million": 4.25
+    },
+    "muse-spark-1.3-contributor": {
+      "$comment": "Meta Muse Spark 1.3 Contributor discounted API card from https://dev.meta.ai/docs/pricing-rate-limits; distinct from the standard model.",
+      "cache_read_per_million": 0.002,
+      "cache_write_per_million": 0.1,
+      "input_per_million": 0.1,
+      "output_per_million": 0.2
+    },
     "xiaomi/mimo-v2.5": {
       "$comment": "OpenRouter provider-prefixed id; same official MiMo-V2.5 card as bare.",
       "cache_read_per_million": 0.0028,
@@ -849,33 +1227,127 @@
       "output_per_million": 0.87
     },
     "gpt-6-luna": {
-      "$comment": "OpenAI GPT-6 Luna official Standard rates (developers.openai.com/api/docs/models/gpt-6-luna). Fast mode is 2x. Long-context (>272k) handled in CodexLogUsageScanner.",
+      "$comment": "OpenAI GPT-6 Luna official Standard rates. Long context (>272k) uses 2x input/cache and 1.5x output (developers.openai.com/api/docs/models/gpt-6-luna). Fast mode is 2x.",
       "input_per_million": 0.1,
       "cache_write_per_million": 0.125,
       "cache_read_per_million": 0.01,
-      "output_per_million": 0.5
+      "output_per_million": 0.5,
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 272000,
+          "input_per_million": 0.2,
+          "output_per_million": 0.75,
+          "cache_write_per_million": 0.25,
+          "cache_read_per_million": 0.02
+        }
+      ]
     },
     "gpt-6-terra": {
       "$comment": "No standalone gpt-6-terra on developers.openai.com (Terra remains gpt-5.6-terra). Transitional pin matches gpt-5.6-terra so router slugs still price.",
       "input_per_million": 2.0,
       "cache_write_per_million": 2.5,
       "cache_read_per_million": 0.2,
-      "output_per_million": 12.0
+      "output_per_million": 12.0,
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 272000,
+          "input_per_million": 4.0,
+          "output_per_million": 18.0,
+          "cache_write_per_million": 5.0,
+          "cache_read_per_million": 0.4
+        }
+      ]
     },
     "gpt-6-sol": {
-      "$comment": "OpenAI GPT-6 Sol official Standard rates (developers.openai.com/api/docs/models/gpt-6-sol). Fast mode is 2x.",
+      "$comment": "OpenAI GPT-6 Sol official Standard rates. Long context (>272k) uses 2x input/cache and 1.5x output (developers.openai.com/api/docs/models/gpt-6-sol). Fast mode is 2x.",
       "input_per_million": 2.0,
       "cache_write_per_million": 2.5,
       "cache_read_per_million": 0.2,
-      "output_per_million": 10.0
+      "output_per_million": 10.0,
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 272000,
+          "input_per_million": 4.0,
+          "output_per_million": 15.0,
+          "cache_write_per_million": 5.0,
+          "cache_read_per_million": 0.4
+        }
+      ]
     },
     "gpt-6-astra": {
-      "$comment": "OpenAI GPT-6 Astra official Standard rates (developers.openai.com/api/docs/models/gpt-6-astra). Fast mode is 2x.",
+      "$comment": "OpenAI GPT-6 Astra official Standard rates. Long context (>272k) uses 2x input/cache and 1.5x output (developers.openai.com/api/docs/models/gpt-6-astra). Fast mode is 2x.",
       "input_per_million": 10.0,
       "cache_write_per_million": 12.5,
       "cache_read_per_million": 1.0,
-      "output_per_million": 50.0
+      "output_per_million": 50.0,
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 272000,
+          "input_per_million": 20.0,
+          "output_per_million": 75.0,
+          "cache_write_per_million": 25.0,
+          "cache_read_per_million": 2.0
+        }
+      ]
+    },
+    "cursor-grok-4.7": {
+      "$comment": "Cursor's Grok 4.7 model pool as of 2026-10-13. Cache write is not published separately and defaults to the input rate. Long context (>256k) is 2x through 500k tokens.",
+      "cache_read_per_million": 0.5,
+      "cache_write_per_million": 2.0,
+      "input_per_million": 2.0,
+      "output_per_million": 6.0,
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 256000,
+          "input_per_million": 4.0,
+          "output_per_million": 12.0,
+          "cache_write_per_million": 4.0,
+          "cache_read_per_million": 1.0
+        }
+      ]
+    },
+    "cursor-grok-4.7-fast": {
+      "$comment": "Cursor fast mode is 2x standard; above 256k, fast long-context usage is 3x standard through 500k.",
+      "cache_read_per_million": 1.0,
+      "cache_write_per_million": 4.0,
+      "input_per_million": 4.0,
+      "output_per_million": 12.0,
+      "prompt_rate_tiers": [
+        {
+          "threshold_prompt_tokens": 256000,
+          "input_per_million": 6.0,
+          "output_per_million": 18.0,
+          "cache_write_per_million": 6.0,
+          "cache_read_per_million": 1.5
+        }
+      ]
+    },
+    "grok-4.7-500k": {
+      "$comment": "Cursor's explicit 500k model selector carries the >256k standard rates $4/$12/$1 per million.",
+      "cache_read_per_million": 1.0,
+      "cache_write_per_million": 4.0,
+      "input_per_million": 4.0,
+      "output_per_million": 12.0
+    },
+    "grok-4.7-500k-fast": {
+      "$comment": "Cursor's explicit 500k fast selector carries the >256k fast rates $6/$18/$1.50 per million.",
+      "cache_read_per_million": 1.5,
+      "cache_write_per_million": 6.0,
+      "input_per_million": 6.0,
+      "output_per_million": 18.0
+    },
+    "space-bunny": {
+      "$comment": "OpenCode GO published rate (opencode.ai/docs/go, verified 2026-10-06): $0.15 input / $0.60 output / $0.03 cache read per 1M, no cache-write lane. Stealth model left the free period - the bundled catalogues still carry only zero-rate space-bunny-free / stealth/space-bunny-alpha, so without this pin the slug prices at $0 or dashes. Log slugs 'space bunny' and 'space-bunny' both reach this entry via the separator-normalized retry.",
+      "cache_read_per_million": 0.03,
+      "input_per_million": 0.15,
+      "output_per_million": 0.6
+    },
+    "space-bunny-free": {
+      "$comment": "Same GO rates as space-bunny: OpenCode kept the legacy '-free' id after the model went paid on GO (verified 2026-10-06 - the router ledger still records current usage as space-bunny-free). This exact pin overrides the stale zero-rate bundle entry. Priced per slug, not per date, so free-period days reprice at the GO rates too.",
+      "cache_read_per_million": 0.03,
+      "input_per_million": 0.15,
+      "output_per_million": 0.6
     }
   },
-  "updated_at": "2026-09-24T19:41:06Z"
+  "updated_at": "2026-10-25T23:47:42Z"
 }

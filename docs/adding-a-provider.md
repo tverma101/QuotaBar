@@ -15,13 +15,11 @@ A provider is a small Swift module under `Sources/QuotaBar/Providers/<Name>/` th
 QuotaBar never asks the user to paste a token — if the provider's own CLI or app has already logged in,
 QuotaBar reads those existing credentials.
 
-Besides `refresh()`, every provider implements `hasLocalCredentials()` — a cheap, local-only check
-(files, keychain; never the network) for whether those credentials exist at all. A fresh install probes
-it once to turn on exactly the providers the user actually has (see `FirstRunSeeder`), and existing
-installs probe it once on the first launch after your provider ships (see `NewProviderSeeder`) — so
-implementing it correctly is what gets the new provider auto-enabled for the users who actually have
-the tool (see [Which Providers Are On](provider-enablement.md)). Mirror the same credential sources
-`refresh()` reads, and run blocking loads via `loadOffMainActor`.
+Besides `refresh()`, every provider implements `hasLocalCredentials()` — a local-only check of whether
+its credentials exist, without contacting the provider. Startup and provider discovery do not call this
+method to enable cards: optional providers stay off until the user selects them in Customize. Keep the
+probe silent and mirror the credential sources `refresh()` reads if a future explicit setup flow uses it.
+Run blocking loads via `loadOffMainActor`. See [Which Providers Are On](provider-enablement.md).
 
 ## The metric contract
 
@@ -73,6 +71,14 @@ factory only when there is no typed error, and never return stale or empty data 
 - Validate only at the boundary (the API response); trust the app's internal types.
 - Match the metric labels and units the provider's own dashboard uses, so numbers are recognizable.
 - Declare the provider's **quick links** on its `Provider` value (`links:`). Each link is a `ProviderLink(label:url:)` rendered as a button in the card's expanded area that opens the URL in the default browser. Ship the provider's own Status / Console / Dashboard pages where they exist; leave `links` off (it defaults to empty) for providers without any. Cap at **two** links per provider (standard labels: Status, Dashboard, API Keys, or Usage). Only `http(s)` URLs with a non-empty label render.
+
+## Keychain credential reads
+
+- Use `readGenericPasswordForRefresh` (or its current-user variant) on every refresh path. Keep the flagless `readGenericPassword` overloads out of refresh code; they cannot reliably suppress Keychain UI.
+- Pass the provider's known account name so reads and prompt suppression stay scoped to the exact item. Codex profiles, for example, have separate account names derived from their `CODEX_HOME` paths.
+- Keep credential probes local and silent. Do not enable interaction from `hasLocalCredentials()`.
+- Only explicit Refresh actions run inside `withManualRefresh`. `loadOffMainActor` carries that context through its detached task, including the shared one-dialog budget. Background, panel-open, and startup passes stay silent.
+- A cancelled prompt is suppressed for the rest of that action; a later user-requested Refresh clears the previous decline and allows one new prompt for the whole provider batch.
 
 ## User-supplied API keys
 
