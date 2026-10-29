@@ -57,24 +57,155 @@ final class CodexResetClaimService {
     convenience init(
         authStore: CodexAuthStore,
         usageClient: CodexUsageClient,
+        allowsKeychainFallback: Bool = true,
         refreshAfterClaim: @escaping () async -> Void
     ) {
         self.init(
             usageClient: usageClient,
             credentialCandidates: {
                 var candidates = authStore.loadAuthCandidates()
-                if let keychain = await loadOffMainActor({ try? authStore.loadKeychainAuth() }) {
+                if allowsKeychainFallback,
+                   let keychain = await loadOffMainActor({ try? authStore.loadKeychainAuth() }) {
                     candidates.append(keychain)
                 }
                 return candidates.compactMap { candidate in
                     guard candidate.hasUsableAccessToken, let token = candidate.auth.tokens?.accessToken else {
                         return nil
                     }
-                    return (token, candidate.auth.tokens?.accountID)
+                    guard let verifiedID = CodexAuthStore.accountIdentity(in: candidate.auth) else {
+                        return nil
+                    }
+                    return (token, verifiedID)
                 }
             },
             refreshAfterClaim: refreshAfterClaim
         )
+    }
+
+    /// Live, account-scoped credit discovery. Credit IDs, not expiry timestamps, identify resets.
+    func availableCredits() async -> [CodexResetCredit]? {
+        let first = await fetchAvailableCredits()
+        if first.authRejected {
+            // Recover a rotated/expired OAuth token through this same account's provider.
+            await refreshAfterClaim()
+            return await fetchAvailableCredits().credits
+        }
+        return first.credits
+    }
+
+    private func fetchAvailableCredits() async -> (credits: [CodexResetCredit]?, authRejected: Bool) {
+        let candidates = await credentialCandidates()
+        guard !candidates.isEmpty else { return (nil, false) }
+        var rejected = false
+        for credentials in candidates {
+            do {
+                let response = try await usageClient.fetchResetCredits(
+                    accessToken: credentials.accessToken, accountID: credentials.accountID
+                )
+                if response.statusCode == 401 || response.statusCode == 403 {
+                    rejected = true
+                    continue
+                }
+                guard (200..<300).contains(response.statusCode),
+                      let body = ProviderParse.jsonObject(response.body),
+                      let credits = body["credits"] as? [[String: Any]]
+                else {
+                    AppLog.warn(LogTag.plugin("codex"), "auto reset: invalid credit list (\(response.statusCode))")
+                    return (nil, false)
+                }
+                let available = credits.compactMap { item -> CodexResetCredit? in
+                    guard let id = item["id"] as? String, !id.isEmpty,
+                          let expiry = Self.parseExpiry(item["expires_at"])
+                    else { return nil }
+                    if let status = item["status"] as? String, status != "available" { return nil }
+                    if let type = item["reset_type"] as? String, type != "codex_rate_limits" { return nil }
+                    return CodexResetCredit(id: id, expiresAt: expiry)
+                }
+                return (available, false)
+            } catch {
+                AppLog.warn(LogTag.plugin("codex"), "auto reset: credit lookup failed: \(error.localizedDescription)")
+                return (nil, false)
+            }
+        }
+        return (nil, rejected)
+    }
+
+    /// Auto-redemption targets only an explicit server credit id. Match a fresh GET, verify
+    /// status and expiry, and recheck consent immediately before the irreversible POST.
+    func claimAuto(
+        credit: CodexResetCredit, redeemRequestID: String,
+        canRedeem: @escaping @MainActor () -> Bool
+    ) async -> ResetClaimOutcome {
+        guard canRedeem(), Date() < credit.expiresAt else { return .noCredit }
+        let candidates = await credentialCandidates()
+        guard !candidates.isEmpty else {
+            AppLog.error(LogTag.plugin("codex"), "auto reset: no usable account credentials")
+            return .failed
+        }
+        let selected: Credentials
+        if credit.isRetry {
+            // The previous POST may have succeeded while its HTTP response was lost. In that
+            // case the credit disappears from a fresh list and a normal match cannot replay
+            // the UUID. Only the exact original (creditID, requestID) is ever sent here.
+            // Authentication stays account-scoped by the caller's CodexAuthStore.
+            guard let candidate = candidates.first(where: { $0.accountID != nil }) else {
+                return .failed
+            }
+            selected = candidate
+        } else {
+            switch await matchExactCredit(credit, candidates: candidates) {
+            case .matched(_, let authenticated): selected = authenticated
+            case .noCredit: return .noCredit
+            case .failed: return .failed
+            }
+        }
+        guard canRedeem(), Date() < credit.expiresAt else { return .noCredit }
+        // Never fall back to a different ChatGPT account on an API write, even when a token
+        // is accepted for more than one account. The selected GET account owns this credit.
+        let preferred = [selected] + candidates.filter {
+            $0.accountID?.lowercased() == selected.accountID?.lowercased()
+                && $0.accessToken != selected.accessToken
+        }
+        let outcome = await consume(
+            creditID: credit.id, redeemRequestID: redeemRequestID, candidates: preferred
+        )
+        if outcome != .failed { await refreshAfterClaim() }
+        return outcome
+    }
+
+    private func matchExactCredit(_ credit: CodexResetCredit, candidates: [Credentials]) async -> MatchResult {
+        for credentials in candidates {
+            let response: HTTPResponse
+            do {
+                response = try await usageClient.fetchResetCredits(
+                    accessToken: credentials.accessToken, accountID: credentials.accountID
+                )
+            } catch {
+                AppLog.error(LogTag.plugin("codex"), "auto reset: pre-claim lookup failed: \(error.localizedDescription)")
+                return .failed
+            }
+            if response.statusCode == 401 || response.statusCode == 403 { continue }
+            guard (200..<300).contains(response.statusCode),
+                  let body = ProviderParse.jsonObject(response.body),
+                  let credits = body["credits"] as? [[String: Any]]
+            else {
+                AppLog.error(LogTag.plugin("codex"), "auto reset: pre-claim list unavailable")
+                return .failed
+            }
+            let exists = credits.contains { item in
+                guard item["id"] as? String == credit.id,
+                      let date = Self.parseExpiry(item["expires_at"]),
+                      abs(date.timeIntervalSince(credit.expiresAt)) < 1,
+                      date > Date()
+                else { return false }
+                if let status = item["status"] as? String, status != "available" { return false }
+                if let type = item["reset_type"] as? String, type != "codex_rate_limits" { return false }
+                return true
+            }
+            return exists ? .matched(creditID: credit.id, credentials: credentials) : .noCredit
+        }
+        AppLog.error(LogTag.plugin("codex"), "auto reset: account credentials rejected")
+        return .failed
     }
 
     /// Claims the credit expiring at `expiry`. Never throws — every failure mode is logged loudly and
@@ -209,6 +340,7 @@ final class CodexResetClaimService {
         guard let credits = body["credits"] as? [[String: Any]] else { return nil }
         return credits.first { credit in
             if let status = credit["status"] as? String, status != "available" { return false }
+            if let type = credit["reset_type"] as? String, type != "codex_rate_limits" { return false }
             guard let date = parseExpiry(credit["expires_at"]) else { return false }
             return abs(date.timeIntervalSince(expiry)) < 1
         }?["id"] as? String
@@ -248,11 +380,28 @@ final class CodexResetClaimService {
 
 /// Hands the claim service to the resets popover through the environment: `nil` (the default — previews,
 /// share-card renders, reorder previews) renders the timeline read-only with no "Use" affordance.
+/// Route each Codex widget to its own credential-scoped claim service.
+@MainActor
+final class CodexResetClaimRouter {
+    private let services: [String: CodexResetClaimService]
+    init(services: [String: CodexResetClaimService]) { self.services = services }
+    func service(for providerID: String) -> CodexResetClaimService? { services[providerID] }
+}
+
+private struct CodexResetClaimRouterKey: EnvironmentKey {
+    static let defaultValue: CodexResetClaimRouter? = nil
+}
+
 private struct CodexResetClaimServiceKey: EnvironmentKey {
     static let defaultValue: CodexResetClaimService? = nil
 }
 
 extension EnvironmentValues {
+    var codexResetClaimRouter: CodexResetClaimRouter? {
+        get { self[CodexResetClaimRouterKey.self] }
+        set { self[CodexResetClaimRouterKey.self] = newValue }
+    }
+
     var codexResetClaim: CodexResetClaimService? {
         get { self[CodexResetClaimServiceKey.self] }
         set { self[CodexResetClaimServiceKey.self] = newValue }
