@@ -6,6 +6,35 @@ import XCTest
 final class CodexAutoResetCoordinatorTests: XCTestCase {
     private let base = Date(timeIntervalSince1970: 1_800_000_000)
 
+    func testDefaultCodexAccountReceivesVerifiedLaunchIdentity() {
+        XCTAssertEqual(
+            CodexAutoResetCoordinator.verifiedIdentity(
+                providerID: "codex", expectedIdentityKey: nil, defaultCodexIdentity: "primary-account"
+            ),
+            "primary-account"
+        )
+    }
+
+    func testRegisteredCodexAccountKeepsItsOwnIdentity() {
+        XCTAssertEqual(
+            CodexAutoResetCoordinator.verifiedIdentity(
+                providerID: "codex-account-secondary", expectedIdentityKey: "secondary-account",
+                defaultCodexIdentity: "primary-account"
+            ),
+            "secondary-account"
+        )
+    }
+
+    func testUnattributedAccountCannotInheritDefaultIdentity() {
+        XCTAssertNil(CodexAutoResetCoordinator.verifiedIdentity(
+            providerID: "codex-account-unknown", expectedIdentityKey: nil,
+            defaultCodexIdentity: "primary-account"
+        ))
+        XCTAssertNil(CodexAutoResetCoordinator.verifiedIdentity(
+            providerID: "codex", expectedIdentityKey: nil, defaultCodexIdentity: nil
+        ))
+    }
+
     private func defaults(enabled: Bool = true) -> UserDefaults {
         let defaults = UserDefaults(suiteName: "CodexAutoResetTests-\(UUID().uuidString)")!
         defaults.set(enabled, forKey: CodexAutoResetCoordinator.enabledKey)
