@@ -207,9 +207,17 @@ final class AppContainer {
         // Each reset service shares its Codex provider's credential loading and HTTP client. Manual
         // claims route by provider card, and automatic claims are admitted only for verified identities.
         let codexProviders = providers.compactMap { $0 as? CodexProvider }
+        let codexIdentityByProviderID = Dictionary(uniqueKeysWithValues: codexProviders.compactMap { codex -> (String, String)? in
+            guard let identity = CodexAutoResetCoordinator.verifiedIdentity(
+                providerID: codex.provider.id,
+                expectedIdentityKey: codex.expectedIdentityKey,
+                defaultCodexIdentity: accountAssembly.identityKeysByCard["codex"]
+            ) else { return nil }
+            return (codex.provider.id, identity)
+        })
         let codexClaimServices = Dictionary(uniqueKeysWithValues: codexProviders.map { codex in
             (codex.provider.id, CodexResetClaimService(
-                authStore: codex.authStore,
+                authStore: codex.authStore.scoped(to: codexIdentityByProviderID[codex.provider.id]),
                 usageClient: codex.usageClient,
                 allowsKeychainFallback: codex.allowsKeychainFallback,
                 refreshAfterClaim: { [weak dataStore] in
@@ -249,14 +257,6 @@ final class AppContainer {
         self.codexResetClaims = CodexResetClaimRouter(services: codexClaimServices)
         self.codexResetClaim = codexProviders.count == 1
             ? codexClaimServices[codexProviders[0].provider.id] : nil
-        let codexIdentityByProviderID = Dictionary(uniqueKeysWithValues: codexProviders.compactMap { codex -> (String, String)? in
-            guard let identity = CodexAutoResetCoordinator.verifiedIdentity(
-                providerID: codex.provider.id,
-                expectedIdentityKey: codex.expectedIdentityKey,
-                defaultCodexIdentity: accountAssembly.identityKeysByCard["codex"]
-            ) else { return nil }
-            return (codex.provider.id, identity)
-        })
         self.codexAutoReset = CodexAutoResetCoordinator(
             services: codexClaimServices.filter { codexIdentityByProviderID[$0.key] != nil },
             verifiedAccountIdentityByProviderID: codexIdentityByProviderID
