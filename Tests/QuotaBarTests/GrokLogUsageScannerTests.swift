@@ -37,9 +37,31 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
         let day = try XCTUnwrap(scan(line).series.daily.first)
 
-        // 200k input + 100k cache write at $2/M, 700k cache read at $0.5/M, 250k output at $6/M.
+        // The turn's 1M prompt tokens cross xAI's published 200K long-context threshold, so the whole
+        // row prices in that tier: 200k input + 100k cache write at $4/M, 700k cache read at $0.60/M,
+        // 250k output at $12/M.
         XCTAssertEqual(day.totalTokens, 1_250_000)
-        XCTAssertEqual(try XCTUnwrap(day.costUSD), 2.45, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(day.costUSD), 4.62, accuracy: 0.0001)
+    }
+
+    func testRecordedCostAndPublicRateEstimateStaySeparateNumbers() throws {
+        // One price resolution per entry feeds both numbers, but they are different numbers: the
+        // day's cost is what Grok recorded, the API estimate is the same tokens at public rates.
+        let line = GrokLogFixture.completedTurn(
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
+            model: "grok-4.5-build",
+            input: 1_000_000,
+            cached: 700_000,
+            cacheWrite: 100_000,
+            output: 250_000,
+            costUsdTicks: 1_000_000_000
+        )
+
+        let usage = scan(line)
+        let day = try XCTUnwrap(usage.series.daily.first)
+
+        XCTAssertEqual(try XCTUnwrap(day.costUSD), 0.1, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(usage.apiEstimateByDay?["2026-06-10"]), 4.62, accuracy: 0.0001)
     }
 
     func testSplitsCompletedTurnAcrossModelsWithoutDuplicatingTheEvent() throws {
@@ -98,7 +120,26 @@ final class GrokLogUsageScannerTests: XCTestCase {
         XCTAssertTrue(usage.unknownModelsByDay.isEmpty)
     }
 
-    func testUnknownModelWithoutRecordedCostIsExcludedAndWarns() {
+    func testPublicRateTotalIsIncompleteWhenRecordedCostHasNoPublicRate() throws {
+        let recordedOnly = GrokLogFixture.completedTurn(
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
+            model: "grok-future-model",
+            input: 500_000,
+            costUsdTicks: 3_000_000_000
+        )
+        let publiclyPriced = GrokLogFixture.completedTurn(
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 11),
+            model: "grok-4.6-build",
+            input: 100_000
+        )
+
+        let usage = scan(recordedOnly + "\n" + publiclyPriced)
+
+        XCTAssertNotNil(usage.apiEstimateByDay?["2026-06-10"])
+        XCTAssertEqual(usage.apiEstimateIncompleteDays, ["2026-06-10"])
+    }
+
+    func testUnknownModelWithoutRecordedCostCountsTokensAndDashesCost() {
         let line = GrokLogFixture.completedTurn(
             timestamp: TestLocalInstant.iso(2026, 6, 10, 10),
             model: "grok-future-model",
@@ -107,7 +148,10 @@ final class GrokLogUsageScannerTests: XCTestCase {
 
         let usage = scan(line)
 
-        XCTAssertTrue(usage.series.daily.isEmpty)
+        // Unpriced usage keeps counting tokens (history shows volume); no cost is claimed, so the
+        // day stays cost-unbacked for a later reveal to backfill.
+        XCTAssertEqual(usage.series.daily.map(\.totalTokens), [500_000])
+        XCTAssertNil(usage.series.daily.first?.costUSD)
         XCTAssertEqual(usage.unknownModelsByDay["2026-06-10"], ["grok-future-model"])
     }
 
@@ -276,8 +320,38 @@ final class GrokLogUsageScannerTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(day.costUSD), 3.5, accuracy: 0.0001)
     }
 
-    func testSkipsSessionWithMalformedSummaryInsteadOfGuessingItsKind() async throws {
+    func testSessionSummaryIsReadOnlyOncePerRevision() async throws {
+        // A finished session's summary never changes, so re-reading and re-parsing one per session on
+        // every fold is pure waste. Make the summary unreadable: a cached classification still
+        // answers, while re-reading the file would fail the whole scan.
         let line = GrokLogFixture.completedTurn(
+            timestamp: TestLocalInstant.iso(2026, 6, 10, 10), model: "grok-build", input: 1_000
+        )
+        let home = try GrokLogFixture.makeHome(files: [
+            "project/session/updates.jsonl": line,
+            "project/session/summary.json": #"{"session_kind":"coordinator"}"#
+        ])
+        defer { try? FileManager.default.removeItem(at: home) }
+        let summary = home.appendingPathComponent("sessions/project/session/summary.json")
+        let scanner = GrokLogFixture.scanner(home: home)
+        let now = TestLocalInstant.date(2026, 6, 18, 12)
+
+        let first = await scanner.scan(daysBack: 30, now: now, pricing: TestPricing.bundled)
+        XCTAssertEqual(first?.series.daily.first?.totalTokens, 1_000)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: summary.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: summary.path) }
+        try XCTSkipUnless(
+            !FileManager.default.isReadableFile(atPath: summary.path),
+            "the summary stays readable for this user, so the re-read cannot be observed"
+        )
+
+        let second = await scanner.scan(daysBack: 30, now: now, pricing: TestPricing.bundled)
+        XCTAssertEqual(second?.series.daily.first?.totalTokens, 1_000,
+                       "the cached classification keeps the session in the scan")
+    }
+
+    func testSkipsSessionWithMalformedSummaryInsteadOfGuessingItsKind() async throws {        let line = GrokLogFixture.completedTurn(
             timestamp: TestLocalInstant.iso(2026, 6, 10, 10), model: "grok-build", input: 1_000
         )
         let home = try GrokLogFixture.makeHome(files: [

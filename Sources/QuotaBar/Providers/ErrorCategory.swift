@@ -26,6 +26,8 @@ enum ErrorCategory: String, Sendable, CaseIterable, Codable {
     /// Usage data is legitimately unavailable for this account/plan (no subscription, API-key-only, quota
     /// endpoint absent) — not a malfunction.
     case notAvailable = "not_available"
+    /// The refresh was cancelled or superseded. The store suppresses this as a failure/backoff outcome.
+    case cancelled = "cancelled"
     case other = "other"
 
     /// Classify a non-2xx HTTP status. 429 is called out as rate limiting; everything else splits on the
@@ -57,7 +59,7 @@ extension ClaudeAuthError: CategorizedError {
         case .notLoggedIn: .notLoggedIn
         case .sessionExpired, .tokenExpired, .desktopTokenExpired: .authExpired
         case .invalidOAuthURL, .desktopCredentialsUnavailable: .authInvalid
-        case .desktopPermissionRequired: .credentialAccess
+        case .credentialPermissionRequired, .credentialKeychainReadFailed, .desktopPermissionRequired: .credentialAccess
         case .credentialsChanged: .other
         }
     }
@@ -78,6 +80,7 @@ extension CodexAuthError: CategorizedError {
         switch self {
         case .notLoggedIn: .notLoggedIn
         case .credentialPermissionRequired: .credentialAccess
+        case .credentialsUnreadable: .credentialAccess
         case .sessionExpired, .tokenConflict, .tokenRevoked, .tokenExpired: .authExpired
         case .usageAPIKey: .notAvailable
         case .invalidAuthPayload: .authInvalid
@@ -100,6 +103,7 @@ extension CursorAuthError: CategorizedError {
         switch self {
         case .notLoggedIn: .notLoggedIn
         case .credentialPermissionRequired: .credentialAccess
+        case .credentialsUnreadable: .credentialAccess
         case .sessionExpired, .tokenExpired: .authExpired
         }
     }
@@ -141,6 +145,7 @@ extension DevinAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .notLoggedIn: .notLoggedIn
+        case .credentialsUnreadable: .credentialAccess
         }
     }
 }
@@ -154,12 +159,38 @@ extension DevinUsageError: CategorizedError {
     }
 }
 
+extension FreebuffAuthError: CategorizedError {
+    var errorCategory: ErrorCategory {
+        switch self {
+        case .notLoggedIn: .notLoggedIn
+        case .invalidConfigDirectory, .invalidCredentials: .authInvalid
+        case .credentialsUnreadable, .credentialPermissionRequired: .credentialAccess
+        case .tokenInvalid: .authExpired
+        }
+    }
+}
+
+extension FreebuffUsageError: CategorizedError {
+    var errorCategory: ErrorCategory {
+        switch self {
+        case .connectionFailed: .network
+        case .invalidResponse: .decoding
+        case .requestFailed(let status): ErrorCategory.http(status)
+        case .quotaUnavailable: .notAvailable
+        case .localHistoryUnreadable: .decoding
+        }
+    }
+}
+
 extension CopilotAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .notLoggedIn: .notLoggedIn
         case .credentialPermissionRequired: .credentialAccess
+        case .credentialsUnreadable: .credentialAccess
+        case .invalidCredentials: .authInvalid
         case .tokenInvalid: .authExpired
+        case .accessDenied: .http4xx
         }
     }
 }
@@ -179,8 +210,10 @@ extension OpenCodeUsageError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .notLoggedIn: .notLoggedIn
-        case .credentialsUnreadable, .databaseUnreadable: .credentialAccess
+        case .credentialsUnreadable, .databaseUnreadable, .usageSourcesIncomplete: .credentialAccess
         case .accountAPIUnauthorized: .authExpired
+        case .accountAPINoEntitlement: .notAvailable
+        case .accountAPIInvalidResponse: .decoding
         case .accountAPIRequestFailed(let status): ErrorCategory.http(status)
         case .accountAPIUnavailable: .network
         }
@@ -191,6 +224,7 @@ extension OpenRouterAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .missingKey: .notLoggedIn
+        case .credentialsUnreadable: .credentialAccess
         case .invalidKey: .authInvalid
         case .saveFailed, .deleteFailed: .other
         }
@@ -211,6 +245,7 @@ extension ZAIAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
         case .missingKey: .notLoggedIn
+        case .credentialsUnreadable: .credentialAccess
         case .invalidKey: .authInvalid
         case .saveFailed, .deleteFailed: .other
         }
@@ -245,7 +280,10 @@ extension AntigravityError: CategorizedError {
         // the remedy differs, which the message now carries.
         case .credentialPermissionRequired: .credentialAccess
         case .invalidCredentialData: .authInvalid
+        case .oauthClientConfigurationInvalid: .authInvalid
         case .authExpired: .authExpired
+        case .accessDenied: .http4xx
+        case .quotaEndpointUnavailable: .notAvailable
         case .unavailable: .network
         }
     }

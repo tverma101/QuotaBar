@@ -1,4 +1,13 @@
 import Foundation
+import CoreFoundation
+import os
+
+/// A missing native source is complete empty data; an incomplete discovery or fold must preserve the
+/// last-good combined history instead of publishing whichever session files happened to succeed.
+enum CodexLogUsageScanResult: Sendable {
+    case complete(LogUsageScan?)
+    case incomplete
+}
 
 /// Builds daily token/cost estimates for Codex by scanning the Codex CLI's local session rollouts
 /// natively (`$CODEX_HOME/sessions/**/*.jsonl` + `archived_sessions/`), replacing the external
@@ -23,7 +32,9 @@ actor CodexLogUsageScanner {
         var output: Int
         var reasoning: Int
         var total: Int
+        var hasCompleteCostBreakdown: Bool = true
         var isFast: Bool = false
+        var serviceTier: String? = nil
     }
 
     /// Token fields of a `token_count` usage object, tolerating the older field spellings ccusage
@@ -34,46 +45,141 @@ actor CodexLogUsageScanner {
         var output: Int
         var reasoning: Int
         var total: Int
+        /// `total` is component-derived when absent or zero; only a positive reported value is a
+        /// cumulative total counter that can authoritatively produce a later delta.
+        var hasReportedTotal: Bool
+        var hasCompleteCostBreakdown: Bool
+        var isValid: Bool
 
         init(json: [String: Any]) {
-            func int(_ keys: String...) -> Int? {
+            func int(_ keys: String...) -> (value: Int?, isPresent: Bool, isValid: Bool) {
                 for key in keys {
-                    if let number = json[key] as? NSNumber { return number.intValue }
+                    guard let raw = json[key] else { continue }
+                    guard let number = raw as? NSNumber,
+                          CFGetTypeID(number) != CFBooleanGetTypeID()
+                    else { return (nil, true, false) }
+                    let value = number.doubleValue
+                    guard value.isFinite,
+                          value >= 0,
+                          value <= 1e15,
+                          value.rounded(.towardZero) == value
+                    else { return (nil, true, false) }
+                    return (Int(value), true, true)
                 }
-                return nil
+                return (nil, false, true)
             }
-            input = int("input_tokens", "prompt_tokens", "input") ?? 0
-            cached = int("cached_input_tokens", "cache_read_input_tokens", "cached_tokens") ?? 0
-            output = int("output_tokens", "completion_tokens", "output") ?? 0
-            reasoning = int("reasoning_output_tokens", "reasoning_tokens") ?? 0
-            let reported = int("total_tokens") ?? 0
+            let parsedInput = int("input_tokens", "prompt_tokens", "input")
+            let parsedCached = int("cached_input_tokens", "cache_read_input_tokens", "cached_tokens")
+            let parsedOutput = int("output_tokens", "completion_tokens", "output")
+            let parsedReasoning = int("reasoning_output_tokens", "reasoning_tokens")
+            let parsedTotal = int("total_tokens")
+            input = parsedInput.value ?? 0
+            // Cached input is a subset of reported input. Some Codex snapshots briefly disagree
+            // while counters settle; count no more cached tokens than the measured input bucket.
+            cached = min(parsedCached.value ?? 0, input)
+            output = parsedOutput.value ?? 0
+            reasoning = parsedReasoning.value ?? 0
+            let reported = parsedTotal.value ?? 0
             // Reasoning tokens are a subset of output on OpenAI/Codex usage; do not add them again.
-            // Saturating: a line carrying `input_tokens` at Int.max plus any output overflowed and
-            // took the process down with it. A corrupt count must cost a wrong number, never a crash.
+            // Counts are bounded before recomputation; the parser rejects an invalid row before aggregation.
             let recomputed = ProviderParse.addingSaturating(input, output)
-            total = (reported > 0 || recomputed == 0) ? reported : recomputed
+            let hasReportedTotal = reported > 0
+            total = hasReportedTotal ? reported : recomputed
+            self.hasReportedTotal = hasReportedTotal
+            let hasAuthoritativeTotal = hasReportedTotal || (parsedInput.isPresent && parsedOutput.isPresent)
+            isValid = parsedInput.isValid && parsedCached.isValid && parsedOutput.isValid
+                && parsedReasoning.isValid && parsedTotal.isValid && hasAuthoritativeTotal
+            hasCompleteCostBreakdown = parsedInput.isPresent && parsedOutput.isPresent
+                && cached <= input && reasoning <= output
+                // A present zero total is still a report. If it contradicts positive components,
+                // keep the component-derived token count but never present its partial price as whole.
+                && (!parsedTotal.isPresent || reported == recomputed)
         }
 
-        private init(input: Int, cached: Int, output: Int, reasoning: Int, total: Int) {
+        private init(
+            input: Int,
+            cached: Int,
+            output: Int,
+            reasoning: Int,
+            total: Int,
+            hasReportedTotal: Bool,
+            isValid: Bool,
+            hasCompleteCostBreakdown: Bool
+        ) {
             self.input = input
-            self.cached = cached
+            self.cached = min(cached, input)
             self.output = output
             self.reasoning = reasoning
             self.total = total
+            self.hasReportedTotal = hasReportedTotal
+            self.isValid = isValid
+            self.hasCompleteCostBreakdown = hasCompleteCostBreakdown
         }
 
         func equalCounts(_ other: RawUsage) -> Bool {
             input == other.input && cached == other.cached && output == other.output
                 && reasoning == other.reasoning && total == other.total
+                && hasReportedTotal == other.hasReportedTotal && isValid == other.isValid
+                && hasCompleteCostBreakdown == other.hasCompleteCostBreakdown
         }
 
         func subtracting(_ previous: RawUsage?) -> RawUsage {
+            guard let previous else {
+                return RawUsage(
+                    input: input, cached: cached, output: output, reasoning: reasoning, total: total,
+                    hasReportedTotal: hasReportedTotal,
+                    isValid: isValid, hasCompleteCostBreakdown: hasCompleteCostBreakdown
+                )
+            }
+            // Components are cumulative too, but their resets require independent deltas. A derived
+            // total cannot be differenced across a component reset or it permanently loses tokens.
+            // A reported total remains authoritative against either a prior reported total or a
+            // baseline accumulated from last-only events. Discrepancies with component deltas make
+            // only the cost incomplete.
+            let inputDelta = input >= previous.input ? input - previous.input : input
+            let cachedDelta = cached >= previous.cached ? cached - previous.cached : cached
+            let outputDelta = output >= previous.output ? output - previous.output : output
+            let reasoningDelta = reasoning >= previous.reasoning ? reasoning - previous.reasoning : reasoning
+            let componentTotal = ProviderParse.addingSaturating(inputDelta, outputDelta)
+            let totalDelta: Int
+            if hasReportedTotal {
+                totalDelta = total >= previous.total ? total - previous.total : total
+            } else {
+                totalDelta = componentTotal
+            }
+            let complete = hasCompleteCostBreakdown && previous.hasCompleteCostBreakdown
+                && cachedDelta <= inputDelta && reasoningDelta <= outputDelta
+                && totalDelta == componentTotal
+            return RawUsage(
+                input: inputDelta, cached: cachedDelta, output: outputDelta, reasoning: reasoningDelta,
+                total: totalDelta, hasReportedTotal: false, isValid: isValid && previous.isValid,
+                hasCompleteCostBreakdown: complete
+            )
+        }
+
+        func addingAsBaseline(_ delta: RawUsage) -> RawUsage {
             RawUsage(
-                input: max(0, input - (previous?.input ?? 0)),
-                cached: max(0, cached - (previous?.cached ?? 0)),
-                output: max(0, output - (previous?.output ?? 0)),
-                reasoning: max(0, reasoning - (previous?.reasoning ?? 0)),
-                total: max(0, total - (previous?.total ?? 0))
+                input: ProviderParse.addingSaturating(input, delta.input),
+                cached: ProviderParse.addingSaturating(cached, delta.cached),
+                output: ProviderParse.addingSaturating(output, delta.output),
+                reasoning: ProviderParse.addingSaturating(reasoning, delta.reasoning),
+                total: ProviderParse.addingSaturating(total, delta.total),
+                hasReportedTotal: false,
+                isValid: isValid && delta.isValid,
+                hasCompleteCostBreakdown: hasCompleteCostBreakdown && delta.hasCompleteCostBreakdown
+            )
+        }
+
+        func asBaseline() -> RawUsage {
+            RawUsage(
+                input: input,
+                cached: cached,
+                output: output,
+                reasoning: reasoning,
+                total: total,
+                hasReportedTotal: false,
+                isValid: isValid,
+                hasCompleteCostBreakdown: hasCompleteCostBreakdown
             )
         }
     }
@@ -99,6 +205,8 @@ actor CodexLogUsageScanner {
         var previousTotals: RawUsage?
         var currentModel: String?
         var currentTierIsFast: Bool
+        var currentServiceTier: String?
+        var currentServiceTierIsValid: Bool
         var sawSessionMeta: Bool
         var replayGate: ChildReplayGate?
     }
@@ -121,19 +229,21 @@ actor CodexLogUsageScanner {
     /// `retainResidentItems: false` unloads IncrementalJSONLScanner CachedFile.items after each
     /// return so Event arrays are not retained twice (scanner + sharedTailCache). Metadata-only
     /// disk loads keep cold identities cheap; hydrate/reparse uses disk or the tail cache.
+    static let parsedEventCachePersistence = JSONLScanCachePersistence(namespace: "codex", schemaVersion: 8)
     private static let sharedScanner = IncrementalJSONLScanner<Event>(
         maxResidentIdentities: 2,
         retainResidentItems: false,
         logTag: LogTag.plugin("codex"),
-        persistence: JSONLScanCachePersistence(namespace: "codex", schemaVersion: 4)
+        persistence: parsedEventCachePersistence
     )
 
     static func flushPersistentCacheWrites() async {
         await sharedScanner.flushPendingWrites()
     }
 
-    /// After a refresh cycle settles, drop Event arrays from the process-wide tail cache while keeping
-    /// append checkpoints. The next exact-match / append path full-reparses when items were unloaded.
+    /// Drop Event arrays from the process-wide tail cache while keeping append checkpoints. Used only
+    /// when the process crosses its memory budget or macOS reports pressure; routine refreshes keep
+    /// this cache warm so an append does not reparse unchanged history.
     static func unloadSharedTailCacheItems() {
         sharedTailCache.unloadRetainedItems()
     }
@@ -143,6 +253,83 @@ actor CodexLogUsageScanner {
     /// under a peer `~/.codex` are skipped so Orca backfills stay attributed to default. Default
     /// `~/.codex` keeps shared inodes (see `sessionFiles`).
     private let peerHomes: [URL]
+
+    /// Priced per-inode folds. A menu-bar tap reuses these when size/mtime/inode are unchanged
+    /// instead of re-walking every retained session event. Only the files that actually grew are
+    /// folded, then merged with the cached slices.
+    private struct InodeAggregateKey: Hashable, Codable {
+        var device: UInt64
+        var inode: UInt64
+    }
+
+    private struct InodeAggregateRecord: Codable {
+        var size: Int
+        var mtime: Date
+        var attributeMtime: Date?
+        var latestIncludedTimestamp: Date?
+        var scan: LogUsageScan
+    }
+
+    private struct PersistedInodeAggregates: Codable {
+        var schema: Int
+        var pricingToken: String
+        var since: Date
+        var timeZoneIdentifier: String
+        var records: [PersistedInodeAggregate]
+    }
+
+    private struct PersistedInodeAggregate: Codable {
+        var device: UInt64
+        var inode: UInt64
+        var record: InodeAggregateRecord
+    }
+
+    private final class PerFileFoldBucket: @unchecked Sendable {
+        var fold = AggregateFoldState()
+        var scans: [String: LogUsageScan] = [:]
+        var latestTimestamps: [String: Date] = [:]
+        var futureTimestamps: [String: Date] = [:]
+        private var currentPath: String?
+        private var currentLatestTimestamp: Date?
+
+        func begin(_ path: String) {
+            currentPath = path
+            fold = AggregateFoldState()
+            currentLatestTimestamp = nil
+        }
+
+        func finish(_ path: String) {
+            scans[path] = fold.accumulator.build()
+            if let currentLatestTimestamp {
+                latestTimestamps[path] = currentLatestTimestamp
+            }
+            currentPath = nil
+        }
+
+        func noteIncludedTimestamp(_ timestamp: Date) {
+            if currentLatestTimestamp.map({ timestamp > $0 }) ?? true {
+                currentLatestTimestamp = timestamp
+            }
+        }
+
+        func noteFutureTimestamp(_ timestamp: Date) {
+            guard let currentPath else { return }
+            if futureTimestamps[currentPath].map({ timestamp > $0 }) ?? true {
+                futureTimestamps[currentPath] = timestamp
+            }
+        }
+    }
+
+    private var inodeAggregates: [InodeAggregateKey: InodeAggregateRecord] = [:]
+    private var aggregatePricingToken: String?
+    private var aggregateSince: Date?
+    private var aggregateTimeZone: String?
+    private var aggregateIdentity: String?
+    private var didAttemptAggregateLoad = false
+
+    private static var persistsUsageAggregates: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
+    }
 
     init(
         environment: EnvironmentReading = QuotaBarEnvironmentReader(),
@@ -156,12 +343,56 @@ actor CodexLogUsageScanner {
         self.scanner = incrementalScanner ?? Self.sharedScanner
     }
 
-    func scan(daysBack: Int = 30, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+    func scan(
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing,
+        peerHomes peerHomesOverride: [URL]? = nil
+    ) async -> LogUsageScan? {
+        switch await scanResult(
+            daysBack: daysBack,
+            now: now,
+            pricing: pricing,
+            peerHomes: peerHomesOverride
+        ) {
+        case .complete(let scan):
+            return scan
+        case .incomplete:
+            return nil
+        }
+    }
+
+    /// Completeness-aware scan used by providers that merge Codex logs with other sources.
+    func scanResult(
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing,
+        peerHomes peerHomesOverride: [URL]? = nil
+    ) async -> CodexLogUsageScanResult {
+        guard !Task.isCancelled else { return .incomplete }
         let homes = codexHomes()
+        guard !Task.isCancelled else { return .incomplete }
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
-        let files = Self.sessionFiles(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory)
+        let futureIdentity = "codex.native.\(context.identity)"
+        guard let files = Self.sessionFilesIfComplete(
+            homes: homes,
+            peerHomes: peerHomesOverride ?? peerHomes,
+            homeDirectory: homeDirectory
+        ) else {
+            if !Task.isCancelled {
+                Self.logScanFailure(
+                    identity: context.identity,
+                    kind: "discovery",
+                    message: "session files or peer inodes could not be completely discovered; preserving last-good history"
+                )
+            }
+            return .incomplete
+        }
+        guard !Task.isCancelled else { return .incomplete }
         guard !files.isEmpty else {
-            _ = await scanner.foldItems(
+            FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: [])
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey(for: futureIdentity))
+            let complete = await scanner.foldItems(
                 from: [], since: context.cacheSince, cacheIdentity: context.identity,
                 parseFile: { url in
                     Self.parseFileIncrementally(
@@ -172,13 +403,112 @@ actor CodexLogUsageScanner {
                 },
                 visit: { _ in }
             )
-            return nil
+            guard complete else {
+                if !Task.isCancelled {
+                    Self.logScanFailure(
+                        identity: context.identity,
+                        kind: "empty-fold",
+                        message: "empty session fold did not complete; preserving last-good history"
+                    )
+                }
+                return .incomplete
+            }
+            Self.clearScanFailures(identity: context.identity)
+            return Task.isCancelled ? .incomplete : .complete(nil)
         }
 
-        let fold = AggregateFoldState()
+        let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        for file in files where FutureTimestampRevisionGate.shouldDefer(
+            identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
+        ) {
+            Self.logFutureTimestamp(identity: futureIdentity)
+            return .incomplete
+        }
+
+        let pricingToken = pricing.aggregateCacheToken
+        let timeZone = Calendar.current.timeZone.identifier
+        prepareInodeAggregates(
+            identity: context.identity,
+            pricingToken: pricingToken,
+            since: context.cacheSince,
+            timeZone: timeZone
+        )
+
         let requestedSince = context.requestedSince
+        // Per-inode aggregates fold the RETENTION window (cacheSince — stable within a day), not the
+        // requested one. Keying them on requestedSince made every scope change discard every
+        // aggregate: menu-bar passes (small daysBack) and full passes (30 days) alternate, so each
+        // paid a full re-fold of the whole session corpus. The narrower window is clipped at serve
+        // time instead, from the same retained aggregates.
+        let minDayKey = DailyUsageAccumulator.dayKey(from: requestedSince)
+        var unchanged: [LogUsageScan] = []
+        var changed: [JSONLScanning.DiscoveredFile] = []
+        var liveInodes: Set<InodeAggregateKey> = []
+        var fileKeysByPath: [String: InodeAggregateKey] = [:]
+        unchanged.reserveCapacity(files.count)
+        for file in files {
+            guard !Task.isCancelled else { return .incomplete }
+            guard let revision = AppendOnlyFileProbe.revision(at: URL(fileURLWithPath: file.path)) else {
+                Self.logScanFailure(
+                    identity: context.identity,
+                    kind: "file-stat",
+                    path: file.path,
+                    message: "session file identity could not be read; preserving last-good history"
+                )
+                return .incomplete
+            }
+            let key = InodeAggregateKey(device: revision.device, inode: revision.inode)
+            liveInodes.insert(key)
+            fileKeysByPath[file.path] = key
+            if let cached = inodeAggregates[key],
+               cached.size == file.size,
+               Self.timestampsMatch(cached.mtime, file.mtime),
+               Self.timestampsMatch(cached.attributeMtime, file.attributeMtime) {
+                guard Self.sourceRevisionStillMatches(file, key: key) else {
+                    Self.logScanFailure(
+                        identity: context.identity,
+                        kind: "changed-after-discovery",
+                        path: file.path,
+                        message: "session file changed after discovery; preserving last-good history"
+                    )
+                    return .incomplete
+                }
+                if cached.latestIncludedTimestamp.map({
+                    $0 > maximumTimestamp
+                }) ?? false {
+                    if let latestTimestamp = cached.latestIncludedTimestamp {
+                        _ = FutureTimestampRevisionGate.record(
+                            latestTimestamp, identity: futureIdentity, file: file
+                        )
+                    }
+                    Self.logFutureTimestamp(identity: futureIdentity)
+                    return .incomplete
+                }
+                unchanged.append(cached.scan)
+            } else {
+                changed.append(file)
+            }
+        }
+        if inodeAggregates.contains(where: { !liveInodes.contains($0.key) }) {
+            inodeAggregates = inodeAggregates.filter { liveInodes.contains($0.key) }
+        }
+        if changed.isEmpty {
+            AppLog.debug(LogTag.plugin("codex"), "aggregate split: unchanged=\(unchanged.count) changed=0")
+            guard !Task.isCancelled else { return .incomplete }
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey(for: futureIdentity))
+            Self.clearScanFailures(identity: context.identity)
+            return .complete(
+                DailyUsageAccumulator.merged(unchanged, droppingDaysBefore: minDayKey)
+                    ?? DailyUsageAccumulator().build()
+            )
+        }
+        AppLog.debug(LogTag.plugin("codex"), "aggregate split: unchanged=\(unchanged.count) changed=\(changed.count)")
+
+        let bucket = PerFileFoldBucket()
+        guard !Task.isCancelled else { return .incomplete }
         let ok = await scanner.foldItems(
-            from: files, since: context.cacheSince, cacheIdentity: context.identity,
+            from: changed, since: context.cacheSince, cacheIdentity: context.identity,
             parseFile: { url in
                 Self.parseFileIncrementally(
                     at: url,
@@ -187,17 +517,262 @@ actor CodexLogUsageScanner {
                 )
             },
             visit: { event in
+                guard Self.hasTokenUsage(event) else { return }
+                guard event.timestamp <= maximumTimestamp else {
+                    bucket.noteFutureTimestamp(event.timestamp)
+                    return
+                }
+                bucket.noteIncludedTimestamp(event.timestamp)
                 Self.accumulate(
                     event: event,
-                    since: requestedSince,
+                    since: context.cacheSince,
                     pricing: pricing,
-                    seen: &fold.seen,
-                    accumulator: &fold.accumulator
+                    seen: &bucket.fold.seen,
+                    accumulator: &bucket.fold.accumulator
                 )
+            },
+            fileStarted: { path in
+                bucket.begin(path)
+            },
+            fileCompleted: { path, _ in
+                bucket.finish(path)
             }
         )
-        guard ok, !Task.isCancelled else { return nil }
-        return fold.accumulator.build()
+        guard ok else {
+            if !Task.isCancelled {
+                Self.logScanFailure(
+                    identity: context.identity,
+                    kind: "fold",
+                    message: "session file fold was incomplete; preserving last-good history"
+                )
+            }
+            return .incomplete
+        }
+        guard !Task.isCancelled else { return .incomplete }
+
+        var refreshed: [(key: InodeAggregateKey, record: InodeAggregateRecord, scan: LogUsageScan)] = []
+        refreshed.reserveCapacity(changed.count)
+        let futurePaths = Set(bucket.futureTimestamps.keys)
+        for file in changed where !futurePaths.contains(file.path) {
+            guard let scan = bucket.scans[file.path],
+                  let key = fileKeysByPath[file.path],
+                  Self.sourceRevisionStillMatches(file, key: key)
+            else {
+                if !Task.isCancelled {
+                    Self.logScanFailure(
+                        identity: context.identity,
+                        kind: "changed-during-fold",
+                        path: file.path,
+                        message: "session file changed during fold; preserving last-good history"
+                    )
+                }
+                return .incomplete
+            }
+            refreshed.append((
+                key: key,
+                record: InodeAggregateRecord(
+                    size: file.size,
+                    mtime: file.mtime,
+                    attributeMtime: file.attributeMtime,
+                    latestIncludedTimestamp: bucket.latestTimestamps[file.path],
+                    scan: scan
+                ),
+                scan: scan
+            ))
+        }
+        for file in changed where futurePaths.contains(file.path) {
+            guard let futureTimestamp = bucket.futureTimestamps[file.path],
+                  let key = fileKeysByPath[file.path],
+                  Self.sourceRevisionStillMatches(file, key: key),
+                  FutureTimestampRevisionGate.record(
+                    futureTimestamp, identity: futureIdentity, file: file
+                  )
+            else {
+                if !Task.isCancelled {
+                    Self.logScanFailure(
+                        identity: context.identity,
+                        kind: "changed-during-future-scan",
+                        path: file.path,
+                        message: "session file changed during future-timestamp scan; preserving last-good history"
+                    )
+                }
+                return .incomplete
+            }
+        }
+        for item in refreshed {
+            inodeAggregates[item.key] = item.record
+            unchanged.append(item.scan)
+        }
+        if !refreshed.isEmpty {
+            persistInodeAggregates(
+                identity: context.identity,
+                pricingToken: pricingToken,
+                since: context.cacheSince,
+                timeZone: timeZone
+            )
+        }
+        guard !Task.isCancelled else { return .incomplete }
+        if !futurePaths.isEmpty {
+            Self.logFutureTimestamp(identity: futureIdentity)
+            return .incomplete
+        }
+        DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey(for: futureIdentity))
+        Self.clearScanFailures(identity: context.identity)
+        return .complete(
+            DailyUsageAccumulator.merged(unchanged, droppingDaysBefore: minDayKey)
+                ?? DailyUsageAccumulator().build()
+        )
+    }
+
+    private static func futureTimestampDiagnosticKey(for identity: String) -> String {
+        "codex.sessions.future-timestamp.\(JSONLScanCachePaths.stableFingerprint(identity))"
+    }
+
+    private static func logFutureTimestamp(identity: String) {
+        DiagnosticGate.logOnce(for: futureTimestampDiagnosticKey(for: identity)) {
+            AppLog.warn(LogTag.plugin("codex"), "session usage contains a timestamp more than five minutes ahead; preserving last-good history")
+        }
+    }
+
+    private static func scanFailurePrefix(for identity: String) -> String {
+        "codex.sessions.scan.\(JSONLScanCachePaths.stableFingerprint(identity))."
+    }
+
+    private static func logScanFailure(
+        identity: String,
+        kind: String,
+        path: String? = nil,
+        message: String
+    ) {
+        let pathKey = path.map { ".\(JSONLScanCachePaths.stableFingerprint($0))" } ?? ""
+        DiagnosticGate.logOnce(for: scanFailurePrefix(for: identity) + kind + pathKey) {
+            AppLog.warn(LogTag.plugin("codex"), message)
+        }
+    }
+
+    private static func clearScanFailures(identity: String) {
+        DiagnosticGate.clearFailures(prefix: scanFailurePrefix(for: identity))
+    }
+
+    private static func sourceRevisionStillMatches(
+        _ file: JSONLScanning.DiscoveredFile,
+        key: InodeAggregateKey
+    ) -> Bool {
+        let url = URL(fileURLWithPath: file.path)
+        guard let revision = AppendOnlyFileProbe.revision(at: url),
+              revision.device == key.device,
+              revision.inode == key.inode,
+              revision.size == UInt64(file.size),
+              let metadata = try? url.resourceValues(forKeys: Set([
+                  .fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey
+              ]))
+        else { return false }
+        return metadata.fileSize == file.size
+            && metadata.contentModificationDate == file.mtime
+            && metadata.attributeModificationDate == file.attributeMtime
+    }
+
+    private func prepareInodeAggregates(
+        identity: String,
+        pricingToken: String,
+        since: Date,
+        timeZone: String
+    ) {
+        let contextChanged = aggregateIdentity != identity
+            || aggregatePricingToken != pricingToken
+            || aggregateTimeZone != timeZone
+            || !Self.timestampsMatch(aggregateSince, since)
+        if contextChanged {
+            inodeAggregates = [:]
+            didAttemptAggregateLoad = false
+            aggregateIdentity = identity
+            aggregatePricingToken = pricingToken
+            aggregateSince = since
+            aggregateTimeZone = timeZone
+        }
+        guard !didAttemptAggregateLoad else { return }
+        didAttemptAggregateLoad = true
+        guard Self.persistsUsageAggregates else { return }
+        let loaded = Self.readInodeAggregates(identity: identity)
+        if loaded == nil {
+            AppLog.debug(LogTag.plugin("codex"), "aggregate load: no index on disk for identity")
+        }
+        guard let loaded,
+              loaded.schema == 5,
+              loaded.pricingToken == pricingToken,
+              loaded.timeZoneIdentifier == timeZone,
+              Self.timestampsMatch(loaded.since, since)
+        else {
+            if let loaded {
+                AppLog.debug(
+                    LogTag.plugin("codex"),
+                    "aggregate load rejected: tokenMatch=\(loaded.pricingToken == pricingToken) tzMatch=\(loaded.timeZoneIdentifier == timeZone) sinceMatch=\(Self.timestampsMatch(loaded.since, since))"
+                )
+            }
+            return
+        }
+        var restored: [InodeAggregateKey: InodeAggregateRecord] = [:]
+        restored.reserveCapacity(loaded.records.count)
+        for entry in loaded.records {
+            restored[InodeAggregateKey(device: entry.device, inode: entry.inode)] = entry.record
+        }
+        inodeAggregates = restored
+    }
+
+    private func persistInodeAggregates(
+        identity: String,
+        pricingToken: String,
+        since: Date,
+        timeZone: String
+    ) {
+        guard Self.persistsUsageAggregates else { return }
+        let payload = PersistedInodeAggregates(
+            schema: 5,
+            pricingToken: pricingToken,
+            since: since,
+            timeZoneIdentifier: timeZone,
+            records: inodeAggregates.map { key, record in
+                PersistedInodeAggregate(device: key.device, inode: key.inode, record: record)
+            }
+        )
+        let url = Self.aggregateIndexURL(identity: identity)
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .secondsSince1970
+            let data = try encoder.encode(payload)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            AppLog.debug(LogTag.plugin("codex"), "usage aggregate index write failed")
+        }
+    }
+
+    private static func readInodeAggregates(identity: String) -> PersistedInodeAggregates? {
+        let url = aggregateIndexURL(identity: identity)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        return try? decoder.decode(PersistedInodeAggregates.self, from: data)
+    }
+
+    private static func aggregateIndexURL(identity: String) -> URL {
+        JSONLScanCachePaths.defaultDirectory
+            .appendingPathComponent("aggregates", isDirectory: true)
+            .appendingPathComponent("codex-sessions-\(JSONLScanCachePaths.stableFingerprint(identity)).json")
+    }
+
+    private static func timestampsMatch(_ lhs: Date?, _ rhs: Date?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (lhs?, rhs?):
+            return abs(lhs.timeIntervalSinceReferenceDate - rhs.timeIntervalSinceReferenceDate) < 0.001
+        default:
+            return false
+        }
     }
 
     /// The parsed turns of the last `daysBack` days. Default 30/33-day consumers share one 35-day
@@ -206,7 +781,11 @@ actor CodexLogUsageScanner {
     func parsedEvents(daysBack: Int = 33, now: Date = Date(), homes: [URL]? = nil) async -> [Event] {
         let homes = homes ?? codexHomes()
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
-        let files = Self.sessionFiles(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory)
+        guard let files = Self.sessionFilesIfComplete(
+            homes: homes,
+            peerHomes: peerHomes,
+            homeDirectory: homeDirectory
+        ) else { return [] }
         guard !files.isEmpty else { return [] }
         let cached = await scanner.items(
             from: files, since: context.cacheSince, cacheIdentity: context.identity,
@@ -232,7 +811,11 @@ actor CodexLogUsageScanner {
     ) async -> Bool {
         let homes = homes ?? codexHomes()
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
-        let files = Self.sessionFiles(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory)
+        guard let files = Self.sessionFilesIfComplete(
+            homes: homes,
+            peerHomes: peerHomes,
+            homeDirectory: homeDirectory
+        ) else { return false }
         guard !files.isEmpty else { return true }
         return await scanner.foldItems(
             from: files, since: context.cacheSince, cacheIdentity: context.identity,
@@ -248,6 +831,87 @@ actor CodexLogUsageScanner {
                 visit(event)
             }
         )
+    }
+
+    /// OpenCode consumes only gateway events. Its own slim cache prevents decoding every native
+    /// Codex event after the ordinary cache has released its resident arrays.
+    @discardableResult
+    func foldHostedGatewayEvents(
+        daysBack: Int = 33,
+        now: Date = Date(),
+        homes: [URL],
+        gatewayScanner: IncrementalJSONLScanner<Event>? = nil,
+        nativeCachePersistence: JSONLScanCachePersistence? = nil,
+        rolloutNameDeduper: CodexRolloutNameDeduper? = nil,
+        visit: @Sendable (Event) -> Void
+    ) async -> Bool {
+        let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
+        guard let discovered = Self.sessionFilesIfComplete(
+            homes: homes,
+            peerHomes: peerHomes,
+            homeDirectory: homeDirectory
+        ) else { return false }
+        let files = rolloutNameDeduper?.retainingFirstOccurrence(of: discovered) ?? discovered
+        let futureIdentity = "codex.gateway.\(context.identity)"
+        guard !files.isEmpty else {
+            FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: [])
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey(for: futureIdentity))
+            return true
+        }
+        let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        for file in files where FutureTimestampRevisionGate.shouldDefer(
+            identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
+        ) {
+            Self.logHostedGatewayFutureTimestamp(identity: futureIdentity)
+            return false
+        }
+        let projection = CodexGatewayCacheProjection.load(
+            persistence: nativeCachePersistence ?? Self.parsedEventCachePersistence,
+            identity: context.identity, files: files
+        )
+        let bucket = FutureTimestampFoldBucket<Event>()
+        let complete = await (gatewayScanner ?? Self.hostedGatewayScanner).foldItems(
+            from: files, since: context.cacheSince, cacheIdentity: context.identity,
+            parseFile: { url in
+                if let projected = projection.read(at: url) { return projected }
+                return Self.parseFileIncrementally(at: url, emitSince: context.cacheSince,
+                    retentionDays: context.retentionDays)?.filter {
+                    OpenCodeUsageScanner.isHostedGatewayModel($0.model)
+                }
+            },
+            visit: { event in
+                guard event.timestamp >= context.requestedSince else { return }
+                guard Self.hasTokenUsage(event) else { return }
+                bucket.observe(timestamp: event.timestamp, maximumTimestamp: maximumTimestamp)
+                guard event.timestamp <= maximumTimestamp else { return }
+                visit(event)
+            },
+            fileStarted: { bucket.begin($0) },
+            fileCompleted: { path, _ in bucket.finish(path) }
+        )
+        guard complete else { return false }
+        for (path, timestamp) in bucket.futureTimestamps {
+            guard let file = files.first(where: { $0.path == path }),
+                  FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
+            else { return false }
+        }
+        guard bucket.futureTimestamps.isEmpty else {
+            Self.logHostedGatewayFutureTimestamp(identity: futureIdentity)
+            return false
+        }
+        DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey(for: futureIdentity))
+        return true
+    }
+
+    private static func logHostedGatewayFutureTimestamp(identity: String) {
+        DiagnosticGate.logOnce(for: futureTimestampDiagnosticKey(for: identity)) {
+            AppLog.warn(LogTag.plugin("codex"), "gateway session usage contains a timestamp more than five minutes ahead; preserving last-good history")
+        }
+    }
+
+    private static func hasTokenUsage(_ event: Event) -> Bool {
+        event.total > 0 || event.input > 0 || event.cached > 0 || event.output > 0 || event.reasoning > 0
     }
 
     private struct ScanContext: Sendable {
@@ -293,6 +957,10 @@ actor CodexLogUsageScanner {
         sharedTailCache.entryCountForTesting()
     }
 
+    static func clearSharedTailCacheForTesting(path: String) {
+        sharedTailCache.remove(tailKey(for: URL(fileURLWithPath: path), retentionDays: minimumCacheRetentionDays))
+    }
+
     /// Exposes the scanner's resolved CODEX_HOME list for multi-account wiring tests.
     func discoveredHomesForTesting() -> [URL] {
         Self.discoverCodexHomes(environment: environment, homeDirectory: homeDirectory)
@@ -306,7 +974,7 @@ actor CodexLogUsageScanner {
     // MARK: - Discovery
 
     /// Device+inode identity used to detect hardlinked Codex rollouts across homes.
-    private struct FileIdentity: Hashable, Sendable {
+    struct FileIdentity: Hashable, Sendable {
         var device: UInt64
         var inode: UInt64
     }
@@ -336,6 +1004,7 @@ actor CodexLogUsageScanner {
     ///   - peerHomes: Other account homes whose hardlinked copies should not be priced when
     ///     enumerating a non-default / managed home (Orca backfilled from `~/.codex`).
     ///   - homeDirectory: User home used to identify the default `~/.codex` path.
+    ///   - peerInodeDiscovery: Optional test seam for simulating a complete or incomplete peer walk.
     ///
     /// Attribution rules:
     /// 1. Collect `(st_dev, st_ino)` for every `*.jsonl` under each peer home's `sessions/` and
@@ -352,21 +1021,46 @@ actor CodexLogUsageScanner {
         peerHomes: [URL] = [],
         homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser }
     ) -> [JSONLScanning.DiscoveredFile] {
+        sessionFilesIfComplete(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory) ?? []
+    }
+
+    /// `nil` means a present Codex session root could not be fully enumerated. A caller must keep
+    /// its last-good history rather than publishing whichever other roots happened to be readable.
+    static func sessionFilesIfComplete(
+        homes: [URL],
+        peerHomes: [URL] = [],
+        homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
+        peerInodeDiscovery: (@Sendable (URL) -> Set<FileIdentity>?)? = nil
+    ) -> [JSONLScanning.DiscoveredFile]? {
+        guard !Task.isCancelled else { return nil }
         let defaultCodexPath = homeDirectory()
             .appendingPathComponent(".codex")
             .resolvingSymlinksInPath()
             .standardizedFileURL
             .path
-        let peerInodes = collectSessionInodes(under: peerHomes)
-
         var nonDefaultHomes: [URL] = []
         var defaultHomes: [URL] = []
         for home in homes {
+            guard !Task.isCancelled else { return nil }
             if isDefaultCodexHome(home, defaultCodexPath: defaultCodexPath) {
                 defaultHomes.append(home)
             } else {
                 nonDefaultHomes.append(home)
             }
+        }
+        // The default ~/.codex card keeps shared hardlinks and never needs peer inode discovery.
+        // For a managed card, every known peer home is supplied by CodexProvider, even when its card
+        // is disabled. This pass reads file identities only (not rollout contents), preserving source
+        // attribution without refreshing or folding the disabled account.
+        let peerInodes: Set<FileIdentity>
+        if nonDefaultHomes.isEmpty {
+            peerInodes = []
+        } else {
+            let discovery = peerInodeDiscovery ?? { home in Self.collectSessionInodesUncached(under: home) }
+            guard let collectedPeerInodes = collectSessionInodes(under: peerHomes, discoverHome: discovery) else {
+                return nil
+            }
+            peerInodes = collectedPeerInodes
         }
         // Prefer default ~/.codex when the same inode appears under both a peer managed home and ~/.codex.
         let orderedHomes = defaultHomes + nonDefaultHomes
@@ -376,6 +1070,7 @@ actor CodexLogUsageScanner {
         var seenInodes: Set<FileIdentity> = []
         var seenRolloutNames: Set<String> = []
         for home in orderedHomes {
+            guard !Task.isCancelled else { return nil }
             // Managed/non-default homes skip inodes that already exist under peer ~/.codex.
             // Default keeps shared hardlinks (Orca backfilled FROM system root INTO managed home).
             let skipPeerHardlinks = !isDefaultCodexHome(home, defaultCodexPath: defaultCodexPath)
@@ -383,11 +1078,17 @@ actor CodexLogUsageScanner {
             var seenRelative: Set<String> = []
             var sourceDirs: [URL] = []
             for name in ["sessions", "archived_sessions"] {
-                let dir = home.appendingPathComponent(name)
-                var isDirectory: ObjCBool = false
-                if FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDirectory), isDirectory.boolValue {
-                    sourceDirs.append(dir)
+                let dir = home.appendingPathComponent(name).resolvingSymlinksInPath()
+                let attributes: [FileAttributeKey: Any]
+                do {
+                    attributes = try FileManager.default.attributesOfItem(atPath: dir.path)
+                } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                    continue
+                } catch {
+                    return nil
                 }
+                guard attributes[.type] as? FileAttributeType == .typeDirectory else { return nil }
+                sourceDirs.append(dir)
             }
             // CodexRouter chatgpt-accounts homes often have auth + plugins but no session rollouts.
             // Falling back to the whole CODEX_HOME walked plugins/ (tens of thousands of files) for
@@ -396,7 +1097,11 @@ actor CodexLogUsageScanner {
                 continue
             }
             for dir in sourceDirs.map({ $0.resolvingSymlinksInPath() }) where seenDirs.insert(dir.path).inserted {
-                for file in JSONLScanning.jsonlFiles(under: dir) {
+                guard !Task.isCancelled,
+                      let discovered = JSONLScanning.jsonlFilesIfComplete(under: dir)
+                else { return nil }
+                for file in discovered {
+                    guard !Task.isCancelled else { return nil }
                     let relative = String(file.path.dropFirst(dir.path.count))
                     guard seenRelative.insert(relative).inserted else { continue }
                     let fileURL = URL(fileURLWithPath: file.path)
@@ -407,12 +1112,11 @@ actor CodexLogUsageScanner {
                     if rolloutName.hasPrefix("rollout-"), !seenRolloutNames.insert(rolloutName).inserted {
                         continue
                     }
-                    if let identity = fileIdentity(at: fileURL) {
-                        if skipPeerHardlinks, peerInodes.contains(identity) {
-                            continue
-                        }
-                        guard seenInodes.insert(identity).inserted else { continue }
+                    guard let identity = fileIdentity(at: fileURL) else { return nil }
+                    if skipPeerHardlinks, peerInodes.contains(identity) {
+                        continue
                     }
+                    guard seenInodes.insert(identity).inserted else { continue }
                     files.append(file)
                 }
             }
@@ -450,8 +1154,9 @@ actor CodexLogUsageScanner {
         func lookupOrCompute(
             key: String,
             signature: String,
-            compute: () -> Set<FileIdentity>
-        ) -> Set<FileIdentity> {
+            shouldCache: () -> Bool,
+            compute: () -> Set<FileIdentity>?
+        ) -> Set<FileIdentity>? {
             let now = ProcessInfo.processInfo.systemUptime
             lock.lock()
             if let entry = entries[key],
@@ -462,8 +1167,14 @@ actor CodexLogUsageScanner {
                 return hit
             }
             lock.unlock()
-            let inodes = compute()
+            guard let inodes = compute() else { return nil }
+            // An incomplete or cancelled traversal never becomes an authoritative cache entry.
+            guard shouldCache() else { return inodes }
             lock.lock()
+            guard shouldCache() else {
+                lock.unlock()
+                return inodes
+            }
             entries[key] = (signature, now, inodes)
             lock.unlock()
             return inodes
@@ -481,64 +1192,88 @@ actor CodexLogUsageScanner {
     /// `(st_dev, st_ino)` for every `*.jsonl` under each home's `sessions/` and `archived_sessions/`.
     /// Lightweight enumerator only — no `DiscoveredFile` / mtime arrays (those were ~11GB-path peak RSS
     /// amplifiers when peer homes held hundreds of hardlinked rollouts).
-    private static func collectSessionInodes(under homes: [URL]) -> Set<FileIdentity> {
+    private static func collectSessionInodes(
+        under homes: [URL],
+        discoverHome: @Sendable (URL) -> Set<FileIdentity>?
+    ) -> Set<FileIdentity>? {
         var result: Set<FileIdentity> = []
         for home in homes {
+            guard !Task.isCancelled else { return nil }
             let key = home.resolvingSymlinksInPath().standardizedFileURL.path
-            let signature = sessionDirectorySignature(for: home)
-            result.formUnion(
-                SessionInodeSetCache.shared.lookupOrCompute(key: key, signature: signature) {
-                    collectSessionInodesUncached(under: home)
-                }
-            )
+            guard let signature = sessionDirectorySignature(for: home),
+                  let inodes = SessionInodeSetCache.shared.lookupOrCompute(
+                    key: key,
+                    signature: signature,
+                    shouldCache: { !Task.isCancelled },
+                    compute: { discoverHome(home) }
+                  )
+            else { return nil }
+            result.formUnion(inodes)
         }
         return result
     }
 
     /// Directory mtime signature for the refresh-lifetime inode cache. Nested file adds may not bump
     /// the top-level dir mtime on every FS; unique per-test paths keep hermetic tests correct.
-    private static func sessionDirectorySignature(for home: URL) -> String {
+    private static func sessionDirectorySignature(for home: URL) -> String? {
         var parts: [String] = []
         for name in ["sessions", "archived_sessions"] {
-            let dir = home.appendingPathComponent(name)
-            guard let values = try? dir.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey]),
-                  values.isDirectory == true,
-                  let mtime = values.contentModificationDate
-            else {
+            let dir = home.appendingPathComponent(name).resolvingSymlinksInPath()
+            let attributes: [FileAttributeKey: Any]
+            do {
+                attributes = try FileManager.default.attributesOfItem(atPath: dir.path)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
                 parts.append("\(name)=missing")
                 continue
+            } catch {
+                return nil
             }
+            guard attributes[.type] as? FileAttributeType == .typeDirectory,
+                  let mtime = attributes[.modificationDate] as? Date
+            else { return nil }
             parts.append("\(name)=\(mtime.timeIntervalSince1970)")
         }
         return parts.joined(separator: ";")
     }
 
-    private static func collectSessionInodesUncached(under home: URL) -> Set<FileIdentity> {
+    private static func collectSessionInodesUncached(under home: URL) -> Set<FileIdentity>? {
         var result: Set<FileIdentity> = []
         for name in ["sessions", "archived_sessions"] {
+            guard !Task.isCancelled else { return nil }
             let dir = home.appendingPathComponent(name).resolvingSymlinksInPath()
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDirectory),
-                  isDirectory.boolValue
-            else { continue }
+            let attributes: [FileAttributeKey: Any]
+            do {
+                attributes = try FileManager.default.attributesOfItem(atPath: dir.path)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                continue
+            } catch {
+                return nil
+            }
+            guard attributes[.type] as? FileAttributeType == .typeDirectory else { return nil }
+            var enumerationFailed = false
             guard let enumerator = FileManager.default.enumerator(
                 at: dir,
                 includingPropertiesForKeys: [.isRegularFileKey],
-                options: []
-            ) else { continue }
-            for case let url as URL in enumerator {
-                guard url.pathExtension == "jsonl" else { continue }
-                let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
-                guard values?.isRegularFile == true else { continue }
-                if let identity = fileIdentity(at: url) {
-                    result.insert(identity)
+                options: [],
+                errorHandler: { _, _ in
+                    enumerationFailed = true
+                    return false
                 }
+            ) else { return nil }
+            for case let url as URL in enumerator {
+                guard !Task.isCancelled else { return nil }
+                guard url.pathExtension == "jsonl" else { continue }
+                guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]) else { return nil }
+                guard values.isRegularFile == true else { continue }
+                guard let identity = fileIdentity(at: url) else { return nil }
+                result.insert(identity)
             }
+            guard !enumerationFailed else { return nil }
         }
         return result
     }
 
-    private static func fileIdentity(at url: URL) -> FileIdentity? {
+    static func fileIdentity(at url: URL) -> FileIdentity? {
         // Reuse AppendOnlyFileProbe's resolve+lstat path so hardlinks share identity with the probe.
         guard let revision = AppendOnlyFileProbe.revision(at: url) else { return nil }
         return FileIdentity(device: revision.device, inode: revision.inode)
@@ -562,7 +1297,7 @@ actor CodexLogUsageScanner {
         let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
             parser.consume(line)
         }
-        guard readSucceeded else { return nil }
+        guard readSucceeded, !parser.hasMalformedUsage else { return nil }
         return parser.finish()
     }
 
@@ -574,13 +1309,14 @@ actor CodexLogUsageScanner {
         retentionDays: Int
     ) -> [Event]? {
         let key = tailKey(for: url, retentionDays: retentionDays)
-        let currentRevision = AppendOnlyFileProbe.revision(at: url)
+        let currentStamp = AppendOnlyFileProbe.stamp(at: url)
 
-        if let currentRevision,
+        if let currentStamp,
            let cached = sharedTailCache.entry(for: key),
-           currentRevision.device == cached.revision.device,
-           currentRevision.inode == cached.revision.inode,
-           currentRevision.size == cached.offset,
+           cached.modificationTimes == currentStamp.modificationTimes,
+           currentStamp.revision.device == cached.revision.device,
+           currentStamp.revision.inode == cached.revision.inode,
+           currentStamp.revision.size == cached.offset,
            AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor
         {
             // Exact revision match: IncrementalJSONLScanner may re-invoke parse after unloading
@@ -592,12 +1328,12 @@ actor CodexLogUsageScanner {
             }
         }
 
-        if let currentRevision,
+        if let currentStamp,
            let cached = sharedTailCache.entry(for: key),
            cached.itemsAvailable,
-           currentRevision.device == cached.revision.device,
-           currentRevision.inode == cached.revision.inode,
-           currentRevision.size > cached.offset,
+           currentStamp.revision.device == cached.revision.device,
+           currentStamp.revision.inode == cached.revision.inode,
+           currentStamp.revision.size > cached.offset,
            AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor
         {
             var parser = FileParser(emitSince: emitSince, checkpoint: cached.parserState)
@@ -611,7 +1347,8 @@ actor CodexLogUsageScanner {
             ) { line in
                 parser.consume(line)
             }
-            guard read.succeeded else { return nil }
+            guard read.isComplete else { return nil }
+            guard !parser.hasMalformedUsage else { return nil }
 
             // A same-inode historical rewrite can race after the pre-read anchor check while we are
             // consuming the tail. Re-prove the exact old checkpoint prefix before accepting any parser
@@ -626,19 +1363,22 @@ actor CodexLogUsageScanner {
             }
 
             consumeCompleteFinalJSONIfPossible(&read, parser: &parser)
+            guard !parser.hasMalformedUsage else { return nil }
 
             let newOffset = cached.offset + UInt64(read.statistics.bytesRead)
-            if let after = AppendOnlyFileProbe.revision(at: url),
-               after.device == currentRevision.device,
-               after.inode == currentRevision.inode,
-               after.size >= newOffset,
+            if let after = AppendOnlyFileProbe.stamp(at: url),
+               after.modificationTimes == currentStamp.modificationTimes,
+               after.revision.device == currentStamp.revision.device,
+               after.revision.inode == currentStamp.revision.inode,
+               after.revision.size >= newOffset,
                let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: newOffset)
             {
                 var merged = cached.items.filter { $0.timestamp >= emitSince }
                 merged.append(contentsOf: parser.finish())
                 sharedTailCache.store(
                     AppendOnlyFileTailCache<Event, ParserCheckpoint>.Entry(
-                        revision: after,
+                        revision: after.revision,
+                        modificationTimes: after.modificationTimes,
                         offset: newOffset,
                         anchor: anchor,
                         partialLine: read.finalPartial,
@@ -666,7 +1406,7 @@ actor CodexLogUsageScanner {
         key: String
     ) -> [Event]? {
         _ = retentionDays
-        let before = AppendOnlyFileProbe.revision(at: url)
+        let before = AppendOnlyFileProbe.stamp(at: url)
         var parser = FileParser(emitSince: emitSince)
         var read = JSONLFileReader.readLines(
             at: url,
@@ -675,24 +1415,30 @@ actor CodexLogUsageScanner {
         ) { line in
             parser.consume(line)
         }
-        guard read.succeeded else {
+        guard read.isComplete else {
             sharedTailCache.remove(key)
             return nil
         }
         consumeCompleteFinalJSONIfPossible(&read, parser: &parser)
+        guard !parser.hasMalformedUsage else {
+            sharedTailCache.remove(key)
+            return nil
+        }
         let events = parser.finish()
         let offset = UInt64(read.statistics.bytesRead)
 
         if let before,
-           let after = AppendOnlyFileProbe.revision(at: url),
-           before.device == after.device,
-           before.inode == after.inode,
-           after.size >= offset,
+           let after = AppendOnlyFileProbe.stamp(at: url),
+           (before.revision.size != after.revision.size || before.modificationTimes == after.modificationTimes),
+           before.revision.device == after.revision.device,
+           before.revision.inode == after.revision.inode,
+           after.revision.size >= offset,
            let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: offset)
         {
             sharedTailCache.store(
                 AppendOnlyFileTailCache<Event, ParserCheckpoint>.Entry(
-                    revision: after,
+                    revision: after.revision,
+                    modificationTimes: after.modificationTimes,
                     offset: offset,
                     anchor: anchor,
                     partialLine: read.finalPartial,
@@ -736,9 +1482,12 @@ actor CodexLogUsageScanner {
         private var previousTotals: RawUsage?
         private var currentModel: String?
         private var currentTierIsFast = false
+        private var currentServiceTier: String?
+        private var currentServiceTierIsValid = true
         private var sawSessionMeta = false
         private var replayGate: ChildReplayGate?
         private let emitSince: Date?
+        var hasMalformedUsage = false
 
         init(emitSince: Date? = nil, checkpoint: ParserCheckpoint? = nil) {
             self.emitSince = emitSince
@@ -746,6 +1495,8 @@ actor CodexLogUsageScanner {
                 self.previousTotals = checkpoint.previousTotals
                 self.currentModel = checkpoint.currentModel
                 self.currentTierIsFast = checkpoint.currentTierIsFast
+                self.currentServiceTier = checkpoint.currentServiceTier
+                self.currentServiceTierIsValid = checkpoint.currentServiceTierIsValid
                 self.sawSessionMeta = checkpoint.sawSessionMeta
                 self.replayGate = checkpoint.replayGate
             }
@@ -759,13 +1510,27 @@ actor CodexLogUsageScanner {
             guard isTurnContext || isSessionMeta || isTaskStarted || isThreadSettings
                 || line.range(of: tokenCountMarker) != nil
             else { return }
-            guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { return }
+            guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
+                if line.range(of: tokenCountMarker) != nil { hasMalformedUsage = true }
+                return
+            }
 
             let type = object["type"] as? String
             let payload = object["payload"] as? [String: Any]
 
             if type == "turn_context" {
-                if let model = payload.flatMap(CodexLogUsageScanner.modelName(in:)) {
+                guard let payload else {
+                    hasMalformedUsage = true
+                    currentModel = nil
+                    return
+                }
+                let modelUpdate = CodexLogUsageScanner.modelNameUpdate(in: payload)
+                if case .invalid = modelUpdate {
+                    hasMalformedUsage = true
+                    currentModel = nil
+                    return
+                }
+                if case .value(let model) = modelUpdate {
                     currentModel = model
                 }
                 return
@@ -784,12 +1549,18 @@ actor CodexLogUsageScanner {
             }
             if isThreadSettings, type == "event_msg",
                payload?["type"] as? String == "thread_settings_applied" {
-                if let tier = CodexLogUsageScanner.serviceTier(in: payload) {
-                    currentTierIsFast = tier == "fast" || tier == "priority"
+                if let update = CodexLogUsageScanner.serviceTierUpdate(in: payload) {
+                    currentServiceTierIsValid = update.isValid
+                    currentServiceTier = update.isValid ? update.tier : nil
+                    currentTierIsFast = update.isValid
+                        && (currentServiceTier == "fast" || currentServiceTier == "priority")
                 }
                 return
             }
-            guard type == "event_msg", let payload else { return }
+            guard type == "event_msg", let payload else {
+                if line.range(of: tokenCountMarker) != nil { hasMalformedUsage = true }
+                return
+            }
 
             if payload["type"] as? String == "task_started" {
                 if let gate = replayGate,
@@ -799,16 +1570,54 @@ actor CodexLogUsageScanner {
                 }
                 return
             }
-            guard payload["type"] as? String == "token_count",
-                  let timestampRaw = (object["timestamp"] as? String)?.trimmingCharacters(in: .whitespaces),
+            guard payload["type"] as? String == "token_count" else {
+                if line.range(of: tokenCountMarker) != nil { hasMalformedUsage = true }
+                return
+            }
+            guard let timestampRaw = (object["timestamp"] as? String)?.trimmingCharacters(in: .whitespaces),
                   let timestamp = OpenUsageISO8601.date(from: timestampRaw)
-            else { return }
+            else {
+                hasMalformedUsage = true
+                return
+            }
 
-            let info = payload["info"] as? [String: Any]
-            let totals = (info?["total_token_usage"] as? [String: Any]).map(RawUsage.init(json:))
+            guard let rawInfo = payload["info"],
+                  let info = rawInfo as? [String: Any]
+            else {
+                hasMalformedUsage = true
+                return
+            }
+            let totals: RawUsage?
+            if let rawTotals = info["total_token_usage"], !(rawTotals is NSNull) {
+                guard let totalsObject = rawTotals as? [String: Any] else {
+                    hasMalformedUsage = true
+                    return
+                }
+                let parsedTotals = RawUsage(json: totalsObject)
+                guard parsedTotals.isValid else {
+                    hasMalformedUsage = true
+                    return
+                }
+                totals = parsedTotals
+            } else {
+                totals = nil
+            }
 
             if replayGate != nil {
-                if let totals { previousTotals = totals }
+                if let totals {
+                    previousTotals = totals
+                } else if let rawLast = info["last_token_usage"], !(rawLast is NSNull) {
+                    guard let lastObject = rawLast as? [String: Any] else {
+                        hasMalformedUsage = true
+                        return
+                    }
+                    let last = RawUsage(json: lastObject)
+                    guard last.isValid else {
+                        hasMalformedUsage = true
+                        return
+                    }
+                    previousTotals = previousTotals?.addingAsBaseline(last) ?? last.asBaseline()
+                }
                 return
             }
             if let totals, let previous = previousTotals, totals.equalCounts(previous) {
@@ -816,18 +1625,51 @@ actor CodexLogUsageScanner {
             }
 
             let usage: RawUsage
-            if let last = (info?["last_token_usage"] as? [String: Any]).map(RawUsage.init(json:)) {
+            if let rawLast = info["last_token_usage"], !(rawLast is NSNull) {
+                guard let lastObject = rawLast as? [String: Any] else {
+                    hasMalformedUsage = true
+                    return
+                }
+                let last = RawUsage(json: lastObject)
+                guard last.isValid else {
+                    hasMalformedUsage = true
+                    return
+                }
                 usage = last
+                if totals == nil {
+                    previousTotals = previousTotals?.addingAsBaseline(last) ?? last.asBaseline()
+                }
             } else if let totals {
                 usage = totals.subtracting(previousTotals)
             } else {
+                hasMalformedUsage = true
+                return
+            }
+            guard usage.isValid else {
+                hasMalformedUsage = true
                 return
             }
             if let totals { previousTotals = totals }
-            guard usage.input > 0 || usage.cached > 0 || usage.output > 0 || usage.reasoning > 0 else { return }
+            guard usage.input > 0 || usage.cached > 0 || usage.output > 0 || usage.reasoning > 0
+                    || usage.total > 0
+            else { return }
 
-            let parsedModel = CodexLogUsageScanner.modelName(in: payload)
-                ?? info.flatMap(CodexLogUsageScanner.modelName(in:))
+            let parsedModel: String?
+            switch CodexLogUsageScanner.modelNameUpdate(in: payload) {
+            case .value(let model):
+                parsedModel = model
+            case .invalid:
+                hasMalformedUsage = true
+                return
+            case .absent:
+                switch CodexLogUsageScanner.modelNameUpdate(in: info) {
+                case .value(let model): parsedModel = model
+                case .invalid:
+                    hasMalformedUsage = true
+                    return
+                case .absent: parsedModel = nil
+                }
+            }
             let model = CodexLogUsageScanner.resolveModel(parsed: parsedModel, currentModel: &currentModel)
             let event = Event(
                 timestamp: timestamp,
@@ -837,11 +1679,13 @@ actor CodexLogUsageScanner {
                     ? CodexLogUsageScanner.autoReviewFallback(at: timestampRaw)
                     : nil,
                 input: usage.input,
-                cached: min(usage.cached, usage.input),
+                cached: usage.cached,
                 output: usage.output,
                 reasoning: usage.reasoning,
                 total: usage.total,
-                isFast: currentTierIsFast
+                hasCompleteCostBreakdown: usage.hasCompleteCostBreakdown && currentServiceTierIsValid,
+                isFast: currentTierIsFast,
+                serviceTier: currentServiceTier
             )
             if emitSince == nil || timestamp >= emitSince! {
                 events.append(event)
@@ -857,30 +1701,69 @@ actor CodexLogUsageScanner {
                 previousTotals: previousTotals,
                 currentModel: currentModel,
                 currentTierIsFast: currentTierIsFast,
+                currentServiceTier: currentServiceTier,
+                currentServiceTierIsValid: currentServiceTierIsValid,
                 sawSessionMeta: sawSessionMeta,
                 replayGate: replayGate
             )
         }
     }
 
-    private static func serviceTier(in payload: [String: Any]?) -> String? {
+    private struct ServiceTierUpdate {
+        var tier: String?
+        var isValid: Bool
+    }
+
+    private static func serviceTierUpdate(in payload: [String: Any]?) -> ServiceTierUpdate? {
         guard let payload else { return nil }
-        let settings = payload["thread_settings"] as? [String: Any]
-        for value in [settings?["service_tier"], payload["service_tier"]] {
-            if let text = (value as? String)?.trimmingCharacters(in: .whitespaces), !text.isEmpty {
-                return text
+        if let rawSettings = payload["thread_settings"] {
+            guard let settings = rawSettings as? [String: Any] else {
+                return ServiceTierUpdate(tier: nil, isValid: false)
             }
+            if let rawTier = settings["service_tier"] {
+                return parsedServiceTier(rawTier)
+            }
+        }
+        if let rawTier = payload["service_tier"] {
+            return parsedServiceTier(rawTier)
         }
         return nil
     }
 
-    private static func modelName(in json: [String: Any]) -> String? {
-        for value in [json["model"], json["model_name"], (json["metadata"] as? [String: Any])?["model"]] {
-            if let text = (value as? String)?.trimmingCharacters(in: .whitespaces), !text.isEmpty {
-                return text
-            }
+    private static func parsedServiceTier(_ raw: Any) -> ServiceTierUpdate {
+        guard let text = raw as? String else {
+            return ServiceTierUpdate(tier: nil, isValid: false)
         }
-        return nil
+        let tier = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let known: Set<String> = [
+            "auto", "default", "standard", "priority", "fast", "flex", "batch", "ultrafast"
+        ]
+        guard !tier.isEmpty, known.contains(tier) else {
+            return ServiceTierUpdate(tier: tier.nilIfEmpty, isValid: false)
+        }
+        return ServiceTierUpdate(tier: tier, isValid: true)
+    }
+
+    private enum ModelNameUpdate {
+        case absent
+        case value(String)
+        case invalid
+    }
+
+    private static func modelNameUpdate(in json: [String: Any]) -> ModelNameUpdate {
+        let values: [Any?] = [
+            json["model"],
+            json["model_name"],
+            (json["metadata"] as? [String: Any])?["model"]
+        ]
+        for value in values {
+            guard let value else { continue }
+            guard let text = value as? String else { return .invalid }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            return .value(trimmed)
+        }
+        return .absent
     }
 
     static func isChildSessionMeta(_ payload: [String: Any]) -> Bool {
@@ -977,6 +1860,9 @@ actor CodexLogUsageScanner {
         var output: Int
         var reasoning: Int
         var total: Int
+        var hasCompleteCostBreakdown: Bool
+        var isFast: Bool
+        var serviceTier: String?
     }
 
     private static func accumulate(
@@ -995,36 +1881,76 @@ actor CodexLogUsageScanner {
             cached: event.cached,
             output: event.output,
             reasoning: event.reasoning,
-            total: event.total
+            total: event.total,
+            hasCompleteCostBreakdown: event.hasCompleteCostBreakdown,
+            isFast: event.isFast,
+            serviceTier: event.serviceTier
         )
         guard seen.insert(key).inserted else { return }
 
         let day = DailyUsageAccumulator.dayKey(from: event.timestamp)
-        let trimmedModel = event.model.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-        guard let model = trimmedModel else { return }
+        // An empty model is not a reason to drop the row's tokens: count them under the shared
+        // Unattributed name (same convention as the Claude scanner). The pricing lookup then misses
+        // and the day's warning triangle carries "Unattributed", so the loss is visible instead of
+        // silently vanishing from every total.
+        let model = event.model.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            ?? ModelUsageEntry.unattributedModelName
         // OpenCode Go/Zen gateway turns are folded into the OpenCode card; counting them here
         // double-counts the same dollars/tokens in Total Spend.
         if OpenCodeUsageScanner.isHostedGatewayModel(model) { return }
         let pricingModel = event.pricingModel ?? model
-        let canonicalModel = pricing.supplement.canonicalName(for: pricingModel) ?? pricingModel
+        let canonicalModel = pricing.canonicalName(for: pricingModel) ?? pricingModel
         let isFastAlias = canonicalModel.hasSuffix("-fast")
         let rateModel = isFastAlias ? String(canonicalModel.dropLast("-fast".count)) : canonicalModel
         let baseRates = pricing.resolve(model: rateModel)
         let resolvedRates = baseRates ?? pricing.resolve(model: pricingModel)
+        // Public-API-rate comparison: the same tokens at the catalog rates, without the router's
+        // priority/fast-tier adjustments. Unrevealed codenames contribute nothing.
+        let apiEstimate = event.hasCompleteCostBreakdown ? resolvedRates.map { rates in
+            rates.costDollars(for: TokenBreakdown(
+                input: max(0, event.input - event.cached),
+                cacheRead: event.cached,
+                output: event.output
+            ))
+        } : nil
+        accumulator.recordApiEstimate(
+            day: day,
+            cost: event.hasCompleteCostBreakdown ? apiEstimate : nil,
+            tokens: event.total
+        )
         guard let rates = resolvedRates else {
             if event.total > 0 {
                 accumulator.addUnknownModel(day: day, model: model)
             }
+            // Count the tokens with a dashed cost so an unrevealed codename stays visible.
+            accumulator.add(
+                day: day,
+                tokens: event.total,
+                cost: nil,
+                model: model,
+                canonical: GatewaySlug.identity(of: model, resolvedPricingModel: rateModel)
+            )
+            if !event.hasCompleteCostBreakdown {
+                accumulator.markCostIncomplete(
+                    day: day,
+                    model: model,
+                    canonical: GatewaySlug.identity(of: model, resolvedPricingModel: rateModel)
+                )
+            }
             return
         }
         let appliesCodexFastTier = isFastAlias ? baseRates != nil : event.isFast
-        let eventCost = cost(
+        let serviceTierMultiplier = codexServiceTierMultiplier(
+            for: rateModel,
+            serviceTier: event.serviceTier
+        )
+        let eventCost = event.hasCompleteCostBreakdown ? cost(
             rates: rates,
             event: event,
             model: rateModel,
-            fastTier: appliesCodexFastTier,
-            fastMultiplier: codexPriorityMultiplier(for: rateModel, rates: rates)
-        )
+            fastTier: serviceTierMultiplier != nil || appliesCodexFastTier,
+            fastMultiplier: serviceTierMultiplier ?? codexPriorityMultiplier(for: rateModel, rates: rates)
+        ) : nil
         // Key the row on the resolved model, not the emitted slug. Session logs carry gateway-prefixed
         // slugs too, so the same model can arrive both tagged and untagged; grouping on the raw slug split
         // it across rows and into the period total twice. The spelling is kept as a tooltip variant.
@@ -1035,6 +1961,13 @@ actor CodexLogUsageScanner {
             model: model,
             canonical: GatewaySlug.identity(of: model, resolvedPricingModel: rateModel)
         )
+        if !event.hasCompleteCostBreakdown {
+            accumulator.markCostIncomplete(
+                day: day,
+                model: model,
+                canonical: GatewaySlug.identity(of: model, resolvedPricingModel: rateModel)
+            )
+        }
     }
 
     static func aggregate(events: [Event], since: Date, pricing: ModelPricing) -> LogUsageScan {
@@ -1095,6 +2028,20 @@ actor CodexLogUsageScanner {
         }
     }
 
+    /// OpenAI publishes the named GPT-6.1 Sol service-tier multipliers. Keep these exact-model
+    /// overrides scoped to that published schedule; unknown tiers and sibling models stay standard.
+    static func codexServiceTierMultiplier(for model: String, serviceTier: String?) -> Double? {
+        let base = datedBaseModel(model)
+        let slug = base.split(separator: "/").last.map(String.init) ?? base
+        guard slug == "gpt-6.1-sol", let serviceTier = serviceTier?.lowercased() else { return nil }
+        switch serviceTier {
+        case "fast", "priority": return 2
+        case "flex", "batch": return 0.5
+        case "ultrafast": return 6
+        default: return nil
+        }
+    }
+
     private static func codexModelHasNoCacheDiscount(_ model: String) -> Bool {
         switch datedBaseModel(model) {
         case "gpt-5.4-pro", "gpt-5.5-pro": return true
@@ -1122,8 +2069,58 @@ actor CodexLogUsageScanner {
     }
 
     private static func datedBaseModel(_ model: String) -> String {
-        model
-            .replacingOccurrences(of: #"-\d{4}-\d{2}-\d{2}$"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: #"-\d{8}$"#, with: "", options: .regularExpression)
+        stripDatedSuffix(model, separated: true)
+            ?? stripDatedSuffix(model, separated: false)
+            ?? model
+    }
+
+    /// These helpers run several times for every priced Codex event. The suffix grammar is fixed, so
+    /// checking its ASCII digits directly avoids compiling/running two regular expressions per event.
+    private static func stripDatedSuffix(_ model: String, separated: Bool) -> String? {
+        let bytes = model.utf8
+        let suffixLength = separated ? 11 : 9
+        guard bytes.count >= suffixLength else { return nil }
+        let start = bytes.index(bytes.endIndex, offsetBy: -suffixLength)
+        func byte(_ offset: Int) -> UInt8 {
+            bytes[bytes.index(start, offsetBy: offset)]
+        }
+        guard byte(0) == UInt8(ascii: "-") else { return nil }
+
+        if separated {
+            for offset in 1...10 {
+                if offset == 5 || offset == 8 {
+                    guard byte(offset) == UInt8(ascii: "-") else { return nil }
+                } else {
+                    guard (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte(offset)) else { return nil }
+                }
+            }
+        } else {
+            for offset in 1...8 {
+                guard (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte(offset)) else { return nil }
+            }
+        }
+
+        guard let stringStart = String.Index(start, within: model) else { return nil }
+        return String(model[..<stringStart])
+    }
+}
+
+/// OpenCode folds enabled Codex homes one at a time to release each home's parsed tail before moving
+/// on. Rollout ids are global across Codex homes, so keep first-seen names across those calls too;
+/// otherwise a copied backfill with a different inode is counted once per home.
+final class CodexRolloutNameDeduper: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen: Set<String> = []
+
+    func retainingFirstOccurrence(
+        of files: [JSONLScanning.DiscoveredFile]
+    ) -> [JSONLScanning.DiscoveredFile] {
+        lock.lock()
+        defer { lock.unlock() }
+        return files.filter { file in
+            let name = URL(fileURLWithPath: file.path).lastPathComponent
+            guard name.hasPrefix("rollout-") else { return true }
+            return seen.insert(name).inserted
+        }
     }
 }

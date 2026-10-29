@@ -65,6 +65,7 @@ final class LayoutBootstrapTests: XCTestCase {
             metricIDs: ["codex.session", "codex@abc12345.session"],
             migrationBaselineMetricIDs: ["codex.session"],
             pinnedMetricIDs: ["codex.session"],
+            migrationBaselinePinnedMetricIDs: ["codex.session"],
             expandedMetricIDs: []
         )
         let state = LayoutBootstrap.load(registry: registry, persistence: persistence, defaults: defaults)
@@ -98,6 +99,7 @@ final class LayoutBootstrapTests: XCTestCase {
                 metricIDs: ["codex.session", "codex@abc12345.session"],
                 migrationBaselineMetricIDs: ["codex.session"],
                 pinnedMetricIDs: ["codex.session"],
+                migrationBaselinePinnedMetricIDs: ["codex.session"],
                 expandedMetricIDs: []
             )
         )
@@ -106,11 +108,62 @@ final class LayoutBootstrapTests: XCTestCase {
         XCTAssertFalse(state.shouldPersistPins)
     }
 
+    func testNewDefaultPinSeedsIntoExistingLayoutOnce() {
+        let (persistence, _) = makePersistence("DefaultPinSeed")
+        persistence.savePlaced([PlacedWidget(descriptorID: "claude.session")])
+        persistence.savePins(["claude.session"])
+        // A pre-existing layout has never seen the new default pin (`claude.weekly`).
+        let defaults = LayoutDefaultSet(
+            metricIDs: ["claude.session", "claude.weekly"],
+            migrationBaselineMetricIDs: ["claude.session", "claude.weekly"],
+            pinnedMetricIDs: ["claude.session", "claude.weekly"],
+            migrationBaselinePinnedMetricIDs: ["claude.session"],
+            expandedMetricIDs: []
+        )
+
+        let state = LayoutBootstrap.load(registry: .mock, persistence: persistence, defaults: defaults)
+
+        XCTAssertEqual(state.pinnedMetricIDs, ["claude.session", "claude.weekly"])
+        XCTAssertTrue(state.shouldPersistPins)
+        XCTAssertEqual(state.seededDefaultPinsToPersist, ["claude.session", "claude.weekly"])
+
+        persistence.savePins(state.pinnedMetricIDs)
+        persistence.saveSeededDefaultPins(state.seededDefaultPinsToPersist ?? [])
+        // Simulate the user unpinning only the newly seeded default before the next launch.
+        persistence.savePins(["claude.session"])
+
+        let reloaded = LayoutBootstrap.load(registry: .mock, persistence: persistence, defaults: defaults)
+
+        XCTAssertEqual(reloaded.pinnedMetricIDs, ["claude.session"])
+        XCTAssertFalse(reloaded.shouldPersistPins, "an explicit unpin of a seeded default must stay removed")
+    }
+
+    func testBaselineDefaultPinsAreNotReSeededOverUserUnpins() {
+        let (persistence, _) = makePersistence("DefaultPinBaseline")
+        persistence.savePlaced([PlacedWidget(descriptorID: "claude.session")])
+        // The user unpinned everything before pin seeding existed; the baseline is what they saw.
+        persistence.savePins([])
+        let defaults = LayoutDefaultSet(
+            metricIDs: ["claude.session", "claude.weekly"],
+            migrationBaselineMetricIDs: ["claude.session", "claude.weekly"],
+            pinnedMetricIDs: ["claude.session", "claude.weekly"],
+            migrationBaselinePinnedMetricIDs: ["claude.session", "claude.weekly"],
+            expandedMetricIDs: []
+        )
+
+        let state = LayoutBootstrap.load(registry: .mock, persistence: persistence, defaults: defaults)
+
+        XCTAssertTrue(state.pinnedMetricIDs.isEmpty)
+        XCTAssertFalse(state.shouldPersistPins)
+        XCTAssertEqual(state.seededDefaultPinsToPersist, ["claude.session", "claude.weekly"])
+    }
+
     private func makeDefaultSet() -> LayoutDefaultSet {
         LayoutDefaultSet(
             metricIDs: ["claude.session", "claude.weekly"],
             migrationBaselineMetricIDs: ["claude.session", "claude.weekly"],
             pinnedMetricIDs: ["claude.session"],
+            migrationBaselinePinnedMetricIDs: ["claude.session"],
             expandedMetricIDs: ["claude.weekly"]
         )
     }

@@ -62,10 +62,24 @@ short trail in the log file:
   launches, so the previous account's cached snapshot was dropped instead of painting under the new
   login.
 - `account identity read skipped for claude, codex: login shell cold and no shell-environment
-  snapshot exists yet` — a first launch raced a slow login shell, so the named families were left
-  unread this launch; every later launch has a persisted snapshot to fall back on.
+  snapshot exists yet` — the login-shell capture failed after its one bounded retry, so the named
+  families were left unread this launch; a successful later launch persists a snapshot for fallback.
 
 ## Tips
+
+For local diagnosis without clicking the menu bar, use the running app's control command:
+
+```sh
+./script/diagnose.sh show
+./script/diagnose.sh show freebuff
+./script/diagnose.sh refresh freebuff
+./script/diagnose.sh close
+```
+
+Omit the provider ID to refresh all enabled providers. Diagnostic refresh bypasses the snapshot cache
+and failure backoff, keeps Keychain prompts disabled, and never enables a provider or changes layout.
+`BUNDLE_ID=com.tverma101.quotabar.dev` targets a running development build. The commands use local
+distributed notifications; the HTTP API stays read-only.
 
 - **A provider shows an error.** Reproduce with `logs` running, then check that provider's page in
   `docs/providers/` for what its error states mean and where it reads credentials from.
@@ -73,7 +87,13 @@ short trail in the log file:
   [Refreshing & caching](refreshing.md) for when a network call actually happens. Use the per-provider
   "Refresh" in the row's context menu to force one.
 - **Permissions / keychain prompts on every rebuild.** The script signs with a stable Apple Development
-  identity so the permission ACLs stick. If you see repeated prompts, make sure such an identity exists in
-  your keychain (the script warns when it falls back to ad-hoc signing).
+  identity so **Always Allow** grants survive rebuilds of the same bundle ID. Development and production
+  are separate app identities, so each needs its own initial grant. The build script requires a stable
+  signing identity by default; ad hoc signing is available only with `ALLOW_ADHOC_SIGNING=1` and cannot
+  preserve grants across rebuilds. Background reads, existence checks, and credential writes disable
+  both legacy Keychain UI and local authentication UI. The legacy switch is shared across providers,
+  so native operations are serialized while it is set. An explicit Refresh gets one dialog budget,
+  and a cancelled item is retried only by a later explicit Refresh. Repeated dialogs within one action
+  indicate a regression in the shared gate. This also covers Claude Desktop's Safe Storage key.
 - **Inspect the local API.** With the app running, `curl 127.0.0.1:6736/v1/usage` shows the same usage
   snapshots the UI uses — handy to confirm whether a problem is in fetching/mapping or in the UI.

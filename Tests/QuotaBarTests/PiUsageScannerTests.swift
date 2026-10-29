@@ -48,7 +48,7 @@ final class PiUsageScannerTests: XCTestCase {
     }
 
     func testSplitsCacheWriteBucketsBy1hPortion() {
-        let entry = PiUsageScanner.parseLine(line(cacheWrite: 1000, cacheWrite1h: 400))
+        let entry = PiUsageScanner.parseLine(line(cacheWrite: 1000, cacheWrite1h: 400, total: 1150))
         XCTAssertEqual(entry?.tokens.cacheWrite1h, 400)
         XCTAssertEqual(entry?.tokens.cacheWrite5m, 600)
     }
@@ -78,10 +78,12 @@ final class PiUsageScannerTests: XCTestCase {
         XCTAssertEqual(scan.series.daily.first?.costUSD ?? 0, 0.002, accuracy: 0.00001)
     }
 
-    func testUnpriceableZeroCostBecomesUnknownModel() {
+    func testUnpriceableZeroCostCountsTokensAndStaysUnpriced() {
         let entry = PiUsageScanner.parseLine(line(provider: "cursor", model: "mystery-model", cost: "0"))!
         let scan = PiUsageScanner.aggregate(entries: [entry], cardID: "cursor", since: .distantPast, pricing: .empty)
-        XCTAssertTrue(scan.series.daily.isEmpty)
+        // Unpriced usage keeps its tokens (history shows volume) but claims no cost.
+        XCTAssertEqual(scan.series.daily.map(\.totalTokens), [150])
+        XCTAssertNil(scan.series.daily.first?.costUSD)
         XCTAssertEqual(
             scan.unknownModelsByDay[TestLocalInstant.isoDay(2026, 7, 12)], ["mystery-model"]
         )
@@ -121,5 +123,43 @@ final class PiUsageScannerTests: XCTestCase {
 
     func testMergedReturnsNilWhenAllNil() {
         XCTAssertNil(DailyUsageAccumulator.merged([nil, nil]))
+    }
+
+    func testScanResultDistinguishesFailedDiscoveryFromAnEmptySource() async {
+        let failingHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pi-scan-failure-\(UUID().uuidString)", isDirectory: true)
+        let failingSessions = failingHome.appendingPathComponent(".pi/agent/sessions")
+        do {
+            try FileManager.default.createDirectory(
+                at: failingSessions.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            try Data("not a directory".utf8).write(to: failingSessions)
+        } catch {
+            return XCTFail("could not create failed-discovery fixture: \(error)")
+        }
+        defer { try? FileManager.default.removeItem(at: failingHome) }
+        let failingScanner = PiUsageScanner(
+            environment: FakeEnvironment([:]),
+            homeDirectory: { failingHome },
+            incrementalScanner: IncrementalJSONLScanner<PiUsageScanner.Entry>()
+        )
+        let failed = await failingScanner.scanResult(cardID: "claude", now: Date(), pricing: .empty)
+        guard case .incomplete = failed else {
+            return XCTFail("failed traversal must not be reported as an empty Pi source")
+        }
+
+        let emptyHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pi-scan-empty-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: emptyHome) }
+        let emptyScanner = PiUsageScanner(
+            environment: FakeEnvironment([:]),
+            homeDirectory: { emptyHome },
+            incrementalScanner: IncrementalJSONLScanner<PiUsageScanner.Entry>()
+        )
+        let empty = await emptyScanner.scanResult(cardID: "claude", now: Date(), pricing: .empty)
+        guard case .complete(let scan) = empty else {
+            return XCTFail("a completed empty traversal is a valid empty source")
+        }
+        XCTAssertNil(scan)
     }
 }

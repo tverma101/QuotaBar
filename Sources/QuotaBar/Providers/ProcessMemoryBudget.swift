@@ -8,10 +8,18 @@ import Foundation
 /// soft we unload caches aggressively; over hard we also ask callers to serialize heavy work.
 enum ProcessMemoryBudget {
     /// Prefer staying under this settled/peak soft ceiling after unload.
-    static let softLimitBytes: UInt64 = 320 * 1024 * 1024
+    ///
+    /// This machine's log corpora are large enough that one provider's warm working set (Codex tail
+    /// items + router index + gateway folds) sits at 310-415 MB. At the previous 320 MB the soft
+    /// limit fired after *every* heavy provider mid-batch, unloading the parse caches the next
+    /// provider was about to share — each card then cold-reparsed and the batch ran several times
+    /// longer than the same batch warm. 512 MB lets a full batch keep its caches; cycle cleanup drops
+    /// the larger Router index when the panel is hidden, while capped session tails stay warm until
+    /// the process reaches this budget or macOS reports memory pressure.
+    static let softLimitBytes: UInt64 = 512 * 1024 * 1024
     /// Never intentionally allow a sustained footprint above this; callers should drop caches and
     /// avoid starting additional concurrent local-log providers.
-    static let hardLimitBytes: UInt64 = 480 * 1024 * 1024
+    static let hardLimitBytes: UInt64 = 768 * 1024 * 1024
 
     /// Current `phys_footprint` for this process, or `nil` when the kernel query fails.
     static func physicalFootprintBytes() -> UInt64? {

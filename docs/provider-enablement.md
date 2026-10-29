@@ -1,32 +1,36 @@
 # Which Providers Are On
 
-How QuotaBar decides which providers start on, what happens when an update adds a new provider, and the one rule that governs it all: **your own toggles always win and are never overridden.**
+How QuotaBar chooses its starting provider cards and how you turn on the rest.
 
 ## First install
 
-A fresh install doesn't turn on every provider QuotaBar knows about. It starts with Claude, Codex, and Cursor, then quickly checks which providers have credentials available on your Mac — an existing local login, saved API key, or supported environment variable; nothing is sent anywhere — and switches to exactly that set. All providers are checked at once, so detection takes as long as the slowest single check, not the sum of them. If nothing is found, the Claude/Codex/Cursor starter set stays. Providers the check turns on are fetched right away, so they appear with data instead of waiting for the next scheduled refresh. See [Dashboard § First launch](dashboard.md#first-launch) for how the dashboard presents this.
+A fresh install starts with Claude, Codex, Cursor, Freebuff, and any registered Codex account cards on. If the bare Claude card ID is unavailable because of saved account history, its preferred account-scoped card carries the Claude default. Every other provider starts off and stays off until you enable it in **Customize**. QuotaBar does not scan local logins or Keychain items to choose providers, so optional cards cannot appear just because a CLI or app happens to be installed. See [Dashboard § First launch](dashboard.md#first-launch).
 
 ## When an update adds a new provider
 
-The same detection runs for providers that arrive later. On the first launch after an update, QuotaBar compares the providers it now ships with the ones this install has seen before. For each brand-new one, it runs the same local-only credential check:
-
-- **Credentials are available locally** → the provider turns on and appears on the dashboard.
-- **No credentials are available** → it stays off. You can always turn it on later in **Customize**.
-
-This check happens **once per provider**. After that, the provider is yours to manage: if you turn it off, no update will ever turn it back on, and installing the tool later won't flip it on behind your back either — head to Customize when you want it.
+An update can add new provider cards to QuotaBar, but they remain off until you enable them in **Customize**. Installing or signing in to the provider's own app never changes your QuotaBar provider selection.
 
 ## Your choices always stick
 
-Everything you set in Customize — providers on or off, metric layout, menu-bar stars — carries across updates untouched. The only thing an update may ever change is turning **on** a provider you have never seen before, and only when you actually have that tool installed.
+Everything you set in Customize — providers on or off, metric layout, menu-bar stars — carries across updates untouched. Newly shipped optional providers are added to Customize but never turned on automatically.
 
-The one exception is deliberate: the **Reset All Customization** button at the top of the Customize provider list. Because you asked for a clean slate, it re-runs the same local credential detection as first launch and switches the enabled set back to exactly the providers with credentials available on your Mac (Claude/Codex/Cursor if none are found) — so it can turn a provider off even if you had it on, or back on if you had turned it off. It also asks for confirmation first. See [Dashboard](dashboard.md) for the metric side of that reset.
+The **Reset All Customization** button at the top of the Customize provider list restores the default set — Claude (using its preferred account-scoped card if needed), Codex, Cursor, Freebuff, and registered Codex accounts — and turns other providers off. It asks for confirmation first. See [Dashboard](dashboard.md) for the metric side of that reset.
 
 ## How it works (for the curious)
 
-The app persists three small lists in its settings:
+The app persists provider choices and legacy discovery metadata:
 
 - **Enabled providers** — the providers currently on. This is the source of truth the dashboard and menu bar read.
-- **Known providers** — every provider this install has ever seen. This is what makes "new in this update" distinguishable from "you turned it off": a provider missing from the enabled list but present in the known list is a deliberate choice, and is left alone. Only providers missing from *both* get the credential check, and each is marked known immediately so the check never repeats.
-- Each provider implements a cheap, local-only credential probe (`hasLocalCredentials()`) — the same files, keychain entries, saved keys, and environment variables its normal refresh reads, never the network.
+- **Known providers** — every provider this install has seen. Newly registered providers stay off until you enable them. Old pending credential-probe records from earlier builds are discarded.
+- Provider implementations may expose a local-only `hasLocalCredentials()` check, but startup and provider discovery do not call it to change your settings.
 
-Older installs (from before first-run detection existed) started with every provider on and stored only the ones turned *off*. A one-time settings migration converts them to the lists above with the exact same providers on and off as before — nothing visibly changes on the launch that migrates; those installs simply join the same new-provider detection from then on.
+Routine startup reads OpenCode's Go-key inventory only while OpenCode is enabled. Enabling it rebuilds the account-specific meters from its configured keys; opening **OpenCode Go Keys** in Customize or making an explicit CLI request also reads that inventory for the requested action.
+
+The one-shot CLI applies the same settings migration and fresh-install defaults before it selects providers. A named request can refresh that provider for the current command, while OpenCode's related Claude, Codex, and Hermes scans still follow their saved enablement.
+
+When every Claude card is off, startup skips Claude Desktop organization discovery and its Safe Storage
+read. Turning a Claude card on rebuilds the account list before the replacement dashboard appears. If
+that action enabled the generic Claude fallback and discovery replaces it with account-scoped cards,
+QuotaBar carries the enablement to the preferred account card unless that card was explicitly turned off.
+
+The settings migration preserves recorded Customize choices and enabled provider cards that can be identified from saved account records. It keeps currently enabled core defaults and turns off optional cards that older versions enabled only through credential detection. Freebuff stays on when it was already enabled; a newly introduced default turns it on only when the saved provider history shows it had not been seen or explicitly disabled. If an older settings format left an optional card's choice ambiguous, that card stays off unless a Customize choice was recorded.

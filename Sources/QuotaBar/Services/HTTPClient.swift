@@ -14,7 +14,9 @@ struct HTTPResponse: Sendable {
     var body: Data
 
     func header(_ name: String) -> String? {
-        headers[name.lowercased()]
+        headers[name.lowercased()] ?? headers.first {
+            $0.key.caseInsensitiveCompare(name) == .orderedSame
+        }?.value
     }
 }
 

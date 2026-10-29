@@ -473,8 +473,8 @@ struct DashboardView: View {
                         height: Self.topBarHeight,
                         horizontalPadding: Self.footerHorizontalPadding,
                         onResetAll: {
-                            layout.resetToDefault()
                             container.reseedEnabledProviders()
+                            layout.resetToDefault()
                         },
                         isPresentingResetAllConfirm: $isPresentingResetAllConfirm
                     )
@@ -514,6 +514,8 @@ struct DashboardView: View {
                 reorderSpaceName: Self.reorderSpace,
                 reorderLift: $reorderLift
             )
+        case .history:
+            HistoryDashboardView()
         case .settings:
             SettingsScreen()
         }

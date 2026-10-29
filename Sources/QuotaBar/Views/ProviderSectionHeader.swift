@@ -24,6 +24,9 @@ struct ProviderSectionHeader: View {
     /// Dashboard-only screenshot action. The reorder preview omits it, while Customize uses its own
     /// row type and is unaffected by this header.
     var onCopyScreenshot: (() -> Bool)?
+    /// A direct retry for a provider with a hard refresh error. Keep the recovery action next to its
+    /// warning instead of requiring the user to discover the footer countdown or a context menu.
+    var onRefresh: (() -> Void)?
 
     /// Header type and icon track the density setting like the rows do, so Compact shrinks the
     /// whole section anatomy — not just the rows under it.
@@ -32,13 +35,22 @@ struct ProviderSectionHeader: View {
     @Environment(\.popoverPartyMode) private var partyMode
     @State private var isHovered = false
 
+    var statusPresentation: ProviderHeaderStatusPresentation {
+        ProviderHeaderStatusPresentation(
+            refreshing: refreshing,
+            hasWarning: warning != nil,
+            hasRetry: onRefresh != nil
+        )
+    }
+
     init(
         provider: Provider,
         plan: String? = nil,
         warning: String? = nil,
         refreshing: Bool = false,
         staleness: StalenessHint? = nil,
-        onCopyScreenshot: (() -> Bool)? = nil
+        onCopyScreenshot: (() -> Bool)? = nil,
+        onRefresh: (() -> Void)? = nil
     ) {
         self.provider = provider
         self.plan = plan
@@ -46,9 +58,11 @@ struct ProviderSectionHeader: View {
         self.refreshing = refreshing
         self.staleness = staleness
         self.onCopyScreenshot = onCopyScreenshot
+        self.onRefresh = onRefresh
     }
 
     var body: some View {
+        let status = statusPresentation
         HStack(spacing: 5) {
             // The provider mark replaces the dashboard's visual drag grip. Reordering still belongs
             // to the whole header at the caller, so the logo itself stays presentational.
@@ -82,15 +96,26 @@ struct ProviderSectionHeader: View {
                         .hoverTooltip(staleness.tooltip)
                 }
             }
-            if refreshing {
-                MotionAwareProgressView(controlSize: .mini)
-                    .accessibilityLabel("Refreshing")
-            } else if let warning {
+            if status.showsWarning, let warning {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Theme.notice)
                     .hoverTooltip(warning)
                     .accessibilityLabel(warning)
+            }
+            if status.showsRetry, let onRefresh {
+                Button(action: onRefresh) {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                        .font(.caption2.weight(.medium))
+                }
+                .buttonStyle(.borderless)
+                .fixedSize()
+                .accessibilityLabel("Refresh \(provider.displayName)")
+                .accessibilityHint("Retries this provider. If macOS asks for Keychain access, allow it.")
+            }
+            if status.showsSpinner {
+                MotionAwareProgressView(controlSize: .mini)
+                    .accessibilityLabel("Refreshing")
             }
             Spacer(minLength: 8)
             if let onCopyScreenshot {
@@ -106,6 +131,18 @@ struct ProviderSectionHeader: View {
         .padding(.vertical, 2)
         .contentShape(Rectangle())
         .onHover { isHovered = $0 }
+    }
+}
+
+struct ProviderHeaderStatusPresentation: Equatable {
+    let showsWarning: Bool
+    let showsRetry: Bool
+    let showsSpinner: Bool
+
+    init(refreshing: Bool, hasWarning: Bool, hasRetry: Bool) {
+        showsWarning = hasWarning
+        showsRetry = hasWarning && hasRetry
+        showsSpinner = refreshing
     }
 }
 

@@ -4,8 +4,10 @@ extension ClaudeAuthStore {
     func loadKeychainCredentials(
         allowInteraction: Bool,
         interactionGate: CredentialInteractionGate?
-    ) -> ClaudeCredentialState? {
+    ) -> (candidate: ClaudeCredentialState?, permissionRequired: Bool, readFailed: Bool, cancelled: Bool) {
         // The service name is safe to log; NEVER log the returned credential blob / OAuth tokens.
+        var permissionRequired = false
+        var readFailed = false
         for service in keychainServiceCandidates() {
             do {
                 if let value = try readClaudeKeychainPassword(
@@ -18,13 +20,15 @@ extension ClaudeAuthStore {
                     service: service,
                     source: .keychainCurrentUser(service: service)
                 ) {
-                    return state
+                    return (state, permissionRequired, readFailed, false)
                 }
             } catch KeychainError.interactionNotAllowed {
-                AppLog.debug(.keychain, "Claude Code Keychain read skipped; user interaction is unavailable")
-                return nil
+                permissionRequired = true
+                continue
+            } catch is CancellationError {
+                return (nil, permissionRequired, readFailed, true)
             } catch {
-                // Preserve the established fallback behavior for absent, malformed, or unreadable entries.
+                readFailed = true
             }
 
             do {
@@ -38,17 +42,18 @@ extension ClaudeAuthStore {
                     service: service,
                     source: .keychainLegacy(service: service)
                 ) {
-                    return state
+                    return (state, permissionRequired, readFailed, false)
                 }
             } catch KeychainError.interactionNotAllowed {
-                AppLog.debug(.keychain, "Claude Code Keychain read skipped; user interaction is unavailable")
-                return nil
+                permissionRequired = true
+                continue
+            } catch is CancellationError {
+                return (nil, permissionRequired, readFailed, true)
             } catch {
-                // Preserve the established fallback behavior for absent, malformed, or unreadable entries.
+                readFailed = true
             }
-            AppLog.debug(.keychain, "read miss service=\(service)")
         }
-        return nil
+        return (nil, permissionRequired, readFailed, false)
     }
 
     private func readClaudeKeychainPassword(
@@ -57,20 +62,18 @@ extension ClaudeAuthStore {
         allowInteraction: Bool,
         interactionGate: CredentialInteractionGate?
     ) throws -> String? {
-        do {
-            if currentUserOnly {
-                return try keychain.readGenericPasswordForCurrentUser(service: service, allowInteraction: false)
-            }
-            return try keychain.readGenericPassword(service: service, allowInteraction: false)
-        } catch KeychainError.interactionNotAllowed {
-            guard allowInteraction, interactionGate?.claim() ?? true else {
-                throw KeychainError.interactionNotAllowed
-            }
-            if currentUserOnly {
-                return try keychain.readGenericPasswordForCurrentUser(service: service, allowInteraction: true)
-            }
-            return try keychain.readGenericPassword(service: service, allowInteraction: true)
+        if currentUserOnly {
+            return try keychain.readGenericPasswordForRefreshForCurrentUser(
+                service: service,
+                allowInteraction: allowInteraction,
+                interactionGate: interactionGate
+            )
         }
+        return try keychain.readGenericPasswordForRefresh(
+            service: service,
+            allowInteraction: allowInteraction,
+            interactionGate: interactionGate
+        )
     }
 
     /// Parse one Keychain hit without logging its credential blob or OAuth tokens.
@@ -86,7 +89,6 @@ extension ClaudeAuthStore {
         else {
             return nil
         }
-        AppLog.debug(.keychain, "read hit service=\(service)")
-        return ClaudeCredentialState(oauth: oauth, source: source, fullData: parsed, inferenceOnly: false)
+        return ClaudeCredentialState(oauth: oauth, source: source, fullData: parsed, rawText: value, inferenceOnly: false)
     }
 }

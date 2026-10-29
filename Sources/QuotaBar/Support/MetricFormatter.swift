@@ -58,9 +58,18 @@ enum MetricFormatter {
     /// A value with its unit label appended, e.g. "772 credits". Token, dollar, and percent values
     /// carry no label and render bare ("56.9M", "$4.08", "95%") — those rows show no unit, by design.
     static func string(for value: MetricValue, style: Style) -> String {
-        let text = number(value.number, kind: value.kind, style: style)
+        let text = number(for: value, style: style)
         guard let label = value.label, !label.isEmpty else { return text }
         return "\(text) \(label)"
+    }
+
+    /// Format a typed value and retain its saturation marker in the UI when the stored count is only
+    /// a lower bound.
+    static func number(for value: MetricValue, style: Style) -> String {
+        let text = number(value.number, kind: value.kind, style: style)
+        let isLowerBound = value.isLowerBound == true
+            || (value.kind == .count && value.tokenCountSaturated == true)
+        return isLowerBound ? "≥\(text)" : text
     }
 
     /// Dollars per million tokens for legends and tooltips — dollar formatting plus a fixed `/MTok`

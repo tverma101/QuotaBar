@@ -9,16 +9,23 @@ enum DevinUsageMapper {
     static let dayPeriodMs = MetricPeriod.dayMs
     static let weekPeriodMs = MetricPeriod.weekMs
 
-    static func mapUserStatusResponse(_ response: HTTPResponse) throws -> DevinMappedUsage {
+    /// How far ahead a reported reset may sit and still be believable. Devin's windows are a day and
+    /// a week; anything further out means the payload used the wrong unit.
+    static let maximumResetHorizon: TimeInterval = 2 * 365 * 24 * 60 * 60
+
+    static func mapUserStatusResponse(
+        _ response: HTTPResponse,
+        now: Date = Date()
+    ) throws -> DevinMappedUsage {
         guard let body = ProviderParse.jsonObject(response.body),
               let userStatus = body["userStatus"] as? [String: Any]
         else {
             throw DevinUsageError.invalidResponse
         }
-        return try mapUserStatus(userStatus)
+        return try mapUserStatus(userStatus, now: now)
     }
 
-    static func mapUserStatus(_ userStatus: [String: Any]) throws -> DevinMappedUsage {
+    static func mapUserStatus(_ userStatus: [String: Any], now: Date = Date()) throws -> DevinMappedUsage {
         let planStatus = userStatus["planStatus"] as? [String: Any] ?? [:]
         let planInfo = planStatus["planInfo"] as? [String: Any] ?? [:]
         let plan = readTrimmedString(planInfo["planName"]) ?? "Unknown"
@@ -26,8 +33,8 @@ enum DevinUsageMapper {
 
         let dailyRemaining = ProviderParse.number(planStatus["dailyQuotaRemainingPercent"])
         let weeklyRemaining = ProviderParse.number(planStatus["weeklyQuotaRemainingPercent"])
-        let dailyReset = hideDailyQuota ? nil : unixSecondsToDate(planStatus["dailyQuotaResetAtUnix"])
-        let weeklyReset = unixSecondsToDate(planStatus["weeklyQuotaResetAtUnix"])
+        let dailyReset = hideDailyQuota ? nil : unixSecondsToDate(planStatus["dailyQuotaResetAtUnix"], now: now)
+        let weeklyReset = unixSecondsToDate(planStatus["weeklyQuotaResetAtUnix"], now: now)
         let extraUsageBalance = dollarsFromMicros(planStatus["overageBalanceMicros"])
 
         var lines: [MetricLine] = []
@@ -86,9 +93,16 @@ enum DevinUsageMapper {
         )
     }
 
-    private static func unixSecondsToDate(_ value: Any?) -> Date? {
-        guard let seconds = ProviderParse.number(value) else { return nil }
-        return Date(timeIntervalSince1970: seconds)
+    /// A reset instant, but only when it is still ahead of `now` and inside a believable horizon.
+    ///
+    /// A zero, or a stale value Devin never advanced after the window closed, would otherwise render
+    /// as "Resets soon" on every refresh. Dropping the instant lets the meter's own cadence
+    /// ("Resets in 24h") answer instead.
+    private static func unixSecondsToDate(_ value: Any?, now: Date) -> Date? {
+        guard let seconds = ProviderParse.number(value), seconds > 0 else { return nil }
+        let date = Date(timeIntervalSince1970: seconds)
+        guard date > now, date.timeIntervalSince(now) <= maximumResetHorizon else { return nil }
+        return date
     }
 
     /// An overage balance in dollars; `nil` only when the field is missing or non-numeric (truly no

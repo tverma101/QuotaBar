@@ -59,4 +59,17 @@ extension WidgetDescriptor {
         copy.hidesWhenEmpty = true
         return copy
     }
+
+    /// Draw this metric in the menu bar as a countdown to its reset rather than as its used/left
+    /// allowance: `2h 14m` instead of `13h`.
+    ///
+    /// Opt-in per metric, because a countdown is only the right reading where the number *is* the
+    /// session clock. A quota meter answering "how much is left" would lose its meaning if the strip
+    /// silently showed "how long until it refills". Rows that carry no reset instant fall back to
+    /// their ordinary value, so this never renders an empty segment.
+    func showingResetTimerInMenuBar() -> WidgetDescriptor {
+        var copy = self
+        copy.sample.trayStyle = .resetCountdown
+        return copy
+    }
 }

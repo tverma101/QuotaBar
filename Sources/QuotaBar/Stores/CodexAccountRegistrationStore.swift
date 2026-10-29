@@ -18,12 +18,14 @@ final class CodexAccountRegistrationStore {
 
     init(
         defaults: UserDefaults = .standard,
-        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        preNormalizedHomes: [String]? = nil
     ) {
         self.defaults = defaults
         self.homeDirectory = homeDirectory
         let saved = defaults.stringArray(forKey: Self.storageKey) ?? []
-        self.registeredHomes = Self.normalizedUniqueHomes(saved, homeDirectory: homeDirectory)
+        self.registeredHomes = preNormalizedHomes
+            ?? Self.normalizedUniqueHomes(saved, homeDirectory: homeDirectory)
         if self.registeredHomes != saved {
             persist()
         }
@@ -35,9 +37,17 @@ final class CodexAccountRegistrationStore {
         guard let normalized = Self.normalizedHome(home, homeDirectory: homeDirectory),
               !registeredHomes.contains(normalized)
         else { return false }
-        registeredHomes.append(normalized)
+        return register(normalizedAbsoluteHome: normalized)
+    }
+
+    /// Persist a path that has already been canonicalized off the MainActor. This avoids repeating
+    /// the filesystem-backed symlink lookup after an account identity read returns to Settings.
+    @discardableResult
+    func register(normalizedAbsoluteHome home: String) -> Bool {
+        guard home.hasPrefix("/"), !registeredHomes.contains(home) else { return false }
+        registeredHomes.append(home)
         persist()
-        AppLog.info(.config, "registered Codex home (\(displayPath(normalized)))")
+        AppLog.info(.config, "registered Codex home (\(displayPath(home)))")
         return true
     }
 
@@ -63,7 +73,7 @@ final class CodexAccountRegistrationStore {
     /// Existing symlinks resolve to their real directory so `/path`, `/path/`, and a symlink to the
     /// same home cannot register duplicate sources. Nonexistent paths stay absolute and standardized;
     /// this is important for a newly-created home before its first login.
-    static func normalizedHome(_ raw: String, homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> String? {
+    nonisolated static func normalizedHome(_ raw: String, homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 

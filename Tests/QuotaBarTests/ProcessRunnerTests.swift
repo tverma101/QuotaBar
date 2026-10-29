@@ -23,4 +23,58 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertEqual(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines), "hello")
     }
+
+    func testCancellationStopsLongRunningSubprocessPromptly() async throws {
+        let startedAt = Date()
+        let task = Task.detached {
+            try SystemProcessRunner().run(
+                executable: "/bin/sleep",
+                arguments: ["5"],
+                environment: [:],
+                timeout: 10
+            )
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("a cancelled subprocess should not return a successful result")
+        } catch is CancellationError {
+            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1)
+        }
+    }
+
+    func testCancellationStopsSubprocessTreeWithInheritedOutputPipes() async throws {
+        let startedAt = Date()
+        let task = Task.detached {
+            try SystemProcessRunner().run(
+                executable: "/bin/sh",
+                arguments: ["-c", "/bin/sleep 5 & wait"],
+                environment: [:],
+                timeout: 10
+            )
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("cancellation should terminate a child that inherited the output pipes")
+        } catch is CancellationError {
+            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 2)
+        }
+    }
+
+    func testLanguageServerSnapshotTreatsCancellationAsNoSnapshot() {
+        let discovery = LanguageServerDiscovery(processRunner: CancellationProcessRunner())
+
+        XCTAssertNil(discovery.processSnapshot())
+    }
+}
+
+private struct CancellationProcessRunner: ProcessRunning {
+    func run(executable: String, arguments: [String], environment: [String: String], timeout: TimeInterval) throws -> ProcessResult {
+        throw CancellationError()
+    }
 }

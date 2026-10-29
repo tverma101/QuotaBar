@@ -1,13 +1,14 @@
 import Foundation
 
 /// Metrics enabled on first launch. Core quota meters and trends stay visible above the fold, while
-/// balances, reset details, and spend-history rows are enabled but tucked behind each provider's caret.
-/// `LayoutStore` filters this to whatever the active registry actually knows, so registries that don't
-/// define an ID (e.g. the test fixtures) silently ignore it. The provider-section order isn't seeded
-/// here: an empty saved order reconciles to plain registry order in `LayoutStore`.
+/// optional balance and spend-history rows are usually tucked behind each provider's caret. Freebuff's
+/// rows are always visible by owner choice, and its Daily Hours meter carries the owner-requested
+/// menu-bar pin. `LayoutStore` filters this to whatever the active registry actually knows, so
+/// registries that don't define an ID (e.g. the test fixtures) silently ignore it. The provider-section
+/// order isn't seeded here: an empty saved order reconciles to plain registry order in `LayoutStore`.
 enum DefaultLayout {
     static let metricIDs: [String] = [
-        "antigravity.geminiPro", "antigravity.geminiWeekly", "antigravity.claude", "antigravity.claudeWeekly",
+        "antigravity.geminiPro", "antigravity.geminiWeekly", "antigravity.argonWeekly", "antigravity.claude", "antigravity.claudeWeekly",
         "antigravity.trend", "antigravity.today", "antigravity.yesterday", "antigravity.last30",
 
         "claude.session", "claude.weekly", "claude.fable", "claude.trend",
@@ -23,6 +24,11 @@ enum DefaultLayout {
         "copilot.chat", "copilot.completions",
 
         "devin.daily", "devin.weekly", "devin.extra",
+
+        "freebuff.session", "freebuff.daily", "freebuff.weekly", "freebuff.fiveDay",
+        "freebuff.monthly", "freebuff.premiumSessions", "freebuff.freePremiumSessions", "freebuff.freebucksDaily",
+        "freebuff.freebucksBalance", "freebuff.monthlySpend",
+        "freebuff.today", "freebuff.yesterday", "freebuff.last30",
 
         "grok.weekly", "grok.trend",
         "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",
@@ -59,9 +65,25 @@ enum DefaultLayout {
 
     /// Metrics pinned to the menu bar on first launch, so the app shows real numbers out of the box
     /// instead of a lone icon. Two per provider for Antigravity, Claude, Codex, and Cursor — the
-    /// per-provider cap (`LayoutStore.maxPinsPerProvider`). Filtered to the active registry by
-    /// `LayoutStore`, like `metricIDs`.
+    /// per-provider cap (`LayoutStore.maxPinsPerProvider`). Freebuff's Daily Hours meter is pinned by
+    /// owner request: its strip segment reads as a live timer for the active window (see
+    /// `showingResetTimerInMenuBar`), so one `h m` countdown shows under the provider mark.
+    /// Filtered to the active registry by `LayoutStore`, like `metricIDs`.
     static let pinnedMetricIDs: [String] = [
+        "antigravity.geminiPro", "antigravity.geminiWeekly",
+        "claude.session", "claude.weekly",
+        "codex.session", "codex.weekly",
+        "cursor.auto", "cursor.api",
+        "freebuff.freebucksDaily",
+        "copilot.premium",
+        "openrouter.credits",
+        "zai.session", "zai.weekly"
+    ]
+
+    /// Pins shipped before the first default-pin seed ran. An existing user without the seed marker
+    /// has already seen these — a fresh install pinned them and an existing install saved or unpinned
+    /// them — so they start the marker instead of being re-pinned by a later default addition.
+    static let migrationBaselinePinnedMetricIDs: [String] = [
         "antigravity.geminiPro", "antigravity.geminiWeekly",
         "claude.session", "claude.weekly",
         "codex.session", "codex.weekly",
@@ -72,14 +94,14 @@ enum DefaultLayout {
     ]
 
     /// Metrics placed in the per-provider On Demand section on a fresh install. This is
-    /// membership, not enablement: optional disabled rows like Sonnet or Cursor Requests/Credits are
-    /// listed here so if the user enables them later they appear below the caret by default.
+    /// membership, not enablement: optional rows like Sonnet, Codex Spark, or Cursor Requests are
+    /// listed here so they appear below the caret by default when data arrives or the user enables them.
     /// Filtered to the active registry by `LayoutStore`, and only seeded on a genuinely fresh launch
     /// (existing layouts keep everything always-shown unless they reset customization).
     static let expandedMetricIDs: [String] = [
         // Antigravity: the Gemini pool pair and usage trend stay above the fold; the non-Gemini
         // pool pair and spend-history rows sit below the caret, matching the other local scanners.
-        "antigravity.claude", "antigravity.claudeWeekly",
+        "antigravity.argonWeekly", "antigravity.claude", "antigravity.claudeWeekly",
         "antigravity.today", "antigravity.yesterday", "antigravity.last30",
         // Claude's core meters (Session, Weekly, Fable, Extra, Usage Trend) stay above the fold;
         // optional Sonnet and spend-history rows sit below the caret.
@@ -92,8 +114,8 @@ enum DefaultLayout {
         "cursor.today", "cursor.yesterday", "cursor.last30",
         // Copilot: Credits (the metered premium pool) + Extra Usage stay above the fold; the org
         // billing pair (org-managed Business/Enterprise seats) and Chat + Completions sit below the
-        // caret. Chat/Completions carry real counts on free only — on paid they're unlimited
-        // (suppressed), so they read "No data" there.
+        // caret. Org billing is role-dependent; Chat/Completions carry real counts on free only.
+        // These optional rows hide when the response has no corresponding data.
         "copilot.orgCredits", "copilot.orgSpend", "copilot.chat", "copilot.completions",
         "devin.extra",
         "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",

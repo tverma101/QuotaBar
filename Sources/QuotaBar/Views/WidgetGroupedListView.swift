@@ -25,36 +25,54 @@ struct WidgetGroupedListView: View {
     var body: some View {
         // Provider-section spacing is noticeably wider than the in-card row rhythm (so groups
         // still read as groups); the exact step comes from the density setting.
-        VStack(alignment: .leading, spacing: density.sectionSpacing) {
-            ForEach(layout.displayGroups) { group in
+        //
+        // `displayGroups` is a computed property that rebuilds dictionaries + filters per access;
+        // capture it once per body evaluation so the `.animation` identity doesn't recompute the
+        // whole thing a second time.
+        let groups = layout.displayGroups
+        return VStack(alignment: .leading, spacing: density.sectionSpacing) {
+            ForEach(groups) { group in
                 section(group)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .onPreferenceChange(ReorderFramePreferenceKey.self) { frameStore.frames = $0 }
-        .animation(Motion.spring, value: layout.displayGroups.map(\.provider.id))
+        .animation(Motion.spring, value: groups.map(\.provider.id))
     }
 
     @ViewBuilder
     private func section(_ group: ProviderGroup) -> some View {
-        // Dropped here rather than in `displayGroups` because only now is visibility known. See
-        // `ProviderGroup.hasVisibleRow(keeping:)`.
-        if group.hasVisibleRow(keeping: isRowVisible) {
-            sectionBody(group, resolved: resolveRows(for: group))
+        // Resolve first, then decide. The old path asked `hasVisibleRow(keeping:)` and then resolved
+        // the same rows again, so the first visible row could build `WidgetData` three times during
+        // the panel's initial mount. One resolution now drives both the visibility decision and the
+        // rendered card.
+        let resolved = resolveRows(for: group)
+        let showSection = ProviderSectionVisibility.shouldRender(
+            hasVisibleMetric: resolved.hasVisibleRow,
+            hasPlan: dataStore.plan(for: group.provider.id) != nil,
+            hasNotice: dataStore.headerNotice(for: group.provider.id) != nil,
+            isRefreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
+            hasStaleness: dataStore.stalenessHint(for: group.provider.id) != nil
+        )
+        if showSection {
+            sectionBody(group, resolved: resolved)
         }
     }
 
     private func sectionBody(_ group: ProviderGroup, resolved: ResolvedCard) -> some View {
         VStack(alignment: .leading, spacing: density.headerToCardSpacing) {
             header(group)
-            card(
-                for: group,
-                cardRows: resolved.cardRows,
-                condensedIDs: resolved.condensedIDs,
-                providerID: group.provider.id,
-                isExpanded: layout.isProviderExpanded(group.provider.id)
-            )
+            if resolved.hasVisibleRow {
+                card(
+                    for: group,
+                    cardRows: resolved.cardRows,
+                    condensedIDs: resolved.condensedIDs,
+                    providerID: group.provider.id,
+                    isExpanded: layout.isProviderExpanded(group.provider.id)
+                )
+            }
         }
+        .background(DiagnosticProviderAnchor(providerID: group.provider.id))
         .opacity(activeProviderID == group.provider.id ? 0 : 1)
         .reorderFrame(id: group.provider.id, in: .named(reorderSpaceName))
     }
@@ -66,7 +84,10 @@ struct WidgetGroupedListView: View {
             warning: dataStore.headerNotice(for: group.provider.id),
             refreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
             staleness: dataStore.stalenessHint(for: group.provider.id),
-            onCopyScreenshot: { shareCard(group) }
+            onCopyScreenshot: { shareCard(group) },
+            onRefresh: dataStore.errorMessage(for: group.provider.id) == nil
+                ? nil
+                : { retryProvider(group.provider.id) }
         )
         // Keep the provider mark and hover-revealed copy control aligned with the card's content edges.
         .padding(.horizontal, 8)
@@ -79,7 +100,7 @@ struct WidgetGroupedListView: View {
             }
             Divider()
             Button("Refresh \(group.provider.displayName)") {
-                Task { await dataStore.refresh(providerID: group.provider.id, force: true) }
+                refreshProvider(group.provider.id)
             }
             Button("Customize…") {
                 openCustomize(for: group.provider.id)
@@ -147,12 +168,12 @@ struct WidgetGroupedListView: View {
     private struct ResolvedCard {
         let cardRows: [DashboardMetricCardRow]
         let condensedIDs: Set<String>
+        let hasVisibleRow: Bool
     }
 
     private func resolveRows(for group: ProviderGroup) -> ResolvedCard {
-        // Resolve each row's descriptor + data exactly once per render, then reuse it for both the
-        // neighbor-aware condensing rule and the row itself — `dataStore.data(for:)` used to be
-        // recomputed several times per row (twice per adjacent pair plus once in `row`).
+        // Resolve each row's descriptor + data exactly once per render, then reuse it for the
+        // visibility decision, the neighbor-aware condensing rule, and the row itself.
         let isExpanded = layout.isProviderExpanded(group.provider.id)
         let alwaysRows = resolvedRows(group.alwaysShownWidgets)
         let expandedRows = resolvedRows(group.expandedWidgets)
@@ -170,7 +191,8 @@ struct WidgetGroupedListView: View {
                 isExpanded: isExpanded,
                 links: group.provider.visibleLinks
             ),
-            condensedIDs: condensedIDs
+            condensedIDs: condensedIDs,
+            hasVisibleRow: !alwaysRows.isEmpty || !expandedRows.isEmpty
         )
     }
 
@@ -201,25 +223,30 @@ struct WidgetGroupedListView: View {
         }
     }
 
-    /// The single visibility predicate: a feature/plan-dependent row with nothing to show is noise, so it
-    /// hides itself — unless the user turned it on, which `showsRow` treats as intent that outranks the
-    /// data.
+    /// One resolution per row: a feature/plan-dependent row with nothing to show is noise, so it hides
+    /// itself — unless the user turned it on, which `showsRow` treats as intent that outranks the data.
     ///
     /// Deliberately a presentation filter rather than a layout change: Customize still lists the row,
     /// menu-bar pins still render it, and quota alerts still fire off the underlying data. Removing it
     /// from `placed` instead would quietly switch all three off.
-    private func isRowVisible(_ widget: PlacedWidget) -> Bool {
-        guard let descriptor = layout.descriptor(for: widget) else { return false }
-        return layout.showsRow(descriptor, hasData: dataStore.data(for: descriptor).hasData)
-    }
-
     private func resolvedRows(_ widgets: [PlacedWidget]) -> [ResolvedRow] {
-        widgets.filter(isRowVisible).compactMap { widget -> ResolvedRow? in
+        widgets.compactMap { widget -> ResolvedRow? in
             guard let descriptor = layout.descriptor(for: widget) else { return nil }
+            let data = dataStore.data(for: descriptor)
+            if !ProviderSectionVisibility.shouldRenderMetricRow(
+                providerID: descriptor.providerID,
+                descriptorID: descriptor.id,
+                hasData: data.hasData,
+                errorCategory: dataStore.errorCategory(for: descriptor.providerID),
+                explicitlyEnabled: layout.explicitlyEnabledMetricIDs.contains(descriptor.id)
+            ) {
+                return nil
+            }
+            guard layout.showsRow(descriptor, hasData: data.hasData) else { return nil }
             return ResolvedRow(
                 widget: widget,
                 descriptor: descriptor,
-                data: dataStore.data(for: descriptor)
+                data: data
             )
         }
     }
@@ -323,7 +350,7 @@ struct WidgetGroupedListView: View {
         Divider()
         if let provider = layout.provider(id: providerID) {
             Button("Refresh \(provider.displayName)") {
-                Task { await dataStore.refresh(providerID: providerID, force: true) }
+                refreshProvider(providerID)
             }
         }
         Button("Customize…") {
@@ -339,6 +366,41 @@ struct WidgetGroupedListView: View {
             withAnimation(Motion.modeSwitch) {
                 layout.customizeProviderID = providerID
                 layout.isEditing = true
+            }
+        }
+    }
+
+    private func refreshProvider(_ providerID: String) {
+        Task {
+            await withManualRefresh {
+                await withThrottledFullAccounting {
+                    await dataStore.refresh(providerID: providerID, force: true)
+                }
+            }
+        }
+    }
+
+    /// A visible error-button retry is aimed at restoring the provider's live status. Publish that
+    /// result as soon as auth/API work finishes, then fold local token history in a separate task so
+    /// the error action isn't held open by accounting work.
+    private func retryProvider(_ providerID: String) {
+        Task {
+            let attempt = await withManualRefresh {
+                let manualActionID = ProviderRefreshContext.manualActionID
+                let interactionGate = ProviderRefreshContext.credentialInteractionGate
+                let outcome = await withThrottledPanelMeters {
+                    await dataStore.refresh(providerID: providerID, force: true)
+                }
+                return (outcome, manualActionID, interactionGate)
+            }
+            guard attempt.0 == .refreshed || attempt.0 == .failed else { return }
+
+            Task { @MainActor in
+                _ = await dataStore.refreshProviderHistoryAfterRetry(
+                    providerID: providerID,
+                    manualActionID: attempt.1,
+                    credentialInteractionGate: attempt.2
+                )
             }
         }
     }

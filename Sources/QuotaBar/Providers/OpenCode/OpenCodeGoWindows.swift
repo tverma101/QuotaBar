@@ -59,11 +59,18 @@ enum OpenCodeGoWindowMath {
     }
 
     private static func sumRange(_ costs: [(ms: Double, cost: Double)], start: Double, end: Double) -> Double {
-        let total = costs.reduce(0.0) { partial, row in
-            (row.ms >= start && row.ms < end) ? partial + row.cost : partial
+        var total = 0.0
+        for row in costs where row.ms >= start && row.ms < end {
+            guard row.cost.isFinite, row.cost >= 0 else { continue }
+            let next = total + row.cost
+            // Keep the finite known subtotal; the meter clamps any already-over-cap spend to 100%.
+            guard next.isFinite else { break }
+            total = next
         }
         // Snap to a hundredth of a cent to shed float-summation noise before the meter divides by the cap.
-        return (total * 10000).rounded() / 10000
+        let scaled = total * 10000
+        guard scaled.isFinite else { return total }
+        return scaled.rounded() / 10000
     }
 
     // MARK: - Week

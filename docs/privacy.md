@@ -42,19 +42,28 @@ a token is configured at all.
 
 ## Credentials stored on this Mac
 
-QuotaBar primarily reads credentials that provider tools already keep on your Mac. When it writes a
-user-supplied API key or saves a refreshed credential, the file is replaced atomically and restricted to
-your macOS account (owner read and write only). Antigravity's short-lived refreshed-token cache is tied
-to the current Keychain login using a one-way fingerprint; the refresh credential itself is not copied.
-The cache is never used after logout, an account change, or while Keychain access is unavailable.
+QuotaBar primarily reads credentials that provider tools already keep on your Mac. User-supplied API
+keys are written atomically to an app-owned config file restricted to your macOS account (owner read and
+write only). When a provider refresh rotates a Keychain credential, QuotaBar uses Security.framework
+to add or update the matching item in the current default file-based keychain. Credential writes forbid
+authentication UI; if macOS requires interaction for a write, QuotaBar returns a typed access error
+instead of opening a prompt during token persistence. Cursor token rotation sends its SQLite update on
+the child process's standard input; credential values are not passed as subprocess arguments. Antigravity's
+short-lived refreshed-token cache is tied to the current Keychain login using a one-way fingerprint; the
+refresh credential itself is not copied. The cache is never used after logout, an account change, or
+while Keychain access is unavailable.
 
 Claude Desktop access is strictly read-only. QuotaBar may ask macOS for permission to use the
 `Claude Safe Storage` Keychain item so it can decrypt Desktop's current access token. It never uses
 Desktop's rotating refresh token and never modifies Desktop's config, cookies, or Keychain data.
 
+Scheduled and background credential reads forbid Keychain UI. An explicit Refresh may show one read
+dialog across the enabled provider cards; cancelling it suppresses duplicate reads during that action,
+and a later explicit Refresh is the retry. Keychain writes always forbid authentication UI.
+
 ## Other network requests
 
-Besides the provider API calls the vendor's own tools would make, QuotaBar fetches public [model price lists](pricing.md) about once an hour (from `raw.githubusercontent.com`, `models.dev`, and this project's GitHub Pages). These are plain downloads of public data — they carry no usage, log, or account information, and they run regardless of the analytics toggle. The spend tiles are computed from local CLI logs entirely on your Mac; no log data ever leaves it.
+Besides the provider API calls the vendor's own tools would make, QuotaBar fetches public [model price lists](pricing.md) about once an hour (from `openrouter.ai`, `raw.githubusercontent.com`, `models.dev`, and this project's GitHub Pages). An unknown model can bring forward an OpenRouter catalogue refresh, with retry limits. These are plain downloads of public data — they carry no model names, usage, log, or account information, and they run regardless of the analytics toggle. The pricing request does not include an OpenRouter API key. The spend tiles are computed from local CLI logs entirely on your Mac; no log data ever leaves it.
 
 To avoid re-reading unchanged Claude, Codex, and pi logs after every relaunch, QuotaBar keeps their
 parsed usage events in `~/Library/Application Support/QuotaBar/log-scan-cache/`. These records contain
