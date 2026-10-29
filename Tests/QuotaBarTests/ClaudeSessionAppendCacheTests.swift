@@ -310,7 +310,7 @@ final class ClaudeSessionAppendCacheTests: XCTestCase {
         try Data(text.utf8).write(to: url)
 
         let cache = ClaudeSessionAppendCache()
-        let task = Task { [cache] () -> [Entry]? in
+        let task = Task {
             // Wait for the cancellation instead of racing it, so the parse really runs cancelled.
             while !Task.isCancelled { await Task.yield() }
             return cache.parse(at: url, parseLine: Self.parseLine)
@@ -352,11 +352,14 @@ final class ClaudeSessionAppendCacheTests: XCTestCase {
         let url = directory.appendingPathComponent("cancelled-fragment.jsonl")
         try Data(Self.usageLine(timestamp: "2026-02-20T12:00:00Z", input: 10, output: 5, id: "m1").utf8).write(to: url)
         let cache = ClaudeSessionAppendCache()
+        // Formed outside the task closure: the CI toolchain's isolation checker cannot check a
+        // nested callback inside a Task body and rejects the task outright.
+        let parseLine: (Data.SubSequence) -> [Entry]? = { line in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return Self.parseLine(line)
+        }
         let task = Task {
-            cache.parse(at: url) { line in
-                withUnsafeCurrentTask { $0?.cancel() }
-                return Self.parseLine(line)
-            }
+            cache.parse(at: url, parseLine: parseLine)
         }
         let result = await task.value
         XCTAssertNil(result)
