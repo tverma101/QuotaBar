@@ -89,12 +89,13 @@ final class IsolationBisectTests: XCTestCase {
         _ = await task.value
     }
 
-    /// Body hoisted into a local function value passed to Task.init.
+    /// Capture the locally defined function in the Task operation closure.
+    /// Task(body) has no matching initializer on the CI Swift toolchain.
     func testLocalFunctionValue() async {
         let cache = ClaudeSessionAppendCache()
         let url = URL(fileURLWithPath: "/tmp/quotabar-bisect")
         func body() -> Int { Self.count2(cache, url) }
-        let task = Task(body)
+        let task = Task { body() }
         _ = await task.value
     }
 
