@@ -24,6 +24,17 @@ final class CodexAutoResetCoordinator {
     private static let maximumAttempts = 3
     private static let storageKey = "codexAutoRedeemAttempts.v3"
 
+    /// The unregistered default Codex card still has a launch-time verified account identity.
+    /// Never borrow that identity for another provider card or an unattributed default card.
+    static func verifiedIdentity(
+        providerID: String,
+        expectedIdentityKey: String?,
+        defaultCodexIdentity: String?
+    ) -> String? {
+        if let expectedIdentityKey { return expectedIdentityKey }
+        return providerID == "codex" ? defaultCodexIdentity : nil
+    }
+
     struct Account {
         var availableCredits: @MainActor () async -> [CodexResetCredit]?
         var claim: @MainActor (CodexResetCredit, String, @escaping @MainActor () -> Bool) async -> ResetClaimOutcome

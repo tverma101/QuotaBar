@@ -174,9 +174,19 @@ final class AppContainer {
         // Create one claim service per Codex account; both manual and background calls use only
         // the credential-scoped runtime for that specific account.
         let codexProviders = providers.compactMap { $0 as? CodexProvider }
+        // The default Codex card is intentionally unregistered when no extra CODEX_HOME
+        // accounts exist. Use the launch account pass to bind its reset writes too.
+        let codexIdentityByProviderID = Dictionary(uniqueKeysWithValues: codexProviders.compactMap { codex -> (String, String)? in
+            guard let identity = CodexAutoResetCoordinator.verifiedIdentity(
+                providerID: codex.provider.id,
+                expectedIdentityKey: codex.expectedIdentityKey,
+                defaultCodexIdentity: accountAssembly.identityKeysByCard["codex"]
+            ) else { return nil }
+            return (codex.provider.id, identity)
+        })
         let codexClaimServices = Dictionary(uniqueKeysWithValues: codexProviders.map { codex in
             let service = CodexResetClaimService(
-                authStore: codex.authStore,
+                authStore: codex.authStore.scoped(to: codexIdentityByProviderID[codex.provider.id]),
                 usageClient: codex.usageClient,
                 allowsKeychainFallback: codex.allowsKeychainFallback,
                 refreshAfterClaim: { [weak dataStore] in
@@ -222,9 +232,7 @@ final class AppContainer {
             ? codexClaimServices[codexProviders[0].provider.id] : nil
         // Fail closed for unknown account identities: only verified account cards can be
         // background write targets. Manual claims remain available where already supported.
-        let verifiedCodexIDs = Set(codexProviders.compactMap { provider in
-            provider.expectedIdentityKey == nil ? nil : provider.provider.id
-        })
+        let verifiedCodexIDs = Set(codexIdentityByProviderID.keys)
         self.codexAutoReset = CodexAutoResetCoordinator(
             services: codexClaimServices.filter { verifiedCodexIDs.contains($0.key) }
         )
