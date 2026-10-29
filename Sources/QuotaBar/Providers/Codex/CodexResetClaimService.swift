@@ -34,7 +34,7 @@ final class CodexResetClaimService {
     /// succeeded but its response was lost, the credit is gone from a re-fetched list — a fresh match
     /// would misread the retry as "no longer available" instead of replaying the POST and letting the
     /// server answer `already_redeemed`. Session-lived, keyed by the popover's per-credit UUIDs.
-    private var matchedCreditIDs: [String: String] = [:]
+    private var matchedCredits: [String: (creditID: String, owner: Credentials)] = [:]
 
     /// Test seam: injected credential candidates and refresh hook, the same `usageClient` the requests
     /// go through. Candidates are tried in order until one authenticates (see `claim`).
@@ -221,19 +221,26 @@ final class CodexResetClaimService {
         // instead of re-matching: after a consume whose response was lost, the credit is no longer in
         // the list, and only the replay lets the server's `already_redeemed` prove the claim landed.
         let creditID: String
-        var preferredCandidates = candidates
-        if let replayID = matchedCreditIDs[redeemRequestID] {
-            creditID = replayID
+        var preferredCandidates: [Credentials]
+        if let replay = matchedCredits[redeemRequestID] {
+            creditID = replay.creditID
+            // A retry must retain the account that authenticated the original GET.
+            // The same idempotency key does not make cross-account POSTs safe.
+            preferredCandidates = candidates.filter { Self.isSameAccount($0, as: replay.owner) }
+            guard !preferredCandidates.isEmpty else {
+                AppLog.error(LogTag.plugin("codex"), "reset claim: original account unavailable for retry")
+                return .failed
+            }
         } else {
             switch await matchCredit(expiringAt: expiry, candidates: candidates) {
             case .matched(let id, let authenticated):
                 creditID = id
-                matchedCreditIDs[redeemRequestID] = id
-                // Lead with the credential that just authenticated the list fetch. Deduplicate by the
-                // full (token, account) pair — ChatGPT-Account-Id changes what a token is authorized
-                // for, so a same-token candidate with a different account is a distinct fallback.
+                matchedCredits[redeemRequestID] = (creditID: id, owner: authenticated)
+                // Only retry with refreshed credentials for this SAME account. A token may
+                // legitimately change while the account identity must remain unchanged.
                 preferredCandidates = [authenticated] + candidates.filter {
-                    $0.accessToken != authenticated.accessToken || $0.accountID != authenticated.accountID
+                    Self.isSameAccount($0, as: authenticated)
+                        && ($0.accessToken != authenticated.accessToken || $0.accountID != authenticated.accountID)
                 }
             case .noCredit:
                 // Not an error: the credit was claimed elsewhere (CLI/web) or expired since the popover
@@ -257,9 +264,17 @@ final class CodexResetClaimService {
         return outcome
     }
 
-    /// POSTs the consume, falling back across credential candidates on an auth rejection (401/403).
-    /// Safe to repeat: every attempt carries the same idempotency key, so at most one credit is ever
-    /// spent no matter how many candidates are tried.
+    /// Unknown account IDs cannot safely opt into a different token on retry.
+    /// Verified identities can rotate tokens, but must never change ChatGPT-Account-Id.
+    private static func isSameAccount(_ candidate: Credentials, as owner: Credentials) -> Bool {
+        if let accountID = owner.accountID {
+            return candidate.accountID?.caseInsensitiveCompare(accountID) == .orderedSame
+        }
+        return candidate.accountID == nil && candidate.accessToken == owner.accessToken
+    }
+
+    /// POSTs the consume, falling back only across eligible credentials belonging to
+    /// the original account on 401/403. The server's idempotency key still protects retries.
     private func consume(
         creditID: String, redeemRequestID: String, candidates: [Credentials]
     ) async -> ResetClaimOutcome {
