@@ -46,11 +46,11 @@ final class AppContainer {
     /// One-time onboarding state (the first-run Customize hint card). Only ever marked pending by
     /// `FirstRunSeeder` on a fresh install, so existing installs never see the card.
     let onboarding: OnboardingStore
-    /// Claims Codex rate-limit reset credits from the resets popover (the app's only provider-API
-    /// write). Shares the Codex provider's auth store and usage client. This is deliberately `nil`
-    /// while multiple Codex accounts are active because the existing UI has no account selector for
-    /// that write; reads remain fully account-scoped.
+    /// Account-routed manual Codex reset claims. Each account card gets a service bound to its own
+    /// auth store and usage client; the legacy single-service environment remains for unscoped rows.
     let codexResetClaim: CodexResetClaimService?
+    let codexResetClaims: CodexResetClaimRouter
+    let codexAutoReset: CodexAutoResetCoordinator
     /// Provider runtimes, kept so Customize's Reset All can restore the owner-selected default set and
     /// register the current provider IDs.
     private let providers: [ProviderRuntime]
@@ -204,13 +204,11 @@ final class AppContainer {
         self.iCloudSync = iCloudSync
         self.ledgerWatcher = ledgerWatcher
 
-        // The resets popover's claim service shares a Codex provider's credential loading and HTTP
-        // client so the claim's auth can't drift from the provider's. With more than one Codex account,
-        // disable this write until the UI can explicitly choose a target account rather than guessing.
+        // Each reset service shares its Codex provider's credential loading and HTTP client. Manual
+        // claims route by provider card, and automatic claims are admitted only for verified identities.
         let codexProviders = providers.compactMap { $0 as? CodexProvider }
-        let writableCodex = codexProviders.count == 1 ? codexProviders[0] : nil
-        self.codexResetClaim = writableCodex.map { codex in
-            CodexResetClaimService(
+        let codexClaimServices = Dictionary(uniqueKeysWithValues: codexProviders.map { codex in
+            (codex.provider.id, CodexResetClaimService(
                 authStore: codex.authStore,
                 usageClient: codex.usageClient,
                 allowsKeychainFallback: codex.allowsKeychainFallback,
@@ -246,8 +244,23 @@ final class AppContainer {
                     }
                     AppLog.error(LogTag.plugin("codex"), "post-claim refresh kept being skipped; meters may lag until the next cycle")
                 }
-            )
-        }
+            ))
+        })
+        self.codexResetClaims = CodexResetClaimRouter(services: codexClaimServices)
+        self.codexResetClaim = codexProviders.count == 1
+            ? codexClaimServices[codexProviders[0].provider.id] : nil
+        let codexIdentityByProviderID = Dictionary(uniqueKeysWithValues: codexProviders.compactMap { codex -> (String, String)? in
+            guard let identity = CodexAutoResetCoordinator.verifiedIdentity(
+                providerID: codex.provider.id,
+                expectedIdentityKey: codex.expectedIdentityKey,
+                defaultCodexIdentity: accountAssembly.identityKeysByCard["codex"]
+            ) else { return nil }
+            return (codex.provider.id, identity)
+        })
+        self.codexAutoReset = CodexAutoResetCoordinator(
+            services: codexClaimServices.filter { codexIdentityByProviderID[$0.key] != nil },
+            verifiedAccountIdentityByProviderID: codexIdentityByProviderID
+        )
 
         // Anonymous usage telemetry (mandatory daily activity and crashes, optional provider rollups).
         // Its state lives in a dedicated UserDefaults suite, kept separate from app settings so the user's
@@ -297,6 +310,7 @@ final class AppContainer {
             transparency: self.transparency,
             ledgerWatcher: ledgerWatcher
         )
+        self.codexAutoReset.start()
         localAPI.start()
         // Become the notification-center delegate so banners show while frontmost — a menu-bar accessory
         // effectively always is. Notification authorization is requested the first time a trigger is
