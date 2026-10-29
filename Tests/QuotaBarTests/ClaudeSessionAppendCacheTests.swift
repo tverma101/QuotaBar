@@ -313,7 +313,7 @@ final class ClaudeSessionAppendCacheTests: XCTestCase {
         let task = Task {
             // Wait for the cancellation instead of racing it, so the parse really runs cancelled.
             while !Task.isCancelled { await Task.yield() }
-            return Self.parseEntries(cache, at: url)
+            return ClaudeSessionAppendCacheTests.parseEntries(cache, at: url)
         }
         task.cancel()
 
@@ -353,7 +353,7 @@ final class ClaudeSessionAppendCacheTests: XCTestCase {
         try Data(Self.usageLine(timestamp: "2026-02-20T12:00:00Z", input: 10, output: 5, id: "m1").utf8).write(to: url)
         let cache = ClaudeSessionAppendCache()
         let task = Task {
-            Self.parseCancellingMidParse(cache, at: url)
+            ClaudeSessionAppendCacheTests.parseCancellingMidParse(cache, at: url)
         }
         let result = await task.value
         XCTAssertNil(result)
