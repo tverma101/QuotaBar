@@ -313,7 +313,7 @@ final class ClaudeSessionAppendCacheTests: XCTestCase {
         let task = Task {
             // Wait for the cancellation instead of racing it, so the parse really runs cancelled.
             while !Task.isCancelled { await Task.yield() }
-            return cache.parse(at: url, parseLine: Self.parseLine)
+            return Self.parseEntries(cache, at: url)
         }
         task.cancel()
 
@@ -352,14 +352,8 @@ final class ClaudeSessionAppendCacheTests: XCTestCase {
         let url = directory.appendingPathComponent("cancelled-fragment.jsonl")
         try Data(Self.usageLine(timestamp: "2026-02-20T12:00:00Z", input: 10, output: 5, id: "m1").utf8).write(to: url)
         let cache = ClaudeSessionAppendCache()
-        // Formed outside the task closure: the CI toolchain's isolation checker cannot check a
-        // nested callback inside a Task body and rejects the task outright.
-        let parseLine: (Data.SubSequence) -> [Entry]? = { line in
-            withUnsafeCurrentTask { $0?.cancel() }
-            return Self.parseLine(line)
-        }
         let task = Task {
-            cache.parse(at: url, parseLine: parseLine)
+            Self.parseCancellingMidParse(cache, at: url)
         }
         let result = await task.value
         XCTAssertNil(result)
@@ -386,10 +380,32 @@ final class ClaudeSessionAppendCacheTests: XCTestCase {
 
     /// Mirrors the Claude scanner's line semantics: a row without usage data carries no rows, a
     /// malformed usage row is reported as `nil` so the whole file can be rejected.
-    private static func parseLine(_ line: Data.SubSequence) -> [Entry]? {
+    private nonisolated static func parseLine(_ line: Data.SubSequence) -> [Entry]? {
         let data = Data(line)
         guard data.range(of: Data(#""usage":{"#.utf8)) != nil else { return [] }
         guard let entry = ClaudeLogUsageScanner.parseLine(data) else { return nil }
         return [entry]
+    }
+
+    /// The cancel tests call `parse` from a Task body, and the CI toolchain's region-based
+    /// isolation checker cannot verify a parse call carrying a closure parameter formed there.
+    /// Routing through plain nonisolated statics keeps the parse call out of the task closure.
+    private nonisolated static func parseEntries(
+        _ cache: ClaudeSessionAppendCache,
+        at url: URL
+    ) -> [Entry]? {
+        cache.parse(at: url, parseLine: parseLine)
+    }
+
+    /// Parses `url` with a line callback that cancels the running task mid-parse, so a test can
+    /// prove a cancellation raised while the fragment parser runs cannot publish a checkpoint.
+    private nonisolated static func parseCancellingMidParse(
+        _ cache: ClaudeSessionAppendCache,
+        at url: URL
+    ) -> [Entry]? {
+        cache.parse(at: url) { line in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return parseLine(line)
+        }
     }
 }
