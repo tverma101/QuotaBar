@@ -282,11 +282,9 @@ final class CodexResetClaimTests: XCTestCase {
         XCTAssertEqual(consume.headers["Authorization"], "Bearer live-token")
     }
 
-    func testConsumeFallsBackToSameTokenDifferentAccountCandidate() async throws {
-        // ChatGPT-Account-Id changes what a token is authorized for: a same-token candidate with a
-        // different account is a distinct fallback and must not be deduplicated away. The list fetch
-        // authenticates with account A, the consume is rejected for A and must retry with account B —
-        // safe, because both attempts carry the same idempotency key.
+    func testConsumeNeverSwitchesAccountsEvenWithTheSameToken() async throws {
+        // A credit belongs to account A. A 403 on its consume must not cause a POST under
+        // account B, even when both accounts share an access token and request UUID.
         let http = RoutingHTTPClient { request in
             switch request.url {
             case CodexUsageClient.resetCreditsURL:
@@ -307,9 +305,54 @@ final class CodexResetClaimTests: XCTestCase {
 
         let outcome = await service.claim(creditExpiringAt: Self.expiry, redeemRequestID: "redeem-1")
 
-        XCTAssertEqual(outcome, .success)
-        let consume = try XCTUnwrap(http.requests.last)
-        XCTAssertEqual(consume.headers["ChatGPT-Account-Id"], "acct-B")
+        XCTAssertEqual(outcome, .failed)
+        let consumes = http.requests.filter { $0.url == CodexUsageClient.consumeResetCreditURL }
+        XCTAssertEqual(consumes.count, 1)
+        XCTAssertEqual(consumes.first?.headers["ChatGPT-Account-Id"], "acct-A")
+    }
+
+    func testManualReplayCannotSwitchToAnotherAccountAfterCredentialsChange() async {
+        var currentAccount = "acct-A"
+        let http = RoutingHTTPClient { request in
+            if request.url == CodexUsageClient.resetCreditsURL {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Self.listBody())
+            }
+            return HTTPResponse(statusCode: 503, headers: [:], body: Data())
+        }
+        let service = CodexResetClaimService(
+            usageClient: CodexUsageClient(http: http),
+            credentialCandidates: { [("token", currentAccount)] }
+        )
+        let first = await service.claim(creditExpiringAt: Self.expiry, redeemRequestID: "same-uuid")
+        XCTAssertEqual(first, .failed)
+        currentAccount = "acct-B"
+        let second = await service.claim(creditExpiringAt: Self.expiry, redeemRequestID: "same-uuid")
+        XCTAssertEqual(second, .failed)
+        let posts = http.requests.filter { $0.url == CodexUsageClient.consumeResetCreditURL }
+        XCTAssertEqual(posts.count, 1, "retry cannot POST the original credit under account B")
+        XCTAssertEqual(posts.first?.headers["ChatGPT-Account-Id"], "acct-A")
+    }
+
+    func testManualConsumeFallsBackOnlyWithinSameAccountAfterAuthRejection() async throws {
+        let http = RoutingHTTPClient { request in
+            if request.url == CodexUsageClient.resetCreditsURL {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Self.listBody())
+            }
+            if request.headers["Authorization"] == "Bearer stale" {
+                return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+            }
+            return HTTPResponse(statusCode: 200, headers: [:], body: Self.consumeBody(code: "reset"))
+        }
+        let service = CodexResetClaimService(
+            usageClient: CodexUsageClient(http: http),
+            credentialCandidates: { [("stale", "acct-A"), ("fresh", "acct-A"), ("other", "acct-B")] }
+        )
+        let result = await service.claim(creditExpiringAt: Self.expiry, redeemRequestID: "same-account-uuid")
+        XCTAssertEqual(result, .success)
+        let posts = http.requests.filter { $0.url == CodexUsageClient.consumeResetCreditURL }
+        XCTAssertEqual(posts.count, 2)
+        XCTAssertEqual(posts.map { $0.headers["ChatGPT-Account-Id"] }, ["acct-A", "acct-A"])
+        XCTAssertEqual(posts.last?.headers["Authorization"], "Bearer fresh")
     }
 
     func testClaimFailsWhenEveryCandidateIsRejected() async {
