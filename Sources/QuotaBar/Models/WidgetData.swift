@@ -89,17 +89,28 @@ struct WidgetData: Hashable {
     var sessionStartSignal: SessionStartSignal?
 
     /// How this row reads in the menu bar. `.value` (the default) is the ordinary used/left figure;
-    /// `.resetCountdown` makes the strip show the time left in the window as a session clock instead.
+    /// `.resetCountdown` uses the reset date, while `.sessionCountdowns` uses explicit session expiries.
     /// Set by a descriptor opt-in and carried through `WidgetDataStore.resolve`, exactly like
     /// `sessionStartSignal`.
     var trayStyle: TrayStyle = .value
+    /// Menu-bar-only clocks, separate from reset-credit expiry tooltips on dashboard rows.
+    var traySessionExpiriesAt: [Date] = []
 
     /// Menu-bar reading styles. `value` is the established behavior — a percent, a compact count, or a
     /// compact dollar amount. `resetCountdown` renders the window's remaining time (`2h 14m`) and is
     /// only for segments whose number *is* the session clock.
-    enum TrayStyle: String, Hashable, Sendable {
+    enum TrayStyle: Hashable, Sendable {
         case value
         case resetCountdown
+        /// Expiries from a separate normalized row; never use this widget's budget reset date.
+        case sessionCountdowns(metricLabel: String)
+
+        var isCountdown: Bool {
+            switch self {
+            case .value: false
+            case .resetCountdown, .sessionCountdowns: true
+            }
+        }
     }
 
     /// Whether this row should render in the menu-bar strip at all right now.
