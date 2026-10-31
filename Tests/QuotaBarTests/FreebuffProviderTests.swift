@@ -426,6 +426,9 @@ final class FreebuffProviderTests: XCTestCase {
                        "use the canonical host directly so a redirect cannot strip Authorization")
         XCTAssertEqual(request.headers["Authorization"], "Bearer test-token")
         XCTAssertEqual(request.headers["x-fb-timezone"], "America/New_York")
+        XCTAssertEqual(request.headers["x-freebuff-multi-session"], "1")
+        XCTAssertNil(request.headers["x-freebuff-instance-id"])
+        XCTAssertNil(request.headers["x-freebuff-heartbeat"], "monitoring must never keep a session alive")
         XCTAssertNil(request.body)
     }
 

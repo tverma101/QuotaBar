@@ -24,6 +24,8 @@ struct MenuBarContent: Equatable {
         let displayName: String
         let icon: IconSource
         let metrics: [Metric]
+        /// Session clocks keep the same small type as stacked usage values, even for one clock.
+        var usesCompactValues: Bool = false
     }
 
     /// Provider groups for the Text style, in Customize order. Dynamic: only metrics that currently
@@ -72,15 +74,32 @@ enum MenuBarContentBuilder {
             // A row can opt out of the strip while it has nothing worth showing — a session timer with
             // no session running drops out along with its provider's icon, so an idle provider costs
             // no menu-bar space at all.
-            let metrics = group.metrics
-                .map { resolve($0, data($0), now: now) }
-                .filter(\.hasData)
+            // A provider opting into session clocks contributes only those clocks, including when
+            // older saved layouts still pin its wallet or daily allowance as well.
+            let sessionMetrics = group.metrics.filter {
+                if case .sessionCountdowns = $0.sample.trayStyle { return true }
+                return false
+            }
+            let metrics: [MenuBarContent.Metric]
+            if let descriptor = sessionMetrics.first {
+                metrics = data(descriptor).traySessionExpiriesAt.filter { $0 > now }.sorted().prefix(2)
+                    .enumerated().map { index, expiry in
+                        MenuBarContent.Metric(
+                            id: "\(descriptor.id).session.\(index)", label: "Session \(index + 1)",
+                            value: Formatters.compactDuration(expiry.timeIntervalSince(now)) ?? "<1m",
+                            fraction: 0, isBounded: false, hasData: true
+                        )
+                    }
+            } else {
+                metrics = group.metrics.map { resolve($0, data($0), now: now) }.filter(\.hasData)
+            }
             guard !metrics.isEmpty else { return nil }
             return MenuBarContent.Group(
                 providerID: group.provider.id,
                 displayName: group.provider.displayName,
                 icon: group.provider.icon,
-                metrics: metrics
+                metrics: metrics,
+                usesCompactValues: !sessionMetrics.isEmpty
             )
         }
         // Bars show any *bounded* metric (it has a fill), not just percentages. Unbounded values (raw

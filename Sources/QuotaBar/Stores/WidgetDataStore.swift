@@ -2035,6 +2035,15 @@ final class WidgetDataStore {
             result.hasData = false
         }
 
+        if case .sessionCountdowns(let metricLabel) = descriptor.sample.trayStyle {
+            // Read only explicit session expiries. Cached daily spend is not session activity.
+            if case .values(_, _, _, let expiries, _, _) = snapshots[descriptor.providerID]?.line(label: metricLabel) {
+                result.traySessionExpiriesAt = expiries
+            } else {
+                result.traySessionExpiriesAt = []
+            }
+        }
+
         // Single global choke point: dashboard/share rows and menu-bar values all funnel through here,
         // so stamping the mode once makes them follow the global setting. Inert for unbounded rows
         // (limit == nil), whose displayed value ignores displayMode.

@@ -20,7 +20,9 @@ struct FreebuffUsageClient: Sendable {
     /// Read-only equivalent of the Freebuff CLI's GET session poll. The POST route admits a session
     /// and must never be used for usage monitoring.
     func fetchSession(auth: FreebuffAuth) async throws -> HTTPResponse {
-        try await fetch(urlString: Self.sessionURL, auth: auth)
+        // Request Desktop purchase metadata without an instance or heartbeat: observation only.
+        try await fetch(urlString: Self.sessionURL, auth: auth,
+                        extraHeaders: ["x-freebuff-multi-session": "1"])
     }
 
     func fetchModelCatalog(auth: FreebuffAuth) async throws -> HTTPResponse {

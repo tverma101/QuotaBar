@@ -60,6 +60,13 @@ extension WidgetDescriptor {
         return copy
     }
 
+    /// Use the individual active-session expiries while retaining this tile's dashboard meter.
+    func showingSessionTimersInMenuBar(metricLabel: String) -> WidgetDescriptor {
+        var copy = self
+        copy.sample.trayStyle = .sessionCountdowns(metricLabel: metricLabel)
+        return copy
+    }
+
     /// Draw this metric in the menu bar as a countdown to its reset rather than as its used/left
     /// allowance: `2h 14m` instead of `13h`.
     ///

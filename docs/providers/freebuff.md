@@ -3,10 +3,11 @@
 QuotaBar reads Freebuff's existing CLI login and shows current hours balances and reset times.
 It does not start a Freebuff session. Freebuff is enabled by default even when you have not logged in;
 turn it off in Customize if you do not want its card. Its metrics are always-visible by default, and
-the Daily Hours meter is pinned to the menu bar as a **session timer** — a small provider mark followed
-by the hours and minutes left in the active window, refreshed on the minute — so the time remaining in
-the current window stays visible while you are active. With no session running the segment disappears
-entirely instead of holding menu-bar space. It appears in the alphabetical provider order.
+the Daily Hours pin shows **active session timers** in the menu bar, refreshed each minute. These use
+actual session expiry times, including occupied Desktop hours, rather than the daily allowance reset.
+With two active sessions, both timers appear. Idle, expired, and unoccupied purchased hours disappear.
+Other Freebuff allowance and balance pins do not add values beside the session timers. It appears in
+the alphabetical provider order.
 
 ## Credentials
 

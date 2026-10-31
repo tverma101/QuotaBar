@@ -67,7 +67,7 @@ enum DefaultLayout {
     /// instead of a lone icon. Two per provider for Antigravity, Claude, Codex, and Cursor — the
     /// per-provider cap (`LayoutStore.maxPinsPerProvider`). Freebuff's Daily Hours meter is pinned by
     /// owner request: its strip segment reads as a live timer for the active window (see
-    /// `showingResetTimerInMenuBar`), so one `h m` countdown shows under the provider mark.
+    /// `showingSessionTimersInMenuBar`), so active session countdowns show beside the provider mark.
     /// Filtered to the active registry by `LayoutStore`, like `metricIDs`.
     static let pinnedMetricIDs: [String] = [
         "antigravity.geminiPro", "antigravity.geminiWeekly",

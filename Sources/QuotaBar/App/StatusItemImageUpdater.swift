@@ -85,7 +85,7 @@ final class StatusItemImageUpdater {
     /// keeps its existing event-driven renders and costs nothing.
     private func scheduleTimerTickIfNeeded() {
         guard container.layout.pinnedGroups.contains(where: { group in
-            group.metrics.contains { $0.sample.trayStyle == .resetCountdown }
+            group.metrics.contains { $0.sample.trayStyle.isCountdown }
         }) else {
             timerTickTask?.cancel()
             timerTickTask = nil
