@@ -12,7 +12,8 @@ enum FreebuffDesktopUsageSQL {
       'selectedModel', selectedModel
     )), '[]') FROM (
       SELECT
-        COALESCE(m.thread_id || ':' || m.seq, '') AS id,
+        COALESCE(CASE WHEN m.request_id LIKE 'cloud:%' THEN m.request_id
+          ELSE m.thread_id || ':' || m.seq END, '') AS id,
         COALESCE(CAST(m.ts AS TEXT), '') AS timestamp,
         COALESCE(m.metrics_json, '') AS metrics,
         COALESCE(t.model, '') AS selectedModel
@@ -46,7 +47,8 @@ enum FreebuffDesktopUsageSQL {
     /// Compatibility query for stores created before mission-manager receipts existed.
     static let assistantMessages = """
     SELECT COALESCE(json_group_array(json_object(
-      'id', COALESCE(m.thread_id || ':' || m.seq, ''),
+      'id', COALESCE(CASE WHEN m.request_id LIKE 'cloud:%' THEN m.request_id
+        ELSE m.thread_id || ':' || m.seq END, ''),
       'timestamp', COALESCE(CAST(m.ts AS TEXT), ''),
       'metrics', COALESCE(m.metrics_json, ''),
       'selectedModel', COALESCE(t.model, '')

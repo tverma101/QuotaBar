@@ -94,7 +94,7 @@ final class ProviderCatalogWiringTests: XCTestCase {
         )
         XCTAssertEqual(
             freebuff.widgetDescriptors.first { $0.id == "freebuff.freebucksDaily" }?.sample.trayStyle,
-            .resetCountdown
+            .sessionCountdowns(metricLabel: "Active Sessions")
         )
         XCTAssertTrue(metrics.isDisjoint(with: Set(DefaultLayout.expandedMetricIDs)))
         let metricOrder = freebuff.widgetDescriptors.map(\.id)

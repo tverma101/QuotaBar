@@ -31,6 +31,7 @@ actor FreebuffDesktopUsageScanner {
 
     private struct CachedScan {
         var databases: [DatabaseSnapshot]
+        var hostedReceipts: [FreebuffUsageReceipt]
         var pricingToken: String
         var catalogNames: [String: String]
         var calendar: Calendar
@@ -147,11 +148,12 @@ actor FreebuffDesktopUsageScanner {
     }
 
     func scan(now: Date, pricing: ModelPricing = .empty,
-              modelCatalog: [String: FreebuffModelCatalog.Entry] = [:]) throws -> Scan? {
+              modelCatalog: [String: FreebuffModelCatalog.Entry] = [:],
+              hostedReceipts: [FreebuffUsageReceipt] = []) throws -> Scan? {
         try Task.checkCancellation()
         let paths = try resolvedPaths(now: now)
         dropRemovedDatabases(paths)
-        guard !paths.isEmpty else {
+        guard !paths.isEmpty || !hostedReceipts.isEmpty else {
             cachedScan = nil
             return nil
         }
@@ -173,6 +175,7 @@ actor FreebuffDesktopUsageScanner {
         }
         if let cachedScan,
            cachedScan.databases == databaseSnapshots,
+           cachedScan.hostedReceipts == hostedReceipts,
            cachedScan.pricingToken == pricingToken,
            cachedScan.catalogNames == catalogNames,
            cachedScan.calendar == calendar,
@@ -184,7 +187,9 @@ actor FreebuffDesktopUsageScanner {
 
         // Keep references to each database's cached turn array instead of flattening every row into
         // a second 200k-element array on every changed-project scan.
-        var turnsByDatabase: [[DerivedTurn]] = []
+        // The current hosted receipt wins over an older Desktop copy of the same cloud:<run>.
+        let hosted = try hostedReceipts.compactMap { try Self.deriveTurn($0.scannerRow, parseMetrics: parseMetrics) }
+        var turnsByDatabase: [[DerivedTurn]] = [hosted]
         turnsByDatabase.reserveCapacity(databaseSnapshots.count)
         var unreadableRows = 0
         var snapshotStable = true
@@ -314,6 +319,7 @@ actor FreebuffDesktopUsageScanner {
         if snapshotStable, Self.fitsCachedScanBudget(result) {
             cachedScan = CachedScan(
                 databases: databaseSnapshots,
+                hostedReceipts: hostedReceipts,
                 pricingToken: pricingToken,
                 catalogNames: catalogNames,
                 calendar: calendar,
@@ -342,53 +348,6 @@ actor FreebuffDesktopUsageScanner {
         }
         for route in contested { names.removeValue(forKey: route) }
         return names
-    }
-
-    /// Conservative estimate for the retained aggregate. It includes collection overhead and
-    /// strings, and stops as soon as the cap is crossed so a pathological breakdown adds little work.
-    private static func fitsCachedScanBudget(_ scan: Scan) -> Bool {
-        var bytes = 512
-        func account(_ amount: Int) -> Bool {
-            let (total, overflow) = bytes.addingReportingOverflow(amount)
-            guard !overflow, total <= maximumCachedScanBytes else { return false }
-            bytes = total
-            return true
-        }
-
-        for day in scan.usage.series.daily {
-            guard account(160 + day.date.utf8.count) else { return false }
-        }
-        for day in scan.usage.modelUsage?.daily ?? [] {
-            guard account(112 + day.date.utf8.count) else { return false }
-            for model in day.models {
-                guard account(192 + model.model.utf8.count) else { return false }
-                for variant in model.variants ?? [] {
-                    guard account(128 + variant.model.utf8.count) else { return false }
-                }
-            }
-        }
-        for (day, models) in scan.usage.unknownModelsByDay {
-            guard account(96 + day.utf8.count) else { return false }
-            for model in models {
-                guard account(80 + model.utf8.count) else { return false }
-            }
-        }
-        for (day, _) in scan.usage.apiEstimateByDay ?? [:] {
-            guard account(96 + day.utf8.count) else { return false }
-        }
-        for day in scan.partialDays {
-            guard account(64 + day.utf8.count) else { return false }
-        }
-        for day in scan.usage.apiEstimateIncompleteDays ?? [] {
-            guard account(64 + day.utf8.count) else { return false }
-        }
-        for day in scan.usage.estimatedCostDays ?? [] {
-            guard account(64 + day.utf8.count) else { return false }
-        }
-        for day in scan.usage.unmeasuredUsageDays ?? [] {
-            guard account(64 + day.utf8.count) else { return false }
-        }
-        return true
     }
 
     func unloadCachesForMemoryPressure() {

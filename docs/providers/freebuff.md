@@ -41,7 +41,7 @@ signing identity keeps the CLI login and its existing Keychain grant. Background
 
 QuotaBar reads Keychain without prompting during scheduled refreshes. A manual refresh can prompt for
 an interaction-required item when no environment fallback is available. Credentials are sent only to
-Freebuff's session and model-catalogue endpoints.
+Freebuff's canonical API host for its session, model catalogue, and read-only hosted history.
 
 ## Metrics
 
@@ -52,8 +52,25 @@ session caps are hidden when the current hours meter is present. Older servers w
 keep their session windows. Monthly Spend appears only when the server supplies actual USD values.
 Hours and tokens are separate measurements; neither is converted into the other.
 
-**Today**, **Yesterday**, and **Last 30 Days** show measured tokens from Freebuff Desktop on this Mac.
-They are enabled, Always Visible, and unpinned by default. QuotaBar reads usage from assistant-message
+**Today**, **Yesterday**, and **Last 30 Days** combine measured hosted-run tokens with older Freebuff
+Desktop history on this Mac. Current **On This Device** sessions also keep their receipts in hosted
+history; the tools run on your Mac, but the older SQLite history no longer receives their tokens.
+These tiles are enabled, Always Visible, and unpinned by default. QuotaBar reads `metrics` usage
+events from Freebuff's existing read-only chat/run history API, with the current client's
+`x-freebuff-device-chats: 1` compatibility header so On This Device chats are included. Each run's
+newest receipt replaces its earlier cumulative values. A local copy with the same `cloud:<run>` identifier counts once, with the
+new hosted receipt taking precedence. Native Claude/Codex and BYOK runs are excluded.
+
+Hosted receipts cover the last 30 days, with one extra boundary day for local calendar periods. A
+bounded, login-scoped cache keeps only run identifiers, models, timestamps, cursors, and measured
+usage. Conversation payloads are not decoded or saved. Completed unchanged runs reuse their cached
+receipt across restarts; active runs resume after the last event cursor. History requests happen in
+the accounting pass, never on menu-bar timer refreshes. Failed pages keep the previous receipts and
+show a warning that totals may be incomplete, which stays visible across successful session polls.
+This mixed history is marked account-wide so another
+Mac cannot blindly add the hosted portion again.
+
+For older Desktop sessions, QuotaBar reads usage from assistant-message
 metrics and the separate `auto_run_decision_receipts.manager_json.usage` records in
 `~/.config/freebuff-desktop/projects/*/desktop-v2.db`, never conversation text. The mission manager's
 recorded model and start time are used for its estimate. `outcome_json.usage` is excluded because it
@@ -94,11 +111,12 @@ not an estimate of Pareto's internal cost or Freebuff's Freebucks charge. The es
 recorded Fast model identity and tokens directly, with no added allowance for hypothetical helper
 calls. Freebuff's actual allowance and charges are server-side Freebucks, not token-priced dollars.
 Since a turn aggregates multiple requests,
-single-request long-context tiers are not applied. The local rows cover Desktop only, not CLI or web
-traffic. Model identities are cached locally without handles or tokens;
+single-request long-context tiers are not applied. The older local rows cover Desktop only; hosted
+runs cover the signed-in account's shared history. Standalone CLI traffic without hosted run receipts
+is not included. Model identities are cached locally without handles or tokens;
 unchanged catalogues refresh at most hourly, and a catalogue endpoint that keeps failing is retried
 at most hourly as well. Public OpenRouter rates use the app's existing pricing cache. A fresh
-installation needs Desktop usage before local history can appear.
+installation needs measured Desktop or hosted usage before token history can appear.
 
 QuotaBar sends a read-only `GET https://www.codebuff.com/api/v1/freebuff/session` request directly to
 the canonical API host, so a redirect cannot strip the login header and make a new login look expired.
@@ -111,6 +129,8 @@ are not presented as connection failures.
 
 - [Freebuff session API client](https://github.com/CodebuffAI/freebuff/blob/main/cli/src/utils/freebuff-session-api.ts)
 - [Freebuff session and usage types](https://github.com/CodebuffAI/freebuff/blob/main/common/src/types/freebuff-session.ts)
+- [Freebuff hosted history API](https://github.com/CodebuffAI/freebuff/blob/main/common/src/desktop-cloud/history.ts)
+- [Cumulative hosted token receipts](https://github.com/CodebuffAI/freebuff/blob/main/common/src/desktop-cloud/turn-metrics.ts)
 - [Freebuff authentication](https://github.com/CodebuffAI/freebuff/blob/main/cli/src/utils/auth.ts)
 - [Freebuff Keychain token store](https://github.com/CodebuffAI/freebuff/blob/main/cli/src/utils/auth-token-store.ts)
 - [Freebuff config directory](https://github.com/CodebuffAI/freebuff/blob/main/cli/src/utils/config-dir.ts)
