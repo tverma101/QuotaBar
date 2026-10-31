@@ -160,8 +160,8 @@ private struct MenuBarTextStrip: View {
         HStack(spacing: 8) {
             ForEach(content.groups, id: \.providerID) { group in
                 HStack(spacing: 3) {
-                    glyph(group.icon)
-                    metricsView(group.metrics)
+                    glyph(group.icon, compact: group.usesCompactValues)
+                    metricsView(group.metrics, compact: group.usesCompactValues)
                 }
             }
         }
@@ -180,8 +180,8 @@ private struct MenuBarTextStrip: View {
     /// Values that could be read ambiguously carry their own unit instead (`13h`, `$12`), so a bare
     /// number is the only thing that ever needed a word and those are the exception, not the rule.
     @ViewBuilder
-    private func metricsView(_ metrics: [MenuBarContent.Metric]) -> some View {
-        if metrics.count <= 1 {
+    private func metricsView(_ metrics: [MenuBarContent.Metric], compact: Bool) -> some View {
+        if metrics.count <= 1 && !compact {
             Text(metrics.first?.value ?? "")
                 .font(.system(size: 12, weight: .bold))
         } else {
@@ -202,7 +202,7 @@ private struct MenuBarTextStrip: View {
     private static let glyphSide: CGFloat = 12
 
     @ViewBuilder
-    private func glyph(_ icon: IconSource) -> some View {
+    private func glyph(_ icon: IconSource, compact: Bool) -> some View {
         if let mark = ProviderMarks.mark(for: icon.providerID) {
             ProviderIconShape(mark: mark, inset: 0.04)
                 .fill(Color.black)
@@ -214,7 +214,7 @@ private struct MenuBarTextStrip: View {
             // SF Symbol, the same stand-in the popover's icon uses, so the strip still identifies
             // whose numbers these are.
             Image(systemName: ProviderMarks.symbolFallback(for: icon.providerID))
-                .font(.system(size: Self.glyphSide - 2, weight: .semibold))
+                .font(.system(size: Self.glyphSide - (compact ? 3 : 2), weight: .semibold))
                 .foregroundStyle(Color.black)
                 .frame(width: Self.glyphSide, height: Self.glyphSide)
         }

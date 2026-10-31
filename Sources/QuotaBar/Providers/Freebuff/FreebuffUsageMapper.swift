@@ -113,9 +113,33 @@ enum FreebuffUsageMapper {
         appendMonthlySpend(subscriptionUsage: subscriptionUsage, freebucks: freebucks, to: &lines)
         MetricLine.appendNoDataIfNeeded(&lines)
 
+        // Separate session expiry metadata from daily-budget reset times. Emit an empty row too,
+        // so a successful idle poll replaces the previous active sessions.
+        lines.append(.values(label: "Active Sessions", values: [],
+                             expiriesAt: try sessionExpiries(root)))
+
         let tier = (subscription?["tierId"] as? String)?.nilIfEmpty
         let accessTier = (root["accessTier"] as? String)?.nilIfEmpty
         return FreebuffMappedUsage(plan: tier ?? accessTier?.capitalized, lines: lines)
+    }
+
+    private static func sessionExpiries(_ root: [String: Any]) throws -> [Date] {
+        var sessions: [String: Date] = [:]
+        if root["status"] as? String == "active" {
+            guard let expiry = date(root["expiresAt"]) else { throw FreebuffUsageError.invalidResponse }
+            let id = (root["instanceId"] as? String)?.nilIfEmpty ?? "single"
+            sessions[id] = expiry
+        }
+        if let purchases = root["desktopPurchases"] as? [[String: Any]] {
+            for purchase in purchases {
+                // Unoccupied purchases are reusable hours, not running sessions.
+                guard let holder = (purchase["holderInstanceId"] as? String)?.nilIfEmpty else { continue }
+                guard let expiry = date(purchase["expiresAt"]) else { throw FreebuffUsageError.invalidResponse }
+                sessions[holder] = expiry
+            }
+        }
+        // Stable earliest-expiry order; equal timestamps still represent distinct sessions.
+        return sessions.values.sorted()
     }
 
     private struct RateLimitPool {
