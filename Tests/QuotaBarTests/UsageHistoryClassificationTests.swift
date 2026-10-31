@@ -9,6 +9,7 @@ final class UsageHistoryClassificationTests: XCTestCase {
             ClaudeProvider().widgetDescriptors,
             CodexProvider().widgetDescriptors,
             CursorProvider().widgetDescriptors,
+            FreebuffProvider().widgetDescriptors,
             GrokProvider().widgetDescriptors,
             OpenCodeProvider().widgetDescriptors
         ]
@@ -26,6 +27,7 @@ final class UsageHistoryClassificationTests: XCTestCase {
             "claude": .machineLocal,
             "codex": .machineLocal,
             "cursor": .accountWide,
+            "freebuff": .accountWide,
             "grok": .machineLocal,
             "opencode": .machineLocal
         ])

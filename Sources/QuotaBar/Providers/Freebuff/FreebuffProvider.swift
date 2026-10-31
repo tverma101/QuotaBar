@@ -16,16 +16,19 @@ final class FreebuffProvider: ProviderRuntime {
     let authStore: FreebuffAuthStore
     let usageClient: FreebuffUsageClient
     let historyScanner: FreebuffDesktopUsageScanner
+    let hostedScanner: FreebuffHostedUsageScanner
     let modelCatalog: FreebuffModelCatalog
     let pricing: @Sendable () async -> ModelPricing
     let now: @Sendable () -> Date
 
     func unloadLocalAccountingCachesForMemoryPressure() async {
         await historyScanner.unloadCachesForMemoryPressure()
+        await hostedScanner.unloadCachesForMemoryPressure()
     }
 
     init(
         historyScanner: FreebuffDesktopUsageScanner = FreebuffDesktopUsageScanner(),
+        hostedScanner: FreebuffHostedUsageScanner = FreebuffHostedUsageScanner(),
         authStore: FreebuffAuthStore = FreebuffAuthStore(),
         usageClient: FreebuffUsageClient = FreebuffUsageClient(),
         now: @escaping @Sendable () -> Date = Date.init,
@@ -34,6 +37,7 @@ final class FreebuffProvider: ProviderRuntime {
     ) {
         self.authStore = authStore
         self.historyScanner = historyScanner
+        self.hostedScanner = hostedScanner
         self.usageClient = usageClient
         self.now = now
         self.modelCatalog = modelCatalog
@@ -76,7 +80,7 @@ final class FreebuffProvider: ProviderRuntime {
             .values(id: "freebuff.freebucksBalance", provider: provider, title: "Hours Balance",
                     metricLabel: "Hours Balance", selection: .kind(.count))
                 .hidingWhenEmpty()
-                .exportingHistory(scope: .machineLocal, estimatedCost: true,
+                .exportingHistory(scope: .accountWide, estimatedCost: true,
                                   sourceNote: Self.historySourceNote),
             .values(id: "freebuff.monthlySpend", provider: provider, title: "Monthly Spend",
                     metricLabel: "Monthly Spend", selection: .kind(.dollars), valueWord: "spent")
@@ -89,20 +93,74 @@ final class FreebuffProvider: ProviderRuntime {
     }
 
     func refresh() async -> ProviderSnapshot {
-        let snapshot: ProviderSnapshot
-        if ProviderRefreshContext.scope.suppressesLiveQuota {
-            snapshot = .make(provider: provider, plan: nil, lines: [], refreshedAt: now())
-        } else {
-            snapshot = await refreshQuota()
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        let scope = ProviderRefreshContext.scope
+        var auth: FreebuffAuth?
+        var authError: (any Error)?
+        do {
+            auth = try await loadOffMainActor { [authStore] in try authStore.loadAuth() }
+            if auth == nil { authError = FreebuffAuthError.notLoggedIn }
+        } catch {
+            if ProviderCancellation.isCancellation(error) { return cancelledRefreshSnapshot(provider: provider) }
+            authError = error
         }
-        guard !ProviderRefreshContext.scope.skipsLocalAccounting, !Task.isCancelled else { return snapshot }
+        let snapshot: ProviderSnapshot
+        if scope.suppressesLiveQuota {
+            snapshot = .make(provider: provider, plan: nil, lines: [], refreshedAt: now())
+        } else if let auth {
+            snapshot = await refreshQuota(auth: auth)
+        } else {
+            snapshot = .error(provider: provider, error: authError ?? FreebuffAuthError.notLoggedIn)
+        }
+        guard !scope.skipsLocalAccounting, !Task.isCancelled else { return snapshot }
         var result = snapshot
         do {
             let scanNow = now()
+            var hostedReceipts: [FreebuffUsageReceipt] = []
+            var incompleteHistory = auth == nil
+            if auth == nil { result.historyWarning = authError?.localizedDescription }
+            if let auth {
+                if scope == .localAccounting {
+                    hostedReceipts = await hostedScanner.cachedReceipts(auth: auth)
+                } else {
+                    do {
+                        hostedReceipts = try await hostedScanner.scan(auth: auth, client: usageClient, now: scanNow)
+                        DiagnosticGate.clearFailure("auth.freebuff.hosted-history.failure")
+                    } catch {
+                        try ProviderCancellation.rethrowIfCancellation(error)
+                        DiagnosticGate.logOnce(for: "auth.freebuff.hosted-history.failure") {
+                            AppLog.warn(LogTag.auth("freebuff"), "hosted token history read failed: \(error.localizedDescription)")
+                        }
+                        hostedReceipts = await hostedScanner.cachedReceipts(auth: auth)
+                        incompleteHistory = true
+                        result.historyWarning = "Freebuff's hosted token history couldn't be refreshed. Totals may be incomplete."
+                    }
+                }
+                var hasHistory = !hostedReceipts.isEmpty
+                if scope != .localAccounting, !hasHistory {
+                    hasHistory = try await historyScanner.hasHistory(now: scanNow)
+                }
+                if scope != .localAccounting, hasHistory {
+                    do {
+                        try await modelCatalog.refresh(auth: auth, client: usageClient, now: scanNow)
+                        DiagnosticGate.clearFailure("auth.freebuff.catalog.failure")
+                    } catch {
+                        try ProviderCancellation.rethrowIfCancellation(error)
+                        DiagnosticGate.logOnce(for: "auth.freebuff.catalog.failure") {
+                            AppLog.warn(LogTag.auth("freebuff"), "model catalogue refresh failed: \(error.localizedDescription)")
+                        }
+                        if result.historyWarning == nil {
+                            result.historyWarning = "Freebuff model names couldn't be refreshed. Saved model data is still available."
+                        }
+                    }
+                }
+            }
             let catalog = await modelCatalog.current()
-            if let scan = try await historyScanner.scan(now: scanNow, pricing: pricing(), modelCatalog: catalog) {
+            if var scan = try await historyScanner.scan(now: scanNow, pricing: pricing(), modelCatalog: catalog,
+                                                       hostedReceipts: hostedReceipts) {
                 DiagnosticGate.clearFailure("auth.freebuff.history.failure")
                 let usage = scan.usage
+                if incompleteHistory { scan.partialDays.formUnion(usage.series.daily.map(\.date)) }
                 result.usageHistory = ProviderUsageHistory(
                     series: usage.series, modelUsage: usage.modelUsage,
                     unknownModelsByDay: usage.unknownModelsByDay, apiEstimateByDay: usage.apiEstimateByDay,
@@ -121,31 +179,15 @@ final class FreebuffProvider: ProviderRuntime {
             return cancelledRefreshSnapshot(provider: provider)
         } catch {
             DiagnosticGate.logOnce(for: "auth.freebuff.history.failure") {
-                AppLog.warn(LogTag.auth("freebuff"), "local token history read failed: \(error.localizedDescription)")
+                AppLog.warn(LogTag.auth("freebuff"), "token history read failed: \(error.localizedDescription)")
             }
-            result.warning = FreebuffUsageError.localHistoryUnreadable.localizedDescription
+            result.historyWarning = FreebuffUsageError.localHistoryUnreadable.localizedDescription
         }
         return result
     }
 
-    private func refreshQuota() async -> ProviderSnapshot {
+    private func refreshQuota(auth: FreebuffAuth) async -> ProviderSnapshot {
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-        let auth: FreebuffAuth
-        do {
-            guard let loaded = try await loadOffMainActor({ [authStore] in try authStore.loadAuth() }) else {
-                return ProviderSnapshot.error(provider: provider, error: FreebuffAuthError.notLoggedIn)
-            }
-            auth = loaded
-        } catch is CancellationError {
-            return cancelledRefreshSnapshot(provider: provider)
-        } catch {
-            if ProviderCancellation.isCancellation(error) {
-                return cancelledRefreshSnapshot(provider: provider)
-            }
-            return ProviderSnapshot.error(provider: provider, error: error)
-        }
-        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-
         do {
             let response = try await usageClient.fetchSession(auth: auth)
             if Task.isCancelled { return cancelledRefreshSnapshot(provider: provider) }
@@ -158,21 +200,8 @@ final class FreebuffProvider: ProviderRuntime {
             }
             let mapped = try FreebuffUsageMapper.map(response: response)
             DiagnosticGate.clearFailures(prefix: Self.usageFailureDiagnosticPrefix)
-            var result = ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines,
+            return ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines,
                                          refreshedAt: now(), clearsPriorMenuBarQuotaState: true)
-            if try await historyScanner.hasHistory(now: now()) {
-                do {
-                    try await modelCatalog.refresh(auth: auth, client: usageClient, now: now())
-                    DiagnosticGate.clearFailure("auth.freebuff.catalog.failure")
-                } catch is CancellationError { throw CancellationError() }
-                catch {
-                    DiagnosticGate.logOnce(for: "auth.freebuff.catalog.failure") {
-                        AppLog.warn(LogTag.auth("freebuff"), "model catalogue refresh failed: \(error.localizedDescription)")
-                    }
-                    result.warning = "Freebuff model names couldn't be refreshed. Saved model data is still available."
-                }
-            }
-            return result
         } catch is CancellationError {
             return cancelledRefreshSnapshot(provider: provider)
         } catch {
@@ -185,7 +214,7 @@ final class FreebuffProvider: ProviderRuntime {
         }
     }
 
-    private static let historySourceNote = "Measured Freebuff Desktop tokens on this Mac; dollars estimated at public API rates, not Freebuff charges."
+    private static let historySourceNote = "Measured Freebuff hosted runs and legacy Desktop tokens on this Mac; dollars estimated at public API rates, not Freebuff charges."
 
     private static func usageFailureDiagnosticKey(_ error: Error) -> String {
         usageFailureDiagnosticPrefix + String(reflecting: type(of: error))

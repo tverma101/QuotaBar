@@ -30,6 +30,19 @@ struct FreebuffUsageClient: Sendable {
                         extraHeaders: ["x-freebuff-catalog-protocol": "1"])
     }
 
+    /// Shared hosted history also backs Desktop's “On This Device” execution mode.
+    func fetchHistory(path: String, cursor: String?, auth: FreebuffAuth) async throws -> HTTPResponse {
+        var url = URLComponents(string: "https://www.codebuff.com/api/v1/cloud/history/" + path)!
+        // Events are bounded at 500 by the history API. Use that supported page size for the
+        // initial backfill; active runs subsequently fetch only bytes after their saved cursor.
+        url.queryItems = [URLQueryItem(name: "limit", value: path.hasSuffix("/events") ? "500" : "100")]
+        if let cursor { url.queryItems?.append(URLQueryItem(name: "cursor", value: cursor)) }
+        // Older bearer clients intentionally receive a list without device-execution chats.
+        // Match the current shared history client so Local/On This Device usage is included.
+        return try await fetch(urlString: url.url!.absoluteString, auth: auth,
+                               extraHeaders: ["x-freebuff-device-chats": "1"])
+    }
+
     private func fetch(urlString: String, auth: FreebuffAuth, extraHeaders: [String: String] = [:]) async throws -> HTTPResponse {
         guard let url = URL(string: urlString) else {
             throw FreebuffUsageError.invalidResponse
