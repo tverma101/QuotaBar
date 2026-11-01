@@ -4,6 +4,7 @@ enum CodexAutoResetStatus: Equatable {
     case off, unverified, checking, monitoring, due
     case scheduled(Date)
     case attention(String)
+    case windowPassed(nextAttempt: Date?)
 
     var title: String {
         switch self {
@@ -13,6 +14,7 @@ enum CodexAutoResetStatus: Equatable {
         case .monitoring, .scheduled: "Auto-Use On"
         case .due: "Auto-Use Due"
         case .attention: "Auto-Use Needs Attention"
+        case .windowPassed: "Reset Window Passed"
         }
     }
 
@@ -25,13 +27,23 @@ enum CodexAutoResetStatus: Equatable {
         case .scheduled: "Next attempt, one minute before expiry:"
         case .due: "An expiring reset is due for an automatic attempt."
         case .attention(let message): message
+        case .windowPassed:
+            "A previously seen credit passed its expiry without a confirmed automatic reset. It may have expired or been used elsewhere."
         }
     }
 
     var needsAttention: Bool {
         switch self {
-        case .unverified, .attention: true
+        case .unverified, .attention, .windowPassed: true
         default: false
+        }
+    }
+
+    var nextAttempt: Date? {
+        switch self {
+        case .scheduled(let date): date
+        case .windowPassed(let date): date
+        default: nil
         }
     }
 }
@@ -44,7 +56,8 @@ struct CodexAutoResetStatusView: View {
             Text(status.title).fontWeight(.medium)
                 .foregroundStyle(status.needsAttention ? Color.orange : Color.primary)
             Text(status.detail).foregroundStyle(.secondary)
-            if case .scheduled(let date) = status {
+            if let date = status.nextAttempt {
+                if case .windowPassed = status { Text("Next scheduled attempt:").foregroundStyle(.secondary) }
                 Text(date, format: .dateTime.month(.abbreviated).day().hour().minute())
                     .monospacedDigit()
             }
