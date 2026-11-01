@@ -22,6 +22,7 @@ struct SettingsScreen: View {
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
     @AppStorage(ReduceAnimationsSetting.key) private var reduceAnimations = ReduceAnimationsSetting.fallback
     @AppStorage(LogLevelSetting.key) private var logLevel = LogLevelSetting.fallback
+    @AppStorage(CodexAutoResetCoordinator.enabledKey) private var autoRedeemCodexResets = false
     /// Surfaced under the Advanced rows when copying the path or revealing the file fails.
     @State private var logActionError: String?
     /// macOS notification authorization for QuotaBar, surfaced in the Notifications section so a
@@ -192,6 +193,29 @@ struct SettingsScreen: View {
             }
             row("Reset Times") {
                 picker($store.resetDisplayMode, options: ResetDisplayMode.allCases, label: \.label)
+            }
+            row("Auto-Use Expiring Codex Resets") {
+                Toggle("", isOn: $autoRedeemCodexResets)
+                    .settingsSwitchStyle()
+                    .onChange(of: autoRedeemCodexResets) { _, _ in
+                        container.codexAutoReset.restart()
+                    }
+            }
+            Text("When enabled, use an available Codex reset 1 minute before expiry, on each connected account. Requires QuotaBar to be running and the Mac awake.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+            if autoRedeemCodexResets {
+                Text("Monitoring \(container.codexAutoReset.monitoredAccountCount) verified Codex account(s).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+            }
+            if autoRedeemCodexResets && !container.codexAutoReset.lastErrorByAccount.isEmpty {
+                Text("Auto-reset needs attention on \(container.codexAutoReset.lastErrorByAccount.count) Codex account(s). Check credentials and QuotaBar logs.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 12)
             }
             // Off (default) leaves pacing on yellow and red only. On also surfaces projection
             // and the even-pace tick on blue rows.

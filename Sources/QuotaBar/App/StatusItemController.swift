@@ -336,7 +336,9 @@ final class StatusItemController: NSObject {
                 .environment(container.layout)
                 .environment(container.dataStore)
                 .environment(container.transparency)
+                .environment(container.codexAutoReset)
                 .environment(\.codexResetClaim, container.codexResetClaim)
+                .environment(\.codexResetClaimRouter, container.codexResetClaims)
         )
     }
 
