@@ -19,6 +19,7 @@ struct CodexResetCredit: Hashable, Sendable {
 final class CodexAutoResetCoordinator {
     static let enabledKey = "codexAutoRedeemExpiringResets"
     static let leadTime: TimeInterval = 60
+    static let wakeNotification = Notification.Name("QuotaBar.CodexResetWake")
     private static let patrolInterval: TimeInterval = 300
     private static let retryInterval: TimeInterval = 15
     private static let maximumAttempts = 3
@@ -61,20 +62,29 @@ final class CodexAutoResetCoordinator {
     private let verifiedAccountIdentityByProviderID: [String: String]
     /// The number of verified Codex accounts eligible for this global opt-in.
     var monitoredAccountCount: Int { accounts.count }
+    var attentionAccountCount: Int {
+        accounts.keys.filter { status(for: $0, enabled: true).needsAttention }.count
+    }
     private let defaults: UserDefaults
     private let now: () -> Date
+    private let wakeCenter: NotificationCenter
+    private let observeSystemEvents: Bool
     /// User-facing status for accounts that could not check/redeem an expiring credit.
     private(set) var lastErrorByAccount: [String: String] = [:]
     private var attempts: [String: Attempt]
     private var lastKnownCredits: [String: [CodexResetCredit]] = [:]
+    private var hasCheckedAccounts: Set<String> = []
     @ObservationIgnored private var inFlight: Set<String> = []
     @ObservationIgnored private var workers: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var systemWakeSource: CodexAutoResetWakeSource?
 
     init(
         accounts: [String: Account],
         defaults: UserDefaults = .standard,
         now: @escaping () -> Date = Date.init,
-        verifiedAccountIdentityByProviderID: [String: String] = [:]
+        verifiedAccountIdentityByProviderID: [String: String] = [:],
+        wakeCenter: NotificationCenter = .default,
+        observeSystemEvents: Bool = false
     ) {
         self.accounts = accounts
         self.verifiedAccountIdentityByProviderID = verifiedAccountIdentityByProviderID.compactMapValues {
@@ -82,6 +92,8 @@ final class CodexAutoResetCoordinator {
         }
         self.defaults = defaults
         self.now = now
+        self.wakeCenter = wakeCenter
+        self.observeSystemEvents = observeSystemEvents
         if let saved = defaults.data(forKey: Self.storageKey),
            let decoded = try? JSONDecoder().decode([String: Attempt].self, from: saved) {
             attempts = decoded
@@ -90,6 +102,14 @@ final class CodexAutoResetCoordinator {
         }
         let cutoff = now().addingTimeInterval(-86_400)
         attempts = attempts.filter { $0.value.expiry >= cutoff }
+        // Previously observed deadlines remain useful during an offline restart. They never
+        // authorize a new POST: availableCredits and claimAuto still perform live validation.
+        for accountID in accounts.keys {
+            let owner = attemptOwner(for: accountID)
+            lastKnownCredits[accountID] = attempts.values.filter {
+                $0.accountID == owner && $0.result == .pending
+            }.map { CodexResetCredit(id: $0.creditID, expiresAt: $0.expiry) }
+        }
     }
 
     convenience init(
@@ -108,12 +128,18 @@ final class CodexAutoResetCoordinator {
                     await service.claimAuto(credit: credit, redeemRequestID: requestID, canRedeem: isEnabled)
                 }
             )
-        }, defaults: defaults, verifiedAccountIdentityByProviderID: verifiedAccountIdentityByProviderID)
+        }, defaults: defaults, verifiedAccountIdentityByProviderID: verifiedAccountIdentityByProviderID,
+           observeSystemEvents: true)
     }
 
     func start() {
         guard workers.isEmpty else { return }
+        if observeSystemEvents, defaults.bool(forKey: Self.enabledKey), !accounts.isEmpty {
+            systemWakeSource = CodexAutoResetWakeSource(center: wakeCenter)
+        }
         for accountID in accounts.keys {
+            // Subscribe before the first check so a wake/reconnect during GET/POST is buffered.
+            let signal = RefreshWakeSignal(name: Self.wakeNotification, center: wakeCenter)
             workers[accountID] = Task { [weak self] in
                 while !Task.isCancelled {
                     let delay: TimeInterval
@@ -122,8 +148,7 @@ final class CodexAutoResetCoordinator {
                         delay = await owner.runOnce(for: accountID)
                     }
                     if Task.isCancelled { return }
-                    do { try await Task.sleep(for: .seconds(max(1, delay))) }
-                    catch { return }
+                    await signal.waitForWake(timeout: max(1, delay))
                 }
             }
         }
@@ -132,6 +157,7 @@ final class CodexAutoResetCoordinator {
     func stop() {
         workers.values.forEach { $0.cancel() }
         workers.removeAll()
+        systemWakeSource = nil
     }
 
     /// The Settings toggle calls this so enabling auto-reset starts an immediate live check,
@@ -150,9 +176,17 @@ final class CodexAutoResetCoordinator {
     func status(for accountID: String, enabled: Bool) -> CodexAutoResetStatus {
         guard enabled else { return .off }
         guard accounts[accountID] != nil else { return .unverified }
-        if let error = lastErrorByAccount[accountID] { return .attention(error) }
-        guard let credits = lastKnownCredits[accountID] else { return .checking }
         let owner = attemptOwner(for: accountID)
+        let windowPassed = attempts.values.contains {
+            $0.accountID == owner && $0.result != .success && $0.result != .nothingToReset && $0.expiry <= now()
+                && $0.expiry > now().addingTimeInterval(-86_400)
+        }
+        if let error = lastErrorByAccount[accountID] {
+            return .attention(error + (windowPassed
+                ? ". A previously seen credit's expiry has passed; automatic use is unconfirmed." : ""))
+        }
+        guard let credits = lastKnownCredits[accountID], !credits.isEmpty || hasCheckedAccounts.contains(accountID)
+        else { return .checking }
         let retries = attempts.values.filter {
             $0.accountID == owner && $0.result == .pending && $0.attempts > 0 && $0.expiry > now()
         }.map { CodexResetCredit(id: $0.creditID, expiresAt: $0.expiry, isRetry: true) }
@@ -166,6 +200,7 @@ final class CodexAutoResetCoordinator {
             }
             return max(trigger, prior.addingTimeInterval(Self.retryInterval))
         }.min()
+        if windowPassed { return .windowPassed(nextAttempt: next) }
         guard let next else { return .monitoring }
         return next <= now() ? .due : .scheduled(next)
     }
@@ -185,11 +220,35 @@ final class CodexAutoResetCoordinator {
             let close = lastKnownCredits[accountID]?.contains {
                 $0.expiresAt > now() && $0.expiresAt.timeIntervalSince(now()) <= 300
             } ?? false
+            if lastErrorByAccount[accountID] != "Could not check reset credits" {
+                AppLog.warn(LogTag.plugin("codex"), "auto reset: credit lookup unavailable for \(accountID)")
+            }
             lastErrorByAccount[accountID] = "Could not check reset credits"
-            AppLog.warn(LogTag.plugin("codex"), "auto reset: credit lookup unavailable for \(accountID)")
-            return close ? 10 : Self.patrolInterval
+            return close ? 10 : Self.retryInterval
         }
+        hasCheckedAccounts.insert(accountID)
         lastKnownCredits[accountID] = credits
+        // Retain observed expiries even before their first attempt, account-bound and bounded
+        // by the existing retention cutoff. Updates from the live list replace unsent deadlines.
+        var changed = false
+        let cutoff = now().addingTimeInterval(-86_400)
+        let retained = attempts.filter { $0.value.expiry >= cutoff }
+        if retained.count != attempts.count { attempts = retained; changed = true }
+        for credit in credits {
+            let key = Self.key(accountID: ledgerAccountID, creditID: credit.id)
+            if var record = attempts[key] {
+                if record.result == .pending, record.attempts == 0, record.expiry != credit.expiresAt {
+                    record.expiry = credit.expiresAt
+                    attempts[key] = record
+                    changed = true
+                }
+            } else {
+                attempts[key] = Attempt(requestID: UUID().uuidString, attempts: 0, lastAttemptAt: nil,
+                    result: .pending, expiry: credit.expiresAt, creditID: credit.id, accountID: ledgerAccountID)
+                changed = true
+            }
+        }
+        if changed { _ = persist() }
         // Clear stale lookup failures after a successful read. Redemption failures stay
         // visible until a successful claim or explicit user intervention.
         if lastErrorByAccount[accountID] == "Could not check reset credits" {
@@ -301,7 +360,7 @@ final class CodexAutoResetCoordinator {
         }
         attempts[key] = record
         _ = persist()
-        return record.result == .pending ? Self.retryInterval : 1
+        return outcome == .cancelled ? 1 : (record.result == .pending ? Self.retryInterval : 1)
     }
 
     /// Positive means wait; zero means the target time has arrived; nil means already expired.
