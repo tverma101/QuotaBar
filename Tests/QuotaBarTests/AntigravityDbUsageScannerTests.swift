@@ -591,7 +591,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
             .init(index: 0, blob: blob),
             .init(index: 10, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: UInt64(yesterday.timeIntervalSince1970)))
         ]])
-        let scanner = AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path })
+        let scanner = AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+                                                projectOversized: { _, _, _ in nil })
         let first = await scanner.scan(now: now, pricing: pricing)
         XCTAssertEqual(first?.series.daily.first?.date, DailyUsageAccumulator.dayKey(from: yesterday))
         XCTAssertEqual(first?.series.daily.first?.totalTokens, 120)
@@ -639,7 +640,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
             .init(index: 10, blob: nil, stepMetadata:
                 antigravityStepMetadata(timestamp: timestamp, stepUUID: "other", botID: "other"))
         ]])
-        let scanner = AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path })
+        let scanner = AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+                                                projectOversized: { _, _, _ in nil })
         _ = await scanner.scan(now: now, pricing: pricing)
         sqlite.append(.init(index: 11, blob: nil, stepMetadata:
             antigravityStepMetadata(timestamp: timestamp, stepUUID: "unrelated", botID: "unrelated")), to: fixture.paths[0])
@@ -684,7 +686,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
             .init(index: 0, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: timestamp)),
             .init(index: 1, blob: valid)
         ]])
-        let scanner = AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path })
+        let scanner = AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+                                                projectOversized: { _, _, _ in nil })
 
         let result = await scanner.scan(now: now, pricing: pricing)
         let scan = try XCTUnwrap(result)
@@ -1622,7 +1625,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         let scanner = AntigravityDbUsageScanner(
             sqlite: sqlite,
             conversationsDirectory: { fixture.url.path },
-            oversizedBlobWarning: { _ in _ = recorder.next() }
+            oversizedBlobWarning: { _ in _ = recorder.next() },
+            projectOversized: { _, _, _ in nil }
         )
 
         let firstResult = await scanner.scan(now: now, pricing: pricing)
@@ -1918,7 +1922,8 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         let sqlite = AntigravityFakeSQLite(rowsByPath: [fixture.paths[0]: [
             .init(index: 0, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: timestamp))
         ]])
-        let scanner = AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path })
+        let scanner = AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+                                                projectOversized: { _, _, _ in nil })
         let partialScan = await scanner.scan(now: fixedNow, pricing: fixedPricing)
         let scan = try XCTUnwrap(partialScan)
         XCTAssertFalse(scan.unmeasuredUsageDays?.isEmpty ?? true,

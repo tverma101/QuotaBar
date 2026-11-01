@@ -655,6 +655,7 @@ extension WidgetData {
         if let subtitleOverride { return subtitleOverride }
         if isFreshSessionWindow(now: now) { return "Not started" }
         if let resetsAt {
+            if now.timeIntervalSince(resetsAt) > 5 * 60 { return "Awaiting Refresh" }
             return resetDisplayMode == .absolute
                 ? Formatters.resetAbsoluteLabel(at: resetsAt, now: now)
                 : Formatters.resetRelativeLabel(until: resetsAt, now: now)
@@ -698,6 +699,9 @@ extension WidgetData {
     func resetTooltip(now: Date = Date()) -> String? {
         if isFreshSessionWindow(now: now) { return Self.freshSessionTooltip }
         guard hasResetLabel(now: now), let resetsAt else { return nil }
+        if now.timeIntervalSince(resetsAt) > 5 * 60 {
+            return "The last reported reset has passed. Refresh to get the current allowance."
+        }
         return resetDisplayMode == .absolute
             ? Formatters.resetRelativeLabel(until: resetsAt, now: now)
             : Formatters.resetAbsoluteLabel(at: resetsAt, now: now)

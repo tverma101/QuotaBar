@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import QuotaBar
 
 @MainActor
@@ -123,10 +124,46 @@ final class ModelUsageHoverTests: XCTestCase {
             ModelUsageVariant(model: "space-bunny-free", totalTokens: 10_500_000_000, costUSD: 0)
         ])
 
-        XCTAssertEqual(ModelUsageDetail.otherVariantSummary(for: other), "space-bunny-free + 1 more")
-        XCTAssertNil(ModelUsageDetail.otherVariantSummary(for: ModelUsageEntry(
+        XCTAssertEqual(ModelUsageDetail.otherContributors(for: other).map(\.model), ["space-bunny-free", "small-tail"])
+        XCTAssertTrue(ModelUsageDetail.otherContributors(for: ModelUsageEntry(
             model: "space-bunny-free", totalTokens: 10, costUSD: 0
-        )))
+        )).isEmpty)
+    }
+
+    func testOtherContributorsIncludeEveryKnownModelAndUnidentifiedUsageWithoutInventingModelCount() {
+        let names = ["GPT-6.1 Terra", "Older Freebuff Usage", "Claude Haiku 5.5", "GLM 5.3 Flash",
+                     "Muse Spark 1.3", "MiMo v2.6 Flash", "upstage/solar-pro4", "Unattributed"]
+        let variants = names.enumerated().map { index, name in
+            ModelUsageVariant(model: name, totalTokens: 100 - index, costUSD: index == 1 ? nil : 1)
+        }
+        let other = ModelUsageEntry(model: "Other", totalTokens: 772, costUSD: 7, variants: variants,
+                                    costIsComplete: false)
+        let contributors = ModelUsageDetail.otherContributors(for: other)
+        XCTAssertEqual(contributors.map(\.model), names)
+        XCTAssertEqual(contributors.map(\.totalTokens), variants.map(\.totalTokens))
+        XCTAssertNil(contributors[1].costUSD)
+        XCTAssertTrue(contributors[1].hasIncompleteCost)
+    }
+
+    func testOtherContributorDetailsRenderInABoundedNativePopover() throws {
+        let variants = ["GPT-6.1 Terra", "Older Freebuff Usage", "Claude Haiku 5.5", "GLM 5.3 Flash",
+                        "Muse Spark 1.3", "MiMo v2.6 Flash", "upstage/solar-pro4"].map {
+            ModelUsageVariant(model: $0, totalTokens: 1_000_000, costUSD: $0 == "Older Freebuff Usage" ? nil : 1)
+        }
+        let breakdown = ModelUsageBreakdown(totalTokens: 100_000_000, totalCostUSD: 90, models: [
+            .init(model: "DeepSeek V4.1 Flash", totalTokens: 93_000_000, costUSD: 84),
+            .init(model: "Other", totalTokens: 7_000_000, costUSD: 6, variants: variants, costIsComplete: false)
+        ], sourceNote: "Measured usage; dollars are public API estimates.")
+        let renderer = ImageRenderer(content: ModelUsageDetail(title: "Last 30 Days", breakdown: breakdown,
+            onHoverChange: { _ in }).environment(\.colorScheme, .dark))
+        renderer.scale = 2
+        let image = try XCTUnwrap(renderer.cgImage)
+        XCTAssertEqual(image.width, 560)
+        XCTAssertLessThan(image.height, 1_200, "large contributor lists scroll instead of growing beyond the display")
+        if let path = ProcessInfo.processInfo.environment["QUOTABAR_MODEL_DETAIL_RENDER_PATH"] {
+            let bitmap = NSBitmapImageRep(cgImage: image)
+            try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: URL(fileURLWithPath: path))
+        }
     }
 
     func testHoverPopoverStateOpensThenClosesAroundBothRegions() async {

@@ -10,8 +10,8 @@ struct AntigravityDbUsageScanResult: Sendable {
 /// Reads token accounting from Antigravity's local conversation databases, discovered by FelixIsaac
 /// in openusage#1058/#1120. Transcript JSONL files contain no usable generation token counts.
 ///
-/// SQLite batches are bounded, and oversized protobufs are skipped before `hex(data)` runs: real
-/// Antigravity sessions can contain generation blobs hundreds of megabytes in size.
+/// SQLite batches are bounded. Oversized protobufs use a bounded accounting projection before
+/// `hex(data)` can expand them: sessions can contain generation blobs hundreds of megabytes in size.
 actor AntigravityDbUsageScanner {
     static let maximumBlobBytes = 1_048_576
     static let batchSize = 1_024
@@ -23,6 +23,7 @@ actor AntigravityDbUsageScanner {
     private let discoverConversationDirectories: @Sendable () throws -> ConversationDirectoryDiscovery
     private let readFailureReporter: UsageLogReadFailureReporter
     private let oversizedBlobReporter: UsageLogReadFailureReporter
+    private let projectOversized: @Sendable (String, Int, Int) throws -> [UInt8]?
     private var scanCache: [String: CachedDatabase] = [:]
     private var sqliteSupportsSHA3Aggregate: Bool?
 
@@ -37,9 +38,13 @@ actor AntigravityDbUsageScanner {
         conversationsDirectories: (@Sendable () throws -> [String])? = nil,
         conversationDiscovery: (@Sendable () throws -> ConversationDirectoryDiscovery)? = nil,
         readFailureWarning: UsageLogReadFailureReporter.Warning? = nil,
-        oversizedBlobWarning: UsageLogReadFailureReporter.Warning? = nil
+        oversizedBlobWarning: UsageLogReadFailureReporter.Warning? = nil,
+        projectOversized: @escaping @Sendable (String, Int, Int) throws -> [UInt8]? = {
+            try AntigravityAccountingProjection.read(path: $0, index: $1, expectedBytes: $2)
+        }
     ) {
         self.sqlite = sqlite
+        self.projectOversized = projectOversized
         if let conversationDiscovery {
             self.discoverConversationDirectories = conversationDiscovery
         } else if let conversationsDirectory {
@@ -572,6 +577,9 @@ actor AntigravityDbUsageScanner {
         }
 
         var cached = scanCache[path]
+        // SHA3 prefix fingerprints intentionally omit oversized payloads. Once such a row has been
+        // projected, a changed source must replay its bounded projection even for same-size edits.
+        if cached?.hasProjectedRows == true { cached = nil }
         if cached?.fingerprint.databaseIdentity != fingerprint.databaseIdentity
             || (cached?.fingerprint.databaseSize ?? 0) > fingerprint.databaseSize
             || (cached?.windowStart ?? since) > since
@@ -863,6 +871,7 @@ actor AntigravityDbUsageScanner {
             cached.undatedUsageTimestamps.removeAll()
             cached.undatedIdentities.removeAll()
             cached.oversizedTimestamps.removeAll()
+            cached.hasProjectedRows = false
         }
         cached.hasStepMetadata = hasStepMetadata
         cached.stepTimestampIndex = stepIndex
@@ -890,13 +899,19 @@ actor AntigravityDbUsageScanner {
                     cached.tableFingerprint = Self.advancingFingerprint(cached.tableFingerprint, with: fingerprint)
                     cached.lastIndex = row.index
                     cached.rowCount += 1
-                    guard let hex = row.hex else {
+                    let blob: [UInt8]?
+                    if let hex = row.hex {
+                        blob = Self.bytes(fromHex: hex)
+                    } else {
+                        blob = try projectOversized(path, row.index, row.byteCount)
+                        if blob != nil { cached.hasProjectedRows = true }
+                    }
+                    guard let blob else {
                         // The generation bytes are unavailable, so its identifiers cannot validate
                         // an index-correlated step timestamp. Mark the first-observed day instead.
                         if observedAt >= since { cached.oversizedTimestamps.append(observedTimestamp) }
                         continue
                     }
-                    guard let blob = Self.bytes(fromHex: hex) else { continue }
                     switch AntigravityProtoDecoder.decodeGenerationEvent(
                         from: blob,
                         stepMetadata: row.stepHex.flatMap(Self.bytes(fromHex:)),
@@ -1271,6 +1286,7 @@ actor AntigravityDbUsageScanner {
         var tableFingerprint = AntigravityDbUsageScanner.emptyTableFingerprint
         var contentFingerprint: String?
         var events: [AntigravityProtoDecoder.GenerationEvent] = []
+        var hasProjectedRows = false
         var oversizedTimestamps: [Int64] = []
         var invalidTokenTimestamps: [Int64] = []
         var malformedUsageTimestamps: [Int64] = []
