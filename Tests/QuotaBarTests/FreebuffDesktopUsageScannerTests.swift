@@ -34,7 +34,7 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         let result = try await scanner.scan(now: now)
         XCTAssertEqual(result?.usage.series.daily.first?.totalTokens, 300)
         let models = result?.usage.modelUsage?.daily.first?.models ?? []
-        XCTAssertEqual(Set(models.map(\.model)), ["Unattributed", "serving-model"])
+        XCTAssertEqual(Set(models.map(\.model)), ["Older Freebuff Usage", "serving-model"])
         XCTAssertTrue(models.allSatisfy { $0.costUSD == nil }, "zero CLI charge is not an API-price estimate")
         XCTAssertEqual(result?.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
         let again = try await scanner.scan(now: now)
@@ -205,8 +205,10 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         let scan = try await scanner.scan(now: scanNow, pricing: pricing, modelCatalog: modelCatalog)
         let day = DailyUsageAccumulator.dayKey(from: peakTimestamp)
         let models = try XCTUnwrap(scan?.usage.modelUsage?.daily.first?.models)
-        let fastModel = try XCTUnwrap(models.first { $0.model == "DeepSeek V4.1 Flash Fast 10/17" })
+        let model = try XCTUnwrap(models.first { $0.model == "DeepSeek V4.1 Flash" })
+        let fastModel = try XCTUnwrap(model.variants?.first { $0.model == "DeepSeek V4.1 Flash Fast 10/17" })
 
+        XCTAssertEqual(models.count, 1, "modes share one model row while retaining their own prices")
         XCTAssertEqual(scan?.usage.series.daily.first?.totalTokens, 300)
         XCTAssertEqual(try XCTUnwrap(scan?.usage.apiEstimateByDay?[day]), 0.000_199_28, accuracy: 0.000_000_001)
         XCTAssertEqual(try XCTUnwrap(fastModel.costUSD), 0.000_132_8, accuracy: 0.000_000_001)

@@ -3,7 +3,7 @@ import Foundation
 /// Keeps only public model identities, never expiring handles or login credentials. The existing
 /// pricing store supplies OpenRouter rates; this catalogue only resolves Freebuff's opaque keys.
 actor FreebuffModelCatalog {
-    struct Entry: Codable, Sendable {
+    struct Entry: Codable, Equatable, Sendable {
         var key: String
         var displayName: String
         var legacyDigests: [String]?
