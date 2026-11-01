@@ -6,6 +6,13 @@ struct OpenUsageISO8601Tests {
     @Test func parsesZuluISO() {
         let date = OpenUsageISO8601.date(from: "2099-01-01T00:00:00.000Z")
         #expect(date != nil)
+        #expect(OpenUsageISO8601.string(from: date!) == "2099-01-01T00:00:00.000Z")
+    }
+
+    @Test func parsesCanonicalWholeSecondsWithoutNormalization() {
+        let date = OpenUsageISO8601.date(from: "2099-01-01T00:00:00Z")
+        #expect(date != nil)
+        #expect(OpenUsageISO8601.string(from: date!) == "2099-01-01T00:00:00.000Z")
     }
 
     @Test func normalizesMicrosecondsWithoutTimezoneLikeClaudeAPI() {

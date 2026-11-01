@@ -38,14 +38,31 @@ final class UsageHistoryRefreshTriggerTests: XCTestCase {
 private final class HistoryTriggerRuntime: ProviderRuntime {
     let provider: Provider
     let widgetDescriptors: [WidgetDescriptor]
+    private var refreshCount = 0
 
     init(id: String) {
         provider = Provider(id: id, displayName: id.capitalized, icon: .providerMark(id))
-        widgetDescriptors = []
+        widgetDescriptors = [WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: false,
+            sourceNote: "test"
+        )]
     }
 
     func refresh() async -> ProviderSnapshot {
-        ProviderSnapshot(providerID: provider.id, displayName: provider.displayName, lines: [])
+        refreshCount += 1
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-07", totalTokens: refreshCount, costUSD: nil)
+            ]),
+            unknownModelsByDay: [:]
+        )
+        return ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            usageHistory: history
+        )
     }
 
     func hasLocalCredentials() async -> Bool { true }

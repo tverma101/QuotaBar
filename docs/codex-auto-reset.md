@@ -5,6 +5,7 @@ QuotaBar can optionally redeem banked **Codex rate-limit reset credits**, one mi
 ## Enable
 
 Settings → Usage Display → **Auto-Use Expiring Codex Resets** (off by default). Settings shows how many verified Codex accounts are monitored and whether any need attention.
+The Codex reset-credit detail also shows whether auto-use is off, checking, monitoring, or needs attention, and the next attempt time when a credit is scheduled. Reset All Settings turns auto-use off without erasing the saved idempotency ledger.
 
 ## Behavior
 
@@ -13,6 +14,7 @@ Settings → Usage Display → **Auto-Use Expiring Codex Resets** (off by defaul
 - Before a POST, an idempotency UUID is saved and flushed against the account and server credit ID. Failures retry with the same UUID, at most three times per credit ID. After an uncertain response, QuotaBar can replay that exact (credit ID, UUID) even when the credit is no longer listed, to confirm the backend’s `already_redeemed` response. It never substitutes a different credit. Successful, no-credit, and nothing-to-reset outcomes stop attempts for that credit ID; no attempts are made for credits without a real expiry time.
 - `nothing_to_reset` means the server did **not** consume a credit, usually because eligible usage is not sufficiently depleted. QuotaBar doesn't force a pointless reset just to spend a credit.
 - The claim service refreshes the specific account's usage after a successful claim, and the UI remains usable for manual claims through its account-aware router.
+- Turning the setting off cancels preflight checks before the consume request. Those credits remain eligible if auto-use is re-enabled before expiry. A consume request already sent cannot be recalled; an uncertain response resumes only with its saved credit ID and request UUID.
 
 ## Limitations
 

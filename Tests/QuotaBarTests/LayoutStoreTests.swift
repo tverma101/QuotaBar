@@ -1,3 +1,4 @@
+import os
 import XCTest
 @testable import QuotaBar
 
@@ -1346,6 +1347,46 @@ final class LayoutStoreTests: XCTestCase {
         XCTAssertTrue(store.showsRow(core, hasData: false))
     }
 
+    /// `placed` is observable and drives the dashboard grouping and the refresh loop's provider
+    /// selection, so a layout change that does not alter the order must not republish it.
+    func testSyncPlacedOrderDoesNotRepublishAnUnchangedOrder() {
+        let store = makeStore("SyncPlacedOrderNoRepublish")
+        store.syncPlacedOrder()
+
+        let republished = RepublishFlag()
+        withObservationTracking {
+            _ = store.placed
+        } onChange: {
+            republished.set()
+        }
+
+        store.syncPlacedOrder()
+
+        XCTAssertFalse(republished.value, "an unchanged order must not be republished")
+    }
+    /// A metric the user just enabled is appended to `placed`; the sync moves it into place. That
+    /// change *is* published, and the enabled metric must still be persisted.
+    func testSyncPlacedOrderPublishesAChangedOrderAndPersistsIt() {
+        let defaults = makeDefaults("SyncPlacedOrderChanged")
+        let store = LayoutStore(registry: .mock, defaults: defaults, storageKey: "layout")
+        store.setMetricEnabled("claude.weekly", false)
+        store.setMetricEnabled("claude.weekly", true)
+
+        XCTAssertTrue(store.placed.contains { $0.descriptorID == "claude.weekly" })
+        let persisted = LayoutPersistence(defaults: defaults, storageKey: "layout").loadPlaced()
+        XCTAssertTrue(
+            persisted?.contains { $0.descriptorID == "claude.weekly" } == true,
+            "the enabled metric must reach the persisted layout"
+        )
+    }
+
+    /// A flag the observation callback can set from any executor.
+    private final class RepublishFlag: @unchecked Sendable {
+        private let state = OSAllocatedUnfairLock(initialState: false)
+        var value: Bool { state.withLock { $0 } }
+        func set() { state.withLock { $0 = true } }
+    }
+
     private func makeStore(_ name: String) -> LayoutStore {
         LayoutStore(registry: .mock, defaults: makeDefaults(name), storageKey: "layout")
     }
@@ -1656,5 +1697,49 @@ extension LayoutStoreTests {
         let store = LayoutStore(registry: .mock, defaults: defaults, storageKey: "layout")
 
         XCTAssertEqual(store.explicitlyEnabledMetricIDs, ["claude.extra"])
+    }
+
+    func testUpgradeInfersManualConditionalRowsOutsideTheHistoricalDefaultSet() throws {
+        let defaults = makeDefaults("InferLegacyConditionalOptIn")
+        let conditional = try conditionalDescriptor()
+        let descriptors = MockData.descriptors.filter { $0.id != conditional.id } + [conditional]
+        let registry = WidgetRegistry(providers: MockData.providers, descriptors: descriptors)
+        saveStored([
+            PlacedWidget(id: UUID(), descriptorID: "claude.session"),
+            PlacedWidget(id: UUID(), descriptorID: "claude.extra")
+        ], forKey: "layout", in: defaults)
+        saveStored(["claude.session"], forKey: "layout.seededDefaults", in: defaults)
+
+        let store = LayoutStore(
+            registry: registry,
+            defaults: defaults,
+            storageKey: "layout",
+            defaultMetricIDs: ["claude.session"],
+            migrationBaselineMetricIDs: ["claude.session"]
+        )
+
+        XCTAssertTrue(store.explicitlyEnabledMetricIDs.contains("claude.extra"))
+        XCTAssertTrue(store.showsRow(conditional, hasData: false))
+        XCTAssertEqual(defaults.stringArray(forKey: "layout.explicitlyEnabledMetrics"), ["claude.extra"])
+    }
+
+    func testUpgradeDoesNotInferAManualOptInFromAnAmbiguousDefaultRow() throws {
+        let defaults = makeDefaults("DoNotInferDefaultOptIn")
+        let conditional = try conditionalDescriptor()
+        let descriptors = MockData.descriptors.filter { $0.id != conditional.id } + [conditional]
+        let registry = WidgetRegistry(providers: MockData.providers, descriptors: descriptors)
+        saveStored([PlacedWidget(id: UUID(), descriptorID: "claude.extra")], forKey: "layout", in: defaults)
+        saveStored(["claude.extra"], forKey: "layout.seededDefaults", in: defaults)
+
+        let store = LayoutStore(
+            registry: registry,
+            defaults: defaults,
+            storageKey: "layout",
+            defaultMetricIDs: ["claude.extra"],
+            migrationBaselineMetricIDs: ["claude.extra"]
+        )
+
+        XCTAssertFalse(store.explicitlyEnabledMetricIDs.contains("claude.extra"))
+        XCTAssertFalse(store.showsRow(conditional, hasData: false))
     }
 }

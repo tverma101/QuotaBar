@@ -66,6 +66,11 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let lines = AntigravityUsageMapper.parseQuotaSummary(Data(json.utf8))
         XCTAssertEqual(lines?.map(\.label), ["Weekly"])
         XCTAssertEqual(used(lines?.first), 50)
+        XCTAssertEqual(
+            AntigravityUsageMapper.parseQuotaSummaryResult(Data(json.utf8))?.isComplete,
+            false,
+            "A missing known fraction cannot prove the omitted meter is gone"
+        )
     }
 
     func testMalformedBucketDoesNotVoidTheEnvelope() {
@@ -81,6 +86,16 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let lines = AntigravityUsageMapper.parseQuotaSummary(Data(json.utf8))
         XCTAssertEqual(lines?.map(\.label), ["Session"])
         XCTAssertEqual(used(lines?.first), 75)
+    }
+
+    func testMalformedGroupDoesNotDiscardReadableGroups() {
+        let json = #"{"groups":["not a group",{"buckets":"wrong type"},{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.25}]}]}"#
+
+        let parsed = AntigravityUsageMapper.parseQuotaSummaryResult(Data(json.utf8))
+
+        XCTAssertEqual(parsed?.lines.map(\.label), ["Session"])
+        XCTAssertEqual(used(parsed?.lines.first), 75)
+        XCTAssertEqual(parsed?.isComplete, false)
     }
 
     func testMissingResetTimeYieldsNilResetsAt() {
@@ -104,6 +119,58 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let lines = AntigravityUsageMapper.parseQuotaSummary(Data(json.utf8))
         XCTAssertEqual(lines?.map(\.label), ["Session"])
         XCTAssertEqual(used(lines?.first), 25)
+        XCTAssertEqual(
+            AntigravityUsageMapper.parseQuotaSummaryResult(Data(json.utf8))?.isComplete,
+            false,
+            "Unknown bucket IDs keep omitted prior meters until the schema is understood"
+        )
+    }
+
+    func testUnknownBucketDoesNotAgeQuotaWhenEveryKnownMeterWasRefreshed() throws {
+        let json = """
+        {"groups":[{"buckets":[
+          {"bucketId":"gemini-5h","remainingFraction":0.75},
+          {"bucketId":"gemini-weekly","remainingFraction":0.8},
+          {"bucketId":"3p-5h","remainingFraction":0.65},
+          {"bucketId":"3p-weekly","remainingFraction":0.55},
+          {"bucketId":"future-pool","remainingFraction":0.1}
+        ]}]}
+        """
+        let parsed = try XCTUnwrap(AntigravityUsageMapper.parseQuotaSummaryResult(Data(json.utf8)))
+        let now = Date(timeIntervalSince1970: 1_900_000_000)
+        let old = now.addingTimeInterval(-3_600)
+        let previous = ProviderSnapshot(
+            providerID: "antigravity",
+            displayName: "Antigravity",
+            lines: AntigravityUsageMapper.summaryBuckets.map {
+                .progress(label: $0.label, used: 50, limit: 100, format: .percent)
+            },
+            refreshedAt: old
+        )
+        let incoming = ProviderSnapshot(
+            providerID: "antigravity",
+            displayName: "Antigravity",
+            lines: parsed.lines,
+            refreshedAt: now,
+            replacesPriorQuotaProgress: parsed.isComplete
+        )
+
+        XCTAssertFalse(parsed.isComplete, "Unknown IDs remain visible as schema drift")
+        XCTAssertEqual(incoming.mergingMenuBarUpdate(over: previous).quotaRefreshedAt, now)
+        XCTAssertEqual(incoming.preservingOmittedQuotaProgress(over: previous).quotaRefreshedAt, now)
+    }
+
+    func testDuplicateKnownBucketsKeepWorstFractionAndRemainIncomplete() throws {
+        let duplicateValues = #"{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8},{"bucketId":"gemini-5h","remainingFraction":0.2}]}]}"#
+        let parsed = try XCTUnwrap(AntigravityUsageMapper.parseQuotaSummaryResult(Data(duplicateValues.utf8)))
+        XCTAssertEqual(parsed.lines.map(\.label), ["Session"])
+        XCTAssertEqual(used(parsed.lines.first), 80)
+        XCTAssertFalse(parsed.isComplete)
+
+        let duplicateMissingValue = #"{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8},{"bucketId":"gemini-5h"}]}]}"#
+        let incomplete = try XCTUnwrap(AntigravityUsageMapper.parseQuotaSummaryResult(Data(duplicateMissingValue.utf8)))
+        XCTAssertEqual(used(incomplete.lines.first), 20)
+        XCTAssertFalse(incomplete.isComplete)
     }
 
     func testWeeklyOnlyAndSessionOnlyShapes() {
@@ -140,6 +207,24 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         // must stop there, never fall into the legacy chain that fabricates 100%-used.
         XCTAssertEqual(AntigravityUsageMapper.parseQuotaSummary(Data(#"{"groups":[]}"#.utf8)), [])
         XCTAssertEqual(AntigravityUsageMapper.parseQuotaSummary(Data(#"{"response":{"groups":[]}}"#.utf8)), [])
+        XCTAssertEqual(
+            AntigravityUsageMapper.parseQuotaSummaryResult(Data(#"{"groups":[]}"#.utf8))?.isComplete,
+            true
+        )
+    }
+
+    func testMissingOrNullGroupBucketsAreIncompleteButExplicitEmptyBucketsAreComplete() {
+        for json in [#"{"groups":[{}]}"#, #"{"groups":[{"buckets":null}]}"#] {
+            let parsed = AntigravityUsageMapper.parseQuotaSummaryResult(Data(json.utf8))
+            XCTAssertEqual(parsed?.lines, [])
+            XCTAssertEqual(parsed?.isComplete, false, "Missing bucket data cannot clear cached quota meters")
+        }
+
+        let empty = AntigravityUsageMapper.parseQuotaSummaryResult(
+            Data(#"{"groups":[{"buckets":[]},{"buckets":[]}]}"#.utf8)
+        )
+        XCTAssertEqual(empty?.lines, [])
+        XCTAssertEqual(empty?.isComplete, true, "Explicit empty arrays remain authoritative")
     }
 
     // MARK: - Label binding (metricLabel == MetricLine.label, exact string)
@@ -151,10 +236,11 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
                 .filter { !$0.limitResources.isEmpty }
                 .map(\.metricLabel)
         )
-        XCTAssertEqual(Set(AntigravityUsageMapper.summaryBuckets.map(\.label)), descriptorLabels)
+        let sharedLabels = descriptorLabels.subtracting([AntigravityMetric.argonWeeklyLabel])
+        XCTAssertEqual(Set(AntigravityUsageMapper.summaryBuckets.map(\.label)), sharedLabels)
 
         let summaryLines = AntigravityUsageMapper.parseQuotaSummary(Data("{\(fullGroupsJSON)}".utf8)) ?? []
-        XCTAssertEqual(Set(summaryLines.map(\.label)), descriptorLabels)
+        XCTAssertEqual(Set(summaryLines.map(\.label)), sharedLabels)
 
         // The legacy path emits the two 5h pool labels — a strict subset of the descriptors.
         let legacyLabels = Set(AntigravityUsageMapper.buildLines([
@@ -217,12 +303,129 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         }
         let provider = makeCloudCodeProvider(routing: routing)
 
-        let snapshot = await provider.refresh()
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.menuBar) {
+            await provider.refresh()
+        }
         XCTAssertNil(snapshot.errorCategory)
         XCTAssertTrue(snapshot.lines.isEmpty)
         XCTAssertNil(snapshot.plan)
+        XCTAssertEqual(snapshot.replacesPriorQuotaProgress, true)
         XCTAssertFalse(routing.requests.contains { $0.url.path.contains("fetchAvailableModels") })
         XCTAssertFalse(routing.requests.contains { $0.url.path == AntigravityUsageClient.retrieveQuotaPath })
+
+        let previous = ProviderSnapshot(
+            providerID: "antigravity",
+            displayName: "Antigravity",
+            plan: "Pro",
+            lines: [.progress(label: "Session", used: 40, limit: 100, format: .percent)]
+        )
+        let merged = snapshot.mergingMenuBarUpdate(over: previous)
+        XCTAssertNil(merged.lines.first { if case .progress = $0 { return true }; return false })
+        XCTAssertEqual(merged.plan, "Pro", "Quota replacement must preserve independently fetched plan state")
+        XCTAssertEqual(merged.quotaRefreshedAt, snapshot.refreshedAt)
+    }
+
+    @MainActor
+    func testMalformedCloudCodeSummaryDoesNotFallThroughToFabricatedLegacyMeters() async {
+        let routing = RoutingHTTPClient { request in
+            if request.url.path.contains("retrieveUserQuotaSummary") {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"groups":[{"buckets":"broken"}]}"#.utf8))
+            }
+            if request.url.path.contains("loadCodeAssist") {
+                return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+            }
+            if request.url.path.contains("fetchAvailableModels") {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"models":{"m":{"model":"m","displayName":"Gemini 3.6 Flash"}}}"#.utf8))
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+
+        let snapshot = await makeCloudCodeProvider(routing: routing).refresh()
+
+        XCTAssertFalse(snapshot.lines.contains { if case .progress = $0 { return true }; return false })
+        XCTAssertEqual(snapshot.replacesPriorQuotaProgress, false)
+        XCTAssertTrue(snapshot.warning?.contains("could not be read") == true)
+        XCTAssertFalse(routing.requests.contains { $0.url.path.contains("fetchAvailableModels") })
+        XCTAssertFalse(routing.requests.contains { $0.url.path == AntigravityUsageClient.retrieveQuotaPath })
+    }
+
+    @MainActor
+    func testUnreadableConversationStoresProducePersistentHistoryWarningWithoutPriorCache() async {
+        let routing = RoutingHTTPClient { request in
+            if request.url.path.contains("retrieveUserQuotaSummary") {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"groups":[]}"#.utf8))
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+        let credentials = #"{"token":{"access_token":"ya29.test","refresh_token":"refresh-test","expiry":"2099-01-01T00:00:00Z"}}"#
+        let wrappedCredentials = "go-keyring-base64:" + Data(credentials.utf8).base64EncodedString()
+        let scanner = AntigravityDbUsageScanner(conversationDiscovery: {
+            .init(directories: [], failures: ["/private/antigravity/conversations": "permission denied"])
+        })
+        let provider = AntigravityProvider(
+            authStore: AntigravityAuthStore(keychain: FakeKeychain(wrappedCredentials), files: FakeFiles()),
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: NoProcessRunner()),
+            dbUsageScanner: scanner
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.usageHistory)
+        XCTAssertTrue(snapshot.historyWarning?.contains("could not be read") == true)
+        XCTAssertNil(snapshot.warning, "a history read warning must not overwrite quota warning state")
+    }
+
+    @MainActor
+    func testCloudCodePartialSummaryRetainsOmittedMetersAsOldData() async {
+        let routing = RoutingHTTPClient { request in
+            if request.url.path.contains("retrieveUserQuotaSummary") {
+                let body = #"{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8},{"bucketId":"gemini-image-5h","remainingFraction":0.2}]}]}"#
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(body.utf8))
+            }
+            if request.url.path.contains("loadCodeAssist") {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"paidTier":{"name":"Google AI Pro"}}"#.utf8))
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+        let provider = makeCloudCodeProvider(routing: routing)
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.menuBar) {
+            await provider.refresh()
+        }
+        let previousTime = snapshot.refreshedAt.addingTimeInterval(-3 * 60 * 60)
+        let previous = ProviderSnapshot(
+            providerID: "antigravity",
+            displayName: "Antigravity",
+            plan: "Pro",
+            lines: [
+                .progress(label: "Session", used: 50, limit: 100, format: .percent),
+                .progress(label: "Weekly", used: 70, limit: 100, format: .percent)
+            ],
+            refreshedAt: previousTime
+        )
+
+        let merged = snapshot.mergingMenuBarUpdate(over: previous)
+
+        XCTAssertEqual(snapshot.lines.map(\.label), ["Session"])
+        XCTAssertEqual(snapshot.replacesPriorQuotaProgress, false)
+        XCTAssertEqual(merged.lines.compactMap { line -> String? in
+            guard case .progress = line else { return nil }
+            return line.label
+        }, ["Session", "Weekly"])
+        XCTAssertEqual(merged.quotaRefreshedAt, previousTime)
+        XCTAssertEqual(merged.plan, "Pro")
+    }
+
+    @MainActor
+    func testAllCloudCodeQuotaEndpointsMissingIsNotReportedAsTransientOutage() async {
+        let routing = RoutingHTTPClient { _ in HTTPResponse(statusCode: 404, headers: [:], body: Data()) }
+        let snapshot = await makeCloudCodeProvider(routing: routing).refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .notAvailable)
+        guard case .badge(_, let text, _, _)? = snapshot.lines.first else {
+            return XCTFail("The missing endpoint should surface a provider error row")
+        }
+        XCTAssertTrue(text.contains("supported usage endpoint"))
     }
 
     // MARK: - Provider integration: language-server transport

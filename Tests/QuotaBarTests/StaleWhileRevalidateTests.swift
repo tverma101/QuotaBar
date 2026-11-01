@@ -206,6 +206,11 @@ final class StaleWhileRevalidateTests: XCTestCase {
     func testCancelledRefreshKeepsLastGoodHistoryAndSkipsPublication() async throws {
         let provider = Self.testProvider
         let descriptor = Self.descriptor(provider, id: "test.alpha", metric: "Alpha")
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: provider).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "test"
+        )
         let defaults = makeUserDefaults("cancelled-history")
         let history = ProviderUsageHistory(
             series: DailyUsageSeries(daily: [
@@ -214,12 +219,12 @@ final class StaleWhileRevalidateTests: XCTestCase {
         )
         let runtime = BlockingProviderRuntime(
             provider: provider,
-            descriptors: [descriptor],
+            descriptors: [descriptor, historyDescriptor],
             snapshot: snapshot(used: 40, plan: "Last good", usageHistory: history)
         )
         let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots")
         let store = WidgetDataStore(
-            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor, historyDescriptor]),
             providers: [runtime],
             cache: cache,
             defaults: defaults

@@ -70,7 +70,7 @@ final class OpenCodeGoUsageClientTests: XCTestCase {
         }
     }
 
-    func testMalformedBodyMapsToUnavailable() async {
+    func testMalformedBodyMapsToInvalidResponse() async {
         let client = OpenCodeGoUsageClient(http: FakeHTTPClient(
             response: HTTPResponse(statusCode: 200, headers: [:], body: Data("not json".utf8))
         ))
@@ -78,32 +78,100 @@ final class OpenCodeGoUsageClientTests: XCTestCase {
             _ = try await client.fetchUsage(key: "sk-test")
             XCTFail("expected a throw")
         } catch let error as OpenCodeUsageError {
-            guard case .accountAPIUnavailable = error else {
-                return XCTFail("expected accountAPIUnavailable, got \(error)")
-            }
+            XCTAssertEqual(error, .accountAPIInvalidResponse)
         } catch {
             XCTFail("unexpected error \(error)")
         }
     }
 
-    func testMissingWindowMakesUsageUnavailable() async throws {
+    func testSuccessStatusWithErrorEnvelopeMapsToInvalidResponse() async {
+        let body = Data(#"{"type":"error","error":{"type":"AuthError","message":"Unauthorized"}}"#.utf8)
+        let client = OpenCodeGoUsageClient(http: FakeHTTPClient(
+            response: HTTPResponse(statusCode: 200, headers: [:], body: body)
+        ))
+        do {
+            _ = try await client.fetchUsage(key: "sk-test")
+            XCTFail("a success status with an error body must not confirm an account")
+        } catch let error as OpenCodeUsageError {
+            XCTAssertEqual(error, .accountAPIInvalidResponse)
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
+    }
+
+    func testMissingWindowMapsToInvalidResponse() async {
         // A payload missing one window must not render partial meters — `isAvailable` is the gate.
         let partial = Data(#"{"usage":{"rolling":{"status":"ok","percent":4,"resetsAt":"2026-08-12T03:53:00.876Z"},"weekly":{"status":"ok","percent":25,"resetsAt":"2026-08-17T00:00:00.876Z"}}}"#.utf8)
         let client = OpenCodeGoUsageClient(http: FakeHTTPClient(
             response: HTTPResponse(statusCode: 200, headers: [:], body: partial)
         ))
-        let usage = try await client.fetchUsage(key: "sk-test")
-        XCTAssertNil(usage.monthly.percent)
-        XCTAssertFalse(usage.isAvailable)
+        do {
+            _ = try await client.fetchUsage(key: "sk-test")
+            XCTFail("expected a throw")
+        } catch let error as OpenCodeUsageError {
+            XCTAssertEqual(error, .accountAPIInvalidResponse)
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
     }
 
-    func testNonOKStatusMakesUsageUnavailable() async throws {
-        let degraded = Data(#"{"usage":{"rolling":{"status":"no_plan","percent":0,"resetsAt":"2026-08-12T03:53:00.876Z"},"weekly":{"status":"ok","percent":25,"resetsAt":"2026-08-17T00:00:00.876Z"},"monthly":{"status":"ok","percent":78,"resetsAt":"2026-08-31T01:28:22.876Z"}}}"#.utf8)
+    func testUnknownWindowStatusMapsToInvalidResponse() async {
+        let degraded = Data(#"{"usage":{"rolling":{"status":"unknown","percent":0,"resetsAt":"2026-08-12T03:53:00.876Z"},"weekly":{"status":"ok","percent":25,"resetsAt":"2026-08-17T00:00:00.876Z"},"monthly":{"status":"ok","percent":78,"resetsAt":"2026-08-31T01:28:22.876Z"}}}"#.utf8)
         let client = OpenCodeGoUsageClient(http: FakeHTTPClient(
             response: HTTPResponse(statusCode: 200, headers: [:], body: degraded)
         ))
+        do {
+            _ = try await client.fetchUsage(key: "sk-test")
+            XCTFail("expected a throw")
+        } catch let error as OpenCodeUsageError {
+            XCTAssertEqual(error, .accountAPIInvalidResponse)
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
+    }
+
+    func testRateLimitedWindowsStillConfirmAnActiveSubscription() async throws {
+        let limited = Data(#"{"usage":{"rolling":{"status":"rate-limited","percent":100,"resetsAt":"2026-08-12T03:53:00Z"},"weekly":{"status":"rate-limited","percent":100,"resetsAt":"2026-08-17T00:00:00Z"},"monthly":{"status":"rate-limited","percent":100,"resetsAt":"2026-08-31T01:28:22Z"}}}"#.utf8)
+        let client = OpenCodeGoUsageClient(http: FakeHTTPClient(
+            response: HTTPResponse(statusCode: 200, headers: [:], body: limited)
+        ))
+
         let usage = try await client.fetchUsage(key: "sk-test")
-        XCTAssertEqual(usage.rolling.status, "no_plan")
-        XCTAssertFalse(usage.isAvailable)
+
+        XCTAssertTrue(usage.isAvailable)
+    }
+
+    func testForbiddenEndpointResponseDoesNotClaimKeyIsInvalid() async {
+        let client = OpenCodeGoUsageClient(http: FakeHTTPClient(
+            response: HTTPResponse(
+                statusCode: 403, headers: [:],
+                body: Data(#"{"type":"error","error":{"type":"EntitlementError","message":"OpenCode Go subscription required."}}"#.utf8)
+            )
+        ))
+        do {
+            _ = try await client.fetchUsage(key: "sk-test")
+            XCTFail("expected an entitlement error")
+        } catch let error as OpenCodeUsageError {
+            XCTAssertEqual(error, .accountAPINoEntitlement)
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
+    }
+
+    func testErrorTypeTakesPrecedenceOverHTTPStatus() async {
+        let client = OpenCodeGoUsageClient(http: FakeHTTPClient(
+            response: HTTPResponse(
+                statusCode: 403, headers: [:],
+                body: Data(#"{"type":"error","error":{"type":"AuthError","message":"Unauthorized"}}"#.utf8)
+            )
+        ))
+        do {
+            _ = try await client.fetchUsage(key: "sk-test")
+            XCTFail("expected an auth error")
+        } catch let error as OpenCodeUsageError {
+            XCTAssertEqual(error, .accountAPIUnauthorized)
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
     }
 }

@@ -37,11 +37,25 @@ struct ClaudeCredentialState: Hashable, Sendable {
     var oauth: ClaudeOAuth
     var source: Source
     var fullData: ClaudeCredentialsFile?
+    var rawText: String?
     var inferenceOnly: Bool
 
+    init(
+        oauth: ClaudeOAuth,
+        source: Source,
+        fullData: ClaudeCredentialsFile? = nil,
+        rawText: String? = nil,
+        inferenceOnly: Bool = false
+    ) {
+        self.oauth = oauth
+        self.source = source
+        self.fullData = fullData
+        self.rawText = rawText
+        self.inferenceOnly = inferenceOnly
+    }
+
     /// Whether this candidate carries a non-blank access token — the single definition of "usable"
-    /// shared by `refresh()`'s candidate filter and `hasLocalCredentials()`'s first-run detection, so
-    /// the two can never drift.
+    /// shared by refresh's candidate filter and the optional local credential probe.
     var hasUsableAccessToken: Bool {
         oauth.accessToken?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
@@ -99,10 +113,39 @@ struct ClaudeCredentialGeneration: Equatable, Sendable {
 struct ClaudeCredentialLoad: Sendable {
     var candidates: [ClaudeCredentialState]
     var desktopStatus: ClaudeDesktopCredentialStatus
+    /// A Claude Code Keychain item exists but its secret could not be read without approval.
+    var keychainPermissionRequired: Bool
+    /// At least one Claude Code Keychain read failed for a reason other than required interaction.
+    var keychainReadFailed: Bool
+    /// A canceled or superseded Keychain read must stop before fallback sources are probed.
+    var keychainReadCancelled: Bool
+    /// A file read failure is distinct from an absent or malformed login. A selected Claude card can
+    /// then show a repair message instead of incorrectly reporting "Not logged in."
+    var credentialsFileUnreadable: Bool
+    /// A present, readable file did not contain a usable Claude OAuth access token.
+    var credentialsFileInvalid: Bool
+}
+
+struct ClaudeCredentialsUnreadableError: Error, LocalizedError, CategorizedError {
+    var errorDescription: String? {
+        "QuotaBar couldn't read Claude Code credentials at ~/.claude/.credentials.json. Check file access, then refresh again."
+    }
+
+    var errorCategory: ErrorCategory { .credentialAccess }
+}
+
+struct ClaudeCredentialsInvalidError: Error, LocalizedError, CategorizedError {
+    var errorDescription: String? {
+        "QuotaBar found Claude Code's credentials file, but it is malformed or has no access token. Run `claude` to sign in again, then refresh."
+    }
+
+    var errorCategory: ErrorCategory { .authInvalid }
 }
 
 enum ClaudeAuthError: Error, LocalizedError, Equatable {
     case notLoggedIn
+    case credentialPermissionRequired
+    case credentialKeychainReadFailed
     case desktopPermissionRequired
     case desktopTokenExpired
     case desktopCredentialsUnavailable
@@ -115,6 +158,10 @@ enum ClaudeAuthError: Error, LocalizedError, Equatable {
         switch self {
         case .notLoggedIn:
             return "Not logged in. Run `claude` to authenticate."
+        case .credentialPermissionRequired:
+            return "Claude Code login found in the macOS Keychain. Refresh manually and choose Always Allow when macOS asks for access."
+        case .credentialKeychainReadFailed:
+            return "QuotaBar couldn't read Claude Code login from the macOS Keychain. Check Keychain access, then refresh again."
         case .desktopPermissionRequired:
             return "Claude Desktop login found. Refresh to be asked once, then choose Always Allow to connect it."
         case .desktopTokenExpired:
@@ -142,7 +189,8 @@ enum ClaudeAuthError: Error, LocalizedError, Equatable {
         switch self {
         case .sessionExpired, .tokenExpired, .desktopTokenExpired:
             return true
-        case .notLoggedIn, .desktopPermissionRequired, .desktopCredentialsUnavailable,
+        case .notLoggedIn, .credentialPermissionRequired, .credentialKeychainReadFailed,
+             .desktopPermissionRequired, .desktopCredentialsUnavailable,
              .credentialsChanged, .invalidOAuthURL:
             return false
         }
@@ -207,10 +255,33 @@ struct ClaudeAuthStore: Sendable {
         interactionGate: CredentialInteractionGate? = nil,
         forceDesktopFallback: Bool = false
     ) -> ClaudeCredentialLoad {
-        var stored = desktopOnly ? [] : orderedStoredCandidates(
+        // The forced Desktop retry only consumes Desktop credentials. Re-reading the CLI Keychain
+        // candidate here used to repeat a blocking Security call and then discard its result.
+        let storedLoad = (desktopOnly || forceDesktopFallback)
+            ? ClaudeStoredCredentialLoad(
+                candidates: [],
+                keychainPermissionRequired: false,
+                keychainReadFailed: false,
+                keychainReadCancelled: false,
+                credentialsFileUnreadable: false,
+                credentialsFileInvalid: false
+            )
+            : orderedStoredCandidates(
             allowInteraction: allowKeychainInteraction,
             interactionGate: interactionGate
         )
+        if storedLoad.keychainReadCancelled {
+            return ClaudeCredentialLoad(
+                candidates: [],
+                desktopStatus: .notChecked,
+                keychainPermissionRequired: false,
+                keychainReadFailed: false,
+                keychainReadCancelled: true,
+                credentialsFileUnreadable: false,
+                credentialsFileInvalid: false
+            )
+        }
+        var stored = storedLoad.candidates
         var desktopStatus: ClaudeDesktopCredentialStatus = .notChecked
         // A working CLI login normally remains the source of truth and avoids a second Keychain prompt.
         // When several organizations have cards, though, its global Keychain token can belong to a
@@ -239,7 +310,15 @@ struct ClaudeAuthStore: Sendable {
         }
 
         let candidates = desktopOnly ? stored : applyingEnvironmentToken(to: stored)
-        return ClaudeCredentialLoad(candidates: candidates, desktopStatus: desktopStatus)
+        return ClaudeCredentialLoad(
+            candidates: candidates,
+            desktopStatus: desktopStatus,
+            keychainPermissionRequired: storedLoad.keychainPermissionRequired,
+            keychainReadFailed: storedLoad.keychainReadFailed,
+            keychainReadCancelled: storedLoad.keychainReadCancelled,
+            credentialsFileUnreadable: storedLoad.credentialsFileUnreadable,
+            credentialsFileInvalid: storedLoad.credentialsFileInvalid
+        )
     }
 
     func loadCredentialCandidates() -> [ClaudeCredentialState] {
@@ -248,11 +327,20 @@ struct ClaudeAuthStore: Sendable {
 
     /// Prompt-free existence check used when a keychain item is present but its secret can't be read
     /// without user approval. This keeps Claude enabled during first-run discovery without opening UI.
-    func hasKeychainCredentialMaterial() -> Bool {
+    func hasKeychainCredentialMaterial() -> Bool? {
         guard !desktopOnly else { return false }
-        return keychainServiceCandidates().contains {
-            keychain.genericPasswordExists(service: $0) == true
+        var probeFailed = false
+        for service in keychainServiceCandidates() {
+            switch keychain.genericPasswordExists(service: service) {
+            case .some(true):
+                return true
+            case .some(false):
+                continue
+            case nil:
+                probeFailed = true
+            }
         }
+        return probeFailed ? nil : false
     }
 
     private func applyingEnvironmentToken(to stored: [ClaudeCredentialState]) -> [ClaudeCredentialState] {
@@ -300,10 +388,9 @@ struct ClaudeAuthStore: Sendable {
     /// The underlying stores provide no atomic compare-and-swap, so this remains best-effort.
     func save(_ state: ClaudeCredentialState, ifUnchanged expected: ClaudeCredentialGeneration) throws -> Bool {
         guard credentialGeneration() == expected else { return false }
-        var fullData = state.fullData ?? ClaudeCredentialsFile()
-        fullData.claudeAiOauth = state.oauth
-        let data = try JSONEncoder().encode(fullData)
-        guard let text = String(data: data, encoding: .utf8) else { return false }
+        guard let text = Self.patchCredentials(rawText: state.rawText, newOAuth: state.oauth) else {
+            return false
+        }
 
         switch state.source {
         case .file:
@@ -320,6 +407,33 @@ struct ClaudeAuthStore: Sendable {
         // NEVER log the credential blob/tokens — only that a rotation was persisted, and to where.
         AppLog.debug(LogTag.auth("claude"), "persisted rotated credentials (source=\(state.source.label))")
         return true
+    }
+
+    /// Patches `claudeAiOauth` in the existing credential payload without dropping unknown keys
+    /// (such as sibling properties or future OAuth fields Claude Code adds).
+    static func patchCredentials(rawText: String?, newOAuth: ClaudeOAuth) -> String? {
+        guard let rawText,
+              let data = rawText.data(using: .utf8),
+              var jsonObject = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            let fullData = ClaudeCredentialsFile(claudeAiOauth: newOAuth)
+            guard let data = try? JSONEncoder().encode(fullData) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+        guard let oauthData = try? JSONEncoder().encode(newOAuth),
+              let oauthJson = (try? JSONSerialization.jsonObject(with: oauthData)) as? [String: Any]
+        else {
+            return nil
+        }
+        var mergedOAuth = (jsonObject["claudeAiOauth"] as? [String: Any]) ?? [:]
+        for (k, v) in oauthJson {
+            mergedOAuth[k] = v
+        }
+        jsonObject["claudeAiOauth"] = mergedOAuth
+        guard let patchedData = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.sortedKeys]) else {
+            return nil
+        }
+        return String(data: patchedData, encoding: .utf8)
     }
 
     /// Why the live-usage endpoint (`/api/oauth/usage`, which backs Session / Weekly / Sonnet / Extra
@@ -437,18 +551,37 @@ struct ClaudeAuthStore: Sendable {
     /// up (#687) WITHOUT letting a stale file outrank the live keychain just because its token carries a
     /// later expiry (the #738 regression from ranking purely by expiry). The source kind (never the
     /// token) is logged so a "locked out" report can be diagnosed from which source was chosen.
+    private struct ClaudeStoredCredentialLoad {
+        var candidates: [ClaudeCredentialState]
+        var keychainPermissionRequired: Bool
+        var keychainReadFailed: Bool
+        var keychainReadCancelled: Bool
+        var credentialsFileUnreadable: Bool
+        var credentialsFileInvalid: Bool
+    }
+
     private func orderedStoredCandidates(
         allowInteraction: Bool,
         interactionGate: CredentialInteractionGate?
-    ) -> [ClaudeCredentialState] {
+    ) -> ClaudeStoredCredentialLoad {
         var candidates: [ClaudeCredentialState] = []
-        if let keychain = loadKeychainCredentials(
+        let keychainLoad = loadKeychainCredentials(
             allowInteraction: allowInteraction,
             interactionGate: interactionGate
-        ) {
-            candidates.append(keychain)
+        )
+        if keychainLoad.cancelled {
+            return ClaudeStoredCredentialLoad(
+                candidates: [],
+                keychainPermissionRequired: false,
+                keychainReadFailed: false,
+                keychainReadCancelled: true,
+                credentialsFileUnreadable: false,
+                credentialsFileInvalid: false
+            )
         }
-        if let file = loadFileCredentials() { candidates.append(file) }
+        if let keychain = keychainLoad.candidate { candidates.append(keychain) }
+        let (file, credentialsFileUnreadable, credentialsFileInvalid) = loadFileCredentials()
+        if let file { candidates.append(file) }
 
         if candidates.count > 1 {
             let labels = candidates.map(\.source.label).joined(separator: ", ")
@@ -456,20 +589,40 @@ struct ClaudeAuthStore: Sendable {
         } else if let only = candidates.first {
             AppLog.debug(LogTag.auth("claude"), "credential source: \(only.source.label)")
         }
-        return candidates
+        return ClaudeStoredCredentialLoad(
+            candidates: candidates,
+            keychainPermissionRequired: keychainLoad.permissionRequired,
+            keychainReadFailed: keychainLoad.readFailed,
+            keychainReadCancelled: keychainLoad.cancelled,
+            credentialsFileUnreadable: credentialsFileUnreadable,
+            credentialsFileInvalid: credentialsFileInvalid
+        )
     }
 
-    private func loadFileCredentials() -> ClaudeCredentialState? {
+    private func loadFileCredentials() -> (
+        ClaudeCredentialState?,
+        credentialsFileUnreadable: Bool,
+        credentialsFileInvalid: Bool
+    ) {
         let path = credentialsPath()
-        guard files.exists(path),
-              let text = try? files.readText(path),
-              let parsed = Self.parseCredentials(text),
-              let oauth = parsed.claudeAiOauth,
-              oauth.accessToken?.isEmpty == false
-        else {
-            return nil
+        let text: String?
+        do {
+            text = try files.readTextIfPresent(path)
+        } catch {
+            return (nil, true, false)
         }
-        return ClaudeCredentialState(oauth: oauth, source: .file, fullData: parsed, inferenceOnly: false)
+        guard let text else { return (nil, false, false) }
+        guard let parsed = Self.parseCredentials(text),
+              let oauth = parsed.claudeAiOauth,
+              oauth.accessToken?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        else {
+            return (nil, false, true)
+        }
+        return (
+            ClaudeCredentialState(oauth: oauth, source: .file, fullData: parsed, rawText: text, inferenceOnly: false),
+            false,
+            false
+        )
     }
 
     private func credentialsPath() -> String {

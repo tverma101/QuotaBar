@@ -21,11 +21,14 @@ QuotaBar shows how much of your AI coding plans you've used: session and weekly 
 swift build                     # build
 swift test                      # run the test suite
 ./script/build_and_run.sh run   # stage a signed dev bundle in dist/ and launch it
+./script/build_and_run.sh install # replace the matching QuotaBar identity in /Applications and launch it
 ```
 
 There is **no auto-update mechanism**. Sparkle and the appcast feed were removed, and the upstream
 feed is served from a public repository this fork has no claim on, so builds must not point at it.
-Reinstall by rebuilding, or replace the app bundle in `/Applications` by hand.
+Reinstall with `./script/build_and_run.sh install`. The installer verifies the existing and staged app
+identities match before replacing the bundle, so a development install cannot silently replace a release
+identity (or the reverse).
 
 ## Supported Providers
 
@@ -35,6 +38,7 @@ Reinstall by rebuilding, or replace the app bundle in `/Applications` by hand.
 - **[Copilot](docs/providers/copilot.md)** — AI credits, extra usage, organization billing, chat and completions
 - **[Cursor](docs/providers/cursor.md)** — credits, total usage, Grok Bot, Cursor Models, Other Models, requests, on-demand, per-day spend
 - **[Devin](docs/providers/devin.md)** — weekly and daily quota, extra usage balance
+- **[Freebuff](docs/providers/freebuff.md)** — session quotas, Freebucks credits, reset times, and reported monthly spend
 - **[Grok](docs/providers/grok.md)** — weekly shared pool, pay-as-you-go, local daily spend
 - **[OpenCode](docs/providers/opencode.md)** — Go session/weekly/monthly caps, Zen spend, local daily spend
 - **[OpenRouter](docs/providers/openrouter.md)** — credit balance, daily/weekly/monthly spend (API key)
@@ -48,7 +52,7 @@ Most providers read the credentials already on your machine (keychain, auth file
 - **Dashboard popover.** Provider-grouped meters with live reset countdowns and pace indicators. Click usage or reset values to flip their display everywhere; right-click a row to hide or star it, refresh its provider, or open Customize.
 - **Global shortcut.** Toggle the popover from anywhere — record any combo in Settings.
 - **Customize.** Turn providers and metrics on or off, choose which rows stay Always Visible or On Demand, and drag-reorder both.
-- **Stale-while-revalidate.** Cached values display instantly at launch; refresh runs every 5 minutes.
+- **Stale-while-revalidate.** Cached values display instantly at launch; live quota meters refresh every minute (every two minutes on battery or in Low Power Mode), while full history refreshes every five minutes.
 - **[One-shot CLI](docs/cli.md).** Agents can read stable limit JSON through the same five-minute cache with `quotabar`, or bypass freshness with `quotabar --force`; the menu-bar app does not need to be running.
 - **[Local HTTP API](docs/local-http-api.md).** Other apps can read machine-friendly limits from `127.0.0.1:6736/v1/limits`; the legacy `/v1/usage` UI contract remains supported. It is loopback-only and never serves credentials; note that browser pages can read it too — see the [privacy note](docs/local-http-api.md#cors-and-privacy).
 - **[Proxy support](docs/proxy.md).** Route provider requests through SOCKS5 or HTTP(S) via `~/.quotabar/config.json`.

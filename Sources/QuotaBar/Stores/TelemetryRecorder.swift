@@ -11,7 +11,7 @@ struct TelemetryConfigSnapshot: Sendable {
 }
 
 /// Turns raw refresh outcomes into the two daily-rollup events, enforcing "at most one event per day"
-/// without flooding the pipeline from the 5-minute refresh timer (~1,440 outcomes/user/day).
+/// without flooding the pipeline from the one-minute quota refresh timer (~1,440 outcomes/user/day).
 ///
 /// - `app_daily_active`: emitted once per local day (DAU + the config snapshot), driven by `tick()`.
 ///   This ping is always sent — the Settings toggle does not gate it.
@@ -24,6 +24,16 @@ final class TelemetryRecorder {
     private let store: TelemetryStore
     private let snapshot: @MainActor () -> TelemetryConfigSnapshot
     private let now: () -> Date
+
+    /// The provider counters for the current day, accumulated in memory.
+    ///
+    /// Every refresh outcome used to decode the counters dictionary, encode it back and write it to
+    /// `UserDefaults` — one write per provider per minute for counters that change by ±1. They are
+    /// accumulated here and written once per refresh pass (`tick`) instead, plus once when a day's
+    /// rollup is emitted (so a restart cannot emit the same rollup twice).
+    private var counters: [String: ProviderDailyCounter]?
+    /// Whether the in-memory counters differ from what the store holds.
+    private var countersDirty = false
 
     init(
         sink: TelemetrySink,
@@ -44,6 +54,8 @@ final class TelemetryRecorder {
     /// Toggle optional provider analytics without stopping daily activity or crash reporting.
     func setEnabled(_ enabled: Bool) {
         guard store.enabled != enabled else { return }
+        // Keep the persisted counters in step with the in-memory ones before the toggle.
+        persistCounters()
         store.enabled = enabled
         sink.setOptionalAnalyticsEnabled(enabled)
         AppLog.info(.config, "optional analytics \(enabled ? "enabled" : "disabled") by user")
@@ -56,6 +68,7 @@ final class TelemetryRecorder {
         let today = Self.dayString(now())
         if store.enabled {
             flushStaleCounters(today: today)
+            persistCounters()
         }
         if store.activeDay != today {
             store.activeDay = today
@@ -70,11 +83,13 @@ final class TelemetryRecorder {
         guard outcome == .refreshed || outcome == .failed else { return }
 
         let today = Self.dayString(now())
-        var counters = store.providerCounters()
+        var counters = currentCounters()
         // Roll a stale prior-day counter over to its own event before accumulating today's.
+        var rolledOver = false
         if let existing = counters[providerID], existing.day != today {
             emitProviderRollup(providerID: providerID, counter: existing)
             counters[providerID] = nil
+            rolledOver = true
         }
         var counter = counters[providerID] ?? ProviderDailyCounter(day: today)
         switch outcome {
@@ -88,25 +103,48 @@ final class TelemetryRecorder {
         }
         if manual { counter.manual += 1 }
         counters[providerID] = counter
-        store.setProviderCounters(counters)
+        self.counters = counters
+        countersDirty = true
+        // The rollup was emitted, so the cleared state has to reach the store now: a restart before the
+        // next pass would otherwise emit the same day's rollup a second time.
+        if rolledOver { persistCounters() }
     }
 
     func flush() {
+        persistCounters()
         sink.flush()
     }
 
     // MARK: - Internals
 
+    /// The counters as they stand, read from the store on first use.
+    private func currentCounters() -> [String: ProviderDailyCounter] {
+        if let counters { return counters }
+        let loaded = store.providerCounters()
+        self.counters = loaded
+        return loaded
+    }
+
+    /// Write the accumulated counters back to the store. Once per refresh pass, not once per outcome.
+    private func persistCounters() {
+        guard countersDirty, let counters else { return }
+        store.setProviderCounters(counters)
+        countersDirty = false
+    }
+
     /// Emit (and clear) every provider counter that belongs to a day other than `today`.
     private func flushStaleCounters(today: String) {
-        var counters = store.providerCounters()
+        var counters = currentCounters()
         var changed = false
         for (providerID, counter) in counters where counter.day != today {
             emitProviderRollup(providerID: providerID, counter: counter)
             counters[providerID] = nil
             changed = true
         }
-        if changed { store.setProviderCounters(counters) }
+        if changed {
+            self.counters = counters
+            countersDirty = true
+        }
     }
 
     private func emitDailyActive() {
@@ -138,7 +176,7 @@ final class TelemetryRecorder {
             "manual_refresh_count": counter.manual
         ]
 
-        for category in ErrorCategory.allCases {
+        for category in ErrorCategory.allCases where category != .cancelled {
             properties["\(category.rawValue)_failure_count"] = counter.errors[category.rawValue] ?? 0
         }
 

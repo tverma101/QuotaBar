@@ -170,6 +170,8 @@ Line types are `progress`, `text`, `badge`, and `barChart`. A `barChart` line ca
 
 The in-app model breakdown shown when hovering spend rows is not included in this API yet. Spend rows continue to serialize as the same `text` lines so existing local integrations keep their current shape.
 
+When an unknown model makes a spend row's dollar amount partial, the legacy `text` value keeps any known priced subtotal and the measured token count, and includes an additive `partial: true` marker. The same marker appears when usage is still changing, such as an active Hermes session, or when a displayed dollar or token total is a known lower bound. The value string prefixes lower bounds with `≥`; clients that do not use the marker can ignore it.
+
 ## Errors
 
 ```json

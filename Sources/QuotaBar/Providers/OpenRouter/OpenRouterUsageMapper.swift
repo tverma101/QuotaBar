@@ -4,18 +4,24 @@ import Foundation
 /// independently so the provider can show whatever came back: `/credits` carries the balance, `/key`
 /// the tier and period spend, and either one failing still leaves the other's rows usable.
 enum OpenRouterUsageMapper {
+    /// Diagnostic key for a per-key cap whose remaining amount never arrived.
+    static let missingLimitRemainingDiagnosticKey = "openrouter.key.limit-remaining-missing"
+
     /// OpenRouter wraps every payload in `{ "data": { ... } }`.
     static func dataObject(_ body: Data) -> [String: Any]? {
         ProviderParse.jsonObject(body)?["data"] as? [String: Any]
     }
 
-    /// Credits meter + Balance from `/credits`. Empty when the payload carries no usable total.
+    /// Credits meter + Balance from `/credits`. Both totals are required: a missing purchased-total
+    /// field cannot be treated as a measured $0 balance just because lifetime usage is present.
     static func creditsLines(from data: [String: Any]) -> [MetricLine] {
-        guard let totalUsage = ProviderParse.number(data["total_usage"]) else { return [] }
+        guard let totalUsage = ProviderParse.number(data["total_usage"]),
+              let reportedCredits = ProviderParse.number(data["total_credits"])
+        else { return [] }
 
         let used = max(0, totalUsage)
         // `total_credits` is the lifetime amount added to the account; balance is what's left of it.
-        let totalCredits = max(0, ProviderParse.number(data["total_credits"]) ?? 0)
+        let totalCredits = max(0, reportedCredits)
 
         var lines: [MetricLine] = []
         // Credits meter: spend against the credits purchased. Only a positive ceiling makes a meter
@@ -43,14 +49,26 @@ enum OpenRouterUsageMapper {
         // Per-key spend cap, when this key is configured with one. `usage` is lifetime spend on
         // the key; `limit_remaining` is what's left in the current window (daily/weekly/monthly
         // or lifetime), so used = limit - remaining.
+        //
+        // `limit_remaining` is the only evidence of how much of the cap is left. A payload that
+        // carries `limit` without it cannot be measured, and treating the missing field as zero
+        // would publish the cap as fully spent. Omit the row instead and say so in the log.
         if let limit = ProviderParse.number(data["limit"]), limit > 0 {
-            let remaining = max(0, ProviderParse.number(data["limit_remaining"]) ?? 0)
-            lines.append(.progress(
-                label: "Key Limit",
-                used: max(0, limit - remaining),
-                limit: limit,
-                format: .dollars
-            ))
+            if let remaining = ProviderParse.number(data["limit_remaining"]) {
+                lines.append(.progress(
+                    label: "Key Limit",
+                    used: max(0, limit - max(0, remaining)),
+                    limit: limit,
+                    format: .dollars
+                ))
+            } else {
+                DiagnosticGate.logOnce(for: missingLimitRemainingDiagnosticKey) {
+                    AppLog.warn(
+                        LogTag.plugin("openrouter"),
+                        "key limit reported without a remaining amount; the Key Limit meter is hidden"
+                    )
+                }
+            }
         }
 
         let plan = (data["is_free_tier"] as? Bool).map { $0 ? "Free tier" : "Pay as you go" }

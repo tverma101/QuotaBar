@@ -1,10 +1,10 @@
 import SwiftUI
 
-/// Hover detail for a spend period: a flat ranked list of models, each two text lines (name/cost,
-/// share percent/tokens) over a proportional share bar. Rows carry no tooltips — everything shown is
-/// already on the row. The header carries only the period name — the hovered row right below already
-/// shows the period total, so repeating it here would duplicate (and wrap on) long figures. Mirrors
-/// `UsageTrendDetail`'s calm — header + flat list + source note.
+/// Hover detail for a spend period: a flat ranked list of models, each with name/cost and
+/// share-percent/token lines over a proportional bar. The Other row lists each contributor's name,
+/// tokens and price rather than an unexplained extra-model count. The header carries only the period name — the hovered row right below
+/// already shows the period total, so repeating it here would duplicate (and wrap on) long figures.
+/// Mirrors `UsageTrendDetail`'s calm — header + flat list + source note.
 struct ModelUsageDetail: View {
     let title: String
     let breakdown: ModelUsageBreakdown
@@ -15,14 +15,32 @@ struct ModelUsageDetail: View {
     private static let width: CGFloat = 280
 
     var body: some View {
-        let shares = Self.shares(for: breakdown.models)
+        let aggregateTokenCountSaturated = breakdown.tokenCountSaturated == true
+        let sharesAreReliable = Self.sharesAreReliable(
+            for: breakdown.models,
+            aggregateTokenCountSaturated: aggregateTokenCountSaturated
+        )
+        let shares = Self.shares(
+            for: breakdown.models,
+            aggregateTokenCountSaturated: aggregateTokenCountSaturated
+        )
         let percents = Self.wholePercents(shares)
         VStack(alignment: .leading, spacing: 8) {
             header
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(breakdown.models.indices, id: \.self) { index in
-                    modelRow(breakdown.models[index], share: shares[index], percent: percents[index])
+                    modelRow(
+                        breakdown.models[index],
+                        share: sharesAreReliable ? shares[index] : nil,
+                        percent: sharesAreReliable ? percents[index] : nil
+                    )
                 }
+            }
+            if !sharesAreReliable {
+                Text("Shares unavailable because a token total is only a lower bound.")
+                    .font(.system(size: density.supportingPointSize - 1))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             PopoverSourceNote(text: breakdown.sourceNote)
         }
@@ -44,21 +62,25 @@ struct ModelUsageDetail: View {
             .foregroundStyle(.primary)
     }
 
-    /// Two text lines and the bar: model name / cost on top, share percent / tokens beneath. The name
-    /// only competes with the short cost figure, so it almost never truncates; the percent line answers
-    /// what the bar can't say precisely.
-    private func modelRow(_ model: ModelUsageEntry, share: Double, percent: Int) -> some View {
+    /// Model name / cost on top, share percent / tokens beneath. The Other row can add a compact
+    /// contributor line below its label; the percent line answers what the bar can't say precisely.
+    private func modelRow(_ model: ModelUsageEntry, share: Double?, percent: Int?) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(model.model)
-                    .font(.system(size: density.supportingPointSize, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                Spacer(minLength: 8)
-                if let cost = model.costUSD {
-                    Text(MetricFormatter.number(cost, kind: .dollars, style: .row))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(model.model)
+                        .font(.system(size: density.supportingPointSize, weight: .semibold))
                         .foregroundStyle(.primary)
-                        .monospacedDigit()
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if model.costUSD != nil {
+                    HStack(spacing: 4) {
+                        let cost = MetricFormatter.number(model.costUSD ?? 0, kind: .dollars, style: .row)
+                        Text(model.hasIncompleteCost ? "≥\(cost)" : cost)
+                            .foregroundStyle(.primary)
+                            .monospacedDigit()
+                    }
                 } else {
                     Text("\u{2014}")
                         .foregroundStyle(.tertiary)
@@ -67,11 +89,16 @@ struct ModelUsageDetail: View {
             .font(.system(size: density.supportingPointSize))
 
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("\(percent)%")
+                Text(percent.map { "\($0)%" } ?? "—")
                     .monospacedDigit()
                 Spacer(minLength: 8)
                 Text(MetricFormatter.string(
-                    for: MetricValue(number: Double(model.totalTokens), kind: .count, label: "tokens"),
+                    for: MetricValue(
+                        number: Double(model.totalTokens),
+                        kind: .count,
+                        label: "tokens",
+                        tokenCountSaturated: model.tokenCountSaturated
+                    ),
                     style: .row
                 ))
                 .monospacedDigit()
@@ -83,15 +110,75 @@ struct ModelUsageDetail: View {
                 Capsule()
                     .fill(.quaternary)
                     .overlay(alignment: .leading) {
-                        Capsule()
-                            .fill(Theme.meterFill(.normal))
-                            .frame(width: proxy.size.width * share)
+                        if let share {
+                            Capsule()
+                                .fill(Theme.meterFill(.normal))
+                                .frame(width: proxy.size.width * share)
+                        }
                     }
             }
             .frame(height: density.meterHeight)
             .padding(.top, 2)
+
+            let contributors = Self.otherContributors(for: model)
+            if !contributors.isEmpty {
+                Group {
+                    if contributors.count <= 8 {
+                        contributorRows(contributors)
+                    } else {
+                        ScrollView(.vertical) {
+                            contributorRows(contributors)
+                        }
+                        .frame(height: 180)
+                    }
+                }
+                .font(.system(size: density.supportingPointSize - 1))
+                .padding(.top, 5)
+            }
         }
         .padding(.vertical, density.textRowPadding)
+    }
+
+    private func contributorRows(_ contributors: [ModelUsageVariant]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(contributors, id: \.model) { contributor in
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(contributor.model)
+                        .foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        Text(MetricFormatter.string(for: MetricValue(
+                            number: Double(contributor.totalTokens), kind: .count, label: "tokens",
+                            tokenCountSaturated: contributor.tokenCountSaturated
+                        ), style: .row))
+                        Spacer(minLength: 4)
+                        if let cost = contributor.costUSD {
+                            Text((contributor.hasIncompleteCost ? "≥" : "")
+                                 + MetricFormatter.number(cost, kind: .dollars, style: .row))
+                        } else {
+                            Text("Unpriced")
+                        }
+                    }
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The collapsed row must still identify the models that contributed to it. Lead with token
+    /// volume because a zero-cost model can dominate tokens while contributing no spend.
+    static func otherContributors(for model: ModelUsageEntry) -> [ModelUsageVariant] {
+        guard model.model.caseInsensitiveCompare(ModelUsageEntry.otherModelName) == .orderedSame,
+              let variants = model.variants,
+              !variants.isEmpty
+        else { return [] }
+
+        return variants.sorted { lhs, rhs in
+            if lhs.totalTokens != rhs.totalTokens { return lhs.totalTokens > rhs.totalTokens }
+            return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
+        }
     }
 
     /// Share against the sum of the listed models' own (display-rounded) figures, not the spend row's
@@ -101,21 +188,42 @@ struct ModelUsageDetail: View {
     /// One basis for the whole list: cost shares only when every listed model is priced — otherwise a
     /// column mixing cost shares (priced rows) with token shares (unpriced rows) would sum past 100%.
     /// With any unpriced model present, every row falls back to its token share.
-    static func shares(for models: [ModelUsageEntry]) -> [Double] {
-        let allPriced = models.allSatisfy { $0.costUSD != nil }
+    static func shares(
+        for models: [ModelUsageEntry],
+        aggregateTokenCountSaturated: Bool = false
+    ) -> [Double] {
+        guard sharesAreReliable(for: models, aggregateTokenCountSaturated: aggregateTokenCountSaturated)
+        else { return models.map { _ in 0 } }
+        let allPriced = models.allSatisfy { $0.costUSD != nil && !$0.hasIncompleteCost }
         if allPriced {
             let costTotal = models.reduce(0.0) { $0 + ($1.costUSD ?? 0) }
-            if costTotal > 0 {
+            if costTotal.isFinite && costTotal > 0 {
                 return models.map { model in
                     min(max((model.costUSD ?? 0) / costTotal, 0), 1)
                 }
             }
         }
-        let tokenTotal = models.reduce(0) { $0 + $1.totalTokens }
+        let tokenTotal = models.reduce(0) { ProviderParse.addingSaturating($0, $1.totalTokens) }
         guard tokenTotal > 0 else { return models.map { _ in 0 } }
         return models.map { model in
             min(max(Double(model.totalTokens) / Double(tokenTotal), 0), 1)
         }
+    }
+
+    static func sharesAreReliable(
+        for models: [ModelUsageEntry],
+        aggregateTokenCountSaturated: Bool = false
+    ) -> Bool {
+        guard !aggregateTokenCountSaturated,
+              !models.contains(where: { $0.tokenCountSaturated == true })
+        else { return false }
+        var tokenTotal = 0
+        for model in models {
+            if model.totalTokens < 0 { return false }
+            if model.totalTokens > 0 && tokenTotal > Int.max - model.totalTokens { return false }
+            tokenTotal += model.totalTokens
+        }
+        return true
     }
 
     /// Integer percentages that always total exactly 100 (largest-remainder rounding): rounding each

@@ -32,6 +32,8 @@ struct WidgetRowView: View {
     /// renders), which renders the timeline read-only.
     @Environment(\.codexResetClaim) private var codexResetClaim
     @Environment(\.codexResetClaimRouter) private var codexResetClaimRouter
+    @Environment(CodexAutoResetCoordinator.self) private var codexAutoReset: CodexAutoResetCoordinator?
+    @AppStorage(CodexAutoResetCoordinator.enabledKey) private var autoUseResets = false
     /// Party easter egg: fill meter bars with the party gradient instead of the severity color. Off by
     /// default everywhere else.
     @Environment(\.popoverPartyMode) private var partyMode
@@ -399,6 +401,9 @@ struct WidgetRowView: View {
                             { expiry, redeemRequestID in
                                 await service.claim(creditExpiringAt: expiry, redeemRequestID: redeemRequestID)
                             }
+                        },
+                        autoResetStatus: providerID.flatMap {
+                            codexAutoReset?.status(for: $0, enabled: autoUseResets)
                         }
                     )
                 }

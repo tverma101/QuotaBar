@@ -1,4 +1,150 @@
 import Foundation
+import CoreFoundation
+
+/// Readable ownership metadata can legitimately be ambiguous or absent. Only a failure to read the
+/// preamble makes an account-scoped scan incomplete.
+enum ClaudeSessionOwnershipLookupResult: Sendable {
+    case readable(organizationID: String?, accountID: String?, isAmbiguous: Bool)
+    case unreadable
+}
+
+/// Lets a provider distinguish a complete empty log scan from a source read that was incomplete.
+enum ClaudeLogUsageScanResult: Sendable {
+    case complete(LogUsageScan?)
+    case incomplete
+}
+
+/// Account-scoped Claude cards share physical logs. Cache ownership metadata across those cards so
+/// each candidate session is classified once; nonmatching usage rows never enter the parse/fold cache.
+private actor ClaudeSessionOwnershipIndex {
+    static let shared = ClaudeSessionOwnershipIndex()
+    private static let ownershipReadDiagnosticBase = "claude.session.ownership-read."
+
+    private struct CachedIdentity {
+        var size: Int
+        var mtime: Date
+        var attributeMtime: Date?
+        var organizationID: String?
+        var accountID: String?
+        var isAmbiguous: Bool
+    }
+
+    private var entries: [String: CachedIdentity] = [:]
+
+    func identity(for file: JSONLScanning.DiscoveredFile) -> ClaudeSessionOwnershipLookupResult {
+        if let cached = entries[file.path], cached.size == file.size,
+           cached.mtime == file.mtime, cached.attributeMtime == file.attributeMtime {
+            DiagnosticGate.clearFailures(prefix: Self.failureDiagnosticPrefix(for: file.path))
+            return .readable(
+                organizationID: cached.organizationID,
+                accountID: cached.accountID,
+                isAmbiguous: cached.isAmbiguous
+            )
+        }
+        guard !Task.isCancelled else { return .unreadable }
+        guard let identity = Self.readOwnershipPrefix(at: URL(fileURLWithPath: file.path)) else {
+            DiagnosticGate.logOnce(for: Self.failureDiagnosticKey(for: file)) {
+                AppLog.warn(LogTag.plugin("claude"), "Failed to read Claude session ownership from \(file.path)")
+            }
+            return .unreadable
+        }
+        DiagnosticGate.clearFailures(prefix: Self.failureDiagnosticPrefix(for: file.path))
+        entries[file.path] = CachedIdentity(
+            size: file.size, mtime: file.mtime, attributeMtime: file.attributeMtime,
+            organizationID: identity.organizationID, accountID: identity.accountID,
+            isAmbiguous: identity.isAmbiguous
+        )
+        return .readable(
+            organizationID: identity.organizationID,
+            accountID: identity.accountID,
+            isAmbiguous: identity.isAmbiguous
+        )
+    }
+
+    private static func failureDiagnosticPrefix(for path: String) -> String {
+        "\(ownershipReadDiagnosticBase)\(JSONLScanCachePaths.stableFingerprint(path))."
+    }
+
+    private static func failureDiagnosticKey(for file: JSONLScanning.DiscoveredFile) -> String {
+        let revision = [
+            String(file.size),
+            String(file.mtime.timeIntervalSinceReferenceDate),
+            file.attributeMtime.map { String($0.timeIntervalSinceReferenceDate) } ?? "no-attribute-mtime"
+        ].joined(separator: "|")
+        return failureDiagnosticPrefix(for: file.path)
+            + JSONLScanCachePaths.stableFingerprint(revision)
+    }
+
+    /// Ownership is written in the session preamble, before the first usage row. Read only that
+    /// prefix: a disabled account's shared-root file needs attribution metadata, not a full-file
+    /// scan just to decide that its usage rows do not belong to this enabled card.
+    private static func readOwnershipPrefix(at url: URL) -> (
+        organizationID: String?, accountID: String?, isAmbiguous: Bool
+    )? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        let ownerMarker = Data(#""ownerOrganizationUuid""#.utf8)
+        let usageMarker = Data(#""usage":{"#.utf8)
+        var owner: String?
+        var account: String?
+        var isAmbiguous = false
+        var carry = Data()
+        let readLimit = 1024 * 1024
+        var bytesRead = 0
+        var reachedUsage = false
+
+        func inspect(_ line: Data.SubSequence) {
+            guard !isAmbiguous, line.range(of: ownerMarker) != nil,
+                  let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  let value = object["ownerOrganizationUuid"] as? String, !value.isEmpty
+            else { return }
+            let candidate = value.lowercased()
+            if let owner, owner != candidate {
+                isAmbiguous = true
+                return
+            }
+            owner = candidate
+            if let candidateAccount = object["ownerAccountUuid"] as? String, !candidateAccount.isEmpty {
+                let normalizedAccount = candidateAccount.lowercased()
+                if let account, account != normalizedAccount {
+                    isAmbiguous = true
+                    return
+                }
+                account = normalizedAccount
+            }
+        }
+
+        do {
+            while bytesRead < readLimit, !reachedUsage {
+                guard !Task.isCancelled else { return nil }
+                let amount = min(64 * 1024, readLimit - bytesRead)
+                guard let chunk = try handle.read(upToCount: amount), !chunk.isEmpty else {
+                    if !carry.isEmpty { inspect(carry[...]) }
+                    break
+                }
+                bytesRead += chunk.count
+                carry.append(chunk)
+                var lineStart = carry.startIndex
+                while let newline = carry[lineStart...].firstIndex(of: UInt8(ascii: "\n")) {
+                    let line = carry[lineStart..<newline]
+                    inspect(line)
+                    lineStart = carry.index(after: newline)
+                    if line.range(of: usageMarker) != nil {
+                        reachedUsage = true
+                        break
+                    }
+                }
+                if lineStart > carry.startIndex {
+                    carry.removeSubrange(carry.startIndex..<lineStart)
+                }
+            }
+        } catch {
+            return nil
+        }
+        return (owner, account, isAmbiguous)
+    }
+}
 
 /// Builds daily token/cost estimates for Claude by scanning Claude Code's local session logs
 /// natively (`<config dir>/projects/**/*.jsonl`), replacing the external `ccusage` CLI.
@@ -21,6 +167,7 @@ import Foundation
 /// changed files, then re-run the cheap dedup + day aggregation over cached entries before local
 /// model-rate estimates.
 actor ClaudeLogUsageScanner {
+    private static let futureTimestampDiagnosticKey = "claude.sessions.future-timestamp"
     private let environment: EnvironmentReading
     private let homeDirectory: @Sendable () -> URL
     private let scanner: IncrementalJSONLScanner<Entry>
@@ -30,9 +177,12 @@ actor ClaudeLogUsageScanner {
     private let organizationID: String?
     private let accountID: String?
     private let allowsUnattributedSessions: Bool
-    private var sessionOwnership: [String: (
-        size: Int, mtime: Date, attributeMtime: Date?, organizationID: String?, accountID: String?
-    )] = [:]
+    private let ownershipLookup: @Sendable (JSONLScanning.DiscoveredFile) async -> ClaudeSessionOwnershipLookupResult
+    private var aggregateCache: ClaudeUsageFoldCache<LogUsageScan>?
+    /// OpenCode needs only hosted gateway entries. Bound that projection independently of the much
+    /// larger native history; oversized projections keep using the streaming fold.
+    private var gatewayCache: ClaudeUsageFoldCache<[Entry]>?
+    private static let maximumCachedGatewayEntries = 4_096
 
     /// One parsed usage line. Token buckets are pre-normalized into `TokenBreakdown`; dedup fields
     /// ride along so the global dedup pass can run over cached entries.
@@ -56,7 +206,8 @@ actor ClaudeLogUsageScanner {
     private static let sharedScanner = IncrementalJSONLScanner<Entry>(
         retainResidentItems: false,
         logTag: LogTag.plugin("claude"),
-        persistence: JSONLScanCachePersistence(namespace: "claude", schemaVersion: 1)
+        // Reparse records classified by the old byte-wide null/usage checks.
+        persistence: JSONLScanCachePersistence(namespace: "claude", schemaVersion: 6)
     )
 
     static func flushPersistentCacheWrites() async {
@@ -70,7 +221,8 @@ actor ClaudeLogUsageScanner {
         cacheIdentityOverride: String? = nil,
         accountUUID: String? = nil,
         organizationUUID: String? = nil,
-        allowsUnattributedSessions: Bool = false
+        allowsUnattributedSessions: Bool = false,
+        ownershipLookup: (@Sendable (JSONLScanning.DiscoveredFile) async -> ClaudeSessionOwnershipLookupResult)? = nil
     ) {
         precondition(cacheIdentityOverride?.isEmpty != true)
         self.environment = environment
@@ -80,42 +232,109 @@ actor ClaudeLogUsageScanner {
         self.organizationID = organizationUUID?.lowercased()
         self.accountID = accountUUID?.lowercased()
         self.allowsUnattributedSessions = allowsUnattributedSessions
+        self.ownershipLookup = ownershipLookup ?? { file in
+            await ClaudeSessionOwnershipIndex.shared.identity(for: file)
+        }
     }
 
     /// Scan the last `daysBack` days of Claude logs. Returns `nil` when no Claude data directory or
     /// no log files exist (the spend tiles then render "No data"); returns an empty series when logs
     /// exist but have no usage in the window.
-    func scan(daysBack: Int = 30, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+    func scan(daysBack: Int = UsageHistoryWindow.previousDays, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+        switch await scanResult(daysBack: daysBack, now: now, pricing: pricing) {
+        case .complete(let scan):
+            return scan
+        case .incomplete:
+            return nil
+        }
+    }
+
+    /// Completeness-aware form used by the Claude provider so an ownership/read failure cannot be
+    /// mistaken for a clean scan that simply found no Claude rows.
+    func scanResult(
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing
+    ) async -> ClaudeLogUsageScanResult {
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
         let cacheIdentity = parseCacheIdentity()
+        let futureIdentity = futureGateIdentity(kind: "sessions", cacheIdentity: cacheIdentity)
         let roots = claudeRoots()
         guard !roots.isEmpty else {
+            aggregateCache = nil
+            FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: [])
             _ = await scanner.items(
                 from: [], since: since, cacheIdentity: cacheIdentity, parseFile: { url in Self.parseFile(at: url) }
             )
-            return nil
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
+            return .complete(nil)
         }
 
-        var files = Self.usageFiles(under: roots)
+        guard var files = Self.usageFilesIfComplete(under: roots) else { return .incomplete }
         if let organizationID {
-            files = ownedUsageFiles(files, organizationID: organizationID)
+            guard let owned = await ownedUsageFiles(files, organizationID: organizationID) else {
+                return .incomplete
+            }
+            files = owned
         }
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled else { return .incomplete }
         guard !files.isEmpty else {
+            aggregateCache = nil
+            FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: [])
             _ = await scanner.items(
                 from: [], since: since, cacheIdentity: cacheIdentity, parseFile: { url in Self.parseFile(at: url) }
             )
-            return nil
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
+            return .complete(nil)
         }
 
-        // Entries come back concatenated in path-sorted file order, so dedup's keep-first is deterministic.
-        guard let entries = await scanner.items(
+        let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        for file in files where FutureTimestampRevisionGate.shouldDefer(
+            identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
+        ) {
+            Self.logFutureTimestamp(identity: futureIdentity)
+            return .incomplete
+        }
+        let aggregateKey = ClaudeUsageFoldCache<LogUsageScan>.Key(
+            files: files, identity: cacheIdentity, since: since,
+            pricingToken: pricing.aggregateCacheToken
+        )
+        if let cached = aggregateCache?.lookup(aggregateKey, now: now) {
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
+            return .complete(cached)
+        }
+        aggregateCache = nil
+        let bucket = FutureTimestampFoldBucket<Entry>()
+        let complete = await scanner.foldItems(
             from: files,
             since: since,
             cacheIdentity: cacheIdentity,
-            parseFile: { url in Self.parseFile(at: url) }
-        ), !Task.isCancelled else { return nil }
-        return Self.aggregate(entries: Self.dedup(entries), since: since, pricing: pricing)
+            parseFile: { url in Self.parseFile(at: url) },
+            visit: { entry in
+                guard Self.contributesUsage(entry) else { return }
+                bucket.append(entry, timestamp: entry.timestamp, maximumTimestamp: maximumTimestamp)
+            },
+            fileStarted: { bucket.begin($0) },
+            fileCompleted: { path, _ in bucket.finish(path) }
+        )
+        guard complete, !Task.isCancelled else { return .incomplete }
+        for (path, timestamp) in bucket.futureTimestamps {
+            guard let file = files.first(where: { $0.path == path }),
+                  FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
+            else { return .incomplete }
+        }
+        guard bucket.futureTimestamps.isEmpty else {
+            Self.logFutureTimestamp(identity: futureIdentity)
+            return .incomplete
+        }
+        DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
+        let deduped = Self.dedup(bucket.items)
+        guard !Task.isCancelled else { return .incomplete }
+        let result = Self.aggregate(entries: deduped, since: since, pricing: pricing)
+        guard !Task.isCancelled else { return .incomplete }
+        aggregateCache = ClaudeUsageFoldCache(key: aggregateKey, observedAt: now, value: result)
+        return .complete(result)
     }
 
     /// The parsed usage entries of the last `daysBack` days — the same incremental scan the card's
@@ -135,10 +354,42 @@ actor ClaudeLogUsageScanner {
         let cacheIdentity = cacheIdentityOverride
             ?? (identityPaths.isEmpty ? "no-claude-root" : identityPaths.joined(separator: "\n"))
         let files = Self.usageFiles(under: roots)
-        guard !files.isEmpty else { return [] }
-        return await scanner.items(
-            from: files, since: since, cacheIdentity: cacheIdentity, parseFile: { url in Self.parseFile(at: url) }
-        ) ?? []
+        let futureIdentity = futureGateIdentity(kind: "parsed", cacheIdentity: cacheIdentity)
+        guard !files.isEmpty else {
+            FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: [])
+            return []
+        }
+        let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        for file in files where FutureTimestampRevisionGate.shouldDefer(
+            identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
+        ) {
+            Self.logFutureTimestamp(identity: futureIdentity)
+            return []
+        }
+        let bucket = FutureTimestampFoldBucket<Entry>()
+        let complete = await scanner.foldItems(
+            from: files, since: since, cacheIdentity: cacheIdentity,
+            parseFile: { url in Self.parseFile(at: url) },
+            visit: { entry in
+                guard Self.contributesUsage(entry) else { return }
+                bucket.append(entry, timestamp: entry.timestamp, maximumTimestamp: maximumTimestamp)
+            },
+            fileStarted: { bucket.begin($0) },
+            fileCompleted: { path, _ in bucket.finish(path) }
+        )
+        guard complete else { return [] }
+        for (path, timestamp) in bucket.futureTimestamps {
+            guard let file = files.first(where: { $0.path == path }),
+                  FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
+            else { return [] }
+        }
+        guard bucket.futureTimestamps.isEmpty else {
+            Self.logFutureTimestamp(identity: futureIdentity)
+            return []
+        }
+        DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
+        return bucket.items
     }
 
     /// Stream Claude entries without building a mega-array (OpenCode gateway fold).
@@ -148,6 +399,7 @@ actor ClaudeLogUsageScanner {
         now: Date = Date(),
         roots: [URL],
         cacheIdentityOverride: String? = nil,
+        hostedGatewayOnly: Bool = false,
         visit: @Sendable (Entry) -> Void
     ) async -> Bool {
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
@@ -155,13 +407,100 @@ actor ClaudeLogUsageScanner {
             .sorted()
         let cacheIdentity = cacheIdentityOverride
             ?? (identityPaths.isEmpty ? "no-claude-root" : identityPaths.joined(separator: "\n"))
-        let files = Self.usageFiles(under: roots)
-        guard !files.isEmpty else { return true }
-        return await scanner.foldItems(
+        guard var files = Self.usageFilesIfComplete(under: roots) else { return false }
+        if let organizationID {
+            guard let owned = await ownedUsageFiles(files, organizationID: organizationID) else { return false }
+            files = owned
+        }
+        guard !Task.isCancelled else { return false }
+        let futureIdentity = futureGateIdentity(kind: "gateway", cacheIdentity: cacheIdentity)
+        guard !files.isEmpty else {
+            gatewayCache = nil
+            FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: [])
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
+            return true
+        }
+        let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        for file in files where FutureTimestampRevisionGate.shouldDefer(
+            identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
+        ) {
+            Self.logFutureTimestamp(identity: futureIdentity)
+            return false
+        }
+        let gatewayKey = ClaudeUsageFoldCache<[Entry]>.Key(
+            files: files, identity: cacheIdentity, since: since
+        )
+        if hostedGatewayOnly, let cached = gatewayCache?.lookup(gatewayKey, now: now) {
+            DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
+            for entry in cached {
+                guard !Task.isCancelled else { return false }
+                visit(entry)
+            }
+            return !Task.isCancelled
+        }
+        if hostedGatewayOnly { gatewayCache = nil }
+        let deduplication = ClaudeEntryDeduplication()
+        let bucket = FutureTimestampFoldBucket<Entry>()
+        let complete = await scanner.foldItems(
             from: files, since: since, cacheIdentity: cacheIdentity,
             parseFile: { url in Self.parseFile(at: url) },
-            visit: visit
+            visit: { entry in
+                guard Self.contributesUsage(entry) else { return }
+                bucket.observe(timestamp: entry.timestamp, maximumTimestamp: maximumTimestamp)
+                deduplication.append(entry)
+            },
+            fileStarted: { bucket.begin($0) },
+            fileCompleted: { path, _ in bucket.finish(path) }
         )
+        guard complete, !Task.isCancelled else { return false }
+        for (path, timestamp) in bucket.futureTimestamps {
+            guard let file = files.first(where: { $0.path == path }),
+                  FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
+            else { return false }
+        }
+        guard bucket.futureTimestamps.isEmpty else {
+            Self.logFutureTimestamp(identity: futureIdentity)
+            return false
+        }
+        DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
+        // Deduplicate the complete source before selecting gateway entries: a native replay may win
+        // a cross-file collision, so filtering first could count a turn owned by the Claude card.
+        let entries = hostedGatewayOnly ? deduplication.entries.filter {
+            $0.model.map { OpenCodeUsageScanner.isHostedGatewayModel($0.trimmingCharacters(in: .whitespacesAndNewlines)) } == true
+        } : deduplication.entries
+        for entry in entries {
+            guard !Task.isCancelled else { return false }
+            visit(entry)
+        }
+        if hostedGatewayOnly, !Task.isCancelled, entries.count <= Self.maximumCachedGatewayEntries {
+            gatewayCache = ClaudeUsageFoldCache(key: gatewayKey, observedAt: now, value: entries)
+        }
+        return !Task.isCancelled
+    }
+
+    private static func futureTimestampDiagnosticGateKey(for identity: String) -> String {
+        "\(futureTimestampDiagnosticKey).\(JSONLScanCachePaths.stableFingerprint(identity))"
+    }
+
+    private func futureGateIdentity(kind: String, cacheIdentity: String) -> String {
+        [
+            kind,
+            cacheIdentity,
+            organizationID ?? "no-organization",
+            accountID ?? "no-account",
+            allowsUnattributedSessions ? "allows-unattributed" : "requires-owned-session"
+        ].joined(separator: "\n")
+    }
+
+    private static func contributesUsage(_ entry: Entry) -> Bool {
+        entry.tokens.totalTokens > 0 || (entry.costUSD ?? 0) > 0
+    }
+
+    private static func logFutureTimestamp(identity: String) {
+        DiagnosticGate.logOnce(for: futureTimestampDiagnosticGateKey(for: identity)) {
+            AppLog.warn(LogTag.plugin("claude"), "session usage contains a timestamp more than five minutes ahead; preserving last-good history")
+        }
     }
 
     /// Stable source configuration identity rather than the discovered root list: Cowork adds session
@@ -229,6 +568,8 @@ actor ClaudeLogUsageScanner {
 
         if let raw = environment.value(for: "CLAUDE_CONFIG_DIR")?.trimmingCharacters(in: .whitespacesAndNewlines),
            !raw.isEmpty {
+            let diagnosticPrefix = "claude.config-dir.invalid."
+            let diagnosticKey = diagnosticPrefix + JSONLScanCachePaths.stableFingerprint(raw)
             for part in raw.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) where !part.isEmpty {
                 var url = URL(fileURLWithPath: expandHome(part))
                 // Accept the `projects/` directory itself as an alias for its parent config dir.
@@ -238,9 +579,14 @@ actor ClaudeLogUsageScanner {
                 addIfValid(url)
             }
             if roots.isEmpty {
-                AppLog.warn(LogTag.plugin("claude"), "CLAUDE_CONFIG_DIR is set but contains no Claude data directory with projects/: \(raw)")
+                DiagnosticGate.logOnce(for: diagnosticKey) {
+                    AppLog.warn(LogTag.plugin("claude"), "CLAUDE_CONFIG_DIR is set but contains no Claude data directory with projects/: \(raw)")
+                }
+            } else {
+                DiagnosticGate.clearFailures(prefix: diagnosticPrefix)
             }
         } else {
+            DiagnosticGate.clearFailures(prefix: "claude.config-dir.invalid.")
             let home = homeDirectory()
             let xdg = environment.value(for: "XDG_CONFIG_HOME")?.nilIfEmpty.map { URL(fileURLWithPath: expandHome($0)) }
                 ?? home.appendingPathComponent(".config")
@@ -297,10 +643,21 @@ actor ClaudeLogUsageScanner {
     /// Every `*.jsonl` under each root's `projects/`, path-sorted so the dedup pass (keep-first wins)
     /// is deterministic — the same order ccusage scans in.
     static func usageFiles(under roots: [URL]) -> [JSONLScanning.DiscoveredFile] {
+        usageFilesIfComplete(under: roots) ?? []
+    }
+
+    static func usageFilesIfComplete(under roots: [URL]) -> [JSONLScanning.DiscoveredFile]? {
         var seenPaths: Set<String> = []
-        return roots
-            .flatMap { JSONLScanning.jsonlFiles(under: $0.appendingPathComponent("projects")) }
-            .sorted { $0.path < $1.path }
+        var files: [JSONLScanning.DiscoveredFile] = []
+        for root in roots {
+            guard !Task.isCancelled,
+                  let rootFiles = JSONLScanning.jsonlFilesIfComplete(
+                    under: root.appendingPathComponent("projects")
+                  )
+            else { return nil }
+            files.append(contentsOf: rootFiles)
+        }
+        return files.sorted { $0.path < $1.path }
             .filter { seenPaths.insert($0.path).inserted }
     }
 
@@ -310,7 +667,7 @@ actor ClaudeLogUsageScanner {
     private func ownedUsageFiles(
         _ files: [JSONLScanning.DiscoveredFile],
         organizationID: String
-    ) -> [JSONLScanning.DiscoveredFile] {
+    ) async -> [JSONLScanning.DiscoveredFile]? {
         let coworkPrefix = homeDirectory()
             .appendingPathComponent("Library/Application Support/Claude/local-agent-mode-sessions")
             .resolvingSymlinksInPath().path + "/"
@@ -320,7 +677,7 @@ actor ClaudeLogUsageScanner {
         var desktopSessionIDs: Set<String>?
 
         for file in files {
-            guard !Task.isCancelled else { return [] }
+            guard !Task.isCancelled else { return nil }
             guard seenPaths.insert(file.path).inserted else { continue }
             let canonicalPath = URL(fileURLWithPath: file.path).resolvingSymlinksInPath().path
             if canonicalPath.hasPrefix(coworkPrefix) {
@@ -342,93 +699,102 @@ actor ClaudeLogUsageScanner {
             } else {
                 sessionFile = file
             }
-            guard let sessionFile, let ownership = sessionIdentity(sessionFile) else { continue }
-            if let owner = ownership.organizationID {
-                if owner == organizationID, accountID == nil || ownership.accountID == accountID {
+            guard let sessionFile else { continue }
+            let lookup = await ownershipLookup(sessionFile)
+            guard !Task.isCancelled else { return nil }
+            switch lookup {
+            case .unreadable:
+                // It may belong to this account; omitting it would publish a successful partial sum.
+                return nil
+            case .readable(let owner, let ownerAccount, let isAmbiguous):
+                guard !isAmbiguous else { continue }
+                if let owner {
+                    if owner == organizationID, accountID == nil || ownerAccount == accountID {
+                        ownedFiles.append(file)
+                    }
+                } else if allowsUnattributedSessions {
                     ownedFiles.append(file)
-                }
-            } else if allowsUnattributedSessions {
-                ownedFiles.append(file)
-            } else if let accountID {
-                if desktopSessionIDs == nil {
-                    desktopSessionIDs = indexedDesktopSessionIDs(accountID: accountID, organizationID: organizationID)
-                }
-                let sessionID = URL(fileURLWithPath: sessionFile.path)
-                    .deletingPathExtension().lastPathComponent.lowercased()
-                if desktopSessionIDs?.contains(sessionID) == true {
-                    ownedFiles.append(file)
+                } else if let accountID {
+                    if desktopSessionIDs == nil {
+                        let diagnosticPrefix = desktopSessionIndexDiagnosticPrefix(
+                            accountID: accountID,
+                            organizationID: organizationID
+                        )
+                        guard let indexed = indexedDesktopSessionIDs(
+                            accountID: accountID,
+                            organizationID: organizationID
+                        ) else {
+                            DiagnosticGate.logOnce(for: diagnosticPrefix + "incomplete") {
+                                AppLog.warn(
+                                    LogTag.plugin("claude"),
+                                    "account-scoped desktop session index could not be completely read; preserving last-good history"
+                                )
+                            }
+                            return nil
+                        }
+                        DiagnosticGate.clearFailures(prefix: diagnosticPrefix)
+                        desktopSessionIDs = indexed
+                    }
+                    let sessionID = URL(fileURLWithPath: sessionFile.path)
+                        .deletingPathExtension().lastPathComponent.lowercased()
+                    if desktopSessionIDs?.contains(sessionID) == true {
+                        ownedFiles.append(file)
+                    }
                 }
             }
         }
         return ownedFiles
     }
 
-    private func indexedDesktopSessionIDs(accountID: String, organizationID: String) -> Set<String> {
-        let directory = homeDirectory()
+    private func indexedDesktopSessionIDs(accountID: String, organizationID: String) -> Set<String>? {
+        let directory = desktopSessionIndexDirectory(accountID: accountID, organizationID: organizationID)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory) else {
+            // A missing index is a valid empty source. A present index that cannot be read below is
+            // different: account ownership is unresolved and the combined history must not publish.
+            return []
+        }
+        guard isDirectory.boolValue, FileManager.default.isReadableFile(atPath: directory.path),
+              let files = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+              )
+        else { return nil }
+
+        var sessionIDs: Set<String> = []
+        for file in files where file.lastPathComponent.hasPrefix("local_") && file.pathExtension == "json" {
+            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else {
+                return nil
+            }
+            // Do not follow index symlinks into another account's directory. They do not establish
+            // ownership for this account's sessions.
+            guard values.isSymbolicLink != true else { continue }
+            guard values.isRegularFile == true,
+                  let data = try? Data(contentsOf: file),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rawSessionID = object["cliSessionId"] as? String
+            else { return nil }
+            // Non-UUID values cannot match Claude's UUID-named session logs; keep ignoring those
+            // well-formed but unrelated index entries.
+            if let sessionID = UUID(uuidString: rawSessionID) {
+                sessionIDs.insert(sessionID.uuidString.lowercased())
+            }
+        }
+        return sessionIDs
+    }
+
+    private func desktopSessionIndexDirectory(accountID: String, organizationID: String) -> URL {
+        homeDirectory()
             .appendingPathComponent("Library/Application Support/Claude/claude-code-sessions")
             .appendingPathComponent(accountID)
             .appendingPathComponent(organizationID)
-        let files = (try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-
-        return Set(files.compactMap { file in
-            guard file.lastPathComponent.hasPrefix("local_"), file.pathExtension == "json",
-                  let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
-                  values.isRegularFile == true, values.isSymbolicLink != true,
-                  let handle = try? FileHandle(forReadingFrom: file)
-            else { return nil }
-            defer { try? handle.close() }
-            guard let prefix = try? handle.read(upToCount: 512),
-                  let header = String(data: prefix, encoding: .utf8),
-                  let field = header.range(of: #""cliSessionId"\s*:\s*""#, options: .regularExpression),
-                  let end = header[field.upperBound...].firstIndex(of: "\""),
-                  let sessionID = UUID(uuidString: String(header[field.upperBound..<end]))
-            else { return nil }
-            return sessionID.uuidString.lowercased()
-        })
     }
 
-    private func sessionIdentity(
-        _ file: JSONLScanning.DiscoveredFile
-    ) -> (organizationID: String?, accountID: String?)? {
-        if let cached = sessionOwnership[file.path],
-           cached.size == file.size,
-           cached.mtime == file.mtime,
-           cached.attributeMtime == file.attributeMtime
-        {
-            return (cached.organizationID, cached.accountID)
-        }
-
-        let data: Data
-        do {
-            data = try Data(contentsOf: URL(fileURLWithPath: file.path), options: .mappedIfSafe)
-        } catch {
-            AppLog.warn(LogTag.plugin("claude"), "Failed to read Claude session ownership from \(file.path): \(error)")
-            return nil
-        }
-
-        let marker = Data(#""ownerOrganizationUuid""#.utf8)
-        var owner: String?
-        var account: String?
-        for line in data.split(separator: UInt8(ascii: "\n")) where line.range(of: marker) != nil {
-            guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-                  let value = object["ownerOrganizationUuid"] as? String,
-                  !value.isEmpty
-            else { continue }
-            let candidate = value.lowercased()
-            if let owner, owner != candidate { return nil }
-            owner = candidate
-            if let candidateAccount = object["ownerAccountUuid"] as? String, !candidateAccount.isEmpty {
-                let normalizedAccount = candidateAccount.lowercased()
-                if let account, account != normalizedAccount { return nil }
-                account = normalizedAccount
-            }
-        }
-
-        sessionOwnership[file.path] = (file.size, file.mtime, file.attributeMtime, owner, account)
-        return (owner, account)
+    private func desktopSessionIndexDiagnosticPrefix(accountID: String, organizationID: String) -> String {
+        let path = desktopSessionIndexDirectory(accountID: accountID, organizationID: organizationID)
+            .standardizedFileURL.path
+        return "claude.desktop.session-index.\(JSONLScanCachePaths.stableFingerprint(path))."
     }
 
     // MARK: - Line parsing
@@ -437,8 +803,9 @@ actor ClaudeLogUsageScanner {
     /// window is applied at aggregation so a cached parse stays valid as the window slides.
     static func parseFile(_ data: Data) -> [Entry] {
         var entries: [Entry] = []
+        var malformedTokenCounts = false
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            appendEntries(from: line, to: &entries)
+            appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
         }
         return entries
     }
@@ -446,41 +813,85 @@ actor ClaudeLogUsageScanner {
     /// Streaming counterpart used by the incremental scanner so a large session file never becomes
     /// one giant Data allocation.
     nonisolated static func parseFile(at url: URL) -> [Entry]? {
-        var entries: [Entry] = []
-        let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
-            appendEntries(from: line, to: &entries)
+        ClaudeSessionAppendCache.shared.parse(at: url) { line in
+            var entries: [Entry] = []
+            var malformedTokenCounts = false
+            appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
+            return malformedTokenCounts ? nil : entries
         }
-        guard readSucceeded else { return nil }
-        return entries
     }
 
-    private static let usageMarker = Data(#""usage":{"#.utf8)
+    private static let usageMarker = Data(#""usage""#.utf8)
 
-    private static func appendEntries(from line: Data.SubSequence, to entries: inout [Entry]) {
+    private static func appendEntries(
+        from line: Data.SubSequence,
+        to entries: inout [Entry],
+        malformedTokenCounts: inout Bool
+    ) {
         guard line.range(of: usageMarker) != nil else { return }
-        if hasUnsupportedNullField(line) { return }
-        entries.append(contentsOf: parseEntries(Data(line)))
+        entries.append(contentsOf: parseEntries(Data(line), malformedTokenCounts: &malformedTokenCounts))
     }
 
     /// Decode one JSONL line into an `Entry`, mirroring what ccusage's serde model accepts: `usage`
     /// with numeric `input_tokens`/`output_tokens` is required, everything else optional, and a
     /// malformed or invalid line is skipped rather than failing the file.
     static func parseLine(_ data: Data) -> Entry? {
-        parseEntries(data).first
+        var malformedTokenCounts = false
+        return parseEntries(data, malformedTokenCounts: &malformedTokenCounts).first
     }
 
     /// A Claude log line can carry nested advisor work in `usage.iterations`. The top-level usage
     /// remains the main-model entry; only advisor-message iterations become additional entries,
     /// matching ccusage without recounting the ordinary message iterations that feed that total.
-    private static func parseEntries(_ data: Data) -> [Entry] {
-        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let timestampRaw = object["timestamp"] as? String,
+    private static func parseEntries(_ data: Data, malformedTokenCounts: inout Bool) -> [Entry] {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            malformedTokenCounts = true
+            return []
+        }
+        // Attachments and tool results can contain unrelated usage objects. Only the assistant
+        // message's accounting belongs to this source; a byte marker alone cannot classify it.
+        if let type = object["type"], type as? String != "assistant" { return [] }
+        guard let message = object["message"] as? [String: Any],
+              let rawUsage = message["usage"] else {
+            // A claimed assistant accounting record in an unfamiliar shape must stay observable.
+            // Other rows may legitimately carry a usage key inside unrelated payloads.
+            if object["type"] as? String == "assistant", object["usage"] != nil {
+                malformedTokenCounts = true
+            }
+            return []
+        }
+        guard let usage = rawUsage as? [String: Any] else {
+            malformedTokenCounts = true
+            return []
+        }
+        guard let timestampRaw = object["timestamp"] as? String,
               let timestamp = OpenUsageISO8601.date(from: timestampRaw),
-              let message = object["message"] as? [String: Any],
-              let usage = message["usage"] as? [String: Any],
-              let parsedUsage = tokenBreakdown(from: usage),
               isValidEntry(object, message: message)
-        else { return [] }
+        else {
+            malformedTokenCounts = true
+            return []
+        }
+        guard let parsedUsage = tokenBreakdown(from: usage, malformedTokenCounts: &malformedTokenCounts) else {
+            return []
+        }
+
+        let costUSD: Double?
+        if let rawCost = object["costUSD"], !(rawCost is NSNull) {
+            guard let number = rawCost as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID()
+            else {
+                malformedTokenCounts = true
+                return []
+            }
+            let value = number.doubleValue
+            guard value.isFinite, value >= 0, value <= 1e12 else {
+                malformedTokenCounts = true
+                return []
+            }
+            costUSD = value
+        } else {
+            costUSD = nil
+        }
 
         let model = (message["model"] as? String).flatMap { $0 == "<synthetic>" ? nil : $0 }
         let parent = Entry(
@@ -490,20 +901,36 @@ actor ClaudeLogUsageScanner {
             requestID: object["requestId"] as? String,
             isSidechain: object["isSidechain"] as? Bool ?? false,
             hasSpeed: parsedUsage.hasSpeed,
-            costUSD: (object["costUSD"] as? NSNumber)?.doubleValue,
+            costUSD: costUSD,
             model: model
         )
 
-        guard let iterations = usage["iterations"] as? [[String: Any]] else { return [parent] }
+        guard let rawIterations = usage["iterations"], !(rawIterations is NSNull) else { return [parent] }
+        guard let iterations = rawIterations as? [Any] else {
+            malformedTokenCounts = true
+            return [parent]
+        }
 
         var entries = [parent]
         var advisorIndex = 0
-        for iteration in iterations {
-            guard iteration["type"] as? String == "advisor_message",
-                  let advisorModel = iteration["model"] as? String,
-                  !advisorModel.isEmpty,
-                  let advisorUsage = tokenBreakdown(from: iteration)
-            else { continue }
+        for rawIteration in iterations {
+            guard let iteration = rawIteration as? [String: Any] else {
+                malformedTokenCounts = true
+                continue
+            }
+            if let rawType = iteration["type"], !(rawType is String) {
+                malformedTokenCounts = true
+                continue
+            }
+            guard iteration["type"] as? String == "advisor_message" else { continue }
+            guard let advisorUsage = tokenBreakdown(from: iteration, malformedTokenCounts: &malformedTokenCounts) else {
+                continue
+            }
+            // Missing or malformed model attribution must not discard measured advisor tokens. Keep
+            // them under the shared Unattributed label so their cost remains visibly unknown.
+            let advisorModel = (iteration["model"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfEmpty
 
             entries.append(Entry(
                 timestamp: parent.timestamp,
@@ -521,94 +948,162 @@ actor ClaudeLogUsageScanner {
     }
 
     private static func tokenBreakdown(
-        from usage: [String: Any]
+        from usage: [String: Any],
+        malformedTokenCounts: inout Bool
     ) -> (tokens: TokenBreakdown, hasSpeed: Bool)? {
-        guard let input = usage["input_tokens"] as? NSNumber,
-              let output = usage["output_tokens"] as? NSNumber
-        else { return nil }
-
-        // Claude tags fast-mode requests with `speed`; any value outside the known set marks a log
-        // shape we don't understand, so the line is skipped (ccusage's enum parse does the same).
-        let speed = usage["speed"] as? String
-        if let speed, speed != "fast", speed != "standard" { return nil }
+        guard let inputRaw = usage["input_tokens"],
+              let outputRaw = usage["output_tokens"]
+        else {
+            malformedTokenCounts = true
+            return nil
+        }
+        guard let input = nonnegativeTokenCount(inputRaw),
+              let output = nonnegativeTokenCount(outputRaw)
+        else {
+            malformedTokenCounts = true
+            return nil
+        }
 
         // Cache writes: the 5m/1h split when present (1h bills at 2x input), else the legacy
         // aggregate `cache_creation_input_tokens` treated as all-5m.
         var cacheWrite5m = 0
         var cacheWrite1h = 0
-        if let cacheCreation = usage["cache_creation"] as? [String: Any] {
-            cacheWrite5m = (cacheCreation["ephemeral_5m_input_tokens"] as? NSNumber)?.intValue ?? 0
-            cacheWrite1h = (cacheCreation["ephemeral_1h_input_tokens"] as? NSNumber)?.intValue ?? 0
+        if let rawCacheCreation = usage["cache_creation"], !(rawCacheCreation is NSNull) {
+            guard let cacheCreation = rawCacheCreation as? [String: Any],
+                  let cache5m = optionalNonnegativeTokenCount(
+                    cacheCreation["ephemeral_5m_input_tokens"]
+                  ),
+                  let cache1h = optionalNonnegativeTokenCount(
+                    cacheCreation["ephemeral_1h_input_tokens"]
+                  )
+            else {
+                malformedTokenCounts = true
+                return nil
+            }
+            cacheWrite5m = cache5m
+            cacheWrite1h = cache1h
         } else {
-            cacheWrite5m = (usage["cache_creation_input_tokens"] as? NSNumber)?.intValue ?? 0
+            guard let cacheWrite = optionalNonnegativeTokenCount(usage["cache_creation_input_tokens"]) else {
+                malformedTokenCounts = true
+                return nil
+            }
+            cacheWrite5m = cacheWrite
+        }
+        guard let cacheRead = optionalNonnegativeTokenCount(usage["cache_read_input_tokens"]) else {
+            malformedTokenCounts = true
+            return nil
+        }
+        // Claude tags fast-mode requests with `speed`; any value outside the known set marks a log
+        // shape we don't understand, so the line is skipped (ccusage's enum parse does the same).
+        let speed: String?
+        if let rawSpeed = usage["speed"], !(rawSpeed is NSNull) {
+            guard let value = rawSpeed as? String,
+                  value == "fast" || value == "standard"
+            else {
+                malformedTokenCounts = true
+                return nil
+            }
+            speed = value
+        } else {
+            speed = nil
         }
 
         return (TokenBreakdown(
-            input: input.intValue,
+            input: input,
             cacheWrite5m: cacheWrite5m,
             cacheWrite1h: cacheWrite1h,
-            cacheRead: (usage["cache_read_input_tokens"] as? NSNumber)?.intValue ?? 0,
-            output: output.intValue,
+            cacheRead: cacheRead,
+            output: output,
             isFast: speed == "fast"
         ), speed != nil)
     }
 
-    /// ccusage's validity rules: a `version` that isn't semver-ish marks a foreign log format, and
+    private static func optionalNonnegativeTokenCount(_ raw: Any?) -> Int? {
+        guard let raw else { return 0 }
+        if raw is NSNull { return 0 }
+        return nonnegativeTokenCount(raw)
+    }
+
+    private static func nonnegativeTokenCount(_ raw: Any) -> Int? {
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return nil }
+        let value = number.doubleValue
+        guard value.isFinite,
+              value >= 0,
+              value <= 1e15,
+              value.rounded(.towardZero) == value
+        else { return nil }
+        return Int(value)
+    }
+
+    /// ccusage's validity rules: a `version` that isn't SemVer marks a foreign log format, and
     /// ids/model that are present but empty mark a malformed line.
     private static func isValidEntry(_ object: [String: Any], message: [String: Any]) -> Bool {
-        if let version = object["version"] as? String, !isSemverPrefix(version) { return false }
-        for value in [object["sessionId"], object["requestId"], message["id"], message["model"]] {
-            if let text = value as? String, text.isEmpty { return false }
+        if let rawVersion = object["version"] {
+            guard let version = rawVersion as? String, isValidSemVer(version) else { return false }
+        }
+        for value in [object["sessionId"], object["requestId"], message["id"]] {
+            guard let value else { continue }
+            guard let text = value as? String, !text.isEmpty else { return false }
+        }
+        if let rawSidechain = object["isSidechain"] {
+            guard let number = rawSidechain as? NSNumber,
+                  CFGetTypeID(number) == CFBooleanGetTypeID()
+            else { return false }
+        }
+        if let rawModel = message["model"] {
+            guard let model = rawModel as? String,
+                  !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return false }
         }
         return true
     }
 
-    /// `digits.digits.digit…` — accepts "1.0.24" and pre-release suffixes, rejects e.g. "unknown".
-    static func isSemverPrefix(_ value: String) -> Bool {
-        let bytes = Array(value.utf8)
-        var index = 0
-        func digits() -> Bool {
-            let start = index
-            while index < bytes.count, bytes[index].isASCIIDigit { index += 1 }
-            return index > start
+    /// Accepts a complete SemVer value, including valid prerelease and build identifiers.
+    static func isValidSemVer(_ value: String) -> Bool {
+        let buildParts = value.split(separator: "+", omittingEmptySubsequences: false)
+        guard buildParts.count <= 2 else { return false }
+        if buildParts.count == 2,
+           !isValidSemVerIdentifiers(String(buildParts[1]), allowNumericLeadingZero: true) {
+            return false
         }
-        guard digits(), index < bytes.count, bytes[index] == UInt8(ascii: ".") else { return false }
-        index += 1
-        guard digits(), index < bytes.count, bytes[index] == UInt8(ascii: ".") else { return false }
-        index += 1
-        return index < bytes.count && bytes[index].isASCIIDigit
+
+        let releaseParts = buildParts[0].split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        let coreParts = releaseParts[0].split(separator: ".", omittingEmptySubsequences: false)
+        guard coreParts.count == 3,
+              coreParts.allSatisfy({ part in
+                  !part.isEmpty
+                      && part.utf8.allSatisfy(\.isASCIIDigit)
+                      && (part == "0" || part.first != "0")
+              })
+        else { return false }
+        if releaseParts.count == 2,
+           !isValidSemVerIdentifiers(String(releaseParts[1]), allowNumericLeadingZero: false) {
+            return false
+        }
+        return true
     }
 
-    /// Claude never writes `null` into these fields; a line that does is a foreign/corrupt shape that
-    /// ccusage skips before JSON parsing, and we match it byte-for-byte.
-    static func hasUnsupportedNullField(_ line: Data.SubSequence) -> Bool {
-        let nullMarker = Data(":null".utf8)
-        let quote = UInt8(ascii: "\"")
-        let bytes = Data(line) // fresh copy → indices are 0-based
-        var offset = bytes.startIndex
-        while let markerRange = bytes.range(of: nullMarker, in: offset..<bytes.endIndex) {
-            let start = markerRange.lowerBound
-            var fieldEnd = start > 0 ? start - 1 : 0
-            if bytes[fieldEnd] != quote {
-                while fieldEnd > 0, bytes[fieldEnd] != quote { fieldEnd -= 1 }
+    private static func isValidSemVerIdentifiers(_ value: String, allowNumericLeadingZero: Bool) -> Bool {
+        let identifiers = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard !identifiers.isEmpty else { return false }
+        return identifiers.allSatisfy { identifier in
+            let bytes = Array(identifier.utf8)
+            guard !bytes.isEmpty,
+                  bytes.allSatisfy({
+                      $0.isASCIIDigit || (65...90).contains($0) || (97...122).contains($0) || $0 == UInt8(ascii: "-")
+                  })
+            else { return false }
+            if !allowNumericLeadingZero,
+               bytes.count > 1,
+               bytes.allSatisfy(\.isASCIIDigit),
+               bytes[0] == UInt8(ascii: "0") {
+                return false
             }
-            if bytes[fieldEnd] == quote, fieldEnd > 0 {
-                var fieldStart = fieldEnd - 1
-                while fieldStart > 0, bytes[fieldStart] != quote { fieldStart -= 1 }
-                if bytes[fieldStart] == quote {
-                    let field = String(decoding: bytes[(fieldStart + 1)..<fieldEnd], as: UTF8.self)
-                    if Self.unsupportedNullableFields.contains(field) { return true }
-                }
-            }
-            offset = markerRange.upperBound
+            return true
         }
-        return false
     }
-
-    private static let unsupportedNullableFields: Set<String> = [
-        "id", "cwd", "model", "speed", "costUSD", "version", "sessionId", "requestId",
-        "isApiErrorMessage", "cache_read_input_tokens", "cache_creation_input_tokens"
-    ]
 
     // MARK: - Deduplication
 
@@ -617,43 +1112,53 @@ actor ClaudeLogUsageScanner {
         var requestID: String?
     }
 
+    /// Stateful counterpart to `dedup` for the gateway fold. `foldItems` calls its visitor serially;
+    /// the unchecked Sendable conformance lets that callback build only the compact deduplicated set,
+    /// which is emitted after the source scan completes so a failed read cannot publish half a fold.
+    private final class ClaudeEntryDeduplication: @unchecked Sendable {
+        private(set) var entries: [Entry] = []
+        private var exactIndex: [ExactKey: Int] = [:]
+        private var messageIndex: [String: [Int]] = [:]
+
+        func append(_ entry: Entry) {
+            guard let messageID = entry.messageID else {
+                entries.append(entry)
+                return
+            }
+            let key = ExactKey(messageID: messageID, requestID: entry.requestID)
+            let collision = exactIndex[key] ?? messageIndex[messageID]?.first(where: { index in
+                entry.isSidechain || entries[index].isSidechain
+            })
+
+            if let index = collision {
+                if ClaudeLogUsageScanner.shouldReplace(candidate: entry, existing: entries[index]) {
+                    let old = entries[index]
+                    if let oldID = old.messageID {
+                        exactIndex.removeValue(forKey: ExactKey(messageID: oldID, requestID: old.requestID))
+                    }
+                    entries[index] = entry
+                    exactIndex[key] = index
+                }
+                return
+            }
+
+            let index = entries.count
+            entries.append(entry)
+            exactIndex[key] = index
+            messageIndex[messageID, default: []].append(index)
+        }
+    }
+
     /// Drop replayed usage lines, keeping ccusage's preferences. Entries are keyed by
     /// `(message.id, requestId)`; a second index on `message.id` alone catches sidechain logs that
     /// replay a parent message under a new request id. On a collision the existing entry is replaced
     /// only when the candidate wins `shouldReplace`. Entries without a message id are always kept.
     static func dedup(_ entries: [Entry]) -> [Entry] {
-        var deduped: [Entry] = []
-        var exactIndex: [ExactKey: Int] = [:]
-        var messageIndex: [String: [Int]] = [:]
-
-        for entry in entries {
-            guard let messageID = entry.messageID else {
-                deduped.append(entry)
-                continue
-            }
-            let key = ExactKey(messageID: messageID, requestID: entry.requestID)
-            let collision = exactIndex[key] ?? messageIndex[messageID]?.first(where: { index in
-                entry.isSidechain || deduped[index].isSidechain
-            })
-
-            if let index = collision {
-                if shouldReplace(candidate: entry, existing: deduped[index]) {
-                    let old = deduped[index]
-                    if let oldID = old.messageID {
-                        exactIndex.removeValue(forKey: ExactKey(messageID: oldID, requestID: old.requestID))
-                    }
-                    deduped[index] = entry
-                    exactIndex[key] = index
-                }
-                continue
-            }
-
-            let index = deduped.count
-            deduped.append(entry)
-            exactIndex[key] = index
-            messageIndex[messageID, default: []].append(index)
+        let deduplication = ClaudeEntryDeduplication()
+        JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
+            deduplication.append(entry)
         }
-        return deduped
+        return deduplication.entries
     }
 
     /// Preference order on a duplicate: the non-sidechain (parent) entry, then the larger token
@@ -675,15 +1180,16 @@ actor ClaudeLogUsageScanner {
     /// Bucket deduplicated entries into local calendar days. Cost mode "auto": a line's `costUSD`
     /// when present, else tokens priced through `pricing`.
     ///
-    /// Entries that can't be priced (an unknown model, or unattributed tokens with no carried cost)
-    /// are excluded from every displayed total — tokens, dollars, the trend, and the model breakdown —
-    /// because mixing measured tokens with unpriceable ones makes the figures incoherent. An unknown
-    /// model's name lands in `unknownModelsByDay` (the tile's warning triangle), the only place
-    /// unpriceable usage surfaces.
+    /// Rows no pricing source can price still count their tokens (cost dashes, per the owner's
+    /// "count tokens, dash cost" policy) and land in `unknownModelsByDay` for the warning triangle
+    /// and the reveal system. Every row with a resolvable rate also contributes its tokens' public-
+    /// API-rate value to `apiEstimateByDay` — the "if it were all API" comparison — including rows
+    /// whose displayed cost is provider-reported.
     static func aggregate(entries: [Entry], since: Date, pricing: ModelPricing) -> LogUsageScan {
         var accumulator = DailyUsageAccumulator()
 
-        for entry in entries where entry.timestamp >= since {
+        JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
+            guard entry.timestamp >= since else { return }
             let day = DailyUsageAccumulator.dayKey(from: entry.timestamp)
             // One trimmed slug for pricing, the unknown-model warning, and the breakdown key alike —
             // diverging spellings would let the warning triangle and the hover panel disagree.
@@ -691,19 +1197,24 @@ actor ClaudeLogUsageScanner {
             let modelName = trimmedModel ?? ModelUsageEntry.unattributedModelName
             // OpenCode Go/Zen gateway turns are folded into the OpenCode card; counting them here
             // double-counts the same dollars/tokens in Total Spend.
-            if let trimmedModel, OpenCodeUsageScanner.isHostedGatewayModel(trimmedModel) { continue }
+            if let trimmedModel, OpenCodeUsageScanner.isHostedGatewayModel(trimmedModel) { return }
 
-            let cost: Double
+            let cost: Double?
             if let carried = entry.costUSD {
                 cost = carried
             } else if let model = trimmedModel, let estimated = pricing.estimatedCostDollars(model: model, tokens: entry.tokens) {
                 cost = estimated
             } else {
-                if let model = trimmedModel, entry.tokens.totalTokens > 0 {
-                    accumulator.addUnknownModel(day: day, model: model)
-                }
-                continue
+                cost = nil
             }
+            if cost == nil, entry.tokens.totalTokens > 0 {
+                accumulator.addUnknownModel(day: day, model: modelName)
+            }
+            accumulator.recordApiEstimate(
+                day: day,
+                cost: trimmedModel.flatMap { pricing.estimatedCostDollars(model: $0, tokens: entry.tokens) },
+                tokens: entry.tokens.totalTokens
+            )
 
             accumulator.add(day: day, tokens: entry.tokens.totalTokens, cost: cost, model: modelName)
         }

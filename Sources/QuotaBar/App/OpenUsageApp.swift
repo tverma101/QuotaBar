@@ -4,8 +4,12 @@ import AppKit
 public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var container: AppContainer?
     private var statusItemController: StatusItemController?
+    private var loadingStatusItem: NSStatusItem?
+    private var accountDiscovery: ProviderAccountDiscovery?
+    private var accountAssembly: ProviderAccountAssembly?
     private var singleInstanceLock: SingleInstanceLock.Token?
-    private var isReloadingForCodexAccount = false
+    private var isReloadingProviderCatalog = false
+    private var pendingProviderCatalogReloads = ProviderCatalogReloadQueue()
 
     public override init() {
         super.init()
@@ -68,13 +72,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         // preferredColorScheme, so the override is applied at the AppKit level once at launch;
         // the Theme picker on the Settings screen re-applies it on change.
         AppearanceSetting.applyCurrent()
+        showLoadingStatusItem()
 
         if ShellEnvironmentSnapshotStore.launchSnapshot == nil,
            !LoginShellEnvironment.shared.capturedSuccessfully {
             Task { [weak self] in
-                await Task.detached(priority: .userInitiated) {
+                let captured = await Task.detached(priority: .userInitiated) {
                     _ = LoginShellEnvironment.shared.ensureCaptured()
+                    return LoginShellEnvironment.shared.capturedSuccessfully
                 }.value
+                if !captured {
+                    await Task.detached(priority: .utility) {
+                        _ = LoginShellEnvironment.shared.retryCaptureAfterFailure()
+                    }.value
+                }
                 self?.finishLaunching(isFreshInstall: isFreshInstall)
             }
             return
@@ -82,27 +93,254 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         finishLaunching(isFreshInstall: isFreshInstall)
     }
 
-    private func finishLaunching(isFreshInstall: Bool) {
-        let container = AppContainer(isFreshInstall: isFreshInstall)
-        container.codexAccountRegistration.onAccountRegistered = { [weak self] in
-            self?.reloadAfterCodexAccountRegistration()
+    private func finishLaunching(
+        isFreshInstall: Bool,
+        completesCodexReload: Bool = false,
+        completesClaudeReload: Bool = false,
+        previouslyDiscoveredCodexAccountIDs: Set<String> = [],
+        restorePresentationState: StatusItemController.ReplacementPresentationState? = nil
+    ) {
+        let rawRegisteredHomes = UserDefaults.standard.stringArray(
+            forKey: CodexAccountRegistrationStore.storageKey
+        ) ?? []
+        let shouldDiscoverOpenCodeAccounts = ProviderEnablementStore()
+            .hasEnabledProviderFamily("opencode")
+        let discoverClaudeDesktopOrganizations = ProviderEnablementStore()
+            .hasEnabledProviderFamily("claude")
+        _ = ProviderRefreshContext.withBackgroundContext {
+            Task { [weak self] in
+                async let discoveryLoad = loadOffMainActor {
+                    ProviderAccountAssembly.scanForLaunch(
+                        waitsForLoginShell: true,
+                        rawRegisteredCodexHomes: rawRegisteredHomes,
+                        discoverClaudeDesktopOrganizations: discoverClaudeDesktopOrganizations,
+                        forceClaudeAccountDiscovery: completesClaudeReload
+                    )
+                }
+                async let cursorHistoryIdentityKeyLoad = loadOffMainActor {
+                    CursorAuthStore().cacheIdentityKeyForLaunch()
+                }
+                async let antigravityIdentityKeyLoad = loadOffMainActor {
+                    AntigravityAuthStore().cacheIdentityKeyForLaunch()
+                }
+                async let openCodeAccountLoad: OpenCodeGoAccountInventory? = shouldDiscoverOpenCodeAccounts
+                    ? OpenCodeProvider.discoverAccountInventory()
+                    : nil
+                let (discovery, cursorHistoryIdentityKey, antigravityIdentityKey, openCodeGoAccountInventory) = await (
+                    discoveryLoad,
+                    cursorHistoryIdentityKeyLoad,
+                    antigravityIdentityKeyLoad,
+                    openCodeAccountLoad
+                )
+                guard let self else { return }
+                self.accountDiscovery = discovery
+                let assembly = ProviderAccountAssembly.make(
+                    observer: DefaultAccountObserver(),
+                    accountsStore: ProviderAccountsStore(),
+                    precomputedDiscovery: discovery
+                )
+                self.accountAssembly = assembly
+                if completesCodexReload {
+                    ProviderEnablementStore().enableNewlyRegisteredCodexAccounts(
+                        discoveredIDs: Set(assembly.codexCards.map(\.id)),
+                        previouslyDiscoveredIDs: previouslyDiscoveredCodexAccountIDs
+                    )
+                }
+                let container = AppContainer(
+                    isFreshInstall: isFreshInstall,
+                    accountDiscovery: discovery,
+                    accountAssembly: assembly,
+                    cursorHistoryIdentityKey: cursorHistoryIdentityKey,
+                    antigravityIdentityKey: antigravityIdentityKey,
+                    openCodeGoAccountInventory: openCodeGoAccountInventory,
+                    onOpenCodeGoKeysChanged: { [weak self] in
+                        self?.reloadAfterOpenCodeGoKeysChanged()
+                    },
+                    onOpenCodeEnablementRequiresCatalogReload: { [weak self] in
+                        self?.reloadAfterOpenCodeEnablement()
+                    },
+                    onClaudeEnablementRequiresCatalogReload: { [weak self] in
+                        self?.reloadAfterClaudeEnablement()
+                    }
+                )
+                container.codexAccountRegistration.onAccountRegistered = { [weak self] in
+                    self?.reloadAfterCodexAccountRegistration()
+                }
+                self.container = container
+                let controller = StatusItemController(container: container)
+                self.statusItemController = controller
+                self.removeLoadingStatusItem()
+                if let restorePresentationState { controller.restorePresentation(restorePresentationState) }
+                if completesCodexReload {
+                    self.isReloadingProviderCatalog = false
+                    self.continuePendingProviderCatalogReload()
+                } else if completesClaudeReload {
+                    self.isReloadingProviderCatalog = false
+                    self.continuePendingProviderCatalogReload()
+                }
+            }
         }
-        self.container = container
-        statusItemController = StatusItemController(container: container)
     }
 
     /// Account discovery is normally a launch-time operation because provider runtimes own their
     /// account-scoped home and identity. Rebuild the small composition root after Codex finishes an
     /// additional login so the new provider/card/status item appears immediately in this session.
     private func reloadAfterCodexAccountRegistration() {
-        guard !isReloadingForCodexAccount else { return }
-        isReloadingForCodexAccount = true
+        guard !isReloadingProviderCatalog else {
+            pendingProviderCatalogReloads.enqueue(.codexAccounts)
+            return
+        }
+        isReloadingProviderCatalog = true
         AppLog.info(.lifecycle, "reloading provider catalog after Codex account registration")
+        let previousCodexAccountIDs = Set(
+            container?.registry.providers.map(\.id).filter { $0.hasPrefix("codex@") } ?? []
+        )
+        container?.prepareForProviderCatalogReload()
+        let presentation = statusItemController?.replacementPresentationState()
         statusItemController?.tearDown()
         statusItemController = nil
         container = nil
-        finishLaunching(isFreshInstall: false)
-        isReloadingForCodexAccount = false
+        showLoadingStatusItem()
+        finishLaunching(
+            isFreshInstall: false,
+            completesCodexReload: true,
+            previouslyDiscoveredCodexAccountIDs: previousCodexAccountIDs,
+            restorePresentationState: presentation
+        )
+    }
+
+    /// A disabled Claude family skips Desktop organization credential discovery. The first explicit
+    /// enable re-runs account discovery before the replacement container can paint a cached org row.
+    private func reloadAfterClaudeEnablement() {
+        guard accountDiscovery?.didSkipClaudeDesktopDiscovery == true else { return }
+        guard !isReloadingProviderCatalog else {
+            pendingProviderCatalogReloads.enqueue(.claudeAccounts)
+            return
+        }
+        isReloadingProviderCatalog = true
+        AppLog.info(.lifecycle, "reloading provider catalog after Claude was enabled")
+        container?.prepareForProviderCatalogReload()
+        let presentation = statusItemController?.replacementPresentationState()
+        statusItemController?.tearDown()
+        statusItemController = nil
+        container = nil
+        showLoadingStatusItem()
+        finishLaunching(
+            isFreshInstall: false,
+            completesClaudeReload: true,
+            restorePresentationState: presentation
+        )
+    }
+
+    /// Account discovery is unchanged when the user adds or removes a saved OpenCode Go key. Rebuild
+    /// the registry from the launch snapshot so the new account-specific meter descriptors are live
+    /// immediately without repeating the slow Claude Desktop/account scan.
+    private func reloadAfterOpenCodeEnablement() {
+        reloadAfterOpenCodeGoKeysChanged(invalidateOpenCodeQuota: false)
+    }
+
+    private func reloadAfterOpenCodeGoKeysChanged(invalidateOpenCodeQuota: Bool = true) {
+        guard !isReloadingProviderCatalog else {
+            pendingProviderCatalogReloads.enqueue(
+                invalidateOpenCodeQuota ? .openCodeGoKeys : .openCodeEnablement
+            )
+            return
+        }
+        guard let accountDiscovery, let accountAssembly else { return }
+        isReloadingProviderCatalog = true
+        let reason = invalidateOpenCodeQuota ? "OpenCode Go key change" : "OpenCode enablement"
+        AppLog.info(.lifecycle, "reloading provider catalog after \(reason)")
+        container?.prepareForProviderCatalogReload(invalidateOpenCodeQuota: invalidateOpenCodeQuota)
+        let presentation = statusItemController?.replacementPresentationState()
+        statusItemController?.tearDown()
+        statusItemController = nil
+        container = nil
+        showLoadingStatusItem()
+
+        _ = ProviderRefreshContext.withBackgroundContext {
+            Task { [weak self] in
+                async let openCodeGoAccountInventoryLoad = OpenCodeProvider.discoverAccountInventory()
+                async let cursorHistoryIdentityKeyLoad = loadOffMainActor {
+                    CursorAuthStore().cacheIdentityKeyForLaunch()
+                }
+                async let antigravityIdentityKeyLoad = loadOffMainActor {
+                    AntigravityAuthStore().cacheIdentityKeyForLaunch()
+                }
+                let (openCodeGoAccountInventory, cursorHistoryIdentityKey, antigravityIdentityKey) = await (
+                    openCodeGoAccountInventoryLoad,
+                    cursorHistoryIdentityKeyLoad,
+                    antigravityIdentityKeyLoad
+                )
+                guard let self else { return }
+                let replacement = AppContainer(
+                    isFreshInstall: false,
+                    accountDiscovery: accountDiscovery,
+                    accountAssembly: accountAssembly,
+                    cursorHistoryIdentityKey: cursorHistoryIdentityKey,
+                    antigravityIdentityKey: antigravityIdentityKey,
+                    openCodeGoAccountInventory: openCodeGoAccountInventory,
+                    onOpenCodeGoKeysChanged: { [weak self] in
+                        self?.reloadAfterOpenCodeGoKeysChanged()
+                    },
+                    onOpenCodeEnablementRequiresCatalogReload: { [weak self] in
+                        self?.reloadAfterOpenCodeEnablement()
+                    },
+                    onClaudeEnablementRequiresCatalogReload: { [weak self] in
+                        self?.reloadAfterClaudeEnablement()
+                    }
+                )
+                replacement.codexAccountRegistration.onAccountRegistered = { [weak self] in
+                    self?.reloadAfterCodexAccountRegistration()
+                }
+                self.container = replacement
+                let controller = StatusItemController(container: replacement)
+                self.statusItemController = controller
+                self.removeLoadingStatusItem()
+                if let presentation { controller.restorePresentation(presentation) }
+                self.isReloadingProviderCatalog = false
+                self.continuePendingProviderCatalogReload()
+            }
+        }
+    }
+
+    private func continuePendingProviderCatalogReload() {
+        guard !isReloadingProviderCatalog,
+              let request = pendingProviderCatalogReloads.takeNext()
+        else { return }
+        switch request {
+        case .codexAccounts:
+            reloadAfterCodexAccountRegistration()
+        case .claudeAccounts:
+            reloadAfterClaudeEnablement()
+        case .openCodeGoKeys:
+            reloadAfterOpenCodeGoKeysChanged()
+        case .openCodeEnablement:
+            reloadAfterOpenCodeEnablement()
+        }
+    }
+
+    private func showLoadingStatusItem() {
+        guard loadingStatusItem == nil else { return }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let image = NSImage(systemSymbolName: "ellipsis.circle", accessibilityDescription: "QuotaBar is loading")
+        item.button?.image = image
+        item.button?.toolTip = "QuotaBar is loading provider accounts"
+        let menu = NSMenu()
+        let loading = NSMenuItem(title: "QuotaBar Is Loading…", action: nil, keyEquivalent: "")
+        loading.isEnabled = false
+        menu.addItem(loading)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit QuotaBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp
+        menu.addItem(quit)
+        item.menu = menu
+        loadingStatusItem = item
+    }
+
+    private func removeLoadingStatusItem() {
+        guard let loadingStatusItem else { return }
+        NSStatusBar.system.removeStatusItem(loadingStatusItem)
+        self.loadingStatusItem = nil
     }
 
     /// Flush queued telemetry on quit. The SDK's lifecycle autocapture is off (we emit our own daily

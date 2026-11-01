@@ -159,6 +159,32 @@ final class CodexLogUsageScannerTests: XCTestCase {
         let events = CodexLogUsageScanner.parseFile(Data(lines.utf8))
 
         XCTAssertEqual(events.map(\.isFast), [false, true, false, true])
+        XCTAssertEqual(events.map(\.serviceTier), [nil, "priority", "default", "fast"])
+    }
+
+    func testGPT61SolServiceTiersUsePublishedPriceMultipliers() {
+        let at = TestLocalInstant.iso(2026, 10, 13, 8, 0)
+        let rates = ModelRates(
+            inputPerMillion: 1_000, outputPerMillion: 3_000,
+            cacheWritePerMillion: 1_000, cacheReadPerMillion: 100
+        )
+        let gptPricing = modelPricing(model: "gpt-6.1-sol", rates: rates)
+        func cost(_ tier: String?) -> Double {
+            let event = CodexLogUsageScanner.Event(
+                timestamp: OpenUsageISO8601.date(from: at)!, model: "gpt-6.1-sol",
+                input: 100, cached: 25, output: 50, reasoning: 0, total: 150,
+                isFast: tier == "fast" || tier == "priority", serviceTier: tier
+            )
+            return CodexLogUsageScanner.aggregate(events: [event], since: .distantPast, pricing: gptPricing)
+                .series.daily.first?.costUSD ?? 0
+        }
+
+        XCTAssertEqual(cost(nil), 0.2275, accuracy: 0.000_000_1)
+        XCTAssertEqual(cost("fast"), 0.455, accuracy: 0.000_000_1)
+        XCTAssertEqual(cost("flex"), 0.11375, accuracy: 0.000_000_1)
+        XCTAssertEqual(cost("batch"), 0.11375, accuracy: 0.000_000_1)
+        XCTAssertEqual(cost("ultrafast"), 1.365, accuracy: 0.000_000_1)
+        XCTAssertNil(CodexLogUsageScanner.codexServiceTierMultiplier(for: "gpt-6.1-terra", serviceTier: "ultrafast"))
     }
 
     func testCachedTokensCapAtInputTokens() {
@@ -446,12 +472,13 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
     private func makeEvent(
         _ timestamp: String, model: String = "gpt-5.2", input: Int = 100, cached: Int = 0,
-        output: Int = 50, reasoning: Int = 0, isFast: Bool = false, pricingModel: String? = nil
+        output: Int = 50, reasoning: Int = 0, isFast: Bool = false, pricingModel: String? = nil,
+        serviceTier: String? = nil
     ) -> CodexLogUsageScanner.Event {
         CodexLogUsageScanner.Event(
             timestamp: OpenUsageISO8601.date(from: timestamp)!,
             model: model, pricingModel: pricingModel, input: input, cached: cached, output: output, reasoning: reasoning,
-            total: input + output, isFast: isFast
+            total: input + output, isFast: isFast, serviceTier: serviceTier
         )
     }
 
@@ -743,7 +770,7 @@ final class CodexLogUsageScannerTests: XCTestCase {
         XCTAssertEqual(long.series.daily.first?.costUSD ?? 0, 3.96, accuracy: 0.000_001)
     }
 
-    func testAggregateUnknownModelIsExcludedFromTotalsButWarns() {
+    func testAggregateUnknownModelCountsTokensButDashesCost() {
         let scan = CodexLogUsageScanner.aggregate(
             events: [
                 makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "mystery-model-9"),
@@ -752,12 +779,14 @@ final class CodexLogUsageScannerTests: XCTestCase {
             since: .distantPast, pricing: fixedRates()
         )
 
-        // Unpriceable tokens never enter the displayed totals — they surface only through the
-        // warning triangle, so the tile's tokens and dollars stay coherent.
-        XCTAssertEqual(scan.series.daily.first?.totalTokens, 150)
-        XCTAssertNotNil(scan.series.daily.first?.costUSD)
+        // Count tokens, dash cost (owner policy): unpriceable tokens stay in the token total so it
+        // matches the provider's own accounting; only priced rows contribute dollars. The unknown
+        // model keeps its warning triangle AND a visible breakdown row (cost nil).
+        XCTAssertEqual(scan.series.daily.first?.totalTokens, 300)
+        // Only the priced gpt-5.2 event contributes dollars: (100/1M·1000) + (50/1M·3000) = 0.25.
+        XCTAssertEqual(scan.series.daily.first?.costUSD, 0.25)
         XCTAssertEqual(scan.unknownModelsByDay[TestLocalInstant.isoDay(2026, 5, 12)], ["mystery-model-9"])
-        XCTAssertEqual(scan.modelUsage?.daily.first?.models.map(\.model), ["gpt-5.2"])
+        XCTAssertEqual(scan.modelUsage?.daily.first?.models.map(\.model), ["gpt-5.2", "mystery-model-9"])
     }
 
     func testAggregateUnknownModelOnlyLeavesDayUnbacked() {
@@ -766,11 +795,44 @@ final class CodexLogUsageScannerTests: XCTestCase {
             since: .distantPast, pricing: fixedRates()
         )
 
-        // A day with nothing priceable produces no series entry at all (→ "No data"), but the
-        // unknown-model warning still names what was excluded.
-        XCTAssertTrue(scan.series.daily.isEmpty)
+        // A day with nothing priceable still reports its measured tokens with a nil cost (→ "$— ·
+        // 150 tokens"), and the breakdown names the unpriced model so the reveal system can backfill it.
+        XCTAssertEqual(scan.series.daily.first?.totalTokens, 150)
+        XCTAssertNil(scan.series.daily.first?.costUSD)
         XCTAssertEqual(scan.unknownModelsByDay[TestLocalInstant.isoDay(2026, 5, 12)], ["mystery-model-9"])
-        XCTAssertEqual(scan.modelUsage?.daily ?? [], [])
+        XCTAssertEqual(scan.modelUsage?.daily.first?.models.map(\.model), ["mystery-model-9"])
+        XCTAssertNil(scan.modelUsage?.daily.first?.models.first?.costUSD)
+    }
+
+    /// The per-model rows of a fold must come out in a deterministic total order (cost desc, tokens
+    /// desc, name asc). `build()` folds a dictionary whose iteration order is randomized per run, so
+    /// without the tiebreakers the same corpus produced differently-ordered rows scan to scan — the
+    /// history screen and tests read unstable data. Repeated aggregation of one tied-token corpus
+    /// must agree every time.
+    func testModelRowOrderIsDeterministicAcrossScans() {
+        // Three unpriced models with EQUAL tokens (150 each — the pure tie that dictionary
+        // randomization reorders) plus one priced model that outranks them on cost.
+        let events = [
+            makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "mystery-b"),
+            makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "mystery-a"),
+            makeEvent(TestLocalInstant.iso(2026, 5, 12, 8, 0), model: "mystery-c"),
+            makeEvent(TestLocalInstant.iso(2026, 5, 12, 9, 0), model: "gpt-5.2")
+        ]
+
+        let first = CodexLogUsageScanner.aggregate(events: events, since: .distantPast, pricing: fixedRates())
+            .modelUsage?.daily.first?.models.map(\.model)
+        XCTAssertNotNil(first)
+
+        // Dictionary iteration order is randomized per process (and per run), so 25 repeats of the
+        // same fold must all agree with the first — and with the documented total order.
+        for _ in 0..<25 {
+            let again = CodexLogUsageScanner.aggregate(events: events, since: .distantPast, pricing: fixedRates())
+                .modelUsage?.daily.first?.models.map(\.model)
+            XCTAssertEqual(again, first, "identical events must produce identically ordered model rows")
+        }
+
+        // The order itself: the priced row first (cost outranks), then the tied unpriced trio by name.
+        XCTAssertEqual(first, ["gpt-5.2", "mystery-a", "mystery-b", "mystery-c"])
     }
 
     func testAggregateFiltersEventsBeforeSince() {
@@ -897,6 +959,27 @@ final class CodexLogUsageScannerTests: XCTestCase {
 
         let second = await scanner.scan(pricing: fixedRates())
         XCTAssertEqual(second?.series.daily.reduce(0) { $0 + $1.totalTokens }, 200)
+    }
+
+    /// A token_count event with an empty model name must not lose its tokens: the resolver falls
+    /// back to the session's current model and the row prices and counts end to end.
+    func testEmptyModelRowsKeepTheirTokensViaSessionModelFallback() async throws {
+        let day = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-3600))
+        let home = try CodexLogFixture.makeHome(files: [
+            "sessions/rollout-a.jsonl": [
+                CodexLogFixture.turnContext(timestamp: day, model: "gpt-5.2"),
+                CodexLogFixture.tokenCount(
+                    timestamp: day, last: CodexLogFixture.usage(input: 100, output: 50), model: ""
+                )
+            ].joined(separator: "\n")
+        ])
+        let scanner = CodexLogFixture.scanner(home: home)
+
+        let scan = await scanner.scan(pricing: fixedRates())
+        XCTAssertEqual(scan?.series.daily.reduce(0) { $0 + $1.totalTokens }, 150,
+                       "empty-model rows fall back to the session model and keep their tokens")
+        XCTAssertTrue(scan?.unknownModelsByDay.isEmpty == true,
+                      "the session fallback model prices, so no warning triangle")
     }
 
     /// Manual parity harness against the real logs on this machine: prints per-day totals to compare
@@ -1073,4 +1156,111 @@ final class CodexLogUsageScannerTests: XCTestCase {
         )
     }
 
+    func testFailedPeerInodeDiscoveryIsIncompleteAndNotCached() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-peer-discovery-failure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let userHome = root.appendingPathComponent("Users/dev", isDirectory: true)
+        let managed = root.appendingPathComponent("orca/managed-home", isDirectory: true)
+        let peer = root.appendingPathComponent("orca/peer-home", isDirectory: true)
+        let managedSessions = managed.appendingPathComponent("sessions/2026/09/06", isDirectory: true)
+        let peerSessions = peer.appendingPathComponent("sessions/2026/09/06", isDirectory: true)
+        try FileManager.default.createDirectory(at: managedSessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: peerSessions, withIntermediateDirectories: true)
+
+        let managedFile = managedSessions.appendingPathComponent("shared.jsonl")
+        let peerFile = peerSessions.appendingPathComponent("shared.jsonl")
+        try "{\"type\":\"session_meta\"}\n".write(to: managedFile, atomically: true, encoding: .utf8)
+        try FileManager.default.linkItem(at: managedFile, to: peerFile)
+        let identity = try XCTUnwrap(CodexLogUsageScanner.fileIdentity(at: peerFile))
+        let attempts = PeerInodeDiscoveryAttempts()
+        let discovery: @Sendable (URL) -> Set<CodexLogUsageScanner.FileIdentity>? = { _ in
+            attempts.next() == 1 ? nil : [identity]
+        }
+
+        let failed = CodexLogUsageScanner.sessionFilesIfComplete(
+            homes: [managed],
+            peerHomes: [peer],
+            homeDirectory: { userHome },
+            peerInodeDiscovery: discovery
+        )
+        XCTAssertNil(failed, "a failed peer walk cannot authorize managed-home attribution")
+
+        let retried = CodexLogUsageScanner.sessionFilesIfComplete(
+            homes: [managed],
+            peerHomes: [peer],
+            homeDirectory: { userHome },
+            peerInodeDiscovery: discovery
+        )
+        XCTAssertEqual(attempts.count, 2, "the incomplete inode set must not be memoized")
+        XCTAssertTrue(retried?.isEmpty == true, "the retry must use the complete peer hardlink set")
+    }
+
+    func testScanResultDistinguishesIncompleteDiscoveryFromCompleteEmptySource() async throws {
+        let incompleteHome = try CodexLogFixture.makeHome(files: [
+            "sessions/readable.jsonl": "{\"type\":\"session_meta\"}\n"
+        ])
+        defer { try? FileManager.default.removeItem(at: incompleteHome) }
+        try "unreadable-root".write(
+            to: incompleteHome.appendingPathComponent("archived_sessions"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let incompleteScanner = CodexLogFixture.scanner(home: incompleteHome)
+        let incomplete = await incompleteScanner.scanResult(now: Date(), pricing: .empty)
+        guard case .incomplete = incomplete else {
+            return XCTFail("a partial Codex root must remain distinguishable from empty history")
+        }
+
+        let emptyHome = try CodexLogFixture.makeHome()
+        defer { try? FileManager.default.removeItem(at: emptyHome) }
+        let emptyScanner = CodexLogFixture.scanner(home: emptyHome)
+        let empty = await emptyScanner.scanResult(now: Date(), pricing: .empty)
+        guard case .complete(let scan) = empty else {
+            return XCTFail("a completed empty Codex scan is valid empty history")
+        }
+        XCTAssertNil(scan)
+    }
+
+    func testSessionFileDiscoveryRejectsAnIncompleteExistingRoot() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-partial-root-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let sessions = home.appendingPathComponent("sessions/2026", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try "{\"type\":\"session_meta\"}\n".write(
+            to: sessions.appendingPathComponent("readable.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        // Codex normally uses this path as a directory. If it exists as an unreadable/non-directory
+        // entry, the readable `sessions` tree is only a partial view and must not publish as complete.
+        try "unreadable-root".write(
+            to: home.appendingPathComponent("archived_sessions"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertNil(CodexLogUsageScanner.sessionFilesIfComplete(homes: [home]))
+    }
+
+}
+
+private final class PeerInodeDiscoveryAttempts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts = 0
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return attempts
+    }
+
+    func next() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        attempts += 1
+        return attempts
+    }
 }

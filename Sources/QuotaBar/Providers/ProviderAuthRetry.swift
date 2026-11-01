@@ -31,6 +31,8 @@ enum ProviderAuthRetry {
     }
 
     /// - Parameters:
+    ///   - diagnosticSourceID: stable credential-source/account identity for warning deduplication;
+    ///     a successful fallback source must not clear another source's persistent failure.
     ///   - token: access token for the first attempt.
     ///   - attempt: performs the request with the given token; called at most twice.
     ///   - refreshAccessToken: returns a fresh access token or throws the provider's auth error.
@@ -39,6 +41,8 @@ enum ProviderAuthRetry {
     ///     (Cursor reports these separately); defaults to `connectionFailed`.
     ///   - authExpired: thrown when the retried request still comes back 401/403.
     static func fetch(
+        providerID: String,
+        diagnosticSourceID: String = "default",
         token: String,
         attempt: (_ accessToken: String) async throws -> HTTPResponse,
         refreshAccessToken: () async throws -> String,
@@ -46,27 +50,55 @@ enum ProviderAuthRetry {
         retriedConnectionFailed: Error? = nil,
         authExpired: Error
     ) async throws -> HTTPResponse {
+        try Task.checkCancellation()
         let response: HTTPResponse
         do {
             response = try await attempt(token)
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             throw connectionFailed
         }
-        guard isAuthFailure(response) else { return response }
+        try Task.checkCancellation()
+        guard isAuthFailure(response) else {
+            if (200..<300).contains(response.statusCode) {
+                DiagnosticGate.clearFailure(diagnosticKey(providerID: providerID, sourceID: diagnosticSourceID))
+            }
+            return response
+        }
 
         AppLog.debug(.auth, "\(response.statusCode) -> refreshing token, retrying once")
-        let refreshed = try await refreshAccessToken()
+        try Task.checkCancellation()
+        let refreshed: String
+        do {
+            refreshed = try await refreshAccessToken()
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            throw error
+        }
+        try Task.checkCancellation()
 
         let retried: HTTPResponse
         do {
             retried = try await attempt(refreshed)
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             throw retriedConnectionFailed ?? connectionFailed
         }
+        try Task.checkCancellation()
         if isAuthFailure(retried) {
-            AppLog.warn(.auth, "retry still unauthorized -> auth expired")
+            let diagnosticKey = diagnosticKey(providerID: providerID, sourceID: diagnosticSourceID)
+            DiagnosticGate.logOnce(for: diagnosticKey) {
+                AppLog.warn(.auth, "retry still unauthorized -> auth expired (\(providerID))")
+            }
             throw authExpired
         }
+        if (200..<300).contains(retried.statusCode) {
+            DiagnosticGate.clearFailure(diagnosticKey(providerID: providerID, sourceID: diagnosticSourceID))
+        }
         return retried
+    }
+
+    private static func diagnosticKey(providerID: String, sourceID: String) -> String {
+        "auth.provider-retry.\(providerID).\(JSONLScanCachePaths.stableFingerprint(sourceID))"
     }
 }

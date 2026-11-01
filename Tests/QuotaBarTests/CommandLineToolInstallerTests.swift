@@ -4,10 +4,34 @@ import XCTest
 
 @MainActor
 final class CommandLineToolInstallerTests: XCTestCase {
+    func testDefaultHelperAndCommandMatchBuildScript() throws {
+        XCTAssertEqual(CommandLineToolInstaller.bundledHelperRelativePath, "Contents/Helpers/quotabar")
+        XCTAssertEqual(CommandLineToolInstaller.defaultCommandPath, "/usr/local/bin/quotabar")
+
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let buildScript = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("script/build_and_run.sh"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(buildScript.contains(#"CLI_BINARY="$APP_HELPERS/quotabar""#))
+        XCTAssertTrue(buildScript.contains(#"ps -p "$pid" -o command="#))
+        XCTAssertFalse(buildScript.contains("-o comm="), "bundle checks need ps's full executable path")
+
+        let settings = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/QuotaBar/Views/SettingsScreen.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(settings.contains("Adds a global `quotabar` command"))
+        XCTAssertFalse(settings.contains("`openusage` command"))
+    }
+
     private func fixture() throws -> (root: URL, source: String, destination: String) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let source = root.appendingPathComponent("OpenUsage.app/Contents/Helpers/openusage")
-        let destination = root.appendingPathComponent("bin/openusage")
+        let source = root.appendingPathComponent("QuotaBar.app/Contents/Helpers/quotabar")
+        let destination = root.appendingPathComponent("bin/quotabar")
         try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data().write(to: source)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: source.path)
@@ -80,7 +104,7 @@ final class CommandLineToolInstallerTests: XCTestCase {
         )
         try FileManager.default.createSymbolicLink(
             atPath: fixture.destination,
-            withDestinationPath: "/tmp/another-openusage"
+            withDestinationPath: "/tmp/another-quotabar"
         )
         var operationRan = false
         let installer = CommandLineToolInstaller(
@@ -97,7 +121,7 @@ final class CommandLineToolInstallerTests: XCTestCase {
         XCTAssertFalse(operationRan)
         XCTAssertEqual(
             try FileManager.default.destinationOfSymbolicLink(atPath: fixture.destination),
-            "/tmp/another-openusage"
+            "/tmp/another-quotabar"
         )
     }
 }

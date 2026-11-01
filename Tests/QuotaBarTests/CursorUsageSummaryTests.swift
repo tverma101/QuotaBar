@@ -73,6 +73,28 @@ final class CursorUsageSummaryMapperTests: XCTestCase {
         XCTAssertEqual(progress(mapped.lines, "On-demand")?.limit, 5_000)
     }
 
+    @MainActor
+    func testPartialSummaryWithOnlyModelPercentagesOmitsAggregateTotal() throws {
+        let mapped = try CursorUsageSummaryMapper.map(
+            summary: [
+                "billingCycleStart": "2026-07-01T00:00:00.000Z",
+                "billingCycleEnd": "2026-08-01T00:00:00.000Z",
+                "individualUsage": [
+                    "plan": ["autoPercentUsed": 18.0, "apiPercentUsed": 7.0]
+                ]
+            ],
+            requestUsage: nil,
+            planName: "Enterprise",
+            unavailableMessage: "unavailable"
+        )
+
+        XCTAssertNil(progress(mapped.lines, "Total usage"))
+        XCTAssertEqual(progress(mapped.lines, "Cursor Models")?.used, 18)
+        XCTAssertEqual(progress(mapped.lines, "Other Models")?.used, 7)
+        let descriptor = try XCTUnwrap(CursorProvider().widgetDescriptors.first { $0.id == "cursor.usage" })
+        XCTAssertTrue(descriptor.hidesWhenEmpty)
+    }
+
     func testFallsBackToTeamOnDemandWhenIndividualBucketIsDisabled() throws {
         let mapped = try CursorUsageSummaryMapper.map(
             summary: [

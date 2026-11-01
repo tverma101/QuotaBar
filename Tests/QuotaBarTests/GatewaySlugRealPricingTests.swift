@@ -16,6 +16,50 @@ final class GatewaySlugRealPricingTests: XCTestCase {
         ("anthropic/openai/gpt-5.6-terra", "gpt-5.6-terra")
     ]
 
+    /// Cursor's export spells DeepSeek V4.1 Flash 10/17 once per thinking effort
+    /// (`deepseek-v41-flash-1017-high`). Those rows showed tokens with no dollars on the dashboard
+    /// even though OpenRouter publishes the route: no bundled snapshot carries the id, and the
+    /// effort-suffixed slug matched no alias, so it never reached a rate at all. The alias now
+    /// collapses every effort onto the dated route, and the supplement prices that route so the
+    /// dollars appear offline too, not only after a live catalogue revalidation.
+    func testCursorDeepSeekEffortSlugsPriceFromTheShippedSupplement() throws {
+        let pricing = TestPricing.bundled
+        for slug in [
+            "deepseek-v41-flash-1017-high",
+            "deepseek-v41-flash-1017-medium",
+            "deepseek-v41-flash-1017-max",
+            "deepseek-v41-flash-1017",
+            "deepseek-v4.1-flash-1017"
+        ] {
+            XCTAssertEqual(
+                pricing.canonicalName(for: slug), "deepseek-v4.1-flash-1017",
+                "\(slug) must collapse onto the dated DeepSeek route"
+            )
+            let cost = try XCTUnwrap(
+                pricing.estimatedCursorCostDollars(
+                    model: slug,
+                    tokens: TokenBreakdown(input: 1_000_000, output: 1_000_000),
+                    applyLongContextRates: false
+                ),
+                "\(slug) must price from the shipped supplement, not only the live catalogue"
+            )
+            // $0.15 input + $0.60 output per million.
+            XCTAssertEqual(cost, 0.75, accuracy: 1e-9, slug)
+        }
+    }
+
+    /// The undated spelling maps to its own route, and the dated rule wins for the dated spelling —
+    /// otherwise a snapshot-specific slug would silently inherit the base route's different rates.
+    func testDeepSeekEffortSlugsKeepTheDatedRouteDistinctFromTheBase() throws {
+        let pricing = TestPricing.bundled
+        XCTAssertEqual(
+            pricing.canonicalName(for: "deepseek-v41-flash-high"), "deepseek-v4.1-flash"
+        )
+        let dated = try XCTUnwrap(pricing.resolve(model: "deepseek-v4.1-flash-1017"))
+        let base = try XCTUnwrap(pricing.resolve(model: "deepseek-v4.1-flash"))
+        XCTAssertNotEqual(dated.outputPerMillion, base.outputPerMillion)
+    }
+
     /// The pricing was never wrong: every model prices, and the tagged and bare spellings price
     /// identically. That is why the defect was invisible in the dollars and only showed up as two rows.
     func testTaggedAndBareSpellingsPriceIdentically() throws {

@@ -158,14 +158,16 @@ struct CodexAccountsSettingsSection: View {
 
     private func registerExistingHome() {
         guard let home = CodexAccountRegistrationService.chooseExistingHome() else { return }
-        do {
-            let label = try registration.registerExistingHome(at: home)
-            actionError = nil
-            actionNotice = label.map { "Registered Codex account \($0). QuotaBar is loading its usage card." }
-                ?? "Codex home registered. QuotaBar is loading its account card."
-        } catch {
-            actionNotice = nil
-            actionError = error.localizedDescription
+        Task { @MainActor in
+            do {
+                let label = try await registration.registerExistingHome(at: home)
+                actionError = nil
+                actionNotice = label.map { "Registered Codex account \($0). QuotaBar is loading its usage card." }
+                    ?? "Codex home registered. QuotaBar is loading its account card."
+            } catch {
+                actionNotice = nil
+                actionError = error.localizedDescription
+            }
         }
     }
 

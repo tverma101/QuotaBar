@@ -7,6 +7,12 @@ enum CursorCSVParser {
     struct Summary: Equatable {
         var isStructurallyComplete: Bool
         var rejectedRecordCount: Int
+        var wasCancelled: Bool = false
+    }
+
+    private struct RowScanResult {
+        var isStructurallyComplete: Bool
+        var wasCancelled: Bool
     }
 
     /// Streams records and reports structural failures plus rows whose width differs from the header.
@@ -20,7 +26,7 @@ enum CursorCSVParser {
     ) -> Summary {
         var header: [String]?
         var rejectedRecordCount = 0
-        let isStructurallyComplete = forEachRow(in: text) { row in
+        let rowScan = forEachRow(in: text) { row in
             guard let keys = header else {
                 let normalized = row.map {
                     $0.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{FEFF}")))
@@ -41,12 +47,22 @@ enum CursorCSVParser {
             body(dict)
         }
         return Summary(
-            isStructurallyComplete: isStructurallyComplete,
-            rejectedRecordCount: rejectedRecordCount
+            isStructurallyComplete: rowScan.isStructurallyComplete,
+            rejectedRecordCount: rejectedRecordCount,
+            wasCancelled: rowScan.wasCancelled
         )
     }
 
-    private static func forEachRow(in text: String, _ body: ([String]) -> Void) -> Bool {
+    private static func forEachRow(in text: String, _ body: ([String]) -> Void) -> RowScanResult {
+        // CSV syntax is ASCII. Scan its UTF-8 storage directly and decode each field once, rather
+        // than segmenting graphemes and growing a String for every character of the export.
+        var text = text
+        return text.withUTF8 { bytes in
+            scanRows(bytes, body)
+        }
+    }
+
+    private static func scanRows(_ bytes: UnsafeBufferPointer<UInt8>, _ body: ([String]) -> Void) -> RowScanResult {
         enum FieldState: Equatable {
             case start
             case unquoted
@@ -54,95 +70,93 @@ enum CursorCSVParser {
             case quoteClosed
         }
 
-        var field = ""
         var row: [String] = []
         var state = FieldState.start
-        var i = text.startIndex
+        var fieldStart = 0
+        var fieldEnd = 0
+        // Only escaped quotes need a scratch buffer; ordinary fields decode their source slice.
+        var unescaped: [UInt8]?
+        var i = 0
 
-        while i < text.endIndex {
-            let c = text[i]
+        func appendField(through end: Int) {
+            if var value = unescaped {
+                value.append(contentsOf: bytes[fieldStart..<end])
+                row.append(String(decoding: value, as: UTF8.self))
+                unescaped = nil
+            } else {
+                row.append(String(decoding: bytes[fieldStart..<end], as: UTF8.self))
+            }
+        }
+
+        var cancellationCheckAt = 0
+        while i < bytes.count {
+            if i >= cancellationCheckAt {
+                cancellationCheckAt = i + 2_048
+                if Task<Never, Never>.isCancelled {
+                    return RowScanResult(isStructurallyComplete: false, wasCancelled: true)
+                }
+            }
+            let c = bytes[i]
 
             if state == .quoted {
-                if c == "\"" {
-                    let next = text.index(after: i)
-                    if next < text.endIndex && text[next] == "\"" {
-                        field.append("\"")
-                        i = text.index(after: next)
-                        continue
-                    } else {
-                        state = .quoteClosed
-                        i = next
+                if c == 34 {
+                    if i + 1 < bytes.count && bytes[i + 1] == 34 {
+                        if unescaped == nil { unescaped = [] }
+                        unescaped!.append(contentsOf: bytes[fieldStart..<i])
+                        unescaped!.append(34)
+                        i += 2
+                        fieldStart = i
                         continue
                     }
-                } else {
-                    field.append(c)
-                    i = text.index(after: i)
-                    continue
+                    fieldEnd = i
+                    state = .quoteClosed
                 }
+                i += 1
+                continue
+            }
+
+            if c == 44 || c == 13 || c == 10 {
+                appendField(through: state == .quoteClosed ? fieldEnd : i)
+                if c != 44 {
+                    emit(row, body)
+                    row.removeAll(keepingCapacity: true)
+                    if c == 13, i + 1 < bytes.count, bytes[i + 1] == 10 { i += 1 }
+                }
+                i += 1
+                fieldStart = i
+                state = .start
+                continue
             }
 
             switch state {
             case .start:
-                switch c {
-                case "\"":
+                if c == 34 {
                     state = .quoted
-                case ",":
-                    row.append(field)
-                    field = ""
-                case "\r", "\n", "\r\n":
-                    row.append(field)
-                    emit(row, body)
-                    row = []
-                    field = ""
-                default:
-                    field.append(c)
+                    fieldStart = i + 1
+                } else {
                     state = .unquoted
                 }
             case .unquoted:
-                switch c {
-                case "\"":
-                    return false
-                case ",":
-                    row.append(field)
-                    field = ""
-                    state = .start
-                case "\r", "\n", "\r\n":
-                    row.append(field)
-                    emit(row, body)
-                    row = []
-                    field = ""
-                    state = .start
-                default:
-                    field.append(c)
+                if c == 34 {
+                    return RowScanResult(isStructurallyComplete: false, wasCancelled: false)
                 }
             case .quoteClosed:
-                switch c {
-                case ",":
-                    row.append(field)
-                    field = ""
-                    state = .start
-                case "\r", "\n", "\r\n":
-                    row.append(field)
-                    emit(row, body)
-                    row = []
-                    field = ""
-                    state = .start
-                default:
-                    return false
-                }
+                return RowScanResult(isStructurallyComplete: false, wasCancelled: false)
             case .quoted:
                 preconditionFailure("quoted fields are handled before the state switch")
             }
-            i = text.index(after: i)
+            i += 1
         }
 
-        guard state != .quoted else { return false }
+        guard state != .quoted else {
+            return RowScanResult(isStructurallyComplete: false, wasCancelled: false)
+        }
         // Trailing partial row.
-        if !field.isEmpty || !row.isEmpty || state == .quoteClosed {
-            row.append(field)
+        if fieldStart < bytes.count || !row.isEmpty || state == .quoteClosed {
+            appendField(through: state == .quoteClosed ? fieldEnd : bytes.count)
             emit(row, body)
         }
-        return true
+        return RowScanResult(isStructurallyComplete: true, wasCancelled: false)
     }
 
     private static func emit(_ row: [String], _ body: ([String]) -> Void) {

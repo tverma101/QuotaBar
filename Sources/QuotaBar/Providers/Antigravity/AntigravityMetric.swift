@@ -1,6 +1,6 @@
 import Foundation
 
-/// The four Antigravity widget IDs and metric labels, shared by `AntigravityProvider.widgetDescriptors`
+/// The Antigravity widget IDs and metric labels, shared by `AntigravityProvider.widgetDescriptors`
 /// and `AntigravityUsageMapper` so both sides of the exact-string label binding
 /// (`WidgetDescriptor.metricLabel` == `MetricLine.label`, resolved in `WidgetDataStore.data(for:)`)
 /// come from one place — label drift there is a silent "No data" failure.
@@ -14,11 +14,13 @@ import Foundation
 enum AntigravityMetric {
     static let geminiID = "antigravity.geminiPro"
     static let geminiWeeklyID = "antigravity.geminiWeekly"
+    static let argonWeeklyID = "antigravity.argonWeekly"
     static let claudeID = "antigravity.claude"
     static let claudeWeeklyID = "antigravity.claudeWeekly"
 
     static let sessionLabel = "Session"
     static let weeklyLabel = "Weekly"
+    static let argonWeeklyLabel = "Argon Weekly"
     static let claudeLabel = "Claude"
     static let claudeWeeklyLabel = "Claude Weekly"
 }

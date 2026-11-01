@@ -30,11 +30,17 @@ struct PopoverTopBar: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("Turns providers back on for the tools you have installed and resets every provider's metrics and order. Are you sure?")
+                    Text("Turns on Claude, Codex, Cursor, Freebuff, and registered Codex accounts, turns other providers off, and resets every provider's metrics and order. Are you sure?")
                 }
             }
         case .settings:
             navigationBar(title: "Settings") {
+                withAnimation(Motion.modeSwitch) { layout.screen = .dashboard }
+            } trailing: {
+                EmptyView()
+            }
+        case .history:
+            navigationBar(title: "Usage History") {
                 withAnimation(Motion.modeSwitch) { layout.screen = .dashboard }
             } trailing: {
                 EmptyView()

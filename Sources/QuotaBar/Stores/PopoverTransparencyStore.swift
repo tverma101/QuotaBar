@@ -12,6 +12,15 @@ import os
 final class PopoverTransparencyStore {
     static let key = "increaseTransparency"
 
+    /// Posted on the default center when the panel becomes visible. The refresh loop sleeps up to
+    /// 2 minutes between closed-panel ticks on battery and presents the panel as a pure
+    /// snapshot, so without this wake a freshly opened panel showed whatever the last closed-panel
+    /// pass had painted — the "Today" tile could sit many minutes behind while the loop slept on.
+    /// Closing stays silent: the loop re-evaluates its cadence at its next wake regardless.
+    static let panelVisibilityDidChangeNotification = Notification.Name(
+        "QuotaBar.PanelVisibilityDidChange"
+    )
+
     /// The persisted preference (default off). Stored here rather than as a view-local `@AppStorage` so
     /// the AppKit panel honors exactly the value the Settings toggle writes. The no-op guard avoids a
     /// redundant defaults write (and the firehose `UserDefaults.didChangeNotification` it would emit).
@@ -38,8 +47,9 @@ final class PopoverTransparencyStore {
     /// mid Space-switch while still following the user on-screen, so an occlusion gate would freeze the
     /// animation on the very panel the user is now looking at.
     /// Process-wide panel visibility for background watchers (ledger FSEvents) that cannot hop
-    /// onto the main actor synchronously. Updated only from `setPopoverShown`.
-    nonisolated(unsafe) private static let panelOpenLock = OSAllocatedUnfairLock(initialState: false)
+    /// onto the main actor synchronously. Updated only from `setPopoverShown`. `nonisolated` (not
+    /// `nonisolated(unsafe)`) is enough for a `static let` of Sendable lock type.
+    nonisolated private static let panelOpenLock = OSAllocatedUnfairLock(initialState: false)
 
     /// Nonisolated read of whether the popover is on-screen. Safe for DispatchSource callbacks.
     nonisolated static var isPopoverShownUnlocked: Bool {
@@ -113,6 +123,12 @@ final class PopoverTransparencyStore {
         guard shown != popoverShown else { return }
         popoverShown = shown
         Self.panelOpenLock.withLock { $0 = shown }
+        // Posted only on open (the guard above makes this the rising edge) so the sleeping refresh
+        // loop runs a full-scope pass immediately instead of finishing its battery-stretched sleep
+        // while the user stares at a stale Today tile.
+        if shown {
+            NotificationCenter.default.post(name: Self.panelVisibilityDidChangeNotification, object: nil)
+        }
     }
 
     /// The resolved level both the panel and the SwiftUI surface render.

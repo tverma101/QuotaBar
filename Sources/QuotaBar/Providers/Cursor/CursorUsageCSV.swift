@@ -14,11 +14,14 @@ struct CursorUsageCSVRow: Sendable, Equatable {
 struct CursorUsageCSVParseResult: Sendable, Equatable {
     var rows: [CursorUsageCSVRow]
     var rejectedRowCount: Int
+    /// Product-labeled Grok Bot rows whose measured tokens are kept without a serving-model price.
+    var unpricedGrokBotRowCount: Int = 0
 }
 
 enum CursorUsageCSVError: Error, Equatable {
     case missingColumns([String])
     case malformedCSV
+    case futureTimestamp
 }
 
 enum CursorUsageCSV {
@@ -30,6 +33,23 @@ enum CursorUsageCSV {
         static let cacheRead = "Cache Read"
         static let output = "Output Tokens"
         static let required = [date, model, cacheWrite, input, cacheRead, output]
+    }
+
+    /// Cursor uses product labels such as `grok-bot-cua` and the legacy `sand-*` names in its
+    /// usage export. They identify Grok Bot work, not the serving model, so keep their measured tokens
+    /// under the product label and do not infer a model or price.
+    static func isOpaqueGrokBotProductLabel(_ rawModel: String) -> Bool {
+        let slug = rawModel
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: " ", with: "-")
+        return slug == "grok-bot"
+            || slug.hasPrefix("grok-bot-")
+            || slug == "grokbot"
+            || slug.hasPrefix("grokbot-")
+            || slug == "sand"
+            || slug.hasPrefix("sand-")
     }
 
     // Date parsing runs once per row of a potentially large export; the three fixed-format parsers are
@@ -53,16 +73,21 @@ enum CursorUsageCSV {
         return f
     }()
 
-    /// Pure boundary parser: maps Cursor's exported CSV text into priced rows, rejects malformed rows,
-    /// and fails when the export schema itself is unusable. Empty numeric cells are valid zeroes; a
+    /// Pure boundary parser: maps Cursor's exported CSV text into priced and unpriced usage rows,
+    /// rejects malformed rows, and fails when the export schema itself is unusable. Empty numeric cells are valid zeroes; a
     /// non-empty non-integer or negative token count rejects that row instead of silently becoming zero.
     ///
     /// Cursor's CSV rows are aggregates, not individual requests, so long-context thresholds and Max
     /// Mode uplift cannot be applied reliably from row totals; rows bill at the base model API rate.
-    static func parse(csv: String, pricing: ModelPricing) throws -> CursorUsageCSVParseResult {
+    static func parse(
+        csv: String,
+        pricing: ModelPricing,
+        maximumTimestamp: Date = JSONLScanning.maximumTimestamp(now: Date())
+    ) throws -> CursorUsageCSVParseResult {
         var rows: [CursorUsageCSVRow] = []
         var rejectedRowCount = 0
-        var acceptedTokenCount = 0
+        var unpricedGrokBotRowCount = 0
+        var hasFutureTimestamp = false
         var missingColumns = Column.required
         var hasDuplicateColumns = false
         let summary = CursorCSVParser.forEachRecord(in: csv, header: { header in
@@ -70,12 +95,17 @@ enum CursorUsageCSV {
             missingColumns = Column.required.filter { !available.contains($0) }
             hasDuplicateColumns = available.count != header.count
         }) { r in
+            guard !Task<Never, Never>.isCancelled else { return }
             guard let dateStr = r[Column.date]?.trimmingCharacters(in: .whitespaces),
                   !dateStr.isEmpty,
                   let date = parseDate(dateStr),
                   let model = r[Column.model]?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !model.isEmpty,
-                  let cacheWrite = parseIntValue(r[Column.cacheWrite]),
+                  !model.isEmpty
+            else {
+                rejectedRowCount += 1
+                return
+            }
+            guard let cacheWrite = parseIntValue(r[Column.cacheWrite]),
                   let input = parseIntValue(r[Column.input]),
                   let cacheRead = parseIntValue(r[Column.cacheRead]),
                   let output = parseIntValue(r[Column.output]),
@@ -84,12 +114,13 @@ enum CursorUsageCSV {
                 rejectedRowCount += 1
                 return
             }
-            let aggregate = acceptedTokenCount.addingReportingOverflow(rowTokenCount)
-            guard !aggregate.overflow else {
-                rejectedRowCount += 1
+            // A zero-token row is valid export structure but carries no usage. Keeping it would let
+            // a $0 mapped row falsely move a provider's lifetime "since" date backward.
+            guard rowTokenCount > 0 else { return }
+            guard date <= maximumTimestamp else {
+                hasFutureTimestamp = true
                 return
             }
-            acceptedTokenCount = aggregate.partialValue
 
             // The CSV's "Input (w/ Cache Write)" tokens were written to the prompt cache; Anthropic
             // bills those at the 5-minute cache-write rate, other providers at the input rate (their
@@ -101,23 +132,43 @@ enum CursorUsageCSV {
                 output: output
             )
 
+            // Cursor reports these rows by product (`grok-bot-cua`, legacy `sand-*`), not by the model
+            // that served them. Preserve the measured tokens under that product label, but do not
+            // assign a serving model or estimate a price we cannot verify.
+            if isOpaqueGrokBotProductLabel(model) {
+                unpricedGrokBotRowCount += 1
+                rows.append(CursorUsageCSVRow(
+                    date: date,
+                    model: model,
+                    tokens: tokens,
+                    imputedCostDollars: nil
+                ))
+                return
+            }
+
             rows.append(CursorUsageCSVRow(
                 date: date,
                 model: model,
                 tokens: tokens,
-                imputedCostDollars: pricing.estimatedCostDollars(
+                imputedCostDollars: pricing.estimatedCursorCostDollars(
                     model: model,
                     tokens: tokens,
                     applyLongContextRates: false
                 )
             ))
         }
+        if summary.wasCancelled || Task<Never, Never>.isCancelled { throw CancellationError() }
         guard summary.isStructurallyComplete, !hasDuplicateColumns else {
             throw CursorUsageCSVError.malformedCSV
         }
         guard missingColumns.isEmpty else { throw CursorUsageCSVError.missingColumns(missingColumns) }
+        guard !hasFutureTimestamp else { throw CursorUsageCSVError.futureTimestamp }
         rejectedRowCount += summary.rejectedRecordCount
-        return CursorUsageCSVParseResult(rows: rows, rejectedRowCount: rejectedRowCount)
+        return CursorUsageCSVParseResult(
+            rows: rows,
+            rejectedRowCount: rejectedRowCount,
+            unpricedGrokBotRowCount: unpricedGrokBotRowCount
+        )
     }
 
     private static func parseDate(_ raw: String) -> Date? {

@@ -146,17 +146,26 @@ enum CursorUsageMapper {
         let isTeamAccount = normalizedPlan == "team" || facts.isTeamByShape
 
         if isTeamAccount {
-            guard let limitCents = facts.limit else {
+            // A Team seat can report only a percentage of the pooled allowance. Keep the legacy
+            // dollar meter whenever a limit exists, and use the percentage for the percent-only
+            // payloads instead of failing the whole provider.
+            if let limitCents = facts.limit {
+                lines.append(.progress(
+                    label: "Total usage",
+                    used: ProviderParse.centsToDollars(planUsedCents),
+                    limit: ProviderParse.centsToDollars(limitCents),
+                    format: .dollars,
+                    resetsAt: cycle.resetsAt,
+                    periodDurationMs: cycle.periodDurationMs
+                ))
+            } else if let percent = facts.totalPercentUsed {
+                lines.append(.progress(
+                    label: "Total usage", used: percent, limit: 100, format: .percent,
+                    resetsAt: cycle.resetsAt, periodDurationMs: cycle.periodDurationMs
+                ))
+            } else {
                 throw CursorUsageError.requestBasedUnavailable("Cursor request-based usage data unavailable. Try again later.")
             }
-            lines.append(.progress(
-                label: "Total usage",
-                used: ProviderParse.centsToDollars(planUsedCents),
-                limit: ProviderParse.centsToDollars(limitCents),
-                format: .dollars,
-                resetsAt: cycle.resetsAt,
-                periodDurationMs: cycle.periodDurationMs
-            ))
         } else {
             lines.append(.progress(
                 label: "Total usage",
@@ -265,17 +274,19 @@ enum CursorUsageMapper {
 
         let normalizedPlan = planName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
 
-        if facts.planUsageUnusable && normalizedPlan == "enterprise" {
+        // A usable total percentage already answers the primary path, so an org seat must not be
+        // pushed onto the request-based fallback (which would drop the live pool meters).
+        if facts.planUsageUnusable && !facts.hasTotalUsagePercent && normalizedPlan == "enterprise" {
             return (true, "Enterprise usage data unavailable. Try again later.")
         }
-        if facts.planUsageUnusable && normalizedPlan == "team" {
+        if facts.planUsageUnusable && !facts.hasTotalUsagePercent && normalizedPlan == "team" {
             return (true, "Team request-based usage data unavailable. Try again later.")
         }
         if facts.planUsageUnusable && !facts.hasTotalUsagePercent && normalizedPlan.isEmpty && planInfoUnavailable {
             return (true, "Cursor request-based usage data unavailable. Try again later.")
         }
 
-        if facts.isTeamByShape && facts.planUsageLimitMissing {
+        if facts.isTeamByShape && facts.planUsageLimitMissing && !facts.hasTotalUsagePercent {
             return (true, "Cursor request-based usage data unavailable. Try again later.")
         }
 
@@ -301,30 +312,99 @@ enum CursorUsageMapper {
         now: Date,
         pricing: ModelPricing,
         to lines: inout [MetricLine]
-    ) -> ProviderUsageHistory {
+    ) throws -> ProviderUsageHistory {
         let calendar = Calendar.current
         var costByDay: [String: Double] = [:]
         var tokensByDay: [String: Int] = [:]
+        var apiEstimateByDay: [String: Double] = [:]
+        var apiEstimateIncompleteDays: Set<String> = []
         var modelsByDay: [String: [String: ModelAccumulator]] = [:]
-        // Rows no pricing source can price (nil imputed cost) are excluded from every displayed total —
-        // tokens, dollars, the trend, and the model breakdown — because mixing measured tokens with
-        // unpriceable ones makes the figures incoherent (a huge token count next to a dollar figure that
-        // ignores it). Their model names surface only through the warning triangle: track them per day so
-        // the spend tile can warn that its figures are incomplete. Only rows that actually spent tokens
-        // count — a 0-token row of an unknown model changes nothing, so it isn't worth flagging.
+        var incompleteCostDays: Set<String> = []
+        var unexplainedIncompleteCostDays: Set<String> = []
+        var tokenCountSaturatedDays: Set<String> = []
+        var overflowedCostDays: Set<String> = []
+        var overflowedApiEstimateDays: Set<String> = []
+        // Rows no pricing source can price (nil imputed cost) still count their tokens with a dashed
+        // cost (owner's "count tokens, dash cost" policy) — the token total stays complete while the
+        // dollar figure only reflects priced rows. Their model names surface through the warning
+        // triangle and the reveal system. Only rows that actually spent tokens flag the day — a
+        // 0-token row of an unknown model changes nothing.
         var unknownModelsByDay: [String: Set<String>] = [:]
-        for row in rows {
+        // Days whose incompleteness comes from Grok Bot product-labeled rows: Cursor named the
+        // product, not the serving model, and the parser deliberately keeps those tokens unpriced
+        // rather than guessing a model. That is an explained gap — the day's priced subtotal stays
+        // displayed with its lower-bound marker and no unknown-model warning fires.
+        var productLabeledIncompleteCostDays: Set<String> = []
+        for (index, row) in rows.enumerated() {
+            if index & 0x7F == 0, Task<Never, Never>.isCancelled { throw CancellationError() }
             let day = DailyUsageAccumulator.dayKey(from: row.date, calendar: calendar)
             let model = row.model.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let cost = row.imputedCostDollars else {
-                if row.tokens.totalTokens > 0, !model.isEmpty {
-                    unknownModelsByDay[day, default: []].insert(model)
+            let modelName = model.isEmpty ? ModelUsageEntry.unattributedModelName : model
+            // Public-API-rate comparison for the row's tokens (regardless of how the CSV cost was
+            // imputed — Cursor's own dollars are the displayed estimate).
+            let apiEstimate = model.isEmpty || CursorUsageCSV.isOpaqueGrokBotProductLabel(model)
+                ? nil
+                : pricing.estimatedCostDollars(
+                model: model,
+                tokens: row.tokens,
+                applyLongContextRates: false
+            )
+            if let apiEstimate {
+                if !overflowedApiEstimateDays.contains(day) {
+                    if let total = Self.addingFiniteCost(apiEstimateByDay[day], apiEstimate) {
+                        apiEstimateByDay[day] = total
+                    } else {
+                        apiEstimateByDay.removeValue(forKey: day)
+                        overflowedApiEstimateDays.insert(day)
+                        apiEstimateIncompleteDays.insert(day)
+                    }
                 }
+            } else if row.tokens.totalTokens > 0 {
+                apiEstimateIncompleteDays.insert(day)
+            }
+            guard let cost = row.imputedCostDollars else {
+                if row.tokens.totalTokens > 0 {
+                    incompleteCostDays.insert(day)
+                    if model.isEmpty {
+                        unexplainedIncompleteCostDays.insert(day)
+                    } else if CursorUsageCSV.isOpaqueGrokBotProductLabel(model) {
+                        productLabeledIncompleteCostDays.insert(day)
+                    } else {
+                        unknownModelsByDay[day, default: []].insert(model)
+                    }
+                }
+                let previousTokens = tokensByDay[day, default: 0]
+                if row.tokens.totalTokens > 0 && previousTokens > Int.max - row.tokens.totalTokens {
+                    tokenCountSaturatedDays.insert(day)
+                }
+                tokensByDay[day] = ProviderParse.addingSaturating(
+                    previousTokens,
+                    row.tokens.totalTokens
+                )
+                let family = model.isEmpty ? modelName : familyName(for: model, pricing: pricing)
+                modelsByDay[day, default: [:]][family, default: ModelAccumulator()].add(
+                    variant: modelName,
+                    tokens: row.tokens.totalTokens,
+                    costUSD: nil
+                )
                 continue
             }
-            costByDay[day, default: 0] += cost
-            tokensByDay[day, default: 0] += row.tokens.totalTokens
-            let modelName = model.isEmpty ? ModelUsageEntry.unattributedModelName : model
+            if overflowedCostDays.contains(day) {
+                incompleteCostDays.insert(day)
+            } else if let total = Self.addingFiniteCost(costByDay[day], cost) {
+                costByDay[day] = total
+            } else {
+                overflowedCostDays.insert(day)
+                incompleteCostDays.insert(day)
+            }
+            let previousTokens = tokensByDay[day, default: 0]
+            if row.tokens.totalTokens > 0 && previousTokens > Int.max - row.tokens.totalTokens {
+                tokenCountSaturatedDays.insert(day)
+            }
+            tokensByDay[day] = ProviderParse.addingSaturating(
+                previousTokens,
+                row.tokens.totalTokens
+            )
             let family = model.isEmpty ? modelName : familyName(for: model, pricing: pricing)
             modelsByDay[day, default: [:]][family, default: ModelAccumulator()].add(
                 variant: modelName,
@@ -334,12 +414,17 @@ enum CursorUsageMapper {
         }
 
         // Sum raw dollars per day, then snap to whole cents once — rounding per row would accumulate
-        // sub-cent drift across a busy day.
+        // sub-cent drift across a busy day. A day with only unpriced rows carries nil cost (dash).
         let daily = tokensByDay.keys.sorted(by: >).map { day in
             DailyUsageEntry(
                 date: day,
                 totalTokens: tokensByDay[day] ?? 0,
-                costUSD: ((costByDay[day] ?? 0) * 100).rounded() / 100
+                costUSD: costByDay[day].map(Self.roundToCents),
+                costIsComplete: !incompleteCostDays.contains(day),
+                hasUnexplainedIncompleteCost: unexplainedIncompleteCostDays.contains(day)
+                    ? true : (overflowedCostDays.contains(day) || productLabeledIncompleteCostDays.contains(day)
+                        ? false : nil),
+                tokenCountSaturated: tokenCountSaturatedDays.contains(day)
             )
         }
         let series = DailyUsageSeries(daily: daily)
@@ -354,7 +439,8 @@ enum CursorUsageMapper {
         SpendTileMapper.appendTokenUsage(series, to: &lines, now: now, estimated: true,
                                          unknownModelsByDay: unknownModelsByDay,
                                          modelUsage: modelUsage,
-                                         modelSourceNote: "From your Cursor usage export")
+                                         modelSourceNote: "From your Cursor usage export",
+                                         apiEstimateByDay: apiEstimateByDay.isEmpty ? nil : apiEstimateByDay)
         // Cursor's tokens come from the server-exported usage CSV, not a local CLI log, so the trend
         // note names that source rather than the "estimated from local logs" line the log-scanning
         // providers use. Tokens are measured either way.
@@ -362,42 +448,102 @@ enum CursorUsageMapper {
         return ProviderUsageHistory(
             series: series,
             modelUsage: modelUsage,
-            unknownModelsByDay: unknownModelsByDay
+            unknownModelsByDay: unknownModelsByDay,
+            apiEstimateByDay: apiEstimateByDay.isEmpty ? nil : apiEstimateByDay,
+            apiEstimateIncompleteDays: apiEstimateIncompleteDays
         )
     }
 
     /// The display family for a raw CSV slug: its canonical pricing key with a `-fast` suffix folded
     /// into the base (`gpt-5.5-extra-high-fast` → `gpt-5.5-fast` → `gpt-5.5`). Slugs no alias rule
-    /// knows keep their raw name — a wrong guess would silently merge unrelated models.
+    /// knows keep their raw name — a wrong guess would silently merge unrelated models. Grok Bot
+    /// product labels name the product, not a model, so their family is that product's display name
+    /// (the raw slugs survive as the row's tooltip variants).
     private static func familyName(for model: String, pricing: ModelPricing) -> String {
-        let canonical = pricing.supplement.canonicalName(for: model) ?? model
+        if CursorUsageCSV.isOpaqueGrokBotProductLabel(model) { return "Grok Bot" }
+        let canonical = pricing.cursorCanonicalName(for: model) ?? pricing.canonicalName(for: model) ?? model
         guard canonical.hasSuffix("-fast") else { return canonical }
         let base = String(canonical.dropLast("-fast".count))
         return base.isEmpty ? canonical : base
     }
 
+    private static func addingFiniteCost(_ current: Double?, _ addition: Double) -> Double? {
+        guard addition.isFinite, addition >= 0 else { return nil }
+        let total = (current ?? 0) + addition
+        return total.isFinite ? total : nil
+    }
+
+    private static func roundToCents(_ value: Double) -> Double {
+        let scaled = value * 100
+        guard value.isFinite, scaled.isFinite else { return value }
+        return scaled.rounded() / 100
+    }
+
     private struct ModelAccumulator {
         var tokens = 0
+        var tokenCountSaturated = false
         var costUSD: Double?
-        var variants: [String: (tokens: Int, costUSD: Double?)] = [:]
+        var costIsComplete = true
+        var costOverflowed = false
+        var variants: [String: (
+            tokens: Int,
+            costUSD: Double?,
+            costIsComplete: Bool,
+            tokenCountSaturated: Bool,
+            costOverflowed: Bool
+        )] = [:]
 
         mutating func add(variant: String, tokens: Int, costUSD: Double?) {
-            self.tokens += tokens
+            if tokens > 0 && self.tokens > Int.max - tokens { tokenCountSaturated = true }
+            self.tokens = ProviderParse.addingSaturating(self.tokens, tokens)
             if let costUSD {
-                self.costUSD = (self.costUSD ?? 0) + costUSD
+                if !self.costOverflowed {
+                    if let total = CursorUsageMapper.addingFiniteCost(self.costUSD, costUSD) {
+                        self.costUSD = total
+                    } else {
+                        self.costOverflowed = true
+                        self.costIsComplete = false
+                    }
+                }
+            } else if tokens > 0 {
+                self.costIsComplete = false
             }
-            let existing = variants[variant] ?? (0, nil)
-            let combinedCost: Double? = costUSD.map { (existing.costUSD ?? 0) + $0 } ?? existing.costUSD
-            variants[variant] = (existing.tokens + tokens, combinedCost)
+            var existing = variants[variant] ?? (tokens: 0, costUSD: nil, costIsComplete: true,
+                                                  tokenCountSaturated: false, costOverflowed: false)
+            if tokens > 0 && existing.tokens > Int.max - tokens { existing.tokenCountSaturated = true }
+            existing.tokens = ProviderParse.addingSaturating(existing.tokens, tokens)
+            if let costUSD {
+                if !existing.costOverflowed {
+                    if let total = CursorUsageMapper.addingFiniteCost(existing.costUSD, costUSD) {
+                        existing.costUSD = total
+                    } else {
+                        existing.costOverflowed = true
+                        existing.costIsComplete = false
+                    }
+                }
+            } else if tokens > 0 {
+                existing.costIsComplete = false
+            }
+            variants[variant] = existing
         }
 
         func entry(model: String) -> ModelUsageEntry {
             // A single variant with the family's own name is not a breakdown — leave `variants` nil so
             // the hover tooltip falls back to plain figures.
-            let list = variants.map { ModelUsageVariant(model: $0.key, totalTokens: $0.value.tokens, costUSD: $0.value.costUSD) }
+            let list = variants.map {
+                ModelUsageVariant(
+                    model: $0.key,
+                    totalTokens: $0.value.tokens,
+                    costUSD: $0.value.costUSD,
+                    costIsComplete: $0.value.costIsComplete ? nil : false,
+                    tokenCountSaturated: $0.value.tokenCountSaturated ? true : nil
+                )
+            }
             let isTrivial = list.count == 1 && list[0].model == model
             return ModelUsageEntry(model: model, totalTokens: tokens, costUSD: costUSD,
-                                   variants: isTrivial ? nil : list)
+                                   variants: isTrivial ? nil : list,
+                                   costIsComplete: costIsComplete ? nil : false,
+                                   tokenCountSaturated: tokenCountSaturated ? true : nil)
         }
     }
 
@@ -441,7 +587,7 @@ enum CursorUsageMapper {
         )
     }
 
-    private static func planLabel(_ value: String?) -> String? {
+    static func planLabel(_ value: String?) -> String? {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }

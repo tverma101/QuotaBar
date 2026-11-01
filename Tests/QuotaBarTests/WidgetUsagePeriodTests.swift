@@ -10,9 +10,12 @@ final class WidgetUsagePeriodTests: XCTestCase {
     private let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
 
     func testSpendTilesAreUsagePeriods() {
+        // Today, Yesterday, Last 30 Days. The All-At-API-Rates estimate is deliberately NOT a tile —
+        // the owner rejected the dashboard estimate row; the comparison lives on the history screen.
         let tiles = WidgetDescriptor.spendTiles(provider: provider)
         XCTAssertEqual(tiles.count, 3)
         XCTAssertTrue(tiles.allSatisfy { $0.sample.isUsagePeriod })
+        XCTAssertFalse(tiles.contains { $0.id == "codex.apiEstimate" })
     }
 
     func testValuesAndCombinedDefaultToNotUsagePeriod() {
@@ -59,11 +62,13 @@ final class WidgetUsagePeriodTests: XCTestCase {
                                 values: [MetricValue(number: 1.0, kind: .dollars)])
         single.unknownModels = ["GLM 5.2"]
         XCTAssertTrue(single.hasUnknownModels)
-        XCTAssertEqual(single.unknownModelTooltip, "Unknown model found\n- GLM 5.2")
+        XCTAssertEqual(single.unknownModelTooltip,
+                       "Unknown model found\n- GLM 5.2\nDisplayed cost includes priced usage only.")
 
         var many = single
         many.unknownModels = ["GLM 5.2", "Some Other Model"]
-        XCTAssertEqual(many.unknownModelTooltip, "Unknown models found\n- GLM 5.2\n- Some Other Model")
+        XCTAssertEqual(many.unknownModelTooltip,
+                       "Unknown models found\n- GLM 5.2\n- Some Other Model\nDisplayed cost includes priced usage only.")
     }
 
     func testNoUnknownModelsLeavesTriangleOff() {

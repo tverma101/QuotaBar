@@ -9,6 +9,18 @@ struct AppendOnlyFileRevision: Equatable, Sendable {
     var size: UInt64
 }
 
+struct AppendOnlyFileModificationTimes: Equatable, Sendable {
+    var mtimeSeconds: Int64
+    var mtimeNanoseconds: Int64
+    var ctimeSeconds: Int64
+    var ctimeNanoseconds: Int64
+}
+
+struct AppendOnlyFileStamp: Equatable, Sendable {
+    var revision: AppendOnlyFileRevision
+    var modificationTimes: AppendOnlyFileModificationTimes
+}
+
 enum AppendOnlyFileProbe {
     /// Total prefix bytes sampled when validating a large append checkpoint. Small files up to this
     /// size are compared in full. Large files spread the same tiny budget across the historical prefix.
@@ -16,16 +28,32 @@ enum AppendOnlyFileProbe {
     private static let anchorSamples = 9
 
     static func revision(at url: URL) -> AppendOnlyFileRevision? {
+        stamp(at: url)?.revision
+    }
+
+    static func modificationTimes(at url: URL) -> AppendOnlyFileModificationTimes? {
+        stamp(at: url)?.modificationTimes
+    }
+
+    static func stamp(at url: URL) -> AppendOnlyFileStamp? {
         // Resolve first, then lstat the concrete path. `stat` is imported into Swift as both the C
         // struct and function name; `lstat` avoids that overload ambiguity while resolution keeps
         // symlink aliases tied to the target file's inode rather than the link object.
         let resolved = url.resolvingSymlinksInPath()
         var value = stat()
         guard Darwin.lstat(resolved.path, &value) == 0, value.st_size >= 0 else { return nil }
-        return AppendOnlyFileRevision(
-            device: UInt64(value.st_dev),
-            inode: UInt64(value.st_ino),
-            size: UInt64(value.st_size)
+        return AppendOnlyFileStamp(
+            revision: AppendOnlyFileRevision(
+                device: UInt64(value.st_dev),
+                inode: UInt64(value.st_ino),
+                size: UInt64(value.st_size)
+            ),
+            modificationTimes: AppendOnlyFileModificationTimes(
+                mtimeSeconds: Int64(value.st_mtimespec.tv_sec),
+                mtimeNanoseconds: Int64(value.st_mtimespec.tv_nsec),
+                ctimeSeconds: Int64(value.st_ctimespec.tv_sec),
+                ctimeNanoseconds: Int64(value.st_ctimespec.tv_nsec)
+            )
         )
     }
 
@@ -93,12 +121,21 @@ enum AppendOnlyFileProbe {
 final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unchecked Sendable {
     struct Entry: Sendable {
         var revision: AppendOnlyFileRevision
+        /// Optional extra guard for consumers that must reject same-size rewrites outside sampled
+        /// prefix anchors. Append-only readers may leave this unset and rely on their own stamp.
+        var modificationTimes: AppendOnlyFileModificationTimes? = nil
         var offset: UInt64
         var anchor: Data
         var partialLine: Data
         var isDiscardingOversizedLine: Bool
         var parserState: ParserState
         var items: [Item]
+        /// Small append fragments can be shared by multiple account folds that observed the same
+        /// file revision. Unlike `items`, this never contains historical rows.
+        var appendedFromRevision: AppendOnlyFileRevision? = nil
+        var appendedFromAnchor: Data? = nil
+        var appendedItems: [Item] = []
+        var appendedItemsAvailable = false
         /// False after `unloadRetainedItems()` cleared `items` while keeping the append checkpoint.
         /// Distinguished from a real empty parse (`items.isEmpty && itemsAvailable`).
         var itemsAvailable: Bool = true
@@ -144,7 +181,13 @@ final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unc
         }
     }
 
-    func store(_ entry: Entry, for key: String, parseKind: ParseKind, bytesRead: Int) {
+    func store(
+        _ entry: Entry,
+        for key: String,
+        parseKind: ParseKind,
+        bytesRead: Int,
+        retainItems: Bool = true
+    ) {
         lock.withLock {
             tick &+= 1
             var stats = storage[key]?.statistics ?? Statistics()
@@ -154,7 +197,12 @@ final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unc
             }
             stats.bytesRead += max(0, bytesRead)
             var storedEntry = entry
-            storedEntry.itemsAvailable = true
+            if retainItems {
+                storedEntry.itemsAvailable = true
+            } else {
+                storedEntry.items = []
+                storedEntry.itemsAvailable = false
+            }
             storage[key] = Stored(entry: storedEntry, statistics: stats, accessTick: tick)
             evictIfNeededLocked()
         }
@@ -184,6 +232,8 @@ final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unc
             for key in Array(storage.keys) {
                 guard var stored = storage[key] else { continue }
                 stored.entry.items = []
+                stored.entry.appendedItems = []
+                stored.entry.appendedItemsAvailable = false
                 stored.entry.itemsAvailable = false
                 storage[key] = stored
             }
@@ -191,7 +241,9 @@ final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unc
     }
 
     private func retainedItemCountLocked() -> Int {
-        storage.values.reduce(into: 0) { $0 += $1.entry.items.count }
+        storage.values.reduce(into: 0) {
+            $0 += $1.entry.items.count + $1.entry.appendedItems.count
+        }
     }
 
     private func evictIfNeededLocked() {

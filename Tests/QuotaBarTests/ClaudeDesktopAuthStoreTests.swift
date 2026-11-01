@@ -13,6 +13,12 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
     private let otherClientID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
     private let password = "fixture-safe-storage-password"
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
+    private var safeStoragePermissionKey: KeychainItemKey {
+        KeychainItemKey(
+            service: ClaudeDesktopSafeStorageKeyReader.service,
+            account: ClaudeDesktopSafeStorageKeyReader.account
+        )
+    }
 
     func testDecryptsElectronSafeStorageValue() throws {
         let key = try ClaudeDesktopAuthStore.deriveKey(password: password)
@@ -66,6 +72,51 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
         ).status, .notFound)
     }
 
+    func testBatchOrganizationLoadRejectsAccountSwitchDuringSafeStorageRead() async throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("account-a-token", expiresIn: 3_600)],
+            accountUUID: accountUUID
+        )
+        let keyReader = AccountSwitchingClaudeDesktopKeyReader(password: password)
+        let fixtureHome = home
+        let fixtureNow = now
+        let expectedAccountUUID = accountUUID
+        let organizationID = organization
+        let store = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow },
+            keyCache: SafeStorageKeyCache()
+        )
+        let task = Task.detached {
+            store.loadOrganizations(
+                [organizationID],
+                allowInteraction: false,
+                expectedAccountUUID: expectedAccountUUID
+            )
+        }
+        XCTAssertEqual(keyReader.readStarted.wait(timeout: .now() + 5), .success)
+        defer { keyReader.allowRead.signal() }
+
+        let configPath = home.appendingPathComponent("Library/Application Support/Claude/config.json").path
+        let config = try XCTUnwrap(fixture.files.files[configPath])
+        var object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(config.utf8)) as? [String: Any]
+        )
+        object["lastKnownAccountUuid"] = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        let switchedConfig = try JSONSerialization.data(withJSONObject: object)
+        fixture.files.files[configPath] = String(decoding: switchedConfig, as: UTF8.self)
+        keyReader.allowRead.signal()
+
+        let result = await task.value
+
+        XCTAssertEqual(result.credentialsByOrganization[organization]?.status, .notFound)
+        XCTAssertNil(result.credentialsByOrganization[organization]?.oauth)
+    }
+
     func testLogoutWithRetainedDatabaseAndCacheDoesNotExposeCredentials() throws {
         let fixture = try makeFixture(
             activeOrganization: organization,
@@ -85,6 +136,44 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
             allowInteraction: false, organization: organization, expectedAccountUUID: accountUUID
         ).status, .notFound)
         XCTAssertTrue(fixture.keyReader.calls.isEmpty)
+    }
+
+    func testUnreadableDesktopConfigCountsAsMaterialWithoutReadingKeychain() throws {
+        let fixtureHome = home
+        let files = ClaudeDesktopUnreadableConfigFiles(
+            path: fixtureHome.appendingPathComponent("Library/Application Support/Claude/config.json").path
+        )
+        let keyReader = FakeClaudeDesktopKeyReader(password: password, requiresInteraction: true)
+        let store = ClaudeDesktopAuthStore(
+            files: files,
+            sqlite: FakeClaudeDesktopSQLite(value: "1"),
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome }
+        )
+
+        XCTAssertEqual(store.credentialMaterialStatus(), .unreadable)
+        XCTAssertTrue(store.hasCredentialMaterial())
+        XCTAssertEqual(store.load(allowInteraction: true).status, .unreadable)
+        XCTAssertTrue(keyReader.calls.isEmpty, "detection and failed config reads must not prompt for Safe Storage")
+    }
+
+    func testUnreadableDesktopCookieDatabaseCountsAsMaterialWithoutReadingKeychain() throws {
+        let fixtureHome = home
+        let configPath = fixtureHome.appendingPathComponent("Library/Application Support/Claude/config.json").path
+        let cookiesPath = fixtureHome.appendingPathComponent("Library/Application Support/Claude/Cookies").path
+        let files = FakeFiles([configPath: #"{"oauth:tokenCacheV2":"encrypted-cache"}"#, cookiesPath: "sqlite-fixture"])
+        let keyReader = FakeClaudeDesktopKeyReader(password: password, requiresInteraction: true)
+        let store = ClaudeDesktopAuthStore(
+            files: files,
+            sqlite: UnreadableClaudeDesktopSQLite(),
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome }
+        )
+
+        XCTAssertEqual(store.credentialMaterialStatus(), .unreadable)
+        XCTAssertTrue(store.hasCredentialMaterial())
+        XCTAssertEqual(store.load(allowInteraction: true).status, .unreadable)
+        XCTAssertTrue(keyReader.calls.isEmpty, "a failed local probe must not escalate to a Keychain prompt")
     }
 
     @MainActor
@@ -116,6 +205,40 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
         XCTAssertEqual(assembly.identityKeysByCard, ["codex": "codex-1"])
         XCTAssertEqual(accountsStore.records.map(\.family), ["codex"])
         XCTAssertTrue(fixture.keyReader.calls.isEmpty)
+    }
+
+    func testDisabledClaudeSkipsSafeStorageDuringDesktopAccountDiscovery() throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)],
+            accountUUID: accountUUID
+        )
+        let fixtureHome = home
+        let observer = DefaultAccountObserver(
+            environment: FakeEnvironment(), files: fixture.files, keychain: FakeKeychain(),
+            homeDirectory: { fixtureHome }
+        )
+
+        let discovery = ProviderAccountAssembly.scan(
+            observer: observer,
+            families: ["claude"],
+            desktop: fixture.store,
+            discoverClaudeDesktopOrganizations: false
+        )
+
+        XCTAssertTrue(discovery.didSkipClaudeDesktopDiscovery)
+        XCTAssertTrue(discovery.desktopOrganizations.isEmpty)
+        XCTAssertTrue(fixture.keyReader.calls.isEmpty, "a disabled provider must not read Desktop Safe Storage")
+    }
+
+    @MainActor
+    func testGenericClaudeFallbackReusesDiscoverySafeStorageKeyCache() throws {
+        let keyCache = SafeStorageKeyCache()
+        let provider = try XCTUnwrap(
+            ProviderCatalog.make(claudeDesktopKeyCache: keyCache).compactMap { $0 as? ClaudeProvider }.first
+        )
+
+        XCTAssertTrue(provider.authStore.desktop.keyCache === keyCache)
     }
 
     @MainActor
@@ -157,8 +280,16 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
         XCTAssertEqual(assembly.identityKeysByCard, [workID: currentIdentity, "claude": previousIdentity])
         XCTAssertEqual(assembly.claudeCards.map(\.displayName), ["Claude — SUNSTORY", "Claude — Personal"])
         let providers = ProviderCatalog.make(
-            claudeCards: assembly.claudeCards, claudeIdentityKeys: assembly.identityKeysByCard
+            claudeCards: assembly.claudeCards,
+            claudeIdentityKeys: assembly.identityKeysByCard,
+            claudeDesktopKeyCache: assembly.desktopKeyCache
         ).compactMap { $0 as? ClaudeProvider }
+        XCTAssertTrue(providers.allSatisfy { $0.authStore.desktop.keyCache === assembly.desktopKeyCache })
+        XCTAssertEqual(fixture.keyReader.calls.count, 1, "discovery performs one successful Safe Storage read")
+        _ = try assembly.desktopKeyCache.getOrLoad {
+            try fixture.keyReader.readPassword(allowInteraction: false).map { Data($0.utf8) }
+        }
+        XCTAssertEqual(fixture.keyReader.calls.count, 1, "the provider cache reuses the discovery key")
         XCTAssertEqual(providers.map { $0.provider.id }, [workID, "claude"])
         XCTAssertEqual(providers.map { $0.authStore.desktopOnly }, [false, true])
         XCTAssertEqual(providers.map { $0.authStore.preferOrganizationScopedDesktop }, [true, false])
@@ -266,7 +397,554 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
         XCTAssertEqual(fixture.keyReader.calls, [false, false, true])
     }
 
+    func testParallelDesktopCardsShareSuccessfulSafeStoragePrompt() async throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)]
+        )
+        let keyCache = SafeStorageKeyCache()
+        let keyReader = BlockingClaudeDesktopKeyReader(password: password, blockInteraction: true)
+        let fixtureHome = home
+        let fixtureNow = now
+        let firstStore = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow },
+            keyCache: keyCache
+        )
+        let siblingStore = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow },
+            keyCache: keyCache
+        )
+        let interactionGate = CredentialInteractionGate()
+        let permissionKey = KeychainItemKey(
+            service: ClaudeDesktopSafeStorageKeyReader.service,
+            account: ClaudeDesktopSafeStorageKeyReader.account
+        )
+        KeychainPermissionGate.shared.reset(permissionKey)
+        defer { KeychainPermissionGate.shared.reset(permissionKey) }
+        let first = Task.detached {
+            firstStore.load(allowInteraction: true, interactionGate: interactionGate)
+        }
+        XCTAssertEqual(keyReader.interactiveReadStarted.wait(timeout: .now() + 5), .success)
+
+        let siblingStarted = DispatchSemaphore(value: 0)
+        let sibling = Task.detached {
+            siblingStarted.signal()
+            return siblingStore.load(allowInteraction: true, interactionGate: interactionGate)
+        }
+        XCTAssertEqual(siblingStarted.wait(timeout: .now() + 5), .success)
+        let siblingWaitedForKey = waitUntil(timeout: 5) { keyCache.waitingReaderCount == 1 }
+        keyReader.allowInteractiveRead.signal()
+
+        let firstResult = await first.value
+        let siblingResult = await sibling.value
+
+        XCTAssertTrue(siblingWaitedForKey, "the second account card should wait for the first Safe Storage read")
+        XCTAssertEqual(firstResult.status, .available)
+        XCTAssertEqual(siblingResult.status, .available)
+        XCTAssertEqual(firstResult.oauth?.accessToken, "desktop-token")
+        XCTAssertEqual(siblingResult.oauth?.accessToken, "desktop-token")
+        XCTAssertEqual(keyReader.calls, [false, true], "only one silent probe and one approval dialog should run")
+    }
+
+    func testSeparateSafeStorageCachesRecoverAfterSiblingGrantWithoutSecondPrompt() async throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)]
+        )
+        let keyReader = GrantingAfterInteractiveClaudeDesktopKeyReader(password: password)
+        let fixtureHome = home
+        let fixtureNow = now
+        let firstStore = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow },
+            keyCache: SafeStorageKeyCache()
+        )
+        let siblingStore = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow },
+            keyCache: SafeStorageKeyCache()
+        )
+        let interactionGate = CredentialInteractionGate()
+        KeychainPermissionGate.shared.reset(safeStoragePermissionKey)
+        defer { KeychainPermissionGate.shared.reset(safeStoragePermissionKey) }
+
+        let first = Task.detached {
+            firstStore.load(allowInteraction: true, interactionGate: interactionGate)
+        }
+        XCTAssertEqual(keyReader.interactiveReadStarted.wait(timeout: .now() + 2), .success)
+        let sibling = Task.detached {
+            siblingStore.load(allowInteraction: true, interactionGate: interactionGate)
+        }
+
+        let siblingWaited = waitUntil(timeout: 2) {
+            KeychainPermissionGate.shared.interactiveQueryWaiterCountForTesting() > 0
+        }
+        keyReader.releaseInteractiveRead.signal()
+
+        let firstResult = await first.value
+        let siblingResult = await sibling.value
+        XCTAssertTrue(siblingWaited, "the sibling must wait for the same item's interactive result")
+        XCTAssertEqual(firstResult.status, .available)
+        XCTAssertEqual(siblingResult.status, .available)
+        XCTAssertEqual(keyReader.calls, [false, true, false], "only the owner may prompt; the sibling retries silently")
+    }
+
+    func testSpentManualPromptBudgetDoesNotRepeatSafeStorageReadForSiblingCard() async throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)]
+        )
+        let keyReader = FakeClaudeDesktopKeyReader(password: password, requiresInteraction: true)
+        let keyCache = SafeStorageKeyCache()
+        let fixtureHome = home
+        let fixtureNow = now
+        let firstStore = ClaudeDesktopAuthStore(
+            files: fixture.files, sqlite: fixture.sqlite, keyReader: keyReader,
+            homeDirectory: { fixtureHome }, now: { fixtureNow }, keyCache: keyCache
+        )
+        let siblingStore = ClaudeDesktopAuthStore(
+            files: fixture.files, sqlite: fixture.sqlite, keyReader: keyReader,
+            homeDirectory: { fixtureHome }, now: { fixtureNow }, keyCache: keyCache
+        )
+        KeychainPermissionGate.shared.reset(safeStoragePermissionKey)
+        defer { KeychainPermissionGate.shared.reset(safeStoragePermissionKey) }
+
+        let result = await withManualRefresh {
+            let interactionGate = ProviderRefreshContext.credentialInteractionGate
+            let spent = interactionGate?.claim() ?? false
+            let first = firstStore.load(allowInteraction: true, interactionGate: interactionGate)
+            let sibling = siblingStore.load(allowInteraction: true, interactionGate: interactionGate)
+            return (spent, first, sibling)
+        }
+
+        XCTAssertTrue(result.0, "another provider has already used this action's shared prompt budget")
+        XCTAssertEqual(result.1.status, .permissionRequired)
+        XCTAssertEqual(result.2.status, .permissionRequired)
+        XCTAssertEqual(keyReader.calls, [false], "a sibling card must reuse the declined-item result")
+        XCTAssertTrue(KeychainPermissionGate.shared.isDeclined(safeStoragePermissionKey))
+    }
+
+    func testCancelledSafeStorageCacheWaiterReturnsBeforeLeaderFinishes() async throws {
+        let cache = SafeStorageKeyCache()
+        let loaderCalls = SafeStorageLoadCounter()
+        let leaderStarted = DispatchSemaphore(value: 0)
+        let releaseLeader = DispatchSemaphore(value: 0)
+        let waiterFinished = SafeStorageLoadCounter()
+        defer { releaseLeader.signal() }
+
+        let leader = Task.detached {
+            try cache.getOrLoad {
+                loaderCalls.increment()
+                leaderStarted.signal()
+                _ = releaseLeader.wait(timeout: .now() + 5)
+                return Data([1])
+            }
+        }
+        XCTAssertEqual(leaderStarted.wait(timeout: .now() + 5), .success)
+
+        let waiterStarted = DispatchSemaphore(value: 0)
+        let waiter = Task.detached {
+            waiterStarted.signal()
+            return try cache.getOrLoad {
+                loaderCalls.increment()
+                return Data([2])
+            }
+        }
+        XCTAssertEqual(waiterStarted.wait(timeout: .now() + 5), .success)
+        XCTAssertTrue(waitUntil(timeout: 5) { cache.waitingReaderCount == 1 })
+        let observer = Task.detached {
+            do {
+                _ = try await waiter.value
+                waiterFinished.increment()
+                return false
+            } catch is CancellationError {
+                waiterFinished.increment()
+                return true
+            } catch {
+                waiterFinished.increment()
+                return false
+            }
+        }
+
+        waiter.cancel()
+        let returnedBeforeLeaderRelease = waitUntil(timeout: 1) { waiterFinished.value > 0 }
+        releaseLeader.signal()
+        let leaderValue = try await leader.value
+        let waiterWasCancelled = await observer.value
+
+        XCTAssertTrue(returnedBeforeLeaderRelease, "a canceled waiter must not occupy a worker until Security returns")
+        XCTAssertTrue(waiterWasCancelled)
+        XCTAssertEqual(leaderValue, Data([1]))
+        XCTAssertEqual(loaderCalls.value, 1, "the canceled waiter must not start another Safe Storage read")
+    }
+
+    func testCurrentSafeStorageWaiterRetriesWhenStaleLeaderIsSuperseded() async throws {
+        let cache = SafeStorageKeyCache()
+        let loaderCalls = SafeStorageLoadCounter()
+        let leaderStarted = SafeStorageLoadCounter()
+        let releaseLeader = DispatchSemaphore(value: 0)
+        let staleAction = SafeStorageActionValidity(true)
+        let currentAction = SafeStorageActionValidity(true)
+        defer { releaseLeader.signal() }
+
+        let leader = Task.detached {
+            try cache.getOrLoad({
+                loaderCalls.increment()
+                leaderStarted.increment()
+                _ = releaseLeader.wait(timeout: .now() + 5)
+                throw CancellationError()
+            }, isCurrent: { staleAction.isCurrent })
+        }
+        XCTAssertTrue(waitUntil(timeout: 5) { leaderStarted.value == 1 })
+
+        let currentWaiter = Task.detached {
+            try cache.getOrLoad({
+                loaderCalls.increment()
+                return Data([2])
+            }, isCurrent: { currentAction.isCurrent })
+        }
+        XCTAssertTrue(waitUntil(timeout: 5) { cache.waitingReaderCount == 1 })
+        staleAction.setCurrent(false)
+        releaseLeader.signal()
+
+        do {
+            _ = try await leader.value
+            XCTFail("the superseded leader should receive cancellation")
+        } catch is CancellationError {
+            // Expected: the leader's manual action no longer owns this read.
+        }
+        let currentValue = try await currentWaiter.value
+        XCTAssertEqual(currentValue, Data([2]))
+        XCTAssertEqual(loaderCalls.value, 2, "the current action must perform its own cache load")
+    }
+
+    func testStaleSafeStorageKeychainFailureDoesNotPoisonCurrentWaiter() async throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)]
+        )
+        let cache = SafeStorageKeyCache()
+        let reader = StaleFailureClaudeDesktopKeyReader(password: password)
+        let fixtureHome = home
+        let fixtureNow = now
+        func store() -> ClaudeDesktopAuthStore {
+            ClaudeDesktopAuthStore(
+                files: fixture.files,
+                sqlite: fixture.sqlite,
+                keyReader: reader,
+                homeDirectory: { fixtureHome },
+                now: { fixtureNow },
+                keyCache: cache
+            )
+        }
+        let staleStore = store()
+        let currentStore = store()
+        KeychainPermissionGate.shared.reset(safeStoragePermissionKey)
+        defer { KeychainPermissionGate.shared.reset(safeStoragePermissionKey) }
+        defer { reader.releaseFirstRead.signal() }
+
+        let staleAction = Task.detached {
+            await withManualRefresh {
+                await loadOffMainActor {
+                    staleStore.load(
+                        allowInteraction: ProviderRefreshContext.isManual,
+                        interactionGate: ProviderRefreshContext.credentialInteractionGate
+                    )
+                }
+            }
+        }
+        XCTAssertEqual(reader.firstReadStarted.wait(timeout: .now() + 5), .success)
+
+        let currentAction = Task.detached {
+            await withManualRefresh {
+                await loadOffMainActor {
+                    currentStore.load(
+                        allowInteraction: ProviderRefreshContext.isManual,
+                        interactionGate: ProviderRefreshContext.credentialInteractionGate
+                    )
+                }
+            }
+        }
+        XCTAssertTrue(waitUntil(timeout: 5) { cache.waitingReaderCount == 1 })
+        reader.releaseFirstRead.signal()
+
+        let staleResult = await staleAction.value
+        let currentResult = await currentAction.value
+
+        XCTAssertEqual(staleResult.status, .notChecked, "the superseded Keychain failure belongs to the stale action")
+        XCTAssertEqual(currentResult.status, .available, "the current action must perform its own Safe Storage read")
+        XCTAssertEqual(reader.calls, [false, false])
+    }
+
+    func testConcurrentSafeStorageWaitersShareAbsenceAndFailuresUntilNextRefresh() async throws {
+        for shouldThrow in [false, true] {
+            let cache = SafeStorageKeyCache()
+            let loaderCalls = SafeStorageLoadCounter()
+            let leaderStarted = DispatchSemaphore(value: 0)
+            let releaseLeader = DispatchSemaphore(value: 0)
+            defer { releaseLeader.signal() }
+
+            let leader = Task.detached {
+                try cache.getOrLoad {
+                    loaderCalls.increment()
+                    leaderStarted.signal()
+                    _ = releaseLeader.wait(timeout: .now() + 5)
+                    if shouldThrow { throw SafeStorageLoadFailure.failed }
+                    return nil
+                }
+            }
+            XCTAssertEqual(leaderStarted.wait(timeout: .now() + 5), .success)
+
+            let waiterStarted = DispatchSemaphore(value: 0)
+            let waiter = Task.detached {
+                waiterStarted.signal()
+                return try cache.getOrLoad {
+                    loaderCalls.increment()
+                    return Data([2])
+                }
+            }
+            XCTAssertEqual(waiterStarted.wait(timeout: .now() + 5), .success)
+            XCTAssertTrue(waitUntil(timeout: 5) { cache.waitingReaderCount == 1 })
+            releaseLeader.signal()
+
+            if shouldThrow {
+                do { _ = try await leader.value; XCTFail("expected the leader failure") }
+                catch SafeStorageLoadFailure.failed { }
+                do { _ = try await waiter.value; XCTFail("the waiter should share the leader failure") }
+                catch SafeStorageLoadFailure.failed { }
+            } else {
+                let leaderValue = try await leader.value
+                let waiterValue = try await waiter.value
+                XCTAssertNil(leaderValue)
+                XCTAssertNil(waiterValue, "the waiter must share absence instead of retrying")
+            }
+            XCTAssertEqual(loaderCalls.value, 1)
+
+            let retried = try cache.getOrLoad { loaderCalls.increment(); return Data([3]) }
+            XCTAssertEqual(retried, Data([3]), "a later independent refresh may retry the failed/absent item")
+            XCTAssertEqual(loaderCalls.value, 2)
+        }
+    }
+
+    func testNewManualActionCannotPromptWhileSafeStorageReadIsInFlight() async throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)]
+        )
+        let fixtureHome = home
+        let fixtureNow = now
+        let blockingReader = BlockingClaudeDesktopKeyReader(password: password, blockInteraction: true)
+        let firstStore = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: blockingReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow }
+        )
+        let retryReader = FakeClaudeDesktopKeyReader(password: password, requiresInteraction: true)
+        let retryStore = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: retryReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow }
+        )
+        let permissionKey = KeychainItemKey(
+            service: ClaudeDesktopSafeStorageKeyReader.service,
+            account: ClaudeDesktopSafeStorageKeyReader.account
+        )
+        KeychainPermissionGate.shared.reset(permissionKey)
+        defer { KeychainPermissionGate.shared.reset(permissionKey) }
+
+        let firstAction = Task.detached {
+            await withManualRefresh {
+                firstStore.load(
+                    allowInteraction: ProviderRefreshContext.isManual,
+                    interactionGate: ProviderRefreshContext.credentialInteractionGate
+                )
+            }
+        }
+        XCTAssertEqual(
+            blockingReader.interactiveReadStarted.wait(timeout: .now() + 5), .success,
+            "the first action must be paused inside the interactive Safe Storage read"
+        )
+
+        let overlappingResult = await withManualRefresh {
+            retryStore.load(
+                allowInteraction: ProviderRefreshContext.isManual,
+                interactionGate: ProviderRefreshContext.credentialInteractionGate
+            )
+        }
+        XCTAssertEqual(overlappingResult.status, .permissionRequired)
+        XCTAssertEqual(retryReader.calls, [false], "a newer action must not start another Keychain query")
+
+        blockingReader.allowInteractiveRead.signal()
+        let staleResult = await firstAction.value
+        XCTAssertEqual(staleResult.status, .notChecked, "the superseded action must not publish its result")
+
+        let retryResult = await withManualRefresh {
+            retryStore.load(
+                allowInteraction: ProviderRefreshContext.isManual,
+                interactionGate: ProviderRefreshContext.credentialInteractionGate
+            )
+        }
+        XCTAssertEqual(retryResult.status, .available)
+        XCTAssertEqual(retryReader.calls, [false, false, true])
+    }
+
+    func testQueuedOlderManualActionCannotPromptAfterNewerManualActionBegins() async throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)]
+        )
+        let fixtureHome = home
+        let fixtureNow = now
+        let keyReader = BlockingClaudeDesktopKeyReader(password: password, blockInteraction: false)
+        let store = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow }
+        )
+        let permissionKey = KeychainItemKey(
+            service: ClaudeDesktopSafeStorageKeyReader.service,
+            account: ClaudeDesktopSafeStorageKeyReader.account
+        )
+        KeychainPermissionGate.shared.reset(permissionKey)
+        defer { KeychainPermissionGate.shared.reset(permissionKey) }
+
+        // The older manual action reaches its detached credential load and pauses on the silent
+        // Keychain probe. A later Refresh starts before that probe returns.
+        let olderAction = Task.detached {
+            await withManualRefresh {
+                await loadOffMainActor {
+                    store.load(
+                        allowInteraction: ProviderRefreshContext.isManual,
+                        interactionGate: ProviderRefreshContext.credentialInteractionGate
+                    )
+                }
+            }
+        }
+        XCTAssertEqual(keyReader.silentReadStarted.wait(timeout: .now() + 5), .success)
+
+        let newerActionID = await withManualRefresh {
+            ProviderRefreshContext.manualActionID
+        }
+        XCTAssertNotNil(newerActionID, "the newer Refresh must advance the action identity")
+
+        keyReader.allowSilentRead.signal()
+        let staleResult = await olderAction.value
+
+        XCTAssertEqual(staleResult.status, .notChecked, "a superseded action must not publish a stale Keychain permission result")
+        XCTAssertEqual(keyReader.calls, [false], "a stale Desktop read may not open a Keychain prompt")
+        XCTAssertFalse(KeychainPermissionGate.shared.isDeclined(permissionKey))
+        XCTAssertFalse(KeychainPermissionGate.shared.isBlocked(permissionKey), "stale work must not block the newer action")
+
+        // The stale refusal must leave the next explicit action free to claim its own prompt.
+        let retry = Task.detached {
+            await withManualRefresh {
+                await loadOffMainActor {
+                    store.load(
+                        allowInteraction: ProviderRefreshContext.isManual,
+                        interactionGate: ProviderRefreshContext.credentialInteractionGate
+                    )
+                }
+            }
+        }
+        XCTAssertEqual(keyReader.silentReadStarted.wait(timeout: .now() + 5), .success)
+        keyReader.allowSilentRead.signal()
+        let retryResult = await retry.value
+        XCTAssertEqual(retryResult.status, .available)
+        XCTAssertEqual(keyReader.calls, [false, false, true])
+    }
+
+    func testCancellationBeforeInteractiveReadDoesNotRecordUserDecline() async throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)]
+        )
+        let fixtureHome = home
+        let fixtureNow = now
+        let permissionKey = KeychainItemKey(
+            service: ClaudeDesktopSafeStorageKeyReader.service,
+            account: ClaudeDesktopSafeStorageKeyReader.account
+        )
+        KeychainPermissionGate.shared.reset(permissionKey)
+        defer { KeychainPermissionGate.shared.reset(permissionKey) }
+        let keyReader = BlockingClaudeDesktopKeyReader(password: password, blockInteraction: false)
+        let store = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow }
+        )
+        let task = Task.detached {
+            store.load(allowInteraction: true, interactionGate: CredentialInteractionGate())
+        }
+        XCTAssertEqual(keyReader.silentReadStarted.wait(timeout: .now() + 5), .success)
+        task.cancel()
+        keyReader.allowSilentRead.signal()
+
+        let result = await task.value
+
+        XCTAssertEqual(result.status, .notChecked)
+        XCTAssertEqual(keyReader.calls, [false], "the canceled refresh must stop before the interactive Keychain query")
+        XCTAssertFalse(KeychainPermissionGate.shared.isDeclined(permissionKey))
+    }
+
+    func testCancellationDuringInteractiveSafeStorageReadDoesNotRecordDecline() throws {
+        let fixture = try makeFixture(
+            activeOrganization: organization,
+            v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)]
+        )
+        let permissionKey = KeychainItemKey(
+            service: ClaudeDesktopSafeStorageKeyReader.service,
+            account: ClaudeDesktopSafeStorageKeyReader.account
+        )
+        KeychainPermissionGate.shared.reset(permissionKey)
+        defer { KeychainPermissionGate.shared.reset(permissionKey) }
+
+        let fixtureHome = home
+        let fixtureNow = now
+        let keyReader = CancellingClaudeDesktopKeyReader()
+        let token = KeychainReadCancellationToken(invalidateContext: { _ in })
+        let store = ClaudeDesktopAuthStore(
+            files: fixture.files,
+            sqlite: fixture.sqlite,
+            keyReader: keyReader,
+            homeDirectory: { fixtureHome },
+            now: { fixtureNow }
+        )
+
+        let result = try ProviderRefreshContext.$keychainReadCancellationToken.withValue(token) {
+            store.load(allowInteraction: true, interactionGate: CredentialInteractionGate())
+        }
+
+        XCTAssertEqual(result.status, .notChecked)
+        XCTAssertEqual(keyReader.calls, [false, true])
+        XCTAssertTrue(KeychainPermissionGate.shared.isBlocked(permissionKey))
+        XCTAssertFalse(KeychainPermissionGate.shared.isDeclined(permissionKey), "load cancellation is not a declined prompt")
+    }
+
     func testExpiredDesktopTokenIsStale() throws {
+        KeychainPermissionGate.shared.reset(safeStoragePermissionKey)
+        defer { KeychainPermissionGate.shared.reset(safeStoragePermissionKey) }
         let fixture = try makeFixture(
             activeOrganization: organization,
             v2: [cacheKey(organization: organization): tokenEntry("expired", expiresIn: -1)]
@@ -290,6 +968,8 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
     }
 
     func testMultiOrganizationCLICardPrefersItsOwnScopedDesktopCredential() throws {
+        KeychainPermissionGate.shared.reset(safeStoragePermissionKey)
+        defer { KeychainPermissionGate.shared.reset(safeStoragePermissionKey) }
         let fixture = try makeFixture(
             activeOrganization: organization,
             v2: [
@@ -333,6 +1013,8 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
 
     @MainActor
     func testDesktopPermissionIsNotMaskedByScopedCLIToken() async throws {
+        KeychainPermissionGate.shared.reset(safeStoragePermissionKey)
+        defer { KeychainPermissionGate.shared.reset(safeStoragePermissionKey) }
         let fixture = try makeFixture(
             activeOrganization: organization,
             v2: [cacheKey(organization: organization): tokenEntry("desktop-token", expiresIn: 3_600)],
@@ -413,7 +1095,8 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
                 "CLAUDE_CONFIG_DIR": "/tmp/claude",
                 "CLAUDE_CODE_OAUTH_TOKEN": "inference-only-env"
             ],
-            keychainJSON: cliCredentials(token: "revoked-cli"),
+            keychainJSON: nil,
+            keychain: CountingClaudeAuthKeychain(cliCredentials(token: "revoked-cli")),
             httpClient: httpClient
         )
 
@@ -424,6 +1107,11 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
         XCTAssertNil(badge(snapshot.lines, "Error"))
         XCTAssertEqual(httpClient.requests.count, 2)
         XCTAssertTrue(httpClient.requests.last?.headers["Authorization"]?.contains("desktop-token") == true)
+        XCTAssertEqual(
+            (provider.authStore.keychain as? CountingClaudeAuthKeychain)?.calls,
+            [false],
+            "the Desktop-only fallback must not reread the rejected CLI Keychain credential"
+        )
     }
 
     @MainActor
@@ -472,11 +1160,12 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
         _ fixture: DesktopFixture,
         environment: [String: String] = ["CLAUDE_CONFIG_DIR": "/tmp/claude"],
         keychainJSON: String?,
+        keychain: (any KeychainAccessing)? = nil,
         httpClient: any HTTPClient
     ) -> ClaudeProvider {
         let now = now
         return ClaudeProvider(
-            authStore: makeAuthStore(fixture, environment: environment, keychainJSON: keychainJSON),
+            authStore: makeAuthStore(fixture, environment: environment, keychainJSON: keychainJSON, keychain: keychain),
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
             now: { now },
@@ -518,7 +1207,7 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
             homeDirectory: { fixtureHome },
             now: { fixtureNow }
         )
-        return DesktopFixture(store: store, files: files, keyReader: keyReader)
+        return DesktopFixture(store: store, files: files, sqlite: sqlite, keyReader: keyReader)
     }
 
     private func cacheKey(
@@ -587,16 +1276,53 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
     }
 }
 
+private final class CountingClaudeAuthKeychain: KeychainAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private let value: String
+    private var recorded: [Bool] = []
+
+    init(_ value: String) { self.value = value }
+
+    var calls: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+
+    private func read(allowInteraction: Bool) -> String {
+        lock.lock()
+        recorded.append(allowInteraction)
+        lock.unlock()
+        return value
+    }
+
+    func readGenericPassword(service: String) throws -> String? { read(allowInteraction: true) }
+    func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? {
+        read(allowInteraction: allowInteraction)
+    }
+    func readGenericPasswordForCurrentUser(service: String) throws -> String? { read(allowInteraction: true) }
+    func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? {
+        read(allowInteraction: allowInteraction)
+    }
+    func writeGenericPassword(service: String, value: String) throws {}
+}
+
 private struct DesktopFixture {
     var store: ClaudeDesktopAuthStore
     var files: FakeFiles
+    var sqlite: FakeClaudeDesktopSQLite
     var keyReader: FakeClaudeDesktopKeyReader
 }
 
 private final class FakeClaudeDesktopKeyReader: ClaudeDesktopSafeStorageKeyReading, @unchecked Sendable {
     let password: String
     let requiresInteraction: Bool
-    var calls: [Bool] = []
+    private let lock = NSLock()
+    private var recordedCalls: [Bool] = []
+    var calls: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedCalls
+    }
 
     init(password: String, requiresInteraction: Bool) {
         self.password = password
@@ -604,12 +1330,179 @@ private final class FakeClaudeDesktopKeyReader: ClaudeDesktopSafeStorageKeyReadi
     }
 
     func readPassword(allowInteraction: Bool) throws -> String? {
-        calls.append(allowInteraction)
+        lock.lock(); recordedCalls.append(allowInteraction); lock.unlock()
         if requiresInteraction, !allowInteraction {
             throw ClaudeDesktopCredentialError.permissionRequired
         }
         return password
     }
+}
+
+private final class CancellingClaudeDesktopKeyReader: ClaudeDesktopSafeStorageKeyReading, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedCalls: [Bool] = []
+
+    var calls: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedCalls
+    }
+
+    func readPassword(allowInteraction: Bool) throws -> String? {
+        lock.lock(); recordedCalls.append(allowInteraction); lock.unlock()
+        guard allowInteraction else {
+            throw ClaudeDesktopCredentialError.permissionRequired
+        }
+        ProviderRefreshContext.keychainReadCancellationToken?.cancel()
+        throw ClaudeDesktopCredentialError.permissionRequired
+    }
+}
+
+private final class BlockingClaudeDesktopKeyReader: ClaudeDesktopSafeStorageKeyReading, @unchecked Sendable {
+    let password: String
+    let blockInteraction: Bool
+    let silentReadStarted = DispatchSemaphore(value: 0)
+    let interactiveReadStarted = DispatchSemaphore(value: 0)
+    let allowSilentRead = DispatchSemaphore(value: 0)
+    let allowInteractiveRead = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var recordedCalls: [Bool] = []
+
+    var calls: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedCalls
+    }
+
+    init(password: String, blockInteraction: Bool) {
+        self.password = password
+        self.blockInteraction = blockInteraction
+    }
+
+    func readPassword(allowInteraction: Bool) throws -> String? {
+        lock.lock(); recordedCalls.append(allowInteraction); lock.unlock()
+        if allowInteraction == blockInteraction {
+            if allowInteraction {
+                interactiveReadStarted.signal()
+                allowInteractiveRead.wait()
+            } else {
+                silentReadStarted.signal()
+                allowSilentRead.wait()
+            }
+        }
+        if !allowInteraction {
+            throw ClaudeDesktopCredentialError.permissionRequired
+        }
+        return password
+    }
+}
+
+private final class AccountSwitchingClaudeDesktopKeyReader: ClaudeDesktopSafeStorageKeyReading, @unchecked Sendable {
+    let password: String
+    let readStarted = DispatchSemaphore(value: 0)
+    let allowRead = DispatchSemaphore(value: 0)
+
+    init(password: String) {
+        self.password = password
+    }
+
+    func readPassword(allowInteraction: Bool) throws -> String? {
+        readStarted.signal()
+        _ = allowRead.wait(timeout: .now() + 5)
+        return password
+    }
+}
+
+private final class GrantingAfterInteractiveClaudeDesktopKeyReader: ClaudeDesktopSafeStorageKeyReading, @unchecked Sendable {
+    let password: String
+    let interactiveReadStarted = DispatchSemaphore(value: 0)
+    let releaseInteractiveRead = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var authorizationGranted = false
+    private var recordedCalls: [Bool] = []
+
+    var calls: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedCalls
+    }
+
+    init(password: String) { self.password = password }
+
+    func readPassword(allowInteraction: Bool) throws -> String? {
+        lock.lock()
+        recordedCalls.append(allowInteraction)
+        if allowInteraction {
+            lock.unlock()
+            interactiveReadStarted.signal()
+            _ = releaseInteractiveRead.wait(timeout: .now() + 5)
+            lock.lock()
+            authorizationGranted = true
+            lock.unlock()
+            return password
+        }
+        let isAuthorized = authorizationGranted
+        lock.unlock()
+        guard isAuthorized else { throw ClaudeDesktopCredentialError.permissionRequired }
+        return password
+    }
+}
+
+private final class StaleFailureClaudeDesktopKeyReader: ClaudeDesktopSafeStorageKeyReading, @unchecked Sendable {
+    let firstReadStarted = DispatchSemaphore(value: 0)
+    let releaseFirstRead = DispatchSemaphore(value: 0)
+    let password: String
+    private let lock = NSLock()
+    private var recordedCalls: [Bool] = []
+
+    var calls: [Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedCalls
+    }
+
+    init(password: String) { self.password = password }
+
+    func readPassword(allowInteraction: Bool) throws -> String? {
+        lock.lock()
+        recordedCalls.append(allowInteraction)
+        let isFirstCall = recordedCalls.count == 1
+        lock.unlock()
+        if isFirstCall {
+            firstReadStarted.signal()
+            _ = releaseFirstRead.wait(timeout: .now() + 5)
+            throw ClaudeDesktopCredentialError.keychainFailure(-25293)
+        }
+        return password
+    }
+}
+
+private struct ClaudeDesktopUnreadableConfigFiles: TextFileAccessing {
+    let path: String
+
+    func exists(_ candidate: String) -> Bool { candidate == path }
+    func readTextIfPresent(_ candidate: String) throws -> String? {
+        guard exists(candidate) else { return nil }
+        throw CocoaError(.fileReadNoPermission)
+    }
+    func readText(_ candidate: String) throws -> String { throw CocoaError(.fileReadNoPermission) }
+    func writeText(_ candidate: String, _ text: String) throws { throw CocoaError(.fileWriteNoPermission) }
+    func remove(_ candidate: String) throws { throw CocoaError(.fileWriteNoPermission) }
+}
+
+private struct UnreadableClaudeDesktopSQLite: SQLiteAccessing {
+    func queryValue(path: String, sql: String) throws -> String? {
+        throw CocoaError(.fileReadNoPermission)
+    }
+
+    func execute(path: String, sql: String) throws {
+        throw CocoaError(.fileReadNoPermission)
+    }
+}
+
+private func waitUntil(timeout: TimeInterval, condition: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return true }
+        Thread.sleep(forTimeInterval: 0.001)
+    }
+    return condition()
 }
 
 private final class FakeClaudeDesktopSQLite: SQLiteAccessing, @unchecked Sendable {
@@ -624,4 +1517,44 @@ private final class FakeClaudeDesktopSQLite: SQLiteAccessing, @unchecked Sendabl
     }
 
     func execute(path: String, sql: String) throws {}
+}
+
+private enum SafeStorageLoadFailure: Error {
+    case failed
+}
+
+private final class SafeStorageLoadCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
+private final class SafeStorageActionValidity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Bool
+
+    init(_ current: Bool) { self.current = current }
+
+    var isCurrent: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return current
+    }
+
+    func setCurrent(_ current: Bool) {
+        lock.lock()
+        self.current = current
+        lock.unlock()
+    }
 }

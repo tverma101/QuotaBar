@@ -6,12 +6,12 @@ Tracks your [OpenRouter](https://openrouter.ai) credit balance and spend from yo
 
 | Metric | Meaning |
 |---|---|
-| Credits | Lifetime spend against the credits you've purchased (a dollar meter) |
-| Balance | Prepaid credits remaining |
+| Credits | Lifetime spend against the credits you've purchased (a dollar meter); hidden by default when no purchased-credit meter is returned, unless you explicitly enable it in Customize |
+| Balance | Prepaid credits remaining; hidden when `/credits` omits either required total |
 | Today | Spend so far today |
 | This Week | Spend so far this week |
 | This Month | Spend so far this month |
-| Key Limit | Spend in the current limit window against this key's cap — shown only when the key has one configured |
+| Key Limit | Spend in the current limit window against this key's cap — shown only when the key has one configured and the response reports how much of it is left |
 
 QuotaBar shows the reported tier (such as "Pay as you go" or "Free tier") beside the provider name.
 
@@ -44,6 +44,7 @@ the saved key falls back to the environment key, or to none.
 ## Troubleshooting
 
 - **"No OpenRouter API key"** — add the key in Settings → API Keys (or the config file / env var), then refresh.
+- **"Couldn't read the saved OpenRouter API key"** — a saved config file exists but QuotaBar can't read it. The API Keys card shows an orange repair state; a valid environment key remains active and is labeled as a fallback. Check file permissions, enter a replacement, or remove the saved file, then refresh.
 - **"API key invalid"** — the key was rejected (401/403). Check or recreate it at openrouter.ai/keys.
 
 ## Under the hood
@@ -51,10 +52,12 @@ the saved key falls back to the environment key, or to none.
 Two REST calls with a `Bearer` token against `https://openrouter.ai/api/v1`:
 
 - `GET /credits` — account-wide `total_credits` and `total_usage`; the Credits meter and Balance come
-  from these. Required for a usable snapshot.
+  from these only when both values are present. A partial payload does not invent a zero balance. If
+  this endpoint is gated, usable tier and spend data from `/key` still appears.
 - `GET /key` — best-effort: the tier, daily/weekly/monthly spend, and an optional per-key cap
   (`limit` minus `limit_remaining` for the current window). If this call fails, the balance still
-  renders from `/credits`.
+  renders from `/credits`. The Key Limit meter needs both numbers: when the response carries a cap
+  but no remaining amount, the meter is hidden rather than reported as fully spent.
 
 A period spend of `$0.00` is shown as a real, measured zero (the API reports it directly) rather than
 "No data". Credit values may be up to ~60 seconds stale on OpenRouter's side.

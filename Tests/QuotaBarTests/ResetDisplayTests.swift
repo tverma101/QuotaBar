@@ -6,6 +6,20 @@ import XCTest
 /// `formatResetAbsoluteLabel`), and `WidgetData` honoring the global mode for the trailing label,
 /// the opposite-format tooltip, and the "Limit in …" run-out projection.
 final class ResetDisplayTests: XCTestCase {
+    func testExpiredCachedMeterRequestsRefreshInsteadOfSayingResetsSoonForever() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var data = WidgetData(title: "Session", icon: .providerMark("antigravity"), kind: .percent, used: 42, limit: 100)
+        data.resetsAt = now.addingTimeInterval(-86_400)
+        XCTAssertEqual(data.boundedTrailingText(now: now), "Awaiting Refresh")
+        XCTAssertTrue(data.resetTooltip(now: now)?.contains("last reported reset has passed") == true)
+        data.resetDisplayMode = .absolute
+        XCTAssertEqual(data.boundedTrailingText(now: now), "Awaiting Refresh")
+        data.resetsAt = now.addingTimeInterval(-30)
+        data.resetDisplayMode = .relative
+        XCTAssertEqual(data.boundedTrailingText(now: now), "Resets soon")
+        data.resetsAt = now.addingTimeInterval(3_600)
+        XCTAssertTrue(data.boundedTrailingText(now: now)?.hasPrefix("Resets in") == true)
+    }
     private func utcCalendar() -> Calendar {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "UTC")!
