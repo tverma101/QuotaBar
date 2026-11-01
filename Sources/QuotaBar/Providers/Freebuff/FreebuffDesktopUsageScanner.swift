@@ -33,7 +33,7 @@ actor FreebuffDesktopUsageScanner {
         var databases: [DatabaseSnapshot]
         var hostedReceipts: [FreebuffUsageReceipt]
         var pricingToken: String
-        var catalogNames: [String: String]
+        var catalog: [String: FreebuffModelCatalog.Entry]
         var calendar: Calendar
         var computedAt: Date
         var nextFutureTimestamp: Date?
@@ -82,17 +82,14 @@ actor FreebuffDesktopUsageScanner {
     private var databaseOrder: [String] = []
     private var retainedTurns = 0
     private var routePricingToken: String?
-    private var routeCatalogNames: [String: String] = [:]
+    private var routeCatalog: [String: FreebuffModelCatalog.Entry] = [:]
     /// Reuses the completed daily fold while the local databases and pricing inputs are unchanged.
     /// File revisions still get checked every refresh; cached derived turns remain the fallback when
     /// pricing changes or a future-dated row crosses into the scan window.
     private var cachedScan: CachedScan?
     private var cachedPaths: [String]?
     private var cachedPathsAt: Date?
-    private var modelRoutes: [String: String] = [:]
-    /// Inverse of `modelRoutes` (unique pairs only), so a priced turn is titled with the model's
-    /// catalog name instead of the OpenRouter routing slug it was priced at.
-    private var routeDisplayNames: [String: String] = [:]
+    private var modelIdentity = FreebuffModelIdentity(entries: [:], pricing: .empty)
     private let sqlite: any SQLiteAccessing
     private let databasePaths: @Sendable () throws -> [String]
     /// Decodes one receipt's metrics JSON. Injectable so a test can count how often the history is
@@ -157,16 +154,14 @@ actor FreebuffDesktopUsageScanner {
             cachedScan = nil
             return nil
         }
-        let catalogNames = modelCatalog.mapValues(\.displayName)
         let calendar = Calendar.current
         // The content token changes only when prices or aliases change; retrieval timestamps do not
         // force route-index rebuilds or a full token-accounting fold.
         let pricingToken = pricing.aggregateCacheToken
-        if routePricingToken != pricingToken || routeCatalogNames != catalogNames {
-            modelRoutes = FreebuffModelCatalog.pricingRoutes(entries: modelCatalog, pricing: pricing)
-            routeDisplayNames = Self.uniqueRouteDisplayNames(modelRoutes)
+        if routePricingToken != pricingToken || routeCatalog != modelCatalog {
+            modelIdentity = FreebuffModelIdentity(entries: modelCatalog, pricing: pricing)
             routePricingToken = pricingToken
-            routeCatalogNames = catalogNames
+            routeCatalog = modelCatalog
         }
         trimRetainedTurns()
 
@@ -177,7 +172,7 @@ actor FreebuffDesktopUsageScanner {
            cachedScan.databases == databaseSnapshots,
            cachedScan.hostedReceipts == hostedReceipts,
            cachedScan.pricingToken == pricingToken,
-           cachedScan.catalogNames == catalogNames,
+           cachedScan.catalog == modelCatalog,
            cachedScan.calendar == calendar,
            now >= cachedScan.computedAt,
            cachedScan.nextFutureTimestamp.map({ now < $0 }) ?? true {
@@ -207,16 +202,7 @@ actor FreebuffDesktopUsageScanner {
                 // Every selected expression is COALESCEd: SQLite's `||` yields NULL when one side is
                 // NULL, and a single NULL element used to fail the whole array cast — taking the
                 // entire history with it. An empty value now marks one unreadable row instead.
-                let text: String?
-                do {
-                    text = try sqlite.queryValue(
-                        path: path,
-                        sql: FreebuffDesktopUsageSQL.messagesAndMissionManagers
-                    )
-                } catch let error as SQLiteError
-                    where FreebuffDesktopUsageSQL.isMissingMissionReceiptTable(error) {
-                    text = try sqlite.queryValue(path: path, sql: FreebuffDesktopUsageSQL.assistantMessages)
-                }
+                let text = try FreebuffDesktopUsageSQL.readRows(sqlite: sqlite, path: path)
                 guard let text,
                       let data = text.data(using: .utf8)
                 else { throw FreebuffUsageError.localHistoryUnreadable }
@@ -267,13 +253,13 @@ actor FreebuffDesktopUsageScanner {
                 let reasoning = try Self.optional(reasoningCount)
                 guard cached <= input, reasoning <= output else { throw FreebuffUsageError.localHistoryUnreadable }
                 let saved = turn.savedModel
-                let route = saved.flatMap { pricing.openRouter.entries[$0] != nil ? $0 : modelRoutes[$0] }
-                // Breakdown rows carry the catalog's display name whenever one is known — the routing
-                // slug is pricing plumbing, not what the user picked — so priced and unpriced turns of
-                // the same model land in one row instead of splitting across two spellings.
-                let displayName = saved.flatMap { modelCatalog[$0]?.displayName }
-                    ?? route.flatMap { routeDisplayNames[$0] }
-                let model = displayName
+                let identity = saved.map { modelIdentity.resolve($0, pricing: pricing) }
+                let route = identity?.route
+                let displayName = identity?.displayName
+                let legacyWithoutIdentity = displayName == nil && !turn.fromReceipt
+                    && !turn.id.hasPrefix("cloud:")
+                    && (saved == nil || saved?.hasPrefix("m-") == true || saved?.hasPrefix("fbm1.") == true)
+                let model = legacyWithoutIdentity ? FreebuffModelIdentity.olderUsageName : displayName
                     ?? saved.flatMap { (turn.fromReceipt || $0.contains("/")) && !$0.hasPrefix("fbm1.") ? $0 : nil }
                     ?? ModelUsageEntry.unattributedModelName
                 // A turn aggregates multiple requests, so do not apply single-request context tiers.
@@ -283,10 +269,15 @@ actor FreebuffDesktopUsageScanner {
                     at: date,
                     applyLongContextRates: false
                 )
-                accumulator.add(day: day, tokens: total, cost: cost, model: model, costIsComplete: cost != nil)
+                accumulator.add(day: day, tokens: total, cost: cost, model: model,
+                                canonical: identity?.group, costIsComplete: cost != nil)
                 if let cost {
                     accumulator.markEstimatedCost(day: day)
                     accumulator.addApiEstimate(day: day, cost: cost)
+                } else if legacyWithoutIdentity {
+                    // A retired/missing label on older local records is an explained history gap,
+                    // not an actionable pricing failure. Preserve tokens and the lower-bound cost.
+                    accumulator.addNamedUnpricedModel(day: day, model: model)
                 } else if displayName == nil {
                     // A raw receipt slug nothing names and unattributed streams stay unknown: the app
                     // genuinely cannot tell what served them, so the warning stays honest.
@@ -321,7 +312,7 @@ actor FreebuffDesktopUsageScanner {
                 databases: databaseSnapshots,
                 hostedReceipts: hostedReceipts,
                 pricingToken: pricingToken,
-                catalogNames: catalogNames,
+                catalog: modelCatalog,
                 calendar: calendar,
                 computedAt: now,
                 nextFutureTimestamp: nextFutureTimestamp,
@@ -333,23 +324,6 @@ actor FreebuffDesktopUsageScanner {
         return result
     }
 
-    /// Inverts a display-name → route map, keeping only routes a single catalog entry claims. Two
-    /// entries resolving to one route leave that route unnamed — titling a row would then merge
-    /// distinct models.
-    private static func uniqueRouteDisplayNames(_ routes: [String: String]) -> [String: String] {
-        var names: [String: String] = [:]
-        var contested: Set<String> = []
-        for (name, route) in routes {
-            if let existing = names[route] {
-                if existing != name { contested.insert(route) }
-                continue
-            }
-            names[route] = name
-        }
-        for route in contested { names.removeValue(forKey: route) }
-        return names
-    }
-
     func unloadCachesForMemoryPressure() {
         databases.removeAll(keepingCapacity: false)
         databaseOrder.removeAll(keepingCapacity: false)
@@ -358,9 +332,8 @@ actor FreebuffDesktopUsageScanner {
         cachedPaths = nil
         cachedPathsAt = nil
         routePricingToken = nil
-        routeCatalogNames.removeAll(keepingCapacity: false)
-        modelRoutes.removeAll(keepingCapacity: false)
-        routeDisplayNames.removeAll(keepingCapacity: false)
+        routeCatalog.removeAll(keepingCapacity: false)
+        modelIdentity = FreebuffModelIdentity(entries: [:], pricing: .empty)
     }
 
     /// Forget the databases whose project directory is gone.

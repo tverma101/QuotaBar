@@ -88,10 +88,19 @@ installs do not keep every raw receipt in memory.
 
 Dollar values are **public API price estimates**, not Freebuff's recorded charges. QuotaBar uses
 OpenRouter for exact routes except for Fast's curated Vercel AI Gateway route. Model rows carry the
-catalogue's display name whenever one is known, so priced and unpriced turns of the same model read
-as one row instead of splitting across a routing slug and a friendly name. Models
+catalogue's display name whenever one is known. Legacy model IDs use the catalogue's published
+identity digests, so receipts recorded with an old route and a current catalogue key share one row.
+The breakdown groups Fast/Slow modes, build-date labels, and context annotations under the model's
+name. Their measured tokens and separate rate estimates remain in the accounting variants; different
+model versions and families stay separate. Grouping does not change token totals or reprice a mode
+at another mode's rate. Unknown or conflicting identities are never guessed. Models
 recorded on receipts take priority. For older receipts, estimates use each thread's saved model
-selection, resolved through Freebuff's model catalogue and an exact OpenRouter route. A
+selection, resolved through Freebuff's model catalogue and an exact OpenRouter route. When Desktop
+has cleared the thread's model column, QuotaBar projects only the model field from its saved thread
+snapshot. Receipt models still take priority. Older local records whose labels are missing or retired
+remain token-only **Older Freebuff Usage**; their price is incomplete, shown by the lower-bound dollar
+marker, without an actionable unknown-pricing warning. Unknown models actually named on receipts
+still raise that warning. No measured tokens are dropped. A
 `100k context` label resolves to the same Claude Haiku 5.5 route; receipts aggregate multiple
 requests, so QuotaBar uses the route's standard rates instead of guessing whether an individual
 request crossed a long-context price tier. That selection can differ from past serving models or
@@ -136,4 +145,5 @@ are not presented as connection failures.
 - [Freebuff config directory](https://github.com/CodebuffAI/freebuff/blob/main/cli/src/utils/config-dir.ts)
 - [Freebuff hours conversion](https://github.com/CodebuffAI/freebuff/blob/main/common/src/util/freebuff-hours.ts)
 - [Freebuff model catalog and Fast-mode pricing notes](https://github.com/CodebuffAI/freebuff/blob/main/common/src/constants/freebuff-models.ts)
+- [Freebuff legacy model identity contract](https://github.com/CodebuffAI/freebuff/blob/main/common/src/types/freebuff-model-catalog.ts)
 - [DeepSeek model prices and peak-hour schedule](https://api-docs.deepseek.com/quick_start/pricing/)
