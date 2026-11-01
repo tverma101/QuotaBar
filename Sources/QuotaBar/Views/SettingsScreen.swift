@@ -211,8 +211,8 @@ struct SettingsScreen: View {
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 12)
             }
-            if autoRedeemCodexResets && !container.codexAutoReset.lastErrorByAccount.isEmpty {
-                Text("Auto-reset needs attention on \(container.codexAutoReset.lastErrorByAccount.count) Codex account(s). Check credentials and QuotaBar logs.")
+            if autoRedeemCodexResets && container.codexAutoReset.attentionAccountCount > 0 {
+                Text("Auto-use needs attention on \(container.codexAutoReset.attentionAccountCount) Codex account(s). Open the account's reset-credit detail for its current status.")
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .padding(.horizontal, 12)
