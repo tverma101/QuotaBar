@@ -245,7 +245,15 @@ final class AppContainer {
                                 return
                             }
                             try? await Task.sleep(for: .seconds(2))
-                        case .skipped, .inFlight:
+                        case .skipped:
+                            // Auto-use also monitors disabled cards. Rotate only this account's
+                            // credentials when the dashboard refresh intentionally skips its card.
+                            if !enablement.isEnabled(codex.provider.id) {
+                                _ = await codex.refresh()
+                                return
+                            }
+                            try? await Task.sleep(for: .seconds(1))
+                        case .inFlight:
                             AppLog.info(LogTag.plugin("codex"), "post-claim refresh waiting out an in-flight refresh (attempt \(attempt + 1))")
                             try? await Task.sleep(for: .seconds(1))
                         }

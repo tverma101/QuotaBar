@@ -21,8 +21,9 @@ hand with `./script/build_and_run.sh build`.
 ### Guardrails (do not break)
 - **Never increase the version number on your own initiative — ask for explicit approval first.**
   Versions continue upstream's `0.7.x` line so the two codebases stay comparable.
-- The app has **no auto-update path**. Sparkle needs a public repository; this one is private. Do not
-  reintroduce an updater without also solving feed hosting.
+- The app has **no auto-update path**. This public fork does not have its own signed appcast or
+  automated release feed. Do not point QuotaBar at upstream’s update feed; a future updater needs a
+  QuotaBar-owned release and signing process.
 - iCloud Sync is inert: its container must be registered in the owner's Apple Developer team first.
   Do not treat the Settings section as a working feature.
 
