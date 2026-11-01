@@ -21,11 +21,44 @@ struct CodexAccountCard: Equatable, Sendable {
     let allowsUnattributedPiUsage: Bool
 }
 
+struct ProviderAccountDiscovery: Sendable {
+    struct FamilyOutcome: Sendable {
+        let family: String
+        let outcome: DefaultAccountObserver.Outcome
+    }
+
+    struct ConfiguredCodexOutcome: Sendable {
+        let home: String
+        let isOrcaManaged: Bool
+        let outcome: DefaultAccountObserver.Outcome
+    }
+
+    let families: Set<String>
+    let registeredCodexHomes: [String]
+    let configuredCodexHomes: [String]
+    let defaultOutcomes: [FamilyOutcome]
+    let configuredCodexOutcomes: [ConfiguredCodexOutcome]
+    let desktopOrganizations: [DesktopOrganization]
+    let desktopKeyCache: SafeStorageKeyCache
+    let didSkipClaudeDesktopDiscovery: Bool
+    let desktopAnchor: String
+    let normalizedCodexHomesByAnchor: [String: String]
+    let defaultCodexHome: String?
+}
+
+struct DesktopOrganization: Sendable {
+    let id: String
+    let identityKey: String
+    let label: String
+}
+
 /// The launch-time account pass: read which account is signed in at each family's known homes,
 /// reconcile the account registry, and expose the per-card identity map that guards snapshot caches.
 @MainActor
 struct ProviderAccountAssembly {
     let identityKeysByCard: [String: String]
+    var desktopKeyCache: SafeStorageKeyCache = SafeStorageKeyCache()
+    var defaultCodexHome: String? = nil
     var claudeCards: [ClaudeAccountCard] = []
     var codexCards: [CodexAccountCard] = []
 
@@ -36,48 +69,69 @@ struct ProviderAccountAssembly {
     ) -> ProviderAccountAssembly {
         let registeredHomes = registeredCodexHomes
             ?? CodexAccountRegistrationStore(defaults: defaults).registeredHomes
-        let observer = DefaultAccountObserver(environment: QuotaBarEnvironmentReader())
+        let discovery = scanForLaunch(
+            waitsForLoginShell: waitsForLoginShell,
+            rawRegisteredCodexHomes: registeredHomes
+        )
+        return make(
+            observer: DefaultAccountObserver(),
+            accountsStore: ProviderAccountsStore(defaults: defaults),
+            precomputedDiscovery: discovery
+        )
+    }
+
+    nonisolated static func scanForLaunch(
+        waitsForLoginShell: Bool,
+        rawRegisteredCodexHomes: [String],
+        discoverClaudeDesktopOrganizations: Bool = true,
+        forceClaudeAccountDiscovery: Bool = false,
+        observer: DefaultAccountObserver = DefaultAccountObserver()
+    ) -> ProviderAccountDiscovery {
+        let homeDirectory = observer.homeDirectory()
         let shellFactsReadable = !waitsForLoginShell
             || LoginShellEnvironment.shared.capturedSuccessfully
             || ShellEnvironmentSnapshotStore.launchSnapshot != nil
         let routerHomes = discoveredCodexRouterChatGPTHomes(
-            environment: QuotaBarEnvironmentReader(),
-            homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+            environment: observer.environment,
+            homeDirectory: homeDirectory
         )
+        var seenRegisteredHomes: Set<String> = []
+        let registeredHomes = rawRegisteredCodexHomes.compactMap {
+            CodexAccountRegistrationStore.normalizedHome($0, homeDirectory: homeDirectory)
+        }.filter { seenRegisteredHomes.insert($0).inserted }
         let families = familiesForAccountPass(
             shellFactsReadable: shellFactsReadable,
             processEnvironment: ProcessInfo.processInfo.environment,
             registeredCodexHomes: registeredHomes,
-            hasRouterChatGPTHomes: !routerHomes.isEmpty
+            hasRouterChatGPTHomes: !routerHomes.isEmpty,
+            forceClaudeAccountDiscovery: forceClaudeAccountDiscovery
         )
         if families.count < ProviderAccountID.families.count {
             AppLog.info(.config, "account identity read skipped for \(ProviderAccountID.families.subtracting(families).sorted().joined(separator: ", ")): login shell cold and no shell-environment snapshot exists yet")
         }
-        return make(
+        return scan(
             observer: observer,
-            accountsStore: ProviderAccountsStore(defaults: defaults),
             families: families,
-            registeredCodexHomes: registeredHomes
+            registeredCodexHomes: registeredHomes,
+            discoverClaudeDesktopOrganizations: discoverClaudeDesktopOrganizations,
+            discoveredRouterHomes: routerHomes
         )
     }
-
-    private static let homeOverrideKeys: [String: String] = [
-        "claude": "CLAUDE_CONFIG_DIR",
-        "codex": "CODEX_HOME",
-    ]
 
     /// Select the account families that can be read before the login-shell environment is ready.
     /// App-registered Codex homes and an explicit process-level `OPENUSAGE_CODEX_HOMES` override do
     /// not depend on shell capture, so keeping Codex in this pass prevents a cold/failed capture from
     /// hiding an account the user deliberately registered.
-    static func familiesForAccountPass(
+    nonisolated static func familiesForAccountPass(
         shellFactsReadable: Bool,
         processEnvironment: [String: String],
         registeredCodexHomes: [String],
-        hasRouterChatGPTHomes: Bool = false
+        hasRouterChatGPTHomes: Bool = false,
+        forceClaudeAccountDiscovery: Bool = false
     ) -> Set<String> {
         guard !shellFactsReadable else { return ProviderAccountID.families }
-        return ProviderAccountID.families.filter { family in
+        let homeOverrideKeys = ["claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"]
+        var families = Set(ProviderAccountID.families.filter { family in
             if family == "codex",
                !registeredCodexHomes.isEmpty
                 || processEnvironment["OPENUSAGE_CODEX_HOMES"]?.nilIfEmpty != nil
@@ -85,9 +139,119 @@ struct ProviderAccountAssembly {
             {
                 return true
             }
-            guard let key = Self.homeOverrideKeys[family] else { return false }
+            guard let key = homeOverrideKeys[family] else { return false }
             return processEnvironment[key]?.nilIfEmpty != nil
+        })
+        if forceClaudeAccountDiscovery { families.insert("claude") }
+        return families
+    }
+
+    nonisolated static func scan(
+        observer: DefaultAccountObserver,
+        families: Set<String>,
+        registeredCodexHomes: [String] = [],
+        desktop: ClaudeDesktopAuthStore? = nil,
+        discoverClaudeDesktopOrganizations: Bool = true,
+        listDesktopOrganizationDirectories: @escaping @Sendable (URL) -> [String] = { root in
+            let urls = (try? FileManager.default.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            return urls.compactMap { url in
+                guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                      values.isDirectory == true, values.isSymbolicLink != true
+                else { return nil }
+                return url.lastPathComponent
+            }
+        },
+        discoveredRouterHomes: [String]? = nil
+    ) -> ProviderAccountDiscovery {
+        let homeDirectory = observer.homeDirectory()
+        let defaultOutcomes: [ProviderAccountDiscovery.FamilyOutcome] = [
+            families.contains("claude")
+                ? .init(family: "claude", outcome: observer.observeClaude())
+                : nil,
+            families.contains("codex")
+                ? .init(family: "codex", outcome: observer.observeCodex())
+                : nil,
+        ].compactMap { $0 }
+
+        let routerHomes = discoveredRouterHomes ?? discoveredCodexRouterChatGPTHomes(
+            environment: observer.environment,
+            homeDirectory: homeDirectory
+        )
+        let configuredHomes = families.contains("codex")
+            ? configuredCodexHomes(
+                environment: observer.environment,
+                registeredHomes: registeredCodexHomes,
+                homeDirectory: homeDirectory,
+                discoveredRouterHomes: routerHomes
+            )
+            : []
+        let orderedHomes = configuredHomes.filter {
+            !isOrcaManagedCodexHome($0, environment: observer.environment)
+        } + configuredHomes.filter {
+            isOrcaManagedCodexHome($0, environment: observer.environment)
         }
+        let configuredOutcomes = orderedHomes.map { home in
+            ProviderAccountDiscovery.ConfiguredCodexOutcome(
+                home: home,
+                isOrcaManaged: isOrcaManagedCodexHome(home, environment: observer.environment),
+                outcome: observer.observeCodex(home: home)
+            )
+        }
+
+        let defaultClaudeIdentity = defaultOutcomes.first(where: { $0.family == "claude" }).flatMap {
+            if case .resolved(let key, _, _) = $0.outcome { return key }
+            return nil
+        }
+        var desktopOrganizations: [DesktopOrganization] = []
+        let desktopStore = desktop ?? ClaudeDesktopAuthStore(
+            files: observer.files, homeDirectory: observer.homeDirectory
+        )
+        if discoverClaudeDesktopOrganizations,
+           families.contains("claude"), defaultClaudeIdentity?.contains("|") != false {
+            desktopOrganizations = discoverDesktopOrganizations(
+                desktop: desktopStore,
+                cliIdentity: defaultClaudeIdentity,
+                listDirectories: listDesktopOrganizationDirectories
+            )
+        }
+        let codexAnchors = defaultOutcomes.compactMap { item -> String? in
+            guard item.family == "codex",
+                  case .resolved(_, _, let anchor) = item.outcome
+            else { return nil }
+            return anchor
+        } + configuredOutcomes.compactMap { item -> String? in
+            guard case .resolved(_, _, let anchor) = item.outcome else { return nil }
+            return anchor
+        }
+        var normalizedCodexHomesByAnchor: [String: String] = [:]
+        for anchor in codexAnchors where normalizedCodexHomesByAnchor[anchor] == nil {
+            if let normalized = CodexAccountRegistrationStore.normalizedHome(
+                anchor, homeDirectory: homeDirectory
+            ) {
+                normalizedCodexHomesByAnchor[anchor] = normalized
+            }
+        }
+        let defaultCodexHome = CodexAccountRegistrationStore.normalizedHome(
+            homeDirectory.appendingPathComponent(".codex").path,
+            homeDirectory: homeDirectory
+        )
+        return ProviderAccountDiscovery(
+            families: families,
+            registeredCodexHomes: registeredCodexHomes,
+            configuredCodexHomes: configuredHomes,
+            defaultOutcomes: defaultOutcomes,
+            configuredCodexOutcomes: configuredOutcomes,
+            desktopOrganizations: desktopOrganizations,
+            desktopKeyCache: desktopStore.keyCache,
+            didSkipClaudeDesktopDiscovery: !families.contains("claude") || !discoverClaudeDesktopOrganizations,
+            desktopAnchor: desktopStore.homeDirectory()
+                .appendingPathComponent("Library/Application Support/Claude").path,
+            normalizedCodexHomesByAnchor: normalizedCodexHomesByAnchor,
+            defaultCodexHome: defaultCodexHome
+        )
     }
 
     static func make(
@@ -107,17 +271,20 @@ struct ProviderAccountAssembly {
                 else { return nil }
                 return url.lastPathComponent
             }
-        }
+        },
+        precomputedDiscovery: ProviderAccountDiscovery? = nil
     ) -> ProviderAccountAssembly {
+        let discovery = precomputedDiscovery ?? scan(
+            observer: observer,
+            families: families,
+            registeredCodexHomes: registeredCodexHomes,
+            desktop: desktop,
+            listDesktopOrganizationDirectories: listDesktopOrganizationDirectories
+        )
+        let outcomes = discovery.defaultOutcomes.map { (family: $0.family, outcome: $0.outcome) }
         var identityKeys: [String: String] = [:]
         var observations: [ProviderAccountsStore.Observation] = []
 
-        let outcomes: [(family: String, outcome: DefaultAccountObserver.Outcome)] = [
-            ("claude", { observer.observeClaude() }),
-            ("codex", { observer.observeCodex() }),
-        ].compactMap { family, observe in
-            families.contains(family) ? (family, observe()) : nil
-        }
         for (family, outcome) in outcomes {
             switch outcome {
             case .resolved(let identityKey, let label, let anchor):
@@ -136,29 +303,15 @@ struct ProviderAccountAssembly {
             }
         }
 
-        let configuredCodexHomes = families.contains("codex")
-            ? configuredCodexHomes(
-                environment: observer.environment,
-                registeredHomes: registeredCodexHomes,
-                homeDirectory: observer.homeDirectory(),
-                discoveredRouterHomes: discoveredCodexRouterChatGPTHomes(
-                    environment: observer.environment,
-                    homeDirectory: observer.homeDirectory()
-                )
-            )
-            : []
+        let configuredCodexHomes = discovery.configuredCodexHomes
         // Resolve ordinary QuotaBar homes first. If an old registration or an inherited explicit
         // list also names an Orca home carrying the same OAuth identity, the Orca source must not be
         // appended to the ordinary card's logHomes. This ordering makes the rule independent of
         // registration/list order and prevents the two roots from becoming one accounting source.
-        let orderedConfiguredCodexHomes = configuredCodexHomes.filter {
-            !isOrcaManagedCodexHome($0, environment: observer.environment)
-        } + configuredCodexHomes.filter {
-            isOrcaManagedCodexHome($0, environment: observer.environment)
-        }
-        for home in orderedConfiguredCodexHomes {
-            let isOrcaManagedHome = isOrcaManagedCodexHome(home, environment: observer.environment)
-            switch observer.observeCodex(home: home) {
+        for configuredHome in discovery.configuredCodexOutcomes {
+            let home = configuredHome.home
+            let isOrcaManagedHome = configuredHome.isOrcaManaged
+            switch configuredHome.outcome {
             case .resolved(let identityKey, let label, let anchor):
                 if isOrcaManagedHome,
                    observations.contains(where: {
@@ -193,32 +346,20 @@ struct ProviderAccountAssembly {
             }
         }
 
-        var desktopOrganizations: [DesktopOrganization] = []
-        if families.contains("claude"), identityKeys["claude"]?.contains("|") != false {
-            let desktop = desktop ?? ClaudeDesktopAuthStore(
-                files: observer.files, homeDirectory: observer.homeDirectory
+        let desktopOrganizations = discovery.desktopOrganizations
+        for organization in desktopOrganizations {
+            let source = ProviderAccountSource(
+                kind: .defaultHome, anchor: discovery.desktopAnchor, holdsDefaultSource: false
             )
-            desktopOrganizations = discoverDesktopOrganizations(
-                desktop: desktop,
-                cliIdentity: identityKeys["claude"],
-                listDirectories: listDesktopOrganizationDirectories
-            )
-            let desktopAnchor = desktop.homeDirectory()
-                .appendingPathComponent("Library/Application Support/Claude").path
-            for organization in desktopOrganizations {
-                let source = ProviderAccountSource(
-                    kind: .defaultHome, anchor: desktopAnchor, holdsDefaultSource: false
-                )
-                if let index = observations.firstIndex(where: {
-                    $0.family == "claude" && $0.identityKey == organization.identityKey
-                }) {
-                    observations[index].sources.append(source)
-                } else {
-                    observations.append(ProviderAccountsStore.Observation(
-                        family: "claude", identityKey: organization.identityKey,
-                        label: organization.label, sources: [source]
-                    ))
-                }
+            if let index = observations.firstIndex(where: {
+                $0.family == "claude" && $0.identityKey == organization.identityKey
+            }) {
+                observations[index].sources.append(source)
+            } else {
+                observations.append(ProviderAccountsStore.Observation(
+                    family: "claude", identityKey: organization.identityKey,
+                    label: organization.label, sources: [source]
+                ))
             }
         }
 
@@ -273,17 +414,10 @@ struct ProviderAccountAssembly {
                     guard let anchor = entry.anchor?.nilIfEmpty,
                           anchor.contains("codex-router/chatgpt-accounts")
                     else { continue }
-                    if let normalized = CodexAccountRegistrationStore.normalizedHome(
-                        anchor, homeDirectory: observer.homeDirectory()
-                    ) {
-                        seen.insert(normalized)
-                    }
+                    seen.insert(discovery.normalizedCodexHomesByAnchor[anchor] ?? anchor)
                 }
             }.count
-            let defaultCodexHome = CodexAccountRegistrationStore.normalizedHome(
-                observer.homeDirectory().appendingPathComponent(".codex").path,
-                homeDirectory: observer.homeDirectory()
-            )
+            let defaultCodexHome = discovery.defaultCodexHome
             for observation in observedCodex {
                 guard let record = records.first(where: {
                     $0.family == "codex" && $0.identityKey == observation.identityKey && !$0.removedTombstone
@@ -299,9 +433,7 @@ struct ProviderAccountAssembly {
                 var seenLogHomes = Set<String>()
                 let logHomes = observation.sources.compactMap { entry -> String? in
                     guard let anchor = entry.anchor?.nilIfEmpty else { return nil }
-                    return CodexAccountRegistrationStore.normalizedHome(
-                        anchor, homeDirectory: observer.homeDirectory()
-                    )
+                    return discovery.normalizedCodexHomesByAnchor[anchor]
                 }.filter { candidate in
                     // With 2+ router account homes, shared ~/.codex mixes both accounts' rollouts
                     // and double-counts Total Spend / daily charts across cards.
@@ -329,8 +461,14 @@ struct ProviderAccountAssembly {
             }
         }
 
+        let defaultCodexHome: String? = discovery.defaultOutcomes.first(where: { $0.family == "codex" }).flatMap {
+            guard case .resolved(_, _, let anchor) = $0.outcome else { return nil }
+            return discovery.normalizedCodexHomesByAnchor[anchor]
+        }
         return ProviderAccountAssembly(
             identityKeysByCard: identityKeys,
+            desktopKeyCache: discovery.desktopKeyCache,
+            defaultCodexHome: defaultCodexHome,
             claudeCards: claudeCards,
             codexCards: codexCards
         )
@@ -342,7 +480,7 @@ struct ProviderAccountAssembly {
     /// `~/.codex`, so auto-discovery would silently merge another application's rollouts into the
     /// default card. Callers that intentionally want an Orca home must pass it explicitly. All
     /// sources share one path normalizer so slash/tilde/symlink spellings cannot duplicate a source.
-    static func configuredCodexHomes(
+    nonisolated static func configuredCodexHomes(
         environment: EnvironmentReading,
         registeredHomes: [String] = [],
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -365,7 +503,7 @@ struct ProviderAccountAssembly {
         .filter { seen.insert($0).inserted }
     }
 
-    private static func isOrcaManagedCodexHome(
+    nonisolated private static func isOrcaManagedCodexHome(
         _ home: String,
         environment: EnvironmentReading
     ) -> Bool {
@@ -425,7 +563,7 @@ struct ProviderAccountAssembly {
     /// `~/.codex/codex-router/chatgpt-accounts/*/auth.json` (and env overrides for the router state
     /// dir). Unlike Orca, these homes are the router's authoritative per-account auth boundary and
     /// must be auto-discovered so QuotaBar keeps a card + meters for every pool account.
-    static func discoveredCodexRouterChatGPTHomes(
+    nonisolated static func discoveredCodexRouterChatGPTHomes(
         environment: EnvironmentReading = QuotaBarEnvironmentReader(),
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         fileExists: @escaping (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
@@ -478,49 +616,23 @@ struct ProviderAccountAssembly {
     }
 
 
-    private struct DesktopOrganization {
-        var id: String
-        var identityKey: String
-        var label: String
-    }
-
     private static func organizationLabel(_ value: String?) -> String? {
         guard let value, let opening = value.lastIndex(of: "("), value.last == ")" else { return value }
         return String(value[value.index(after: opening)..<value.index(before: value.endIndex)])
     }
 
-    private static func discoverDesktopOrganizations(
+    nonisolated private static func discoverDesktopOrganizations(
         desktop: ClaudeDesktopAuthStore,
         cliIdentity: String?,
         listDirectories: @Sendable (URL) -> [String]
     ) -> [DesktopOrganization] {
-        guard let user = desktop.lastKnownAccountUUID(), desktop.hasCredentialMaterial() else { return [] }
-        let active = desktop.load(allowInteraction: false, expectedAccountUUID: user)
-        let activeOrganization = active.organization
+        guard let user = desktop.lastKnownAccountUUID() else { return [] }
 
         let root = desktop.homeDirectory().appendingPathComponent("Library/Application Support/Claude")
         let memberships = Set(["claude-code-sessions", "local-agent-mode-sessions"].flatMap { directory in
             listDirectories(root.appendingPathComponent(directory).appendingPathComponent(user))
                 .compactMap { UUID(uuidString: $0)?.uuidString.lowercased() }
         })
-        var organizations = memberships
-        if let activeOrganization { organizations.insert(activeOrganization) }
-        if let text = try? desktop.files.readTextIfPresent(root.appendingPathComponent("config.json").path),
-           let rootObject = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
-        {
-            organizations.formUnion(rootObject.keys.compactMap {
-                $0.split(separator: ":").last.flatMap { UUID(uuidString: String($0))?.uuidString.lowercased() }
-            })
-        }
-        if let text = try? desktop.files.readTextIfPresent(
-            root.appendingPathComponent("plan-usage-history.json").path
-        ), let history = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-           let samples = history["samples"] as? [[String: Any]]
-        {
-            organizations.formUnion(samples.compactMap {
-                ($0["org"] as? String).flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
-            })
-        }
         let cliOrganization = cliIdentity.flatMap { identity -> String? in
             let parts = identity.split(separator: "|")
             guard parts.count == 2,
@@ -528,16 +640,22 @@ struct ProviderAccountAssembly {
             else { return nil }
             return String(parts[1]).lowercased()
         }
+        let candidates = memberships.union(cliOrganization.map { [$0] } ?? [])
+        let loaded = desktop.loadOrganizations(
+            candidates,
+            allowInteraction: false,
+            expectedAccountUUID: user
+        )
+        let activeOrganization = loaded.activeOrganization
+        let organizations = memberships
+            .union(activeOrganization.map { [$0] } ?? [])
+            .union(cliOrganization.map { [$0] } ?? [])
 
         return organizations.sorted { lhs, rhs in
-            lhs == activeOrganization ? true : rhs == activeOrganization ? false : lhs < rhs
+            if lhs == rhs { return false }
+            return lhs == activeOrganization ? true : rhs == activeOrganization ? false : lhs < rhs
         }.compactMap { organization in
-            guard memberships.contains(organization)
-                || organization == activeOrganization || organization == cliOrganization
-            else { return nil }
-            let result = organization == activeOrganization ? active : desktop.load(
-                allowInteraction: false, organization: organization, expectedAccountUUID: user
-            )
+            guard let result = loaded.credentialsByOrganization[organization] else { return nil }
             guard result.status == .available || result.status == .permissionRequired else { return nil }
             let plan = result.oauth?.subscriptionType?.lowercased()
             let label = plan.map { ["max", "pro", "free"].contains($0) } == true ? "Personal"

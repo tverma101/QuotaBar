@@ -3,6 +3,43 @@ import XCTest
 @testable import QuotaBar
 
 final class JSONLFileReaderEfficiencyTests: XCTestCase {
+    func testSnapshotStopsAtOriginalEOFWhileWriterAppends() throws {
+        let directory = try temporaryDirectory(named: "SnapshotAppend")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("usage.jsonl")
+        let original = Data("first\nsecond\n".utf8)
+        try original.write(to: url)
+        var lines: [String] = []
+        let read = JSONLFileReader.readLines(at: url, chunkSize: 6, endOffset: UInt64(original.count)) { line in
+            lines.append(String(decoding: line, as: UTF8.self))
+            if lines.count == 1 {
+                let handle = try! FileHandle(forWritingTo: url)
+                try! handle.seekToEnd()
+                try! handle.write(contentsOf: Data("new\n".utf8))
+                try! handle.close()
+            }
+        }
+        XCTAssertTrue(read.isComplete)
+        XCTAssertEqual(read.statistics.bytesRead, original.count)
+        XCTAssertEqual(lines, ["first", "second"])
+        var tail: [String] = []
+        let resumed = JSONLFileReader.readLines(at: url, chunkSize: 6, startOffset: UInt64(original.count)) {
+            tail.append(String(decoding: $0, as: UTF8.self))
+        }
+        XCTAssertTrue(resumed.isComplete)
+        XCTAssertEqual(tail, ["new"])
+    }
+
+    func testSnapshotCannotSucceedWhenTruncatedBeforeBound() throws {
+        let directory = try temporaryDirectory(named: "SnapshotTruncate")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("usage.jsonl")
+        try Data("short\n".utf8).write(to: url)
+        let read = JSONLFileReader.readLines(at: url, chunkSize: 4, endOffset: 100) { _ in }
+        XCTAssertFalse(read.isComplete)
+        XCTAssertEqual(read.statistics.bytesRead, 6)
+    }
+
     func testShortLineCorpusCopiesOnlyChunkBoundaryFragments() throws {
         let directory = try temporaryDirectory(named: "ShortLines")
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -72,6 +72,30 @@ final class OpenRouterAuthStoreTests: XCTestCase {
                        .overrideActive)
     }
 
+    func testUnreadableSavedKeyStatusShowsRepairAndPreservesEnvironmentFallback() throws {
+        let path = OpenRouterAuthStore.configPaths[0]
+        let unreadableStore = OpenRouterAuthStore(
+            files: UnreadableFiles(present: [path]),
+            environment: FakeEnvironment()
+        )
+        let unreadableStatus = unreadableStore.keyStatus()
+
+        XCTAssertEqual(unreadableStatus, .savedUnreadable)
+        XCTAssertEqual(unreadableStatus.indicator, .needsAttention)
+        XCTAssertEqual(unreadableStatus.editorMode, .savedUnreadable)
+
+        let environmentStore = OpenRouterAuthStore(
+            files: UnreadableFiles(present: [path]),
+            environment: FakeEnvironment(["OPENROUTER_API_KEY": "sk-or-env"])
+        )
+        let environmentStatus = environmentStore.keyStatus()
+
+        XCTAssertEqual(environmentStatus, .environmentFallback)
+        XCTAssertEqual(environmentStatus.indicator, .needsAttention)
+        XCTAssertEqual(environmentStatus.editorMode, .environmentFallback)
+        XCTAssertEqual(try environmentStore.loadAPIKeyForRefresh()?.apiKey, "sk-or-env")
+    }
+
     func testCurrentAPIKeyReturnsEffectiveKey() {
         let store = OpenRouterAuthStore(
             files: FakeFiles([OpenRouterAuthStore.configPaths[0]: #"{"apiKey":"sk-or-file"}"#]),
@@ -126,6 +150,12 @@ final class OpenRouterUsageMapperTests: XCTestCase {
         XCTAssertTrue(OpenRouterUsageMapper.creditsLines(from: ["foo": "bar"]).isEmpty)
     }
 
+    func testCreditsLinesDoNotInventZeroBalanceWhenPurchasedTotalIsMissing() {
+        let lines = OpenRouterUsageMapper.creditsLines(from: ["total_usage": 2.5])
+
+        XCTAssertTrue(lines.isEmpty)
+    }
+
     func testNoCreditsMeterWhenNothingPurchased() {
         let lines = OpenRouterUsageMapper.creditsLines(from: ["total_credits": 0, "total_usage": 0])
 
@@ -176,6 +206,49 @@ final class OpenRouterUsageMapperTests: XCTestCase {
         XCTAssertNil(progress(mapped.lines, "Key Limit"))
     }
 
+    func testKeyLimitIsOmittedWhenTheRemainingAmountIsMissing() throws {
+        // `limit_remaining` is the only evidence of how much of the cap is left. Treating a missing
+        // field as zero published the cap as 100 % spent — a wrong number dressed as a measurement.
+        DiagnosticGate.clearFailure(OpenRouterUsageMapper.missingLimitRemainingDiagnosticKey)
+        let logs = try captureLogs {
+            OpenRouterUsageMapper.keyMetrics(from: ["is_free_tier": false, "usage": 2, "limit": 5])
+        }
+
+        XCTAssertNil(progress(logs.lines, "Key Limit"), "a missing remaining amount is not a measured zero")
+        XCTAssertTrue(logs.text.contains("limit"), "the missing field must leave a diagnostic: \(logs.text)")
+    }
+
+    func testKeyLimitIsOmittedWhenTheRemainingAmountIsNotNumeric() throws {
+        DiagnosticGate.clearFailure(OpenRouterUsageMapper.missingLimitRemainingDiagnosticKey)
+        let logs = try captureLogs {
+            OpenRouterUsageMapper.keyMetrics(from: ["limit": 5, "limit_remaining": "many"])
+        }
+
+        XCTAssertNil(progress(logs.lines, "Key Limit"))
+        XCTAssertFalse(logs.text.isEmpty, "an unparsable remaining amount must leave a diagnostic")
+    }
+
+    private func captureLogs(
+        _ operation: () -> (plan: String?, lines: [MetricLine])
+    ) throws -> (lines: [MetricLine], text: String) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenUsageTests.OpenRouter.\(UUID().uuidString)", isDirectory: true)
+        let sink = LogFile(directory: directory, fileName: "OpenUsage.log")
+        sink.open()
+        let originalSink = AppLog.sink
+        AppLog.sink = sink
+        AppLog.reloadLevel(.warn)
+        defer {
+            AppLog.sink = originalSink
+            AppLog.reloadLevel()
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let mapped = operation()
+        let text = try String(contentsOf: sink.fileURL, encoding: .utf8)
+        return (mapped.lines, text)
+    }
+
     private func progress(_ lines: [MetricLine], _ label: String) -> (used: Double, limit: Double)? {
         guard case .progress(_, let used, let limit, _, _, _, _, _) = lines.first(where: { $0.label == label }) else {
             return nil
@@ -193,6 +266,20 @@ final class OpenRouterUsageMapperTests: XCTestCase {
 
 @MainActor
 final class OpenRouterProviderTests: XCTestCase {
+    func testCreditsCancellationStopsBeforeKeyEndpoint() async {
+        let http = RoutingHTTPClient { _ in throw CancellationError() }
+        let provider = OpenRouterProvider(
+            authStore: makeAuthStore(key: "sk-or-test"),
+            usageClient: OpenRouterUsageClient(http: http)
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .cancelled)
+        XCTAssertEqual(http.requests.count, 1)
+        XCTAssertEqual(http.requests[0].url.absoluteString, OpenRouterUsageClient.creditsURL)
+    }
+
     func testRefreshMapsBothEndpoints() async throws {
         let provider = OpenRouterProvider(
             authStore: makeAuthStore(key: "sk-or-test"),
@@ -267,6 +354,26 @@ final class OpenRouterProviderTests: XCTestCase {
         XCTAssertEqual(snapshot.errorCategory, .notLoggedIn)
     }
 
+    func testUnreadableSavedKeyRemainsDetectedAndSurfacesCredentialAccess() async {
+        let path = OpenRouterAuthStore.configPaths[0]
+        let provider = OpenRouterProvider(
+            authStore: OpenRouterAuthStore(
+                files: UnreadableFiles(present: [path]),
+                environment: FakeEnvironment()
+            ),
+            usageClient: OpenRouterUsageClient(http: RoutingHTTPClient { _ in
+                XCTFail("should not hit the network without a readable key")
+                return jsonResponse([:])
+            })
+        )
+
+        let detected = await provider.hasLocalCredentials()
+        let snapshot = await provider.refresh()
+
+        XCTAssertTrue(detected)
+        XCTAssertEqual(snapshot.errorCategory, .credentialAccess)
+    }
+
     func testRefreshOnAuthFailureReportsInvalidKey() async {
         // Both endpoints reject the key — nothing usable comes back, so it's a hard auth failure.
         let provider = OpenRouterProvider(
@@ -316,6 +423,15 @@ final class OpenRouterProviderTests: XCTestCase {
 
         try provider.deleteAPIKey()
         XCTAssertEqual(provider.apiKeyStatus, .fromEnvironment)
+    }
+
+    func testUnreadableSavedKeyFallsBackToEnvironmentForRefresh() throws {
+        let store = OpenRouterAuthStore(
+            files: UnreadableFiles(present: [OpenRouterAuthStore.configPaths[0]]),
+            environment: FakeEnvironment(["OPENROUTER_API_KEY": "sk-or-env"])
+        )
+
+        XCTAssertEqual(try store.loadAPIKeyForRefresh()?.apiKey, "sk-or-env")
     }
 
     private func makeAuthStore(key: String) -> OpenRouterAuthStore {

@@ -87,7 +87,10 @@ enum OpenCodeUsageMapper {
     }
 
     private static func percent(_ spend: Double, cap: Double) -> Double {
-        guard cap > 0 else { return 0 }
-        return spend / cap * 100
+        guard cap.isFinite, cap > 0 else { return 0 }
+        // This is a capped allowance meter. Clamp before dividing so malformed or extreme local
+        // values stay finite and report the meaningful state (limit reached) instead of infinity.
+        guard spend.isFinite else { return spend > 0 ? 100 : 0 }
+        return min(max(spend, 0), cap) / cap * 100
     }
 }

@@ -24,13 +24,12 @@ struct OpenCodeGoAccountUsage: Sendable, Equatable {
     var weekly: OpenCodeGoAccountWindow
     var monthly: OpenCodeGoAccountWindow
 
-    /// The account data is authoritative only when every window reports `ok` with a usable percent —
-    /// a partial or non-`ok` response must not mix account percentages with local fallbacks in one card.
+    /// The account data is authoritative only when every window has a recognized status and percent —
+    /// a partial response must not mix account percentages with local fallbacks in one card.
     var isAvailable: Bool {
-        [rolling, weekly, monthly].allSatisfy { window in
-            window.status == "ok" && window.percent != nil
-        }
+        [rolling, weekly, monthly].allSatisfy(\.isUsable)
     }
+
 }
 
 /// Calls OpenCode's official account-wide usage endpoint with the `opencode-go` key as the Bearer token.
@@ -65,24 +64,47 @@ struct OpenCodeGoUsageClient: Sendable {
             timeout: 15
         ))
 
-        if response.statusCode == 401 || response.statusCode == 403 {
-            throw OpenCodeUsageError.accountAPIUnauthorized
-        }
-        guard (200..<300).contains(response.statusCode) else {
-            throw OpenCodeUsageError.accountAPIRequestFailed(response.statusCode)
+        if (200..<300).contains(response.statusCode) {
+            guard let object = ProviderParse.jsonObject(response.body),
+                  let usage = object["usage"] as? [String: Any] else {
+                throw OpenCodeUsageError.accountAPIInvalidResponse
+            }
+            let parsed = Self.parse(usage)
+            guard parsed.isAvailable else {
+                throw OpenCodeUsageError.accountAPIInvalidResponse
+            }
+            return parsed
         }
 
-        guard let object = ProviderParse.jsonObject(response.body),
-              let usage = object["usage"] as? [String: Any] else {
-            throw OpenCodeUsageError.accountAPIUnavailable(detail: "unexpected response shape")
+        switch Self.errorType(in: response.body) {
+        case "AuthError":
+            throw OpenCodeUsageError.accountAPIUnauthorized
+        case "EntitlementError":
+            throw OpenCodeUsageError.accountAPINoEntitlement
+        default:
+            break
         }
-        return Self.parse(usage)
+        if response.statusCode == 401 {
+            throw OpenCodeUsageError.accountAPIUnauthorized
+        }
+        if response.statusCode == 403 {
+            throw OpenCodeUsageError.accountAPINoEntitlement
+        }
+        throw OpenCodeUsageError.accountAPIRequestFailed(response.statusCode)
+    }
+
+    /// Error type is the stable API signal, including when a fronting proxy changes HTTP status codes.
+    private static func errorType(in body: Data) -> String? {
+        guard let object = ProviderParse.jsonObject(body),
+              let error = object["error"] as? [String: Any]
+        else { return nil }
+        return error["type"] as? String
     }
 
     /// Tolerant parse: each window's `status` (string), `percent` (number), and `resetsAt` (ISO 8601)
     /// are read independently, and a missing window parses as an empty one — so one odd or absent
-    /// field can't hide the others. The provider gates on `isAvailable`, which requires every window
-    /// to be `ok` with a percent, so a partial payload simply falls back to local logs.
+    /// field can't hide the others. The provider gates on `isAvailable`, which accepts both normal
+    /// and cap-exhausted windows but rejects partial or unrecognized statuses.
     private static func parse(_ usage: [String: Any]) -> OpenCodeGoAccountUsage {
         func window(_ key: String) -> OpenCodeGoAccountWindow {
             guard let raw = usage[key] as? [String: Any] else {

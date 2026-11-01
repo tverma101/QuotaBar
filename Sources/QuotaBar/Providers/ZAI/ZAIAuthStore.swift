@@ -6,6 +6,7 @@ struct ZAIAuth: Hashable, Sendable {
 
 enum ZAIAuthError: Error, LocalizedError, Equatable {
     case missingKey
+    case credentialsUnreadable
     case invalidKey
     case saveFailed
     case deleteFailed
@@ -22,6 +23,8 @@ enum ZAIAuthError: Error, LocalizedError, Equatable {
         switch self {
         case .missingKey:
             return "No Z.ai API key. Set ZAI_API_KEY or add it to ~/.config/openusage/zai.json."
+        case .credentialsUnreadable:
+            return "Couldn't read the saved Z.ai API key. Check the config file permissions, then refresh again."
         case .invalidKey:
             return "Z.ai API key invalid. Check your key at z.ai/manage-apikey/apikey-list."
         case .saveFailed:
@@ -68,6 +71,14 @@ struct ZAIAuthStore: Sendable {
     }
 
     func loadAPIKey() -> ZAIAuth? { store.loadKey().map(ZAIAuth.init(apiKey:)) }
+    func loadAPIKeyForRefresh() throws -> ZAIAuth? {
+        do {
+            return try store.loadKeyForRefresh().map(ZAIAuth.init(apiKey:))
+        } catch UserAPIKeyStore.ReadFailure.configUnreadable {
+            throw ZAIAuthError.credentialsUnreadable
+        }
+    }
+    func hasKeyOrUnreadableConfig() -> Bool { store.hasKeyOrUnreadableConfig() }
     func currentAPIKey() -> String? { store.loadKey() }
     func keyStatus() -> APIKeyStatus { store.keyStatus() }
     func saveAPIKey(_ key: String) throws { try store.saveKey(key) }

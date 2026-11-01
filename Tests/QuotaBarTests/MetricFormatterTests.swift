@@ -50,6 +50,24 @@ final class MetricFormatterTests: XCTestCase {
         XCTAssertEqual(MetricFormatter.string(for: tokens, style: .full), "56,904,995")
     }
 
+    func testSaturatedTokenCountIsDisplayedAsALowerBound() {
+        let tokens = MetricValue(
+            number: Double(Int.max),
+            kind: .count,
+            label: "tokens",
+            tokenCountSaturated: true
+        )
+        XCTAssertTrue(MetricFormatter.string(for: tokens, style: .row).hasPrefix("≥"))
+        XCTAssertTrue(MetricFormatter.string(for: tokens, style: .full).hasPrefix("≥"))
+        XCTAssertTrue(MetricFormatter.string(for: tokens, style: .full).hasSuffix(" tokens"))
+    }
+
+    func testPartialDollarSubtotalIsDisplayedAsALowerBound() {
+        let cost = MetricValue(number: 1.25, kind: .dollars, isLowerBound: true)
+        XCTAssertTrue(MetricFormatter.string(for: cost, style: .row).hasPrefix("≥"))
+        XCTAssertTrue(MetricFormatter.string(for: cost, style: .full).hasPrefix("≥"))
+    }
+
     func testCostPerMtokAppendsUnitToDollarFormatting() {
         XCTAssertEqual(MetricFormatter.costPerMtok(32, style: .tray), "$32/MTok")
         XCTAssertEqual(MetricFormatter.costPerMtok(32.1, style: .row), "$32.10/MTok")

@@ -1,8 +1,8 @@
 import Foundation
 
 /// Reads the OpenCode Go/Zen credential already on the machine. Local-only — never the network. The
-/// `opencode-go` key is both the first-run detection signal and (for a future `/zen/go/v1/usage` API)
-/// the Bearer token, so it lives behind one loader.
+/// `opencode-go` key is both the optional local-credential signal and (for a future `/zen/go/v1/usage`
+/// API) the Bearer token, so it lives behind one loader.
 struct OpenCodeAuthStore: Sendable {
     var files: TextFileAccessing
     var environment: EnvironmentReading
@@ -44,6 +44,7 @@ struct OpenCodeAuthStore: Sendable {
         do {
             text = try files.readTextIfPresent(authFilePath)
         } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
             throw OpenCodeUsageError.credentialsUnreadable(detail: error.localizedDescription)
         }
         guard let text else { return [] }
@@ -62,6 +63,6 @@ struct OpenCodeAuthStore: Sendable {
             guard !trimmed.isEmpty else { return nil }
             return (name, trimmed)
         }
-        return keys
+        return keys.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 }

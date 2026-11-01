@@ -253,7 +253,7 @@ final class CodexMultiAccountTests: XCTestCase {
         XCTAssertFalse(service.state.isSigningIn)
     }
 
-    func testExistingHomeRegistrationRequiresCodexIdentityAndDeduplicates() throws {
+    func testExistingHomeRegistrationRequiresCodexIdentityAndDeduplicates() async throws {
         let defaults = makeScratchDefaults()
         let accounts = CodexAccountRegistrationStore(defaults: defaults)
         let root = FileManager.default.temporaryDirectory
@@ -267,15 +267,19 @@ final class CodexMultiAccountTests: XCTestCase {
         let service = CodexAccountRegistrationService(accounts: accounts)
         var reloadCount = 0
         service.onAccountRegistered = { reloadCount += 1 }
-        XCTAssertNil(try service.registerExistingHome(at: home))
+        let label = try await service.registerExistingHome(at: home)
+        XCTAssertNil(label)
         XCTAssertEqual(accounts.registeredHomes, [home.resolvingSymlinksInPath().standardizedFileURL.path])
         XCTAssertEqual(reloadCount, 1)
-        XCTAssertThrowsError(try service.registerExistingHome(at: home)) { error in
+        do {
+            _ = try await service.registerExistingHome(at: home)
+            XCTFail("duplicate home should be rejected")
+        } catch {
             XCTAssertEqual(error as? CodexAccountRegistrationService.RegistrationError, .alreadyRegistered)
         }
     }
 
-    func testExistingHomeRegistrationRejectsAuthWithoutAccountIdentity() throws {
+    func testExistingHomeRegistrationRejectsAuthWithoutAccountIdentity() async throws {
         let defaults = makeScratchDefaults()
         let accounts = CodexAccountRegistrationStore(defaults: defaults)
         let root = FileManager.default.temporaryDirectory
@@ -287,10 +291,45 @@ final class CodexMultiAccountTests: XCTestCase {
             .write(to: home.appendingPathComponent("auth.json"))
 
         let service = CodexAccountRegistrationService(accounts: accounts)
-        XCTAssertThrowsError(try service.registerExistingHome(at: home)) { error in
+        do {
+            _ = try await service.registerExistingHome(at: home)
+            XCTFail("auth without account identity should be rejected")
+        } catch {
             XCTAssertEqual(error as? CodexAccountRegistrationService.RegistrationError, .existingHomeNoAccount)
         }
         XCTAssertTrue(accounts.registeredHomes.isEmpty)
+    }
+
+    func testExistingHomeIdentityReadRunsOffMainActor() async throws {
+        let defaults = makeScratchDefaults()
+        let accounts = CodexAccountRegistrationStore(defaults: defaults)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenUsageTests-CodexHome-OffMain-\(UUID().uuidString)", isDirectory: true)
+        let home = root.appendingPathComponent("account", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let normalizedHome = home.resolvingSymlinksInPath().standardizedFileURL
+        let files = ThreadRecordingCodexFiles([
+            normalizedHome.appendingPathComponent("auth.json").path:
+                codexAuth(accountID: "ACCOUNT-OFF-MAIN", accessToken: "token")
+        ])
+        let service = CodexAccountRegistrationService(
+            accounts: accounts,
+            accountObserverFactory: { home in
+                DefaultAccountObserver(
+                    environment: FakeEnvironment([:]),
+                    files: files,
+                    keychain: FakeKeychain(),
+                    homeDirectory: { home.deletingLastPathComponent() }
+                )
+            }
+        )
+
+        let label = try await service.registerExistingHome(at: home)
+        XCTAssertNil(label)
+        XCTAssertEqual(files.lastReadWasOnMainThread, false)
+        XCTAssertEqual(accounts.registeredHomes, [normalizedHome.path])
     }
 
     func testProviderCatalogBuildsOneScopedRuntimePerCodexCard() {
@@ -599,12 +638,14 @@ final class CodexMultiAccountTests: XCTestCase {
 
     func testProviderCatalogWiresPeerHomesAcrossCodexCards() async throws {
         let secondID = ProviderAccountID.make(family: "codex", identityKey: "account-b")
+        let defaultHome = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex").standardizedFileURL.path
         let cards = [
             CodexAccountCard(
                 id: "codex",
                 identityKey: "account-a",
-                home: "/Users/dev/.codex",
-                logHomes: ["/Users/dev/.codex"],
+                home: defaultHome,
+                logHomes: [defaultHome],
                 displayName: "Codex — A",
                 allowsKeychainFallback: false,
                 allowsUnattributedPiUsage: false
@@ -620,28 +661,52 @@ final class CodexMultiAccountTests: XCTestCase {
             ),
         ]
 
-        let runtimes = ProviderCatalog.make(codexCards: cards)
+        var enabledProviderIDs = Set(cards.map(\.id))
+        let runtimes = ProviderCatalog.make(
+            codexCards: cards,
+            isProviderEnabled: { enabledProviderIDs.contains($0) }
+        )
             .compactMap { $0 as? CodexProvider }
         XCTAssertEqual(runtimes.count, 2)
 
         // Auth stays single-home; log env is still the comma-joined logHomes list.
-        XCTAssertEqual(runtimes[0].authStore.codexHome(), "/Users/dev/.codex")
+        XCTAssertEqual(runtimes[0].authStore.codexHome(), defaultHome)
         XCTAssertEqual(runtimes[1].authStore.codexHome(), "/Users/dev/orca/account-b")
         let homesA = await runtimes[0].logUsageScanner.discoveredHomesForTesting().map(\.path)
         let homesB = await runtimes[1].logUsageScanner.discoveredHomesForTesting().map(\.path)
-        XCTAssertEqual(homesA, ["/Users/dev/.codex"])
+        XCTAssertEqual(homesA, [defaultHome])
         XCTAssertEqual(Set(homesB), Set([
             "/Users/dev/orca/account-b",
             "/Users/dev/OpenUsage/Account-B",
         ]))
 
-        let peersA = await runtimes[0].logUsageScanner.peerHomesForTesting().map(\.path)
-        let peersB = await runtimes[1].logUsageScanner.peerHomesForTesting().map(\.path)
-        XCTAssertEqual(Set(peersA), Set([
-            "/Users/dev/orca/account-b",
-            "/Users/dev/OpenUsage/Account-B",
-        ]))
-        XCTAssertEqual(peersB, ["/Users/dev/.codex"])
+        let peersA = runtimes[0].peerHomes().map(\.path)
+        let peersB = runtimes[1].peerHomes().map(\.path)
+        XCTAssertTrue(peersA.isEmpty, "the default home has first ownership priority")
+        XCTAssertEqual(peersB, [defaultHome])
+
+        enabledProviderIDs.remove(secondID)
+        XCTAssertTrue(runtimes[0].peerHomes().isEmpty)
+        XCTAssertEqual(runtimes[1].peerHomes().map(\.path), [defaultHome],
+                       "peer identity paths remain available when their owner card is disabled")
+    }
+
+    func testManagedPeerOwnershipIsDeterministic() {
+        let cardA = CodexAccountCard(
+            id: "codex-a", identityKey: "account-a", home: "/tmp/codex/account-a",
+            logHomes: ["/tmp/codex/account-a"], displayName: "Codex A",
+            allowsKeychainFallback: false, allowsUnattributedPiUsage: false
+        )
+        let cardB = CodexAccountCard(
+            id: "codex-b", identityKey: "account-b", home: "/tmp/codex/account-b",
+            logHomes: ["/tmp/codex/account-b"], displayName: "Codex B",
+            allowsKeychainFallback: false, allowsUnattributedPiUsage: false
+        )
+        let runtimes = ProviderCatalog.make(codexCards: [cardB, cardA])
+            .compactMap { $0 as? CodexProvider }
+
+        XCTAssertEqual(runtimes[0].peerHomes().map(\.path), ["/tmp/codex/account-a"])
+        XCTAssertTrue(runtimes[1].peerHomes().isEmpty)
     }
 
 
@@ -697,4 +762,41 @@ final class CodexMultiAccountTests: XCTestCase {
         XCTAssertEqual(homes, ["/Users/dev/codex-registered", routerPath])
     }
 
+}
+
+private final class ThreadRecordingCodexFiles: TextFileAccessing, @unchecked Sendable {
+    private let lock = NSLock()
+    private let contents: [String: String]
+    private var readWasOnMainThread: Bool?
+
+    init(_ contents: [String: String]) {
+        self.contents = contents
+    }
+
+    var lastReadWasOnMainThread: Bool? {
+        lock.lock(); defer { lock.unlock() }
+        return readWasOnMainThread
+    }
+
+    func exists(_ path: String) -> Bool {
+        contents[path] != nil
+    }
+
+    func readTextIfPresent(_ path: String) throws -> String? {
+        lock.lock()
+        readWasOnMainThread = Thread.isMainThread
+        lock.unlock()
+        return contents[path]
+    }
+
+    func readText(_ path: String) throws -> String {
+        lock.lock()
+        readWasOnMainThread = Thread.isMainThread
+        lock.unlock()
+        return contents[path] ?? ""
+    }
+
+    func writeText(_ path: String, _ text: String) throws {}
+
+    func remove(_ path: String) throws {}
 }

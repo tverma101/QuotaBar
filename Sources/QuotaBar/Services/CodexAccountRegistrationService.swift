@@ -2,6 +2,12 @@ import AppKit
 import Foundation
 import Observation
 
+private struct CodexHomeInspection: Sendable {
+    let home: URL
+    let hasAuthFile: Bool
+    let outcome: DefaultAccountObserver.Outcome
+}
+
 /// Runs the official Codex browser-login flow for an additional account.
 ///
 /// QuotaBar owns the isolated `CODEX_HOME` directory, but Codex owns OAuth, the browser callback,
@@ -71,6 +77,7 @@ final class CodexAccountRegistrationService {
     var onAccountRegistered: (@MainActor () -> Void)?
     private let fileManager: FileManager
     private let applicationSupportDirectory: URL
+    private let accountObserverFactory: @Sendable (URL) -> DefaultAccountObserver
     private(set) var state: State = .idle
 
     private var loginProcess: Process?
@@ -80,7 +87,8 @@ final class CodexAccountRegistrationService {
     init(
         accounts: CodexAccountRegistrationStore,
         fileManager: FileManager = .default,
-        applicationSupportDirectory: URL? = nil
+        applicationSupportDirectory: URL? = nil,
+        accountObserverFactory: (@Sendable (URL) -> DefaultAccountObserver)? = nil
     ) {
         self.accounts = accounts
         self.fileManager = fileManager
@@ -89,6 +97,14 @@ final class CodexAccountRegistrationService {
             ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(
                 "Library/Application Support", isDirectory: true
             )
+        self.accountObserverFactory = accountObserverFactory ?? { home in
+            DefaultAccountObserver(
+                environment: OverrideEnvironmentReader(["CODEX_HOME": home.path]),
+                files: LocalTextFileAccessor(),
+                keychain: SecurityKeychainAccessor(),
+                homeDirectory: { FileManager.default.homeDirectoryForCurrentUser }
+            )
+        }
     }
 
     /// Starts Codex's normal browser OAuth login with a private, isolated home.
@@ -123,7 +139,7 @@ final class CodexAccountRegistrationService {
         process.terminationHandler = { [weak self] process in
             let exitCode = process.terminationStatus
             Task { @MainActor [weak self] in
-                self?.completeLogin(exitCode: exitCode)
+                await self?.completeLogin(exitCode: exitCode)
             }
         }
 
@@ -158,22 +174,23 @@ final class CodexAccountRegistrationService {
         panel.title = "Choose Codex Home"
         panel.message = "Select the CODEX_HOME directory for an account already authenticated with Codex."
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        return url.resolvingSymlinksInPath().standardizedFileURL
+        return url
     }
 
     /// Registers an already-authenticated home only when Codex's own auth metadata identifies it.
     /// This keeps the manual-import path subject to the same attribution rule as browser sign-in.
-    func registerExistingHome(at home: URL) throws -> String? {
-        let normalizedHome = home.resolvingSymlinksInPath().standardizedFileURL
-        guard fileManager.fileExists(
-            atPath: normalizedHome.appendingPathComponent("auth.json").path
-        ) else {
+    func registerExistingHome(at home: URL) async throws -> String? {
+        let observer = accountObserver(for: home)
+        let inspection = await loadOffMainActor {
+            Self.inspectCodexHome(home, observer: observer)
+        }
+        guard inspection.hasAuthFile else {
             throw RegistrationError.existingHomeMissingAuth
         }
 
-        switch accountObserver(for: normalizedHome).observeCodex(home: normalizedHome.path) {
+        switch inspection.outcome {
         case .resolved(_, let label, _):
-            guard accounts.register(home: normalizedHome.path) else {
+            guard accounts.register(normalizedAbsoluteHome: inspection.home.path) else {
                 throw RegistrationError.alreadyRegistered
             }
             onAccountRegistered?()
@@ -196,7 +213,7 @@ final class CodexAccountRegistrationService {
         )
     }
 
-    private func completeLogin(exitCode: Int32) {
+    private func completeLogin(exitCode: Int32) async {
         guard let home = pendingHome else {
             loginProcess = nil
             outputCapture = nil
@@ -204,6 +221,13 @@ final class CodexAccountRegistrationService {
             return
         }
 
+        let observer = accountObserver(for: home)
+        let inspection = await loadOffMainActor {
+            Self.inspectCodexHome(home, observer: observer)
+        }
+        // Keep the login slot occupied while disk identity is checked. A second login must not
+        // replace this completion's home during the off-main read.
+        guard pendingHome == home else { return }
         loginProcess = nil
         pendingHome = nil
         outputCapture = nil
@@ -211,9 +235,9 @@ final class CodexAccountRegistrationService {
         // Trust Codex's own exit status only when its resulting auth file also proves which account
         // was signed in. Conversely, a valid auth file wins over a wrapper's non-zero exit so an
         // interrupted UI teardown cannot make a completed browser sign-in unusable.
-        switch accountObserver(for: home).observeCodex(home: home.path) {
+        switch inspection.outcome {
         case .resolved(_, let label, _):
-            guard accounts.register(home: home.path) else {
+            guard accounts.register(normalizedAbsoluteHome: inspection.home.path) else {
                 state = .failed(RegistrationError.alreadyRegistered.localizedDescription)
                 return
             }
@@ -234,12 +258,20 @@ final class CodexAccountRegistrationService {
     }
 
     private func accountObserver(for home: URL) -> DefaultAccountObserver {
-        DefaultAccountObserver(
-            environment: OverrideEnvironmentReader(["CODEX_HOME": home.path]),
-            files: LocalTextFileAccessor(),
-            keychain: SecurityKeychainAccessor(),
-            homeDirectory: { FileManager.default.homeDirectoryForCurrentUser }
-        )
+        accountObserverFactory(home)
+    }
+
+    private nonisolated static func inspectCodexHome(
+        _ home: URL,
+        observer: DefaultAccountObserver
+    ) -> CodexHomeInspection {
+        let normalizedHome = home.resolvingSymlinksInPath().standardizedFileURL
+        let authPath = normalizedHome.appendingPathComponent("auth.json").path
+        let hasAuthFile = observer.files.exists(authPath)
+        let outcome = hasAuthFile
+            ? observer.observeCodex(home: normalizedHome.path)
+            : .absent
+        return CodexHomeInspection(home: normalizedHome, hasAuthFile: hasAuthFile, outcome: outcome)
     }
 
     private func makeUnusedHome() throws -> URL {

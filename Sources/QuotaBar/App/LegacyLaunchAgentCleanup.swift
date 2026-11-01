@@ -35,16 +35,26 @@ enum LegacyLaunchAgentCleanup {
     }
 
     /// `tauri-plugin-autostart` named the plist after the app's product name.
-    static var defaultAgentURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/LaunchAgents/OpenUsage.plist")
+    static var defaultAgentURLs: [URL] {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        return ["QuotaBar.plist", "OpenUsage.plist"].map {
+            directory.appendingPathComponent($0)
+        }
     }
 
     /// Live entry point, called once per launch. Parameters exist for tests only.
     static func removeLeftoverAgent(
-        agentURL: URL = defaultAgentURL,
+        agentURL: URL? = nil,
         bundlePath: String = Bundle.main.bundlePath
     ) {
+        let agentURLs = agentURL.map { [$0] } ?? defaultAgentURLs
+        for agentURL in agentURLs {
+            removeLeftoverAgent(at: agentURL, bundlePath: bundlePath)
+        }
+    }
+
+    private static func removeLeftoverAgent(at agentURL: URL, bundlePath: String) {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: agentURL.path) else { return }
 

@@ -19,6 +19,8 @@ final class HermesProvider: ProviderRuntime {
     let usageScanner: HermesUsageScanner
     let now: @Sendable () -> Date
 
+    var panelMetersRefreshIncludesHistory: Bool { true }
+
     init(
         authStore: HermesAuthStore = HermesAuthStore(),
         usageScanner: HermesUsageScanner = HermesUsageScanner(),
@@ -73,11 +75,23 @@ final class HermesProvider: ProviderRuntime {
             plan: nil,
             lines: lines,
             refreshedAt: refreshedAt,
-            usageHistory: ProviderUsageHistory(
-                series: scan.daily,
-                modelUsage: nil,
-                unknownModelsByDay: [:]
-            )
+            usageHistory: Self.usageHistory(from: scan)
+        )
+    }
+
+    /// Hermes' daily rows have no serving-model detail to price at public API rates. Mark every
+    /// token-bearing day incomplete so Usage History does not present other providers' estimates as
+    /// a complete cross-provider total.
+    nonisolated static func usageHistory(from scan: HermesUsageScan) -> ProviderUsageHistory {
+        let incompleteEstimateDays = Set(
+            scan.daily.daily.lazy.filter { $0.totalTokens > 0 }.map(\.date)
+        )
+        return ProviderUsageHistory(
+            series: scan.daily,
+            modelUsage: nil,
+            unknownModelsByDay: [:],
+            apiEstimateIncompleteDays: incompleteEstimateDays,
+            partialDays: scan.partialDays
         )
     }
 }

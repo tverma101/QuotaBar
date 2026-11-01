@@ -14,8 +14,14 @@ enum AntigravityError: Error, LocalizedError, Equatable {
     case credentialPermissionRequired
     /// The Keychain item was present but did not contain usable Antigravity credential data.
     case invalidCredentialData
-    /// A token was found but rejected (401/403) and a refresh couldn't recover it.
+    /// Google rejected QuotaBar's OAuth client configuration; this does not mean the user's sign-in expired.
+    case oauthClientConfigurationInvalid
+    /// A token was found but rejected as expired or invalid, and a refresh could not recover it.
     case authExpired
+    /// Cloud Code explicitly denied access. A permission denial is not evidence that the token expired.
+    case accessDenied
+    /// Credentials are valid, but this Antigravity client/account exposes none of the known quota endpoints.
+    case quotaEndpointUnavailable
     /// Credentials exist and look valid, but every endpoint was unreachable (network / server outage).
     /// Distinct from `notSignedIn` so a signed-in user isn't told to start Antigravity during an outage.
     case unavailable
@@ -30,8 +36,14 @@ enum AntigravityError: Error, LocalizedError, Equatable {
             return "Antigravity needs permission to read its Keychain item. Use Refresh Now to be asked once, then grant it."
         case .invalidCredentialData:
             return "Antigravity credentials are invalid. Open Antigravity or run `agy` to sign in again."
+        case .oauthClientConfigurationInvalid:
+            return "Google rejected QuotaBar's Antigravity OAuth client configuration. Update QuotaBar and try again."
         case .authExpired:
             return "Antigravity sign-in expired. Open Antigravity or run `agy` to refresh."
+        case .accessDenied:
+            return "Google denied access to Antigravity usage. Check that this account and project have access."
+        case .quotaEndpointUnavailable:
+            return "Antigravity did not provide a supported usage endpoint for this account or app version."
         case .unavailable:
             return "Antigravity usage is temporarily unavailable. Try again shortly."
         }

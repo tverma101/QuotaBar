@@ -99,6 +99,8 @@ extension WidgetDescriptor {
     /// The three local-spend tiles every spend-tracking provider exposes — Today / Yesterday / Last 30
     /// Days — each a combined "cost · tokens" row, backed by `SpendTileMapper`. Ids are
     /// `<provider>.today|yesterday|last30`, so the set is identical across Claude / Codex / Cursor / Grok.
+    /// The plan-versus-API comparison is deliberately not a tile here; it lives on the Usage History
+    /// screen's total line.
     static func spendTiles(provider: Provider, valueTooltipNote: String? = nil) -> [WidgetDescriptor] {
         let descriptors: [WidgetDescriptor] = [
             .combined(id: "\(provider.id).today", provider: provider, title: "Today", isUsagePeriod: true),

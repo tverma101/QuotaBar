@@ -199,9 +199,10 @@ enum CopilotUsageMapper {
         return dayOnlyFormatter.date(from: raw)
     }
 
-    /// `nonisolated(unsafe)` is sound: `DateFormatter` is documented thread-safe on macOS 10.9+, and the
-    /// formatter is never mutated after creation (same pattern as `CursorUsageCSV`/`QuotaBarISO8601`).
-    private nonisolated(unsafe) static let dayOnlyFormatter: DateFormatter = {
+    /// `DateFormatter` is documented thread-safe on macOS 10.9+, and the formatter is never mutated
+    /// after creation (same pattern as `CursorUsageCSV`/`QuotaBarISO8601`). A `static let` of Sendable
+    /// type is readable from any isolation without an explicit `nonisolated(unsafe)`.
+    private static let dayOnlyFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")

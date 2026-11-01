@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Per-provider running tally for one local calendar day. Persisted so counts survive app restarts
 /// within a day, then emitted as a single `provider_refresh_daily` event once the day rolls over.
@@ -65,6 +66,11 @@ final class TelemetryStore {
             AppLog.warn(.config, "failed to persist telemetry counters")
             return
         }
+        TelemetryStore.counterWriteCount.withLock { $0 += 1 }
         defaults.set(data, forKey: Self.providerDaysKey)
     }
+
+    /// Test instrumentation: how many times the counters were written. The recorder batches them into
+    /// one write per refresh pass, so the count must not grow with the number of outcomes.
+    static let counterWriteCount = OSAllocatedUnfairLock(initialState: 0)
 }

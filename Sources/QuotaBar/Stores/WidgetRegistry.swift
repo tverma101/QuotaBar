@@ -1,12 +1,13 @@
 import Foundation
+import os
 
 /// Read-only catalog of providers and the widgets they register, built from the live
 /// `ProviderRuntime`s at launch.
 ///
 /// The registry is immutable once built, and its lookups are read on every render through
 /// `LayoutStore`'s `@Observable` computed properties (display groups, metric order, pin counts).
-/// So the three accessors are backed by lookup maps precomputed once at construction — O(1)/O(k)
-/// instead of linear scans of every descriptor on every call.
+/// So the accessors are backed by lookup maps precomputed once at construction — O(1)/O(k) instead
+/// of linear scans of every descriptor on every call.
 struct WidgetRegistry: Sendable {
     let providers: [Provider]
     let descriptors: [WidgetDescriptor]
@@ -19,6 +20,15 @@ struct WidgetRegistry: Sendable {
     /// (a stable `filter` walk), so `descriptors(for:)` returns the exact sequence the UI metric order
     /// depends on.
     private let descriptorsByProvider: [String: [WidgetDescriptor]]
+    /// Per-provider history descriptor, precomputed — the accessor used to rebuild the map on every
+    /// read, and the store reads it a dozen times per refresh tick.
+    private let historyDescriptors: [String: UsageHistoryDescriptor]
+    /// Per-provider limit descriptors, precomputed for the same reason.
+    private let limitDescriptors: [String: [WidgetDescriptor]]
+
+    /// Test instrumentation: how many times the history map was built. It is built once per registry,
+    /// so reading the accessor must not change the count.
+    static let historyMapBuildCount = OSAllocatedUnfairLock(initialState: 0)
 
     init(providers: [Provider], descriptors: [WidgetDescriptor]) {
         self.providers = providers
@@ -36,6 +46,12 @@ struct WidgetRegistry: Sendable {
             byProvider[descriptor.providerID, default: []].append(descriptor)
         }
         self.descriptorsByProvider = byProvider
+        let history = byProvider.compactMapValues { descriptors in
+            descriptors.compactMap(\.historyResource).first
+        }
+        WidgetRegistry.historyMapBuildCount.withLock { $0 += 1 }
+        self.historyDescriptors = history
+        self.limitDescriptors = byProvider.mapValues { $0.filter { !$0.limitResources.isEmpty } }
     }
 
     func descriptor(id: String) -> WidgetDescriptor? { descriptorsByID[id] }
@@ -69,13 +85,11 @@ struct WidgetRegistry: Sendable {
     }
 
     var limitDescriptorsByProvider: [String: [WidgetDescriptor]] {
-        descriptorsByProvider.mapValues { $0.filter { !$0.limitResources.isEmpty } }
+        limitDescriptors
     }
 
     var historyDescriptorsByProvider: [String: UsageHistoryDescriptor] {
-        descriptorsByProvider.compactMapValues { descriptors in
-            descriptors.compactMap(\.historyResource).first
-        }
+        historyDescriptors
     }
 
     @MainActor

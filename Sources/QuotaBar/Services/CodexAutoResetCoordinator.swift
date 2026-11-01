@@ -65,8 +65,8 @@ final class CodexAutoResetCoordinator {
     private let now: () -> Date
     /// User-facing status for accounts that could not check/redeem an expiring credit.
     private(set) var lastErrorByAccount: [String: String] = [:]
-    @ObservationIgnored private var attempts: [String: Attempt]
-    @ObservationIgnored private var lastKnownCredits: [String: [CodexResetCredit]] = [:]
+    private var attempts: [String: Attempt]
+    private var lastKnownCredits: [String: [CodexResetCredit]] = [:]
     @ObservationIgnored private var inFlight: Set<String> = []
     @ObservationIgnored private var workers: [String: Task<Void, Never>] = [:]
 
@@ -139,6 +139,35 @@ final class CodexAutoResetCoordinator {
     func restart() {
         stop()
         start()
+    }
+
+    func resetToDefaults() {
+        defaults.removeObject(forKey: Self.enabledKey)
+        restart()
+    }
+
+    /// Visible account-scoped state, derived from live checks rather than the dashboard's cached count.
+    func status(for accountID: String, enabled: Bool) -> CodexAutoResetStatus {
+        guard enabled else { return .off }
+        guard accounts[accountID] != nil else { return .unverified }
+        if let error = lastErrorByAccount[accountID] { return .attention(error) }
+        guard let credits = lastKnownCredits[accountID] else { return .checking }
+        let owner = attemptOwner(for: accountID)
+        let retries = attempts.values.filter {
+            $0.accountID == owner && $0.result == .pending && $0.attempts > 0 && $0.expiry > now()
+        }.map { CodexResetCredit(id: $0.creditID, expiresAt: $0.expiry, isRetry: true) }
+        let next = (credits + retries).filter {
+            $0.expiresAt > now()
+                && attempts[Self.key(accountID: owner, creditID: $0.id)]?.result.isTerminal != true
+        }.map { credit in
+            let trigger = credit.expiresAt.addingTimeInterval(-Self.leadTime)
+            guard let prior = attempts[Self.key(accountID: owner, creditID: credit.id)]?.lastAttemptAt else {
+                return trigger
+            }
+            return max(trigger, prior.addingTimeInterval(Self.retryInterval))
+        }.min()
+        guard let next else { return .monitoring }
+        return next <= now() ? .due : .scheduled(next)
     }
 
     deinit { workers.values.forEach { $0.cancel() } }
@@ -251,9 +280,20 @@ final class CodexAutoResetCoordinator {
         case .noCredit:
             record.result = .noCredit
             lastErrorByAccount[accountID] = nil
+        case .cancelled:
+            // claimAuto returns this only before the consume POST. Don't spend the
+            // retry budget or make the live credit terminal when the user opts out
+            // during preflight; a later re-enable should be able to resume it.
+            record.result = .pending
+            record.attempts = max(0, record.attempts - 1)
+            record.lastAttemptAt = nil
         case .nothingToReset:
             record.result = .nothingToReset
             lastErrorByAccount[accountID] = nil
+        case .credentialAccess:
+            if record.attempts >= Self.maximumAttempts { record.result = .exhausted }
+            lastErrorByAccount[accountID] = "Couldn't access Codex credentials"
+            AppLog.error(LogTag.plugin("codex"), "auto reset: credential access failed for \(accountID)")
         case .failed:
             if record.attempts >= Self.maximumAttempts { record.result = .exhausted }
             lastErrorByAccount[accountID] = "Could not redeem expiring reset"

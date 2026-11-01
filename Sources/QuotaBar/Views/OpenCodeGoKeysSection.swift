@@ -21,6 +21,7 @@ struct OpenCodeGoKeysSection: View {
     @State private var labelInput = ""
     @State private var keyInput = ""
     @State private var actionError: String?
+    @State private var isPerformingKeyAction = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: density.headerToCardSpacing) {
@@ -42,8 +43,8 @@ struct OpenCodeGoKeysSection: View {
             .cardSurface()
             .clipShape(Theme.cardShape)
         }
-        .onAppear {
-            refreshEntries()
+        .task {
+            await refreshEntries()
             if entries.isEmpty { isOpen = true }
         }
     }
@@ -70,7 +71,7 @@ struct OpenCodeGoKeysSection: View {
     /// Tapping a row pins the card to that key's account; the checkmark marks the active state.
     private var keyRows: some View {
         VStack(spacing: 0) {
-            if entries.count > 1 {
+            if OpenCodeGoKeyEntry.hasMultipleAccounts(entries) {
                 selectionRow(
                     id: nil,
                     label: "Show All Accounts",
@@ -132,6 +133,7 @@ struct OpenCodeGoKeysSection: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
+                .disabled(isPerformingKeyAction)
                 .accessibilityLabel("Remove \(label)")
             }
         }
@@ -162,13 +164,14 @@ struct OpenCodeGoKeysSection: View {
                 Button("Save") { save() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .disabled(!hasKeyInput)
+                    .disabled(!hasKeyInput || isPerformingKeyAction)
                 Button("Cancel") {
                     resetEditor()
                     isOpen = false
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
+                .disabled(isPerformingKeyAction)
             }
             if let actionError {
                 Text(actionError)
@@ -199,8 +202,8 @@ struct OpenCodeGoKeysSection: View {
         }
     }
 
-    private func refreshEntries() {
-        entries = provider.goKeyEntries()
+    private func refreshEntries() async {
+        entries = await provider.goKeyEntries()
     }
 
     private func toggleExpand() {
@@ -215,43 +218,57 @@ struct OpenCodeGoKeysSection: View {
     }
 
     private func select(_ id: String) {
+        dataStore.invalidateQuotaStateForAccountSelectionChange(providerID: provider.provider.id)
         provider.selectGoKey(id: id)
-        refreshEntries()
-        triggerRefresh()
+        Task {
+            await refreshEntries()
+            triggerRefresh()
+        }
     }
 
     private func clearSelection() {
         // No protocol-level clear: selecting nothing = the default "show all accounts" state.
+        dataStore.invalidateQuotaStateForAccountSelectionChange(providerID: provider.provider.id)
         if provider.activeGoKeyID() != nil {
             OpenCodeGoKeyStore.setActiveSelection(nil)
         }
-        refreshEntries()
-        triggerRefresh()
+        Task {
+            await refreshEntries()
+            triggerRefresh()
+        }
     }
 
     private func save() {
         let key = keyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { return }
-        do {
-            try provider.saveGoKey(label: labelInput, key: key)
-            resetEditor()
-            refreshEntries()
-            triggerRefresh()
-        } catch {
-            actionError = error.localizedDescription
-            AppLog.error(.auth, "OpenCode Go key save failed: \(error.localizedDescription)")
+        guard !key.isEmpty, !isPerformingKeyAction else { return }
+        let label = labelInput
+        isPerformingKeyAction = true
+        Task {
+            defer { isPerformingKeyAction = false }
+            do {
+                try await provider.saveGoKey(label: label, key: key)
+                // Saving changes the provider's descriptor inventory. The app rebuilds its registry
+                // from the cached account-discovery result and closes this obsolete settings tree.
+            } catch {
+                actionError = error.localizedDescription
+                AppLog.error(.auth, "OpenCode Go key save failed: \(error.localizedDescription)")
+            }
         }
     }
 
     private func remove(_ entry: OpenCodeGoKeyEntry) {
-        guard let id = UUID(uuidString: entry.id) else { return }
-        do {
-            try provider.removeGoKey(id: id)
-            refreshEntries()
-            triggerRefresh()
-        } catch {
-            actionError = error.localizedDescription
-            AppLog.error(.auth, "OpenCode Go key remove failed: \(error.localizedDescription)")
+        guard let id = UUID(uuidString: entry.id), !isPerformingKeyAction else { return }
+        isPerformingKeyAction = true
+        Task {
+            defer { isPerformingKeyAction = false }
+            do {
+                try await provider.removeGoKey(id: id)
+                // Removing a key changes the provider's descriptor inventory, so the owning app
+                // rebuilds the registry and refreshes the replacement provider runtime.
+            } catch {
+                actionError = error.localizedDescription
+                AppLog.error(.auth, "OpenCode Go key remove failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -260,6 +277,10 @@ struct OpenCodeGoKeysSection: View {
     private func triggerRefresh() {
         let id = provider.provider.id
         dataStore.clearFailureBackoff(for: id)
-        Task { await dataStore.refresh(providerID: id, force: true) }
+        Task {
+            await withThrottledFullAccounting {
+                await dataStore.refresh(providerID: id, force: true)
+            }
+        }
     }
 }

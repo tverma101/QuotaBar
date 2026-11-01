@@ -31,7 +31,13 @@ enum HermesUsageMapper {
         }
 
         if !scan.daily.daily.isEmpty {
-            SpendTileMapper.appendUsageTrend(scan.daily, to: &lines, now: now, note: sourceNote)
+            SpendTileMapper.appendUsageTrend(
+                scan.daily,
+                to: &lines,
+                now: now,
+                note: sourceNote,
+                partialDays: scan.partialDays
+            )
         }
 
         MetricLine.appendNoDataIfNeeded(&lines)
@@ -49,9 +55,15 @@ enum HermesUsageMapper {
     private static func values(_ usage: HermesPeriodUsage) -> [MetricValue] {
         var values: [MetricValue] = []
         if let costUSD = usage.costUSD {
-            values.append(MetricValue(number: costUSD, kind: .dollars, estimated: true))
+            values.append(MetricValue(number: costUSD, kind: .dollars, estimated: true, isPartial: usage.isPartial))
         }
-        values.append(MetricValue(number: Double(usage.counts.total), kind: .count, label: "tokens"))
+        values.append(MetricValue(
+            number: Double(usage.counts.total),
+            kind: .count,
+            label: "tokens",
+            estimated: usage.isPartial,
+            isPartial: usage.isPartial
+        ))
         return values
     }
 
@@ -68,18 +80,30 @@ enum HermesUsageMapper {
         var otherTokens = 0
         var otherCost: Double?
         var otherModels: [ModelUsageVariant] = []
+        var otherHasPartial = false
 
         for model in models {
             let name = model.model.nilIfEmpty ?? ModelUsageEntry.unattributedModelName
-            let entry = ModelUsageEntry(model: name, totalTokens: model.tokens, costUSD: model.costUSD)
+            let entry = ModelUsageEntry(
+                model: name,
+                totalTokens: model.tokens,
+                costUSD: model.costUSD,
+                costIsComplete: model.isPartial ? false : nil
+            )
             if named.count < namedModelCap {
                 named.append(entry)
             } else {
-                otherTokens += model.tokens
+                otherTokens = ProviderParse.addingSaturating(otherTokens, model.tokens)
                 if let cost = model.costUSD {
                     otherCost = (otherCost ?? 0) + cost
                 }
-                otherModels.append(ModelUsageVariant(model: name, totalTokens: model.tokens, costUSD: model.costUSD))
+                otherModels.append(ModelUsageVariant(
+                    model: name,
+                    totalTokens: model.tokens,
+                    costUSD: model.costUSD,
+                    costIsComplete: model.isPartial ? false : nil
+                ))
+                otherHasPartial = otherHasPartial || model.isPartial
             }
         }
         if otherTokens > 0 || (otherCost ?? 0) > 0 {
@@ -87,7 +111,8 @@ enum HermesUsageMapper {
                 model: ModelUsageEntry.otherModelName,
                 totalTokens: otherTokens,
                 costUSD: otherCost,
-                variants: otherModels
+                variants: otherModels,
+                costIsComplete: otherHasPartial ? false : nil
             ))
         }
         guard !named.isEmpty else { return nil }

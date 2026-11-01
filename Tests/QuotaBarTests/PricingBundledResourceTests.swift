@@ -25,6 +25,22 @@ final class PricingBundledResourceTests: XCTestCase {
         }
     }
 
+    func testCursorScopedPricingAliasesResolveToTheirCursorRates() throws {
+        let pricing = Self.pricing
+        for model in [
+            "grok-4.7",
+            "grok-4.7-fast",
+            "Grok 4.7 (Auto Balanced)",
+            "Gemini 4 Argon (Auto Balanced)"
+        ] {
+            XCTAssertNotNil(pricing.cursorCanonicalName(for: model), model)
+            XCTAssertNotNil(
+                pricing.estimatedCursorCostDollars(model: model, tokens: TokenBreakdown(input: 1_000_000)),
+                model
+            )
+        }
+    }
+
     func testEveryFastMultiplierBaseResolves() {
         let pricing = Self.pricing
         for base in Self.pricing.supplement.fastMultipliers.keys {
@@ -44,7 +60,7 @@ final class PricingBundledResourceTests: XCTestCase {
             ("gpt-5.6-terra-high", 2), ("gpt-5.6-terra-high-fast", 4),
             ("gpt-5.6-luna", 0.2), ("gpt-5.6-luna-fast", 0.4),
             ("gemini-3.6-flash-high", 1.5), ("gemini-3.7-flash-high", 0.75),
-            ("grok-4-20-thinking", 2), ("grok-4.5", 2),
+            ("grok-4-20-thinking", 1.25), ("grok-4.5", 2),
             ("grok-4.5-fast-high", 4), ("grok-4.5-high-fast", 4),
             ("cursor-grok-4.5-high-fast", 4), ("cursor-grok-4.6-high", 2),
             ("cursor-grok-4.6-high-fast", 4), ("grok-4-6-xhigh", 2),
@@ -109,19 +125,24 @@ final class PricingBundledResourceTests: XCTestCase {
         XCTAssertEqual(fable.outputPerMillion, opus48.outputPerMillion * 2)
     }
 
-    /// Claude Sonnet 5: same API pool rates as Claude 4.6 Sonnet; thinking/effort slugs resolve to
-    /// one canonical entry.
+    /// Claude Sonnet 5: Anthropic made the introductory $2/$10 pricing permanent
+    /// (anthropic.com/news/claude-sonnet-5), with 1.25x cache writes and 0.1x cache hits; the
+    /// catalogues moved off the original $3/$15 standard rate. thinking/effort slugs resolve to
+    /// the one canonical entry, which no longer shares Sonnet 4.6's pool rates.
     func testClaudeSonnet5PricingAndAliases() throws {
         let pricing = Self.pricing
         let sonnet5 = try XCTUnwrap(pricing.resolve(model: "claude-sonnet-5-thinking-high"))
-        XCTAssertEqual(sonnet5.inputPerMillion, 3.0)
-        XCTAssertEqual(sonnet5.outputPerMillion, 15.0)
-        XCTAssertEqual(sonnet5.cacheWritePerMillion, 3.75)
-        XCTAssertEqual(sonnet5.cacheReadPerMillion, 0.3)
+        XCTAssertEqual(sonnet5.inputPerMillion, 2.0)
+        XCTAssertEqual(sonnet5.outputPerMillion, 10.0)
+        XCTAssertEqual(sonnet5.cacheWritePerMillion, 2.5)
+        XCTAssertEqual(sonnet5.cacheReadPerMillion, 0.2, accuracy: 0.0001)
 
+        // Sonnet 4.6 keeps the old $3/$15 pool rate; Sonnet 5's permanent intro rate must not
+        // collapse into it.
         let sonnet46 = try XCTUnwrap(pricing.resolve(model: "claude-4.6-sonnet"))
-        XCTAssertEqual(sonnet5.inputPerMillion, sonnet46.inputPerMillion)
-        XCTAssertEqual(sonnet5.outputPerMillion, sonnet46.outputPerMillion)
+        XCTAssertEqual(sonnet46.inputPerMillion, 3.0)
+        XCTAssertNotEqual(sonnet5.inputPerMillion, sonnet46.inputPerMillion)
+        XCTAssertNotEqual(sonnet5.outputPerMillion, sonnet46.outputPerMillion)
     }
 
     /// Claude Opus 5: standard Opus-tier rates from the supplement (no public catalog lists it yet),
@@ -159,6 +180,29 @@ final class PricingBundledResourceTests: XCTestCase {
         XCTAssertEqual(opus5.costDollars(for: fastTokens), opus5.costDollars(for: tokens) * 2, accuracy: 0.000_001)
     }
 
+    /// Opus 4.6/4.7 fast mode: same scanner-flagged `speed` path as Opus 5, but these bases resolve
+    /// from the LiteLLM catalogue — whose feed dropped the per-entry `fast` field in October 2026 —
+    /// so the supplement's `fast_multipliers` pin must supply the 6x onto the catalog-resolved entry.
+    /// Guards against a silent 6x under-estimate on speed-flagged requests.
+    func testClaudeOpus46And47FastModeBillsAtSixTimesBaseRate() throws {
+        let pricing = Self.pricing
+        for model in ["claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-6-20260205", "claude-opus-4-7-20260416"] {
+            let entry = try XCTUnwrap(pricing.resolve(model: model), model)
+            XCTAssertEqual(entry.fastMultiplier, 6.0, model)
+
+            let tokens = TokenBreakdown(input: 1_000_000, cacheWrite5m: 1_000_000, cacheRead: 1_000_000, output: 1_000_000)
+            var fastTokens = tokens
+            fastTokens.isFast = true
+            XCTAssertEqual(
+                entry.costDollars(for: fastTokens), entry.costDollars(for: tokens) * 6,
+                accuracy: 0.000_001, model
+            )
+        }
+        // The dedicated -fast slug keeps scaling off the base card and must not be re-multiplied.
+        let fastSlug = try XCTUnwrap(pricing.resolve(model: "claude-opus-4-6-fast"))
+        XCTAssertEqual(fastSlug.inputPerMillion, 30.0)
+    }
+
     /// Kimi K3: Cursor's published rates. Cursor lists no separate cache-write fee, so cache writes
     /// bill at the input rate, and the effort suffixes Cursor's CSV uses fold into the one entry.
     func testKimiK3PricingAndAliases() throws {
@@ -173,6 +217,26 @@ final class PricingBundledResourceTests: XCTestCase {
         XCTAssertEqual(pricing.resolve(model: "kimi-k3-code"), k3)
         // K3 must not collapse into the cheaper K2.7 entry.
         XCTAssertNotEqual(pricing.resolve(model: "kimi-k2.7-code"), k3)
+    }
+
+    func testCursorGLM53CSVSlugsUsePublishedRates() throws {
+        let pricing = Self.pricing
+        for version in ["5.3", "5p3", "5-3"] {
+            for effort in ["", "-low", "-high", "-max"] {
+                let flash = try XCTUnwrap(pricing.resolve(model: "glm-\(version)-flash\(effort)"))
+                XCTAssertEqual(flash.inputPerMillion, 0.15)
+                XCTAssertEqual(flash.cacheReadPerMillion, 0.029)
+                XCTAssertEqual(flash.outputPerMillion, 0.5)
+                let base = try XCTUnwrap(pricing.resolve(model: "glm-\(version)\(effort)"))
+                XCTAssertEqual(base.inputPerMillion, 1.4)
+                XCTAssertEqual(base.cacheReadPerMillion, 0.26)
+                XCTAssertEqual(base.outputPerMillion, 4.4)
+                XCTAssertNotEqual(flash, base)
+            }
+        }
+        for unknown in ["glm-5p3-flash-fast", "glm-5p3-flash-max-extra", "glm-5p4-flash-low"] {
+            XCTAssertNil(pricing.supplement.canonicalName(for: unknown))
+        }
     }
 
     /// Cursor's CSV still carries a bare, unversioned `composer` slug from before the model was
@@ -309,6 +373,15 @@ final class PricingBundledResourceTests: XCTestCase {
         XCTAssertEqual(pricing.resolve(model: "grok-composer-2.5-fast")?.inputPerMillion, 3)
     }
 
+    /// Grok Bot product labels do not identify the serving model. Keep the ordinary Grok 4.7 rate
+    /// available for genuine model rows, but never price a Grok Bot surface label as that model.
+    func testGrokBotProductLabelIsNotPricedAsServingModel() {
+        let pricing = Self.pricing
+        XCTAssertNotNil(pricing.resolve(model: "grok-4.7"))
+        XCTAssertNil(pricing.resolve(model: "grok-bot-cua"))
+        XCTAssertNil(pricing.resolve(model: "sand-automation"))
+    }
+
     /// Both first-party Grok versions share rates and accept effort, separator, and Cursor-prefix variants.
     func testGrokPricingAndAliases() throws {
         let pricing = Self.pricing
@@ -316,14 +389,18 @@ final class PricingBundledResourceTests: XCTestCase {
             let dashedVersion = version.replacingOccurrences(of: ".", with: "-")
             let standard = try XCTUnwrap(pricing.resolve(model: "grok-\(version)-high"))
             let fast = try XCTUnwrap(pricing.resolve(model: "grok-\(version)-fast"))
+            let expectedFastOutput = version == "4.5" ? 18.0 : 12.0
+            // xAI's published cached-input price differs per version: $0.30/M for Grok 4.5, $0.50/M
+            // for Grok 4.6. Cursor's own rates live under the `cursor-grok-*` keys.
+            let expectedCacheRead = version == "4.5" ? 0.3 : 0.5
             XCTAssertEqual(
                 [standard.inputPerMillion, standard.cacheWritePerMillion, standard.cacheReadPerMillion, standard.outputPerMillion],
-                [2, 2, 0.5, 6],
+                [2, 2, expectedCacheRead, 6],
                 version
             )
             XCTAssertEqual(
                 [fast.inputPerMillion, fast.cacheWritePerMillion, fast.cacheReadPerMillion, fast.outputPerMillion],
-                [4, 4, 1, 12],
+                [4, 4, 1, expectedFastOutput],
                 version
             )
 
@@ -343,6 +420,164 @@ final class PricingBundledResourceTests: XCTestCase {
             XCTAssertEqual(pricing.supplement.canonicalName(for: "cursor-grok-\(version)-high"), "grok-\(version)")
             XCTAssertEqual(pricing.supplement.canonicalName(for: "cursor-grok-\(version)-high-fast"), "grok-\(version)-fast")
         }
+    }
+
+    func testNewCursorModelLabelsResolveToVerifiedCurrentRates() throws {
+        let pricing = Self.pricing
+        let expected: [(label: String, canonical: String, input: Double, cacheRead: Double, output: Double)] = [
+            ("Claude Fable 5.1 (Auto Balanced)", "claude-fable-5-1", 10, 0.25, 50),
+            ("Claude Haiku 5.5 (Auto Cost)", "claude-haiku-5-5", 0.1, 0.01, 0.5),
+            ("Claude Opus 5.5 (Auto)", "claude-opus-5-5", 4, 0.2, 20),
+            ("Claude Opus 5.5 Fast (Auto)", "claude-opus-5-5-fast", 8, 0.4, 40),
+            ("Claude Sonnet 5.5 (Auto)", "claude-sonnet-5-5", 2, 0.1, 10),
+            ("Gemini 4 Argon (Auto Balanced)", "gemini-4-argon", 2, 0.1, 10),
+            ("Gemini 3.8 Flash (Auto)", "gemini-3.8-flash", 0.75, 0.075, 3.75),
+            ("Muse Spark 1.3 (Auto)", "muse-spark-1.3", 1.25, 0.15, 4.25)
+        ]
+
+        for item in expected {
+            if item.canonical == "gemini-4-argon" {
+                XCTAssertEqual(pricing.cursorCanonicalName(for: item.label), item.canonical, item.label)
+                let tokens = TokenBreakdown(input: 1_000_000, cacheRead: 1_000_000, output: 1_000_000)
+                XCTAssertEqual(
+                    try XCTUnwrap(pricing.estimatedCursorCostDollars(model: item.label, tokens: tokens)),
+                    item.input + item.cacheRead + item.output,
+                    accuracy: 0.000_001,
+                    item.label
+                )
+                continue
+            }
+            XCTAssertEqual(pricing.canonicalName(for: item.label), item.canonical, item.label)
+            let rates = try XCTUnwrap(pricing.resolve(model: item.label), item.label)
+            XCTAssertEqual(rates.inputPerMillion, item.input, item.label)
+            XCTAssertEqual(rates.cacheReadPerMillion, item.cacheRead, item.label)
+            XCTAssertEqual(rates.outputPerMillion, item.output, item.label)
+        }
+
+        let haiku = try XCTUnwrap(pricing.resolve(model: "claude-haiku-5.5"))
+        XCTAssertEqual(haiku.costDollars(for: TokenBreakdown(input: 100_000)), 0.01, accuracy: 0.000_001)
+        XCTAssertEqual(haiku.costDollars(for: TokenBreakdown(input: 100_001)), 0.0500005, accuracy: 0.000_001)
+        XCTAssertEqual(haiku.cacheWrite1hPerMillion, 0.2)
+        XCTAssertEqual(pricing.resolve(model: "claude-opus-5.5")?.fastMultiplier, 2)
+
+        let contributor = try XCTUnwrap(pricing.resolve(model: "meta/muse-spark-1.3-contributor"))
+        XCTAssertEqual(contributor.inputPerMillion, 0.1)
+        XCTAssertEqual(contributor.cacheReadPerMillion, 0.002)
+        XCTAssertEqual(contributor.outputPerMillion, 0.2)
+
+        let grok500k = try XCTUnwrap(pricing.resolve(model: "Grok 4.7 500k"))
+        let grok500kFast = try XCTUnwrap(pricing.resolve(model: "Grok 4.7 500k (Fast)"))
+        XCTAssertEqual([grok500k.inputPerMillion, grok500k.cacheReadPerMillion, grok500k.outputPerMillion], [4, 1, 12])
+        XCTAssertEqual([grok500kFast.inputPerMillion, grok500kFast.cacheReadPerMillion, grok500kFast.outputPerMillion], [6, 1.5, 18])
+
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCursorCostDollars(model: "grok-4.7", tokens: TokenBreakdown(input: 256_000))),
+            0.512,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCursorCostDollars(model: "grok-4.7", tokens: TokenBreakdown(input: 256_001))),
+            1.024004,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCursorCostDollars(model: "grok-4.7-fast", tokens: TokenBreakdown(input: 256_001))),
+            1.536006,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCostDollars(model: "grok-4.7", tokens: TokenBreakdown(input: 220_000))),
+            0.88,
+            accuracy: 0.000_001,
+            "the generic xAI route uses its >200K tier independently of Cursor's >256K tier"
+        )
+    }
+
+    func testGrok45And46UseProviderScopedCursorPrices() throws {
+        let pricing = Self.pricing
+
+        // The prose label names the routed model, so it canonicalizes everywhere; the provider
+        // split lives in the rate keys (cursor-grok-4.5 vs grok-4.5), not in the alias.
+        XCTAssertEqual(pricing.canonicalName(for: "Grok 4.5 (Auto Balanced)"), "grok-4.5")
+        XCTAssertEqual(pricing.cursorCanonicalName(for: "Grok 4.5 (Auto Balanced)"), "grok-4.5")
+        XCTAssertEqual(pricing.cursorCanonicalName(for: "Grok 4.5 Fast (Auto Balanced)"), "grok-4.5-fast")
+        XCTAssertEqual(pricing.cursorCanonicalName(for: "Cursor Grok 4.6 (Auto Balanced)"), "grok-4.6")
+        XCTAssertEqual(pricing.cursorCanonicalName(for: "grok-4.6-fast-high"), "grok-4.6-fast")
+
+        let xai45 = try XCTUnwrap(pricing.resolve(model: "grok-4.5"))
+        XCTAssertEqual(xai45.cacheReadPerMillion, 0.3, "xAI cached input is $0.30/M")
+        XCTAssertEqual(
+            xai45.costDollars(for: TokenBreakdown(input: 199_999)),
+            0.399998,
+            accuracy: 0.000_001,
+            "xAI's short-context rate applies below 200K"
+        )
+        XCTAssertEqual(
+            xai45.costDollars(for: TokenBreakdown(input: 200_000)),
+            0.8,
+            accuracy: 0.000_001,
+            "xAI's long-context tier begins at 200K"
+        )
+        XCTAssertEqual(
+            xai45.costDollars(for: TokenBreakdown(input: 200_000, cacheRead: 1_000_000)),
+            1.4,
+            accuracy: 0.000_001,
+            "the xAI tier carries its published $0.60/M cached-input price"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCursorCostDollars(
+                model: "grok-4.5", tokens: TokenBreakdown(cacheRead: 1_000_000), applyLongContextRates: false
+            )),
+            0.5,
+            accuracy: 0.000_001,
+            "Cursor Grok 4.5 cached input is $0.50/M"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCursorCostDollars(
+                model: "Grok 4.5 Fast (Auto Balanced)", tokens: TokenBreakdown(input: 1_000_000),
+                applyLongContextRates: false
+            )),
+            4,
+            accuracy: 0.000_001,
+            "Cursor Fast rates stay provider-scoped"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCursorCostDollars(
+                model: "grok-4.5-fast", tokens: TokenBreakdown(output: 1_000_000),
+                applyLongContextRates: false
+            )),
+            18,
+            accuracy: 0.000_001
+        )
+
+        let xai46 = try XCTUnwrap(pricing.resolve(model: "grok-4.6"))
+        XCTAssertEqual(xai46.cacheReadPerMillion, 0.5)
+        XCTAssertEqual(
+            xai46.costDollars(for: TokenBreakdown(input: 200_000)),
+            0.8,
+            accuracy: 0.000_001,
+            "xAI Grok 4.6 also enters its long-context tier at 200K"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCursorCostDollars(
+                model: "grok-4.6", tokens: TokenBreakdown(input: 1_000_000), applyLongContextRates: false
+            )),
+            2,
+            accuracy: 0.000_001,
+            "Cursor's 256K model uses its normal aggregate CSV rate"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(pricing.estimatedCursorCostDollars(
+                model: "grok-4.6-fast", tokens: TokenBreakdown(input: 1_000_000), applyLongContextRates: false
+            )),
+            4,
+            accuracy: 0.000_001
+        )
+        // The plain `-fast` keys carry xAI's published Fast rates. For these two models Cursor
+        // charges the same Fast rates, so they coincide; the base cached-input rate above is where
+        // the two providers genuinely differ.
+        XCTAssertEqual(pricing.resolve(model: "grok-4.5-fast"), pricing.resolve(model: "cursor-grok-4.5-fast"))
+        XCTAssertEqual(pricing.resolve(model: "grok-4.6-fast"), pricing.resolve(model: "cursor-grok-4.6-fast"))
     }
 
     /// Kimi K2.7 Code: Cursor's published rates override messy public-catalog entries.
@@ -432,6 +667,25 @@ final class PricingBundledResourceTests: XCTestCase {
         XCTAssertEqual(pricing.resolve(model: "mimo-v2.5-free")?.outputPerMillion, 0)
         XCTAssertEqual(pricing.resolve(model: "mimo-v2.5-pro-free")?.inputPerMillion, 0)
         XCTAssertEqual(pricing.resolve(model: "mimo-v2.5-pro-free")?.outputPerMillion, 0)
+    }
+
+    /// Space Bunny left its free period on the OpenCode GO plan: published rates
+    /// (opencode.ai/docs/go, verified 2026-10-06) are $0.15 input / $0.60 output / $0.03 cache
+    /// read per 1M with no cache-write lane. The bundled catalogues only carry zero-rate
+    /// space-bunny-free / stealth/space-bunny-alpha cards, so the supplement pins the paid card.
+    /// The router ledger kept the legacy '-free' id for current usage after the switch, so
+    /// space-bunny-free must resolve at the GO rates too — the supplement pin overrides the
+    /// zero-rate bundled catalog entry. The spaced log slug reaches the same entry via the
+    /// separator-normalized retry.
+    func testSpaceBunnyGORatesMatchOfficialPricing() {
+        let pricing = Self.pricing
+        for model in ["space-bunny", "space bunny", "space-bunny-free", "space bunny free"] {
+            let rates = pricing.resolve(model: model)
+            XCTAssertNotNil(rates, "'\(model)' resolves against no pricing source")
+            XCTAssertEqual(rates?.inputPerMillion, 0.15, "\(model) input rate")
+            XCTAssertEqual(rates?.outputPerMillion, 0.6, "\(model) output rate")
+            XCTAssertEqual(rates?.cacheReadPerMillion, 0.03, "\(model) cache-hit rate")
+        }
     }
 
 }

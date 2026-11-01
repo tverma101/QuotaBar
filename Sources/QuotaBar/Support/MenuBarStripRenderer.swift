@@ -157,11 +157,11 @@ private struct MenuBarTextStrip: View {
     let content: MenuBarContent
 
     var body: some View {
-        HStack(spacing: 11) {
+        HStack(spacing: 8) {
             ForEach(content.groups, id: \.providerID) { group in
-                HStack(spacing: 4) {
-                    glyph(group.icon)
-                    metricsView(group.metrics)
+                HStack(spacing: 3) {
+                    glyph(group.icon, compact: group.usesCompactValues)
+                    metricsView(group.metrics, compact: group.usesCompactValues)
                 }
             }
         }
@@ -174,9 +174,14 @@ private struct MenuBarTextStrip: View {
 
     /// A provider's pinned values, no labels: one metric as a single large number, two stacked on two
     /// tight lines (much narrower than side-by-side), read positionally.
+    ///
+    /// The stack deliberately carries no label text. Adding one for every pair made every provider
+    /// wordy — a Claude/Codex pair read "Session 87% / Wk 32%" where "87% / 32%" was already clear.
+    /// Values that could be read ambiguously carry their own unit instead (`13h`, `$12`), so a bare
+    /// number is the only thing that ever needed a word and those are the exception, not the rule.
     @ViewBuilder
-    private func metricsView(_ metrics: [MenuBarContent.Metric]) -> some View {
-        if metrics.count <= 1 {
+    private func metricsView(_ metrics: [MenuBarContent.Metric], compact: Bool) -> some View {
+        if metrics.count <= 1 && !compact {
             Text(metrics.first?.value ?? "")
                 .font(.system(size: 12, weight: .bold))
         } else {
@@ -190,20 +195,28 @@ private struct MenuBarTextStrip: View {
         }
     }
 
-    /// Side length of the glyph box. Sized to fill the strip's height so the mark reads at the same
-    /// scale as the dual-line metric block beside it (the single number is shorter), instead of
-    /// floating small in the middle. `ProviderIconShape` already normalizes every mark to its true
-    /// bounding box, so a near-zero `inset` here makes each provider fill this box uniformly.
-    private static let glyphSide: CGFloat = 16
+    /// Side length of the glyph box. Kept small deliberately: the strip is competing with every other
+    /// menu-bar item, and a provider mark only has to be recognisable, not dominant. It is sized just
+    /// under the stacked pair's height so the mark reads level with the numbers instead of setting the
+    /// strip's width.
+    private static let glyphSide: CGFloat = 12
 
     @ViewBuilder
-    private func glyph(_ icon: IconSource) -> some View {
+    private func glyph(_ icon: IconSource, compact: Bool) -> some View {
         if let mark = ProviderMarks.mark(for: icon.providerID) {
             ProviderIconShape(mark: mark, inset: 0.04)
                 .fill(Color.black)
                 .frame(width: Self.glyphSide, height: Self.glyphSide)
         } else {
-            Circle().fill(Color.black).frame(width: Self.glyphSide - 1, height: Self.glyphSide - 1)
+            // A provider with no vector mark (Freebuff ships none) used to draw a bare filled
+            // circle, which reads as an unlabeled dot with no connection to the provider — the
+            // strip looked like it was reporting an anonymous value. Fall back to the provider's
+            // SF Symbol, the same stand-in the popover's icon uses, so the strip still identifies
+            // whose numbers these are.
+            Image(systemName: ProviderMarks.symbolFallback(for: icon.providerID))
+                .font(.system(size: Self.glyphSide - (compact ? 3 : 2), weight: .semibold))
+                .foregroundStyle(Color.black)
+                .frame(width: Self.glyphSide, height: Self.glyphSide)
         }
     }
 }

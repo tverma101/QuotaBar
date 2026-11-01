@@ -13,6 +13,10 @@ struct UserAPIKeyStore: Sendable {
     /// A save/delete failure the wrapper maps to its provider's own error, preserving the user-facing message.
     enum Failure { case missingKey, saveFailed, deleteFailed }
 
+    enum ReadFailure: Error, Sendable {
+        case configUnreadable
+    }
+
     let configPaths: [String]
     let environmentNames: [String]
     var files: TextFileAccessing
@@ -25,16 +29,51 @@ struct UserAPIKeyStore: Sendable {
         keyFromConfigFile() ?? keyFromEnvironment()
     }
 
-    /// Which combination of sources currently holds a key — drives the four-state per-provider API-key
-    /// editor. A saved key plus an environment key is `overrideActive` because config wins.
+    /// The refresh path preserves the distinction between no configured key and a config file that
+    /// exists but cannot be read. Keep trying later config paths and environment keys first so an
+    /// alternate source can still serve the provider.
+    func loadKeyForRefresh() throws -> String? {
+        var sawUnreadableConfig = false
+        for path in configPaths {
+            guard files.exists(path) else { continue }
+            let text: String
+            do {
+                text = try files.readText(path)
+            } catch {
+                sawUnreadableConfig = true
+                continue
+            }
+            if let key = Self.keyFromConfigText(text) { return key }
+        }
+
+        if let environmentKey = keyFromEnvironment() { return environmentKey }
+        if sawUnreadableConfig { throw ReadFailure.configUnreadable }
+        return nil
+    }
+
+    /// A present unreadable config is a configured source even when no usable key can be returned yet;
+    /// keep its provider visible so a refresh can show the repair error.
+    func hasKeyOrUnreadableConfig() -> Bool {
+        do {
+            return try loadKeyForRefresh() != nil
+        } catch {
+            return true
+        }
+    }
+
+    /// Which combination of sources currently holds a key — drives the per-provider API-key editor.
+    /// A saved key plus an environment key is `overrideActive` because config wins. A readable
+    /// environment key remains active when a saved config file cannot be read.
     func keyStatus() -> APIKeyStatus {
         let hasConfig = keyFromConfigFile() != nil
         let hasEnv = keyFromEnvironment() != nil
         switch (hasConfig, hasEnv) {
         case (true, true): return .overrideActive
         case (true, false): return .saved
-        case (false, true): return .fromEnvironment
-        default: return .notSet
+        case (false, true):
+            return hasUnreadableConfigFile() ? .environmentFallback : .fromEnvironment
+        case (false, false):
+            return hasUnreadableConfigFile() ? .savedUnreadable : .notSet
         }
     }
 
@@ -85,6 +124,17 @@ struct UserAPIKeyStore: Sendable {
             }
         }
         return nil
+    }
+
+    private func hasUnreadableConfigFile() -> Bool {
+        for path in configPaths where files.exists(path) {
+            do {
+                _ = try files.readText(path)
+            } catch {
+                return true
+            }
+        }
+        return false
     }
 
     /// Accept a JSON object with `apiKey` / `api_key` / `key`, or a plain-text file holding only the key.

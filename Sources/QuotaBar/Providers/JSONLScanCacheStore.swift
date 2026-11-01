@@ -201,6 +201,12 @@ actor JSONLScanCacheWriter {
     static let shared = JSONLScanCacheWriter()
 
     func commit(_ batch: JSONLScanCacheWriteBatch) throws -> JSONLScanCacheCommitResult {
+        try JSONLAccountingWorkPacer.shared.perform {
+            try self.commitWithoutPacing(batch)
+        }
+    }
+
+    private func commitWithoutPacing(_ batch: JSONLScanCacheWriteBatch) throws -> JSONLScanCacheCommitResult {
         let persistence = batch.persistence
         let identity = batch.identity
         let manifestURL = JSONLScanCachePaths.manifestURL(
@@ -351,53 +357,14 @@ actor JSONLScanCacheWriter {
             identity: identity
         )
         guard FileManager.default.fileExists(atPath: identityDirectory.path) else { return nil }
-        return try Self.withSharedLock(
+        let manifestURL = JSONLScanCachePaths.manifestURL(
+            persistence: persistence,
+            identity: identity
+        )
+        let manifestData = try Self.withSharedLock(
             at: JSONLScanCachePaths.lockURL(persistence: persistence, identity: identity)
         ) {
-            let manifestURL = JSONLScanCachePaths.manifestURL(
-                persistence: persistence,
-                identity: identity
-            )
-            let manifestData = try Data(contentsOf: manifestURL, options: .mappedIfSafe)
-            let manifest = try PropertyListDecoder().decode(
-                JSONLScanCacheManifest.self,
-                from: manifestData
-            )
-            var files: [String: JSONLScanCachedFile<Item>] = [:]
-            var invalidRecords: [String: JSONLScanCacheFileMetadata] = [:]
-            if manifest.formatVersion == JSONLScanCachePaths.formatVersion,
-               manifest.schemaVersion == persistence.schemaVersion,
-               manifest.identity == identity
-            {
-                files.reserveCapacity(manifest.files.count)
-                let recordDecoder = PropertyListDecoder()
-                for (path, metadata) in manifest.files {
-                    let url = JSONLScanCachePaths.recordURL(
-                        persistence: persistence,
-                        identity: identity,
-                        fileName: metadata.recordFileName
-                    )
-                    guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-                          let record = try? recordDecoder.decode(
-                              JSONLScanCacheRecord<Item>.self,
-                              from: data
-                          ),
-                          record.path == path,
-                          record.size == metadata.size,
-                          record.mtime == metadata.mtime,
-                          record.attributeMtime == metadata.attributeMtime
-                    else {
-                        invalidRecords[path] = metadata
-                        continue
-                    }
-                    files[path] = JSONLScanCachedFile(
-                        size: record.size,
-                        mtime: record.mtime,
-                        attributeMtime: record.attributeMtime,
-                        items: record.items
-                    )
-                }
-            }
+            let data = try Data(contentsOf: manifestURL, options: .mappedIfSafe)
             do {
                 try FileManager.default.setAttributes(
                     [.modificationDate: Date()],
@@ -409,12 +376,34 @@ actor JSONLScanCacheWriter {
                     "could not mark \(persistence.namespace) log parse cache as used: \(error.localizedDescription)"
                 )
             }
-            return JSONLScanCacheReadSnapshot(
-                manifest: manifest,
-                files: files,
-                invalidRecords: invalidRecords
-            )
+            return data
         }
+        let manifest = try JSONLAccountingWorkPacer.shared.perform {
+            try PropertyListDecoder().decode(JSONLScanCacheManifest.self, from: manifestData)
+        }
+        var files: [String: JSONLScanCachedFile<Item>] = [:]
+        var invalidRecords: [String: JSONLScanCacheFileMetadata] = [:]
+        if manifest.formatVersion == JSONLScanCachePaths.formatVersion,
+           manifest.schemaVersion == persistence.schemaVersion,
+           manifest.identity == identity
+        {
+            files.reserveCapacity(manifest.files.count)
+            // One locked pass for every record; the per-record loop used to take a shared flock per
+            // file (~8 syscalls each) on every cold cache load.
+            let batch = try loadRecords(
+                persistence: persistence,
+                identity: identity,
+                requested: manifest.files,
+                itemType: Item.self
+            )
+            files = batch.files
+            invalidRecords = batch.invalid
+        }
+        return JSONLScanCacheReadSnapshot(
+            manifest: manifest,
+            files: files,
+            invalidRecords: invalidRecords
+        )
     }
 
     /// Manifest + touch only. Used when the scanner keeps resident items unloaded and hydrates
@@ -423,12 +412,21 @@ actor JSONLScanCacheWriter {
         persistence: JSONLScanCachePersistence,
         identity: String
     ) throws -> JSONLScanCacheManifest? {
+        let diagnosticIdentity = [
+            persistence.directory.standardizedFileURL.path,
+            persistence.namespace,
+            identity
+        ].joined(separator: "|")
+        let diagnosticKey = "jsonl.cache.touch.\(JSONLScanCachePaths.stableFingerprint(diagnosticIdentity))"
         let identityDirectory = JSONLScanCachePaths.identityDirectory(
             persistence: persistence,
             identity: identity
         )
-        guard FileManager.default.fileExists(atPath: identityDirectory.path) else { return nil }
-        return try Self.withSharedLock(
+        guard FileManager.default.fileExists(atPath: identityDirectory.path) else {
+            DiagnosticGate.clearFailure(diagnosticKey)
+            return nil
+        }
+        let manifestData = try Self.withSharedLock(
             at: JSONLScanCachePaths.lockURL(persistence: persistence, identity: identity)
         ) {
             let manifestURL = JSONLScanCachePaths.manifestURL(
@@ -436,22 +434,24 @@ actor JSONLScanCacheWriter {
                 identity: identity
             )
             let manifestData = try Data(contentsOf: manifestURL, options: .mappedIfSafe)
-            let manifest = try PropertyListDecoder().decode(
-                JSONLScanCacheManifest.self,
-                from: manifestData
-            )
             do {
                 try FileManager.default.setAttributes(
                     [.modificationDate: Date()],
                     ofItemAtPath: identityDirectory.path
                 )
+                DiagnosticGate.clearFailure(diagnosticKey)
             } catch {
-                AppLog.warn(
-                    .cache,
-                    "could not mark \(persistence.namespace) log parse cache as used: \(error.localizedDescription)"
-                )
+                DiagnosticGate.logOnce(for: diagnosticKey) {
+                    AppLog.warn(
+                        .cache,
+                        "could not mark \(persistence.namespace) log parse cache as used: \(error.localizedDescription)"
+                    )
+                }
             }
-            return manifest
+            return manifestData
+        }
+        return try JSONLAccountingWorkPacer.shared.perform {
+            try PropertyListDecoder().decode(JSONLScanCacheManifest.self, from: manifestData)
         }
     }
 
@@ -464,31 +464,88 @@ actor JSONLScanCacheWriter {
         itemType: Item.Type
     ) throws -> JSONLScanCachedFile<Item>? {
         _ = itemType
-        return try Self.withSharedLock(
+        let url = JSONLScanCachePaths.recordURL(
+            persistence: persistence,
+            identity: identity,
+            fileName: metadata.recordFileName
+        )
+        let data = try Self.withSharedLock(
             at: JSONLScanCachePaths.lockURL(persistence: persistence, identity: identity)
         ) {
-            let url = JSONLScanCachePaths.recordURL(
-                persistence: persistence,
-                identity: identity,
-                fileName: metadata.recordFileName
-            )
-            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-                  let record = try? PropertyListDecoder().decode(
-                      JSONLScanCacheRecord<Item>.self,
-                      from: data
-                  ),
-                  record.path == path,
-                  record.size == metadata.size,
-                  record.mtime == metadata.mtime,
-                  record.attributeMtime == metadata.attributeMtime
-            else { return nil }
-            return JSONLScanCachedFile(
-                size: record.size,
-                mtime: record.mtime,
-                attributeMtime: record.attributeMtime,
-                items: record.items
-            )
+            try? Data(contentsOf: url, options: .mappedIfSafe)
         }
+        guard let data,
+              let record = JSONLAccountingWorkPacer.shared.perform({
+                  try? PropertyListDecoder().decode(JSONLScanCacheRecord<Item>.self, from: data)
+              }),
+              record.path == path,
+              record.size == metadata.size,
+              record.mtime == metadata.mtime,
+              record.attributeMtime == metadata.attributeMtime
+        else { return nil }
+        return JSONLScanCachedFile(
+            size: record.size,
+            mtime: record.mtime,
+            attributeMtime: record.attributeMtime,
+            items: record.items
+        )
+    }
+
+    /// Decode many persisted records under ONE shared cross-process lock. Hydrating N records used
+    /// to cost N full lock acquisitions (~8 syscalls each: open/fchmod/flock/unlock/close plus the
+    /// directory fixups), which dominated warm refreshes whose per-file parse work is a single
+    /// plist decode. One lock + N reads + N decodes keeps the identical cross-process ordering
+    /// guarantees (records are revision-immutable, so shared-read batching cannot see torn state
+    /// that per-record locking would have prevented).
+    nonisolated func loadRecords<Item: Codable & Sendable>(
+        persistence: JSONLScanCachePersistence,
+        identity: String,
+        requested: [String: JSONLScanCacheFileMetadata],
+        itemType: Item.Type
+    ) throws -> (
+        files: [String: JSONLScanCachedFile<Item>],
+        invalid: [String: JSONLScanCacheFileMetadata]
+    ) {
+        _ = itemType
+        guard !requested.isEmpty else { return ([:], [:]) }
+        let recordDecoder = PropertyListDecoder()
+        var files: [String: JSONLScanCachedFile<Item>] = [:]
+        var invalid: [String: JSONLScanCacheFileMetadata] = [:]
+        files.reserveCapacity(requested.count)
+
+        try Self.withSharedLock(
+            at: JSONLScanCachePaths.lockURL(persistence: persistence, identity: identity)
+        ) {
+            for (path, metadata) in requested {
+                let url = JSONLScanCachePaths.recordURL(
+                    persistence: persistence,
+                    identity: identity,
+                    fileName: metadata.recordFileName
+                )
+                guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+                    invalid[path] = metadata
+                    continue
+                }
+                guard let record = JSONLAccountingWorkPacer.shared.perform({
+                    try? recordDecoder.decode(JSONLScanCacheRecord<Item>.self, from: data)
+                }),
+                record.path == path,
+                record.size == metadata.size,
+                record.mtime == metadata.mtime,
+                record.attributeMtime == metadata.attributeMtime
+                else {
+                    invalid[path] = metadata
+                    continue
+                }
+                files[path] = JSONLScanCachedFile(
+                    size: record.size,
+                    mtime: record.mtime,
+                    attributeMtime: record.attributeMtime,
+                    items: record.items
+                )
+            }
+        }
+        return (files, invalid)
     }
 
     /// Removes identity directories that have not been read or written for longer than the retained scan
@@ -641,14 +698,21 @@ actor JSONLScanCacheWriter {
             [.posixPermissions: 0o700],
             ofItemAtPath: url.deletingLastPathComponent().path
         )
-        let fd = Darwin.open(url.path, O_CREAT | O_RDWR | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR))
+        // Fix up permissions only when this call creates the lock file. Every acquisition used to
+        // fchmod, which is pure overhead on the per-record hydration path (hundreds of acquisitions
+        // per refresh) and can never change a lock owned by another uid.
+        var fd = Darwin.open(url.path, O_RDWR | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR))
+        if fd < 0, errno == ENOENT {
+            fd = Darwin.open(url.path, O_CREAT | O_RDWR | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR))
+            if fd >= 0 {
+                // O_CREAT's mode is masked by the process umask; normalize like the old fchmod did.
+                _ = Darwin.fchmod(fd, mode_t(S_IRUSR | S_IWUSR))
+            }
+        }
         guard fd >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         defer {
             flock(fd, LOCK_UN)
             Darwin.close(fd)
-        }
-        guard Darwin.fchmod(fd, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
-            throw POSIXError(.init(rawValue: errno) ?? .EIO)
         }
         guard flock(fd, operation) == 0 else {
             throw POSIXError(.init(rawValue: errno) ?? .EIO)

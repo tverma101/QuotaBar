@@ -142,11 +142,14 @@ final class ResourceEfficiencyContractTests: XCTestCase {
     }
 
     private func discovered(_ url: URL) throws -> JSONLScanning.DiscoveredFile {
-        let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let values = try url.resourceValues(forKeys: [
+            .fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey,
+        ])
         return JSONLScanning.DiscoveredFile(
             path: url.path,
             size: try XCTUnwrap(values.fileSize),
-            mtime: try XCTUnwrap(values.contentModificationDate)
+            mtime: try XCTUnwrap(values.contentModificationDate),
+            attributeMtime: values.attributeModificationDate
         )
     }
 }

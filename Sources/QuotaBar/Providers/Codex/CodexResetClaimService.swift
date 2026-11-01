@@ -9,6 +9,8 @@ enum ResetClaimOutcome: Equatable, Sendable {
     case success
     case nothingToReset
     case noCredit
+    case credentialAccess
+    case cancelled
     case failed
 }
 
@@ -27,8 +29,31 @@ enum ResetClaimOutcome: Equatable, Sendable {
 final class CodexResetClaimService {
     typealias Credentials = (accessToken: String, accountID: String?)
 
+    private struct CredentialCandidateLoad {
+        let candidates: [Credentials]
+        let credentialAccessFailed: Bool
+        let wasCancelled: Bool
+
+        init(
+            candidates: [Credentials],
+            credentialAccessFailed: Bool,
+            wasCancelled: Bool = false
+        ) {
+            self.candidates = candidates
+            self.credentialAccessFailed = credentialAccessFailed
+            self.wasCancelled = wasCancelled
+        }
+    }
+
+    private enum ConsumeResult {
+        case outcome(ResetClaimOutcome)
+        case authenticationRejected
+        case cancelled
+    }
+
     private let usageClient: CodexUsageClient
-    private let credentialCandidates: () async -> [Credentials]
+    private let credentialCandidates: () async -> CredentialCandidateLoad
+    private let keychainCandidates: () async -> CredentialCandidateLoad
     private let refreshAfterClaim: () async -> Void
     /// The credit id each idempotency key was matched to, kept for the key's retries: if a consume
     /// succeeded but its response was lost, the credit is gone from a re-fetched list — a fresh match
@@ -44,14 +69,34 @@ final class CodexResetClaimService {
         refreshAfterClaim: @escaping () async -> Void = {}
     ) {
         self.usageClient = usageClient
-        self.credentialCandidates = credentialCandidates
+        self.credentialCandidates = {
+            CredentialCandidateLoad(
+                candidates: await credentialCandidates(),
+                credentialAccessFailed: false
+            )
+        }
+        self.keychainCandidates = {
+            CredentialCandidateLoad(candidates: [], credentialAccessFailed: false)
+        }
+        self.refreshAfterClaim = refreshAfterClaim
+    }
+
+    private init(
+        usageClient: CodexUsageClient,
+        credentialCandidateLoader: @escaping () async -> CredentialCandidateLoad,
+        keychainCandidateLoader: @escaping () async -> CredentialCandidateLoad,
+        refreshAfterClaim: @escaping () async -> Void
+    ) {
+        self.usageClient = usageClient
+        self.credentialCandidates = credentialCandidateLoader
+        self.keychainCandidates = keychainCandidateLoader
         self.refreshAfterClaim = refreshAfterClaim
     }
 
     /// Production wiring: shares the Codex provider's auth store and usage client, so credential
-    /// selection can't drift from `refresh()` — every usable candidate in the provider's order (files
-    /// first, then keychain), and `claim` falls back across them on an auth rejection the same way the
-    /// provider's probe does. No token refresh here: the claim runs seconds after a successful usage
+    /// selection can't drift from `refresh()`. File candidates are tried first; Keychain is read only
+    /// when there is no usable file candidate or the API rejects every file candidate. No token refresh
+    /// here: the claim runs seconds after a successful usage
     /// fetch (which rotates tokens back to disk), so a candidate that still fails auth is genuinely
     /// dead and the next one is the right move.
     convenience init(
@@ -62,129 +107,514 @@ final class CodexResetClaimService {
     ) {
         self.init(
             usageClient: usageClient,
-            credentialCandidates: {
-                var candidates = authStore.loadAuthCandidates()
-                if allowsKeychainFallback,
-                   let keychain = await loadOffMainActor({ try? authStore.loadKeychainAuth() }) {
-                    candidates.append(keychain)
+            credentialCandidateLoader: {
+                var candidates: [CodexAuthState] = []
+                var credentialAccessFailed = false
+                do {
+                    candidates = try await loadOffMainActor { [authStore] in
+                        try authStore.loadAuthCandidates()
+                    }
+                    DiagnosticGate.clearFailure("auth.codex.reset-claim.files")
+                } catch is CancellationError {
+                    return CredentialCandidateLoad(
+                        candidates: [], credentialAccessFailed: false, wasCancelled: true
+                    )
+                } catch {
+                    credentialAccessFailed = true
+                    DiagnosticGate.logOnce(for: "auth.codex.reset-claim.files") {
+                        AppLog.error(
+                            LogTag.auth("codex"),
+                            "reset claim could not read auth files: \(error.localizedDescription)"
+                        )
+                    }
                 }
-                return candidates.compactMap { candidate in
+                if Task.isCancelled {
+                    return CredentialCandidateLoad(
+                        candidates: [], credentialAccessFailed: false, wasCancelled: true
+                    )
+                }
+                let usableCandidates: [Credentials] = candidates.compactMap { candidate in
                     guard candidate.hasUsableAccessToken, let token = candidate.auth.tokens?.accessToken else {
                         return nil
                     }
-                    guard let verifiedID = CodexAuthStore.accountIdentity(in: candidate.auth) else {
-                        return nil
+                    return (accessToken: token, accountID: CodexAuthStore.accountIdentity(in: candidate.auth))
+                }
+                return CredentialCandidateLoad(
+                    candidates: usableCandidates,
+                    credentialAccessFailed: credentialAccessFailed
+                )
+            },
+            keychainCandidateLoader: {
+                guard allowsKeychainFallback else {
+                    return CredentialCandidateLoad(candidates: [], credentialAccessFailed: false)
+                }
+                guard !Task.isCancelled else {
+                    return CredentialCandidateLoad(
+                        candidates: [], credentialAccessFailed: false, wasCancelled: true
+                    )
+                }
+                do {
+                    let candidate = try await loadOffMainActor({ [authStore] in
+                        try authStore.loadKeychainAuth()
+                    })
+                    DiagnosticGate.clearFailure("auth.codex.reset-claim.keychain")
+                    guard let candidate, candidate.hasUsableAccessToken,
+                       let token = candidate.auth.tokens?.accessToken
+                    else {
+                        return CredentialCandidateLoad(candidates: [], credentialAccessFailed: false)
                     }
-                    return (token, verifiedID)
+                    return CredentialCandidateLoad(
+                        candidates: [(accessToken: token, accountID: CodexAuthStore.accountIdentity(in: candidate.auth))],
+                        credentialAccessFailed: false
+                    )
+                } catch is CancellationError {
+                    return CredentialCandidateLoad(
+                        candidates: [], credentialAccessFailed: false, wasCancelled: true
+                    )
+                } catch {
+                    DiagnosticGate.logOnce(for: "auth.codex.reset-claim.keychain") {
+                        AppLog.error(
+                            LogTag.auth("codex"),
+                            "reset claim could not read Keychain credentials: \(error.localizedDescription)"
+                        )
+                    }
+                    return CredentialCandidateLoad(candidates: [], credentialAccessFailed: true)
                 }
             },
             refreshAfterClaim: refreshAfterClaim
         )
     }
 
-    /// Live, account-scoped credit discovery. Credit IDs, not expiry timestamps, identify resets.
+    /// Reads the live account's available reset credits. This is called only while the opt-in
+    /// coordinator is enabled; file credentials are preferred and Keychain is consulted only when
+    /// the files are empty or rejected.
     func availableCredits() async -> [CodexResetCredit]? {
-        let first = await fetchAvailableCredits()
-        if first.authRejected {
-            // Recover a rotated/expired OAuth token through this same account's provider.
-            await refreshAfterClaim()
-            return await fetchAvailableCredits().credits
+        let fileLoad = await credentialCandidates()
+        guard !fileLoad.wasCancelled, !Task.isCancelled else { return nil }
+        var candidates = fileLoad.candidates
+        var keychainAttempted = false
+        if candidates.isEmpty {
+            keychainAttempted = true
+            let keychainLoad = await keychainCandidates()
+            guard !keychainLoad.wasCancelled, !Task.isCancelled else { return nil }
+            candidates = keychainLoad.candidates
         }
-        return first.credits
+
+        var result = await fetchAvailableCredits(using: candidates)
+        guard result.authRejected else { return result.credits }
+        if !keychainAttempted {
+            keychainAttempted = true
+            let keychainLoad = await keychainCandidates()
+            guard !keychainLoad.wasCancelled, !Task.isCancelled else { return nil }
+            candidates.append(contentsOf: keychainLoad.candidates)
+            result = await fetchAvailableCredits(using: candidates)
+            guard result.authRejected else { return result.credits }
+        }
+
+        // A normal Codex refresh rotates credentials through the existing provider path. Retry once
+        // with the refreshed file credentials; don't loop or repeatedly prompt Keychain on failure.
+        await refreshAfterClaim()
+        let refreshed = await credentialCandidates()
+        guard !refreshed.wasCancelled, !Task.isCancelled else { return nil }
+        return await fetchAvailableCredits(using: refreshed.candidates).credits
     }
 
-    private func fetchAvailableCredits() async -> (credits: [CodexResetCredit]?, authRejected: Bool) {
-        let candidates = await credentialCandidates()
-        guard !candidates.isEmpty else { return (nil, false) }
+    private func fetchAvailableCredits(
+        using candidates: [Credentials]
+    ) async -> (credits: [CodexResetCredit]?, authRejected: Bool) {
         var rejected = false
         for credentials in candidates {
-            do {
-                let response = try await usageClient.fetchResetCredits(
-                    accessToken: credentials.accessToken, accountID: credentials.accountID
-                )
-                if response.statusCode == 401 || response.statusCode == 403 {
-                    rejected = true
-                    continue
-                }
-                guard (200..<300).contains(response.statusCode),
-                      let body = ProviderParse.jsonObject(response.body),
-                      let credits = body["credits"] as? [[String: Any]]
-                else {
-                    AppLog.warn(LogTag.plugin("codex"), "auto reset: invalid credit list (\(response.statusCode))")
-                    return (nil, false)
-                }
-                let available = credits.compactMap { item -> CodexResetCredit? in
-                    guard let id = item["id"] as? String, !id.isEmpty,
-                          let expiry = Self.parseExpiry(item["expires_at"])
-                    else { return nil }
-                    if let status = item["status"] as? String, status != "available" { return nil }
-                    if let type = item["reset_type"] as? String, type != "codex_rate_limits" { return nil }
-                    return CodexResetCredit(id: id, expiresAt: expiry)
-                }
-                return (available, false)
-            } catch {
-                AppLog.warn(LogTag.plugin("codex"), "auto reset: credit lookup failed: \(error.localizedDescription)")
-                return (nil, false)
-            }
-        }
-        return (nil, rejected)
-    }
-
-    /// Auto-redemption targets only an explicit server credit id. Match a fresh GET, verify
-    /// status and expiry, and recheck consent immediately before the irreversible POST.
-    func claimAuto(
-        credit: CodexResetCredit, redeemRequestID: String,
-        canRedeem: @escaping @MainActor () -> Bool
-    ) async -> ResetClaimOutcome {
-        guard canRedeem(), Date() < credit.expiresAt else { return .noCredit }
-        let candidates = await credentialCandidates()
-        guard !candidates.isEmpty else {
-            AppLog.error(LogTag.plugin("codex"), "auto reset: no usable account credentials")
-            return .failed
-        }
-        let selected: Credentials
-        if credit.isRetry {
-            // The previous POST may have succeeded while its HTTP response was lost. In that
-            // case the credit disappears from a fresh list and a normal match cannot replay
-            // the UUID. Only the exact original (creditID, requestID) is ever sent here.
-            // Authentication stays account-scoped by the caller's CodexAuthStore.
-            guard let candidate = candidates.first(where: { $0.accountID != nil }) else {
-                return .failed
-            }
-            selected = candidate
-        } else {
-            switch await matchExactCredit(credit, candidates: candidates) {
-            case .matched(_, let authenticated): selected = authenticated
-            case .noCredit: return .noCredit
-            case .failed: return .failed
-            }
-        }
-        guard canRedeem(), Date() < credit.expiresAt else { return .noCredit }
-        // Never fall back to a different ChatGPT account on an API write, even when a token
-        // is accepted for more than one account. The selected GET account owns this credit.
-        let preferred = [selected] + candidates.filter {
-            $0.accountID?.lowercased() == selected.accountID?.lowercased()
-                && $0.accessToken != selected.accessToken
-        }
-        let outcome = await consume(
-            creditID: credit.id, redeemRequestID: redeemRequestID, candidates: preferred
-        )
-        if outcome != .failed { await refreshAfterClaim() }
-        return outcome
-    }
-
-    private func matchExactCredit(_ credit: CodexResetCredit, candidates: [Credentials]) async -> MatchResult {
-        for credentials in candidates {
+            guard !Task.isCancelled else { return (nil, false) }
             let response: HTTPResponse
             do {
                 response = try await usageClient.fetchResetCredits(
                     accessToken: credentials.accessToken, accountID: credentials.accountID
                 )
             } catch {
+                if ProviderCancellation.isCancellation(error) { return (nil, false) }
+                AppLog.warn(LogTag.plugin("codex"), "auto reset: credit lookup failed: \(error.localizedDescription)")
+                return (nil, false)
+            }
+            guard !Task.isCancelled else { return (nil, false) }
+            if response.statusCode == 401 || response.statusCode == 403 {
+                rejected = true
+                continue
+            }
+            guard (200..<300).contains(response.statusCode),
+                  let body = ProviderParse.jsonObject(response.body),
+                  let rawCredits = body["credits"] as? [[String: Any]]
+            else {
+                AppLog.warn(LogTag.plugin("codex"), "auto reset: invalid credit list (\(response.statusCode))")
+                return (nil, false)
+            }
+            let available = rawCredits.compactMap { item -> CodexResetCredit? in
+                guard let id = item["id"] as? String, !id.isEmpty,
+                      let expiry = Self.parseExpiry(item["expires_at"])
+                else { return nil }
+                if let status = item["status"] as? String, status != "available" { return nil }
+                if let type = item["reset_type"] as? String, type != "codex_rate_limits" { return nil }
+                return CodexResetCredit(id: id, expiresAt: expiry)
+            }
+            return (available, false)
+        }
+        return (nil, rejected)
+    }
+
+    /// Revalidates the server credit ID and user consent immediately before the automatic POST.
+    func claimAuto(
+        credit: CodexResetCredit,
+        redeemRequestID: String,
+        canRedeem: @escaping @MainActor () -> Bool
+    ) async -> ResetClaimOutcome {
+        guard canRedeem() else { return .cancelled }
+        guard Date() < credit.expiresAt else { return .noCredit }
+
+        let fileLoad = await credentialCandidates()
+        guard !fileLoad.wasCancelled, !Task.isCancelled else { return .cancelled }
+        var candidates = fileLoad.candidates
+        var credentialAccessFailed = fileLoad.credentialAccessFailed
+        var keychainAttempted = false
+        var loadedKeychainCandidates: [Credentials] = []
+        if candidates.isEmpty {
+            keychainAttempted = true
+            let keychainLoad = await keychainCandidates()
+            guard !keychainLoad.wasCancelled, !Task.isCancelled else { return .cancelled }
+            credentialAccessFailed = credentialAccessFailed || keychainLoad.credentialAccessFailed
+            loadedKeychainCandidates = keychainLoad.candidates
+            candidates.append(contentsOf: loadedKeychainCandidates)
+        }
+        guard canRedeem() else { return .cancelled }
+        guard !candidates.isEmpty else {
+            return credentialAccessFailed ? .credentialAccess : .failed
+        }
+
+        let selected: Credentials
+        if credit.isRetry {
+            // Only a verified account identity can replay the same persisted request against the
+            // server's idempotency ledger after the original POST response was lost.
+            guard let candidate = candidates.first(where: { $0.accountID != nil }) else { return .failed }
+            selected = candidate
+        } else {
+            let matchCandidates = fileLoad.candidates.isEmpty ? loadedKeychainCandidates : fileLoad.candidates
+            var match = await matchExactCredit(credit, candidates: matchCandidates)
+            guard canRedeem(), !Task.isCancelled else { return .cancelled }
+            if case .authenticationRejected = match, !keychainAttempted {
+                keychainAttempted = true
+                let keychainLoad = await keychainCandidates()
+                guard !keychainLoad.wasCancelled, !Task.isCancelled else { return .cancelled }
+                credentialAccessFailed = credentialAccessFailed || keychainLoad.credentialAccessFailed
+                loadedKeychainCandidates = keychainLoad.candidates
+                candidates.append(contentsOf: loadedKeychainCandidates)
+                match = await matchExactCredit(credit, candidates: loadedKeychainCandidates)
+                guard canRedeem(), !Task.isCancelled else { return .cancelled }
+            }
+            switch match {
+            case .matched(let id, let credentials):
+                guard id == credit.id else { return .noCredit }
+                selected = credentials
+            case .noCredit:
+                return .noCredit
+            case .cancelled:
+                return .cancelled
+            case .failed, .authenticationRejected:
+                return credentialAccessFailed ? .credentialAccess : .failed
+            }
+        }
+
+        guard canRedeem() else { return .cancelled }
+        guard Date() < credit.expiresAt else { return .noCredit }
+        // A background write must be tied to the verified account chosen for this provider card.
+        guard let accountID = selected.accountID else { return .failed }
+        let preferred = [selected] + candidates.filter {
+            $0.accountID?.caseInsensitiveCompare(accountID) == .orderedSame
+                && $0.accessToken != selected.accessToken
+        }
+        let result = await consume(
+            creditID: credit.id,
+            redeemRequestID: redeemRequestID,
+            candidates: preferred,
+            consentCheck: canRedeem
+        )
+        switch result {
+        case .cancelled:
+            return .cancelled
+        case .authenticationRejected:
+            return .failed
+        case .outcome(let outcome):
+            if outcome != .failed && outcome != .cancelled, canRedeem() {
+                await refreshAfterClaim()
+            }
+            return outcome
+        }
+    }
+
+    /// Claims the credit expiring at `expiry`. Never throws — every failure mode is logged loudly and
+    /// collapsed to an outcome the popover can render.
+    func claim(creditExpiringAt expiry: Date, redeemRequestID: String) async -> ResetClaimOutcome {
+        let credentialLoad = await credentialCandidates()
+        guard !credentialLoad.wasCancelled, !Task.isCancelled else { return .cancelled }
+        var candidates = credentialLoad.candidates
+        var credentialAccessFailed = credentialLoad.credentialAccessFailed
+        var keychainLoadAttempted = false
+        var loadedKeychainCandidates: [Credentials] = []
+        if candidates.isEmpty {
+            keychainLoadAttempted = true
+            let keychainLoad = await keychainCandidates()
+            guard !keychainLoad.wasCancelled, !Task.isCancelled else { return .cancelled }
+            credentialAccessFailed = credentialAccessFailed || keychainLoad.credentialAccessFailed
+            loadedKeychainCandidates = keychainLoad.candidates
+            candidates.append(contentsOf: loadedKeychainCandidates)
+        }
+        guard !candidates.isEmpty else {
+            if credentialAccessFailed {
+                DiagnosticGate.logOnce(for: "auth.codex.reset-claim.no-credential-access") {
+                    AppLog.error(
+                        LogTag.plugin("codex"),
+                        "reset claim: no usable Codex credentials because credential access failed"
+                    )
+                }
+                return .credentialAccess
+            }
+            DiagnosticGate.logOnce(for: "auth.codex.reset-claim.no-usable-credentials") {
+                AppLog.error(LogTag.plugin("codex"), "reset claim: no usable Codex credentials")
+            }
+            return .failed
+        }
+        DiagnosticGate.clearFailure("auth.codex.reset-claim.no-credential-access")
+        DiagnosticGate.clearFailure("auth.codex.reset-claim.no-usable-credentials")
+
+        // A retry of an idempotency key that already matched replays the exact same (key, credit) pair
+        // instead of re-matching: after a consume whose response was lost, the credit is no longer in
+        // the list, and only the replay lets the server's `already_redeemed` prove the claim landed.
+        let creditID: String
+        let owner: Credentials
+        var preferredCandidates: [Credentials]
+        if let replay = matchedCredits[redeemRequestID] {
+            creditID = replay.creditID
+            owner = replay.owner
+            preferredCandidates = candidates.filter { Self.isSameAccount($0, as: owner) }
+            guard !preferredCandidates.isEmpty else {
+                AppLog.error(LogTag.plugin("codex"), "reset claim: original account unavailable for retry")
+                return .failed
+            }
+        } else {
+            let initialMatchCandidates = credentialLoad.candidates.isEmpty
+                ? loadedKeychainCandidates
+                : credentialLoad.candidates
+            var match = await matchCredit(expiringAt: expiry, candidates: initialMatchCandidates)
+            if case .authenticationRejected = match, !keychainLoadAttempted {
+                keychainLoadAttempted = true
+                let keychainLoad = await keychainCandidates()
+                guard !keychainLoad.wasCancelled, !Task.isCancelled else { return .cancelled }
+                credentialAccessFailed = credentialAccessFailed || keychainLoad.credentialAccessFailed
+                loadedKeychainCandidates = keychainLoad.candidates
+                if !loadedKeychainCandidates.isEmpty {
+                    for fallback in loadedKeychainCandidates where !candidates.contains(where: {
+                        $0.accessToken == fallback.accessToken && $0.accountID == fallback.accountID
+                    }) {
+                        candidates.append(fallback)
+                    }
+                    match = await matchCredit(expiringAt: expiry, candidates: loadedKeychainCandidates)
+                } else if credentialAccessFailed {
+                    return .credentialAccess
+                }
+            }
+            switch match {
+            case .matched(let id, let authenticated):
+                creditID = id
+                owner = authenticated
+                matchedCredits[redeemRequestID] = (creditID: id, owner: authenticated)
+                // Tokens can rotate, but the originating account cannot change across retries.
+                preferredCandidates = [authenticated] + candidates.filter {
+                    Self.isSameAccount($0, as: authenticated)
+                        && ($0.accessToken != authenticated.accessToken || $0.accountID != authenticated.accountID)
+                }
+            case .noCredit:
+                // Not an error: the credit was claimed elsewhere (CLI/web) or expired since the popover
+                // rendered. The refresh reconciles the timeline with reality.
+                AppLog.warn(LogTag.plugin("codex"), "reset claim: no available credit matches the picked expiry")
+                await refreshAfterClaim()
+                return .noCredit
+            case .failed:
+                return .failed
+            case .authenticationRejected:
+                return credentialAccessFailed ? .credentialAccess : .failed
+            case .cancelled:
+                return .cancelled
+            }
+        }
+
+        // A late list response must never authorize a new consume POST after the user canceled.
+        guard !Task.isCancelled else { return .cancelled }
+        let consumeResult = await consume(
+            creditID: creditID, redeemRequestID: redeemRequestID, candidates: preferredCandidates
+        )
+        var outcome: ResetClaimOutcome
+        switch consumeResult {
+        case .outcome(let value):
+            outcome = value
+        case .cancelled:
+            return .cancelled
+        case .authenticationRejected where !keychainLoadAttempted:
+            keychainLoadAttempted = true
+            let keychainLoad = await keychainCandidates()
+            guard !keychainLoad.wasCancelled, !Task.isCancelled else { return .cancelled }
+            let sameAccountFallbacks = keychainLoad.candidates.filter {
+                Self.isSameAccount($0, as: owner)
+            }
+            if sameAccountFallbacks.isEmpty {
+                outcome = keychainLoad.credentialAccessFailed ? .credentialAccess : .failed
+            } else {
+                switch await consume(
+                    creditID: creditID,
+                    redeemRequestID: redeemRequestID,
+                    candidates: sameAccountFallbacks
+                ) {
+                case .outcome(let value): outcome = value
+                case .authenticationRejected: outcome = .failed
+                case .cancelled: return .cancelled
+                }
+            }
+        case .authenticationRejected:
+            outcome = .failed
+        }
+        guard outcome != .cancelled else { return .cancelled }
+        if outcome != .failed {
+            // The world changed (or turned out different from the snapshot): refresh before returning,
+            // so the result banner appears over already-reconciled meters and credit count.
+            await refreshAfterClaim()
+        }
+        return outcome
+    }
+
+    /// Verified identities may rotate tokens, but a claim may never fall back to another account.
+    /// Without an identity, allow only the exact token that authenticated the credit lookup.
+    private static func isSameAccount(_ candidate: Credentials, as owner: Credentials) -> Bool {
+        if let accountID = owner.accountID {
+            return candidate.accountID?.caseInsensitiveCompare(accountID) == .orderedSame
+        }
+        return candidate.accountID == nil && candidate.accessToken == owner.accessToken
+    }
+
+    /// POSTs the consume, falling back only across candidates scoped to the originating account.
+    private func consume(
+        creditID: String,
+        redeemRequestID: String,
+        candidates: [Credentials],
+        consentCheck: (@MainActor () -> Bool)? = nil
+    ) async -> ConsumeResult {
+        var lastRejection: Int?
+        var consumeWasSent = false
+        for credentials in candidates {
+            guard !Task.isCancelled else {
+                return consumeWasSent && consentCheck != nil ? .outcome(.failed) : .cancelled
+            }
+            guard consentCheck?() != false else {
+                return consumeWasSent ? .outcome(.failed) : .cancelled
+            }
+            // From this point a cancellation or lost response is ambiguous: the server may have
+            // accepted the idempotent claim. Keep the coordinator's attempt so it can replay the
+            // exact same (credit ID, request UUID) after the user re-enables auto-use.
+            consumeWasSent = true
+            let response: HTTPResponse
+            do {
+                response = try await usageClient.consumeResetCredit(
+                    accessToken: credentials.accessToken,
+                    accountID: credentials.accountID,
+                    creditID: creditID,
+                    redeemRequestID: redeemRequestID
+                )
+            } catch {
+                if ProviderCancellation.isCancellation(error) {
+                    return consentCheck == nil ? .cancelled : .outcome(.failed)
+                }
+                AppLog.error(LogTag.plugin("codex"), "reset claim: consume request failed: \(error.localizedDescription)")
+                return .outcome(.failed)
+            }
+            // A response received after cancellation still resolves the write authoritatively. Manual
+            // claims retain their prior cancellation behavior; auto-claims must persist known results.
+            if Task.isCancelled, consentCheck == nil { return .cancelled }
+            if response.statusCode == 401 || response.statusCode == 403 {
+                lastRejection = response.statusCode
+                continue
+            }
+            let outcome = Self.outcome(fromConsume: response)
+            if outcome == .failed {
+                AppLog.error(
+                    LogTag.plugin("codex"),
+                    "reset claim: consume failed (\(response.statusCode)): "
+                        + LogRedaction.bodyPreview(String(decoding: response.body, as: UTF8.self), limit: 300)
+                )
+            }
+            return .outcome(outcome)
+        }
+        AppLog.error(LogTag.plugin("codex"), "reset claim: consume rejected for every credential (last: \(lastRejection.map(String.init) ?? "none"))")
+        return .authenticationRejected
+    }
+
+    private enum MatchResult {
+        case matched(creditID: String, credentials: Credentials)
+        case noCredit
+        case cancelled
+        case failed
+        case authenticationRejected
+    }
+
+    /// Fresh credit list (safe GET) → the id of the credit the user picked, matched by expiry. Tries
+    /// each credential candidate in order, moving on when one is rejected as unauthenticated (401/403)
+    /// — the same fallback the provider's probe applies — so a stale first auth file can't strand the
+    /// claim while the dashboard works off a later one.
+    private func matchCredit(expiringAt expiry: Date, candidates: [Credentials]) async -> MatchResult {
+        var lastFailure = "no credential candidate authenticated"
+        for credentials in candidates {
+            guard !Task.isCancelled else { return .cancelled }
+            let list: HTTPResponse
+            do {
+                list = try await usageClient.fetchResetCredits(
+                    accessToken: credentials.accessToken, accountID: credentials.accountID
+                )
+            } catch {
+                if ProviderCancellation.isCancellation(error) { return .cancelled }
+                AppLog.error(LogTag.plugin("codex"), "reset claim: credit list fetch failed: \(error.localizedDescription)")
+                return .failed
+            }
+            // URLSession fakes and real transports may deliver a successful response after the task
+            // was canceled. Do not turn that late GET into a consume POST.
+            guard !Task.isCancelled else { return .cancelled }
+            if list.statusCode == 401 || list.statusCode == 403 {
+                lastFailure = "credit list fetch rejected (\(list.statusCode))"
+                continue
+            }
+            guard (200..<300).contains(list.statusCode), let body = ProviderParse.jsonObject(list.body) else {
+                AppLog.error(LogTag.plugin("codex"), "reset claim: credit list fetch failed (\(list.statusCode))")
+                return .failed
+            }
+            guard let matched = Self.creditID(in: body, expiringAt: expiry) else { return .noCredit }
+            return .matched(creditID: matched, credentials: credentials)
+        }
+        AppLog.error(LogTag.plugin("codex"), "reset claim: \(lastFailure)")
+        return .authenticationRejected
+    }
+
+    private func matchExactCredit(_ credit: CodexResetCredit, candidates: [Credentials]) async -> MatchResult {
+        var rejected = false
+        for credentials in candidates {
+            guard !Task.isCancelled else { return .cancelled }
+            let response: HTTPResponse
+            do {
+                response = try await usageClient.fetchResetCredits(
+                    accessToken: credentials.accessToken, accountID: credentials.accountID
+                )
+            } catch {
+                if ProviderCancellation.isCancellation(error) { return .cancelled }
                 AppLog.error(LogTag.plugin("codex"), "auto reset: pre-claim lookup failed: \(error.localizedDescription)")
                 return .failed
             }
-            if response.statusCode == 401 || response.statusCode == 403 { continue }
+            guard !Task.isCancelled else { return .cancelled }
+            if response.statusCode == 401 || response.statusCode == 403 {
+                rejected = true
+                continue
+            }
             guard (200..<300).contains(response.statusCode),
                   let body = ProviderParse.jsonObject(response.body),
                   let credits = body["credits"] as? [[String: Any]]
@@ -204,147 +634,7 @@ final class CodexResetClaimService {
             }
             return exists ? .matched(creditID: credit.id, credentials: credentials) : .noCredit
         }
-        AppLog.error(LogTag.plugin("codex"), "auto reset: account credentials rejected")
-        return .failed
-    }
-
-    /// Claims the credit expiring at `expiry`. Never throws — every failure mode is logged loudly and
-    /// collapsed to an outcome the popover can render.
-    func claim(creditExpiringAt expiry: Date, redeemRequestID: String) async -> ResetClaimOutcome {
-        let candidates = await credentialCandidates()
-        guard !candidates.isEmpty else {
-            AppLog.error(LogTag.plugin("codex"), "reset claim: no usable Codex credentials")
-            return .failed
-        }
-
-        // A retry of an idempotency key that already matched replays the exact same (key, credit) pair
-        // instead of re-matching: after a consume whose response was lost, the credit is no longer in
-        // the list, and only the replay lets the server's `already_redeemed` prove the claim landed.
-        let creditID: String
-        var preferredCandidates: [Credentials]
-        if let replay = matchedCredits[redeemRequestID] {
-            creditID = replay.creditID
-            // A retry must retain the account that authenticated the original GET.
-            // The same idempotency key does not make cross-account POSTs safe.
-            preferredCandidates = candidates.filter { Self.isSameAccount($0, as: replay.owner) }
-            guard !preferredCandidates.isEmpty else {
-                AppLog.error(LogTag.plugin("codex"), "reset claim: original account unavailable for retry")
-                return .failed
-            }
-        } else {
-            switch await matchCredit(expiringAt: expiry, candidates: candidates) {
-            case .matched(let id, let authenticated):
-                creditID = id
-                matchedCredits[redeemRequestID] = (creditID: id, owner: authenticated)
-                // Only retry with refreshed credentials for this SAME account. A token may
-                // legitimately change while the account identity must remain unchanged.
-                preferredCandidates = [authenticated] + candidates.filter {
-                    Self.isSameAccount($0, as: authenticated)
-                        && ($0.accessToken != authenticated.accessToken || $0.accountID != authenticated.accountID)
-                }
-            case .noCredit:
-                // Not an error: the credit was claimed elsewhere (CLI/web) or expired since the popover
-                // rendered. The refresh reconciles the timeline with reality.
-                AppLog.warn(LogTag.plugin("codex"), "reset claim: no available credit matches the picked expiry")
-                await refreshAfterClaim()
-                return .noCredit
-            case .failed:
-                return .failed
-            }
-        }
-
-        let outcome = await consume(
-            creditID: creditID, redeemRequestID: redeemRequestID, candidates: preferredCandidates
-        )
-        if outcome != .failed {
-            // The world changed (or turned out different from the snapshot): refresh before returning,
-            // so the result banner appears over already-reconciled meters and credit count.
-            await refreshAfterClaim()
-        }
-        return outcome
-    }
-
-    /// Unknown account IDs cannot safely opt into a different token on retry.
-    /// Verified identities can rotate tokens, but must never change ChatGPT-Account-Id.
-    private static func isSameAccount(_ candidate: Credentials, as owner: Credentials) -> Bool {
-        if let accountID = owner.accountID {
-            return candidate.accountID?.caseInsensitiveCompare(accountID) == .orderedSame
-        }
-        return candidate.accountID == nil && candidate.accessToken == owner.accessToken
-    }
-
-    /// POSTs the consume, falling back only across eligible credentials belonging to
-    /// the original account on 401/403. The server's idempotency key still protects retries.
-    private func consume(
-        creditID: String, redeemRequestID: String, candidates: [Credentials]
-    ) async -> ResetClaimOutcome {
-        var lastRejection: Int?
-        for credentials in candidates {
-            let response: HTTPResponse
-            do {
-                response = try await usageClient.consumeResetCredit(
-                    accessToken: credentials.accessToken,
-                    accountID: credentials.accountID,
-                    creditID: creditID,
-                    redeemRequestID: redeemRequestID
-                )
-            } catch {
-                AppLog.error(LogTag.plugin("codex"), "reset claim: consume request failed: \(error.localizedDescription)")
-                return .failed
-            }
-            if response.statusCode == 401 || response.statusCode == 403 {
-                lastRejection = response.statusCode
-                continue
-            }
-            let outcome = Self.outcome(fromConsume: response)
-            if outcome == .failed {
-                AppLog.error(
-                    LogTag.plugin("codex"),
-                    "reset claim: consume failed (\(response.statusCode)): "
-                        + LogRedaction.bodyPreview(String(decoding: response.body, as: UTF8.self), limit: 300)
-                )
-            }
-            return outcome
-        }
-        AppLog.error(LogTag.plugin("codex"), "reset claim: consume rejected for every credential (last: \(lastRejection.map(String.init) ?? "none"))")
-        return .failed
-    }
-
-    private enum MatchResult {
-        case matched(creditID: String, credentials: Credentials)
-        case noCredit
-        case failed
-    }
-
-    /// Fresh credit list (safe GET) → the id of the credit the user picked, matched by expiry. Tries
-    /// each credential candidate in order, moving on when one is rejected as unauthenticated (401/403)
-    /// — the same fallback the provider's probe applies — so a stale first auth file can't strand the
-    /// claim while the dashboard works off a later one.
-    private func matchCredit(expiringAt expiry: Date, candidates: [Credentials]) async -> MatchResult {
-        var lastFailure = "no credential candidate authenticated"
-        for credentials in candidates {
-            let list: HTTPResponse
-            do {
-                list = try await usageClient.fetchResetCredits(
-                    accessToken: credentials.accessToken, accountID: credentials.accountID
-                )
-            } catch {
-                AppLog.error(LogTag.plugin("codex"), "reset claim: credit list fetch failed: \(error.localizedDescription)")
-                return .failed
-            }
-            if list.statusCode == 401 || list.statusCode == 403 {
-                lastFailure = "credit list fetch rejected (\(list.statusCode))"
-                continue
-            }
-            guard (200..<300).contains(list.statusCode), let body = ProviderParse.jsonObject(list.body) else {
-                AppLog.error(LogTag.plugin("codex"), "reset claim: credit list fetch failed (\(list.statusCode))")
-                return .failed
-            }
-            guard let matched = Self.creditID(in: body, expiringAt: expiry) else { return .noCredit }
-            return .matched(creditID: matched, credentials: credentials)
-        }
-        AppLog.error(LogTag.plugin("codex"), "reset claim: \(lastFailure)")
-        return .failed
+        return rejected ? .authenticationRejected : .failed
     }
 
     /// The id of the still-available credit whose `expires_at` matches `expiry` (±1s — the popover's
@@ -355,7 +645,6 @@ final class CodexResetClaimService {
         guard let credits = body["credits"] as? [[String: Any]] else { return nil }
         return credits.first { credit in
             if let status = credit["status"] as? String, status != "available" { return false }
-            if let type = credit["reset_type"] as? String, type != "codex_rate_limits" { return false }
             guard let date = parseExpiry(credit["expires_at"]) else { return false }
             return abs(date.timeIntervalSince(expiry)) < 1
         }?["id"] as? String
@@ -395,30 +684,36 @@ final class CodexResetClaimService {
 
 /// Hands the claim service to the resets popover through the environment: `nil` (the default — previews,
 /// share-card renders, reorder previews) renders the timeline read-only with no "Use" affordance.
-/// Route each Codex widget to its own credential-scoped claim service.
+private struct CodexResetClaimServiceKey: EnvironmentKey {
+    static let defaultValue: CodexResetClaimService? = nil
+}
+
+/// Resolves a manual reset claim to the service for the account card that displayed the credit.
 @MainActor
 final class CodexResetClaimRouter {
     private let services: [String: CodexResetClaimService]
-    init(services: [String: CodexResetClaimService]) { self.services = services }
-    func service(for providerID: String) -> CodexResetClaimService? { services[providerID] }
+
+    init(services: [String: CodexResetClaimService]) {
+        self.services = services
+    }
+
+    func service(for providerID: String) -> CodexResetClaimService? {
+        services[providerID]
+    }
 }
 
 private struct CodexResetClaimRouterKey: EnvironmentKey {
     static let defaultValue: CodexResetClaimRouter? = nil
 }
 
-private struct CodexResetClaimServiceKey: EnvironmentKey {
-    static let defaultValue: CodexResetClaimService? = nil
-}
-
 extension EnvironmentValues {
-    var codexResetClaimRouter: CodexResetClaimRouter? {
-        get { self[CodexResetClaimRouterKey.self] }
-        set { self[CodexResetClaimRouterKey.self] = newValue }
-    }
-
     var codexResetClaim: CodexResetClaimService? {
         get { self[CodexResetClaimServiceKey.self] }
         set { self[CodexResetClaimServiceKey.self] = newValue }
+    }
+
+    var codexResetClaimRouter: CodexResetClaimRouter? {
+        get { self[CodexResetClaimRouterKey.self] }
+        set { self[CodexResetClaimRouterKey.self] = newValue }
     }
 }

@@ -69,6 +69,80 @@ final class MenuBarRefreshFilterTests: XCTestCase {
         XCTAssertFalse(relevant.contains("hermes"))
     }
 
+    func testClosedPanelLedgerWakeAffectsVisibleMetrics() {
+        let codexSpend = WidgetDescriptor.values(
+            id: "codex.today", provider: codex, title: "Today", isUsagePeriod: true
+        )
+        let map: [String: WidgetDescriptor] = [
+            "codex.session": session,
+            "codex.today": codexSpend,
+            "claude.session": claudeSession,
+            "opencode.session": openSession,
+            "hermes.today": hermesToday
+        ]
+
+        // When only quota meters are pinned (Session), ledger wake does NOT affect visible metrics.
+        XCTAssertFalse(
+            MenuBarRefreshFilter.closedPanelLedgerWakeAffectsVisibleMetrics(
+                pinnedMetricIDs: ["codex.session", "claude.session"],
+                descriptorForMetric: { map[$0] }
+            )
+        )
+
+        // When Codex spend tile is pinned, ledger wake DOES affect visible metrics.
+        XCTAssertTrue(
+            MenuBarRefreshFilter.closedPanelLedgerWakeAffectsVisibleMetrics(
+                pinnedMetricIDs: ["codex.today"],
+                descriptorForMetric: { map[$0] }
+            )
+        )
+
+        // When OpenCode metric is pinned, ledger wake DOES affect visible metrics.
+        XCTAssertTrue(
+            MenuBarRefreshFilter.closedPanelLedgerWakeAffectsVisibleMetrics(
+                pinnedMetricIDs: ["opencode.session"],
+                descriptorForMetric: { map[$0] }
+            )
+        )
+
+        // When unrelated metric is pinned, returns false.
+        XCTAssertFalse(
+            MenuBarRefreshFilter.closedPanelLedgerWakeAffectsVisibleMetrics(
+                pinnedMetricIDs: ["claude.session", "hermes.today"],
+                descriptorForMetric: { map[$0] }
+            )
+        )
+    }
+
+    func testMenuBarSkipsProvidersHiddenFromTheStrip() {
+        // A provider the user removed from the strip still needs no live menu-bar refresh: nothing
+        // it produces can be painted there. Refreshing it every tick burned network, CPU, and
+        // Keychain probes for an invisible value.
+        let ids = MenuBarRefreshFilter.providerIDs(
+            enabledProviderIDs: ["codex", "claude", "cursor", "freebuff"],
+            pinnedMetricIDs: ["codex.session", "cursor.auto", "freebuff.freebucksDaily"],
+            providerIDForMetric: providerID(for:),
+            notificationRelevantProviderIDs: ["codex", "claude", "cursor", "freebuff"],
+            notificationsEnabled: false,
+            hiddenProviderIDs: ["cursor", "freebuff"]
+        )
+        XCTAssertEqual(ids, ["codex"])
+    }
+
+    /// Notifications read the layout rather than the strip, so a hidden provider with bounded metrics
+    /// must still refresh when a pace trigger is on — otherwise a hidden card's alert goes stale.
+    func testHiddenProviderStillRefreshesForNotifications() {
+        let ids = MenuBarRefreshFilter.providerIDs(
+            enabledProviderIDs: ["codex", "claude", "cursor"],
+            pinnedMetricIDs: ["codex.session"],
+            providerIDForMetric: providerID(for:),
+            notificationRelevantProviderIDs: ["codex", "claude", "cursor"],
+            notificationsEnabled: true,
+            hiddenProviderIDs: ["cursor"]
+        )
+        XCTAssertEqual(ids, ["codex", "claude", "cursor"])
+    }
+
     func testFullScopePrioritizesPinnedFirst() {
         let ordered = MenuBarRefreshFilter.prioritize(
             providerIDs: ["opencode", "claude", "codex", "hermes"],
@@ -100,6 +174,82 @@ final class MenuBarRefreshFilterTests: XCTestCase {
             notificationsEnabled: false
         )
         XCTAssertEqual(ids, ["codex"])
+    }
+
+    func testSelectProviderIDsLocalAccountingFiltersToLocalFamilies() {
+        // A closed-panel ledger wake folds only the providers that consume local usage corpora.
+        // Multi-account codex cards (codex@<fingerprint>) share the codex family.
+        let ids = WidgetDataStore.selectProviderIDsForRefresh(
+            enabledProviderIDs: ["opencode", "claude", "codex", "codex@0577ce6e", "hermes", "cursor"],
+            scope: .localAccounting,
+            pinnedMetricIDs: ["codex.session"],
+            providerIDForMetric: providerID(for:),
+            orderedDescriptors: [session, claudeSession, openSession],
+            notificationsEnabled: false
+        )
+        XCTAssertEqual(ids, ["opencode", "codex", "codex@0577ce6e"])
+    }
+
+    func testBatchScopeLabelsAreDistinctPerScope() {
+        // Distinct labels keep a `.localAccounting` batch from joining (or being joined by) a
+        // concurrently requested `.full` batch — the two do different work. The panel phases do
+        // different work from each other and from `.full`, so all five must label distinctly.
+        let labels = [
+            WidgetDataStore.batchScopeLabel(.menuBar),
+            WidgetDataStore.batchScopeLabel(.panelMeters),
+            WidgetDataStore.batchScopeLabel(.localAccounting),
+            WidgetDataStore.batchScopeLabel(.panelAccounting),
+            WidgetDataStore.batchScopeLabel(.full),
+        ]
+        XCTAssertEqual(Set(labels).count, 5)
+    }
+
+    // MARK: - Panel scopes (two-phase panel-open pass)
+
+    /// Phase 1 refreshes every enabled provider (meters for the whole dashboard, not just the
+    /// pinned strip), prioritized like a full pass so the cards the user sees first update first.
+    func testSelectProviderIDsPanelMetersCoversAllEnabled() {
+        let ids = WidgetDataStore.selectProviderIDsForRefresh(
+            enabledProviderIDs: ["opencode", "claude", "codex"],
+            scope: .panelMeters,
+            pinnedMetricIDs: ["codex.session"],
+            providerIDForMetric: providerID(for:),
+            orderedDescriptors: [session, claudeSession, openSession],
+            notificationsEnabled: false
+        )
+        XCTAssertEqual(ids, ["codex", "opencode", "claude"])
+    }
+
+    /// Phase 2 also selects every enabled provider here; the history-exporter narrowing happens in
+    /// `runBatch` (pure-API providers have no fold to recompute and phase 1 already fetched their
+    /// meters).
+    func testSelectProviderIDsPanelAccountingCoversAllEnabled() {
+        let ids = WidgetDataStore.selectProviderIDsForRefresh(
+            enabledProviderIDs: ["opencode", "claude", "codex"],
+            scope: .panelAccounting,
+            pinnedMetricIDs: ["codex.session"],
+            providerIDForMetric: providerID(for:),
+            orderedDescriptors: [session, claudeSession, openSession],
+            notificationsEnabled: false
+        )
+        XCTAssertEqual(ids, ["codex", "opencode", "claude"])
+    }
+
+    /// The two panel phases read different local sources, so their scope helpers must not overlap:
+    /// meters-only phases skip the folds; fold-only phases suppress the live quota fetch.
+    func testPanelScopeHelpersPartitionTheWork() {
+        for scope in [ProviderRefreshContext.Scope.menuBar, .panelMeters] {
+            XCTAssertTrue(scope.skipsLocalAccounting, "\(scope) is meters-only")
+            XCTAssertFalse(scope.suppressesLiveQuota, "\(scope) reads the live quota API")
+        }
+        for scope in [ProviderRefreshContext.Scope.localAccounting, .panelAccounting] {
+            XCTAssertFalse(scope.skipsLocalAccounting, "\(scope) folds local corpora")
+            XCTAssertTrue(scope.suppressesLiveQuota, "\(scope) must not re-read the live quota API")
+        }
+        // `.full` does both in one pass.
+        let full = ProviderRefreshContext.Scope.full
+        XCTAssertFalse(full.skipsLocalAccounting)
+        XCTAssertFalse(full.suppressesLiveQuota)
     }
 
     func testRefreshAllMenuBarSkipsUnpinnedProviders() async {
@@ -179,9 +329,15 @@ final class MenuBarRefreshFilterTests: XCTestCase {
     }
 
     func testMenuBarMergeStillPreservesHistoryAfterQuotaOnlyRefresh() async {
+        let now = Date(timeIntervalSince1970: 2_000)
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: codex).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "test"
+        )
         let history = ProviderUsageHistory(
             series: DailyUsageSeries(daily: [
-                DailyUsageEntry(date: "2026-09-22", totalTokens: 42, costUSD: 0.02)
+                DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 42, costUSD: 0.02)
             ])
         )
         let first = ProviderSnapshot(
@@ -205,17 +361,18 @@ final class MenuBarRefreshFilterTests: XCTestCase {
         )
         let runtime = SequenceProviderRuntime(
             provider: codex,
-            descriptors: [session],
+            descriptors: [session, historyDescriptor],
             snapshots: [first, second]
         )
         // ttl: 0 so the menuBar pass (force: false, matching production) is never a cache hit.
         let defaults = makeUserDefaults("menu-bar-merge-store")
         let store = WidgetDataStore(
-            registry: WidgetRegistry(providers: [codex], descriptors: [session]),
+            registry: WidgetRegistry(providers: [codex], descriptors: [session, historyDescriptor]),
             providers: [runtime],
-            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 0),
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 0, now: { now }),
             defaults: defaults,
-            pinnedMetricIDs: { ["codex.session"] }
+            pinnedMetricIDs: { ["codex.session"] },
+            now: { now }
         )
 
         await ProviderRefreshContext.$scope.withValue(.full) {
@@ -228,7 +385,10 @@ final class MenuBarRefreshFilterTests: XCTestCase {
         let snap = store.snapshots["codex"]
         XCTAssertEqual(snap?.line(label: "Session"),
                        .progress(label: "Session", used: 55, limit: 100, format: .percent))
-        XCTAssertEqual(snap?.line(label: "Today"), first.line(label: "Today"))
+        XCTAssertEqual(snap?.line(label: "Today"), .values(label: "Today", values: [
+            MetricValue(number: 0.02, kind: .dollars, estimated: true),
+            MetricValue(number: 42, kind: .count, label: "tokens"),
+        ]))
         XCTAssertEqual(snap?.usageHistory, history)
     }
 
@@ -250,9 +410,15 @@ final class MenuBarRefreshFilterTests: XCTestCase {
     }
 
     func testForceRefreshWaitsForInFlightMenuBarThenAppliesFullSnapshot() async {
+        let now = ISO8601DateFormatter().date(from: "2026-09-24T12:00:00Z")!
+        let historyDescriptor = WidgetDescriptor.usageTrend(provider: codex).exportingHistory(
+            scope: .machineLocal,
+            estimatedCost: true,
+            sourceNote: "test"
+        )
         let history = ProviderUsageHistory(
             series: DailyUsageSeries(daily: [
-                DailyUsageEntry(date: "2026-09-24", totalTokens: 77, costUSD: 0.07)
+                DailyUsageEntry(date: DailyUsageAccumulator.dayKey(from: now), totalTokens: 77, costUSD: 0.07)
             ])
         )
         let seeded = ProviderSnapshot(
@@ -292,16 +458,19 @@ final class MenuBarRefreshFilterTests: XCTestCase {
         )
         let runtime = SeedThenGateProviderRuntime(
             provider: codex,
-            descriptors: [session],
+            descriptors: [session, historyDescriptor],
             seed: seeded,
             menuBarSnapshot: menuBarSnap,
             fullSnapshot: fullSnap
         )
+        let defaults = makeUserDefaults("force-wait-race")
         let store = WidgetDataStore(
-            registry: WidgetRegistry(providers: [codex], descriptors: [session]),
+            registry: WidgetRegistry(providers: [codex], descriptors: [session, historyDescriptor]),
             providers: [runtime],
-            defaults: makeUserDefaults("force-wait-race"),
-            pinnedMetricIDs: { ["codex.session"] }
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 0, now: { now }),
+            defaults: defaults,
+            pinnedMetricIDs: { ["codex.session"] },
+            now: { now }
         )
 
         await ProviderRefreshContext.$scope.withValue(.full) {
@@ -341,7 +510,10 @@ final class MenuBarRefreshFilterTests: XCTestCase {
             .progress(label: "Session", used: 22, limit: 100, format: .percent),
             "force must run after in-flight menuBar and apply full Session"
         )
-        XCTAssertEqual(snap?.line(label: "Today"), fullSnap.line(label: "Today"))
+        XCTAssertEqual(snap?.line(label: "Today"), .values(label: "Today", values: [
+            MetricValue(number: 0.07, kind: .dollars, estimated: true),
+            MetricValue(number: 77, kind: .count, label: "tokens"),
+        ]))
         XCTAssertEqual(
             snap?.usageHistory,
             history,

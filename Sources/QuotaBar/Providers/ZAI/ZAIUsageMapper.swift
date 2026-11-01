@@ -18,12 +18,21 @@ enum ZAIUsageMapper {
     /// fallback for the web-search line and the widget-descriptor default.
     static let monthlyPeriodMs = 30 * 24 * 60 * 60 * 1000
 
+    /// How far ahead a reported reset may sit and still be believable. A payload that reports
+    /// milliseconds where seconds were expected lands in the year 55000; a plan's real windows are
+    /// hours or weeks.
+    static let maximumResetHorizon: TimeInterval = 2 * 365 * 24 * 60 * 60
+
     /// `(plan, lines)` from the quota + subscription payloads. `subscription` may be `nil` (the
     /// request is best-effort) and the quota's `limits` array may carry one to three entries — only
     /// what's present is mapped, so a plan without web searches still shows the session meter.
-    static func map(quotaBody: Data, subscriptionBody: Data?) throws -> (plan: String?, lines: [MetricLine]) {
+    static func map(
+        quotaBody: Data,
+        subscriptionBody: Data?,
+        now: Date = Date()
+    ) throws -> (plan: String?, lines: [MetricLine]) {
         let plan = subscriptionBody.flatMap { planName(from: $0) }
-        let lines = try mapQuota(quotaBody)
+        let lines = try mapQuota(quotaBody, now: now)
         return (plan, lines)
     }
 
@@ -40,7 +49,7 @@ enum ZAIUsageMapper {
 
     /// Session + weekly + web-search meters from the quota payload. Missing required values are an
     /// invalid response rather than zero usage; an explicit empty array remains a valid no-data state.
-    static func mapQuota(_ body: Data) throws -> [MetricLine] {
+    static func mapQuota(_ body: Data, now: Date = Date()) throws -> [MetricLine] {
         guard let root = ProviderParse.jsonObject(body) else {
             throw ZAIUsageError.invalidResponse
         }
@@ -75,14 +84,16 @@ enum ZAIUsageMapper {
             sawRecognizedLimit = true
             switch window {
             case .session(let periodMs):
-                lines.append(try percentLine(entry, label: "Session", periodMs: periodMs))
+                lines.append(try percentLine(entry, label: "Session", periodMs: periodMs, now: now))
             case .weekly(let periodMs):
-                lines.append(try percentLine(entry, label: "Weekly", periodMs: periodMs))
+                lines.append(try percentLine(entry, label: "Weekly", periodMs: periodMs, now: now))
             }
         }
         if let web = findLimit(limits, type: "TIME_LIMIT") {
-            sawRecognizedLimit = true
-            lines.append(try webSearchLine(from: web))
+            if let line = try webSearchLine(from: web, now: now) {
+                sawRecognizedLimit = true
+                lines.append(line)
+            }
         }
 
         guard !lines.isEmpty else {
@@ -144,12 +155,17 @@ enum ZAIUsageMapper {
     }
 
     /// A percentage meter (Session or Weekly) from a credit/token quota entry.
-    private static func percentLine(_ entry: [String: Any], label: String, periodMs: Int) throws -> MetricLine {
+    private static func percentLine(
+        _ entry: [String: Any],
+        label: String,
+        periodMs: Int,
+        now: Date
+    ) throws -> MetricLine {
         guard let rawPercentage = ProviderParse.number(entry["percentage"]) else {
             throw ZAIUsageError.invalidResponse
         }
         let percentage = ProviderParse.clampPercent(rawPercentage)
-        let resetsAt = ProviderParse.number(entry["nextResetTime"]).map { epochMsToDate($0) }
+        let resetsAt = resetDate(entry["nextResetTime"], now: now)
         return .progress(
             label: label,
             used: percentage,
@@ -160,17 +176,21 @@ enum ZAIUsageMapper {
         )
     }
 
-    /// TIME_LIMIT → a count meter (used / limit) for monthly web-search/reader calls.
-    private static func webSearchLine(from entry: [String: Any]) throws -> MetricLine {
+    /// TIME_LIMIT → a count meter (used / limit) for monthly web-search/reader calls. `nil` when the
+    /// plan carries no web-search allowance at all (a zero cap) — there is no meter to draw.
+    private static func webSearchLine(from entry: [String: Any], now: Date) throws -> MetricLine? {
         guard let used = ProviderParse.number(entry["currentValue"]),
               let limit = ProviderParse.number(entry["usage"]),
               used >= 0,
               limit >= 0 else {
             throw ZAIUsageError.invalidResponse
         }
+        // A zero cap is a plan without web searches, not a measurement of zero use. A meter with a
+        // zero limit reads as an empty allowance that the user has not touched, which is misleading.
+        guard limit > 0 else { return nil }
         // TIME_LIMIT carries a nextResetTime in current payloads (monthly renewal); honor it when
         // present so the countdown shows the real reset, otherwise the period cadence reads "monthly".
-        let resetsAt = ProviderParse.number(entry["nextResetTime"]).map { epochMsToDate($0) }
+        let resetsAt = resetDate(entry["nextResetTime"], now: now)
         return .progress(
             label: "Web Searches",
             used: used,
@@ -179,6 +199,19 @@ enum ZAIUsageMapper {
             resetsAt: resetsAt,
             periodDurationMs: monthlyPeriodMs
         )
+    }
+
+    /// A reset instant, but only when it is still ahead of `now` and inside a believable horizon.
+    ///
+    /// `nextResetTime` arrives as epoch milliseconds (e.g. `1770648402389`). A zero, a stale value
+    /// the server forgot to advance, or a payload that reports seconds where milliseconds were
+    /// expected would otherwise render as "Resets soon" — or as a reset in the year 55000 — on every
+    /// refresh. Dropping the instant lets the meter's own cadence ("Resets in 5h") answer instead.
+    private static func resetDate(_ value: Any?, now: Date) -> Date? {
+        guard let milliseconds = ProviderParse.number(value), milliseconds > 0 else { return nil }
+        let date = Date(timeIntervalSince1970: milliseconds / 1000)
+        guard date > now, date.timeIntervalSince(now) <= maximumResetHorizon else { return nil }
+        return date
     }
 
     /// A limit entry matches by `type` or `name`; the legacy plugin checked both because Z.ai's
@@ -190,10 +223,5 @@ enum ZAIUsageMapper {
             }
         }
         return nil
-    }
-
-    /// `nextResetTime` arrives as epoch milliseconds (e.g. `1770648402389`).
-    private static func epochMsToDate(_ ms: Double) -> Date {
-        Date(timeIntervalSince1970: ms / 1000)
     }
 }

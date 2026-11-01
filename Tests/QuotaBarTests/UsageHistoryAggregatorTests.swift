@@ -31,7 +31,7 @@ final class UsageHistoryAggregatorTests: XCTestCase {
         let secondPeer = document(
             deviceID: "peer-b",
             updatedAt: 150,
-            providers: ["claude": history(tokens: 50, cost: nil, model: "Sonnet")]
+            providers: ["claude": history(tokens: 50, cost: nil, model: "Sonnet", unknown: ["Sonnet"])]
         )
 
         let merged = UsageHistoryAggregator.merged(
@@ -46,35 +46,188 @@ final class UsageHistoryAggregatorTests: XCTestCase {
 
         let claude = try XCTUnwrap(merged["claude"])
         XCTAssertEqual(claude.series.daily, [
-            DailyUsageEntry(date: "2026-07-13", totalTokens: 350, costUSD: 3)
-        ])
+            DailyUsageEntry(
+                date: "2026-07-13",
+                totalTokens: 350,
+                costUSD: 3,
+                costIsComplete: false,
+                hasUnexplainedIncompleteCost: false
+            )
+        ], "known prices remain available while the coverage flag marks the subtotal incomplete")
         XCTAssertEqual(claude.modelUsage?.daily[0].models.map(\.model), ["Opus", "Sonnet"])
         XCTAssertEqual(claude.modelUsage?.daily[0].models.first?.totalTokens, 300)
-        XCTAssertEqual(claude.unknownModelsByDay["2026-07-13"], ["unknown-a", "unknown-b"])
+        XCTAssertEqual(claude.unknownModelsByDay["2026-07-13"], ["Sonnet", "unknown-a", "unknown-b"])
         XCTAssertNil(merged["cursor"], "account-wide Cursor history must never be added across Macs")
     }
 
-    func testAggregationExcludesRowsOutsideScannerWindow() throws {
+    func testFinitePeerCostsThatOverflowMergeKeepSubtotalAndRemainEncodable() throws {
+        let local = ProviderSnapshot(
+            providerID: "opencode",
+            displayName: "OpenCode",
+            lines: [],
+            usageHistory: history(tokens: 1, cost: 1e308, model: "space-bunny")
+        )
+        let peer = document(
+            deviceID: "peer",
+            updatedAt: 200,
+            providers: ["opencode": history(tokens: 1, cost: 1e308, model: "space-bunny")]
+        )
+
+        let merged = UsageHistoryAggregator.merged(
+            localSnapshots: ["opencode": local],
+            peerDocuments: [peer],
+            descriptors: ["opencode": UsageHistoryDescriptor(
+                scope: .machineLocal, estimatedCost: true, sourceNote: "gateway logs"
+            )],
+            now: localDay(2026, 7, 13)
+        )
+        let history = try XCTUnwrap(merged["opencode"])
+        let day = try XCTUnwrap(history.series.daily.first)
+        let model = try XCTUnwrap(history.modelUsage?.daily.first?.models.first)
+
+        XCTAssertEqual(day.totalTokens, 2)
+        XCTAssertEqual(day.costUSD, 1e308)
+        XCTAssertFalse(day.costIsComplete)
+        XCTAssertTrue(day.hasUnexplainedIncompleteCost == false)
+        XCTAssertEqual(model.costUSD, 1e308)
+        XCTAssertTrue(model.hasIncompleteCost)
+        XCTAssertNoThrow(try JSONEncoder().encode(history),
+                         "peer history cannot create a non-finite cost in a provider snapshot")
+    }
+
+    func testSameModelKeepsKnownSubtotalAcrossMacs() throws {
+        let local = ProviderSnapshot(
+            providerID: "claude",
+            displayName: "Claude",
+            lines: [],
+            usageHistory: history(tokens: 100, cost: nil, model: "same-model", unknown: ["same-model"])
+        )
+        let peer = document(
+            deviceID: "peer",
+            updatedAt: 200,
+            providers: ["claude": history(tokens: 200, cost: 2, model: "same-model")]
+        )
+        let merged = UsageHistoryAggregator.merged(
+            localSnapshots: ["claude": local],
+            peerDocuments: [peer],
+            descriptors: ["claude": UsageHistoryDescriptor(scope: .machineLocal, estimatedCost: true, sourceNote: "logs")],
+            now: localDay(2026, 7, 13)
+        )
+
+        let model = try XCTUnwrap(merged["claude"]?.modelUsage?.daily.first?.models.first)
+        XCTAssertEqual(model.totalTokens, 300)
+        XCTAssertEqual(model.costUSD, 2)
+        XCTAssertTrue(model.hasIncompleteCost)
+    }
+
+    func testLegacyPartialDayUsesNamedUnknownModelAsExplanation() throws {
+        let day = "2026-07-13"
+        let legacyJSON = #"{"series":{"daily":[{"date":"2026-07-13","totalTokens":100,"costUSD":1,"costIsComplete":false}]},"modelUsage":{"daily":[{"date":"2026-07-13","models":[{"model":"mystery-model","totalTokens":100,"costUSD":1}]}]},"unknownModelsByDay":{"2026-07-13":["mystery-model"]}}"#
+        let legacyHistory = try JSONDecoder().decode(ProviderUsageHistory.self, from: Data(legacyJSON.utf8))
+        let local = ProviderSnapshot(
+            providerID: "claude",
+            displayName: "Claude",
+            lines: [],
+            usageHistory: legacyHistory
+        )
+
+        let merged = UsageHistoryAggregator.merged(
+            localSnapshots: ["claude": local],
+            peerDocuments: [],
+            descriptors: ["claude": UsageHistoryDescriptor(scope: .machineLocal, estimatedCost: true, sourceNote: "logs")],
+            now: localDay(2026, 7, 13)
+        )
+        let history = try XCTUnwrap(merged["claude"])
+        XCTAssertEqual(history.series.daily.first?.hasUnexplainedIncompleteCost, false)
+        XCTAssertTrue(try XCTUnwrap(history.modelUsage?.daily.first?.models.first).hasIncompleteCost)
+
+        var lines: [MetricLine] = []
+        SpendTileMapper.appendTokenUsage(
+            history.series,
+            to: &lines,
+            now: localDay(2026, 7, 13),
+            unknownModelsByDay: history.unknownModelsByDay,
+            modelUsage: history.modelUsage
+        )
+        guard case .values(_, let values, _, _, let unknownModels, _) = try XCTUnwrap(
+            lines.first { $0.label == "Today" }
+        ) else {
+            return XCTFail("the legacy partial spend row should render")
+        }
+        XCTAssertEqual(values.first(where: { $0.kind == .dollars })?.number, 1)
+        XCTAssertEqual(unknownModels, ["mystery-model"])
+        XCTAssertEqual(history.series.daily.first?.date, day)
+    }
+
+    func testLegacyUnknownModelDoesNotMaskUnreconciledTokenTotal() throws {
+        let day = "2026-07-13"
+        let legacyJSON = #"{"series":{"daily":[{"date":"2026-07-13","totalTokens":110,"costUSD":1,"costIsComplete":false}]},"modelUsage":{"daily":[{"date":"2026-07-13","models":[{"model":"known-model","totalTokens":90,"costUSD":1},{"model":"mystery-model","totalTokens":10,"costUSD":null}]}]},"unknownModelsByDay":{"2026-07-13":["mystery-model"]}}"#
+        let legacyHistory = try JSONDecoder().decode(ProviderUsageHistory.self, from: Data(legacyJSON.utf8))
+        let local = ProviderSnapshot(
+            providerID: "claude",
+            displayName: "Claude",
+            lines: [],
+            usageHistory: legacyHistory
+        )
+
+        let merged = UsageHistoryAggregator.merged(
+            localSnapshots: ["claude": local],
+            peerDocuments: [],
+            descriptors: ["claude": UsageHistoryDescriptor(scope: .machineLocal, estimatedCost: true, sourceNote: "logs")],
+            now: localDay(2026, 7, 13)
+        )
+        let history = try XCTUnwrap(merged["claude"])
+        XCTAssertEqual(history.series.daily.first?.hasUnexplainedIncompleteCost, true)
+
+        var lines: [MetricLine] = []
+        SpendTileMapper.appendTokenUsage(
+            history.series,
+            to: &lines,
+            now: localDay(2026, 7, 13),
+            unknownModelsByDay: history.unknownModelsByDay,
+            modelUsage: history.modelUsage
+        )
+        guard case .values(_, let values, _, _, let unknownModels, _) = try XCTUnwrap(
+            lines.first { $0.label == "Today" }
+        ) else {
+            return XCTFail("the legacy structural-gap spend row should render")
+        }
+        XCTAssertEqual(values, [MetricValue(number: 110, kind: .count, label: "tokens")])
+        XCTAssertEqual(unknownModels, ["mystery-model"])
+        XCTAssertEqual(history.series.daily.first?.date, day)
+    }
+
+    func testAggregationExcludesRowsOutsideLifetimeWindow() throws {
+        let now = localDay(2026, 7, 13)
+        let includedDate = Calendar.current.date(byAdding: .year, value: -10, to: now)!
+        let excludedDate = Calendar.current.date(byAdding: .day, value: -1, to: includedDate)!
+        XCTAssertTrue(UsageHistoryWindow.lifetimeDayKeys(through: now).contains(DailyUsageAccumulator.dayKey(from: includedDate)))
+        XCTAssertFalse(UsageHistoryWindow.lifetimeDayKeys(through: now).contains(DailyUsageAccumulator.dayKey(from: excludedDate)))
+        let includedKey = DailyUsageAccumulator.dayKey(from: includedDate)
+        let excludedKey = DailyUsageAccumulator.dayKey(from: excludedDate)
         let peerHistory = ProviderUsageHistory(
             series: DailyUsageSeries(daily: [
                 DailyUsageEntry(date: "2026-07-13", totalTokens: 10, costUSD: 1),
-                // 2026-06-14 is the last day inside a 30-day window ending 2026-07-13; 2026-06-13 is
-                // the first day outside it. Pinned either side of the boundary on purpose.
-                DailyUsageEntry(date: "2026-06-14", totalTokens: 20, costUSD: 2),
-                DailyUsageEntry(date: "2026-06-13", totalTokens: 9_000, costUSD: 90)
+                DailyUsageEntry(date: includedKey, totalTokens: 20, costUSD: 2),
+                DailyUsageEntry(date: excludedKey, totalTokens: 9_000, costUSD: 90)
             ]),
             modelUsage: ModelUsageSeries(daily: [
                 DailyModelUsageEntry(date: "2026-07-13", models: [
                     ModelUsageEntry(model: "Current", totalTokens: 10, costUSD: 1)
                 ]),
-                DailyModelUsageEntry(date: "2026-06-13", models: [
+                DailyModelUsageEntry(date: includedKey, models: [
+                    ModelUsageEntry(model: "Older detail", totalTokens: 20, costUSD: 2)
+                ]),
+                DailyModelUsageEntry(date: excludedKey, models: [
                     ModelUsageEntry(model: "Stale", totalTokens: 9_000, costUSD: 90)
                 ])
             ]),
             unknownModelsByDay: [
                 "2026-07-13": ["current-unknown"],
-                "2026-06-13": ["stale-unknown"]
-            ]
+                includedKey: ["older-unknown"],
+                excludedKey: ["stale-unknown"]
+            ],
+            apiEstimateByDay: ["2026-07-13": 1, includedKey: 2, excludedKey: 90]
         )
 
         let merged = UsageHistoryAggregator.merged(
@@ -83,14 +236,40 @@ final class UsageHistoryAggregatorTests: XCTestCase {
             descriptors: [
                 "claude": UsageHistoryDescriptor(scope: .machineLocal, estimatedCost: true, sourceNote: "logs")
             ],
-            now: localDay(2026, 7, 13)
+            now: now
         )
 
         let claude = try XCTUnwrap(merged["claude"])
-        XCTAssertEqual(claude.series.daily.map(\.date), ["2026-07-13", "2026-06-14"])
+        XCTAssertEqual(claude.series.daily.map(\.date), ["2026-07-13", includedKey])
         XCTAssertEqual(claude.series.daily.reduce(0) { $0 + $1.totalTokens }, 30)
         XCTAssertEqual(claude.modelUsage?.daily.flatMap(\.models).map(\.model), ["Current"])
         XCTAssertEqual(claude.unknownModelsByDay, ["2026-07-13": ["current-unknown"]])
+        XCTAssertEqual(claude.apiEstimateByDay, ["2026-07-13": 1, includedKey: 2])
+        XCTAssertEqual(claude.apiEstimateIncompleteDays, Set(["2026-07-13", includedKey]),
+                       "full-retention estimate completeness survives model-name pruning")
+    }
+
+    func testAggregationSaturatesCombinedTokenTotals() throws {
+        let local = ProviderSnapshot(
+            providerID: "claude",
+            displayName: "Claude",
+            lines: [],
+            usageHistory: history(tokens: .max, cost: nil, model: "Opus")
+        )
+        let peer = document(
+            deviceID: "peer",
+            updatedAt: 100,
+            providers: ["claude": history(tokens: 1, cost: nil, model: "Opus")]
+        )
+        let merged = UsageHistoryAggregator.merged(
+            localSnapshots: ["claude": local],
+            peerDocuments: [peer],
+            descriptors: ["claude": UsageHistoryDescriptor(scope: .machineLocal, estimatedCost: true, sourceNote: "logs")],
+            now: localDay(2026, 7, 13)
+        )
+
+        XCTAssertEqual(merged["claude"]?.series.daily.first?.totalTokens, .max)
+        XCTAssertEqual(merged["claude"]?.modelUsage?.daily.first?.models.first?.totalTokens, .max)
     }
 
     func testClaudeOrganizationsMatchByIdentityInsteadOfCardID() throws {
@@ -274,6 +453,60 @@ final class UsageHistoryAggregatorTests: XCTestCase {
         XCTAssertNoThrow(try multiple.validate())
     }
 
+    @MainActor
+    func testCloudExportKeepsLifetimeTotalsButBoundsModelDetailsToThirtyDays() throws {
+        let suiteName = "UsageHistoryAggregatorTests.ExportWindow.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let now = localDay(2026, 7, 13)
+        let oldDate = Calendar.current.date(byAdding: .day, value: -90, to: now)!
+        let oldKey = DailyUsageAccumulator.dayKey(from: oldDate)
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-07-13", totalTokens: 100, costUSD: 1),
+                DailyUsageEntry(date: oldKey, totalTokens: 200, costUSD: 2)
+            ]),
+            modelUsage: ModelUsageSeries(daily: [
+                DailyModelUsageEntry(date: "2026-07-13", models: [
+                    ModelUsageEntry(model: "Current", totalTokens: 100, costUSD: 1)
+                ]),
+                DailyModelUsageEntry(date: oldKey, models: [
+                    ModelUsageEntry(model: "Older", totalTokens: 200, costUSD: 2)
+                ])
+            ]),
+            unknownModelsByDay: ["2026-07-13": ["current-unknown"], oldKey: ["old-unknown"]],
+            apiEstimateByDay: ["2026-07-13": 1, oldKey: 2]
+        )
+        let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        let descriptor = WidgetDescriptor.usageTrend(provider: provider)
+            .exportingHistory(scope: .machineLocal, estimatedCost: true, sourceNote: "logs")
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots")
+        cache.store(ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            usageHistory: history
+        ))
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [],
+            cache: cache,
+            defaults: defaults,
+            now: { now }
+        )
+
+        let exported = try XCTUnwrap(store.localHistoryDocument(
+            deviceID: "this-mac",
+            deviceName: "This Mac",
+            updatedAt: now
+        ).providers["claude"])
+
+        XCTAssertEqual(exported.series.daily.map(\.date), ["2026-07-13", oldKey])
+        XCTAssertEqual(exported.modelUsage?.daily.map(\.date), ["2026-07-13"])
+        XCTAssertEqual(exported.unknownModelsByDay, ["2026-07-13": ["current-unknown"]])
+        XCTAssertEqual(exported.apiEstimateByDay, ["2026-07-13": 1, oldKey: 2])
+    }
+
     func testRendererReplacesOnlySpendRowsAndKeepsLocalState() throws {
         let local = ProviderSnapshot(
             providerID: "claude",
@@ -305,9 +538,244 @@ final class UsageHistoryAggregatorTests: XCTestCase {
             return XCTFail("Today should be rebuilt as a values row")
         }
         XCTAssertEqual(values.map(\.number), [3, 350])
+        XCTAssertTrue(values.first(where: { $0.kind == .dollars })?.estimated == true,
+                      "uniformly estimated providers fall back to their history descriptor")
         XCTAssertEqual(breakdown?.totalTokens, 350)
         XCTAssertEqual(breakdown?.models.map(\.model), ["Opus"])
         XCTAssertTrue(rendered.lines.contains { $0.label == "Usage Trend" })
+        XCTAssertEqual(rendered.usageHistory, combined)
+    }
+
+    func testRendererRestoresPerDayEstimatedCostMarkers() throws {
+        let today = "2026-07-13"
+        let yesterday = "2026-07-12"
+        let history = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: today, totalTokens: 100, costUSD: 1),
+                DailyUsageEntry(date: yesterday, totalTokens: 50, costUSD: 0.5)
+            ]),
+            estimatedCostDays: [today]
+        )
+        let local = ProviderSnapshot(providerID: "opencode", displayName: "OpenCode", lines: [])
+        let descriptor = UsageHistoryDescriptor(scope: .machineLocal, estimatedCost: false, sourceNote: "From logs")
+
+        let rendered = UsageHistorySnapshotRenderer.render(
+            local: local,
+            history: history,
+            descriptor: descriptor,
+            now: localDay(2026, 7, 13)
+        )
+
+        guard case .values(_, let todayValues, _, _, _, _) = rendered.line(label: "Today"),
+              case .values(_, let yesterdayValues, _, _, _, _) = rendered.line(label: "Yesterday"),
+              case .values(_, let monthValues, _, _, _, _) = rendered.line(label: "Last 30 Days") else {
+            return XCTFail("rendered spend rows should be available")
+        }
+        XCTAssertTrue(todayValues.first(where: { $0.kind == .dollars })?.estimated == true)
+        XCTAssertFalse(yesterdayValues.first(where: { $0.kind == .dollars })?.estimated == true)
+        XCTAssertTrue(monthValues.first(where: { $0.kind == .dollars })?.estimated == true)
+    }
+
+    func testLegacyOpenCodeHistoryKeepsUnknownEstimateProvenance() throws {
+        let day = "2026-07-13"
+        let now = localDay(2026, 7, 13)
+        let legacyHistory = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [DailyUsageEntry(date: day, totalTokens: 100, costUSD: 1)])
+        )
+        let local = ProviderSnapshot(
+            providerID: "opencode",
+            displayName: "OpenCode",
+            lines: [],
+            usageHistory: legacyHistory
+        )
+        let descriptor = UsageHistoryDescriptor(scope: .machineLocal, estimatedCost: false, sourceNote: "From logs")
+
+        let renderedLegacy = UsageHistorySnapshotRenderer.render(
+            local: local,
+            history: legacyHistory,
+            descriptor: descriptor,
+            now: now,
+            combined: false
+        )
+        guard case .values(_, let legacyValues, _, _, _, _) = renderedLegacy.line(label: "Today") else {
+            return XCTFail("legacy history should keep its spend row")
+        }
+        XCTAssertTrue(legacyValues.first(where: { $0.kind == .dollars })?.estimated == true,
+                      "missing legacy provenance must not claim imputed gateway cost is authoritative")
+
+        let mergedLegacy = UsageHistoryAggregator.merged(
+            localSnapshots: [:],
+            peerDocuments: [document(deviceID: "peer", updatedAt: 200, providers: ["opencode": legacyHistory])],
+            descriptors: ["opencode": descriptor],
+            now: now
+        )
+        XCTAssertEqual(mergedLegacy["opencode"]?.estimatedCostDays, [day],
+                       "legacy peer history is conservatively marked until its source publishes explicit provenance")
+
+        let knownExactHistory = ProviderUsageHistory(
+            series: legacyHistory.series,
+            estimatedCostDays: []
+        )
+        let mergedKnownExact = UsageHistoryAggregator.merged(
+            localSnapshots: ["opencode": ProviderSnapshot(
+                providerID: "opencode",
+                displayName: "OpenCode",
+                lines: [],
+                usageHistory: knownExactHistory
+            )],
+            peerDocuments: [],
+            descriptors: ["opencode": descriptor],
+            now: now
+        )
+        XCTAssertEqual(mergedKnownExact["opencode"]?.estimatedCostDays, [],
+                       "a fresh known-empty set must remain distinct from missing legacy metadata")
+    }
+
+    func testPartialHermesDaySurvivesPeerMergeAndSnapshotRender() throws {
+        let day = "2026-07-13"
+        let now = localDay(2026, 7, 13)
+        let localHistory = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: day, totalTokens: 100, costUSD: 1)
+            ]),
+            partialDays: [day],
+            estimatedCostDays: [day]
+        )
+        let local = ProviderSnapshot(
+            providerID: "opencode",
+            displayName: "OpenCode",
+            lines: [],
+            usageHistory: localHistory
+        )
+        let peer = document(
+            deviceID: "peer",
+            updatedAt: 200,
+            providers: ["opencode": history(tokens: 200, cost: 2, model: "Opus")]
+        )
+        let descriptor = UsageHistoryDescriptor(scope: .machineLocal, estimatedCost: true, sourceNote: "From logs")
+
+        let merged = UsageHistoryAggregator.merged(
+            localSnapshots: ["opencode": local],
+            peerDocuments: [peer],
+            descriptors: ["opencode": descriptor],
+            now: now
+        )
+        let combined = try XCTUnwrap(merged["opencode"])
+        XCTAssertEqual(combined.partialDays, [day])
+        XCTAssertEqual(combined.estimatedCostDays, [day])
+
+        let rendered = UsageHistorySnapshotRenderer.render(
+            local: local,
+            history: combined,
+            descriptor: descriptor,
+            now: now
+        )
+        guard case .values(_, let values, _, _, _, _) = rendered.line(label: "Today") else {
+            return XCTFail("Today should render after merging histories")
+        }
+        XCTAssertTrue(values.first(where: { $0.kind == .count })?.estimated == true)
+        guard case .chart(_, _, let note) = rendered.line(label: "Usage Trend") else {
+            return XCTFail("Usage Trend should render after merging histories")
+        }
+        XCTAssertTrue(try XCTUnwrap(note).contains("partial until it ends"))
+    }
+
+    func testPartialMarkerSurvivesBeyondThirtyDayDetailWindow() throws {
+        let day = "2026-06-12"
+        let now = localDay(2026, 7, 13)
+        let local = ProviderSnapshot(
+            providerID: "hermes",
+            displayName: "Hermes",
+            lines: [],
+            usageHistory: ProviderUsageHistory(
+                series: DailyUsageSeries(daily: [DailyUsageEntry(date: day, totalTokens: 100, costUSD: 1)]),
+                partialDays: [day]
+            )
+        )
+        let merged = UsageHistoryAggregator.merged(
+            localSnapshots: ["hermes": local],
+            peerDocuments: [],
+            descriptors: ["hermes": UsageHistoryDescriptor(scope: .machineLocal, estimatedCost: true, sourceNote: "From logs")],
+            now: now
+        )
+
+        let history = try XCTUnwrap(merged["hermes"])
+        XCTAssertEqual(history.series.daily.first?.date, day, "lifetime totals retain the day")
+        XCTAssertEqual(history.partialDays, [day], "lifetime totals must retain its active-session marker")
+    }
+
+    @MainActor
+    func testRenderedSnapshotExposesLifetimePeerHistoryWithoutChangingLocalExport() throws {
+        let suiteName = "UsageHistoryAggregatorTests.RenderedPeers.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let now = localDay(2026, 7, 13)
+        let oldDate = Calendar.current.date(byAdding: .day, value: -3_300, to: now)!
+        let oldKey = DailyUsageAccumulator.dayKey(from: oldDate)
+        let localHistory = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-07-13", totalTokens: 100, costUSD: 1),
+                DailyUsageEntry(date: oldKey, totalTokens: 1_000, costUSD: 10)
+            ]),
+            unknownModelsByDay: [:]
+        )
+        let peerHistory = ProviderUsageHistory(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-07-13", totalTokens: 200, costUSD: 2),
+                DailyUsageEntry(date: oldKey, totalTokens: 2_000, costUSD: 20)
+            ]),
+            unknownModelsByDay: [:]
+        )
+        let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        let descriptor = WidgetDescriptor.usageTrend(provider: provider)
+            .exportingHistory(scope: .machineLocal, estimatedCost: true, sourceNote: "logs")
+        let registry = WidgetRegistry(providers: [provider], descriptors: [descriptor])
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots")
+        cache.store(ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            usageHistory: localHistory
+        ))
+        let store = WidgetDataStore(
+            registry: registry,
+            providers: [],
+            cache: cache,
+            defaults: defaults,
+            now: { now }
+        )
+
+        store.setPeerHistoryDocuments(
+            [document(deviceID: "peer", updatedAt: 200, providers: ["claude": peerHistory])],
+            ownDeviceID: "this-mac"
+        )
+
+        XCTAssertEqual(store.snapshots["claude"]?.usageHistory?.series.daily.map(\.totalTokens), [300, 3_000])
+        XCTAssertEqual(store.localSnapshots["claude"]?.usageHistory?.series.daily.map(\.totalTokens), [100, 1_000])
+    }
+
+    func testGapFillMergePreservesModelVariants() throws {
+        let primary = LogUsageScan(
+            series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-07-13", totalTokens: 100, costUSD: 0.1)
+            ]),
+            modelUsage: ModelUsageSeries(daily: [
+                DailyModelUsageEntry(date: "2026-07-13", models: [
+                    ModelUsageEntry(
+                        model: "gpt-5.4",
+                        totalTokens: 100,
+                        costUSD: 0.1,
+                        variants: [ModelUsageVariant(model: "anthropic/openai/gpt-5.4", totalTokens: 100, costUSD: 0.1)]
+                    )
+                ])
+            ]),
+            unknownModelsByDay: [:]
+        )
+
+        let merged = try XCTUnwrap(DailyUsageAccumulator.mergedPreferringPrimary(primary, fillingGapsFrom: []).scan)
+        let model = try XCTUnwrap(merged.modelUsage?.daily.first?.models.first)
+        XCTAssertEqual(model.totalTokens, 100)
+        XCTAssertEqual(model.variants?.map(\.model), ["anthropic/openai/gpt-5.4"])
     }
 
     private func history(

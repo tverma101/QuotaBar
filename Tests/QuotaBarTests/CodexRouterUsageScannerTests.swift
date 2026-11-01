@@ -23,6 +23,12 @@ final class CodexRouterUsageScannerTests: XCTestCase {
                     outputPerMillion: 3_000,
                     cacheWritePerMillion: 1_000,
                     cacheReadPerMillion: 100
+                ),
+                "gpt-6.1-sol": ModelRates(
+                    inputPerMillion: 1_000,
+                    outputPerMillion: 3_000,
+                    cacheWritePerMillion: 1_000,
+                    cacheReadPerMillion: 100
                 )
             ]),
             secondary: PricingCatalog(entries: [:])
@@ -79,16 +85,65 @@ final class CodexRouterUsageScannerTests: XCTestCase {
         )
         let scan = try XCTUnwrap(optionalScan)
 
-        // Cost: non-cached input 75 @ 1000/M + cacheRead 25 @ 100/M + output 50 @ 3000/M
-        // = 0.075 + 0.0025 + 0.15 = 0.2275; tokens from totalTokens = 160
+        // The measured breakdown prices 150 tokens, but the reported total is 160. Keep the
+        // reported token count and component subtotal while flagging both dollar totals incomplete.
         XCTAssertEqual(scan.series.daily.count, 1)
         // The scanner buckets by *local* calendar day, so the expectation is derived from the same local
         // clock rather than hardcoded to the UTC date. These fixtures used UTC instants with a UTC
         // expectation, which is only self-consistent when the suite runs on UTC: at UTC+9 the 15:00Z event
         // falls on the following local day and the assertion fails.
         XCTAssertEqual(scan.series.daily[0].date, TestLocalInstant.isoDay(2026, 9, 2))
-        XCTAssertEqual(scan.series.daily[0].totalTokens, 160)
-        XCTAssertEqual(scan.series.daily[0].costUSD!, 0.2275, accuracy: 0.000_000_1)
+        let day = scan.series.daily[0]
+        XCTAssertEqual(day.totalTokens, 160)
+        XCTAssertEqual(day.costUSD ?? -1, 0.2275, accuracy: 0.000_000_1)
+        XCTAssertFalse(day.costIsComplete)
+        XCTAssertNil(scan.apiEstimateByDay?[day.date])
+        XCTAssertTrue(scan.apiEstimateIncompleteDays?.contains(day.date) == true)
+        XCTAssertEqual(scan.modelUsage?.daily.first?.models.first?.costUSD ?? -1,
+                       0.2275, accuracy: 0.000_000_1,
+                       "keep the known priced subtotal while marking the reported total incomplete")
+    }
+
+    func testEstimatedInputKeepsMeasuredTokensAndMarksDollarCoverageIncomplete() async throws {
+        let accountID = "1118f6f1-8697-4e7b-9112-1771b3e36099"
+        let fingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountID)!
+        let contents = ledger([[
+            "at": TestLocalInstant.iso(2026, 9, 2, 15),
+            "model": "gpt-5.6-luna",
+            "provider": "openai",
+            "status": 200,
+            "inputTokens": 0,
+            "cachedInputTokens": 0,
+            "outputTokens": 25,
+            "totalTokens": 25,
+            "estimatedInputTokens": 1_000_000_000_000_001,
+            "accountFingerprint": fingerprint,
+            "accountId": accountID
+        ]])
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { ["/tmp/usage-events.jsonl"] },
+            readFile: { _ in contents }
+        )
+
+        let optionalScan = await scanner.scan(
+            accountIdentityKey: accountID,
+            allowsUnscopedEvents: false,
+            daysBack: 30,
+            now: TestLocalInstant.date(2026, 9, 3, 12),
+            pricing: pricing()
+        )
+        let scan = try XCTUnwrap(optionalScan)
+        let day = try XCTUnwrap(scan.series.daily.first)
+
+        XCTAssertEqual(day.totalTokens, 25, "the router approximation must not inflate measured tokens")
+        XCTAssertFalse(day.tokenCountSaturated,
+                       "an oversized estimated input does not make the measured count a lower bound")
+        XCTAssertFalse(day.costIsComplete)
+        XCTAssertTrue(scan.apiEstimateIncompleteDays?.contains(day.date) == true)
+        XCTAssertNil(scan.apiEstimateByDay?[day.date])
+        XCTAssertEqual(scan.modelUsage?.daily.first?.models.first?.costUSD ?? -1,
+                       0.075, accuracy: 0.000_000_1,
+                       "estimated input must not hide the measured output subtotal")
     }
 
     func testLegacyUnscopedEventsOnlyWhenAllowed() async {
@@ -125,6 +180,202 @@ final class CodexRouterUsageScannerTests: XCTestCase {
         )
         XCTAssertNotNil(allowed)
         XCTAssertEqual(allowed?.series.daily.first?.totalTokens, 15)
+    }
+
+    func testIgnoresFutureDatedEvents() async throws {
+        let now = TestLocalInstant.date(2026, 9, 3, 12)
+        let accountID = "1118f6f1-8697-4e7b-9112-1771b3e36099"
+        let fingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountID)!
+        let contents = ledger([
+            [
+                "at": TestLocalInstant.iso(2026, 9, 2, 15),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "accountFingerprint": fingerprint
+            ],
+            [
+                "at": TestLocalInstant.iso(2026, 9, 6, 15),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 1_000,
+                "outputTokens": 500,
+                "totalTokens": 1_500,
+                "accountFingerprint": fingerprint
+            ]
+        ])
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { ["/tmp/usage-events.jsonl"] },
+            readFile: { _ in contents }
+        )
+
+        let optionalScan = await scanner.scan(
+            accountIdentityKey: accountID,
+            allowsUnscopedEvents: false,
+            daysBack: 30,
+            now: now,
+            pricing: pricing()
+        )
+        let scan = try XCTUnwrap(optionalScan)
+
+        XCTAssertEqual(scan.series.daily.count, 1)
+        XCTAssertEqual(scan.series.daily[0].totalTokens, 15)
+    }
+
+    func testDiskBackedAggregateCacheExpiresWhenFutureEventBecomesEligible() async throws {
+        let firstNow = TestLocalInstant.date(2026, 10, 1, 12)
+        let futureAt = firstNow.addingTimeInterval(30 * 60)
+        let laterNow = firstNow.addingTimeInterval(60 * 60)
+        let accountID = "1118f6f1-8697-4e7b-9112-1771b3e36099"
+        let fingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountID)!
+        let contents = ledger([
+            [
+                "at": TestLocalInstant.iso(2026, 10, 1, 11),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15,
+                "accountFingerprint": fingerprint
+            ],
+            [
+                "at": OpenUsageISO8601.string(from: futureAt),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 1_000,
+                "outputTokens": 500,
+                "totalTokens": 1_500,
+                "accountFingerprint": fingerprint
+            ]
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("router-future-cache-\(UUID().uuidString)", isDirectory: true)
+        let ledgerURL = root.appendingPathComponent("usage-events.jsonl")
+        let cacheDirectory = root.appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data(contents.utf8).write(to: ledgerURL)
+        defer {
+            CodexRouterUsageScanner.clearSharedTailCacheForTesting(path: ledgerURL.path, retentionDays: 35)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let parseCache = IncrementalJSONLScanner<CodexRouterUsageScanner.Event>(
+            maxConcurrentParses: 1,
+            maxResidentIdentities: 1,
+            retainResidentItems: true,
+            persistence: JSONLScanCachePersistence(
+                namespace: "codex-router-future-test",
+                schemaVersion: 1,
+                directory: cacheDirectory
+            )
+        )
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { [ledgerURL.path] },
+            identityAliases: { [:] },
+            incrementalScanner: parseCache
+        )
+        let modelPricing = pricing()
+
+        let firstScan = await scanner.scan(
+            accountIdentityKey: accountID,
+            allowsUnscopedEvents: false,
+            daysBack: 30,
+            now: firstNow,
+            pricing: modelPricing
+        )
+        let first = try XCTUnwrap(firstScan)
+        XCTAssertEqual(first.series.daily.reduce(0) { $0 + $1.totalTokens }, 15)
+
+        let afterFutureScan = await scanner.scan(
+            accountIdentityKey: accountID,
+            allowsUnscopedEvents: false,
+            daysBack: 30,
+            now: laterNow,
+            pricing: modelPricing
+        )
+        let afterFuture = try XCTUnwrap(afterFutureScan)
+        XCTAssertEqual(afterFuture.series.daily.reduce(0) { $0 + $1.totalTokens }, 1_515)
+        await parseCache.flushPendingWrites()
+    }
+
+    func testParsedCacheIsSeparatedByRetentionWindow() async throws {
+        let now = TestLocalInstant.date(2026, 10, 3, 12)
+        let oldDate = Calendar.current.date(byAdding: .day, value: -50, to: now)!
+        let recentDate = Calendar.current.date(byAdding: .day, value: -2, to: now)!
+        let contents = ledger([
+            [
+                "at": OpenUsageISO8601.string(from: oldDate),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "totalTokens": 15
+            ],
+            [
+                "at": OpenUsageISO8601.string(from: recentDate),
+                "model": "gpt-5.6-luna",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 20,
+                "outputTokens": 10,
+                "totalTokens": 30
+            ]
+        ])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("router-retention-\(UUID().uuidString)", isDirectory: true)
+        let ledgerURL = root.appendingPathComponent("usage-events.jsonl")
+        let cacheDirectory = root.appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data(contents.utf8).write(to: ledgerURL)
+        defer {
+            CodexRouterUsageScanner.clearSharedTailCacheForTesting(path: ledgerURL.path, retentionDays: 35)
+            CodexRouterUsageScanner.clearSharedTailCacheForTesting(path: ledgerURL.path, retentionDays: 60)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let parseCache = IncrementalJSONLScanner<CodexRouterUsageScanner.Event>(
+            maxConcurrentParses: 1,
+            maxResidentIdentities: 1,
+            retainResidentItems: true,
+            persistence: JSONLScanCachePersistence(
+                namespace: "codex-router-retention-test",
+                schemaVersion: 1,
+                directory: cacheDirectory
+            )
+        )
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { [ledgerURL.path] },
+            identityAliases: { [:] },
+            incrementalScanner: parseCache
+        )
+
+        let optionalNarrow = await scanner.scan(
+            accountIdentityKey: nil,
+            allowsUnscopedEvents: true,
+            daysBack: 30,
+            now: now,
+            pricing: pricing()
+        )
+        let narrow = try XCTUnwrap(optionalNarrow)
+        XCTAssertEqual(narrow.series.daily.reduce(0) { $0 + $1.totalTokens }, 30)
+
+        let optionalWide = await scanner.scan(
+            accountIdentityKey: nil,
+            allowsUnscopedEvents: true,
+            daysBack: 60,
+            now: now,
+            pricing: pricing()
+        )
+        let wide = try XCTUnwrap(optionalWide)
+        XCTAssertEqual(wide.series.daily.reduce(0) { $0 + $1.totalTokens }, 45)
+        await parseCache.flushPendingWrites()
     }
 
     func testRejectsOtherAccountFingerprint() async {
@@ -312,6 +563,41 @@ final class CodexRouterUsageScannerTests: XCTestCase {
         )
         let scan = try XCTUnwrap(optionalScan)
         XCTAssertEqual(scan.series.daily[0].costUSD!, 0.2275, accuracy: 0.000_000_1)
+    }
+
+    func testGPT61NamedServiceTiersApplyToRouterEvents() async throws {
+        let accountID = "1118f6f1-8697-4e7b-9112-1771b3e36099"
+        let fingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountID)!
+        let tiers = ["default", "fast", "flex", "batch", "ultrafast"]
+        let contents = ledger(tiers.map { tier in
+            [
+                "at": "2026-09-02T15:00:00.000Z",
+                "model": "gpt-6.1-sol",
+                "provider": "openai",
+                "status": 200,
+                "inputTokens": 100,
+                "cachedInputTokens": 25,
+                "outputTokens": 50,
+                "totalTokens": 150,
+                "serviceTier": tier,
+                "accountFingerprint": fingerprint,
+                "accountId": accountID
+            ]
+        })
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { ["/tmp/usage-events.jsonl"] },
+            readFile: { _ in contents }
+        )
+        let now = TestLocalInstant.date(2026, 9, 3, 12)
+        let optionalScan = await scanner.scan(
+            accountIdentityKey: accountID,
+            allowsUnscopedEvents: false,
+            daysBack: 30,
+            now: now,
+            pricing: pricing()
+        )
+        let scan = try XCTUnwrap(optionalScan)
+        XCTAssertEqual(scan.series.daily[0].costUSD!, 2.275, accuracy: 0.000_001)
     }
 
     func testMultiSegmentModelSlugPricesViaSuffixCandidates() async throws {

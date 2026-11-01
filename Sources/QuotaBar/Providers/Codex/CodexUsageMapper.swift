@@ -182,7 +182,8 @@ enum CodexUsageMapper {
     /// `limit_name`/`metered_feature` names Spark as the
     /// `Spark` and `Spark Weekly` meters; a non-dictionary or null array element is skipped rather than
     /// discarding its valid siblings. Returns an empty list when the field is absent or carries no Spark
-    /// entry (the common case for accounts without the limit), so those rows simply read "No data".
+    /// entry (the common case for accounts without the limit), so the dashboard hides those rows by
+    /// default; explicitly enabling one in Customize shows its "No data" state.
     private static func sparkLines(body: [String: Any], now: Date) -> [MetricLine] {
         guard let rawEntries = body["additional_rate_limits"] as? [Any] else { return [] }
         let entries = rawEntries.compactMap { $0 as? [String: Any] }

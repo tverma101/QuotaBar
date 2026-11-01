@@ -24,6 +24,23 @@ final class GrokAuthStoreTests: XCTestCase {
         XCTAssertEqual(candidates.first?.entryKey, "https://auth.x.ai::client")
     }
 
+    func testUnreadablePresentAuthFileThrowsCredentialAccessError() {
+        let store = GrokAuthStore(files: UnreadableFiles(present: [GrokAuthStore.authPath]))
+
+        XCTAssertThrowsError(try store.loadAuthCandidates()) { error in
+            XCTAssertTrue(error is GrokCredentialsUnreadableError)
+            XCTAssertEqual((error as? CategorizedError)?.errorCategory, .credentialAccess)
+        }
+    }
+
+    func testMalformedPresentAuthFileThrowsInvalidAuth() {
+        let store = GrokAuthStore(files: FakeFiles([GrokAuthStore.authPath: "not json"]))
+
+        XCTAssertThrowsError(try store.loadAuthCandidates()) { error in
+            XCTAssertEqual(error as? GrokAuthError, .invalidAuth)
+        }
+    }
+
     func testSaveRefusesToOverwriteACorruptAuthFile() throws {
         // A present-but-corrupt auth.json must NOT be silently rebuilt from in-memory state (which
         // would drop other accounts' entries). save() must throw and leave the file untouched.
@@ -40,6 +57,59 @@ final class GrokAuthStoreTests: XCTestCase {
         XCTAssertThrowsError(try store.save(state))
         XCTAssertEqual(files.files[GrokAuthStore.authPath], corrupt, "corrupt file must be left untouched, not clobbered")
     }
+
+    func testSaveDoesNotOverwritePresentUnreadableAuthFile() {
+        let key = "https://auth.x.ai::client"
+        let entry = GrokAuthEntry(
+            key: "rotated-token",
+            refreshToken: "refresh",
+            refresh: nil,
+            idToken: nil,
+            expiresAt: nil,
+            expires: nil,
+            oidcClientID: nil
+        )
+        let otherEntry = GrokAuthEntry(
+            key: "other-account-token",
+            refreshToken: nil,
+            refresh: nil,
+            idToken: nil,
+            expiresAt: nil,
+            expires: nil,
+            oidcClientID: nil
+        )
+        let state = GrokAuthState(
+            auth: [key: entry, "https://auth.x.ai::other": otherEntry],
+            entryKey: key,
+            entry: entry,
+            token: "rotated-token"
+        )
+        let files = UnreadableTrackingFiles()
+        let store = GrokAuthStore(files: files)
+
+        XCTAssertThrowsError(try store.save(state)) { error in
+            XCTAssertTrue(error is GrokCredentialsUnreadableError)
+            XCTAssertEqual((error as? CategorizedError)?.errorCategory, .credentialAccess)
+        }
+        XCTAssertEqual(files.writeCount, 0, "an unreadable multi-account file must never be replaced")
+    }
+}
+
+private final class UnreadableTrackingFiles: TextFileAccessing, @unchecked Sendable {
+    private(set) var writeCount = 0
+
+    func exists(_ path: String) -> Bool { path == GrokAuthStore.authPath }
+
+    func readText(_ path: String) throws -> String {
+        throw CocoaError(.fileReadNoPermission)
+    }
+
+    func readTextIfPresent(_ path: String) throws -> String? {
+        throw CocoaError(.fileReadNoPermission)
+    }
+
+    func writeText(_ path: String, _ text: String) throws { writeCount += 1 }
+    func remove(_ path: String) throws {}
 }
 
 private func makeJWT(exp: Int) -> String {

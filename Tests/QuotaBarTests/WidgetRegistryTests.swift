@@ -113,4 +113,22 @@ final class WidgetRegistryTests: XCTestCase {
         // WidgetDescriptor equality is id-only; compare the sample to prove the first one wins.
         XCTAssertEqual(registry.descriptor(id: "dup.m")?.sample.title, "First")
     }
+
+    /// The per-provider history map used to be rebuilt on every read — the store reads it a dozen
+    /// times per refresh tick. It is built once, at construction.
+    func testHistoryDescriptorMapIsBuiltOnceAndNotOnAccess() {
+        let claude = provider("claude")
+        let registry = WidgetRegistry(
+            providers: [claude],
+            descriptors: [descriptor("claude.session", provider: claude)]
+        )
+
+        let buildsBefore = WidgetRegistry.historyMapBuildCount.withLock { $0 }
+        _ = registry.historyDescriptorsByProvider
+        _ = registry.historyDescriptorsByProvider
+        _ = registry.limitDescriptorsByProvider
+        let buildsAfter = WidgetRegistry.historyMapBuildCount.withLock { $0 }
+
+        XCTAssertEqual(buildsAfter, buildsBefore, "the map must not be rebuilt on access")
+    }
 }

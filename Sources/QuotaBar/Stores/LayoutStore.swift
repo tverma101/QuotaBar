@@ -147,6 +147,7 @@ final class LayoutStore {
         defaultMetricIDs: [String] = DefaultLayout.metricIDs,
         migrationBaselineMetricIDs: [String] = DefaultLayout.migrationBaselineMetricIDs,
         defaultPinnedMetricIDs: [String] = DefaultLayout.pinnedMetricIDs,
+        migrationBaselinePinnedMetricIDs: [String] = DefaultLayout.migrationBaselinePinnedMetricIDs,
         defaultExpandedMetricIDs: [String] = DefaultLayout.expandedMetricIDs,
         isProviderEnabled: @escaping @MainActor (String) -> Bool = { _ in true }
     ) {
@@ -165,6 +166,7 @@ final class LayoutStore {
                 metricIDs: defaultMetricIDs,
                 migrationBaselineMetricIDs: migrationBaselineMetricIDs,
                 pinnedMetricIDs: defaultPinnedMetricIDs,
+                migrationBaselinePinnedMetricIDs: migrationBaselinePinnedMetricIDs,
                 expandedMetricIDs: defaultExpandedMetricIDs
             )
         )
@@ -182,12 +184,35 @@ final class LayoutStore {
         // ever reappeared would silently re-arm the opt-in for a row the user had never chosen. The stale
         // entry is also unreachable from Customize, because that switch reads `placed` rather than the
         // opt-in, so nothing could clear it.
-        let loadedExplicitlyEnabled = Set(persistence.loadExplicitlyEnabledMetrics())
+        let hadStoredMetricOptIns = persistence.hasStoredExplicitlyEnabledMetrics
+        let savedExplicitlyEnabled = persistence.loadExplicitlyEnabledMetrics()
+        let inferredLegacyOptIns: Set<String>
+        if hadStoredMetricOptIns || !persistence.hasStoredLayout {
+            inferredLegacyOptIns = []
+        } else {
+            // Before explicit opt-ins had their own key, a saved optional row outside the historical
+            // default set is evidence that the user added it in Customize. Recover those choices once.
+            // Rows that were themselves historical defaults are ambiguous in the old layout and stay
+            // unmarked; treating every placed default as manual would revive the empty rows this filter
+            // is meant to remove.
+            let historicalDefaults = Set(
+                persistence.loadSeededDefaults() ?? migrationBaselineMetricIDs
+            )
+            inferredLegacyOptIns = Set(
+                (persistence.loadPlaced() ?? []).map(\.descriptorID).filter { id in
+                    guard !historicalDefaults.contains(id),
+                          let descriptor = registry.descriptor(id: id)
+                    else { return false }
+                    return descriptor.hidesWhenEmpty
+                }
+            )
+        }
+        let loadedExplicitlyEnabled = savedExplicitlyEnabled.union(inferredLegacyOptIns)
         explicitlyEnabledMetricIDs = loadedExplicitlyEnabled.filter { registry.descriptor(id: $0) != nil }
         menuBarStyle = initial.menuBarStyle
 
         // Write the pruned set back so the blob cannot keep accumulating dead ids.
-        if explicitlyEnabledMetricIDs != loadedExplicitlyEnabled {
+        if !hadStoredMetricOptIns || explicitlyEnabledMetricIDs != savedExplicitlyEnabled {
             persistExplicitlyEnabledMetrics()
         }
         if initial.shouldPersistExpandOnEnable { persistExpandOnEnable() }
@@ -196,6 +221,9 @@ final class LayoutStore {
         if initial.shouldPersistPins { persistPins() }
         if let seededAccountPins = initial.seededAccountPinsToPersist {
             persistSeededAccountPins(seededAccountPins)
+        }
+        if let seededDefaultPins = initial.seededDefaultPinsToPersist {
+            persistence.saveSeededDefaultPins(seededDefaultPins)
         }
         syncPlacedOrder(persistChanges: initial.shouldPersistPlaced)
     }
@@ -629,7 +657,13 @@ final class LayoutStore {
         }
         let orderedIDs = Set(ordered.map(\.id))
         ordered.append(contentsOf: placed.filter { !orderedIDs.contains($0.id) })
-        placed = ordered
+        // Only republish when the order actually changed. `placed` is observable and drives the
+        // dashboard grouping and the refresh loop's provider selection, so a no-op layout change
+        // re-rendered every layout observer for nothing. The persist still runs: the *set* of
+        // widgets may have changed even when the order did not.
+        if ordered != placed {
+            placed = ordered
+        }
         if persistChanges { persist() }
     }
 

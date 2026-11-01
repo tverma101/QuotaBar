@@ -71,7 +71,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         var data: [String: String]
         init(data: [String: String] = [:]) { self.data = data }
         func queryValue(path: String, sql: String) throws -> String? {
-            if sql.contains("json_group_array") { return data[path] }
+            if sql.contains("json_group_array") { return data[path] ?? "[]" }
             if sql.contains("SELECT 1") { return data[path] == nil ? nil : "1" }
             return nil
         }
@@ -97,7 +97,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
-        let scan = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertNotNil(scan)
         XCTAssertTrue(scan!.includesEstimatedCost)
 
@@ -135,7 +135,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
-        let scan = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertNotNil(scan)
         XCTAssertTrue(scan!.includesEstimatedCost)
 
@@ -149,6 +149,30 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // DB row's recorded $0.005 + fold at $0.50/M × 9200 tokens = $0.0046.
         let dollars = values.first(where: { $0.kind == .dollars })?.number ?? 0
         XCTAssertEqual(dollars, 0.0096, accuracy: 1e-9)
+    }
+
+    func testSaturatedDatabaseCountsDoNotCalibrateGatewayRates() async throws {
+        let claudeHome = try fixtureClaudeHome(files: [
+            ".claude/projects/-Users-tejas-Gaming/session.jsonl":
+                line(TestLocalInstant.iso(2026, 7, 12, 11),
+                     "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000) + "\n",
+        ])
+        let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
+        // This row's raw count exceeds the safe parser range. Its $2 charge remains part of history,
+        // but the clamped denominator must not be used to price other gateway sessions.
+        let db = "[[\(ms),2.0,2000000000000000,\"deepseek-v4-flash\",\"opencode-go\"]]"
+        let scanner = OpenCodeUsageScanner(
+            sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databasePaths: { ["/oc/opencode.db"] },
+            claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
+        )
+
+        let maybeScan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
+        let scan = try XCTUnwrap(maybeScan)
+        let day = try XCTUnwrap(scan.logScan.series.daily.first)
+        XCTAssertTrue(day.tokenCountSaturated)
+        XCTAssertEqual(day.costUSD ?? -1, 2.0002184, accuracy: 1e-9,
+                       "the saturated amount is retained; gateway cost falls back to catalog rates")
     }
 
     func testGatewayFoldPricedAtZeroWhenRecordedCostIsZero() async throws {
@@ -179,6 +203,38 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         XCTAssertEqual(values.first(where: { $0.kind == .dollars })?.number ?? 0, 0, accuracy: 1e-9)
     }
 
+    func testSpaceBunnyFreeFoldsAtGOCardDespiteZeroRecordedCost() async throws {
+        // Space Bunny's DB rows recorded $0 during the free promo, but the model is paid on the
+        // GO plan now and OpenCode kept the legacy '-free' id. The poisoned $0 calibration must
+        // not win: the fold prices token-only rows at the supplement's GO card ($0.15 input /
+        // $0.60 output / $0.03 cache read per 1M, opencode.ai/docs/go verified 2026-10-06) —
+        // unlike genuinely-free models, whose recorded $0 is the truth (see the deepseek test).
+        let claudeHome = try fixtureClaudeHome(files: [
+            ".claude/projects/-Users-tejas-Gaming/session.jsonl":
+                line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/space-bunny-free", input: 1000, output: 200, cacheRead: 8000) + "\n",
+        ])
+        let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
+        let db = "[[\(ms),0.0,5000,\"space-bunny-free\",\"opencode-go\"]]"
+        let scanner = OpenCodeUsageScanner(
+            sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databasePaths: { ["/oc/opencode.db"] },
+            claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
+        )
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
+        XCTAssertNotNil(scan)
+
+        var lines: [MetricLine] = []
+        SpendTileMapper.appendTokenUsage(scan!.logScan.series, to: &lines, now: now, estimated: scan!.includesEstimatedCost)
+        guard case let .values(_, values, _, _, _, _)? = lines.first(where: { $0.label == "Today" }) else {
+            return XCTFail("expected a Today tile")
+        }
+        // 5000 recorded tokens + 9200 folded (1000 input + 200 output + 8000 cache read).
+        XCTAssertEqual(values.first(where: { $0.kind == .count })?.number ?? 0, 14_200)
+        // DB row's recorded $0 + GO-card fold: 1000×0.15/M + 200×0.6/M + 8000×0.03/M = $0.00051.
+        let dollars = values.first(where: { $0.kind == .dollars })?.number ?? 0
+        XCTAssertEqual(dollars, 0.00051, accuracy: 1e-9)
+    }
+
     func testGoWindowsIncludeGoQuotaFoldsButExcludeZen() async throws {
         // The cap meters' local dollar context must match the tiles: Go-subscription gateway
         // sessions (anthropic/opencode_go/…) count against the caps; Zen pay-as-you-go sessions
@@ -195,7 +251,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
-        let scan = try await scanner.scan(now: now, hasGoKey: true, pricing: TestPricing.bundled)
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         let windows = scan?.goWindows
         XCTAssertNotNil(windows)
         // Recorded $1.00 + the Go fold's catalog price: 100_000/20_000/800_000 at 0.14/0.28/0.0028
@@ -205,9 +261,10 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         XCTAssertEqual(windows?.monthlySpend ?? -1, 1.0218, accuracy: 1e-9)
     }
 
-    func testUnpricedGatewayModelSurfacesAsUnknownAndIsExcluded() async throws {
-        // A model the catalogs don't know must not fabricate a price: its tokens are excluded and it
-        // lands in the unknown-model warning, matching the Claude tiles' convention.
+    func testUnpricedGatewayModelCountsTokensAndStaysUnpriced() async throws {
+        // A model the catalogs don't know must not fabricate a price: its tokens still count (the
+        // history screen shows volume) but no cost is claimed, and it lands in the unknown-model
+        // warning for the reveal affordance.
         let claudeHome = try fixtureClaudeHome(files: [
             ".claude/projects/-Users-tejas-Gaming/session.jsonl":
                 line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/not-a-real-model-xyz", input: 1000, output: 200) + "\n"
@@ -219,7 +276,8 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         )
         let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
         XCTAssertFalse(scan!.includesEstimatedCost)
-        XCTAssertFalse(scan!.logScan.series.daily.contains { $0.totalTokens > 0 })
+        XCTAssertEqual(scan!.logScan.series.daily.map(\.totalTokens), [1200])
+        XCTAssertNil(scan!.logScan.series.daily.first?.costUSD)
         XCTAssertTrue(scan!.logScan.unknownModelsByDay.values.contains { $0.contains("not-a-real-model-xyz") })
     }
 

@@ -14,12 +14,13 @@ final class RefreshSettingTests: XCTestCase {
         XCTAssertEqual(RefreshSetting.interval, 300)
     }
 
-    func testBackgroundIntervalIsFiveOrFifteenMinutes() {
-        // backgroundInterval is 300 on AC, 900 on battery/LPM — never changes `interval` (cache TTL).
-        XCTAssertEqual(RefreshSetting.onBatteryBackgroundMinutes, 15)
+    func testQuotaMetersRefreshEveryMinuteOrTwoAndDetailStaysFiveMinutes() {
+        XCTAssertEqual(RefreshSetting.quotaMinutes, 1)
+        XCTAssertEqual(RefreshSetting.quotaInterval, 60)
+        XCTAssertEqual(RefreshSetting.onBatteryBackgroundMinutes, 2)
         XCTAssertTrue(
-            RefreshSetting.backgroundInterval == 300 || RefreshSetting.backgroundInterval == 900,
-            "backgroundInterval must be 5m (AC) or 15m (battery/LPM), got \(RefreshSetting.backgroundInterval)"
+            RefreshSetting.backgroundInterval == 60 || RefreshSetting.backgroundInterval == 120,
+            "backgroundInterval must be 1m (AC) or 2m (battery/LPM), got \(RefreshSetting.backgroundInterval)"
         )
         XCTAssertEqual(RefreshSetting.interval, 300, "full/cache interval must stay fixed at 5 minutes")
     }

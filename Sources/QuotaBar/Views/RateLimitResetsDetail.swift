@@ -28,7 +28,8 @@ struct RateLimitResetsDetail: View {
     var onPinChange: ((Bool) -> Void)?
     /// Claims the reset credit expiring at the given instant, using the given idempotency key (see the
     /// type doc). `nil` makes the timeline read-only (no "Use" affordance).
-    var claim: ((_ expiry: Date, _ redeemRequestID: String) async -> ResetClaimOutcome)?
+    var claim: (@Sendable (_ expiry: Date, _ redeemRequestID: String) async -> ResetClaimOutcome)?
+    var autoResetStatus: CodexAutoResetStatus? = nil
 
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
 
@@ -66,6 +67,10 @@ struct RateLimitResetsDetail: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let autoResetStatus {
+                CodexAutoResetStatusView(status: autoResetStatus)
+                Divider()
+            }
             if let banner {
                 bannerView(banner)
                     // Unfold from the top edge as the claimed node collapses below — one combined motion.
@@ -388,7 +393,9 @@ struct RateLimitResetsDetail: View {
             claimingExpiry = date
         }
         Task {
-            let outcome = await claim(date, redeemRequestID)
+            let outcome = await withManualRefresh {
+                await claim(date, redeemRequestID)
+            }
             withAnimation(Self.flowAnimation) {
                 claimingExpiry = nil
                 apply(outcome, for: date)
@@ -409,6 +416,14 @@ struct RateLimitResetsDetail: View {
         case .noCredit:
             claimedExpiries.insert(date)
             banner = .init(text: "That reset is no longer available", icon: "exclamationmark.triangle.fill", tint: .orange)
+        case .credentialAccess:
+            banner = .init(
+                text: "Couldn't access Codex credentials. Grant Keychain access or check the auth file, then try again.",
+                icon: "exclamationmark.triangle.fill",
+                tint: .red
+            )
+        case .cancelled:
+            break
         case .failed:
             banner = .init(text: "Couldn't reset usage. Please try again.", icon: "xmark.circle.fill", tint: .red)
         }

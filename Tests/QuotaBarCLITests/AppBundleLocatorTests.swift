@@ -4,7 +4,7 @@ import XCTest
 final class AppBundleLocatorTests: XCTestCase {
     func testFindsContainingAppThroughHelperSymlink() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let app = root.appendingPathComponent("OpenUsage.app")
+        let app = root.appendingPathComponent("QuotaBar.app")
         let contents = app.appendingPathComponent("Contents")
         let helpers = contents.appendingPathComponent("Helpers")
         let bin = root.appendingPathComponent("bin")
@@ -16,9 +16,9 @@ final class AppBundleLocatorTests: XCTestCase {
         ]
         let plistData = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
         try plistData.write(to: contents.appendingPathComponent("Info.plist"))
-        let helper = helpers.appendingPathComponent("openusage")
+        let helper = helpers.appendingPathComponent("quotabar")
         try Data().write(to: helper)
-        let symlink = bin.appendingPathComponent("openusage")
+        let symlink = bin.appendingPathComponent("quotabar")
         try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: helper)
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -33,7 +33,7 @@ final class AppBundleLocatorTests: XCTestCase {
 
     func testEnvironmentCanSelectDefaultsSuiteForDevelopment() {
         let located = AppBundleLocator.locate(
-            executableURL: URL(fileURLWithPath: "/tmp/openusage"),
+            executableURL: URL(fileURLWithPath: "/tmp/quotabar"),
             environment: ["OPENUSAGE_DEFAULTS_SUITE": "com.example.dev"]
         )
 

@@ -24,9 +24,9 @@ final class ModelPricingStoreTests: XCTestCase {
              "fast_multipliers": {}, "alias_rules": []}
             """.utf8)
         case "pricing_litellm_snapshot":
-            return Data(#"{"models": {"bundled-model": {"i": 1, "o": 2, "cw": 1, "cr": 0.1}}}"#.utf8)
+            return Data(#"{"retrieved_at":"2026-10-13T22:08:54Z","models":{"bundled-model":{"i":1,"o":2,"cw":1,"cr":0.1}}}"#.utf8)
         case "pricing_models_dev_snapshot":
-            return Data(#"{"models": {"bundled-dev-model": {"i": 3, "o": 4, "cw": 3, "cr": 0.3}}}"#.utf8)
+            return Data(#"{"retrieved_at":"2026-10-13T22:08:54Z","models":{"bundled-dev-model":{"i":3,"o":4,"cw":3,"cr":0.3}}}"#.utf8)
         default:
             return nil
         }
@@ -39,6 +39,13 @@ final class ModelPricingStoreTests: XCTestCase {
 
     private static let modelsDevFeed = """
     {"xai": {"models": {"fetched-dev-model": {"cost": {"input": 1, "output": 2, "cache_read": 0.2}}}}}
+    """
+
+    private static let openRouterFeed = """
+    {"data": [
+      {"id": "example/fetched-openrouter-model", "pricing": {"prompt": "0.000007", "completion": "0.00002"}},
+      {"id": "example/free-model:free", "pricing": {"prompt": "0", "completion": "0"}}
+    ], "total_count": 2, "links": {"next": null}}
     """
 
     private static let supplementFeed = """
@@ -64,6 +71,8 @@ final class ModelPricingStoreTests: XCTestCase {
         let body: String
         if request.url.absoluteString.contains("litellm") {
             body = litellmFeed
+        } else if request.url.host() == "openrouter.ai" {
+            body = openRouterFeed
         } else if request.url.host() == "models.dev" {
             body = modelsDevFeed
         } else {
@@ -85,11 +94,18 @@ final class ModelPricingStoreTests: XCTestCase {
     func testRefreshFetchesAllSourcesAndAppliesData() async throws {
         let (store, http) = makeStore(handler: { Self.respond(to: $0) })
         await store.refreshNow()
-        XCTAssertEqual(http.requests.count, 3)
+        XCTAssertEqual(http.requests.count, 4)
+
+        let cachedCatalog = try PricingCatalogCodecs.catalogFromCompact(
+            Data(contentsOf: tempDir.appendingPathComponent("litellm.json"))
+        )
+        XCTAssertNotNil(cachedCatalog.retrievedAt, "fresh caches retain a timestamp for bundle precedence")
 
         let pricing = await store.current()
         XCTAssertEqual(pricing.resolve(model: "fetched-model")?.inputPerMillion, 5)
         XCTAssertEqual(pricing.resolve(model: "fetched-dev-model")?.inputPerMillion, 1)
+        XCTAssertEqual(pricing.resolve(model: "fetched-openrouter-model")?.inputPerMillion, 7)
+        XCTAssertEqual(pricing.resolve(model: "example/free-model:free")?.inputPerMillion, 0)
         XCTAssertEqual(pricing.resolve(model: "auto")?.inputPerMillion, 9, "fetched supplement replaces bundled")
         XCTAssertEqual(pricing.resolve(model: "bundled-model")?.inputPerMillion, 1, "bundled entries survive the merge")
     }
@@ -101,11 +117,70 @@ final class ModelPricingStoreTests: XCTestCase {
         // Second store, network dead: cached fetch results still apply.
         let (revived, http) = makeStore(handler: { _ in throw URLError(.notConnectedToInternet) })
         let pricing = await revived.current()
-        XCTAssertEqual(pricing.resolve(model: "fetched-model")?.inputPerMillion, 5)
-        XCTAssertEqual(pricing.resolve(model: "auto")?.inputPerMillion, 9)
+        XCTAssertEqual(pricing.primary.entries["fetched-model"]?.inputPerMillion, 5)
+        XCTAssertEqual(pricing.supplement.pricing["auto"]?.inputPerMillion, 9)
         // Fresh state file -> nothing due until the TTL elapses.
         await revived.refreshNow()
-        XCTAssertTrue(http.requests.isEmpty, "sources within TTL must not refetch")
+        XCTAssertTrue(
+            http.requests.isEmpty,
+            "sources within TTL must not refetch; got \(http.requests.map { $0.url.absoluteString })"
+        )
+
+        // Resolving a fallback-priced model intentionally triggers an immediate, coalesced OpenRouter
+        // check so a newly published exact route can replace the stale estimate without waiting an hour.
+        _ = pricing.resolve(model: "fetched-model")
+        await revived.runUnresolvedDiscoveryIfNeeded()
+        XCTAssertEqual(http.requests.count, 1)
+        XCTAssertEqual(http.requests.first?.url.host(), "openrouter.ai")
+    }
+
+    func testOlderCachedCatalogCannotOverrideNewerBundledSnapshot() async throws {
+        let cached = Data(#"{"retrieved_at":"2026-01-01T00:00:00Z","models":{"bundled-model":{"i":9,"o":18,"cw":9,"cr":0.9},"cached-only-model":{"i":7,"o":14,"cw":7,"cr":0.7}}}"#.utf8)
+        try cached.write(to: tempDir.appendingPathComponent("litellm.json"), options: .atomic)
+
+        let (store, _) = makeStore(handler: { _ in throw URLError(.notConnectedToInternet) })
+        let pricing = await store.current()
+
+        XCTAssertEqual(pricing.resolve(model: "bundled-model")?.inputPerMillion, 1,
+                       "the newer shipped snapshot wins conflicting cached rates while offline")
+        XCTAssertEqual(pricing.resolve(model: "cached-only-model")?.inputPerMillion, 7,
+                       "older cache-only models remain available")
+    }
+
+    func testNewerLegacyModelsDevCacheCannotUndoBundledConflictTombstone() async throws {
+        let cached = Data(#"{"retrieved_at":"2026-10-15T00:00:00Z","models":{"ambiguous":{"i":9,"o":18,"cw":9,"cr":1.8}}}"#.utf8)
+        try cached.write(to: tempDir.appendingPathComponent("models_dev.json"), options: .atomic)
+        let bundledModelsDev = Data(#"{"retrieved_at":"2026-10-14T21:35:38Z","models":{},"retired":["ambiguous"]}"#.utf8)
+
+        let store = ModelPricingStore(
+            http: RoutingHTTPClient(handler: { _ in throw URLError(.notConnectedToInternet) }),
+            cacheDirectory: tempDir,
+            bundledData: { name in
+                name == "pricing_models_dev_snapshot" ? bundledModelsDev : Self.bundledFixtures(name)
+            }
+        )
+        let pricing = await store.current()
+
+        XCTAssertNil(pricing.resolve(model: "ambiguous"),
+                     "a legacy cache entry must not restore a model the current snapshot marks provider-conflicted")
+    }
+
+    func testNewerCompleteModelsDevCacheCanResolveBundledConflictTombstone() async throws {
+        let cached = Data(#"{"retrieved_at":"2026-10-15T00:00:00Z","models":{"ambiguous":{"i":9,"o":18,"cw":9,"cr":1.8}},"retired":[]}"#.utf8)
+        try cached.write(to: tempDir.appendingPathComponent("models_dev.json"), options: .atomic)
+        let bundledModelsDev = Data(#"{"retrieved_at":"2026-10-14T21:35:38Z","models":{},"retired":["ambiguous"]}"#.utf8)
+
+        let store = ModelPricingStore(
+            http: RoutingHTTPClient(handler: { _ in throw URLError(.notConnectedToInternet) }),
+            cacheDirectory: tempDir,
+            bundledData: { name in
+                name == "pricing_models_dev_snapshot" ? bundledModelsDev : Self.bundledFixtures(name)
+            }
+        )
+        let pricing = await store.current()
+
+        XCTAssertEqual(pricing.resolve(model: "ambiguous")?.inputPerMillion, 9,
+                       "a complete refreshed cache can clear a conflict tombstone once rates agree")
     }
 
     func testRefetchAfterTTLSendsETagAndHandles304() async throws {
@@ -115,13 +190,17 @@ final class ModelPricingStoreTests: XCTestCase {
         let later = Date().addingTimeInterval(2 * 60 * 60)
         let (aged, http) = makeStore(
             handler: { request in
+                if request.url.host() == "openrouter.ai" {
+                    XCTAssertNil(request.headers["If-None-Match"], "every OpenRouter page must be checked")
+                    return HTTPResponse(statusCode: 200, headers: [:], body: Data(Self.openRouterFeed.utf8))
+                }
                 XCTAssertEqual(request.headers["If-None-Match"], "\"v1\"")
                 return HTTPResponse(statusCode: 304, headers: [:], body: Data())
             },
             now: { later }
         )
         await aged.refreshNow()
-        XCTAssertEqual(http.requests.count, 3, "all sources past TTL revalidate")
+        XCTAssertEqual(http.requests.count, 4, "all sources past TTL revalidate")
 
         let pricing = await aged.current()
         XCTAssertEqual(pricing.resolve(model: "fetched-model")?.inputPerMillion, 5, "304 keeps cached data")
@@ -170,6 +249,107 @@ final class ModelPricingStoreTests: XCTestCase {
         }
     }
 
+    func testNewerBundledSupplementRetiresRemovedCachedRates() async throws {
+        let cached = #"""
+        {"updated_at":"2026-10-13T22:22:57Z","pricing":{"grok-4.7":{"input_per_million":2,"output_per_million":6},"grok-4.7-fast":{"input_per_million":4,"output_per_million":12},"gemini-4-argon":{"input_per_million":2,"output_per_million":10}},"alias_rules":[]}
+        """#
+        let bundled = #"""
+        {"updated_at":"2026-10-14T13:27:52Z","pricing":{"cursor-grok-4.7":{"input_per_million":2,"output_per_million":6},"cursor-grok-4.7-fast":{"input_per_million":4,"output_per_million":12},"cursor-gemini-4-argon":{"input_per_million":2,"output_per_million":10}},"alias_rules":[],"cursor_alias_rules":[],"retired_pricing_keys":["grok-4.7","grok-4.7-fast","gemini-4-argon"]}
+        """#
+        try Data(cached.utf8).write(to: tempDir.appendingPathComponent("supplement.json"), options: .atomic)
+
+        let store = ModelPricingStore(
+            http: RoutingHTTPClient(handler: { _ in throw URLError(.notConnectedToInternet) }),
+            cacheDirectory: tempDir,
+            bundledData: { name in
+                name == "pricing_supplement" ? Data(bundled.utf8) : Self.bundledFixtures(name)
+            }
+        )
+        let pricing = await store.current()
+
+        XCTAssertNil(pricing.supplement.pricing["grok-4.7"], "the newer bundle retires the old shared Cursor key")
+        XCTAssertNil(pricing.supplement.pricing["grok-4.7-fast"])
+        XCTAssertNil(pricing.supplement.pricing["gemini-4-argon"])
+        XCTAssertEqual(pricing.supplement.pricing["cursor-grok-4.7"]?.inputPerMillion, 2)
+    }
+
+    func testNewerCachedSupplementCannotUndoBundledRateRetirements() async throws {
+        let cached = #"""
+        {"updated_at":"2026-10-15T13:27:52Z","pricing":{"grok-4.7":{"input_per_million":2,"output_per_million":6},"grok-4.7-fast":{"input_per_million":4,"output_per_million":12},"gemini-4-argon":{"input_per_million":2,"output_per_million":10}},"alias_rules":[]}
+        """#
+        let bundled = #"""
+        {"updated_at":"2026-10-14T13:27:52Z","pricing":{"cursor-grok-4.7":{"input_per_million":2,"output_per_million":6},"cursor-grok-4.7-fast":{"input_per_million":4,"output_per_million":12},"cursor-gemini-4-argon":{"input_per_million":2,"output_per_million":10}},"alias_rules":[],"cursor_alias_rules":[],"retired_pricing_keys":["grok-4.7","grok-4.7-fast","gemini-4-argon"]}
+        """#
+        try Data(cached.utf8).write(to: tempDir.appendingPathComponent("supplement.json"), options: .atomic)
+
+        let store = ModelPricingStore(
+            http: RoutingHTTPClient(handler: { _ in throw URLError(.notConnectedToInternet) }),
+            cacheDirectory: tempDir,
+            bundledData: { name in
+                name == "pricing_supplement" ? Data(bundled.utf8) : Self.bundledFixtures(name)
+            }
+        )
+        let pricing = await store.current()
+
+        XCTAssertNil(pricing.supplement.pricing["grok-4.7"], "a newer cache cannot undo the bundle's explicit retirement")
+        XCTAssertNil(pricing.supplement.pricing["grok-4.7-fast"])
+        XCTAssertNil(pricing.supplement.pricing["gemini-4-argon"])
+        XCTAssertNil(pricing.resolve(model: "grok-4.7"), "retired shared Cursor pricing must not leak into provider-wide resolution")
+        XCTAssertEqual(pricing.supplement.pricing["cursor-grok-4.7"]?.inputPerMillion, 2)
+    }
+
+    func testBundledAliasRetirementSuppressesNewerLegacyCachedRuleButKeepsCanonicalRate() async throws {
+        let cachedSupplement = #"""
+        {"updated_at":"2026-10-15T00:00:00Z","pricing":{"grok-4.7":{"input_per_million":2,"output_per_million":6}},"alias_rules":[{"pattern":"^grok-bot-cua$","canonical":"grok-4.7"}]}
+        """#
+        let bundledSupplement = #"""
+        {"updated_at":"2026-10-14T21:49:44Z","pricing":{"cursor-grok-4.7":{"input_per_million":2,"output_per_million":6}},"alias_rules":[],"cursor_alias_rules":[],"retired_pricing_keys":["grok-4.7"],"retired_alias_patterns":["^grok-bot-cua$"]}
+        """#
+        let openRouterCache = Data(#"{"retrieved_at":"2026-10-14T21:00:00Z","models":{"x-ai/grok-4.7":{"i":2,"o":6,"cw":2,"cr":0.5},"grok-4.7":{"i":2,"o":6,"cw":2,"cr":0.5}}}"#.utf8)
+        try Data(cachedSupplement.utf8).write(to: tempDir.appendingPathComponent("supplement.json"), options: .atomic)
+        try openRouterCache.write(to: tempDir.appendingPathComponent("openrouter.json"), options: .atomic)
+
+        let store = ModelPricingStore(
+            http: RoutingHTTPClient(handler: { _ in throw URLError(.notConnectedToInternet) }),
+            cacheDirectory: tempDir,
+            bundledData: { name in
+                name == "pricing_supplement" ? Data(bundledSupplement.utf8) : Self.bundledFixtures(name)
+            }
+        )
+        let pricing = await store.current()
+
+        XCTAssertNil(pricing.resolve(model: "grok-bot-cua"),
+                     "the retired global product-label alias must not map an opaque label to a serving model")
+        XCTAssertEqual(pricing.resolve(model: "grok-4.7")?.inputPerMillion, 2,
+                       "retiring the alias must not suppress the legitimate canonical route price")
+    }
+
+    func testNewerCompleteSupplementCanReenableBundledRetiredAlias() async throws {
+        let cachedSupplement = #"""
+        {"updated_at":"2026-10-15T00:00:00Z","pricing":{"grok-4.7":{"input_per_million":2,"output_per_million":6}},"alias_rules":[{"pattern":"^grok-bot-cua$","canonical":"grok-4.7"}],"retired_alias_patterns":[]}
+        """#
+        let bundledSupplement = #"""
+        {"updated_at":"2026-10-14T21:49:44Z","pricing":{"cursor-grok-4.7":{"input_per_million":2,"output_per_million":6}},"alias_rules":[],"retired_pricing_keys":["grok-4.7"],"retired_alias_patterns":["^grok-bot-cua$"]}
+        """#
+        let openRouterCache = Data(#"{"retrieved_at":"2026-10-14T21:00:00Z","models":{"x-ai/grok-4.7":{"i":2,"o":6,"cw":2,"cr":0.5},"grok-4.7":{"i":2,"o":6,"cw":2,"cr":0.5}}}"#.utf8)
+        try Data(cachedSupplement.utf8).write(to: tempDir.appendingPathComponent("supplement.json"), options: .atomic)
+        try openRouterCache.write(to: tempDir.appendingPathComponent("openrouter.json"), options: .atomic)
+
+        let store = ModelPricingStore(
+            http: RoutingHTTPClient(handler: { _ in throw URLError(.notConnectedToInternet) }),
+            cacheDirectory: tempDir,
+            bundledData: { name in
+                name == "pricing_supplement" ? Data(bundledSupplement.utf8) : Self.bundledFixtures(name)
+            }
+        )
+        let pricing = await store.current()
+
+        XCTAssertTrue(pricing.supplement.retiredAliasPatternsAreAuthoritative)
+        XCTAssertEqual(pricing.canonicalName(for: "grok-bot-cua"), "grok-4.7",
+                       "a newer complete feed can restore a deliberately reintroduced alias")
+        XCTAssertEqual(pricing.resolve(model: "grok-bot-cua")?.inputPerMillion, 2)
+    }
+
     private static func supplementJSON(updatedAt: String?, autoInput: Double) -> String {
         let dateField = updatedAt.map { "\"updated_at\": \"\($0)\", " } ?? ""
         return """
@@ -203,10 +383,10 @@ final class ModelPricingStoreTests: XCTestCase {
             throw URLError(.notConnectedToInternet)
         })
         await store.refreshNow()
-        XCTAssertEqual(counter.value, 3)
+        XCTAssertEqual(counter.value, 4)
         // Immediately after a failure, nothing is due.
         await store.refreshNow()
-        XCTAssertEqual(counter.value, 3)
+        XCTAssertEqual(counter.value, 4)
     }
 }
 

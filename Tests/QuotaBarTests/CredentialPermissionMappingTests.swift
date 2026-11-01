@@ -105,6 +105,22 @@ final class CredentialPermissionMappingTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testUnreadableKeychainDoesNotHideKeychainOnlyProvidersDuringSeeding() async {
+        let unreadableKeychain = UnreadableKeychain()
+        let codex = CodexProvider(authStore: CodexAuthStore(files: FakeFiles(), keychain: unreadableKeychain))
+        let copilot = CopilotProvider(authStore: CopilotAuthStore(files: FakeFiles(), keychain: unreadableKeychain))
+        let cursor = CursorProvider(authStore: CursorAuthStore(sqlite: MissingSQLite(), keychain: unreadableKeychain))
+
+        let codexDetected = await codex.hasLocalCredentials()
+        let copilotDetected = await copilot.hasLocalCredentials()
+        let cursorDetected = await cursor.hasLocalCredentials()
+
+        XCTAssertTrue(codexDetected)
+        XCTAssertTrue(copilotDetected)
+        XCTAssertTrue(cursorDetected)
+    }
+
     /// The mirror case, and the reason the fix is scoped rather than blanket: a genuine miss must still
     /// be `nil`, never a permission error. Otherwise every unconfigured provider would claim macOS is
     /// withholding a credential that does not exist.
@@ -188,6 +204,19 @@ final class CredentialPermissionMappingTests: XCTestCase {
         func writeGenericPassword(service: String, value: String) throws {}
         func readGenericPasswordForCurrentUser(service: String) throws -> String? { nil }
         func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? { nil }
+        func writeGenericPasswordForCurrentUser(service: String, value: String) throws {}
+    }
+
+    private final class UnreadableKeychain: KeychainAccessing, @unchecked Sendable {
+        private func fail() -> KeychainError { .readFailed("temporary Keychain read failure") }
+
+        func readGenericPassword(service: String) throws -> String? { throw fail() }
+        func readGenericPassword(service: String, allowInteraction: Bool) throws -> String? { throw fail() }
+        func readGenericPassword(service: String, account: String) throws -> String? { throw fail() }
+        func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? { throw fail() }
+        func readGenericPasswordForCurrentUser(service: String) throws -> String? { throw fail() }
+        func readGenericPasswordForCurrentUser(service: String, allowInteraction: Bool) throws -> String? { throw fail() }
+        func writeGenericPassword(service: String, value: String) throws {}
         func writeGenericPasswordForCurrentUser(service: String, value: String) throws {}
     }
 

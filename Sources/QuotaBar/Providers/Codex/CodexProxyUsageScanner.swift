@@ -1,5 +1,12 @@
 import CryptoKit
+import CoreFoundation
+import Darwin
 import Foundation
+
+enum CodexProxyUsageScanResult: Sendable {
+    case complete(LogUsageScan?)
+    case incomplete
+}
 
 /// Reads only the metadata needed to fold FCC-routed Codex requests into the matching Codex card.
 ///
@@ -12,6 +19,9 @@ actor CodexProxyUsageScanner {
     private let environment: EnvironmentReading
     private let homeDirectory: @Sendable () -> URL
     private let databasePaths: @Sendable () -> [String]
+    /// The default FCC database is optional when it has never been created. Explicitly configured
+    /// paths (including injected test paths) are expected sources and must fail closed if unavailable.
+    private let optionalDefaultDatabasePath: String?
 
     init(
         sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
@@ -25,6 +35,11 @@ actor CodexProxyUsageScanner {
         self.databasePaths = databasePaths ?? {
             Self.defaultDatabasePaths(environment: environment, homeDirectory: homeDirectory())
         }
+        if databasePaths == nil, Self.configuredDatabasePaths(environment: environment).isEmpty {
+            self.optionalDefaultDatabasePath = homeDirectory().appendingPathComponent(".fcc/usage.db").path
+        } else {
+            self.optionalDefaultDatabasePath = nil
+        }
     }
 
     /// Scan FCC's local ledger for one exact Codex account. A missing account identity, missing
@@ -35,7 +50,31 @@ actor CodexProxyUsageScanner {
         now: Date = Date(),
         pricing: ModelPricing
     ) async -> LogUsageScan? {
-        guard let fingerprint = Self.accountFingerprint(for: accountIdentityKey) else { return nil }
+        switch await scanResult(
+            accountIdentityKey: accountIdentityKey,
+            daysBack: daysBack,
+            now: now,
+            pricing: pricing
+        ) {
+        case .complete(let scan): return scan
+        case .incomplete: return nil
+        }
+    }
+
+    /// Completeness-aware scan for providers that merge FCC rows with other local histories.
+    /// A configured DB or row that cannot be validated invalidates the combined fold; callers must
+    /// keep the previous snapshot rather than publish a smaller sum.
+    func scanResult(
+        accountIdentityKey: String?,
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing
+    ) async -> CodexProxyUsageScanResult {
+        guard let fingerprint = Self.accountFingerprint(for: accountIdentityKey) else {
+            return .complete(nil)
+        }
+        let paths = Self.uniqueDatabasePaths(databasePaths())
+        let diagnosticPrefix = Self.diagnosticPrefix(fingerprint: fingerprint, paths: paths)
         let days = max(1, daysBack)
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
@@ -45,30 +84,60 @@ actor CodexProxyUsageScanner {
 
         var accumulator = DailyUsageAccumulator()
         var sawRows = false
-        for path in databasePaths() {
-            guard !Task.isCancelled else { return nil }
-            guard let schema = try? sqlite.queryValue(path: path, sql: Self.schemaSQL),
-                  Self.hasRequiredSchema(schema)
-            else { continue }
-            guard let payload = try? sqlite.queryValue(
-                path: path,
-                sql: Self.eventsSQL(
-                    fingerprint: fingerprint,
-                    sinceDay: sinceDay,
-                    throughDay: throughDay
-                )
-            ) else { continue }
-            for row in Self.rows(from: payload) {
+        var sawSource = false
+        for path in paths {
+            guard !Task.isCancelled else { return .incomplete }
+            if Self.isDefinitelyMissingOptionalDefault(path, optionalPath: optionalDefaultDatabasePath) {
+                continue
+            }
+            sawSource = true
+            let schema: String?
+            do {
+                schema = try JSONLAccountingWorkPacer.shared.perform {
+                    try sqlite.queryValue(path: path, sql: Self.schemaSQL)
+                }
+            } catch {
+                Self.logIncomplete("read", "FCC usage database could not be read; preserving last-good history", prefix: diagnosticPrefix)
+                return .incomplete
+            }
+            guard Self.hasRequiredSchema(schema) else {
+                Self.logIncomplete("schema", "FCC usage database schema is incomplete; preserving last-good history", prefix: diagnosticPrefix)
+                return .incomplete
+            }
+            let payload: String?
+            do {
+                payload = try JSONLAccountingWorkPacer.shared.perform {
+                    try sqlite.queryValue(
+                        path: path,
+                        sql: Self.eventsSQL(
+                            fingerprint: fingerprint,
+                            sinceDay: sinceDay,
+                            throughDay: throughDay
+                        )
+                    )
+                }
+            } catch {
+                Self.logIncomplete("query", "FCC usage query failed; preserving last-good history", prefix: diagnosticPrefix)
+                return .incomplete
+            }
+            guard let payload, let rows = JSONLAccountingWorkPacer.shared.perform({ Self.rows(from: payload) }) else {
+                Self.logIncomplete("decode", "FCC usage rows could not be decoded; preserving last-good history", prefix: diagnosticPrefix)
+                return .incomplete
+            }
+            var malformedRow = false
+            JSONLAccountingWorkPacer.shared.forEach(rows) { row in
                 guard let day = Self.validDay(row["local_day"] as? String),
                       let model = Self.modelName(row["model"] as? String),
                       let input = Self.count(row["input_tokens"]),
                       let output = Self.count(row["output_tokens"]),
                       let cacheRead = Self.count(row["cache_read_input_tokens"]),
                       let cacheWrite = Self.count(row["cache_creation_input_tokens"])
-                else { continue }
-                guard let total = Self.total(input: input, cacheRead: cacheRead, cacheWrite: cacheWrite, output: output),
-                      total > 0
-                else { continue }
+                else { malformedRow = true; return }
+                guard let total = Self.total(input: input, cacheRead: cacheRead, cacheWrite: cacheWrite, output: output) else {
+                    malformedRow = true
+                    return
+                }
+                guard total > 0 else { return }
 
                 sawRows = true
                 let tokens = TokenBreakdown(
@@ -81,8 +150,21 @@ actor CodexProxyUsageScanner {
                       let cost = pricing.estimatedCostDollars(model: pricingModel, tokens: tokens)
                 else {
                     accumulator.addUnknownModel(day: day, model: model)
-                    continue
+                    // Unpriced rows count their tokens with a dashed cost (owner policy).
+                    accumulator.add(
+                        day: day,
+                        tokens: total,
+                        cost: nil,
+                        model: model,
+                        canonical: GatewaySlug.identity(of: model, resolvedPricingModel: model)
+                    )
+                    return
                 }
+                accumulator.recordApiEstimate(
+                    day: day,
+                    cost: pricing.estimatedCostDollars(model: pricingModel, tokens: tokens),
+                    tokens: total
+                )
                 // Same reason as the router scanner: the proxy stamps routing prefixes onto its slugs, so
                 // keying on the raw slug split one model across rows and counted it twice in the total.
                 accumulator.add(
@@ -93,11 +175,17 @@ actor CodexProxyUsageScanner {
                     canonical: GatewaySlug.identity(of: model, resolvedPricingModel: pricingModel)
                 )
             }
+            guard !malformedRow else {
+                Self.logIncomplete("malformed", "FCC usage database contains malformed rows; preserving last-good history", prefix: diagnosticPrefix)
+                return .incomplete
+            }
         }
 
-        guard sawRows else { return nil }
+        guard !Task.isCancelled else { return .incomplete }
+        DiagnosticGate.clearFailures(prefix: diagnosticPrefix)
+        guard sawSource, sawRows else { return .complete(nil) }
         let result = accumulator.build()
-        return result.series.daily.isEmpty && result.unknownModelsByDay.isEmpty ? nil : result
+        return .complete(result.series.daily.isEmpty && result.unknownModelsByDay.isEmpty ? nil : result)
     }
 
     /// The exact compatibility contract with FCC's `account_fingerprint("openai", account_id)`.
@@ -115,15 +203,37 @@ actor CodexProxyUsageScanner {
         environment: EnvironmentReading,
         homeDirectory: URL
     ) -> [String] {
-        let configured = [
-            environment.value(for: "OPENUSAGE_CODEX_PROXY_USAGE_DB"),
-            environment.value(for: "FCC_USAGE_DB")
-        ].flatMap(splitPaths)
-        guard configured.isEmpty else { return unique(configured) }
+        let configured = configuredDatabasePaths(environment: environment)
+        guard configured.isEmpty else { return uniqueDatabasePaths(configured) }
         return [homeDirectory.appendingPathComponent(".fcc/usage.db").path]
     }
 
+    private static func configuredDatabasePaths(environment: EnvironmentReading) -> [String] {
+        [
+            environment.value(for: "OPENUSAGE_CODEX_PROXY_USAGE_DB"),
+            environment.value(for: "FCC_USAGE_DB")
+        ].flatMap(splitPaths)
+    }
+
     private static let schemaSQL = "PRAGMA table_info(usage_events);"
+    private static let diagnosticPrefixBase = "codex.proxy.scan."
+
+    private static func diagnosticPrefix(fingerprint: String, paths: [String]) -> String {
+        let sourceIdentity = paths.sorted().joined(separator: "\n")
+        return "\(diagnosticPrefixBase)\(fingerprint).\(JSONLScanCachePaths.stableFingerprint(sourceIdentity))."
+    }
+
+    private static func logIncomplete(_ kind: String, _ message: String, prefix: String) {
+        DiagnosticGate.logOnce(for: prefix + kind) {
+            AppLog.warn(LogTag.plugin("codex"), message)
+        }
+    }
+
+    private static func isDefinitelyMissingOptionalDefault(_ path: String, optionalPath: String?) -> Bool {
+        guard path == optionalPath else { return false }
+        var status = stat()
+        return Darwin.lstat(path, &status) != 0 && errno == ENOENT
+    }
 
     private static func eventsSQL(fingerprint: String, sinceDay: String, throughDay: String) -> String {
         let escapedFingerprint = fingerprint.replacingOccurrences(of: "'", with: "''")
@@ -160,11 +270,11 @@ actor CodexProxyUsageScanner {
         ].allSatisfy(columns.contains)
     }
 
-    private static func rows(from payload: String) -> [[String: Any]] {
+    private static func rows(from payload: String) -> [[String: Any]]? {
         guard let data = payload.data(using: .utf8),
               let value = try? JSONSerialization.jsonObject(with: data),
               let rows = value as? [[String: Any]]
-        else { return [] }
+        else { return nil }
         return rows
     }
 
@@ -181,12 +291,16 @@ actor CodexProxyUsageScanner {
     }
 
     private static func count(_ value: Any?) -> Int? {
-        // `Double(Int.max)` rounds up to 2^63, so `<= Double(Int.max)` admits exactly 2^63 — which then
-        // traps in the conversion below. Compare in the clamped domain instead.
-        guard let number = ProviderParse.number(value), number >= 0, number < 9_223_372_036_854_775_808 else {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else {
             return nil
         }
-        return Int(number.rounded(.down))
+        let count = number.doubleValue
+        guard count.isFinite, count >= 0, count <= 1e15, count.rounded(.towardZero) == count else {
+            return nil
+        }
+        return Int(count)
     }
 
     private static func total(input: Int, cacheRead: Int, cacheWrite: Int, output: Int) -> Int? {
@@ -210,7 +324,7 @@ actor CodexProxyUsageScanner {
             guard !remainder.isEmpty else { break }
             candidates.append(remainder)
         }
-        return unique(candidates)
+        return uniqueStrings(candidates)
     }
 
     private static func splitPaths(_ raw: String?) -> [String] {
@@ -220,8 +334,30 @@ actor CodexProxyUsageScanner {
             .filter { !$0.isEmpty }
     }
 
-    private static func unique(_ paths: [String]) -> [String] {
+    private static func uniqueStrings(_ values: [String]) -> [String] {
         var seen: Set<String> = []
-        return paths.filter { seen.insert($0).inserted }
+        return values.filter { seen.insert($0).inserted }
+    }
+
+    private static func uniqueDatabasePaths(_ paths: [String]) -> [String] {
+        var seen: Set<String> = []
+        return paths.filter { path in
+            let canonical = URL(fileURLWithPath: path)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+            var metadata = stat()
+            let identity: String
+            if Darwin.lstat(canonical, &metadata) == 0 {
+                // Distinct symlink, relative, and hard-link spellings of one SQLite database still
+                // describe one source; scanning each alias would count every event more than once.
+                identity = "inode:\(metadata.st_dev):\(metadata.st_ino)"
+            } else {
+                // Preserve explicit missing paths so the scan can report an incomplete source, while
+                // still coalescing repeated spellings of that same missing path.
+                identity = "path:\(canonical)"
+            }
+            return seen.insert(identity).inserted
+        }
     }
 }

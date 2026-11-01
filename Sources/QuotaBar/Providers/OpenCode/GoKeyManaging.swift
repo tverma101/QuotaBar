@@ -14,8 +14,14 @@ struct OpenCodeGoKeyEntry: Sendable, Equatable, Identifiable {
     var id: String
     var label: String
     var maskedKey: String
+    /// Opaque hash used only to distinguish duplicate key copies from distinct account credentials.
+    var accountID: String
     var source: OpenCodeGoKeySource
     var isActive: Bool
+
+    static func hasMultipleAccounts(_ entries: [OpenCodeGoKeyEntry]) -> Bool {
+        Set(entries.map(\.accountID)).count > 1
+    }
 }
 
 /// A `ProviderRuntime` whose account meters are keyed to one of several OpenCode Go API keys.
@@ -27,12 +33,12 @@ struct OpenCodeGoKeyEntry: Sendable, Equatable, Identifiable {
 protocol GoKeyManaging: ProviderRuntime {
     /// Every Go key the card can use, in fetch order: the `opencode-go` auth.json entry first, then
     /// app-saved keys. `isActive` marks the current selection.
-    func goKeyEntries() -> [OpenCodeGoKeyEntry]
+    func goKeyEntries() async -> [OpenCodeGoKeyEntry]
     /// Persist a new key via the app-owned store. Returns the stored entry.
     @discardableResult
-    func saveGoKey(label: String, key: String) throws -> OpenCodeGoKey
+    func saveGoKey(label: String, key: String) async throws -> OpenCodeGoKey
     /// Remove an app-saved key. `auth.json` entries cannot be removed from the app.
-    func removeGoKey(id: UUID) throws
+    func removeGoKey(id: UUID) async throws
     /// Make `id` (a saved key's UUID or an `auth.json` entry name) the active selection.
     func selectGoKey(id: String)
     /// The active selection, or `nil` when no key is pinned (the card shows every distinct

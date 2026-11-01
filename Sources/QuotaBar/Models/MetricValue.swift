@@ -19,12 +19,30 @@ struct MetricValue: Hashable, Sendable, Codable {
     /// True when the number is imputed locally rather than measured or billed — it drives the ⓘ note.
     /// Per value because a spend row's dollars are an estimate while its token count is real.
     var estimated: Bool
+    /// True when the number is current but can still change, such as usage from an active Hermes
+    /// session. Optional so snapshots written before this marker continue to decode.
+    var isPartial: Bool?
+    /// True when a token total was clipped at `Int.max`; the value is then a lower bound.
+    var tokenCountSaturated: Bool?
+    /// True when an aggregate is a known lower bound, such as a priced subtotal with unpriced usage.
+    var isLowerBound: Bool?
 
-    init(number: Double, kind: MetricKind, label: String? = nil, estimated: Bool = false) {
+    init(
+        number: Double,
+        kind: MetricKind,
+        label: String? = nil,
+        estimated: Bool = false,
+        tokenCountSaturated: Bool? = nil,
+        isPartial: Bool = false,
+        isLowerBound: Bool = false
+    ) {
         self.number = number
         self.kind = kind
         self.label = label
         self.estimated = estimated
+        self.isPartial = isPartial ? true : nil
+        self.tokenCountSaturated = tokenCountSaturated
+        self.isLowerBound = isLowerBound ? true : nil
     }
 }
 

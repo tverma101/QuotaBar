@@ -4,7 +4,24 @@ import Foundation
 /// apart from a transient outage (try the next base URL / strategy, don't refresh).
 enum CloudCodeOutcome: Sendable {
     case ok(Data)
+    case notFound
     case authFailed
+    case forbidden
+    case unavailable
+
+    var isUnavailable: Bool {
+        switch self {
+        case .notFound, .unavailable: return true
+        case .ok, .authFailed, .forbidden: return false
+        }
+    }
+}
+
+enum CloudCodeBatchOutcome: Sendable {
+    case ok([Data], allHostsAnswered: Bool)
+    case authFailed
+    case forbidden
+    case notFound
     case unavailable
 }
 
@@ -12,6 +29,7 @@ enum CloudCodeOutcome: Sendable {
 /// 5xx/network failure reads as a transient outage.
 enum TokenRefreshOutcome: Sendable {
     case refreshed(accessToken: String, expiresIn: Double)
+    case clientConfigurationInvalid
     case authFailed
     case unavailable
 }
@@ -51,7 +69,8 @@ struct AntigravityUsageClient: Sendable {
     }
 
     /// Call a language-server RPC method. Returns nil on a transport failure (port not the live one).
-    func callLS(scheme: String, port: Int, csrf: String, method: String) async -> HTTPResponse? {
+    func callLS(scheme: String, port: Int, csrf: String, method: String) async throws -> HTTPResponse? {
+        try Task.checkCancellation()
         guard let url = URL(string: "\(scheme)://127.0.0.1:\(port)/\(Self.lsService)/\(method)") else { return nil }
         let body = try? JSONSerialization.data(withJSONObject: ["metadata": Self.lsMetadata])
         let request = HTTPRequest(
@@ -65,15 +84,47 @@ struct AntigravityUsageClient: Sendable {
             body: body,
             timeout: 10
         )
-        return try? await lsHTTP.send(request)
+        do {
+            let response = try await lsHTTP.send(request)
+            try Task.checkCancellation()
+            return response
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            return nil
+        }
     }
 
-    /// POST a Cloud Code endpoint, trying each base URL in turn. A 401/403 short-circuits to `.authFailed`
-    /// (same token would fail on the other base); other non-2xx / transport errors fall through to the
-    /// next base and finally `.unavailable`.
-    func cloudCode(path: String, token: String, userAgent: String, body: [String: String]) async -> CloudCodeOutcome {
+    /// POST a Cloud Code endpoint, trying each base URL in turn. A 401 is evidence of invalid/expired
+    /// authentication; a 403 is a permission denial and must not trigger OAuth refresh. Both
+    /// short-circuit because the same request would fail on the other base. Other non-2xx / transport
+    /// errors fall through to the next base and finally `.unavailable`.
+    func cloudCode(path: String, token: String, userAgent: String, body: [String: String]) async throws -> CloudCodeOutcome {
+        switch try await cloudCodeResponses(path: path, token: token, userAgent: userAgent, body: body, collectSummaries: false) {
+        case .ok(let bodies, _): return .ok(bodies[0])
+        case .authFailed: return .authFailed
+        case .forbidden: return .forbidden
+        case .notFound: return .notFound
+        case .unavailable: return .unavailable
+        }
+    }
+
+    /// A host can omit an entire quota pool. Consult the other host only when the first usable body
+    /// cannot supply all shared meters; a failed supplemental host never discards measured limits.
+    func cloudCodeSummaries(token: String) async throws -> CloudCodeBatchOutcome {
+        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: "antigravity", body: [:], collectSummaries: true)
+    }
+
+    private func cloudCodeResponses(
+        path: String, token: String, userAgent: String, body: [String: String], collectSummaries: Bool
+    ) async throws -> CloudCodeBatchOutcome {
         let payload = (try? JSONSerialization.data(withJSONObject: body)) ?? Data("{}".utf8)
+        var sawNotFound = false
+        var sawOtherFailure = false
+        var bodies: [Data] = []
         for base in Self.cloudCodeURLs {
+            try Task.checkCancellation()
             guard let url = URL(string: base + path) else { continue }
             let request = HTTPRequest(
                 method: "POST",
@@ -87,17 +138,46 @@ struct AntigravityUsageClient: Sendable {
                 body: payload,
                 timeout: 15
             )
-            guard let response = try? await http.send(request) else { continue }
-            if response.statusCode == 401 || response.statusCode == 403 { return .authFailed }
-            if (200..<300).contains(response.statusCode) { return .ok(response.body) }
+            let response: HTTPResponse
+            do {
+                response = try await http.send(request)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                try ProviderCancellation.rethrowIfCancellation(error)
+                try Task.checkCancellation()
+                sawOtherFailure = true
+                continue
+            }
+            try Task.checkCancellation()
+            if response.statusCode == 401 || response.statusCode == 403 {
+                if !bodies.isEmpty { return .ok(bodies, allHostsAnswered: false) }
+                return response.statusCode == 401 ? .authFailed : .forbidden
+            }
+            if (200..<300).contains(response.statusCode) {
+                bodies.append(response.body)
+                if !collectSummaries || AntigravityUsageMapper.hasAllSharedQuotaMeters(response.body, sourceID: "cloud-code-\(bodies.count - 1)") {
+                    return .ok(bodies, allHostsAnswered: true)
+                }
+                continue
+            }
+            if response.statusCode == 404 {
+                sawNotFound = true
+            } else {
+                sawOtherFailure = true
+            }
         }
-        return .unavailable
+        if !bodies.isEmpty {
+            return .ok(bodies, allHostsAnswered: !sawNotFound && !sawOtherFailure)
+        }
+        return sawNotFound && !sawOtherFailure ? .notFound : .unavailable
     }
 
-    /// Exchange a Google refresh token for a fresh access token. Distinguishes a dead refresh token
-    /// (4xx, e.g. `invalid_grant`) from a transient failure (5xx / network / undecodable) so the caller
-    /// can report "sign-in expired" vs "temporarily unavailable" correctly.
-    func refreshGoogleToken(_ refreshToken: String) async -> TokenRefreshOutcome {
+    /// Exchange a Google refresh token for a fresh access token. Distinguishes a rejected OAuth client
+    /// (`invalid_client`) from a dead refresh token (`invalid_grant`) and transient failures so the
+    /// caller does not report expired sign-in when QuotaBar's client configuration was rejected.
+    func refreshGoogleToken(_ refreshToken: String) async throws -> TokenRefreshOutcome {
+        try Task.checkCancellation()
         guard let url = URL(string: Self.googleOAuthURL) else { return .unavailable }
         let form = [
             "client_id=\(Self.googleClientID.urlFormEncoded)",
@@ -112,7 +192,17 @@ struct AntigravityUsageClient: Sendable {
             body: Data(form.utf8),
             timeout: 15
         )
-        guard let response = try? await http.send(request) else { return .unavailable }
+        let response: HTTPResponse
+        do {
+            response = try await http.send(request)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try ProviderCancellation.rethrowIfCancellation(error)
+            try Task.checkCancellation()
+            return .unavailable
+        }
+        try Task.checkCancellation()
         switch response.statusCode {
         case 200..<300:
             guard let decoded = try? JSONDecoder().decode(GoogleTokenResponse.self, from: response.body),
@@ -124,10 +214,29 @@ struct AntigravityUsageClient: Sendable {
         case 408, 429:
             return .unavailable // request timeout / rate limited — transient, not a revoked token
         case 400..<500:
-            return .authFailed // invalid_grant / invalid_client — refresh token revoked or expired
+            switch Self.oauthError(response.body) {
+            case "invalid_client", "deleted_client", "invalid_request", "unauthorized_client", "unsupported_grant_type", "invalid_scope":
+                return .clientConfigurationInvalid
+            case "invalid_grant":
+                return .authFailed
+            default:
+                // A non-transient OAuth 4xx means this authorization was rejected, even when Google
+                // returned an unknown code or a non-JSON body. Keep 408/429 and 5xx in the branches
+                // above/below as transient failures.
+                return .authFailed
+            }
         default:
             return .unavailable // 5xx and anything else — transient
         }
+    }
+
+    private static func oauthError(_ body: Data) -> String? {
+        guard let value = try? JSONSerialization.jsonObject(with: body),
+              let object = value as? [String: Any]
+        else {
+            return nil
+        }
+        return object["error"] as? String
     }
 }
 
