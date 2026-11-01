@@ -55,6 +55,7 @@ final class CodexResetClaimService {
     private let credentialCandidates: () async -> CredentialCandidateLoad
     private let keychainCandidates: () async -> CredentialCandidateLoad
     private let refreshAfterClaim: () async -> Void
+    private let now: () -> Date
     /// The credit id each idempotency key was matched to, kept for the key's retries: if a consume
     /// succeeded but its response was lost, the credit is gone from a re-fetched list — a fresh match
     /// would misread the retry as "no longer available" instead of replaying the POST and letting the
@@ -66,7 +67,8 @@ final class CodexResetClaimService {
     init(
         usageClient: CodexUsageClient,
         credentialCandidates: @escaping () async -> [Credentials],
-        refreshAfterClaim: @escaping () async -> Void = {}
+        refreshAfterClaim: @escaping () async -> Void = {},
+        now: @escaping () -> Date = Date.init
     ) {
         self.usageClient = usageClient
         self.credentialCandidates = {
@@ -79,6 +81,7 @@ final class CodexResetClaimService {
             CredentialCandidateLoad(candidates: [], credentialAccessFailed: false)
         }
         self.refreshAfterClaim = refreshAfterClaim
+        self.now = now
     }
 
     private init(
@@ -91,6 +94,7 @@ final class CodexResetClaimService {
         self.credentialCandidates = credentialCandidateLoader
         self.keychainCandidates = keychainCandidateLoader
         self.refreshAfterClaim = refreshAfterClaim
+        self.now = Date.init
     }
 
     /// Production wiring: shares the Codex provider's auth store and usage client, so credential
@@ -267,7 +271,10 @@ final class CodexResetClaimService {
         canRedeem: @escaping @MainActor () -> Bool
     ) async -> ResetClaimOutcome {
         guard canRedeem() else { return .cancelled }
-        guard Date() < credit.expiresAt else { return .noCredit }
+        guard now() < credit.expiresAt else { return .noCredit }
+        guard now() >= credit.expiresAt.addingTimeInterval(-CodexAutoResetCoordinator.leadTime) else {
+            return .cancelled
+        }
 
         let fileLoad = await credentialCandidates()
         guard !fileLoad.wasCancelled, !Task.isCancelled else { return .cancelled }
@@ -322,7 +329,10 @@ final class CodexResetClaimService {
         }
 
         guard canRedeem() else { return .cancelled }
-        guard Date() < credit.expiresAt else { return .noCredit }
+        guard now() < credit.expiresAt else { return .noCredit }
+        guard now() >= credit.expiresAt.addingTimeInterval(-CodexAutoResetCoordinator.leadTime) else {
+            return .cancelled
+        }
         // A background write must be tied to the verified account chosen for this provider card.
         guard let accountID = selected.accountID else { return .failed }
         let preferred = [selected] + candidates.filter {
@@ -333,7 +343,8 @@ final class CodexResetClaimService {
             creditID: credit.id,
             redeemRequestID: redeemRequestID,
             candidates: preferred,
-            consentCheck: canRedeem
+            consentCheck: canRedeem,
+            automaticExpiry: credit.expiresAt
         )
         switch result {
         case .cancelled:
@@ -501,7 +512,8 @@ final class CodexResetClaimService {
         creditID: String,
         redeemRequestID: String,
         candidates: [Credentials],
-        consentCheck: (@MainActor () -> Bool)? = nil
+        consentCheck: (@MainActor () -> Bool)? = nil,
+        automaticExpiry: Date? = nil
     ) async -> ConsumeResult {
         var lastRejection: Int?
         var consumeWasSent = false
@@ -511,6 +523,12 @@ final class CodexResetClaimService {
             }
             guard consentCheck?() != false else {
                 return consumeWasSent ? .outcome(.failed) : .cancelled
+            }
+            if let automaticExpiry {
+                guard now() < automaticExpiry else { return .outcome(.noCredit) }
+                guard now() >= automaticExpiry.addingTimeInterval(-CodexAutoResetCoordinator.leadTime) else {
+                    return consumeWasSent ? .outcome(.failed) : .cancelled
+                }
             }
             // From this point a cancellation or lost response is ambiguous: the server may have
             // accepted the idempotent claim. Keep the coordinator's attempt so it can replay the
@@ -622,17 +640,20 @@ final class CodexResetClaimService {
                 AppLog.error(LogTag.plugin("codex"), "auto reset: pre-claim list unavailable")
                 return .failed
             }
-            let exists = credits.contains { item in
-                guard item["id"] as? String == credit.id,
-                      let date = Self.parseExpiry(item["expires_at"]),
-                      abs(date.timeIntervalSince(credit.expiresAt)) < 1,
-                      date > Date()
-                else { return false }
-                if let status = item["status"] as? String, status != "available" { return false }
-                if let type = item["reset_type"] as? String, type != "codex_rate_limits" { return false }
-                return true
+            let matching = credits.filter { $0["id"] as? String == credit.id }
+            guard matching.count <= 1 else {
+                AppLog.error(LogTag.plugin("codex"), "auto reset: duplicate credit identity in preflight")
+                return .failed
             }
-            return exists ? .matched(creditID: credit.id, credentials: credentials) : .noCredit
+            guard let item = matching.first,
+                  let date = Self.parseExpiry(item["expires_at"]), date > now() else { return .noCredit }
+            if let status = item["status"] as? String, status != "available" { return .noCredit }
+            if let type = item["reset_type"] as? String, type != "codex_rate_limits" { return .noCredit }
+            guard abs(date.timeIntervalSince(credit.expiresAt)) < 1 else {
+                AppLog.info(LogTag.plugin("codex"), "auto reset: credit expiry changed during preflight; rescheduling")
+                return .cancelled
+            }
+            return .matched(creditID: credit.id, credentials: credentials)
         }
         return rejected ? .authenticationRejected : .failed
     }
