@@ -8,6 +8,10 @@ Right-click (or control-click) the QuotaBar menu bar icon for a quick menu with 
 
 ## Usage History
 
+Hovering a spend value shows its model breakdown. **Other** keeps smaller contributors together,
+but lists every contributor's name, measured tokens, and cost or **Unpriced**. Missing older model
+labels remain explicit usage categories rather than being counted as additional named models.
+
 The dashboard footer's **Options** menu → **Usage History** opens a read-only report built from the same local usage data the spend tiles show, so the two can never disagree:
 
 - **Lifetime** — recorded tokens and plan-priced cost from the retained history window (up to 10 years), dated by its earliest day ("Since Mar 2026"). Claude, Codex, and Grok fold up to ten years of local logs; sources with shorter scan or retention windows contribute only the history they preserve. When those dollars were imputed from token counts (subscription logs carry no per-message cost, so they are priced at public API rates), the headline carries an **Est.** mark.

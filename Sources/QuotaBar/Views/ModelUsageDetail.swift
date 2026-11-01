@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// Hover detail for a spend period: a flat ranked list of models, each with name/cost and
-/// share-percent/token lines over a proportional bar. The Other row adds a short contributor line so
-/// folded names remain visible. The header carries only the period name — the hovered row right below
+/// share-percent/token lines over a proportional bar. The Other row lists each contributor's name,
+/// tokens and price rather than an unexplained extra-model count. The header carries only the period name — the hovered row right below
 /// already shows the period total, so repeating it here would duplicate (and wrap on) long figures.
 /// Mirrors `UsageTrendDetail`'s calm — header + flat list + source note.
 struct ModelUsageDetail: View {
@@ -72,12 +72,6 @@ struct ModelUsageDetail: View {
                         .font(.system(size: density.supportingPointSize, weight: .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    if let summary = Self.otherVariantSummary(for: model) {
-                        Text(summary)
-                            .font(.system(size: density.supportingPointSize - 1))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
                 }
                 Spacer(minLength: 8)
                 if model.costUSD != nil {
@@ -125,27 +119,66 @@ struct ModelUsageDetail: View {
             }
             .frame(height: density.meterHeight)
             .padding(.top, 2)
+
+            let contributors = Self.otherContributors(for: model)
+            if !contributors.isEmpty {
+                Group {
+                    if contributors.count <= 8 {
+                        contributorRows(contributors)
+                    } else {
+                        ScrollView(.vertical) {
+                            contributorRows(contributors)
+                        }
+                        .frame(height: 180)
+                    }
+                }
+                .font(.system(size: density.supportingPointSize - 1))
+                .padding(.top, 5)
+            }
         }
         .padding(.vertical, density.textRowPadding)
     }
 
+    private func contributorRows(_ contributors: [ModelUsageVariant]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(contributors, id: \.model) { contributor in
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(contributor.model)
+                        .foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        Text(MetricFormatter.string(for: MetricValue(
+                            number: Double(contributor.totalTokens), kind: .count, label: "tokens",
+                            tokenCountSaturated: contributor.tokenCountSaturated
+                        ), style: .row))
+                        Spacer(minLength: 4)
+                        if let cost = contributor.costUSD {
+                            Text((contributor.hasIncompleteCost ? "≥" : "")
+                                 + MetricFormatter.number(cost, kind: .dollars, style: .row))
+                        } else {
+                            Text("Unpriced")
+                        }
+                    }
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     /// The collapsed row must still identify the models that contributed to it. Lead with token
     /// volume because a zero-cost model can dominate tokens while contributing no spend.
-    static func otherVariantSummary(for model: ModelUsageEntry) -> String? {
+    static func otherContributors(for model: ModelUsageEntry) -> [ModelUsageVariant] {
         guard model.model.caseInsensitiveCompare(ModelUsageEntry.otherModelName) == .orderedSame,
-              let variants = model.variants?.filter({
-                  $0.model.caseInsensitiveCompare(ModelUsageEntry.unattributedModelName) != .orderedSame
-              }),
+              let variants = model.variants,
               !variants.isEmpty
-        else { return nil }
+        else { return [] }
 
-        let ranked = variants.sorted { lhs, rhs in
+        return variants.sorted { lhs, rhs in
             if lhs.totalTokens != rhs.totalTokens { return lhs.totalTokens > rhs.totalTokens }
             return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
         }
-        let leadingName = ranked[0].model
-        let additionalCount = ranked.count - 1
-        return additionalCount == 0 ? leadingName : "\(leadingName) + \(additionalCount) more"
     }
 
     /// Share against the sum of the listed models' own (display-rounded) figures, not the spend row's

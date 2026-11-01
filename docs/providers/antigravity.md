@@ -44,6 +44,9 @@ QuotaBar never asks for a token — it reads what Antigravity already has:
 - **App closed** — it falls back to the OAuth token Antigravity / `agy` store in your macOS Keychain and queries Google's Cloud Code API. An expired token is refreshed automatically (QuotaBar never writes back to Antigravity's own keychain item). Its short-lived cache is reused only while the same Keychain login is present and readable.
 
 If macOS needs approval for that existing Gemini Keychain item, use the provider's **Refresh** action and choose **Always Allow**. Automatic refreshes stay silent and won't open a Keychain dialog.
+Opening Antigravity also lets QuotaBar use its local server without a new Keychain grant. Cached
+meters whose reported reset passed more than five minutes ago say **Awaiting Refresh** until current
+quota can be fetched; an old reset does not prove that the allowance is still depleted.
 
 If neither is available you'll see *Start Antigravity or run `agy` and try again.* An expired access token with no refresh token is reported as expired sign-in. A Cloud Code 403 is shown as an access denial and does not trigger an OAuth refresh.
 
@@ -80,8 +83,12 @@ sidecars while reading. Each bounded batch accounts for both generation data and
 hex expansion. When a client root or database disappears from discovery, its last-good rows remain in the aggregate while
 readable stores continue updating. A completed scan of a readable database with no in-window usage
 clears old history; an empty directory listing alone does not, because it can race database rotation.
-Missing or unpriced models aren't assigned an invented price. Oversized generation records are skipped
-with a warning. When a row has a timestamp, QuotaBar marks its day as a lower bound; when its timestamp or contents cannot be
+Missing or unpriced models aren't assigned an invented price. Large generation records use SQLite's
+read-only incremental BLOB API to project accounting fields while skipping conversation payloads.
+Reads are capped at 512 KiB and the projected envelope at 64 KiB; ordinary batch limits stay the same.
+Unchanged projections reuse cached totals. Changed sources replay projected rows so same-size edits
+cannot retain stale accounting. Records that exceed these bounds or cannot be projected stay
+incomplete with a warning. When a row has a timestamp, QuotaBar marks its day as a lower bound; when its timestamp or contents cannot be
 trusted, measured rows remain visible as partial lower bounds and the provider shows a warning. If a
 scan finds no measured rows, QuotaBar keeps the last visible history and still surfaces the warning.
 Rows without a trustworthy timestamp are excluded from dated totals and keep an incomplete-history
