@@ -99,7 +99,7 @@ final class FreebuffSessionTimerTests: XCTestCase {
 
     private func snapshot(payload: [String: Any]) throws -> ProviderSnapshot {
         var payload = payload
-        payload["freebucks"] = ["balance": 65, "daily": [
+        payload["freebucks"] = ["balance": 215, "wallet": ["balance": 65], "daily": [
             "spent": 15, "limit": 165, "resetAt": iso(4 * 3600)
         ]] as [String: Any]
         let mapped = try FreebuffUsageMapper.map(response: HTTPResponse(

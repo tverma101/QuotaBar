@@ -261,7 +261,8 @@ final class FreebuffUsageMapperTests: XCTestCase {
         XCTAssertNil(progress(mapped.lines, "Weekly"))
         XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.used, 3)
         XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.limit, 33)
-        XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.number, 45)
+        XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.number, 15,
+                       "the remaining daily 150 Freebucks must not appear in the wallet row")
     }
 
     func testUnavailableCurrentMeterDoesNotReviveLegacyCaps() throws {
@@ -283,7 +284,7 @@ final class FreebuffUsageMapperTests: XCTestCase {
                 "monthUsed": 21, "monthLimit": 100, "monthResetAt": "2026-11-01T07:00:00Z"
             ],
             "freebucks": [
-                "balance": 75,
+                "balance": 125,
                 "daily": ["limit": 100, "spent": 25, "remaining": 75, "resetAt": "2026-10-14T07:00:00Z"],
                 "wallet": ["balance": 50, "monthlyBonus": 0],
                 "monthly": ["limitUsd": 12, "spentUsd": 3.5, "remainingUsd": 8.5, "resetAt": "2026-11-01T07:00:00Z"]
@@ -296,7 +297,7 @@ final class FreebuffUsageMapperTests: XCTestCase {
         XCTAssertNil(progress(mapped.lines, "Monthly"))
         XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.used, 5)
         XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.limit, 20)
-        XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.number, 15)
+        XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.number, 10)
         XCTAssertEqual(progress(mapped.lines, "Monthly Spend")?.used, 3.5)
         XCTAssertEqual(progress(mapped.lines, "Monthly Spend")?.limit, 12)
     }
@@ -364,7 +365,7 @@ final class FreebuffUsageMapperTests: XCTestCase {
             "freebucks": ["balance": 99, "daily": ["limit": 100, "spent": 1], "wallet": ["balance": 0]]
         ]))
 
-        XCTAssertNil(mapped.lines.first { $0.label == "Monthly Spend" })
+        XCTAssertTrue(values(mapped.lines, "Monthly Spend")?.isEmpty == true)
         XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.kind, .count)
     }
 

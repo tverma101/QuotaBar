@@ -21,11 +21,10 @@ enum FreebuffDesktopUsageSQL {
         COALESCE(CASE WHEN m.request_id LIKE 'cloud:%' THEN m.request_id
           ELSE m.thread_id || ':' || m.seq END, '') AS id,
         COALESCE(CAST(m.ts AS TEXT), '') AS timestamp,
-        COALESCE(m.metrics_json, '') AS metrics,
+        COALESCE(NULLIF(m.metrics_json, ''), '{}') AS metrics,
         \(selectedModel) AS selectedModel
       FROM messages m JOIN threads t ON t.id = m.thread_id
       WHERE t.harness_id = 'codebuff' AND m.role = 'assistant'
-        AND m.metrics_json IS NOT NULL AND m.metrics_json != '{}'
 
       UNION ALL
 
@@ -56,11 +55,10 @@ enum FreebuffDesktopUsageSQL {
       'id', COALESCE(CASE WHEN m.request_id LIKE 'cloud:%' THEN m.request_id
         ELSE m.thread_id || ':' || m.seq END, ''),
       'timestamp', COALESCE(CAST(m.ts AS TEXT), ''),
-      'metrics', COALESCE(m.metrics_json, ''),
+      'metrics', COALESCE(NULLIF(m.metrics_json, ''), '{}'),
       'selectedModel', \(selectedModel)
     )), '[]') FROM messages m JOIN threads t ON t.id = m.thread_id
     WHERE t.harness_id = 'codebuff' AND m.role = 'assistant'
-      AND m.metrics_json IS NOT NULL AND m.metrics_json != '{}'
     """
 
     static func isMissingMissionReceiptTable(_ error: SQLiteError) -> Bool {

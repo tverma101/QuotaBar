@@ -69,7 +69,7 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
             historyByProviderID: ["claude": dataStore.snapshots["claude"]!.usageHistory!,
                                   "codex": dataStore.snapshots["codex"]!.usageHistory!],
             estimatedCostByProviderID: estimatedCosts
-        ))
+        ), now: TestLocalInstant.date(2026, 10, 5, 12))
         XCTAssertFalse(report.isEmpty, "fixture must produce sections")
         XCTAssertNotNil(report.apiEstimateTotal)
         XCTAssertTrue(report.lifetimeCostIsEstimated,
@@ -84,7 +84,7 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
             section.rows.contains { $0.slug == "space bunny" && $0.cost == nil && $0.tokens > 0 }
         }, "the stealth codename row must show tokens with a dashed cost")
 
-        let view = HistoryDashboardView()
+        let view = HistoryDashboardView(now: { TestLocalInstant.date(2026, 10, 5, 12) })
             .environment(layout)
             .environment(dataStore)
             .environment(\.colorScheme, .dark)
@@ -141,12 +141,12 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
             displayNameByProviderID: [:],
             historyByProviderID: ["claude": dataStore.snapshots["claude"]!.usageHistory!],
             estimatedCostByProviderID: estimatedCosts
-        ))
+        ), now: TestLocalInstant.date(2026, 10, 5, 12))
         XCTAssertTrue(report.lifetimeCostIsEstimated)
         XCTAssertFalse(report.showsAPIEstimateCard,
                        "estimate equals the hero total — the duplicate card must be suppressed")
 
-        let view = HistoryDashboardView()
+        let view = HistoryDashboardView(now: { TestLocalInstant.date(2026, 10, 5, 12) })
             .environment(layout)
             .environment(dataStore)
             .environment(\.colorScheme, .dark)
