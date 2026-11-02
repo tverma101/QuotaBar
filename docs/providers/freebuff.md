@@ -58,15 +58,24 @@ history; the tools run on your Mac, but the older SQLite history no longer recei
 These tiles are enabled, Always Visible, and unpinned by default. QuotaBar reads `metrics` usage
 events from Freebuff's existing read-only chat/run history API, with the current client's
 `x-freebuff-device-chats: 1` compatibility header so On This Device chats are included. Each run's
-newest receipt replaces its earlier cumulative values. A local copy with the same `cloud:<run>` identifier counts once, with the
-new hosted receipt taking precedence. Native Claude/Codex and BYOK runs are excluded.
+newest measured receipt replaces its earlier cumulative values. Later context-only or
+interruption updates preserve the last measured counts and coverage flag. A local copy with the same
+`cloud:<run>` identifier counts once, with a measured hosted receipt taking precedence. When hosted
+usage is missing, a measured older Desktop copy remains included and its coverage stays incomplete. Native Claude/Codex and BYOK runs are excluded.
 
 Hosted receipts cover the last 30 days, with one extra boundary day for local calendar periods. A
 bounded, login-scoped cache keeps only run identifiers, models, timestamps, cursors, and measured
 usage. Conversation payloads are not decoded or saved. Completed unchanged runs reuse their cached
-receipt across restarts; active runs resume after the last event cursor. History requests happen in
-the accounting pass, never on menu-bar timer refreshes. Failed pages keep the previous receipts and
+receipt across restarts; active runs resume after the last event cursor. Memory-pressure cleanup
+unloads the in-memory mirror; local accounting restores the saved receipts before publishing totals.
+History requests happen in the accounting pass, never on menu-bar timer refreshes. Failed pages keep the previous receipts and
 show a warning that totals may be incomplete, which stays visible across successful session polls.
+Runs with missing or incomplete token receipts also keep their day marked incomplete and show a
+history warning. Their missing tokens are unknown, never counted as zero or estimated from hours.
+Older receipt caches are replayed once to recover counts that a later sparse update could have hidden.
+Incomplete runs are checked again at most once every five minutes even when their completed status
+and chat timestamp have not changed, so a late receipt can repair the subtotal. Removing a chat or
+run from the history list does not erase its already measured consumption inside the saved window.
 This mixed history is marked account-wide so another
 Mac cannot blindly add the hosted portion again.
 
@@ -82,7 +91,9 @@ entries remain cached. Changed turns replace their latest measurement. A row tha
 identifier or timestamp is skipped — and logged — instead of making the whole history unreadable. The
 per-turn cache is capped; an evicted project is read again only when a source or pricing change
 requires a new fold. Cached input tokens are already in input, and reasoning tokens are already in
-output, so neither is added again. Incomplete receipts keep their coverage flags in details. Missing
+output, so neither is added again. Incomplete receipts and rows without usage keep their coverage
+flags in details and mark the measured subtotal as a lower bound. Empty or absent assistant metrics
+are included in this coverage check, rather than being filtered out of the database query. Missing
 history stays No Data. Both the per-turn cache and completed aggregate stay bounded so long-lived
 installs do not keep every raw receipt in memory.
 

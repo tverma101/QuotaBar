@@ -225,7 +225,7 @@ actor FreebuffDesktopUsageScanner {
         for databaseTurns in turnsByDatabase {
             for turn in databaseTurns {
                 try Task.checkCancellation()
-                guard seen.insert(turn.id).inserted else { continue }
+                guard !seen.contains(turn.id) else { continue }
                 let date = Date(timeIntervalSince1970: turn.timestampMs / 1000)
                 guard date <= now else {
                     if nextFutureTimestamp.map({ date < $0 }) ?? true { nextFutureTimestamp = date }
@@ -236,6 +236,8 @@ actor FreebuffDesktopUsageScanner {
                     if turn.partial { partialDays.insert(day) }
                     continue
                 }
+                // A hosted placeholder must not hide a measured older Desktop copy.
+                seen.insert(turn.id)
                 guard case .counts(let inputCount, let outputCount, let cachedCount,
                                   let reasoningCount, let reportedTotal) = usage else { continue }
                 let input = try Self.required(inputCount)
@@ -423,7 +425,7 @@ actor FreebuffDesktopUsageScanner {
             usage: nil,
             savedModel: savedModel,
             fromReceipt: recordedModel != nil,
-            partial: metrics["usageIncomplete"] as? Bool == true
+            partial: usage == nil || metrics["usageIncomplete"] as? Bool == true
         )
         if let usage {
             derived.usage = .counts(
