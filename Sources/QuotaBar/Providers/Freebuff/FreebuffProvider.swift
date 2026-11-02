@@ -121,7 +121,7 @@ final class FreebuffProvider: ProviderRuntime {
             if auth == nil { result.historyWarning = authError?.localizedDescription }
             if let auth {
                 if scope == .localAccounting {
-                    hostedReceipts = await hostedScanner.cachedReceipts(auth: auth)
+                    hostedReceipts = try await hostedScanner.cachedReceipts(auth: auth)
                 } else {
                     do {
                         hostedReceipts = try await hostedScanner.scan(auth: auth, client: usageClient, now: scanNow)
@@ -131,7 +131,7 @@ final class FreebuffProvider: ProviderRuntime {
                         DiagnosticGate.logOnce(for: "auth.freebuff.hosted-history.failure") {
                             AppLog.warn(LogTag.auth("freebuff"), "hosted token history read failed: \(error.localizedDescription)")
                         }
-                        hostedReceipts = await hostedScanner.cachedReceipts(auth: auth)
+                        hostedReceipts = try await hostedScanner.cachedReceipts(auth: auth)
                         incompleteHistory = true
                         result.historyWarning = "Freebuff's hosted token history couldn't be refreshed. Totals may be incomplete."
                     }
@@ -160,6 +160,18 @@ final class FreebuffProvider: ProviderRuntime {
                                                        hostedReceipts: hostedReceipts) {
                 DiagnosticGate.clearFailure("auth.freebuff.history.failure")
                 let usage = scan.usage
+                let firstDay = DailyUsageAccumulator.dayKey(from: Calendar.current.date(byAdding: .day, value: -29, to: scanNow)!)
+                let today = DailyUsageAccumulator.dayKey(from: scanNow)
+                if scan.partialDays.contains(where: { $0 >= firstDay && $0 <= today }) {
+                    DiagnosticGate.logOnce(for: "auth.freebuff.history.missing-receipts") {
+                        AppLog.warn(LogTag.auth("freebuff"), "token history contains incomplete or missing usage receipts")
+                    }
+                    if result.historyWarning == nil {
+                        result.historyWarning = "Some Freebuff runs have no complete token receipt. Totals include only measured usage."
+                    }
+                } else {
+                    DiagnosticGate.clearFailure("auth.freebuff.history.missing-receipts")
+                }
                 if incompleteHistory { scan.partialDays.formUnion(usage.series.daily.map(\.date)) }
                 result.usageHistory = ProviderUsageHistory(
                     series: usage.series, modelUsage: usage.modelUsage,

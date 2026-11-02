@@ -68,11 +68,25 @@ actor FreebuffHostedUsageScanner {
         }
         var usage: Usage?
         var usageIncomplete: Bool?
+
+        /// Metrics can arrive as patches (for example a late context or interruption update).
+        /// Missing fields are unknown, not instructions to erase a previously measured count.
+        func merging(over previous: Metrics?) -> Metrics {
+            Metrics(usage: usage ?? previous?.usage,
+                    usageIncomplete: usageIncomplete ?? previous?.usageIncomplete)
+        }
     }
     private struct CachedRun: Codable, Equatable, Sendable {
         var run: Run
         var cursor: String?
         var receipt: FreebuffUsageReceipt?
+        /// Replay older cached streams once: those versions could discard usage on a sparse patch.
+        var metricsVersion: Int?
+        var retryAfter: Date?
+
+        func needsReceiptRefresh(now: Date) -> Bool {
+            metricsVersion != FreebuffHostedUsageScanner.metricsVersion || retryAfter.map { now >= $0 } == true
+        }
     }
     private struct Cache: Codable, Equatable, Sendable {
         var accountKey: String
@@ -85,6 +99,8 @@ actor FreebuffHostedUsageScanner {
         var task: Task<Cache, Error>
     }
 
+    private static let metricsVersion = 2
+    static let incompleteReceiptRetryInterval: TimeInterval = 300
     static let maximumRuns = 10_000
     static let maximumCacheBytes = 8 * 1_024 * 1_024
     private let cacheURL: URL?
@@ -94,19 +110,27 @@ actor FreebuffHostedUsageScanner {
     init(cacheURL: URL? = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/QuotaBar/freebuff-hosted-usage-v1.json")) {
         self.cacheURL = cacheURL
-        if let cacheURL, FileManager.default.fileExists(atPath: cacheURL.path) {
-            do {
-                let data = try Data(contentsOf: cacheURL)
-                guard data.count <= Self.maximumCacheBytes else { throw FreebuffUsageError.invalidResponse }
-                cache = try JSONDecoder().decode(Cache.self, from: data)
-            } catch {
-                AppLog.warn(LogTag.auth("freebuff"), "saved hosted token receipts could not be read; history will be fetched again")
-            }
-        }
+        do { cache = try Self.loadCache(cacheURL) }
+        catch { Self.logCacheReadFailure() }
+    }
+
+    private static func loadCache(_ url: URL?) throws -> Cache? {
+        guard let url, FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let data = try Data(contentsOf: url)
+        guard data.count <= maximumCacheBytes else { throw FreebuffUsageError.invalidResponse }
+        return try JSONDecoder().decode(Cache.self, from: data)
+    }
+
+    private static func logCacheReadFailure() {
+        AppLog.warn(LogTag.auth("freebuff"), "saved hosted token receipts could not be read; history will be fetched again")
     }
 
     func scan(auth: FreebuffAuth, client: FreebuffUsageClient, now: Date) async throws -> [FreebuffUsageReceipt] {
         let key = Self.accountKey(auth)
+        if cache == nil {
+            do { cache = try Self.loadCache(cacheURL) }
+            catch { Self.logCacheReadFailure() }
+        }
         let work: Pending
         if let pending, pending.key == key {
             work = pending
@@ -145,7 +169,10 @@ actor FreebuffHostedUsageScanner {
         }
     }
 
-    func cachedReceipts(auth: FreebuffAuth) -> [FreebuffUsageReceipt] {
+    func cachedReceipts(auth: FreebuffAuth) throws -> [FreebuffUsageReceipt] {
+        // Memory pressure drops the decoded mirror, not the persisted accounting evidence.
+        // An offline/local fold must restore it before publishing totals without hosted usage.
+        if cache == nil { cache = try Self.loadCache(cacheURL) }
         guard let cache, cache.accountKey == Self.accountKey(auth) else { return [] }
         return Self.receipts(cache)
     }
@@ -171,21 +198,23 @@ actor FreebuffHostedUsageScanner {
         let chats: [Chat] = try await pages(path: "chats", auth: auth, client: client)
         let chatIDs = Set(chats.map(\.id))
         result.chats = result.chats.filter { chatIDs.contains($0.key) }
-        result.runs = result.runs.filter { chatIDs.contains($0.value.run.chatId) }
-        let activeChatIDs = Set(result.runs.values.filter { $0.run.isActive }.map { $0.run.chatId })
+        let activeChatIDs = Set(result.runs.values.filter {
+            $0.run.isActive || $0.needsReceiptRefresh(now: now)
+        }.map { $0.run.chatId })
         for chat in chats {
             try Task.checkCancellation()
             let active = chat.latestRun?.isActive == true || activeChatIDs.contains(chat.id)
             guard result.chats[chat.id] != chat.updatedAt || active else { continue }
             let runs: [Run] = try await pages(path: "chats/\(chat.id.urlFormEncoded)/runs", auth: auth, client: client)
-            let runIDs = Set(runs.map(\.id))
-            result.runs = result.runs.filter { $0.value.run.chatId != chat.id || runIDs.contains($0.key) }
+            // A hidden/deleted chat or run cannot undo already measured consumption. Keep
+            // accounting-only receipts until the window expires, independently of list visibility.
+            for run in runs where !run.isFreebuff { result.runs.removeValue(forKey: run.id) }
             for run in runs where run.isFreebuff {
                 guard let started = OpenUsageISO8601.date(from: run.createdAt) else { throw FreebuffUsageError.invalidResponse }
                 guard started >= cutoff else { continue }
                 let previous = result.runs[run.id]
-                guard previous?.run != run || run.isActive else { continue }
-                result.runs[run.id] = try await readRun(run, previous: previous, auth: auth, client: client)
+                guard previous?.run != run || run.isActive || previous?.needsReceiptRefresh(now: now) == true else { continue }
+                result.runs[run.id] = try await readRun(run, previous: previous, auth: auth, client: client, now: now)
                 guard result.runs.count <= maximumRuns else { throw FreebuffUsageError.invalidResponse }
             }
             result.chats[chat.id] = chat.updatedAt
@@ -194,10 +223,14 @@ actor FreebuffHostedUsageScanner {
     }
 
     private static func readRun(_ run: Run, previous: CachedRun?, auth: FreebuffAuth,
-                                client: FreebuffUsageClient) async throws -> CachedRun {
+                                client: FreebuffUsageClient, now: Date) async throws -> CachedRun {
         var result = previous ?? CachedRun(run: run)
         result.run = run
-        var cursor = previous?.cursor
+        if previous?.metricsVersion != metricsVersion {
+            result.cursor = nil
+            result.receipt = nil
+        }
+        var cursor = result.cursor
         var seen: Set<String> = []
         for _ in 0..<1_000 {
             try Task.checkCancellation()
@@ -207,15 +240,31 @@ actor FreebuffHostedUsageScanner {
                 guard let date = OpenUsageISO8601.date(from: run.finishedAt ?? run.createdAt) else {
                     throw FreebuffUsageError.invalidResponse
                 }
+                let patch = try JSONDecoder().decode(Metrics.self, from: Data(metrics.utf8))
+                let prior = try result.receipt.map { try JSONDecoder().decode(Metrics.self, from: Data($0.metricsJSON.utf8)) }
+                let merged = String(decoding: try JSONEncoder().encode(patch.merging(over: prior)), as: UTF8.self)
                 result.receipt = FreebuffUsageReceipt(id: "cloud:" + run.id, timestampMs: date.timeIntervalSince1970 * 1_000,
-                                                     metricsJSON: metrics, model: run.model)
+                                                     metricsJSON: merged, model: run.model)
             }
             // endCursor advances across non-metric events as well, so an idle run downloads nothing twice.
             result.cursor = page.endCursor ?? page.nextCursor ?? cursor
             guard let next = page.nextCursor else {
-                if let date = OpenUsageISO8601.date(from: run.finishedAt ?? run.createdAt) {
-                    result.receipt?.timestampMs = date.timeIntervalSince1970 * 1_000
+                guard let date = OpenUsageISO8601.date(from: run.finishedAt ?? run.createdAt) else {
+                    throw FreebuffUsageError.invalidResponse
                 }
+                // A run that supplied no metrics still has a coverage gap; never make it vanish
+                // from the accounting pass or manufacture a measured zero.
+                if result.receipt == nil {
+                    result.receipt = FreebuffUsageReceipt(
+                        id: "cloud:" + run.id, timestampMs: date.timeIntervalSince1970 * 1_000,
+                        metricsJSON: "{}", model: run.model
+                    )
+                }
+                result.receipt?.timestampMs = date.timeIntervalSince1970 * 1_000
+                result.metricsVersion = metricsVersion
+                let metrics = try JSONDecoder().decode(Metrics.self, from: Data(result.receipt!.metricsJSON.utf8))
+                result.retryAfter = metrics.usage == nil || metrics.usageIncomplete == true
+                    ? now.addingTimeInterval(incompleteReceiptRetryInterval) : nil
                 return result
             }
             guard seen.insert(next).inserted else { throw FreebuffUsageError.invalidResponse }
