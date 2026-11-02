@@ -9,6 +9,7 @@ charts, or spend-history tiles.
 quotabar                 # every enabled provider, refreshing stale cache entries
 quotabar codex           # one provider, refreshing when its cache is stale
 quotabar codex --force   # refresh through the shared provider engine, cache, print, exit
+quotabar freebuff --diagnose --force # refresh and inspect backend metrics without opening the panel
 ```
 
 The command and app import the same providers, authentication stores, pricing, refresh coordinator, and
@@ -36,3 +37,23 @@ points to the signed helper inside QuotaBar, so in-place app updates also update
 
 Exit codes are `0` for success, `2` for invalid arguments or an unknown provider, and `4` when a
 refresh or local read fails.
+
+## Backend Diagnostics
+
+`--diagnose` prints `quotabar.diagnostics.v1` JSON instead of scalar limits. The report contains
+normalized snapshots and token coverage, resolved widget values, enabled and pinned metric IDs,
+active session clocks, separate quota/history ages, and explicit findings. It uses the app's
+provider, widget, and menu-bar data paths without rendering views. `--force` requests a fresh read;
+without it, the normal shared-cache rules apply. Warnings and errors produce exit status 4, while
+still returning the report. Diagnostic output includes usage and model names; review it before sharing.
+
+If macOS grants a provider's Keychain item to the app but not its CLI helper, the installed app
+executable supports the same headless path:
+
+```sh
+/Applications/QuotaBar.app/Contents/MacOS/QuotaBar --diagnose freebuff --force
+```
+
+This exits before starting SwiftUI, the menu-bar controller, servers, or timers. It can run beside
+the normal app and uses its existing silent credential access. Refresh errors stay visible even
+when usable older snapshots or newly scanned local history remain available.

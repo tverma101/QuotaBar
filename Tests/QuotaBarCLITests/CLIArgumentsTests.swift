@@ -12,4 +12,12 @@ final class CLIArgumentsTests: XCTestCase {
         XCTAssertThrowsError(try CLIArguments.parse(["--json"]))
         XCTAssertThrowsError(try CLIArguments.parse(["claude", "codex"]))
     }
+
+    func testHeadlessDiagnosticCanNameAProviderAndForceALiveRefresh() throws {
+        let parsed = try CLIArguments.parse(["freebuff", "--diagnose", "--force"])
+        XCTAssertEqual(parsed.providerID, "freebuff")
+        XCTAssertTrue(parsed.diagnostic)
+        XCTAssertTrue(parsed.force)
+        XCTAssertFalse(try CLIArguments.parse([]).diagnostic)
+    }
 }

@@ -42,7 +42,8 @@ public struct UsageReader {
         self.providersOverride = providers
     }
 
-    public func read(providerID requestedProviderID: String? = nil, force: Bool = false) async throws -> UsageReadResult {
+    public func read(providerID requestedProviderID: String? = nil, force: Bool = false,
+                     diagnostic: Bool = false) async throws -> UsageReadResult {
         // The CLI shares the app's provider settings, so migrate them before a store interprets the
         // enabled/disabled lists. If migration stops partway through, fail closed before discovery can
         // read optional providers' local credentials under the legacy "everything on" rule.
@@ -241,6 +242,14 @@ public struct UsageReader {
             errors = dataStore.providerErrors
             warnings = orderedIDs
                 .compactMap { id in errors[id].map { "\(id): \($0)" } }
+        }
+
+        if diagnostic {
+            let report = UsageDiagnostics.make(providerIDs: enabledOrderedIDs, snapshots: snapshots, errors: errors,
+                                               registry: registry, runtimes: providers, defaults: defaults)
+            return UsageReadResult(data: try UsageDiagnostics.encode(report), warnings: report.findings.map {
+                "\($0.providerID): \($0.severity): \($0.message)"
+            })
         }
 
         let state = LocalUsageAPI.State(

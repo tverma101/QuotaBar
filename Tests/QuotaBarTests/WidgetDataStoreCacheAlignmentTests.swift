@@ -15,7 +15,7 @@ final class WidgetDataStoreCacheAlignmentTests: XCTestCase {
         return defaults
     }
 
-    /// A NaN meter cannot be encoded, so the cache write fails while the refresh itself succeeds.
+    /// A NaN meter cannot be encoded, so the cache write fails despite the provider answering.
     private func makeStore(
         provider: Provider,
         descriptor: WidgetDescriptor,
@@ -70,7 +70,9 @@ final class WidgetDataStoreCacheAlignmentTests: XCTestCase {
             now: now
         )
 
-        _ = await store.refresh(providerID: provider.id, force: true, bypassSnapshotCache: true)
+        let failed = await store.refresh(providerID: provider.id, force: true, bypassSnapshotCache: true)
+        XCTAssertEqual(failed, .failed)
+        XCTAssertNotNil(store.errorMessage(for: provider.id), "discarded fresh values must not be reported as success")
 
         // The failed write must not leave the store holding data the blob never saw.
         XCTAssertNil(store.localSnapshots[provider.id])
