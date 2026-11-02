@@ -46,8 +46,12 @@ Freebuff's canonical API host for its session, model catalogue, and read-only ho
 ## Metrics
 
 Current accounts show **Daily Hours** and **Hours Balance**, matching Freebuff's conversion of five
-Freebucks per hour. The balance includes the remaining daily pool and the wallet; it is not added to
-the daily pool again. Whole balance hours round down like Freebuff. Legacy daily/weekly/monthly
+Freebucks per hour. Daily Hours is today's replenishing allowance. Hours Balance is the separate
+wallet, including any remaining monthly bonus and earned or purchased funds. It excludes the daily
+pool. Freebuff's top-level API balance combines both, so it must not be used for this wallet row.
+Older responses without a wallet field use the combined balance minus the daily remainder. Whole
+wallet hours round down like Freebuff. An unavailable meter clears old values and shows a warning;
+a missing wallet never silently becomes zero. Legacy daily/weekly/monthly
 session caps are hidden when the current hours meter is present. Older servers without that meter
 keep their session windows. Monthly Spend appears only when the server supplies actual USD values.
 Hours and tokens are separate measurements; neither is converted into the other.
@@ -63,7 +67,10 @@ interruption updates preserve the last measured counts and coverage flag. A loca
 `cloud:<run>` identifier counts once, with a measured hosted receipt taking precedence. When hosted
 usage is missing, a measured older Desktop copy remains included and its coverage stays incomplete. Native Claude/Codex and BYOK runs are excluded.
 
-Hosted receipts cover the last 30 days, with one extra boundary day for local calendar periods. A
+Hosted receipts cover the last 30 days, with one extra boundary day for local calendar periods.
+Completed runs are included by finish time, so a long run that started before the window still
+counts when it finishes inside it. Active runs remain eligible. Model corrections update cached
+receipts even when no new metrics event arrives. A
 bounded, login-scoped cache keeps only run identifiers, models, timestamps, cursors, and measured
 usage. Conversation payloads are not decoded or saved. Completed unchanged runs reuse their cached
 receipt across restarts; active runs resume after the last event cursor. Memory-pressure cleanup
@@ -142,8 +149,25 @@ QuotaBar sends a read-only `GET https://www.codebuff.com/api/v1/freebuff/session
 the canonical API host, so a redirect cannot strip the login header and make a new login look expired.
 A `404` is treated as a normal
 no-active-session response; other HTTP and decoding failures remain visible on the provider card.
-Transport failures are shown as a retryable network error. Cancelled refreshes remain cancellations and
+Transport failures are shown as a retryable network error. A quota or credential error remains
+visible even when local token history succeeds; the successful history can still be saved without
+making old balances look freshly checked. Cancelled refreshes remain cancellations and
 are not presented as connection failures.
+
+## Headless Checks
+
+Run `quotabar freebuff --diagnose --force` to refresh and print a backend JSON report. It includes
+the normalized receipt totals, resolved widget values, session clocks, freshness, and coverage
+warnings without opening the panel. A cached read can omit `--force`.
+
+For the same Keychain access identity as the installed app, use
+`/Applications/QuotaBar.app/Contents/MacOS/QuotaBar --diagnose freebuff --force`. This mode branches
+before SwiftUI or the app delegate starts and exits after printing the report. The running menu-bar
+app can remain open. It starts no session, heartbeat, window, local server, or refresh timer.
+Fresh Freebuff checks also include an allowlisted numeric source projection, so daily, wallet,
+and combined balances can be compared. Login tokens, purchase holder IDs, and conversations are
+excluded. Exit status 4 means the JSON contains warnings or errors; missing receipts remain a
+coverage warning after a successful balance check.
 
 ## Source references
 

@@ -7,6 +7,7 @@ import SwiftUI
 /// per-model rows. A codename model (e.g. "space-bunny") shows tokens with a dashed cost until the
 /// automatic pricing discovery prices it — then the cost backfills with no user action.
 struct HistoryDashboardView: View {
+    var now: () -> Date = Date.init
     @Environment(LayoutStore.self) private var layout
     @Environment(WidgetDataStore.self) private var dataStore
 
@@ -42,7 +43,7 @@ struct HistoryDashboardView: View {
             displayNameByProviderID: names,
             historyByProviderID: histories,
             estimatedCostByProviderID: estimatedCosts
-        ))
+        ), now: now())
     }
 
     @ViewBuilder

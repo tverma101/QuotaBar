@@ -47,6 +47,40 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
                        "unchanged completed chats require only the lightweight chat list")
     }
 
+    func testLongRunFinishingInsideWindowIsNotDroppedBecauseItStartedEarlier() async throws {
+        var long = run(model: "vendor/model")
+        long["createdAt"] = "2026-09-01T10:00:00Z"
+        let http = HostedHTTP([
+            prefix + "chats": [try chats(long)],
+            prefix + "chats/chat-1/runs": [try page([long])],
+            prefix + "runs/run-1/events": [try page([metric(100)], end: "1")]
+        ])
+        let scanner = FreebuffHostedUsageScanner(cacheURL: nil)
+        let client = FreebuffUsageClient(http: http)
+        for _ in 0..<2 {
+            let receipts = try await scanner.scan(auth: auth, client: client, now: now)
+            XCTAssertEqual(receipts.count, 1, "pruning and discovery must both use the receipt's period")
+            XCTAssertEqual(receipts.first?.timestampMs, OpenUsageISO8601.date(from: "2026-10-31T10:10:00Z")!.timeIntervalSince1970 * 1000)
+        }
+    }
+
+    func testRunModelCorrectionReattributesReceiptWithoutAnotherMetricsEvent() async throws {
+        let old = run(model: "vendor/old")
+        let corrected = run(model: "vendor/new")
+        let http = HostedHTTP([
+            prefix + "chats": [try chats(old), try chats(corrected, revision: "b")],
+            prefix + "chats/chat-1/runs": [try page([old]), try page([corrected])],
+            prefix + "runs/run-1/events": [try page([metric(100)], end: "1")],
+            prefix + "runs/run-1/events?cursor=1": [try page([], end: "1")]
+        ])
+        let scanner = FreebuffHostedUsageScanner(cacheURL: nil)
+        let client = FreebuffUsageClient(http: http)
+        _ = try await scanner.scan(auth: auth, client: client, now: now)
+        let receipts = try await scanner.scan(auth: auth, client: client, now: now)
+        XCTAssertEqual(receipts.first?.model, "vendor/new")
+        XCTAssertTrue(receipts.first?.metricsJSON.contains("100") == true)
+    }
+
     func testSparseMetricsPreserveEarlierUsageAndIncompleteFlagAcrossPagesAndRefreshes() async throws {
         let active = run(status: "running")
         var incomplete = metric(100)

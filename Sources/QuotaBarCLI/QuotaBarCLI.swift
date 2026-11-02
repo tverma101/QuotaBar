@@ -26,7 +26,8 @@ struct QuotaBarCLI {
                 settingsDomainName: app.bundleIdentifier
             ).read(
                 providerID: arguments.providerID,
-                force: arguments.force
+                force: arguments.force,
+                diagnostic: arguments.diagnostic
             )
             FileHandle.standardOutput.write(result.data)
             FileHandle.standardOutput.write(Data("\n".utf8))
@@ -55,12 +56,13 @@ struct QuotaBarCLI {
     }
 
     private static let help = """
-    Usage: quotabar [provider] [--force]
+    Usage: quotabar [provider] [--force] [--diagnose]
 
     Read limits through QuotaBar's shared five-minute cache and exit. Output is always JSON.
 
     Options:
       --force      Refresh even when the shared cache is still fresh
+      --diagnose   Headless backend report: metrics, widgets, clocks, freshness, and warnings
       -v, --version
       -h, --help
     """

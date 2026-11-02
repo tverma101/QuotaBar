@@ -90,6 +90,7 @@ actor FreebuffHostedUsageScanner {
     }
     private struct Cache: Codable, Equatable, Sendable {
         var accountKey: String
+        var windowVersion: Int?
         var chats: [String: String] = [:]
         var runs: [String: CachedRun] = [:]
     }
@@ -188,13 +189,27 @@ actor FreebuffHostedUsageScanner {
     }
 
     private static func receipts(_ cache: Cache) -> [FreebuffUsageReceipt] {
-        cache.runs.values.compactMap(\.receipt).sorted { $0.id < $1.id }
+        cache.runs.values.compactMap { cached in
+            cached.receipt.map { receipt in
+                var receipt = receipt
+                receipt.model = cached.run.model
+                return receipt
+            }
+        }.sorted { $0.id < $1.id }
     }
 
     private static func fetch(auth: FreebuffAuth, client: FreebuffUsageClient, now: Date, initial: Cache) async throws -> Cache {
         var result = initial
+        // Previous versions chose the window by start time and may have skipped a long run that
+        // finished recently. Recheck run lists once, retaining already measured event receipts.
+        if result.windowVersion != 1 {
+            result.chats = [:]
+            result.windowVersion = 1
+        }
         let cutoff = Calendar.current.date(byAdding: .day, value: -30, to: Calendar.current.startOfDay(for: now))!
-        result.runs = result.runs.filter { OpenUsageISO8601.date(from: $0.value.run.createdAt).map { $0 >= cutoff } ?? false }
+        result.runs = result.runs.filter {
+            $0.value.run.isActive || OpenUsageISO8601.date(from: $0.value.run.finishedAt ?? $0.value.run.createdAt).map { $0 >= cutoff } ?? false
+        }
         let chats: [Chat] = try await pages(path: "chats", auth: auth, client: client)
         let chatIDs = Set(chats.map(\.id))
         result.chats = result.chats.filter { chatIDs.contains($0.key) }
@@ -210,8 +225,10 @@ actor FreebuffHostedUsageScanner {
             // accounting-only receipts until the window expires, independently of list visibility.
             for run in runs where !run.isFreebuff { result.runs.removeValue(forKey: run.id) }
             for run in runs where run.isFreebuff {
-                guard let started = OpenUsageISO8601.date(from: run.createdAt) else { throw FreebuffUsageError.invalidResponse }
-                guard started >= cutoff else { continue }
+                guard let timestamp = OpenUsageISO8601.date(from: run.finishedAt ?? run.createdAt) else {
+                    throw FreebuffUsageError.invalidResponse
+                }
+                guard run.isActive || timestamp >= cutoff else { continue }
                 let previous = result.runs[run.id]
                 guard previous?.run != run || run.isActive || previous?.needsReceiptRefresh(now: now) == true else { continue }
                 result.runs[run.id] = try await readRun(run, previous: previous, auth: auth, client: client, now: now)
@@ -261,6 +278,7 @@ actor FreebuffHostedUsageScanner {
                     )
                 }
                 result.receipt?.timestampMs = date.timeIntervalSince1970 * 1_000
+                result.receipt?.model = run.model
                 result.metricsVersion = metricsVersion
                 let metrics = try JSONDecoder().decode(Metrics.self, from: Data(result.receipt!.metricsJSON.utf8))
                 result.retryAfter = metrics.usage == nil || metrics.usageIncomplete == true
