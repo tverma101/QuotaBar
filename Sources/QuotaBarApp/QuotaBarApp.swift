@@ -1,7 +1,23 @@
 import QuotaBar
 import SwiftUI
+import Darwin
 
 @main
+enum QuotaBarMain {
+    @MainActor
+    static func main() async {
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments.contains("--diagnose") {
+            let status = await HeadlessDiagnosticCommand.run(
+                arguments: arguments,
+                defaultsDomain: Bundle.main.bundleIdentifier ?? "com.tverma101.quotabar"
+            )
+            exit(status)
+        }
+        OpenUsageApp.main()
+    }
+}
+
 struct OpenUsageApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 

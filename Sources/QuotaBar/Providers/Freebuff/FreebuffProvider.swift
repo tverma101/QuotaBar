@@ -20,6 +20,7 @@ final class FreebuffProvider: ProviderRuntime {
     let modelCatalog: FreebuffModelCatalog
     let pricing: @Sendable () async -> ModelPricing
     let now: @Sendable () -> Date
+    private(set) var quotaObservation: FreebuffQuotaObservation?
 
     func unloadLocalAccountingCachesForMemoryPressure() async {
         await historyScanner.unloadCachesForMemoryPressure()
@@ -199,6 +200,7 @@ final class FreebuffProvider: ProviderRuntime {
     }
 
     private func refreshQuota(auth: FreebuffAuth) async -> ProviderSnapshot {
+        quotaObservation = nil
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         do {
             let response = try await usageClient.fetchSession(auth: auth)
@@ -211,9 +213,11 @@ final class FreebuffProvider: ProviderRuntime {
                 return ProviderSnapshot.error(provider: provider, error: FreebuffUsageError.requestFailed(response.statusCode))
             }
             let mapped = try FreebuffUsageMapper.map(response: response)
+            quotaObservation = FreebuffQuotaObservation(response: response)
             DiagnosticGate.clearFailures(prefix: Self.usageFailureDiagnosticPrefix)
             return ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines,
-                                         refreshedAt: now(), clearsPriorMenuBarQuotaState: true)
+                                         refreshedAt: now(), warning: mapped.warning,
+                                         clearsPriorMenuBarQuotaState: true)
         } catch is CancellationError {
             return cancelledRefreshSnapshot(provider: provider)
         } catch {

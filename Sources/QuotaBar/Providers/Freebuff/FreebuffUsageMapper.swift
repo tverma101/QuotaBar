@@ -3,6 +3,7 @@ import Foundation
 struct FreebuffMappedUsage: Equatable, Sendable {
     var plan: String?
     var lines: [MetricLine]
+    var warning: String?
 }
 
 /// Maps Freebuff's read-only session endpoint. The current meter supersedes legacy session caps;
@@ -20,13 +21,20 @@ enum FreebuffUsageMapper {
         } else {
             throw FreebuffUsageError.invalidResponse
         }
-        guard root["status"] is String else { throw FreebuffUsageError.invalidResponse }
+        guard let status = root["status"] as? String, !status.isEmpty else { throw FreebuffUsageError.invalidResponse }
 
         let subscription = root["subscription"] as? [String: Any]
         let subscriptionUsage = subscription?["usage"] as? [String: Any]
         let freeWindows = root["freeWindows"] as? [String: Any]
         let freebucks = root["freebucks"] as? [String: Any]
         var lines: [MetricLine] = []
+        var warning: String?
+        if let raw = root["freebucks"], !(raw is NSNull), freebucks == nil {
+            throw FreebuffUsageError.invalidResponse
+        }
+        if root["freebucks"] is NSNull {
+            warning = "Freebuff couldn't refresh its hours balances. Refresh again to get current hours."
+        }
 
         if root.keys.contains("freebucks") {
             // Legacy free/subscription windows are still sent for compatibility. They no longer
@@ -95,23 +103,54 @@ enum FreebuffUsageMapper {
         }
 
         if let daily = freebucks?["daily"] as? [String: Any] {
+            guard let spent = nonnegative(daily["spent"]), let limit = nonnegative(daily["limit"]) else {
+                throw FreebuffUsageError.invalidResponse
+            }
+            if let reset = daily["resetAt"], date(reset) == nil { throw FreebuffUsageError.invalidResponse }
             appendProgress(
                 label: "Daily Hours",
-                used: ProviderParse.number(daily["spent"]).map { $0 / freebucksPerHour },
-                limit: ProviderParse.number(daily["limit"]).map { $0 / freebucksPerHour },
+                used: spent / freebucksPerHour,
+                limit: limit / freebucksPerHour,
                 format: .count(suffix: "hours"), resetsAt: daily["resetAt"],
                 periodDurationMs: MetricPeriod.dayMs, to: &lines
             )
+        } else if freebucks != nil {
+            throw FreebuffUsageError.invalidResponse
         }
-        if let balance = ProviderParse.number(freebucks?["balance"]), balance >= 0 {
+        if let freebucks {
+            let wallet: Double
+            if let rawWallet = freebucks["wallet"] {
+                guard let object = rawWallet as? [String: Any], let balance = nonnegative(object["balance"]) else {
+                    throw FreebuffUsageError.invalidResponse
+                }
+                wallet = balance
+            } else {
+                // Older servers only supplied the combined total. Remove the daily remainder;
+                // displaying that total beside Daily Hours counted the daily pool twice.
+                guard let total = nonnegative(freebucks["balance"]),
+                      let daily = freebucks["daily"] as? [String: Any],
+                      let spent = nonnegative(daily["spent"]), let limit = nonnegative(daily["limit"])
+                else { throw FreebuffUsageError.invalidResponse }
+                let remaining = nonnegative(daily["remaining"]) ?? max(0, limit - spent)
+                guard total + 1e-9 >= remaining else { throw FreebuffUsageError.invalidResponse }
+                wallet = max(0, total - remaining)
+            }
             lines.append(.values(
                 label: "Hours Balance",
-                values: [MetricValue(number: floor(balance / freebucksPerHour + 1e-9), kind: .count, label: "hours")]
+                values: [MetricValue(number: floor(wallet / freebucksPerHour + 1e-9), kind: .count, label: "hours")]
             ))
+        } else {
+            // Explicit empty value rows replace an old balance during quota-only merges.
+            lines.append(.values(label: "Hours Balance", values: []))
         }
 
         appendMonthlySpend(subscriptionUsage: subscriptionUsage, freebucks: freebucks, to: &lines)
-        MetricLine.appendNoDataIfNeeded(&lines)
+        if !lines.contains(where: { if case .values(_, let values, _, _, _, _) = $0 { return !values.isEmpty }; return true }) {
+            lines.append(.noUsageData)
+        }
+        if !lines.contains(where: { $0.label == "Monthly Spend" }) {
+            lines.append(.values(label: "Monthly Spend", values: []))
+        }
 
         // Separate session expiry metadata from daily-budget reset times. Emit an empty row too,
         // so a successful idle poll replaces the previous active sessions.
@@ -120,7 +159,12 @@ enum FreebuffUsageMapper {
 
         let tier = (subscription?["tierId"] as? String)?.nilIfEmpty
         let accessTier = (root["accessTier"] as? String)?.nilIfEmpty
-        return FreebuffMappedUsage(plan: tier ?? accessTier?.capitalized, lines: lines)
+        return FreebuffMappedUsage(plan: tier ?? accessTier?.capitalized, lines: lines, warning: warning)
+    }
+
+    private static func nonnegative(_ value: Any?) -> Double? {
+        guard let number = ProviderParse.number(value), number >= 0 else { return nil }
+        return number
     }
 
     private static func sessionExpiries(_ root: [String: Any]) throws -> [Date] {
@@ -129,6 +173,9 @@ enum FreebuffUsageMapper {
             guard let expiry = date(root["expiresAt"]) else { throw FreebuffUsageError.invalidResponse }
             let id = (root["instanceId"] as? String)?.nilIfEmpty ?? "single"
             sessions[id] = expiry
+        }
+        if let raw = root["desktopPurchases"], !(raw is NSNull), !(raw is [[String: Any]]) {
+            throw FreebuffUsageError.invalidResponse
         }
         if let purchases = root["desktopPurchases"] as? [[String: Any]] {
             for purchase in purchases {

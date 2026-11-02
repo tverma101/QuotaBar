@@ -1445,6 +1445,14 @@ final class WidgetDataStore {
         }
         rebuildRenderedSnapshots()
         if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
+        if !persistedToBlob {
+            recordProviderFailure("Refreshed usage couldn't be saved. Previous values are still shown.",
+                                  category: .other, for: providerID, domains: failureDomains)
+            let retryAfter = now().addingTimeInterval(Self.failureRetryBackoff)
+            for key in failureBackoffKeys { failureRetryAfter[key] = retryAfter }
+            onRefreshOutcome?(providerID, .failed, .other, force)
+            return .failed
+        }
         AppLog.info(.refresh, "\(providerID) ok (\(durationMs)ms)")
         onRefreshOutcome?(providerID, .refreshed, nil, force)
         // Local-log providers can allocate large parse arrays. Their bounded warm caches remain in
@@ -1913,10 +1921,11 @@ final class WidgetDataStore {
         errorMessage(for: providerID) ?? warningMessage(for: providerID)
     }
 
-    /// A snapshot that carries only error lines is a failed refresh; its message comes from the badge.
+    /// Local history may succeed beside a failed quota read. Any explicit provider error remains a
+    /// failure; the separate history merge retains those useful receipts without hiding the error.
     private static func errorMessage(in snapshot: ProviderSnapshot) -> String? {
-        guard !snapshot.lines.isEmpty, snapshot.lines.allSatisfy(\.isError) else { return nil }
-        if case .badge(_, let text, _, _) = snapshot.lines[0] { return text }
+        guard let line = snapshot.lines.first(where: \.isError) else { return nil }
+        if case .badge(_, let text, _, _) = line { return text }
         return "Refresh failed"
     }
 
