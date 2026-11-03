@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.7.1
+
+QuotaBar's first public downloadable build. It does not update automatically; users replace the app in `/Applications` manually.
+
+### New Features
+- Discover supported provider setups already present on this Mac; no network scan or silent activation. ([#21](https://github.com/tverma101/QuotaBar/pull/21)) by @tverma101
+
+### Chores
+- Update PostHog iOS SDK 3.92.1 → 3.92.7. ([#18](https://github.com/tverma101/QuotaBar/pull/18)) by @app/dependabot
+- Derive the app version from the release tag and package arm64 + x86_64. ([#21](https://github.com/tverma101/QuotaBar/pull/21)) by @tverma101
+
+---
+
+### Changelog
+**Full Changelog**: [476efb3...v0.7.1](https://github.com/tverma101/QuotaBar/compare/476efb3...v0.7.1)
+
 ## Unreleased
 
 - Page the full OpenRouter model catalog, recheck fallback-priced names so new exact routes replace stale estimates, and stop per-model checks after three misses.
