@@ -40,6 +40,7 @@ identity (or the reverse).
 - **[Devin](docs/providers/devin.md)** — weekly and daily quota, extra usage balance
 - **[Freebuff](docs/providers/freebuff.md)** — session quotas, Freebucks credits, reset times, and reported monthly spend
 - **[Grok](docs/providers/grok.md)** — weekly shared pool, pay-as-you-go, local daily spend
+- **[Hermes](docs/providers/hermes.md)** — session and weekly quota, local daily spend
 - **[OpenCode](docs/providers/opencode.md)** — Go session/weekly/monthly caps, Zen spend, local daily spend
 - **[OpenRouter](docs/providers/openrouter.md)** — credit balance, daily/weekly/monthly spend (API key)
 - **[Z.ai](docs/providers/zai.md)** — session, weekly, web-search quotas (GLM Coding Plan, API key)
@@ -52,6 +53,7 @@ Most providers read the credentials already on your machine (keychain, auth file
 - **Dashboard popover.** Provider-grouped meters with live reset countdowns and pace indicators. Click usage or reset values to flip their display everywhere; right-click a row to hide or star it, refresh its provider, or open Customize.
 - **Global shortcut.** Toggle the popover from anywhere — record any combo in Settings.
 - **Customize.** Turn providers and metrics on or off, choose which rows stay Always Visible or On Demand, and drag-reorder both.
+- **Local setup discovery.** QuotaBar checks supported provider setup sources on this Mac and marks matches in Customize. You choose which providers to enable; discovery stays local and never activates providers automatically.
 - **Stale-while-revalidate.** Cached values display instantly at launch; live quota meters refresh every minute (every two minutes on battery or in Low Power Mode), while full history refreshes every five minutes.
 - **[One-shot CLI](docs/cli.md).** Agents can read stable limit JSON through the same five-minute cache with `quotabar`, or bypass freshness with `quotabar --force`; the menu-bar app does not need to be running.
 - **[Local HTTP API](docs/local-http-api.md).** Other apps can read machine-friendly limits from `127.0.0.1:6736/v1/limits`; the legacy `/v1/usage` UI contract remains supported. It is loopback-only and never serves credentials; note that browser pages can read it too — see the [privacy note](docs/local-http-api.md#cors-and-privacy).
@@ -83,16 +85,21 @@ SwiftPM package, SwiftUI content hosted in an AppKit-owned `NSStatusItem` + cust
 
 ## Releasing
 
-There is no automated release pipeline. To produce an installable build:
+There is no automated release pipeline. A local development build can be staged with:
 
 ```sh
 ./script/build_and_run.sh build          # stage a signed bundle in dist/
 ```
 
-The staged bundle is signed with an Apple Development identity found in your keychain, which is
-enough to run it locally but not to distribute it. Distributing to other machines needs a Developer ID
-Application certificate, a provisioning profile for `com.tverma101.quotabar`, and notarization — none
-of which this repository is set up to automate.
+For distribution, run the script from the exact release tag with a Developer ID certificate:
+
+```sh
+RELEASE=1 CODESIGN_IDENTITY="Developer ID Application: <name> (<team>)" ./script/build_and_run.sh build
+```
+
+That stages a universal arm64 + x86_64 app whose version comes from the tag. The Developer ID signed
+bundle still needs to be packaged as a DMG, notarized, and stapled before distribution. There is no
+auto-update; users replace the app in `/Applications` manually.
 
 ### iCloud Sync
 

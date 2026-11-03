@@ -108,9 +108,9 @@ standard controls with the same behavior (the footer still pins, the buttons kee
 one of those version checks lives in a single file — `Support/LiquidGlassFallbacks.swift` — so the views
 stay free of `#available` checks.
 
-The release build (`script/release.sh`) ships a universal binary (arm64 + x86_64), so a single DMG runs
-natively on both Apple Silicon and Intel Macs. The dev build (`script/build_and_run.sh`) stays host-arch
-only — a universal dev build just doubles compile time on the maintainer's own machine for no benefit.
+The development build (`script/build_and_run.sh`) stays host-architecture only. A production build with
+`RELEASE=1` requires an exact `v…` Git tag, derives the app version from that tag, and packages universal
+arm64 + x86_64 app and CLI binaries for distribution.
 
 ## Local HTTP API
 

@@ -16,9 +16,9 @@ QuotaBar never asks the user to paste a token — if the provider's own CLI or a
 QuotaBar reads those existing credentials.
 
 Besides `refresh()`, every provider implements `hasLocalCredentials()` — a local-only check of whether
-its credentials exist, without contacting the provider. Startup and provider discovery do not call this
-method to enable cards: optional providers stay off until the user selects them in Customize. Keep the
-probe silent and mirror the credential sources `refresh()` reads if a future explicit setup flow uses it.
+its setup credentials exist, without contacting the provider. Customize uses this probe to mark
+matching setups on the Mac. The probe must stay silent and mirror the credential sources `refresh()`
+reads. Its result is a hint only: optional providers stay off until the user selects them in Customize.
 Run blocking loads via `loadOffMainActor`. See [Which Providers Are On](provider-enablement.md).
 
 ## The metric contract

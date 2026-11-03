@@ -10,6 +10,7 @@ struct ProviderListRow<Handle: View>: View {
     let provider: Provider
     let isEnabled: Bool
     let metricCount: Int
+    var hasLocalSetup = false
     let handle: (AnyView) -> Handle
     var onToggle: ((Bool) -> Void) = { _ in }
     var onOpen: () -> Void = {}
@@ -33,7 +34,7 @@ struct ProviderListRow<Handle: View>: View {
                         .font(.system(size: density.headerPointSize, weight: .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    Text("\(metricCount) metrics")
+                    Text(hasLocalSetup ? "Setup found · \(metricCount) metrics" : "\(metricCount) metrics")
                         .font(.system(size: density.planBadgePointSize))
                         .foregroundStyle(.secondary)
                 }
