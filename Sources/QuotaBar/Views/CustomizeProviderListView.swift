@@ -19,6 +19,8 @@ struct CustomizeProviderListView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: density.sectionSpacing) {
+            setupDiscoverySummary
+
             VStack(spacing: 0) {
                 ForEach(orderedRows) { row in
                     providerRow(row)
@@ -35,6 +37,42 @@ struct CustomizeProviderListView: View {
             )
         }
         .animation(Motion.spring, value: orderedRows.map(\.id))
+        .animation(Motion.spring, value: container.providerSetupDiscovery.isScanning)
+        .animation(Motion.spring, value: container.providerSetupDiscovery.foundProviderIDs)
+        .onAppear { container.discoverLocalProviderSetups() }
+    }
+
+    private var setupDiscoverySummary: some View {
+        let discovery = container.providerSetupDiscovery
+        let message: String
+        if discovery.isScanning {
+            message = "Checking this Mac for supported provider setups…"
+        } else if !discovery.hasScanned {
+            message = "Provider setups are checked locally when this list opens."
+        } else if discovery.foundProviderFamilyCount > 0 {
+            let count = discovery.foundProviderFamilyCount
+            let noun = count == 1 ? "provider" : "providers"
+            message = "Found setups for \(count) \(noun). Choose which to turn on below."
+        } else {
+            message = "No local setups found. You can still configure any provider below."
+        }
+
+        return HStack(spacing: 10) {
+            Image(systemName: discovery.isScanning ? "magnifyingglass" : "checkmark.circle")
+                .foregroundStyle(.secondary)
+            Text(message)
+                .font(.system(size: density.planBadgePointSize))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Rescan") { container.discoverLocalProviderSetups(rescan: true) }
+                .buttonStyle(.plain)
+                .font(.system(size: density.planBadgePointSize, weight: .semibold))
+                .disabled(discovery.isScanning)
+                .accessibilityLabel("Scan for provider setups again")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .cardSurface()
     }
 
     private func providerRow(_ row: ProviderRow) -> some View {
@@ -42,6 +80,7 @@ struct CustomizeProviderListView: View {
             provider: row.provider,
             isEnabled: row.isEnabled,
             metricCount: row.metricCount,
+            hasLocalSetup: container.providerSetupDiscovery.hasLocalSetup(for: row.id),
             // The grip leads the tappable bar; a tap opens L2, a drag reorders. Drag-reorder is enabled
             // only for active providers — `reorderProvider` operates on the enabled set, so a disabled
             // row's grip stays inert (the row still opens/toggles).
@@ -79,7 +118,12 @@ struct CustomizeProviderListView: View {
     private func makeProviderLift(for row: ProviderRow, value: DragGesture.Value) -> ReorderLift? {
         ReorderLift.make(
             id: row.id,
-            payload: .customizeProviderRow(provider: row.provider, isEnabled: row.isEnabled, metricCount: row.metricCount),
+            payload: .customizeProviderRow(
+                provider: row.provider,
+                isEnabled: row.isEnabled,
+                metricCount: row.metricCount,
+                hasLocalSetup: container.providerSetupDiscovery.hasLocalSetup(for: row.id)
+            ),
             value: value,
             frames: frameStore.frames
         )
