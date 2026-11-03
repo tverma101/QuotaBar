@@ -61,6 +61,12 @@ Scheduled and background credential reads forbid Keychain UI. An explicit Refres
 dialog across the enabled provider cards; cancelling it suppresses duplicate reads during that action,
 and a later explicit Refresh is the retry. Keychain writes always forbid authentication UI.
 
+Opening **Customize** runs local-only setup checks for supported providers so matching rows can be marked
+**Setup found**. These checks reuse each provider's local credential sources; they make no
+network requests, show no Keychain prompts, and their results remain in memory for the current app
+session. Discovery does not enable a provider or send setup results anywhere. A match indicates that a
+local setup source was found, not that a later provider refresh is guaranteed to succeed.
+
 ## Other network requests
 
 Besides the provider API calls the vendor's own tools would make, QuotaBar fetches public [model price lists](pricing.md) about once an hour (from `openrouter.ai`, `raw.githubusercontent.com`, `models.dev`, and this project's GitHub Pages). An unknown model can bring forward an OpenRouter catalogue refresh, with retry limits. These are plain downloads of public data — they carry no model names, usage, log, or account information, and they run regardless of the analytics toggle. The pricing request does not include an OpenRouter API key. The spend tiles are computed from local CLI logs entirely on your Mac; no log data ever leaves it.

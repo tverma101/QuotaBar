@@ -21,6 +21,8 @@ final class AppContainer {
     /// Single source of truth for which providers the user has turned off. Both stores consult it (via
     /// injected closures) and the Customize provider list drives it.
     let enablement: ProviderEnablementStore
+    /// Local-only setup matches surfaced in Customize; results never affect enablement.
+    let providerSetupDiscovery: ProviderSetupDiscoveryStore
     /// Providers that need a user-supplied API key (currently OpenRouter and Z.ai), conforming to
     /// `APIKeyManaging`. Each matching Customize provider detail shows an API Key section and writes
     /// changes through the capability. Empty when no installed provider needs a user key.
@@ -99,6 +101,7 @@ final class AppContainer {
         )
         let codexAccountRegistration = CodexAccountRegistrationService(accounts: codexAccounts)
         let enablement = ProviderEnablementStore()
+        let providerSetupDiscovery = ProviderSetupDiscoveryStore()
         if !accountAssembly.claudeCards.isEmpty,
            !accountAssembly.claudeCards.contains(where: { $0.id == "claude" })
         {
@@ -176,7 +179,7 @@ final class AppContainer {
                 onClaudeEnablementRequiresCatalogReload()
             }
         }
-        // Fresh installs start with the owner-selected defaults; no provider credential scan is needed.
+        // Fresh installs start with the owner-selected defaults; Customize setup discovery is separate.
         let onboarding = OnboardingStore()
         self.seedTask = FirstRunSeeder.seedIfNeeded(
             isFreshInstall: isFreshInstall,
@@ -196,6 +199,7 @@ final class AppContainer {
         self.onboarding = onboarding
         self.registry = registry
         self.enablement = enablement
+        self.providerSetupDiscovery = providerSetupDiscovery
         self.apiKeyProviders = apiKeyProviders
         self.goKeyProviders = goKeyProviders
         self.notificationSettings = notificationSettings
@@ -378,6 +382,15 @@ final class AppContainer {
     @discardableResult
     func reseedEnabledProviders() -> Task<Void, Never> {
         FirstRunSeeder.reseed(providers: providers, enablement: enablement)
+    }
+
+    /// Checks supported provider setup sources only when the user opens Customize.
+    func discoverLocalProviderSetups(rescan: Bool = false) {
+        if rescan {
+            providerSetupDiscovery.rescan(providers: providers)
+        } else {
+            providerSetupDiscovery.scanIfNeeded(providers: providers)
+        }
     }
 
     /// Stop work owned by the old account registry before a replacement store starts refreshing.
