@@ -160,7 +160,9 @@ private struct MenuBarTextStrip: View {
         HStack(spacing: 8) {
             ForEach(content.groups, id: \.providerID) { group in
                 HStack(spacing: 3) {
-                    glyph(group.icon, compact: group.usesCompactValues)
+                    if group.showsProviderIcon {
+                        glyph(group.icon, compact: group.usesCompactValues)
+                    }
                     metricsView(group.metrics, compact: group.usesCompactValues)
                 }
             }
