@@ -1,9 +1,10 @@
 import Foundation
 
 /// Resolved, ordered, capped data for the menu-bar strip, built from the pinned metrics and their live
-/// values. The renderers consume this: `groups` drives the Text style (one segment per pinned provider,
-/// each with its 1–2 pinned metrics), `bars` drives the Bars style (the first four bounded metrics — any
-/// with a fill, not just percentages — in order). `isEmpty` means render the plain app icon.
+/// values. The renderers consume this: `groups` drives the Text style (one segment per pinned provider
+/// or account, each with its 1–2 pinned metrics; multiple Codex accounts share one provider mark),
+/// `bars` drives the Bars style (the first four bounded metrics — any with a fill, not just percentages
+/// — in order). `isEmpty` means render the plain app icon.
 struct MenuBarContent: Equatable {
     /// One resolved pinned metric.
     struct Metric: Equatable {
@@ -24,6 +25,8 @@ struct MenuBarContent: Equatable {
         let displayName: String
         let icon: IconSource
         let metrics: [Metric]
+        /// Multiple Codex accounts share one mark; each account keeps its own metric segment.
+        var showsProviderIcon: Bool = true
         /// Session clocks keep the same small type as stacked usage values, even for one clock.
         var usesCompactValues: Bool = false
     }
@@ -69,6 +72,7 @@ enum MenuBarContentBuilder {
         now: Date = Date(),
         data: (WidgetDescriptor) -> WidgetData
     ) -> MenuBarContent {
+        var hasShownCodexIcon = false
         let resolvedGroups = groups.compactMap { group -> MenuBarContent.Group? in
             guard !hiddenProviderIDs.contains(group.provider.id) else { return nil }
             // A row can opt out of the strip while it has nothing worth showing — a session timer with
@@ -94,11 +98,15 @@ enum MenuBarContentBuilder {
                 metrics = group.metrics.map { resolve($0, data($0), now: now) }.filter(\.hasData)
             }
             guard !metrics.isEmpty else { return nil }
+            let isCodexAccount = ProviderAccountID.family(of: group.provider.id) == "codex"
+            let showsProviderIcon = !isCodexAccount || !hasShownCodexIcon
+            if isCodexAccount { hasShownCodexIcon = true }
             return MenuBarContent.Group(
                 providerID: group.provider.id,
                 displayName: group.provider.displayName,
                 icon: group.provider.icon,
                 metrics: metrics,
+                showsProviderIcon: showsProviderIcon,
                 usesCompactValues: !sessionMetrics.isEmpty
             )
         }
