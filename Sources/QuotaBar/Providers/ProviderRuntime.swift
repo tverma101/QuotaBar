@@ -351,9 +351,9 @@ protocol ProviderRuntime: AnyObject {
     func refresh() async -> ProviderSnapshot
 
     /// Whether credentials for this provider already exist on this machine — a local-only probe
-    /// (files, keychain, SQLite; never the network). Startup and provider discovery do not call this to
-    /// change provider enablement. If an explicit setup flow uses it, mirror the credential sources
-    /// `refresh()` reads and run blocking loads via `loadOffMainActor`.
+    /// (files, keychain, SQLite; never the network). Customize may use it to show a setup hint, but it
+    /// must never change provider enablement. Mirror the credential sources `refresh()` reads and run
+    /// blocking loads via `loadOffMainActor`.
     func hasLocalCredentials() async -> Bool
 }
 

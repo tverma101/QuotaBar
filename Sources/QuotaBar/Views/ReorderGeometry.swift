@@ -4,7 +4,7 @@ struct ReorderLift {
     enum Payload {
         case dashboardProvider(provider: Provider, plan: String?, rows: [WidgetData])
         case dashboardMetric(data: WidgetData)
-        case customizeProviderRow(provider: Provider, isEnabled: Bool, metricCount: Int)
+        case customizeProviderRow(provider: Provider, isEnabled: Bool, metricCount: Int, hasLocalSetup: Bool)
         case customizeMetric(title: String)
     }
 
@@ -65,8 +65,13 @@ struct ReorderLiftPreview: View {
             dashboardProviderPreview(provider: provider, plan: plan, rows: rows)
         case .dashboardMetric(let data):
             dashboardMetricPreview(data)
-        case .customizeProviderRow(let provider, let isEnabled, let metricCount):
-            customizeProviderRowPreview(provider: provider, isEnabled: isEnabled, metricCount: metricCount)
+        case .customizeProviderRow(let provider, let isEnabled, let metricCount, let hasLocalSetup):
+            customizeProviderRowPreview(
+                provider: provider,
+                isEnabled: isEnabled,
+                metricCount: metricCount,
+                hasLocalSetup: hasLocalSetup
+            )
         case .customizeMetric(let title):
             customizeMetricPreview(title)
         }
@@ -92,7 +97,12 @@ struct ReorderLiftPreview: View {
             .liftedRowSurface()
     }
 
-    private func customizeProviderRowPreview(provider: Provider, isEnabled: Bool, metricCount: Int) -> some View {
+    private func customizeProviderRowPreview(
+        provider: Provider,
+        isEnabled: Bool,
+        metricCount: Int,
+        hasLocalSetup: Bool
+    ) -> some View {
         // Same row anatomy as the live L1 (`ProviderListRow`), rendered inert — the lift's shadow +
         // scale read as the floating chip, and the whole preview is non-interactive (`.allowsHitTesting`
         // false in `body`), so the toggle/chevron carry no live action.
@@ -100,6 +110,7 @@ struct ReorderLiftPreview: View {
             provider: provider,
             isEnabled: isEnabled,
             metricCount: metricCount,
+            hasLocalSetup: hasLocalSetup,
             handle: { $0 }
         )
         .liftedRowSurface()

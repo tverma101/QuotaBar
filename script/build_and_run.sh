@@ -14,7 +14,8 @@ set -euo pipefail
 #        ALLOW_ADHOC_SIGNING "1" permits signing without a stable identity (grants reset on rebuild)
 #        CONFIG             "release" (default) or "debug"
 #        BUILD_JOBS         SwiftPM worker count (default: 2, to limit peak compiler memory)
-#        RELEASE            "1" uses the production app identity; install preserves the destination identity
+#        RELEASE            "1" requires a v-prefixed tag at HEAD and builds universal arm64 + x86_64
+#                           with the production app identity; install preserves the destination identity
 #        ICLOUD_PROVISIONING_PROFILE  optional override for the development provisioning profile;
 #                         otherwise the newest matching installed profile is selected automatically
 
@@ -38,19 +39,27 @@ fi
 BUNDLE_ID="${BUNDLE_ID:-$DEFAULT_BUNDLE_ID}"
 ICLOUD_CONTAINER_ID="${ICLOUD_CONTAINER_ID:-iCloud.$BUNDLE_ID}"
 MIN_SYSTEM_VERSION="15.0"
-APP_VERSION="0.7.0"
-APP_BUILD="0.7.0"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [ "$RELEASE" = "1" ]; then
+  RELEASE_TAG="$(git -C "$ROOT_DIR" describe --exact-match --tags HEAD 2>/dev/null || true)"
+  if [[ "$RELEASE_TAG" != v* ]]; then
+    echo "RELEASE=1 requires an exact v-prefixed Git release tag at HEAD" >&2
+    exit 1
+  fi
+  APP_VERSION="${RELEASE_TAG#v}"
+  APP_BUILD="${APP_VERSION%%-*}"
   DISPLAY_VERSION="$APP_VERSION"
 else
+  APP_VERSION="0.7.0"
+  APP_BUILD="$APP_VERSION"
   DISPLAY_VERSION="$APP_VERSION-dev"
 fi
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_DISPLAY.app"
 STAGING_APP_BUNDLE="$DIST_DIR/.$APP_DISPLAY.staging.$$"
 DIST_BACKUP_BUNDLE="$DIST_DIR/.$APP_DISPLAY.backup.$$"
+PACKAGE_SCRATCH_DIR="$ROOT_DIR/.build/package-staging"
 APP_CONTENTS="$STAGING_APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_HELPERS="$APP_CONTENTS/Helpers"
@@ -132,6 +141,9 @@ cleanup_build() {
   if [ -e "$STAGING_APP_BUNDLE" ]; then
     trash_if_present "$STAGING_APP_BUNDLE"
   fi
+  if [ -e "$PACKAGE_SCRATCH_DIR" ]; then
+    trash_if_present "$PACKAGE_SCRATCH_DIR"
+  fi
   if [ -e "$INSTALL_STAGE" ]; then
     trash_if_present "$INSTALL_STAGE"
   fi
@@ -170,47 +182,94 @@ if { [ -z "$CODESIGN_IDENTITY" ] || [ "$CODESIGN_IDENTITY" = "-" ]; } && [ "${AL
 fi
 
 BUILD_JOBS="${BUILD_JOBS:-2}"
-echo "==> swift build ($CONFIG, $BUILD_JOBS jobs, index store disabled)"
-swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store
-BUILD_DIR="$(swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store --show-bin-path)"
-BUILD_BINARY="$BUILD_DIR/$TARGET_NAME"
-BUILD_CLI_BINARY="$BUILD_DIR/quotabar-cli"
-
-if [ ! -x "$BUILD_BINARY" ]; then
-  echo "missing built binary: $BUILD_BINARY" >&2
-  exit 1
+if [ "$RELEASE" = "1" ]; then
+  ARM64_SCRATCH="$ROOT_DIR/.build/$CONFIG-arm64"
+  X86_64_SCRATCH="$ROOT_DIR/.build/$CONFIG-x86_64"
+  echo "==> swift build ($CONFIG arm64, $BUILD_JOBS jobs, index store disabled)"
+  swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store \
+    --scratch-path "$ARM64_SCRATCH" --triple arm64-apple-macosx15.0
+  ARM64_BUILD_DIR="$(swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store \
+    --scratch-path "$ARM64_SCRATCH" --triple arm64-apple-macosx15.0 --show-bin-path)"
+  echo "==> swift build ($CONFIG x86_64, $BUILD_JOBS jobs, index store disabled)"
+  swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store \
+    --scratch-path "$X86_64_SCRATCH" --triple x86_64-apple-macosx15.0
+  X86_64_BUILD_DIR="$(swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store \
+    --scratch-path "$X86_64_SCRATCH" --triple x86_64-apple-macosx15.0 --show-bin-path)"
+  RESOURCE_BUILD_DIR="$ARM64_BUILD_DIR"
+else
+  echo "==> swift build ($CONFIG, $BUILD_JOBS jobs, index store disabled)"
+  swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store
+  BUILD_DIR="$(swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store --show-bin-path)"
+  BUILD_BINARY="$BUILD_DIR/$TARGET_NAME"
+  BUILD_CLI_BINARY="$BUILD_DIR/quotabar-cli"
+  RESOURCE_BUILD_DIR="$BUILD_DIR"
 fi
-if [ ! -x "$BUILD_CLI_BINARY" ]; then
-  echo "missing built CLI: $BUILD_CLI_BINARY" >&2
-  exit 1
+
+if [ "$RELEASE" = "1" ]; then
+  for build_dir in "$ARM64_BUILD_DIR" "$X86_64_BUILD_DIR"; do
+    if [ ! -x "$build_dir/$TARGET_NAME" ] || [ ! -x "$build_dir/quotabar-cli" ]; then
+      echo "missing release binaries in $build_dir" >&2
+      exit 1
+    fi
+  done
+else
+  if [ ! -x "$BUILD_BINARY" ]; then
+    echo "missing built binary: $BUILD_BINARY" >&2
+    exit 1
+  fi
+  if [ ! -x "$BUILD_CLI_BINARY" ]; then
+    echo "missing built CLI: $BUILD_CLI_BINARY" >&2
+    exit 1
+  fi
 fi
 
 echo "==> staging $STAGING_APP_BUNDLE"
 trash_if_present "$STAGING_APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_HELPERS" "$APP_RESOURCES"
-cp "$BUILD_BINARY" "$APP_BINARY"
-cp "$BUILD_CLI_BINARY" "$CLI_BINARY"
-chmod +x "$APP_BINARY"
-chmod +x "$CLI_BINARY"
-# Helpers sit one directory below Contents, so give dyld the same embedded-framework location as the app
-# binary, matching where the app's own dependencies are embedded.
-install_name_tool -add_rpath "@executable_path/../Frameworks" "$CLI_BINARY"
+if [ "$RELEASE" = "1" ]; then
+  trash_if_present "$PACKAGE_SCRATCH_DIR"
+  mkdir -p "$PACKAGE_SCRATCH_DIR"
+  for arch in arm64 x86_64; do
+    if [ "$arch" = "arm64" ]; then
+      build_dir="$ARM64_BUILD_DIR"
+    else
+      build_dir="$X86_64_BUILD_DIR"
+    fi
+    app_slice="$PACKAGE_SCRATCH_DIR/$TARGET_NAME-$arch"
+    cli_slice="$PACKAGE_SCRATCH_DIR/quotabar-cli-$arch"
+    # Stamp thin binaries before lipo combines them; vtool edits one Mach-O slice at a time.
+    vtool -set-build-version macos "$MIN_SYSTEM_VERSION" 26.0 -replace \
+      -output "$app_slice" "$build_dir/$TARGET_NAME"
+    cp "$build_dir/quotabar-cli" "$cli_slice"
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$cli_slice"
+  done
+  lipo -create "$PACKAGE_SCRATCH_DIR/$TARGET_NAME-arm64" "$PACKAGE_SCRATCH_DIR/$TARGET_NAME-x86_64" \
+    -output "$APP_BINARY"
+  lipo -create "$PACKAGE_SCRATCH_DIR/quotabar-cli-arm64" "$PACKAGE_SCRATCH_DIR/quotabar-cli-x86_64" \
+    -output "$CLI_BINARY"
+  chmod +x "$APP_BINARY" "$CLI_BINARY"
+  echo "==> universal app and CLI: $(lipo -archs "$APP_BINARY")"
+else
+  cp "$BUILD_BINARY" "$APP_BINARY"
+  cp "$BUILD_CLI_BINARY" "$CLI_BINARY"
+  chmod +x "$APP_BINARY" "$CLI_BINARY"
+  # Helpers sit one directory below Contents, so give dyld the same embedded-framework location as the app
+  # binary, matching where the app's own dependencies are embedded.
+  install_name_tool -add_rpath "@executable_path/../Frameworks" "$CLI_BINARY"
 
-# SwiftPM stamps LC_BUILD_VERSION's `sdk` field with the deployment target (macOS 15), not the real
-# SDK it compiled against. macOS gates the modern Liquid Glass control appearance (pop-up buttons,
-# pickers, etc.) on the linked SDK — a "15.0" stamp makes AppKit fall back to legacy Aqua controls.
-# Restamp the sdk to 26.0 (Tahoe, where Liquid Glass landed) while keeping minos at MIN_SYSTEM_VERSION
-# so the app still runs on macOS 15 but gets the modern controls. Re-signed below.
-echo "==> stamping linked SDK 26.0 for Liquid Glass controls (minos stays $MIN_SYSTEM_VERSION)"
-vtool -set-build-version macos "$MIN_SYSTEM_VERSION" 26.0 -replace -output "$APP_BINARY.tmp" "$APP_BINARY"
-mv "$APP_BINARY.tmp" "$APP_BINARY"
-chmod +x "$APP_BINARY"
+  # SwiftPM stamps LC_BUILD_VERSION's `sdk` field with the deployment target (macOS 15), not the real
+  # SDK it compiled against. Restamp to 26.0 while keeping minos at MIN_SYSTEM_VERSION, then re-sign.
+  echo "==> stamping linked SDK 26.0 for Liquid Glass controls (minos stays $MIN_SYSTEM_VERSION)"
+  vtool -set-build-version macos "$MIN_SYSTEM_VERSION" 26.0 -replace -output "$APP_BINARY.tmp" "$APP_BINARY"
+  mv "$APP_BINARY.tmp" "$APP_BINARY"
+  chmod +x "$APP_BINARY"
+fi
 # Stage every SwiftPM resource bundle produced by the build (the app's own
 # QuotaBar_QuotaBar.bundle, which carries the provider SVGs + model manifest)
 # into Contents/Resources, the standard app layout. Bundle.openUsageResources
 # (see Support/ResourceBundle.swift) loads it from there.
 shopt -s nullglob
-for bundle in "$BUILD_DIR"/*.bundle; do
+for bundle in "$RESOURCE_BUILD_DIR"/*.bundle; do
   cp -R "$bundle" "$APP_RESOURCES/$(basename "$bundle")"
 done
 shopt -u nullglob

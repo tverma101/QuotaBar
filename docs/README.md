@@ -7,6 +7,7 @@ What the app does and how it behaves. These pages describe **behavior, not visua
 - [Dashboard](dashboard.md) — the popover: rows, toggles, reordering, keyboard shortcuts
 - [Menu bar](menu-bar.md) — pinning metrics into the menu bar
 - [Settings](settings.md) — every option, what it changes
+- [Which Providers Are On](provider-enablement.md) — local setup discovery and provider selection
 - [Refreshing & caching](refreshing.md) — when data updates and what happens when a fetch fails
 - [iCloud Sync](icloud-sync.md) — how spend history is combined across Macs
 - [Model pricing](pricing.md) — how spend tiles price tokens, and where the rates come from

@@ -17,7 +17,7 @@ struct CustomizeHintCard: View {
         DismissableHintCard(
             systemImage: "slider.horizontal.3",
             title: "Welcome to QuotaBar",
-            message: "Claude, Codex, Cursor, and Freebuff are on. Add or hide providers any time.",
+            message: "Claude, Codex, Cursor, and Freebuff are on. Customize shows supported setups found on this Mac; you choose what to turn on.",
             buttonTitle: "Open Customize",
             action: { withAnimation(Motion.modeSwitch) { layout.screen = .customize } },
             onDismiss: { withAnimation(Motion.spring) { container.onboarding.dismissCustomizeHint() } }

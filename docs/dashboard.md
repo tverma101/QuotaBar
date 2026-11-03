@@ -4,7 +4,7 @@ The popover that opens from the menu bar icon. Providers are sections; each sect
 
 ## First launch
 
-A fresh install starts with Claude, Codex, Cursor, Freebuff, and any registered Codex account cards on. Other providers stay off until you enable them in **Customize**; QuotaBar does not scan local credentials to choose provider cards. A one-time card at the top of the dashboard points to **Customize** and stays until you close it with its ✕ button.
+A fresh install starts with Claude, Codex, Cursor, Freebuff, and any registered Codex account cards on. Other providers stay off until you enable them in **Customize**. Opening Customize checks for supported local setups and marks matching rows, but discovery never chooses or enables provider cards. A one-time card at the top of the dashboard points to **Customize** and stays until you close it with its ✕ button.
 
 Providers added by future updates also start off. Updates preserve your saved provider choices, and a provider never turns on just because its CLI or app is installed. See [Which Providers Are On](provider-enablement.md) for the full lifecycle.
 
