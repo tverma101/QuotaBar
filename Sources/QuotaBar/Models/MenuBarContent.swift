@@ -131,6 +131,9 @@ enum MenuBarContentBuilder {
             fraction: data.fraction,
             isBounded: data.isBounded,
             hasData: data.showsInMenuBar(now: now)
+                && !(["claude", "antigravity"].contains(ProviderAccountID.family(of: descriptor.providerID))
+                    && data.isBounded
+                    && data.resetsAt.map { now.timeIntervalSince($0) > 5 * 60 } == true)
         )
     }
 }

@@ -18,6 +18,7 @@ QuotaBar's first public downloadable build. It does not update automatically; us
 
 ## Unreleased
 
+- Hide overdue Claude and Antigravity quota percentages from the menu bar until refreshed.
 - Page the full OpenRouter model catalog, recheck fallback-priced names so new exact routes replace stale estimates, and stop per-model checks after three misses.
 - Keep optional provider cards off until selected in Customize, preserve Freebuff in the default set, and reset to those explicit defaults.
 - Resume first-run provider defaults and manual provider choices safely after an interrupted launch.

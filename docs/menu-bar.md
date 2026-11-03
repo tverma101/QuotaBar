@@ -49,3 +49,5 @@ The strip only renders real data. A starred metric with nothing fetched yet is s
 A bounded count meter carries a compact unit in the strip when the unit is the only thing that makes the number meaningful — an hours balance reads `30h`, not a bare `30` — while percent and dollar meters stay as they are. Units that would abbreviate ambiguously (sessions would collapse to `s`, which reads as seconds) keep their bare number instead.
 
 Freebuff's Daily Hours pin shows only **active session timers**, using each session's actual expiry time. Two active sessions each get a countdown. Daily reset times, remaining allowances, balances, expired sessions, and unoccupied purchased hours do not appear beside those timers. The countdowns update each minute and disappear when no sessions remain active.
+
+Claude and Antigravity meters disappear from the menu bar when their saved reset time is more than five minutes past, until a fresh value arrives. Open the dashboard to see the last known value and any refresh warning.
