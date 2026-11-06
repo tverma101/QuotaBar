@@ -34,6 +34,8 @@ final class AppContainer {
     /// Quota pace notification preferences (three independent triggers). Drives the Settings section
     /// and is read by `WidgetDataStore.evaluateNotifications`.
     let notificationSettings: NotificationSettingsStore
+    /// Menu-bar icon snooze preferences for low or exhausted subscriptions.
+    let snooze: MenuBarSnoozeStore
     /// Anonymous usage telemetry (mandatory daily activity and crashes, optional provider rollups).
     /// Exposed so Settings can toggle extra analytics and termination can flush queued events.
     let telemetry: TelemetryRecorder
@@ -203,6 +205,7 @@ final class AppContainer {
         self.apiKeyProviders = apiKeyProviders
         self.goKeyProviders = goKeyProviders
         self.notificationSettings = notificationSettings
+        self.snooze = MenuBarSnoozeStore()
         self.layout = layout
         self.dataStore = dataStore
         self.iCloudSync = iCloudSync
@@ -423,6 +426,7 @@ final class AppContainer {
         dataStore.resetDisplaySettings()
         codexAutoReset.resetToDefaults()
         notificationSettings.resetToDefaults()
+        snooze.resetToDefaults()
         transparency.resetToDefaults()
         privacy.hideUsageWhileScreenSharing = false
         // Same as flipping the Settings toggle off: stops syncing and removes this Mac's document

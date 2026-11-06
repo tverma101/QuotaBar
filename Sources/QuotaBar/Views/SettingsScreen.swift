@@ -61,6 +61,7 @@ struct SettingsScreen: View {
             ICloudSyncSettingsSection(sync: container.iCloudSync)
             appearanceSection
             usageDisplaySection
+            SnoozeSettingsSection(snooze: container.snooze)
             notificationsSection
             privacySection
             commandLineSection
