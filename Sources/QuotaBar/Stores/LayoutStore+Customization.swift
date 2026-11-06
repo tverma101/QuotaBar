@@ -146,6 +146,11 @@ extension LayoutStore {
         metricOrder(for: providerID).compactMap { registry.descriptor(id: $0) }
     }
 
+    /// Pinned metrics for a specific provider in custom order.
+    func pinnedMetrics(for providerID: String) -> [WidgetDescriptor] {
+        orderedSupportedMetrics(for: providerID).filter { pinnedMetricIDs.contains($0.id) }
+    }
+
     func metricOrderWithDivider(for providerID: String, dividerID: String) -> [String] {
         let ordered = orderedSupportedMetrics(for: providerID).map(\.id)
         return ordered.filter { !expandedMetricIDs.contains($0) }

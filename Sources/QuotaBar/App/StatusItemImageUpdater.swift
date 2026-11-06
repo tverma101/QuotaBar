@@ -122,10 +122,17 @@ final class StatusItemImageUpdater {
                 ?? MenuBarIcon.image
                 ?? MenuBarStripRenderer.fallbackIcon
         }
+        let now = Date()
+        let snoozedIDs = container.snooze.snoozedProviderIDs(
+            groups: container.layout.pinnedGroups,
+            data: { container.dataStore.data(for: $0) },
+            now: now
+        )
         let content = MenuBarContentBuilder.build(
             groups: container.layout.pinnedGroups,
             hiddenProviderIDs: container.layout.hiddenMenuBarProviderIDs,
-            now: Date(),
+            snoozedProviderIDs: snoozedIDs,
+            now: now,
             data: { container.dataStore.data(for: $0) }
         )
         return MenuBarStripRenderer.image(for: content, style: container.layout.menuBarStyle)
