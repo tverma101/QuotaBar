@@ -42,6 +42,10 @@ Settings → Privacy → **Hide From Screen Share** (off by default). While your
 
 Detection rides the system's own "an app is capturing the screen" signal — the same one that lights the capture indicator in the menu bar — checked the instant it changes and re-checked every few seconds while the setting is on.
 
+## Snoozing low-usage or exhausted subscriptions
+
+Settings → **Snooze Subscriptions** (off by default) lets you temporarily hide menu bar icons for subscriptions that are out of usage or below a chosen threshold (0%, 5%, 10%, 15%, or 20% remaining). When a subscription's quota resets or recovers, its menu bar icon and values automatically reappear. You can choose which subscriptions auto-snooze or manually snooze a subscription until its next reset from its context menu.
+
 ## What the strip shows
 
 The strip only renders real data. A starred metric with nothing fetched yet is skipped; a provider whose stars all lack data disappears entirely (icon included). When nothing has data, the strip falls back to the app icon, but the single status item remains clickable and opens the aggregate dashboard. Stars follow your Customize order — Always Visible metrics first, then On Demand ones. A metric can be starred whether it's Always Visible or On Demand. Multiple Claude and Codex accounts remain separate provider cards inside the same panel. Codex account values remain separate in the strip but share one provider mark. When an account moves from a family ID to an account-specific ID, its existing family pins carry over once, even when the old family card is no longer active; later explicit unpins are preserved.

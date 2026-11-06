@@ -69,12 +69,14 @@ enum MenuBarContentBuilder {
     static func build(
         groups: [ProviderMetrics],
         hiddenProviderIDs: Set<String> = [],
+        snoozedProviderIDs: Set<String> = [],
         now: Date = Date(),
         data: (WidgetDescriptor) -> WidgetData
     ) -> MenuBarContent {
         var hasShownCodexIcon = false
         let resolvedGroups = groups.compactMap { group -> MenuBarContent.Group? in
-            guard !hiddenProviderIDs.contains(group.provider.id) else { return nil }
+            guard !hiddenProviderIDs.contains(group.provider.id),
+                  !snoozedProviderIDs.contains(group.provider.id) else { return nil }
             // A row can opt out of the strip while it has nothing worth showing — a session timer with
             // no session running drops out along with its provider's icon, so an idle provider costs
             // no menu-bar space at all.
