@@ -65,6 +65,43 @@ final class FreebuffSessionTimerTests: XCTestCase {
         XCTAssertEqual(content.groups.first?.metrics.map(\.value), ["30m", "30m"])
     }
 
+    func testThreeDesktopSessionsShowSecondIconForThirdSession() throws {
+        let (content, _) = try content(payload: [
+            "status": "active", "instanceId": "cli", "expiresAt": iso(18 * 60),
+            "desktopPurchases": [
+                ["holderInstanceId": "b", "model": "fast", "expiresAt": iso(51 * 60)],
+                ["holderInstanceId": "c", "model": "fast", "expiresAt": iso(75 * 60)]
+            ]
+        ])
+        XCTAssertEqual(content.groups.count, 2)
+        XCTAssertEqual(content.groups[0].metrics.map(\.value), ["18m", "51m"])
+        XCTAssertTrue(content.groups[0].showsProviderIcon)
+        XCTAssertTrue(content.groups[0].usesCompactValues)
+        XCTAssertEqual(content.groups[1].metrics.map(\.value), ["1h 15m"])
+        XCTAssertTrue(content.groups[1].showsProviderIcon)
+        XCTAssertTrue(content.groups[1].usesCompactValues)
+        XCTAssertEqual(content.accessibilityText, "Freebuff Session 1 18m, Session 2 51m; Freebuff Session 3 1h 15m")
+        let image = try XCTUnwrap(MenuBarStripRenderer.textImage(for: content))
+        XCTAssertLessThanOrEqual(image.size.height, 22)
+    }
+
+    func testFourDesktopSessionsStackTwoPerIconAcrossTwoIcons() throws {
+        let (content, _) = try content(payload: [
+            "status": "active", "instanceId": "cli", "expiresAt": iso(18 * 60),
+            "desktopPurchases": [
+                ["holderInstanceId": "b", "model": "fast", "expiresAt": iso(25 * 60)],
+                ["holderInstanceId": "c", "model": "fast", "expiresAt": iso(50 * 60)],
+                ["holderInstanceId": "d", "model": "fast", "expiresAt": iso(80 * 60)]
+            ]
+        ])
+        XCTAssertEqual(content.groups.count, 2)
+        XCTAssertEqual(content.groups[0].metrics.map(\.value), ["18m", "25m"])
+        XCTAssertTrue(content.groups[0].showsProviderIcon)
+        XCTAssertEqual(content.groups[1].metrics.map(\.value), ["50m", "1h 20m"])
+        XCTAssertTrue(content.groups[1].showsProviderIcon)
+        XCTAssertEqual(content.accessibilityText, "Freebuff Session 1 18m, Session 2 25m; Freebuff Session 3 50m, Session 4 1h 20m")
+    }
+
     func testTimersAdvanceAndDisappearWithoutAnotherNetworkResponse() throws {
         let (advanced, _) = try content(payload: [
             "status": "active", "instanceId": "cli", "expiresAt": iso(42 * 60)
