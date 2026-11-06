@@ -20,7 +20,8 @@ struct MenuBarContent: Equatable {
     }
 
     /// A provider and its pinned metrics, in order. One segment of the Text strip.
-    struct Group: Equatable {
+    struct Group: Equatable, Identifiable {
+        let id: String
         let providerID: String
         let displayName: String
         let icon: IconSource
@@ -29,6 +30,24 @@ struct MenuBarContent: Equatable {
         var showsProviderIcon: Bool = true
         /// Session clocks keep the same small type as stacked usage values, even for one clock.
         var usesCompactValues: Bool = false
+
+        init(
+            id: String? = nil,
+            providerID: String,
+            displayName: String,
+            icon: IconSource,
+            metrics: [Metric],
+            showsProviderIcon: Bool = true,
+            usesCompactValues: Bool = false
+        ) {
+            self.id = id ?? providerID
+            self.providerID = providerID
+            self.displayName = displayName
+            self.icon = icon
+            self.metrics = metrics
+            self.showsProviderIcon = showsProviderIcon
+            self.usesCompactValues = usesCompactValues
+        }
     }
 
     /// Provider groups for the Text style, in Customize order. Dynamic: only metrics that currently
@@ -69,12 +88,14 @@ enum MenuBarContentBuilder {
     static func build(
         groups: [ProviderMetrics],
         hiddenProviderIDs: Set<String> = [],
+        snoozedProviderIDs: Set<String> = [],
         now: Date = Date(),
         data: (WidgetDescriptor) -> WidgetData
     ) -> MenuBarContent {
         var hasShownCodexIcon = false
-        let resolvedGroups = groups.compactMap { group -> MenuBarContent.Group? in
-            guard !hiddenProviderIDs.contains(group.provider.id) else { return nil }
+        let resolvedGroups = groups.flatMap { group -> [MenuBarContent.Group] in
+            guard !hiddenProviderIDs.contains(group.provider.id),
+                  !snoozedProviderIDs.contains(group.provider.id) else { return [] }
             // A row can opt out of the strip while it has nothing worth showing — a session timer with
             // no session running drops out along with its provider's icon, so an idle provider costs
             // no menu-bar space at all.
@@ -84,31 +105,52 @@ enum MenuBarContentBuilder {
                 if case .sessionCountdowns = $0.sample.trayStyle { return true }
                 return false
             }
-            let metrics: [MenuBarContent.Metric]
             if let descriptor = sessionMetrics.first {
-                metrics = data(descriptor).traySessionExpiriesAt.filter { $0 > now }.sorted().prefix(2)
-                    .enumerated().map { index, expiry in
-                        MenuBarContent.Metric(
-                            id: "\(descriptor.id).session.\(index)", label: "Session \(index + 1)",
+                let expiries = data(descriptor).traySessionExpiriesAt.filter { $0 > now }.sorted().prefix(4)
+                guard !expiries.isEmpty else { return [] }
+                let pairs = stride(from: 0, to: expiries.count, by: 2).map { startIndex -> [Date] in
+                    let endIndex = min(startIndex + 2, expiries.count)
+                    return Array(expiries[startIndex..<endIndex])
+                }
+                return pairs.enumerated().map { chunkIndex, chunk in
+                    let metrics = chunk.enumerated().map { subIndex, expiry in
+                        let globalIndex = chunkIndex * 2 + subIndex
+                        return MenuBarContent.Metric(
+                            id: "\(descriptor.id).session.\(globalIndex)",
+                            label: "Session \(globalIndex + 1)",
                             value: Formatters.compactDuration(expiry.timeIntervalSince(now)) ?? "<1m",
-                            fraction: 0, isBounded: false, hasData: true
+                            fraction: 0,
+                            isBounded: false,
+                            hasData: true
                         )
                     }
+                    let groupID = chunkIndex == 0 ? group.provider.id : "\(group.provider.id).sessions.\(chunkIndex)"
+                    return MenuBarContent.Group(
+                        id: groupID,
+                        providerID: group.provider.id,
+                        displayName: group.provider.displayName,
+                        icon: group.provider.icon,
+                        metrics: metrics,
+                        showsProviderIcon: true,
+                        usesCompactValues: true
+                    )
+                }
             } else {
-                metrics = group.metrics.map { resolve($0, data($0), now: now) }.filter(\.hasData)
+                let metrics = group.metrics.map { resolve($0, data($0), now: now) }.filter(\.hasData)
+                guard !metrics.isEmpty else { return [] }
+                let isCodexAccount = ProviderAccountID.family(of: group.provider.id) == "codex"
+                let showsProviderIcon = !isCodexAccount || !hasShownCodexIcon
+                if isCodexAccount { hasShownCodexIcon = true }
+                return [MenuBarContent.Group(
+                    id: group.provider.id,
+                    providerID: group.provider.id,
+                    displayName: group.provider.displayName,
+                    icon: group.provider.icon,
+                    metrics: metrics,
+                    showsProviderIcon: showsProviderIcon,
+                    usesCompactValues: false
+                )]
             }
-            guard !metrics.isEmpty else { return nil }
-            let isCodexAccount = ProviderAccountID.family(of: group.provider.id) == "codex"
-            let showsProviderIcon = !isCodexAccount || !hasShownCodexIcon
-            if isCodexAccount { hasShownCodexIcon = true }
-            return MenuBarContent.Group(
-                providerID: group.provider.id,
-                displayName: group.provider.displayName,
-                icon: group.provider.icon,
-                metrics: metrics,
-                showsProviderIcon: showsProviderIcon,
-                usesCompactValues: !sessionMetrics.isEmpty
-            )
         }
         // Bars show any *bounded* metric (it has a fill), not just percentages. Unbounded values (raw
         // spend/credits, no limit) have no fill and are dropped.

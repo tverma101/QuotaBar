@@ -44,6 +44,14 @@ time; it also reports unavailable iCloud, loading, write, and malformed-file sta
 | Auto-Use Expiring Codex Resets | Off | Redeem eligible Codex credits one minute before expiry for verified connected accounts. The Mac must be awake and QuotaBar running; see [auto-use behavior](codex-auto-reset.md). |
 | Always Show Pacing | Off / On | Off (default) shows pacing only when a metric is close to or over its limit. On surfaces it on every metric with a reset window: on-track rows gain their projection ("~33% left at reset") and an even-pace tick marking where steady use would put you right now. Metrics without a reset window have no pace to show. |
 
+## Snooze Subscriptions
+
+| Setting | Options | What it does |
+|---|---|---|
+| Snooze Low Usage | Off / On | Off by default. When on, temporarily hides menu bar icons and pinned metrics for subscriptions that are out of usage or below the threshold until their quota resets. |
+| Threshold | 0% (Out of Usage) / Below 5% / Below 10% / Below 15% / Below 20% | The quota threshold at or below which an eligible subscription's menu bar icon is snoozed. Defaults to 0% (Out of Usage). |
+| Subscriptions list | Per-subscription toggle | Lets you choose which subscriptions are eligible for automatic snoozing. You can also right-click a subscription to snooze it until its next reset or un-snooze it. |
+
 ## Notifications
 
 QuotaBar can alert you with a macOS notification when a metric runs low or its pace gets worse, so you don't have to keep the popover open to catch a quota creeping toward its limit. Alerts work while the app runs in the menu bar, even with the popover closed.
@@ -76,7 +84,7 @@ All three alerts default off. The first time you turn one on, QuotaBar asks for 
 
 See [Logging](logging.md) for the full behavior: subsystem tags, the file size cap, and the guarantee that secrets are never written.
 
-**Reset All Settings…** restores every setting on this screen to its default — appearance, usage display, notifications, privacy, log level, the global shortcut (cleared), Launch at Login (turned off), iCloud sync (turned off), and the update preferences (stable channel, automatic checks on) — and also resets all customization, exactly like Customize's Reset All: default layout, order, and menu-bar stars, with Claude, Codex, Cursor, Freebuff, and registered Codex accounts on. Other providers stay off until you enable them in Customize. The reset cannot be undone.
+**Reset All Settings…** restores every setting on this screen to its default — appearance, usage display, snooze preferences, notifications, privacy, log level, the global shortcut (cleared), Launch at Login (turned off), iCloud sync (turned off), and the update preferences (stable channel, automatic checks on) — and also resets all customization, exactly like Customize's Reset All: default layout, order, and menu-bar stars, with Claude, Codex, Cursor, Freebuff, and registered Codex accounts on. Other providers stay off until you enable them in Customize. The reset cannot be undone.
 
 Not touched: provider logins and API keys, registered Codex home paths, cached usage data, and your extra-analytics choice. Registered Codex accounts remain available after the reset; removing one requires its explicit account action, and its Codex credentials and session history are never deleted by QuotaBar. Turning iCloud sync off as part of the reset works exactly like flipping its toggle off: this Mac's synced history is removed from the shared iCloud data, and your other Macs keep their own.
 

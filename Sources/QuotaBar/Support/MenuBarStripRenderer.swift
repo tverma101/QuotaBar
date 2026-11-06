@@ -158,7 +158,7 @@ private struct MenuBarTextStrip: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            ForEach(content.groups, id: \.providerID) { group in
+            ForEach(content.groups) { group in
                 HStack(spacing: 3) {
                     if group.showsProviderIcon {
                         glyph(group.icon, compact: group.usesCompactValues)
