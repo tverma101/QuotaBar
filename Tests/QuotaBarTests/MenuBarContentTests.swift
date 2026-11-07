@@ -36,6 +36,7 @@ final class MenuBarContentTests: XCTestCase {
         let content = MenuBarContentBuilder.build(groups: [first, second, cursor], data: { $0.sample })
 
         XCTAssertEqual(content.groups.map(\.providerID), ["codex", "codex@0577ce6e", "cursor"])
+        XCTAssertEqual(content.groups.map(\.showsProviderIcon), [true, false, true])
         XCTAssertFalse(content.isEmpty)
         XCTAssertNotNil(MenuBarStripRenderer.image(for: content, style: .text))
     }
@@ -95,6 +96,38 @@ final class MenuBarContentTests: XCTestCase {
             groups: [group("a", noDataPercent("a.nd", "ND"))],
             data: { $0.sample }
         )
+        XCTAssertTrue(content.isEmpty)
+    }
+
+    func testExpiredClaudeQuotaDoesNotShowAsCurrentInMenuBar() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let session = percent("claude.session", "Session", 25)
+        let weekly = percent("claude.weekly", "Weekly", 75)
+        let account = group("claude", session, weekly)
+        let content = MenuBarContentBuilder.build(groups: [account], now: now) { descriptor in
+            var value = descriptor.sample
+            value.resetsAt = now.addingTimeInterval(descriptor.id == session.id ? -301 : 3600)
+            return value
+        }
+        XCTAssertEqual(content.groups.first?.metrics.map(\.id), [weekly.id])
+        XCTAssertEqual(content.bars.map(\.id), [weekly.id])
+
+        let recovered = MenuBarContentBuilder.build(groups: [account], now: now) { descriptor in
+            var value = descriptor.sample
+            value.resetsAt = now.addingTimeInterval(3600)
+            return value
+        }
+        XCTAssertEqual(recovered.groups.first?.metrics.map(\.id), [session.id, weekly.id])
+    }
+
+    func testExpiredAntigravityQuotaDoesNotShowAsCurrentInMenuBar() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let claude = percent("antigravity.claude", "Claude", 66)
+        let content = MenuBarContentBuilder.build(groups: [group("antigravity", claude)], now: now) { descriptor in
+            var value = descriptor.sample
+            value.resetsAt = now.addingTimeInterval(-301)
+            return value
+        }
         XCTAssertTrue(content.isEmpty)
     }
 

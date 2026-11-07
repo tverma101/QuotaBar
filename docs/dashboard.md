@@ -104,3 +104,7 @@ A global shortcut (recorded in Settings) toggles the popover from anywhere.
 ## Closing
 
 Closing the popover resets navigation state: scroll position returns to the top and Customize / Settings close. Provider cards remember whether their expand caret was open.
+
+## Priority and All Usage
+
+The popup opens on the last selected tab. **Priority** brings enabled limits that need attention together with pinned metrics; used-up limits appear last. Select a row to open its provider in **All Usage**, where you can continue to customize visibility, On Demand rows, and pins.

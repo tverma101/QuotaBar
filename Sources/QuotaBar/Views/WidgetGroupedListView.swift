@@ -33,8 +33,10 @@ struct WidgetGroupedListView: View {
         return VStack(alignment: .leading, spacing: density.sectionSpacing) {
             ForEach(groups) { group in
                 section(group)
+                    .id(group.provider.id)
             }
         }
+        .scrollTargetLayout()
         .frame(maxWidth: .infinity, alignment: .leading)
         .onPreferenceChange(ReorderFramePreferenceKey.self) { frameStore.frames = $0 }
         .animation(Motion.spring, value: groups.map(\.provider.id))

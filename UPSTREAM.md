@@ -95,3 +95,7 @@ QuotaBar is a maintained fork, so the old "do not edit this subtree" quarantine 
 The engineering conventions in `AGENTS.md` govern. The upstream notices — `LICENSE`,
 `CODE_OF_CONDUCT.md`, `SECURITY.md`, `CONTRIBUTING.md`, `TRADEMARK.md` — must not be removed or
 rewritten, and upstream attribution must be preserved.
+
+## Popup adaptation — 2026-11-07
+
+Adapted the Priority and All Usage popup tabs from upstream’s dashboard update (starting with `4f1b92f3`). QuotaBar retains its provider enablement, metric visibility, On Demand, and menu-bar pin controls; Priority uses those enabled rows and the existing meter state.
