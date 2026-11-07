@@ -213,11 +213,13 @@ final class FreebuffProvider: ProviderRuntime {
                 return ProviderSnapshot.error(provider: provider, error: FreebuffUsageError.requestFailed(response.statusCode))
             }
             let mapped = try FreebuffUsageMapper.map(response: response)
+            let resolvedSessions = await historyScanner.resolveLocalSessions(mapped.activeSessions)
             quotaObservation = FreebuffQuotaObservation(response: response)
             DiagnosticGate.clearFailures(prefix: Self.usageFailureDiagnosticPrefix)
             return ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines,
                                          refreshedAt: now(), warning: mapped.warning,
-                                         clearsPriorMenuBarQuotaState: true)
+                                         clearsPriorMenuBarQuotaState: true,
+                                         activeSessions: resolvedSessions)
         } catch is CancellationError {
             return cancelledRefreshSnapshot(provider: provider)
         } catch {

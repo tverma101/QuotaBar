@@ -178,7 +178,8 @@ your Mac.
 The spend detail never hides a model that holds a material share of the period's tokens on its own
 named row — even when its cost share (or actual cost) is tiny: tokens are the measured quantity, so
 half the usage can never disappear behind "Other". Models grouped into `Other` are identified
-beneath that row's label, led by the model with the most tokens.
+beneath that row's label, led by the model with the most tokens. A tail of one model stays on
+its own row instead of being listed twice, once as Other and again under it.
 
 ## Troubleshooting
 

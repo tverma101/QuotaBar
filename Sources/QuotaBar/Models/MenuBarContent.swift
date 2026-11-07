@@ -2,7 +2,8 @@ import Foundation
 
 /// Resolved, ordered, capped data for the menu-bar strip, built from the pinned metrics and their live
 /// values. The renderers consume this: `groups` drives the Text style (one segment per pinned provider
-/// or account, each with its 1–2 pinned metrics; multiple Codex accounts share one provider mark),
+/// or account; multiple Codex accounts share one provider mark, and a provider's session clocks share
+/// one mark too),
 /// `bars` drives the Bars style (the first four bounded metrics — any with a fill, not just percentages
 /// — in order). `isEmpty` means render the plain app icon.
 struct MenuBarContent: Equatable {
@@ -106,35 +107,51 @@ enum MenuBarContentBuilder {
                 return false
             }
             if let descriptor = sessionMetrics.first {
-                let expiries = data(descriptor).traySessionExpiriesAt.filter { $0 > now }.sorted().prefix(4)
-                guard !expiries.isEmpty else { return [] }
-                let pairs = stride(from: 0, to: expiries.count, by: 2).map { startIndex -> [Date] in
-                    let endIndex = min(startIndex + 2, expiries.count)
-                    return Array(expiries[startIndex..<endIndex])
+                let sessionData = data(descriptor)
+                let activeSessions = sessionData.activeSessions
+                let sessionItems: [(Date, String?)]
+                if !activeSessions.isEmpty {
+                    sessionItems = activeSessions
+                        .filter { $0.expiresAt > now }
+                        .sorted { $0.expiresAt < $1.expiresAt }
+                        .prefix(4)
+                        .map { ($0.expiresAt, $0.chatTitle) }
+                } else {
+                    sessionItems = sessionData.traySessionExpiriesAt
+                        .filter { $0 > now }
+                        .sorted()
+                        .prefix(4)
+                        .map { ($0, nil) }
                 }
-                return pairs.enumerated().map { chunkIndex, chunk in
-                    let metrics = chunk.enumerated().map { subIndex, expiry in
-                        let globalIndex = chunkIndex * 2 + subIndex
-                        return MenuBarContent.Metric(
-                            id: "\(descriptor.id).session.\(globalIndex)",
-                            label: "Session \(globalIndex + 1)",
-                            value: Formatters.compactDuration(expiry.timeIntervalSince(now)) ?? "<1m",
-                            fraction: 0,
-                            isBounded: false,
-                            hasData: true
-                        )
+                guard !sessionItems.isEmpty else { return [] }
+                // Every live clock stays under one provider mark. A second mark for the third
+                // session doubled the strip's width without adding information.
+                let metrics = sessionItems.enumerated().map { index, item in
+                    let (expiry, chatTitle) = item
+                    let label: String
+                    if let title = chatTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
+                        label = "Session \(index + 1) (\(title))"
+                    } else {
+                        label = "Session \(index + 1)"
                     }
-                    let groupID = chunkIndex == 0 ? group.provider.id : "\(group.provider.id).sessions.\(chunkIndex)"
-                    return MenuBarContent.Group(
-                        id: groupID,
-                        providerID: group.provider.id,
-                        displayName: group.provider.displayName,
-                        icon: group.provider.icon,
-                        metrics: metrics,
-                        showsProviderIcon: true,
-                        usesCompactValues: true
+                    return MenuBarContent.Metric(
+                        id: "\(descriptor.id).session.\(index)",
+                        label: label,
+                        value: Formatters.compactDuration(expiry.timeIntervalSince(now)) ?? "<1m",
+                        fraction: 0,
+                        isBounded: false,
+                        hasData: true
                     )
                 }
+                return [MenuBarContent.Group(
+                    id: group.provider.id,
+                    providerID: group.provider.id,
+                    displayName: group.provider.displayName,
+                    icon: group.provider.icon,
+                    metrics: metrics,
+                    showsProviderIcon: true,
+                    usesCompactValues: true
+                )]
             } else {
                 let metrics = group.metrics.map { resolve($0, data($0), now: now) }.filter(\.hasData)
                 guard !metrics.isEmpty else { return [] }

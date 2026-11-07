@@ -4,6 +4,7 @@ struct FreebuffMappedUsage: Equatable, Sendable {
     var plan: String?
     var lines: [MetricLine]
     var warning: String?
+    var activeSessions: [FreebuffActiveSession] = []
 }
 
 /// Maps Freebuff's read-only session endpoint. The current meter supersedes legacy session caps;
@@ -152,14 +153,15 @@ enum FreebuffUsageMapper {
             lines.append(.values(label: "Monthly Spend", values: []))
         }
 
+        let sessions = try activeSessions(root)
         // Separate session expiry metadata from daily-budget reset times. Emit an empty row too,
         // so a successful idle poll replaces the previous active sessions.
         lines.append(.values(label: "Active Sessions", values: [],
-                             expiriesAt: try sessionExpiries(root)))
+                             expiriesAt: sessions.map(\.expiresAt)))
 
         let tier = (subscription?["tierId"] as? String)?.nilIfEmpty
         let accessTier = (root["accessTier"] as? String)?.nilIfEmpty
-        return FreebuffMappedUsage(plan: tier ?? accessTier?.capitalized, lines: lines, warning: warning)
+        return FreebuffMappedUsage(plan: tier ?? accessTier?.capitalized, lines: lines, warning: warning, activeSessions: sessions)
     }
 
     private static func nonnegative(_ value: Any?) -> Double? {
@@ -167,12 +169,16 @@ enum FreebuffUsageMapper {
         return number
     }
 
-    private static func sessionExpiries(_ root: [String: Any]) throws -> [Date] {
-        var sessions: [String: Date] = [:]
+    static func activeSessions(_ root: [String: Any]) throws -> [FreebuffActiveSession] {
+        var sessions: [String: FreebuffActiveSession] = [:]
         if root["status"] as? String == "active" {
             guard let expiry = date(root["expiresAt"]) else { throw FreebuffUsageError.invalidResponse }
             let id = (root["instanceId"] as? String)?.nilIfEmpty ?? "single"
-            sessions[id] = expiry
+            sessions[id] = FreebuffActiveSession(
+                instanceID: id,
+                expiresAt: expiry,
+                model: (root["model"] as? String)?.nilIfEmpty
+            )
         }
         if let raw = root["desktopPurchases"], !(raw is NSNull), !(raw is [[String: Any]]) {
             throw FreebuffUsageError.invalidResponse
@@ -182,11 +188,16 @@ enum FreebuffUsageMapper {
                 // Unoccupied purchases are reusable hours, not running sessions.
                 guard let holder = (purchase["holderInstanceId"] as? String)?.nilIfEmpty else { continue }
                 guard let expiry = date(purchase["expiresAt"]) else { throw FreebuffUsageError.invalidResponse }
-                sessions[holder] = expiry
+                let model = (purchase["model"] as? String)?.nilIfEmpty
+                sessions[holder] = FreebuffActiveSession(
+                    instanceID: holder,
+                    expiresAt: expiry,
+                    model: model
+                )
             }
         }
         // Stable earliest-expiry order; equal timestamps still represent distinct sessions.
-        return sessions.values.sorted()
+        return sessions.values.sorted { $0.expiresAt < $1.expiresAt }
     }
 
     private struct RateLimitPool {

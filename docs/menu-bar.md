@@ -8,9 +8,11 @@ Right-click (or control-click) the QuotaBar menu bar icon for a quick menu with 
 
 ## Usage History
 
-Hovering a spend value shows its model breakdown. **Other** keeps smaller contributors together,
-but lists every contributor's name, measured tokens, and cost or **Unpriced**. Missing older model
-labels remain explicit usage categories rather than being counted as additional named models.
+Hovering a spend value shows its model breakdown. Several small models stay together as **Other**,
+which lists each one's name, measured tokens, and cost or **Unpriced** once. A single small model,
+or the one model that accounts for Other's whole price, keeps its own row, so the same tokens and
+cost are not shown twice. Missing older model labels remain explicit usage categories rather than
+being counted as additional named models.
 
 The dashboard footer's **Options** menu → **Usage History** opens a read-only report built from the same local usage data the spend tiles show, so the two can never disagree:
 
@@ -52,6 +54,6 @@ The strip only renders real data. A starred metric with nothing fetched yet is s
 
 A bounded count meter carries a compact unit in the strip when the unit is the only thing that makes the number meaningful — an hours balance reads `30h`, not a bare `30` — while percent and dollar meters stay as they are. Units that would abbreviate ambiguously (sessions would collapse to `s`, which reads as seconds) keep their bare number instead.
 
-Freebuff's Daily Hours pin shows only **active session timers**, using each session's actual expiry time. Sessions stack in pairs of two; when a third session is active, an additional Freebuff icon appears in the menu bar to show its remaining time (supporting up to four concurrent sessions across two icons). Daily reset times, remaining allowances, balances, expired sessions, and unoccupied purchased hours do not appear beside those timers. The countdowns update each minute and disappear when no sessions remain active.
+Freebuff's Daily Hours pin shows only **active session timers**, using each session's actual expiry time. Every live session stays under the one Freebuff mark. Two timers stack. A third or fourth sits beside that pair, so the strip stays the same height as the other providers. Daily reset times, remaining allowances, balances, expired sessions, and unoccupied purchased hours do not appear beside those timers. The countdowns update each minute and disappear when no sessions remain active.
 
 Claude and Antigravity meters disappear from the menu bar when their saved reset time is more than five minutes past, until a fresh value arrives. Open the dashboard to see the last known value and any refresh warning.

@@ -26,6 +26,7 @@ final class StatusItemImageUpdater {
 
     private let container: AppContainer
     private let apply: (NSImage) -> Void
+    private let updateTooltip: ((String?) -> Void)?
     private var applyGate = ApplyGate()
     /// A provider refresh can publish several observable fields in quick succession. Keep at most one
     /// delayed render queued so a multi-account batch does not turn every field write into a separate
@@ -37,9 +38,15 @@ final class StatusItemImageUpdater {
 
     /// - Parameters:
     ///   - apply: sets the rendered image onto the status-item button.
-    init(container: AppContainer, apply: @escaping (NSImage) -> Void) {
+    ///   - updateTooltip: sets the tooltip onto the status-item button.
+    init(
+        container: AppContainer,
+        apply: @escaping (NSImage) -> Void,
+        updateTooltip: ((String?) -> Void)? = nil
+    ) {
         self.container = container
         self.apply = apply
+        self.updateTooltip = updateTooltip
     }
 
     deinit {
@@ -118,6 +125,7 @@ final class StatusItemImageUpdater {
         // replaced with the wordmark so a shared screen never carries usage numbers. Read inside the
         // observation closure so the render re-arms on capture-state changes too.
         if container.privacy.concealUsage {
+            updateTooltip?("QuotaBar, usage hidden while the screen is shared")
             return MenuBarStripRenderer.privacyImage
                 ?? MenuBarIcon.image
                 ?? MenuBarStripRenderer.fallbackIcon
@@ -135,6 +143,8 @@ final class StatusItemImageUpdater {
             now: now,
             data: { container.dataStore.data(for: $0) }
         )
+        let tooltip = content.accessibilityText.isEmpty ? "QuotaBar" : content.accessibilityText
+        updateTooltip?(tooltip)
         return MenuBarStripRenderer.image(for: content, style: container.layout.menuBarStyle)
             ?? MenuBarIcon.image
             ?? MenuBarStripRenderer.fallbackIcon

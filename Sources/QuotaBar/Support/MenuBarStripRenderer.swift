@@ -186,15 +186,42 @@ private struct MenuBarTextStrip: View {
         if metrics.count <= 1 && !compact {
             Text(metrics.first?.value ?? "")
                 .font(.system(size: 12, weight: .bold))
+        } else if compact && metrics.count > 2 {
+            // A third clock used to add another line and overlap the first two. Two columns keep
+            // the same height and type size as a normal pair, still under the one provider mark.
+            sessionColumns(metrics)
         } else {
             VStack(alignment: .trailing, spacing: -2) {
                 ForEach(metrics, id: \.id) { metric in
                     Text(metric.value)
+                        .lineLimit(1)
                 }
             }
             .font(.system(size: 9, weight: .semibold))
             .fixedSize()
         }
+    }
+
+    /// Session clocks past the first pair, read left to right, soonest first. Two rows match the
+    /// height of every other two-value provider, so the strip does not grow or shrink.
+    @ViewBuilder
+    private func sessionColumns(_ metrics: [MenuBarContent.Metric]) -> some View {
+        let rowCount = (metrics.count + 1) / 2
+        VStack(alignment: .leading, spacing: -2) {
+            ForEach(0..<rowCount, id: \.self) { row in
+                HStack(spacing: 3) {
+                    let start = row * 2
+                    Text(metrics[start].value)
+                        .lineLimit(1)
+                    if start + 1 < metrics.count {
+                        Text(metrics[start + 1].value)
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+        .font(.system(size: 9, weight: .semibold))
+        .fixedSize()
     }
 
     /// Side length of the glyph box. Kept small deliberately: the strip is competing with every other

@@ -15,22 +15,23 @@ struct ModelUsageDetail: View {
     private static let width: CGFloat = 280
 
     var body: some View {
+        let models = breakdown.models.flatMap { $0.presentedRows() }
         let aggregateTokenCountSaturated = breakdown.tokenCountSaturated == true
         let sharesAreReliable = Self.sharesAreReliable(
-            for: breakdown.models,
+            for: models,
             aggregateTokenCountSaturated: aggregateTokenCountSaturated
         )
         let shares = Self.shares(
-            for: breakdown.models,
+            for: models,
             aggregateTokenCountSaturated: aggregateTokenCountSaturated
         )
         let percents = Self.wholePercents(shares)
         VStack(alignment: .leading, spacing: 8) {
             header
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(breakdown.models.indices, id: \.self) { index in
+                ForEach(models.indices, id: \.self) { index in
                     modelRow(
-                        breakdown.models[index],
+                        models[index],
                         share: sharesAreReliable ? shares[index] : nil,
                         percent: sharesAreReliable ? percents[index] : nil
                     )

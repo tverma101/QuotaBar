@@ -42,6 +42,10 @@ actor FreebuffDesktopUsageScanner {
 
     /// How long the resolved project database list stays fresh.
     static let pathCacheInterval: TimeInterval = 300
+    /// A renamed chat is picked up on the next refresh after this interval. Automatic refreshes
+    /// inside the interval keep the last title, so an active project's WAL does not spawn sqlite3
+    /// on every menu-bar poll.
+    static let titleRefreshInterval: TimeInterval = 60
 
     /// The most usage events kept in memory across project databases. Assistant messages and
     /// auto-run manager receipts both count; older raw caches are dropped at the cap and read again
@@ -92,22 +96,52 @@ actor FreebuffDesktopUsageScanner {
     private var modelIdentity = FreebuffModelIdentity(entries: [:], pricing: .empty)
     private let sqlite: any SQLiteAccessing
     private let databasePaths: @Sendable () throws -> [String]
+    private let sessionEndsPath: @Sendable () -> String?
     /// Decodes one receipt's metrics JSON. Injectable so a test can count how often the history is
     /// decoded.
     private let parseMetrics: @Sendable (String) -> [String: Any]?
     /// The most usage events kept in memory across every project database.
     private let maximumRetainedTurns: Int
 
+    struct SessionChatInfo: Sendable, Equatable {
+        var chatTitle: String
+        var projectPath: String
+        var threadID: String
+        var sourcePath: String
+        var sourceStamp: SourceStamp
+        var fetchedAt: Date
+    }
+
+    /// Size and mtime of a project database and its WAL. A title rename updates one of them.
+    struct SourceStamp: Sendable, Equatable {
+        var dbSize: UInt64
+        var dbModified: TimeInterval
+        var walSize: UInt64
+        var walModified: TimeInterval
+
+        static let missing = SourceStamp(dbSize: 0, dbModified: 0, walSize: 0, walModified: 0)
+    }
+
+    private var cachedSessionChats: [String: SessionChatInfo] = [:]
+
     init(
         sqlite: any SQLiteAccessing = SQLiteCLIAccessor(),
         databasePaths: @escaping @Sendable () throws -> [String] = FreebuffDesktopUsageScanner.defaultDatabasePaths,
+        sessionEndsPath: @escaping @Sendable () -> String? = FreebuffDesktopUsageScanner.defaultSessionEndsPath,
         parseMetrics: @escaping @Sendable (String) -> [String: Any]? = { ProviderParse.jsonObject(Data($0.utf8)) },
         maximumRetainedTurns: Int = FreebuffDesktopUsageScanner.maximumRetainedTurns
     ) {
         self.sqlite = sqlite
         self.databasePaths = databasePaths
+        self.sessionEndsPath = sessionEndsPath
         self.parseMetrics = parseMetrics
         self.maximumRetainedTurns = maximumRetainedTurns
+    }
+
+    static func defaultSessionEndsPath() -> String? {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/freebuff-desktop/state.json.session-ends.json")
+        return FileManager.default.fileExists(atPath: url.path) ? url.path : nil
     }
 
     static func defaultDatabasePaths() throws -> [String] {
@@ -326,6 +360,177 @@ actor FreebuffDesktopUsageScanner {
         return result
     }
 
+    func resolveLocalSessions(
+        _ sessions: [FreebuffActiveSession],
+        now: Date = Date()
+    ) -> [FreebuffActiveSession] {
+        guard !sessions.isEmpty else {
+            cachedSessionChats.removeAll(keepingCapacity: false)
+            return []
+        }
+        let activeIDs = Set(sessions.map(\.instanceID))
+        cachedSessionChats = cachedSessionChats.filter { activeIDs.contains($0.key) }
+
+        var result = sessions
+        var unresolvedIndices: [Int] = []
+        let manual = ProviderRefreshContext.isManual
+
+        for (index, session) in sessions.enumerated() {
+            if session.instanceID == "single" || session.instanceID == "cli" { continue }
+            if let cached = cachedSessionChats[session.instanceID],
+               cachedTitleIsReusable(cached, now: now, manual: manual) {
+                if !cached.chatTitle.isEmpty {
+                    result[index].chatTitle = cached.chatTitle
+                    result[index].projectPath = cached.projectPath
+                    result[index].threadID = cached.threadID
+                }
+            } else {
+                unresolvedIndices.append(index)
+            }
+        }
+        guard !unresolvedIndices.isEmpty else { return result }
+
+        var remainingInstanceIDs = Set(unresolvedIndices.map { result[$0].instanceID })
+        let instanceToThread = sessionEndThreads(for: remainingInstanceIDs)
+        var remainingThreadIDs = Set(instanceToThread.values)
+
+        let knownPaths = Array(Set(unresolvedIndices.compactMap { index -> String? in
+            cachedSessionChats[result[index].instanceID]?.sourcePath.nilIfEmpty
+        }))
+        for path in knownPaths where !remainingInstanceIDs.isEmpty {
+            ingestSessionChats(
+                path: path, now: now,
+                instanceToThread: instanceToThread,
+                remainingInstanceIDs: &remainingInstanceIDs,
+                remainingThreadIDs: &remainingThreadIDs
+            )
+        }
+
+        if !remainingInstanceIDs.isEmpty, let paths = try? databasePaths() {
+            let known = Set(knownPaths)
+            let sortedPaths = paths.filter { !known.contains($0) }.sorted { lhs, rhs in
+                let left = (try? FileManager.default.attributesOfItem(atPath: lhs)[.modificationDate] as? Date) ?? .distantPast
+                let right = (try? FileManager.default.attributesOfItem(atPath: rhs)[.modificationDate] as? Date) ?? .distantPast
+                return left > right
+            }
+            for path in sortedPaths where !remainingInstanceIDs.isEmpty {
+                ingestSessionChats(
+                    path: path, now: now,
+                    instanceToThread: instanceToThread,
+                    remainingInstanceIDs: &remainingInstanceIDs,
+                    remainingThreadIDs: &remainingThreadIDs
+                )
+            }
+        }
+
+        for id in remainingInstanceIDs {
+            if var existing = cachedSessionChats[id], !existing.sourcePath.isEmpty {
+                existing.fetchedAt = now
+                cachedSessionChats[id] = existing
+            } else {
+                cachedSessionChats[id] = SessionChatInfo(
+                    chatTitle: "", projectPath: "", threadID: "",
+                    sourcePath: "", sourceStamp: .missing, fetchedAt: now
+                )
+            }
+        }
+
+        for index in unresolvedIndices {
+            let iid = result[index].instanceID
+            if let resolved = cachedSessionChats[iid], !resolved.chatTitle.isEmpty {
+                result[index].chatTitle = resolved.chatTitle
+                result[index].projectPath = resolved.projectPath
+                result[index].threadID = resolved.threadID
+            }
+        }
+        return result
+    }
+
+    /// An unchanged database keeps its title with no sqlite3 spawn. A changed database waits out
+    /// `titleRefreshInterval` unless the user asked for a refresh, so chat traffic does not re-read
+    /// titles on every poll. The next read then returns the renamed title.
+    private func cachedTitleIsReusable(_ cached: SessionChatInfo, now: Date, manual: Bool) -> Bool {
+        if cached.sourcePath.isEmpty {
+            return !manual && now.timeIntervalSince(cached.fetchedAt) < Self.titleRefreshInterval
+        }
+        if sourceStamp(cached.sourcePath) == cached.sourceStamp { return true }
+        return !manual && now.timeIntervalSince(cached.fetchedAt) < Self.titleRefreshInterval
+    }
+
+    private func sessionEndThreads(for instanceIDs: Set<String>) -> [String: String] {
+        guard let endsPath = sessionEndsPath(),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: endsPath)),
+              let rawArray = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+        else { return [:] }
+        var instanceToThread: [String: String] = [:]
+        for entry in rawArray {
+            if let iid = (entry["instanceId"] as? String)?.nilIfEmpty,
+               let tid = (entry["threadId"] as? String)?.nilIfEmpty,
+               instanceIDs.contains(iid) {
+                instanceToThread[iid] = tid
+            }
+        }
+        return instanceToThread
+    }
+
+    private func ingestSessionChats(
+        path: String,
+        now: Date,
+        instanceToThread: [String: String],
+        remainingInstanceIDs: inout Set<String>,
+        remainingThreadIDs: inout Set<String>
+    ) {
+        guard let jsonString = try? FreebuffDesktopUsageSQL.readActiveSessionChats(
+            sqlite: sqlite, path: path,
+            instanceIDs: Array(remainingInstanceIDs),
+            threadIDs: Array(remainingThreadIDs)
+        ),
+        let data = jsonString.data(using: .utf8),
+        let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return }
+
+        let stamp = sourceStamp(path)
+        var best: [String: (preferred: Bool, info: SessionChatInfo)] = [:]
+        for row in rows {
+            let iid = (row["instanceId"] as? String) ?? ""
+            let tid = (row["threadId"] as? String) ?? ""
+            let title = ((row["title"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let project = (row["projectPath"] as? String) ?? ""
+            guard !title.isEmpty else { continue }
+            let info = SessionChatInfo(
+                chatTitle: title, projectPath: project, threadID: tid,
+                sourcePath: path, sourceStamp: stamp, fetchedAt: now
+            )
+            var targets: [String] = []
+            if !iid.isEmpty, remainingInstanceIDs.contains(iid) { targets.append(iid) }
+            for (targetIID, targetTID) in instanceToThread where targetTID == tid && remainingInstanceIDs.contains(targetIID) {
+                targets.append(targetIID)
+            }
+            guard !targets.isEmpty else { continue }
+            for target in Set(targets) {
+                let preferred = instanceToThread[target] == tid && !tid.isEmpty
+                if let existing = best[target], existing.preferred, !preferred { continue }
+                best[target] = (preferred, info)
+            }
+            if !tid.isEmpty { remainingThreadIDs.remove(tid) }
+        }
+        for (instanceID, match) in best {
+            cachedSessionChats[instanceID] = match.info
+            remainingInstanceIDs.remove(instanceID)
+        }
+    }
+
+    private func sourceStamp(_ path: String) -> SourceStamp {
+        func part(_ name: String) -> (UInt64, TimeInterval) {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: name) else { return (0, 0) }
+            let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+            let modified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            return (size, modified)
+        }
+        let db = part(path)
+        let wal = part(path + "-wal")
+        return SourceStamp(dbSize: db.0, dbModified: db.1, walSize: wal.0, walModified: wal.1)
+    }
+
     func unloadCachesForMemoryPressure() {
         databases.removeAll(keepingCapacity: false)
         databaseOrder.removeAll(keepingCapacity: false)
@@ -336,6 +541,7 @@ actor FreebuffDesktopUsageScanner {
         routePricingToken = nil
         routeCatalog.removeAll(keepingCapacity: false)
         modelIdentity = FreebuffModelIdentity(entries: [:], pricing: .empty)
+        cachedSessionChats.removeAll(keepingCapacity: false)
     }
 
     /// Forget the databases whose project directory is gone.
