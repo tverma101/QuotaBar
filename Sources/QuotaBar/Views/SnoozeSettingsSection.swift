@@ -7,52 +7,7 @@ struct SnoozeSettingsSection: View {
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
 
     var body: some View {
-        VStack(alignment: .leading, spacing: density.headerToCardSpacing) {
-            Text("Snooze Subscriptions")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 8)
-
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    Text("Snooze Low Usage")
-                    Spacer(minLength: 8)
-                    Toggle("", isOn: $snooze.isEnabled)
-                        .settingsSwitchStyle()
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, density.controlRowPadding)
-
-                Text("Temporarily hide menu bar icons for subscriptions that are out of usage or below the threshold until they reset.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                if snooze.isEnabled {
-                    Divider().opacity(0.4)
-
-                    HStack(spacing: 10) {
-                        Text("Threshold")
-                        Spacer(minLength: 8)
-                        Picker("", selection: $snooze.threshold) {
-                            ForEach(SnoozeThreshold.allCases, id: \.self) { threshold in
-                                Text(threshold.label).tag(threshold)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .labelsHidden()
-                        .fixedSize()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, density.controlRowPadding)
-
-                    subscriptionRows
-                }
-            }
-            .cardSurface()
-        }
+        SnoozeControls(snooze: snooze) { subscriptionRows }
     }
 
     @ViewBuilder
@@ -110,4 +65,61 @@ struct SnoozeSettingsSection: View {
             }
         }
     }
+}
+
+/// The shared settings card, separated so the controls can be rendered with synthetic data.
+struct SnoozeControls<SubscriptionRows: View>: View {
+    @Bindable var snooze: MenuBarSnoozeStore
+    @ViewBuilder var subscriptionRows: () -> SubscriptionRows
+    @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: density.headerToCardSpacing) {
+            Text("Snooze Subscriptions")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Text("Snooze Low Usage")
+                    Spacer(minLength: 8)
+                    Toggle("", isOn: $snooze.isEnabled)
+                        .settingsSwitchStyle()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, density.controlRowPadding)
+
+                Text("Temporarily hide menu bar icons for subscriptions that are out of usage or below the threshold until they reset.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if snooze.isEnabled {
+                    Divider().opacity(0.4)
+
+                    HStack(spacing: 10) {
+                        Text("Threshold")
+                        Spacer(minLength: 8)
+                        Picker("", selection: $snooze.threshold) {
+                            ForEach(SnoozeThreshold.allCases, id: \.self) { threshold in
+                                Text(threshold.label).tag(threshold)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, density.controlRowPadding)
+
+                    subscriptionRows()
+                }
+            }
+            .cardSurface()
+        }
+    }
+
 }

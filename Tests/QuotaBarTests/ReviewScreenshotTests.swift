@@ -31,6 +31,13 @@ final class ReviewScreenshotTests: XCTestCase {
         .environment(layout).environment(dataStore).defaultAppStorage(defaults)
         let image = try XCTUnwrap(ImageRenderer(content: priority).nsImage)
         XCTAssertGreaterThan(image.size.height, 44)
+        let snooze = MenuBarSnoozeStore(defaults: defaults)
+        snooze.isEnabled = true
+        snooze.threshold = .tenPercent
+        let snoozeView = SnoozeControls(snooze: snooze) { EmptyView() }
+            .frame(width: 320).padding(14).background(Theme.traySurface).defaultAppStorage(defaults)
+        let snoozeImage = try XCTUnwrap(ImageRenderer(content: snoozeView).nsImage)
+        XCTAssertGreaterThan(snoozeImage.size.height, 20)
         let icon = IconSource.providerMark("freebuff")
         func metric(_ id: String, _ value: String) -> MenuBarContent.Metric {
             MenuBarContent.Metric(id: id, label: id, value: value, fraction: 0, isBounded: false, hasData: true)
@@ -44,7 +51,7 @@ final class ReviewScreenshotTests: XCTestCase {
         let finalImage = try XCTUnwrap(ImageRenderer(content: Image(nsImage: finalStrip).renderingMode(.original)
             .padding(12).background(Color.white)).nsImage)
         if let dir = ProcessInfo.processInfo.environment["QUOTABAR_REVIEW_IMAGE_DIR"] {
-            for (name, render) in [("priority.png", image), ("sessions.png", finalImage)] {
+            for (name, render) in [("priority.png", image), ("sessions.png", finalImage), ("snooze.png", snoozeImage)] {
                 let data = try XCTUnwrap(ShareCardRenderer.pngData(from: render))
                 try data.write(to: URL(fileURLWithPath: dir).appendingPathComponent(name))
             }
