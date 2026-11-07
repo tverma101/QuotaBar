@@ -673,7 +673,9 @@ enum SpendTileMapper {
         }
 
         if other.tokens > 0 || (other.costUSD ?? 0) > 0 {
-            visible.append(other.entry(model: ModelUsageEntry.otherModelName))
+            // A single folded model is not a tail. Leaving it under Other made the hover print
+            // that model's tokens and cost twice: once on Other, again as its only contributor.
+            visible.append(contentsOf: other.entry(model: ModelUsageEntry.otherModelName).presentedRows())
         }
         return visible
     }

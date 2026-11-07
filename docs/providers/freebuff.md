@@ -5,7 +5,10 @@ It does not start a Freebuff session. Freebuff is enabled by default even when y
 turn it off in Customize if you do not want its card. Its metrics are always-visible by default, and
 the Daily Hours pin shows **active session timers** in the menu bar, refreshed each minute. These use
 actual session expiry times, including occupied Desktop hours, rather than the daily allowance reset.
-With two active sessions, both timers appear. Idle, expired, and unoccupied purchased hours disappear.
+With several active sessions, every timer stays under the one Freebuff mark, in the same two-line height as the other providers. Idle, expired, and unoccupied purchased hours disappear.
+For Freebuff Desktop sessions on this Mac, each session is linked to its local chat title and project.
+A renamed chat shows its current title on the next refresh. Hovering the session count lists those titles.
+Raw model routes are left off that list.
 Other Freebuff allowance and balance pins do not add values beside the session timers. It appears in
 the alphabetical provider order.
 

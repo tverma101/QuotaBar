@@ -95,6 +95,8 @@ struct WidgetData: Hashable {
     var trayStyle: TrayStyle = .value
     /// Menu-bar-only clocks, separate from reset-credit expiry tooltips on dashboard rows.
     var traySessionExpiriesAt: [Date] = []
+    /// Active sessions for session countdowns and detail popovers, including chat title & project.
+    var activeSessions: [FreebuffActiveSession] = []
 
     /// Menu-bar reading styles. `value` is the established behavior — a percent, a compact count, or a
     /// compact dollar amount. `resetCountdown` renders the window's remaining time (`2h 14m`) and is

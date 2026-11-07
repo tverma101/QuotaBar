@@ -109,6 +109,10 @@ struct WidgetRowView: View {
             meter(state)
             primaryTextRow
         }
+        .onChange(of: data.activeSessions) { _, _ in
+            if !modelHover.isPinned { modelHover.dismiss() }
+        }
+        .onDisappear { modelHover.dismiss() }
     }
 
     /// Label with the pace warning right-aligned on the same line — one slot, escalating with the
@@ -225,12 +229,57 @@ struct WidgetRowView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .layoutPriority(0)
+            } else if !data.activeSessions.isEmpty {
+                activeSessionsBadge
             }
             Spacer(minLength: 8)
             trailingContext
         }
         .font(supportingFont)
         .lineLimit(1)
+    }
+
+    @ViewBuilder
+    private var activeSessionsBadge: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(Color.accentColor)
+                .frame(width: 5, height: 5)
+            Text(data.activeSessions.count == 1 ? "1 session" : "\(data.activeSessions.count) sessions")
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .layoutPriority(0)
+        }
+        .padding(.horizontal, 4)
+        .padding(.vertical, 1)
+        .background {
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .fill(.quaternary)
+                .opacity(showActiveSessionsHighlight ? 1 : 0)
+        }
+        .contentShape(Rectangle())
+        .onContinuousHover { phase in
+            if case .active = phase {
+                modelHover.inlineHover(true)
+            } else {
+                modelHover.inlineHover(false)
+            }
+        }
+        .motionAwareHoverPopover(
+            isPresented: Binding(
+                get: { !data.activeSessions.isEmpty && modelHover.isPresented },
+                set: { if !$0 { modelHover.dismiss() } }
+            ),
+            reduceAnimations: reduceAnimations
+        ) {
+            FreebuffActiveSessionsDetail(sessions: data.activeSessions) { inside in
+                modelHover.detailHover(inside)
+            }
+        }
+    }
+
+    private var showActiveSessionsHighlight: Bool {
+        !data.activeSessions.isEmpty && (modelHover.overInline || modelHover.isPresented)
     }
 
     // The headline value is the row's payload — the number the user opened the popover to read —

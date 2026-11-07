@@ -146,6 +146,11 @@ extension LayoutStore {
         metricOrder(for: providerID).compactMap { registry.descriptor(id: $0) }
     }
 
+    /// Pinned metrics for a specific provider in custom order.
+    func pinnedMetrics(for providerID: String) -> [WidgetDescriptor] {
+        orderedSupportedMetrics(for: providerID).filter { pinnedMetricIDs.contains($0.id) }
+    }
+
     func metricOrderWithDivider(for providerID: String, dividerID: String) -> [String] {
         let ordered = orderedSupportedMetrics(for: providerID).map(\.id)
         return ordered.filter { !expandedMetricIDs.contains($0) }
@@ -179,6 +184,18 @@ extension LayoutStore {
             guard let next = Self.reordered(shown, dragged: dragged, target: target) else { return false }
             let rest = orderedProviderIDs().filter { !next.contains($0) }
             providerOrder = next + rest
+            persistProviderOrder()
+            syncPlacedOrder()
+            return true
+        }
+    }
+
+    /// The compact reorder list includes disabled providers, whose future position is also editable.
+    @discardableResult
+    func reorderAnyProvider(dragged: String, target: String) -> Bool {
+        recordingUndoStep {
+            guard let next = Self.reordered(orderedProviderIDs(), dragged: dragged, target: target) else { return false }
+            providerOrder = next
             persistProviderOrder()
             syncPlacedOrder()
             return true

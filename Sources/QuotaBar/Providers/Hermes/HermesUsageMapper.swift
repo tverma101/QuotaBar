@@ -107,13 +107,13 @@ enum HermesUsageMapper {
             }
         }
         if otherTokens > 0 || (otherCost ?? 0) > 0 {
-            named.append(ModelUsageEntry(
+            named.append(contentsOf: ModelUsageEntry(
                 model: ModelUsageEntry.otherModelName,
                 totalTokens: otherTokens,
                 costUSD: otherCost,
                 variants: otherModels,
                 costIsComplete: otherHasPartial ? false : nil
-            ))
+            ).presentedRows())
         }
         guard !named.isEmpty else { return nil }
         return ModelUsageBreakdown(

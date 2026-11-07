@@ -28,10 +28,14 @@ private final class MenuBarStatusItem {
         let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.statusItem = statusItem
         self.imageUpdater = StatusItemImageUpdater(
-            container: container
-        ) { image in
-            statusItem.button?.image = image
-        }
+            container: container,
+            apply: { [weak statusItem] image in
+                statusItem?.button?.image = image
+            },
+            updateTooltip: { [weak statusItem] tooltip in
+                statusItem?.button?.toolTip = tooltip
+            }
+        )
     }
 }
 

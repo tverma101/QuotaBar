@@ -2,7 +2,8 @@ import Foundation
 
 /// Resolved, ordered, capped data for the menu-bar strip, built from the pinned metrics and their live
 /// values. The renderers consume this: `groups` drives the Text style (one segment per pinned provider
-/// or account, each with its 1–2 pinned metrics; multiple Codex accounts share one provider mark),
+/// or account; multiple Codex accounts share one provider mark, and a provider's session clocks share
+/// one mark too),
 /// `bars` drives the Bars style (the first four bounded metrics — any with a fill, not just percentages
 /// — in order). `isEmpty` means render the plain app icon.
 struct MenuBarContent: Equatable {
@@ -20,7 +21,8 @@ struct MenuBarContent: Equatable {
     }
 
     /// A provider and its pinned metrics, in order. One segment of the Text strip.
-    struct Group: Equatable {
+    struct Group: Equatable, Identifiable {
+        let id: String
         let providerID: String
         let displayName: String
         let icon: IconSource
@@ -29,6 +31,24 @@ struct MenuBarContent: Equatable {
         var showsProviderIcon: Bool = true
         /// Session clocks keep the same small type as stacked usage values, even for one clock.
         var usesCompactValues: Bool = false
+
+        init(
+            id: String? = nil,
+            providerID: String,
+            displayName: String,
+            icon: IconSource,
+            metrics: [Metric],
+            showsProviderIcon: Bool = true,
+            usesCompactValues: Bool = false
+        ) {
+            self.id = id ?? providerID
+            self.providerID = providerID
+            self.displayName = displayName
+            self.icon = icon
+            self.metrics = metrics
+            self.showsProviderIcon = showsProviderIcon
+            self.usesCompactValues = usesCompactValues
+        }
     }
 
     /// Provider groups for the Text style, in Customize order. Dynamic: only metrics that currently
@@ -69,12 +89,14 @@ enum MenuBarContentBuilder {
     static func build(
         groups: [ProviderMetrics],
         hiddenProviderIDs: Set<String> = [],
+        snoozedProviderIDs: Set<String> = [],
         now: Date = Date(),
         data: (WidgetDescriptor) -> WidgetData
     ) -> MenuBarContent {
         var hasShownCodexIcon = false
-        let resolvedGroups = groups.compactMap { group -> MenuBarContent.Group? in
-            guard !hiddenProviderIDs.contains(group.provider.id) else { return nil }
+        let resolvedGroups = groups.flatMap { group -> [MenuBarContent.Group] in
+            guard !hiddenProviderIDs.contains(group.provider.id),
+                  !snoozedProviderIDs.contains(group.provider.id) else { return [] }
             // A row can opt out of the strip while it has nothing worth showing — a session timer with
             // no session running drops out along with its provider's icon, so an idle provider costs
             // no menu-bar space at all.
@@ -84,31 +106,68 @@ enum MenuBarContentBuilder {
                 if case .sessionCountdowns = $0.sample.trayStyle { return true }
                 return false
             }
-            let metrics: [MenuBarContent.Metric]
             if let descriptor = sessionMetrics.first {
-                metrics = data(descriptor).traySessionExpiriesAt.filter { $0 > now }.sorted().prefix(2)
-                    .enumerated().map { index, expiry in
-                        MenuBarContent.Metric(
-                            id: "\(descriptor.id).session.\(index)", label: "Session \(index + 1)",
-                            value: Formatters.compactDuration(expiry.timeIntervalSince(now)) ?? "<1m",
-                            fraction: 0, isBounded: false, hasData: true
-                        )
+                let sessionData = data(descriptor)
+                let activeSessions = sessionData.activeSessions
+                let sessionItems: [(Date, String?)]
+                if !activeSessions.isEmpty {
+                    sessionItems = activeSessions
+                        .filter { $0.expiresAt > now }
+                        .sorted { $0.expiresAt < $1.expiresAt }
+                        .prefix(4)
+                        .map { ($0.expiresAt, $0.chatTitle) }
+                } else {
+                    sessionItems = sessionData.traySessionExpiriesAt
+                        .filter { $0 > now }
+                        .sorted()
+                        .prefix(4)
+                        .map { ($0, nil) }
+                }
+                guard !sessionItems.isEmpty else { return [] }
+                // Every live clock stays under one provider mark. A second mark for the third
+                // session doubled the strip's width without adding information.
+                let metrics = sessionItems.enumerated().map { index, item in
+                    let (expiry, chatTitle) = item
+                    let label: String
+                    if let title = chatTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
+                        label = "Session \(index + 1) (\(title))"
+                    } else {
+                        label = "Session \(index + 1)"
                     }
+                    return MenuBarContent.Metric(
+                        id: "\(descriptor.id).session.\(index)",
+                        label: label,
+                        value: Formatters.compactDuration(expiry.timeIntervalSince(now)) ?? "<1m",
+                        fraction: 0,
+                        isBounded: false,
+                        hasData: true
+                    )
+                }
+                return [MenuBarContent.Group(
+                    id: group.provider.id,
+                    providerID: group.provider.id,
+                    displayName: group.provider.displayName,
+                    icon: group.provider.icon,
+                    metrics: metrics,
+                    showsProviderIcon: true,
+                    usesCompactValues: true
+                )]
             } else {
-                metrics = group.metrics.map { resolve($0, data($0), now: now) }.filter(\.hasData)
+                let metrics = group.metrics.map { resolve($0, data($0), now: now) }.filter(\.hasData)
+                guard !metrics.isEmpty else { return [] }
+                let isCodexAccount = ProviderAccountID.family(of: group.provider.id) == "codex"
+                let showsProviderIcon = !isCodexAccount || !hasShownCodexIcon
+                if isCodexAccount { hasShownCodexIcon = true }
+                return [MenuBarContent.Group(
+                    id: group.provider.id,
+                    providerID: group.provider.id,
+                    displayName: group.provider.displayName,
+                    icon: group.provider.icon,
+                    metrics: metrics,
+                    showsProviderIcon: showsProviderIcon,
+                    usesCompactValues: false
+                )]
             }
-            guard !metrics.isEmpty else { return nil }
-            let isCodexAccount = ProviderAccountID.family(of: group.provider.id) == "codex"
-            let showsProviderIcon = !isCodexAccount || !hasShownCodexIcon
-            if isCodexAccount { hasShownCodexIcon = true }
-            return MenuBarContent.Group(
-                providerID: group.provider.id,
-                displayName: group.provider.displayName,
-                icon: group.provider.icon,
-                metrics: metrics,
-                showsProviderIcon: showsProviderIcon,
-                usesCompactValues: !sessionMetrics.isEmpty
-            )
         }
         // Bars show any *bounded* metric (it has a fill), not just percentages. Unbounded values (raw
         // spend/credits, no limit) have no fill and are dropped.
@@ -131,6 +190,9 @@ enum MenuBarContentBuilder {
             fraction: data.fraction,
             isBounded: data.isBounded,
             hasData: data.showsInMenuBar(now: now)
+                && !(["claude", "antigravity"].contains(ProviderAccountID.family(of: descriptor.providerID))
+                    && data.isBounded
+                    && data.resetsAt.map { now.timeIntervalSince($0) > 5 * 60 } == true)
         )
     }
 }

@@ -89,6 +89,25 @@ final class LayoutStoreTests: XCTestCase {
                        "undo restores the exact prior provider order")
     }
 
+    func testCompactProviderOrderIncludesDisabledProvidersAndPersists() {
+        let defaults = makeDefaults("CompactProviderOrder")
+        let make = { LayoutStore(registry: .mock, defaults: defaults, storageKey: "layout",
+                                 isProviderEnabled: { $0 != "codex" }) }
+        let store = make()
+        let original = store.orderedProviderIDs()
+        XCTAssertTrue(store.reorderAnyProvider(dragged: "codex", target: "claude"))
+        XCTAssertNotEqual(store.orderedProviderIDs(), original)
+        XCTAssertEqual(make().orderedProviderIDs(), store.orderedProviderIDs())
+        XCTAssertTrue(store.undo())
+        XCTAssertEqual(store.orderedProviderIDs(), original)
+        store.showProviderReorder()
+        XCTAssertTrue(store.isProviderReorderMode)
+        XCTAssertEqual(store.screen, .customize)
+        store.resetForPopoverClose()
+        XCTAssertFalse(store.isProviderReorderMode)
+        XCTAssertEqual(store.screen, .dashboard)
+    }
+
     func testUndoReversesPinAndUnpin() {
         let store = makeStore("UndoPin")
         // cursor.usage is enabled by default but not pinned (cursor's default pins aren't in the mock).

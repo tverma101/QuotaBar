@@ -13,12 +13,13 @@ struct WidgetGroupedListView: View {
     @Environment(AppContainer.self) private var container
     @Environment(LayoutStore.self) private var layout
     @Environment(WidgetDataStore.self) private var dataStore
+    @Environment(PopoverTransparencyStore.self) private var transparency: PopoverTransparencyStore?
     @Environment(\.colorScheme) private var colorScheme
     let reorderSpaceName: String
     @Binding var reorderLift: ReorderLift?
 
     @State private var frameStore = ReorderFrameStore()
-    @State private var activeProviderID: String?
+    @State private var hoveredProviderID: String?
     @State private var activeMetricID: String?
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
 
@@ -36,6 +37,9 @@ struct WidgetGroupedListView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .onChange(of: transparency?.popoverShown) { _, shown in
+            if shown == false { hoveredProviderID = nil }
+        }
         .onPreferenceChange(ReorderFramePreferenceKey.self) { frameStore.frames = $0 }
         .animation(Motion.spring, value: groups.map(\.provider.id))
     }
@@ -72,8 +76,12 @@ struct WidgetGroupedListView: View {
                 )
             }
         }
+        .contentShape(Rectangle())
+        .onHover { isHovered in
+            if isHovered { hoveredProviderID = group.provider.id }
+            else if hoveredProviderID == group.provider.id { hoveredProviderID = nil }
+        }
         .background(DiagnosticProviderAnchor(providerID: group.provider.id))
-        .opacity(activeProviderID == group.provider.id ? 0 : 1)
         .reorderFrame(id: group.provider.id, in: .named(reorderSpaceName))
     }
 
@@ -84,6 +92,7 @@ struct WidgetGroupedListView: View {
             warning: dataStore.headerNotice(for: group.provider.id),
             refreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
             staleness: dataStore.stalenessHint(for: group.provider.id),
+            cardIsHovered: hoveredProviderID == group.provider.id,
             onCopyScreenshot: { shareCard(group) },
             onRefresh: dataStore.errorMessage(for: group.provider.id) == nil
                 ? nil
@@ -91,7 +100,10 @@ struct WidgetGroupedListView: View {
         )
         // Keep the provider mark and hover-revealed copy control aligned with the card's content edges.
         .padding(.horizontal, 8)
-        .highPriorityGesture(providerDragGesture(for: group))
+        .simultaneousGesture(DragGesture(minimumDistance: 8).onChanged { _ in
+            guard layout.screen == .dashboard else { return }
+            withAnimation(Motion.modeSwitch) { layout.showProviderReorder() }
+        })
         .contextMenu {
             // Hides the whole provider section (the Customize provider list brings it back). Mirrors
             // the per-metric "Hide" but one level up, so the verb order reads the same on a header as a row.
@@ -104,6 +116,9 @@ struct WidgetGroupedListView: View {
             }
             Button("Customize…") {
                 openCustomize(for: group.provider.id)
+            }
+            Button("Reorder Providers…") {
+                withAnimation(Motion.modeSwitch) { layout.showProviderReorder() }
             }
             Divider()
             Button("Share Screenshot") { _ = shareCard(group) }
@@ -406,21 +421,6 @@ struct WidgetGroupedListView: View {
         }
     }
 
-    private func providerDragGesture(for group: ProviderGroup) -> some Gesture {
-        reorderDragGesture(
-            id: group.provider.id,
-            coordinateSpaceName: reorderSpaceName,
-            frameStore: frameStore,
-            active: $activeProviderID,
-            lift: $reorderLift,
-            makeLift: { makeProviderLift(for: group, value: $0) },
-            orderedIDs: { layout.displayGroups.map(\.provider.id) },
-            reorder: { layout.reorderProvider(dragged: group.provider.id, target: $0) },
-            onEditBegan: { layout.beginCoalescedEdit() },
-            onEditEnded: { layout.endCoalescedEdit() }
-        )
-    }
-
     private func metricDragGesture(for descriptor: WidgetDescriptor, providerID: String) -> some Gesture {
         reorderDragGesture(
             id: descriptor.id,
@@ -462,26 +462,6 @@ struct WidgetGroupedListView: View {
         guard hasExpandedContent, layout.isProviderExpanded(providerID) else { return alwaysShown }
         let expanded = group.expandedWidgets.compactMap { layout.descriptor(for: $0)?.id }
         return alwaysShown + [expandedDividerID(for: providerID)] + expanded
-    }
-
-    private func makeProviderLift(for group: ProviderGroup, value: DragGesture.Value) -> ReorderLift? {
-        // The floating preview should match what the card shows: only the always-shown rows unless this
-        // provider's caret is currently open.
-        let visibleWidgets = layout.isProviderExpanded(group.provider.id) ? group.widgets : group.alwaysShownWidgets
-        let rows = visibleWidgets.compactMap { widget -> WidgetData? in
-            guard let descriptor = layout.descriptor(for: widget) else { return nil }
-            return dataStore.data(for: descriptor)
-        }
-        return ReorderLift.make(
-            id: group.provider.id,
-            payload: .dashboardProvider(
-                provider: group.provider,
-                plan: dataStore.plan(for: group.provider.id),
-                rows: rows
-            ),
-            value: value,
-            frames: frameStore.frames
-        )
     }
 
     private func makeMetricLift(for descriptor: WidgetDescriptor, value: DragGesture.Value) -> ReorderLift? {

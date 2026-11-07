@@ -57,6 +57,8 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
     /// Set only on error snapshots: a stable, non-PII bucket for the failure, read by telemetry on the
     /// failure path. Always `nil` on success (and error snapshots aren't cached), so it never persists.
     var errorCategory: ErrorCategory?
+    /// Active sessions for session countdowns (including linked local chat info when available).
+    var activeSessions: [FreebuffActiveSession]?
 
     init(
         providerID: String,
@@ -71,7 +73,8 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         replacesPriorQuotaProgress: Bool? = nil,
         invalidatesQuotaIdentity: Bool? = nil,
         carriesPriorHistory: Bool? = nil,
-        errorCategory: ErrorCategory? = nil
+        errorCategory: ErrorCategory? = nil,
+        activeSessions: [FreebuffActiveSession]? = nil
     ) {
         self.providerID = providerID
         self.displayName = displayName
@@ -86,6 +89,7 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         self.invalidatesQuotaIdentity = invalidatesQuotaIdentity
         self.carriesPriorHistory = carriesPriorHistory
         self.errorCategory = errorCategory
+        self.activeSessions = activeSessions
         // A provider-produced snapshot assumes its meters are live until the data store says
         // otherwise (fold-only scopes carry the previous snapshot's stamp instead — see
         // `WidgetDataStore.refresh`). Legacy cached payloads decode this as nil and the cache
@@ -110,7 +114,8 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         warning: String? = nil,
         historyWarning: String? = nil,
         clearsPriorMenuBarQuotaState: Bool? = nil,
-        replacesPriorQuotaProgress: Bool? = nil
+        replacesPriorQuotaProgress: Bool? = nil,
+        activeSessions: [FreebuffActiveSession]? = nil
     ) -> ProviderSnapshot {
         ProviderSnapshot(
             providerID: provider.id,
@@ -122,7 +127,8 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
             warning: warning,
             historyWarning: historyWarning,
             clearsPriorMenuBarQuotaState: clearsPriorMenuBarQuotaState,
-            replacesPriorQuotaProgress: replacesPriorQuotaProgress
+            replacesPriorQuotaProgress: replacesPriorQuotaProgress,
+            activeSessions: activeSessions
         )
     }
 
@@ -233,6 +239,9 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
         }
         if !clearsPriorQuota && (merged.plan == nil || merged.plan?.isEmpty == true) {
             merged.plan = previous.plan
+        }
+        if merged.activeSessions == nil {
+            merged.activeSessions = previous.activeSessions
         }
         let preserved = previous.lines.filter { line in
             if !sameLocalDay, Self.isDayLabeledSpendTile(line) { return false }

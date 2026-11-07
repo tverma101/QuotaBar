@@ -315,4 +315,135 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         XCTAssertEqual(result?.usage.series.daily.first?.totalTokens, 400,
                        "an updated cumulative turn replaces its earlier value instead of adding it again")
     }
+
+    private final class SessionChatsSQLite: SQLiteAccessing, @unchecked Sendable {
+        var queryResults: [String: String] = [:]
+        var calls = 0
+        func queryValue(path: String, sql: String) throws -> String? {
+            calls += 1
+            return queryResults[path] ?? "[]"
+        }
+        func execute(path: String, sql: String) throws { XCTFail("must not write") }
+    }
+
+    func testResolveLocalSessionsLinksChatTitleAndProject() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let dbPath = directory.appendingPathComponent("desktop-v2.db").path
+        try Data().write(to: URL(fileURLWithPath: dbPath))
+
+        let sessionEndsPath = directory.appendingPathComponent("state.json.session-ends.json").path
+        let endsJSON = """
+        [{"instanceId":"sess-1","threadId":"th-1","active":true}]
+        """
+        try Data(endsJSON.utf8).write(to: URL(fileURLWithPath: sessionEndsPath))
+
+        let sqlite = SessionChatsSQLite()
+        sqlite.queryResults[dbPath] = """
+        [{"instanceId":"sess-1","threadId":"th-1","title":"Refactor Widget","projectPath":"/Users/test/Project"}]
+        """
+
+        let scanner = FreebuffDesktopUsageScanner(
+            sqlite: sqlite,
+            databasePaths: { [dbPath] },
+            sessionEndsPath: { sessionEndsPath }
+        )
+
+        let sessions = [
+            FreebuffActiveSession(instanceID: "sess-1", expiresAt: now.addingTimeInterval(1800), model: "fast"),
+            FreebuffActiveSession(instanceID: "cli", expiresAt: now.addingTimeInterval(3600))
+        ]
+
+        let resolved = await scanner.resolveLocalSessions(sessions)
+        XCTAssertEqual(resolved.count, 2)
+        XCTAssertEqual(resolved[0].chatTitle, "Refactor Widget")
+        XCTAssertEqual(resolved[0].projectPath, "/Users/test/Project")
+        XCTAssertEqual(resolved[0].threadID, "th-1")
+        XCTAssertEqual(resolved[0].model, "fast")
+
+        // CLI session stays unlinked
+        XCTAssertNil(resolved[1].chatTitle)
+        XCTAssertNil(resolved[1].projectPath)
+
+        // Second call reuses memory cache without calling SQLite again
+        let initialCalls = sqlite.calls
+        let cached = await scanner.resolveLocalSessions(sessions)
+        XCTAssertEqual(cached[0].chatTitle, "Refactor Widget")
+        XCTAssertEqual(sqlite.calls, initialCalls)
+    }
+
+    func testResolveLocalSessionsKeepsATitleUntilTheDatabaseChanges() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let dbPath = directory.appendingPathComponent("desktop-v2.db").path
+        try Data("original".utf8).write(to: URL(fileURLWithPath: dbPath))
+        let sessionEndsPath = directory.appendingPathComponent("state.json.session-ends.json").path
+        try Data(#"[{"instanceId":"sess-1","threadId":"th-1","active":true}]"#.utf8)
+            .write(to: URL(fileURLWithPath: sessionEndsPath))
+
+        let sqlite = SessionChatsSQLite()
+        sqlite.queryResults[dbPath] = """
+        [{"instanceId":"sess-1","threadId":"th-1","title":"Complete NonML Backlog","projectPath":"/Users/test/MathNotes"}]
+        """
+        let scanner = FreebuffDesktopUsageScanner(
+            sqlite: sqlite,
+            databasePaths: { [dbPath] },
+            sessionEndsPath: { sessionEndsPath }
+        )
+        let started = Date(timeIntervalSince1970: 1_800_000_000)
+        let sessions = [FreebuffActiveSession(instanceID: "sess-1", expiresAt: started.addingTimeInterval(1800))]
+
+        let first = await scanner.resolveLocalSessions(sessions, now: started)
+        XCTAssertEqual(first[0].chatTitle, "Complete NonML Backlog")
+        let callsAfterFirst = sqlite.calls
+
+        sqlite.queryResults[dbPath] = """
+        [{"instanceId":"sess-1","threadId":"th-1","title":"Non2","projectPath":"/Users/test/MathNotes"}]
+        """
+        let unchangedFile = await scanner.resolveLocalSessions(sessions, now: started.addingTimeInterval(10))
+        XCTAssertEqual(unchangedFile[0].chatTitle, "Complete NonML Backlog")
+        XCTAssertEqual(sqlite.calls, callsAfterFirst, "an unchanged database must not spawn sqlite3")
+
+        try Data("renamed".utf8).write(to: URL(fileURLWithPath: dbPath))
+        let tooSoon = await scanner.resolveLocalSessions(sessions, now: started.addingTimeInterval(20))
+        XCTAssertEqual(tooSoon[0].chatTitle, "Complete NonML Backlog")
+        XCTAssertEqual(sqlite.calls, callsAfterFirst, "chat traffic inside the refresh interval must not re-read titles")
+
+        let renamed = await scanner.resolveLocalSessions(
+            sessions, now: started.addingTimeInterval(FreebuffDesktopUsageScanner.titleRefreshInterval + 5)
+        )
+        XCTAssertEqual(renamed[0].chatTitle, "Non2")
+        XCTAssertEqual(sqlite.calls, callsAfterFirst + 1, "a rename re-reads only the known project database")
+    }
+
+    func testResolveLocalSessionsPrefersTheSessionEndThreadOverAStaleInstanceRow() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let dbPath = directory.appendingPathComponent("desktop-v2.db").path
+        try Data().write(to: URL(fileURLWithPath: dbPath))
+        let sessionEndsPath = directory.appendingPathComponent("state.json.session-ends.json").path
+        try Data(#"[{"instanceId":"sess-1","threadId":"th-new","active":true}]"#.utf8)
+            .write(to: URL(fileURLWithPath: sessionEndsPath))
+        let sqlite = SessionChatsSQLite()
+        sqlite.queryResults[dbPath] = """
+        [{"instanceId":"sess-1","threadId":"th-old","title":"Complete NonML Backlog","projectPath":"/Users/test/MathNotes"},
+         {"instanceId":"","threadId":"th-new","title":"Non2","projectPath":"/Users/test/MathNotes"}]
+        """
+        let scanner = FreebuffDesktopUsageScanner(
+            sqlite: sqlite,
+            databasePaths: { [dbPath] },
+            sessionEndsPath: { sessionEndsPath }
+        )
+        let resolved = await scanner.resolveLocalSessions([
+            FreebuffActiveSession(instanceID: "sess-1", expiresAt: now.addingTimeInterval(1800), model: "deepseek/deepseek-v4-flash")
+        ])
+        XCTAssertEqual(resolved[0].chatTitle, "Non2")
+        XCTAssertEqual(resolved[0].threadID, "th-new")
+        XCTAssertNil(resolved[0].subtitleModel)
+    }
 }

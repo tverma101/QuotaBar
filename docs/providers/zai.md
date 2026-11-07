@@ -9,12 +9,13 @@ Tracks [Z.ai](https://z.ai) (Zhipu AI) GLM Coding Plan usage quotas for coding s
 | Session | 5-hour rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
 | Weekly | 7-day rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
 | Web Searches | Monthly web-search / web-reader / Zread calls (used / limit); hidden when the plan carries no web-search allowance |
+| ZCode Tokens | All-time tokens recorded locally by ZCode across its configured models; optional, off by default |
 
 When Z.ai reports your plan name, QuotaBar shows it beside the provider name.
 
 ## Where credentials come from
 
-Z.ai has no companion CLI/app that QuotaBar can reuse a credential from, so you supply an API key.
+QuotaBar uses an API key for Coding Plan quotas. ZCode Tokens uses local ZCode history independently and does not need a key.
 QuotaBar reads it from the first place it finds one, in this order:
 
 1. `~/.config/openusage/zai.json` — `{"apiKey":"…"}` (the file Settings writes to)
@@ -36,6 +37,10 @@ export ZAI_API_KEY="YOUR_API_KEY"
 ```
 
 3. Z.ai appears on the dashboard and (after you star a metric) the menu bar on the next refresh.
+
+## ZCode Tokens
+
+Enable **ZCode Tokens** in Customize → Z.ai to see the all-time total from this Mac’s `~/.zcode/cli/db/db.sqlite`. It counts recorded input and output across models used in ZCode, including cached input once. This is local app usage, not the Coding Plan quota or a billing figure. It appears under On Demand and is not pinned by default.
 
 ## Under the hood
 

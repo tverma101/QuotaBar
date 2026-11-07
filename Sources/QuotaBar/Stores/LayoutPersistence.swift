@@ -14,6 +14,9 @@ final class LayoutPersistence {
 
     /// Presence is separate from successful decoding. Existing-but-unreadable data is still an existing
     /// layout, so startup must not mistake corruption for a fresh install and apply fresh-only defaults.
+    var hasSeededZCodePlacement: Bool { defaults.bool(forKey: keys.zcodePlacementSeeded) }
+    func markZCodePlacementSeeded() { defaults.set(true, forKey: keys.zcodePlacementSeeded) }
+
     var hasStoredLayout: Bool { defaults.data(forKey: keys.placed) != nil }
     var hasStoredSeededDefaults: Bool { defaults.data(forKey: keys.seededDefaults) != nil }
     var hasStoredSeededAccountPins: Bool { defaults.data(forKey: keys.seededAccountPins) != nil }
@@ -102,6 +105,7 @@ final class LayoutPersistence {
     }
 
     private struct Keys {
+        let zcodePlacementSeeded: String
         let placed: String
         let providerOrder: String
         let metricOrder: String
@@ -118,6 +122,7 @@ final class LayoutPersistence {
         let legacyHiddenMenuBarIconProviderIDs: String
 
         init(storageKey: String) {
+            zcodePlacementSeeded = "\(storageKey).zcodePlacementSeeded"
             placed = storageKey
             providerOrder = "\(storageKey).providerOrder"
             metricOrder = "\(storageKey).metricOrderByProvider"

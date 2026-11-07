@@ -20,7 +20,18 @@ final class LayoutStore {
     /// popover-closed reset alike.
     var screen: PopoverScreen {
         get { navigation.screen }
-        set { navigation.screen = newValue }
+        set {
+            if newValue != .customize { isProviderReorderMode = false }
+            navigation.screen = newValue
+        }
+    }
+    /// A compact, temporary provider-order screen opened by dragging a dashboard header.
+    var isProviderReorderMode = false
+
+    func showProviderReorder() {
+        customizeProviderID = nil
+        isProviderReorderMode = true
+        screen = .customize
     }
     /// The screen being left plus a per-switch counter, for DashboardView's horizontal slide.
     var screenSlideFrom: PopoverScreen { navigation.screenSlideFrom }
@@ -37,6 +48,7 @@ final class LayoutStore {
     }
     /// Close-path navigation reset (no screen-slide morph). See `PopoverNavigationStore.resetForPopoverClose`.
     func resetForPopoverClose() {
+        isProviderReorderMode = false
         navigation.resetForPopoverClose()
     }
     /// Cold-open presentation without a screen-slide morph. See `PopoverNavigationStore.presentWithoutSlide`.
@@ -215,7 +227,19 @@ final class LayoutStore {
         if !hadStoredMetricOptIns || explicitlyEnabledMetricIDs != savedExplicitlyEnabled {
             persistExplicitlyEnabledMetrics()
         }
-        if initial.shouldPersistExpandOnEnable { persistExpandOnEnable() }
+        // This optional metric was introduced after the saved opt-in queue. Seed it once without
+        // changing an existing placement or re-arming the default after the user moves it.
+        let seedZCode = !persistence.hasSeededZCodePlacement && registry.descriptor(id: "zai.zcodeTokens") != nil
+        if seedZCode {
+            if !placed.contains(where: { $0.descriptorID == "zai.zcodeTokens" }),
+               !expandedMetricIDs.contains("zai.zcodeTokens") {
+                defaultExpandedOnEnableIDs.insert("zai.zcodeTokens")
+            }
+            persistExpandOnEnable()
+            persistence.markZCodePlacementSeeded()
+        } else if initial.shouldPersistExpandOnEnable {
+            persistExpandOnEnable()
+        }
         if initial.shouldPersistExpanded { persistExpanded() }
         if let seededDefaults = initial.seededDefaultsToPersist { persistSeededDefaults(seededDefaults) }
         if initial.shouldPersistPins { persistPins() }

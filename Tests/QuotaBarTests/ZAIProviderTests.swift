@@ -305,6 +305,7 @@ final class ZAIProviderTests: XCTestCase {
     func testQuotaCancellationStopsBeforeSubscriptionEndpoint() async {
         let http = RoutingHTTPClient { _ in throw URLError(.cancelled) }
         let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
             authStore: makeAuthStore(key: "zai-test"),
             usageClient: ZAIUsageClient(http: http)
         )
@@ -318,6 +319,7 @@ final class ZAIProviderTests: XCTestCase {
 
     func testRefreshMapsBothEndpoints() async throws {
         let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
             authStore: makeAuthStore(key: "zai-test"),
             usageClient: ZAIUsageClient(http: RoutingHTTPClient { request in
                 XCTAssertEqual(request.headers["Authorization"], "Bearer zai-test")
@@ -341,6 +343,7 @@ final class ZAIProviderTests: XCTestCase {
         // The subscription endpoint is best-effort (plan name only) — a failure there must not blank
         // out the quota meters.
         let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
             authStore: makeAuthStore(key: "zai-test"),
             usageClient: ZAIUsageClient(http: RoutingHTTPClient { request in
                 if request.url == ZAIUsageClient.quotaURL {
@@ -364,6 +367,7 @@ final class ZAIProviderTests: XCTestCase {
         let clock = ZAIMutableClock(Date(timeIntervalSince1970: 1_800_000_000))
         let subscription = ZAIRequestCounter()
         let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
             authStore: makeAuthStore(key: "zai-test"),
             usageClient: ZAIUsageClient(http: RoutingHTTPClient { request in
                 if request.url == ZAIUsageClient.quotaURL {
@@ -397,6 +401,7 @@ final class ZAIProviderTests: XCTestCase {
         let subscription = ZAIRequestCounter()
         let fakeFiles = FakeFiles([ZAIAuthStore.configPaths[0]: #"{"apiKey":"key-1"}"#])
         let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
             authStore: ZAIAuthStore(files: fakeFiles, environment: FakeEnvironment()),
             usageClient: ZAIUsageClient(http: RoutingHTTPClient { request in
                 if request.url == ZAIUsageClient.quotaURL {
@@ -430,6 +435,7 @@ final class ZAIProviderTests: XCTestCase {
 
     func testRefreshWithoutKeyReportsNotLoggedIn() async {
         let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
             authStore: ZAIAuthStore(files: FakeFiles(), environment: FakeEnvironment()),
             usageClient: ZAIUsageClient(http: RoutingHTTPClient { _ in
                 XCTFail("should not hit the network without a key")
@@ -446,6 +452,7 @@ final class ZAIProviderTests: XCTestCase {
     func testUnreadableSavedKeyRemainsDetectedAndSurfacesCredentialAccess() async {
         let path = ZAIAuthStore.configPaths[0]
         let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
             authStore: ZAIAuthStore(
                 files: UnreadableFiles(present: [path]),
                 environment: FakeEnvironment()
@@ -468,6 +475,7 @@ final class ZAIProviderTests: XCTestCase {
 
         for entry in cases {
             let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
                 authStore: makeAuthStore(key: "zai-test"),
                 usageClient: ZAIUsageClient(http: RoutingHTTPClient { request in
                     request.url == ZAIUsageClient.quotaURL
@@ -484,6 +492,7 @@ final class ZAIProviderTests: XCTestCase {
 
     func testRefreshOnTransportErrorReportsNetwork() async {
         let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
             authStore: makeAuthStore(key: "zai-test"),
             usageClient: ZAIUsageClient(http: RoutingHTTPClient { _ in
                 throw ZAIUsageError.connectionFailed
@@ -499,6 +508,7 @@ final class ZAIProviderTests: XCTestCase {
         // A valid key whose account has no GLM Coding Plan: the quota endpoint answers a 2xx with
         // `success:false`. Surface a clear (non-malfunction) error so the header explains the empty card.
         let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
             authStore: makeAuthStore(key: "zai-test"),
             usageClient: ZAIUsageClient(http: RoutingHTTPClient { request in
                 if request.url == ZAIUsageClient.quotaURL {
@@ -522,6 +532,7 @@ final class ZAIProviderTests: XCTestCase {
     func testProviderAPIKeyManagingDelegatesToAuthStore() throws {
         let files = FakeFiles()
         let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite"),
             authStore: ZAIAuthStore(files: files, environment: FakeEnvironment(["ZAI_API_KEY": "zai-env"])),
             usageClient: ZAIUsageClient(http: RoutingHTTPClient { _ in jsonResponse("{}") })
         )

@@ -15,7 +15,8 @@ final class UsageDiagnosticsTests: XCTestCase {
                       resetsAt: now.addingTimeInterval(12 * 3600)),
             .values(label: "Hours Balance", values: [MetricValue(number: 73, kind: .count, label: "hours")]),
             .values(label: "Active Sessions", values: [], expiriesAt: [now.addingTimeInterval(42 * 60)])
-        ], refreshedAt: now, historyWarning: "Missing receipt")
+        ], refreshedAt: now, historyWarning: "Missing receipt",
+        activeSessions: [FreebuffActiveSession(instanceID: "sess-1", expiresAt: now.addingTimeInterval(42 * 60), model: "fast", chatTitle: "Refactor Widget")])
         let report = UsageDiagnostics.make(providerIDs: ["freebuff"], snapshots: ["freebuff": snapshot], errors: [:],
                                            registry: registry, runtimes: [provider], defaults: defaults(), now: now)
         let entry = try XCTUnwrap(report.providers["freebuff"])
@@ -26,6 +27,7 @@ final class UsageDiagnosticsTests: XCTestCase {
         XCTAssertTrue(wallet.headline.contains("73"))
         let timer = try XCTUnwrap(entry.widgets.first { $0.metricLabel == "Daily Hours" })
         XCTAssertEqual(timer.activeSessionExpiries, [now.addingTimeInterval(42 * 60)])
+        XCTAssertEqual(timer.activeSessions?.first?.chatTitle, "Refactor Widget")
         XCTAssertEqual(report.menuBar.first { $0.providerID == "freebuff" }?.values, ["42m"])
         XCTAssertTrue(report.findings.contains { $0.message == "Missing receipt" })
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: UsageDiagnostics.encode(report)) as? [String: Any])

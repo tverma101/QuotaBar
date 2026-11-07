@@ -14,6 +14,7 @@ set -euo pipefail
 #        ALLOW_ADHOC_SIGNING "1" permits signing without a stable identity (grants reset on rebuild)
 #        CONFIG             "release" (default) or "debug"
 #        BUILD_JOBS         SwiftPM worker count (default: 2, to limit peak compiler memory)
+#        LOCAL_APP_VERSION  preserve an existing installed version for a local non-release build
 #        RELEASE            "1" requires a v-prefixed tag at HEAD and builds universal arm64 + x86_64
 #                           with the production app identity; install preserves the destination identity
 #        ICLOUD_PROVISIONING_PROFILE  optional override for the development provisioning profile;
@@ -50,9 +51,9 @@ if [ "$RELEASE" = "1" ]; then
   APP_BUILD="${APP_VERSION%%-*}"
   DISPLAY_VERSION="$APP_VERSION"
 else
-  APP_VERSION="0.7.0"
+  APP_VERSION="${LOCAL_APP_VERSION:-0.7.0}"
   APP_BUILD="$APP_VERSION"
-  DISPLAY_VERSION="$APP_VERSION-dev"
+  DISPLAY_VERSION="${LOCAL_APP_VERSION:-$APP_VERSION-dev}"
 fi
 
 DIST_DIR="$ROOT_DIR/dist"
