@@ -52,13 +52,25 @@ struct CustomizeProviderDetailView: View {
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 8)
-            Toggle("Show in menu bar", isOn: Binding(
-                get: { layout.isMenuBarProviderVisible(for: providerID) },
-                set: { layout.setMenuBarProviderVisible($0, for: providerID) }
-            ))
-            .settingsSwitchStyle()
-            .padding(.horizontal, 12)
-            .padding(.vertical, density.controlRowPadding)
+            VStack(spacing: 0) {
+                Toggle("Show in Menu Bar", isOn: Binding(
+                    get: { layout.isMenuBarProviderVisible(for: providerID) },
+                    set: { layout.setMenuBarProviderVisible($0, for: providerID) }
+                ))
+                .settingsSwitchStyle()
+                .padding(.horizontal, 12)
+                .padding(.vertical, density.controlRowPadding)
+
+                Divider().opacity(0.4)
+
+                Toggle("Snooze When Out of Usage", isOn: Binding(
+                    get: { container.snooze.isSubscriptionEnabled(providerID) },
+                    set: { container.snooze.setSubscriptionEnabled(providerID, enabled: $0) }
+                ))
+                .settingsSwitchStyle()
+                .padding(.horizontal, 12)
+                .padding(.vertical, density.controlRowPadding)
+            }
             .cardSurface()
             Text("Shows this provider or account’s icon and pinned usage values.")
                 .font(.caption)
