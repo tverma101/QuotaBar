@@ -26,13 +26,6 @@ struct DashboardContentView: View {
                         .padding(.bottom, density.sectionSpacing)
                         .transition(.scale(scale: 0.95).combined(with: .opacity))
                 }
-                Picker("Dashboard", selection: $priorityTab) {
-                    Text("Priority").tag(true)
-                    Text("All Usage").tag(false)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .padding(.bottom, density.sectionSpacing)
                 if priorityTab {
                     PriorityDashboardView { providerID in
                         _ = layout.setProviderExpanded(true, for: providerID)
