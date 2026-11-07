@@ -40,12 +40,12 @@ final class PanelHeightCoordinator {
         recomposeIdeal(for: screen)
     }
 
-    /// Sum a screen's measured parts into its ideal window height. Each screen pins a top bar at
-    /// `topBarHeight`. A zero/absent scroll content leaves the ideal unset (not yet
+    /// Sum a screen's measured parts into its ideal window height. The dashboard shows no top bar; other
+    /// screens pin it to `topBarHeight`. A zero/absent scroll content leaves the ideal unset (not yet
     /// measured), so the view keeps the size the controller opened at until a real measurement lands.
     private func recomposeIdeal(for screen: PopoverScreen) {
         guard let content = measuredScrollContent[screen], content > 0 else { return }
-        let topBar = topBarHeight
+        let topBar: CGFloat = screen == .dashboard ? 0 : topBarHeight
         let footer = measuredFooter[screen] ?? 0
         let ideal = topBar + footer + content
         guard measuredIdeal[screen] != ideal else { return }

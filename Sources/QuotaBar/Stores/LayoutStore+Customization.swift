@@ -190,6 +190,18 @@ extension LayoutStore {
         }
     }
 
+    /// The compact reorder list includes disabled providers, whose future position is also editable.
+    @discardableResult
+    func reorderAnyProvider(dragged: String, target: String) -> Bool {
+        recordingUndoStep {
+            guard let next = Self.reordered(orderedProviderIDs(), dragged: dragged, target: target) else { return false }
+            providerOrder = next
+            persistProviderOrder()
+            syncPlacedOrder()
+            return true
+        }
+    }
+
     /// Reorder metrics within one provider when `dragged` is dropped onto `target` (both descriptor ids of
     /// that provider). Operates on the provider's full metric order so disabled metrics keep their place too.
     ///

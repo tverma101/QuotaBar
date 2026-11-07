@@ -9,24 +9,18 @@ struct PopoverTopBar: View {
     let onResetAll: () -> Void
 
     @Binding var isPresentingResetAllConfirm: Bool
-    @AppStorage("dashboardPriorityTab") private var priorityTab = true
 
     @ViewBuilder
     var body: some View {
         switch layout.screen {
         case .dashboard:
-            Picker("Dashboard", selection: $priorityTab) {
-                Text("Priority").tag(true)
-                Text("All Usage").tag(false)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .padding(.horizontal, horizontalPadding)
-            .frame(height: height)
-            .frame(maxWidth: .infinity)
-            .barGlass()
+            EmptyView()
         case .customize:
-            if let providerID = layout.customizeProviderID {
+            if layout.isProviderReorderMode {
+                navigationBar(title: "Reorder Providers", back: customizeBack) {
+                    Button("Done") { customizeBack() }.buttonStyle(.plain)
+                }
+            } else if let providerID = layout.customizeProviderID {
                 navigationBar(title: customizeTitle, back: customizeBack) {
                     resetButton(for: providerID)
                 }

@@ -51,7 +51,9 @@ struct CustomizeView: View {
 
     @ViewBuilder
     private var content: some View {
-        if let id = layout.customizeProviderID {
+        if layout.isProviderReorderMode {
+            ProviderReorderListView(reorderSpaceName: reorderSpaceName, reorderLift: $reorderLift, frameStore: frameStore)
+        } else if let id = layout.customizeProviderID {
             CustomizeProviderDetailView(
                 providerID: id,
                 reorderSpaceName: reorderSpaceName,

@@ -14,7 +14,6 @@ struct DashboardContentView: View {
 
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
     @AppStorage(TotalSpendSetting.key) private var showTotalSpend = true
-    @AppStorage("dashboardPriorityTab") private var priorityTab = true
 
     var body: some View {
         PopoverScrollView {
@@ -26,15 +25,7 @@ struct DashboardContentView: View {
                         .padding(.bottom, density.sectionSpacing)
                         .transition(.scale(scale: 0.95).combined(with: .opacity))
                 }
-                if priorityTab {
-                    PriorityDashboardView { providerID in
-                        _ = layout.setProviderExpanded(true, for: providerID)
-                        priorityTab = false
-                        DispatchQueue.main.async { scrollPosition.scrollTo(id: providerID, anchor: .top) }
-                    }
-                } else {
-                    widgetContent
-                }
+                widgetContent
             }
             .animation(Motion.spring, value: container.onboarding.isCustomizeHintPending)
             .padding(.horizontal, horizontalPadding)

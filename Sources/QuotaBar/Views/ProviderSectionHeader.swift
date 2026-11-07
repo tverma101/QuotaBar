@@ -23,6 +23,7 @@ struct ProviderSectionHeader: View {
     var staleness: StalenessHint?
     /// Dashboard-only screenshot action. The reorder preview omits it, while Customize uses its own
     /// row type and is unaffected by this header.
+    var cardIsHovered = false
     var onCopyScreenshot: (() -> Bool)?
     /// A direct retry for a provider with a hard refresh error. Keep the recovery action next to its
     /// warning instead of requiring the user to discover the footer countdown or a context menu.
@@ -33,6 +34,7 @@ struct ProviderSectionHeader: View {
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
     /// Party easter egg: pulse the provider mark. Off by default everywhere else.
     @Environment(\.popoverPartyMode) private var partyMode
+    @Environment(\.popoverIsVisible) private var popoverIsVisible
     @State private var isHovered = false
 
     var statusPresentation: ProviderHeaderStatusPresentation {
@@ -49,6 +51,7 @@ struct ProviderSectionHeader: View {
         warning: String? = nil,
         refreshing: Bool = false,
         staleness: StalenessHint? = nil,
+        cardIsHovered: Bool = false,
         onCopyScreenshot: (() -> Bool)? = nil,
         onRefresh: (() -> Void)? = nil
     ) {
@@ -57,6 +60,7 @@ struct ProviderSectionHeader: View {
         self.warning = warning
         self.refreshing = refreshing
         self.staleness = staleness
+        self.cardIsHovered = cardIsHovered
         self.onCopyScreenshot = onCopyScreenshot
         self.onRefresh = onRefresh
     }
@@ -121,7 +125,7 @@ struct ProviderSectionHeader: View {
             if let onCopyScreenshot {
                 CopyFeedbackButton(
                     accessibilityLabel: "Copy \(provider.displayName) Screenshot",
-                    isRevealed: isHovered,
+                    isRevealed: isHovered || cardIsHovered,
                     action: onCopyScreenshot
                 )
             }
@@ -131,6 +135,9 @@ struct ProviderSectionHeader: View {
         .padding(.vertical, 2)
         .contentShape(Rectangle())
         .onHover { isHovered = $0 }
+        .onChange(of: popoverIsVisible) { _, shown in
+            if !shown { isHovered = false }
+        }
     }
 }
 

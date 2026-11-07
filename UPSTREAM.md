@@ -98,4 +98,4 @@ rewritten, and upstream attribution must be preserved.
 
 ## Popup adaptation — 2026-11-07
 
-Adapted the Priority and All Usage popup tabs from upstream’s dashboard update (starting with `4f1b92f3`). QuotaBar retains its provider enablement, metric visibility, On Demand, and menu-bar pin controls; Priority uses those enabled rows and the existing meter state.
+Adapted upstream `214ba770`: the screenshot action appears while the pointer is over a provider card. The existing single dashboard and customization controls remain in place.

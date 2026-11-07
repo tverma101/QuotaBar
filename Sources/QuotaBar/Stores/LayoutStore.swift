@@ -20,7 +20,18 @@ final class LayoutStore {
     /// popover-closed reset alike.
     var screen: PopoverScreen {
         get { navigation.screen }
-        set { navigation.screen = newValue }
+        set {
+            if newValue != .customize { isProviderReorderMode = false }
+            navigation.screen = newValue
+        }
+    }
+    /// A compact, temporary provider-order screen opened by dragging a dashboard header.
+    var isProviderReorderMode = false
+
+    func showProviderReorder() {
+        customizeProviderID = nil
+        isProviderReorderMode = true
+        screen = .customize
     }
     /// The screen being left plus a per-switch counter, for DashboardView's horizontal slide.
     var screenSlideFrom: PopoverScreen { navigation.screenSlideFrom }
@@ -37,6 +48,7 @@ final class LayoutStore {
     }
     /// Close-path navigation reset (no screen-slide morph). See `PopoverNavigationStore.resetForPopoverClose`.
     func resetForPopoverClose() {
+        isProviderReorderMode = false
         navigation.resetForPopoverClose()
     }
     /// Cold-open presentation without a screen-slide morph. See `PopoverNavigationStore.presentWithoutSlide`.

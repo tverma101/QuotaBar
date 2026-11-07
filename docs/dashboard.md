@@ -62,8 +62,9 @@ When a provider has a refresh error, its header also shows a visible **Refresh**
 
 ## Share
 
-Copy a clean, branded PNG of one provider's usage to your clipboard, ready to paste into a chat, a tweet, or a doc. There are two ways to reach it:
+Copy a clean, branded PNG of one provider's usage to your clipboard, ready to paste into a chat, a tweet, or a doc. There are three ways to reach it:
 
+- Point at a provider card and click the copy button in its header.
 - Right-click a provider header and choose **Share Screenshot**.
 - Open the footer's **Options** menu and choose **Share Screenshot** ▸ *\<provider\>*. The submenu lists every provider currently showing on the dashboard.
 
@@ -81,7 +82,7 @@ The **provider list** shows every provider with a switch to turn it on or off, a
 
 A provider's **detail** has a back button and provider-specific Reset control in its top bar, followed by two metric sections: **Always Visible** (shown on the dashboard card) and **On Demand** (tucked behind the card's caret). Each metric row has a drag grip, its name, an always-visible star for the menu bar, and an on/off switch. Drag a metric into the other card—or onto one of that card's rows—to move it between Always Visible and On Demand. An empty card shows a dashed **Drag metrics here** target. You can star up to two metrics per provider. OpenRouter and Z.ai also show an **API Key** section here, where you can add, replace, reveal, or clear that provider's key.
 
-Drag-reorder also works directly on the dashboard — drag a row within its provider, drag it across the caret boundary while the card is open, or drag a provider header to reorder sections. On a Force Touch trackpad you'll feel a light tap each time the dragged item snaps into a new slot.
+Drag metrics directly on the dashboard within a provider or across the caret boundary while the card is open. Dragging a provider header opens the compact provider-order list. On a Force Touch trackpad you'll feel a light tap each time the dragged item snaps into a new slot.
 
 The default reset layout keeps each provider's core quota meters and Usage Trend always visible, then tucks balances, reset details, and spend-history rows on demand. Optional detail rows like Claude Sonnet and Cursor Requests/Credits stay off by default, but start on demand if you enable them.
 
@@ -105,6 +106,6 @@ A global shortcut (recorded in Settings) toggles the popover from anywhere.
 
 Closing the popover resets navigation state: scroll position returns to the top and Customize / Settings close. Provider cards remember whether their expand caret was open.
 
-## Priority and All Usage
+## Reorder Providers
 
-The popup opens on the last selected tab. **Priority** brings enabled limits that need attention together with pinned metrics; used-up limits appear last. Select a row to open its provider in **All Usage**, where you can continue to customize visibility, On Demand rows, and pins.
+Drag a provider header to open a compact list, then drag names into the order you want. The list includes disabled providers, so you can set their position before turning them on. Choose **Done** to return to the dashboard.
