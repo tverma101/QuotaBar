@@ -8,9 +8,11 @@ Right-click (or control-click) the QuotaBar menu bar icon for a quick menu with 
 
 ## Usage History
 
-Hovering a spend value shows its model breakdown. **Other** keeps smaller contributors together,
-but lists every contributor's name, measured tokens, and cost or **Unpriced**. Missing older model
-labels remain explicit usage categories rather than being counted as additional named models.
+Hovering a spend value shows its model breakdown. Several small models stay together as **Other**,
+which lists each one's name, measured tokens, and cost or **Unpriced** once. A single small model,
+or the one model that accounts for Other's whole price, keeps its own row, so the same tokens and
+cost are not shown twice. Missing older model labels remain explicit usage categories rather than
+being counted as additional named models.
 
 The dashboard footer's **Options** menu → **Usage History** opens a read-only report built from the same local usage data the spend tiles show, so the two can never disagree:
 
@@ -42,10 +44,16 @@ Settings → Privacy → **Hide From Screen Share** (off by default). While your
 
 Detection rides the system's own "an app is capturing the screen" signal — the same one that lights the capture indicator in the menu bar — checked the instant it changes and re-checked every few seconds while the setting is on.
 
+## Snoozing low-usage or exhausted subscriptions
+
+Settings → **Snooze Subscriptions** (off by default) lets you temporarily hide menu bar icons for subscriptions that are out of usage or below a chosen threshold (0%, 5%, 10%, 15%, or 20% remaining). When a subscription's quota resets or recovers, its menu bar icon and values automatically reappear. You can choose which subscriptions auto-snooze or manually snooze a subscription until its next reset from its context menu.
+
 ## What the strip shows
 
 The strip only renders real data. A starred metric with nothing fetched yet is skipped; a provider whose stars all lack data disappears entirely (icon included). When nothing has data, the strip falls back to the app icon, but the single status item remains clickable and opens the aggregate dashboard. Stars follow your Customize order — Always Visible metrics first, then On Demand ones. A metric can be starred whether it's Always Visible or On Demand. Multiple Claude and Codex accounts remain separate provider cards inside the same panel. Codex account values remain separate in the strip but share one provider mark. When an account moves from a family ID to an account-specific ID, its existing family pins carry over once, even when the old family card is no longer active; later explicit unpins are preserved.
 
 A bounded count meter carries a compact unit in the strip when the unit is the only thing that makes the number meaningful — an hours balance reads `30h`, not a bare `30` — while percent and dollar meters stay as they are. Units that would abbreviate ambiguously (sessions would collapse to `s`, which reads as seconds) keep their bare number instead.
 
-Freebuff's Daily Hours pin shows only **active session timers**, using each session's actual expiry time. Two active sessions each get a countdown. Daily reset times, remaining allowances, balances, expired sessions, and unoccupied purchased hours do not appear beside those timers. The countdowns update each minute and disappear when no sessions remain active.
+Freebuff's Daily Hours pin shows only **active session timers**, using each session's actual expiry time. Every live session stays under the one Freebuff mark. Two timers stack. A third or fourth sits beside that pair, so the strip stays the same height as the other providers. Daily reset times, remaining allowances, balances, expired sessions, and unoccupied purchased hours do not appear beside those timers. The countdowns update each minute and disappear when no sessions remain active.
+
+Claude and Antigravity meters disappear from the menu bar when their saved reset time is more than five minutes past, until a fresh value arrives. Open the dashboard to see the last known value and any refresh warning.

@@ -14,6 +14,7 @@ final class ZAIProvider: ProviderRuntime {
 
     let authStore: ZAIAuthStore
     let usageClient: ZAIUsageClient
+    let zcodeScanner: ZCodeUsageScanner
     let now: @Sendable () -> Date
 
     /// The plan name changes about once a month, so re-reading it on every refresh doubled the
@@ -24,12 +25,14 @@ final class ZAIProvider: ProviderRuntime {
     private var cachedSubscriptionAt: Date?
 
     init(
+        zcodeScanner: ZCodeUsageScanner = ZCodeUsageScanner(),
         authStore: ZAIAuthStore = ZAIAuthStore(),
         usageClient: ZAIUsageClient = ZAIUsageClient(),
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.authStore = authStore
         self.usageClient = usageClient
+        self.zcodeScanner = zcodeScanner
         self.now = now
     }
 
@@ -45,6 +48,9 @@ final class ZAIProvider: ProviderRuntime {
                           metricLabel: "Web Searches", limit: 1000, suffix: "searches",
                           periodDurationMs: ZAIUsageMapper.monthlyPeriodMs)
                 .exportingLimit("webSearches", unit: "searches")
+                .hidingWhenEmpty(),
+            .values(id: "zai.zcodeTokens", provider: provider, title: "ZCode Tokens",
+                    metricLabel: "ZCode Tokens", selection: .kind(.count))
                 .hidingWhenEmpty()
         ]
     }
@@ -52,10 +58,45 @@ final class ZAIProvider: ProviderRuntime {
     func hasLocalCredentials() async -> Bool {
         // Same source as `refresh()`: a stored or environment-exported API key. A present but
         // unreadable config still counts so refresh can surface its repair message.
-        await loadOffMainActor { [authStore] in authStore.hasKeyOrUnreadableConfig() }
+        await loadOffMainActor { [authStore, zcodeScanner] in
+            authStore.hasKeyOrUnreadableConfig() || zcodeScanner.hasHistory()
+        }
     }
 
     func refresh() async -> ProviderSnapshot {
+        let quota = await refreshQuota()
+        guard quota.errorCategory != .cancelled, !Task.isCancelled else { return quota }
+        do {
+            let total = try await loadOffMainActor { [zcodeScanner] in try zcodeScanner.totalTokens() }
+            guard let total else { return quota }
+            var result = quota
+            if case .badge(_, let message, _, _) = result.lines.first(where: \.isError) {
+                // Keep local usage usable even when the separate Coding Plan request fails.
+                DiagnosticGate.logOnce(for: "auth.zai.quota-with-zcode.failure") {
+                    AppLog.warn(LogTag.auth("zai"), "quota refresh failed: \(message)")
+                }
+                result = .make(provider: provider, plan: nil, lines: [], refreshedAt: now(),
+                               warning: message)
+                result.quotaRefreshedAt = .distantPast
+                result.clearsPriorMenuBarQuotaState = quota.clearsPriorMenuBarQuotaState
+            }
+            if quota.lines.allSatisfy({ !$0.isError }) {
+                DiagnosticGate.clearFailure("auth.zai.quota-with-zcode.failure")
+            }
+            result.lines.append(.values(label: "ZCode Tokens", values: [
+                MetricValue(number: total, kind: .count, label: "tokens")
+            ]))
+            return result
+        } catch {
+            if ProviderCancellation.isCancellation(error) { return cancelledRefreshSnapshot(provider: provider) }
+            AppLog.warn(LogTag.auth("zai"), "ZCode token history read failed: \(error.localizedDescription)")
+            var result = quota
+            result.historyWarning = "Couldn't read ZCode token usage."
+            return result
+        }
+    }
+
+    private func refreshQuota() async -> ProviderSnapshot {
         let auth: ZAIAuth?
         do {
             auth = try await loadOffMainActor { [authStore] in try authStore.loadAPIKeyForRefresh() }

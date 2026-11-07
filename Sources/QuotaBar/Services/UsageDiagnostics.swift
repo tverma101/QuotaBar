@@ -37,6 +37,7 @@ enum UsageDiagnostics {
         var limit: Double?
         var resetsAt: Date?
         var activeSessionExpiries: [Date]
+        var activeSessions: [FreebuffActiveSession]?
         var pinned: Bool
         var enabled: Bool
     }
@@ -110,6 +111,7 @@ enum UsageDiagnostics {
                               limit: value.hasData ? value.limit : nil,
                               resetsAt: value.resetsAt,
                               activeSessionExpiries: value.traySessionExpiriesAt.filter { $0 > now }.sorted(),
+                              activeSessions: value.activeSessions.isEmpty ? nil : value.activeSessions.filter { $0.expiresAt > now }.sorted { $0.expiresAt < $1.expiresAt },
                               pinned: layout.pinnedMetricIDs.contains(descriptor.id),
                               enabled: enabledMetrics.contains(descriptor.id))
             }

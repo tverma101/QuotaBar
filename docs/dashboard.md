@@ -43,7 +43,7 @@ The ring center is always two short lines — a compact number on top and a quie
 
 Feature-dependent rows stay hidden when the provider has no matching data; explicitly enabling one in Customize keeps its empty state visible. During upgrades, QuotaBar can recover old manual choices when a row was outside that version's saved defaults. Older layouts cannot distinguish a manual choice from a default row, so those ambiguous rows may need to be enabled again.
 
-For Claude, Codex, Cursor, Grok, Freebuff, and OpenCode spend rows, the value gently highlights when you point at it, signaling it's interactive; hovering it for a moment opens a small model breakdown for that period: a ranked list of models, each showing its name and spend on one line, its share percentage and tokens on the next, and a thin share bar. Cursor groups its per-thinking-effort export slugs (like `claude-opus-4-8-thinking-max`) under the base model. Long tails fold into **Other** — anything past the top named models or under 5% of the period. Models without a price stay in the breakdown with their token counts and no dollar amount; the warning triangle names them. Known priced usage remains visible as a partial subtotal when those unknown models explain the incomplete day. Partial dollar subtotals use a `≥` marker. Coverage information stays in the existing details; cards and model rows do not repeat a Partial badge. Shares are hidden when the period token total is only a lower bound. If the source also reports an unrelated accounting gap, or older synced detail cannot confirm the cause, the uncertain dollar total is hidden. See [Pricing](pricing.md).
+For Claude, Codex, Cursor, Grok, Freebuff, and OpenCode spend rows, the value gently highlights when you point at it, signaling it's interactive; hovering it for a moment opens a small model breakdown for that period: a ranked list of models, each showing its name and spend on one line, its share percentage and tokens on the next, and a thin share bar. Cursor groups its per-thinking-effort export slugs (like `claude-opus-4-8-thinking-max`) under the base model. Several small models fold into **Other** — anything past the top named models, or under 5% of both the period's cost and its tokens. One small model keeps its own name. A model that accounts for Other's whole price stays on its own row too, including when unpriced usage was folded beside it. Other lists each remaining model once. Models without a price stay in the breakdown with their token counts and no dollar amount; the warning triangle names them. Known priced usage remains visible as a partial subtotal when those unknown models explain the incomplete day. Partial dollar subtotals use a `≥` marker. Coverage information stays in the existing details; cards and model rows do not repeat a Partial badge. Shares are hidden when the period token total is only a lower bound. If the source also reports an unrelated accounting gap, or older synced detail cannot confirm the cause, the uncertain dollar total is hidden. See [Pricing](pricing.md).
 
 **Usage Trend** (Claude, Codex, Cursor, Grok, and OpenCode) is a small bar chart of the last 30 days of token usage — one bar per day, drawn from the same source as that provider's spend rows (local logs for Claude, Codex, Grok, and OpenCode; Cursor's usage export for Cursor). **Hover it** for the peak day, the date range, and the source. It's on by default; turn it off or reorder it from Customize like any other metric. It can't be starred for the menu bar — the strip shows single values, not a chart.
 
@@ -62,8 +62,9 @@ When a provider has a refresh error, its header also shows a visible **Refresh**
 
 ## Share
 
-Copy a clean, branded PNG of one provider's usage to your clipboard, ready to paste into a chat, a tweet, or a doc. There are two ways to reach it:
+Copy a clean, branded PNG of one provider's usage to your clipboard, ready to paste into a chat, a tweet, or a doc. There are three ways to reach it:
 
+- Point at a provider card and click the copy button in its header.
 - Right-click a provider header and choose **Share Screenshot**.
 - Open the footer's **Options** menu and choose **Share Screenshot** ▸ *\<provider\>*. The submenu lists every provider currently showing on the dashboard.
 
@@ -81,7 +82,7 @@ The **provider list** shows every provider with a switch to turn it on or off, a
 
 A provider's **detail** has a back button and provider-specific Reset control in its top bar, followed by two metric sections: **Always Visible** (shown on the dashboard card) and **On Demand** (tucked behind the card's caret). Each metric row has a drag grip, its name, an always-visible star for the menu bar, and an on/off switch. Drag a metric into the other card—or onto one of that card's rows—to move it between Always Visible and On Demand. An empty card shows a dashed **Drag metrics here** target. You can star up to two metrics per provider. OpenRouter and Z.ai also show an **API Key** section here, where you can add, replace, reveal, or clear that provider's key.
 
-Drag-reorder also works directly on the dashboard — drag a row within its provider, drag it across the caret boundary while the card is open, or drag a provider header to reorder sections. On a Force Touch trackpad you'll feel a light tap each time the dragged item snaps into a new slot.
+Drag metrics directly on the dashboard within a provider or across the caret boundary while the card is open. Dragging a provider header opens the compact provider-order list. On a Force Touch trackpad you'll feel a light tap each time the dragged item snaps into a new slot.
 
 The default reset layout keeps each provider's core quota meters and Usage Trend always visible, then tucks balances, reset details, and spend-history rows on demand. Optional detail rows like Claude Sonnet and Cursor Requests/Credits stay off by default, but start on demand if you enable them.
 
@@ -104,3 +105,7 @@ A global shortcut (recorded in Settings) toggles the popover from anywhere.
 ## Closing
 
 Closing the popover resets navigation state: scroll position returns to the top and Customize / Settings close. Provider cards remember whether their expand caret was open.
+
+## Reorder Providers
+
+Drag a provider header to open a compact list, then drag names into the order you want. The list includes disabled providers, so you can set their position before turning them on. Choose **Done** to return to the dashboard.

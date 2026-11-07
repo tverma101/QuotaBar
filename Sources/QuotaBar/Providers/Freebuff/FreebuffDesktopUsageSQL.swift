@@ -84,4 +84,56 @@ enum FreebuffDesktopUsageSQL {
             }
         }
     }
+
+    static func activeSessionChatsQuery(instanceIDs: [String], threadIDs: [String]) -> String {
+        let escapedInstances = instanceIDs.map { "'\($0.replacingOccurrences(of: "'", with: "''"))'" }.joined(separator: ", ")
+        let escapedThreads = threadIDs.map { "'\($0.replacingOccurrences(of: "'", with: "''"))'" }.joined(separator: ", ")
+        var conditions: [String] = []
+        if !escapedInstances.isEmpty {
+            conditions.append("freebuff_instance_id IN (\(escapedInstances))")
+        }
+        if !escapedThreads.isEmpty {
+            conditions.append("id IN (\(escapedThreads))")
+        }
+        let whereClause = conditions.isEmpty ? "1=0" : conditions.joined(separator: " OR ")
+        return """
+        SELECT COALESCE(json_group_array(json_object(
+          'instanceId', COALESCE(freebuff_instance_id, ''),
+          'threadId', COALESCE(id, ''),
+          'title', COALESCE(title, ''),
+          'projectPath', COALESCE(project_path, '')
+        )), '[]') FROM threads
+        WHERE \(whereClause)
+        """
+    }
+
+    static func readActiveSessionChats(
+        sqlite: any SQLiteAccessing,
+        path: String,
+        instanceIDs: [String],
+        threadIDs: [String]
+    ) throws -> String? {
+        guard !instanceIDs.isEmpty || !threadIDs.isEmpty else { return "[]" }
+        let sql = activeSessionChatsQuery(instanceIDs: instanceIDs, threadIDs: threadIDs)
+        do {
+            return try sqlite.queryValue(path: path, sql: sql)
+        } catch let error as SQLiteError {
+            if case .queryFailed(let message) = error,
+               message.localizedCaseInsensitiveContains("no such column: freebuff_instance_id"),
+               !threadIDs.isEmpty {
+                let escapedThreads = threadIDs.map { "'\($0.replacingOccurrences(of: "'", with: "''"))'" }.joined(separator: ", ")
+                let fallbackSQL = """
+                SELECT COALESCE(json_group_array(json_object(
+                  'instanceId', '',
+                  'threadId', COALESCE(id, ''),
+                  'title', COALESCE(title, ''),
+                  'projectPath', COALESCE(project_path, '')
+                )), '[]') FROM threads
+                WHERE id IN (\(escapedThreads))
+                """
+                return try sqlite.queryValue(path: path, sql: fallbackSQL)
+            }
+            throw error
+        }
+    }
 }

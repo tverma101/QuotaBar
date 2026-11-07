@@ -2,7 +2,7 @@ import SwiftUI
 
 struct ReorderLift {
     enum Payload {
-        case dashboardProvider(provider: Provider, plan: String?, rows: [WidgetData])
+        case providerOrder(provider: Provider)
         case dashboardMetric(data: WidgetData)
         case customizeProviderRow(provider: Provider, isEnabled: Bool, metricCount: Int, hasLocalSetup: Bool)
         case customizeMetric(title: String)
@@ -41,9 +41,7 @@ struct ReorderLiftPreview: View {
     let lift: ReorderLift
 
     // The previews are deliberately the same views the live screens render (shared row/card
-    // builders); reading the density here lets the header→card spacing track the live sections too,
-    // so a lifted provider block matches its source block in every density.
-    @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
+    // builders) so the lifted preview matches the source row.
 
     var body: some View {
         preview
@@ -61,8 +59,8 @@ struct ReorderLiftPreview: View {
     @ViewBuilder
     private var preview: some View {
         switch lift.payload {
-        case .dashboardProvider(let provider, let plan, let rows):
-            dashboardProviderPreview(provider: provider, plan: plan, rows: rows)
+        case .providerOrder(let provider):
+            ProviderOrderRow(provider: provider).liftedRowSurface()
         case .dashboardMetric(let data):
             dashboardMetricPreview(data)
         case .customizeProviderRow(let provider, let isEnabled, let metricCount, let hasLocalSetup):
@@ -74,21 +72,6 @@ struct ReorderLiftPreview: View {
             )
         case .customizeMetric(let title):
             customizeMetricPreview(title)
-        }
-    }
-
-    private func dashboardProviderPreview(provider: Provider, plan: String?, rows: [WidgetData]) -> some View {
-        // Same anatomy as the live dashboard section (`WidgetGroupedListView.section` + `container`):
-        // header over the shared metric card, at the density's header→card spacing.
-        VStack(alignment: .leading, spacing: density.headerToCardSpacing) {
-            ProviderSectionHeader(provider: provider, plan: plan)
-                .padding(.horizontal, 8)
-
-            DashboardMetricCard {
-                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                    WidgetRowView(data: row)
-                }
-            }
         }
     }
 

@@ -2048,8 +2048,10 @@ final class WidgetDataStore {
             // Read only explicit session expiries. Cached daily spend is not session activity.
             if case .values(_, _, _, let expiries, _, _) = snapshots[descriptor.providerID]?.line(label: metricLabel) {
                 result.traySessionExpiriesAt = expiries
+                result.activeSessions = snapshots[descriptor.providerID]?.activeSessions ?? []
             } else {
                 result.traySessionExpiriesAt = []
+                result.activeSessions = []
             }
         }
 

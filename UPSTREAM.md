@@ -95,3 +95,7 @@ QuotaBar is a maintained fork, so the old "do not edit this subtree" quarantine 
 The engineering conventions in `AGENTS.md` govern. The upstream notices — `LICENSE`,
 `CODE_OF_CONDUCT.md`, `SECURITY.md`, `CONTRIBUTING.md`, `TRADEMARK.md` — must not be removed or
 rewritten, and upstream attribution must be preserved.
+
+## Popup adaptation — 2026-11-07
+
+Adapted upstream `214ba770`: the screenshot action appears while the pointer is over a provider card. The existing single dashboard and customization controls remain in place.

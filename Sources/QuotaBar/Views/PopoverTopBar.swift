@@ -16,7 +16,11 @@ struct PopoverTopBar: View {
         case .dashboard:
             EmptyView()
         case .customize:
-            if let providerID = layout.customizeProviderID {
+            if layout.isProviderReorderMode {
+                navigationBar(title: "Reorder Providers", back: customizeBack) {
+                    Button("Done") { customizeBack() }.buttonStyle(.plain)
+                }
+            } else if let providerID = layout.customizeProviderID {
                 navigationBar(title: customizeTitle, back: customizeBack) {
                     resetButton(for: providerID)
                 }
