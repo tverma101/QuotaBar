@@ -41,7 +41,7 @@ enum DefaultLayout {
         "openrouter.credits", "openrouter.balance",
         "openrouter.today", "openrouter.week", "openrouter.month", "openrouter.keyLimit",
 
-        "zai.session", "zai.weekly", "zai.webSearches"
+        "zai.session", "zai.weekly", "zai.webSearches", "zai.zcodeTokens"
     ]
 
     /// Frozen snapshot of the default-on metrics from the release that introduced default seeding.

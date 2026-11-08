@@ -754,6 +754,9 @@ final class AppContainer {
                     await PersistentJSONLScanCaches.unloadAfterRefreshCycle(
                         keepRouterItemsResident: keepRouterIndexWarm
                     )
+                    if ProcessMemoryBudget.isOverSoftLimit {
+                        await dataStore.unloadProviderCachesForMemoryPressure()
+                    }
                 }
                 // Re-evaluate quota pace milestones every tick — after the refresh so it sees fresh data,
                 // and on every loop (not just on a fetch) so pace worsening from elapsed time alone still
