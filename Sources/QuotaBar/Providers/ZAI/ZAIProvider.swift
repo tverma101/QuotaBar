@@ -67,18 +67,31 @@ final class ZAIProvider: ProviderRuntime {
         let quota = await refreshQuota()
         guard quota.errorCategory != .cancelled, !Task.isCancelled else { return quota }
         do {
-            let total = try await loadOffMainActor { [zcodeScanner] in try zcodeScanner.totalTokens() }
-            guard let total else { return quota }
+            let usage = try await loadOffMainActor { [zcodeScanner] in try zcodeScanner.usage() }
+            guard let usage, let total = usage.totalTokens, total > 0 else { return quota }
             var result = quota
             if case .badge(_, let message, _, _) = result.lines.first(where: \.isError) {
                 // Keep local usage usable even when the separate Coding Plan request fails.
-                DiagnosticGate.logOnce(for: "auth.zai.quota-with-zcode.failure") {
-                    AppLog.warn(LogTag.auth("zai"), "quota refresh failed: \(message)")
+                // When no API key is configured at all, do not surface an amber error warning
+                // over legitimate local ZCode usage.
+                let isPureLocalUser = authStore.keyStatus() == .notSet && quota.errorCategory == .notLoggedIn
+                let warning = isPureLocalUser ? nil : message
+                if warning != nil {
+                    DiagnosticGate.logOnce(for: "auth.zai.quota-with-zcode.failure") {
+                        AppLog.warn(LogTag.auth("zai"), "quota refresh failed: \(message)")
+                    }
                 }
-                result = .make(provider: provider, plan: nil, lines: [], refreshedAt: now(),
-                               warning: message)
+                result = .make(
+                    provider: provider,
+                    plan: quota.plan ?? usage.planName,
+                    lines: [],
+                    refreshedAt: now(),
+                    warning: warning
+                )
                 result.quotaRefreshedAt = .distantPast
                 result.clearsPriorMenuBarQuotaState = quota.clearsPriorMenuBarQuotaState
+            } else if result.plan == nil, let localPlan = usage.planName {
+                result.plan = localPlan
             }
             if quota.lines.allSatisfy({ !$0.isError }) {
                 DiagnosticGate.clearFailure("auth.zai.quota-with-zcode.failure")
@@ -94,6 +107,10 @@ final class ZAIProvider: ProviderRuntime {
             result.historyWarning = "Couldn't read ZCode token usage."
             return result
         }
+    }
+
+    func unloadLocalAccountingCachesForMemoryPressure() async {
+        zcodeScanner.unloadCachesForMemoryPressure()
     }
 
     private func refreshQuota() async -> ProviderSnapshot {

@@ -260,6 +260,9 @@ final class WidgetDataStore {
         if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
             await freebuff.unloadLocalAccountingCachesForMemoryPressure()
         }
+        if let zai = providersByID["zai"] as? ZAIProvider {
+            await zai.unloadLocalAccountingCachesForMemoryPressure()
+        }
     }
 
     init(

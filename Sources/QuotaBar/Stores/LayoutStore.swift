@@ -229,12 +229,18 @@ final class LayoutStore {
         }
         // This optional metric was introduced after the saved opt-in queue. Seed it once without
         // changing an existing placement or re-arming the default after the user moves it.
-        let seedZCode = !persistence.hasSeededZCodePlacement && registry.descriptor(id: "zai.zcodeTokens") != nil
+        let seedZCode = (!persistence.hasSeededZCodePlacement || defaultExpandedOnEnableIDs.contains("zai.zcodeTokens"))
+            && registry.descriptor(id: "zai.zcodeTokens") != nil
         if seedZCode {
-            if !placed.contains(where: { $0.descriptorID == "zai.zcodeTokens" }),
-               !expandedMetricIDs.contains("zai.zcodeTokens") {
-                defaultExpandedOnEnableIDs.insert("zai.zcodeTokens")
+            if !placed.contains(where: { $0.descriptorID == "zai.zcodeTokens" }) {
+                placed.append(PlacedWidget(descriptorID: "zai.zcodeTokens"))
+                persist()
             }
+            if !expandedMetricIDs.contains("zai.zcodeTokens") {
+                expandedMetricIDs.insert("zai.zcodeTokens")
+                persistExpanded()
+            }
+            defaultExpandedOnEnableIDs.remove("zai.zcodeTokens")
             persistExpandOnEnable()
             persistence.markZCodePlacementSeeded()
         } else if initial.shouldPersistExpandOnEnable {
