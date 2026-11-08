@@ -25,7 +25,7 @@ enum ProviderSectionVisibility {
         explicitlyEnabled: Bool
     ) -> Bool {
         let isCoreQuotaRow = descriptorID == "zai.session" || descriptorID == "zai.weekly"
-        guard isCoreQuotaRow, !hasData, errorCategory == .notAvailable else { return true }
+        guard isCoreQuotaRow, !hasData, (errorCategory == .notAvailable || errorCategory == .notLoggedIn) else { return true }
         return explicitlyEnabled
     }
 
