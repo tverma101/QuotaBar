@@ -8,7 +8,7 @@ import Foundation
 /// `ValueSelection`. That's what lets one row back a cost-only tile, a tokens-only tile, and a
 /// combined tile without the mapper emitting the data three times.
 struct MetricValue: Hashable, Sendable, Codable {
-    /// The raw magnitude: USD for `.dollars`, 0...100 for `.percent`, an absolute count otherwise.
+    /// The raw magnitude: currency units for `.dollars`, 0...100 for `.percent`, a count otherwise.
     var number: Double
     /// How this number prints ($ / % / plain count). Distinct per value within a row, which is what
     /// lets a widget pick "the dollars one" or "the count one" by kind.
@@ -16,6 +16,8 @@ struct MetricValue: Hashable, Sendable, Codable {
     /// Unit noun shown after the number ("tokens", "credits", "available"). `nil` renders the number
     /// bare — a dollar amount takes its trailing word from the widget (`unboundedValueWord`) instead.
     var label: String?
+    /// ISO currency code, or nil for the existing USD default.
+    var currencyCode: String?
     /// True when the number is imputed locally rather than measured or billed — it drives the ⓘ note.
     /// Per value because a spend row's dollars are an estimate while its token count is real.
     var estimated: Bool
@@ -34,11 +36,13 @@ struct MetricValue: Hashable, Sendable, Codable {
         estimated: Bool = false,
         tokenCountSaturated: Bool? = nil,
         isPartial: Bool = false,
-        isLowerBound: Bool = false
+        isLowerBound: Bool = false,
+        currencyCode: String? = nil
     ) {
         self.number = number
         self.kind = kind
         self.label = label
+        self.currencyCode = currencyCode
         self.estimated = estimated
         self.isPartial = isPartial ? true : nil
         self.tokenCountSaturated = tokenCountSaturated

@@ -13,11 +13,14 @@ the same account and organization through both Claude Code and Claude Desktop st
 | Weekly | 7-day window usage |
 | Fable | Separate weekly Fable limit (model-scoped window from the `limits` array) |
 | Sonnet | Separate weekly Sonnet limit (plan-dependent; hidden until Claude returns it, unless you explicitly enable the row) |
-| Extra Usage | Extra-usage credits spent against your monthly cap |
+| Extra Usage | Extra-usage spending in the billing currency, with the monthly cap when supplied |
 | Today / Yesterday / Last 30 Days | Local spend, as cost, tokens, or both (see below) |
 
 Fable is enabled and always visible directly below Weekly by default. Sonnet stays off until you
 enable it in Customize. When Claude reports your plan name, QuotaBar shows it beside the provider name.
+Extra Usage uses the billing currency Claude reports. For example:
+
+![Example Extra Usage in euros](../assets/claude-billing-currency.png)
 
 ## Where credentials come from
 

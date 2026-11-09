@@ -146,6 +146,33 @@ final class LocalLimitsAPITests: XCTestCase {
         XCTAssertNil(resource["utilization"])
     }
 
+    func testClaudeExtraUsageExportsBillingCurrencyForCappedAndUncappedValues() throws {
+        let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        let extra = WidgetDescriptor.boundedDollars(
+            id: "claude.extra", provider: provider, title: "Extra Usage",
+            metricLabel: "Extra usage spent", limit: 100
+        ).exportingLimit("extraUsage", unit: "usd", source: .progressOrValue(kind: .dollars))
+        let lines: [MetricLine] = [
+            .progress(label: "Extra usage spent", used: 12.34, limit: 50, format: .currency(code: "EUR")),
+            .values(label: "Extra usage spent", values: [MetricValue(number: 1500, kind: .dollars, currencyCode: "JPY")])
+        ]
+        for (line, expectation) in zip(lines, [("eur", 12.34), ("jpy", 1500.0)]) {
+            let snapshot = ProviderSnapshot(providerID: "claude", displayName: "Claude", lines: [line], refreshedAt: fetchedAt)
+            let resource = try limitResource("extraUsage", snapshot: snapshot, descriptors: [extra])
+            XCTAssertEqual(resource["unit"] as? String, expectation.0)
+            XCTAssertEqual(resource["used"] as? Double, expectation.1)
+        }
+        let snapshot = ProviderSnapshot(providerID: "claude", displayName: "Claude", lines: [lines[0]], refreshedAt: fetchedAt)
+        let state = makeState(snapshot: snapshot, descriptors: [extra])
+        let usage = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: XCTUnwrap(LocalUsageAPI.respond(method: "GET", path: "/v1/usage", state: state).body)
+        ) as? [[String: Any]])
+        let line = try XCTUnwrap((usage.first?["lines"] as? [[String: Any]])?.first)
+        let format = try XCTUnwrap(line["format"] as? [String: String])
+        XCTAssertEqual(format["kind"], "dollars")
+        XCTAssertEqual(format["code"], "EUR")
+    }
+
     @MainActor
     func testCopilotPremiumCreditsExportsPersonalCountAndPaidPercent() throws {
         let credits = CopilotProvider().widgetDescriptors.first { $0.id == "copilot.premium" }!

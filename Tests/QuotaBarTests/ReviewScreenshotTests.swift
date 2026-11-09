@@ -6,6 +6,26 @@ import XCTest
 /// Renders synthetic values only, for PR review without exposing a user's account data.
 @MainActor
 final class ReviewScreenshotTests: XCTestCase {
+    func testClaudeBillingCurrencyRendersForReview() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "quotabar.review.\(UUID().uuidString)"))
+        let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        var row = WidgetData(title: "Extra Usage", icon: provider.icon, kind: .dollars, used: 12.34, limit: 50)
+        row.currencyCode = "EUR"
+        row.currencyFractionDigits = 2
+        row.displayMode = .used
+        XCTAssertEqual(row.boundedHeadline, "€12.34 used")
+        let card = VStack(alignment: .leading, spacing: 6) {
+            ProviderSectionHeader(provider: provider, cardIsHovered: false, onCopyScreenshot: { true })
+            DashboardMetricCard { WidgetRowView(data: row) }
+        }.frame(width: 320).padding(14).background(Theme.traySurface).defaultAppStorage(defaults)
+        let image = try XCTUnwrap(ImageRenderer(content: card).nsImage)
+        XCTAssertGreaterThan(image.size.height, 20)
+        if let dir = ProcessInfo.processInfo.environment["QUOTABAR_REVIEW_IMAGE_DIR"] {
+            let png = try XCTUnwrap(ShareCardRenderer.pngData(from: image))
+            try png.write(to: URL(fileURLWithPath: dir).appendingPathComponent("claude-billing-currency.png"))
+        }
+    }
+
     func testSnoozeAndSessionStripRenderWithSyntheticData() throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "quotabar.review.\(UUID().uuidString)"))
         let snooze = MenuBarSnoozeStore(defaults: defaults)

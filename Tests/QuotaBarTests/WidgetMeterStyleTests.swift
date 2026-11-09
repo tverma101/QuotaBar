@@ -11,6 +11,7 @@ final class WidgetMeterStyleTests: XCTestCase {
                      remaining: String, consumed: String, subtitle: String?)] = [
             ("percent", .percent, 80, 100, "20%", "80%", nil),
             ("dollars", .dollars, 80, 100, "$20.00", "$80.00", "$100 limit"),
+            ("euros", .currency(code: "EUR"), 80, 100, "€20.00", "€80.00", "€100.00 limit"),
             ("count", .count(suffix: "credits"), 320, 1_000, "680", "320", "credits")
         ]
 
@@ -52,6 +53,16 @@ final class WidgetMeterStyleTests: XCTestCase {
         store.meterStyle = .used
         XCTAssertEqual(store.data(for: descriptor).displayMode, .used)
         XCTAssertEqual(store.data(for: descriptor).valueText, "80%")
+    }
+
+    func testThreeDecimalCurrencyDoesNotRoundRemainingBalanceToZero() async {
+        let (store, descriptor) = await makeRefreshedStore(
+            format: .currency(code: "KWD"), used: 0.004, limit: 0.005, suite: "currency-precision"
+        )
+        let data = store.data(for: descriptor)
+        XCTAssertEqual(data.currencyFractionDigits, 3)
+        XCTAssertEqual(data.fraction, 0.2, accuracy: 0.0001)
+        XCTAssertNotEqual(data.meterState(now: Date()), .spent)
     }
 
     func testFallbackSampleShowsNoDataRegardlessOfMode() {
