@@ -99,3 +99,8 @@ rewritten, and upstream attribution must be preserved.
 ## Popup adaptation — 2026-11-07
 
 Adapted upstream `214ba770`: the screenshot action appears while the pointer is over a provider card. The existing single dashboard and customization controls remain in place.
+
+## Claude billing currency adaptation
+
+Adapted upstream `8a883219` to carry Claude Extra Usage's billing currency and minor-unit scale through
+the dashboard and local limits API. Existing USD output and the fork's uncapped-row behavior are retained.

@@ -288,6 +288,46 @@ final class ClaudeUsageMapperTests: XCTestCase {
         XCTAssertNil(progress(mapped.lines, "Extra usage spent"))
     }
 
+    func testExtraUsageUsesBillingCurrencyAndMinorUnitScale() throws {
+        func lines(_ extra: String) throws -> [MetricLine] {
+            let response = HTTPResponse(statusCode: 200, headers: [:], body: Data("{\"extra_usage\":\(extra)}".utf8))
+            return try ClaudeUsageMapper.mapUsageResponse(response, credentials: ClaudeOAuth(subscriptionType: "pro")).lines
+        }
+        let capped = try XCTUnwrap(lines(#"{"is_enabled":true,"used_credits":1234,"monthly_limit":5000,"currency":"eur","decimal_places":2}"#).first)
+        guard case .progress(_, let used, let limit, let format, _, _, _, _) = capped else {
+            return XCTFail("Expected capped currency progress")
+        }
+        XCTAssertEqual(used, 12.34, accuracy: 0.000_001)
+        XCTAssertEqual(limit, 50)
+        XCTAssertEqual(format, .currency(code: "EUR"))
+
+        let uncapped = try XCTUnwrap(lines(#"{"is_enabled":true,"used_credits":1500,"currency":"JPY","decimal_places":0}"#).first)
+        guard case .values(_, let values, _, _, _, _) = uncapped else {
+            return XCTFail("Expected uncapped currency value")
+        }
+        XCTAssertEqual(values.first?.number, 1500)
+        XCTAssertEqual(values.first?.currencyCode, "JPY")
+        for line in [capped, uncapped] {
+            XCTAssertEqual(try JSONDecoder().decode(MetricLine.self, from: JSONEncoder().encode(line)), line)
+        }
+        struct LegacyFormat: Decodable {
+            enum Kind: String, Decodable { case percent, dollars, count }
+            let kind: Kind
+        }
+        let encodedFormat = try JSONEncoder().encode(format)
+        XCTAssertEqual(try JSONDecoder().decode(LegacyFormat.self, from: encodedFormat).kind, .dollars)
+        XCTAssertEqual(try JSONDecoder().decode(ProgressFormat.self, from: encodedFormat), .currency(code: "EUR"))
+
+        let legacy = try XCTUnwrap(lines(#"{"is_enabled":true,"used_credits":500,"monthly_limit":1000}"#).first)
+        guard case .progress(_, let legacyUsed, _, let legacyFormat, _, _, _, _) = legacy else {
+            return XCTFail("Expected USD progress")
+        }
+        XCTAssertEqual(legacyUsed, 5)
+        XCTAssertEqual(legacyFormat, .dollars)
+        XCTAssertThrowsError(try lines(#"{"is_enabled":true,"used_credits":123,"currency":"EUR","decimal_places":-1}"#))
+        XCTAssertThrowsError(try lines(#"{"is_enabled":true,"used_credits":123,"currency":"EURO"}"#))
+    }
+
     func testMapsResetDatesFromMicrosecondTimestampsAndUnixEpochs() throws {
         let cases: [(value: String, expected: Date)] = [
             (#""2099-06-01T12:00:00.123456""#, OpenUsageISO8601.date(from: "2099-06-01T12:00:00.123Z")!),
