@@ -372,7 +372,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let snapshot = await provider.refresh()
 
         XCTAssertNil(snapshot.usageHistory)
-        XCTAssertTrue(snapshot.historyWarning?.contains("could not be read") == true)
+        XCTAssertTrue(snapshot.historyWarning?.contains("could not be updated") == true)
         XCTAssertNil(snapshot.warning, "a history read warning must not overwrite quota warning state")
     }
 
