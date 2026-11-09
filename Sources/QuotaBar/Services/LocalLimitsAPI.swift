@@ -82,7 +82,7 @@ enum LocalLimitsAPI {
 
     private struct WireResource: Encodable {
         let kind: LimitResourceDescriptor.Kind
-        let unit: String
+        var unit: String
         var used: Double?
         var available: Double?
         var limit: Double?
@@ -118,6 +118,7 @@ enum LocalLimitsAPI {
                 guard let metric = values.first(where: { value in
                     value.kind == expectedKind && (expectedLabel == nil || value.label == expectedLabel)
                 }) else { return nil }
+                unit = metric.currencyCode?.lowercased() ?? unit
                 if resource.kind == .balance {
                     available = metric.number
                 } else {
@@ -141,6 +142,8 @@ enum LocalLimitsAPI {
                 return "percent"
             case .dollars:
                 return "usd"
+            case .currency(let code):
+                return code.lowercased()
             case .count(let suffix):
                 return suffix.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
             }
