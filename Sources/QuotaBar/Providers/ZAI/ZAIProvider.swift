@@ -15,6 +15,7 @@ final class ZAIProvider: ProviderRuntime {
     let authStore: ZAIAuthStore
     let usageClient: ZAIUsageClient
     let zcodeScanner: ZCodeUsageScanner
+    let pricing: @Sendable () async -> ModelPricing
     let now: @Sendable () -> Date
 
     /// The plan name changes about once a month, so re-reading it on every refresh doubled the
@@ -28,11 +29,13 @@ final class ZAIProvider: ProviderRuntime {
         zcodeScanner: ZCodeUsageScanner = ZCodeUsageScanner(),
         authStore: ZAIAuthStore = ZAIAuthStore(),
         usageClient: ZAIUsageClient = ZAIUsageClient(),
+        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() },
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.authStore = authStore
         self.usageClient = usageClient
         self.zcodeScanner = zcodeScanner
+        self.pricing = pricing
         self.now = now
     }
 
@@ -44,15 +47,15 @@ final class ZAIProvider: ProviderRuntime {
             .percent(id: "zai.weekly", provider: provider, title: "Weekly",
                      metricLabel: "Weekly")
                 .exportingLimit("weekly", unit: "percent"),
+            .boundedCount(id: "zai.weekendBuild", provider: provider, title: "Weekend Build",
+                          metricLabel: "Weekend Build", limit: 500_000_000, suffix: "tokens")
+                .hidingWhenEmpty(),
             .boundedCount(id: "zai.webSearches", provider: provider, title: "Web Searches",
                           metricLabel: "Web Searches", limit: 1000, suffix: "searches",
                           periodDurationMs: ZAIUsageMapper.monthlyPeriodMs)
                 .exportingLimit("webSearches", unit: "searches")
-                .hidingWhenEmpty(),
-            .values(id: "zai.zcodeTokens", provider: provider, title: "ZCode Tokens",
-                    metricLabel: "ZCode Tokens", selection: .kind(.count))
                 .hidingWhenEmpty()
-        ]
+        ] + WidgetDescriptor.spendTiles(provider: provider)
     }
 
     func hasLocalCredentials() async -> Bool {
@@ -67,8 +70,9 @@ final class ZAIProvider: ProviderRuntime {
         let quota = await refreshQuota()
         guard quota.errorCategory != .cancelled, !Task.isCancelled else { return quota }
         do {
-            let usage = try await loadOffMainActor { [zcodeScanner] in try zcodeScanner.usage() }
-            guard let usage, let total = usage.totalTokens, total > 0 else { return quota }
+            let modelPricing = await pricing()
+            let usage = try await loadOffMainActor { [zcodeScanner] in try zcodeScanner.usage(pricing: modelPricing) }
+            guard let usage, (usage.totalTokens ?? 0) > 0 || usage.weekendBuild != nil || usage.dailySeries != nil else { return quota }
             var result = quota
             if case .badge(_, let message, _, _) = result.lines.first(where: \.isError) {
                 // Keep local usage usable even when the separate Coding Plan request fails.
@@ -96,9 +100,31 @@ final class ZAIProvider: ProviderRuntime {
             if quota.lines.allSatisfy({ !$0.isError }) {
                 DiagnosticGate.clearFailure("auth.zai.quota-with-zcode.failure")
             }
-            result.lines.append(.values(label: "ZCode Tokens", values: [
-                MetricValue(number: total, kind: .count, label: "tokens")
-            ]))
+
+            if let weekend = usage.weekendBuild {
+                result.lines.append(.progress(
+                    label: "Weekend Build",
+                    used: weekend.used,
+                    limit: weekend.limit,
+                    format: .count(suffix: "tokens"),
+                    resetsAt: weekend.resetsAt
+                ))
+                result.quotaRefreshedAt = now()
+            }
+
+            if let scan = usage.logScan {
+                SpendTileMapper.appendTokenUsage(
+                    scan.series,
+                    to: &result.lines,
+                    now: now(),
+                    unknownModelsByDay: scan.unknownModelsByDay,
+                    modelUsage: scan.modelUsage,
+                    modelSourceNote: "From your ZCode usage history (estimated)",
+                    estimatedCostDays: scan.estimatedCostDays
+                )
+            } else if let dailySeries = usage.dailySeries {
+                SpendTileMapper.appendTokenUsage(dailySeries, to: &result.lines, now: now())
+            }
             return result
         } catch {
             if ProviderCancellation.isCancellation(error) { return cancelledRefreshSnapshot(provider: provider) }

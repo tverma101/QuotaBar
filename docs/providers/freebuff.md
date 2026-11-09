@@ -59,6 +59,8 @@ session caps are hidden when the current hours meter is present. Older servers w
 keep their session windows. Monthly Spend appears only when the server supplies actual USD values.
 Hours and tokens are separate measurements; neither is converted into the other.
 
+**Usage Trend** shows a daily sparkline of measured token volume across the last 30 days. It is enabled, Always Visible, and unpinned by default.
+
 **Today**, **Yesterday**, and **Last 30 Days** combine measured hosted-run tokens with older Freebuff
 Desktop history on this Mac. Current **On This Device** sessions also keep their receipts in hosted
 history; the tools run on your Mac, but the older SQLite history no longer receives their tokens.

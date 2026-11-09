@@ -1,3 +1,4 @@
+import Darwin
 import Dispatch
 import Foundation
 import KeyboardShortcuts
@@ -754,8 +755,10 @@ final class AppContainer {
                     await PersistentJSONLScanCaches.unloadAfterRefreshCycle(
                         keepRouterItemsResident: keepRouterIndexWarm
                     )
-                    if ProcessMemoryBudget.isOverSoftLimit {
+                    if !transparency.popoverShown || ProcessMemoryBudget.isOverSoftLimit {
                         await dataStore.unloadProviderCachesForMemoryPressure()
+                        await ModelPricingStore.shared.clearCaches()
+                        malloc_zone_pressure_relief(nil, 0)
                     }
                 }
                 // Re-evaluate quota pace milestones every tick — after the refresh so it sees fresh data,
@@ -864,6 +867,19 @@ final class AppContainer {
                 }
             }
             }
+        }
+    }
+
+    /// Drops resident accounting parse caches and trims memory when the panel closes.
+    /// The user is not looking at the popover, so keeping multi-megabyte raw parse trees resident
+    /// serves no purpose; any subsequent background refresh or reopen will re-hydrate incrementally.
+    func purgeClosedPanelCaches() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await PersistentJSONLScanCaches.unloadAfterRefreshCycle(keepRouterItemsResident: false)
+            await dataStore.unloadProviderCachesForMemoryPressure()
+            await ModelPricingStore.shared.clearCaches()
+            malloc_zone_pressure_relief(nil, 0)
         }
     }
 

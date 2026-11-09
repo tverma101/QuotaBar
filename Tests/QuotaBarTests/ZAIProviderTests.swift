@@ -561,9 +561,10 @@ final class ZAIProviderTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quotabar-zai-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let path = directory.appendingPathComponent("db.sqlite").path
+        let nowMs = Int(Date().timeIntervalSince1970 * 1000)
         try SQLiteCLIAccessor().execute(path: path, sql: """
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER, provider_id TEXT, started_at INTEGER);
-            INSERT INTO model_usage VALUES (1000, 200, 'account:zai-start-plan', 1000);
+            INSERT INTO model_usage VALUES (1000, 200, 'account:zai-start-plan', \(nowMs));
             """)
 
         let provider = ZAIProvider(
@@ -575,13 +576,10 @@ final class ZAIProviderTests: XCTestCase {
         let snapshot = await provider.refresh()
         XCTAssertNil(snapshot.warning)
         XCTAssertEqual(snapshot.plan, "Start Plan")
-        let tokensLine = snapshot.lines.first { $0.label == "ZCode Tokens" }
-        XCTAssertNotNil(tokensLine)
-        if case .values(_, let vals, _, _, _, _) = tokensLine {
-            XCTAssertEqual(vals.first?.number, 1200)
-        } else {
-            XCTFail("Expected values metric line for ZCode Tokens")
+        guard case .values(_, let vals, _, _, _, _) = snapshot.line(label: "Today") else {
+            return XCTFail("Expected values metric line for Today")
         }
+        XCTAssertEqual(vals.first?.number, 1200)
     }
 
     func testProviderIdentityAndLinks() {

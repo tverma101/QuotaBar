@@ -85,7 +85,8 @@ final class FreebuffProvider: ProviderRuntime {
                                   sourceNote: Self.historySourceNote),
             .values(id: "freebuff.monthlySpend", provider: provider, title: "Monthly Spend",
                     metricLabel: "Monthly Spend", selection: .kind(.dollars), valueWord: "spent")
-                .hidingWhenEmpty()
+                .hidingWhenEmpty(),
+            .usageTrend(provider: provider)
         ] + WidgetDescriptor.spendTiles(provider: provider)
     }
 
@@ -186,6 +187,12 @@ final class FreebuffProvider: ProviderRuntime {
                     modelSourceNote: Self.historySourceNote,
                     partialDays: scan.partialDays,
                     apiEstimateByDay: usage.apiEstimateByDay, estimatedCostDays: usage.estimatedCostDays
+                )
+                SpendTileMapper.appendUsageTrend(
+                    usage.series, to: &result.lines, now: scanNow,
+                    note: Self.historySourceNote,
+                    partialDays: scan.partialDays,
+                    partialNote: "incomplete Freebuff history is shown as a lower bound"
                 )
             }
         } catch is CancellationError {

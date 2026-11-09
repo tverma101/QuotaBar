@@ -41,17 +41,19 @@ enum MenuBarStripRenderer {
     /// extra-large gap next to neighboring items).
     static func textImage(for content: MenuBarContent) -> NSImage? {
         guard !content.isEmpty else { return nil }
-        let renderer = ImageRenderer(content: MenuBarTextStrip(content: content))
-        renderer.scale = 2
-        guard let rendered = renderer.cgImage else { return nil }
-        let cgImage = trimmedToVisibleContent(rendered) ?? rendered
-        let image = NSImage(
-            cgImage: cgImage,
-            size: NSSize(width: CGFloat(cgImage.width) / renderer.scale, height: CGFloat(cgImage.height) / renderer.scale)
-        )
-        image.isTemplate = true
-        image.accessibilityDescription = content.accessibilityText
-        return image
+        return autoreleasepool {
+            let renderer = ImageRenderer(content: MenuBarTextStrip(content: content))
+            renderer.scale = 2
+            guard let rendered = renderer.cgImage else { return nil }
+            let cgImage = trimmedToVisibleContent(rendered) ?? rendered
+            let image = NSImage(
+                cgImage: cgImage,
+                size: NSSize(width: CGFloat(cgImage.width) / renderer.scale, height: CGFloat(cgImage.height) / renderer.scale)
+            )
+            image.isTemplate = true
+            image.accessibilityDescription = content.accessibilityText
+            return image
+        }
     }
 
     /// Crops fully transparent margins off a rendered strip, or `nil` when the image has no visible
@@ -91,14 +93,16 @@ enum MenuBarStripRenderer {
 
     /// The compact Bars glyph (≤4 bounded-metric bars), or `nil` when no pinned metric has a fill.
     static func barsImage(for content: MenuBarContent) -> NSImage? {
-        let fractions = content.bars.map(\.fraction)
-        guard !fractions.isEmpty else { return nil }
-        let renderer = ImageRenderer(content: MenuBarBars(fractions: fractions, side: 18))
-        renderer.scale = 2
-        guard let image = renderer.nsImage else { return nil }
-        image.isTemplate = true
-        image.accessibilityDescription = content.accessibilityText
-        return image
+        autoreleasepool {
+            let fractions = content.bars.map(\.fraction)
+            guard !fractions.isEmpty else { return nil }
+            let renderer = ImageRenderer(content: MenuBarBars(fractions: fractions, side: 18))
+            renderer.scale = 2
+            guard let image = renderer.nsImage else { return nil }
+            image.isTemplate = true
+            image.accessibilityDescription = content.accessibilityText
+            return image
+        }
     }
 
     /// The screen-share privacy stand-in: the wordmark instead of usage values, shown while
