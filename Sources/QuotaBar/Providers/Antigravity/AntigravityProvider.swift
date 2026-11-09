@@ -212,7 +212,7 @@ final class AntigravityProvider: ProviderRuntime {
             return LocalHistoryResult(
                 history: nil,
                 lines: [],
-                warning: "Antigravity conversation history could not be read. Any displayed totals are last known and may be stale."
+                warning: "Antigravity conversation history could not be updated. Any displayed totals are last known and may be stale."
             )
         }
 

@@ -11,7 +11,7 @@ enum AntigravityProtoDecoder {
         case fixed
     }
 
-    struct GenerationEvent: Equatable, Sendable {
+    struct GenerationEvent: Equatable, Sendable, Codable {
         static let unknownModel = "Unknown Antigravity Model"
 
         var model: String
