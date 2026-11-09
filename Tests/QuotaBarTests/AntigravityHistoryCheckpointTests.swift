@@ -10,6 +10,29 @@ private final class CheckpointRecheckCounter: @unchecked Sendable {
 }
 
 final class AntigravityHistoryCheckpointTests: XCTestCase {
+    func testMissingSourceFoldAgesOutOfTheRequestedWindow() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("history.plist")
+        let now = Date()
+        let record = AntigravityHistoryCheckpoint.Record(
+            path: "/missing/conversation.db", device: 1, inode: 2, revision: "r1", observedAt: now,
+            windowStart: Calendar.current.startOfDay(for: now), stepTimeZone: nil,
+            events: [.init(model: "test-model", inputTokens: 10, outputTokens: 5, cacheReadTokens: 0,
+                           timestampSeconds: Int64(now.timeIntervalSince1970))],
+            undated: [], oversized: [], invalidTokens: [], malformed: []
+        )
+        _ = try AntigravityHistoryCheckpoint.update(at: url, records: [record],
+            excluding: { _, _ in false }, valid: { _ in true })
+        let scanner = AntigravityDbUsageScanner(conversationsDirectories: { [] }, checkpointURL: url)
+        let first = await scanner.scan(daysBack: 0, now: now, pricing: TestPricing.bundled)
+        XCTAssertEqual(first?.series.daily.first?.totalTokens, 15)
+        let later = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: 2, to: now))
+        let expired = await scanner.scan(daysBack: 0, now: later, pricing: TestPricing.bundled)
+        XCTAssertNil(expired, "Expired checkpoint events must not leave an indefinite partial warning")
+    }
+
     func testCorruptManifestFailsClosedWithoutClaimingEmptyHistory() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

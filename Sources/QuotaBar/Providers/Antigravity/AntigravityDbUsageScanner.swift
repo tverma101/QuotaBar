@@ -355,6 +355,7 @@ actor AntigravityDbUsageScanner {
                               fold.recordModifiedAt == candidate.recordModifiedAt,
                               fold.timeZoneIdentifier == timeZoneIdentifier,
                               fold.pricingToken == pricingToken, fold.windowStart <= since,
+                              fold.latestRelevant >= since,
                               fold.recomputeAfter.map({ now < $0 }) != false,
                               fold.latestAccepted.map({ $0 <= JSONLScanning.maximumTimestamp(now: now) }) != false
                         else { return false }
@@ -415,6 +416,7 @@ actor AntigravityDbUsageScanner {
                 slot: candidate.slot, recordBytes: candidate.recordBytes,
                 recordModifiedAt: candidate.recordModifiedAt,
                 timeZoneIdentifier: timeZoneIdentifier, pricingToken: pricingToken, windowStart: since,
+                latestRelevant: Self.latestCheckpointDate(record),
                 scan: stale, recomputeAfter: result.recomputeAfter, latestAccepted: result.latestAccepted,
                 estimatedBytes: Self.estimatedFoldBytes(stale)
             )
@@ -507,6 +509,13 @@ actor AntigravityDbUsageScanner {
     private static func estimatedFoldBytes(_ scan: LogUsageScan) -> Int {
         let models = scan.modelUsage?.daily.reduce(0) { $0 + $1.models.count } ?? 0
         return (scan.series.daily.count + models) * 512
+    }
+
+    private static func latestCheckpointDate(_ record: AntigravityHistoryCheckpoint.Record) -> Date {
+        let latestEvent = record.events.lazy.map(\.timestampSeconds).max()
+        let latestIssue = [record.undated.max(), record.oversized.max(), record.invalidTokens.max(), record.malformed.max()]
+            .compactMap { $0 }.max()
+        return Date(timeIntervalSince1970: TimeInterval(max(latestEvent ?? .min, latestIssue ?? .min)))
     }
 
     /// Reuse the priced per-database fold while its source revision, pricing snapshot, calendar
@@ -1491,6 +1500,7 @@ actor AntigravityDbUsageScanner {
         let timeZoneIdentifier: String
         let pricingToken: String
         let windowStart: Date
+        let latestRelevant: Date
         let scan: LogUsageScan
         let recomputeAfter: Date?
         let latestAccepted: Date?
