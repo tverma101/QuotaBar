@@ -52,7 +52,7 @@ enum UsageDiagnostics {
                      now: Date = Date()) -> Report {
         let selected = Set(providerIDs)
         let layout = LayoutStore(registry: registry, defaults: defaults, isProviderEnabled: { selected.contains($0) })
-        let store = WidgetDataStore(registry: registry, providers: [], defaults: defaults)
+        let store = WidgetDataStore(registry: registry, providers: [], defaults: defaults, now: { now })
         store.snapshots = snapshots
         let enabledMetrics = Set(layout.placed.map(\.descriptorID))
         var entries: [String: Entry] = [:]

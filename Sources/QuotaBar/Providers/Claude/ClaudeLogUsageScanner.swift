@@ -805,7 +805,9 @@ actor ClaudeLogUsageScanner {
         var entries: [Entry] = []
         var malformedTokenCounts = false
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
+            autoreleasepool {
+                appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
+            }
         }
         return entries
     }
@@ -814,10 +816,12 @@ actor ClaudeLogUsageScanner {
     /// one giant Data allocation.
     nonisolated static func parseFile(at url: URL) -> [Entry]? {
         ClaudeSessionAppendCache.shared.parse(at: url) { line in
-            var entries: [Entry] = []
-            var malformedTokenCounts = false
-            appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
-            return malformedTokenCounts ? nil : entries
+            autoreleasepool {
+                var entries: [Entry] = []
+                var malformedTokenCounts = false
+                appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
+                return malformedTokenCounts ? nil : entries
+            }
         }
     }
 

@@ -141,31 +141,9 @@ final class CodexProvider: ProviderRuntime {
         // phase 1 fetched the meters seconds ago. The data store's merge recovers the quota
         // meters from the prior snapshot and carries their freshness stamp.
         if ProviderRefreshContext.scope.suppressesLiveQuota {
-            var lines: [MetricLine] = []
-            let accountIdentityKey = expectedIdentityKey ?? lastResolvedAccountIdentityKey
-            let usageHistory: ProviderUsageHistory?
-            if let accountIdentityKey {
-                let modelPricing = await pricing()
-                guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-                usageHistory = await appendLocalUsage(
-                    to: &lines,
-                    now: now(),
-                    pricing: modelPricing,
-                    accountIdentityKey: accountIdentityKey
-                )
-            } else {
-                // A fold-only wake cannot prove which account stamped the shared Router ledger yet.
-                // Keep the stored history until the first authenticated probe establishes identity.
-                usageHistory = nil
-            }
-            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-            MetricLine.appendNoDataIfNeeded(&lines)
-            return ProviderSnapshot.make(
+            return await ScanWorkerClient.shared.foldOnlySnapshot(
                 provider: provider,
-                plan: nil,
-                lines: lines,
-                refreshedAt: now(),
-                usageHistory: usageHistory
+                inProcessFallback: { await self.foldOnlySnapshotInProcess() }
             )
         }
 
@@ -236,6 +214,37 @@ final class CodexProvider: ProviderRuntime {
 
         return await localOnlySnapshot(
             after: lastFallbackError ?? localSourceError ?? CodexAuthError.notLoggedIn
+        )
+    }
+
+    /// The in-process fold-only body, kept verbatim as the scan worker's fallback (and the child's
+    /// own path): the router ledger and native sessions fold without re-reading live quota APIs.
+    private func foldOnlySnapshotInProcess() async -> ProviderSnapshot {
+        var lines: [MetricLine] = []
+        let accountIdentityKey = expectedIdentityKey ?? lastResolvedAccountIdentityKey
+        let usageHistory: ProviderUsageHistory?
+        if let accountIdentityKey {
+            let modelPricing = await pricing()
+            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+            usageHistory = await appendLocalUsage(
+                to: &lines,
+                now: now(),
+                pricing: modelPricing,
+                accountIdentityKey: accountIdentityKey
+            )
+        } else {
+            // A fold-only wake cannot prove which account stamped the shared Router ledger yet.
+            // Keep the stored history until the first authenticated probe establishes identity.
+            usageHistory = nil
+        }
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        MetricLine.appendNoDataIfNeeded(&lines)
+        return ProviderSnapshot.make(
+            provider: provider,
+            plan: nil,
+            lines: lines,
+            refreshedAt: now(),
+            usageHistory: usageHistory
         )
     }
 

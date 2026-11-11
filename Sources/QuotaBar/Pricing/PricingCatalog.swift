@@ -15,11 +15,14 @@ struct PricingCatalog: Sendable, Equatable {
     /// Whether `retiredKeys` is a complete source snapshot, including when the set is empty.
     /// Legacy compact caches omit the field and may contain arbitrary rates for conflicted IDs.
     var retiredKeysAreAuthoritative: Bool
+
+    private let fuzzyBox: FuzzyIndexBox
+
     /// Per-entry match corpus precomputed at build: raw key bytes plus separator-normalized key
-    /// bytes. The fuzzy scan used to materialize both arrays per entry per miss (~20k allocations
-    /// for one miss over the LiteLLM snapshot), and misses repeat across distinct gateway-tagged
-    /// slug spellings within a refresh.
-    var fuzzyIndex: [FuzzyIndexEntry]
+    /// bytes. Built lazily on first access to avoid allocating thousands of byte arrays on startup.
+    var fuzzyIndex: [FuzzyIndexEntry] {
+        fuzzyBox.index(for: entries)
+    }
 
     /// One catalog entry's precomputed match bytes. `rates` is carried so a match needs no
     /// dictionary hop.
@@ -40,7 +43,11 @@ struct PricingCatalog: Sendable, Equatable {
         self.retrievedAt = retrievedAt
         self.retiredKeys = retiredKeys
         self.retiredKeysAreAuthoritative = retiredKeysAreAuthoritative
-        self.fuzzyIndex = Self.buildFuzzyIndex(entries: entries)
+        self.fuzzyBox = FuzzyIndexBox()
+    }
+
+    func clearFuzzyIndex() {
+        fuzzyBox.clear()
     }
 
     /// Derived from `entries` alone, so equality ignores it (two catalogs that price identically
@@ -52,7 +59,7 @@ struct PricingCatalog: Sendable, Equatable {
             && lhs.retiredKeysAreAuthoritative == rhs.retiredKeysAreAuthoritative
     }
 
-    private static func buildFuzzyIndex(entries: [String: ModelRates]) -> [FuzzyIndexEntry] {
+    fileprivate static func buildFuzzyIndex(entries: [String: ModelRates]) -> [FuzzyIndexEntry] {
         entries.map { key, rates in
             FuzzyIndexEntry(
                 key: key,
@@ -70,10 +77,12 @@ struct PricingCatalog: Sendable, Equatable {
     /// Fuzzy lookup over every entry; prefers the longest matching key (then the lexicographically
     /// smallest for determinism). Only called after exact lookups miss.
     func findFuzzy(_ model: String) -> (key: String, rates: ModelRates)? {
+        let entries = fuzzyIndex
+        guard !entries.isEmpty else { return nil }
         let modelBytes = Array(model.utf8)
         let normalizedModelBytes = Array(Self.normalizedKey(model).utf8)
         var best: (key: String, rates: ModelRates)?
-        for entry in fuzzyIndex {
+        for entry in entries {
             guard Self.indexKeyMatches(
                 entry: entry,
                 modelBytes: modelBytes,
@@ -154,7 +163,7 @@ extension PricingCatalog {
             guard valueBytes[start..<(start + keyBytes.count)].elementsEqual(keyBytes) else { continue }
             let beforeOK = start == 0 || !valueBytes[start - 1].isASCIIAlphanumeric
             guard beforeOK else { continue }
-            let suffix = Array(valueBytes[(start + keyBytes.count)...])
+            let suffix = valueBytes[(start + keyBytes.count)...]
             if suffixAllowsMatch(key: keyBytes, suffix: suffix) {
                 return true
             }
@@ -162,7 +171,7 @@ extension PricingCatalog {
         return false
     }
 
-    private static func suffixAllowsMatch(key: [UInt8], suffix: [UInt8]) -> Bool {
+    private static func suffixAllowsMatch(key: [UInt8], suffix: ArraySlice<UInt8>) -> Bool {
         guard let separator = suffix.first else { return true }
         if separator.isASCIIAlphanumeric { return false }
         return !suffixStartsWithNumericModelVersion(key: key, suffix: suffix)
@@ -170,7 +179,7 @@ extension PricingCatalog {
 
     /// Rejects matches where the suffix looks like a version continuation of a numeric key
     /// (`claude-sonnet-4` + `-5-...`), while allowing 8-digit date suffixes (`-20250514`).
-    private static func suffixStartsWithNumericModelVersion(key: [UInt8], suffix: [UInt8]) -> Bool {
+    private static func suffixStartsWithNumericModelVersion(key: [UInt8], suffix: ArraySlice<UInt8>) -> Bool {
         let dateSuffixDigits = 8
         guard let last = key.last, last.isASCIIDigit else { return false }
         guard let separator = suffix.first, separator == UInt8(ascii: "-") || separator == UInt8(ascii: ".") else {
@@ -182,6 +191,31 @@ extension PricingCatalog {
         let afterDigits = rest.dropFirst(digitCount).first
         let isDateSuffix = digitCount == dateSuffixDigits && (afterDigits.map { !$0.isASCIIAlphanumeric } ?? true)
         return !isDateSuffix
+    }
+}
+
+/// Thread-safe lazy cache container for precomputed fuzzy search byte entries.
+/// Deferred until an actual fuzzy lookup is needed, eliminating startup allocation spikes.
+final class FuzzyIndexBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cachedIndex: [PricingCatalog.FuzzyIndexEntry]?
+
+    func index(for entries: [String: ModelRates]) -> [PricingCatalog.FuzzyIndexEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cachedIndex {
+            return cachedIndex
+        }
+        guard !entries.isEmpty else { return [] }
+        let built = PricingCatalog.buildFuzzyIndex(entries: entries)
+        cachedIndex = built
+        return built
+    }
+
+    func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        cachedIndex = nil
     }
 }
 

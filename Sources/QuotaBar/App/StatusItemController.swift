@@ -511,6 +511,7 @@ final class StatusItemController: NSObject {
         outsideClickMonitor.stop()
         highlight(nil)
         heightController.finishClosing()
+        container.purgeClosedPanelCaches()
     }
 
     /// Drops keyboard focus inside the panel so a clicked plain-styled control (a metric row's

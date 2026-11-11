@@ -1285,7 +1285,9 @@ actor CodexLogUsageScanner {
     static func parseFile(_ data: Data) -> [Event] {
         var parser = FileParser()
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            parser.consume(line)
+            autoreleasepool {
+                parser.consume(line)
+            }
         }
         return parser.finish()
     }
@@ -1295,7 +1297,9 @@ actor CodexLogUsageScanner {
     nonisolated static func parseFile(at url: URL) -> [Event]? {
         var parser = FileParser()
         let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
-            parser.consume(line)
+            autoreleasepool {
+                parser.consume(line)
+            }
         }
         guard readSucceeded, !parser.hasMalformedUsage else { return nil }
         return parser.finish()
@@ -1345,7 +1349,9 @@ actor CodexLogUsageScanner {
                 discardingOversizedLine: cached.isDiscardingOversizedLine,
                 deliverFinalPartial: false
             ) { line in
-                parser.consume(line)
+                autoreleasepool {
+                    parser.consume(line)
+                }
             }
             guard read.isComplete else { return nil }
             guard !parser.hasMalformedUsage else { return nil }
@@ -1413,7 +1419,9 @@ actor CodexLogUsageScanner {
             chunkSize: 64 * 1024,
             deliverFinalPartial: false
         ) { line in
-            parser.consume(line)
+            autoreleasepool {
+                parser.consume(line)
+            }
         }
         guard read.isComplete else {
             sharedTailCache.remove(key)

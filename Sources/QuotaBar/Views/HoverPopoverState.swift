@@ -37,6 +37,17 @@ final class HoverPopoverState {
     var isPinned: Bool { pinned }
     @ObservationIgnored private var showTask: Task<Void, Never>?
     @ObservationIgnored private var hideTask: Task<Void, Never>?
+    /// When the popover last force-closed, for `toggleForTap`'s just-dismissed guard. The transient
+    /// NSPopover closes on a click outside it and can pass that same click through to the anchor
+    /// view — without the timestamp, the tap gesture arriving after that close would read "not
+    /// presented" and immediately re-open what the click just shut.
+    @ObservationIgnored private var lastDismissAt: ContinuousClock.Instant?
+    /// How long a tap after a dismissal is treated as the tail of that closing click rather than a
+    /// fresh open request. The pass-through click lands sub-millisecond after the close, so this only
+    /// needs to cover event-delivery slack; re-opening by tapping right after a hover-out close is
+    /// practically impossible anyway — the cursor had to leave the value (`overInline` false at the
+    /// close) and come back.
+    private static let tapCloseGuardWindow: Duration = .milliseconds(250)
 
     /// 400ms reveal matches the app's hover-tooltip dwell (see `HoverTooltip`), so the popover opens on
     /// the same deliberate intent as every other hover affordance; 180ms grace lets the cursor cross
@@ -55,6 +66,33 @@ final class HoverPopoverState {
         // now-observed `overInline` doesn't post a change notification on every frame of a hover.
         if overInline != active { overInline = active }
         active ? scheduleShow() : scheduleHide()
+    }
+
+    /// Tap toggle on the inline row: present immediately, with no reveal dwell, or force shut.
+    ///
+    /// The value column is a small target, so a deliberate tap must not also outwait the 400 ms
+    /// hover dwell (or risk the cursor having moved on before the reveal lands) — a tap is explicit
+    /// intent, so it opens on the spot; tapping while a dwell is still pending skips the wait and
+    /// opens now rather than dismissing. Dismissal is immediate too: unlike hover-out there is no
+    /// grace period to outwait. After a tap-present, the normal hover rules own the popover again —
+    /// the cursor sitting on the row keeps it open (`overInline` reads true), and leaving both the
+    /// row and the popover hides it.
+    func toggleForTap() {
+        if isPresented {
+            dismiss()
+            return
+        }
+        // The transient popover's outside-click close can deliver this same tap here after it already
+        // shut the popover — treat it as part of that close, not a fresh open request.
+        if let lastDismissAt, ContinuousClock.now - lastDismissAt < Self.tapCloseGuardWindow {
+            return
+        }
+        showTask?.cancel()
+        showTask = nil
+        hideTask?.cancel()
+        hideTask = nil
+        overInline = true
+        isPresented = true
     }
 
     func detailHover(_ inside: Bool) {
@@ -78,6 +116,7 @@ final class HoverPopoverState {
         overDetail = false
         pinned = false
         isPresented = false
+        lastDismissAt = ContinuousClock.now
     }
 
     private func scheduleShow() {

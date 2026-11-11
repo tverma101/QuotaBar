@@ -414,4 +414,14 @@ final class ModelPricing: Sendable {
         }).first else { return nil }
         return (candidate.key, candidate.rates)
     }
+
+    /// Releases memoized model lookups and lazy fuzzy index byte structures to reduce memory footprint.
+    func clearCaches() {
+        memo.withLock { $0.removeAll(keepingCapacity: false) }
+        canonicalNameMemo.withLock { $0.removeAll(keepingCapacity: false) }
+        cursorCanonicalNameMemo.withLock { $0.removeAll(keepingCapacity: false) }
+        primary.clearFuzzyIndex()
+        secondary.clearFuzzyIndex()
+        openRouter.clearFuzzyIndex()
+    }
 }

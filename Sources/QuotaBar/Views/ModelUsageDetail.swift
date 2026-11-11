@@ -127,10 +127,12 @@ struct ModelUsageDetail: View {
                     if contributors.count <= 8 {
                         contributorRows(contributors)
                     } else {
+                        // Tall enough that a long tail (many small models folded into Other) reads as
+                        // real usage rather than a sliver — ~8 rows visible, the rest scrollable.
                         ScrollView(.vertical) {
                             contributorRows(contributors)
                         }
-                        .frame(height: 180)
+                        .frame(height: 260)
                     }
                 }
                 .font(.system(size: density.supportingPointSize - 1))

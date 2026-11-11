@@ -85,7 +85,8 @@ final class FreebuffProvider: ProviderRuntime {
                                   sourceNote: Self.historySourceNote),
             .values(id: "freebuff.monthlySpend", provider: provider, title: "Monthly Spend",
                     metricLabel: "Monthly Spend", selection: .kind(.dollars), valueWord: "spent")
-                .hidingWhenEmpty()
+                .hidingWhenEmpty(),
+            .usageTrend(provider: provider)
         ] + WidgetDescriptor.spendTiles(provider: provider)
     }
 
@@ -94,6 +95,20 @@ final class FreebuffProvider: ProviderRuntime {
     }
 
     func refresh() async -> ProviderSnapshot {
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        // Fold-only passes run the hosted-receipt fetch and Desktop-database history fold in the
+        // scan-worker child when available; the body below stays the in-process path for the
+        // fallback and for meter/full scopes.
+        if ProviderRefreshContext.scope.suppressesLiveQuota {
+            return await ScanWorkerClient.shared.foldOnlySnapshot(
+                provider: provider,
+                inProcessFallback: { await self.refreshInProcess() }
+            )
+        }
+        return await refreshInProcess()
+    }
+
+    private func refreshInProcess() async -> ProviderSnapshot {
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         let scope = ProviderRefreshContext.scope
         var auth: FreebuffAuth?
@@ -186,6 +201,12 @@ final class FreebuffProvider: ProviderRuntime {
                     modelSourceNote: Self.historySourceNote,
                     partialDays: scan.partialDays,
                     apiEstimateByDay: usage.apiEstimateByDay, estimatedCostDays: usage.estimatedCostDays
+                )
+                SpendTileMapper.appendUsageTrend(
+                    usage.series, to: &result.lines, now: scanNow,
+                    note: Self.historySourceNote,
+                    partialDays: scan.partialDays,
+                    partialNote: "incomplete Freebuff history is shown as a lower bound"
                 )
             }
         } catch is CancellationError {

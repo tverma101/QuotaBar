@@ -74,7 +74,7 @@ final class StatusItemImageUpdater {
         pendingUpdateTask = Task { @MainActor [weak self] in
             defer { self?.pendingUpdateTask = nil }
             do {
-                try await Task.sleep(for: .milliseconds(50))
+                try await Task.sleep(for: .milliseconds(50), tolerance: .milliseconds(10))
             } catch {
                 return
             }
@@ -106,7 +106,7 @@ final class StatusItemImageUpdater {
                 let now = Date()
                 let secondsToBoundary = 60 - (now.timeIntervalSince1970.truncatingRemainder(dividingBy: 60))
                 do {
-                    try await Task.sleep(for: .seconds(max(1, secondsToBoundary)))
+                    try await Task.sleep(for: .seconds(max(1, secondsToBoundary)), tolerance: .seconds(1))
                 } catch {
                     return
                 }
@@ -121,32 +121,34 @@ final class StatusItemImageUpdater {
 
     /// The pinned-metrics strip in the chosen style, or the app icon when nothing is pinned.
     private func renderButtonImage() -> NSImage {
-        // Screen-share privacy: while a capture is active (and the setting is on), the strip is
-        // replaced with the wordmark so a shared screen never carries usage numbers. Read inside the
-        // observation closure so the render re-arms on capture-state changes too.
-        if container.privacy.concealUsage {
-            updateTooltip?("QuotaBar, usage hidden while the screen is shared")
-            return MenuBarStripRenderer.privacyImage
+        autoreleasepool {
+            // Screen-share privacy: while a capture is active (and the setting is on), the strip is
+            // replaced with the wordmark so a shared screen never carries usage numbers. Read inside the
+            // observation closure so the render re-arms on capture-state changes too.
+            if container.privacy.concealUsage {
+                updateTooltip?("QuotaBar, usage hidden while the screen is shared")
+                return MenuBarStripRenderer.privacyImage
+                    ?? MenuBarIcon.image
+                    ?? MenuBarStripRenderer.fallbackIcon
+            }
+            let now = Date()
+            let snoozedIDs = container.snooze.snoozedProviderIDs(
+                groups: container.layout.pinnedGroups,
+                data: { container.dataStore.data(for: $0) },
+                now: now
+            )
+            let content = MenuBarContentBuilder.build(
+                groups: container.layout.pinnedGroups,
+                hiddenProviderIDs: container.layout.hiddenMenuBarProviderIDs,
+                snoozedProviderIDs: snoozedIDs,
+                now: now,
+                data: { container.dataStore.data(for: $0) }
+            )
+            let tooltip = content.accessibilityText.isEmpty ? "QuotaBar" : content.accessibilityText
+            updateTooltip?(tooltip)
+            return MenuBarStripRenderer.image(for: content, style: container.layout.menuBarStyle)
                 ?? MenuBarIcon.image
                 ?? MenuBarStripRenderer.fallbackIcon
         }
-        let now = Date()
-        let snoozedIDs = container.snooze.snoozedProviderIDs(
-            groups: container.layout.pinnedGroups,
-            data: { container.dataStore.data(for: $0) },
-            now: now
-        )
-        let content = MenuBarContentBuilder.build(
-            groups: container.layout.pinnedGroups,
-            hiddenProviderIDs: container.layout.hiddenMenuBarProviderIDs,
-            snoozedProviderIDs: snoozedIDs,
-            now: now,
-            data: { container.dataStore.data(for: $0) }
-        )
-        let tooltip = content.accessibilityText.isEmpty ? "QuotaBar" : content.accessibilityText
-        updateTooltip?(tooltip)
-        return MenuBarStripRenderer.image(for: content, style: container.layout.menuBarStyle)
-            ?? MenuBarIcon.image
-            ?? MenuBarStripRenderer.fallbackIcon
     }
 }
