@@ -38,10 +38,12 @@ struct URLSessionHTTPClient: HTTPClient {
     var allowsInsecureLoopback: Bool = false
 
     /// One session for every provider request, built once with the optional `~/.quotabar/config.json`
-    /// proxy applied (see `ProxyConfig`). Default configuration — same cookie/cache semantics as
-    /// `URLSession.shared` — when no valid proxy is configured.
+    /// proxy applied (see `ProxyConfig`). In-memory and disk URLCache disabled so continuous API
+    /// polls never accumulate dirty response buffers in memory.
     private static let session: URLSession = {
         let configuration = URLSessionConfiguration.default
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         if let proxy = ProxyConfig.current {
             configuration.proxyConfigurations = [proxy.proxyConfiguration()]
             // Record that a proxy is in effect (useful in a support log). Scheme/host/port only —
@@ -54,7 +56,10 @@ struct URLSessionHTTPClient: HTTPClient {
     /// Loopback-only session: ephemeral (no shared cookie/cache state), no proxy (localhost), and a
     /// delegate that trusts a self-signed cert exclusively for `127.0.0.1`. Built once.
     private static let loopbackSession: URLSession = {
-        URLSession(configuration: .ephemeral, delegate: LoopbackTLSDelegate(), delegateQueue: nil)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration, delegate: LoopbackTLSDelegate(), delegateQueue: nil)
     }()
 
     func send(_ request: HTTPRequest) async throws -> HTTPResponse {

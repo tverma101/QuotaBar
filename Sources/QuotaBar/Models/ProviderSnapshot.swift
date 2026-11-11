@@ -99,7 +99,13 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
     }
 
     func line(label: String) -> MetricLine? {
-        lines.first { $0.label == label }
+        if let exact = lines.first(where: { $0.label == label }) {
+            return exact
+        }
+        if label == "Weekend Build" {
+            return lines.first { $0.label.contains("Build") }
+        }
+        return nil
     }
 
     /// The success-path counterpart to `error(provider:message:)`: derives `providerID`/`displayName`
@@ -241,7 +247,7 @@ struct ProviderSnapshot: Hashable, Sendable, Codable {
             merged.plan = previous.plan
         }
         if merged.activeSessions == nil {
-            merged.activeSessions = previous.activeSessions
+            merged.activeSessions = clearsPriorQuota ? [] : previous.activeSessions
         }
         let preserved = previous.lines.filter { line in
             if !sameLocalDay, Self.isDayLabeledSpendTile(line) { return false }

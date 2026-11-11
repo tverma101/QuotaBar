@@ -172,11 +172,21 @@ final class CursorProvider: ProviderRuntime {
         // Fold-only pass (panel phase 2): the meters-only phase just ran this account's API chain;
         // re-running it per fold would double every panel-open request burst. Only the token needs
         // acquiring (the CSV download authenticates with it) — skip the meter chain, fold the CSV,
-        // and let the store's merge recover the meters onto the fresh history.
+        // and let the store's merge recover the meters onto the fresh history. The CSV fold runs
+        // in the scan-worker child when available; the closure below stays the in-process path.
         if ProviderRefreshContext.scope.suppressesLiveQuota {
-            var working = CursorMappedUsage(plan: nil, lines: [])
-            let history = try await appendSpendLines(to: &working.lines, accessToken: accessToken)
-            return snapshot(working, usageHistory: history)
+            return await ScanWorkerClient.shared.foldOnlySnapshot(provider: provider) {
+                do {
+                    var working = CursorMappedUsage(plan: nil, lines: [])
+                    let history = try await self.appendSpendLines(to: &working.lines, accessToken: accessToken)
+                    return self.snapshot(working, usageHistory: history)
+                } catch {
+                    if ProviderCancellation.isCancellation(error) {
+                        return cancelledRefreshSnapshot(provider: self.provider)
+                    }
+                    return ProviderSnapshot.error(provider: self.provider, error: error)
+                }
+            }
         }
 
         let usageResponse = try await fetchUsageWithRetry(accessToken: accessToken, authState: &authState)

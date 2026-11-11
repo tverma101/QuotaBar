@@ -119,7 +119,9 @@ actor FreebuffHostedUsageScanner {
         guard let url, FileManager.default.fileExists(atPath: url.path) else { return nil }
         let data = try Data(contentsOf: url)
         guard data.count <= maximumCacheBytes else { throw FreebuffUsageError.invalidResponse }
-        return try JSONDecoder().decode(Cache.self, from: data)
+        return try autoreleasepool {
+            try JSONDecoder().decode(Cache.self, from: data)
+        }
     }
 
     private static func logCacheReadFailure() {
@@ -257,11 +259,13 @@ actor FreebuffHostedUsageScanner {
                 guard let date = OpenUsageISO8601.date(from: run.finishedAt ?? run.createdAt) else {
                     throw FreebuffUsageError.invalidResponse
                 }
-                let patch = try JSONDecoder().decode(Metrics.self, from: Data(metrics.utf8))
-                let prior = try result.receipt.map { try JSONDecoder().decode(Metrics.self, from: Data($0.metricsJSON.utf8)) }
-                let merged = String(decoding: try JSONEncoder().encode(patch.merging(over: prior)), as: UTF8.self)
-                result.receipt = FreebuffUsageReceipt(id: "cloud:" + run.id, timestampMs: date.timeIntervalSince1970 * 1_000,
-                                                     metricsJSON: merged, model: run.model)
+                try autoreleasepool {
+                    let patch = try JSONDecoder().decode(Metrics.self, from: Data(metrics.utf8))
+                    let prior = try result.receipt.map { try JSONDecoder().decode(Metrics.self, from: Data($0.metricsJSON.utf8)) }
+                    let merged = String(decoding: try JSONEncoder().encode(patch.merging(over: prior)), as: UTF8.self)
+                    result.receipt = FreebuffUsageReceipt(id: "cloud:" + run.id, timestampMs: date.timeIntervalSince1970 * 1_000,
+                                                         metricsJSON: merged, model: run.model)
+                }
             }
             // endCursor advances across non-metric events as well, so an idle run downloads nothing twice.
             result.cursor = page.endCursor ?? page.nextCursor ?? cursor
