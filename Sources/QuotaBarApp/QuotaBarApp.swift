@@ -6,9 +6,20 @@ import Darwin
 enum QuotaBarMain {
     @MainActor
     static func main() async {
+        setenv("MallocLargeCache", "0", 1)
+        URLCache.shared.removeAllCachedResponses()
+        URLCache.shared.diskCapacity = 0
+        URLCache.shared.memoryCapacity = 0
         let arguments = Array(CommandLine.arguments.dropFirst())
         if arguments.contains("--diagnose") {
             let status = await HeadlessDiagnosticCommand.run(
+                arguments: arguments,
+                defaultsDomain: Bundle.main.bundleIdentifier ?? "com.tverma101.quotabar"
+            )
+            exit(status)
+        }
+        if arguments.contains("--scan-worker") {
+            let status = await ScanWorkerCommand.run(
                 arguments: arguments,
                 defaultsDomain: Bundle.main.bundleIdentifier ?? "com.tverma101.quotabar"
             )

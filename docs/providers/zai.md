@@ -8,14 +8,18 @@ Tracks [Z.ai](https://z.ai) (Zhipu AI) GLM Coding Plan usage quotas for coding s
 |---|---|
 | Session | 5-hour rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
 | Weekly | 7-day rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
+| Weekend Build | A promotional one-time token grant read from local ZCode (used / total); shows its expiry, and "Expired" once the grant ends; hidden when the account has none |
 | Web Searches | Monthly web-search / web-reader / Zread calls (used / limit); hidden when the plan carries no web-search allowance |
-| ZCode Tokens | All-time tokens recorded locally by ZCode across its configured models; optional, off by default |
+| Today / Yesterday / Last 30 Days | Local ZCode usage history, estimated at public API rates; sit below the caret |
 
-When Z.ai reports your plan name, QuotaBar shows it beside the provider name.
+When Z.ai reports your plan name, QuotaBar shows it beside the provider name. For promotional
+plans (such as Start Plan) that the quota API doesn't cover, the plan name and grant come from the
+local ZCode entitlement snapshot instead.
 
 ## Where credentials come from
 
-QuotaBar uses an API key for Coding Plan quotas. ZCode Tokens uses local ZCode history independently and does not need a key.
+QuotaBar uses an API key for Coding Plan quotas. Weekend Build and the local usage history read ZCode
+data on this Mac independently and do not need a key.
 QuotaBar reads it from the first place it finds one, in this order:
 
 1. `~/.config/openusage/zai.json` — `{"apiKey":"…"}` (the file Settings writes to)
@@ -38,9 +42,19 @@ export ZAI_API_KEY="YOUR_API_KEY"
 
 3. Z.ai appears on the dashboard and (after you star a metric) the menu bar on the next refresh.
 
-## ZCode Tokens
+## Weekend Build
 
-Enable **ZCode Tokens** in Customize → Z.ai to see the all-time total from this Mac’s `~/.zcode/cli/db/db.sqlite`. It counts recorded input and output across models used in ZCode, including cached input once. This is local app usage, not the Coding Plan quota or a billing figure. It appears under On Demand and is not pinned by default.
+Promotional grants (like a one-time token bonus) are read from ZCode's local entitlement snapshot —
+no API key involved. The row shows how much of the grant is used and, when the grant has a recorded
+end date, how long it lasts; after that date it reads "Expired" until the next snapshot drops it.
+Grant data updates whenever ZCode refreshes its snapshot, so a fresh manual ZCode run feeds QuotaBar.
+
+## ZCode History
+
+The Today / Yesterday / Last 30 Days tiles come from this Mac's `~/.zcode/cli/db/db.sqlite`. They
+count recorded input and output across models used in ZCode, including cached input once, and
+estimate cost at public API rates. This is local app usage, not the Coding Plan quota or a billing
+figure. They appear below the caret and are not pinned by default.
 
 ## Under the hood
 

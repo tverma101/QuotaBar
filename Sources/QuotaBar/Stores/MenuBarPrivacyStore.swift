@@ -88,7 +88,7 @@ final class MenuBarPrivacyStore {
         refreshCaptureState()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: Self.pollInterval)
+                try? await Task.sleep(for: Self.pollInterval, tolerance: .seconds(1))
                 guard !Task.isCancelled else { return }
                 self?.refreshCaptureState()
             }

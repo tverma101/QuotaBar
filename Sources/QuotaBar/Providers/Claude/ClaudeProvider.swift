@@ -124,9 +124,14 @@ final class ClaudeProvider: ProviderRuntime {
             // credentials here can repeat a failed Keychain read during the visible retry's
             // history follow-up, even though this pass never uses the token or calls Anthropic.
             // The scanner is already bound to the card identity when account cards are created.
-            return await snapshotWithLocalUsage(
-                mapped: ClaudeMappedUsage(plan: nil, lines: []),
-                warning: nil
+            return await ScanWorkerClient.shared.foldOnlySnapshot(
+                provider: provider,
+                inProcessFallback: {
+                    await self.snapshotWithLocalUsage(
+                        mapped: ClaudeMappedUsage(plan: nil, lines: []),
+                        warning: nil
+                    )
+                }
             )
         }
         let manualActionID = ProviderRefreshContext.manualActionID

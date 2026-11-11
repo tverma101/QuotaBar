@@ -64,19 +64,19 @@ private func antigravityStepMetadata(
     return metadata
 }
 
-private struct AntigravityFixtureRow: Sendable {
+struct AntigravityFixtureRow: Sendable {
     var index: Int
     var blob: [UInt8]?
     var stepMetadata: [UInt8]? = nil
 }
 
-private final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
+final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
     private let lock = NSLock()
     private var rowsByPath: [String: [AntigravityFixtureRow]]
     private var cursors: [Int] = []
     private var stepTimestampCursors: [Int] = []
     private var queryCounts: [String: Int] = [:]
-    private var contentFingerprintQueryCount = 0
+    private(set) var contentFingerprintQueryCount = 0
     private var maximumIndexQueryCount = 0
     private(set) var contentFingerprintSQLs: [String] = []
     private var stepMetadataQueryCount = 0
@@ -452,6 +452,22 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         ]),
         secondary: PricingCatalog()
     )
+
+    override func setUp() {
+        super.setUp()
+        // Scanner instances now reload persisted derivation records; keep each test's writes in a
+        // scratch directory so no fixture leaks into (or warms from) the user's real scan cache.
+        AntigravityAggregatePersistence.directoryOverride = FileManager.default.temporaryDirectory
+            .appendingPathComponent("antigravity-scanner-tests-\(UUID().uuidString)", isDirectory: true)
+    }
+
+    override func tearDown() {
+        if let override = AntigravityAggregatePersistence.directoryOverride {
+            try? FileManager.default.removeItem(at: override)
+        }
+        AntigravityAggregatePersistence.directoryOverride = nil
+        super.tearDown()
+    }
 
     private func makeDatabaseDirectory(fileNames: [String] = ["conversation.db"]) throws -> (url: URL, paths: [String]) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1674,6 +1690,11 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
             rowsByPath: fixture.paths.reduce(into: [:]) { $0[$1] = [.init(index: 0, blob: blob)] },
             cancellingPath: fixture.paths[1]
         )
+        // This phase proves cancellation stops a scan mid-read, so it must exercise the cold
+        // path: the earlier phases persisted derivation records for these same file stamps, and
+        // a warm record would serve b.db without ever reaching the cancelling SQLite query.
+        AntigravityAggregatePersistence.directoryOverride = FileManager.default.temporaryDirectory
+            .appendingPathComponent("antigravity-scanner-tests-\(UUID().uuidString)", isDirectory: true)
         let cancellableScanner = AntigravityDbUsageScanner(
             sqlite: cancellableSQLite, conversationsDirectory: { fixture.url.path }
         )

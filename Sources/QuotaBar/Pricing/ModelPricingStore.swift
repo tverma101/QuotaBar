@@ -124,6 +124,11 @@ actor ModelPricingStore {
         await refreshTask?.value
     }
 
+    /// Drops model pricing memo entries and lazy fuzzy matching indices to relieve memory footprint.
+    func clearCaches() {
+        pricing.clearCaches()
+    }
+
     // MARK: - Initial load (bundled + disk cache)
 
     func loadIfNeeded() {

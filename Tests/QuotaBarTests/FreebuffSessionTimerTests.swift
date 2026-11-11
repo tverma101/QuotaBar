@@ -31,7 +31,7 @@ final class FreebuffSessionTimerTests: XCTestCase {
     }
 
     func testTwoDesktopSessionsStackAndUnoccupiedOrExpiredPurchasesDisappear() throws {
-        let (content, _) = try content(payload: [
+        let (content, daily) = try content(payload: [
             "status": "none",
             "desktopPurchases": [
                 ["holderInstanceId": "b", "model": "fast", "expiresAt": iso(51 * 60)],
@@ -41,6 +41,8 @@ final class FreebuffSessionTimerTests: XCTestCase {
             ]
         ])
         XCTAssertEqual(content.groups.first?.metrics.map(\.value), ["18m", "51m"])
+        XCTAssertEqual(daily.activeSessions.count, 2, "expired session must not be present in activeSessions")
+        XCTAssertEqual(daily.traySessionExpiriesAt.count, 2, "expired session expiry must be excluded from traySessionExpiriesAt")
         XCTAssertEqual(Set(content.groups[0].metrics.map(\.id)).count, 2)
         let image = try XCTUnwrap(MenuBarStripRenderer.textImage(for: content))
         XCTAssertLessThanOrEqual(image.size.height, 22)
@@ -193,7 +195,10 @@ final class FreebuffSessionTimerTests: XCTestCase {
         let balance = try XCTUnwrap(descriptors.first { $0.id == "freebuff.freebucksBalance" })
         let defaults = UserDefaults(suiteName: "FreebuffSessionTimerTests.\(UUID())")!
         let store = WidgetDataStore(
-            registry: WidgetRegistry(providers: [provider.provider], descriptors: descriptors), providers: [], defaults: defaults
+            registry: WidgetRegistry(providers: [provider.provider], descriptors: descriptors),
+            providers: [],
+            defaults: defaults,
+            now: { [now] in now }
         )
         store.snapshots["freebuff"] = try snapshot(payload: payload, sessions: sessions)
         let group = ProviderMetrics(provider: provider.provider, alwaysShownMetrics: [daily, balance], expandedMetrics: [])

@@ -14,6 +14,7 @@ credential cache across its organizations rather than rereading it for each card
 - Local JSONL folds treat an oversized discarded record as an incomplete source. They keep the prior complete history and do not advance the byte checkpoint over data that may contain usage.
 - Quota and local-history failures have separate retry windows. A failed quota request does not hold back a local fold, and a local scan failure does not postpone the next live meter request. A visible Retry runs meters first and then folds providers that export local history; both phases retain the same one-dialog Keychain allowance and use the interactive CPU budget. During the second phase, the warning and Retry action stay visible beside a supplementary spinner. If a newer manual action supersedes the meter phase, silent recovery keeps the interactive accounting budget without reopening Keychain. The error remains until the work that failed succeeds. Full-refresh failures share backoff with those component passes. Forced retries keep their requested scope through the provider deadline, so a meter retry does not unexpectedly start a slow full-history scan. Providers whose meter pass already scans history, such as Hermes, are skipped by the separate fold phase. Deferred history retries keep their cache, backoff bypass, and manual Keychain context when a meter pass finishes first; disabling that provider invalidates its queued history request, including a request already handed to the scheduler.
 - Background menu-bar ticks pace instrumented local accounting toward 7.5% of one CPU core. A closed-panel tick only refreshes providers that can actually put something in the menu bar: those with a starred metric, plus any with a visible bounded metric while quota notifications are on. A provider you've hidden from the strip with **Show in menu bar** is skipped, since nothing it produces can be drawn there — and a provider with nothing starred is never woken just to recompute a value nobody displays. Opening the panel refreshes everything enabled, so a re-shown provider fills in immediately. Explicit full-history reads (Refresh Now, the one-shot CLI, and the local API) use the 25% interactive budget when their accounting work is instrumented. Visible provider retries use that same interactive budget across their meter and history phases. Panel-open and accepted background accounting folds run without pacing. CodexRouter and OpenCode also read a cold compact ledger without pacing to stay inside the provider deadline; persisted summaries make unchanged refreshes skip event bytes. The pacing target averages work over bounded slices, includes CPU from reaped helper processes, and is not an instantaneous hard cap. The repeatable benchmark covers a synthetic CodexRouter scanner/cache path, not every provider.
+- Fold-only passes (the five-minute history refresh, closed-panel ledger wakes, and the panel's accounting phase) run in a short-lived **scan worker**: QuotaBar re-launches its own executable with `--scan-worker`, the child folds the requested providers against the same shared disk caches, prints the refreshed snapshots, and exits. A fold's parse working set — the JSON decoding churn of large local logs — therefore settles into the child's memory and dies with the process instead of piling up inside the menu-bar app. The child inherits the pass's scope and pacing (closed-panel wakes run paced, panel accounting unpaced). Delegation is transparent when it works and self-healing when it does not: a child that cannot be spawned or reports a refresh failure surfaces the error like any failed refresh, and an inconclusive child answer falls back to the in-process fold. `QUOTABAR_DISABLE_SCAN_WORKER=1` turns the worker off and always folds in-process.
 - Across a local-midnight rollover, all enabled live meters refresh first and the local fold runs separately, so Today / Yesterday tiles rebuild with the new day without blocking later meter deadlines. History folds also cover the **lifetime** window — the local log corpus in full — so the Usage History screen's Lifetime card stays current; parse and aggregate caches make the deep fold incremental after its first pass, and the 30-day tiles clip the wide result by day key.
 - Turning a provider on in Customize schedules all enabled meters promptly and queues its history fold. Turning one off cancels its in-flight refresh; cancellation checks stop later scanner and API stages, and disabled cards are never selected by later passes. Disabling the last Codex card also disarms the CodexRouter file and directory watches, so a turned-off source is not even monitored; enabling a Codex card arms them again. Disabling a Codex card cancels sibling scans that captured its peer-home list. Codex managed-home deduplication walks only enabled peer homes. Claude account ownership metadata is cached across enabled cards; a shared-root candidate is read only through its ownership preamble and first usage row to classify it, then nonmatching usage rows stay out of the enabled card's parser. A CodexRouter ledger wake is ignored when every Codex card is disabled, and OpenCode is not rescanned for that disabled source. If a closed-panel ledger append lands inside the wake cooldown, one trailing wake runs when the cooldown expires so the final append is not stranded.
 - OpenCode's combined spend fold also skips Claude, Codex, Hermes, or Muse log sources when that source family is disabled; with multiple Claude or Codex account cards, it folds only enabled Claude scanners and Codex homes. Hermes remains serialized with heavy local work because its meter refresh reads its local database even in a meters-only pass; that local-only scan does not advance the global quota deadline.
@@ -92,17 +93,32 @@ applies model-rate estimates, so pricing updates take effect without re-reading 
 relaunch, an entry is reused only when its path, size, modification time, and parser version still match.
 Same-home cards share parsed data, and changing one source file rewrites only that file's record. Old files
 leave the cache as the history window advances, and identities unused for 35 days are removed. App writes
-are debounced until after refresh; the one-shot CLI drains pending writes before it exits.
+are debounced until after refresh; the one-shot CLI drains pending writes before it exits. Freebuff
+Desktop's per-database derived turn cache keeps a disk mirror in the same directory, validated against
+each database's revision before use, so a fresh process — the scan worker, or this app after a
+memory-pressure unload — reloads derived turns instead of re-reading sqlite and re-parsing receipts.
+Antigravity does the same for each conversation database: parsed generation events plus the priced
+daily aggregate are mirrored to disk and validated against the database's file stamps, so a fresh
+process skips the SQLite read and protobuf decode entirely, and an appended database verifies its
+cached prefix and folds only the new rows.
 
 QuotaBar keeps the capped native Codex session tail and Claude append cache warm between scans so
 appends do not reparse unchanged history. The larger CodexRouter index stays warm while the panel is
 open. When the process crosses its memory budget or macOS reports memory pressure, QuotaBar saves
 pending parse-cache writes and releases those arrays in the background. This cleanup does not require
 the main thread and keeps the app running without clearing the usage values already on screen.
-Antigravity's database rows and step-date index are evicted together under memory pressure so a later
-scan rebuilds matching rows and dates.
+Between cycles QuotaBar prefers to keep these caches warm: releasing them every pass would make each
+accounting cycle cold-rebuild the provider databases, which costs CPU and leaves the rebuilds' parse
+churn parked in the heap as fragmentation.
+Antigravity's in-memory database rows and step-date index are evicted together under memory pressure;
+a later scan reloads rows and the priced aggregate from the disk mirror instead of rebuilding them
+from SQLite, re-deriving the step-date index only when a scan needs to resolve undated rows.
 Freebuff's cached receipts and completed accounting fold are also released; the next history scan
-re-reads its local databases.
+re-reads its local databases. After each cleanup (and at the end of every refresh cycle) the app also
+asks the allocator to hand its free pages back to the system, so the settled footprint tracks the
+live caches instead of the scan's transient peak. Long log scans check in as they go: once the
+footprint has grown a threshold past the last hand-back, the allocator's freed pages are returned
+mid-scan, so a history fold's peak stays near its live aggregates instead of piling up parse scratch.
 
 ## When a fetch fails
 
