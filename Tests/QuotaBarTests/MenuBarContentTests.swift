@@ -99,6 +99,64 @@ final class MenuBarContentTests: XCTestCase {
         XCTAssertTrue(content.isEmpty)
     }
 
+    // MARK: - The status item must never render blank (regression)
+
+    /// When every provider is auto-snoozed out of usage the strip content empties and the renderers
+    /// return nil, so the status item falls back to the small app icon — the item keeps its little
+    /// space and stays the panel's click target. A non-nil-but-invisible render here would blank the
+    /// item out of the menu bar entirely, leaving no way to open the panel.
+    func testAllSnoozedProvidersFallBackToAVisibleAppIcon() throws {
+        let content = MenuBarContentBuilder.build(
+            groups: [group("a", percent("a.live", "Session", 41)), group("b", percent("b.live", "Session", 12))],
+            snoozedProviderIDs: ["a", "b"],
+            data: { $0.sample }
+        )
+        XCTAssertTrue(content.isEmpty)
+        XCTAssertNil(MenuBarStripRenderer.image(for: content, style: .text))
+        XCTAssertNil(MenuBarStripRenderer.image(for: content, style: .bars))
+
+        let applied = MenuBarStripRenderer.image(for: content, style: .text)
+            ?? MenuBarIcon.image
+            ?? MenuBarStripRenderer.fallbackIcon
+        XCTAssertGreaterThan(applied.size.width, 0, "the fallback icon must occupy visible menu-bar space")
+        let cg = try XCTUnwrap(applied.cgImage(forProposedRect: nil, context: nil, hints: nil))
+        XCTAssertNotNil(MenuBarStripRenderer.visibleBounds(of: cg), "the fallback icon must have visible pixels")
+    }
+
+    /// A strip whose groups render nothing visible (here: an empty-value metric on a segment without
+    /// a provider mark) must return nil rather than a fully transparent image — a transparent
+    /// status-item image disappears from the menu bar and takes the panel's only click target with it.
+    func testTextStripWithNoVisiblePixelsFallsBackToAppIcon() {
+        let content = MenuBarContent(
+            groups: [MenuBarContent.Group(
+                providerID: "codex@0577ce6e",
+                displayName: "Codex",
+                icon: .providerMark("codex"),
+                metrics: [MenuBarContent.Metric(
+                    id: "codex@0577ce6e.spend", label: "Monthly Spend",
+                    value: "", fraction: 0, isBounded: false, hasData: true
+                )],
+                showsProviderIcon: false
+            )],
+            bars: []
+        )
+        XCTAssertFalse(content.isEmpty, "content is non-empty yet renders no pixels — the bug's shape")
+        XCTAssertNil(MenuBarStripRenderer.image(for: content, style: .text))
+    }
+
+    /// All providers freshly reset (0% everywhere) render the Bars style's faint tracks: visible
+    /// pixels, not a blank item.
+    func testZeroFractionBarsStillRenderVisibleTracks() throws {
+        let content = MenuBarContentBuilder.build(
+            groups: [group("a", percent("a.m1", "Session", 0), percent("a.m2", "Weekly", 0))],
+            data: { $0.sample }
+        )
+        XCTAssertFalse(content.isEmpty)
+        let image = try XCTUnwrap(MenuBarStripRenderer.image(for: content, style: .bars))
+        let cg = try XCTUnwrap(image.cgImage(forProposedRect: nil, context: nil, hints: nil))
+        XCTAssertNotNil(MenuBarStripRenderer.visibleBounds(of: cg))
+    }
+
     func testExpiredClaudeQuotaDoesNotShowAsCurrentInMenuBar() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         let session = percent("claude.session", "Session", 25)

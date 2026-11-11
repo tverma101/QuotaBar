@@ -27,7 +27,7 @@ enum DefaultLayout {
 
         "freebuff.session", "freebuff.daily", "freebuff.weekly", "freebuff.fiveDay",
         "freebuff.monthly", "freebuff.premiumSessions", "freebuff.freePremiumSessions", "freebuff.freebucksDaily",
-        "freebuff.freebucksBalance", "freebuff.monthlySpend",
+        "freebuff.freebucksBalance", "freebuff.monthlySpend", "freebuff.trend",
         "freebuff.today", "freebuff.yesterday", "freebuff.last30",
 
         "grok.weekly", "grok.trend",
@@ -41,7 +41,8 @@ enum DefaultLayout {
         "openrouter.credits", "openrouter.balance",
         "openrouter.today", "openrouter.week", "openrouter.month", "openrouter.keyLimit",
 
-        "zai.session", "zai.weekly", "zai.webSearches", "zai.zcodeTokens"
+        "zai.session", "zai.weekly", "zai.weekendBuild", "zai.webSearches",
+        "zai.today", "zai.yesterday", "zai.last30"
     ]
 
     /// Frozen snapshot of the default-on metrics from the release that introduced default seeding.
@@ -128,7 +129,7 @@ enum DefaultLayout {
         // OpenRouter: Credits meter + Balance stay above the fold; period spend and the per-key cap
         // sit below the caret.
         "openrouter.today", "openrouter.week", "openrouter.month", "openrouter.keyLimit",
-        // Z.ai: Session meter stays above the fold; Web Searches (monthly count) sits below the caret.
-        "zai.webSearches", "zai.zcodeTokens"
+        // Z.ai: Session and Weekend Build stay above the fold; spend tiles sit below the caret.
+        "zai.webSearches", "zai.today", "zai.yesterday", "zai.last30"
     ]
 }

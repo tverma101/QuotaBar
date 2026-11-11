@@ -1,7 +1,8 @@
 import Foundation
 
-/// Display identity is separate from the rate used for each receipt. Fast/Slow modes can share a
-/// model row while keeping their own measured tokens and public-rate estimates in its variants.
+/// Display identity is separate from the rate used for each receipt. Modes can share a model row
+/// while keeping their own measured tokens and public-rate estimates in its variants — except the
+/// removed Flash Fast mode, which collapses onto its base model entirely (`presentedName`).
 struct FreebuffModelIdentity {
     static let olderUsageName = "Older Freebuff Usage"
     struct Resolved {
@@ -29,7 +30,7 @@ struct FreebuffModelIdentity {
             return pairs.first?.1
         }
         routeNames = Dictionary(grouping: routes.keys, by: { routes[$0]! }).compactMapValues { keys in
-            let names = Set(keys.compactMap { entries[$0]?.displayName })
+            let names = Set(keys.compactMap { entries[$0]?.displayName }.map(Self.presentedName))
             // Multiple opaque keys with the same display name still name one model. Distinct
             // catalogue names on one price route do not prove an identity.
             return names.count == 1 ? names.first : nil
@@ -46,11 +47,19 @@ struct FreebuffModelIdentity {
         } else {
             route = entry.flatMap { routes[$0.key] }
         }
-        let displayName = entry?.displayName ?? route.flatMap { routeNames[$0] }
+        let displayName = (entry?.displayName ?? route.flatMap { routeNames[$0] }).map(Self.presentedName)
         let resolved = Resolved(route: route, displayName: displayName,
                                 group: displayName.map(Self.groupName))
         if memo.count < 4_096 { memo[model] = resolved }
         return resolved
+    }
+
+    /// The catalogue name a model row presents. Freebuff removed its Flash Fast serving mode, so a
+    /// name that still claims it is stale — the key serves the base Flash model (hosted receipts
+    /// carry only the plain slug). Present that base name; the removed mode must not reappear as a
+    /// model identity or a spelling variant anywhere. Slow remains a real mode and keeps its label.
+    static func presentedName(_ name: String) -> String {
+        FreebuffModelCatalog.removedModeBaseName(name) ?? name
     }
 
     /// Matches `freebuffLegacyModelDigest` in Freebuff's common/types/freebuff-model-catalog.ts:

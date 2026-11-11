@@ -59,6 +59,8 @@ session caps are hidden when the current hours meter is present. Older servers w
 keep their session windows. Monthly Spend appears only when the server supplies actual USD values.
 Hours and tokens are separate measurements; neither is converted into the other.
 
+**Usage Trend** shows a daily sparkline of measured token volume across the last 30 days. It is enabled, Always Visible, and unpinned by default.
+
 **Today**, **Yesterday**, and **Last 30 Days** combine measured hosted-run tokens with older Freebuff
 Desktop history on this Mac. Current **On This Device** sessions also keep their receipts in hosted
 history; the tools run on your Mac, but the older SQLite history no longer receives their tokens.
@@ -108,10 +110,13 @@ history stays No Data. Both the per-turn cache and completed aggregate stay boun
 installs do not keep every raw receipt in memory.
 
 Dollar values are **public API price estimates**, not Freebuff's recorded charges. QuotaBar uses
-OpenRouter for exact routes except for Fast's curated Vercel AI Gateway route. Model rows carry the
+OpenRouter for exact routes. Model rows carry the
 catalogue's display name whenever one is known. Legacy model IDs use the catalogue's published
 identity digests, so receipts recorded with an old route and a current catalogue key share one row.
-The breakdown groups Fast/Slow modes, build-date labels, and context annotations under the model's
+Freebuff removed its Flash Fast serving mode; a catalogue name that still claims it presents and
+prices as the base Flash model (hosted receipts only ever carry the plain slug), so no row or
+variant is labelled Fast. The breakdown groups Slow modes, build-date labels, and context
+annotations under the model's
 name. Their measured tokens and separate rate estimates remain in the accounting variants; different
 model versions and families stay separate. Grouping does not change token totals or reprice a mode
 at another mode's rate. Unknown or conflicting identities are never guessed. Models
@@ -133,13 +138,13 @@ Cached input is priced separately from uncached input; reasoning stays inside ou
 Flash's dated OpenRouter route publishes UTC weekday/time price windows, which QuotaBar applies at
 each stored assistant-message or mission-manager timestamp. A turn can aggregate calls across a
 window boundary, so that estimate is approximate for those turns. The route metadata does not include
-DeepSeek's Chinese-public-holiday exception. Fast mode uses a separate Pareto route in Freebuff, so
-its exact backend cost and Freebucks charge are not available in local receipts. QuotaBar now prices
-persisted Fast-root tokens at the public DeepSeek V4.1 Flash Fast route listed by Vercel AI Gateway:
-$0.60 input, $2.40 output, and $0.01 cached input per million tokens. This is a public API comparison,
-not an estimate of Pareto's internal cost or Freebuff's Freebucks charge. The estimate uses the
-recorded Fast model identity and tokens directly, with no added allowance for hypothetical helper
-calls. Freebuff's actual allowance and charges are server-side Freebucks, not token-priced dollars.
+DeepSeek's Chinese-public-holiday exception. Freebuff removed its Fast serving mode, so usage
+recorded under the old Fast catalogue key is presented and priced as the base Flash model; receipts
+recorded with a raw Fast route slug from before the removal still price at the public DeepSeek V4.1
+Flash Fast route listed by Vercel AI Gateway: $0.60 input, $2.40 output, and $0.01 cached input per
+million tokens. This is a public API comparison,
+not an estimate of Pareto's internal cost or Freebuff's Freebucks charge. Freebuff's actual
+allowance and charges are server-side Freebucks, not token-priced dollars.
 Since a turn aggregates multiple requests,
 single-request long-context tiers are not applied. The older local rows cover Desktop only; hosted
 runs cover the signed-in account's shared history. Standalone CLI traffic without hosted run receipts

@@ -229,7 +229,7 @@ struct WidgetRowView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .layoutPriority(0)
-            } else if !data.activeSessions.isEmpty {
+            } else if !activeSessions.isEmpty {
                 activeSessionsBadge
             }
             Spacer(minLength: 8)
@@ -239,13 +239,19 @@ struct WidgetRowView: View {
         .lineLimit(1)
     }
 
+    private var activeSessions: [FreebuffActiveSession] {
+        let currentNow = Date()
+        return data.activeSessions.filter { $0.expiresAt > currentNow }
+    }
+
     @ViewBuilder
     private var activeSessionsBadge: some View {
+        let currentSessions = activeSessions
         HStack(spacing: 4) {
             Circle()
                 .fill(Color.accentColor)
                 .frame(width: 5, height: 5)
-            Text(data.activeSessions.count == 1 ? "1 session" : "\(data.activeSessions.count) sessions")
+            Text(currentSessions.count == 1 ? "1 session" : "\(currentSessions.count) sessions")
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .layoutPriority(0)
@@ -265,21 +271,25 @@ struct WidgetRowView: View {
                 modelHover.inlineHover(false)
             }
         }
+        .onTapGesture {
+            guard !currentSessions.isEmpty else { return }
+            modelHover.toggleForTap()
+        }
         .motionAwareHoverPopover(
             isPresented: Binding(
-                get: { !data.activeSessions.isEmpty && modelHover.isPresented },
+                get: { !currentSessions.isEmpty && modelHover.isPresented },
                 set: { if !$0 { modelHover.dismiss() } }
             ),
             reduceAnimations: reduceAnimations
         ) {
-            FreebuffActiveSessionsDetail(sessions: data.activeSessions) { inside in
+            FreebuffActiveSessionsDetail(sessions: currentSessions) { inside in
                 modelHover.detailHover(inside)
             }
         }
     }
 
     private var showActiveSessionsHighlight: Bool {
-        !data.activeSessions.isEmpty && (modelHover.overInline || modelHover.isPresented)
+        !activeSessions.isEmpty && (modelHover.overInline || modelHover.isPresented)
     }
 
     // The headline value is the row's payload — the number the user opened the popover to read —
@@ -411,8 +421,10 @@ struct WidgetRowView: View {
             // Both the hover trigger and the popover anchor live on the value column, not the whole
             // row: hovering the label (or empty gap) shouldn't reveal the breakdown — only the figure
             // it explains should — and the arrow then centers on that figure, matching the trend
-            // popover's anchoring off the sparkline strip.
-            .contentShape(Rectangle())
+            // popover's anchoring off the sparkline strip. The shape reaches 8pt past the text (past
+            // the highlight chip's -7/-4) — the figure alone is a tiny target for the pointer to land
+            // on, and a near-miss that lights nothing reads as "not interactive".
+            .contentShape(Rectangle().inset(by: -8))
             .onContinuousHover { phase in
                 guard hasHoverPopover else {
                     modelHover.dismiss()
@@ -423,6 +435,13 @@ struct WidgetRowView: View {
                 } else {
                     modelHover.inlineHover(false)
                 }
+            }
+            // Tap toggles the same popover, with no dwell: hovering a small value is fiddly, and the
+            // 400 ms reveal outwaits a quick click. Only rows that actually have a popover respond —
+            // a tap on a plain row is a no-op, exactly like hovering it.
+            .onTapGesture {
+                guard hasHoverPopover else { return }
+                modelHover.toggleForTap()
             }
             .motionAwareHoverPopover(
                 isPresented: Binding(

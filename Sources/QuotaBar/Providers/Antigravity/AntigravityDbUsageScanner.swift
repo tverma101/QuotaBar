@@ -26,6 +26,10 @@ actor AntigravityDbUsageScanner {
     private let projectOversized: @Sendable (String, Int, Int) throws -> [UInt8]?
     private var scanCache: [String: CachedDatabase] = [:]
     private var sqliteSupportsSHA3Aggregate: Bool?
+    /// What is currently on disk per path, so unchanged databases skip record rewrites. Fingerprints
+    /// plus the aggregate's recompute inputs fully determine a record's content: events follow the
+    /// fingerprint, and the fold follows the events plus these inputs.
+    private var persistedStamps: [String: PersistedCacheStamp] = [:]
 
     struct ConversationDirectoryDiscovery: Sendable {
         let directories: [String]
@@ -379,6 +383,7 @@ actor AntigravityDbUsageScanner {
                         latestAcceptedTimestamp: aggregate.latestAcceptedTimestamp
                     )
                     scanCache[path] = current
+                    persistIfNeeded(path: path, cache: current)
                 }
             } else {
                 scan = aggregate.scan
@@ -429,6 +434,7 @@ actor AntigravityDbUsageScanner {
                 latestAcceptedTimestamp: latestAcceptedTimestamp
             )
             scanCache[path] = current
+            persistIfNeeded(path: path, cache: current)
         }
         return Self.markingCachedDataIncomplete(
             scan,
@@ -526,6 +532,59 @@ actor AntigravityDbUsageScanner {
         """
     }
 
+    private struct PersistedCacheStamp: Equatable {
+        let fingerprint: DatabaseFingerprint
+        let aggregateStamp: AggregateStamp?
+
+        init(_ cache: CachedDatabase) {
+            fingerprint = cache.fingerprint
+            aggregateStamp = cache.aggregate.map(AggregateStamp.init)
+        }
+    }
+
+    private struct AggregateStamp: Equatable {
+        let pricingToken: String
+        let windowStart: Date
+        let timeZoneIdentifier: String
+        let recomputeAfter: Date?
+        let latestAcceptedTimestamp: Int64?
+
+        init(_ aggregate: CachedAggregate) {
+            pricingToken = aggregate.pricingToken
+            windowStart = aggregate.windowStart
+            timeZoneIdentifier = aggregate.timeZoneIdentifier
+            recomputeAfter = aggregate.recomputeAfter
+            latestAcceptedTimestamp = aggregate.latestAcceptedTimestamp
+        }
+    }
+
+    /// Reload a previously persisted database record. With `requireFingerprint` the record must
+    /// match the live stamps exactly (the warm-reuse path); without it any record for the path is
+    /// returned as the retained prefix candidate, and the caller's identity/size checks decide.
+    private func loadPersistedCache(
+        path: String,
+        requireFingerprint: DatabaseFingerprint?
+    ) -> CachedDatabase? {
+        guard let record = AntigravityAggregatePersistence.read(path: path) else { return nil }
+        if let requireFingerprint, record.cache.fingerprint != requireFingerprint { return nil }
+        persistedStamps[path] = PersistedCacheStamp(record.cache)
+        scanCache[path] = record.cache
+        return record.cache
+    }
+
+    private func persistIfNeeded(path: String, cache: CachedDatabase) {
+        let stamp = PersistedCacheStamp(cache)
+        guard persistedStamps[path] != stamp else { return }
+        persistedStamps[path] = stamp
+        AntigravityAggregatePersistence.write(
+            AntigravityAggregatePersistence.Record(
+                schema: AntigravityAggregatePersistence.schema,
+                cache: cache
+            ),
+            path: path
+        )
+    }
+
     private func cachedDatabase(path: String, since: Date, observedAt: Date) async throws -> CachedDatabase? {
         var didRetry = false
         while true {
@@ -567,7 +626,8 @@ actor AntigravityDbUsageScanner {
         let fingerprint = try DatabaseFingerprint(path: path)
         guard fingerprint.latestModification >= since else { return nil }
 
-        if var cached = scanCache[path], cached.fingerprint == fingerprint, cached.windowStart <= since,
+        if var cached = scanCache[path] ?? loadPersistedCache(path: path, requireFingerprint: fingerprint),
+           cached.fingerprint == fingerprint, cached.windowStart <= since,
            cached.stepTimestampIndex.map({ $0.timeZoneIdentifier == Calendar.current.timeZone.identifier }) != false {
             if cached.windowStart < since {
                 Self.prune(&cached, before: since)
@@ -576,7 +636,7 @@ actor AntigravityDbUsageScanner {
             return cached
         }
 
-        var cached = scanCache[path]
+        var cached = scanCache[path] ?? loadPersistedCache(path: path, requireFingerprint: nil)
         // SHA3 prefix fingerprints intentionally omit oversized payloads. Once such a row has been
         // projected, a changed source must replay its bounded projection even for same-size edits.
         if cached?.hasProjectedRows == true { cached = nil }
@@ -724,6 +784,7 @@ actor AntigravityDbUsageScanner {
         }
 
         scanCache[path] = refreshed
+        persistIfNeeded(path: path, cache: refreshed)
         if retainedStepTimestampIndexBytes() > Self.maximumRetainedStepIndexBytes {
             // Keep one source from pushing all prior databases over the cap. The current scan still
             // uses `refreshed`; only its process-resident cache is evicted.
@@ -886,7 +947,9 @@ actor AntigravityDbUsageScanner {
                 )
             }) else { break }
             let rows = try JSONLAccountingWorkPacer.shared.perform {
-                try JSONDecoder().decode([Row].self, from: Data(payload.utf8))
+                try autoreleasepool {
+                    try JSONDecoder().decode([Row].self, from: Data(payload.utf8))
+                }
             }
             guard !rows.isEmpty else { break }
             let hasMore = rows.last?.hasMore ?? (rows.count == Self.batchSize)
@@ -1060,7 +1123,9 @@ actor AntigravityDbUsageScanner {
             try Task.checkCancellation()
             guard let payload = queriedPayload else { return false }
             guard let rows = try? JSONLAccountingWorkPacer.shared.perform({
-                try JSONDecoder().decode([Row].self, from: Data(payload.utf8))
+                try autoreleasepool {
+                    try JSONDecoder().decode([Row].self, from: Data(payload.utf8))
+                }
             }), !rows.isEmpty else { return false }
             let validBatch = try JSONLAccountingWorkPacer.shared.perform { () throws -> Bool in
                 for row in rows {
@@ -1208,12 +1273,12 @@ actor AntigravityDbUsageScanner {
             .map { directory.trimmingTrailingSlashes + "/" + $0 }
     }
 
-    private struct DatabaseIdentity: Hashable {
+    struct DatabaseIdentity: Codable, Hashable {
         let device: UInt64
         let inode: UInt64
     }
 
-    private struct FileStamp: Equatable {
+    struct FileStamp: Codable, Equatable {
         let identity: DatabaseIdentity
         let size: Int64
         let modificationSeconds: Int64
@@ -1256,7 +1321,7 @@ actor AntigravityDbUsageScanner {
         )
     }
 
-    private struct DatabaseFingerprint: Equatable {
+    struct DatabaseFingerprint: Codable, Equatable {
         let database: FileStamp
         let wal: FileStamp?
 
@@ -1278,7 +1343,11 @@ actor AntigravityDbUsageScanner {
         }
     }
 
-    private struct CachedDatabase {
+    /// The unit of derived state per conversation database: source stamps plus parsed events plus
+    /// the priced daily aggregate. Codable mirrors the whole value to the disk record except the
+    /// step timestamp index, which is process-resident and rebuilt from SQLite only when a scan
+    /// needs to resolve undated rows.
+    struct CachedDatabase {
         var fingerprint: DatabaseFingerprint
         var windowStart: Date
         var lastIndex = -1
@@ -1297,12 +1366,64 @@ actor AntigravityDbUsageScanner {
         var aggregate: CachedAggregate?
     }
 
-    private struct CachedAggregate {
+    struct CachedAggregate: Codable {
         let pricingToken: String
         let windowStart: Date
         let timeZoneIdentifier: String
         let scan: LogUsageScan
         let recomputeAfter: Date?
         let latestAcceptedTimestamp: Int64?
+    }
+}
+
+extension AntigravityDbUsageScanner.CachedDatabase: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case fingerprint, windowStart, lastIndex, rowCount, tableFingerprint, contentFingerprint
+        case events, hasProjectedRows, oversizedTimestamps, invalidTokenTimestamps
+        case malformedUsageTimestamps, undatedUsageTimestamps, undatedIdentities, hasStepMetadata
+        case aggregate
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        fingerprint = try container.decode(AntigravityDbUsageScanner.DatabaseFingerprint.self, forKey: .fingerprint)
+        windowStart = try container.decode(Date.self, forKey: .windowStart)
+        lastIndex = try container.decode(Int.self, forKey: .lastIndex)
+        rowCount = try container.decode(Int.self, forKey: .rowCount)
+        tableFingerprint = try container.decode(Data.self, forKey: .tableFingerprint)
+        contentFingerprint = try container.decodeIfPresent(String.self, forKey: .contentFingerprint)
+        events = try container.decode([AntigravityProtoDecoder.GenerationEvent].self, forKey: .events)
+        hasProjectedRows = try container.decode(Bool.self, forKey: .hasProjectedRows)
+        oversizedTimestamps = try container.decode([Int64].self, forKey: .oversizedTimestamps)
+        invalidTokenTimestamps = try container.decode([Int64].self, forKey: .invalidTokenTimestamps)
+        malformedUsageTimestamps = try container.decode([Int64].self, forKey: .malformedUsageTimestamps)
+        undatedUsageTimestamps = try container.decode([Int64].self, forKey: .undatedUsageTimestamps)
+        undatedIdentities = try container.decodeIfPresent(
+            Set<AntigravityProtoDecoder.StepIdentity>.self, forKey: .undatedIdentities
+        ) ?? []
+        hasStepMetadata = try container.decodeIfPresent(Bool.self, forKey: .hasStepMetadata)
+        aggregate = try container.decodeIfPresent(AntigravityDbUsageScanner.CachedAggregate.self, forKey: .aggregate)
+        // The step timestamp index is deliberately not persisted: it is a bounded memory-budget
+        // structure that a scan rebuilds from SQLite the first time it resolves undated rows.
+        stepTimestampIndex = nil
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(fingerprint, forKey: .fingerprint)
+        try container.encode(windowStart, forKey: .windowStart)
+        try container.encode(lastIndex, forKey: .lastIndex)
+        try container.encode(rowCount, forKey: .rowCount)
+        try container.encode(tableFingerprint, forKey: .tableFingerprint)
+        try container.encodeIfPresent(contentFingerprint, forKey: .contentFingerprint)
+        try container.encode(events, forKey: .events)
+        try container.encode(hasProjectedRows, forKey: .hasProjectedRows)
+        try container.encode(oversizedTimestamps, forKey: .oversizedTimestamps)
+        try container.encode(invalidTokenTimestamps, forKey: .invalidTokenTimestamps)
+        try container.encode(malformedUsageTimestamps, forKey: .malformedUsageTimestamps)
+        try container.encode(undatedUsageTimestamps, forKey: .undatedUsageTimestamps)
+        try container.encode(undatedIdentities, forKey: .undatedIdentities)
+        try container.encodeIfPresent(hasStepMetadata, forKey: .hasStepMetadata)
+        try container.encodeIfPresent(aggregate, forKey: .aggregate)
     }
 }

@@ -222,51 +222,53 @@ extension PricingSupplement {
     /// Decodes the supplement JSON (bundled resource or the gh-pages feed). Throws on malformed
     /// JSON; individually invalid alias patterns are skipped loudly.
     static func decode(from data: Data) throws -> PricingSupplement {
-        let file = try JSONDecoder().decode(SupplementFile.self, from: data)
-        var pricing: [String: ModelRates] = [:]
-        for (model, entry) in file.pricing {
-            pricing[model] = ModelRates(
-                inputPerMillion: entry.inputPerMillion,
-                outputPerMillion: entry.outputPerMillion,
-                cacheWritePerMillion: entry.cacheWritePerMillion ?? entry.inputPerMillion,
-                cacheReadPerMillion: entry.cacheReadPerMillion ?? entry.inputPerMillion,
-                cacheWrite1hPerMillion: entry.cacheWrite1hPerMillion,
-                promptRateTiers: entry.promptRateTiers ?? [],
-                cacheReadIsExplicit: entry.cacheReadPerMillion != nil
-                    || entry.promptRateTiers?.contains { $0.cacheReadPerMillion != nil } == true,
-                // Carry the declared multiplier onto the entry itself: scanners that flag fast mode
-                // on the request (Claude's `speed` field) price the base slug, never a `-fast` one.
-                fastMultiplier: file.fastMultipliers?[model] ?? 1
+        try autoreleasepool {
+            let file = try JSONDecoder().decode(SupplementFile.self, from: data)
+            var pricing: [String: ModelRates] = [:]
+            for (model, entry) in file.pricing {
+                pricing[model] = ModelRates(
+                    inputPerMillion: entry.inputPerMillion,
+                    outputPerMillion: entry.outputPerMillion,
+                    cacheWritePerMillion: entry.cacheWritePerMillion ?? entry.inputPerMillion,
+                    cacheReadPerMillion: entry.cacheReadPerMillion ?? entry.inputPerMillion,
+                    cacheWrite1hPerMillion: entry.cacheWrite1hPerMillion,
+                    promptRateTiers: entry.promptRateTiers ?? [],
+                    cacheReadIsExplicit: entry.cacheReadPerMillion != nil
+                        || entry.promptRateTiers?.contains { $0.cacheReadPerMillion != nil } == true,
+                    // Carry the declared multiplier onto the entry itself: scanners that flag fast mode
+                    // on the request (Claude's `speed` field) price the base slug, never a `-fast` one.
+                    fastMultiplier: file.fastMultipliers?[model] ?? 1
+                )
+            }
+            var rules: [AliasRule] = []
+            for rule in file.aliasRules {
+                do {
+                    let pattern = try NSRegularExpression(pattern: rule.pattern)
+                    rules.append(AliasRule(pattern: pattern, canonical: rule.canonical))
+                } catch {
+                    AppLog.warn(.cache, "pricing supplement: invalid alias pattern '\(rule.pattern)' skipped: \(error.localizedDescription)")
+                }
+            }
+            var cursorRules: [AliasRule] = []
+            for rule in file.cursorAliasRules ?? [] {
+                do {
+                    let pattern = try NSRegularExpression(pattern: rule.pattern)
+                    cursorRules.append(AliasRule(pattern: pattern, canonical: rule.canonical))
+                } catch {
+                    AppLog.warn(.cache, "pricing supplement: invalid Cursor alias pattern '\(rule.pattern)' skipped: \(error.localizedDescription)")
+                }
+            }
+            return PricingSupplement(
+                pricing: pricing,
+                fastMultipliers: file.fastMultipliers ?? [:],
+                aliasRules: rules,
+                cursorAliasRules: cursorRules,
+                retiredPricingKeys: Set(file.retiredPricingKeys ?? []),
+                retiredAliasPatterns: Set(file.retiredAliasPatterns ?? []),
+                retiredAliasPatternsAreAuthoritative: file.retiredAliasPatterns != nil,
+                updatedAt: file.updatedAt
             )
         }
-        var rules: [AliasRule] = []
-        for rule in file.aliasRules {
-            do {
-                let pattern = try NSRegularExpression(pattern: rule.pattern)
-                rules.append(AliasRule(pattern: pattern, canonical: rule.canonical))
-            } catch {
-                AppLog.warn(.cache, "pricing supplement: invalid alias pattern '\(rule.pattern)' skipped: \(error.localizedDescription)")
-            }
-        }
-        var cursorRules: [AliasRule] = []
-        for rule in file.cursorAliasRules ?? [] {
-            do {
-                let pattern = try NSRegularExpression(pattern: rule.pattern)
-                cursorRules.append(AliasRule(pattern: pattern, canonical: rule.canonical))
-            } catch {
-                AppLog.warn(.cache, "pricing supplement: invalid Cursor alias pattern '\(rule.pattern)' skipped: \(error.localizedDescription)")
-            }
-        }
-        return PricingSupplement(
-            pricing: pricing,
-            fastMultipliers: file.fastMultipliers ?? [:],
-            aliasRules: rules,
-            cursorAliasRules: cursorRules,
-            retiredPricingKeys: Set(file.retiredPricingKeys ?? []),
-            retiredAliasPatterns: Set(file.retiredAliasPatterns ?? []),
-            retiredAliasPatternsAreAuthoritative: file.retiredAliasPatterns != nil,
-            updatedAt: file.updatedAt
-        )
     }
 
     private struct SupplementFile: Decodable {

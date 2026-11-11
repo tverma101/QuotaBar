@@ -87,7 +87,8 @@ final class RefreshWakeSignal {
     @discardableResult
     func waitForWake(timeout: TimeInterval) async -> WakeReason {
         let timer = Task { [continuation] in
-            try? await Task.sleep(for: .seconds(timeout))
+            let tolerance: Duration = timeout > 5 ? .seconds(max(1, timeout * 0.1)) : .milliseconds(100)
+            try? await Task.sleep(for: .seconds(timeout), tolerance: tolerance)
             guard !Task.isCancelled else { return }
             continuation.yield(.timeout)
         }

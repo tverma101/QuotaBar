@@ -8,11 +8,14 @@ Right-click (or control-click) the QuotaBar menu bar icon for a quick menu with 
 
 ## Usage History
 
-Hovering a spend value shows its model breakdown. Several small models stay together as **Other**,
+Hovering a spend value shows its model breakdown. Tapping the value toggles the same breakdown
+without the hover wait, and the value's touch area reaches a little past the text so the tap lands
+easily. Several small models stay together as **Other**,
 which lists each one's name, measured tokens, and cost or **Unpriced** once. A single small model,
 or the one model that accounts for Other's whole price, keeps its own row, so the same tokens and
 cost are not shown twice. Missing older model labels remain explicit usage categories rather than
-being counted as additional named models.
+being counted as additional named models. When Other has more contributors than fit, the list
+scrolls inside the popover.
 
 The dashboard footer's **Options** menu → **Usage History** opens a read-only report built from the same local usage data the spend tiles show, so the two can never disagree:
 
@@ -50,7 +53,7 @@ Settings → **Snooze Subscriptions** (off by default) lets you temporarily hide
 
 ## What the strip shows
 
-The strip only renders real data. A starred metric with nothing fetched yet is skipped; a provider whose stars all lack data disappears entirely (icon included). When nothing has data, the strip falls back to the app icon, but the single status item remains clickable and opens the aggregate dashboard. Stars follow your Customize order — Always Visible metrics first, then On Demand ones. A metric can be starred whether it's Always Visible or On Demand. Multiple Claude and Codex accounts remain separate provider cards inside the same panel. Codex account values remain separate in the strip but share one provider mark. When an account moves from a family ID to an account-specific ID, its existing family pins carry over once, even when the old family card is no longer active; later explicit unpins are preserved.
+The strip only renders real data. A starred metric with nothing fetched yet is skipped; a provider whose stars all lack data disappears entirely (icon included). When nothing has data, the strip falls back to the app icon, but the single status item remains clickable and opens the aggregate dashboard. The same fallback keeps the icon when every subscription is snoozed at once, so the panel always stays openable. Stars follow your Customize order — Always Visible metrics first, then On Demand ones. A metric can be starred whether it's Always Visible or On Demand. Multiple Claude and Codex accounts remain separate provider cards inside the same panel. Codex account values remain separate in the strip but share one provider mark. When an account moves from a family ID to an account-specific ID, its existing family pins carry over once, even when the old family card is no longer active; later explicit unpins are preserved.
 
 A bounded count meter carries a compact unit in the strip when the unit is the only thing that makes the number meaningful — an hours balance reads `30h`, not a bare `30` — while percent and dollar meters stay as they are. Units that would abbreviate ambiguously (sessions would collapse to `s`, which reads as seconds) keep their bare number instead.
 

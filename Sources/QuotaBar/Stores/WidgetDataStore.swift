@@ -263,6 +263,24 @@ final class WidgetDataStore {
         if let zai = providersByID["zai"] as? ZAIProvider {
             await zai.unloadLocalAccountingCachesForMemoryPressure()
         }
+        // Unloading frees blocks into the malloc zone; relief is what returns the pages.
+        ProcessMemoryBudget.releaseAllocatorFreePages()
+    }
+
+    /// Releases Freebuff's derived accounting caches on every refresh cycle, below the memory budget.
+    ///
+    /// An active session rewrites its database receipts continuously, so the desktop scan re-derives
+    /// its turn cache every history pass whether or not the cache was retained — measured at ~18 s
+    /// per cycle both warm and cold. Retaining the derived turns between cycles therefore pays their
+    /// memory (tens of MB) without saving any rescan work; releasing them each cycle returns those
+    /// pages while the cheap-to-rebuild provider caches (Antigravity's ~8 MB index and friends) stay
+    /// warm under the soft budget.
+    func unloadFreebuffAccountingCacheForMemoryPressure() async {
+        if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
+            await freebuff.unloadLocalAccountingCachesForMemoryPressure()
+        }
+        // Unloading frees blocks into the malloc zone; relief is what returns the pages.
+        ProcessMemoryBudget.releaseAllocatorFreePages()
     }
 
     init(
@@ -1157,7 +1175,7 @@ final class WidgetDataStore {
                         return .skipped
                     }
                     // `try?` because cancellation throws here; the `isCancelled` check above acts on it.
-                    try? await Task.sleep(for: .seconds(delay))
+                    try? await Task.sleep(for: .seconds(delay), tolerance: .milliseconds(100))
                     delay = min(delay * 2, Self.forceWaitMaxDelay)
                 }
             }
@@ -2050,8 +2068,9 @@ final class WidgetDataStore {
         if case .sessionCountdowns(let metricLabel) = descriptor.sample.trayStyle {
             // Read only explicit session expiries. Cached daily spend is not session activity.
             if case .values(_, _, _, let expiries, _, _) = snapshots[descriptor.providerID]?.line(label: metricLabel) {
-                result.traySessionExpiriesAt = expiries
-                result.activeSessions = snapshots[descriptor.providerID]?.activeSessions ?? []
+                let currentNow = now()
+                result.traySessionExpiriesAt = expiries.filter { $0 > currentNow }
+                result.activeSessions = (snapshots[descriptor.providerID]?.activeSessions ?? []).filter { $0.expiresAt > currentNow }
             } else {
                 result.traySessionExpiriesAt = []
                 result.activeSessions = []
@@ -2139,7 +2158,7 @@ final class WidgetDataStore {
             // conveyed by the meter's spent state rather than hidden.
             let normalizedUsed = format == .percent ? ProviderParse.clampPercent(used) : used
             var result = WidgetData(
-                title: descriptor.sample.title,
+                title: (descriptor.id == "zai.weekendBuild" && !line.label.isEmpty) ? line.label : descriptor.sample.title,
                 icon: descriptor.sample.icon,
                 kind: format.metricKind,
                 used: normalizedUsed,

@@ -407,15 +407,15 @@
     },
     {
       "canonical": "glm-5.2",
-      "pattern": "^glm-5\\.2(?:-(?:high|max))?$"
+      "pattern": "(?i)^glm-5\\.2(?:-(?:high|max))?$"
     },
     {
       "canonical": "glm-5.3-flash",
-      "pattern": "^glm-5(?:p|[.-])3-flash(?:-(?:low|high|max))?$"
+      "pattern": "(?i)^glm-5(?:p|[.-])3-flash(?:-(?:low|high|max))?$"
     },
     {
       "canonical": "glm-5.3",
-      "pattern": "^glm-5(?:p|[.-])3(?:-(?:low|high|max))?$"
+      "pattern": "(?i)^glm-5(?:p|[.-])3(?:-(?:low|high|max))?$"
     },
     {
       "canonical": "gpt-5.3-codex",
@@ -631,12 +631,12 @@
     },
     {
       "canonical": "deepseek-v4.1-flash-1017",
-      "pattern": "(?i)^(?:cursor-|deepseek/)?deepseek[- ]?v4[.-]?1[- ]?flash[- ]?(?:10/17|1017)(?:-(?:minimal|low|medium|high|xhigh|max))?$",
+      "pattern": "(?i)^(?:cursor-|deepseek/)?(?:deepseek[- ]?v4[.-]?1[- ]?flash[- ]?(?:10/17|1017)|deepseek[- ]fast|deepseek)(?:-(?:minimal|low|medium|high|xhigh|max))?$",
       "$comment": "Cursor exports one slug per thinking effort for DeepSeek V4.1 Flash 10/17 (`deepseek-v41-flash-1017-high`). Collapse the effort suffix onto the base route so those rows price and group as one model instead of splitting or going unpriced."
     },
     {
       "canonical": "deepseek-v4.1-flash",
-      "pattern": "(?i)^(?:cursor-|deepseek/)?deepseek[- ]?v4[.-]?1[- ]?flash(?:-(?:minimal|low|medium|high|xhigh|max))?$",
+      "pattern": "(?i)^(?:cursor-|deepseek/)?deepseek(?:[- ]?v4[.-]?1[- ]?flash)?(?:-(?:minimal|low|medium|high|xhigh|max))?$",
       "$comment": "Effort-suffixed DeepSeek V4.1 Flash slugs without the 10/17 snapshot marker. Ordered after the dated rule above so the dated spelling wins its own identity."
     }
   ],
@@ -716,7 +716,10 @@
     "gemini-4-argon"
   ],
   "retired_alias_patterns": [
-    "^grok-bot-cua$"
+    "^grok-bot-cua$",
+    "^glm-5\\.2(?:-(?:high|max))?$",
+    "^glm-5(?:p|[.-])3-flash(?:-(?:low|high|max))?$",
+    "^glm-5(?:p|[.-])3(?:-(?:low|high|max))?$"
   ],
   "fast_multipliers": {
     "claude-opus-4-6": 6.0,
@@ -1349,5 +1352,5 @@
       "output_per_million": 0.6
     }
   },
-  "updated_at": "2026-10-25T23:47:42Z"
+  "updated_at": "2026-11-09T10:25:00Z"
 }

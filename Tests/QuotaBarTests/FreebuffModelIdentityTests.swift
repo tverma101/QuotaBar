@@ -4,6 +4,7 @@ import XCTest
 final class FreebuffModelIdentityTests: XCTestCase {
     private let normalRoute = "deepseek/deepseek-v4.1-flash-1017"
     private let legacyRoute = "deepseek/deepseek-v4-flash"
+    private let plainRoute = "deepseek/deepseek-v4.1-flash"
     private let fastRoute = "deepseek-v4.1-flash-fast"
     private let now = TestLocalInstant.date(2026, 10, 31, 12)
 
@@ -27,7 +28,9 @@ final class FreebuffModelIdentityTests: XCTestCase {
         )
         return ModelPricing(supplement: PricingSupplement(pricing: [fastRoute: fast], aliasRules: [rule]),
                             primary: PricingCatalog(), secondary: PricingCatalog(),
-                            openRouter: PricingCatalog(entries: [normalRoute: normal, legacyRoute: normal]))
+                            openRouter: PricingCatalog(entries: [
+                                normalRoute: normal, legacyRoute: normal, plainRoute: normal
+                            ]))
     }
 
     private func receipt(_ id: String, model: String) -> FreebuffUsageReceipt {
@@ -56,9 +59,10 @@ final class FreebuffModelIdentityTests: XCTestCase {
         XCTAssertEqual(model.model, "DeepSeek V4.1 Flash")
         XCTAssertEqual(model.totalTokens, 750)
         XCTAssertEqual(day.totalTokens, 750)
-        // Normal: (20*1 + 80*0.1 + 50*2)/1M = 0.000128. Fast costs four times that.
-        XCTAssertEqual(try XCTUnwrap(model.costUSD), 0.000896, accuracy: 1e-12)
-        XCTAssertEqual(try XCTUnwrap(day.costUSD), 0.000896, accuracy: 1e-12)
+        // Normal: (20*1 + 80*0.1 + 50*2)/1M = 0.000128. The removed Fast mode prices the same —
+        // four priced receipts at the base rate.
+        XCTAssertEqual(try XCTUnwrap(model.costUSD), 0.000512, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(day.costUSD), 0.000512, accuracy: 1e-12)
         XCTAssertTrue(model.hasIncompleteCost, "the named Slow variant has no verified public rate")
         XCTAssertTrue(scan.usage.unknownModelsByDay.isEmpty, "known but unpriced is not unknown")
         let variants = try XCTUnwrap(model.variants)
@@ -66,8 +70,9 @@ final class FreebuffModelIdentityTests: XCTestCase {
         let normal = try XCTUnwrap(variants.first { $0.model == "DeepSeek V4.1 Flash 10/17" })
         XCTAssertEqual(normal.totalTokens, 450)
         XCTAssertEqual(try XCTUnwrap(normal.costUSD), 0.000384, accuracy: 1e-12)
-        let fast = try XCTUnwrap(variants.first { $0.model == "DeepSeek V4.1 Flash Fast 10/17" })
-        XCTAssertEqual(try XCTUnwrap(fast.costUSD), 0.000512, accuracy: 1e-12)
+        let fast = try XCTUnwrap(variants.first { $0.model == "DeepSeek V4.1 Flash" })
+        XCTAssertEqual(fast.totalTokens, 150)
+        XCTAssertEqual(try XCTUnwrap(fast.costUSD), 0.000128, accuracy: 1e-12)
 
         var lines: [MetricLine] = []
         SpendTileMapper.appendTokenUsage(scan.usage.series, to: &lines, now: now,
@@ -78,6 +83,19 @@ final class FreebuffModelIdentityTests: XCTestCase {
             XCTAssertEqual(breakdown?.models.map(\.model), ["DeepSeek V4.1 Flash"])
             XCTAssertEqual(breakdown?.totalTokens, 750)
         }
+    }
+
+    func testRemovedFastModeCollapsesOntoTheBaseFlashModel() {
+        var resolver = FreebuffModelIdentity(entries: catalog, pricing: pricing)
+        let resolved = resolver.resolve("m-fast", pricing: pricing)
+        XCTAssertEqual(resolved.route, plainRoute,
+                       "the removed Fast mode prices as the base Flash model, not the Fast-tier estimate")
+        XCTAssertEqual(resolved.displayName, "DeepSeek V4.1 Flash",
+                       "the stale Fast label no longer presents anywhere")
+        XCTAssertEqual(resolved.group, "DeepSeek V4.1 Flash")
+        // A raw persisted Fast-root slug (from before the removal) still prices at the retired
+        // Fast-tier rates — the collapse is a catalogue-name rule, not a rate rewrite.
+        XCTAssertEqual(resolver.resolve(fastRoute, pricing: pricing).route, fastRoute)
     }
 
     func testDifferentVersionsAndUnidentifiedSlugsStaySeparate() async throws {
@@ -157,7 +175,7 @@ final class FreebuffModelIdentityTests: XCTestCase {
         let scan = try XCTUnwrap(result)
         XCTAssertEqual(scan.usage.modelUsage?.daily.first?.models.map(\.model), ["DeepSeek V4.1 Flash"])
         XCTAssertEqual(scan.usage.series.daily.first?.totalTokens, 300)
-        XCTAssertEqual(try XCTUnwrap(scan.usage.series.daily.first?.costUSD), 0.000640, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(scan.usage.series.daily.first?.costUSD), 0.000256, accuracy: 1e-12)
         XCTAssertTrue(scan.usage.unknownModelsByDay.isEmpty)
     }
 

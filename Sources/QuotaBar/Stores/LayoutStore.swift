@@ -227,24 +227,43 @@ final class LayoutStore {
         if !hadStoredMetricOptIns || explicitlyEnabledMetricIDs != savedExplicitlyEnabled {
             persistExplicitlyEnabledMetrics()
         }
-        // This optional metric was introduced after the saved opt-in queue. Seed it once without
-        // changing an existing placement or re-arming the default after the user moves it.
-        let seedZCode = (!persistence.hasSeededZCodePlacement || defaultExpandedOnEnableIDs.contains("zai.zcodeTokens"))
-            && registry.descriptor(id: "zai.zcodeTokens") != nil
-        if seedZCode {
-            if !placed.contains(where: { $0.descriptorID == "zai.zcodeTokens" }) {
-                placed.append(PlacedWidget(descriptorID: "zai.zcodeTokens"))
+        // Prune deprecated redundant zai.zcodeTokens if present in saved placements
+        if placed.contains(where: { $0.descriptorID == "zai.zcodeTokens" }) {
+            placed.removeAll { $0.descriptorID == "zai.zcodeTokens" }
+            persist()
+        }
+        if expandedMetricIDs.contains("zai.zcodeTokens") {
+            expandedMetricIDs.remove("zai.zcodeTokens")
+            persistExpanded()
+        }
+        defaultExpandedOnEnableIDs.remove("zai.zcodeTokens")
+        if initial.shouldPersistExpandOnEnable {
+            persistExpandOnEnable()
+        }
+        if registry.descriptor(id: "zai.weekendBuild") != nil && !placed.contains(where: { $0.descriptorID == "zai.weekendBuild" }) {
+            placed.append(PlacedWidget(descriptorID: "zai.weekendBuild"))
+            persist()
+        }
+        for spendID in ["zai.today", "zai.yesterday", "zai.last30"] {
+            if registry.descriptor(id: spendID) != nil && !placed.contains(where: { $0.descriptorID == spendID }) {
+                placed.append(PlacedWidget(descriptorID: spendID))
                 persist()
             }
-            if !expandedMetricIDs.contains("zai.zcodeTokens") {
-                expandedMetricIDs.insert("zai.zcodeTokens")
+            if registry.descriptor(id: spendID) != nil && !expandedMetricIDs.contains(spendID) {
+                expandedMetricIDs.insert(spendID)
                 persistExpanded()
             }
-            defaultExpandedOnEnableIDs.remove("zai.zcodeTokens")
-            persistExpandOnEnable()
-            persistence.markZCodePlacementSeeded()
-        } else if initial.shouldPersistExpandOnEnable {
-            persistExpandOnEnable()
+        }
+        let freebuffTrend = "freebuff.trend"
+        if registry.descriptor(id: freebuffTrend) != nil && !placed.contains(where: { $0.descriptorID == freebuffTrend }) {
+            if let idx = placed.firstIndex(where: { $0.descriptorID == "freebuff.today" }) {
+                placed.insert(PlacedWidget(descriptorID: freebuffTrend), at: idx)
+            } else if let lastFreebuff = placed.lastIndex(where: { $0.descriptorID.hasPrefix("freebuff.") }) {
+                placed.insert(PlacedWidget(descriptorID: freebuffTrend), at: lastFreebuff + 1)
+            } else {
+                placed.append(PlacedWidget(descriptorID: freebuffTrend))
+            }
+            persist()
         }
         if initial.shouldPersistExpanded { persistExpanded() }
         if let seededDefaults = initial.seededDefaultsToPersist { persistSeededDefaults(seededDefaults) }
