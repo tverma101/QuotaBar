@@ -242,9 +242,15 @@ enum CursorUsageSummaryMapper {
         let start = (summary?["billingCycleStart"] as? String).flatMap(OpenUsageISO8601.date(from:))
         let end = (summary?["billingCycleEnd"] as? String).flatMap(OpenUsageISO8601.date(from:))
         if let start, let end, end > start {
+            let milliseconds = (end.timeIntervalSince(start) * 1000).rounded()
+            // Same defensive bound as `CursorUsageMapper.billingCycle`: untrusted doubles must not
+            // reach `Int(_:)` unchecked, and a cycle longer than a year is a unit error anyway.
+            let maximumMs = 366.0 * 24 * 60 * 60 * 1000
             return BillingCycle(
                 resetsAt: end,
-                periodDurationMs: Int(end.timeIntervalSince(start) * 1000)
+                periodDurationMs: milliseconds.isFinite && milliseconds > 0 && milliseconds <= maximumMs
+                    ? Int(milliseconds)
+                    : CursorUsageMapper.billingPeriodMs
             )
         }
 

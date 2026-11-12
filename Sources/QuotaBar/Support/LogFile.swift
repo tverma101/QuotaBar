@@ -136,8 +136,11 @@ final class LogFile: @unchecked Sendable {
                 return
             }
         }
-        guard handle != nil else { return }
+        guard let liveHandle = handle else { return }
 
+        // The app and `quotabar-cli` share this file. Re-read the real size before deciding to
+        // rotate: another process's appends are invisible to this handle's cached `size`.
+        size = Self.fileSize(descriptor: liveHandle.fileDescriptor) ?? size
         let data = Data("\(line)\n".utf8)
         if size + data.count > maxBytes {
             do {
@@ -148,13 +151,22 @@ final class LogFile: @unchecked Sendable {
             }
         }
         // Re-fetch after a possible rotation, which swaps the handle out.
-        guard let liveHandle = handle else { return }
+        guard let writer = handle else { return }
         do {
-            try liveHandle.write(contentsOf: data)
-            size += data.count
+            // The descriptor is O_APPEND, so this write lands at the shared file end even when the
+            // other process appended since our last write. A plain FileHandle opened for writing
+            // keeps a private offset and overwrote the other process's lines (corrupting the log).
+            try writer.write(contentsOf: data)
+            size = Self.fileSize(descriptor: writer.fileDescriptor) ?? (size + data.count)
         } catch {
             failLocked("write failed: \(error.localizedDescription)")
         }
+    }
+
+    private static func fileSize(descriptor: Int32) -> Int? {
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_size >= 0 else { return nil }
+        return Int(info.st_size)
     }
 
     // MARK: - Locked internals (caller holds `lock`)
@@ -164,15 +176,22 @@ final class LogFile: @unchecked Sendable {
         if !FileManager.default.fileExists(atPath: fileURL.path) {
             FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         }
-        let handle = try FileHandle(forWritingTo: fileURL)
-        let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+        // O_APPEND is the cross-process contract: both processes write to the shared end of the
+        // same file instead of at offsets captured when each opened it.
+        let descriptor = Darwin.open(
+            fileURL.path,
+            O_WRONLY | O_APPEND | O_CLOEXEC,
+            mode_t(S_IRUSR | S_IWUSR)
+        )
+        guard descriptor >= 0 else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         self.handle = handle
-        self.size = (attributes?[.size] as? Int) ?? 0
+        self.size = Self.fileSize(descriptor: descriptor) ?? 0
         // Launch-time trim: a leftover oversize file is rotated once before the first write.
         if self.size > maxBytes {
             try rotateLocked()
-        } else {
-            try handle.seekToEnd()
         }
     }
 
@@ -186,7 +205,15 @@ final class LogFile: @unchecked Sendable {
             try FileManager.default.moveItem(at: fileURL, to: archiveURL)
         }
         FileManager.default.createFile(atPath: fileURL.path, contents: nil)
-        handle = try FileHandle(forWritingTo: fileURL)
+        let descriptor = Darwin.open(
+            fileURL.path,
+            O_WRONLY | O_APPEND | O_CLOEXEC,
+            mode_t(S_IRUSR | S_IWUSR)
+        )
+        guard descriptor >= 0 else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         size = 0
     }
 

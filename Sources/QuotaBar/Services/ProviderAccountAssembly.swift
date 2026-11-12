@@ -16,6 +16,10 @@ struct CodexAccountCard: Equatable, Sendable {
     let home: String
     /// All unique Codex homes that belong to this identity and should be scanned for session logs.
     let logHomes: [String]
+    /// Every home verified to hold this identity's credentials, in preference order. Two homes for
+    /// one account can rotate the same OAuth bundle independently, so a dead token in the first must
+    /// not hide a usable one in the second.
+    var authHomes: [String] = []
     let displayName: String
     let allowsKeychainFallback: Bool
     let allowsUnattributedPiUsage: Bool
@@ -444,12 +448,22 @@ struct ProviderAccountAssembly {
                     }
                     return seenLogHomes.insert(candidate).inserted
                 }
+                var seenAuthHomes = Set<String>()
+                let authHomes = ([home] + observation.sources.compactMap { entry -> String? in
+                    guard let anchor = entry.anchor?.nilIfEmpty else { return nil }
+                    return discovery.normalizedCodexHomesByAnchor[anchor]
+                        ?? CodexAccountRegistrationStore.normalizedHome(
+                            anchor,
+                            homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+                        )
+                }).filter { seenAuthHomes.insert($0).inserted }
                 let label = observation.label?.nilIfEmpty ?? record.label?.nilIfEmpty
                 codexCards.append(CodexAccountCard(
                     id: record.id,
                     identityKey: observation.identityKey,
                     home: home,
                     logHomes: logHomes.isEmpty ? [home] : logHomes,
+                    authHomes: authHomes,
                     displayName: label.map { "Codex — \($0)" } ?? "Codex — \(record.id == "codex" ? "Account" : String(record.id.suffix(8)))",
                     allowsKeychainFallback: source.holdsDefaultSource,
                     allowsUnattributedPiUsage: allowsUnattributedPiUsage

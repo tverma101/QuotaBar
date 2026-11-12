@@ -66,7 +66,16 @@ final class ModelUsageHoverTests: XCTestCase {
         XCTAssertEqual(ModelUsageDetail.wholePercents([0.62, 0.335, 0.045]), [62, 34, 4])
         XCTAssertEqual(ModelUsageDetail.wholePercents([1.0]), [100])
         XCTAssertEqual(ModelUsageDetail.wholePercents([0, 0]), [0, 0], "an empty period stays all zero")
+    }
 
+    /// An upstream overflow can hand the view a non-finite share. `Int(_:)` on that traps inside the
+    /// SwiftUI body and kills the app; the column must stay renderable instead.
+    func testWholePercentsSurvivesNonFiniteShares() {
+        let percents = ModelUsageDetail.wholePercents([.infinity, .nan, 2.0])
+        XCTAssertEqual(percents.count, 3)
+        XCTAssertEqual(percents.reduce(0, +), 100, "finite shares still complete the column")
+        XCTAssertTrue(percents.allSatisfy { (0...100).contains($0) })
+        XCTAssertEqual(ModelUsageDetail.wholePercents([.infinity, .nan]), [0, 0])
     }
 
     func testSharesUseCostWhenEveryModelIsPriced() {

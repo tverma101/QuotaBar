@@ -53,6 +53,7 @@ final class PaceTests: XCTestCase {
 
     private func pacedData(
         used: Double,
+        limit: Double = 100,
         elapsed: Double = 0.5,
         period: TimeInterval? = nil,
         displayMode: WidgetDisplayMode = .used,
@@ -60,7 +61,7 @@ final class PaceTests: XCTestCase {
     ) -> WidgetData {
         let period = period ?? week
         var data = WidgetData(title: "Weekly", icon: .providerMark("codex"), kind: .percent,
-                              used: used, limit: 100, displayMode: displayMode)
+                              used: used, limit: limit, displayMode: displayMode)
         data.resetsAt = resetsAt(elapsed: elapsed, period: period)
         data.periodDurationMs = Int(period * 1000)
         data.alwaysShowPacing = alwaysShowPacing
@@ -70,6 +71,20 @@ final class PaceTests: XCTestCase {
     private func tick(_ data: WidgetData) -> Double? {
         let state = data.meterState(now: now)
         return data.paceTick(for: state, now: now)
+    }
+
+    /// A malformed provider sample can be huge but finite. The projection then overflows `Double` to
+    /// infinity, and `Int(infinity)` in the tooltip used to trap while the row rendered.
+    func testHugeUsageSampleTooltipDoesNotTrap() {
+        // 90% of a 1e308 limit, projected over the full window, overflows `Double` to infinity while
+        // the meter is still legitimately unspent.
+        let data = pacedData(used: 9e307, limit: 1e308)
+        let state = data.meterState(now: now)
+        guard case .runningOut(_, let projected) = state else {
+            return XCTFail("expected an overflowing projection to stay in the runningOut state")
+        }
+        XCTAssertFalse(projected.isFinite)
+        XCTAssertEqual(state.tooltip, "~100% over limit at reset")
     }
 
     /// The amber spare copy, present only in the `closeToLimit` state.

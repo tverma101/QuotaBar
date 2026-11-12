@@ -167,8 +167,14 @@ struct BackgroundRefreshGate {
     /// True when this trigger should cause a pass; records the acceptance so the next call compares
     /// against it.
     mutating func shouldAccept(at now: Date) -> Bool {
-        if let lastAcceptedAt, now.timeIntervalSince(lastAcceptedAt) < minimumInterval {
-            return false
+        if let lastAcceptedAt {
+            let elapsed = now.timeIntervalSince(lastAcceptedAt)
+            // A backward wall-clock jump (NTP correction, manual change, wake from sleep) makes the
+            // elapsed time negative. Treating that as "too soon" rejected every trigger until the
+            // clock caught up again — minutes or hours of stalled refreshes. Re-anchor instead.
+            if elapsed >= 0, elapsed < minimumInterval {
+                return false
+            }
         }
         lastAcceptedAt = now
         return true
@@ -178,7 +184,11 @@ struct BackgroundRefreshGate {
     /// bursts without losing the final change when no later event arrives.
     func delayUntilNextAcceptance(at now: Date) -> TimeInterval {
         guard let lastAcceptedAt else { return 0 }
-        return max(0, minimumInterval - now.timeIntervalSince(lastAcceptedAt))
+        let elapsed = now.timeIntervalSince(lastAcceptedAt)
+        // A backward clock jump must not turn into a full-interval delay against a timestamp that is
+        // now in the future; the next trigger is acceptable immediately.
+        guard elapsed >= 0 else { return 0 }
+        return max(0, minimumInterval - elapsed)
     }
 
     /// Drop the recorded acceptance (used when the accepted trigger's pass never actually ran, e.g.

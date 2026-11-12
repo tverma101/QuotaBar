@@ -70,6 +70,19 @@ final class ProviderSnapshotCacheTests: XCTestCase {
         XCTAssertNil(cache.snapshot(providerID: "alpha"))
     }
 
+    /// A snapshot stamped in the future (clock corrected backwards, or restored from another Mac)
+    /// must not satisfy the freshness gate until the wall clock catches up.
+    func testSnapshotStampedInTheFutureIsStaleNotFresh() {
+        let (defaults, suite) = makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date()
+        let future = now.addingTimeInterval(3_600)
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 100, now: { now })
+
+        cache.store(snapshot("alpha", used: 42, now: future), now: future)
+        XCTAssertNil(cache.snapshot(providerID: "alpha"), "a future stamp must trigger a refresh, not suppress it")
+    }
+
     func testFullRefreshFreshnessIncludesHistoryStampButMeterOnlyFreshnessDoesNot() {
         let (defaults, suite) = makeDefaults()
         defer { defaults.removePersistentDomain(forName: suite) }

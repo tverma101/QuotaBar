@@ -776,9 +776,15 @@ final class AppContainer {
                 let hasRunnableAccounting = accountingTask == nil
                     && (pendingHistoryAccountingPass || pendingLocalAccountingPass)
                 let hasRunnableMeters = pendingFullScopePass || pendingPanelPass || pendingMenuBarMeterRetry
+                // A fold that outlives the five-minute history interval re-latches the next deadline
+                // while `accountingTask` is still running. Deriving the wait from that deadline alone
+                // then yields zero and the loop spins on an immediate timeout until the fold ends,
+                // burning a core. Nothing is runnable while the task runs, so poll its completion at
+                // a bounded cadence instead of at 0 s.
+                let deadlineWait = min(quotaWaitRemaining, historyWaitRemaining)
                 let wakeTimeout = hasRunnableAccounting || hasRunnableMeters
                     ? 0
-                    : min(quotaWaitRemaining, historyWaitRemaining)
+                    : accountingTask == nil ? deadlineWait : max(deadlineWait, 1)
                 _ = await wakeSignal.waitForWake(timeout: wakeTimeout)
                 // Ledger appends invalidate only the enabled Codex/OpenCode accounting snapshots and
                 // schedule their narrow local fold. Meter snapshots and unrelated history providers

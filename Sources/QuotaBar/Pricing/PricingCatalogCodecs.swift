@@ -117,26 +117,26 @@ enum PricingCatalogCodecs {
         var entries: [String: ModelRates] = [:]
         for (key, value) in root {
             guard let entry = value as? [String: Any],
-                  let input = doubleValue(entry["input_cost_per_token"]),
-                  let output = doubleValue(entry["output_cost_per_token"]) else { continue }
-            let cacheWrite = doubleValue(entry["cache_creation_input_token_cost"])
-            let cacheRead = doubleValue(entry["cache_read_input_token_cost"])
+                  let input = perMillionFromPerToken(entry["input_cost_per_token"]),
+                  let output = perMillionFromPerToken(entry["output_cost_per_token"]) else { continue }
+            let cacheWrite = perMillionFromPerToken(entry["cache_creation_input_token_cost"])
+            let cacheRead = perMillionFromPerToken(entry["cache_read_input_token_cost"])
             let promptRateTiers = liteLLMPromptRateTiers(entry)
             var rates = ModelRates(
-                inputPerMillion: input * 1_000_000,
-                outputPerMillion: output * 1_000_000,
-                cacheWritePerMillion: (cacheWrite ?? input) * 1_000_000,
-                cacheReadPerMillion: (cacheRead ?? input) * 1_000_000,
+                inputPerMillion: input,
+                outputPerMillion: output,
+                cacheWritePerMillion: cacheWrite ?? input,
+                cacheReadPerMillion: cacheRead ?? input,
                 cacheReadIsExplicit: cacheRead != nil
                     || promptRateTiers.contains { $0.cacheReadPerMillion != nil }
             )
             rates.promptRateTiers = promptRateTiers
-            rates.inputAbove200kPerMillion = doubleValue(entry["input_cost_per_token_above_200k_tokens"]).map { $0 * 1_000_000 }
-            rates.outputAbove200kPerMillion = doubleValue(entry["output_cost_per_token_above_200k_tokens"]).map { $0 * 1_000_000 }
-            rates.cacheWriteAbove200kPerMillion = doubleValue(entry["cache_creation_input_token_cost_above_200k_tokens"]).map { $0 * 1_000_000 }
-            rates.cacheReadAbove200kPerMillion = doubleValue(entry["cache_read_input_token_cost_above_200k_tokens"]).map { $0 * 1_000_000 }
+            rates.inputAbove200kPerMillion = perMillionFromPerToken(entry["input_cost_per_token_above_200k_tokens"])
+            rates.outputAbove200kPerMillion = perMillionFromPerToken(entry["output_cost_per_token_above_200k_tokens"])
+            rates.cacheWriteAbove200kPerMillion = perMillionFromPerToken(entry["cache_creation_input_token_cost_above_200k_tokens"])
+            rates.cacheReadAbove200kPerMillion = perMillionFromPerToken(entry["cache_read_input_token_cost_above_200k_tokens"])
             if let providerSpecific = entry["provider_specific_entry"] as? [String: Any],
-               let fast = doubleValue(providerSpecific["fast"]) {
+               let fast = doubleValue(providerSpecific["fast"]), fast.isFinite, fast > 0 {
                 rates.fastMultiplier = fast
             }
             entries[key] = rates
@@ -162,8 +162,8 @@ enum PricingCatalogCodecs {
             for (modelID, value) in models {
                 guard let model = value as? [String: Any],
                       let cost = model["cost"] as? [String: Any],
-                      let input = doubleValue(cost["input"]),
-                      let output = doubleValue(cost["output"]) else { continue }
+                      let input = validPerMillionRate(cost["input"]),
+                      let output = validPerMillionRate(cost["output"]) else { continue }
                 var tiers = modelsDevPromptRateTiers(cost["tiers"])
                 if !tiers.contains(where: { $0.thresholdPromptTokens == 200_000 }),
                    let longContext = cost["context_over_200k"] as? [String: Any] {
@@ -171,13 +171,14 @@ enum PricingCatalogCodecs {
                         tiers.append(tier)
                     }
                 }
+                let cacheRead = validPerMillionRate(cost["cache_read"])
                 candidates[modelID, default: []].append(ModelRates(
                     inputPerMillion: input,
                     outputPerMillion: output,
-                    cacheWritePerMillion: doubleValue(cost["cache_write"]) ?? input,
-                    cacheReadPerMillion: doubleValue(cost["cache_read"]) ?? input,
+                    cacheWritePerMillion: validPerMillionRate(cost["cache_write"]) ?? input,
+                    cacheReadPerMillion: cacheRead ?? input,
                     promptRateTiers: tiers.sorted { $0.thresholdPromptTokens < $1.thresholdPromptTokens },
-                    cacheReadIsExplicit: cost["cache_read"] != nil
+                    cacheReadIsExplicit: cacheRead != nil
                         || tiers.contains { $0.cacheReadPerMillion != nil }
                 ))
             }
@@ -204,10 +205,10 @@ enum PricingCatalogCodecs {
             return makePromptRateTier(
                 threshold: threshold,
                 includesThreshold: false,
-                input: doubleValue(entry["input_cost_per_token_\(suffix)"]).map { $0 * 1_000_000 },
-                output: doubleValue(entry["output_cost_per_token_\(suffix)"]).map { $0 * 1_000_000 },
-                cacheWrite: doubleValue(entry["cache_creation_input_token_cost_\(suffix)"]).map { $0 * 1_000_000 },
-                cacheRead: doubleValue(entry["cache_read_input_token_cost_\(suffix)"]).map { $0 * 1_000_000 }
+                input: perMillionFromPerToken(entry["input_cost_per_token_\(suffix)"]),
+                output: perMillionFromPerToken(entry["output_cost_per_token_\(suffix)"]),
+                cacheWrite: perMillionFromPerToken(entry["cache_creation_input_token_cost_\(suffix)"]),
+                cacheRead: perMillionFromPerToken(entry["cache_read_input_token_cost_\(suffix)"])
             )
         }
     }
@@ -226,10 +227,10 @@ enum PricingCatalogCodecs {
         makePromptRateTier(
             threshold: threshold,
             includesThreshold: true,
-            input: doubleValue(rates["input"]),
-            output: doubleValue(rates["output"]),
-            cacheWrite: doubleValue(rates["cache_write"]),
-            cacheRead: doubleValue(rates["cache_read"])
+            input: validPerMillionRate(rates["input"]),
+            output: validPerMillionRate(rates["output"]),
+            cacheWrite: validPerMillionRate(rates["cache_write"]),
+            cacheRead: validPerMillionRate(rates["cache_read"])
         )
     }
 
@@ -261,6 +262,31 @@ enum PricingCatalogCodecs {
     private static func doubleValue(_ value: Any?) -> Double? {
         if let number = value as? NSNumber { return number.doubleValue }
         return nil
+    }
+
+    /// No real model rate approaches this, but an absurd feed value would otherwise survive into
+    /// spend imputation and overflow a token product to infinity (or, if negative, subtract from a
+    /// total). OpenRouter's parser already bounds its per-token values the same way.
+    private static let maximumPerMillionRate = 1_000_000_000.0
+
+    /// A published per-million cost. Rejects booleans, negatives, non-finite values, and magnitudes
+    /// that would poison a dollar total.
+    private static func validPerMillionRate(_ value: Any?) -> Double? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let rate = number.doubleValue
+        guard rate.isFinite, rate >= 0, rate <= maximumPerMillionRate else { return nil }
+        return rate
+    }
+
+    /// A published per-token cost converted to per-million. Validated before the multiplication so a
+    /// huge feed value cannot reach `infinity`.
+    private static func perMillionFromPerToken(_ value: Any?) -> Double? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let rate = number.doubleValue
+        guard rate.isFinite, rate >= 0, rate <= maximumPerMillionRate / 1_000_000 else { return nil }
+        return rate * 1_000_000
     }
 
     private static func nonnegativeFiniteDouble(_ value: Any?) -> Double? {

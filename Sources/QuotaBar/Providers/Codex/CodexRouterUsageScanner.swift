@@ -377,9 +377,15 @@ actor CodexRouterUsageScanner {
         }
         guard preflight.discoveryComplete else { return .incomplete }
         if case .hit(let cachedResult) = preflight.cacheLookup {
-            guard !Task.isCancelled,
-                  sourcesAndAliasesStillMatch(preflight)
-            else { return .incomplete }
+            // A cache hit skips the event fold, but it still re-discovers the ledgers, stats every
+            // source and samples each append anchor. That metadata work must share the same CPU
+            // allowance as the preflight that produced the hit: unpaced, it made a repeated
+            // unchanged refresh exceed the 10%-of-one-core budget the benchmark pins (the paced
+            // fold path already accounts for the identical validation at the end of a cold scan).
+            let sourceStayedStable = JSONLAccountingWorkPacer.shared.perform {
+                sourcesAndAliasesStillMatch(preflight)
+            }
+            guard !Task.isCancelled, sourceStayedStable else { return .incomplete }
             return .complete(cachedResult)
         }
         let sourceFiles = preflight.sourceFiles

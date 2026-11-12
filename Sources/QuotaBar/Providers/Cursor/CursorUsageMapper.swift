@@ -96,7 +96,13 @@ enum CursorUsageMapper {
         let start = (usage["currentPeriodStart"] as? String).flatMap(OpenUsageISO8601.date(from:))
         let periodDurationMs: Int
         if let start, let reset, reset > start {
-            periodDurationMs = Int(reset.timeIntervalSince(start) * 1000)
+            let milliseconds = (reset.timeIntervalSince(start) * 1000).rounded()
+            // Grok Bot is a weekly allowance; an implausible span means the payload's unit is wrong,
+            // not that the window is genuinely centuries long. Also keeps `Int(_:)` in range.
+            let maximumMs = 366.0 * 24 * 60 * 60 * 1000
+            periodDurationMs = milliseconds.isFinite && milliseconds > 0 && milliseconds <= maximumMs
+                ? Int(milliseconds)
+                : MetricPeriod.weekMs
         } else {
             periodDurationMs = MetricPeriod.weekMs
         }
@@ -572,19 +578,34 @@ enum CursorUsageMapper {
         ))
     }
 
+    /// The latest epoch-millisecond instant this build will treat as a real billing boundary.
+    /// 2100-01-01 is decades past any plausible cycle and keeps every later duration conversion
+    /// comfortably inside `Int`'s range.
+    private static let maximumBillingEpochMs = 4_102_444_800_000.0
+    /// A billing cycle is monthly; a year is the most generous believable window.
+    private static let maximumBillingPeriodMs = 366.0 * 24 * 60 * 60 * 1000
+
     private static func billingCycle(from usage: [String: Any]) -> (resetsAt: Date?, periodDurationMs: Int) {
         let cycleStart = ProviderParse.number(usage["billingCycleStart"])
         let cycleEnd = ProviderParse.number(usage["billingCycleEnd"])
+        let resetsAt = cycleEnd.flatMap { end -> Date? in
+            guard end.isFinite, end > 0, end <= maximumBillingEpochMs else { return nil }
+            return Date(timeIntervalSince1970: end / 1000)
+        }
         guard let cycleStart,
               let cycleEnd,
+              cycleStart.isFinite, cycleStart >= 0,
               cycleEnd > cycleStart
         else {
-            return (cycleEnd.map { Date(timeIntervalSince1970: $0 / 1000) }, billingPeriodMs)
+            return (resetsAt, billingPeriodMs)
         }
-        return (
-            Date(timeIntervalSince1970: cycleEnd / 1000),
-            Int(cycleEnd - cycleStart)
-        )
+        let duration = cycleEnd - cycleStart
+        // Untrusted doubles: the subtraction can leave `Int`'s range, and `Int(_:)` traps. An
+        // implausible gap falls back to the documented monthly cadence instead of crashing.
+        guard duration.isFinite, duration <= maximumBillingPeriodMs else {
+            return (resetsAt, billingPeriodMs)
+        }
+        return (resetsAt, Int(duration.rounded()))
     }
 
     static func planLabel(_ value: String?) -> String? {

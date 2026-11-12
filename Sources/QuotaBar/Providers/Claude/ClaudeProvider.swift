@@ -601,7 +601,10 @@ final class ClaudeProvider: ProviderRuntime {
             )) {
                 AppLog.info(LogTag.plugin("claude"), "rate-limited (cooldown active, serving \(lastGoodUsage == nil ? "badge" : "last-good usage"))")
             }
-            return rateLimitedSnapshot(credentials: state.oauth, retryAfterSeconds: Int(until.timeIntervalSince(now()).rounded(.up)))
+            // Clamp before converting: a poisoned persisted cooldown must not trap here.
+            let remaining = max(0, until.timeIntervalSince(now()))
+            let retrySeconds = Int(min(remaining, Double(ClaudeUsageMapper.maximumRetryAfterSeconds)).rounded(.up))
+            return rateLimitedSnapshot(credentials: state.oauth, retryAfterSeconds: retrySeconds)
         }
 
         if authStore.needsRefresh(state.oauth),
@@ -739,7 +742,11 @@ final class ClaudeProvider: ProviderRuntime {
         // (respecting Retry-After) and serve the last-good usage rather than a bare badge.
         if response.statusCode == 429 {
             let retryAfterSeconds = ClaudeUsageMapper.parseRetryAfterSeconds(response, now: now())
-            rateLimitedUntil = now().addingTimeInterval(TimeInterval(retryAfterSeconds ?? Int(Self.rateLimitCooldown)))
+            let cooldown = min(
+                retryAfterSeconds ?? Int(Self.rateLimitCooldown),
+                ClaudeUsageMapper.maximumRetryAfterSeconds
+            )
+            rateLimitedUntil = now().addingTimeInterval(TimeInterval(max(0, cooldown)))
             DiagnosticGate.logOnce(for: Self.liveUsageDiagnosticKey(
                 kind: "rateLimit",
                 providerID: provider.id,

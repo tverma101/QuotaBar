@@ -344,7 +344,10 @@ final class GrokProvider: ProviderRuntime {
                         "plan label request failed (HTTP \(response.statusCode))"
                     )
                 }
-                return cachedPlan
+                // Keep the last good label only for the account that produced it. After a login
+                // switch the cached plan belongs to the previous account, and showing it on the new
+                // card is a stale-identity bug the next successful read would not fix until later.
+                return cachedPlanAccount == account ? cachedPlan : nil
             }
             let plan = GrokUsageMapper.planName(from: response)
             DiagnosticGate.clearFailure(Self.planFailureDiagnosticKey)
@@ -360,7 +363,7 @@ final class GrokProvider: ProviderRuntime {
                     "plan label request failed (transport): \(error.localizedDescription)"
                 )
             }
-            return cachedPlan
+            return cachedPlanAccount == account ? cachedPlan : nil
         }
     }
 }

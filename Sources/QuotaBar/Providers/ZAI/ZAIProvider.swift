@@ -174,7 +174,10 @@ final class ZAIProvider: ProviderRuntime {
             return cachedSubscription
         }
         let body = try await loadOptional { try await usageClient.fetchSubscription(apiKey: apiKey) }
-        guard let body else { return cachedSubscription }
+        // The fallback must be scoped to the same API key. A key switched in Settings leaves the old
+        // account's cached subscription body behind, and returning it after a failed fetch showed the
+        // previous account's plan on the new card.
+        guard let body else { return cachedSubscriptionApiKey == apiKey ? cachedSubscription : nil }
         cachedSubscription = body
         cachedSubscriptionApiKey = apiKey
         cachedSubscriptionAt = now()

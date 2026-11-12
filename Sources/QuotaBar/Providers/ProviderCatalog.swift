@@ -117,7 +117,11 @@ enum ProviderCatalog {
                     ),
                     authStore: CodexAuthStore(
                         environment: authEnvironment,
-                        expectedIdentityKey: card.identityKey
+                        expectedIdentityKey: card.identityKey,
+                        // A CodexRouter pool home and the default home can hold the same account's
+                        // OAuth bundle; either may have refreshed last. Try every verified home so a
+                        // token the CLI rotated elsewhere does not blank the card's live meters.
+                        candidateAuthHomes: card.authHomes.isEmpty ? [card.home] : card.authHomes
                     ),
                     logUsageScanner: CodexLogUsageScanner(environment: logEnvironment),
                     expectedIdentityKey: card.identityKey,

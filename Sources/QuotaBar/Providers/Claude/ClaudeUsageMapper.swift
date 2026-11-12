@@ -24,10 +24,10 @@ enum ClaudeUsageMapper {
         }
 
         var lines: [MetricLine] = []
-        appendUsageWindow(body["five_hour"], label: "Session", periodDurationMs: sessionPeriodMs, to: &lines)
-        appendUsageWindow(body["seven_day"], label: "Weekly", periodDurationMs: weeklyPeriodMs, to: &lines)
-        appendUsageWindow(body["seven_day_sonnet"], label: "Sonnet", periodDurationMs: weeklyPeriodMs, to: &lines)
-        appendScopedWeeklyLimit(body["limits"], modelName: "Fable", label: "Fable", to: &lines)
+        appendUsageWindow(body["five_hour"], label: "Session", periodDurationMs: sessionPeriodMs, now: now, to: &lines)
+        appendUsageWindow(body["seven_day"], label: "Weekly", periodDurationMs: weeklyPeriodMs, now: now, to: &lines)
+        appendUsageWindow(body["seven_day_sonnet"], label: "Sonnet", periodDurationMs: weeklyPeriodMs, now: now, to: &lines)
+        appendScopedWeeklyLimit(body["limits"], modelName: "Fable", label: "Fable", now: now, to: &lines)
         appendExtraUsage(body["extra_usage"], to: &lines)
 
         return ClaudeMappedUsage(
@@ -76,6 +76,13 @@ enum ClaudeUsageMapper {
         return .text(label: "Note", value: noteText)
     }
 
+    /// The longest Retry-After this build will honor. Live-usage windows are minutes; a day is
+    /// already generous. Without a ceiling, a malformed header (or a millisecond value) parked the
+    /// card behind a cooldown it could never leave, and its remaining time eventually reached
+    /// `Int(_:)` beyond `Int.max` — a trap during refresh instead of the rate-limit notice. Copilot's
+    /// org-probe cooldown is capped for the same reason.
+    static let maximumRetryAfterSeconds = 24 * 60 * 60
+
     static func parseRetryAfterSeconds(_ response: HTTPResponse, now: Date = Date()) -> Int? {
         guard let raw = response.header("retry-after")?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty
@@ -83,10 +90,12 @@ enum ClaudeUsageMapper {
             return nil
         }
         if let seconds = Int(raw), seconds >= 0 {
-            return seconds
+            return min(seconds, maximumRetryAfterSeconds)
         }
         if let date = HTTPDateFormatter.date(from: raw) {
-            return max(0, Int(ceil(date.timeIntervalSince(now))))
+            let seconds = ceil(date.timeIntervalSince(now))
+            guard seconds.isFinite, seconds > 0 else { return 0 }
+            return Int(min(seconds, Double(maximumRetryAfterSeconds)))
         }
         return nil
     }
@@ -107,7 +116,13 @@ enum ClaudeUsageMapper {
         return "\(base) \(tier[match])"
     }
 
-    private static func appendUsageWindow(_ value: Any?, label: String, periodDurationMs: Int, to lines: inout [MetricLine]) {
+    private static func appendUsageWindow(
+        _ value: Any?,
+        label: String,
+        periodDurationMs: Int,
+        now: Date,
+        to lines: inout [MetricLine]
+    ) {
         guard let object = value as? [String: Any],
               let used = ProviderParse.number(object["utilization"])
         else {
@@ -118,7 +133,7 @@ enum ClaudeUsageMapper {
             used: used,
             limit: 100,
             format: .percent,
-            resetsAt: resetDate(object["resets_at"]),
+            resetsAt: resetDate(object["resets_at"], now: now),
             periodDurationMs: periodDurationMs
         ))
     }
@@ -127,7 +142,13 @@ enum ClaudeUsageMapper {
     /// `scope.model.display_name` naming the model (e.g. "Fable"). Anthropic moved the per-model
     /// weekly windows off the legacy top-level `seven_day_<model>` keys (which now come back null)
     /// and into this array, so each scoped row is read by display name. `percent` is 0–100.
-    private static func appendScopedWeeklyLimit(_ limits: Any?, modelName: String, label: String, to lines: inout [MetricLine]) {
+    private static func appendScopedWeeklyLimit(
+        _ limits: Any?,
+        modelName: String,
+        label: String,
+        now: Date,
+        to lines: inout [MetricLine]
+    ) {
         guard let array = limits as? [Any] else { return }
         for entry in array {
             guard let object = entry as? [String: Any],
@@ -142,7 +163,7 @@ enum ClaudeUsageMapper {
                 used: used,
                 limit: 100,
                 format: .percent,
-                resetsAt: resetDate(object["resets_at"]),
+                resetsAt: resetDate(object["resets_at"], now: now),
                 periodDurationMs: weeklyPeriodMs
             ))
             return
@@ -172,17 +193,28 @@ enum ClaudeUsageMapper {
         }
     }
 
-    private static func resetDate(_ value: Any?) -> Date? {
+    /// The furthest future instant accepted as a reset. Claude's windows are five hours and a week;
+    /// this is a sanity bound for unit mix-ups and corrupted values, not a semantic window. It stays
+    /// below the range where duration formatting could overflow `Int`, while still accepting any
+    /// legitimately parsed timestamp.
+    static let maximumResetHorizon: TimeInterval = 100 * 365 * 24 * 60 * 60
+
+    private static func resetDate(_ value: Any?, now: Date) -> Date? {
+        let parsed: Date?
         if let text = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !text.isEmpty,
-           let date = OpenUsageISO8601.date(from: text) {
-            return date
+           !text.isEmpty {
+            parsed = OpenUsageISO8601.date(from: text)
+        } else if let number = ProviderParse.number(value), number.isFinite {
+            let milliseconds = abs(number) < 1e10 ? number * 1000 : number
+            parsed = Date(timeIntervalSince1970: milliseconds / 1000)
+        } else {
+            parsed = nil
         }
-        guard let number = ProviderParse.number(value), number.isFinite else {
-            return nil
-        }
-        let milliseconds = abs(number) < 1e10 ? number * 1000 : number
-        return Date(timeIntervalSince1970: milliseconds / 1000)
+        guard let parsed,
+              parsed > now,
+              parsed.timeIntervalSince(now) <= maximumResetHorizon
+        else { return nil }
+        return parsed
     }
 
     private static func formatRateLimitMinutes(_ seconds: Int) -> String {
@@ -193,12 +225,19 @@ enum ClaudeUsageMapper {
 }
 
 private enum HTTPDateFormatter {
-    static func date(from value: String) -> Date? {
+    /// Built once: `DateFormatter` construction dominates parsing, and this is called for every
+    /// rate-limit response that carries an HTTP-date `Retry-After`. `DateFormatter` is documented
+    /// thread-safe once configured and this one is never mutated.
+    private static let formatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss zzz"
-        return formatter.date(from: value)
+        return formatter
+    }()
+
+    static func date(from value: String) -> Date? {
+        formatter.date(from: value)
     }
 }
 

@@ -128,8 +128,10 @@ actor PiUsageScanner {
             fileCompleted: { path, _ in bucket.finish(path) }
         )
         guard complete, !Task.isCancelled else { return .incomplete }
+        // Index once instead of scanning the whole file list per future-timestamp entry.
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         for (path, timestamp) in bucket.futureTimestamps {
-            guard let file = files.first(where: { $0.path == path }),
+            guard let file = filesByPath[path],
                   FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
             else { return .incomplete }
         }
@@ -312,20 +314,24 @@ actor PiUsageScanner {
             let trimmedModel = entry.model.nilIfEmpty
             let modelName = trimmedModel ?? ModelUsageEntry.unattributedModelName
 
+            // Price the tokens once. The estimate feeds both the row's fallback cost and the
+            // per-day API-estimate series; computing it twice repeated model-alias resolution and
+            // rate-table lookups for every row on every refresh.
+            let apiEstimate = trimmedModel.flatMap {
+                pricing.estimatedCostDollars(model: $0, tokens: entry.tokens)
+            }
             let cost: Double?
             if let carried = entry.carriedCost, carried > 0 {
                 cost = carried
-            } else if let model = trimmedModel, let estimated = pricing.estimatedCostDollars(model: model, tokens: entry.tokens) {
-                cost = estimated
             } else {
-                cost = nil
+                cost = apiEstimate
             }
             if cost == nil, entry.reportedTotalTokens > 0 {
                 accumulator.addUnknownModel(day: day, model: modelName)
             }
             accumulator.recordApiEstimate(
                 day: day,
-                cost: trimmedModel.flatMap { pricing.estimatedCostDollars(model: $0, tokens: entry.tokens) },
+                cost: apiEstimate,
                 tokens: entry.reportedTotalTokens
             )
             accumulator.add(day: day, tokens: entry.reportedTotalTokens, cost: cost, model: modelName)
