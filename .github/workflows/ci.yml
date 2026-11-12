@@ -27,12 +27,10 @@ jobs:
           persist-credentials: false
 
       - name: Build
-        run: swift build
+        run: swift build -j 2 --disable-index-store
 
-      - name: Run tests
-        run: |
-          script/test_measure_token_accounting.sh
-          swift test
+      - name: Run test suites
+        run: bash script/test_suites.sh
 
       # This dedicated public branch runs the deterministic synthetic-ledger benchmark on GitHub's
       # isolated macOS runner. It never copies or uploads a user's local usage ledger.
