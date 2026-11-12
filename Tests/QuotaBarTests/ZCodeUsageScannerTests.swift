@@ -22,20 +22,72 @@ final class ZCodeUsageScannerTests: XCTestCase {
 
     func testMissingDatabaseIsNotCreated() throws {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
-        let scanner = ZCodeUsageScanner(path: path)
+        let scanner = ZCodeUsageScanner(path: path, leveldbPath: "/nonexistent-quotabar-zcode-test/leveldb")
         XCTAssertFalse(scanner.hasHistory())
         XCTAssertNil(try scanner.totalTokens())
         XCTAssertNil(try scanner.usage())
         XCTAssertFalse(FileManager.default.fileExists(atPath: path))
     }
 
-    func testInvalidTokenCountsAreReported() throws {
+    /// A corrupt `model_usage` row (negative/non-integer tokens) must not throw away the whole
+    /// card: it is excluded from totals and reported via `damagedRows`, so the provider can
+    /// surface a history warning instead of silently reading low.
+    func testInvalidTokenCountsAreExcludedAndReported() throws {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
         try SQLiteCLIAccessor().execute(path: path, sql: """
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER, provider_id TEXT, started_at INTEGER);
             INSERT INTO model_usage VALUES (100, 20, 'account:zai-start-plan', 1000), (-1, 2, 'account:zai-start-plan', 1001);
             """)
-        XCTAssertThrowsError(try ZCodeUsageScanner(path: path).totalTokens())
+        let scanner = ZCodeUsageScanner(path: path, leveldbPath: "/nonexistent-quotabar-zcode-test/leveldb")
+        XCTAssertEqual(try scanner.totalTokens(), 120)
+        let usage = try XCTUnwrap(scanner.usage())
+        XCTAssertEqual(usage.totalTokens, 120)
+        XCTAssertEqual(usage.damagedRows, 1)
+        XCTAssertEqual(usage.planName, "Start Plan")
+    }
+
+    /// A fresh plan (or cleared db) has no local sqlite history yet — the LevelDB entitlement
+    /// alone must still surface the plan and its promotional allowance instead of the scanner
+    /// returning nil and hiding the Weekend Build meter.
+    func testEntitlementSurvivesMissingSqliteDatabase() throws {
+        let levelDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quotabar-zcode-nosqlite-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: levelDir, withIntermediateDirectories: true)
+        let payload = """
+        zcode:usage-entitlement:subscription-v2:account:zai-start-plan:["hash",{}]:auth:1\u{0001}{"cachedAt":1794163892440,"snapshot":{"quota":{"level":"Start","limits":[{"planId":"zcode-v3-start-plan-1106-wk","period":"one_time","unit":500000000,"usage":100000000,"remaining":400000000,"nextResetTime":1794186000000}]}}}
+        """
+        try Data(payload.utf8).write(to: levelDir.appendingPathComponent("000001.log"))
+
+        let scanner = ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite", leveldbPath: levelDir.path)
+        XCTAssertTrue(scanner.hasHistory())
+        let usage = try XCTUnwrap(scanner.usage())
+        XCTAssertNil(usage.totalTokens)
+        XCTAssertNil(usage.logScan)
+        XCTAssertEqual(usage.planName, "Start Plan")
+        XCTAssertEqual(usage.weekendBuild?.label, "Weekend Build")
+        XCTAssertEqual(usage.weekendBuild?.remaining, 400_000_000)
+        XCTAssertEqual(usage.damagedRows, 0)
+    }
+
+    /// Implausible promo reset instants — zero, or seconds reported where milliseconds were
+    /// expected (landing in 1970) — are dropped rather than rendered as "Resets soon"/"expired".
+    func testBogusPromoResetInstantsAreDropped() throws {
+        let levelDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quotabar-zcode-reset-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: levelDir, withIntermediateDirectories: true)
+        let payload = """
+        zcode:usage-entitlement:subscription-v2:account:zai-start-plan:["hash",{}]:auth:1\u{0001}{"cachedAt":1794163892440,"snapshot":{"quota":{"level":"Start","limits":[{"planId":"zcode-v3-start-plan-zero","period":"one_time","unit":100000000,"usage":0,"remaining":100000000,"nextResetTime":0},{"planId":"zcode-v3-start-plan-secs","period":"one_time","unit":100000000,"usage":0,"remaining":100000000,"nextResetTime":1794186000}]}}}
+        """
+        try Data(payload.utf8).write(to: levelDir.appendingPathComponent("000001.log"))
+
+        let scanner = ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite", leveldbPath: levelDir.path)
+        let now = Date(timeIntervalSince1970: 1_794_166_000)
+        let usage = try XCTUnwrap(scanner.usage(now: now))
+        // The selected (first) allowance carries a zero `nextResetTime`; the seconds-as-ms variant
+        // would land in 1970. Either way the allowance still surfaces, just without a date.
+        XCTAssertNotNil(usage.weekendBuild, "An allowance with an implausible reset must still surface")
+        XCTAssertNil(usage.weekendBuild?.resetsAt)
+        XCTAssertNil(usage.weekendBuild?.expiresAt)
     }
 
     func testIncompatibleDatabaseThrows() throws {

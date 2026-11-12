@@ -47,8 +47,10 @@ enum ZAIUsageMapper {
         return ((root["msg"] as? String) ?? "").lowercased().contains("coding plan")
     }
 
-    /// Session + weekly + web-search meters from the quota payload. Missing required values are an
-    /// invalid response rather than zero usage; an explicit empty array remains a valid no-data state.
+    /// Session + weekly + web-search meters from the quota payload. An unreadable entry is skipped
+    /// with a warning (its siblings' meters still render); a payload where a recognized entry
+    /// existed but *no* meter could be built remains an invalid response rather than zero usage,
+    /// and an explicit empty array remains a valid no-data state.
     static func mapQuota(_ body: Data, now: Date = Date()) throws -> [MetricLine] {
         guard let root = ProviderParse.jsonObject(body) else {
             throw ZAIUsageError.invalidResponse
@@ -80,19 +82,36 @@ enum ZAIUsageMapper {
             return type == "CREDIT_LIMIT" || type == "TOKENS_LIMIT"
         }
         for entry in percentageLimits {
-            guard let window = try classifyTokenWindow(entry) else { continue }
-            sawRecognizedLimit = true
-            switch window {
-            case .session(let periodMs):
-                lines.append(try percentLine(entry, label: "Session", periodMs: periodMs, now: now))
-            case .weekly(let periodMs):
-                lines.append(try percentLine(entry, label: "Weekly", periodMs: periodMs, now: now))
+            switch classifyTokenWindow(entry) {
+            case .recognized(let window):
+                sawRecognizedLimit = true
+                switch window {
+                case .session(let periodMs):
+                    if let line = percentLine(entry, label: "Session", periodMs: periodMs, now: now) {
+                        lines.append(line)
+                    }
+                case .weekly(let periodMs):
+                    if let line = percentLine(entry, label: "Weekly", periodMs: periodMs, now: now) {
+                        lines.append(line)
+                    }
+                }
+            case .unknownWindow:
+                break
+            case .damaged:
+                // The entry clearly claims a usage window we failed to read. If no other entry
+                // yields a meter either, the payload is invalid rather than "no usage".
+                sawRecognizedLimit = true
             }
         }
         if let web = findLimit(limits, type: "TIME_LIMIT") {
-            if let line = try webSearchLine(from: web, now: now) {
+            switch webSearchLine(from: web, now: now) {
+            case .yielded(let line):
                 sawRecognizedLimit = true
                 lines.append(line)
+            case .notApplicable:
+                break
+            case .damaged:
+                sawRecognizedLimit = true
             }
         }
 
@@ -127,11 +146,33 @@ enum ZAIUsageMapper {
         case weekly(periodMs: Int)
     }
 
-    private static func classifyTokenWindow(_ entry: [String: Any]) throws -> TokenWindow? {
+    /// Result of classifying a percentage quota entry's window.
+    private enum WindowOutcome {
+        /// Parsed window that maps to a meter (session or weekly).
+        case recognized(TokenWindow)
+        /// A window unit QuotaBar doesn't know yet — ignored quietly so a future Z.ai window
+        /// cannot hide meters whose units QuotaBar still understands.
+        case unknownWindow
+        /// The entry claims a usage window but its fields are unreadable — skipped with a
+        /// warning instead of failing the whole payload.
+        case damaged
+    }
+
+    /// Result of reading the TIME_LIMIT (web-search) entry.
+    private enum WebSearchOutcome {
+        case yielded(MetricLine)
+        /// A zero cap is a plan without web searches, not a measurement of zero use — no meter.
+        case notApplicable
+        /// The entry claims the web-search allowance but its fields are unreadable — skipped
+        /// with a warning instead of failing the whole payload.
+        case damaged
+    }
+
+    private static func classifyTokenWindow(_ entry: [String: Any]) -> WindowOutcome {
         guard let unit = ProviderParse.number(entry["unit"]),
               let number = ProviderParse.number(entry["number"]),
               number > 0 else {
-            throw ZAIUsageError.invalidResponse
+            return damagedWindowEntry(entry, reason: "missing or non-positive unit/number")
         }
         let unitMs: Double
         switch unit {
@@ -139,30 +180,43 @@ enum ZAIUsageMapper {
         case 4: unitMs = 24 * 60 * 60 * 1000
         case 6: unitMs = 7 * 24 * 60 * 60 * 1000
         case 5: unitMs = 30 * 24 * 60 * 60 * 1000
-        default: return nil
+        default: return .unknownWindow
         }
         let duration = unitMs * number
         guard duration >= 1, duration < Double(Int.max) else {
-            throw ZAIUsageError.invalidResponse
+            return damagedWindowEntry(entry, reason: "unbelievable window duration")
         }
         let periodMs = Int(duration)
         // Sub-daily → session; multi-day → weekly. The computed window rides along so the meter's
         // cadence reflects the payload instead of a hardcoded constant.
         if periodMs < 24 * 60 * 60 * 1000 {
-            return .session(periodMs: periodMs)
+            return .recognized(.session(periodMs: periodMs))
         }
-        return .weekly(periodMs: periodMs)
+        return .recognized(.weekly(periodMs: periodMs))
     }
 
-    /// A percentage meter (Session or Weekly) from a credit/token quota entry.
+    /// A recognized quota entry we could not read is skipped with a one-time warning (fail loudly
+    /// into the log) — its siblings' meters still render.
+    private static func damagedWindowEntry(_ entry: [String: Any], reason: String) -> WindowOutcome {
+        DiagnosticGate.logOnce(for: "zai.quota.damaged-window-entry") {
+            AppLog.warn(LogTag.auth("zai"), "skipped unreadable quota window entry (\(reason)): \(entry)")
+        }
+        return .damaged
+    }
+
+    /// A percentage meter (Session or Weekly) from a credit/token quota entry. `nil` (with a
+    /// warning) when the entry's percentage is unreadable — its siblings' meters still render.
     private static func percentLine(
         _ entry: [String: Any],
         label: String,
         periodMs: Int,
         now: Date
-    ) throws -> MetricLine {
+    ) -> MetricLine? {
         guard let rawPercentage = ProviderParse.number(entry["percentage"]) else {
-            throw ZAIUsageError.invalidResponse
+            DiagnosticGate.logOnce(for: "zai.quota.damaged-percentage-entry") {
+                AppLog.warn(LogTag.auth("zai"), "skipped \(label) quota entry with unreadable percentage: \(entry)")
+            }
+            return nil
         }
         let percentage = ProviderParse.clampPercent(rawPercentage)
         let resetsAt = resetDate(entry["nextResetTime"], now: now)
@@ -176,29 +230,33 @@ enum ZAIUsageMapper {
         )
     }
 
-    /// TIME_LIMIT → a count meter (used / limit) for monthly web-search/reader calls. `nil` when the
-    /// plan carries no web-search allowance at all (a zero cap) — there is no meter to draw.
-    private static func webSearchLine(from entry: [String: Any], now: Date) throws -> MetricLine? {
+    /// TIME_LIMIT → a count meter (used / limit) for monthly web-search/reader calls.
+    /// `.notApplicable` when the plan carries no web-search allowance at all (a zero cap) — there
+    /// is no meter to draw.
+    private static func webSearchLine(from entry: [String: Any], now: Date) -> WebSearchOutcome {
         guard let used = ProviderParse.number(entry["currentValue"]),
               let limit = ProviderParse.number(entry["usage"]),
               used >= 0,
               limit >= 0 else {
-            throw ZAIUsageError.invalidResponse
+            DiagnosticGate.logOnce(for: "zai.quota.damaged-time-limit") {
+                AppLog.warn(LogTag.auth("zai"), "skipped unreadable TIME_LIMIT entry: \(entry)")
+            }
+            return .damaged
         }
         // A zero cap is a plan without web searches, not a measurement of zero use. A meter with a
         // zero limit reads as an empty allowance that the user has not touched, which is misleading.
-        guard limit > 0 else { return nil }
+        guard limit > 0 else { return .notApplicable }
         // TIME_LIMIT carries a nextResetTime in current payloads (monthly renewal); honor it when
         // present so the countdown shows the real reset, otherwise the period cadence reads "monthly".
         let resetsAt = resetDate(entry["nextResetTime"], now: now)
-        return .progress(
+        return .yielded(.progress(
             label: "Web Searches",
             used: used,
             limit: limit,
             format: .count(suffix: "searches"),
             resetsAt: resetsAt,
             periodDurationMs: monthlyPeriodMs
-        )
+        ))
     }
 
     /// A reset instant, but only when it is still ahead of `now` and inside a believable horizon.
