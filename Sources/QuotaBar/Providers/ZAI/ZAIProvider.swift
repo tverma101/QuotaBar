@@ -83,7 +83,9 @@ final class ZAIProvider: ProviderRuntime {
             let currentNow = now()
             let modelPricing = await pricing()
             let usage = try await loadOffMainActor { [zcodeScanner] in try zcodeScanner.usage(pricing: modelPricing, now: currentNow) }
-            guard let usage, (usage.totalTokens ?? 0) > 0 || usage.weekendBuild != nil || usage.dailySeries != nil else { return quota }
+            guard let usage,
+                  (usage.totalTokens ?? 0) > 0 || usage.weekendBuild != nil || usage.dailySeries != nil || usage.damagedRows > 0
+            else { return quota }
             var result = quota
             if case .badge(_, let message, _, _) = result.lines.first(where: \.isError) {
                 // Keep local usage usable even when the separate Coding Plan request fails.
@@ -163,6 +165,13 @@ final class ZAIProvider: ProviderRuntime {
                 )
             } else if let dailySeries = usage.dailySeries {
                 SpendTileMapper.appendTokenUsage(dailySeries, to: &result.lines, now: currentNow)
+            }
+            if usage.damagedRows > 0 {
+                // Corrupt rows were excluded from the history rather than blanking it — say so.
+                DiagnosticGate.logOnce(for: "zcode.damaged-usage-rows") {
+                    AppLog.warn(LogTag.auth("zai"), "ZCode history had \(usage.damagedRows) invalid rows; totals exclude them")
+                }
+                result.historyWarning = "Skipped \(usage.damagedRows) invalid ZCode usage row\(usage.damagedRows == 1 ? "" : "s"); recent totals may be slightly low."
             }
             return result
         } catch {

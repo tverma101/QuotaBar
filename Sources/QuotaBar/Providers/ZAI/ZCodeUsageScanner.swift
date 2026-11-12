@@ -18,6 +18,10 @@ struct ZCodeUsageResult: Sendable, Equatable {
     var planName: String?
     var logScan: LogUsageScan?
     var weekendBuild: ZCodeAllowance?
+    /// `model_usage` rows excluded from totals because they were corrupt (non-integer or negative
+    /// token columns). Surfaced as a historyWarning so a partial history explains itself instead
+    /// of silently reading low.
+    var damagedRows: Int = 0
 
     var dailySeries: DailyUsageSeries? {
         logScan?.series
@@ -28,7 +32,8 @@ struct ZCodeUsageResult: Sendable, Equatable {
         planName: String? = nil,
         logScan: LogUsageScan? = nil,
         dailySeries: DailyUsageSeries? = nil,
-        weekendBuild: ZCodeAllowance? = nil
+        weekendBuild: ZCodeAllowance? = nil,
+        damagedRows: Int = 0
     ) {
         self.totalTokens = totalTokens
         self.planName = planName
@@ -44,6 +49,7 @@ struct ZCodeUsageResult: Sendable, Equatable {
             self.logScan = nil
         }
         self.weekendBuild = weekendBuild
+        self.damagedRows = damagedRows
     }
 }
 
@@ -75,7 +81,11 @@ final class ZCodeUsageScanner: @unchecked Sendable {
 
     func hasHistory() -> Bool {
         let expanded = (path as NSString).expandingTildeInPath
-        return FileManager.default.fileExists(atPath: expanded)
+        if FileManager.default.fileExists(atPath: expanded) { return true }
+        // A LevelDB entitlement without local sqlite history (fresh plan, cleared db) is still
+        // usage QuotaBar can render — don't report "nothing here" and skip the refresh.
+        let dbPath = (leveldbPath as NSString).expandingTildeInPath
+        return FileManager.default.fileExists(atPath: dbPath)
     }
 
     func totalTokens(pricing: ModelPricing = .empty) throws -> Double? {
@@ -85,25 +95,15 @@ final class ZCodeUsageScanner: @unchecked Sendable {
     func usage(pricing: ModelPricing = .empty, now: Date? = nil) throws -> ZCodeUsageResult? {
         try Task.checkCancellation()
         let expanded = (path as NSString).expandingTildeInPath
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: expanded),
-              let size = attrs[.size] as? UInt64,
-              let mdate = attrs[.modificationDate] as? Date else {
-            lock.withLock {
-                cachedResult = nil
-                cachedSqliteStamp = nil
-                cachedLevelDBStamp = nil
-                cachedPricingToken = nil
-            }
-            return nil
-        }
-        let currentSqliteStamp = (size, mdate.timeIntervalSinceReferenceDate)
+        // Stamps are optional per source: a missing sqlite file must not blind the LevelDB
+        // entitlement scan (and vice versa), so the cache compares each source independently.
+        let currentSqliteStamp = Self.sqliteStamp(at: expanded)
         let currentLevelDBStamp = levelDBStamp()
         let currentPricingToken = pricing.aggregateCacheToken
 
         if let cached = lock.withLock({ () -> ZCodeUsageResult? in
-            guard let sStamp = cachedSqliteStamp,
-                  sStamp.size == currentSqliteStamp.0,
-                  sStamp.mtime == currentSqliteStamp.1,
+            guard cachedSqliteStamp?.size == currentSqliteStamp?.size,
+                  cachedSqliteStamp?.mtime == currentSqliteStamp?.mtime,
                   cachedLevelDBStamp?.size == currentLevelDBStamp?.size,
                   cachedLevelDBStamp?.mtime == currentLevelDBStamp?.mtime,
                   cachedPricingToken == currentPricingToken else {
@@ -119,49 +119,88 @@ final class ZCodeUsageScanner: @unchecked Sendable {
         }
 
         try Task.checkCancellation()
-        let sql = """
-            SELECT (SELECT CASE WHEN SUM(CASE WHEN typeof(input_tokens) != 'integer'
-                OR typeof(output_tokens) != 'integer' OR input_tokens < 0 OR output_tokens < 0
-                THEN 1 ELSE 0 END) > 0 THEN 'invalid'
-                ELSE CAST(SUM(CAST(input_tokens AS REAL) + CAST(output_tokens AS REAL)) AS TEXT) END
-            FROM model_usage) || '|' || COALESCE((SELECT provider_id FROM model_usage WHERE provider_id LIKE 'account:zai%' ORDER BY started_at DESC LIMIT 1), '');
-            """
-        let raw = try sqlite.queryValue(path: path, sql: sql)
-        try Task.checkCancellation()
 
-        guard let raw else {
-            lock.withLock {
-                cachedResult = nil
-                cachedSqliteStamp = currentSqliteStamp
-                cachedLevelDBStamp = currentLevelDBStamp
-                cachedPricingToken = currentPricingToken
+        // Local sqlite history is one source; the LevelDB entitlement is another. Neither is
+        // required: a missing or unreadable source yields its part as nil instead of hiding the
+        // other source's data (a fresh Weekend Build plan has no sqlite db yet, for example).
+        var totalTokens: Double? = nil
+        var planName: String? = nil
+        var logScan: LogUsageScan? = nil
+        var damagedRows = 0
+
+        if currentSqliteStamp != nil {
+            // Valid-row total + damaged-row count instead of a blanket 'invalid' sentinel: one
+            // corrupt row in model_usage must not throw away the whole card's history. Damaged
+            // rows are excluded from the total and reported (damagedRows > 0 → historyWarning).
+            let sql = """
+                SELECT (SELECT CAST(COALESCE(SUM(CASE WHEN typeof(input_tokens) != 'integer'
+                        OR typeof(output_tokens) != 'integer' OR input_tokens < 0 OR output_tokens < 0
+                        THEN 0 ELSE CAST(input_tokens AS REAL) + CAST(output_tokens AS REAL) END), 0) AS TEXT)
+                    FROM model_usage) || '|' ||
+                    CAST((SELECT COUNT(*) FROM model_usage WHERE typeof(input_tokens) != 'integer'
+                        OR typeof(output_tokens) != 'integer' OR input_tokens < 0 OR output_tokens < 0) AS TEXT)
+                    || '|' || COALESCE((SELECT provider_id FROM model_usage WHERE provider_id LIKE 'account:zai%' ORDER BY started_at DESC LIMIT 1), '');
+                """
+            let raw = try sqlite.queryValue(path: path, sql: sql)
+            try Task.checkCancellation()
+
+            if let raw {
+                // parts[0] is the valid-row total, parts[1] the damaged-row count, and the
+                // provider_id tail is joined back in case it ever contains the '|' delimiter.
+                let parts = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+                guard parts.count >= 2 else { throw ZCodeUsageError.invalidUsage }
+                if let total = Double(parts[0]), total.isFinite, total >= 0 {
+                    totalTokens = total > 0 ? total : nil
+                } else if !parts[0].isEmpty {
+                    throw ZCodeUsageError.invalidUsage
+                }
+                damagedRows = Int(parts[1]) ?? 0
+                if parts.count > 2 {
+                    let providerID = parts[2...].joined(separator: "|")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if providerID.contains("start-plan") {
+                        planName = "Start Plan"
+                    } else if providerID.contains("coding-plan") {
+                        planName = "Coding Plan"
+                    }
+                }
             }
+
+            // Daily series for spend tiles (Today, Yesterday, Last 30 Days)
+            logScan = readDailySeries(pricing: pricing)
+        }
+
+        // Read live entitlement from LevelDB (e.g. Weekend Build total token allowance)
+        let entitlement = scanLevelDBEntitlement(leveldbPath: leveldbPath, now: now)
+        if planName == nil, let entitlementPlan = entitlement?.planName {
+            planName = entitlementPlan
+        }
+
+        if totalTokens == nil && logScan == nil && entitlement == nil {
+            // Neither source yielded anything readable — no result to build (and nothing to cache).
             return nil
         }
 
-        let parts = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-        guard let tokenString = parts.first else { throw ZCodeUsageError.invalidUsage }
-        guard tokenString != "invalid" else { throw ZCodeUsageError.invalidUsage }
-
-        var totalTokens: Double? = nil
-        if let total = Double(tokenString), total.isFinite, total >= 0 {
-            totalTokens = total > 0 ? total : nil
-        } else if !tokenString.isEmpty {
-            throw ZCodeUsageError.invalidUsage
+        let result = ZCodeUsageResult(
+            totalTokens: totalTokens,
+            planName: planName,
+            logScan: logScan,
+            weekendBuild: entitlement?.weekendBuild,
+            damagedRows: damagedRows
+        )
+        lock.withLock {
+            cachedResult = result
+            cachedSqliteStamp = currentSqliteStamp
+            cachedLevelDBStamp = currentLevelDBStamp
+            cachedPricingToken = currentPricingToken
         }
+        return result
+    }
 
-        var planName: String? = nil
-        if parts.count > 1 {
-            let providerID = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
-            if providerID.contains("start-plan") {
-                planName = "Start Plan"
-            } else if providerID.contains("coding-plan") {
-                planName = "Coding Plan"
-            }
-        }
-
-        // Daily series for spend tiles (Today, Yesterday, Last 30 Days)
-        var logScan: LogUsageScan? = nil
+    /// The per-day model usage series read from the local sqlite history, for spend tiles and the
+    /// Usage History screen. Corrupt rows are excluded by the query itself and skipped during
+    /// parsing; a schema without model/cache columns falls back to a bare day-total query.
+    private func readDailySeries(pricing: ModelPricing) -> LogUsageScan? {
         let dailySql = """
             SELECT date(started_at / 1000, 'unixepoch', 'localtime') || '|' ||
                    model_id || '|' ||
@@ -213,50 +252,31 @@ final class ZCodeUsageScanner: @unchecked Sendable {
             }
             let built = accumulator.build()
             if !built.series.daily.isEmpty {
-                logScan = built
+                return built
             }
-        } else {
-            // Fallback for minimal schemas (e.g. test fixtures without model_id/cache columns)
-            let fallbackSql = """
-                SELECT date(started_at / 1000, 'unixepoch', 'localtime') || ':' || CAST(SUM(input_tokens + output_tokens) AS TEXT)
-                FROM model_usage
-                WHERE input_tokens >= 0 AND output_tokens >= 0
-                GROUP BY date(started_at / 1000, 'unixepoch', 'localtime')
-                ORDER BY date(started_at / 1000, 'unixepoch', 'localtime') DESC;
-                """
-            if let fallbackRaw = try? sqlite.queryValue(path: path, sql: fallbackSql) {
-                let lines = fallbackRaw.split(whereSeparator: \.isNewline)
-                var entries: [DailyUsageEntry] = []
-                for line in lines {
-                    let segments = line.split(separator: ":", maxSplits: 1)
-                    guard segments.count == 2, let tokens = Int(segments[1]), tokens > 0 else { continue }
-                    entries.append(DailyUsageEntry(date: String(segments[0]), totalTokens: tokens, costUSD: nil, costIsComplete: false))
-                }
-                if !entries.isEmpty {
-                    logScan = LogUsageScan(series: DailyUsageSeries(daily: entries), modelUsage: nil, unknownModelsByDay: [:])
-                }
+            return nil
+        }
+        // Fallback for minimal schemas (e.g. test fixtures without model_id/cache columns)
+        let fallbackSql = """
+            SELECT date(started_at / 1000, 'unixepoch', 'localtime') || ':' || CAST(SUM(input_tokens + output_tokens) AS TEXT)
+            FROM model_usage
+            WHERE input_tokens >= 0 AND output_tokens >= 0
+            GROUP BY date(started_at / 1000, 'unixepoch', 'localtime')
+            ORDER BY date(started_at / 1000, 'unixepoch', 'localtime') DESC;
+            """
+        if let fallbackRaw = try? sqlite.queryValue(path: path, sql: fallbackSql) {
+            let lines = fallbackRaw.split(whereSeparator: \.isNewline)
+            var entries: [DailyUsageEntry] = []
+            for line in lines {
+                let segments = line.split(separator: ":", maxSplits: 1)
+                guard segments.count == 2, let tokens = Int(segments[1]), tokens > 0 else { continue }
+                entries.append(DailyUsageEntry(date: String(segments[0]), totalTokens: tokens, costUSD: nil, costIsComplete: false))
+            }
+            if !entries.isEmpty {
+                return LogUsageScan(series: DailyUsageSeries(daily: entries), modelUsage: nil, unknownModelsByDay: [:])
             }
         }
-
-        // Read live entitlement from LevelDB (e.g. Weekend Build total token allowance)
-        let entitlement = scanLevelDBEntitlement(leveldbPath: leveldbPath, now: now)
-        if planName == nil, let entitlementPlan = entitlement?.planName {
-            planName = entitlementPlan
-        }
-
-        let result = ZCodeUsageResult(
-            totalTokens: totalTokens,
-            planName: planName,
-            logScan: logScan,
-            weekendBuild: entitlement?.weekendBuild
-        )
-        lock.withLock {
-            cachedResult = result
-            cachedSqliteStamp = currentSqliteStamp
-            cachedLevelDBStamp = currentLevelDBStamp
-            cachedPricingToken = currentPricingToken
-        }
-        return result
+        return nil
     }
 
     func unloadCachesForMemoryPressure() {
@@ -266,6 +286,13 @@ final class ZCodeUsageScanner: @unchecked Sendable {
             cachedLevelDBStamp = nil
             cachedPricingToken = nil
         }
+    }
+
+    private static func sqliteStamp(at path: String) -> (size: UInt64, mtime: TimeInterval)? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attrs[.size] as? UInt64,
+              let mdate = attrs[.modificationDate] as? Date else { return nil }
+        return (size, mdate.timeIntervalSinceReferenceDate)
     }
 
     private func levelDBStamp() -> (size: UInt64, mtime: TimeInterval)? {
@@ -378,6 +405,19 @@ final class ZCodeUsageScanner: @unchecked Sendable {
         return (root, cachedAt)
     }
 
+    /// A promo reset instant, but only when it is ahead of `now` and inside a believable horizon —
+    /// the same guard as `ZAIUsageMapper.resetDate`. A zero, a stale value, or seconds reported
+    /// where milliseconds were expected would otherwise render as "Resets soon" or as a countdown
+    /// in the year 55000 on every refresh. An implausible instant is dropped (the allowance shows
+    /// without a date) rather than turned into a date we don't believe.
+    private static func plausibleResetDate(ms milliseconds: Double, now: Date?) -> Date? {
+        guard milliseconds > 0 else { return nil }
+        let date = Date(timeIntervalSince1970: milliseconds / 1000)
+        guard let now else { return date }
+        guard date > now, date.timeIntervalSince(now) <= ZAIUsageMapper.maximumResetHorizon else { return nil }
+        return date
+    }
+
     /// Reads plan name, promotional allowance (Weekend Build / Global Build), and expiry.
     /// Expired allowances auto-remove when `now` is provided; upcoming scheduled promos are detected.
     private static func entitlement(
@@ -448,13 +488,15 @@ final class ZCodeUsageScanner: @unchecked Sendable {
                 var resetMs = limit["nextResetTime"] as? Double ?? (limit["nextResetTime"] as? Int).map(Double.init)
                 var expiresAt = promos[planId]?.expiresAt ?? expiryByProductID[planId]
                 if isOneTime {
-                    if expiresAt == nil, let resetMs { expiresAt = Date(timeIntervalSince1970: resetMs / 1000) }
+                    // `one_time` buckets expire rather than reset; when the purchase record carried
+                    // no expireTime, the reset instant stands in for the expiry.
+                    if expiresAt == nil, let resetMs { expiresAt = plausibleResetDate(ms: resetMs, now: now) }
                     resetMs = nil
                 }
                 allowances.append(ZCodeAllowance(
                     label: promos[planId]?.label ?? "Weekend Build",
                     used: usage, limit: unit, remaining: remaining,
-                    resetsAt: resetMs.map { Date(timeIntervalSince1970: $0 / 1000) },
+                    resetsAt: resetMs.flatMap { plausibleResetDate(ms: $0, now: now) },
                     expiresAt: expiresAt, effectiveAt: promos[planId]?.effectiveAt
                 ))
             }
