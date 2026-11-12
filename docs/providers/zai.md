@@ -54,7 +54,8 @@ Grant data updates whenever ZCode refreshes its snapshot, so a fresh manual ZCod
 The Today / Yesterday / Last 30 Days tiles come from this Mac's `~/.zcode/cli/db/db.sqlite`. They
 count recorded input and output across models used in ZCode, including cached input once, and
 estimate cost at public API rates. This is local app usage, not the Coding Plan quota or a billing
-figure. They appear below the caret and are not pinned by default.
+figure. They appear below the caret and are not pinned by default. A corrupt row in the sqlite
+history is skipped with a warning (and a note on the card) instead of hiding the rest of the history.
 
 ## Under the hood
 
@@ -69,7 +70,7 @@ The quota response carries a `limits` array. Each `CREDIT_LIMIT` entry (called `
 older responses) is a percentage quota window; its window length decides which meter it feeds
 (sub-daily → Session, multi-day → Weekly), while a `TIME_LIMIT` entry is the monthly web-search
 count. Reset times come back as epoch milliseconds. Missing required usage values are reported as
-an invalid response instead of being shown as zero. A reset time that is zero, stale, or outside a
+an invalid response instead of being shown as zero. Unreadable entries are skipped with a warning while their sibling meters still render; only when no meter can be built at all is the payload invalid. A reset time that is zero, stale, or outside a
 believable window is ignored, so the meter falls back to its own cadence ("Resets in 5h") instead of
 reading "Resets soon" forever. A web-search entry with a zero cap means the plan has no web-search
 allowance, so that meter is hidden rather than drawn empty.
