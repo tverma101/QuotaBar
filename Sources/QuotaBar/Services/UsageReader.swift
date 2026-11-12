@@ -212,19 +212,20 @@ public struct UsageReader {
         var snapshots = cachedSnapshots
         var warnings: [String] = []
         var errors: [String: String] = [:]
+        // The read-only CLI and menu bar must render the same VM history even when
+        // their account quota cache is still fresh. Imported receipts never alter it.
+        let dataStore = WidgetDataStore(
+            registry: registry,
+            providers: providers,
+            cache: cache,
+            defaults: defaults,
+            isProviderEnabled: includesProvider,
+            providerIdentityKeys: providerIdentityKeys,
+            vmBoxHistoryDirectory: providersOverride == nil ? VMBoxUsageHistory.defaultDirectory : nil
+        )
 
         if needsRefresh {
             LoginShellEnvironment.shared.prewarm()
-            let dataStore = WidgetDataStore(
-                registry: registry,
-                providers: providers,
-                cache: cache,
-                defaults: defaults,
-                isProviderEnabled: includesProvider,
-                // The CLI shares the app's snapshot cache, so its writes must carry the same account
-                // stamp — an unstamped claude/codex entry would be discarded at the app's next launch.
-                providerIdentityKeys: providerIdentityKeys
-            )
             let shouldFlushPersistence = providersOverride == nil
             await withThrottledFullAccounting {
                 if let matchedIDs {
@@ -242,6 +243,8 @@ public struct UsageReader {
             errors = dataStore.providerErrors
             warnings = orderedIDs
                 .compactMap { id in errors[id].map { "\(id): \($0)" } }
+        } else {
+            snapshots = dataStore.snapshots
         }
 
         if diagnostic {
