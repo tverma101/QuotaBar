@@ -19,6 +19,10 @@ struct CodexAccountCard: Equatable, Sendable {
     let displayName: String
     let allowsKeychainFallback: Bool
     let allowsUnattributedPiUsage: Bool
+    /// When set (2+ router homes, card anchored to the shared `~/.codex`), the scanner re-enables
+    /// that shared home with per-file attribution via `session_meta.creator_account_id`, keeping
+    /// this account's own rollouts and (for the default-anchored card) unattributed ones.
+    var attributionSharedHome: String? = nil
 }
 
 struct ProviderAccountDiscovery: Sendable {
@@ -431,20 +435,28 @@ struct ProviderAccountAssembly {
                     ?? observation.sources.first(where: { $0.kind == .configuredHome })
                 guard let source = preferredSource, let home = source.anchor?.nilIfEmpty else { continue }
                 var seenLogHomes = Set<String>()
+                let defaultAnchored = observation.sources.contains(where: \.holdsDefaultSource)
                 let logHomes = observation.sources.compactMap { entry -> String? in
                     guard let anchor = entry.anchor?.nilIfEmpty else { return nil }
                     return discovery.normalizedCodexHomesByAnchor[anchor]
                 }.filter { candidate in
-                    // With 2+ router account homes, shared ~/.codex mixes both accounts' rollouts
-                    // and double-counts Total Spend / daily charts across cards.
+                    // With 2+ router account homes, shared ~/.codex mixes both accounts' rollouts.
+                    // The default-anchored card keeps it anyway: the scanner re-filters by
+                    // `session_meta.creator_account_id`, so each file lands on its own account only.
+                    // Managed cards keep the exclusion — they have no unattributed right to the
+                    // shared tree and must not double-count it.
                     if routerAccountHomeCount >= 2,
                        let defaultCodexHome,
                        candidate == defaultCodexHome {
-                        return false
+                        return defaultAnchored
                     }
                     return seenLogHomes.insert(candidate).inserted
                 }
                 let label = observation.label?.nilIfEmpty ?? record.label?.nilIfEmpty
+                let attributionSharedHome = (defaultAnchored && routerAccountHomeCount >= 2
+                    && defaultCodexHome.map(logHomes.contains) == true)
+                    ? defaultCodexHome
+                    : nil
                 codexCards.append(CodexAccountCard(
                     id: record.id,
                     identityKey: observation.identityKey,
@@ -452,7 +464,8 @@ struct ProviderAccountAssembly {
                     logHomes: logHomes.isEmpty ? [home] : logHomes,
                     displayName: label.map { "Codex — \($0)" } ?? "Codex — \(record.id == "codex" ? "Account" : String(record.id.suffix(8)))",
                     allowsKeychainFallback: source.holdsDefaultSource,
-                    allowsUnattributedPiUsage: allowsUnattributedPiUsage
+                    allowsUnattributedPiUsage: allowsUnattributedPiUsage,
+                    attributionSharedHome: attributionSharedHome
                 ))
             }
             if !codexCards.isEmpty {
