@@ -2298,8 +2298,8 @@ final class WidgetDataStoreTests: XCTestCase {
     }
 
     func testCcusageSpendSplitsIntoCostTokensAndCombined() async {
-        // One `.values` spend row backs three tiles: cost-only (dollars + ⓘ), tokens-only (the
-        // measured count, no ⓘ), and combined (both, ⓘ because a shown value is estimated).
+        // One `.values` spend row backs three tiles: cost-only (dollars, imputed), tokens-only (the
+        // measured count), and combined (both). The imputation flag rides on `MetricValue.estimated`.
         let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
         let cost = WidgetDescriptor.values(id: "test.last30", provider: provider, title: "Last 30 Days",
                                            selection: .kind(.dollars), valueWord: "spent")
@@ -2336,11 +2336,11 @@ final class WidgetDataStoreTests: XCTestCase {
         let store = WidgetDataStore(registry: registry, providers: [runtime], cache: cache)
         await store.refreshAll()
 
-        // Cost-only: the dollars, locally estimated.
+        // Cost-only: the dollars, locally imputed — the rows state the figures plainly.
         let costData = store.data(for: cost)
         XCTAssertEqual(costData.valueText, "$478.00")
         XCTAssertEqual(costData.unboundedDetail, "$478.00 spent")
-        XCTAssertEqual(costData.infoNote, WidgetData.localEstimateNote)
+        XCTAssertNil(costData.infoNote)
 
         // Tokens-only: the measured count with its "tokens" unit; the tooltip has every digit.
         let tokenData = store.data(for: tokens)
@@ -2354,11 +2354,13 @@ final class WidgetDataStoreTests: XCTestCase {
         XCTAssertEqual(combinedData.unboundedDetail, "$478.00 · 891K tokens")
         XCTAssertEqual(combinedData.menuBarValue, "$478")
         XCTAssertEqual(combinedData.unboundedTooltip, "$478.00 · 891,000 tokens")
-        XCTAssertEqual(combinedData.infoNote, WidgetData.localEstimateNote)
+        XCTAssertNil(combinedData.infoNote)
 
-        // The value hover carries exact figures plus the source note.
-        XCTAssertEqual(combinedData.unboundedValueTooltip, "$478.00 · 891,000 tokens\n\(WidgetData.localEstimateNote)")
-        XCTAssertEqual(costData.unboundedValueTooltip, "$478.00\n\(WidgetData.localEstimateNote)")
+        // The value hover is the exact figures, nothing else. The measured tokens tile has only its
+        // figures (unabbreviated would be redundant at this size, so the count stays visible on the
+        // row); the small, note-free cost-only row has no tooltip at all.
+        XCTAssertEqual(combinedData.unboundedValueTooltip, "$478.00 · 891,000 tokens")
+        XCTAssertNil(costData.unboundedValueTooltip)
         // The measured tokens tile has no source note, so it has only the exact-number value hover.
         XCTAssertNil(tokenData.infoNote)
         XCTAssertEqual(tokenData.unboundedValueTooltip, "891,000 tokens")

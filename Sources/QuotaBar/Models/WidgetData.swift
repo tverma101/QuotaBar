@@ -5,9 +5,6 @@ import Foundation
 /// A metric with a `limit` has a beginning and an end, so it renders as a capsule meter row.
 /// Without a `limit` it's an unbounded amount → a single right-aligned text line.
 struct WidgetData: Hashable {
-    /// Hover note for locally-estimated spend tiles (Codex/Claude/Grok Today / Yesterday / Last 30
-    /// Days), whose dollars are imputed from token counts rather than billed.
-    static let localEstimateNote = "Public model-rate estimate, including OpenRouter rates where matched; provider billing may differ"
     /// Hover note for Cursor spend tiles, whose spend comes from Cursor's usage-history export.
     static let cursorUsageHistoryNote = "From your Cursor usage history."
     /// Headline shown on a placed tile with no real backing metric (em dash, U+2014).
@@ -46,6 +43,10 @@ struct WidgetData: Hashable {
     /// Period-scoped model spend/tokens for the Today / Yesterday / Last 30 Days hover popover. Nil for
     /// non-spend rows and for periods where the provider has no model-level data.
     var modelBreakdown: ModelUsageBreakdown?
+    /// True only for the Last 30 Days spend tiles, where unfolding every model up front is a wall
+    /// of rows: the value popover shows the period's aggregate figures with a tap-to-reveal instead
+    /// of the full list. Today / Yesterday render their short lists immediately.
+    var revealsBreakdownOnTap: Bool = false
     var periodDurationMs: Int?
     var valueTextOverride: String?
     /// Optional secondary figure shown after the headline on a bounded row (e.g. a percent meter's
@@ -142,7 +143,7 @@ struct WidgetData: Hashable {
     }
     /// Per-day points for a Usage Trend row (empty for every other tile). Set true `isChart` flags the
     /// row so the view draws the sparkline instead of the value layout; `chartNote` is the source line
-    /// shown on hover (e.g. "From your Claude usage history (estimated)").
+    /// shown on hover (e.g. "From your Claude usage history").
     var isChart: Bool = false
     var chartPoints: [MetricChartPoint] = []
     var chartNote: String?

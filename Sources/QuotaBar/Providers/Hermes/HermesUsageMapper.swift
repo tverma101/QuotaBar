@@ -6,7 +6,7 @@ import Foundation
 /// provider's spend tiles.
 enum HermesUsageMapper {
     /// Names the local source on hover. Token counts are measured by Hermes itself; the cost is Hermes'
-    /// own per-session estimate (`estimated_cost_usd`), so dollars carry the local-estimate marker (ⓘ).
+    /// own per-session estimate (`estimated_cost_usd`).
     static let sourceNote = "From your Hermes state database"
 
     /// Models above this count fold into "Other" (mirrors the spend tiles' `namedModelCap`).

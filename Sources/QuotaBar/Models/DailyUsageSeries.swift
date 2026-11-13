@@ -403,7 +403,9 @@ struct ModelUsageBreakdown: Hashable, Sendable, Codable {
     var tokenCountSaturated: Bool? = nil
     var totalCostUSD: Double?
     var models: [ModelUsageEntry]
-    var sourceNote: String
+    /// Provenance for the figures (e.g. "From your ZCode usage history"); nil when the popover
+    /// renders no footer.
+    var sourceNote: String? = nil
 }
 
 /// Daily token/cost series plus the per-day models the pricing sources couldn't price — the inputs

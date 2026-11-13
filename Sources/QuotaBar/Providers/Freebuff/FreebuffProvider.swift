@@ -253,7 +253,7 @@ final class FreebuffProvider: ProviderRuntime {
         }
     }
 
-    private static let historySourceNote = "Measured Freebuff hosted runs and legacy Desktop tokens on this Mac; dollars estimated at public API rates, not Freebuff charges."
+    private static let historySourceNote = "Measured Freebuff hosted runs and legacy Desktop tokens on this Mac."
 
     private static func usageFailureDiagnosticKey(_ error: Error) -> String {
         usageFailureDiagnosticPrefix + String(reflecting: type(of: error))

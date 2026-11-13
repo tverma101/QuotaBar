@@ -40,7 +40,7 @@ final class AntigravityProvider: ProviderRuntime {
         portFlag: nil
     )
 
-    private static let usageSourceNote = "From your Antigravity conversations (estimated)"
+    private static let usageSourceNote = "From your Antigravity conversations"
 
     init(
         authStore: AntigravityAuthStore = AntigravityAuthStore(),

@@ -62,7 +62,7 @@ final class ZAIProvider: ProviderRuntime {
                 ? descriptor.exportingHistory(
                     scope: .machineLocal,
                     estimatedCost: true,
-                    sourceNote: "From your ZCode usage history (estimated)"
+                    sourceNote: "From your ZCode usage history"
                 )
                 : descriptor
         }
@@ -149,7 +149,7 @@ final class ZAIProvider: ProviderRuntime {
                     now: currentNow,
                     unknownModelsByDay: scan.unknownModelsByDay,
                     modelUsage: scan.modelUsage,
-                    modelSourceNote: "From your ZCode usage history (estimated)",
+                    modelSourceNote: "From your ZCode usage history",
                     apiEstimateByDay: scan.apiEstimateByDay,
                     estimatedCostDays: scan.estimatedCostDays
                 )

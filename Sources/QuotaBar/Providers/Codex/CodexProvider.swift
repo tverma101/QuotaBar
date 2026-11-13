@@ -91,7 +91,7 @@ final class CodexProvider: ProviderRuntime {
                 .exportingHistory(
                     scope: .machineLocal,
                     estimatedCost: true,
-                    sourceNote: "From your Codex logs (estimated)"
+                    sourceNote: "From your Codex logs"
                 )
         ] + WidgetDescriptor.spendTiles(provider: provider)
     }
@@ -539,7 +539,7 @@ final class CodexProvider: ProviderRuntime {
             piScan.map { _ in "pi" }
         ].compactMap { $0 }
         let unmeasuredDays = routerScan?.unmeasuredUsageDays ?? []
-        let note = "From your \(sourceNames.joined(separator: ", ")) (estimated)"
+        let note = "From your \(sourceNames.joined(separator: ", "))"
             + (unmeasuredDays.isEmpty ? "" : ". Some routed requests have no token measurements; totals include measured requests only.")
         if !unmeasuredDays.isEmpty {
             DiagnosticGate.logOnce(for: "codex.router.unmeasured.\(provider.id)") {
