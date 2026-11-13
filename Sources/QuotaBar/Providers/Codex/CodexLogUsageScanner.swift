@@ -1,6 +1,11 @@
 import Foundation
 import CoreFoundation
 import os
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// A missing native source is complete empty data; an incomplete discovery or fold must preserve the
 /// last-good combined history instead of publishing whichever session files happened to succeed.
@@ -254,6 +259,21 @@ actor CodexLogUsageScanner {
     /// `~/.codex` keeps shared inodes (see `sessionFiles`).
     private let peerHomes: [URL]
 
+    /// Per-file account attribution for a *shared* `~/.codex` whose rollouts are otherwise
+    /// invisible to managed cards (the anti-double-count rule drops the shared default home when
+    /// 2+ router homes exist). Rollouts name their author in `session_meta.payload.creator_account_id`,
+    /// so a file's owner is knowable without folding it: this member re-enables scanning the shared
+    /// tree with files kept only for their actual account. `keepsUnattributed` decides files whose
+    /// session_meta predates/omits the field — true for the default-home-anchored card (the natural
+    /// owner of `~/.codex`), false for managed cards (their unattributed files must stay dropped or
+    /// both cards would count them).
+    struct SharedAttribution: Sendable, Equatable {
+        var home: String
+        var identity: String
+        var keepsUnattributed: Bool
+    }
+    private let sharedAttribution: SharedAttribution?
+
     /// Priced per-inode folds. A menu-bar tap reuses these when size/mtime/inode are unchanged
     /// instead of re-walking every retained session event. Only the files that actually grew are
     /// folded, then merged with the cached slices.
@@ -335,11 +355,13 @@ actor CodexLogUsageScanner {
         environment: EnvironmentReading = QuotaBarEnvironmentReader(),
         homeDirectory: @escaping @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
         peerHomes: [URL] = [],
+        sharedAttribution: SharedAttribution? = nil,
         incrementalScanner: IncrementalJSONLScanner<Event>? = nil
     ) {
         self.environment = environment
         self.homeDirectory = homeDirectory
         self.peerHomes = peerHomes
+        self.sharedAttribution = sharedAttribution.map(Self.normalizedAttribution)
         self.scanner = incrementalScanner ?? Self.sharedScanner
     }
 
@@ -377,7 +399,8 @@ actor CodexLogUsageScanner {
         guard let files = Self.sessionFilesIfComplete(
             homes: homes,
             peerHomes: peerHomesOverride ?? peerHomes,
-            homeDirectory: homeDirectory
+            homeDirectory: homeDirectory,
+            sharedAttribution: sharedAttribution
         ) else {
             if !Task.isCancelled {
                 Self.logScanFailure(
@@ -1019,9 +1042,15 @@ actor CodexLogUsageScanner {
     static func sessionFiles(
         homes: [URL],
         peerHomes: [URL] = [],
-        homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser }
+        homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
+        sharedAttribution: SharedAttribution? = nil
     ) -> [JSONLScanning.DiscoveredFile] {
-        sessionFilesIfComplete(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory) ?? []
+        sessionFilesIfComplete(
+            homes: homes,
+            peerHomes: peerHomes,
+            homeDirectory: homeDirectory,
+            sharedAttribution: sharedAttribution
+        ) ?? []
     }
 
     /// `nil` means a present Codex session root could not be fully enumerated. A caller must keep
@@ -1030,7 +1059,8 @@ actor CodexLogUsageScanner {
         homes: [URL],
         peerHomes: [URL] = [],
         homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
-        peerInodeDiscovery: (@Sendable (URL) -> Set<FileIdentity>?)? = nil
+        peerInodeDiscovery: (@Sendable (URL) -> Set<FileIdentity>?)? = nil,
+        sharedAttribution: SharedAttribution? = nil
     ) -> [JSONLScanning.DiscoveredFile]? {
         guard !Task.isCancelled else { return nil }
         let defaultCodexPath = homeDirectory()
@@ -1121,7 +1151,64 @@ actor CodexLogUsageScanner {
                 }
             }
         }
+        if let sharedAttribution {
+            files = Self.attributedFiles(files, to: Self.normalizedAttribution(sharedAttribution))
+        }
         return files
+    }
+
+    private static func normalizedAttribution(_ attribution: SharedAttribution) -> SharedAttribution {
+        var copy = attribution
+        copy.home = Self.realpathString(attribution.home)
+        return copy
+    }
+
+    /// Absolute canonical path (symlinks resolved at the syscall layer), or a standardized
+    /// fallback for paths that don't exist. Foundation's `resolvingSymlinksInPath` is not
+    /// consistent with `FileManager.enumerator` URL spellings on this volume.
+    static func realpathString(_ path: String) -> String {
+        #if canImport(Darwin) || canImport(Glibc)
+        if let resolved = realpath(path, nil) {
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+        #endif
+        return URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    /// Read only the head of a rollout to find the account that created it. `session_meta` is the
+    /// first line of every rollout and `creator_account_id` is among its first keys, so 16 KB is
+    /// generous. Returns nil for missing/unparseable/absent metadata (older rollouts).
+    static func peekCreatorAccountID(path: String) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let head = handle.readData(ofLength: 16 * 1024)
+        let marker = Data(#""creator_account_id":""#.utf8)
+        guard let range = head.range(of: marker) else { return nil }
+        let rest = head[range.upperBound...]
+        guard let end = rest.firstIndex(of: UInt8(ascii: "\"")) else { return nil }
+        let raw = rest[..<end]
+        guard !raw.isEmpty, let value = String(data: raw, encoding: .utf8) else { return nil }
+        return value
+    }
+
+    /// Keep only the files under `sharedHome` that belong to `identity` (plus the unattributed,
+    /// when `keepsUnattributed`). Files anywhere else pass through untouched.
+    private static func attributedFiles(
+        _ files: [JSONLScanning.DiscoveredFile],
+        to attribution: SharedAttribution
+    ) -> [JSONLScanning.DiscoveredFile] {
+        let prefix = attribution.home.trimmingTrailingSlashes + "/"
+        return files.filter { file in
+            // Compare realpaths, not Foundation-resolved URLs: on this volume /var keeps its
+            // spelling under `resolvingSymlinksInPath` while the enumerator's URLs come out as
+            // /private/var — two spellings of one directory.
+            guard Self.realpathString(file.path).hasPrefix(prefix) else { return true }
+            guard let creator = peekCreatorAccountID(path: file.path) else {
+                return attribution.keepsUnattributed
+            }
+            return creator.caseInsensitiveCompare(attribution.identity) == .orderedSame
+        }
     }
 
     private static func isDefaultCodexHome(_ home: URL, defaultCodexPath: String) -> Bool {
