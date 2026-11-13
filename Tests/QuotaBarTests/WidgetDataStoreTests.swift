@@ -157,7 +157,7 @@ final class WidgetDataStoreTests: XCTestCase {
                 await store.refresh(providerID: provider.id, force: true)
             }
         }
-        while !runtime.didStart { await Task.yield() }
+        await waitUntil({ runtime.didStart }, "the provider refresh started")
 
         let outcome = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
             await store.refresh(providerID: provider.id)
@@ -299,7 +299,7 @@ final class WidgetDataStoreTests: XCTestCase {
                 await store.refresh(providerID: provider.id, force: true)
             }
         }
-        while !runtime.didStart { await Task.yield() }
+        await waitUntil({ runtime.didStart }, "the provider refresh started")
 
         let foldRetry = try await withManualRefresh {
             let manualActionID = try XCTUnwrap(ProviderRefreshContext.manualActionID)
@@ -375,7 +375,7 @@ final class WidgetDataStoreTests: XCTestCase {
                 await store.refresh(providerID: provider.id, force: true)
             }
         }
-        while !runtime.didStart { await Task.yield() }
+        await waitUntil({ runtime.didStart }, "the provider refresh started")
 
         let deferred = try await withManualRefresh {
             let manualActionID = try XCTUnwrap(ProviderRefreshContext.manualActionID)
@@ -442,7 +442,7 @@ final class WidgetDataStoreTests: XCTestCase {
                 await store.refresh(providerID: provider.id, force: true)
             }
         }
-        while !runtime.didStart { await Task.yield() }
+        await waitUntil({ runtime.didStart }, "the provider refresh started")
 
         let deferred = try await withManualRefresh {
             let manualActionID = try XCTUnwrap(ProviderRefreshContext.manualActionID)

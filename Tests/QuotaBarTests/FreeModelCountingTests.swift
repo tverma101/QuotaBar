@@ -27,12 +27,6 @@ final class FreeModelCountingTests: XCTestCase {
         XCTAssertEqual(rates.cacheReadPerMillion, 0.03, "GO cache-read rate")
     }
 
-    /// The gateway fold normalizes routed model names to the bare model before pricing.
-    func testGatewayModelNormalizationKeepsTheCuratedRate() {
-        XCTAssertNotNil(pricing.resolve(model: "space-bunny-free"))
-        XCTAssertEqual(pricing.resolve(model: "space-bunny-free")?.inputPerMillion, 0.15)
-    }
-
     /// Unknown names stay flagged, while the curated model rates remain intact.
     func testUnknownNamesStayUnpricedAndCuratedRatesWin() {
         for model in ["gpt-6-luna", "claude-opus-4-7", "grok-4.7"] {

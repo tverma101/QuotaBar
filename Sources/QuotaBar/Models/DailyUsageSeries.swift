@@ -108,9 +108,49 @@ enum UsageHistoryWindow {
         dayKeys(through: now, count: lifetimeDays(through: now, calendar: calendar), calendar: calendar)
     }
 
+    /// Memo key for a built window: the local start-of-day, the window size, and everything about
+    /// the calendar that can change the answer (identifier and time zone). Two calls with the same
+    /// local day, count and calendar produce byte-identical keys.
+    private struct DayKeysCacheKey: Hashable {
+        let startOfDay: Date
+        let count: Int
+        let calendarIdentifier: Calendar.Identifier
+        let timeZoneIdentifier: String
+    }
+
+    /// `dayKeys` walks up to ten years of calendar days per call and is re-derived on every
+    /// `WidgetDataStore` init and history export, so identical inputs are common within one run.
+    /// The build is a pure function of the start-of-day, the window size and the calendar, so
+    /// memoizing is behavior-preserving: the same inputs always return an equal set. Sets are
+    /// value types, so callers can never mutate the cached set; the lock only guards the dictionary.
+    private nonisolated(unsafe) static var dayKeysCache: [DayKeysCacheKey: Set<String>] = [:]
+    private static let dayKeysCacheLock = NSLock()
+
     private static func dayKeys(through now: Date, count: Int, calendar: Calendar) -> Set<String> {
         let today = calendar.startOfDay(for: now)
-        return Set((0..<max(0, count)).compactMap { offset in
+        let key = DayKeysCacheKey(
+            startOfDay: today,
+            count: count,
+            calendarIdentifier: calendar.identifier,
+            timeZoneIdentifier: calendar.timeZone.identifier
+        )
+        if let cached = dayKeysCacheLock.withLock({ dayKeysCache[key] }) {
+            return cached
+        }
+        let built = buildDayKeys(through: today, count: count, calendar: calendar)
+        dayKeysCacheLock.withLock {
+            // Bound the cache: the suite (and a long-lived app) only ever builds a handful of
+            // distinct days/windows, but don't let a caller loop over arbitrary dates grow it.
+            if dayKeysCache.count >= 16 {
+                dayKeysCache.removeAll(keepingCapacity: true)
+            }
+            dayKeysCache[key] = built
+        }
+        return built
+    }
+
+    private static func buildDayKeys(through today: Date, count: Int, calendar: Calendar) -> Set<String> {
+        Set((0..<max(0, count)).compactMap { offset in
             calendar.date(byAdding: .day, value: -offset, to: today)
                 .map { DailyUsageAccumulator.dayKey(from: $0, calendar: calendar) }
         })
