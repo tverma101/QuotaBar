@@ -865,6 +865,27 @@ final class CodexLogUsageScannerTests: XCTestCase {
         XCTAssertEqual(scan?.series.daily.reduce(0) { $0 + $1.totalTokens }, 200)
     }
 
+    func testScanSkipsRateLimitOnlyTokenCountRows() async throws {
+        // OpenAI emits `token_count` rows with `"info": null` (a rate-limit-only ping while a turn
+        // is in flight, nothing to count). They must not poison the fold — a single such row used
+        // to mark the whole source malformed, silently freezing the card's local history forever.
+        let day = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-3600))
+        let ping = #"{"timestamp":"\#(day)","ordinal":6,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":0.0,"window_minutes":300,"resets_at":1794266586}}}}"#
+        let home = try CodexLogFixture.makeHome(files: [
+            "sessions/rollout-a.jsonl": [
+                CodexLogFixture.turnContext(timestamp: day, model: "gpt-5.2"),
+                CodexLogFixture.tokenCount(timestamp: day, last: CodexLogFixture.usage(input: 100, output: 50)),
+                ping,
+                CodexLogFixture.tokenCount(timestamp: day, last: CodexLogFixture.usage(input: 200, output: 100))
+            ].joined(separator: "\n")
+        ])
+        let scanner = CodexLogFixture.scanner(home: home)
+
+        let scan = await scanner.scan(pricing: fixedRates())
+
+        XCTAssertEqual(scan?.series.daily.reduce(0) { $0 + $1.totalTokens }, 450)
+    }
+
     func testScanPrefersActiveSessionsCopyOverArchivedDuplicate() async throws {
         let day = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-3600))
         let content = CodexLogFixture.tokenCount(

@@ -1676,6 +1676,12 @@ actor CodexLogUsageScanner {
                 return
             }
 
+            // A rate-limit-only ping: `info` is explicitly null (OpenAI emits these while a turn
+            // is in flight with no usage to report). Nothing to count — skipping it must not
+            // mark the source malformed.
+            if payload["info"] is NSNull {
+                return
+            }
             guard let rawInfo = payload["info"],
                   let info = rawInfo as? [String: Any]
             else {
