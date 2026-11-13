@@ -361,9 +361,6 @@ struct TotalSpendRingContent: View {
         let center = formatValue(projection.centerValue, style: .full)
         let exact = projection.centerValueIsLowerBound ? "≥\(center)" : center
         var notes: [String] = []
-        if projection.isEstimated, projection.metric.usesDollarEstimateNote {
-            notes.append(WidgetData.localEstimateNote)
-        }
         if projection.hasPartialData {
             switch projection.metric {
             case .cost:

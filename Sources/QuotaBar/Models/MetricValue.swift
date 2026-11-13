@@ -16,8 +16,8 @@ struct MetricValue: Hashable, Sendable, Codable {
     /// Unit noun shown after the number ("tokens", "credits", "available"). `nil` renders the number
     /// bare — a dollar amount takes its trailing word from the widget (`unboundedValueWord`) instead.
     var label: String?
-    /// True when the number is imputed locally rather than measured or billed — it drives the ⓘ note.
-    /// Per value because a spend row's dollars are an estimate while its token count is real.
+    /// True when the number is imputed locally rather than measured or billed. Per value because a
+    /// spend row's dollars are imputed while its token count is real.
     var estimated: Bool
     /// True when the number is current but can still change, such as usage from an active Hermes
     /// session. Optional so snapshots written before this marker continue to decode.

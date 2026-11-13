@@ -453,7 +453,8 @@ struct WidgetRowView: View {
                 reduceAnimations: reduceAnimations
             ) {
                 if let breakdown = data.modelBreakdown {
-                    ModelUsageDetail(title: data.title, breakdown: breakdown) { inside in
+                    ModelUsageDetail(title: data.title, breakdown: breakdown,
+                                     loadOnTap: data.revealsBreakdownOnTap) { inside in
                         modelHover.detailHover(inside)
                     }
                 } else if data.showsResetExpiries {

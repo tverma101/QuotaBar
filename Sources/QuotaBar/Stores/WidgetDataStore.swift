@@ -93,7 +93,7 @@ final class WidgetDataStore {
     var snapshots: [String: ProviderSnapshot] = [:]
     /// Each provider's history descriptor, keyed by provider ID — the classifying metadata the
     /// Usage History screen reuses (e.g. `estimatedCost`, which drives the lifetime hero's
-    /// "(Est.)" mark). Same source the spend tiles' ⓘ flag reads.
+    /// "(Est.)" mark).
     var historyDescriptorsByProvider: [String: UsageHistoryDescriptor] {
         registry.historyDescriptorsByProvider
     }
@@ -2201,11 +2201,6 @@ final class WidgetDataStore {
             // A tile whose selection finds no value (e.g. a cost-only tile on a day the scanner couldn't
             // price) has nothing real to show — render "No data" rather than a misleading $0.00 / 0.
             data.hasData = !data.selectedValues.isEmpty
-            // The ⓘ is data-driven: it shows when a *shown* value is locally estimated (a spend row's
-            // dollars) and stays off for a measured one (its tokens), so the tokens-only tile reads clean.
-            data.infoNote = data.selectedValues.contains(where: \.estimated)
-                ? WidgetData.localEstimateNote
-                : descriptor.sample.infoNote
             return data
         case .badge(_, let text, _, let subtitle):
             var data = descriptor.sample

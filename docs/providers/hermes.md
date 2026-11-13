@@ -20,8 +20,7 @@ The token counts come straight from Hermes' accounting (`input_tokens`, `output_
 `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`), so they include cached and reasoning
 tokens the way Hermes bills them. OpenCode-billed sessions appear on the OpenCode card, which reflects
 the account that paid for them; including them here as well would double count those tokens in Total
-Spend. The dollar figure is Hermes' own per-session estimate, so it carries the ⓘ marker; tokens are
-always measured. Sessions whose `ended_at` is still empty are marked Partial on the provider row, in
+Spend. The dollar figure is Hermes' own per-session estimate; tokens are always measured. Sessions whose `ended_at` is still empty are marked Partial on the provider row, in
 spend totals, their affected model breakdown rows, and Usage History until Hermes closes them. The
 marker stays with the lifetime total after older per-model details age out.
 
@@ -45,7 +44,7 @@ counters, and billing metadata in. Read-only: QuotaBar never writes to it, and n
   so it creates the database, then refresh.
 - **"Couldn't read Hermes' state database"** — the database exists but couldn't be read this refresh
   (locked, corrupt, permissions). Quit Hermes and refresh, or check the permissions on `~/.hermes`.
-- **The ⓘ appears on the rows** — the dollar figures are Hermes' estimates of what the sessions cost;
+- **Some dollars are imputed** — the dollar figures are Hermes' estimates of what the sessions cost;
   the token counts are measured.
 
 ## Under the hood

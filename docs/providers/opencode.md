@@ -150,15 +150,13 @@ source revision before counting the row.
 Future-dated Hermes sessions with no tokens in any usage bucket are ignored after their fields are validated,
 since they cannot change spend totals.
 
-Whenever imputed dollars are present the tiles carry the ⓘ estimate marker; models the catalogs don't
-know surface as a warning instead of a guess.
+Models the pricing catalogs don't know surface as a warning instead of a guess rather than being estimated.
 
 **Days with a still-running Hermes session are partial.** Hermes writes a session's usage ledger to
 `~/.hermes/state.db` in delayed bursts while the session runs, so the fold's view of an in-progress
 session always trails the actual consumption — and keeps rising until the session ends. QuotaBar
-detects those sessions (`ended_at` not yet set) and marks the affected day's tiles with the ⓘ marker
-on BOTH the dollars and the token count, and the Usage Trend note explains it — a live session is
-never presented as a settled total. Once the session ends, the ledger finalizes and the numbers
+detects those sessions (`ended_at` not yet set) and marks the affected day's dollars and token count
+as imputed — a live session is never presented as a settled total. Once the session ends, the ledger finalizes and the numbers
 converge on the next refresh. The card's official account meters are unaffected and stay current.
 Usage History totals and model rows also show Partial for those days, and Total Spend excludes an
 active-session period from Cost/MTok. The local `/v1/usage` response adds `partial: true` while keeping
@@ -200,8 +198,8 @@ its own row instead of being listed twice, once as Other and again under it.
   requests, including when only one key is currently known. Unreadable credentials clear cached caps
   because their account owner cannot be verified. Local spend history still refreshes when its database
   can be read, and the last confirmed local history stays available if the database scan fails.
-- **The ⓘ appears on the spend tiles** — some of the dollars are imputed from token counts (Claude Code
-  sessions routed through the gateway don't record a per-message cost); the tokens are always measured.
+- **Some dollars are imputed** — Claude Code sessions routed through the gateway don't record a
+  per-message cost, so their dollars are imputed from token counts; the tokens are always measured.
 - **A warning triangle names a model** — a model the pricing catalogs don't know was used through the
   gateway; its tokens were left out of the totals rather than guessed. Add an alias or pricing entry if
   you want it counted.

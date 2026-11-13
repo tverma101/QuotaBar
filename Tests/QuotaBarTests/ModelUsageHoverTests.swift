@@ -58,6 +58,41 @@ final class ModelUsageHoverTests: XCTestCase {
         }
     }
 
+    func testStoreCarriesRevealOnTapFlagIntoWidgetData() {
+        let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
+        let tiles = WidgetDescriptor.spendTiles(provider: provider)
+        let last30 = tiles.first { $0.id == "codex.last30" }!
+        let today = tiles.first { $0.id == "codex.today" }!
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: tiles),
+            providers: [],
+            defaults: makeDefaults("reveal-on-tap")
+        )
+        store.snapshots[provider.id] = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.values(
+                label: "Last 30 Days",
+                values: [
+                    MetricValue(number: 3, kind: .dollars),
+                    MetricValue(number: 300, kind: .count, label: "tokens")
+                ],
+                modelBreakdown: sampleBreakdown()
+            ), .values(
+                label: "Today",
+                values: [
+                    MetricValue(number: 3, kind: .dollars),
+                    MetricValue(number: 300, kind: .count, label: "tokens")
+                ],
+                modelBreakdown: sampleBreakdown()
+            )]
+        )
+
+        XCTAssertTrue(store.data(for: last30).revealsBreakdownOnTap)
+        XCTAssertFalse(store.data(for: today).revealsBreakdownOnTap)
+        XCTAssertTrue(store.data(for: last30).hasModelBreakdown)
+    }
+
     func testWholePercentsAlwaysSumToOneHundred() {
         // Independent rounding would print 33 / 33 / 33 = 99; the largest remainder takes the leftover point.
         XCTAssertEqual(ModelUsageDetail.wholePercents([1.0 / 3, 1.0 / 3, 1.0 / 3]), [34, 33, 33])

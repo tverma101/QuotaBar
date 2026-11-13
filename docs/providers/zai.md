@@ -10,7 +10,7 @@ Tracks [Z.ai](https://z.ai) (Zhipu AI) GLM Coding Plan usage quotas for coding s
 | Weekly | 7-day rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
 | Weekend Build | A promotional one-time token grant read from local ZCode (used / total); shows its expiry, and "Expired" once the grant ends; hidden when the account has none |
 | Web Searches | Monthly web-search / web-reader / Zread calls (used / limit); hidden when the plan carries no web-search allowance |
-| Today / Yesterday / Last 30 Days | Local ZCode usage history, estimated at public API rates; sit below the caret |
+| Today / Yesterday / Last 30 Days | Local ZCode usage history; sit below the caret |
 
 When Z.ai reports your plan name, QuotaBar shows it beside the provider name. For promotional
 plans (such as Start Plan) that the quota API doesn't cover, the plan name and grant come from the
@@ -52,10 +52,10 @@ Grant data updates whenever ZCode refreshes its snapshot, so a fresh manual ZCod
 ## ZCode History
 
 The Today / Yesterday / Last 30 Days tiles come from this Mac's `~/.zcode/cli/db/db.sqlite`. They
-count recorded input and output across models used in ZCode, including cached input once, and
-estimate cost at public API rates. This is local app usage, not the Coding Plan quota or a billing
-figure. They appear below the caret and are not pinned by default. A corrupt row in the sqlite
-history is skipped with a warning (and a note on the card) instead of hiding the rest of the history.
+count recorded input and output across models used in ZCode, including cached input once. This is
+local app usage, not the Coding Plan quota or a billing figure. They appear below the caret and are
+not pinned by default. A corrupt row in the sqlite history is skipped with a warning (and a note on
+the card) instead of hiding the rest of the history.
 
 ## Under the hood
 
