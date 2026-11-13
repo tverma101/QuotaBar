@@ -85,13 +85,8 @@ final class AntigravityAccountingProjectionTests: XCTestCase {
     func testRealSQLiteOversizedRowIsCountedOnceAndReusedOnWarmScan() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer {
-            let trash = Process()
-            trash.executableURL = URL(fileURLWithPath: "/usr/bin/trash")
-            trash.arguments = ["-v", directory.path]
-            try? trash.run()
-            trash.waitUntilExit()
-        }
+        // Same destination (the Trash) without spawning a trash subprocess per test run.
+        defer { try? FileManager.default.trashItem(at: directory, resultingItemURL: nil) }
         let path = directory.appendingPathComponent("history.db").path
         var database: OpaquePointer?
         XCTAssertEqual(sqlite3_open(path, &database), SQLITE_OK)

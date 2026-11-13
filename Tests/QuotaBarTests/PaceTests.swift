@@ -197,12 +197,16 @@ final class PaceTests: XCTestCase {
 
     // MARK: Always Show Pacing (opt-in tick + healthy copy on blue)
 
-    func testAlwaysShowPacingAddsEvenPaceTickToHealthyBar() {
-        XCTAssertEqual(tick(pacedData(used: 30, elapsed: 0.4, alwaysShowPacing: true)) ?? -1,
-                       0.4, accuracy: 0.001)
-        XCTAssertEqual(tick(pacedData(used: 30, elapsed: 0.4, displayMode: .remaining,
-                                     alwaysShowPacing: true)) ?? -1,
-                       0.6, accuracy: 0.001)
+    func testEvenPaceTickTracksDisplayMode() {
+        // Same contract, two window positions: the tick is the even-pace line — elapsed in "used"
+        // mode, 1 − elapsed in "remaining" mode — at any usage level.
+        for (used, elapsed) in [(30.0, 0.4), (76.0, 0.8)] {
+            XCTAssertEqual(tick(pacedData(used: used, elapsed: elapsed, alwaysShowPacing: true)) ?? -1,
+                           elapsed, accuracy: 0.001)
+            XCTAssertEqual(tick(pacedData(used: used, elapsed: elapsed, displayMode: .remaining,
+                                          alwaysShowPacing: true)) ?? -1,
+                           1 - elapsed, accuracy: 0.001)
+        }
     }
 
     func testAmberTickIsAlwaysEvenPaceLine() {
@@ -210,14 +214,6 @@ final class PaceTests: XCTestCase {
         XCTAssertEqual(tick(pacedData(used: 46, elapsed: 0.5, alwaysShowPacing: true)) ?? -1,
                        0.5, accuracy: 0.001)
         XCTAssertEqual(spare(pacedData(used: 46, elapsed: 0.5, alwaysShowPacing: true)), "~8% spare")
-    }
-
-    func testEvenPaceTickTracksDisplayMode() {
-        XCTAssertEqual(tick(pacedData(used: 76, elapsed: 0.8, alwaysShowPacing: true)) ?? -1,
-                       0.8, accuracy: 0.001)
-        XCTAssertEqual(tick(pacedData(used: 76, elapsed: 0.8, displayMode: .remaining,
-                                      alwaysShowPacing: true)) ?? -1,
-                       0.2, accuracy: 0.001)
     }
 
     func testRedBarShowsEvenPaceTickWithAlwaysShowPacingOn() {

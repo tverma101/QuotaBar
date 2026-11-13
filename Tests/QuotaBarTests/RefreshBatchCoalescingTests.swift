@@ -40,7 +40,7 @@ final class RefreshBatchCoalescingTests: XCTestCase {
         }
 
         func waitForEntries(_ count: Int) async {
-            while refreshCount < count { await Task.yield() }
+            await waitUntil({ self.refreshCount >= count }, "runtime made \(count) entries")
         }
     }
 
@@ -165,7 +165,7 @@ final class RefreshBatchCoalescingTests: XCTestCase {
         let store = makeStore(runtime: runtime)
 
         let owner = Task { await store.refreshAll(force: true) }
-        while runtime.refreshCount == 0 { await Task.yield() }
+        await waitUntil({ runtime.refreshCount >= 1 }, "provider refresh began")
         let joiner = Task { await store.refreshAll(force: true) }
         await Task.yield()
         joiner.cancel()
@@ -191,17 +191,15 @@ final class RefreshBatchCoalescingTests: XCTestCase {
         let older = Task {
             await withManualRefresh { await store.refreshAll(force: true) }
         }
-        while runtime.refreshCount == 0 { await Task.yield() }
+        await waitUntil({ runtime.refreshCount >= 1 }, "provider refresh began")
         let olderActionID = runtime.manualActionIDs[0]
         let newer = Task {
             await withManualRefresh { await store.refreshAll(force: true) }
         }
-        while KeychainPermissionGate.shared.isCurrentManualAction(olderActionID) {
-            await Task.yield()
-        }
+        await waitUntil({ !KeychainPermissionGate.shared.isCurrentManualAction(olderActionID) }, "older manual action superseded")
 
         older.cancel()
-        while runtime.refreshCount < 2 { await Task.yield() }
+        await waitUntil({ runtime.refreshCount >= 2 }, "both refresh passes ran")
         gate.openGate()
         await older.value
         await newer.value
@@ -230,9 +228,7 @@ final class RefreshBatchCoalescingTests: XCTestCase {
         let targetedRefresh = Task {
             await withManualRefresh { await store.refresh(providerID: "b", force: true) }
         }
-        while KeychainPermissionGate.shared.isCurrentManualAction(originalActionID) {
-            await Task.yield()
-        }
+        await waitUntil({ !KeychainPermissionGate.shared.isCurrentManualAction(originalActionID) }, "original manual action superseded")
 
         // A and B model Keychain reads cancelled when the newer action begins. C's unrelated work
         // succeeds under the old action and must still be allowed to publish.
@@ -422,7 +418,9 @@ final class RefreshBatchCoalescingTests: XCTestCase {
 
         func refresh() async -> ProviderSnapshot {
             if !enter(manualActionID: ProviderRefreshContext.manualActionID) {
+                let deadline = ContinuousClock.now.advanced(by: .seconds(10))
                 while !isReleased {
+                    if ContinuousClock.now >= deadline { break }
                     try? await Task.sleep(for: .milliseconds(2))
                 }
             }
@@ -430,7 +428,12 @@ final class RefreshBatchCoalescingTests: XCTestCase {
         }
 
         func waitForEntries(_ n: Int) async throws {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
             while entries < n {
+                if ContinuousClock.now >= deadline {
+                    throw NSError(domain: "RefreshBatchCoalescingTests", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "timed out waiting for \(n) provider entries"])
+                }
                 try await Task.sleep(for: .milliseconds(2))
             }
         }
@@ -490,7 +493,7 @@ final class RefreshBatchCoalescingTests: XCTestCase {
         }
 
         func waitForEntries(_ count: Int) async {
-            while calls.count < count { await Task.yield() }
+            await waitUntil({ self.calls.count >= count }, "runtime made \(count) calls")
         }
     }
 }

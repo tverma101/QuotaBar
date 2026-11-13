@@ -512,3 +512,26 @@ final class RoutingHTTPClient: HTTPClient, @unchecked Sendable {
         return try await handler(request)
     }
 }
+
+/// Poll `condition` until it holds, or fail the test after `timeout`. The suite used to spin
+/// `while !condition { await Task.yield() }` — an unbounded, un-yielding busy loop that can
+/// live-lock the MainActor on loaded or low-core machines and run forever. Every spin waits here
+/// with a bounded deadline and a real suspension between polls.
+func waitUntil(
+    _ condition: @MainActor () -> Bool,
+    timeout: Duration = .seconds(60),
+    poll: Duration = .milliseconds(2),
+    _ message: String,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !(await condition()) {
+        if clock.now >= deadline {
+            XCTFail("timed out waiting for condition: \(message)", file: file, line: line)
+            return
+        }
+        try? await Task.sleep(for: poll)
+    }
+}
