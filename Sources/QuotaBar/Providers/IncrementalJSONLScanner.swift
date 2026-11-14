@@ -47,7 +47,10 @@ enum JSONLScanning {
     /// Every `*.jsonl` regular file under `dir` (recursively), path-sorted so a keep-first dedup is
     /// deterministic. A missing optional root is a complete empty result; an existing root that cannot
     /// be read or fully enumerated returns nil so a multi-root caller cannot publish partial history.
-    static func jsonlFilesIfComplete(under dir: URL) -> [DiscoveredFile]? {
+    /// `includeCompressedJSONL` additionally yields `*.jsonl.zst` archives (Codex compacts finished
+    /// sessions this way); callers that opt in must route them through a decompressor — the file
+    /// bytes are not JSONL until expanded.
+    static func jsonlFilesIfComplete(under dir: URL, includeCompressedJSONL: Bool = false) -> [DiscoveredFile]? {
         guard !Task.isCancelled else { return nil }
         return JSONLAccountingWorkPacer.shared.perform {
             // `FileManager.enumerator` silently yields nothing when `dir` itself is a symlink.
@@ -77,7 +80,8 @@ enum JSONLScanning {
             var files: [DiscoveredFile] = []
             for case let url as URL in enumerator {
                 guard !Task.isCancelled else { return nil }
-                guard url.pathExtension == "jsonl" else { continue }
+                let compressed = url.lastPathComponent.hasSuffix(".jsonl.zst")
+                guard url.pathExtension == "jsonl" || (includeCompressedJSONL && compressed) else { continue }
                 guard let values = try? url.resourceValues(forKeys: keySet) else { return nil }
                 guard values.isRegularFile == true else { continue }
                 files.append(DiscoveredFile(

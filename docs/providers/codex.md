@@ -35,6 +35,8 @@ If you already authenticated a custom Codex home, use **Use Existing Codex Homeâ
 
 ## The spend tiles
 
+Finished rollouts that Codex compacted into `.jsonl.zst` archives (found under `sessions/` and `archived_sessions/`) are folded too: QuotaBar decompresses them on read with the `zstd` CLI. Apple's Compression framework has no zstd, so `zstd` must be installed (Homebrew: `brew install zstd`) at `/opt/homebrew/bin/zstd` or `/usr/local/bin/zstd`; when it is missing, compressed archives are skipped with one logged warning and everything else behaves exactly as before. Archives are decompressed fully in memory (256 MB cap) and memoized per process â€” appends never happen to a finished rollout, so the fold never re-decompresses them. Decompression uses no external tools beyond `zstd` itself; conversation content never leaves your Mac.
+
 Native Codex session rollouts remain the primary local source. FCC-routed Codex requests are also folded
 from the local FCC usage ledger (`~/.fcc/usage.db`, or `FCC_USAGE_DB`) when its request-start account
 fingerprint exactly matches this card's Codex account id. This covers a registered Codex home with no
