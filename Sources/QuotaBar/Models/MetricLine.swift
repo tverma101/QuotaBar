@@ -6,17 +6,23 @@ import Foundation
 enum ProgressFormat: Hashable, Sendable, Codable {
     case percent
     case dollars
+    case currency(code: String)
     case count(suffix: String)
 
     var metricKind: MetricKind {
         switch self {
         case .percent:
             return .percent
-        case .dollars:
+        case .dollars, .currency:
             return .dollars
         case .count:
             return .count
         }
+    }
+
+    var currencyCode: String? {
+        if case .currency(let code) = self { return code }
+        return nil
     }
 
     var countSuffix: String? {
@@ -27,11 +33,13 @@ enum ProgressFormat: Hashable, Sendable, Codable {
     private enum CodingKeys: String, CodingKey {
         case kind
         case suffix
+        case code
     }
 
     private enum Kind: String, Codable {
         case percent
         case dollars
+        case currency
         case count
     }
 
@@ -41,7 +49,13 @@ enum ProgressFormat: Hashable, Sendable, Codable {
         case .percent:
             self = .percent
         case .dollars:
-            self = .dollars
+            if let code = try container.decodeIfPresent(String.self, forKey: .code) {
+                self = .currency(code: code)
+            } else {
+                self = .dollars
+            }
+        case .currency:
+            self = .currency(code: try container.decode(String.self, forKey: .code))
         case .count:
             self = .count(suffix: try container.decode(String.self, forKey: .suffix))
         }
@@ -54,6 +68,11 @@ enum ProgressFormat: Hashable, Sendable, Codable {
             try container.encode(Kind.percent, forKey: .kind)
         case .dollars:
             try container.encode(Kind.dollars, forKey: .kind)
+        case .currency(let code):
+            // Old app and CLI processes share this cache and only know the dollars kind.
+            // They can still decode the snapshot; updated readers also use the currency code.
+            try container.encode(Kind.dollars, forKey: .kind)
+            try container.encode(code, forKey: .code)
         case .count(let suffix):
             try container.encode(Kind.count, forKey: .kind)
             try container.encode(suffix, forKey: .suffix)

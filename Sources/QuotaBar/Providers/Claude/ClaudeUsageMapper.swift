@@ -28,7 +28,7 @@ enum ClaudeUsageMapper {
         appendUsageWindow(body["seven_day"], label: "Weekly", periodDurationMs: weeklyPeriodMs, to: &lines)
         appendUsageWindow(body["seven_day_sonnet"], label: "Sonnet", periodDurationMs: weeklyPeriodMs, to: &lines)
         appendScopedWeeklyLimit(body["limits"], modelName: "Fable", label: "Fable", to: &lines)
-        appendExtraUsage(body["extra_usage"], to: &lines)
+        try appendExtraUsage(body["extra_usage"], to: &lines)
 
         return ClaudeMappedUsage(
             plan: formatPlan(subscriptionType: credentials.subscriptionType, rateLimitTier: credentials.rateLimitTier),
@@ -149,26 +149,51 @@ enum ClaudeUsageMapper {
         }
     }
 
-    private static func appendExtraUsage(_ value: Any?, to lines: inout [MetricLine]) {
+    private static func appendExtraUsage(_ value: Any?, to lines: inout [MetricLine]) throws {
         guard let object = value as? [String: Any],
               object["is_enabled"] as? Bool == true,
-              let usedCents = ProviderParse.number(object["used_credits"])
+              let usedMinor = ProviderParse.number(object["used_credits"])
         else {
             return
         }
 
-        let used = ProviderParse.centsToDollars(usedCents)
-        if let limitCents = ProviderParse.number(object["monthly_limit"]), limitCents > 0 {
+        let code: String
+        if let raw = object["currency"], !(raw is NSNull) {
+            guard let text = raw as? String else { throw ClaudeUsageError.invalidResponse }
+            let normalized = text.uppercased()
+            guard normalized.utf8.count == 3, normalized.utf8.allSatisfy({ (65...90).contains($0) }) else {
+                throw ClaudeUsageError.invalidResponse
+            }
+            code = normalized
+        } else {
+            code = "USD"
+        }
+        let decimals: Double
+        if let raw = object["decimal_places"], !(raw is NSNull) {
+            guard let value = ProviderParse.number(raw), value.isFinite,
+                  (0...6).contains(value), value.rounded() == value else {
+                throw ClaudeUsageError.invalidResponse
+            }
+            decimals = value
+        } else {
+            decimals = 2
+        }
+        let scale = pow(10, decimals)
+        let used = usedMinor / scale
+        let currencyCode: String? = code == "USD" ? nil : code
+        if let limitMinor = ProviderParse.number(object["monthly_limit"]), limitMinor > 0 {
             lines.append(.progress(
                 label: "Extra usage spent",
                 used: used,
-                limit: ProviderParse.centsToDollars(limitCents),
-                format: .dollars
+                limit: limitMinor / scale,
+                format: currencyCode.map { .currency(code: $0) } ?? .dollars
             ))
         } else if used > 0 {
             // No monthly cap: an unbounded spend, carried raw so it formats through `MetricFormatter`
             // (compact like the spend tiles, e.g. "$1.2K spent") instead of a baked full-currency string.
-            lines.append(.values(label: "Extra usage spent", values: [MetricValue(number: used, kind: .dollars)]))
+            lines.append(.values(label: "Extra usage spent", values: [
+                MetricValue(number: used, kind: .dollars, currencyCode: currencyCode)
+            ]))
         }
     }
 

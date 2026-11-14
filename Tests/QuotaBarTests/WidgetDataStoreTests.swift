@@ -2273,6 +2273,39 @@ final class WidgetDataStoreTests: XCTestCase {
         XCTAssertEqual(data.unboundedTooltip, "$1,234.56")      // hover still reveals the exact figure
     }
 
+    func testClaudeExtraUsageCurrencyReachesAllDisplaySurfaces() async throws {
+        let provider = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+        let descriptor = WidgetDescriptor.boundedDollars(
+            id: "claude.extra", provider: provider, title: "Extra Usage",
+            metricLabel: "Extra usage spent", limit: 100, valueWord: "spent"
+        )
+        func data(_ extra: String) async throws -> WidgetData {
+            let response = HTTPResponse(statusCode: 200, headers: [:], body: Data("{\"extra_usage\":\(extra)}".utf8))
+            let mapped = try ClaudeUsageMapper.mapUsageResponse(response, credentials: ClaudeOAuth(subscriptionType: "pro"))
+            let runtime = TestProviderRuntime(provider: provider, descriptors: [descriptor],
+                snapshot: ProviderSnapshot(providerID: provider.id, displayName: provider.displayName, lines: mapped.lines))
+            let defaults = makeUserDefaults("claude-currency-\(UUID())")
+            let store = WidgetDataStore(
+                registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]), providers: [runtime],
+                cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600, now: { Date() }),
+                defaults: defaults
+            )
+            store.meterStyle = .used
+            await store.refreshAll()
+            return store.data(for: descriptor)
+        }
+        let capped = try await data(#"{"is_enabled":true,"used_credits":1234,"monthly_limit":5000,"currency":"EUR","decimal_places":2}"#)
+        XCTAssertEqual(capped.boundedHeadline, "€12.34 used")
+        XCTAssertEqual(capped.boundedSubtitle, "€50.00 limit")
+        XCTAssertEqual(capped.meterStyleTooltip, "€37.66 left")
+        XCTAssertEqual(capped.menuBarValue, "€12")
+
+        let uncapped = try await data(#"{"is_enabled":true,"used_credits":1500,"currency":"JPY","decimal_places":0}"#)
+        XCTAssertEqual(uncapped.unboundedDetail, "¥1.5K spent")
+        XCTAssertEqual(uncapped.menuBarValue, "¥1.5K")
+        XCTAssertEqual(uncapped.unboundedTooltip, "¥1,500")
+    }
+
     func testCreditValuesFloorAndClampBalance() {
         var data = WidgetData(title: "Extra Usage", icon: .providerMark("codex"), kind: .dollars, used: 0, limit: nil)
         data.values = CodexUsageMapper.creditValues(remaining: 820.9)
