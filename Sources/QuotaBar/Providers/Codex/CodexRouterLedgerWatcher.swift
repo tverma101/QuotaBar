@@ -72,6 +72,16 @@ final class CodexRouterLedgerWatcher: @unchecked Sendable {
         setEnabled(true)
     }
 
+    /// Waits for the serial watch-installation queue to finish a preceding start().
+    /// Integration tests use this barrier instead of sleeping and racing vnode arming.
+    func waitUntilSourcesArmed() async -> Bool {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(returning: !self.fileSources.isEmpty)
+            }
+        }
+    }
+
     /// Watches CodexRouter only while at least one Codex card is enabled. Keeping the watcher
     /// dormant otherwise avoids even opening/statting a turned-off provider's source files.
     func setEnabled(_ enabled: Bool) {
