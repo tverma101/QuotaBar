@@ -48,7 +48,7 @@ By submitting a pull request, you agree that your contribution is licensed under
 3. Fork the repo
 4. Create a branch (`feat/my-change`, `fix/some-bug`, etc.)
 5. Make only the approved change
-6. Run `swift build` and `swift test` to verify nothing is broken
+6. Run `swift build -j 2 --disable-index-store` and `bash script/test_suites.sh` to verify all Swift, Python, and shell test suites (see [testing](docs/testing.md))
 7. Open a PR against `main` and link your assigned, approved issue with `Fixes #<issue>`
 
 ### Add a provider

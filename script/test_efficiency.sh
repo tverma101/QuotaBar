@@ -1,33 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
 
-echo "==> OpenUsage deterministic efficiency contracts"
+jobs="${QUOTABAR_TEST_JOBS:-2}"
+if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'QUOTABAR_TEST_JOBS must be a positive integer.\n' >&2
+    exit 2
+fi
 
-echo "==> JSONL reader copy/buffer/tail contracts"
-swift test --filter JSONLFileReaderEfficiencyTests
-
-echo "==> Append checkpoint identity/state bounds"
-swift test --filter AppendOnlyFileTailCacheTests
-
-echo "==> Incremental scanner cache/concurrency contracts"
-swift test --filter IncrementalJSONLScannerTests
-
-echo "==> Multi-session resource-envelope contracts"
-swift test --filter ResourceEfficiencyContractTests
-
-echo "==> Repeated-refresh/parallel soak contracts"
-swift test --filter ResourceSoakContractTests
-
-echo "==> Cross-provider account-isolation contracts"
-swift test --filter CrossProviderAccountIsolationContractTests
-
-echo "==> Codex append-only efficiency contracts"
-swift test --filter CodexIncrementalEfficiencyTests
-
-echo "==> Codex local-log regression suite"
-swift test --filter CodexLogUsageScannerTests
-
-echo "==> Efficiency-focused suites passed"
+# One SwiftPM invocation avoids eight repeated build/index-store startups.
+# The full suite is covered by test_suites.sh; this is a fast, focused subset.
+printf '==> QuotaBar deterministic efficiency and account-isolation contracts\n'
+swift test -j "$jobs" --disable-index-store --filter \
+  'JSONLFileReaderEfficiencyTests|AppendOnlyFileTailCacheTests|IncrementalJSONLScannerTests|ResourceEfficiencyContractTests|ResourceSoakContractTests|CrossProviderAccountIsolationContractTests|CodexIncrementalEfficiencyTests|CodexLogUsageScannerTests'
+printf '==> Efficiency-focused suites passed\n
