@@ -22,7 +22,7 @@ enum MetricFormatter {
     private static let locale = Locale(identifier: "en_US")
 
     /// A bare number in the given kind and style (no unit label).
-    static func number(_ value: Double, kind: MetricKind, style: Style) -> String {
+    static func number(_ value: Double, kind: MetricKind, style: Style, currencyCode: String? = nil) -> String {
         switch kind {
         case .percent:
             // Percent is a bounded 0...100 domain, so clamp defensively: a bad sample (a provider
@@ -31,6 +31,16 @@ enum MetricFormatter {
             // and color (see `WidgetData.meterState`), not by an out-of-range headline number.
             return "\(Int(ProviderParse.clampPercent(value).rounded()))%"
         case .dollars:
+            if let code = currencyCode, code != "USD" {
+                let symbol = Locale(identifier: "en_US@currency=\(code)").currencySymbol ?? code + " "
+                if abs(value) >= 1000, style != .full {
+                    return symbol + value.formatted(.number.notation(.compactName).precision(.fractionLength(0...1)).locale(locale))
+                }
+                if style == .tray {
+                    return symbol + value.formatted(.number.precision(.fractionLength(0)).locale(locale))
+                }
+                return value.formatted(.currency(code: code).locale(locale))
+            }
             // Tray and row abbreviate four figures and up ("$1.2M", "$2.1K") so neither carries
             // "$2,059.07"; the full form (tooltips/headlines) always keeps grouped cents.
             if abs(value) >= 1000, style != .full {
@@ -66,7 +76,7 @@ enum MetricFormatter {
     /// Format a typed value and retain its saturation marker in the UI when the stored count is only
     /// a lower bound.
     static func number(for value: MetricValue, style: Style) -> String {
-        let text = number(value.number, kind: value.kind, style: style)
+        let text = number(value.number, kind: value.kind, style: style, currencyCode: value.currencyCode)
         let isLowerBound = value.isLowerBound == true
             || (value.kind == .count && value.tokenCountSaturated == true)
         return isLowerBound ? "≥\(text)" : text

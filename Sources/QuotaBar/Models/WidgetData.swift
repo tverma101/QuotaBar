@@ -18,6 +18,8 @@ struct WidgetData: Hashable {
     let title: String          // "Claude 5h", "Cursor credits"
     let icon: IconSource
     let kind: MetricKind
+    var currencyCode: String? = nil
+    var currencyFractionDigits: Int? = nil
     let used: Double
     var limit: Double?         // nil => unbounded (number tile); cleared when a .values line resolves
     var countSuffix: String?   // e.g. "credits", "requests"
@@ -264,7 +266,9 @@ struct WidgetData: Hashable {
         switch kind {
         case .percent: return value.rounded()
         case .count: return (value * 10).rounded() / 10
-        case .dollars: return (value * 100).rounded() / 100
+        case .dollars:
+            let scale = pow(10, Double(currencyFractionDigits ?? 2))
+            return (value * scale).rounded() / scale
         }
     }
 
@@ -301,7 +305,7 @@ struct WidgetData: Hashable {
                 let percent = min(100, max(0, Int((displayedValue / limit * 100).rounded())))
                 return "\(percent)%"
             }
-            let number = MetricFormatter.number(displayedValue, kind: kind, style: .tray)
+            let number = MetricFormatter.number(displayedValue, kind: kind, style: .tray, currencyCode: currencyCode)
             // Carry the unit: a bounded count meter (Freebuff's hours, Cursor's requests) otherwise
             // reads as a bare number in the strip, so "20" is indistinguishable from a token count,
             // a percent, or a session total. Percent and dollar meters are self-describing and stay
@@ -324,7 +328,7 @@ struct WidgetData: Hashable {
             return MetricFormatter.string(for: first, style: .tray)
         }
         if let valueTextOverride { return valueTextOverride }
-        let number = MetricFormatter.number(displayedValue, kind: kind, style: .tray)
+        let number = MetricFormatter.number(displayedValue, kind: kind, style: .tray, currencyCode: currencyCode)
         if kind == .count, let countSuffix { return "\(number) \(countSuffix)" }
         return number
     }
@@ -384,7 +388,9 @@ struct WidgetData: Hashable {
             // "$<limit> limit" — no "of" prefix, and cents only when the limit isn't a whole dollar.
             guard let limit else { return nil }
             let digits = limit.rounded() == limit ? 0 : 2
-            let amount = Formatters.currency(limit, fractionDigits: digits)
+            let amount = currencyCode == nil
+                ? Formatters.currency(limit, fractionDigits: digits)
+                : MetricFormatter.number(limit, kind: .dollars, style: .full, currencyCode: currencyCode)
             return "\(amount) \(limitNoun ?? "limit")"
         case .count:
             // The unit (e.g. "credits") shows whether the count is bounded or a plain balance.
@@ -413,7 +419,7 @@ struct WidgetData: Hashable {
             if selected.count == 1 {
                 let value = selected[0]
                 if value.kind == .dollars, let word = unboundedValueWord {
-                    return "\(MetricFormatter.number(value.number, kind: .dollars, style: .row)) \(word)"
+                    return "\(MetricFormatter.number(for: value, style: .row)) \(word)"
                 }
                 return MetricFormatter.string(for: value, style: .row)
             }
@@ -550,7 +556,7 @@ struct WidgetData: Hashable {
     /// Bounded/fallback formatting, delegated to the shared formatter so the popover and tray always
     /// agree. Unbounded `.values` rows format their values directly (`unboundedDetail`).
     private func format(_ value: Double) -> String {
-        MetricFormatter.number(value, kind: kind, style: .full)
+        MetricFormatter.number(value, kind: kind, style: .full, currencyCode: currencyCode)
     }
 }
 

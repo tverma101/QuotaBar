@@ -12,6 +12,7 @@ struct StalenessHint: Equatable {
 @MainActor
 @Observable
 final class WidgetDataStore {
+    @ObservationIgnored private var currencyPrecisions: [String: Int] = [:]
     private let registry: WidgetRegistry
     private let providersByID: [String: ProviderRuntime]
     private let cache: ProviderSnapshotCache
@@ -2148,6 +2149,20 @@ final class WidgetDataStore {
                 limitNoun: descriptor.sample.limitNoun,
                 infoNote: descriptor.sample.infoNote
             )
+            result.currencyCode = format.currencyCode
+            if let code = format.currencyCode {
+                if let digits = currencyPrecisions[code] {
+                    result.currencyFractionDigits = digits
+                } else {
+                    let formatter = NumberFormatter()
+                    formatter.locale = Locale(identifier: "en_US")
+                    formatter.numberStyle = .currency
+                    formatter.currencyCode = code
+                    let digits = formatter.maximumFractionDigits
+                    if currencyPrecisions.count < 16 { currencyPrecisions[code] = digits }
+                    result.currencyFractionDigits = digits
+                }
+            }
             // Descriptor opt-in (session-window meters read "Not started" when unused); the fresh
             // `.progress` result doesn't start from the sample, so carry the signal explicitly.
             result.sessionStartSignal = descriptor.sample.sessionStartSignal
