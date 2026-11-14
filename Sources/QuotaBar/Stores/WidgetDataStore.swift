@@ -219,6 +219,9 @@ final class WidgetDataStore {
     /// Wired by `ICloudUsageSyncStore`; debounced there so a concurrent provider batch produces one file.
     @ObservationIgnored var onLocalHistoryChanged: (@MainActor () -> Void)?
     @ObservationIgnored private var peerHistoryDocuments: [UsageHistoryDocument] = []
+    @ObservationIgnored private var vmBoxHistory: VMBoxUsageHistory?
+    @ObservationIgnored private var vmBoxHistoryTask: Task<Void, Never>?
+    @ObservationIgnored private var lastVMBoxHistory = VMBoxUsageHistory.Result()
     /// The merged daily fold is reused across quota-only refreshes. Its value arrays are shared with
     /// rendered snapshots through copy-on-write, while history, peer, enablement, and day changes
     /// explicitly invalidate it.
@@ -278,7 +281,8 @@ final class WidgetDataStore {
         providerRefreshTimeout: TimeInterval = WidgetDataStore.defaultProviderRefreshTimeout,
         notificationSettings: (@MainActor () -> NotificationSettingsStore)? = nil,
         postNotification: (@MainActor (String, String, String, String) async -> Bool)? = nil,
-        providerIdentityKeys: [String: String] = [:]
+        providerIdentityKeys: [String: String] = [:],
+        vmBoxHistoryDirectory: URL? = nil
     ) {
         precondition(slowProviderRefreshThreshold >= 0)
         precondition(providerRefreshTimeout > 0)
@@ -300,6 +304,7 @@ final class WidgetDataStore {
                 await AppNotifications.shared.post(idPrefix: idPrefix, title: title, subtitle: subtitle, body: body)
             }
         self.providerIdentityKeys = providerIdentityKeys
+        self.vmBoxHistory = vmBoxHistoryDirectory.map(VMBoxUsageHistory.init(directory:))
         self.meterStyle = defaults.enumValue(forKey: Self.meterStyleKey, default: .remaining)
         self.resetDisplayMode = defaults.enumValue(forKey: Self.resetDisplayModeKey, default: .relative)
         self.alwaysShowPacing = defaults.bool(forKey: Self.alwaysShowPacingKey)
@@ -329,6 +334,20 @@ final class WidgetDataStore {
         }
         self.localSnapshots = loaded
         self.snapshots = loaded
+        if vmBoxHistory != nil {
+            rebuildRenderedSnapshots()
+            vmBoxHistoryTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: .seconds(30)) } catch { return }
+                    guard let self else { return }
+                    self.rebuildRenderedSnapshots()
+                }
+            }
+        }
+    }
+
+    deinit {
+        vmBoxHistoryTask?.cancel()
     }
 
     /// Mark Codex card snapshots stale for this session so a ledger wake can re-scan JSONL without
@@ -1830,11 +1849,19 @@ final class WidgetDataStore {
     /// forget it. `ProviderSnapshot` is `Equatable`, so the comparison is cheap relative to the work this
     /// function has just done.
     private func rebuildRenderedSnapshots() {
-        guard !peerHistoryDocuments.isEmpty else {
-            if snapshots != localSnapshots { snapshots = localSnapshots }
+        let renderDate = now()
+        let vmBox = vmBoxHistory?.load(identityKeys: providerIdentityKeys,
+            providerIDs: Set(registry.providers.map(\.id)), now: renderDate) ?? .init()
+        if vmBox != lastVMBoxHistory {
+            lastVMBoxHistory = vmBox
+            invalidateMergedHistoryCache()
+        }
+        let peerDocuments = UsageHistoryDocument.newestByDevice(peerHistoryDocuments + vmBox.documents)
+        guard !peerDocuments.isEmpty else {
+            let rendered = applyingVMBoxWarnings(vmBox.warnings, to: applyingVMBoxZCodeTotal(vmBox.documents, to: localSnapshots))
+            if snapshots != rendered { snapshots = rendered }
             return
         }
-        let renderDate = now()
         let renderDayKey = DailyUsageAccumulator.dayKey(from: renderDate)
         if mergedHistoryCacheDayKey != renderDayKey {
             invalidateMergedHistoryCache()
@@ -1850,7 +1877,7 @@ final class WidgetDataStore {
         } else {
             merged = UsageHistoryAggregator.merged(
                 localSnapshots: localSnapshots,
-                peerDocuments: peerHistoryDocuments,
+                peerDocuments: peerDocuments,
                 descriptors: enabledDescriptors,
                 providerIdentityKeys: providerIdentityKeys,
                 now: renderDate
@@ -1867,7 +1894,7 @@ final class WidgetDataStore {
                 providerID: providerID,
                 displayName: provider.displayName,
                 lines: [],
-                refreshedAt: peerHistoryDocuments.map(\.updatedAt).max() ?? renderDate
+                refreshedAt: peerDocuments.map(\.updatedAt).max() ?? renderDate
             )
             rendered[providerID] = UsageHistorySnapshotRenderer.render(
                 local: local,
@@ -1876,7 +1903,44 @@ final class WidgetDataStore {
                 now: renderDate
             )
         }
+        rendered = applyingVMBoxZCodeTotal(vmBox.documents, to: rendered)
+        rendered = applyingVMBoxWarnings(vmBox.warnings, to: rendered)
         if snapshots != rendered { snapshots = rendered }
+    }
+
+    private func applyingVMBoxWarnings(_ warnings: [String: String], to values: [String: ProviderSnapshot]) -> [String: ProviderSnapshot] {
+        var result = values
+        for (id, warning) in warnings where isProviderEnabled(id) {
+            guard var snapshot = result[id] else { continue }
+            snapshot.historyWarning = [snapshot.historyWarning, warning].compactMap { $0 }.joined(separator: " · ")
+            result[id] = snapshot
+        }
+        return result
+    }
+
+    /// Older installations expose ZCode's cumulative Tokens tile rather than daily history.
+    /// Preserve that existing metric and its layout settings; newer daily-history catalogs use
+    /// the normal merger above. Neither path changes Z.ai Coding Plan quota meters.
+    private func applyingVMBoxZCodeTotal(_ documents: [UsageHistoryDocument], to values: [String: ProviderSnapshot]) -> [String: ProviderSnapshot] {
+        guard registry.historyDescriptorsByProvider["zai"] == nil,
+              registry.descriptors.contains(where: { $0.id == "zai.zcodeTokens" }),
+              isProviderEnabled("zai")
+        else { return values }
+        let remote = documents.compactMap { $0.providers["zai"] }.flatMap(\.series.daily)
+            .reduce(0.0) { $0 + Double($1.totalTokens) }
+        guard remote > 0, remote.isFinite else { return values }
+        var result = values
+        var snapshot = result["zai"] ?? ProviderSnapshot(providerID: "zai", displayName: "Z.ai", lines: [], refreshedAt: .distantPast)
+        var local = 0.0
+        for line in snapshot.lines {
+            if case let .values(label, numbers, _, _, _, _) = line, label == "ZCode Tokens" {
+                local += numbers.filter { $0.kind == .count }.reduce(0) { $0 + $1.number }
+            }
+        }
+        snapshot.lines.removeAll { $0.label == "ZCode Tokens" }
+        snapshot.lines.append(.values(label: "ZCode Tokens", values: [MetricValue(number: local + remote, kind: .count, label: "tokens")]))
+        result["zai"] = snapshot
+        return result
     }
 
     private func invalidateMergedHistoryCache() {
