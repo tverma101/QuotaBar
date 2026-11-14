@@ -1208,6 +1208,66 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         )
     }
 
+    func testRetiredRootHistorySurvivesScannerRestartAndSiblingUpdates() async throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let geminiRoot = home.appendingPathComponent(".gemini", isDirectory: true)
+        let directories = ["antigravity", "antigravity-cli"].map {
+            geminiRoot.appendingPathComponent($0, isDirectory: true)
+                .appendingPathComponent("conversations", isDirectory: true)
+        }
+        for directory in directories {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data().write(to: directory.appendingPathComponent("conversation.db"))
+        }
+        addTeardownBlock { try? FileManager.default.removeItem(at: home) }
+        let paths = directories.map { $0.appendingPathComponent("conversation.db").path }
+        let timestamp = UInt64(now.timeIntervalSince1970) - 3_600
+        let initial = antigravityGenerationBlob(model: "gemini-3.6-flash", input: 10, output: 5, timestamp: timestamp)
+        let sqlite = AntigravityFakeSQLite(rowsByPath: Dictionary(uniqueKeysWithValues: paths.map {
+            ($0, [.init(index: 0, blob: initial)])
+        }))
+        func scanner() -> AntigravityDbUsageScanner {
+            AntigravityDbUsageScanner(sqlite: sqlite, conversationsDirectories: {
+                try AntigravityDbUsageScanner.conversationDirectories(in: geminiRoot)
+            }, checkpointURL: home.appendingPathComponent("history.plist"))
+        }
+        let first = scanner()
+        let initialScan = await first.scan(now: now, pricing: pricing)
+        XCTAssertEqual(try XCTUnwrap(initialScan).series.daily.first?.totalTokens, 30)
+        let retired = directories[0].deletingLastPathComponent()
+        let backup = home.appendingPathComponent("retired-root")
+        try FileManager.default.moveItem(at: retired, to: backup)
+        sqlite.append(.init(index: 1, blob: antigravityGenerationBlob(
+            model: "gemini-3.6-flash", input: 20, output: 0, timestamp: timestamp
+        )), to: paths[1])
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: paths[1])
+
+        let restartedScan = await scanner().scan(now: now, pricing: pricing)
+        let restarted = try XCTUnwrap(restartedScan)
+        XCTAssertEqual(restarted.series.daily.first?.totalTokens, 50,
+                       "A restart must retain the missing root and include new sibling usage")
+        XCTAssertFalse(restarted.unmeasuredUsageDays?.isEmpty ?? true)
+
+        await first.unloadCachesForMemoryPressure()
+        let afterPressure = await first.scan(now: now, pricing: pricing)
+        XCTAssertEqual(try XCTUnwrap(afterPressure).series.daily.first?.totalTokens, 50)
+
+        try FileManager.default.moveItem(at: backup, to: retired)
+        let recoveredScan = await scanner().scan(now: now, pricing: pricing)
+        let recovered = try XCTUnwrap(recoveredScan)
+        XCTAssertEqual(recovered.series.daily.first?.totalTokens, 50,
+                       "Restoring a source must replace its checkpoint, not count both")
+        XCTAssertTrue(recovered.unmeasuredUsageDays?.isEmpty ?? true)
+
+        let renamedPath = directories[0].appendingPathComponent("renamed.db").path
+        try FileManager.default.moveItem(atPath: paths[0], toPath: renamedPath)
+        sqlite.moveRows(from: paths[0], to: renamedPath)
+        let renamedScan = await scanner().scan(now: now, pricing: pricing)
+        let renamed = try XCTUnwrap(renamedScan)
+        XCTAssertEqual(renamed.series.daily.first?.totalTokens, 50,
+                       "A renamed database must not be counted twice across restarts")
+    }
+
     func testConversationRootDiscoveryFailureCannotPublishPartialHistoryOrEvictCache() async throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let geminiRoot = home.appendingPathComponent(".gemini", isDirectory: true)

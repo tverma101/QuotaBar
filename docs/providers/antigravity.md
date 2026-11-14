@@ -75,7 +75,9 @@ compact SQLite digests, then decode appended rows. Older SQLite builds use bound
 batches. Historical edits, changed date matches, and time-zone changes rebuild the affected totals.
 Step-date indexes share a 64 MB in-memory budget; an index that exceeds the remaining budget evicts
 its whole database cache, and macOS memory pressure clears those database caches together so usage
-rows and their dates are rebuilt as one unit.
+rows and their dates are rebuilt as one unit. QuotaBar also keeps private, per-database accounting
+checkpoints on this Mac so a missing source's last measured tokens survive memory pressure and restarts.
+The checkpoints contain model names, token counts, and timestamps, not conversation content.
 
 The transcript logs don't include token accounting, so they aren't used. QuotaBar opens Antigravity
 databases in SQLite read-only mode and never retries with read-write access; SQLite may still use WAL
@@ -92,8 +94,13 @@ incomplete with a warning. When a row has a timestamp, QuotaBar marks its day as
 trusted, measured rows remain visible as partial lower bounds and the provider shows a warning. If a
 scan finds no measured rows, QuotaBar keeps the last visible history and still surfaces the warning.
 Rows without a trustworthy timestamp are excluded from dated totals and keep an incomplete-history
-warning until the source can be dated. Read failures remain visible alongside that warning. Missing-root contributions stay cached for the current session; after a
-restart, QuotaBar can only re-derive history from roots it can discover.
+warning until the source can be dated. Read failures remain visible alongside that warning. A missing
+source's checkpoint remains a lower bound until the source returns; its events are re-priced using the
+current price list. If the time zone changes while a source with step dates is missing, its checkpoint is
+withheld until the source returns because some date matches may become ambiguous. Sources lost before a
+checkpoint was first saved cannot be recovered from the combined history alone.
+If a checkpoint cannot be read or written, or one source's checkpoint exceeds 64 MiB, QuotaBar keeps
+the previous history and shows a warning until the checkpoint can be updated.
 An unreadable database uses its last-good cached rows when available and marks the combined result
 partial; readable sibling stores continue updating. If no database can be read and there is no cached
 result, the previous visible history is retained. Cached rows from a temporarily unreadable source recover
