@@ -154,8 +154,11 @@ final class AppLogTests: XCTestCase {
 
         _ = await store.refresh(providerID: provider.id, force: true)
         now.addTimeInterval(61)
+        // Deterministic credential failures back off for half an hour now: this probe is skipped.
         _ = await store.refresh(providerID: provider.id, force: false)
         _ = await store.refresh(providerID: provider.id, force: true)
+        now.addTimeInterval(30 * 60 + 1)
+        _ = await store.refresh(providerID: provider.id, force: false)
         _ = await store.refresh(providerID: provider.id, force: true)
         _ = await store.refresh(providerID: provider.id, force: true)
 
