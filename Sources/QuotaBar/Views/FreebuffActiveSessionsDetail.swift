@@ -12,9 +12,14 @@ struct FreebuffActiveSessionsDetail: View {
     private static let width: CGFloat = 300
 
     var body: some View {
-        let currentTime = now()
-        let active = sessions.filter { $0.expiresAt > currentTime }.sorted { $0.expiresAt < $1.expiresAt }
-        VStack(alignment: .leading, spacing: 10) {
+        TimelineView(.everyMinute) { context in
+            content(now: context.date)
+        }
+    }
+
+    private func content(now: Date) -> some View {
+        let active = sessions.filter { $0.expiresAt > now }.sorted { $0.expiresAt < $1.expiresAt }
+        return VStack(alignment: .leading, spacing: 10) {
             header(count: active.count)
             if active.isEmpty {
                 Text("No active sessions")
@@ -23,7 +28,7 @@ struct FreebuffActiveSessionsDetail: View {
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(active, id: \.instanceID) { session in
-                        sessionRow(session, now: currentTime)
+                        sessionRow(session, now: now)
                     }
                 }
             }

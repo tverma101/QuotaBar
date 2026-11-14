@@ -74,7 +74,7 @@ final class ClaudeProvider: ProviderRuntime {
                 .exportingHistory(
                     scope: .machineLocal,
                     estimatedCost: true,
-                    sourceNote: "From your Claude usage history (estimated)"
+                    sourceNote: "From your Claude usage history"
                 )
         ] + WidgetDescriptor.spendTiles(provider: provider)
     }
@@ -124,9 +124,14 @@ final class ClaudeProvider: ProviderRuntime {
             // credentials here can repeat a failed Keychain read during the visible retry's
             // history follow-up, even though this pass never uses the token or calls Anthropic.
             // The scanner is already bound to the card identity when account cards are created.
-            return await snapshotWithLocalUsage(
-                mapped: ClaudeMappedUsage(plan: nil, lines: []),
-                warning: nil
+            return await ScanWorkerClient.shared.foldOnlySnapshot(
+                provider: provider,
+                inProcessFallback: {
+                    await self.snapshotWithLocalUsage(
+                        mapped: ClaudeMappedUsage(plan: nil, lines: []),
+                        warning: nil
+                    )
+                }
             )
         }
         let manualActionID = ProviderRefreshContext.manualActionID
@@ -534,8 +539,8 @@ final class ClaudeProvider: ProviderRuntime {
         // partial result cannot replace the last-good combined history in WidgetDataStore.
         if !Task.isCancelled, let scan = DailyUsageAccumulator.merged([nativeScan, piScan]) {
             let note = piScan == nil
-                ? "From your Claude usage history (estimated)"
-                : "From your Claude usage history and pi (estimated)"
+                ? "From your Claude usage history"
+                : "From your Claude usage history and pi"
             usageHistory = ProviderUsageHistory(
                 series: scan.series,
                 modelUsage: scan.modelUsage,

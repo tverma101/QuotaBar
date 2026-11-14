@@ -58,8 +58,8 @@ extension WidgetDescriptor {
 
     /// Unbounded numeric row backed by a provider `.values` line. `selection` decides which of the
     /// row's values this tile renders (cost-only, tokens-only, or the combined `.all`); `valueWord` is
-    /// the trailing word for a lone dollar value ("spent", "left"). The ⓘ for a locally-estimated
-    /// dollar amount is data-driven (set when a shown value is `estimated`), so it isn't a parameter.
+    /// the trailing word for a lone dollar value ("spent", "left"). Whether a dollar value is imputed
+    /// is on the emitted `MetricValue.estimated`, not on the descriptor.
     static func values(
         id: String,
         provider: Provider,
@@ -112,6 +112,9 @@ extension WidgetDescriptor {
         return descriptors.map { descriptor in
             var sample = descriptor.sample
             sample.valueTooltipNote = valueTooltipNote
+            if descriptor.id.hasSuffix(".last30") {
+                sample.revealsBreakdownOnTap = true
+            }
             var copy = descriptor
             copy.sample = sample
             copy.isSpendTile = true

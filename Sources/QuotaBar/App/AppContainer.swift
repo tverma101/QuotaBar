@@ -1,3 +1,4 @@
+import Darwin
 import Dispatch
 import Foundation
 import KeyboardShortcuts
@@ -474,6 +475,8 @@ final class AppContainer {
             unload: { [weak dataStore] in
                 await PersistentJSONLScanCaches.unloadForMemoryPressure()
                 await dataStore?.unloadProviderCachesForMemoryPressure()
+                await ModelPricingStore.shared.clearCaches()
+                ProcessMemoryBudget.releaseAllocatorFreePages()
             },
             shouldDefer: { [weak dataStore] in
                 await MainActor.run { !(dataStore?.refreshingProviderIDs.isEmpty ?? true) }
@@ -496,7 +499,7 @@ final class AppContainer {
                     // Bounded wait (~5s): do not block unload forever if a provider is wedged.
                     for _ in 0..<50 {
                         if await !shouldDefer() { break }
-                        try? await Task.sleep(for: .milliseconds(100))
+                        try? await Task.sleep(for: .milliseconds(100), tolerance: .milliseconds(50))
                     }
                 }
                 await unload()
@@ -740,6 +743,15 @@ final class AppContainer {
                                 }
                             }
                             accountingTask = nil
+                            let keepWarm = transparency.popoverShown && !ProcessMemoryBudget.isOverSoftLimit
+                            await PersistentJSONLScanCaches.unloadAfterRefreshCycle(keepRouterItemsResident: keepWarm)
+                            await dataStore.unloadFreebuffAccountingCacheForMemoryPressure()
+                            if !transparency.popoverShown || ProcessMemoryBudget.isOverSoftLimit {
+                                await dataStore.unloadProviderCachesForMemoryPressure()
+                                await ModelPricingStore.shared.clearCaches()
+                            }
+                            URLCache.shared.removeAllCachedResponses()
+                            ProcessMemoryBudget.releaseAllocatorFreePages()
                             wakeSignal.signalWorkCompletion()
                         }
                     }
@@ -754,6 +766,24 @@ final class AppContainer {
                     await PersistentJSONLScanCaches.unloadAfterRefreshCycle(
                         keepRouterItemsResident: keepRouterIndexWarm
                     )
+                    // Release the provider database caches only over the soft budget. Unloading them
+                    // every closed-panel pass forced each accounting cycle to cold-rebuild Antigravity
+                    // (~25 s), Freebuff (~20 s), and Cursor (~9 s) from their local databases — both a
+                    // large recurring CPU sink and, via the rebuilds' parse churn interleaving with
+                    // the live heap, the dominant settled-footprint fragmentation. Warm caches are the
+                    // cheaper state; the soft budget and OS pressure still release them when they are
+                    // actually too big.
+                    if !transparency.popoverShown || ProcessMemoryBudget.isOverSoftLimit {
+                        await dataStore.unloadProviderCachesForMemoryPressure()
+                        await ModelPricingStore.shared.clearCaches()
+                    } else {
+                        // Freebuff's scan re-derives its turn cache every history pass regardless of
+                        // retention (an active session rewrites its receipts continuously), so its
+                        // derived caches cost memory without saving work; release them each cycle.
+                        await dataStore.unloadFreebuffAccountingCacheForMemoryPressure()
+                    }
+                    URLCache.shared.removeAllCachedResponses()
+                    ProcessMemoryBudget.releaseAllocatorFreePages()
                 }
                 // Re-evaluate quota pace milestones every tick — after the refresh so it sees fresh data,
                 // and on every loop (not just on a fetch) so pace worsening from elapsed time alone still
@@ -861,6 +891,20 @@ final class AppContainer {
                 }
             }
             }
+        }
+    }
+
+    /// Drops resident accounting parse caches and trims memory when the panel closes.
+    /// The user is not looking at the popover, so keeping multi-megabyte raw parse trees resident
+    /// serves no purpose; any subsequent background refresh or reopen will re-hydrate incrementally.
+    func purgeClosedPanelCaches() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await PersistentJSONLScanCaches.unloadAfterRefreshCycle(keepRouterItemsResident: false)
+            await dataStore.unloadProviderCachesForMemoryPressure()
+            await ModelPricingStore.shared.clearCaches()
+            URLCache.shared.removeAllCachedResponses()
+            ProcessMemoryBudget.releaseAllocatorFreePages()
         }
     }
 

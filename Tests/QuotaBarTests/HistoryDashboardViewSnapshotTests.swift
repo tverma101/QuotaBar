@@ -11,8 +11,9 @@ import XCTest
 @MainActor
 final class HistoryDashboardViewSnapshotTests: XCTestCase {
     func testRendersHistoryScreenWithFixtureData() throws {
-        let suiteName = "HistoryDashboardViewSnapshotTests"
+        let suiteName = "HistoryDashboardViewSnapshotTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.removePersistentDomain(forName: suiteName)
 
         let providers: [any ProviderRuntime] = [ClaudeProvider(), CodexProvider(), GrokProvider()]
@@ -99,7 +100,7 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
         )
         hosting.cacheDisplay(in: hosting.bounds, to: rep)
         let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("quotabar_history_render.png")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("quotabar_history_render-\(UUID().uuidString).png")
         try png.write(to: url)
         print("history render saved to: \(url.path), size: \(hosting.bounds.size), bytes: \(png.count)")
         XCTAssertGreaterThan(png.count, 20_000, "a real history screen renders far more than a blank bitmap")
@@ -111,8 +112,9 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
     /// and only the hero's "Est." mark remains.
     @MainActor
     func testEstimateCardHiddenWhenFoldCostIsTheEstimate() throws {
-        let suiteName = "HistoryDashboardViewSnapshotTests-EstimateSuppressed"
+        let suiteName = "HistoryDashboardViewSnapshotTests-EstimateSuppressed.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.removePersistentDomain(forName: suiteName)
 
         let providers: [any ProviderRuntime] = [ClaudeProvider(), CodexProvider()]
@@ -159,7 +161,7 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
         hosting.cacheDisplay(in: hosting.bounds, to: rep)
         let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("quotabar_history_render_no_estimate_card.png")
+            .appendingPathComponent("quotabar_history_render_no_estimate_card-\(UUID().uuidString).png")
         try png.write(to: url)
         print("suppressed render saved to: \(url.path), bytes: \(png.count)")
     }

@@ -90,18 +90,50 @@ actor FreebuffModelCatalog {
             normalized(String($0.split(separator: "/").last ?? Substring($0)))
         }
         var routes: [String: String] = entries.compactMapValues { entry -> String? in
-            guard let matches = index[normalized(entry.displayName)], matches.count == 1 else { return nil }
-            return matches.first
+            if let matches = index[normalized(entry.displayName)], matches.count == 1 {
+                return matches.first
+            }
+            // Freebuff removed its Flash Fast serving mode: the catalogue still lists the old key,
+            // but hosted receipts only ever carry the plain Flash slug, so the base model serves
+            // that usage. Collapse the removed mode onto its base name so it prices as the model
+            // that actually served it, never at the retired Fast-tier estimate rates.
+            if let base = removedModeBaseName(entry.displayName),
+               let matches = index[normalized(base)], matches.count == 1 {
+                return matches.first
+            }
+            return nil
         }
         // OpenRouter has no separate DeepSeek Flash Fast route. A verified model-specific alias
         // may point to a curated public route rate instead; only consider it after exact OpenRouter
         // matching, so the public route keeps precedence and unrelated variants stay unpriced.
         for (model, entry) in entries where routes[model] == nil {
-            guard let canonical = pricing.supplement.canonicalName(for: entry.displayName),
+            // A removed Fast mode resolves through its base model's alias, keeping the retired
+            // Fast-tier canonical unreachable from catalogue names.
+            let name = removedModeBaseName(entry.displayName) ?? entry.displayName
+            guard let canonical = pricing.supplement.canonicalName(for: name),
                   pricing.supplement.pricing[canonical] != nil else { continue }
             routes[model] = canonical
         }
         return routes
+    }
+
+    /// The base model name when a display name carries Freebuff's removed "Fast" serving mode, or
+    /// nil for every other name. Mode words sit behind a trailing snapshot date
+    /// (`DeepSeek V4.1 Flash Fast 10/17`), so the date is stripped first — the same date-then-mode
+    /// order `groupName` uses. Slow remains a real, separately-served mode and is never stripped.
+    static func removedModeBaseName(_ displayName: String) -> String? {
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dateStripped = trimmed.replacingOccurrences(
+            of: #"\s+\d{1,2}/\d{1,2}$"#,
+            with: "", options: [.regularExpression, .caseInsensitive]
+        )
+        guard dateStripped.range(of: #"\s+Fast$"#, options: [.regularExpression, .caseInsensitive]) != nil
+        else { return nil }
+        let base = dateStripped.replacingOccurrences(
+            of: #"\s+Fast$"#,
+            with: "", options: [.regularExpression, .caseInsensitive]
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        return base.isEmpty ? nil : base
     }
 
     private static func normalized(_ name: String) -> String {

@@ -160,6 +160,10 @@ enum JSONLFileReader {
                     )
                 }
             }
+            // Between chunks the fold's freed parse objects are still contiguous on the free
+            // lists; check in so the allocator returns them before the next chunk interleaves
+            // them with live pages. Threshold-gated: small reads never trigger relief.
+            ProcessMemoryBudget.reliefCheckpointIfGrown()
         }
 
         if readFailed {

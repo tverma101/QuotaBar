@@ -350,6 +350,11 @@ cat >"$INFO_PLIST" <<PLIST
       <string>None</string>
     </dict>
   </dict>
+  <key>LSEnvironment</key>
+  <dict>
+    <key>MallocLargeCache</key>
+    <string>0</string>
+  </dict>
 </dict>
 </plist>
 PLIST

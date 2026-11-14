@@ -4,6 +4,22 @@ import os
 @testable import QuotaBar
 
 final class AntigravityAccountingProjectionTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        // Scans persist derivation records; keep each test's writes in a scratch directory so no
+        // fixture leaks into (or warms from) the user's real scan cache.
+        AntigravityAggregatePersistence.directoryOverride = FileManager.default.temporaryDirectory
+            .appendingPathComponent("antigravity-projection-tests-\(UUID().uuidString)", isDirectory: true)
+    }
+
+    override func tearDown() {
+        if let override = AntigravityAggregatePersistence.directoryOverride {
+            try? FileManager.default.removeItem(at: override)
+        }
+        AntigravityAggregatePersistence.directoryOverride = nil
+        super.tearDown()
+    }
+
     private func varint(_ value: UInt64) -> [UInt8] {
         var n = value
         var result: [UInt8] = []
@@ -69,13 +85,8 @@ final class AntigravityAccountingProjectionTests: XCTestCase {
     func testRealSQLiteOversizedRowIsCountedOnceAndReusedOnWarmScan() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer {
-            let trash = Process()
-            trash.executableURL = URL(fileURLWithPath: "/usr/bin/trash")
-            trash.arguments = ["-v", directory.path]
-            try? trash.run()
-            trash.waitUntilExit()
-        }
+        // Same destination (the Trash) without spawning a trash subprocess per test run.
+        defer { try? FileManager.default.trashItem(at: directory, resultingItemURL: nil) }
         let path = directory.appendingPathComponent("history.db").path
         var database: OpaquePointer?
         XCTAssertEqual(sqlite3_open(path, &database), SQLITE_OK)

@@ -116,13 +116,30 @@ struct CodexAuthStore: Sendable {
         files: TextFileAccessing = LocalTextFileAccessor(),
         keychain: KeychainAccessing = SecurityKeychainAccessor(),
         now: @escaping @Sendable () -> Date = Date.init,
-        expectedIdentityKey: String? = nil
+        expectedIdentityKey: String? = nil,
+        additionalAuthHomes: [String] = []
     ) {
         self.environment = environment
         self.files = files
         self.keychain = keychain
         self.now = now
         self.expectedIdentityKey = Self.normalizedIdentityKey(expectedIdentityKey)
+        self.additionalAuthHomes = additionalAuthHomes.map(Self.absoluteHomePath)
+    }
+
+    /// Extra homes whose `auth.json` should be tried after the primary home, in order. Used
+    /// when an account's router-home credential is stale or revoked but the same account is live in
+    /// `~/.codex/auth.json` (the CLI's own login). Candidates from here are identity-filtered like
+    /// any other source, so an additional home holding a *different* account is invisible.
+    private let additionalAuthHomes: [String]
+
+    private static func absoluteHomePath(_ home: String) -> String {
+        let trimmed = (home.trimmingTrailingSlashes as NSString).expandingTildeInPath
+        if trimmed.hasPrefix("/") {
+            return URL(fileURLWithPath: trimmed, isDirectory: true)
+                .resolvingSymlinksInPath().standardizedFileURL.path
+        }
+        return trimmed
     }
 
     func loadAuthCandidates() throws -> [CodexAuthState] {
@@ -302,10 +319,16 @@ struct CodexAuthStore: Sendable {
     }
 
     func authPaths() -> [String] {
+        let primary: [String]
         if let codexHome = codexHome() {
-            return [joinPath(codexHome, Self.authFile)]
+            primary = [joinPath(codexHome, Self.authFile)]
+        } else {
+            primary = Self.defaultAuthHomes.map { joinPath($0, Self.authFile) }
         }
-        return Self.defaultAuthHomes.map { joinPath($0, Self.authFile) }
+        // Fallback homes (e.g. ~/.codex for a router-home card) come last, in order, deduped.
+        var seen = Set<String>()
+        let paths = primary + additionalAuthHomes.map { joinPath($0, Self.authFile) }
+        return paths.filter { seen.insert(URL(fileURLWithPath: $0).standardizedFileURL.path).inserted }
     }
 
     func codexHome() -> String? {

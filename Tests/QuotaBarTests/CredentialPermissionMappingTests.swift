@@ -98,6 +98,9 @@ final class CredentialPermissionMappingTests: XCTestCase {
         }
     }
 
+    /// The mirror case for the Cursor triad: with no database credential, the Keychain *is* the only
+    /// source, so a refusal is the real answer and must still surface as the permission error rather
+    /// than as "not logged in".
     func testCursorKeychainRefusalThrowsInsteadOfReturningNil() throws {
         let store = CursorAuthStore(sqlite: MissingSQLite(), keychain: RefusingKeychain())
         XCTAssertThrowsError(try store.loadAuthState()) { error in
@@ -247,14 +250,6 @@ extension CredentialPermissionMappingTests {
         XCTAssertEqual(state.accessToken, "sqlite-token")
     }
 
-    /// The mirror: with no database credential, the Keychain *is* the only source, so a refusal is the
-    /// real answer and must still surface as the permission error rather than as "not logged in".
-    func testKeychainRefusalStillSurfacesWhenThereIsNoOtherCredential() {
-        let store = CursorAuthStore(sqlite: MissingSQLite(), keychain: RefusingKeychain())
-        XCTAssertThrowsError(try store.loadAuthState()) { error in
-            XCTAssertEqual(error as? CursorAuthError, .credentialPermissionRequired)
-        }
-    }
 }
 
 private extension CredentialPermissionMappingTests {

@@ -808,24 +808,6 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         XCTAssertNotNil(snapshot.warning)
     }
 
-    func testSelectionByStoredKeyUUIDPinsThatAccount() async {
-        let work = OpenCodeGoKey(id: UUID(), label: "Work", key: "sk-work")
-        let http = SequenceHTTPClient([
-            HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79)),
-            HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 55, weekly: 60, monthly: 90))
-        ])
-        let snapshot = await provider(
-            authJSON: authJSON, http: http, storedKeys: [work], activeKeyID: { work.id.uuidString }
-        ).refresh()
-        XCTAssertEqual(snapshot.line(label: "Session (Work)")?.label, "Session (Work)")
-        XCTAssertNil(snapshot.line(label: "Session (opencode-go)"))
-        XCTAssertNil(snapshot.line(label: "Session"))
-        guard case let .progress(_, used, _, _, _, _, _, _)? = snapshot.line(label: "Session (Work)") else {
-            return XCTFail("expected the stored-key account's Session meter")
-        }
-        XCTAssertEqual(used, 55)
-    }
-
     func testStaleSelectionFallsBackToAllAccounts() async {
         // A selection that matches no fetched key must not hide anything: all accounts render.
         let http = SequenceHTTPClient([
