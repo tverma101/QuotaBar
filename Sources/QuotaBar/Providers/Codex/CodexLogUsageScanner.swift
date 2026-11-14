@@ -1126,19 +1126,32 @@ actor CodexLogUsageScanner {
             if sourceDirs.isEmpty {
                 continue
             }
+            // `.jsonl.zst` archives are always discovered; when zstd itself is absent they are
+            // dropped (with one process-wide warning) so the fold degrades to today's behavior
+            // instead of failing the whole source as unreadable.
             for dir in sourceDirs.map({ $0.resolvingSymlinksInPath() }) where seenDirs.insert(dir.path).inserted {
                 guard !Task.isCancelled,
-                      let discovered = JSONLScanning.jsonlFilesIfComplete(under: dir)
+                      let discovered = JSONLScanning.jsonlFilesIfComplete(under: dir, includeCompressedJSONL: true)
                 else { return nil }
                 for file in discovered {
                     guard !Task.isCancelled else { return nil }
+                    if file.path.hasSuffix(".zst"), ZstdDecompressor.shared.zstdExecutable == nil {
+                        DiagnosticGate.logOnce(for: "codex.zstd-unavailable") {
+                            AppLog.warn(
+                                LogTag.plugin("codex"),
+                                "zstd is not installed (expected at /opt/homebrew/bin/zstd or /usr/local/bin/zstd); compressed rollout archives are skipped"
+                            )
+                        }
+                        continue
+                    }
                     let relative = String(file.path.dropFirst(dir.path.count))
                     guard seenRelative.insert(relative).inserted else { continue }
                     let fileURL = URL(fileURLWithPath: file.path)
                     // Rollout IDs are globally unique. This catches copied backfills whose inode
                     // differs from the canonical file, while leaving generic fixture names and any
-                    // future non-rollout JSONL sources untouched.
-                    let rolloutName = fileURL.lastPathComponent
+                    // future non-rollout JSONL sources untouched. A `.jsonl.zst` archive shares its
+                    // rollout id with the plain `.jsonl`, so both collapse onto the same dedupe key.
+                    let rolloutName = Self.normalizedRolloutName(fileURL.lastPathComponent)
                     if rolloutName.hasPrefix("rollout-"), !seenRolloutNames.insert(rolloutName).inserted {
                         continue
                     }
@@ -1178,11 +1191,22 @@ actor CodexLogUsageScanner {
 
     /// Read only the head of a rollout to find the account that created it. `session_meta` is the
     /// first line of every rollout and `creator_account_id` is among its first keys, so 16 KB is
-    /// generous. Returns nil for missing/unparseable/absent metadata (older rollouts).
+    /// generous. Returns nil for missing/unparseable/absent metadata (older rollouts). `.jsonl.zst`
+    /// archives are read through the decompressor's prefix path, so the peek stays cheap.
     static func peekCreatorAccountID(path: String) -> String? {
+        if path.hasSuffix(".zst") {
+            guard let prefix = ZstdDecompressor.shared.decompressPrefix(path: path, maxBytes: 16 * 1024) else {
+                return nil
+            }
+            return peekCreatorAccountID(in: prefix)
+        }
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
         let head = handle.readData(ofLength: 16 * 1024)
+        return peekCreatorAccountID(in: head)
+    }
+
+    private static func peekCreatorAccountID(in head: Data) -> String? {
         let marker = Data(#""creator_account_id":""#.utf8)
         guard let range = head.range(of: marker) else { return nil }
         let rest = head[range.upperBound...]
@@ -1349,7 +1373,8 @@ actor CodexLogUsageScanner {
             ) else { return nil }
             for case let url as URL in enumerator {
                 guard !Task.isCancelled else { return nil }
-                guard url.pathExtension == "jsonl" else { continue }
+                let compressed = url.lastPathComponent.hasSuffix(".jsonl.zst")
+                guard url.pathExtension == "jsonl" || (ZstdDecompressor.shared.zstdExecutable != nil && compressed) else { continue }
                 guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]) else { return nil }
                 guard values.isRegularFile == true else { continue }
                 guard let identity = fileIdentity(at: url) else { return nil }
@@ -1358,6 +1383,12 @@ actor CodexLogUsageScanner {
             guard !enumerationFailed else { return nil }
         }
         return result
+    }
+
+    /// Rollout file names differ only by the `.zst` suffix between a finished archive and the live
+    /// source. The identity of a rollout for dedupe purposes drops that suffix.
+    static func normalizedRolloutName(_ name: String) -> String {
+        name.hasSuffix(".zst") ? String(name.dropLast(4)) : name
     }
 
     static func fileIdentity(at url: URL) -> FileIdentity? {
@@ -1392,6 +1423,71 @@ actor CodexLogUsageScanner {
         return parser.finish()
     }
 
+    /// Parse a finished `.jsonl.zst` rollout through the decompressor. The decompressor itself is
+    /// optional equipment — nil here means "zstd missing", which the discovery path already filtered
+    /// out, so this is reached only on machines with zstd. Results are memoized per process keyed on
+    /// the archive's revision; appends never happen to a finished rollout, so the memo is exact.
+    private final class CompressedRolloutCache: @unchecked Sendable {
+        static let shared = CompressedRolloutCache()
+        private struct Entry {
+            let revision: AppendOnlyFileRevision
+            let mtimeKey: String
+            let items: [Event]
+        }
+        private let lock = NSLock()
+        private var entries: [String: Entry] = [:]
+
+        private static func key(revision: AppendOnlyFileRevision, times: AppendOnlyFileModificationTimes) -> String {
+            "\(revision.device)-\(revision.inode)-\(revision.size)-\(times.mtimeSeconds)-\(times.mtimeNanoseconds)-\(times.ctimeSeconds)-\(times.ctimeNanoseconds)"
+        }
+
+        func load(path: String, revision: AppendOnlyFileRevision, times: AppendOnlyFileModificationTimes) -> [Event]? {
+            let keyValue = Self.key(revision: revision, times: times)
+            return lock.withLock { () -> [Event]? in
+                guard let entry = entries[path], entry.mtimeKey == keyValue else { return nil }
+                return entry.items
+            }
+        }
+
+        func store(path: String, revision: AppendOnlyFileRevision, times: AppendOnlyFileModificationTimes, items: [Event]) {
+            let keyValue = Self.key(revision: revision, times: times)
+            lock.withLock {
+                if entries.count >= 512 {
+                    // Archives are few and static; dropping the whole memo on overflow keeps the
+                    // cache trivially correct without an eviction policy.
+                    entries.removeAll(keepingCapacity: true)
+                }
+                entries[path] = Entry(revision: revision, mtimeKey: keyValue, items: items)
+            }
+        }
+    }
+
+    nonisolated private static func parseCompressedRollout(at url: URL, emitSince: Date) -> [Event]? {
+        let key = url.standardizedFileURL.path
+        guard let stamp = AppendOnlyFileProbe.stamp(at: url) else { return nil }
+        if let cached = CompressedRolloutCache.shared.load(path: key, revision: stamp.revision, times: stamp.modificationTimes) {
+            return cached.filter { $0.timestamp >= emitSince }
+        }
+        do {
+            guard let data = try ZstdDecompressor.shared.decompress(path: url.path) else { return nil }
+            var parser = FileParser(emitSince: nil)
+            for line in data.split(separator: UInt8(ascii: "\n")) {
+                autoreleasepool {
+                    parser.consume(line)
+                }
+            }
+            guard !parser.hasMalformedUsage else { return nil }
+            let items = parser.finish()
+            CompressedRolloutCache.shared.store(path: key, revision: stamp.revision, times: stamp.modificationTimes, items: items)
+            return items.filter { $0.timestamp >= emitSince }
+        } catch is CancellationError {
+            return nil
+        } catch {
+            // The read-failure reporter reports this as unreadable and the fold keeps last-good.
+            return nil
+        }
+    }
+
     /// Read only bytes after the prior EOF when the file still proves to be an append of the same
     /// prefix. Otherwise perform the safe full streaming parse and replace the checkpoint.
     nonisolated private static func parseFileIncrementally(
@@ -1399,6 +1495,12 @@ actor CodexLogUsageScanner {
         emitSince: Date,
         retentionDays: Int
     ) -> [Event]? {
+        // `.jsonl.zst` archives are finished rollouts — read-once, never appended. They bypass the
+        // append-only checkpoint machinery entirely and go through the decompressor with a
+        // process-local cache: re-folds in a long-lived process must not re-decompress the archive.
+        if url.pathExtension == "zst" || url.lastPathComponent.hasSuffix(".jsonl.zst") {
+            return parseCompressedRollout(at: url, emitSince: emitSince)
+        }
         let key = tailKey(for: url, retentionDays: retentionDays)
         let currentStamp = AppendOnlyFileProbe.stamp(at: url)
 
