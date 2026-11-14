@@ -61,6 +61,20 @@ final class WidgetDataStore {
     /// than the AC meter cadence; on battery, the next two-minute quota tick retries it. The manual
     /// `force` refresh (⌘R) always bypasses it.
     private static let failureRetryBackoff: TimeInterval = 60
+
+    /// Provider-failure negative cache keyed by failure category. Credential-access and structurally
+    /// invalid auth failures are deterministic: the failing probe spends a Keychain read and a process
+    /// scan every minute for no new information, so those get a half-hour window instead of the
+    /// one-minute transient cadence. Manual refresh always bypasses the backoff, and a success clears
+    /// it immediately, so this never strands a genuinely-recovered provider.
+    static func failureRetryBackoff(for category: ErrorCategory?) -> TimeInterval {
+        switch category {
+        case .credentialAccess, .notLoggedIn, .authInvalid:
+            return 30 * 60
+        default:
+            return failureRetryBackoff
+        }
+    }
     static let defaultSlowProviderRefreshThreshold: TimeInterval = 10
     /// Hard deadline for a single provider's `refresh()` call. If the provider hasn't returned by then
     /// the refresh is cancelled, the spinner stops, and the failure is surfaced like any other error.
@@ -1338,7 +1352,7 @@ final class WidgetDataStore {
                 domains: failureDomains
             )
             // Negative-cache the failure so a wake burst can't re-probe this provider in a tight loop.
-            let retryAfter = now().addingTimeInterval(Self.failureRetryBackoff)
+            let retryAfter = now().addingTimeInterval(Self.failureRetryBackoff(for: snapshot.errorCategory))
             for key in failureBackoffKeys { failureRetryAfter[key] = retryAfter }
             let failureIdentity = ProviderFailureLogIdentity(message: message, category: snapshot.errorCategory)
             let priorLoggedFailures = lastLoggedProviderFailure[providerID, default: [:]]

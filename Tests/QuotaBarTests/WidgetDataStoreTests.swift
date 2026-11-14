@@ -38,6 +38,17 @@ final class WidgetDataStoreTests: XCTestCase {
         XCTAssertFalse(context.6)
     }
 
+    func testFailureBackoffIsCategoryAware() {
+        // Deterministic credential failures get a half-hour negative cache; transient classes keep
+        // the one-minute cadence they were tuned for.
+        XCTAssertEqual(WidgetDataStore.failureRetryBackoff(for: .credentialAccess), 30 * 60)
+        XCTAssertEqual(WidgetDataStore.failureRetryBackoff(for: .notLoggedIn), 30 * 60)
+        XCTAssertEqual(WidgetDataStore.failureRetryBackoff(for: .authInvalid), 30 * 60)
+        XCTAssertEqual(WidgetDataStore.failureRetryBackoff(for: .network), 60)
+        XCTAssertEqual(WidgetDataStore.failureRetryBackoff(for: .http5xx), 60)
+        XCTAssertEqual(WidgetDataStore.failureRetryBackoff(for: nil), 60)
+    }
+
     func testCatalogReloadCancelsEveryProviderRefresh() async {
         let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
         let descriptor = WidgetDescriptor.percent(id: "test.session", provider: provider, title: "Session")

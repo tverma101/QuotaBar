@@ -50,7 +50,15 @@ quota can be fetched; an old reset does not prove that the allowance is still de
 
 If neither is available you'll see *Start Antigravity or run `agy` and try again.* An expired access token with no refresh token is reported as expired sign-in. A Cloud Code 403 is shown as an access denial and does not trigger an OAuth refresh.
 
+When a refresh fails with a deterministic credential failure (an unreadable or denied Keychain item — not a transient network error), the provider backs off for half an hour instead of probing every meter tick; the manual **Refresh Now** action always probes immediately, and one successful refresh clears the backoff. If the meters stay stale across launches, grant access (**Refresh Now** → **Always Allow**) or disable the provider in Customize.
+
 ## Spend and usage history
+
+Note the daily numbers can be nonzero on days you never opened Antigravity: the fold counts every
+generation the IDE recorded locally — including autonomous/background agent turns. QuotaBar cannot
+distinguish an agent turn from one you typed, and it will not silently drop either, so the history
+is simply what Antigravity's stores hold. If you don't want these rows counted, disable the provider;
+the meters keep their last-good values while it is off.
 
 QuotaBar reads generation token counts, including the fixed system prompt, from every
 `~/.gemini/antigravity*/conversations/*.db` store. This covers the app, IDE, CLI, and compatible
