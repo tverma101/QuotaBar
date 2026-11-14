@@ -24,7 +24,9 @@ actor AntigravityDbUsageScanner {
     private let readFailureReporter: UsageLogReadFailureReporter
     private let oversizedBlobReporter: UsageLogReadFailureReporter
     private let projectOversized: @Sendable (String, Int, Int) throws -> [UInt8]?
+    private let checkpointURL: URL?
     private var scanCache: [String: CachedDatabase] = [:]
+    private var checkpointFolds: [String: CachedCheckpointFold] = [:]
     private var sqliteSupportsSHA3Aggregate: Bool?
 
     struct ConversationDirectoryDiscovery: Sendable {
@@ -37,6 +39,7 @@ actor AntigravityDbUsageScanner {
         conversationsDirectory: (@Sendable () -> String)? = nil,
         conversationsDirectories: (@Sendable () throws -> [String])? = nil,
         conversationDiscovery: (@Sendable () throws -> ConversationDirectoryDiscovery)? = nil,
+        checkpointURL: URL? = nil,
         readFailureWarning: UsageLogReadFailureReporter.Warning? = nil,
         oversizedBlobWarning: UsageLogReadFailureReporter.Warning? = nil,
         projectOversized: @escaping @Sendable (String, Int, Int) throws -> [UInt8]? = {
@@ -45,6 +48,8 @@ actor AntigravityDbUsageScanner {
     ) {
         self.sqlite = sqlite
         self.projectOversized = projectOversized
+        self.checkpointURL = checkpointURL ?? (conversationDiscovery == nil && conversationsDirectory == nil
+            && conversationsDirectories == nil ? AntigravityHistoryCheckpoint.defaultURL : nil)
         if let conversationDiscovery {
             self.discoverConversationDirectories = conversationDiscovery
         } else if let conversationsDirectory {
@@ -126,6 +131,8 @@ actor AntigravityDbUsageScanner {
         now: Date = Date(),
         pricing: ModelPricing
     ) async -> AntigravityDbUsageScanResult {
+        let scanStartedAt = Date()
+        var checkpointRecords: [AntigravityHistoryCheckpoint.Record] = []
         let home = FileManager.default.homeDirectoryForCurrentUser
         let geminiRoot = home.appendingPathComponent(".gemini", isDirectory: true).path
         let discoveredDirectories: [String]
@@ -212,7 +219,8 @@ actor AntigravityDbUsageScanner {
         // while readable databases continue to update.
         let retainedAbsentCachedPaths = absentCachedPaths.filter { scanCache[$0] != nil }
 
-        guard !paths.isEmpty || !retainedAbsentCachedPaths.isEmpty || !cachedPathsUnderUnreadableDirectories.isEmpty else {
+        guard !paths.isEmpty || !retainedAbsentCachedPaths.isEmpty || !cachedPathsUnderUnreadableDirectories.isEmpty
+                || checkpointURL != nil else {
             let newlyFailing = await readFailureReporter.update(
                 checkedPaths: checkedPaths,
                 failingPaths: Set(failingPaths.keys).subtracting(absentCachedPaths)
@@ -226,6 +234,10 @@ actor AntigravityDbUsageScanner {
         }
 
         var databaseScans: [LogUsageScan] = []
+        var representedPaths = Set<String>()
+        var representedIdentities = Set<DatabaseIdentity>()
+        var checkpointUpdates: [AntigravityHistoryCheckpoint.Record] = []
+        var reusedCheckpointPaths = Set<String>()
         let pricingToken = pricing.aggregateCacheToken
         let timeZoneIdentifier = Calendar.current.timeZone.identifier
         var oversizedPaths: Set<String> = []
@@ -236,6 +248,7 @@ actor AntigravityDbUsageScanner {
                 return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: false)
             }
             let lastGoodAggregate = scanCache[path]?.aggregate
+            let lastGoodIdentity = scanCache[path]?.fingerprint.databaseIdentity
             do {
                 let cached = try await cachedDatabase(path: path, since: since, observedAt: now)
                 guard !Task.isCancelled else {
@@ -255,6 +268,13 @@ actor AntigravityDbUsageScanner {
                     now: now
                 ) else { return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: false) }
                 databaseScans.append(aggregate)
+                representedPaths.insert(path)
+                representedIdentities.insert(cached.fingerprint.databaseIdentity)
+                if checkpointURL != nil {
+                    checkpointUpdates.append(Self.checkpointRecord(
+                        path: path, cached: cached, observedAt: scanStartedAt, timeZoneIdentifier: timeZoneIdentifier
+                    ))
+                }
             } catch is CancellationError {
                 return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: false)
             } catch {
@@ -277,6 +297,8 @@ actor AntigravityDbUsageScanner {
                     databaseScans.append(staleAggregate.markingUnmeasuredUsage(
                         on: Set(staleAggregate.series.daily.map(\.date)).union([DailyUsageAccumulator.dayKey(from: now)])
                     ))
+                    representedPaths.insert(path)
+                    representedIdentities.insert(cached.fingerprint.databaseIdentity)
                 } else if let lastGoodAggregate {
                     // An oversized step index evicts its whole database cache. Preserve the last
                     // completed fold for this scan without keeping generation rows or step IDs alive.
@@ -286,6 +308,8 @@ actor AntigravityDbUsageScanner {
                     databaseScans.append(staleScan.markingUnmeasuredUsage(
                         on: Set(staleScan.series.daily.map(\.date)).union([DailyUsageAccumulator.dayKey(from: now)])
                     ))
+                    representedPaths.insert(path)
+                    if let lastGoodIdentity { representedIdentities.insert(lastGoodIdentity) }
                 }
             }
         }
@@ -310,6 +334,106 @@ actor AntigravityDbUsageScanner {
             databaseScans.append(aggregate.markingUnmeasuredUsage(
                 on: Set(aggregate.series.daily.map(\.date)).union([DailyUsageAccumulator.dayKey(from: now)])
             ))
+            representedPaths.insert(path)
+            representedIdentities.insert(cached.fingerprint.databaseIdentity)
+        }
+
+        guard !Task.isCancelled else { return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: false) }
+        if let checkpointURL {
+            do {
+                checkpointRecords = try AntigravityHistoryCheckpoint.update(
+                    at: checkpointURL, records: checkpointUpdates,
+                    excluding: { path, candidate in
+                        if representedPaths.contains(path)
+                            || representedIdentities.contains(DatabaseIdentity(device: candidate.device, inode: candidate.inode)) {
+                            return true
+                        }
+                        guard let fold = checkpointFolds[path], fold.device == candidate.device, fold.inode == candidate.inode,
+                              fold.revision == candidate.revision, fold.sourceWindowStart == candidate.windowStart,
+                              fold.stepTimeZone == candidate.stepTimeZone, fold.slot == candidate.slot,
+                              fold.recordBytes == candidate.recordBytes,
+                              fold.recordModifiedAt == candidate.recordModifiedAt,
+                              fold.timeZoneIdentifier == timeZoneIdentifier,
+                              fold.pricingToken == pricingToken, fold.windowStart <= since,
+                              fold.latestRelevant >= since,
+                              fold.recomputeAfter.map({ now < $0 }) != false,
+                              fold.latestAccepted.map({ $0 <= JSONLScanning.maximumTimestamp(now: now) }) != false
+                        else { return false }
+                        reusedCheckpointPaths.insert(path)
+                        return true
+                    },
+                    tolerateInvalid: { path, candidate in
+                        representedPaths.contains(path)
+                            || representedIdentities.contains(DatabaseIdentity(device: candidate.device, inode: candidate.inode))
+                    },
+                    valid: { record in
+                        (try? DatabaseFingerprint(path: record.path).checkpointRevision) == record.revision
+                    }
+                )
+            } catch is CancellationError {
+                return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: false)
+            } catch {
+                AppLog.warn(LogTag.plugin("antigravity"), "history checkpoint could not be updated: \(error.localizedDescription)")
+                return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: true)
+            }
+        }
+        checkpointFolds = checkpointFolds.filter { reusedCheckpointPaths.contains($0.key) }
+        for path in reusedCheckpointPaths.sorted() {
+            guard let fold = checkpointFolds[path] else { continue }
+            let stale = fold.scan.droppingDays(before: DailyUsageAccumulator.dayKey(from: since))
+            databaseScans.append(stale.markingUnmeasuredUsage(
+                on: Set(stale.series.daily.map(\.date)).union([DailyUsageAccumulator.dayKey(from: now)])
+            ))
+            representedPaths.insert(path)
+            representedIdentities.insert(DatabaseIdentity(device: fold.device, inode: fold.inode))
+            hasUnknownIncompleteSource = true
+        }
+        for record in checkpointRecords.sorted(by: { $0.path < $1.path }) {
+            let identity = DatabaseIdentity(device: record.device, inode: record.inode)
+            guard !representedPaths.contains(record.path), !representedIdentities.contains(identity) else { continue }
+            guard record.events.contains(where: { Date(timeIntervalSince1970: TimeInterval($0.timestampSeconds)) >= since })
+                || (record.undated + record.oversized + record.invalidTokens + record.malformed)
+                    .contains(where: { Date(timeIntervalSince1970: TimeInterval($0)) >= since }) else { continue }
+            guard !Task.isCancelled else { return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: false) }
+            if let zone = record.stepTimeZone, zone != Calendar.current.timeZone.identifier {
+                // A formerly unambiguous step match can span different days in another zone.
+                // Without the original step metadata, don't assign those events to a guessed day.
+                databaseScans.append(DailyUsageAccumulator().build().markingUnmeasuredUsage(
+                    on: [DailyUsageAccumulator.dayKey(from: now)]
+                ))
+                hasUnknownIncompleteSource = true
+                continue
+            }
+            let result = Self.scanCheckpoint(record, since: since, now: now, pricing: pricing)
+            guard !Task.isCancelled else { return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: false) }
+            let stale = result.scan
+            guard let candidate = record.checkpointCandidate else {
+                return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: true)
+            }
+            let fold = CachedCheckpointFold(
+                device: record.device, inode: record.inode, revision: record.revision,
+                sourceWindowStart: record.windowStart, stepTimeZone: record.stepTimeZone,
+                slot: candidate.slot, recordBytes: candidate.recordBytes,
+                recordModifiedAt: candidate.recordModifiedAt,
+                timeZoneIdentifier: timeZoneIdentifier, pricingToken: pricingToken, windowStart: since,
+                latestRelevant: Self.latestCheckpointDate(record),
+                scan: stale, recomputeAfter: result.recomputeAfter, latestAccepted: result.latestAccepted,
+                estimatedBytes: Self.estimatedFoldBytes(stale)
+            )
+            let retainedBytes = checkpointFolds.values.reduce(0) { $0 + $1.estimatedBytes }
+            if fold.estimatedBytes <= 8 * 1024 * 1024 - retainedBytes {
+                checkpointFolds[record.path] = fold
+            }
+            databaseScans.append(stale.markingUnmeasuredUsage(
+                on: Set(stale.series.daily.map(\.date)).union([DailyUsageAccumulator.dayKey(from: now)])
+            ))
+            representedPaths.insert(record.path)
+            representedIdentities.insert(identity)
+            hasUnknownIncompleteSource = true
+        }
+
+        if paths.isEmpty && databaseScans.isEmpty && failingPaths.isEmpty {
+            return AntigravityDbUsageScanResult(scan: nil, hasReadFailures: false)
         }
 
         let newlyFailing = await readFailureReporter.update(
@@ -341,6 +465,57 @@ actor AntigravityDbUsageScanner {
             )
         }
         return AntigravityDbUsageScanResult(scan: merged, hasReadFailures: !failingPaths.isEmpty)
+    }
+
+    private static func checkpointRecord(
+        path: String, cached: CachedDatabase, observedAt: Date, timeZoneIdentifier: String
+    ) -> AntigravityHistoryCheckpoint.Record {
+        AntigravityHistoryCheckpoint.Record(
+            path: path, device: cached.fingerprint.databaseIdentity.device,
+            inode: cached.fingerprint.databaseIdentity.inode,
+            revision: cached.fingerprint.checkpointRevision, observedAt: observedAt,
+            windowStart: cached.windowStart,
+            stepTimeZone: cached.hasStepMetadata == true
+                ? (cached.stepTimestampIndex?.timeZoneIdentifier ?? timeZoneIdentifier) : nil,
+            events: cached.events,
+            undated: cached.undatedUsageTimestamps, oversized: cached.oversizedTimestamps,
+            invalidTokens: cached.invalidTokenTimestamps, malformed: cached.malformedUsageTimestamps
+        )
+    }
+
+    /// Reprice the last observed accounting events using today's rates and calendar when their
+    /// source's timestamp matches remain valid in this time zone.
+    private static func scanCheckpoint(
+        _ record: AntigravityHistoryCheckpoint.Record, since: Date, now: Date, pricing: ModelPricing
+    ) -> (scan: LogUsageScan, recomputeAfter: Date?, latestAccepted: Date?) {
+        var accumulator = DailyUsageAccumulator()
+        let maximum = JSONLScanning.maximumTimestamp(now: now)
+        let skew = maximum.timeIntervalSince(now)
+        var recomputeAfter: Date?
+        var latestAccepted: Date?
+        JSONLAccountingWorkPacer.shared.forEach(record.events) { event in
+            let date = Date(timeIntervalSince1970: TimeInterval(event.timestampSeconds))
+            guard date <= maximum else {
+                let transition = date.addingTimeInterval(-skew)
+                recomputeAfter = min(recomputeAfter ?? transition, transition)
+                return
+            }
+            latestAccepted = max(latestAccepted ?? date, date)
+            accumulate(event, since: since, pricing: pricing, into: &accumulator)
+        }
+        return (accumulator.build(), recomputeAfter, latestAccepted)
+    }
+
+    private static func estimatedFoldBytes(_ scan: LogUsageScan) -> Int {
+        let models = scan.modelUsage?.daily.reduce(0) { $0 + $1.models.count } ?? 0
+        return (scan.series.daily.count + models) * 512
+    }
+
+    private static func latestCheckpointDate(_ record: AntigravityHistoryCheckpoint.Record) -> Date {
+        let latestEvent = record.events.lazy.map(\.timestampSeconds).max()
+        let latestIssue = [record.undated.max(), record.oversized.max(), record.invalidTokens.max(), record.malformed.max()]
+            .compactMap { $0 }.max()
+        return Date(timeIntervalSince1970: TimeInterval(max(latestEvent ?? .min, latestIssue ?? .min)))
     }
 
     /// Reuse the priced per-database fold while its source revision, pricing snapshot, calendar
@@ -757,9 +932,10 @@ actor AntigravityDbUsageScanner {
     /// Step dates and generation rows form one cache unit. Pressure drops the whole unit so a later
     /// scan rebuilds both together instead of pairing new generations with an old date index.
     func unloadCachesForMemoryPressure() {
-        guard !scanCache.isEmpty else { return }
+        guard !scanCache.isEmpty || !checkpointFolds.isEmpty else { return }
         let releasedIndexBytes = retainedStepTimestampIndexBytes()
         scanCache.removeAll(keepingCapacity: false)
+        checkpointFolds.removeAll(keepingCapacity: false)
         AppLog.info(
             .refresh,
             "Antigravity memory-pressure unload released database caches (step index estimate \(releasedIndexBytes / 1_048_576) MB)"
@@ -1269,6 +1445,12 @@ actor AntigravityDbUsageScanner {
         }
 
         var databaseIdentity: DatabaseIdentity { database.identity }
+        var checkpointRevision: String {
+            func components(_ stamp: FileStamp) -> String {
+                "\(stamp.identity.device):\(stamp.identity.inode):\(stamp.size):\(stamp.modificationSeconds):\(stamp.modificationNanoseconds):\(stamp.changeSeconds):\(stamp.changeNanoseconds)"
+            }
+            return components(database) + "/" + (wal.map(components) ?? "none")
+        }
         var databaseSize: Int64 { database.size }
         var latestModification: Date {
             max(
@@ -1304,5 +1486,24 @@ actor AntigravityDbUsageScanner {
         let scan: LogUsageScan
         let recomputeAfter: Date?
         let latestAcceptedTimestamp: Int64?
+    }
+
+    private struct CachedCheckpointFold {
+        let device: UInt64
+        let inode: UInt64
+        let revision: String
+        let sourceWindowStart: Date
+        let stepTimeZone: String?
+        let slot: Int
+        let recordBytes: Int64
+        let recordModifiedAt: Date
+        let timeZoneIdentifier: String
+        let pricingToken: String
+        let windowStart: Date
+        let latestRelevant: Date
+        let scan: LogUsageScan
+        let recomputeAfter: Date?
+        let latestAccepted: Date?
+        let estimatedBytes: Int
     }
 }
