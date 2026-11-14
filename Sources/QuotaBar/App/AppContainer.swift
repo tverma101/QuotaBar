@@ -153,7 +153,8 @@ final class AppContainer {
             pinnedMetricIDs: { [layout] in layout.pinnedMetricIDs },
             hiddenMenuBarProviderIDs: { [layout] in layout.hiddenMenuBarProviderIDs },
             notificationSettings: { notificationSettings },
-            providerIdentityKeys: providerIdentityKeys
+            providerIdentityKeys: providerIdentityKeys,
+            vmBoxHistoryDirectory: VMBoxUsageHistory.defaultDirectory
         )
         let iCloudSync = ICloudUsageSyncStore(dataStore: dataStore)
         let ledgerWatcher = CodexRouterLedgerWatcher(
