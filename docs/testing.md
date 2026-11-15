@@ -23,10 +23,11 @@ bash script/test_efficiency.sh
 
 This uses one `swift test` process with a combined filter instead of repeatedly starting SwiftPM. It is a developer convenience, **not** a substitute for the full suites above.
 
-The Rust-core benchmark is opt-in and prints a comparison of the Rust FFI parser against the Swift reference implementation:
+The Rust-core benchmarks are opt-in and print a comparison of the Rust FFI parser against the Swift reference implementation:
 
 ```sh
 QUOTABAR_CLAUDE_PARSE_BENCH=1 swift test --filter testClaudeParseBenchmarkRustVsSwift
+QUOTABAR_CODEX_PARSE_BENCH=1 swift test --filter testCodexParseBenchmarkRustVsSwift
 ```
 
 ## Interpreting skips

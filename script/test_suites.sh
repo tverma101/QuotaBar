@@ -6,6 +6,11 @@ cd "$repo_root"
 
 printf '\n==> Rust core\n'
 bash script/build_rust_core.sh
+(
+    cd Rust/quotabar-core
+    printf '\n==> Rust unit tests\n'
+    cargo test --release --locked
+)
 
 jobs="${QUOTABAR_TEST_JOBS:-2}"
 if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then

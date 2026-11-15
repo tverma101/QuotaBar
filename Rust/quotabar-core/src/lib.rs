@@ -1,20 +1,23 @@
 //! QuotaBar core — performance-critical primitives compiled to a static library and called from
 //! the Swift app over the C ABI declared in `Sources/CQuotabarCore/include/quotabar_core.h`.
 //!
-//! Stage 1 ports the Claude usage-line parser (`ClaudeLogUsageScanner.parseEntries` in Swift).
-//! The Swift implementation remains in the tree as the reference oracle and as the runtime
+//! Stage 1 ports the Claude usage-line parser (`ClaudeLogUsageScanner.parseEntries` in Swift);
+//! stage 2 ports the Codex rollout-line parser (`CodexLogUsageScanner.FileParser` in Swift).
+//! The Swift implementations remain in the tree as the reference oracles and as the runtime
 //! fallback for shapes this fast path deliberately rejects with the null-pointer `Fallback`
 //! signal: usage lines whose timestamp is a string but is not one of the canonical UTC shapes
 //! handled here, and lines that would exceed the fixed per-line entry cap. Every other input
 //! produces byte-for-byte the same result the Swift parser produces, including the
-//! `malformedTokenCounts` side channel.
+//! `malformedTokenCounts` / `hasMalformedUsage` side channels.
 
 use serde_json::{Map, Value};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
+mod codex;
+
 const MAX_ENTRIES_PER_LINE: usize = 64;
-const NIL_STRING: u32 = u32::MAX;
+pub(crate) const NIL_STRING: u32 = u32::MAX;
 
 /// Status returned by [`qb_claude_result_status`].
 pub const QB_CLAUDE_STATUS_PARSED: u32 = 0;
@@ -59,7 +62,7 @@ pub struct ClaudeParseResult {
 // Canonical UTC timestamp parsing (mirror of OpenUsageISO8601's canonical fast path)
 // ---------------------------------------------------------------------------
 
-enum CanonicalTimestamp {
+pub(crate) enum CanonicalTimestamp {
     /// Parsed successfully: seconds + millis since the epoch.
     Ok(f64),
     /// Canonical shape, invalid calendar values — Swift's `parseCanonicalUTC` returns nil for
@@ -69,7 +72,7 @@ enum CanonicalTimestamp {
     NotCanonical,
 }
 
-fn is_ascii_digit(b: u8) -> bool {
+pub(crate) fn is_ascii_digit(b: u8) -> bool {
     b.is_ascii_digit()
 }
 
@@ -81,7 +84,7 @@ fn number(bytes: &[u8], range: std::ops::Range<usize>) -> u32 {
     value
 }
 
-fn parse_canonical_utc(s: &[u8]) -> CanonicalTimestamp {
+pub(crate) fn parse_canonical_utc(s: &[u8]) -> CanonicalTimestamp {
     let (millis,) = match s.len() {
         20 if s[19] == b'Z' => (0,),
         24 if s[19] == b'.' && s[23] == b'Z'
@@ -608,7 +611,7 @@ fn parse_line(line: &[u8]) -> LineOutcome {
 // C ABI
 // ---------------------------------------------------------------------------
 
-fn intern(blob: &mut Vec<u8>, s: &str) -> Option<(u32, u32)> {
+pub(crate) fn intern(blob: &mut Vec<u8>, s: &str) -> Option<(u32, u32)> {
     let offset: u32 = blob.len().try_into().ok()?;
     let length: u32 = s.len().try_into().ok()?;
     if u64::from(offset) + u64::from(length) > u64::from(u32::MAX) {
@@ -677,7 +680,7 @@ fn build_result(outcome: LineOutcome) -> *mut ClaudeParseResult {
 /// ABI version of this library. Bump when the entry layout changes.
 #[no_mangle]
 pub extern "C" fn qb_core_version() -> u32 {
-    1
+    2
 }
 
 /// Parse one Claude usage line.
