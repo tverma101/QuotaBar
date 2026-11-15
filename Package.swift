@@ -1,5 +1,13 @@
 // swift-tools-version: 6.2
+import Foundation
 import PackageDescription
+
+// Absolute path to the Rust static library directory, so the CQuotabarCore clang target can
+// link the archive produced by script/build_rust_core.sh regardless of the checkout location.
+let rustCoreReleaseLibrary = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .appendingPathComponent("Rust/quotabar-core/target/release")
+    .path
 
 let package = Package(
     name: "QuotaBar",
@@ -20,8 +28,20 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CQuotabarCore",
+            path: "Sources/CQuotabarCore",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedLibrary("quotabar_core"),
+                // The Rust static library is produced by script/build_rust_core.sh (run
+                // automatically by build_and_run.sh, ci.yml and script/test_suites.sh).
+                .unsafeFlags(["-L", rustCoreReleaseLibrary])
+            ]
+        ),
+        .target(
             name: "QuotaBar",
             dependencies: [
+                "CQuotabarCore",
                 .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
                 .product(name: "PostHog", package: "posthog-ios")
             ],

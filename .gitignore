@@ -33,3 +33,5 @@ appcast.xml
 # Personal agent tooling: kept in the working tree, never published.
 .codex/
 .cursor/
+Rust/quotabar-core/target/
+__pycache__/

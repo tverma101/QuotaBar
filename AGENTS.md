@@ -51,7 +51,13 @@ Conventions for the per-provider modules under `Sources/QuotaBar/Providers/<Name
 
 ## Building
 
-`swift build` and `swift test` are the normal commands, but the single `QuotaBar` module is large
+`swift build` and `swift test` are the normal commands. The package links a small Rust static
+library (`Rust/quotabar-core`, see `docs/rust-core.md`) into the `CQuotabarCore` clang target, so
+**run `bash script/build_rust_core.sh` once after cloning** (it is also run automatically by
+`script/build_and_run.sh`, `script/test_suites.sh` and CI). A plain `swift build` without the
+archive fails at link time.
+
+The single `QuotaBar` module is large
 enough that `-emit-module` is the peak-memory step of the whole build. On a machine under memory
 pressure the kernel kills `swift-frontend` mid-`emit-module` and SwiftPM reports only
 `error: SwiftCompile ... failed with a nonzero exit code` — with no compiler diagnostic, because the
