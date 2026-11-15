@@ -110,6 +110,10 @@ struct CodexAuthStore: Sendable {
     /// different ChatGPT account, or auth whose account-id and id-token disagree, is invisible and
     /// cannot be persisted through this store. Provider-level checks remain as a second defense.
     var expectedIdentityKey: String?
+    /// Every `auth.json` home already verified to hold `expectedIdentityKey`. When non-empty these
+    /// replace the single `CODEX_HOME` path, so a card can fall back to another home of the *same*
+    /// account instead of going dark when one home's rotated refresh token goes stale.
+    var candidateAuthHomes: [String]
 
     init(
         environment: EnvironmentReading = QuotaBarEnvironmentReader(),
@@ -117,7 +121,8 @@ struct CodexAuthStore: Sendable {
         keychain: KeychainAccessing = SecurityKeychainAccessor(),
         now: @escaping @Sendable () -> Date = Date.init,
         expectedIdentityKey: String? = nil,
-        additionalAuthHomes: [String] = []
+        additionalAuthHomes: [String] = [],
+        candidateAuthHomes: [String] = []
     ) {
         self.environment = environment
         self.files = files
@@ -125,6 +130,8 @@ struct CodexAuthStore: Sendable {
         self.now = now
         self.expectedIdentityKey = Self.normalizedIdentityKey(expectedIdentityKey)
         self.additionalAuthHomes = additionalAuthHomes.map(Self.absoluteHomePath)
+        var seenHomes = Set<String>()
+        self.candidateAuthHomes = candidateAuthHomes.filter { seenHomes.insert($0).inserted }
     }
 
     /// Extra homes whose `auth.json` should be tried after the primary home, in order. Used
@@ -163,7 +170,22 @@ struct CodexAuthStore: Sendable {
         if candidates.isEmpty, let firstError {
             throw firstError
         }
+        if candidateAuthHomes.count > 1 {
+            // Prefer the token that will live longest: homes of one account refresh independently,
+            // so file order alone would keep retrying a bundle the CLI already rotated away.
+            candidates.sort { credentialFreshness($0) > credentialFreshness($1) }
+        }
         return candidates
+    }
+
+    /// Sort key for same-identity candidates: access-token expiry, then the recorded refresh time.
+    /// Unknown values sort last instead of pretending to be fresh.
+    private func credentialFreshness(_ state: CodexAuthState) -> (TimeInterval, TimeInterval) {
+        let expiry = state.auth.tokens?.accessToken
+            .flatMap(accessTokenExpiresAt)?.timeIntervalSince1970 ?? -1
+        let refreshed = state.auth.lastRefresh
+            .flatMap(OpenUsageISO8601.date(from:))?.timeIntervalSince1970 ?? -1
+        return (expiry, refreshed)
     }
 
     /// Reads the credential from a single on-disk auth file — the targeted counterpart to
@@ -319,6 +341,15 @@ struct CodexAuthStore: Sendable {
     }
 
     func authPaths() -> [String] {
+        // A caller that verified homes for one account passes them; they are tried in order and
+        // ignore any environment override. Otherwise the environment-home (or default set) is the
+        // primary source and explicitly-configured additional homes come last, deduped.
+        if !candidateAuthHomes.isEmpty {
+            var candidateSeen = Set<String>()
+            return candidateAuthHomes
+                .map { joinPath($0, Self.authFile) }
+                .filter { candidateSeen.insert(URL(fileURLWithPath: $0).standardizedFileURL.path).inserted }
+        }
         let primary: [String]
         if let codexHome = codexHome() {
             primary = [joinPath(codexHome, Self.authFile)]

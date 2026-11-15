@@ -469,6 +469,8 @@ actor CodexLogUsageScanner {
         pricing: ModelPricing,
         peerHomes peerHomesOverride: [URL]? = nil
     ) async -> CodexLogUsageScanResult {
+        let homes = codexHomes()
+        guard !Task.isCancelled else { return .incomplete }
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
         let futureIdentity = "codex.native.\(context.identity)"
         guard let files = Self.sessionFilesIfComplete(
@@ -516,7 +518,7 @@ actor CodexLogUsageScanner {
         }
 
         let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
-        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map { $0.path }))
         for file in files where FutureTimestampRevisionGate.shouldDefer(
             identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
         ) {
@@ -957,7 +959,7 @@ actor CodexLogUsageScanner {
             return true
         }
         let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
-        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map { $0.path }))
         for file in files where FutureTimestampRevisionGate.shouldDefer(
             identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
         ) {
@@ -989,8 +991,10 @@ actor CodexLogUsageScanner {
             fileCompleted: { path, _ in bucket.finish(path) }
         )
         guard complete else { return false }
+        // Index once instead of scanning the whole file list per future-timestamp entry.
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         for (path, timestamp) in bucket.futureTimestamps {
-            guard let file = files.first(where: { $0.path == path }),
+            guard let file = filesByPath[path],
                   FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
             else { return false }
         }
@@ -2241,9 +2245,9 @@ actor CodexLogUsageScanner {
 
     static func autoReviewFallback(at timestamp: String) -> String {
         let date = String(timestamp.prefix(10))
-        guard date.count == 10,
-              date.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
-        else { return "gpt-5" }
+        // Called for every unresolvable auto-review/reserve row on every refresh; a shape check
+        // avoids compiling the same regex per row.
+        guard ProviderParse.hasISODayShape(date) else { return "gpt-5" }
         return autoReviewFallbacks.first(where: { date >= $0.releasedOn })?.model ?? "gpt-5"
     }
 

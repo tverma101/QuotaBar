@@ -65,7 +65,10 @@ enum LocalLimitsAPI {
             fetchedAt = OpenUsageISO8601.string(from: snapshot.refreshedAt)
             let expiry = snapshot.refreshedAt.addingTimeInterval(RefreshSetting.interval)
             expiresAt = OpenUsageISO8601.string(from: expiry)
-            stale = generatedAt >= expiry
+            // A snapshot stamped after the report was generated cannot be trusted: the clock moved
+            // backwards, or the timestamp came from another machine. Reporting it as fresh made an
+            // honestly-stale resource look current until that future instant passed.
+            stale = snapshot.refreshedAt > generatedAt || generatedAt >= expiry
 
             var resources: [String: WireResource] = [:]
             for descriptor in descriptors {

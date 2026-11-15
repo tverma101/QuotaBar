@@ -192,7 +192,7 @@ final class LogUsageAggregateScannerIntegrationTests: XCTestCase {
         let scanner = CodexRouterUsageScanner(
             ledgerPaths: { [ledger.path] },
             identityAliases: { [:] },
-            aggregateCache: cache
+            persistentAggregateCache: cache
         )
         let pricing = TestPricing.bundled
 

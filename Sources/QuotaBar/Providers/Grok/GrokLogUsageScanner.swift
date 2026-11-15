@@ -115,8 +115,10 @@ actor GrokLogUsageScanner {
             fileCompleted: { path, _ in bucket.finish(path) }
         )
         guard complete, !Task.isCancelled else { return nil }
+        // Index once instead of scanning the whole file list per future-timestamp entry.
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         for (path, timestamp) in bucket.futureTimestamps {
-            guard let file = files.first(where: { $0.path == path }),
+            guard let file = filesByPath[path],
                   FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
             else { return nil }
         }

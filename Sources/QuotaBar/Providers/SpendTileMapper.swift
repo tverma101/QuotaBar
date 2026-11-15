@@ -265,7 +265,9 @@ enum SpendTileMapper {
         let value = rawDate.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
 
-        if value.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil {
+        // Shape checks instead of `range(of:options:.regularExpression)`: this runs once per history
+        // row on every refresh, and the regex form compiled the pattern each time.
+        if ProviderParse.hasISODayShape(value) {
             return value
         }
 
@@ -273,14 +275,11 @@ enum SpendTileMapper {
             return dayKey(from: date)
         }
 
-        if let match = value.range(of: #"^\d{4}-\d{2}-\d{2}"#, options: .regularExpression) {
-            return String(value[match])
+        if let prefix = ProviderParse.isoDayPrefix(value) {
+            return prefix
         }
-        if value.range(of: #"^\d{8}$"#, options: .regularExpression) != nil {
-            let year = value.prefix(4)
-            let month = value.dropFirst(4).prefix(2)
-            let day = value.suffix(2)
-            return "\(year)-\(month)-\(day)"
+        if let compact = ProviderParse.compactDayKey(value) {
+            return compact
         }
 
         return fallbackDateFormatterAccess.withLock { $0.date(from: value) }.map(dayKey(from:))

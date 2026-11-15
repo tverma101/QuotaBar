@@ -326,7 +326,10 @@ struct ProviderSnapshotCache {
         let age = now().timeIntervalSince(freshnessStamp)
         let trusted = allowsPersistedFreshness || writtenThisSession
         let effectiveTTL = freshnessInterval ?? ttl
-        let fresh = trusted && age < effectiveTTL
+        // A stamp in the future (clock corrected backwards, or a snapshot restored from another
+        // Mac) yields a negative age. Treating that as fresh suppressed every refresh for as long
+        // as the skew lasted, leaving the card on data that could no longer be trusted.
+        let fresh = trusted && age >= 0 && age < effectiveTTL
         let reason = !trusted ? "stale (not written this session)"
             : fresh ? "fresh" : "stale"
         AppLog.debug(.cache, "\(providerID) staleness \(Int(age))s vs ttl \(Int(effectiveTTL))s -> \(reason)")

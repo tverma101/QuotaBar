@@ -228,6 +228,15 @@ struct WidgetData: Hashable {
             }
         }
 
+        /// A projection percentage safe to print. `used` is untrusted provider data: a huge but finite
+        /// sample makes `Pace` project beyond `Double`'s range, and `Int(infinity)` traps while the row
+        /// is merely being drawn. Saturate instead of killing the menu-bar process.
+        private static func wholePercent(_ fraction: Double, complement: Bool = false) -> Int {
+            guard fraction.isFinite else { return complement ? 0 : 100 }
+            let percent = (complement ? (1 - fraction) : fraction) * 100
+            return ProviderParse.intFromClampedDouble(percent.rounded(), lower: 0, upper: 100_000)
+        }
+
         /// Hover-tooltip detail shared by the bar, the spare note, and the flame: a short numeric
         /// projection of where pace lands at reset, adding the one figure the row doesn't already
         /// show. Blue → the projected cushion ("~35% left at reset"); amber → projected usage
@@ -240,15 +249,15 @@ struct WidgetData: Hashable {
             case .noData, .level: return nil
             case .spent: return "Limit reached"
             case .healthy(let projectedFraction):
-                let left = Int(((1 - projectedFraction) * 100).rounded())
+                let left = Self.wholePercent(projectedFraction, complement: true)
                 return "~\(left)% left at reset"
             case .closeToLimit(_, let projectedFraction):
-                let used = Int((projectedFraction * 100).rounded())
+                let used = Self.wholePercent(projectedFraction)
                 return "~\(used)% used at reset"
             case .runningOut(_, let projectedFraction):
                 guard projectedFraction > 1 else { return "~100% used at reset" }
                 // Floored to 1% so a bar projected even slightly over never reads "~0% over limit".
-                let over = max(1, Int(((projectedFraction - 1) * 100).rounded()))
+                let over = max(1, Self.wholePercent(projectedFraction - 1))
                 return "~\(over)% over limit at reset"
             }
         }
@@ -302,8 +311,14 @@ struct WidgetData: Hashable {
         if let limit, limit > 0 {
             if kind == .percent {
                 // Percent is the only bounded unit that should collapse to a tray percentage. Clamp both
-                // ends so a provider sample can never print "-5%" or "105%" beside the icon.
-                let percent = min(100, max(0, Int((displayedValue / limit * 100).rounded())))
+                // ends so a provider sample can never print "-5%" or "105%" beside the icon. The
+                // sanitizer also covers an untrusted sample: `Int(_:)` on a large or NaN value traps,
+                // and this runs on every menu-bar repaint.
+                let percent = ProviderParse.intFromClampedDouble(
+                    (displayedValue / limit * 100).rounded(),
+                    lower: 0,
+                    upper: 100
+                )
                 return "\(percent)%"
             }
             let number = MetricFormatter.number(displayedValue, kind: kind, style: .tray, currencyCode: currencyCode)
@@ -460,7 +475,14 @@ struct WidgetData: Hashable {
     /// couldn't fetch" — the usage-body fallback carries the count but no expiry list, so `expiriesAt`
     /// is empty while the row still reads e.g. "3 available".
     var resetCreditCount: Int {
-        Int((selectedValues.first?.number ?? 0).rounded(.down))
+        // A row value originates in a provider payload (or a persisted snapshot), and `Int(_:)` on a
+        // large double traps. No plan has a meaningful count past this bound, so saturating keeps the
+        // row renderable instead of killing the process.
+        ProviderParse.intFromClampedDouble(
+            (selectedValues.first?.number ?? 0).rounded(.down),
+            lower: 0,
+            upper: 1_000_000
+        )
     }
 
     /// Hover tooltip for a row carrying expiry instants (the Codex reset-credit row, "2 available"):

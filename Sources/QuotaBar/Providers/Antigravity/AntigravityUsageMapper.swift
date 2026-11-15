@@ -291,8 +291,14 @@ enum AntigravityUsageMapper {
     // MARK: - Pooling helpers (pure)
 
     /// "Gemini 3 Pro (High)" → "Gemini 3 Pro" — strip a trailing parenthetical variant.
+    /// Compiled once: this runs for every model label on every legacy refresh, and
+    /// `range(of:options:.regularExpression)` recompiles the pattern per call.
+    private static let trailingParenthetical = try! NSRegularExpression(pattern: #"\s*\([^)]*\)\s*$"#)
+
     static func normalizeLabel(_ label: String) -> String {
-        if let range = label.range(of: #"\s*\([^)]*\)\s*$"#, options: .regularExpression) {
+        let fullRange = NSRange(label.startIndex..., in: label)
+        if let match = trailingParenthetical.firstMatch(in: label, range: fullRange),
+           let range = Range(match.range, in: label) {
             return String(label[..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
         }
         return label.trimmingCharacters(in: .whitespaces)

@@ -83,11 +83,17 @@ struct RateLimitResetsDetail: View {
             // "You have no rate limit resets" under a still-running spinner reads as a contradiction.
             if let claimingExpiry, !visibleExpiries.contains(claimingExpiry) {
                 claimingRow().transition(.opacity)
-                if case .timeline(let entries) = Self.content(count: count - claimedExpiries.count, expiries: visibleExpiries) {
+                if case .timeline(let entries) = Self.content(
+                    count: Self.remainingCount(count: count, expiries: expiries, claimed: claimedExpiries),
+                    expiries: visibleExpiries
+                ) {
                     timeline(entries)
                 }
             } else {
-                switch Self.content(count: count - claimedExpiries.count, expiries: visibleExpiries) {
+                switch Self.content(
+                    count: Self.remainingCount(count: count, expiries: expiries, claimed: claimedExpiries),
+                    expiries: visibleExpiries
+                ) {
                 case .timeline(let entries): timeline(entries)
                 case .unknownExpiries(let count): unknownExpiriesState(count)
                 case .empty: emptyState
@@ -452,6 +458,15 @@ struct RateLimitResetsDetail: View {
         if !entries.isEmpty { return .timeline(entries) }
         if count > 0 { return .unknownExpiries(count: count) }
         return .empty
+    }
+
+    /// The row count minus credits claimed in this popover that the latest snapshot still counts.
+    /// A claim is only subtracted while its expiry is still listed; once a refresh has removed that
+    /// credit it has already decremented `count`, and subtracting it again under-reported the
+    /// remaining resets (eventually pushing the count negative in the unknown-expiries state).
+    static func remainingCount(count: Int, expiries: [Date], claimed: Set<Date>) -> Int {
+        guard count > 0, !claimed.isEmpty else { return max(0, count) }
+        return max(0, count - expiries.reduce(0) { $0 + (claimed.contains($1) ? 1 : 0) })
     }
 
     /// One timeline node's display strings, derived from a credit's expiry instant. Pure and static so

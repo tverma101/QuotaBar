@@ -328,24 +328,33 @@ final class CopilotProvider: ProviderRuntime {
         defaults.set(now().addingTimeInterval(Self.billingOrgProbeBackoff), forKey: Self.billingOrgProbeRetryAfterKey)
     }
 
+    /// The longest org-billing pause this build will honor. Rate-limit windows are minutes; an
+    /// hour is already generous. Without a ceiling, a malformed or millisecond-valued header (GitHub
+    /// documents epoch seconds) would pause org discovery until the year 58000 — a permanently stale
+    /// card that no refresh could recover.
+    private static let maximumOrgRateLimitCooldown: TimeInterval = 60 * 60
+
     private func recordOrgRateLimitCooldown(retryAfter: String?, rateLimitReset: String?) {
         let currentTime = now()
         var retryDate: Date?
         if let retryAfter {
             if let seconds = TimeInterval(retryAfter), seconds >= 0 {
-                retryDate = currentTime.addingTimeInterval(seconds)
+                retryDate = currentTime.addingTimeInterval(min(seconds, Self.maximumOrgRateLimitCooldown))
             } else if let date = Self.httpDateFormatter.date(from: retryAfter) {
                 retryDate = date
             }
         }
         if let rateLimitReset, let epoch = TimeInterval(rateLimitReset) {
             let resetDate = Date(timeIntervalSince1970: epoch)
-            retryDate = retryDate.map { max($0, resetDate) } ?? resetDate
+            if resetDate > currentTime,
+               resetDate.timeIntervalSince(currentTime) <= Self.maximumOrgRateLimitCooldown {
+                retryDate = retryDate.map { max($0, resetDate) } ?? resetDate
+            }
         }
-        defaults.set(
-            retryDate ?? currentTime.addingTimeInterval(Self.billingOrgProbeBackoff),
-            forKey: Self.billingOrgRateLimitRetryAfterKey
-        )
+        let clamped = retryDate.map {
+            min($0, currentTime.addingTimeInterval(Self.maximumOrgRateLimitCooldown))
+        } ?? currentTime.addingTimeInterval(Self.billingOrgProbeBackoff)
+        defaults.set(clamped, forKey: Self.billingOrgRateLimitRetryAfterKey)
     }
 
     private static let httpDateFormatter: DateFormatter = {

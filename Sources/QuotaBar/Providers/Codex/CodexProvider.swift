@@ -25,7 +25,9 @@ final class CodexProvider: ProviderRuntime {
     private var lastResolvedAccountIdentityKey: String?
     private var lastNativeScan: LogUsageScan?
     private var lastProxyScan: LogUsageScan?
-    private var lastPiScan: LogUsageScan?
+    /// Source revision the cached proxy fold was built from. Ledger wakes reuse that fold only while
+    /// the FCC databases (and their WAL sidecars) are byte-for-byte unchanged.
+    private var lastProxyScanRevision: [String: TimeInterval]?
     let allowsKeychainFallback: Bool
     let allowsUnattributedPiUsage: Bool
     /// Higher-priority peer homes are identity-only sources for excluding shared rollouts. They are
@@ -439,7 +441,8 @@ final class CodexProvider: ProviderRuntime {
         }
 
         let proxyScan: LogUsageScan?
-        if isLocalAccountingWake, let cached = lastProxyScan {
+        let proxyRevision = isLocalAccountingWake ? await proxyUsageScanner.sourceRevision() : nil
+        if isLocalAccountingWake, let cached = lastProxyScan, lastProxyScanRevision == proxyRevision {
             proxyScan = cached
         } else {
             let proxyResult = await proxyUsageScanner.scanResult(
@@ -453,15 +456,17 @@ final class CodexProvider: ProviderRuntime {
             case .complete(let scan):
                 proxyScan = scan
                 lastProxyScan = scan
+                lastProxyScanRevision = await proxyUsageScanner.sourceRevision()
             case .incomplete:
                 return nil
             }
         }
 
         let piScan: LogUsageScan?
-        if isLocalAccountingWake, let cached = lastPiScan {
-            piScan = cached
-        } else {
+        // Pi sessions append to JSONL files without touching the Codex ledger, so a ledger wake can
+        // never prove the cached pi fold is current. The incremental scanner re-reads only appended
+        // bytes, so folding it again on a wake is cheap and keeps new pi turns from arriving late.
+        do {
             let piResult: PiUsageScanResult = allowsUnattributedPiUsage
                 ? await piUsageScanner.scanResult(
                     cardID: provider.id,
@@ -474,7 +479,6 @@ final class CodexProvider: ProviderRuntime {
             switch piResult {
             case .complete(let scan):
                 piScan = scan
-                lastPiScan = scan
                 DiagnosticGate.clearFailure(piIncompleteDiagnosticKey)
             case .incomplete:
                 DiagnosticGate.logOnce(for: piIncompleteDiagnosticKey) {
@@ -608,6 +612,14 @@ final class CodexProvider: ProviderRuntime {
                 do {
                     return try await self.refreshAccessToken(authState: &working, refreshToken: refreshToken)
                 } catch let error as CodexAuthError {
+                    throw error
+                } catch let error as CodexUsageError {
+                    // The token endpoint rejected this credential bundle (400/401). Treat it as a dead
+                    // credential so refresh() can try the card's other same-identity home instead of
+                    // claiming the network failed. A 5xx/429 stays a request failure for the next pass.
+                    if case .requestFailed(let status) = error, status == 400 || status == 401 {
+                        throw CodexAuthError.tokenExpired
+                    }
                     throw error
                 } catch {
                     try ProviderCancellation.rethrowIfCancellation(error)

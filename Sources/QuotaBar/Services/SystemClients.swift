@@ -192,10 +192,17 @@ struct LocalTextFileAccessor: TextFileAccessing {
             guard length > 0 else { return current }
             buffer[length] = 0
             let target = String(decoding: buffer[..<length].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            // A relative link resolves against the directory holding *this* link, not the directory
+            // of the original path. Reusing the original parent for every hop sent a second
+            // relative link in a chain to the wrong directory, so a rotated credential was written
+            // beside the first link and the real credential file (the one the user linked to)
+            // stayed stale. Lexically normalize each hop so `..` segments don't accumulate.
+            let currentParent = (current as NSString).deletingLastPathComponent
+            let parent = currentParent.isEmpty ? fallbackParent.path : currentParent
             let next = target.hasPrefix("/")
                 ? target
-                : fallbackParent.path + "/" + target
-            current = (next as NSString).expandingTildeInPath
+                : parent + "/" + target
+            current = ((next as NSString).expandingTildeInPath as NSString).standardizingPath
         }
         // Cycle, or deeper than the hop budget: return where we started rather than somewhere arbitrary.
         return path

@@ -111,7 +111,14 @@ struct OpenCodeGoUsageClient: Sendable {
                 return OpenCodeGoAccountWindow(status: "", percent: nil, resetsAt: nil)
             }
             let status = (raw["status"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let percent = ProviderParse.number(raw["percent"]).flatMap { Int($0.rounded()) }
+            // Percent is documented as 0...100. Reject anything outside that instead of converting it:
+            // `Int(_:)` traps on a large untrusted double, and a clamped 100 would invent a capped
+            // account. A rejected window makes the response unavailable, so the card uses its honest
+            // local fallback rather than a fabricated official reading.
+            let percent = ProviderParse.number(raw["percent"]).flatMap { value -> Int? in
+                guard value >= 0, value <= 100 else { return nil }
+                return Int(value.rounded())
+            }
             let resetsAt = (raw["resetsAt"] as? String).flatMap(OpenUsageISO8601.date(from:))
             return OpenCodeGoAccountWindow(status: status, percent: percent, resetsAt: resetsAt)
         }

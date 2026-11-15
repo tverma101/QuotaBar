@@ -86,7 +86,11 @@ enum OpenCodeGoWindowMath {
     // MARK: - Month (anchored to earliest usage's day-of-month)
 
     private static func anchoredMonthBounds(nowMs: Double, anchorMs: Double?) -> (start: Double, end: Double) {
-        guard let anchorMs, anchorMs.isFinite else {
+        // The anchor comes from a SQLite MIN() over local rows, i.e. external input. A corrupt or
+        // non-epoch value (including 1e300) would otherwise reach the calendar math, where month
+        // arithmetic overflows `Int` and traps. A real anchor is never in the future; fall back to
+        // the calendar month for anything outside (0, now].
+        guard let anchorMs, anchorMs.isFinite, anchorMs > 0, anchorMs <= nowMs else {
             let components = utc.dateComponents([.year, .month], from: date(ms: nowMs))
             let start = utcDate(year: components.year!, month: components.month!, day: 1)
             let end = utcDate(year: components.year!, month: components.month! + 1, day: 1)

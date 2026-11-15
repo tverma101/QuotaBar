@@ -128,7 +128,14 @@ final class MenuBarSnoozeStore {
             let isSpent = item.data.meterState(now: now) == .spent || remaining <= 0.0001
             let isBelow = isSpent || (cutoff > 0.0001 && remaining <= cutoff)
             if isBelow {
-                let percentText = "\(Int((remaining * 100).rounded()))%"
+                // `remainingFraction` is normally clamped, but a NaN sample slips through min/max and
+                // `Int(_:)` would trap. Sanitizing keeps the snooze evaluation renderable.
+                let percent = ProviderParse.intFromClampedDouble(
+                    (remaining * 100).rounded(),
+                    lower: 0,
+                    upper: 100
+                )
+                let percentText = "\(percent)%"
                 let reason: String
                 if isSpent {
                     reason = "\(item.descriptor.metricLabel) out of usage"

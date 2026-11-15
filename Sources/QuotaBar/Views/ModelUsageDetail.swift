@@ -285,7 +285,14 @@ struct ModelUsageDetail: View {
     /// (an empty period) stay all zero.
     static func wholePercents(_ shares: [Double]) -> [Int] {
         guard shares.contains(where: { $0 > 0 }) else { return shares.map { _ in 0 } }
-        let raw = shares.map { $0 * 100 }
+        // Shares come from cost division and can be non-finite if an upstream cost overflowed. A raw
+        // `Int(_:)` on NaN/infinity traps — inside a SwiftUI body, that kills the app. Clamp first.
+        let raw = shares.map { share -> Double in
+            guard share.isFinite else { return 0 }
+            return min(max(share * 100, 0), 100)
+        }
+        // Every share was non-finite: there is no meaningful distribution to complete to 100%.
+        guard raw.contains(where: { $0 > 0 }) else { return raw.map { _ in 0 } }
         var percents = raw.map { Int($0.rounded(.down)) }
         var leftover = 100 - percents.reduce(0, +)
         guard leftover > 0 else { return percents }

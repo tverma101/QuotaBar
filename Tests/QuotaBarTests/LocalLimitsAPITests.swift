@@ -76,6 +76,26 @@ final class LocalLimitsAPITests: XCTestCase {
         XCTAssertEqual(expiredProvider["stale"] as? Bool, true)
     }
 
+    /// A snapshot stamped after the envelope was generated cannot be fresh: the clock moved
+    /// backwards, or the stamp came from another machine. Reporting it fresh kept the machine API
+    /// from retrying until the future instant passed.
+    func testFutureFetchedAtIsReportedStale() throws {
+        let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
+        let session = WidgetDescriptor.percent(id: "codex.session", provider: provider, title: "Session")
+            .exportingLimit("session", unit: "percent")
+        let snapshot = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            lines: [.progress(label: "Session", used: 10, limit: 100, format: .percent)],
+            refreshedAt: generatedAt.addingTimeInterval(60)
+        )
+        let state = makeState(snapshot: snapshot, descriptors: [session])
+
+        let root = try json(LocalUsageAPI.respond(method: "GET", path: "/v1/limits", state: state).body)
+        let providerJSON = try XCTUnwrap((root["providers"] as? [String: Any])?["codex"] as? [String: Any])
+        XCTAssertEqual(providerJSON["stale"] as? Bool, true)
+    }
+
     func testUsageAndLimitsProjectTheSameRenderedSnapshot() throws {
         let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
         let session = WidgetDescriptor.percent(id: "codex.session", provider: provider, title: "Session")
