@@ -3,7 +3,7 @@ name = "quotabar-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Performance-critical QuotaBar primitives compiled to a static library and called from Swift over a small C ABI."
+description = "Performance-critical QuotaBar primitives compiled to a static library and called from Swift over a small C ABI (Claude and Codex usage-line parsers)."
 
 [lib]
 name = "quotabar_core"

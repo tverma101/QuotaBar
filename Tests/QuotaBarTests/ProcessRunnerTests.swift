@@ -41,7 +41,10 @@ final class ProcessRunnerTests: XCTestCase {
             _ = try await task.value
             XCTFail("a cancelled subprocess should not return a successful result")
         } catch is CancellationError {
-            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1)
+            // The cancellation loop wakes once per 100 ms wait tick plus subprocess teardown; on a
+            // loaded CI host (2 test jobs, 2.5k tests in flight) the total can transiently exceed
+            // 1 s without any regression — the sibling tree test uses the same 2 s budget.
+            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 2)
         }
     }
 

@@ -8,10 +8,11 @@ build and extend it.
 ## Why a Rust core
 
 The menu-bar app is already native code, so this is not about a slow interpreter. The goal is to
-do the hot accounting work — today, parsing Claude usage lines from large local JSONL ledgers —
-without Foundation's overhead per line: JSONSerialization dictionary materialization, `Data`
-copies, and per-call formatting. Measured on a 20,000-line synthetic corpus: the Rust path uses
-roughly **10x less CPU** for the parse step (run it yourself with the benchmark below).
+do the hot accounting work — today, the per-line parsers behind the Claude and Codex local-history
+folds — without Foundation's overhead per line: JSONSerialization dictionary materialization,
+`Data` copies, and per-call formatting. Measured on a 20,000-line synthetic corpus: the Rust path
+uses roughly **10x less CPU** for the Claude parse (**~4.6x** for the Codex rollout parser) — run
+it yourself with the benchmarks below.
 
 QuotaBar shares none of this behavior change: the Rust parser is a line-for-line port of the
 Swift reference implementation, and the two are tested against each other.
@@ -24,11 +25,17 @@ Swift reference implementation, and the two are tested against each other.
   from AGENTS.md.
 - `Sources/CQuotabarCore/` — a clang target whose header (`include/quotabar_core.h`) declares the
   C ABI the Swift code imports. The `.c` shim is a link probe.
-- `Sources/QuotaBar/Support/ClaudeUsageLineRustParser.swift` — the Swift bridge. Maps the FFI
+- `Sources/QuotaBar/Support/ClaudeUsageLineRustParser.swift` — the Claude bridge. Maps the FFI
   result onto `ClaudeLogUsageScanner.Entry`, or returns nil.
+- `Sources/QuotaBar/Support/CodexRolloutRustParser.swift` — the Codex bridge. Stateful across one
+  file's lines; `consume(_:)` returns false when the file must be re-parsed with Swift.
 - `Sources/QuotaBar/Providers/Claude/ClaudeLogUsageScanner.swift` — `parseEntries` tries the Rust
   bridge first and falls back to the untouched Swift reference (`parseEntriesSwift`) when the
   bridge declines.
+- `Sources/QuotaBar/Providers/Codex/CodexLogUsageScanner.swift` — `fullParseAndCheckpoint` tries
+  the Rust engine (`attemptRustFullParse`) and falls back to `fullParseAndCheckpointSwift` when
+  any line declines. Incremental (tail) parsing stays in Swift; the checkpoint crosses the FFI
+  one-way so the in-memory append cache can round-trip through either engine.
 
 ## The fallback contract
 
@@ -36,13 +43,18 @@ The bridge can return nil, and production then runs the Swift path, **never a di
 
 - a timestamp that is a string but is not one of the canonical UTC shapes this module accepts
   (the Foundation-backed normalization path in `OpenUsageISO8601` handles those),
-- a line with more than 64 entries (parent + advisor iterations),
+- a line with more than 64 entries (parent + advisor iterations, Claude only),
 - any internal failure (a panic is caught at the FFI boundary and reported as "fall back").
+
+For Codex the scope is **one whole file, not one line**: the engine is stateful across the file's
+lines (running model, fast-tier flags, the child-session replay gate), so a line it cannot emulate
+makes the entire file re-parse with the Swift engine. Mixing engines within a file is never done.
 
 Everything else — invalid JSON, non-object JSON, malformed tokens, advisor iterations, SemVer
 rules, leap-second calendar math — is implemented identically in both paths and pinned by the
-parity suite in `Tests/QuotaBarTests/ClaudeUsageLineRustParserTests.swift` (run the full suite,
-not just the filter, when touching either side).
+parity suites in `Tests/QuotaBarTests/ClaudeUsageLineRustParserTests.swift` and
+`Tests/QuotaBarTests/CodexRolloutRustParserTests.swift` (run the full suite, not just the filter,
+when touching either side).
 
 The C ABI returns a heap-allocated opaque result; Swift copies the strings out and calls
 `qb_claude_result_destroy`. A null result is the "fall back to Swift" signal, not an error.
@@ -65,9 +77,11 @@ its unit tests (shared with nothing — the crate must not depend on Swift).
 
 ```sh
 QUOTABAR_CLAUDE_PARSE_BENCH=1 swift test --filter testClaudeParseBenchmarkRustVsSwift
+QUOTABAR_CODEX_PARSE_BENCH=1 swift test --filter testCodexParseBenchmarkRustVsSwift
 ```
 
-prints `CLAUDE_PARSE_BENCH` with Rust vs Swift CPU/wall for 20,000 synthetic lines.
+print `CLAUDE_PARSE_BENCH` / `CODEX_PARSE_BENCH` with Rust vs Swift CPU/wall for the synthetic
+corpora in those tests.
 
 ## Extending it
 

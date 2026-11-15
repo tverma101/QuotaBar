@@ -55,6 +55,74 @@ const uint8_t *qb_claude_result_strings(const void *result, uint32_t *length);
 /// Free a result returned by qb_claude_parse_usage_line. Safe to call with NULL.
 void qb_claude_result_destroy(void *result);
 
+// ---------------------------------------------------------------------------
+// Codex rollout-line parser (port of CodexLogUsageScanner.FileParser)
+// ---------------------------------------------------------------------------
+
+/// One emitted Codex event. `model` is the resolved display model (never nil); string offsets
+/// index into the blob returned by qb_codex_take_events_strings; UINT32_MAX marks absent
+/// optional strings.
+typedef struct {
+    double timestamp;
+    int64_t input_tokens;
+    int64_t cached_tokens;
+    int64_t output_tokens;
+    int64_t reasoning_tokens;
+    int64_t total_tokens;
+    uint32_t model_offset;
+    uint32_t model_length;
+    uint32_t pricing_model_offset;
+    uint32_t pricing_model_length;
+    uint32_t service_tier_offset;
+    uint32_t service_tier_length;
+    uint8_t has_complete_cost_breakdown;
+    uint8_t is_fast;
+    uint8_t reserved[6];
+} QbCodexEvent;
+
+#define QB_CODEX_FEED_OK 0
+/// The line carries a timestamp this library cannot emulate (Foundation could): abandon this
+/// parser and re-parse the whole file with the Swift implementation.
+#define QB_CODEX_FEED_FALLBACK 1
+
+void *qb_codex_parser_create(uint8_t has_emit_since, double emit_since_seconds);
+uint32_t qb_codex_parser_feed_line(void *parser, const uint8_t *line, size_t line_len);
+/// Nonzero when Swift's `hasMalformedUsage` semantics apply to at least one line.
+uint32_t qb_codex_parser_malformed(const void *parser);
+/// Move out the events emitted so far. Call once at the end of a file.
+void *qb_codex_parser_take_events(void *parser);
+uint32_t qb_codex_take_events_count(const void *result);
+const QbCodexEvent *qb_codex_take_events_entries(const void *result);
+const uint8_t *qb_codex_take_events_strings(const void *result, uint32_t *length);
+void qb_codex_take_events_destroy(void *result);
+
+/// Checkpoint export (one-way read; the parser keeps its state). All `*_offset`/`*_length` pairs
+/// reference the blob returned by qb_codex_checkpoint_strings.
+void *qb_codex_parser_checkpoint(const void *parser);
+uint8_t qb_codex_checkpoint_has_previous_totals(const void *result);
+int64_t qb_codex_checkpoint_previous_input(const void *result);
+int64_t qb_codex_checkpoint_previous_cached(const void *result);
+int64_t qb_codex_checkpoint_previous_output(const void *result);
+int64_t qb_codex_checkpoint_previous_reasoning(const void *result);
+int64_t qb_codex_checkpoint_previous_total(const void *result);
+uint8_t qb_codex_checkpoint_previous_has_reported_total(const void *result);
+uint8_t qb_codex_checkpoint_previous_is_valid(const void *result);
+uint8_t qb_codex_checkpoint_previous_has_complete_cost_breakdown(const void *result);
+uint8_t qb_codex_checkpoint_saw_session_meta(const void *result);
+uint8_t qb_codex_checkpoint_current_tier_is_fast(const void *result);
+uint8_t qb_codex_checkpoint_current_service_tier_is_valid(const void *result);
+/// 0 none, 1 until_started_at, 2 until_self_timed.
+uint8_t qb_codex_checkpoint_replay_gate_kind(const void *result);
+double qb_codex_checkpoint_replay_gate_started_at(const void *result);
+uint32_t qb_codex_checkpoint_current_model_offset(const void *result);
+uint32_t qb_codex_checkpoint_current_model_length(const void *result);
+uint32_t qb_codex_checkpoint_service_tier_offset(const void *result);
+uint32_t qb_codex_checkpoint_service_tier_length(const void *result);
+const uint8_t *qb_codex_checkpoint_strings(const void *result, uint32_t *length);
+void qb_codex_checkpoint_destroy(void *result);
+
+void qb_codex_parser_destroy(void *parser);
+
 #ifdef __cplusplus
 }
 #endif
