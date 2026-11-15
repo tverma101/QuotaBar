@@ -8,42 +8,28 @@ import SwiftUI
 struct ModelUsageDetail: View {
     let title: String
     let breakdown: ModelUsageBreakdown
+    /// Collapses the model list behind a tap for windows whose full breakdown is a wall of rows
+    /// (the Last 30 Days spend tile). The header and a one-line total stay visible; tapping the
+    /// button reveals the full per-model detail.
+    var loadOnTap: Bool = false
     var onHoverChange: (Bool) -> Void
 
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
+    @State private var revealed = false
 
     private static let width: CGFloat = 280
 
     var body: some View {
-        let models = breakdown.models.flatMap { $0.presentedRows() }
-        let aggregateTokenCountSaturated = breakdown.tokenCountSaturated == true
-        let sharesAreReliable = Self.sharesAreReliable(
-            for: models,
-            aggregateTokenCountSaturated: aggregateTokenCountSaturated
-        )
-        let shares = Self.shares(
-            for: models,
-            aggregateTokenCountSaturated: aggregateTokenCountSaturated
-        )
-        let percents = Self.wholePercents(shares)
         VStack(alignment: .leading, spacing: 8) {
             header
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(models.indices, id: \.self) { index in
-                    modelRow(
-                        models[index],
-                        share: sharesAreReliable ? shares[index] : nil,
-                        percent: sharesAreReliable ? percents[index] : nil
-                    )
-                }
+            if loadOnTap, !revealed {
+                collapsedSummary
+            } else {
+                fullList
             }
-            if !sharesAreReliable {
-                Text("Shares unavailable because a token total is only a lower bound.")
-                    .font(.system(size: density.supportingPointSize - 1))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            if let note = breakdown.sourceNote {
+                PopoverSourceNote(text: note)
             }
-            PopoverSourceNote(text: breakdown.sourceNote)
         }
         .padding(14)
         .frame(width: Self.width)
@@ -61,6 +47,70 @@ struct ModelUsageDetail: View {
         Text(title)
             .font(.system(size: density.headerPointSize, weight: .semibold))
             .foregroundStyle(.primary)
+    }
+
+    /// The Last 30 Days tile's resting state: the period's aggregate figures plus the deferred
+    /// disclosure. Everything the popover is for is one tap away — it just isn't unfolded up front.
+    private var collapsedSummary: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(MetricFormatter.string(
+                    for: MetricValue(
+                        number: Double(breakdown.totalTokens),
+                        kind: .count,
+                        label: "tokens",
+                        tokenCountSaturated: breakdown.tokenCountSaturated
+                    ),
+                    style: .row
+                ))
+                .monospacedDigit()
+                Spacer(minLength: 8)
+                if let cost = breakdown.totalCostUSD {
+                    let incomplete = breakdown.models.contains { $0.hasIncompleteCost }
+                    Text((incomplete ? "≥" : "") + MetricFormatter.number(cost, kind: .dollars, style: .row))
+                        .monospacedDigit()
+                }
+            }
+            .font(.system(size: density.supportingPointSize))
+            .foregroundStyle(.secondary)
+
+            Button("Show Model Breakdown") {
+                revealed = true
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .font(.system(size: density.supportingPointSize))
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var fullList: some View {
+        let models = breakdown.models.flatMap { $0.presentedRows() }
+        let aggregateTokenCountSaturated = breakdown.tokenCountSaturated == true
+        let sharesAreReliable = Self.sharesAreReliable(
+            for: models,
+            aggregateTokenCountSaturated: aggregateTokenCountSaturated
+        )
+        let shares = Self.shares(
+            for: models,
+            aggregateTokenCountSaturated: aggregateTokenCountSaturated
+        )
+        let percents = Self.wholePercents(shares)
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(models.indices, id: \.self) { index in
+                modelRow(
+                    models[index],
+                    share: sharesAreReliable ? shares[index] : nil,
+                    percent: sharesAreReliable ? percents[index] : nil
+                )
+            }
+            if !sharesAreReliable {
+                Text("Shares unavailable because a token total is only a lower bound.")
+                    .font(.system(size: density.supportingPointSize - 1))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     /// Model name / cost on top, share percent / tokens beneath. The Other row can add a compact
@@ -127,10 +177,12 @@ struct ModelUsageDetail: View {
                     if contributors.count <= 8 {
                         contributorRows(contributors)
                     } else {
+                        // Tall enough that a long tail (many small models folded into Other) reads as
+                        // real usage rather than a sliver — ~8 rows visible, the rest scrollable.
                         ScrollView(.vertical) {
                             contributorRows(contributors)
                         }
-                        .frame(height: 180)
+                        .frame(height: 260)
                     }
                 }
                 .font(.system(size: density.supportingPointSize - 1))

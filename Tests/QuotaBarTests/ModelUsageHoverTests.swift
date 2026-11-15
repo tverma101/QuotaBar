@@ -58,6 +58,41 @@ final class ModelUsageHoverTests: XCTestCase {
         }
     }
 
+    func testStoreCarriesRevealOnTapFlagIntoWidgetData() {
+        let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
+        let tiles = WidgetDescriptor.spendTiles(provider: provider)
+        let last30 = tiles.first { $0.id == "codex.last30" }!
+        let today = tiles.first { $0.id == "codex.today" }!
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: tiles),
+            providers: [],
+            defaults: makeDefaults("reveal-on-tap")
+        )
+        store.snapshots[provider.id] = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [.values(
+                label: "Last 30 Days",
+                values: [
+                    MetricValue(number: 3, kind: .dollars),
+                    MetricValue(number: 300, kind: .count, label: "tokens")
+                ],
+                modelBreakdown: sampleBreakdown()
+            ), .values(
+                label: "Today",
+                values: [
+                    MetricValue(number: 3, kind: .dollars),
+                    MetricValue(number: 300, kind: .count, label: "tokens")
+                ],
+                modelBreakdown: sampleBreakdown()
+            )]
+        )
+
+        XCTAssertTrue(store.data(for: last30).revealsBreakdownOnTap)
+        XCTAssertFalse(store.data(for: today).revealsBreakdownOnTap)
+        XCTAssertTrue(store.data(for: last30).hasModelBreakdown)
+    }
+
     func testWholePercentsAlwaysSumToOneHundred() {
         // Independent rounding would print 33 / 33 / 33 = 99; the largest remainder takes the leftover point.
         XCTAssertEqual(ModelUsageDetail.wholePercents([1.0 / 3, 1.0 / 3, 1.0 / 3]), [34, 33, 33])
@@ -200,6 +235,50 @@ final class ModelUsageHoverTests: XCTestCase {
 
         state.dismiss()
         XCTAssertFalse(state.isPresented, "teardown closes it immediately")
+    }
+
+    func testHoverPopoverStateTapOpensWithoutWaitingForTheDwell() {
+        // A reveal delay far beyond the test's life: only the tap's immediate path can open it.
+        let state = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        XCTAssertFalse(state.isPresented)
+
+        state.toggleForTap()
+        XCTAssertTrue(state.isPresented, "a tap presents on the spot — a deliberate tap must not outwait the 400 ms dwell")
+        XCTAssertTrue(state.overInline, "tap-present lights the value highlight like a hover-present does")
+    }
+
+    func testHoverPopoverStateTapClosesWhenAlreadyPresented() {
+        let state = HoverPopoverState(revealDelay: .milliseconds(1), hideGrace: .milliseconds(1))
+        state.toggleForTap()
+        XCTAssertTrue(state.isPresented)
+
+        state.toggleForTap()
+        XCTAssertFalse(state.isPresented, "a second tap closes it — unlike hover-out, with no grace period")
+        XCTAssertFalse(state.overInline, "dismissal clears the value highlight")
+    }
+
+    func testHoverPopoverStateTapBeatsPendingHoverDwell() {
+        let state = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        // The cursor is already hovering, so a reveal is scheduled; the user taps out of impatience.
+        state.inlineHover(true)
+        state.toggleForTap()
+
+        XCTAssertTrue(state.isPresented, "tapping during the dwell opens now instead of dismissing")
+    }
+
+    func testHoverPopoverStateTapRightAfterDismissalDoesNotReopen() async {
+        let state = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        state.toggleForTap()
+        // The transient popover's outside-click close ran first; this tap is that same click
+        // passing through to the anchor view, not a fresh open request.
+        state.dismiss()
+
+        state.toggleForTap()
+        XCTAssertFalse(state.isPresented, "the pass-through click of a tap-close must not re-open the popover")
+
+        try? await Task.sleep(for: .milliseconds(300))
+        state.toggleForTap()
+        XCTAssertTrue(state.isPresented, "the just-dismissed guard is a momentary race window, not a lockout")
     }
 
     private func sampleBreakdown() -> ModelUsageBreakdown {

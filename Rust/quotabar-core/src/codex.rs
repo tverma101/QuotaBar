@@ -581,6 +581,13 @@ impl CodexParser {
             CanonicalTimestamp::NotCanonical => return Err(()),
         };
 
+        // A rate-limit-only ping: `info` is explicitly null (OpenAI emits these while a turn is in
+        // flight with no usage to report). Nothing to count — skipping it must not mark the
+        // source malformed.
+        if matches!(payload.get("info"), Some(Value::Null)) {
+            return Ok(());
+        }
+
         let info = match payload.get("info").and_then(Value::as_object) {
             Some(info) => info,
             None => {

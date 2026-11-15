@@ -44,127 +44,34 @@ public struct UsageReader {
 
     public func read(providerID requestedProviderID: String? = nil, force: Bool = false,
                      diagnostic: Bool = false) async throws -> UsageReadResult {
-        // The CLI shares the app's provider settings, so migrate them before a store interprets the
-        // enabled/disabled lists. If migration stops partway through, fail closed before discovery can
-        // read optional providers' local credentials under the legacy "everything on" rule.
-        let isFreshInstall = providersOverride == nil
-            ? SettingsMigrator.isFreshInstall(defaults: defaults, domainName: settingsDomainName)
-            : false
-        if providersOverride == nil {
-            let version = SettingsMigrator.migrate(defaults: defaults, domainName: settingsDomainName)
-            guard version >= SettingsSchema.current else {
-                throw UsageReaderError.refreshFailed(
-                    "Provider settings could not be updated safely. Launch QuotaBar and try again."
-                )
-            }
-        }
-
-        // The launch account pass (see `ProviderAccountAssembly`): resolves each family's default
-        // account so cached snapshots are guarded — and refreshed ones stamped — with the correct
-        // account. Skipped when a test injects its own providers — they have no real homes to read.
-        //
-        // Warm the login-shell capture FIRST (off-main, one bounded subprocess). Identity-relevant
-        // keys are pinned to the persisted shell-environment snapshot, but a CLI spawned without the
-        // user's shell exports AND without a snapshot (the app never ran here) still needs the live
-        // capture warm before the identity read — a MainActor read never triggers the capture itself,
-        // so identity would read one home while the providers' off-main reads (which do trigger it)
-        // fetch usage from another. From an interactive terminal the capture is redundant but harmless.
-        if providersOverride == nil {
-            let captured = await Task.detached(priority: .userInitiated) {
-                LoginShellEnvironment.shared.ensureCaptured()
-            }.value
-            if !captured {
-                await Task.detached(priority: .utility) {
-                    _ = LoginShellEnvironment.shared.retryCaptureAfterFailure()
-                }.value
-            }
-        }
-        let registeredCodexHomes = providersOverride == nil
-            ? CodexAccountRegistrationStore(defaults: defaults).registeredHomes
-            : []
-        let enablement = ProviderEnablementStore(defaults: defaults)
         let requestedToken = requestedProviderID?.lowercased()
-        let requestedProviderFamily = requestedToken.map(ProviderAccountID.family(of:))
-        let requestedProviderNeedsClaudeAccounts = requestedProviderID.map {
-            ProviderAccountID.family(of: $0.lowercased()) == "claude"
-        } ?? false
-        let requestedProviderNeedsOpenCodeAccounts = requestedProviderID.map {
-            ProviderAccountID.family(of: $0.lowercased()) == "opencode"
-        } ?? false
-        let discoverClaudeDesktopOrganizations = enablement.hasEnabledProviderFamily("claude")
-            || requestedProviderNeedsClaudeAccounts
-        let accountAssembly: ProviderAccountAssembly
-        if providersOverride == nil {
-            // Account discovery reads provider auth files and performs silent Keychain metadata
-            // queries. Keep that synchronous work off the CLI's MainActor, matching app launch.
-            let discovery = await loadOffMainActor {
-                ProviderAccountAssembly.scanForLaunch(
-                    waitsForLoginShell: false,
-                    rawRegisteredCodexHomes: registeredCodexHomes,
-                    discoverClaudeDesktopOrganizations: discoverClaudeDesktopOrganizations
-                )
-            }
-            accountAssembly = ProviderAccountAssembly.make(
-                observer: DefaultAccountObserver(),
-                accountsStore: ProviderAccountsStore(defaults: defaults),
-                precomputedDiscovery: discovery
+        let requestedFamily = requestedToken.map(ProviderAccountID.family(of:))
+
+        let providers: [ProviderRuntime]
+        let registry: WidgetRegistry
+        let providerIdentityKeys: [String: String]
+        let enablement = ProviderEnablementStore(defaults: defaults)
+        if let providersOverride {
+            // Test-injected providers have no real homes to read, so the migration, shell capture,
+            // and account discovery that a real headless process needs are all skipped.
+            providers = providersOverride
+            registry = WidgetRegistry.from(providers)
+            providerIdentityKeys = [:]
+        } else {
+            let isFreshInstall = SettingsMigrator.isFreshInstall(defaults: defaults, domainName: settingsDomainName)
+            let assembly = try await HeadlessProviderAssembly.assemble(
+                defaults: defaults,
+                settingsDomainName: settingsDomainName,
+                forceEnabledFamilies: requestedFamily.map { Set([$0]) } ?? []
             )
-            if !accountAssembly.claudeCards.isEmpty,
-               !accountAssembly.claudeCards.contains(where: { $0.id == "claude" })
-            {
-                _ = enablement.transferEnabledGenericClaudeFamily(
-                    to: accountAssembly.claudeCards.map(\.id)
-                )
-            }
-        } else {
-            accountAssembly = ProviderAccountAssembly(identityKeysByCard: [:])
-        }
-        let shouldDiscoverOpenCodeAccounts = providersOverride == nil
-            && (enablement.hasEnabledProviderFamily("opencode") || requestedProviderNeedsOpenCodeAccounts)
-        let openCodeAccountInventory: OpenCodeGoAccountInventory?
-        if shouldDiscoverOpenCodeAccounts {
-            openCodeAccountInventory = await OpenCodeProvider.discoverAccountInventory()
-        } else {
-            openCodeAccountInventory = nil
-        }
-        let providers = providersOverride ?? ProviderCatalog.make(
-            defaults: defaults,
-            claudeCards: accountAssembly.claudeCards,
-            codexCards: accountAssembly.codexCards,
-            claudeIdentityKeys: accountAssembly.identityKeysByCard,
-            claudeDesktopKeyCache: accountAssembly.desktopKeyCache,
-            codexDefaultIdentityKey: accountAssembly.identityKeysByCard["codex"],
-            codexDefaultHome: accountAssembly.defaultCodexHome,
-            codexLogHomes: registeredCodexHomes,
-            openCodeGoAccountInventory: openCodeAccountInventory,
-            openCodeAccountInventoryDeferred: providersOverride == nil && !shouldDiscoverOpenCodeAccounts,
-            // A named CLI request may read that provider's own local sources for this action. Other
-            // providers folded into OpenCode keep following the saved enablement choices.
-            isProviderEnabled: { id in
-                enablement.isEnabled(id)
-                    || requestedProviderFamily == ProviderAccountID.family(of: id)
-            }
-        )
-        var providerIdentityKeys = accountAssembly.identityKeysByCard
-        if providersOverride == nil {
-            providerIdentityKeys["cursor"] = await loadOffMainActor {
-                CursorAuthStore().cacheIdentityKeyForLaunch()
-            }
-            providerIdentityKeys["antigravity"] = await loadOffMainActor {
-                AntigravityAuthStore().cacheIdentityKeyForLaunch()
-            }
-        }
-        if let openCodeAccountInventory {
-            providerIdentityKeys["opencode"] = openCodeAccountInventory.cacheIdentityKey
-        }
-        let registry = WidgetRegistry.from(providers)
-        if providersOverride == nil {
-            let onboarding = OnboardingStore(defaults: defaults)
+            providers = assembly.providers
+            registry = assembly.registry
+            providerIdentityKeys = assembly.providerIdentityKeys
             _ = FirstRunSeeder.seedIfNeeded(
                 isFreshInstall: isFreshInstall,
                 providers: providers,
                 enablement: enablement,
-                onboarding: onboarding
+                onboarding: OnboardingStore(defaults: defaults)
             )
             _ = NewProviderSeeder.reconcileIfNeeded(providers: providers, enablement: enablement)
         }

@@ -43,66 +43,68 @@ enum PricingCatalogCodecs {
     /// prompt-length tiers, and UTC time/day rates for event-level callers. Bare aliases are added
     /// only when exactly one non-variant route owns them.
     static func catalogFromOpenRouter(_ data: Data) throws -> PricingCatalog {
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let models = root["data"] as? [[String: Any]] else {
-            throw PricingCodecError.notAnObject
-        }
-
-        guard let totalCount = integerValue(root["total_count"]),
-              totalCount == models.count,
-              let links = root["links"] as? [String: Any],
-              let next = links["next"], next is NSNull else {
-            throw PricingCodecError.incompleteModelList
-        }
-
-        var routes: [String: ModelRates] = [:]
-        var aliases: [String: [String]] = [:]
-        routes.reserveCapacity(models.count)
-        for model in models {
-            guard let id = model["id"] as? String else { continue }
-            let key = id.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !key.isEmpty, routes[key] == nil,
-                  let pricing = model["pricing"] as? [String: Any],
-                  let prompt = nonnegativeFiniteDouble(pricing["prompt"]),
-                  let completion = nonnegativeFiniteDouble(pricing["completion"]),
-                  prompt <= Double.greatestFiniteMagnitude / 1_000_000,
-                  completion <= Double.greatestFiniteMagnitude / 1_000_000 else { continue }
-
-            let input = prompt * 1_000_000
-            let cacheWrite = perMillionRate(pricing["input_cache_write"])
-            let cacheRead = perMillionRate(pricing["input_cache_read"])
-            let promptTiers = openRouterPromptRateTiers(pricing["overrides"], modelID: key)
-            let utcOverrides = openRouterUTCTimeRateOverrides(pricing["overrides"])
-            routes[key] = ModelRates(
-                inputPerMillion: input,
-                outputPerMillion: completion * 1_000_000,
-                cacheWritePerMillion: cacheWrite ?? input,
-                cacheReadPerMillion: cacheRead ?? input,
-                cacheWrite1hPerMillion: perMillionRate(pricing["input_cache_write_1h"]),
-                promptRateTiers: promptTiers,
-                utcPriceOverrides: utcOverrides.isEmpty ? nil : utcOverrides,
-                cacheReadIsExplicit: cacheRead != nil
-                    || promptTiers.contains { $0.cacheReadPerMillion != nil }
-                    || utcOverrides.contains { $0.cacheReadPerMillion != nil }
-            )
-
-            let components = key.split(separator: "/", omittingEmptySubsequences: false)
-            guard components.count == 2,
-                  !components[1].contains(":"),
-                  !components[1].isEmpty else { continue }
-            let alias = components[1].lowercased()
-            aliases[alias, default: []].append(key)
-        }
-
-        guard !routes.isEmpty else { throw PricingCodecError.noUsableEntries }
-
-        var entries = routes
-        for (alias, routeIDs) in aliases where routeIDs.count == 1 && entries[alias] == nil {
-            if let rates = routes[routeIDs[0]] {
-                entries[alias] = rates
+        try autoreleasepool {
+            guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let models = root["data"] as? [[String: Any]] else {
+                throw PricingCodecError.notAnObject
             }
+
+            guard let totalCount = integerValue(root["total_count"]),
+                  totalCount == models.count,
+                  let links = root["links"] as? [String: Any],
+                  let next = links["next"], next is NSNull else {
+                throw PricingCodecError.incompleteModelList
+            }
+
+            var routes: [String: ModelRates] = [:]
+            var aliases: [String: [String]] = [:]
+            routes.reserveCapacity(models.count)
+            for model in models {
+                guard let id = model["id"] as? String else { continue }
+                let key = id.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !key.isEmpty, routes[key] == nil,
+                      let pricing = model["pricing"] as? [String: Any],
+                      let prompt = nonnegativeFiniteDouble(pricing["prompt"]),
+                      let completion = nonnegativeFiniteDouble(pricing["completion"]),
+                      prompt <= Double.greatestFiniteMagnitude / 1_000_000,
+                      completion <= Double.greatestFiniteMagnitude / 1_000_000 else { continue }
+
+                let input = prompt * 1_000_000
+                let cacheWrite = perMillionRate(pricing["input_cache_write"])
+                let cacheRead = perMillionRate(pricing["input_cache_read"])
+                let promptTiers = openRouterPromptRateTiers(pricing["overrides"], modelID: key)
+                let utcOverrides = openRouterUTCTimeRateOverrides(pricing["overrides"])
+                routes[key] = ModelRates(
+                    inputPerMillion: input,
+                    outputPerMillion: completion * 1_000_000,
+                    cacheWritePerMillion: cacheWrite ?? input,
+                    cacheReadPerMillion: cacheRead ?? input,
+                    cacheWrite1hPerMillion: perMillionRate(pricing["input_cache_write_1h"]),
+                    promptRateTiers: promptTiers,
+                    utcPriceOverrides: utcOverrides.isEmpty ? nil : utcOverrides,
+                    cacheReadIsExplicit: cacheRead != nil
+                        || promptTiers.contains { $0.cacheReadPerMillion != nil }
+                        || utcOverrides.contains { $0.cacheReadPerMillion != nil }
+                )
+
+                let components = key.split(separator: "/", omittingEmptySubsequences: false)
+                guard components.count == 2,
+                      !components[1].contains(":"),
+                      !components[1].isEmpty else { continue }
+                let alias = components[1].lowercased()
+                aliases[alias, default: []].append(key)
+            }
+
+            guard !routes.isEmpty else { throw PricingCodecError.noUsableEntries }
+
+            var entries = routes
+            for (alias, routeIDs) in aliases where routeIDs.count == 1 && entries[alias] == nil {
+                if let rates = routes[routeIDs[0]] {
+                    entries[alias] = rates
+                }
+            }
+            return PricingCatalog(entries: entries)
         }
-        return PricingCatalog(entries: entries)
     }
 
     // MARK: - LiteLLM (model_prices_and_context_window.json)
@@ -111,38 +113,40 @@ enum PricingCatalogCodecs {
     /// skipped (stubs and non-chat modes). Costs are per-token in the feed; stored per-million.
     /// Parsed with JSONSerialization so one malformed entry can't sink the whole feed.
     static func catalogFromLiteLLM(_ data: Data) throws -> PricingCatalog {
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw PricingCodecError.notAnObject
-        }
-        var entries: [String: ModelRates] = [:]
-        for (key, value) in root {
-            guard let entry = value as? [String: Any],
-                  let input = doubleValue(entry["input_cost_per_token"]),
-                  let output = doubleValue(entry["output_cost_per_token"]) else { continue }
-            let cacheWrite = doubleValue(entry["cache_creation_input_token_cost"])
-            let cacheRead = doubleValue(entry["cache_read_input_token_cost"])
-            let promptRateTiers = liteLLMPromptRateTiers(entry)
-            var rates = ModelRates(
-                inputPerMillion: input * 1_000_000,
-                outputPerMillion: output * 1_000_000,
-                cacheWritePerMillion: (cacheWrite ?? input) * 1_000_000,
-                cacheReadPerMillion: (cacheRead ?? input) * 1_000_000,
-                cacheReadIsExplicit: cacheRead != nil
-                    || promptRateTiers.contains { $0.cacheReadPerMillion != nil }
-            )
-            rates.promptRateTiers = promptRateTiers
-            rates.inputAbove200kPerMillion = doubleValue(entry["input_cost_per_token_above_200k_tokens"]).map { $0 * 1_000_000 }
-            rates.outputAbove200kPerMillion = doubleValue(entry["output_cost_per_token_above_200k_tokens"]).map { $0 * 1_000_000 }
-            rates.cacheWriteAbove200kPerMillion = doubleValue(entry["cache_creation_input_token_cost_above_200k_tokens"]).map { $0 * 1_000_000 }
-            rates.cacheReadAbove200kPerMillion = doubleValue(entry["cache_read_input_token_cost_above_200k_tokens"]).map { $0 * 1_000_000 }
-            if let providerSpecific = entry["provider_specific_entry"] as? [String: Any],
-               let fast = doubleValue(providerSpecific["fast"]) {
-                rates.fastMultiplier = fast
+        try autoreleasepool {
+            guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw PricingCodecError.notAnObject
             }
-            entries[key] = rates
+            var entries: [String: ModelRates] = [:]
+            for (key, value) in root {
+                guard let entry = value as? [String: Any],
+                      let input = doubleValue(entry["input_cost_per_token"]),
+                      let output = doubleValue(entry["output_cost_per_token"]) else { continue }
+                let cacheWrite = doubleValue(entry["cache_creation_input_token_cost"])
+                let cacheRead = doubleValue(entry["cache_read_input_token_cost"])
+                let promptRateTiers = liteLLMPromptRateTiers(entry)
+                var rates = ModelRates(
+                    inputPerMillion: input * 1_000_000,
+                    outputPerMillion: output * 1_000_000,
+                    cacheWritePerMillion: (cacheWrite ?? input) * 1_000_000,
+                    cacheReadPerMillion: (cacheRead ?? input) * 1_000_000,
+                    cacheReadIsExplicit: cacheRead != nil
+                        || promptRateTiers.contains { $0.cacheReadPerMillion != nil }
+                )
+                rates.promptRateTiers = promptRateTiers
+                rates.inputAbove200kPerMillion = doubleValue(entry["input_cost_per_token_above_200k_tokens"]).map { $0 * 1_000_000 }
+                rates.outputAbove200kPerMillion = doubleValue(entry["output_cost_per_token_above_200k_tokens"]).map { $0 * 1_000_000 }
+                rates.cacheWriteAbove200kPerMillion = doubleValue(entry["cache_creation_input_token_cost_above_200k_tokens"]).map { $0 * 1_000_000 }
+                rates.cacheReadAbove200kPerMillion = doubleValue(entry["cache_read_input_token_cost_above_200k_tokens"]).map { $0 * 1_000_000 }
+                if let providerSpecific = entry["provider_specific_entry"] as? [String: Any],
+                   let fast = doubleValue(providerSpecific["fast"]) {
+                    rates.fastMultiplier = fast
+                }
+                entries[key] = rates
+            }
+            guard !entries.isEmpty else { throw PricingCodecError.noUsableEntries }
+            return PricingCatalog(entries: entries)
         }
-        guard !entries.isEmpty else { throw PricingCodecError.noUsableEntries }
-        return PricingCatalog(entries: entries)
     }
 
     // MARK: - models.dev (api.json)
@@ -152,48 +156,50 @@ enum PricingCatalogCodecs {
     /// same rates; an ambiguous reseller price is less useful than leaving the model unpriced.
     /// Costs are already per-million.
     static func catalogFromModelsDev(_ data: Data) throws -> PricingCatalog {
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw PricingCodecError.notAnObject
-        }
-        var candidates: [String: [ModelRates]] = [:]
-        for providerName in root.keys.sorted() {
-            guard let provider = root[providerName] as? [String: Any],
-                  let models = provider["models"] as? [String: Any] else { continue }
-            for (modelID, value) in models {
-                guard let model = value as? [String: Any],
-                      let cost = model["cost"] as? [String: Any],
-                      let input = doubleValue(cost["input"]),
-                      let output = doubleValue(cost["output"]) else { continue }
-                var tiers = modelsDevPromptRateTiers(cost["tiers"])
-                if !tiers.contains(where: { $0.thresholdPromptTokens == 200_000 }),
-                   let longContext = cost["context_over_200k"] as? [String: Any] {
-                    if let tier = modelsDevPromptRateTier(longContext, threshold: 200_000) {
-                        tiers.append(tier)
-                    }
-                }
-                candidates[modelID, default: []].append(ModelRates(
-                    inputPerMillion: input,
-                    outputPerMillion: output,
-                    cacheWritePerMillion: doubleValue(cost["cache_write"]) ?? input,
-                    cacheReadPerMillion: doubleValue(cost["cache_read"]) ?? input,
-                    promptRateTiers: tiers.sorted { $0.thresholdPromptTokens < $1.thresholdPromptTokens },
-                    cacheReadIsExplicit: cost["cache_read"] != nil
-                        || tiers.contains { $0.cacheReadPerMillion != nil }
-                ))
+        try autoreleasepool {
+            guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw PricingCodecError.notAnObject
             }
+            var candidates: [String: [ModelRates]] = [:]
+            for providerName in root.keys.sorted() {
+                guard let provider = root[providerName] as? [String: Any],
+                      let models = provider["models"] as? [String: Any] else { continue }
+                for (modelID, value) in models {
+                    guard let model = value as? [String: Any],
+                          let cost = model["cost"] as? [String: Any],
+                          let input = doubleValue(cost["input"]),
+                          let output = doubleValue(cost["output"]) else { continue }
+                    var tiers = modelsDevPromptRateTiers(cost["tiers"])
+                    if !tiers.contains(where: { $0.thresholdPromptTokens == 200_000 }),
+                       let longContext = cost["context_over_200k"] as? [String: Any] {
+                        if let tier = modelsDevPromptRateTier(longContext, threshold: 200_000) {
+                            tiers.append(tier)
+                        }
+                    }
+                    candidates[modelID, default: []].append(ModelRates(
+                        inputPerMillion: input,
+                        outputPerMillion: output,
+                        cacheWritePerMillion: doubleValue(cost["cache_write"]) ?? input,
+                        cacheReadPerMillion: doubleValue(cost["cache_read"]) ?? input,
+                        promptRateTiers: tiers.sorted { $0.thresholdPromptTokens < $1.thresholdPromptTokens },
+                        cacheReadIsExplicit: cost["cache_read"] != nil
+                            || tiers.contains { $0.cacheReadPerMillion != nil }
+                    ))
+                }
+            }
+            let entries = candidates.compactMapValues { rates -> ModelRates? in
+                guard let first = rates.first,
+                      rates.dropFirst().allSatisfy({ $0 == first }) else { return nil }
+                return first
+            }
+            guard !entries.isEmpty else { throw PricingCodecError.noUsableEntries }
+            let retiredKeys = Set(candidates.keys.filter { entries[$0] == nil })
+            return PricingCatalog(
+                entries: entries,
+                retiredKeys: retiredKeys,
+                retiredKeysAreAuthoritative: true
+            )
         }
-        let entries = candidates.compactMapValues { rates -> ModelRates? in
-            guard let first = rates.first,
-                  rates.dropFirst().allSatisfy({ $0 == first }) else { return nil }
-            return first
-        }
-        guard !entries.isEmpty else { throw PricingCodecError.noUsableEntries }
-        let retiredKeys = Set(candidates.keys.filter { entries[$0] == nil })
-        return PricingCatalog(
-            entries: entries,
-            retiredKeys: retiredKeys,
-            retiredKeysAreAuthoritative: true
-        )
     }
 
     private static let liteLLMTierThresholds = [100_000, 128_000, 200_000, 272_000, 512_000]
@@ -461,21 +467,12 @@ enum PricingCatalogCodecs {
         var retiredKeys: [String]?
 
         struct Model: Codable {
-            var i: Double
-            var o: Double
-            var cw: Double
-            var cr: Double
-            var cw1: Double?
-            var tiers: [PromptRateTier]?
-            var utc: [UTCPriceRateOverride]?
-            var ia: Double?
-            var oa: Double?
-            var cwa: Double?
-            var cra: Double?
+            var i: Double, o: Double, cw: Double, cr: Double
+            var cw1: Double?, tiers: [PromptRateTier]?, utc: [UTCPriceRateOverride]?
+            var ia: Double?, oa: Double?, cwa: Double?, cra: Double?
             /// Omitted means explicit for backward compatibility with snapshots written before the
             /// provenance bit existed. Newly compacted synthesized rates write `false`.
-            var cre: Bool?
-            var fast: Double?
+            var cre: Bool?, fast: Double?
         }
 
         enum CodingKeys: String, CodingKey {
@@ -487,9 +484,7 @@ enum PricingCatalogCodecs {
 }
 
 enum PricingCodecError: Error, LocalizedError, Equatable {
-    case notAnObject
-    case noUsableEntries
-    case incompleteModelList
+    case notAnObject, noUsableEntries, incompleteModelList
 
     var errorDescription: String? {
         switch self {

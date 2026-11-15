@@ -52,6 +52,15 @@ final class HermesUsageScannerRealDBTests: XCTestCase {
         )
     }
 
+    override func tearDownWithError() throws {
+        if let dbPath {
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: dbPath).deletingLastPathComponent())
+        }
+        dbPath = nil
+        scanner = nil
+        try super.tearDownWithError()
+    }
+
     func testPeriodTotalsAndDailySeries() async throws {
         let now = Date(timeIntervalSince1970: 1_784_800_000) // fixed instant
         // One recent session (inside every period) and one ancient session (outside all of them).

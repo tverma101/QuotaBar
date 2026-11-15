@@ -32,8 +32,8 @@ enum MenuBarStripRenderer {
         return image
     }
 
-    /// The pinned-metrics strip, or `nil` when nothing is pinned or no pinned metric has data yet
-    /// (caller falls back to the app icon).
+    /// The pinned-metrics strip, or `nil` when nothing is pinned, no pinned metric has data yet, or
+    /// the render carries no visible pixels (caller falls back to the app icon).
     ///
     /// The render is trimmed to its visible pixels: the view's anti-aliasing padding and the provider
     /// glyph's normalization inset would otherwise ship as transparent margins, widening the status
@@ -41,24 +41,38 @@ enum MenuBarStripRenderer {
     /// extra-large gap next to neighboring items).
     static func textImage(for content: MenuBarContent) -> NSImage? {
         guard !content.isEmpty else { return nil }
-        let renderer = ImageRenderer(content: MenuBarTextStrip(content: content))
-        renderer.scale = 2
-        guard let rendered = renderer.cgImage else { return nil }
-        let cgImage = trimmedToVisibleContent(rendered) ?? rendered
+        return autoreleasepool {
+            let renderer = ImageRenderer(content: MenuBarTextStrip(content: content))
+            renderer.scale = 2
+            guard let rendered = renderer.cgImage else { return nil }
+            return visibleImage(rendered, scale: renderer.scale, accessibility: content.accessibilityText)
+        }
+    }
+
+    /// Wraps a rendered strip into its trimmed template `NSImage`, or `nil` when the render has no
+    /// visible pixels at all — every metric's data can disappear while the strip's content stays
+    /// non-empty (e.g. every provider auto-snoozed out of usage drops its metrics, leaving empty
+    /// segments), and a fully transparent status-item image vanishes from the menu bar with the
+    /// panel's only click target. Returning `nil` keeps the app icon on the item instead, so
+    /// QuotaBar always takes its little space and the panel stays openable.
+    private static func visibleImage(_ rendered: CGImage, scale: CGFloat, accessibility: String) -> NSImage? {
+        guard let cgImage = trimmedToVisibleContent(rendered) else { return nil }
         let image = NSImage(
             cgImage: cgImage,
-            size: NSSize(width: CGFloat(cgImage.width) / renderer.scale, height: CGFloat(cgImage.height) / renderer.scale)
+            size: NSSize(width: CGFloat(cgImage.width) / scale, height: CGFloat(cgImage.height) / scale)
         )
         image.isTemplate = true
-        image.accessibilityDescription = content.accessibilityText
+        image.accessibilityDescription = accessibility
         return image
     }
 
     /// Crops fully transparent margins off a rendered strip, or `nil` when the image has no visible
     /// pixels (caller keeps the untrimmed render).
     nonisolated static func trimmedToVisibleContent(_ image: CGImage) -> CGImage? {
-        guard let bounds = visibleBounds(of: image) else { return nil }
-        return image.cropping(to: bounds)
+        autoreleasepool {
+            guard let bounds = visibleBounds(of: image) else { return nil }
+            return image.cropping(to: bounds)
+        }
     }
 
     /// The bounding box of pixels with non-zero alpha, in pixel coordinates (origin at the top-left
@@ -89,34 +103,28 @@ enum MenuBarStripRenderer {
         return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
     }
 
-    /// The compact Bars glyph (≤4 bounded-metric bars), or `nil` when no pinned metric has a fill.
+    /// The compact Bars glyph (≤4 bounded-metric bars), or `nil` when no pinned metric has a fill or
+    /// the render has no visible pixels (caller falls back to the app icon).
     static func barsImage(for content: MenuBarContent) -> NSImage? {
-        let fractions = content.bars.map(\.fraction)
-        guard !fractions.isEmpty else { return nil }
-        let renderer = ImageRenderer(content: MenuBarBars(fractions: fractions, side: 18))
-        renderer.scale = 2
-        guard let image = renderer.nsImage else { return nil }
-        image.isTemplate = true
-        image.accessibilityDescription = content.accessibilityText
-        return image
+        autoreleasepool {
+            let fractions = content.bars.map(\.fraction)
+            guard !fractions.isEmpty else { return nil }
+            let renderer = ImageRenderer(content: MenuBarBars(fractions: fractions, side: 18))
+            renderer.scale = 2
+            guard let rendered = renderer.cgImage else { return nil }
+            return visibleImage(rendered, scale: renderer.scale, accessibility: content.accessibilityText)
+        }
     }
 
     /// The screen-share privacy stand-in: the wordmark instead of usage values, shown while
     /// `MenuBarPrivacyStore.concealUsage` is true so a shared or recorded screen never carries token
-    /// counts or spend. Deterministic, so rendered once; `nil` only if `ImageRenderer` fails entirely
-    /// (caller falls back to the app icon).
+    /// counts or spend. Deterministic, so rendered once; `nil` if `ImageRenderer` fails entirely or
+    /// the render has no visible pixels (caller falls back to the app icon).
     static let privacyImage: NSImage? = {
         let renderer = ImageRenderer(content: MenuBarPrivacyLabel())
         renderer.scale = 2
         guard let rendered = renderer.cgImage else { return nil }
-        let cgImage = trimmedToVisibleContent(rendered) ?? rendered
-        let image = NSImage(
-            cgImage: cgImage,
-            size: NSSize(width: CGFloat(cgImage.width) / renderer.scale, height: CGFloat(cgImage.height) / renderer.scale)
-        )
-        image.isTemplate = true
-        image.accessibilityDescription = "QuotaBar, usage hidden while the screen is shared"
-        return image
+        return visibleImage(rendered, scale: renderer.scale, accessibility: "QuotaBar, usage hidden while the screen is shared")
     }()
 
     /// Last-resort icon if the brand mark fails to load.

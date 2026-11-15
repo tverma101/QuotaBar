@@ -31,6 +31,7 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("qb-router-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("usage-events.jsonl")
         try (line + "\n").write(to: path, atomically: true, encoding: .utf8)
         XCTAssertTrue(rows(path.path).isEmpty)
@@ -45,6 +46,7 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("qb-router-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("usage-events.jsonl")
         try (lines.joined(separator: "\n") + "\n").write(to: path, atomically: true, encoding: .utf8)
         return path.path
@@ -261,6 +263,7 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("qb-router-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("usage-events.jsonl")
         try """
         {"at":"\(Self.recentISO)","model":"opencode-free/space-bunny-free","provider":"opencode-free","status":500,"inputTokens":100,"outputTokens":10}
@@ -357,6 +360,7 @@ final class RouterLedgerProviderRoutingTests: XCTestCase {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("qb-router-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("usage-events.jsonl").path
         let text = #"{"at":"\#(stamp)","model":"opencode-zen-messages/union-alpha","provider":"opencode-go","status":200,"inputTokens":406,"cachedInputTokens":6,"outputTokens":10,"totalTokens":416}"#
         try (text + "\n").write(toFile: path, atomically: true, encoding: .utf8)
@@ -502,6 +506,7 @@ extension RouterLedgerProviderRoutingTests {
     private func writeLedger(_ lines: [String]) throws -> String {        let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("qb-router-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("usage-events.jsonl")
         try (lines.joined(separator: "\n") + "\n").write(to: path, atomically: true, encoding: .utf8)
         return path.path
@@ -641,6 +646,7 @@ extension RouterLedgerProviderRoutingTests {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("qb-router-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("usage-events.jsonl")
         try text.write(to: path, atomically: true, encoding: .utf8)
         return path.path

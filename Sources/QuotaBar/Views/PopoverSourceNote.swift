@@ -6,11 +6,15 @@ struct PopoverSourceNote: View {
     let text: String
 
     var body: some View {
-        Text(text)
-            .font(.system(size: 10))
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-            .multilineTextAlignment(.center)
-            .frame(maxWidth: .infinity)
+        Group {
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(text)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
+        }
     }
 }

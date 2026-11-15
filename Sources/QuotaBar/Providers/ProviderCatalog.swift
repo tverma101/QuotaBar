@@ -75,6 +75,26 @@ enum ProviderCatalog {
                     ["CODEX_HOME": card.home],
                     base: openUsageEnvironment
                 )
+                let defaultHomePath = CodexAccountRegistrationStore.normalizedHome(
+                    "~/.codex", homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+                )
+                // When the card's own home is not the stock CLI home, offer it as a fallback:
+                // router pools can hold a stale/revoked grant while the same account is live in
+                // ~/.codex/auth.json. The anchor home is always tried before the fallback
+                // (see CodexAuthStore.additionalAuthHomes).
+                let authFallbackHomes: [String] = {
+                    guard let defaultHomePath else { return [] }
+                    let resolvedCardHome = URL(fileURLWithPath: card.home, isDirectory: true)
+                        .resolvingSymlinksInPath().standardizedFileURL.path
+                    return resolvedCardHome == defaultHomePath ? [] : [defaultHomePath]
+                }()
+                let sharedAttribution = card.attributionSharedHome.map {
+                    CodexLogUsageScanner.SharedAttribution(
+                        home: $0,
+                        identity: card.identityKey,
+                        keepsUnattributed: true
+                    )
+                }
                 let logHomeList = card.logHomes.isEmpty ? [card.home] : card.logHomes
                 let logEnvironment = OverrideEnvironmentReader(
                     ["CODEX_HOME": logHomeList.joined(separator: ",")],
@@ -117,9 +137,13 @@ enum ProviderCatalog {
                     ),
                     authStore: CodexAuthStore(
                         environment: authEnvironment,
-                        expectedIdentityKey: card.identityKey
+                        expectedIdentityKey: card.identityKey,
+                        additionalAuthHomes: authFallbackHomes
                     ),
-                    logUsageScanner: CodexLogUsageScanner(environment: logEnvironment),
+                    logUsageScanner: CodexLogUsageScanner(
+                        environment: logEnvironment,
+                        sharedAttribution: sharedAttribution
+                    ),
                     expectedIdentityKey: card.identityKey,
                     allowsKeychainFallback: card.allowsKeychainFallback,
                     allowsUnattributedPiUsage: card.allowsUnattributedPiUsage,

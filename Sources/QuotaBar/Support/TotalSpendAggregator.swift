@@ -52,13 +52,6 @@ enum TotalSpendMetric: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Dollar-backed modes can inherit the local-estimate note when any contributor's spend is imputed.
-    var usesDollarEstimateNote: Bool {
-        switch self {
-        case .cost, .costPerMtok: true
-        case .tokens: false
-        }
-    }
 }
 
 /// One provider's contribution to a period's total: dollars and tokens from the same spend line,

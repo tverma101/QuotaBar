@@ -11,13 +11,13 @@ struct OpenCodeUsageScan: Sendable {
     var goWindows: OpenCodeGoWindows?
     /// True when the combined series includes cost imputed from token counts — Claude Code sessions
     /// routed through the OpenCode gateway, whose logs carry tokens but no per-message cost — rather
-    /// than OpenCode's own recorded cost alone. Drives the ⓘ marker on the spend tiles.
+    /// than OpenCode's own recorded cost alone. Marks the tiles' dollars as imputed.
     var includesEstimatedCost: Bool
     /// Local-calendar day keys (`yyyy-MM-dd`) whose totals are PARTIAL: they include Hermes sessions
     /// that are still running (`ended_at IS NULL`). Hermes writes a session's usage ledger in delayed
     /// bursts while it runs, so the fold always reads an incomplete picture for the active session —
     /// the day's number is real but not final, and keeps rising until the session ends. The mapper
-    /// marks partial days' tiles with the ⓘ-estimated marker so a live session is never presented as
+    /// flags partial days' dollars as imputed so a live session is never presented as
     /// a settled total. Empty when no tracked Hermes session is in progress.
     var partialDays: Set<String>
 }
@@ -637,12 +637,12 @@ struct OpenCodeUsageScanner: Sendable {
         // `anthropic/opencode/…` model ids) burn the same OpenCode-hosted quota but never land in
         // `opencode*.db`. Fold their measured tokens into the tiles + trend. Their logs carry no
         // per-message cost, so dollars are imputed from token counts through the pricing engine —
-        // which marks the whole series as estimated (ⓘ) and leaves unpriced models to the unknown-
+        // which marks the whole series as estimated and leaves unpriced models to the unknown-
         // model warning, the same convention the Claude tiles use.
         var includesEstimatedCost = false
         // Days (local `yyyy-MM-dd`) that hold still-running Hermes sessions (`ended_at IS NULL`):
         // Hermes finalizes a session's usage ledger in delayed bursts, so those days' totals are
-        // partial — real but not final. Carried to the tiles so a live session is marked ⓘ instead
+        // partial — real but not final. Carried to the tiles so a live session is marked imputed instead
         // of being presented as a settled number.
         var partialDays: Set<String> = []
         // Go-cap window costs: the Go subscription's recorded `opencode*.db` rows, to which the
@@ -664,7 +664,7 @@ struct OpenCodeUsageScanner: Sendable {
         // a fraction of the sticker input rate, so the recorded average can sit ~15x below the
         // catalog miss rate — charging every token at the miss rate would overstate spend by the
         // same factor), else through the pricing engine. Either way the series is marked estimated
-        // (ⓘ) and unpriced models fall to the unknown-model warning, the convention the Claude
+        // (imputed) and unpriced models fall to the unknown-model warning, the convention the Claude
         // tiles use.
         // Current spend tiles use a recent observed average. Older rates can differ after a provider
         // changes pricing or cache billing, so lifetime history must not recalibrate today's tile.
@@ -1014,7 +1014,7 @@ struct OpenCodeUsageScanner: Sendable {
         /// True for Hermes sessions that are STILL RUNNING (`ended_at IS NULL`): Hermes writes a
         /// session's usage ledger in delayed bursts, so the fold's view of an in-progress session is
         /// partial and keeps growing until the session ends. The row's day is marked partial and its
-        /// tiles carry the ⓘ marker instead of being presented as a settled total. Always false for
+        /// tiles carry imputed dollars instead of being presented as a settled total. Always false for
         /// the Claude/Codex log folds — those CLIs write per-message in real time, so their rows are
         /// complete as recorded.
         var isInProgress: Bool

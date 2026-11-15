@@ -164,7 +164,7 @@ enum AntigravityProtoDecoder {
         case invalid
     }
 
-    struct StepIdentity: Hashable, Sendable {
+    struct StepIdentity: Codable, Hashable, Sendable {
         let uuid: String?
         let botID: String?
     }

@@ -14,13 +14,15 @@ enum CodexRouterAggregatePersistence {
     }
 
     static func read(id: String) -> CodexRouterAggregateIndex.Record? {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .secondsSince1970
-        guard let data = try? Data(contentsOf: fileURL(id: id)),
-              let record = try? decoder.decode(CodexRouterAggregateIndex.Record.self, from: data),
-              record.schema == CodexRouterAggregateIndex.schema
-        else { return nil }
-        return record
+        autoreleasepool {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .secondsSince1970
+            guard let data = try? Data(contentsOf: fileURL(id: id)),
+                  let record = try? decoder.decode(CodexRouterAggregateIndex.Record.self, from: data),
+                  record.schema == CodexRouterAggregateIndex.schema
+            else { return nil }
+            return record
+        }
     }
 
     static func write(_ record: CodexRouterAggregateIndex.Record, id: String) throws {
