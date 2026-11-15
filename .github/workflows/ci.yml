@@ -26,6 +26,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust core
+        run: bash script/build_rust_core.sh
+
       - name: Build
         run: swift build -j 2 --disable-index-store
 

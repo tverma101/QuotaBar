@@ -23,6 +23,12 @@ bash script/test_efficiency.sh
 
 This uses one `swift test` process with a combined filter instead of repeatedly starting SwiftPM. It is a developer convenience, **not** a substitute for the full suites above.
 
+The Rust-core benchmark is opt-in and prints a comparison of the Rust FFI parser against the Swift reference implementation:
+
+```sh
+QUOTABAR_CLAUDE_PARSE_BENCH=1 swift test --filter testClaudeParseBenchmarkRustVsSwift
+```
+
 ## Interpreting skips
 
 A few Swift tests intentionally skip on CI because they require local account state, a real ledger, or an explicit benchmarking/live-validation opt-in. A successful hosted CI run does not certify those environment-dependent checks. Do not inject live credentials into CI just to remove a skip; use local opt-in instructions in the corresponding test when authorized.

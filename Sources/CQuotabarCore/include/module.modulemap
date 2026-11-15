@@ -1,0 +1,4 @@
+module CQuotabarCore {
+    header "quotabar_core.h"
+    export *
+}
