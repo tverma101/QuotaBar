@@ -14,5 +14,5 @@ fi
 # The full suite is covered by test_suites.sh; this is a fast, focused subset.
 printf '==> QuotaBar deterministic efficiency and account-isolation contracts\n'
 swift test -j "$jobs" --disable-index-store --filter \
-  'JSONLFileReaderEfficiencyTests|AppendOnlyFileTailCacheTests|IncrementalJSONLScannerTests|ResourceEfficiencyContractTests|ResourceSoakContractTests|CrossProviderAccountIsolationContractTests|CodexIncrementalEfficiencyTests|CodexLogUsageScannerTests'
-printf '==> Efficiency-focused suites passed\n
+  'JSONLFileReaderEfficiencyTests|AppendOnlyFileTailCacheTests|IncrementalJSONLScannerTests|ResourceEfficiencyContractTests|ResourceSoakContractTests|CrossProviderAccountIsolationContractTests|CodexIncrementalEfficiencyTests|CodexLogUsageScannerTests|LogUsageAggregateCacheTests'
+printf '==> Efficiency-focused suites passed\n'

@@ -258,6 +258,9 @@ actor CodexLogUsageScanner {
     /// under a peer `~/.codex` are skipped so Orca backfills stay attributed to default. Default
     /// `~/.codex` keeps shared inodes (see `sessionFiles`).
     private let peerHomes: [URL]
+    /// Production-only daily-aggregate gate (see `LogUsageAggregateCache`); test scanner
+    /// injections keep the plain incremental path.
+    private let aggregateCache: LogUsageAggregateCache?
 
     /// Per-file account attribution for a *shared* `~/.codex` whose rollouts are otherwise
     /// invisible to managed cards (the anti-double-count rule drops the shared default home when
@@ -356,13 +359,17 @@ actor CodexLogUsageScanner {
         homeDirectory: @escaping @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
         peerHomes: [URL] = [],
         sharedAttribution: SharedAttribution? = nil,
-        incrementalScanner: IncrementalJSONLScanner<Event>? = nil
+        incrementalScanner: IncrementalJSONLScanner<Event>? = nil,
+        aggregateCache: LogUsageAggregateCache? = nil
     ) {
         self.environment = environment
         self.homeDirectory = homeDirectory
         self.peerHomes = peerHomes
         self.sharedAttribution = sharedAttribution.map(Self.normalizedAttribution)
         self.scanner = incrementalScanner ?? Self.sharedScanner
+        self.aggregateCache = aggregateCache ?? ((incrementalScanner == nil)
+            ? LogUsageAggregateCache.shared
+            : nil)
     }
 
     func scan(
@@ -384,7 +391,22 @@ actor CodexLogUsageScanner {
         }
     }
 
+    private static func aggregateScopeKey(homes: [URL], peerHomes: [URL]) -> String {
+        let homesKey = homes
+            .map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
+            .sorted()
+            .joined(separator: ",")
+        let peersKey = peerHomes
+            .map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
+            .sorted()
+            .joined(separator: ",")
+        return "homes=\(homesKey)|peers=\(peersKey)"
+    }
+
     /// Completeness-aware scan used by providers that merge Codex logs with other sources.
+    /// Gates through the persisted stat-fingerprint aggregate (see `LogUsageAggregateCache`):
+    /// when the discovered source set is stat-identical to the last completed scan, the finished
+    /// aggregate is served without parsing, hydration, replay, or re-encoding.
     func scanResult(
         daysBack: Int = UsageHistoryWindow.previousDays,
         now: Date = Date(),
@@ -392,8 +414,61 @@ actor CodexLogUsageScanner {
         peerHomes peerHomesOverride: [URL]? = nil
     ) async -> CodexLogUsageScanResult {
         guard !Task.isCancelled else { return .incomplete }
-        let homes = codexHomes()
-        guard !Task.isCancelled else { return .incomplete }
+        if let aggregateCache {
+            let homes = codexHomes()
+            let files = Self.sessionFiles(
+                homes: homes,
+                peerHomes: peerHomesOverride ?? peerHomes,
+                homeDirectory: homeDirectory,
+                sharedAttribution: sharedAttribution
+            )
+            if files.isEmpty {
+                // A genuinely empty Codex home is a complete empty fold, not an incomplete one —
+                // it must not engage the cache's nil-fresh sentinel and masquerade as a failed
+                // scan (callers would wrongly preserve last-good history forever).
+                return await scanResultUncached(
+                    daysBack: daysBack,
+                    now: now,
+                    pricing: pricing,
+                    peerHomes: peerHomesOverride
+                )
+            }
+            let fingerprints: [String: LogUsageSourceFingerprint] = [
+                "sessions": LogUsageSourceFingerprint.of(files)
+            ]
+            let cacheKey = "codex-native|\(Self.aggregateScopeKey(homes: homes, peerHomes: peerHomesOverride ?? peerHomes))"
+            return await aggregateCache.scan(
+                key: cacheKey,
+                pricingStamp: LogUsagePricingStamp.of(pricing),
+                daysBack: daysBack,
+                fingerprints: fingerprints,
+                now: now
+            ) { [self] in
+                switch await scanResultUncached(
+                    daysBack: daysBack,
+                    now: now,
+                    pricing: pricing,
+                    peerHomes: peerHomesOverride
+                ) {
+                case .complete(let scan): return scan
+                case .incomplete: return nil
+                }
+            }.map { .complete($0) } ?? .incomplete
+        }
+        return await scanResultUncached(
+            daysBack: daysBack,
+            now: now,
+            pricing: pricing,
+            peerHomes: peerHomesOverride
+        )
+    }
+
+    private func scanResultUncached(
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing,
+        peerHomes peerHomesOverride: [URL]? = nil
+    ) async -> CodexLogUsageScanResult {
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
         let futureIdentity = "codex.native.\(context.identity)"
         guard let files = Self.sessionFilesIfComplete(

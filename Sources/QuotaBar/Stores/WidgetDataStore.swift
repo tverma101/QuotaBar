@@ -443,6 +443,14 @@ final class WidgetDataStore {
     /// task per provider, each of which then hit the forced-wait path for any provider already in
     /// flight. A caller arriving while an identical batch runs now joins it, which yields the same
     /// result because the batch refreshes the same provider set.
+    /// One refresh batch, coalescing callers that asked for exactly the same work.
+    ///
+    /// The panel fires a forced full-scope batch on every popover open and never cancels the previous
+    /// one, so a user opening and closing the panel repeatedly used to stack batches — each spawning a
+    /// task per provider, each of which then hit the forced-wait path for any provider already in
+    /// flight. A caller arriving while an identical batch runs now joins it, which yields the same
+    /// result because the batch refreshes the same provider set.
+    ///
     ///
     /// A caller with a *different* force/cache/scope tuple is deliberately not joined: a forced caller
     /// must not be handed a menu-bar-scoped pass, and a scheduled history fold must not join a batch
@@ -625,6 +633,7 @@ final class WidgetDataStore {
                 unregisterProviderRefreshTask(taskID, providerID: providerID)
             }
         }
+
         let durationMs = durationMilliseconds(since: start)
         // Count THIS batch's actual outcomes, not the long-lived `providerErrors` map (which persists
         // across passes, so reading it would miscount cache hits and stale earlier failures).
