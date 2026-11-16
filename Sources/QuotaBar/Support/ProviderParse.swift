@@ -96,6 +96,39 @@ enum ProviderParse {
         return nil
     }
 
+    /// True when `value` is exactly ten characters of `yyyy-MM-dd` shape (ASCII digits and dashes).
+    /// Calendar validity is the caller's concern; this replaces a compiled regex on per-row paths,
+    /// where `range(of:options:.regularExpression)` recompiled the pattern for every row.
+    static func hasISODayShape(_ value: String) -> Bool {
+        let bytes = value.utf8
+        guard bytes.count == 10 else { return false }
+        for (index, byte) in bytes.enumerated() {
+            if index == 4 || index == 7 {
+                guard byte == 45 else { return false }
+            } else {
+                guard (48...57).contains(byte) else { return false }
+            }
+        }
+        return true
+    }
+
+    /// The leading `yyyy-MM-dd` of a timestamp-shaped string, if it starts with one.
+    static func isoDayPrefix(_ value: String) -> String? {
+        guard value.utf8.count >= 10 else { return nil }
+        let prefix = String(value.prefix(10))
+        return hasISODayShape(prefix) ? prefix : nil
+    }
+
+    /// `yyyyMMdd` → `yyyy-MM-dd`, or nil when the input is not exactly eight ASCII digits.
+    static func compactDayKey(_ value: String) -> String? {
+        let bytes = value.utf8
+        guard bytes.count == 8, bytes.allSatisfy({ (48...57).contains($0) }) else { return nil }
+        let year = value.prefix(4)
+        let month = value.dropFirst(4).prefix(2)
+        let day = value.suffix(2)
+        return "\(year)-\(month)-\(day)"
+    }
+
     /// Clamp a percentage into 0...100, treating non-finite input as 0.
     static func clampPercent(_ value: Double) -> Double {
         guard value.isFinite else { return 0 }

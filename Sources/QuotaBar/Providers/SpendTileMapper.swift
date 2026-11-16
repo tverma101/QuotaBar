@@ -13,7 +13,7 @@ enum SpendTileMapper {
     /// that proves otherwise. This holds for every source (the Claude/Codex/Grok log scanners,
     /// Cursor's CSV export); there's no per-source branching. "No data" is also what a tile shows when
     /// the source couldn't be read at all (missing log, failed API/CSV), where the caller appends
-    /// nothing. `estimated` controls whether the dollar value carries the local-estimate marker (ⓘ).
+    /// nothing. `estimated` flags imputed dollars on the emitted values; nothing else reads it here.
     /// `unknownModelsByDay` maps a `yyyy-MM-dd` day key to model names no pricing source can price.
     /// Their tokens still count, and any known priced subtotal remains visible beside the warning.
     /// Today / Yesterday pick up their own day's set; Last 30 Days carries the union across the whole
@@ -265,7 +265,9 @@ enum SpendTileMapper {
         let value = rawDate.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
 
-        if value.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil {
+        // Shape checks instead of `range(of:options:.regularExpression)`: this runs once per history
+        // row on every refresh, and the regex form compiled the pattern each time.
+        if ProviderParse.hasISODayShape(value) {
             return value
         }
 
@@ -273,14 +275,11 @@ enum SpendTileMapper {
             return dayKey(from: date)
         }
 
-        if let match = value.range(of: #"^\d{4}-\d{2}-\d{2}"#, options: .regularExpression) {
-            return String(value[match])
+        if let prefix = ProviderParse.isoDayPrefix(value) {
+            return prefix
         }
-        if value.range(of: #"^\d{8}$"#, options: .regularExpression) != nil {
-            let year = value.prefix(4)
-            let month = value.dropFirst(4).prefix(2)
-            let day = value.suffix(2)
-            return "\(year)-\(month)-\(day)"
+        if let compact = ProviderParse.compactDayKey(value) {
+            return compact
         }
 
         return fallbackDateFormatterAccess.withLock { $0.date(from: value) }.map(dayKey(from:))
@@ -350,10 +349,9 @@ enum SpendTileMapper {
     /// way Codex credits carry "credits"), so the three spend tiles read consistently.
     ///
     /// Only called for a period with real usage (see `hasUsage`). Some token-only callers may not provide
-    /// a dollar value. `estimated` flags locally calculated dollars with the ⓘ; token counts are always
-    /// measured, never flagged. `tokensEstimated` marks the period PARTIAL (a Hermes session is still
-    /// running, so the recorded total is real but not final) — both values carry the ⓘ then, so a
-    /// live-session day is never presented as a settled number.
+    /// a dollar value. `estimated` flags locally calculated dollars on the value itself; token counts are
+    /// always measured, never flagged. `tokensEstimated` marks the period PARTIAL (a Hermes session is
+    /// still running, so the recorded total is real but not final).
     private static func spendValues(
         tokens: Int,
         costUSD: Double?,
@@ -553,7 +551,7 @@ enum SpendTileMapper {
         sourceNote: String?,
         unexplainedIncompleteDays: Set<String>
     ) -> ModelUsageBreakdown? {
-        guard let usage, let sourceNote, !days.isEmpty else { return nil }
+        guard let usage, !days.isEmpty else { return nil }
 
         // Keyed by the case-folded name so `GLM-5.2` and `glm-5.2` land in one row; the accumulator's
         // spelling vote decides which casing titles it.

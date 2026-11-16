@@ -49,6 +49,16 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
             """)
     }
 
+    override func tearDownWithError() throws {
+        if let hermesDB {
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: hermesDB).deletingLastPathComponent())
+        }
+        hermesDB = nil
+        opencodeDB = nil
+        now = nil
+        try super.tearDownWithError()
+    }
+
     func testHermesGatewaySQLSelectsOnlyOpencodeBilledSessions() async throws {
         try sqlite(hermesDB, """
             INSERT INTO sessions (id, model, started_at, billing_provider, billing_base_url, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, ended_at) VALUES

@@ -107,11 +107,38 @@ actor FreebuffHostedUsageScanner {
     private let cacheURL: URL?
     private var cache: Cache?
     private var pending: Pending?
+    /// Identity of the on-disk cache this instance last read or wrote. The app and `quotabar-cli`
+    /// share this file; without the stamp, each process kept its launch-time mirror forever and a
+    /// later write could silently overwrite receipts the other process had appended.
+    private var cacheFileStamp: String?
 
     init(cacheURL: URL? = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/QuotaBar/freebuff-hosted-usage-v1.json")) {
         self.cacheURL = cacheURL
         do { cache = try Self.loadCache(cacheURL) }
+        catch { Self.logCacheReadFailure() }
+        cacheFileStamp = Self.fileStamp(cacheURL)
+    }
+
+    private static func fileStamp(_ url: URL?) -> String? {
+        guard let url,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        else { return nil }
+        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(size)|\(modified)"
+    }
+
+    /// Pick up a write from another process before merging or publishing receipts.
+    private func reloadIfChangedOnDisk() {
+        let stamp = Self.fileStamp(cacheURL)
+        guard stamp != cacheFileStamp else { return }
+        cacheFileStamp = stamp
+        guard let url = cacheURL, FileManager.default.fileExists(atPath: url.path) else {
+            cache = nil
+            return
+        }
+        do { cache = try Self.loadCache(url) }
         catch { Self.logCacheReadFailure() }
     }
 
@@ -119,7 +146,9 @@ actor FreebuffHostedUsageScanner {
         guard let url, FileManager.default.fileExists(atPath: url.path) else { return nil }
         let data = try Data(contentsOf: url)
         guard data.count <= maximumCacheBytes else { throw FreebuffUsageError.invalidResponse }
-        return try JSONDecoder().decode(Cache.self, from: data)
+        return try autoreleasepool {
+            try JSONDecoder().decode(Cache.self, from: data)
+        }
     }
 
     private static func logCacheReadFailure() {
@@ -128,6 +157,7 @@ actor FreebuffHostedUsageScanner {
 
     func scan(auth: FreebuffAuth, client: FreebuffUsageClient, now: Date) async throws -> [FreebuffUsageReceipt] {
         let key = Self.accountKey(auth)
+        reloadIfChangedOnDisk()
         if cache == nil {
             do { cache = try Self.loadCache(cacheURL) }
             catch { Self.logCacheReadFailure() }
@@ -159,6 +189,7 @@ actor FreebuffHostedUsageScanner {
                 if let cacheURL {
                     try FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                     try data.write(to: cacheURL, options: [.atomic, .completeFileProtectionUnlessOpen])
+                    cacheFileStamp = Self.fileStamp(cacheURL)
                 }
             }
             cache = replacement
@@ -173,6 +204,7 @@ actor FreebuffHostedUsageScanner {
     func cachedReceipts(auth: FreebuffAuth) throws -> [FreebuffUsageReceipt] {
         // Memory pressure drops the decoded mirror, not the persisted accounting evidence.
         // An offline/local fold must restore it before publishing totals without hosted usage.
+        reloadIfChangedOnDisk()
         if cache == nil { cache = try Self.loadCache(cacheURL) }
         guard let cache, cache.accountKey == Self.accountKey(auth) else { return [] }
         return Self.receipts(cache)
@@ -257,11 +289,13 @@ actor FreebuffHostedUsageScanner {
                 guard let date = OpenUsageISO8601.date(from: run.finishedAt ?? run.createdAt) else {
                     throw FreebuffUsageError.invalidResponse
                 }
-                let patch = try JSONDecoder().decode(Metrics.self, from: Data(metrics.utf8))
-                let prior = try result.receipt.map { try JSONDecoder().decode(Metrics.self, from: Data($0.metricsJSON.utf8)) }
-                let merged = String(decoding: try JSONEncoder().encode(patch.merging(over: prior)), as: UTF8.self)
-                result.receipt = FreebuffUsageReceipt(id: "cloud:" + run.id, timestampMs: date.timeIntervalSince1970 * 1_000,
-                                                     metricsJSON: merged, model: run.model)
+                try autoreleasepool {
+                    let patch = try JSONDecoder().decode(Metrics.self, from: Data(metrics.utf8))
+                    let prior = try result.receipt.map { try JSONDecoder().decode(Metrics.self, from: Data($0.metricsJSON.utf8)) }
+                    let merged = String(decoding: try JSONEncoder().encode(patch.merging(over: prior)), as: UTF8.self)
+                    result.receipt = FreebuffUsageReceipt(id: "cloud:" + run.id, timestampMs: date.timeIntervalSince1970 * 1_000,
+                                                         metricsJSON: merged, model: run.model)
+                }
             }
             // endCursor advances across non-metric events as well, so an idle run downloads nothing twice.
             result.cursor = page.endCursor ?? page.nextCursor ?? cursor

@@ -463,6 +463,39 @@ final class ModelPricingTests: XCTestCase {
         )
     }
 
+    func testInvalidPublishedCostsAreRejectedInsteadOfPoisoningSpend() throws {
+        let liteLLM = Data(#"""
+        {
+          "negative": {"input_cost_per_token": -0.000001, "output_cost_per_token": 0.000002},
+          "huge": {"input_cost_per_token": 1e308, "output_cost_per_token": 0.000002},
+          "bad-cache": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000002,
+                        "cache_read_input_token_cost": -0.0000005},
+          "valid": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000002}
+        }
+        """#.utf8)
+
+        let catalog = try PricingCatalogCodecs.catalogFromLiteLLM(liteLLM)
+        XCTAssertNil(catalog.entries["negative"], "a negative published rate must not invert spend")
+        XCTAssertNil(catalog.entries["huge"], "an unrepresentable rate must not reach a dollar total")
+        let badCache = try XCTUnwrap(catalog.entries["bad-cache"])
+        XCTAssertFalse(badCache.cacheReadIsExplicit, "an invalid cache rate falls back to the input rate")
+        XCTAssertEqual(badCache.cacheReadPerMillion, badCache.inputPerMillion)
+        XCTAssertNotNil(catalog.entries["valid"])
+
+        let modelsDev = Data(#"""
+        {"provider":{"models":{
+          "negative":{"cost":{"input":-1,"output":2}},
+          "huge":{"cost":{"input":1e308,"output":2}},
+          "valid":{"cost":{"input":1,"output":2}}
+        }}}
+        """#.utf8)
+
+        let dev = try PricingCatalogCodecs.catalogFromModelsDev(modelsDev)
+        XCTAssertNil(dev.entries["negative"])
+        XCTAssertNil(dev.entries["huge"])
+        XCTAssertNotNil(dev.entries["valid"])
+    }
+
     func testOpenRouterCodecAddsOnlyUniqueBaseAliasesAndKeepsVariantPricingExact() throws {
         let source = Data(#"""
         {

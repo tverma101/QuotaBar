@@ -49,6 +49,43 @@ final class SymlinkPreservingWriteTests: XCTestCase {
         )
     }
 
+    /// A relative link resolves against its own directory, so a chain of relative links must still
+    /// land on the final target. The old resolver reused the original path's parent for every hop:
+    /// link1 (`../b/link2`) then link2 (`target.txt`) resolved to `a/target.txt` instead of
+    /// `b/target.txt`, quietly writing the rotated credential to a new file and leaving the real
+    /// one stale.
+    func testWriteFollowsAChainOfRelativeSymlinks() throws {
+        let links = root.appendingPathComponent("a", isDirectory: true)
+        let real = root.appendingPathComponent("b", isDirectory: true)
+        try FileManager.default.createDirectory(at: links, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        let realFile = real.appendingPathComponent("target.txt")
+        try Data("old".utf8).write(to: realFile)
+
+        let second = real.appendingPathComponent("link2")
+        try FileManager.default.createSymbolicLink(atPath: second.path, withDestinationPath: "target.txt")
+        let first = links.appendingPathComponent("link1")
+        try FileManager.default.createSymbolicLink(atPath: first.path, withDestinationPath: "../b/link2")
+
+        try LocalTextFileAccessor().writeText(first.path, "rotated")
+
+        XCTAssertEqual(
+            try String(contentsOf: realFile, encoding: .utf8), "rotated",
+            "a chained relative symlink must resolve to the final target, not the first link's parent"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: links.appendingPathComponent("target.txt").path),
+            "the write must not create a stray credential beside the first link"
+        )
+        for link in [first, second] {
+            let attributes = try FileManager.default.attributesOfItem(atPath: link.path)
+            XCTAssertEqual(
+                attributes[.type] as? FileAttributeType, .typeSymbolicLink,
+                "every link in the chain must survive the rotation"
+            )
+        }
+    }
+
     /// The security property the original `O_NOFOLLOW` was protecting must be unchanged: the written file
     /// is still private, and the temp file is still never placed through a link.
     func testWrittenFileKeepsItsPrivateMode() throws {

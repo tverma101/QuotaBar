@@ -280,7 +280,7 @@ actor CodexProxyUsageScanner {
 
     private static func validDay(_ raw: String?) -> String? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
-              raw.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
+              ProviderParse.hasISODayShape(raw)
         else { return nil }
         return raw
     }
@@ -337,6 +337,22 @@ actor CodexProxyUsageScanner {
     private static func uniqueStrings(_ values: [String]) -> [String] {
         var seen: Set<String> = []
         return values.filter { seen.insert($0).inserted }
+    }
+
+    /// Cheap revision of the on-disk sources: each database's main file plus its SQLite WAL/SHM
+    /// sidecars, which is where a live writer's new rows actually land. Used by the provider to decide
+    /// whether a cached fold can be reused for a ledger wake — a cached fold reused after the proxy
+    /// appended rows hid that usage until the next full pass.
+    func sourceRevision() -> [String: TimeInterval] {
+        var revision: [String: TimeInterval] = [:]
+        for path in Self.uniqueDatabasePaths(databasePaths()) {
+            for candidate in [path, path + "-wal", path + "-shm"] {
+                let attributes = try? FileManager.default.attributesOfItem(atPath: candidate)
+                let modified = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+                revision[candidate] = modified
+            }
+        }
+        return revision
     }
 
     private static func uniqueDatabasePaths(_ paths: [String]) -> [String] {

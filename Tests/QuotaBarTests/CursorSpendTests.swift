@@ -624,7 +624,7 @@ final class CursorSpendProviderTests: XCTestCase {
             XCTAssertTrue(remaining.hasData)
             XCTAssertEqual(remaining.valueText, expectedValue)
             XCTAssertEqual(remaining.unboundedDetail, expectedDetail)
-            XCTAssertEqual(remaining.infoNote, WidgetData.localEstimateNote)
+            XCTAssertNil(remaining.infoNote)
             // Unbounded: identical under both meter styles.
             XCTAssertEqual(used.valueText, remaining.valueText)
             XCTAssertEqual(used.unboundedDetail, remaining.unboundedDetail)

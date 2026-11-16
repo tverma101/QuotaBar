@@ -75,6 +75,10 @@ final class CodexAutoResetCoordinator {
     private var lastKnownCredits: [String: [CodexResetCredit]] = [:]
     private var hasCheckedAccounts: Set<String> = []
     @ObservationIgnored private var inFlight: Set<String> = []
+    /// Consecutive credit-lookup failures per account, used to back off a dead endpoint. Without
+    /// this, an offline Mac retried every account every 15 s indefinitely, which is both network
+    /// churn and a log storm that hides the real failure.
+    @ObservationIgnored private var creditLookupFailures: [String: Int] = [:]
     @ObservationIgnored private var workers: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var systemWakeSource: CodexAutoResetWakeSource?
 
@@ -176,10 +180,13 @@ final class CodexAutoResetCoordinator {
     func status(for accountID: String, enabled: Bool) -> CodexAutoResetStatus {
         guard enabled else { return .off }
         guard accounts[accountID] != nil else { return .unverified }
+        // One captured instant for the whole evaluation. Calling `now()` at each comparison could
+        // straddle an expiry boundary and report `scheduled` and `windowPassed` for the same credit.
+        let current = now()
         let owner = attemptOwner(for: accountID)
         let windowPassed = attempts.values.contains {
-            $0.accountID == owner && $0.result != .success && $0.result != .nothingToReset && $0.expiry <= now()
-                && $0.expiry > now().addingTimeInterval(-86_400)
+            $0.accountID == owner && $0.result != .success && $0.result != .nothingToReset && $0.expiry <= current
+                && $0.expiry > current.addingTimeInterval(-86_400)
         }
         if let error = lastErrorByAccount[accountID] {
             return .attention(error + (windowPassed
@@ -188,10 +195,10 @@ final class CodexAutoResetCoordinator {
         guard let credits = lastKnownCredits[accountID], !credits.isEmpty || hasCheckedAccounts.contains(accountID)
         else { return .checking }
         let retries = attempts.values.filter {
-            $0.accountID == owner && $0.result == .pending && $0.attempts > 0 && $0.expiry > now()
+            $0.accountID == owner && $0.result == .pending && $0.attempts > 0 && $0.expiry > current
         }.map { CodexResetCredit(id: $0.creditID, expiresAt: $0.expiry, isRetry: true) }
         let next = (credits + retries).filter {
-            $0.expiresAt > now()
+            $0.expiresAt > current
                 && attempts[Self.key(accountID: owner, creditID: $0.id)]?.result.isTerminal != true
         }.map { credit in
             let trigger = credit.expiresAt.addingTimeInterval(-Self.leadTime)
@@ -202,7 +209,7 @@ final class CodexAutoResetCoordinator {
         }.min()
         if windowPassed { return .windowPassed(nextAttempt: next) }
         guard let next else { return .monitoring }
-        return next <= now() ? .due : .scheduled(next)
+        return next <= current ? .due : .scheduled(next)
     }
 
     deinit { workers.values.forEach { $0.cancel() } }
@@ -224,8 +231,16 @@ final class CodexAutoResetCoordinator {
                 AppLog.warn(LogTag.plugin("codex"), "auto reset: credit lookup unavailable for \(accountID)")
             }
             lastErrorByAccount[accountID] = "Could not check reset credits"
-            return close ? 10 : Self.retryInterval
+            let failures = (creditLookupFailures[accountID] ?? 0) + 1
+            creditLookupFailures[accountID] = failures
+            // Exponential backoff capped at the normal patrol cadence: 15 s, 30 s, 60 s, … 300 s.
+            // A credit that is about to expire still gets the short retry, because missing that
+            // deadline is the one case where waiting is worse than the extra request.
+            let exponent = Double(min(failures - 1, 5))
+            let backoff = min(Self.patrolInterval, Self.retryInterval * pow(2, exponent))
+            return close ? 10 : backoff
         }
+        creditLookupFailures[accountID] = nil
         hasCheckedAccounts.insert(accountID)
         lastKnownCredits[accountID] = credits
         // Retain observed expiries even before their first attempt, account-bound and bounded

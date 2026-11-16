@@ -1,6 +1,11 @@
 import Foundation
 import CoreFoundation
 import os
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// A missing native source is complete empty data; an incomplete discovery or fold must preserve the
 /// last-good combined history instead of publishing whichever session files happened to succeed.
@@ -253,6 +258,24 @@ actor CodexLogUsageScanner {
     /// under a peer `~/.codex` are skipped so Orca backfills stay attributed to default. Default
     /// `~/.codex` keeps shared inodes (see `sessionFiles`).
     private let peerHomes: [URL]
+    /// Production-only daily-aggregate gate (see `LogUsageAggregateCache`); test scanner
+    /// injections keep the plain incremental path.
+    private let aggregateCache: LogUsageAggregateCache?
+
+    /// Per-file account attribution for a *shared* `~/.codex` whose rollouts are otherwise
+    /// invisible to managed cards (the anti-double-count rule drops the shared default home when
+    /// 2+ router homes exist). Rollouts name their author in `session_meta.payload.creator_account_id`,
+    /// so a file's owner is knowable without folding it: this member re-enables scanning the shared
+    /// tree with files kept only for their actual account. `keepsUnattributed` decides files whose
+    /// session_meta predates/omits the field — true for the default-home-anchored card (the natural
+    /// owner of `~/.codex`), false for managed cards (their unattributed files must stay dropped or
+    /// both cards would count them).
+    struct SharedAttribution: Sendable, Equatable {
+        var home: String
+        var identity: String
+        var keepsUnattributed: Bool
+    }
+    private let sharedAttribution: SharedAttribution?
 
     /// Priced per-inode folds. A menu-bar tap reuses these when size/mtime/inode are unchanged
     /// instead of re-walking every retained session event. Only the files that actually grew are
@@ -335,12 +358,18 @@ actor CodexLogUsageScanner {
         environment: EnvironmentReading = QuotaBarEnvironmentReader(),
         homeDirectory: @escaping @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
         peerHomes: [URL] = [],
-        incrementalScanner: IncrementalJSONLScanner<Event>? = nil
+        sharedAttribution: SharedAttribution? = nil,
+        incrementalScanner: IncrementalJSONLScanner<Event>? = nil,
+        aggregateCache: LogUsageAggregateCache? = nil
     ) {
         self.environment = environment
         self.homeDirectory = homeDirectory
         self.peerHomes = peerHomes
+        self.sharedAttribution = sharedAttribution.map(Self.normalizedAttribution)
         self.scanner = incrementalScanner ?? Self.sharedScanner
+        self.aggregateCache = aggregateCache ?? ((incrementalScanner == nil)
+            ? LogUsageAggregateCache.shared
+            : nil)
     }
 
     func scan(
@@ -362,7 +391,22 @@ actor CodexLogUsageScanner {
         }
     }
 
+    private static func aggregateScopeKey(homes: [URL], peerHomes: [URL]) -> String {
+        let homesKey = homes
+            .map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
+            .sorted()
+            .joined(separator: ",")
+        let peersKey = peerHomes
+            .map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
+            .sorted()
+            .joined(separator: ",")
+        return "homes=\(homesKey)|peers=\(peersKey)"
+    }
+
     /// Completeness-aware scan used by providers that merge Codex logs with other sources.
+    /// Gates through the persisted stat-fingerprint aggregate (see `LogUsageAggregateCache`):
+    /// when the discovered source set is stat-identical to the last completed scan, the finished
+    /// aggregate is served without parsing, hydration, replay, or re-encoding.
     func scanResult(
         daysBack: Int = UsageHistoryWindow.previousDays,
         now: Date = Date(),
@@ -370,6 +414,73 @@ actor CodexLogUsageScanner {
         peerHomes peerHomesOverride: [URL]? = nil
     ) async -> CodexLogUsageScanResult {
         guard !Task.isCancelled else { return .incomplete }
+        if let aggregateCache {
+            let homes = codexHomes()
+            let files = Self.sessionFiles(
+                homes: homes,
+                peerHomes: peerHomesOverride ?? peerHomes,
+                homeDirectory: homeDirectory,
+                sharedAttribution: sharedAttribution
+            )
+            if files.isEmpty {
+                // A genuinely empty Codex home is a complete empty fold, not an incomplete one —
+                // it must not engage the cache's nil-fresh sentinel and masquerade as a failed
+                // scan (callers would wrongly preserve last-good history forever).
+                return await scanResultUncached(
+                    daysBack: daysBack,
+                    now: now,
+                    pricing: pricing,
+                    peerHomes: peerHomesOverride
+                )
+            }
+            let fingerprints: [String: LogUsageSourceFingerprint] = [
+                "sessions": LogUsageSourceFingerprint.of(files)
+            ]
+            let scopeKey = Self.aggregateScopeKey(
+                homes: homes,
+                peerHomes: peerHomesOverride ?? peerHomes
+            )
+            let cacheKey = "codex-native|\(scopeKey)"
+            let outcome = await aggregateCache.scan(
+                key: cacheKey,
+                pricingStamp: LogUsagePricingStamp.of(pricing),
+                daysBack: daysBack,
+                fingerprints: fingerprints,
+                now: now
+            ) { [self] in
+                switch await scanResultUncached(
+                    daysBack: daysBack,
+                    now: now,
+                    pricing: pricing,
+                    peerHomes: peerHomesOverride
+                ) {
+                case .complete(let scan):
+                    return .complete(scan, validUntil: nil)
+                case .incomplete:
+                    return .incomplete
+                }
+            }
+            switch outcome {
+            case .complete(let scan):
+                return .complete(scan)
+            case .incomplete:
+                return .incomplete
+            }
+        }
+        return await scanResultUncached(
+            daysBack: daysBack,
+            now: now,
+            pricing: pricing,
+            peerHomes: peerHomesOverride
+        )
+    }
+
+    private func scanResultUncached(
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: ModelPricing,
+        peerHomes peerHomesOverride: [URL]? = nil
+    ) async -> CodexLogUsageScanResult {
         let homes = codexHomes()
         guard !Task.isCancelled else { return .incomplete }
         let context = Self.scanContext(homes: homes, daysBack: daysBack, now: now)
@@ -377,7 +488,8 @@ actor CodexLogUsageScanner {
         guard let files = Self.sessionFilesIfComplete(
             homes: homes,
             peerHomes: peerHomesOverride ?? peerHomes,
-            homeDirectory: homeDirectory
+            homeDirectory: homeDirectory,
+            sharedAttribution: sharedAttribution
         ) else {
             if !Task.isCancelled {
                 Self.logScanFailure(
@@ -418,7 +530,7 @@ actor CodexLogUsageScanner {
         }
 
         let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
-        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map { $0.path }))
         for file in files where FutureTimestampRevisionGate.shouldDefer(
             identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
         ) {
@@ -859,7 +971,7 @@ actor CodexLogUsageScanner {
             return true
         }
         let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
-        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map { $0.path }))
         for file in files where FutureTimestampRevisionGate.shouldDefer(
             identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
         ) {
@@ -891,8 +1003,10 @@ actor CodexLogUsageScanner {
             fileCompleted: { path, _ in bucket.finish(path) }
         )
         guard complete else { return false }
+        // Index once instead of scanning the whole file list per future-timestamp entry.
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         for (path, timestamp) in bucket.futureTimestamps {
-            guard let file = files.first(where: { $0.path == path }),
+            guard let file = filesByPath[path],
                   FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
             else { return false }
         }
@@ -1019,9 +1133,15 @@ actor CodexLogUsageScanner {
     static func sessionFiles(
         homes: [URL],
         peerHomes: [URL] = [],
-        homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser }
+        homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
+        sharedAttribution: SharedAttribution? = nil
     ) -> [JSONLScanning.DiscoveredFile] {
-        sessionFilesIfComplete(homes: homes, peerHomes: peerHomes, homeDirectory: homeDirectory) ?? []
+        sessionFilesIfComplete(
+            homes: homes,
+            peerHomes: peerHomes,
+            homeDirectory: homeDirectory,
+            sharedAttribution: sharedAttribution
+        ) ?? []
     }
 
     /// `nil` means a present Codex session root could not be fully enumerated. A caller must keep
@@ -1030,7 +1150,8 @@ actor CodexLogUsageScanner {
         homes: [URL],
         peerHomes: [URL] = [],
         homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
-        peerInodeDiscovery: (@Sendable (URL) -> Set<FileIdentity>?)? = nil
+        peerInodeDiscovery: (@Sendable (URL) -> Set<FileIdentity>?)? = nil,
+        sharedAttribution: SharedAttribution? = nil
     ) -> [JSONLScanning.DiscoveredFile]? {
         guard !Task.isCancelled else { return nil }
         let defaultCodexPath = homeDirectory()
@@ -1096,19 +1217,32 @@ actor CodexLogUsageScanner {
             if sourceDirs.isEmpty {
                 continue
             }
+            // `.jsonl.zst` archives are always discovered; when zstd itself is absent they are
+            // dropped (with one process-wide warning) so the fold degrades to today's behavior
+            // instead of failing the whole source as unreadable.
             for dir in sourceDirs.map({ $0.resolvingSymlinksInPath() }) where seenDirs.insert(dir.path).inserted {
                 guard !Task.isCancelled,
-                      let discovered = JSONLScanning.jsonlFilesIfComplete(under: dir)
+                      let discovered = JSONLScanning.jsonlFilesIfComplete(under: dir, includeCompressedJSONL: true)
                 else { return nil }
                 for file in discovered {
                     guard !Task.isCancelled else { return nil }
+                    if file.path.hasSuffix(".zst"), ZstdDecompressor.shared.zstdExecutable == nil {
+                        DiagnosticGate.logOnce(for: "codex.zstd-unavailable") {
+                            AppLog.warn(
+                                LogTag.plugin("codex"),
+                                "zstd is not installed (expected at /opt/homebrew/bin/zstd or /usr/local/bin/zstd); compressed rollout archives are skipped"
+                            )
+                        }
+                        continue
+                    }
                     let relative = String(file.path.dropFirst(dir.path.count))
                     guard seenRelative.insert(relative).inserted else { continue }
                     let fileURL = URL(fileURLWithPath: file.path)
                     // Rollout IDs are globally unique. This catches copied backfills whose inode
                     // differs from the canonical file, while leaving generic fixture names and any
-                    // future non-rollout JSONL sources untouched.
-                    let rolloutName = fileURL.lastPathComponent
+                    // future non-rollout JSONL sources untouched. A `.jsonl.zst` archive shares its
+                    // rollout id with the plain `.jsonl`, so both collapse onto the same dedupe key.
+                    let rolloutName = Self.normalizedRolloutName(fileURL.lastPathComponent)
                     if rolloutName.hasPrefix("rollout-"), !seenRolloutNames.insert(rolloutName).inserted {
                         continue
                     }
@@ -1121,7 +1255,75 @@ actor CodexLogUsageScanner {
                 }
             }
         }
+        if let sharedAttribution {
+            files = Self.attributedFiles(files, to: Self.normalizedAttribution(sharedAttribution))
+        }
         return files
+    }
+
+    private static func normalizedAttribution(_ attribution: SharedAttribution) -> SharedAttribution {
+        var copy = attribution
+        copy.home = Self.realpathString(attribution.home)
+        return copy
+    }
+
+    /// Absolute canonical path (symlinks resolved at the syscall layer), or a standardized
+    /// fallback for paths that don't exist. Foundation's `resolvingSymlinksInPath` is not
+    /// consistent with `FileManager.enumerator` URL spellings on this volume.
+    static func realpathString(_ path: String) -> String {
+        #if canImport(Darwin) || canImport(Glibc)
+        if let resolved = realpath(path, nil) {
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+        #endif
+        return URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    /// Read only the head of a rollout to find the account that created it. `session_meta` is the
+    /// first line of every rollout and `creator_account_id` is among its first keys, so 16 KB is
+    /// generous. Returns nil for missing/unparseable/absent metadata (older rollouts). `.jsonl.zst`
+    /// archives are read through the decompressor's prefix path, so the peek stays cheap.
+    static func peekCreatorAccountID(path: String) -> String? {
+        if path.hasSuffix(".zst") {
+            guard let prefix = ZstdDecompressor.shared.decompressPrefix(path: path, maxBytes: 16 * 1024) else {
+                return nil
+            }
+            return peekCreatorAccountID(in: prefix)
+        }
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let head = handle.readData(ofLength: 16 * 1024)
+        return peekCreatorAccountID(in: head)
+    }
+
+    private static func peekCreatorAccountID(in head: Data) -> String? {
+        let marker = Data(#""creator_account_id":""#.utf8)
+        guard let range = head.range(of: marker) else { return nil }
+        let rest = head[range.upperBound...]
+        guard let end = rest.firstIndex(of: UInt8(ascii: "\"")) else { return nil }
+        let raw = rest[..<end]
+        guard !raw.isEmpty, let value = String(data: raw, encoding: .utf8) else { return nil }
+        return value
+    }
+
+    /// Keep only the files under `sharedHome` that belong to `identity` (plus the unattributed,
+    /// when `keepsUnattributed`). Files anywhere else pass through untouched.
+    private static func attributedFiles(
+        _ files: [JSONLScanning.DiscoveredFile],
+        to attribution: SharedAttribution
+    ) -> [JSONLScanning.DiscoveredFile] {
+        let prefix = attribution.home.trimmingTrailingSlashes + "/"
+        return files.filter { file in
+            // Compare realpaths, not Foundation-resolved URLs: on this volume /var keeps its
+            // spelling under `resolvingSymlinksInPath` while the enumerator's URLs come out as
+            // /private/var — two spellings of one directory.
+            guard Self.realpathString(file.path).hasPrefix(prefix) else { return true }
+            guard let creator = peekCreatorAccountID(path: file.path) else {
+                return attribution.keepsUnattributed
+            }
+            return creator.caseInsensitiveCompare(attribution.identity) == .orderedSame
+        }
     }
 
     private static func isDefaultCodexHome(_ home: URL, defaultCodexPath: String) -> Bool {
@@ -1262,7 +1464,8 @@ actor CodexLogUsageScanner {
             ) else { return nil }
             for case let url as URL in enumerator {
                 guard !Task.isCancelled else { return nil }
-                guard url.pathExtension == "jsonl" else { continue }
+                let compressed = url.lastPathComponent.hasSuffix(".jsonl.zst")
+                guard url.pathExtension == "jsonl" || (ZstdDecompressor.shared.zstdExecutable != nil && compressed) else { continue }
                 guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]) else { return nil }
                 guard values.isRegularFile == true else { continue }
                 guard let identity = fileIdentity(at: url) else { return nil }
@@ -1271,6 +1474,12 @@ actor CodexLogUsageScanner {
             guard !enumerationFailed else { return nil }
         }
         return result
+    }
+
+    /// Rollout file names differ only by the `.zst` suffix between a finished archive and the live
+    /// source. The identity of a rollout for dedupe purposes drops that suffix.
+    static func normalizedRolloutName(_ name: String) -> String {
+        name.hasSuffix(".zst") ? String(name.dropLast(4)) : name
     }
 
     static func fileIdentity(at url: URL) -> FileIdentity? {
@@ -1285,7 +1494,9 @@ actor CodexLogUsageScanner {
     static func parseFile(_ data: Data) -> [Event] {
         var parser = FileParser()
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            parser.consume(line)
+            autoreleasepool {
+                parser.consume(line)
+            }
         }
         return parser.finish()
     }
@@ -1295,10 +1506,77 @@ actor CodexLogUsageScanner {
     nonisolated static func parseFile(at url: URL) -> [Event]? {
         var parser = FileParser()
         let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
-            parser.consume(line)
+            autoreleasepool {
+                parser.consume(line)
+            }
         }
         guard readSucceeded, !parser.hasMalformedUsage else { return nil }
         return parser.finish()
+    }
+
+    /// Parse a finished `.jsonl.zst` rollout through the decompressor. The decompressor itself is
+    /// optional equipment — nil here means "zstd missing", which the discovery path already filtered
+    /// out, so this is reached only on machines with zstd. Results are memoized per process keyed on
+    /// the archive's revision; appends never happen to a finished rollout, so the memo is exact.
+    private final class CompressedRolloutCache: @unchecked Sendable {
+        static let shared = CompressedRolloutCache()
+        private struct Entry {
+            let revision: AppendOnlyFileRevision
+            let mtimeKey: String
+            let items: [Event]
+        }
+        private let lock = NSLock()
+        private var entries: [String: Entry] = [:]
+
+        private static func key(revision: AppendOnlyFileRevision, times: AppendOnlyFileModificationTimes) -> String {
+            "\(revision.device)-\(revision.inode)-\(revision.size)-\(times.mtimeSeconds)-\(times.mtimeNanoseconds)-\(times.ctimeSeconds)-\(times.ctimeNanoseconds)"
+        }
+
+        func load(path: String, revision: AppendOnlyFileRevision, times: AppendOnlyFileModificationTimes) -> [Event]? {
+            let keyValue = Self.key(revision: revision, times: times)
+            return lock.withLock { () -> [Event]? in
+                guard let entry = entries[path], entry.mtimeKey == keyValue else { return nil }
+                return entry.items
+            }
+        }
+
+        func store(path: String, revision: AppendOnlyFileRevision, times: AppendOnlyFileModificationTimes, items: [Event]) {
+            let keyValue = Self.key(revision: revision, times: times)
+            lock.withLock {
+                if entries.count >= 512 {
+                    // Archives are few and static; dropping the whole memo on overflow keeps the
+                    // cache trivially correct without an eviction policy.
+                    entries.removeAll(keepingCapacity: true)
+                }
+                entries[path] = Entry(revision: revision, mtimeKey: keyValue, items: items)
+            }
+        }
+    }
+
+    nonisolated private static func parseCompressedRollout(at url: URL, emitSince: Date) -> [Event]? {
+        let key = url.standardizedFileURL.path
+        guard let stamp = AppendOnlyFileProbe.stamp(at: url) else { return nil }
+        if let cached = CompressedRolloutCache.shared.load(path: key, revision: stamp.revision, times: stamp.modificationTimes) {
+            return cached.filter { $0.timestamp >= emitSince }
+        }
+        do {
+            guard let data = try ZstdDecompressor.shared.decompress(path: url.path) else { return nil }
+            var parser = FileParser(emitSince: nil)
+            for line in data.split(separator: UInt8(ascii: "\n")) {
+                autoreleasepool {
+                    parser.consume(line)
+                }
+            }
+            guard !parser.hasMalformedUsage else { return nil }
+            let items = parser.finish()
+            CompressedRolloutCache.shared.store(path: key, revision: stamp.revision, times: stamp.modificationTimes, items: items)
+            return items.filter { $0.timestamp >= emitSince }
+        } catch is CancellationError {
+            return nil
+        } catch {
+            // The read-failure reporter reports this as unreadable and the fold keeps last-good.
+            return nil
+        }
     }
 
     /// Read only bytes after the prior EOF when the file still proves to be an append of the same
@@ -1308,6 +1586,12 @@ actor CodexLogUsageScanner {
         emitSince: Date,
         retentionDays: Int
     ) -> [Event]? {
+        // `.jsonl.zst` archives are finished rollouts — read-once, never appended. They bypass the
+        // append-only checkpoint machinery entirely and go through the decompressor with a
+        // process-local cache: re-folds in a long-lived process must not re-decompress the archive.
+        if url.pathExtension == "zst" || url.lastPathComponent.hasSuffix(".jsonl.zst") {
+            return parseCompressedRollout(at: url, emitSince: emitSince)
+        }
         let key = tailKey(for: url, retentionDays: retentionDays)
         let currentStamp = AppendOnlyFileProbe.stamp(at: url)
 
@@ -1345,7 +1629,9 @@ actor CodexLogUsageScanner {
                 discardingOversizedLine: cached.isDiscardingOversizedLine,
                 deliverFinalPartial: false
             ) { line in
-                parser.consume(line)
+                autoreleasepool {
+                    parser.consume(line)
+                }
             }
             guard read.isComplete else { return nil }
             guard !parser.hasMalformedUsage else { return nil }
@@ -1456,7 +1742,9 @@ actor CodexLogUsageScanner {
             deliverFinalPartial: false
         ) { line in
             guard !declined else { return }
-            if !parser.consume(line) { declined = true }
+            autoreleasepool {
+                if !parser.consume(line) { declined = true }
+            }
         }
         guard read.isComplete else { return .incomplete }
         if !declined {
@@ -1723,6 +2011,12 @@ actor CodexLogUsageScanner {
                 return
             }
 
+            // A rate-limit-only ping: `info` is explicitly null (OpenAI emits these while a turn
+            // is in flight with no usage to report). Nothing to count — skipping it must not
+            // mark the source malformed.
+            if payload["info"] is NSNull {
+                return
+            }
             guard let rawInfo = payload["info"],
                   let info = rawInfo as? [String: Any]
             else {
@@ -1963,9 +2257,9 @@ actor CodexLogUsageScanner {
 
     static func autoReviewFallback(at timestamp: String) -> String {
         let date = String(timestamp.prefix(10))
-        guard date.count == 10,
-              date.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
-        else { return "gpt-5" }
+        // Called for every unresolvable auto-review/reserve row on every refresh; a shape check
+        // avoids compiling the same regex per row.
+        guard ProviderParse.hasISODayShape(date) else { return "gpt-5" }
         return autoReviewFallbacks.first(where: { date >= $0.releasedOn })?.model ?? "gpt-5"
     }
 

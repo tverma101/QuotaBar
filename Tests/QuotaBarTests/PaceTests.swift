@@ -53,6 +53,7 @@ final class PaceTests: XCTestCase {
 
     private func pacedData(
         used: Double,
+        limit: Double = 100,
         elapsed: Double = 0.5,
         period: TimeInterval? = nil,
         displayMode: WidgetDisplayMode = .used,
@@ -60,7 +61,7 @@ final class PaceTests: XCTestCase {
     ) -> WidgetData {
         let period = period ?? week
         var data = WidgetData(title: "Weekly", icon: .providerMark("codex"), kind: .percent,
-                              used: used, limit: 100, displayMode: displayMode)
+                              used: used, limit: limit, displayMode: displayMode)
         data.resetsAt = resetsAt(elapsed: elapsed, period: period)
         data.periodDurationMs = Int(period * 1000)
         data.alwaysShowPacing = alwaysShowPacing
@@ -70,6 +71,20 @@ final class PaceTests: XCTestCase {
     private func tick(_ data: WidgetData) -> Double? {
         let state = data.meterState(now: now)
         return data.paceTick(for: state, now: now)
+    }
+
+    /// A malformed provider sample can be huge but finite. The projection then overflows `Double` to
+    /// infinity, and `Int(infinity)` in the tooltip used to trap while the row rendered.
+    func testHugeUsageSampleTooltipDoesNotTrap() {
+        // 90% of a 1e308 limit, projected over the full window, overflows `Double` to infinity while
+        // the meter is still legitimately unspent.
+        let data = pacedData(used: 9e307, limit: 1e308)
+        let state = data.meterState(now: now)
+        guard case .runningOut(_, let projected) = state else {
+            return XCTFail("expected an overflowing projection to stay in the runningOut state")
+        }
+        XCTAssertFalse(projected.isFinite)
+        XCTAssertEqual(state.tooltip, "~100% over limit at reset")
     }
 
     /// The amber spare copy, present only in the `closeToLimit` state.
@@ -197,12 +212,16 @@ final class PaceTests: XCTestCase {
 
     // MARK: Always Show Pacing (opt-in tick + healthy copy on blue)
 
-    func testAlwaysShowPacingAddsEvenPaceTickToHealthyBar() {
-        XCTAssertEqual(tick(pacedData(used: 30, elapsed: 0.4, alwaysShowPacing: true)) ?? -1,
-                       0.4, accuracy: 0.001)
-        XCTAssertEqual(tick(pacedData(used: 30, elapsed: 0.4, displayMode: .remaining,
-                                     alwaysShowPacing: true)) ?? -1,
-                       0.6, accuracy: 0.001)
+    func testEvenPaceTickTracksDisplayMode() {
+        // Same contract, two window positions: the tick is the even-pace line — elapsed in "used"
+        // mode, 1 − elapsed in "remaining" mode — at any usage level.
+        for (used, elapsed) in [(30.0, 0.4), (76.0, 0.8)] {
+            XCTAssertEqual(tick(pacedData(used: used, elapsed: elapsed, alwaysShowPacing: true)) ?? -1,
+                           elapsed, accuracy: 0.001)
+            XCTAssertEqual(tick(pacedData(used: used, elapsed: elapsed, displayMode: .remaining,
+                                          alwaysShowPacing: true)) ?? -1,
+                           1 - elapsed, accuracy: 0.001)
+        }
     }
 
     func testAmberTickIsAlwaysEvenPaceLine() {
@@ -210,14 +229,6 @@ final class PaceTests: XCTestCase {
         XCTAssertEqual(tick(pacedData(used: 46, elapsed: 0.5, alwaysShowPacing: true)) ?? -1,
                        0.5, accuracy: 0.001)
         XCTAssertEqual(spare(pacedData(used: 46, elapsed: 0.5, alwaysShowPacing: true)), "~8% spare")
-    }
-
-    func testEvenPaceTickTracksDisplayMode() {
-        XCTAssertEqual(tick(pacedData(used: 76, elapsed: 0.8, alwaysShowPacing: true)) ?? -1,
-                       0.8, accuracy: 0.001)
-        XCTAssertEqual(tick(pacedData(used: 76, elapsed: 0.8, displayMode: .remaining,
-                                      alwaysShowPacing: true)) ?? -1,
-                       0.2, accuracy: 0.001)
     }
 
     func testRedBarShowsEvenPaceTickWithAlwaysShowPacingOn() {

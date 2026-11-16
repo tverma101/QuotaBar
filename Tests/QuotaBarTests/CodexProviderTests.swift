@@ -51,6 +51,39 @@ final class CodexAuthStoreTests: XCTestCase {
         return "\(header).\(payload).sig"
     }
 
+    func testCandidateAuthHomesPreferTheFreshestSameAccountToken() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func jwt(exp: TimeInterval) -> String {
+            func b64url(_ string: String) -> String {
+                Data(string.utf8).base64EncodedString()
+                    .replacingOccurrences(of: "+", with: "-")
+                    .replacingOccurrences(of: "/", with: "_")
+                    .replacingOccurrences(of: "=", with: "")
+            }
+            let header = b64url(#"{"alg":"RS256","typ":"JWT"}"#)
+            let payload = b64url(#"{"exp":\#(Int(exp))}"#)
+            return "\(header).\(payload).sig"
+        }
+        let files = FakeFiles([
+            "/tmp/codex-router/auth.json": #"{"tokens":{"access_token":"\#(jwt(exp: now.timeIntervalSince1970 + 600))","account_id":"account-a"}}"#,
+            "/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"\#(jwt(exp: now.timeIntervalSince1970 + 86_400))","account_id":"account-a"}}"#
+        ])
+        let store = CodexAuthStore(
+            files: files,
+            keychain: FakeKeychain(),
+            now: { now },
+            expectedIdentityKey: "account-a",
+            candidateAuthHomes: ["/tmp/codex-router", "/tmp/codex-home"]
+        )
+
+        let candidates = try store.loadAuthCandidates()
+
+        XCTAssertEqual(candidates.map(\.source), [
+            .file(path: "/tmp/codex-home/auth.json"),
+            .file(path: "/tmp/codex-router/auth.json")
+        ])
+    }
+
     func testUsesCodexHomeAuthPathBeforeDefaultPaths() throws {
         let files = FakeFiles([
             "/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#
@@ -924,6 +957,73 @@ final class CodexProviderTests: XCTestCase {
             XCTAssertEqual(http.requests.map(\.url), [CodexUsageClient.refreshURL])
             XCTAssertEqual(files.files[path], replacement, "the late refresh must preserve logout or the replacement account")
         }
+    }
+
+    func testRefreshFallsBackToAnotherVerifiedHomeWhenThePrimaryTokenIsDead() async throws {
+        let now = TestLocalInstant.date(2026, 2, 20, 12)
+        func jwt(exp: TimeInterval) -> String {
+            func b64url(_ string: String) -> String {
+                Data(string.utf8).base64EncodedString()
+                    .replacingOccurrences(of: "+", with: "-")
+                    .replacingOccurrences(of: "/", with: "_")
+                    .replacingOccurrences(of: "=", with: "")
+            }
+            let header = b64url(#"{"alg":"RS256","typ":"JWT"}"#)
+            let payload = b64url(#"{"exp":\#(Int(exp))}"#)
+            return "\(header).\(payload).sig"
+        }
+        let deadToken = jwt(exp: now.timeIntervalSince1970 + 2 * 86_400)
+        let liveToken = jwt(exp: now.timeIntervalSince1970 + 86_400)
+        let files = FakeFiles([
+            "/tmp/codex-router/auth.json": #"{"tokens":{"access_token":"\#(deadToken)","refresh_token":"dead-refresh","account_id":"codex-fixture-account"},"last_refresh":"\#(OpenUsageISO8601.string(from: now.addingTimeInterval(-9 * 24 * 60 * 60)))"}"#,
+            "/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"\#(liveToken)","refresh_token":"live-refresh","account_id":"codex-fixture-account"},"last_refresh":"\#(OpenUsageISO8601.string(from: now))"}"#
+        ])
+        let usage = Data(#"{"rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":60}}}"#.utf8)
+        let http = RoutingHTTPClient { request in
+            switch request.url {
+            case CodexUsageClient.usageURL:
+                if request.headers["Authorization"] == "Bearer \(liveToken)" {
+                    return HTTPResponse(statusCode: 200, headers: [:], body: usage)
+                }
+                return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+            case CodexUsageClient.refreshURL:
+                // The pool home's rotated refresh token is dead on the server.
+                return HTTPResponse(statusCode: 400, headers: [:], body: Data(#"{"error":"invalid_grant"}"#.utf8))
+            case CodexUsageClient.resetCreditsURL:
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data("{}".utf8))
+            default:
+                XCTFail("unexpected request: \(request.url)")
+                return HTTPResponse(statusCode: 500, headers: [:], body: Data())
+            }
+        }
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                files: files,
+                keychain: FakeKeychain(),
+                now: { now },
+                expectedIdentityKey: "codex-fixture-account",
+                candidateAuthHomes: ["/tmp/codex-router", "/tmp/codex-home"]
+            ),
+            usageClient: CodexUsageClient(http: http),
+            logUsageScanner: CodexLogFixture.scanner(home: nil),
+            proxyUsageScanner: CodexProxyUsageScanner(databasePaths: { [] }),
+            routerUsageScanner: CodexRouterUsageScanner(ledgerPaths: { [] }, identityAliases: { [:] }),
+            expectedIdentityKey: "codex-fixture-account",
+            allowsKeychainFallback: false,
+            allowsUnattributedPiUsage: false,
+            now: { now }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.warning)
+        XCTAssertTrue(snapshot.lines.contains { $0.label == "Session" })
+        let deadUsageRequests = http.requests.filter { request in
+            request.url == CodexUsageClient.usageURL
+                && request.headers["Authorization"] == "Bearer \(deadToken)"
+        }
+        XCTAssertEqual(deadUsageRequests.count, 1,
+                       "the dead home is tried once, then the live same-account home answers")
     }
 
     func testLocalHistoryReplacesStaleSnapshotWhenLiveQuotaAuthFails() async throws {

@@ -25,7 +25,9 @@ final class CodexProvider: ProviderRuntime {
     private var lastResolvedAccountIdentityKey: String?
     private var lastNativeScan: LogUsageScan?
     private var lastProxyScan: LogUsageScan?
-    private var lastPiScan: LogUsageScan?
+    /// Source revision the cached proxy fold was built from. Ledger wakes reuse that fold only while
+    /// the FCC databases (and their WAL sidecars) are byte-for-byte unchanged.
+    private var lastProxyScanRevision: [String: TimeInterval]?
     let allowsKeychainFallback: Bool
     let allowsUnattributedPiUsage: Bool
     /// Higher-priority peer homes are identity-only sources for excluding shared rollouts. They are
@@ -91,7 +93,7 @@ final class CodexProvider: ProviderRuntime {
                 .exportingHistory(
                     scope: .machineLocal,
                     estimatedCost: true,
-                    sourceNote: "From your Codex logs (estimated)"
+                    sourceNote: "From your Codex logs"
                 )
         ] + WidgetDescriptor.spendTiles(provider: provider)
     }
@@ -141,31 +143,9 @@ final class CodexProvider: ProviderRuntime {
         // phase 1 fetched the meters seconds ago. The data store's merge recovers the quota
         // meters from the prior snapshot and carries their freshness stamp.
         if ProviderRefreshContext.scope.suppressesLiveQuota {
-            var lines: [MetricLine] = []
-            let accountIdentityKey = expectedIdentityKey ?? lastResolvedAccountIdentityKey
-            let usageHistory: ProviderUsageHistory?
-            if let accountIdentityKey {
-                let modelPricing = await pricing()
-                guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-                usageHistory = await appendLocalUsage(
-                    to: &lines,
-                    now: now(),
-                    pricing: modelPricing,
-                    accountIdentityKey: accountIdentityKey
-                )
-            } else {
-                // A fold-only wake cannot prove which account stamped the shared Router ledger yet.
-                // Keep the stored history until the first authenticated probe establishes identity.
-                usageHistory = nil
-            }
-            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-            MetricLine.appendNoDataIfNeeded(&lines)
-            return ProviderSnapshot.make(
+            return await ScanWorkerClient.shared.foldOnlySnapshot(
                 provider: provider,
-                plan: nil,
-                lines: lines,
-                refreshedAt: now(),
-                usageHistory: usageHistory
+                inProcessFallback: { await self.foldOnlySnapshotInProcess() }
             )
         }
 
@@ -236,6 +216,37 @@ final class CodexProvider: ProviderRuntime {
 
         return await localOnlySnapshot(
             after: lastFallbackError ?? localSourceError ?? CodexAuthError.notLoggedIn
+        )
+    }
+
+    /// The in-process fold-only body, kept verbatim as the scan worker's fallback (and the child's
+    /// own path): the router ledger and native sessions fold without re-reading live quota APIs.
+    private func foldOnlySnapshotInProcess() async -> ProviderSnapshot {
+        var lines: [MetricLine] = []
+        let accountIdentityKey = expectedIdentityKey ?? lastResolvedAccountIdentityKey
+        let usageHistory: ProviderUsageHistory?
+        if let accountIdentityKey {
+            let modelPricing = await pricing()
+            guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+            usageHistory = await appendLocalUsage(
+                to: &lines,
+                now: now(),
+                pricing: modelPricing,
+                accountIdentityKey: accountIdentityKey
+            )
+        } else {
+            // A fold-only wake cannot prove which account stamped the shared Router ledger yet.
+            // Keep the stored history until the first authenticated probe establishes identity.
+            usageHistory = nil
+        }
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        MetricLine.appendNoDataIfNeeded(&lines)
+        return ProviderSnapshot.make(
+            provider: provider,
+            plan: nil,
+            lines: lines,
+            refreshedAt: now(),
+            usageHistory: usageHistory
         )
     }
 
@@ -430,7 +441,8 @@ final class CodexProvider: ProviderRuntime {
         }
 
         let proxyScan: LogUsageScan?
-        if isLocalAccountingWake, let cached = lastProxyScan {
+        let proxyRevision = isLocalAccountingWake ? await proxyUsageScanner.sourceRevision() : nil
+        if isLocalAccountingWake, let cached = lastProxyScan, lastProxyScanRevision == proxyRevision {
             proxyScan = cached
         } else {
             let proxyResult = await proxyUsageScanner.scanResult(
@@ -444,15 +456,17 @@ final class CodexProvider: ProviderRuntime {
             case .complete(let scan):
                 proxyScan = scan
                 lastProxyScan = scan
+                lastProxyScanRevision = await proxyUsageScanner.sourceRevision()
             case .incomplete:
                 return nil
             }
         }
 
         let piScan: LogUsageScan?
-        if isLocalAccountingWake, let cached = lastPiScan {
-            piScan = cached
-        } else {
+        // Pi sessions append to JSONL files without touching the Codex ledger, so a ledger wake can
+        // never prove the cached pi fold is current. The incremental scanner re-reads only appended
+        // bytes, so folding it again on a wake is cheap and keeps new pi turns from arriving late.
+        do {
             let piResult: PiUsageScanResult = allowsUnattributedPiUsage
                 ? await piUsageScanner.scanResult(
                     cardID: provider.id,
@@ -465,7 +479,6 @@ final class CodexProvider: ProviderRuntime {
             switch piResult {
             case .complete(let scan):
                 piScan = scan
-                lastPiScan = scan
                 DiagnosticGate.clearFailure(piIncompleteDiagnosticKey)
             case .incomplete:
                 DiagnosticGate.logOnce(for: piIncompleteDiagnosticKey) {
@@ -530,7 +543,7 @@ final class CodexProvider: ProviderRuntime {
             piScan.map { _ in "pi" }
         ].compactMap { $0 }
         let unmeasuredDays = routerScan?.unmeasuredUsageDays ?? []
-        let note = "From your \(sourceNames.joined(separator: ", ")) (estimated)"
+        let note = "From your \(sourceNames.joined(separator: ", "))"
             + (unmeasuredDays.isEmpty ? "" : ". Some routed requests have no token measurements; totals include measured requests only.")
         if !unmeasuredDays.isEmpty {
             DiagnosticGate.logOnce(for: "codex.router.unmeasured.\(provider.id)") {
@@ -599,6 +612,14 @@ final class CodexProvider: ProviderRuntime {
                 do {
                     return try await self.refreshAccessToken(authState: &working, refreshToken: refreshToken)
                 } catch let error as CodexAuthError {
+                    throw error
+                } catch let error as CodexUsageError {
+                    // The token endpoint rejected this credential bundle (400/401). Treat it as a dead
+                    // credential so refresh() can try the card's other same-identity home instead of
+                    // claiming the network failed. A 5xx/429 stays a request failure for the next pass.
+                    if case .requestFailed(let status) = error, status == 400 || status == 401 {
+                        throw CodexAuthError.tokenExpired
+                    }
                     throw error
                 } catch {
                     try ProviderCancellation.rethrowIfCancellation(error)

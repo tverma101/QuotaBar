@@ -452,6 +452,21 @@ final class OpenCodeProvider: ProviderRuntime {
 
     func refresh() async -> ProviderSnapshot {
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
+        // Fold-only passes run the multi-corpus scan (Claude/Codex session logs, the router ledger,
+        // Hermes, and Muse — 15-20s of JSONSerialization churn on a real corpus) in the scan-worker
+        // child when available; the body below stays the in-process path for the fallback and for
+        // meter/full scopes.
+        if ProviderRefreshContext.scope.suppressesLiveQuota {
+            return await ScanWorkerClient.shared.foldOnlySnapshot(
+                provider: provider,
+                inProcessFallback: { await self.refreshInProcess() }
+            )
+        }
+        return await refreshInProcess()
+    }
+
+    private func refreshInProcess() async -> ProviderSnapshot {
+        guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         // One clock for the whole refresh, so the scan cutoff, tiles, trend, and snapshot timestamp
         // can't straddle a midnight boundary.
         let refreshedAt = now()

@@ -12,8 +12,17 @@ struct GrokCreditsConfig: Equatable, Sendable {
     /// Pay-as-you-go cap in credits; 0 when disabled (proto-JSON also omits the field at 0).
     var onDemandCap: Double
 
+    /// A believable weekly cadence when the reported period is unusable. The decoder only requires
+    /// `end > start`, so a malformed far-apart pair could otherwise leave `Int`'s range and trap.
+    private static let fallbackPeriodMs = MetricPeriod.weekMs
+    private static let maximumPeriodMs = 366.0 * 24 * 60 * 60 * 1000
+
     var periodDurationMs: Int {
-        Int((periodEnd.timeIntervalSince(periodStart) * 1000).rounded())
+        let milliseconds = (periodEnd.timeIntervalSince(periodStart) * 1000).rounded()
+        guard milliseconds.isFinite, milliseconds > 0, milliseconds <= Self.maximumPeriodMs else {
+            return Self.fallbackPeriodMs
+        }
+        return Int(milliseconds)
     }
 }
 

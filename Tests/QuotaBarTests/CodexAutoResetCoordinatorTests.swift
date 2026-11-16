@@ -121,6 +121,21 @@ final class CodexAutoResetCoordinatorTests: XCTestCase {
         XCTAssertEqual(subject.status(for: "codex", enabled: true), .attention("Could not check reset credits"))
     }
 
+    func testCreditLookupFailureBacksOffInsteadOfPollingEvery15Seconds() async {
+        let defaults = defaults()
+        let subject = CodexAutoResetCoordinator(accounts: ["codex": .init(
+            availableCredits: { nil },
+            claim: { _, _, _ in .success }
+        )], defaults: defaults, now: { self.base })
+
+        let first = await subject.runOnce(for: "codex")
+        let second = await subject.runOnce(for: "codex")
+        let third = await subject.runOnce(for: "codex")
+        XCTAssertEqual(first, 15)
+        XCTAssertEqual(second, 30)
+        XCTAssertEqual(third, 60)
+    }
+
     private func defaults(enabled: Bool = true) -> UserDefaults {
         let defaults = UserDefaults(suiteName: "CodexAutoResetTests-\(UUID().uuidString)")!
         defaults.set(enabled, forKey: CodexAutoResetCoordinator.enabledKey)

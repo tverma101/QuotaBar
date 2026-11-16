@@ -11,7 +11,7 @@ actor FreebuffDesktopUsageScanner {
         var partialDays: Set<String>
     }
 
-    private struct Revision: Equatable {
+    struct Revision: Codable, Equatable {
         var path: String
         var size: UInt64
         var modified: Date
@@ -56,8 +56,9 @@ actor FreebuffDesktopUsageScanner {
     static let maximumCachedScanBytes = 8 * 1_024 * 1_024
 
     /// One assistant or mission-manager usage event reduced to what the fold needs. Its JSON is
-    /// parsed once, when the database changes, instead of on every fold.
-    private struct DerivedTurn {
+    /// parsed once, when the database changes, instead of on every fold. Codable so the derived
+    /// rows survive in the per-database disk record (see `FreebuffDesktopTurnPersistence`).
+    struct DerivedTurn: Codable {
         var id: String
         var timestampMs: Double
         /// `nil` when the receipt carries no usage object at all.
@@ -71,13 +72,13 @@ actor FreebuffDesktopUsageScanner {
 
     /// The counts of one receipt. `invalid` keeps "the field was there but was not a number" apart
     /// from "the field was not there", because the two are reported differently.
-    private enum Count {
+    enum Count: Codable, Equatable {
         case absent
         case value(Int)
         case invalid
     }
 
-    private enum DerivedUsage {
+    enum DerivedUsage: Codable {
         case counts(input: Count, output: Count, cached: Count, reasoning: Count, reportedTotal: Count)
     }
 
@@ -228,6 +229,14 @@ actor FreebuffDesktopUsageScanner {
             if let cached = databases[path], cached.revision == before {
                 turnsByDatabase.append(cached.rows)
                 unreadableRows += cached.unreadableRows
+            } else if let diskRecord = FreebuffDesktopTurnPersistence.read(path: path, revision: before) {
+                // Disk-warm start: a fresh process (scan-worker child, or after a memory-pressure
+                // unload) reloads derived turns without another SQLite read. The record's revision
+                // was validated against `before`, so the rows match this pass's snapshot exactly.
+                let derived = DerivedTurns(turns: diskRecord.rows, unreadable: diskRecord.unreadableRows)
+                store(path: path, revision: before, derived: derived)
+                turnsByDatabase.append(diskRecord.rows)
+                unreadableRows += diskRecord.unreadableRows
             } else {
                 try Task.checkCancellation()
                 // Saved selection is used only when a receipt lacks its serving model. Mission
@@ -247,6 +256,15 @@ actor FreebuffDesktopUsageScanner {
                 // running, keep that result for this pass and re-read the changed DB on the next.
                 if try revisions([path]) == before {
                     store(path: path, revision: before, derived: derived)
+                    FreebuffDesktopTurnPersistence.write(
+                        FreebuffDesktopTurnPersistence.Record(
+                            schema: FreebuffDesktopTurnPersistence.schema,
+                            revision: before,
+                            rows: derived.turns,
+                            unreadableRows: derived.unreadable
+                        ),
+                        path: path
+                    )
                 } else {
                     snapshotStable = false
                 }
@@ -541,7 +559,6 @@ actor FreebuffDesktopUsageScanner {
         routePricingToken = nil
         routeCatalog.removeAll(keepingCapacity: false)
         modelIdentity = FreebuffModelIdentity(entries: [:], pricing: .empty)
-        cachedSessionChats.removeAll(keepingCapacity: false)
     }
 
     /// Forget the databases whose project directory is gone.

@@ -220,6 +220,18 @@ final class ModelPricingStoreTests: XCTestCase {
         XCTAssertEqual(pricing.resolve(model: "auto")?.inputPerMillion, 9)
     }
 
+    /// The fetch state file outlives launches. A stamp written while the clock was ahead must read
+    /// as expired after the clock is corrected, not as fresh until the skew elapses.
+    func testFutureFetchStampAfterAClockCorrectionDoesNotSuppressRefresh() async throws {
+        let future = Date().addingTimeInterval(24 * 60 * 60)
+        let (skewed, _) = makeStore(handler: { Self.respond(to: $0) }, now: { future })
+        await skewed.refreshNow()
+
+        let (corrected, http) = makeStore(handler: { Self.respond(to: $0) })
+        await corrected.refreshNow()
+        XCTAssertEqual(http.requests.count, 4, "future-dated source state must not gate a refresh")
+    }
+
     func testGarbageFeedDoesNotReplaceGoodCache() async throws {
         let (store, _) = makeStore(handler: { Self.respond(to: $0) })
         await store.refreshNow()

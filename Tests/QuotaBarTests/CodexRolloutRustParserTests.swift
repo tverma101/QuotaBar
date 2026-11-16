@@ -125,6 +125,14 @@ final class CodexRolloutRustParserTests: XCTestCase {
         XCTAssertEqual(swift.events.first?.pricingModel, CodexLogUsageScanner.autoReviewFallback(at: iso(1)))
     }
 
+    func testRateLimitOnlyTokenCountPingIsNoOp() {
+        // `info: null` with the token_count marker present is a rate-limit ping, not accounting
+        // (ported fix from 8e62c5d7); it must not mark the source malformed.
+        assertParity([
+            #"{"type":"event_msg","timestamp":"\#(iso(0))","payload":{"type":"token_count","info":null}}"#,
+        ])
+    }
+
     func testMalformedTokenCountVariants() {
         assertParity([// Missing info.
             #"{"type":"event_msg","timestamp":"\#(iso(0))","payload":{"type":"token_count"}}"#])

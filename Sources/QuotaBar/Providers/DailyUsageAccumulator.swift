@@ -389,8 +389,14 @@ struct DailyUsageAccumulator {
                     }
                 }
             }
+            // Index the series once: a linear `first(where:)` per added day made a long scan
+            // O(days × seriesDays) on every refresh.
+            let seriesByDay = Dictionary(
+                scan.series.daily.map { ($0.date, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
             for day in addedDays {
-                guard let entry = scan.series.daily.first(where: { $0.date == day }) else { continue }
+                guard let entry = seriesByDay[day] else { continue }
                 if !entry.costIsComplete { accumulator.incompleteCostDays.insert(day) }
                 if entry.hasUnexplainedIncompleteCost == true {
                     accumulator.structuralIncompleteCostDays.insert(day)

@@ -62,6 +62,20 @@ final class WidgetDataStore {
     /// than the AC meter cadence; on battery, the next two-minute quota tick retries it. The manual
     /// `force` refresh (⌘R) always bypasses it.
     private static let failureRetryBackoff: TimeInterval = 60
+
+    /// Provider-failure negative cache keyed by failure category. Credential-access and structurally
+    /// invalid auth failures are deterministic: the failing probe spends a Keychain read and a process
+    /// scan every minute for no new information, so those get a half-hour window instead of the
+    /// one-minute transient cadence. Manual refresh always bypasses the backoff, and a success clears
+    /// it immediately, so this never strands a genuinely-recovered provider.
+    static func failureRetryBackoff(for category: ErrorCategory?) -> TimeInterval {
+        switch category {
+        case .credentialAccess, .notLoggedIn, .authInvalid:
+            return 30 * 60
+        default:
+            return failureRetryBackoff
+        }
+    }
     static let defaultSlowProviderRefreshThreshold: TimeInterval = 10
     /// Hard deadline for a single provider's `refresh()` call. If the provider hasn't returned by then
     /// the refresh is cancelled, the spinner stops, and the failure is surfaced like any other error.
@@ -94,7 +108,7 @@ final class WidgetDataStore {
     var snapshots: [String: ProviderSnapshot] = [:]
     /// Each provider's history descriptor, keyed by provider ID — the classifying metadata the
     /// Usage History screen reuses (e.g. `estimatedCost`, which drives the lifetime hero's
-    /// "(Est.)" mark). Same source the spend tiles' ⓘ flag reads.
+    /// "(Est.)" mark).
     var historyDescriptorsByProvider: [String: UsageHistoryDescriptor] {
         registry.historyDescriptorsByProvider
     }
@@ -264,6 +278,27 @@ final class WidgetDataStore {
         if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
             await freebuff.unloadLocalAccountingCachesForMemoryPressure()
         }
+        if let zai = providersByID["zai"] as? ZAIProvider {
+            await zai.unloadLocalAccountingCachesForMemoryPressure()
+        }
+        // Unloading frees blocks into the malloc zone; relief is what returns the pages.
+        ProcessMemoryBudget.releaseAllocatorFreePages()
+    }
+
+    /// Releases Freebuff's derived accounting caches on every refresh cycle, below the memory budget.
+    ///
+    /// An active session rewrites its database receipts continuously, so the desktop scan re-derives
+    /// its turn cache every history pass whether or not the cache was retained — measured at ~18 s
+    /// per cycle both warm and cold. Retaining the derived turns between cycles therefore pays their
+    /// memory (tens of MB) without saving any rescan work; releasing them each cycle returns those
+    /// pages while the cheap-to-rebuild provider caches (Antigravity's ~8 MB index and friends) stay
+    /// warm under the soft budget.
+    func unloadFreebuffAccountingCacheForMemoryPressure() async {
+        if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
+            await freebuff.unloadLocalAccountingCachesForMemoryPressure()
+        }
+        // Unloading frees blocks into the malloc zone; relief is what returns the pages.
+        ProcessMemoryBudget.releaseAllocatorFreePages()
     }
 
     init(
@@ -408,6 +443,14 @@ final class WidgetDataStore {
     /// task per provider, each of which then hit the forced-wait path for any provider already in
     /// flight. A caller arriving while an identical batch runs now joins it, which yields the same
     /// result because the batch refreshes the same provider set.
+    /// One refresh batch, coalescing callers that asked for exactly the same work.
+    ///
+    /// The panel fires a forced full-scope batch on every popover open and never cancels the previous
+    /// one, so a user opening and closing the panel repeatedly used to stack batches — each spawning a
+    /// task per provider, each of which then hit the forced-wait path for any provider already in
+    /// flight. A caller arriving while an identical batch runs now joins it, which yields the same
+    /// result because the batch refreshes the same provider set.
+    ///
     ///
     /// A caller with a *different* force/cache/scope tuple is deliberately not joined: a forced caller
     /// must not be handed a menu-bar-scoped pass, and a scheduled history fold must not join a batch
@@ -590,6 +633,7 @@ final class WidgetDataStore {
                 unregisterProviderRefreshTask(taskID, providerID: providerID)
             }
         }
+
         let durationMs = durationMilliseconds(since: start)
         // Count THIS batch's actual outcomes, not the long-lived `providerErrors` map (which persists
         // across passes, so reading it would miscount cache hits and stale earlier failures).
@@ -1174,7 +1218,7 @@ final class WidgetDataStore {
                         return .skipped
                     }
                     // `try?` because cancellation throws here; the `isCancelled` check above acts on it.
-                    try? await Task.sleep(for: .seconds(delay))
+                    try? await Task.sleep(for: .seconds(delay), tolerance: .milliseconds(100))
                     delay = min(delay * 2, Self.forceWaitMaxDelay)
                 }
             }
@@ -1337,7 +1381,7 @@ final class WidgetDataStore {
                 domains: failureDomains
             )
             // Negative-cache the failure so a wake burst can't re-probe this provider in a tight loop.
-            let retryAfter = now().addingTimeInterval(Self.failureRetryBackoff)
+            let retryAfter = now().addingTimeInterval(Self.failureRetryBackoff(for: snapshot.errorCategory))
             for key in failureBackoffKeys { failureRetryAfter[key] = retryAfter }
             let failureIdentity = ProviderFailureLogIdentity(message: message, category: snapshot.errorCategory)
             let priorLoggedFailures = lastLoggedProviderFailure[providerID, default: [:]]
@@ -2112,8 +2156,9 @@ final class WidgetDataStore {
         if case .sessionCountdowns(let metricLabel) = descriptor.sample.trayStyle {
             // Read only explicit session expiries. Cached daily spend is not session activity.
             if case .values(_, _, _, let expiries, _, _) = snapshots[descriptor.providerID]?.line(label: metricLabel) {
-                result.traySessionExpiriesAt = expiries
-                result.activeSessions = snapshots[descriptor.providerID]?.activeSessions ?? []
+                let currentNow = now()
+                result.traySessionExpiriesAt = expiries.filter { $0 > currentNow }
+                result.activeSessions = (snapshots[descriptor.providerID]?.activeSessions ?? []).filter { $0.expiresAt > currentNow }
             } else {
                 result.traySessionExpiriesAt = []
                 result.activeSessions = []
@@ -2201,7 +2246,7 @@ final class WidgetDataStore {
             // conveyed by the meter's spent state rather than hidden.
             let normalizedUsed = format == .percent ? ProviderParse.clampPercent(used) : used
             var result = WidgetData(
-                title: descriptor.sample.title,
+                title: (descriptor.id == "zai.weekendBuild" && !line.label.isEmpty) ? line.label : descriptor.sample.title,
                 icon: descriptor.sample.icon,
                 kind: format.metricKind,
                 used: normalizedUsed,
@@ -2258,11 +2303,6 @@ final class WidgetDataStore {
             // A tile whose selection finds no value (e.g. a cost-only tile on a day the scanner couldn't
             // price) has nothing real to show — render "No data" rather than a misleading $0.00 / 0.
             data.hasData = !data.selectedValues.isEmpty
-            // The ⓘ is data-driven: it shows when a *shown* value is locally estimated (a spend row's
-            // dollars) and stays off for a measured one (its tokens), so the tokens-only tile reads clean.
-            data.infoNote = data.selectedValues.contains(where: \.estimated)
-                ? WidgetData.localEstimateNote
-                : descriptor.sample.infoNote
             return data
         case .badge(_, let text, _, let subtitle):
             var data = descriptor.sample

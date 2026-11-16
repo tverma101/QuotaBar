@@ -312,8 +312,13 @@ enum PersistentJSONLScanCaches {
             CodexRouterUsageScanner.unloadSharedTailCacheItems()
             await CodexRouterUsageScanner.unloadSharedParsedItems()
         }
+        // The cycle's folds grew the malloc zone for their transient parse arrays; hand the freed
+        // pages back so the settled idle footprint tracks the live caches, not the cycle's peak.
+        ProcessMemoryBudget.releaseAllocatorFreePages()
         if let summary = ProcessMemoryBudget.footprintSummary() {
-            AppLog.debug(.refresh, "post-unload footprint \(summary)")
+            let checkpoints = ProcessMemoryBudget.checkpointReliefSummary
+                .map { ", checkpoints \($0)" } ?? ""
+            AppLog.debug(.refresh, "post-unload footprint \(summary)\(checkpoints)")
         }
     }
 
@@ -336,6 +341,9 @@ enum PersistentJSONLScanCaches {
                 )
             }
         }
+        // Even under budget, the provider's fold left freed scratch space on the allocator's free
+        // lists. Return it every time so a quiet machine never carries the last heavy fold's peak.
+        ProcessMemoryBudget.releaseAllocatorFreePages()
     }
 
     /// Memory-pressure / hard-limit path: flush and unload even mid-cycle (including the router tail).
@@ -345,6 +353,9 @@ enum PersistentJSONLScanCaches {
         ClaudeSessionAppendCache.shared.unloadRetainedItems()
         CodexRouterUsageScanner.unloadSharedTailCacheItems()
         await CodexRouterUsageScanner.unloadSharedParsedItems()
+        // Unloading caches only frees blocks; relief is what actually lowers the footprint the
+        // kernel sees.
+        ProcessMemoryBudget.releaseAllocatorFreePages()
         if let summary = ProcessMemoryBudget.footprintSummary() {
             AppLog.warn(.refresh, "memory-pressure unload complete (\(summary))")
         }

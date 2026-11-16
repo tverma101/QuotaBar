@@ -48,7 +48,7 @@ enum CodexUsageMapper {
         // The row reads "2 available" (the count is carried raw, so the menu-bar tile reads the same
         // number); each still-available credit's expiry rides along in `expiriesAt` and surfaces in the
         // row's hover tooltip ("Resets expire in: …").
-        if let resets = readResetCredits(body: body, resetCredits: resetCredits) {
+        if let resets = readResetCredits(body: body, resetCredits: resetCredits, now: now) {
             lines.append(.values(
                 label: "Rate Limit Resets",
                 values: [MetricValue(number: Double(resets.count), kind: .count, label: "available")],
@@ -209,21 +209,41 @@ enum CodexUsageMapper {
             .contains { $0.contains("spark") }
     }
 
+    /// The furthest future instant accepted as a reset. Codex windows are hours or a week; this is a
+    /// sanity bound for unit mix-ups and corrupted values, not a semantic window. It is deliberately
+    /// far beyond any real reset yet far below the range where duration formatting could overflow
+    /// `Int`: a millisecond value used as seconds (year ~58000) and `1e300` are both rejected.
+    static let maximumResetHorizon: TimeInterval = 100 * 365 * 24 * 60 * 60
+
+    /// The longest rate-limit window QuotaBar will accept from `limit_window_seconds`. A year covers
+    /// every real Codex window with room to spare; anything longer is a malformed payload, not a plan.
+    private static let maximumPeriodMs = 366.0 * 24 * 60 * 60 * 1000
+
     private static func resetDate(_ window: [String: Any]?, now: Date) -> Date? {
         guard let window else { return nil }
         if let resetAt = ProviderParse.number(window["reset_at"]) {
-            return Date(timeIntervalSince1970: resetAt)
+            let date = Date(timeIntervalSince1970: resetAt)
+            guard date > now, date.timeIntervalSince(now) <= maximumResetHorizon else { return nil }
+            return date
         }
         if let resetAfter = ProviderParse.number(window["reset_after_seconds"]) {
+            guard resetAfter > 0, resetAfter <= maximumResetHorizon else { return nil }
             return now.addingTimeInterval(resetAfter)
         }
         return nil
     }
 
     private static func readPeriodMs(_ window: [String: Any]?) -> Int? {
-        guard let window else { return nil }
-        guard let seconds = ProviderParse.number(window["limit_window_seconds"]) else { return nil }
-        return Int(seconds * 1000)
+        guard let window,
+              let seconds = ProviderParse.number(window["limit_window_seconds"]),
+              seconds > 0
+        else { return nil }
+        let milliseconds = seconds * 1000
+        // A direct `Int(_:)` on this untrusted value traps once it leaves Int's range (SIGTRAP in the
+        // menu-bar process). Reject an implausible window instead, so the caller falls back to the
+        // label's known cadence rather than showing a 5,000-year period.
+        guard milliseconds.isFinite, milliseconds <= maximumPeriodMs else { return nil }
+        return Int(milliseconds.rounded(.down))
     }
 
     /// Codex flex credits as raw values: the floored credit count and its dollar value (count × 4¢),
@@ -232,7 +252,13 @@ enum CodexUsageMapper {
     /// mutually consistent. Negative balances clamp to zero, so an exhausted balance reads
     /// "$0.00 · 0 credits" — a real, measured zero, not "No data".
     static func creditValues(remaining: Double) -> [MetricValue] {
-        let credits = max(0, Int(remaining.rounded(.down)))
+        // Clamp before converting: the balance is untrusted JSON, and `Int(_:)` traps outside Int's
+        // range. A billion credits is already far past any real plan, so saturating there is honest.
+        let credits = ProviderParse.intFromClampedDouble(
+            remaining.rounded(.down),
+            lower: 0,
+            upper: 1_000_000_000
+        )
         let usd = Double(credits) * creditUSDRate
         return [
             MetricValue(number: usd, kind: .dollars),
@@ -249,14 +275,20 @@ enum CodexUsageMapper {
     /// returns nil for missing/null/non-numeric counts, so a malformed count skips the row entirely.
     static func readResetCredits(
         body: [String: Any],
-        resetCredits: HTTPResponse?
+        resetCredits: HTTPResponse?,
+        now: Date = Date()
     ) -> (count: Int, expiries: [Date])? {
         guard let source = resetCreditsSource(body: body, resetCredits: resetCredits),
               let count = ProviderParse.number(source["available_count"]), count >= 0
         else {
             return nil
         }
-        return (Int(count.rounded(.down)), availableExpiries(in: source["credits"]))
+        let clampedCount = ProviderParse.intFromClampedDouble(
+            count.rounded(.down),
+            lower: 0,
+            upper: 1_000_000
+        )
+        return (clampedCount, availableExpiries(in: source["credits"], now: now))
     }
 
     /// The dictionary the count and expiry list are read from: the dedicated endpoint's body when it
@@ -282,25 +314,33 @@ enum CodexUsageMapper {
     /// `== "available"` would otherwise blank the whole expiry list (tooltip + 24h warning) for responses
     /// that omit status, even though `available_count` reported credits. `expires_at` is parsed as an
     /// ISO-8601 string or an epoch number.
-    private static func availableExpiries(in value: Any?) -> [Date] {
+    private static func availableExpiries(in value: Any?, now: Date) -> [Date] {
         guard let credits = value as? [[String: Any]] else { return [] }
         return credits
             .filter { credit in
                 guard let status = credit["status"] as? String else { return true }
                 return status == "available"
             }
-            .compactMap { parseExpiry($0["expires_at"]) }
+            .compactMap { parseExpiry($0["expires_at"], now: now) }
             .sorted()
     }
 
-    private static func parseExpiry(_ value: Any?) -> Date? {
-        if let string = value as? String, let date = OpenUsageISO8601.date(from: string) {
-            return date
+    private static func parseExpiry(_ value: Any?, now: Date) -> Date? {
+        let parsed: Date?
+        if let string = value as? String {
+            parsed = OpenUsageISO8601.date(from: string)
+        } else if let seconds = ProviderParse.number(value) {
+            parsed = Date(timeIntervalSince1970: seconds)
+        } else {
+            parsed = nil
         }
-        if let seconds = ProviderParse.number(value) {
-            return Date(timeIntervalSince1970: seconds)
-        }
-        return nil
+        // Same untrusted-instant rule as reset windows: an expiry decades out would reach duration
+        // formatting and must not be trusted (or crash it).
+        guard let parsed,
+              parsed > now,
+              parsed.timeIntervalSince(now) <= maximumResetHorizon
+        else { return nil }
+        return parsed
     }
 
     private static func readCreditsRemaining(response: HTTPResponse, body: [String: Any]) -> Double? {

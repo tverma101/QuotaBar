@@ -318,6 +318,12 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
             return XCTFail("hosted-only usage must publish Today without a legacy SQLite database")
         }
         XCTAssertEqual(values.first { $0.kind == .count }?.number, 150)
+        guard case .chart(let label, let points, let note) = snapshot.line(label: "Usage Trend") else {
+            return XCTFail("hosted-only usage must publish Usage Trend chart")
+        }
+        XCTAssertEqual(label, "Usage Trend")
+        XCTAssertFalse(points.isEmpty)
+        XCTAssertTrue(try XCTUnwrap(note).contains("Freebuff"))
         XCTAssertNil(snapshot.warning)
         XCTAssertNil(snapshot.historyWarning)
         XCTAssertEqual(provider.widgetDescriptors.first { $0.historyResource != nil }?.historyResource?.scope, .accountWide)

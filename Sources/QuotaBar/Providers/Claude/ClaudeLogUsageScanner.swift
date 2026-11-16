@@ -319,8 +319,11 @@ actor ClaudeLogUsageScanner {
             fileCompleted: { path, _ in bucket.finish(path) }
         )
         guard complete, !Task.isCancelled else { return .incomplete }
+        // Index once: a linear lookup per future-timestamp file made this O(files × future entries)
+        // on a scan that already walks every session file.
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         for (path, timestamp) in bucket.futureTimestamps {
-            guard let file = files.first(where: { $0.path == path }),
+            guard let file = filesByPath[path],
                   FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
             else { return .incomplete }
         }
@@ -379,8 +382,9 @@ actor ClaudeLogUsageScanner {
             fileCompleted: { path, _ in bucket.finish(path) }
         )
         guard complete else { return [] }
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         for (path, timestamp) in bucket.futureTimestamps {
-            guard let file = files.first(where: { $0.path == path }),
+            guard let file = filesByPath[path],
                   FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
             else { return [] }
         }
@@ -454,8 +458,9 @@ actor ClaudeLogUsageScanner {
             fileCompleted: { path, _ in bucket.finish(path) }
         )
         guard complete, !Task.isCancelled else { return false }
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         for (path, timestamp) in bucket.futureTimestamps {
-            guard let file = files.first(where: { $0.path == path }),
+            guard let file = filesByPath[path],
                   FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
             else { return false }
         }
@@ -805,7 +810,9 @@ actor ClaudeLogUsageScanner {
         var entries: [Entry] = []
         var malformedTokenCounts = false
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
+            autoreleasepool {
+                appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
+            }
         }
         return entries
     }
@@ -814,10 +821,12 @@ actor ClaudeLogUsageScanner {
     /// one giant Data allocation.
     nonisolated static func parseFile(at url: URL) -> [Entry]? {
         ClaudeSessionAppendCache.shared.parse(at: url) { line in
-            var entries: [Entry] = []
-            var malformedTokenCounts = false
-            appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
-            return malformedTokenCounts ? nil : entries
+            autoreleasepool {
+                var entries: [Entry] = []
+                var malformedTokenCounts = false
+                appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
+                return malformedTokenCounts ? nil : entries
+            }
         }
     }
 

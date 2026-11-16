@@ -52,13 +52,6 @@ enum TotalSpendMetric: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Dollar-backed modes can inherit the local-estimate note when any contributor's spend is imputed.
-    var usesDollarEstimateNote: Bool {
-        switch self {
-        case .cost, .costPerMtok: true
-        case .tokens: false
-        }
-    }
 }
 
 /// One provider's contribution to a period's total: dollars and tokens from the same spend line,
@@ -368,15 +361,16 @@ enum TotalSpendAggregator {
     private static func dayKey(fromUsageDate rawDate: String, calendar: Calendar) -> String? {
         let value = rawDate.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
-        if value.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil { return value }
+        // Shape checks instead of a compiled regex on this per-row path.
+        if ProviderParse.hasISODayShape(value) { return value }
         if let date = OpenUsageISO8601.date(from: value) {
             return DailyUsageAccumulator.dayKey(from: date, calendar: calendar)
         }
-        if let match = value.range(of: #"^\d{4}-\d{2}-\d{2}"#, options: .regularExpression) {
-            return String(value[match])
+        if let prefix = ProviderParse.isoDayPrefix(value) {
+            return prefix
         }
-        if value.range(of: #"^\d{8}$"#, options: .regularExpression) != nil {
-            return "\(value.prefix(4))-\(value.dropFirst(4).prefix(2))-\(value.suffix(2))"
+        if let compact = ProviderParse.compactDayKey(value) {
+            return compact
         }
         return nil
     }

@@ -143,6 +143,9 @@ actor CodexRouterUsageScanner {
     }
 
     private var aggregateCache: AggregateCache?
+    /// Production-only whole-scan aggregate gate (see `LogUsageAggregateCache`). Stat fingerprints
+    /// only — runs ahead of the in-memory machinery above and serves the persisted rows on a hit.
+    private let persistentAggregateCache: LogUsageAggregateCache?
 
     /// Empty checkpoint: router lines are independent (no cross-line parser state).
     private struct ParserCheckpoint: Sendable, Equatable {
@@ -220,7 +223,8 @@ actor CodexRouterUsageScanner {
         readFile: (@Sendable (String) -> String?)? = nil,
         identityAliases: (@Sendable () -> [String: String])? = nil,
         incrementalScanner: IncrementalJSONLScanner<Event>? = nil,
-        beforeAggregateValidationForTesting: (@Sendable () -> Void)? = nil
+        beforeAggregateValidationForTesting: (@Sendable () -> Void)? = nil,
+        persistentAggregateCache: LogUsageAggregateCache? = nil
     ) {
         self.environment = environment
         self.homeDirectory = homeDirectory
@@ -248,10 +252,17 @@ actor CodexRouterUsageScanner {
         self.usesInjectedScanner = incrementalScanner != nil
         self.beforeAggregateValidationForTesting = beforeAggregateValidationForTesting
         self.scanner = incrementalScanner ?? Self.sharedScanner
+        self.persistentAggregateCache = persistentAggregateCache ?? ((readFile == nil && incrementalScanner == nil)
+            ? LogUsageAggregateCache.shared
+            : nil)
     }
 
     /// Scan the CodexRouter ledger for one Codex card. Returns `nil` when nothing matched so the
     /// caller leaves native logs / FCC untouched.
+    ///
+    /// The daily aggregate is persisted (see `LogUsageAggregateCache`): when the ledger file and
+    /// account-pool file are stat-identical to the last computed scan, this returns the persisted
+    /// per-day rows without parsing, hydrating, or replaying any ledger event.
     func scan(
         accountIdentityKey: String?,
         allowsUnscopedEvents: Bool,
@@ -273,6 +284,11 @@ actor CodexRouterUsageScanner {
 
     /// Completeness-aware scan for callers that merge router usage with other local sources.
     /// A configured ledger read that fails is distinct from an absent or empty optional ledger.
+    /// Gates through the persisted stat-fingerprint aggregate: when the ledger and pool files
+    /// are stat-identical to the last completed scan, the persisted rows serve without parsing,
+    /// hydrating, or replaying any ledger event. The gate is bypassed when discovery is not
+    /// complete (the fingerprint would not cover the source set) and when both sources are
+    /// genuinely empty (an empty fold is complete, not incomplete).
     func scanResult(
         accountIdentityKey: String?,
         allowsUnscopedEvents: Bool,
@@ -280,6 +296,91 @@ actor CodexRouterUsageScanner {
         now: Date = Date(),
         pricing: ModelPricing
     ) async -> CodexRouterUsageScanResult {
+        if let persistentAggregateCache {
+            let ledger = Self.discoveredLedgers(
+                paths: ledgerPaths(),
+                optionalDefaultPath: optionalDefaultLedgerPath
+            )
+            let poolPaths = Self.poolStatePaths(environment: environment, homeDirectory: homeDirectory())
+            // The default ~/.codex pool file is optional and frequently absent — absence must not
+            // mark discovery incomplete. Only that fallback path is allowed to be missing.
+            let pool = Self.discoveredLedgers(
+                paths: poolPaths,
+                optionalDefaultPath: poolPaths.last
+            )
+            if ledger.complete, pool.complete, !(ledger.files.isEmpty && pool.files.isEmpty) {
+                let fingerprints: [String: LogUsageSourceFingerprint] = [
+                    "ledger": LogUsageSourceFingerprint.of(ledger.files),
+                    "pool": LogUsageSourceFingerprint.of(pool.files),
+                ]
+                let scopeKey = Self.aggregateScopeKey(
+                    accountIdentityKey: accountIdentityKey,
+                    allowsUnscopedEvents: allowsUnscopedEvents
+                )
+                let cacheKey = "codex-router|\(scopeKey)"
+                let outcome = await persistentAggregateCache.scan(
+                    key: cacheKey,
+                    pricingStamp: LogUsagePricingStamp.of(pricing),
+                    daysBack: daysBack,
+                    fingerprints: fingerprints,
+                    now: now
+                ) { [self] in
+                    let full = await scanResultUncached(
+                        accountIdentityKey: accountIdentityKey,
+                        allowsUnscopedEvents: allowsUnscopedEvents,
+                        daysBack: daysBack,
+                        now: now,
+                        pricing: pricing
+                    )
+                    switch full.result {
+                    case .complete(let scan):
+                        return .complete(scan, validUntil: full.nextFutureEventAt)
+                    case .incomplete:
+                        return .incomplete
+                    }
+                }
+                switch outcome {
+                case .complete(let scan):
+                    return .complete(scan)
+                case .incomplete:
+                    return .incomplete
+                }
+            }
+        }
+        let full = await scanResultUncached(
+            accountIdentityKey: accountIdentityKey,
+            allowsUnscopedEvents: allowsUnscopedEvents,
+            daysBack: daysBack,
+            now: now,
+            pricing: pricing
+        )
+        return full.result
+    }
+
+    private static func aggregateScopeKey(accountIdentityKey: String?, allowsUnscopedEvents: Bool) -> String {
+        let identity = accountIdentityKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty?
+            .lowercased() ?? "-"
+        return "\(identity)|allows-unscoped=\(allowsUnscopedEvents)"
+    }
+
+    /// The un-gated scan body: the incremental tail/parse machinery plus per-account folding.
+    /// Fold result plus the earliest event the fold excluded because it was in the future at
+    /// fold time, if any. Fed back to the persisted aggregate gate so it can stop serving the
+    /// aggregate once that event becomes eligible.
+    private struct RouterFoldOutcome {
+        var result: CodexRouterUsageScanResult
+        var nextFutureEventAt: Date?
+    }
+
+    private func scanResultUncached(
+        accountIdentityKey: String?,
+        allowsUnscopedEvents: Bool,
+        daysBack: Int,
+        now: Date,
+        pricing: ModelPricing
+    ) async -> RouterFoldOutcome {
         let days = max(1, daysBack)
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
@@ -375,12 +476,20 @@ actor CodexRouterUsageScanner {
                 identityAliasSnapshot: aliasSnapshot
             )
         }
-        guard preflight.discoveryComplete else { return .incomplete }
+        guard preflight.discoveryComplete else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
         if case .hit(let cachedResult) = preflight.cacheLookup {
-            guard !Task.isCancelled,
-                  sourcesAndAliasesStillMatch(preflight)
-            else { return .incomplete }
-            return .complete(cachedResult)
+            // A cache hit skips the event fold, but it still re-discovers the ledgers, stats every
+            // source and samples each append anchor. That metadata work must share the same CPU
+            // allowance as the preflight that produced the hit: unpaced, it made a repeated
+            // unchanged refresh exceed the 10%-of-one-core budget the benchmark pins (the paced
+            // fold path already accounts for the identical validation at the end of a cold scan).
+            let sourceStayedStable = JSONLAccountingWorkPacer.shared.perform {
+                sourcesAndAliasesStillMatch(preflight)
+            }
+            guard !Task.isCancelled, sourceStayedStable else {
+                return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil)
+            }
+            return RouterFoldOutcome(result: .complete(cachedResult), nextFutureEventAt: nil)
         }
         let sourceFiles = preflight.sourceFiles
         let sourceRevisions = preflight.sourceRevisions
@@ -548,10 +657,10 @@ actor CodexRouterUsageScanner {
         if let readFile {
             var malformedEventLine = false
             for path in ledgerPaths() {
-                guard !Task.isCancelled else { return .incomplete }
+                guard !Task.isCancelled else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
                 guard let contents = readFile(path) else { continue }
                 for line in contents.split(whereSeparator: \.isNewline) {
-                    guard !Task.isCancelled else { return .incomplete }
+                    guard !Task.isCancelled else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
                     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { continue }
                     let data = Data(trimmed.utf8)
@@ -564,9 +673,9 @@ actor CodexRouterUsageScanner {
                     }
                 }
             }
-            guard !malformedEventLine else { return .incomplete }
+            guard !malformedEventLine else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
         } else {
-            guard let files = sourceFiles else { return .incomplete }
+            guard let files = sourceFiles else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
             // Keep ~35 days of parsed rows in the append checkpoint so multi-account refreshes
             // share one parse without retaining the entire historical ledger in RAM.
             let retentionDays = max(days, 35)
@@ -629,12 +738,14 @@ actor CodexRouterUsageScanner {
                         fold.itemCountsByPath[path] = itemCount
                     }
                 )
-                if !ok { return .incomplete }
+                if !ok { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
             }
         }
 
         // A cancelled tail fold must not publish a partial aggregate for an unchanged source revision.
-        guard !Task.isCancelled, !fold.sawInvalidUsageRow else { return .incomplete }
+        guard !Task.isCancelled, !fold.sawInvalidUsageRow else {
+            return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil)
+        }
 
         let result = JSONLAccountingWorkPacer.shared.perform { () -> LogUsageScan? in
             let deltaResult: LogUsageScan?
@@ -668,9 +779,11 @@ actor CodexRouterUsageScanner {
                 )
                 return true
             }
-            guard sourceStayedStable else { return .incomplete }
+            guard sourceStayedStable else {
+                return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil)
+            }
         }
-        return .complete(result)
+        return RouterFoldOutcome(result: .complete(result), nextFutureEventAt: fold.nextFutureEventAt)
     }
 
     /// Escaping fold visits cannot capture `inout` accumulators; this tiny box owns them.
@@ -1493,6 +1606,32 @@ actor CodexRouterUsageScanner {
 
     /// Read `chatgpt-account-pool.json` → map pool opaque id / email aliases onto the ChatGPT
     /// `identity.accountId` UUID QuotaBar cards use as `expectedIdentityKey`.
+    static func poolStatePaths(
+        environment: EnvironmentReading,
+        homeDirectory: URL
+    ) -> [String] {
+        var paths: [String] = []
+        if let override = environment.value(for: "MODEL_ROUTER_CHATGPT_ACCOUNT_POOL")?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            paths.append(override)
+        }
+        for key in ["CODEX_ROUTER_STATE_DIR", "MODEL_ROUTER_STATE_DIR"] {
+            if let state = environment.value(for: key)?
+                .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+                paths.append(
+                    URL(fileURLWithPath: state)
+                        .appendingPathComponent("chatgpt-account-pool.json").path
+                )
+            }
+        }
+        paths.append(
+            homeDirectory
+                .appendingPathComponent(".codex/codex-router/chatgpt-account-pool.json")
+                .path
+        )
+        return paths
+    }
+
     static func loadPoolIdentityAliases(
         environment: EnvironmentReading,
         homeDirectory: URL
@@ -1504,32 +1643,7 @@ actor CodexRouterUsageScanner {
         environment: EnvironmentReading,
         homeDirectory: URL
     ) -> IdentityAliasSnapshot {
-        var candidates: [String] = []
-        func appendCandidate(_ path: String) {
-            let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
-            if !candidates.contains(normalized) {
-                candidates.append(normalized)
-            }
-        }
-
-        if let override = environment.value(for: "MODEL_ROUTER_CHATGPT_ACCOUNT_POOL")?
-            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
-            appendCandidate(override)
-        }
-        for key in ["CODEX_ROUTER_STATE_DIR", "MODEL_ROUTER_STATE_DIR"] {
-            if let state = environment.value(for: key)?
-                .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
-                appendCandidate(
-                    URL(fileURLWithPath: state)
-                        .appendingPathComponent("chatgpt-account-pool.json").path
-                )
-            }
-        }
-        appendCandidate(
-            homeDirectory
-                .appendingPathComponent(".codex/codex-router/chatgpt-account-pool.json")
-                .path
-        )
+        let candidates = poolStatePaths(environment: environment, homeDirectory: homeDirectory)
 
         var aliases: [String: String] = [:]
         var conflicts: Set<String> = []
@@ -1630,7 +1744,7 @@ actor CodexRouterUsageScanner {
         now: Date,
         calendar: Calendar,
         pricing: ModelPricing
-    ) async -> CodexRouterUsageScanResult {
+    ) async -> RouterFoldOutcome {
         let expectedFingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountIdentityKey)
         let expectedAccountId = accountIdentityKey?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1645,11 +1759,11 @@ actor CodexRouterUsageScanner {
             })
         }()
         let index = CodexRouterAggregateIndex.shared
-        func incomplete(_ reason: String) -> CodexRouterUsageScanResult {
+        func incomplete(_ reason: String) -> RouterFoldOutcome {
             DiagnosticGate.logOnce(for: "codex.router.incomplete." + reason) {
                 AppLog.warn(LogTag.plugin("codex"), "Router checkpoint rejected: \(reason)")
             }
-            return .incomplete
+            return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil)
         }
         let paths = ledgerPaths()
         let discovery = Self.discoveredLedgers(
@@ -1687,7 +1801,7 @@ actor CodexRouterUsageScanner {
             guard !Task.isCancelled,
                   identityAliasesStillMatch(aliasSnapshot, hasLedgerSources: !discovery.files.isEmpty)
             else { return incomplete("cached-identity-changed") }
-            return .complete(cached)
+            return RouterFoldOutcome(result: .complete(cached), nextFutureEventAt: nil)
         case .append(let record):
             prior = record
         case .rebuild:
@@ -1923,7 +2037,7 @@ actor CodexRouterUsageScanner {
             complete: true,
             pricingDependencies: dependencies
         ))
-        return .complete(result)
+        return RouterFoldOutcome(result: .complete(result), nextFutureEventAt: nextFuture)
     }
 
 }

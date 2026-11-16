@@ -198,6 +198,23 @@ final class BackgroundRefreshTriggerTests: XCTestCase {
         XCTAssertEqual(accepted, 20, "a 1 Hz poster must be bounded to one pass per cooldown window")
     }
 
+    /// A backward wall-clock jump must not lock the gate out. Before the fix the negative elapsed
+    /// time read as "inside the cooldown" and rejected every trigger until the clock caught up.
+    func testGateAcceptsAfterBackwardClockJump() {
+        var gate = BackgroundRefreshGate(minimumInterval: 15)
+        let t0 = Date()
+        XCTAssertTrue(gate.shouldAccept(at: t0))
+        XCTAssertTrue(
+            gate.shouldAccept(at: t0.addingTimeInterval(-3600)),
+            "a clock that jumped an hour backwards must re-anchor, not stall refreshes for an hour"
+        )
+        XCTAssertEqual(
+            gate.delayUntilNextAcceptance(at: t0.addingTimeInterval(-7200)),
+            0,
+            "no cooldown may be measured against a timestamp in the future"
+        )
+    }
+
     /// `reset()` releases a recorded acceptance, so a trigger whose pass never ran does not block
     /// the next one for a whole cooldown.
     func testGateResetReleasesCooldown() {

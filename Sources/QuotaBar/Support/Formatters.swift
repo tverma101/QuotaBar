@@ -107,7 +107,13 @@ enum Formatters {
     /// "4d" that hides the sub-day remainder. Minutes are dropped at the day scale.
     static func compactDuration(_ seconds: TimeInterval) -> String? {
         guard seconds.isFinite, seconds > 0 else { return nil }
-        let totalMinutes = max(1, Int((seconds / 60).rounded(.up)))
+        let durationMinutes = seconds / 60
+        // Duration formatting converts to an `Int` minute count. A far-future instant — a malformed
+        // provider reset, or one restored from a persisted/iCloud snapshot written by an older build —
+        // can leave `Int`'s range and trap here, killing the menu-bar process. Such a span is not a
+        // meaningful countdown, so return nil and let the caller omit the label.
+        guard durationMinutes <= 5_256_000_000 else { return nil }
+        let totalMinutes = max(1, Int(durationMinutes.rounded(.up)))
         let days = totalMinutes / (24 * 60)
         let hours = (totalMinutes % (24 * 60)) / 60
         let minutes = totalMinutes % 60

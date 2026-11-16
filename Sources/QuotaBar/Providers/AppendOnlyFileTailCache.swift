@@ -247,11 +247,17 @@ final class AppendOnlyFileTailCache<Item: Sendable, ParserState: Sendable>: @unc
     }
 
     private func evictIfNeededLocked() {
-        while storage.count > maxEntries || retainedItemCountLocked() > maxRetainedItems {
-            guard let victim = storage.min(by: { $0.value.accessTick < $1.value.accessTick })?.key else {
+        // Count retained items once and decrement per eviction. Recomputing the total inside the
+        // loop made evicting k of n entries O(n·k) — each pass walked every cached item array
+        // while holding the lock, on the refresh path this cache exists to make cheap.
+        var retained = retainedItemCountLocked()
+        while storage.count > maxEntries || retained > maxRetainedItems {
+            guard let victim = storage.min(by: { $0.value.accessTick < $1.value.accessTick })?.key,
+                  let removed = storage.removeValue(forKey: victim)
+            else {
                 return
             }
-            storage[victim] = nil
+            retained -= removed.entry.items.count + removed.entry.appendedItems.count
         }
     }
 }

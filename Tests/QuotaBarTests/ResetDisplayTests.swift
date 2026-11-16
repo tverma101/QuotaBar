@@ -270,6 +270,23 @@ final class ResetDisplayTests: XCTestCase {
             .unknownExpiries(count: 3)
         )
 
+        // A claimed credit is only deducted while the snapshot still lists it. Once a refresh drops
+        // it and decrements `count`, subtracting the claim again under-reported the balance.
+        let claimedExpiry = now.addingTimeInterval(24 * 3600)
+        XCTAssertEqual(
+            RateLimitResetsDetail.remainingCount(count: 2, expiries: [claimedExpiry], claimed: [claimedExpiry]),
+            1
+        )
+        XCTAssertEqual(
+            RateLimitResetsDetail.remainingCount(count: 2, expiries: [], claimed: [claimedExpiry]),
+            2,
+            "a refresh that already removed the credit must not be charged for the claim twice"
+        )
+        XCTAssertEqual(
+            RateLimitResetsDetail.remainingCount(count: 1, expiries: [], claimed: [claimedExpiry, claimedExpiry.addingTimeInterval(60)]),
+            1
+        )
+
         // Expiries present -> the timeline.
         let expiries = [now.addingTimeInterval(4 * 24 * 3600)]
         guard case .timeline(let entries) = RateLimitResetsDetail.content(count: 1, expiries: expiries, now: now) else {

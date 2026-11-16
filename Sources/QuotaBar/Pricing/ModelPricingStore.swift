@@ -124,6 +124,11 @@ actor ModelPricingStore {
         await refreshTask?.value
     }
 
+    /// Drops model pricing memo entries and lazy fuzzy matching indices to relieve memory footprint.
+    func clearCaches() {
+        pricing.clearCaches()
+    }
+
     // MARK: - Initial load (bundled + disk cache)
 
     func loadIfNeeded() {
@@ -286,11 +291,16 @@ actor ModelPricingStore {
 
     private func isDue(_ source: SourceID) -> Bool {
         let state = sourceStates[source] ?? SourceState()
-        if let failedAt = state.failedAt, now().timeIntervalSince(failedAt) < Self.failureRetryInterval {
-            return false
+        // The state file outlives launches, so a stamp written while the clock was set forward can
+        // sit in the future. A negative elapsed time must mean "expired", not "fresh forever", or
+        // pricing never refreshes again until the wall clock catches up.
+        if let failedAt = state.failedAt {
+            let elapsed = now().timeIntervalSince(failedAt)
+            if elapsed >= 0, elapsed < Self.failureRetryInterval { return false }
         }
         guard let fetchedAt = state.fetchedAt else { return true }
-        return now().timeIntervalSince(fetchedAt) >= Self.refreshInterval
+        let elapsed = now().timeIntervalSince(fetchedAt)
+        return elapsed < 0 || elapsed >= Self.refreshInterval
     }
 
     private func refreshDueSources() async {
@@ -486,7 +496,8 @@ actor ModelPricingStore {
     /// an unknown-model round.
     func failureRetryBlocked(_ source: SourceID) -> Bool {
         guard let failedAt = sourceStates[source]?.failedAt else { return false }
-        return now().timeIntervalSince(failedAt) < Self.failureRetryInterval
+        let elapsed = now().timeIntervalSince(failedAt)
+        return elapsed >= 0 && elapsed < Self.failureRetryInterval
     }
 
     private func readCache(_ source: SourceID) -> Data? {

@@ -16,6 +16,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        URLCache.shared.removeAllCachedResponses()
+        URLCache.shared.diskCapacity = 0
+        URLCache.shared.memoryCapacity = 0
         // Open/trim the file log, seed the cached level, and emit the startup line BEFORE anything
         // else logs, so the first lines of a session are captured.
         AppLog.bootstrap()

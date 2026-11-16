@@ -22,8 +22,11 @@ enum MenuBarIcon {
                 .frame(width: side, height: side)
         )
         renderer.scale = 2
-        guard let nsImage = renderer.nsImage else { return nil }
-        nsImage.size = NSSize(width: side, height: side)
+        // An all-transparent mark (a broken SVG parse) must not blank the status item out of the
+        // menu bar: report failure so the caller uses the symbol fallbackIcon instead.
+        guard let cgImage = renderer.cgImage,
+              MenuBarStripRenderer.visibleBounds(of: cgImage) != nil else { return nil }
+        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: side, height: side))
         nsImage.isTemplate = true
         return nsImage
     }

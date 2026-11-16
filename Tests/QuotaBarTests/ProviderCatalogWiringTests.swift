@@ -85,6 +85,7 @@ final class ProviderCatalogWiringTests: XCTestCase {
         XCTAssertEqual(Array(ids.prefix(3)), ["claude", "codex", "cursor"])
         XCTAssertEqual(ids[ids.firstIndex(of: "freebuff")! - 1], "devin")
         XCTAssertEqual(ids[ids.firstIndex(of: "freebuff")! + 1], "grok")
+        XCTAssertTrue(metrics.contains("freebuff.trend"))
         XCTAssertTrue(metrics.isSubset(of: Set(DefaultLayout.metricIDs)))
         // Freebuff's Daily Hours meter is the owner-requested menu-bar pin, and it reads as the
         // active session clock in the strip rather than an allowance figure.

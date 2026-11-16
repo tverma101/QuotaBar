@@ -74,7 +74,7 @@ final class ClaudeProvider: ProviderRuntime {
                 .exportingHistory(
                     scope: .machineLocal,
                     estimatedCost: true,
-                    sourceNote: "From your Claude usage history (estimated)"
+                    sourceNote: "From your Claude usage history"
                 )
         ] + WidgetDescriptor.spendTiles(provider: provider)
     }
@@ -124,9 +124,14 @@ final class ClaudeProvider: ProviderRuntime {
             // credentials here can repeat a failed Keychain read during the visible retry's
             // history follow-up, even though this pass never uses the token or calls Anthropic.
             // The scanner is already bound to the card identity when account cards are created.
-            return await snapshotWithLocalUsage(
-                mapped: ClaudeMappedUsage(plan: nil, lines: []),
-                warning: nil
+            return await ScanWorkerClient.shared.foldOnlySnapshot(
+                provider: provider,
+                inProcessFallback: {
+                    await self.snapshotWithLocalUsage(
+                        mapped: ClaudeMappedUsage(plan: nil, lines: []),
+                        warning: nil
+                    )
+                }
             )
         }
         let manualActionID = ProviderRefreshContext.manualActionID
@@ -534,8 +539,8 @@ final class ClaudeProvider: ProviderRuntime {
         // partial result cannot replace the last-good combined history in WidgetDataStore.
         if !Task.isCancelled, let scan = DailyUsageAccumulator.merged([nativeScan, piScan]) {
             let note = piScan == nil
-                ? "From your Claude usage history (estimated)"
-                : "From your Claude usage history and pi (estimated)"
+                ? "From your Claude usage history"
+                : "From your Claude usage history and pi"
             usageHistory = ProviderUsageHistory(
                 series: scan.series,
                 modelUsage: scan.modelUsage,
@@ -601,7 +606,10 @@ final class ClaudeProvider: ProviderRuntime {
             )) {
                 AppLog.info(LogTag.plugin("claude"), "rate-limited (cooldown active, serving \(lastGoodUsage == nil ? "badge" : "last-good usage"))")
             }
-            return rateLimitedSnapshot(credentials: state.oauth, retryAfterSeconds: Int(until.timeIntervalSince(now()).rounded(.up)))
+            // Clamp before converting: a poisoned persisted cooldown must not trap here.
+            let remaining = max(0, until.timeIntervalSince(now()))
+            let retrySeconds = Int(min(remaining, Double(ClaudeUsageMapper.maximumRetryAfterSeconds)).rounded(.up))
+            return rateLimitedSnapshot(credentials: state.oauth, retryAfterSeconds: retrySeconds)
         }
 
         if authStore.needsRefresh(state.oauth),
@@ -739,7 +747,11 @@ final class ClaudeProvider: ProviderRuntime {
         // (respecting Retry-After) and serve the last-good usage rather than a bare badge.
         if response.statusCode == 429 {
             let retryAfterSeconds = ClaudeUsageMapper.parseRetryAfterSeconds(response, now: now())
-            rateLimitedUntil = now().addingTimeInterval(TimeInterval(retryAfterSeconds ?? Int(Self.rateLimitCooldown)))
+            let cooldown = min(
+                retryAfterSeconds ?? Int(Self.rateLimitCooldown),
+                ClaudeUsageMapper.maximumRetryAfterSeconds
+            )
+            rateLimitedUntil = now().addingTimeInterval(TimeInterval(max(0, cooldown)))
             DiagnosticGate.logOnce(for: Self.liveUsageDiagnosticKey(
                 kind: "rateLimit",
                 providerID: provider.id,

@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// One provider-independent piece of the Usage History report: a single calendar day's measured
 /// tokens, the known plan-priced subtotal, and the public-API-rate comparison computed at fold time.
@@ -607,11 +608,24 @@ enum HistoryDashboardAggregator {
     /// ("Mar 2025"). Nil when the day key isn't parseable — the caption just disappears.
     private static func sinceLabel(for dayKey: String, calendar: Calendar) -> String? {
         guard let day = parseDay(dayKey, calendar: calendar) else { return nil }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = calendar
-        formatter.dateFormat = "MMM yyyy"
-        return formatter.string(from: day)
+        // Built once per calendar, not once per dashboard render: `DateFormatter` construction is the
+        // expensive part of formatting and this caption is recomputed on every body pass.
+        return monthYearFormatter(calendar: calendar).string(from: day)
+    }
+
+    private static let monthYearFormatters = OSAllocatedUnfairLock<[String: DateFormatter]>(initialState: [:])
+
+    private static func monthYearFormatter(calendar: Calendar) -> DateFormatter {
+        let key = String(describing: calendar.identifier) + "|" + calendar.timeZone.identifier
+        return monthYearFormatters.withLock { cache in
+            if let cached = cache[key] { return cached }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.calendar = calendar
+            formatter.dateFormat = "MMM yyyy"
+            cache[key] = formatter
+            return formatter
+        }
     }
 
     /// `yyyy-MM-dd` → Date at local midnight, for the axis label. Nil keeps the raw key as the label.

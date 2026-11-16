@@ -35,7 +35,7 @@ final class OptionalMetricVisibilityTests: XCTestCase {
             "grok.payAsYouGo",
             "opencode.session", "opencode.weekly", "opencode.monthly",
             "openrouter.credits", "openrouter.balance", "openrouter.keyLimit",
-            "zai.webSearches", "zai.zcodeTokens"
+            "zai.weekendBuild", "zai.webSearches"
         ]
         let actualConditionalIDs = Set(registry.descriptors.filter(\.hidesWhenEmpty).map(\.id))
         XCTAssertEqual(actualConditionalIDs, expectedConditionalIDs, "keep the full provider descriptor inventory covered")

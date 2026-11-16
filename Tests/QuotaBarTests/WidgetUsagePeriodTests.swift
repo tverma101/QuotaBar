@@ -18,6 +18,16 @@ final class WidgetUsagePeriodTests: XCTestCase {
         XCTAssertFalse(tiles.contains { $0.id == "codex.apiEstimate" })
     }
 
+    func testLast30SpendTileRevealsItsBreakdownOnTap() {
+        // The Last 30 Days popover is a wall of rows, so it opens on the period's aggregate figures
+        // and reveals the per-model list on tap. Today / Yesterday stay instant — their lists are
+        // two or three rows.
+        let tiles = Dictionary(uniqueKeysWithValues: WidgetDescriptor.spendTiles(provider: provider).map { ($0.id, $0.sample) })
+        XCTAssertEqual(tiles["codex.last30"]?.revealsBreakdownOnTap, true)
+        XCTAssertEqual(tiles["codex.today"]?.revealsBreakdownOnTap, false)
+        XCTAssertEqual(tiles["codex.yesterday"]?.revealsBreakdownOnTap, false)
+    }
+
     func testValuesAndCombinedDefaultToNotUsagePeriod() {
         // The exact shape the Codex balance rows use: `.values(...)` for Rate Limit Resets and
         // `.combined(...)` for Extra Usage credits, neither opting into a usage period.
