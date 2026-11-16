@@ -436,8 +436,12 @@ actor CodexLogUsageScanner {
             let fingerprints: [String: LogUsageSourceFingerprint] = [
                 "sessions": LogUsageSourceFingerprint.of(files)
             ]
-            let cacheKey = "codex-native|\(Self.aggregateScopeKey(homes: homes, peerHomes: peerHomesOverride ?? peerHomes))"
-            return await aggregateCache.scan(
+            let scopeKey = Self.aggregateScopeKey(
+                homes: homes,
+                peerHomes: peerHomesOverride ?? peerHomes
+            )
+            let cacheKey = "codex-native|\(scopeKey)"
+            let outcome = await aggregateCache.scan(
                 key: cacheKey,
                 pricingStamp: LogUsagePricingStamp.of(pricing),
                 daysBack: daysBack,
@@ -450,10 +454,18 @@ actor CodexLogUsageScanner {
                     pricing: pricing,
                     peerHomes: peerHomesOverride
                 ) {
-                case .complete(let scan): return scan
-                case .incomplete: return nil
+                case .complete(let scan):
+                    return .complete(scan, validUntil: nil)
+                case .incomplete:
+                    return .incomplete
                 }
-            }.map { .complete($0) } ?? .incomplete
+            }
+            switch outcome {
+            case .complete(let scan):
+                return .complete(scan)
+            case .incomplete:
+                return .incomplete
+            }
         }
         return await scanResultUncached(
             daysBack: daysBack,

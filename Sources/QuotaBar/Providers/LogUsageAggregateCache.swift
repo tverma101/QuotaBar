@@ -1,3 +1,4 @@
+import os
 import CryptoKit
 import Foundation
 
@@ -34,23 +35,63 @@ struct LogUsageSourceFingerprint: Codable, Sendable, Equatable {
 }
 
 /// Identity of the pricing snapshot an aggregate was computed with. Aggregates store dollar
-/// costs, so a pricing change must invalidate them. Counts + `updated_at` + the supplement's
-/// key/multiplier/rule names are cheap to hash and catch every feed refresh we ship; a rate
-/// edit that changes no key set is tolerated until the next source change recomputes anyway.
+/// costs, so any rate change must invalidate them — including edits that change no key sets. The
+/// stamp hashes every rate, tier and qualifier in both catalogs and the supplement, so a price
+/// change is always detected here.
+///
+/// The payload is hashed on every call: rates must be checked field for field, and a fold's
+/// hot path can afford microseconds of hashing against hundreds of milliseconds of I/O. Callers
+/// that need a stable value memoize it themselves.
 enum LogUsagePricingStamp {
     static func of(_ pricing: ModelPricing) -> String {
+        computeStamp(pricing)
+    }
+
+    private static func computeStamp(_ pricing: ModelPricing) -> String {
         var payload = ""
         payload += "updatedAt=\(pricing.supplement.updatedAt ?? "-")\n"
-        payload += "supplement=\(pricing.supplement.pricing.keys.sorted().joined(separator: ","))\n"
-        let fast = pricing.supplement.fastMultipliers
-            .sorted { $0.key < $1.key }
-            .map { "\($0.key)=\($0.value)" }
-            .joined(separator: ",")
-        payload += "fast=\(fast)\n"
-        payload += "rules=\(pricing.supplement.aliasRules.map(\.pattern.pattern).joined(separator: ","))\n"
-        payload += "primary=\(pricing.primary.entries.count)\n"
-        payload += "secondary=\(pricing.secondary.entries.count)\n"
+        for (key, rates) in pricing.supplement.pricing.sorted(by: { $0.key < $1.key }) {
+            payload += "suppl|\(key)|\(ratesPayload(rates))\n"
+        }
+        payload += "fast=\(pricing.supplement.fastMultipliers.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ","))\n"
+        payload += "normFast=\(pricing.supplement.normalizedFastMultipliers.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ","))\n"
+        payload += "aliases=\(pricing.supplement.aliasRules.map { "\($0.pattern.pattern)>\($0.canonical)" }.joined(separator: "|"))\n"
+        payload += "cursorAliases=\(pricing.supplement.cursorAliasRules.map { "\($0.pattern.pattern)>\($0.canonical)" }.joined(separator: "|"))\n"
+        payload += "retiredPricing=\(pricing.supplement.retiredPricingKeys.sorted().joined(separator: ","))\n"
+        payload += "retiredAliasPatterns=\(pricing.supplement.retiredAliasPatterns.sorted().joined(separator: ","))\n"
+        payload += "retiredAliasPatternsAuthoritative=\(pricing.supplement.retiredAliasPatternsAreAuthoritative ? 1 : 0)\n"
+        payload += catalogPayload("primary", pricing.primary)
+        payload += catalogPayload("secondary", pricing.secondary)
         return LogUsageSourceFingerprint.sha256(payload)
+    }
+
+    private static func catalogPayload(_ name: String, _ catalog: PricingCatalog) -> String {
+        var section = "catalog=\(name) retired=\(catalog.retiredKeys.sorted().joined(separator: ",")) retiredAuthoritative=\(catalog.retiredKeysAreAuthoritative ? 1 : 0) retrievedAt=\(catalog.retrievedAt ?? "-")\n"
+        for (key, rates) in catalog.entries.sorted(by: { $0.key < $1.key }) {
+            section += "\(name)|\(key)|\(ratesPayload(rates))\n"
+        }
+        return section
+    }
+
+    private static func ratesPayload(_ rates: ModelRates) -> String {
+        var payload = "i=\(rates.inputPerMillion),o=\(rates.outputPerMillion),cw=\(rates.cacheWritePerMillion),cr=\(rates.cacheReadPerMillion)"
+        payload += ",cw1h=\(rates.cacheWrite1hPerMillion.map { String($0) } ?? "-")"
+        payload += ",cri=\(rates.cacheReadIsExplicit ? 1 : 0)"
+        payload += ",lct=\(rates.longContextThresholdTokens)"
+        payload += ",fast=\(rates.fastMultiplier)"
+        for tier in rates.promptRateTiers {
+            payload += ",tier{threshold=\(tier.thresholdPromptTokens),incl=\(tier.includesThreshold ? 1 : 0),i=\(tier.inputPerMillion.map { String($0) } ?? "-"),o=\(tier.outputPerMillion.map { String($0) } ?? "-"),cw=\(tier.cacheWritePerMillion.map { String($0) } ?? "-"),cr=\(tier.cacheReadPerMillion.map { String($0) } ?? "-"),cw1h=\(tier.cacheWrite1hPerMillion.map { String($0) } ?? "-")}"
+        }
+        if let lanes = rates.utcPriceOverrides {
+            for lane in lanes {
+                payload += ",utc{days=\((lane.utcDays ?? []).sorted().joined(separator: ".")),start=\(lane.utcStartMinute.map { String($0) } ?? "-"),end=\(lane.utcEndMinute.map { String($0) } ?? "-"),i=\(lane.inputPerMillion.map { String($0) } ?? "-"),o=\(lane.outputPerMillion.map { String($0) } ?? "-"),cw=\(lane.cacheWritePerMillion.map { String($0) } ?? "-"),cr=\(lane.cacheReadPerMillion.map { String($0) } ?? "-"),cw1h=\(lane.cacheWrite1hPerMillion.map { String($0) } ?? "-")}"
+            }
+        }
+        payload += ",i200k=\(rates.inputAbove200kPerMillion.map { String($0) } ?? "-")"
+        payload += ",o200k=\(rates.outputAbove200kPerMillion.map { String($0) } ?? "-")"
+        payload += ",cw200k=\(rates.cacheWriteAbove200kPerMillion.map { String($0) } ?? "-")"
+        payload += ",cr200k=\(rates.cacheReadAbove200kPerMillion.map { String($0) } ?? "-")"
+        return payload
     }
 }
 
@@ -79,10 +120,26 @@ enum LogUsageAggregatePaths {
     }
 }
 
+
+
+/// Computed by the caller's fold and handed to the cache; `.foldComplete` with a nil scan means
+/// the fold finished but produced a complete-but-empty history (not persisted, so the next call
+/// recomputes rather than serving a stale empty aggregate).
+enum AggregateComputeResult: Sendable {
+    case complete(LogUsageScan?, validUntil: Date?)
+    case incomplete
+}
+
+/// What callers should do with the fold result.
+enum AggregateCacheOutcome: Sendable {
+    case complete(LogUsageScan?)
+    case incomplete
+}
+
 actor LogUsageAggregateCache {
     static let shared = LogUsageAggregateCache(directory: LogUsageAggregatePaths.defaultDirectory)
 
-    private static let schemaVersion = 1
+    private static let schemaVersion = 2
     /// Reuse bound. Retention windows are ≥ 35 days while request windows are ≤ ~33, so anything
     /// reused within this horizon still covers the full requested window. Beyond it, recompute.
     static let maxReuseAge: TimeInterval = 36 * 3600
@@ -95,6 +152,10 @@ actor LogUsageAggregateCache {
         var fingerprints: [String: LogUsageSourceFingerprint]
         var computedAt: Date
         var scan: LogUsageScan
+        /// Earliest event the fold excluded because it was in the future at compute time, if any.
+        /// Once `now` reaches it, the aggregate is stale by time alone: an event that was "not yet
+        /// eligible" then has become eligible now.
+        var validUntil: Date?
     }
 
     private let directory: URL
@@ -107,16 +168,16 @@ actor LogUsageAggregateCache {
 
     /// Returns the persisted aggregate when `key`, pricing, window, and every source fingerprint
     /// match the stored entry; otherwise runs `compute` and persists its result. `compute`
-    /// returning nil (cancellation, unreadable sources) is never persisted, so the next caller
-    /// retries rather than caching a failure.
+    /// returning `.incomplete` (cancellation, unreadable sources) is never persisted, so the next
+    /// caller retries rather than caching a failure.
     func scan(
         key: String,
         pricingStamp: String,
         daysBack: Int,
         fingerprints: [String: LogUsageSourceFingerprint],
         now: Date = Date(),
-        compute: @Sendable () async -> LogUsageScan?
-    ) async -> LogUsageScan? {
+        compute: @Sendable () async -> AggregateComputeResult
+    ) async -> AggregateCacheOutcome {
         precondition(!key.isEmpty)
         let days = max(1, daysBack)
         _ = loadEntryIfNeeded(key: key)
@@ -125,23 +186,34 @@ actor LogUsageAggregateCache {
            entry.pricingStamp == pricingStamp,
            entry.daysBack == days,
            entry.fingerprints == fingerprints,
+           entry.validUntil.map({ now < $0 }) ?? true,
            now.timeIntervalSince(entry.computedAt) <= Self.maxReuseAge
         {
-            return Self.windowFiltered(entry.scan, daysBack: days, now: now)
+            return .complete(Self.windowFiltered(entry.scan, daysBack: days, now: now))
         }
-        guard let fresh = await compute() else { return nil }
-        let entry = Entry(
-            schemaVersion: Self.schemaVersion,
-            key: key,
-            pricingStamp: pricingStamp,
-            daysBack: days,
-            fingerprints: fingerprints,
-            computedAt: now,
-            scan: fresh
-        )
-        entries[key] = entry
-        persist(entry)
-        return fresh
+        switch await compute() {
+        case .incomplete:
+            return .incomplete
+        case .complete(let fresh, let validUntil):
+            guard let fresh else {
+                // A complete fold with no rows persists nothing useful; the empty result is not a
+                // failure, it is just not cacheable.
+                return .complete(nil)
+            }
+            let entry = Entry(
+                schemaVersion: Self.schemaVersion,
+                key: key,
+                pricingStamp: pricingStamp,
+                daysBack: days,
+                fingerprints: fingerprints,
+                computedAt: now,
+                scan: fresh,
+                validUntil: validUntil
+            )
+            entries[key] = entry
+            persist(entry)
+            return .complete(fresh)
+        }
     }
 
     /// Drops every in-memory and on-disk entry (tests only).
@@ -160,11 +232,7 @@ actor LogUsageAggregateCache {
     /// result is identical to a fresh scan over the same unchanged sources.
     static func windowFiltered(_ scan: LogUsageScan, daysBack: Int, now: Date) -> LogUsageScan {
         let sinceDay = DailyUsageAccumulator.dayKey(from: JSONLScanning.sinceDate(daysBack: daysBack, now: now))
-        func keeps(_ day: String) -> Bool { day >= sinceDay }
-        let series = DailyUsageSeries(daily: scan.series.daily.filter { keeps($0.date) })
-        let modelUsage = scan.modelUsage.map { ModelUsageSeries(daily: $0.daily.filter { keeps($0.date) }) }
-        let unknown = scan.unknownModelsByDay.filter { keeps($0.key) }
-        return LogUsageScan(series: series, modelUsage: modelUsage, unknownModelsByDay: unknown)
+        return scan.droppingDays(before: sinceDay)
     }
 
     /// Loads the entry for `key` from disk exactly once per process. Returns whether an entry is

@@ -301,9 +301,12 @@ actor CodexRouterUsageScanner {
                 paths: ledgerPaths(),
                 optionalDefaultPath: optionalDefaultLedgerPath
             )
+            let poolPaths = Self.poolStatePaths(environment: environment, homeDirectory: homeDirectory())
+            // The default ~/.codex pool file is optional and frequently absent — absence must not
+            // mark discovery incomplete. Only that fallback path is allowed to be missing.
             let pool = Self.discoveredLedgers(
-                paths: Self.poolStatePaths(environment: environment, homeDirectory: homeDirectory()),
-                optionalDefaultPath: nil
+                paths: poolPaths,
+                optionalDefaultPath: poolPaths.last
             )
             if ledger.complete, pool.complete, !(ledger.files.isEmpty && pool.files.isEmpty) {
                 let fingerprints: [String: LogUsageSourceFingerprint] = [
@@ -315,33 +318,43 @@ actor CodexRouterUsageScanner {
                     allowsUnscopedEvents: allowsUnscopedEvents
                 )
                 let cacheKey = "codex-router|\(scopeKey)"
-                return await persistentAggregateCache.scan(
+                let outcome = await persistentAggregateCache.scan(
                     key: cacheKey,
                     pricingStamp: LogUsagePricingStamp.of(pricing),
                     daysBack: daysBack,
                     fingerprints: fingerprints,
                     now: now
                 ) { [self] in
-                    switch await scanResultUncached(
+                    let full = await scanResultUncached(
                         accountIdentityKey: accountIdentityKey,
                         allowsUnscopedEvents: allowsUnscopedEvents,
                         daysBack: daysBack,
                         now: now,
                         pricing: pricing
-                    ) {
-                    case .complete(let scan): return scan
-                    case .incomplete: return nil
+                    )
+                    switch full.result {
+                    case .complete(let scan):
+                        return .complete(scan, validUntil: full.nextFutureEventAt)
+                    case .incomplete:
+                        return .incomplete
                     }
-                }.map { .complete($0) } ?? .incomplete
+                }
+                switch outcome {
+                case .complete(let scan):
+                    return .complete(scan)
+                case .incomplete:
+                    return .incomplete
+                }
             }
         }
-        return await scanResultUncached(
+        let full = await scanResultUncached(
             accountIdentityKey: accountIdentityKey,
             allowsUnscopedEvents: allowsUnscopedEvents,
             daysBack: daysBack,
             now: now,
             pricing: pricing
         )
+        return full.result
     }
 
     private static func aggregateScopeKey(accountIdentityKey: String?, allowsUnscopedEvents: Bool) -> String {
@@ -353,13 +366,21 @@ actor CodexRouterUsageScanner {
     }
 
     /// The un-gated scan body: the incremental tail/parse machinery plus per-account folding.
+    /// Fold result plus the earliest event the fold excluded because it was in the future at
+    /// fold time, if any. Fed back to the persisted aggregate gate so it can stop serving the
+    /// aggregate once that event becomes eligible.
+    private struct RouterFoldOutcome {
+        var result: CodexRouterUsageScanResult
+        var nextFutureEventAt: Date?
+    }
+
     private func scanResultUncached(
         accountIdentityKey: String?,
         allowsUnscopedEvents: Bool,
         daysBack: Int,
         now: Date,
         pricing: ModelPricing
-    ) async -> CodexRouterUsageScanResult {
+    ) async -> RouterFoldOutcome {
         let days = max(1, daysBack)
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
@@ -455,7 +476,7 @@ actor CodexRouterUsageScanner {
                 identityAliasSnapshot: aliasSnapshot
             )
         }
-        guard preflight.discoveryComplete else { return .incomplete }
+        guard preflight.discoveryComplete else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
         if case .hit(let cachedResult) = preflight.cacheLookup {
             // A cache hit skips the event fold, but it still re-discovers the ledgers, stats every
             // source and samples each append anchor. That metadata work must share the same CPU
@@ -465,8 +486,10 @@ actor CodexRouterUsageScanner {
             let sourceStayedStable = JSONLAccountingWorkPacer.shared.perform {
                 sourcesAndAliasesStillMatch(preflight)
             }
-            guard !Task.isCancelled, sourceStayedStable else { return .incomplete }
-            return .complete(cachedResult)
+            guard !Task.isCancelled, sourceStayedStable else {
+                return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil)
+            }
+            return RouterFoldOutcome(result: .complete(cachedResult), nextFutureEventAt: nil)
         }
         let sourceFiles = preflight.sourceFiles
         let sourceRevisions = preflight.sourceRevisions
@@ -634,10 +657,10 @@ actor CodexRouterUsageScanner {
         if let readFile {
             var malformedEventLine = false
             for path in ledgerPaths() {
-                guard !Task.isCancelled else { return .incomplete }
+                guard !Task.isCancelled else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
                 guard let contents = readFile(path) else { continue }
                 for line in contents.split(whereSeparator: \.isNewline) {
-                    guard !Task.isCancelled else { return .incomplete }
+                    guard !Task.isCancelled else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
                     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { continue }
                     let data = Data(trimmed.utf8)
@@ -650,9 +673,9 @@ actor CodexRouterUsageScanner {
                     }
                 }
             }
-            guard !malformedEventLine else { return .incomplete }
+            guard !malformedEventLine else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
         } else {
-            guard let files = sourceFiles else { return .incomplete }
+            guard let files = sourceFiles else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
             // Keep ~35 days of parsed rows in the append checkpoint so multi-account refreshes
             // share one parse without retaining the entire historical ledger in RAM.
             let retentionDays = max(days, 35)
@@ -715,12 +738,14 @@ actor CodexRouterUsageScanner {
                         fold.itemCountsByPath[path] = itemCount
                     }
                 )
-                if !ok { return .incomplete }
+                if !ok { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
             }
         }
 
         // A cancelled tail fold must not publish a partial aggregate for an unchanged source revision.
-        guard !Task.isCancelled, !fold.sawInvalidUsageRow else { return .incomplete }
+        guard !Task.isCancelled, !fold.sawInvalidUsageRow else {
+            return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil)
+        }
 
         let result = JSONLAccountingWorkPacer.shared.perform { () -> LogUsageScan? in
             let deltaResult: LogUsageScan?
@@ -754,9 +779,11 @@ actor CodexRouterUsageScanner {
                 )
                 return true
             }
-            guard sourceStayedStable else { return .incomplete }
+            guard sourceStayedStable else {
+                return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil)
+            }
         }
-        return .complete(result)
+        return RouterFoldOutcome(result: .complete(result), nextFutureEventAt: fold.nextFutureEventAt)
     }
 
     /// Escaping fold visits cannot capture `inout` accumulators; this tiny box owns them.
@@ -1717,7 +1744,7 @@ actor CodexRouterUsageScanner {
         now: Date,
         calendar: Calendar,
         pricing: ModelPricing
-    ) async -> CodexRouterUsageScanResult {
+    ) async -> RouterFoldOutcome {
         let expectedFingerprint = CodexProxyUsageScanner.accountFingerprint(for: accountIdentityKey)
         let expectedAccountId = accountIdentityKey?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1732,11 +1759,11 @@ actor CodexRouterUsageScanner {
             })
         }()
         let index = CodexRouterAggregateIndex.shared
-        func incomplete(_ reason: String) -> CodexRouterUsageScanResult {
+        func incomplete(_ reason: String) -> RouterFoldOutcome {
             DiagnosticGate.logOnce(for: "codex.router.incomplete." + reason) {
                 AppLog.warn(LogTag.plugin("codex"), "Router checkpoint rejected: \(reason)")
             }
-            return .incomplete
+            return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil)
         }
         let paths = ledgerPaths()
         let discovery = Self.discoveredLedgers(
@@ -1774,7 +1801,7 @@ actor CodexRouterUsageScanner {
             guard !Task.isCancelled,
                   identityAliasesStillMatch(aliasSnapshot, hasLedgerSources: !discovery.files.isEmpty)
             else { return incomplete("cached-identity-changed") }
-            return .complete(cached)
+            return RouterFoldOutcome(result: .complete(cached), nextFutureEventAt: nil)
         case .append(let record):
             prior = record
         case .rebuild:
@@ -2010,7 +2037,7 @@ actor CodexRouterUsageScanner {
             complete: true,
             pricingDependencies: dependencies
         ))
-        return .complete(result)
+        return RouterFoldOutcome(result: .complete(result), nextFutureEventAt: nextFuture)
     }
 
 }

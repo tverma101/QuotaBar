@@ -32,9 +32,24 @@ final class LogUsageAggregateCacheTests: XCTestCase {
         var count = 0
     }
 
-    private func countingCompute(_ result: LogUsageScan, _ counter: Counter) -> (@Sendable () async -> LogUsageScan?) {
+    private func countingCompute(_ result: LogUsageScan?, _ counter: Counter) -> (@Sendable () async -> AggregateComputeResult) {
         { counter.count += 1
-            return result }
+            return .complete(result, validUntil: nil) }
+    }
+
+    private func completeScan(
+        cache: LogUsageAggregateCache,
+        key: String,
+        pricingStamp: String,
+        daysBack: Int,
+        fingerprints: [String: LogUsageSourceFingerprint],
+        now: Date,
+        compute: @Sendable () async -> AggregateComputeResult
+    ) async -> LogUsageScan? {
+        switch await cache.scan(key: key, pricingStamp: pricingStamp, daysBack: daysBack, fingerprints: fingerprints, now: now, compute: compute) {
+        case .complete(let scan): return scan
+        case .incomplete: return nil
+        }
     }
 
     func testUnchangedSourcesReturnPersistedAggregateWithoutRecomputing() async {
@@ -43,14 +58,14 @@ final class LogUsageAggregateCacheTests: XCTestCase {
         let counter = Counter()
         let result = scan([("2026-04-29", 100)])
 
-        let first = await cache.scan(
+        let first = await completeScan(cache: cache,
             key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints, now: now,
             compute: countingCompute(result, counter)
         )
         XCTAssertEqual(counter.count, 1)
         XCTAssertEqual(first?.series.daily.first?.totalTokens, 100)
 
-        let second = await cache.scan(
+        let second = await completeScan(cache: cache,
             key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints, now: now,
             compute: countingCompute(result, counter)
         )
@@ -65,26 +80,26 @@ final class LogUsageAggregateCacheTests: XCTestCase {
         let result = scan([("2026-04-29", 100)])
 
         let initial = ["ledger": LogUsageSourceFingerprint.of([file("/l.jsonl", size: 10, mtime: mtime)])]
-        _ = await cache.scan(key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: initial, now: now, compute: countingCompute(result, counter))
+        _ = await completeScan(cache: cache,key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: initial, now: now, compute: countingCompute(result, counter))
         XCTAssertEqual(counter.count, 1)
 
         // Append: size grows.
         let appended = ["ledger": LogUsageSourceFingerprint.of([file("/l.jsonl", size: 20, mtime: mtime.addingTimeInterval(1))])]
-        _ = await cache.scan(key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: appended, now: now, compute: countingCompute(result, counter))
+        _ = await completeScan(cache: cache,key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: appended, now: now, compute: countingCompute(result, counter))
         XCTAssertEqual(counter.count, 2, "an append must invalidate the aggregate")
 
         // Truncate: size shrinks below the prior offset.
         let truncated = ["ledger": LogUsageSourceFingerprint.of([file("/l.jsonl", size: 4, mtime: mtime.addingTimeInterval(2))])]
-        _ = await cache.scan(key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: truncated, now: now, compute: countingCompute(result, counter))
+        _ = await completeScan(cache: cache,key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: truncated, now: now, compute: countingCompute(result, counter))
         XCTAssertEqual(counter.count, 3, "a truncate must invalidate the aggregate")
 
         // Rotate: the ledger path is replaced.
         let rotated = ["ledger": LogUsageSourceFingerprint.of([file("/l-2.jsonl", size: 10, mtime: mtime)])]
-        _ = await cache.scan(key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: rotated, now: now, compute: countingCompute(result, counter))
+        _ = await completeScan(cache: cache,key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: rotated, now: now, compute: countingCompute(result, counter))
         XCTAssertEqual(counter.count, 4, "a rotate must invalidate the aggregate")
 
         // Same shape again → hit.
-        _ = await cache.scan(key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: rotated, now: now, compute: countingCompute(result, counter))
+        _ = await completeScan(cache: cache,key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: rotated, now: now, compute: countingCompute(result, counter))
         XCTAssertEqual(counter.count, 4)
     }
 
@@ -95,11 +110,11 @@ final class LogUsageAggregateCacheTests: XCTestCase {
         let original = ["ledger": LogUsageSourceFingerprint.of([
             file("/l.jsonl", size: 10, mtime: now, attributeMtime: now)
         ])]
-        _ = await cache.scan(key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: original, now: now, compute: countingCompute(result, counter))
+        _ = await completeScan(cache: cache,key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: original, now: now, compute: countingCompute(result, counter))
         let rewritten = ["ledger": LogUsageSourceFingerprint.of([
             file("/l.jsonl", size: 10, mtime: now, attributeMtime: now.addingTimeInterval(1))
         ])]
-        _ = await cache.scan(key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: rewritten, now: now, compute: countingCompute(result, counter))
+        _ = await completeScan(cache: cache,key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: rewritten, now: now, compute: countingCompute(result, counter))
         XCTAssertEqual(counter.count, 2, "an in-place rewrite must invalidate the aggregate")
     }
 
@@ -108,8 +123,8 @@ final class LogUsageAggregateCacheTests: XCTestCase {
         let fingerprints = ["ledger": LogUsageSourceFingerprint.of([file("/l.jsonl", size: 10, mtime: now)])]
         let counter = Counter()
         let result = scan([("2026-04-29", 100)])
-        _ = await cache.scan(key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints, now: now, compute: countingCompute(result, counter))
-        _ = await cache.scan(key: "k", pricingStamp: "p2", daysBack: 30, fingerprints: fingerprints, now: now, compute: countingCompute(result, counter))
+        _ = await completeScan(cache: cache,key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints, now: now, compute: countingCompute(result, counter))
+        _ = await completeScan(cache: cache,key: "k", pricingStamp: "p2", daysBack: 30, fingerprints: fingerprints, now: now, compute: countingCompute(result, counter))
         XCTAssertEqual(counter.count, 2, "a pricing change must reprice the aggregate")
     }
 
@@ -120,10 +135,10 @@ final class LogUsageAggregateCacheTests: XCTestCase {
         let fingerprints = ["ledger": LogUsageSourceFingerprint.of([file("/l.jsonl", size: 10, mtime: now)])]
         let counter = Counter()
         let result = scan([("2026-04-29", 100)])
-        _ = await first.scan(key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints, now: now, compute: countingCompute(result, counter))
+        _ = await completeScan(cache: first,key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints, now: now, compute: countingCompute(result, counter))
 
         let second = LogUsageAggregateCache(directory: directory)
-        let reused = await second.scan(key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints, now: now, compute: countingCompute(result, counter))
+        let reused = await completeScan(cache: second,key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints, now: now, compute: countingCompute(result, counter))
         XCTAssertEqual(counter.count, 1, "a second process/instance must load the persisted aggregate")
         XCTAssertEqual(reused?.series.daily.first?.totalTokens, 100)
     }
