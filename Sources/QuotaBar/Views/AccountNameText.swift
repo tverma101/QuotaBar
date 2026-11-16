@@ -45,7 +45,7 @@ struct AccountNameText: View {
                     .font(font)
                     .foregroundStyle(foregroundStyle)
                     .lineLimit(lineLimit)
-                    .blur(radius: revealed ? 0 : 7)
+                    .blur(radius: revealed ? 0 : 10)
                     .contentShape(Rectangle())
                     .onTapGesture { withAnimation(.easeInOut(duration: 0.15)) { revealed.toggle() } }
                     .accessibilityLabel(revealed ? split.account : "Account name hidden")
