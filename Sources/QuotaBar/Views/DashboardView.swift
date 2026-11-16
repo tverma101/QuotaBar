@@ -6,15 +6,15 @@ import SwiftUI
 /// controls.
 ///
 /// The chrome is fixed: it's keyed off `layout.screen` and applied uniformly in `screenView`, so on a
-/// screen switch only the content slides while the footer and top bar stay put. Each screen's scroll
-/// content underlaps the footer with the native soft scroll-edge fade (`softBottomScrollEdge` →
-/// `.scrollEdgeEffectStyle(.soft)`, macOS 26+) — Apple's blurred boundary, not a custom gradient or a
-/// material bar. On macOS 15 the footer/top bar still pin via `safeAreaInset`, just without the blur
-/// (content scrolls flush). The panel **auto-fits its content**: each screen publishes its intrinsic
-/// height (`ScrollContentHeightKey` + the measured footer), and the host window is driven to that on
-/// SwiftUI's animation clock (`drivesPanelHeight` / `PanelHeightModifier`) — so a screen switch morphs
-/// the window height in lockstep with the slide (one spring), and the scroll views only take over once
-/// content exceeds the screen-height cap.
+/// screen switch only the content slides while the footer and top bar stay put. Each screen scrolls
+/// under the fixed bars with the panel's fade/frost treatment (`panelBars`): content under the top
+/// bar is hidden behind the panel's surface, and content under the bottom bar is blurred behind it
+/// (the system's soft scroll-edge effect on macOS 27, an in-window frost before it). The panel
+/// **auto-fits its content**: each screen publishes its intrinsic height (`ScrollContentHeightKey` +
+/// the measured footer), and the host window is driven to that on SwiftUI's animation clock
+/// (`drivesPanelHeight` / `PanelHeightModifier`) — so a screen switch morphs the window height in
+/// lockstep with the slide, and the scroll views only take over once content exceeds the
+/// screen-height cap.
 struct DashboardView: View {
     @Environment(AppContainer.self) private var container
     @Environment(LayoutStore.self) private var layout
@@ -100,7 +100,7 @@ struct DashboardView: View {
                         // From a provider's L2 detail, back out to the L1 list first; only from L1 /
                         // Settings drop to the dashboard. Pressing Esc again from L1 closes the popover.
                         if layout.customizeProviderID != nil {
-                            withAnimation(Motion.spring) { layout.customizeProviderID = nil }
+                            withAnimation(Motion.navigation) { layout.customizeProviderID = nil }
                             return true
                         }
                         guard layout.screen != .dashboard else { return false }
@@ -111,7 +111,7 @@ struct DashboardView: View {
                         // From a provider's L2 detail, back out to the L1 list first — matching Esc —
                         // so Return steps L2 → L1 → dashboard instead of jumping L2 → dashboard.
                         if layout.customizeProviderID != nil {
-                            withAnimation(Motion.spring) { layout.customizeProviderID = nil }
+                            withAnimation(Motion.navigation) { layout.customizeProviderID = nil }
                             return true
                         }
                         let target: PopoverScreen = layout.screen == .dashboard ? .customize : .dashboard
@@ -200,18 +200,18 @@ struct DashboardView: View {
                 animatedSlideID = id
                 let destination = layout.screen
                 Task { @MainActor in
-                    // Co-animate the slide and the height on ONE spring → the coordinated morph: the
-                    // panel grows/shrinks to the destination's size as that screen slides in. The
-                    // destination is usually mounted+measured by now (it mounted on the slideProgress=0
-                    // render), so we morph to its ideal. If it ISN'T measured yet and the height was
-                    // never established (animatedHeight still the 0 sentinel — e.g. opening Settings
-                    // straight from the status-item menu), we must NOT morph to a clamped zero, which
-                    // floors to minPanelHeight and wrongly shrinks the panel: leave the height alone and
-                    // let the completion / measurement establish it once a real ideal lands.
+                    // Co-animate the slide and the height on one native-pace animation → the
+                    // coordinated morph: the panel grows/shrinks to the destination's size as that
+                    // screen slides in. The destination is usually mounted+measured by now (it mounted
+                    // on the slideProgress=0 render), so we morph to its ideal. If it ISN'T measured yet
+                    // and the height was never established (animatedHeight still the 0 sentinel — e.g.
+                    // opening Settings straight from the status-item menu), we must NOT morph to a
+                    // clamped zero, which would shrink the panel: leave the height alone and let the
+                    // completion / measurement establish it once a real ideal lands.
                     let coTarget: CGFloat? = heightCoordinator.target(for: destination)
                         ?? (animatedHeight > 0 ? animatedHeight : nil)
                     if coTarget != nil { didEstablishHeight = true }
-                    withAnimation(Motion.spring, completionCriteria: .logicallyComplete) {
+                    withAnimation(Motion.navigation, completionCriteria: .logicallyComplete) {
                         slideProgress = 1
                         if let coTarget { animatedHeight = coTarget }
                     } completion: {
@@ -220,22 +220,27 @@ struct DashboardView: View {
                             didEstablishHeight = true
                             animatedHeight = target            // un-animated establish — never grow from 0
                         } else if abs(target - animatedHeight) > 1 {
-                            withAnimation(Motion.spring) { animatedHeight = target }
+                            withAnimation(Motion.navigation) { animatedHeight = target }
                         }
                     }
                 }
             }
             // In-screen growth/shrink (a provider card expands, the footer notice appears, a refresh
-            // loads rows): re-target the height on the same spring. Establishment is allowed even mid-
-            // slide (a measurement that lands during a switch must seed the height — there's nothing to
-            // fight yet); the animated *re-target* defers to the switch path while a slide is in flight.
+            // loads rows): a mounting page measures before its bars are inset (macOS 15 reports scroll
+            // geometry after layout), so the slide's co-target may be short — follow the corrected
+            // height mid-slide rather than after it. Establishment is allowed even mid-slide (a
+            // measurement that lands during a switch must seed the height — there's nothing to fight
+            // yet); outside a slide the panel takes its new size in one step, like a native window.
             .onChange(of: heightCoordinator.measuredIdeal[layout.screen]) { _, _ in
                 guard let target = heightCoordinator.target(for: layout.screen) else { return }
                 if !didEstablishHeight {
                     didEstablishHeight = true
                     animatedHeight = target
-                } else if !isSliding, abs(target - animatedHeight) > 1 {
-                    withAnimation(Motion.spring) { animatedHeight = target }
+                } else if !isSliding {
+                    // Outside a screen slide the panel takes its new size in one step, like a native window.
+                    if abs(target - animatedHeight) > 1 { animatedHeight = target }
+                } else if abs(target - animatedHeight) > 1 {
+                    withAnimation(Motion.navigation) { animatedHeight = target }
                 }
             }
             // Watches for the secret transparency code while the panel is key and toggles the egg. A
@@ -464,9 +469,7 @@ struct DashboardView: View {
             .onPreferenceChange(ScrollContentHeightKey.self) { height in
                 heightCoordinator.setScrollContent(height, for: screen)
             }
-            .softTopScrollEdge()
-            .softBottomScrollEdge()
-            .pinnedTopBar(spacing: 0) {
+            .panelBars {
                 if includeChrome {
                     PopoverTopBar(
                         layout: layout,
@@ -479,8 +482,7 @@ struct DashboardView: View {
                         isPresentingResetAllConfirm: $isPresentingResetAllConfirm
                     )
                 }
-            }
-            .pinnedFooter(spacing: 0) {
+            } bottom: {
                 if includeChrome {
                     PopoverFooter(
                         screen: layout.screen,

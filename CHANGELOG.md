@@ -18,6 +18,8 @@ QuotaBar's first public downloadable build. It does not update automatically; us
 
 ## Unreleased
 
+- Show Antigravity's active Gemini quota readings (daily host, production fills omissions) and keep an in-flight session from reading as "Not started" while its reset countdown is due.
+- Size the panel to its screen with no minimum height, land every resize on whole points, and host the dashboard below the panel's content view; content under the top bar is hidden and content under the footer frosts (system soft edge on macOS 27, an in-window frost on macOS 26 and earlier); screen and page motion runs at the native pace.
 - Preserve last-known Antigravity history across restarts when a conversation database disappears, while readable sources keep updating.
 - Page the full OpenRouter model catalog, recheck fallback-priced names so new exact routes replace stale estimates, and stop per-model checks after three misses.
 - Keep optional provider cards off until selected in Customize, preserve Freebuff in the default set, and reset to those explicit defaults.

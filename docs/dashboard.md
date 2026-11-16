@@ -74,7 +74,7 @@ The image is a flexible-height PNG using the app's look — the provider's mark 
 
 ## Footer
 
-The bar pinned to the bottom of the popover. On the left: the app version, and a live "Next update in …" countdown you can click (or press **⌘R**) to refresh right away. On the right: an **Options** menu button. It holds everything in one place — **Customize**, **Settings**, **Share Screenshot** (submenu of providers), **Check for Updates…**, **About QuotaBar**, and **Quit QuotaBar**.
+The bar pinned to the bottom of the popover. Content scrolling underneath it blurs softly behind it — the system's soft scroll edge on macOS 27, an in-window frost before it — and shows nothing when nothing is under it; content scrolling under the top bar is hidden behind the panel instead. On the left: the app version, and a live "Next update in …" countdown you can click (or press **⌘R**) to refresh right away. On the right: an **Options** menu button. It holds everything in one place — **Customize**, **Settings**, **Share Screenshot** (submenu of providers), **Check for Updates…**, **About QuotaBar**, and **Quit QuotaBar**.
 
 ## Customize
 

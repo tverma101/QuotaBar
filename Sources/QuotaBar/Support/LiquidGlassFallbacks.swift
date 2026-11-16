@@ -6,7 +6,7 @@ import SwiftUI
 ///
 /// These are purely cosmetic fallbacks — they swap Liquid Glass styling for the established
 /// pre-Tahoe controls (`.bordered` button styles, `.safeAreaInset`, no scroll-edge blur). Function
-/// is preserved on every supported OS: the footer still pins, the buttons keep their active/inactive
+/// is preserved on every supported OS: the chrome bars pin, the buttons keep their active/inactive
 /// distinction, the scroll view still scrolls. Nothing here hides a runtime error — each branch is a
 /// compile-time `#available` check, which is the intended way to back-deploy newer-SDK APIs.
 ///
@@ -66,55 +66,6 @@ extension View {
             glassEffect(.regular, in: Rectangle())
         } else {
             background(.bar)
-        }
-    }
-
-    /// Pins a bottom bar below scrolling content. On macOS 26 this uses `safeAreaBar`, which also
-    /// feeds the native scroll-edge blur as content passes under it; on macOS 15 it uses
-    /// `safeAreaInset` (macOS 12+), which pins the bar identically but without the blur.
-    @ViewBuilder
-    func pinnedFooter<Footer: View>(spacing: CGFloat, @ViewBuilder content: () -> Footer) -> some View {
-        if #available(macOS 26, *) {
-            safeAreaBar(edge: .bottom, spacing: spacing, content: content)
-        } else {
-            safeAreaInset(edge: .bottom, spacing: spacing, content: content)
-        }
-    }
-
-    /// Pins a bar above scrolling content (the Customize / Settings back nav bar). On macOS 26 this
-    /// uses `safeAreaBar`, which also feeds the native scroll-edge blur as content passes under it; on
-    /// macOS 15 it uses `safeAreaInset` (macOS 12+), which pins the bar identically but without the blur.
-    @ViewBuilder
-    func pinnedTopBar<Bar: View>(spacing: CGFloat, @ViewBuilder content: () -> Bar) -> some View {
-        if #available(macOS 26, *) {
-            safeAreaBar(edge: .top, spacing: spacing, content: content)
-        } else {
-            safeAreaInset(edge: .top, spacing: spacing, content: content)
-        }
-    }
-
-    /// Applies the soft top scroll-edge effect on macOS 26. On macOS 15 there is no equivalent, so
-    /// this is a no-op — the scroll view still scrolls and clips correctly, it just loses the blur.
-    @ViewBuilder
-    func softTopScrollEdge() -> some View {
-        if #available(macOS 26, *) {
-            scrollEdgeEffectStyle(.soft, for: .top)
-        } else {
-            self
-        }
-    }
-
-    /// Applies the soft *bottom* scroll-edge effect on macOS 26 — the subtle blurred fade of content
-    /// passing under the pinned footer (Apple's `.soft` `ScrollEdgeEffectStyle`, vs the `.hard`/default
-    /// "linear, nearly opaque" bar). This is the native way to get the early-0.7 fade-into-footer look;
-    /// no custom gradient or material bar. On macOS 15 there's no equivalent, so it's a no-op — the
-    /// footer still pins via `safeAreaInset`, content just scrolls flush to it.
-    @ViewBuilder
-    func softBottomScrollEdge() -> some View {
-        if #available(macOS 26, *) {
-            scrollEdgeEffectStyle(.soft, for: .bottom)
-        } else {
-            self
         }
     }
 }
