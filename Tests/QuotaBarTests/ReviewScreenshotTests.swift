@@ -75,3 +75,35 @@ final class ReviewScreenshotTests: XCTestCase {
         }
     }
 }
+
+extension ReviewScreenshotTests {
+    func testAccountNameBlurRendersForReview() throws {
+        func card(_ suite: String, blurred: Bool) throws -> NSImage {
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: "quotabar.review.\(UUID().uuidString)"))
+            defaults.removeObject(forKey: AccountNamePrivacySetting.key)
+            if !blurred { defaults.set(false, forKey: AccountNamePrivacySetting.key) }
+            let provider = Provider(id: "codex", displayName: "Codex — alice@example.com",
+                                    icon: .providerMark("codex"))
+            let row = WidgetData(title: "Weekly", icon: provider.icon, kind: .percent, used: 35, limit: 100)
+            let card = VStack(alignment: .leading, spacing: 6) {
+                ProviderSectionHeader(provider: provider, cardIsHovered: false, onCopyScreenshot: { true })
+                DashboardMetricCard { WidgetRowView(data: row) }
+            }
+            .frame(width: 320).padding(14).background(Theme.traySurface)
+            .defaultAppStorage(defaults)
+            return try XCTUnwrap(ImageRenderer(content: card).nsImage)
+        }
+
+        let blurred = try card("blurred", blurred: true)
+        let plain = try card("plain", blurred: false)
+        XCTAssertGreaterThan(blurred.size.height, 20)
+        XCTAssertGreaterThan(plain.size.height, 20)
+
+        if let dir = ProcessInfo.processInfo.environment["QUOTABAR_REVIEW_IMAGE_DIR"] {
+            for (name, image) in [("account-blur-on.png", blurred), ("account-blur-off.png", plain)] {
+                let png = try XCTUnwrap(ShareCardRenderer.pngData(from: image))
+                try png.write(to: URL(fileURLWithPath: dir).appendingPathComponent(name))
+            }
+        }
+    }
+}

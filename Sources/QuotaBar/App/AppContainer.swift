@@ -440,6 +440,7 @@ final class AppContainer {
             AppearanceSetting.key, TimeFormatSetting.key, DensitySetting.key,
             ReduceAnimationsSetting.key, LogLevelSetting.key, TotalSpendSetting.key,
             TotalSpendSetting.periodKey, TotalSpendSetting.metricKey,
+            AccountNamePrivacySetting.key,
         ] {
             UserDefaults.standard.removeObject(forKey: key)
         }

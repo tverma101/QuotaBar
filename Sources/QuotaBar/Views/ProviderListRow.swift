@@ -30,10 +30,11 @@ struct ProviderListRow<Handle: View>: View {
                 ProviderIcon(source: provider.icon)
                     .frame(width: 18, height: 18)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(provider.displayName)
-                        .font(.system(size: density.headerPointSize, weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
+                    AccountNameText(
+                        text: provider.displayName,
+                        font: .system(size: density.headerPointSize, weight: .semibold),
+                        foregroundStyle: AnyShapeStyle(.primary)
+                    )
                     Text(hasLocalSetup ? "Setup found · \(metricCount) metrics" : "\(metricCount) metrics")
                         .font(.system(size: density.planBadgePointSize))
                         .foregroundStyle(.secondary)

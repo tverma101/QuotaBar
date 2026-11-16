@@ -40,6 +40,10 @@ a token is configured at all.
 - No actual usage **values** (no spend amounts, token counts, or limits).
 - No error **messages** or file paths — only coarse error categories as counts.
 
+## Account names on screen
+
+Account-scoped provider cards (“Claude — Acme Corp”) render their account suffix **blurred by default** — in the dashboard, history, the Total Spend legend, share cards, and popover menus — so a glimpse at your screen does not leak which accounts you use. Tap a blurred suffix to reveal it; tap again to hide it. **Blur Account Names** in Settings → Privacy turns the behavior off. The reveal state is never persisted; only the setting survives a restart. This is a screen concern, not a data-flow one: nothing about the blur changes what leaves this Mac.
+
 ## Credentials stored on this Mac
 
 QuotaBar primarily reads credentials that provider tools already keep on your Mac. User-supplied API

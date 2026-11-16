@@ -8,6 +8,8 @@ A fresh install starts with Claude, Codex, Cursor, Freebuff, and any registered 
 
 Providers added by future updates also start off. Updates preserve your saved provider choices, and a provider never turns on just because its CLI or app is installed. See [Which Providers Are On](provider-enablement.md) for the full lifecycle.
 
+Multiple account cards of one provider are named `"Family — Account"` (for example `Codex — alice@example.com`). Account names stay **blurred by default** — in the card header, the history sections, the Total Spend legend, the share card, and the popover menus — until you tap one to reveal it. Set **Blur Account Names** in [Settings](settings.md) → Privacy to off to always show account names. The reveal is transient; the setting is the one persistent control.
+
 Each provider card leads with its **Always Visible** metrics. Any metrics you've moved below the **On Demand** line are tucked away behind the in-card caret — click it to reveal them below the caret, click again to collapse. Open cards stay open across popover closes and app restarts. A provider with neither On Demand metrics nor quick links shows no caret.
 
 When you expand a card, the tucked-away metrics open below the caret as a single-column list, so each detail row keeps the full card width.
@@ -68,7 +70,7 @@ Copy a clean, branded PNG of one provider's usage to your clipboard, ready to pa
 - Right-click a provider header and choose **Share Screenshot**.
 - Open the footer's **Options** menu and choose **Share Screenshot** ▸ *\<provider\>*. The submenu lists every provider currently showing on the dashboard.
 
-The image is a flexible-height PNG using the app's look — the provider's mark and name up top, the metric rows you currently see for that provider, and a small QuotaBar mark centered at the bottom. It follows your Light/Dark appearance and shows everything on the card as-is (nothing is hidden or blurred).
+The image is a flexible-height PNG using the app's look — the provider's mark and name up top, the metric rows you currently see for that provider, and a small QuotaBar mark centered at the bottom. It follows your Light/Dark appearance and shows the card as-is; an account-scoped name keeps its account suffix blurred unless you turn off **Blur Account Names** in [Settings](settings.md) → Privacy.
 
 ## Footer
 

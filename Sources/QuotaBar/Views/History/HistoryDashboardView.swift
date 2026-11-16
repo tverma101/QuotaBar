@@ -250,10 +250,11 @@ struct HistoryDashboardView: View {
     private func providerSection(_ section: HistoryProviderSection) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(section.displayName)
-                    .font(.system(size: density.headerPointSize, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
+                AccountNameText(
+                    text: section.displayName,
+                    font: .system(size: density.headerPointSize, weight: .semibold),
+                    foregroundStyle: AnyShapeStyle(.primary)
+                )
                 Spacer(minLength: 8)
                 Text(MetricFormatter.string(for: MetricValue(
                     number: Double(section.tokens),

@@ -107,12 +107,16 @@ struct WidgetGroupedListView: View {
         .contextMenu {
             // Hides the whole provider section (the Customize provider list brings it back). Mirrors
             // the per-metric "Hide" but one level up, so the verb order reads the same on a header as a row.
-            Button("Hide \(group.provider.displayName)") {
+            Button {
                 container.enablement.setEnabled(false, for: group.provider.id)
+            } label: {
+                AccountNameText(text: "Hide \(group.provider.displayName)", font: .system(size: 13), interactiveReveal: false)
             }
             Divider()
-            Button("Refresh \(group.provider.displayName)") {
+            Button {
                 refreshProvider(group.provider.id)
+            } label: {
+                AccountNameText(text: "Refresh \(group.provider.displayName)", font: .system(size: 13), interactiveReveal: false)
             }
             Button("Customize…") {
                 openCustomize(for: group.provider.id)
@@ -365,8 +369,10 @@ struct WidgetGroupedListView: View {
         }
         Divider()
         if let provider = layout.provider(id: providerID) {
-            Button("Refresh \(provider.displayName)") {
+            Button {
                 refreshProvider(providerID)
+            } label: {
+                AccountNameText(text: "Refresh \(provider.displayName)", font: .system(size: 13), interactiveReveal: false)
             }
         }
         Button("Customize…") {

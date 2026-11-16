@@ -133,7 +133,11 @@ struct HeaderView: View {
                     .disabled(true)
             } else {
                 ForEach(groups) { group in
-                    Button(group.provider.displayName) { shareCard(group) }
+                    Button {
+                        shareCard(group)
+                    } label: {
+                        AccountNameText(text: group.provider.displayName, font: .system(size: 13), interactiveReveal: false)
+                    }
                 }
             }
         } label: {

@@ -70,9 +70,7 @@ struct PopoverTopBar: View {
         @ViewBuilder trailing: () -> Trailing
     ) -> some View {
         ZStack {
-            Text(title)
-                .font(.headline)
-                .lineLimit(1)
+            AccountNameText(text: title, font: .headline)
                 .frame(maxWidth: .infinity)
 
             HStack(spacing: 0) {
@@ -112,7 +110,7 @@ struct PopoverTopBar: View {
         .glassButtonStyle()
         .buttonBorderShape(.circle)
         .controlSize(.large)
-        .hoverTooltip("Reset \(layout.provider(id: providerID)?.displayName ?? providerID)")
+        .hoverTooltip("Reset \(AccountNamePrivacySetting.displayName(for: layout.provider(id: providerID)?.displayName ?? providerID))")
         .accessibilityLabel("Reset")
     }
 
