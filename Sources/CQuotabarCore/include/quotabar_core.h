@@ -123,11 +123,6 @@ void qb_codex_checkpoint_destroy(void *result);
 
 void qb_codex_parser_destroy(void *parser);
 
-#ifdef __cplusplus
-}
-#endif
-
-
 /// Rust pricing catalog parser — parses the compact pricing catalog JSON.
 /// Field order must match `Rust/quotabar-core/src/pricing.rs` exactly.
 typedef struct {
@@ -149,7 +144,7 @@ typedef struct {
 
 typedef struct {
     uint64_t threshold_prompt_tokens;
-    uint8_t includes_threshold;          /* 1 = above, 0 = greater-or-equal */
+    uint8_t includes_threshold;          /* 1 = threshold is inclusive (>=); 0 = strictly above */
     double input_per_million;            /* NaN when untouched */
     double output_per_million;
     double cache_write_per_million;
@@ -167,6 +162,24 @@ uint32_t qb_pricing_compact_catalog_retrieved_at_length(const void *result);
 uint32_t qb_pricing_compact_catalog_retired_count(const void *result);
 uint32_t qb_pricing_compact_catalog_retired_offset(const void *result);
 const uint8_t *qb_pricing_compact_catalog_strings(const void *result, uint32_t *length);
+uint8_t qb_pricing_compact_catalog_retired_present(const void *result);
 void qb_pricing_compact_catalog_destroy(void *result);
+
+
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+static_assert(sizeof(QbCompactTier) == 56, "QbCompactTier layout drifted");
+static_assert(sizeof(QbCompactEntry) == 104, "QbCompactEntry layout drifted");
+static_assert(alignof(QbCompactTier) == 8, "QbCompactTier alignment drifted");
+static_assert(alignof(QbCompactEntry) == 8, "QbCompactEntry alignment drifted");
+#else
+_Static_assert(sizeof(QbCompactTier) == 56, "QbCompactTier layout drifted");
+_Static_assert(sizeof(QbCompactEntry) == 104, "QbCompactEntry layout drifted");
+_Static_assert(_Alignof(QbCompactTier) == 8, "QbCompactTier alignment drifted");
+_Static_assert(_Alignof(QbCompactEntry) == 8, "QbCompactEntry alignment drifted");
+#endif
 
 #endif /* QUOTABAR_CORE_H */

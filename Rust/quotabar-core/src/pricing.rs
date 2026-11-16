@@ -10,13 +10,23 @@
 //! "ia"?: 1.0, "oa"?: 1.0, "cwa"?: 1.0, "cra"?: 1.0,
 //! "cre"?: true, "fast"?: 1.0}} , "retired"?: ["…"]}`
 //!
-//! The Rust entry point returns an opaque handle; Swift walks entries through the C ABI or falls
-//! back to the Swift reference implementation when the handle is NULL.
+//! The Rust entry point returns an opaque handle; Swift reassembles `ModelRates` through the C ABI.
+//! This is the *fallback*: Swift's `catalogFromCompact` runs Foundation's `JSONDecoder` first
+//! (byte-exact with the snapshots that Foundation itself wrote — serde_json rounds exact-half
+//! decimals to even, Foundation toward zero). This module only runs when Foundation cannot handle
+//! an input at all; `catalogFromCompact` throws `PricingCodecError.notAnObject` if both fail.
 
 use crate::{intern, NIL_STRING};
 use serde_json::Value;
 use serde_json::Map;
 use std::ptr;
+
+// The C header (Sources/CQuotabarCore/include/quotabar_core.h) must agree on layout. If these
+// asserts fire, do not change a field — fix the header to match or revert.
+const _: () = assert!(std::mem::size_of::<QbCompactTier>() == 56);
+const _: () = assert!(std::mem::size_of::<QbCompactEntry>() == 104);
+const _: () = assert!(std::mem::align_of::<QbCompactTier>() == 8);
+const _: () = assert!(std::mem::align_of::<QbCompactEntry>() == 8);
 
 pub const QB_PRICING_MAX_TIERS_PER_ENTRY: usize = 4;
 pub const QB_PRICING_MAX_RETIRED_KEYS: usize = 4096;
@@ -60,23 +70,22 @@ pub struct PricingCompactResult {
     pub tiers: Vec<QbCompactTier>,
     pub retired_count: u32,
     pub retired_offset: u32,           // first retired key in blob (count entries, contiguous)
+    /// Whether the catalog contained a "retired" key at all (even an empty array). Swift treats
+    /// presence, not non-emptiness, as authoritative (`file.retiredKeys != nil`).
+    pub retired_present: u8,
     pub strings: Vec<u8>,
 }
 
-fn parse_f64_optional(v: Option<&Value>) -> Option<f64> {
-    v.and_then(|x| x.as_f64())
+/// Optional cost field: None when absent, Some(None→NaN sentinel handled by caller), wrong-type → reject.
+fn opt_f64(member: &Map<String, Value>, name: &str) -> Option<Option<f64>> {
+    match member.get(name) {
+        None => Some(None),
+        Some(v) => v.as_f64().filter(|d| d.is_finite()).map(Some),
+    }
 }
 
 fn parse_double(member: &Map<String, Value>, name: &str) -> Option<f64> {
-    member.get(name).and_then(|v| v.as_f64())
-}
-
-fn nonnegative_finite(value: f64) -> Option<f64> {
-    if value.is_finite() && value >= 0.0 && value <= 1e18 {
-        Some(value)
-    } else {
-        None
-    }
+    member.get(name).and_then(|v| v.as_f64()).filter(|d| d.is_finite())
 }
 
 fn intern_entry(
@@ -85,32 +94,41 @@ fn intern_entry(
     key: &str,
     model: &Map<String, Value>,
 ) -> Option<QbCompactEntry> {
-    let input = nonnegative_finite(parse_double(model, "i")?)?;
-    let output = nonnegative_finite(parse_double(model, "o")?)?;
-    let cw = nonnegative_finite(parse_double(model, "cw")?)?;
-    let cr = nonnegative_finite(parse_double(model, "cr")?)?;
-    let cw1 = parse_f64_optional(model.get("cw1")).and_then(nonnegative_finite);
+    let input = parse_double(model, "i")?;
+    let output = parse_double(model, "o")?;
+    let cw = parse_double(model, "cw")?;
+    let cr = parse_double(model, "cr")?;
+    // Foundation throws on a wrong-typed required or optional Double; so does this path.
+    // In-range numbers pass through unchecked (the compact path never range-checks, like the
+    // Swift reference decode).
+    let cw1 = opt_f64(model, "cw1")?;
+    let input_200k = opt_f64(model, "ia")?;
+    let output_200k = opt_f64(model, "oa")?;
+    let cw_200k = opt_f64(model, "cwa")?;
+    let cr_200k = opt_f64(model, "cra")?;
 
-    let input_200k = parse_f64_optional(model.get("ia")).and_then(nonnegative_finite).unwrap_or(f64::NAN);
-    let output_200k = parse_f64_optional(model.get("oa")).and_then(nonnegative_finite).unwrap_or(f64::NAN);
-    let cw_200k = parse_f64_optional(model.get("cwa")).and_then(nonnegative_finite).unwrap_or(f64::NAN);
-    let cr_200k = parse_f64_optional(model.get("cra")).and_then(nonnegative_finite).unwrap_or(f64::NAN);
+    let cache_read_is_explicit = match model.get("cre") {
+        None => 1,
+        Some(v) => match v.as_bool() {
+            Some(b) => u8::from(b),
+            None => return None, // Foundation throws on a wrong-typed cre
+        },
+    };
+    let fast_multiplier = match model.get("fast") {
+        None => 1.0,
+        Some(v) => match v.as_f64().filter(|d| d.is_finite()) {
+            Some(d) => d,
+            None => return None, // Foundation throws on a wrong-typed fast
+        },
+    };
 
-    let cache_read_is_explicit = model
-        .get("cre")
-        .and_then(|v| v.as_bool())
-        .map(|b| u8::from(b))
-        .unwrap_or(1);
-    let fast_multiplier = parse_f64_optional(model.get("fast"))
-        .and_then(nonnegative_finite)
-        .filter(|v| *v > 0.0)
-        .unwrap_or(1.0);
-
-    let tiers_json = model
-        .get("tiers")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let tiers_json = match model.get("tiers") {
+        None => Vec::new(),
+        Some(v) => match v.as_array() {
+            Some(arr) => arr.clone(),
+            None => return None, // Foundation throws on a non-array tiers
+        },
+    };
     if tiers_json.len() > QB_PRICING_MAX_TIERS_PER_ENTRY {
         return None;
     }
@@ -118,19 +136,36 @@ fn intern_entry(
     let tier_offset = tiers_blob.len() as u32;
     for tier in &tiers_json {
         let Some(t) = tier.as_object() else { return None };
-        let threshold = t
-            .get("threshold_prompt_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let includes = t.get("includes_threshold").and_then(|v| v.as_bool()).unwrap_or(false);
+        let threshold = match t.get("threshold_prompt_tokens").and_then(|v| v.as_u64()) {
+            Some(v) => v,
+            None => return None, // required (Swift's PromptRateTier throws on missing/wrong type)
+        };
+        let includes = match t.get("includes_threshold") {
+            None => false,
+            Some(v) => match v.as_bool() {
+                Some(b) => b,
+                None => return None, // Foundation throws on a wrong-typed includes_threshold
+            },
+        };
+        let tier_opt = |name: &str| -> Option<Option<f64>> {
+            match t.get(name) {
+                None => Some(None),
+                Some(v) => v.as_f64().filter(|d| d.is_finite()).map(Some),
+            }
+        };
+        let input_t = tier_opt("input_per_million")?;
+        let output_t = tier_opt("output_per_million")?;
+        let cw_t = tier_opt("cache_write_per_million")?;
+        let cr_t = tier_opt("cache_read_per_million")?;
+        let cw1_t = tier_opt("cache_write_1h_per_million")?;
         tiers_blob.push(QbCompactTier {
             threshold_prompt_tokens: threshold,
             includes_threshold: u8::from(includes),
-            input_per_million: parse_f64_optional(t.get("input_per_million")).unwrap_or(f64::NAN),
-            output_per_million: parse_f64_optional(t.get("output_per_million")).unwrap_or(f64::NAN),
-            cache_write_per_million: parse_f64_optional(t.get("cache_write_per_million")).unwrap_or(f64::NAN),
-            cache_read_per_million: parse_f64_optional(t.get("cache_read_per_million")).unwrap_or(f64::NAN),
-            cache_write_1h_per_million: parse_f64_optional(t.get("cache_write_1h_per_million")).unwrap_or(f64::NAN),
+            input_per_million: input_t.unwrap_or(f64::NAN),
+            output_per_million: output_t.unwrap_or(f64::NAN),
+            cache_write_per_million: cw_t.unwrap_or(f64::NAN),
+            cache_read_per_million: cr_t.unwrap_or(f64::NAN),
+            cache_write_1h_per_million: cw1_t.unwrap_or(f64::NAN),
         });
     }
 
@@ -143,10 +178,10 @@ fn intern_entry(
         cache_write_per_million: cw,
         cache_read_per_million: cr,
         cache_write_1h_per_million: cw1.unwrap_or(f64::NAN),
-        input_above_200k_per_million: input_200k,
-        output_above_200k_per_million: output_200k,
-        cache_write_above_200k_per_million: cw_200k,
-        cache_read_above_200k_per_million: cr_200k,
+        input_above_200k_per_million: input_200k.unwrap_or(f64::NAN),
+        output_above_200k_per_million: output_200k.unwrap_or(f64::NAN),
+        cache_write_above_200k_per_million: cw_200k.unwrap_or(f64::NAN),
+        cache_read_above_200k_per_million: cr_200k.unwrap_or(f64::NAN),
         cache_read_is_explicit,
         fast_multiplier,
         tier_count: tiers_json.len() as u8,
@@ -171,13 +206,9 @@ pub fn parse_compact_catalog(data: &[u8]) -> Option<PricingCompactResult> {
         let Some(model) = model.as_object() else { return None };
         entries.push(intern_entry(&mut strings, &mut tiers, key, model)?);
     }
-    // Preserve deterministic order for parity tests (Swift iterates sorted JSON keys).
-    entries.sort_by_key(|e| {
-        let s = std::str::from_utf8(&strings[e.key_offset as usize..(e.key_offset + e.key_length) as usize]).unwrap_or("");
-        s.to_string()
-    });
 
     let (retrieved_at_offset, retrieved_at_length) = match root.get("retrieved_at") {
+        None => (NIL_STRING, 0),
         Some(Value::String(s)) => {
             if s.is_empty() {
                 (NIL_STRING, 0)
@@ -187,14 +218,19 @@ pub fn parse_compact_catalog(data: &[u8]) -> Option<PricingCompactResult> {
                 return None;
             }
         }
-        _ => (NIL_STRING, 0),
+        Some(_) => return None, // Foundation throws on a wrong-typed retrieved_at
     };
 
-    let (retired_count, retired_offset) = match root.get("retired") {
+    let (retired_count, retired_offset, retired_present) = match root.get("retired") {
+        None => (0, 0, 0),
         Some(Value::Array(arr)) => {
+            // Strings are u32-addressed by the C ABI; a >4 GiB blob cannot arise here
+            // (snapshots are ~1 MB, the disk cache ~8 MB), so the cast is unrepresentable input,
+            // never a silent truncation.
+            if strings.len() as u64 > u64::from(u32::MAX) { return None }
             if arr.len() > QB_PRICING_MAX_RETIRED_KEYS { return None }
             if arr.is_empty() {
-                (0, 0)
+                (0, 0, 1)
             } else {
                 let off = strings.len() as u32;
                 for item in arr {
@@ -206,10 +242,10 @@ pub fn parse_compact_catalog(data: &[u8]) -> Option<PricingCompactResult> {
                     strings.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                     strings.extend_from_slice(bytes);
                 }
-                (arr.len() as u32, off)
+                (arr.len() as u32, off, 1)
             }
         }
-        _ => (0, 0),
+        Some(_) => return None, // Foundation throws on a wrong-typed retired
     };
 
     Some(PricingCompactResult {
@@ -219,6 +255,7 @@ pub fn parse_compact_catalog(data: &[u8]) -> Option<PricingCompactResult> {
         tiers,
         retired_count,
         retired_offset,
+        retired_present,
         strings,
     })
 }
@@ -294,6 +331,13 @@ pub extern "C" fn qb_pricing_compact_catalog_retired_count(result: *const Pricin
     unsafe { result.as_ref().map(|r| r.retired_count).unwrap_or(0) }
 }
 
+/// 1 when the catalog contained a "retired" key at all (even an empty array); 0 otherwise.
+/// Swift treats presence as authoritative, matching the Swift decode path (`retiredKeys != nil`).
+#[no_mangle]
+pub extern "C" fn qb_pricing_compact_catalog_retired_present(result: *const PricingCompactResult) -> u8 {
+    unsafe { result.as_ref().map(|r| r.retired_present).unwrap_or(0) }
+}
+
 /// Offset of the first retired-key record in the string blob ([u32le length][bytes]*, count
 /// from qb_pricing_compact_catalog_retired_count). Keys are stored in catalog order, not sorted.
 #[no_mangle]
@@ -347,7 +391,7 @@ mod tests {
     #[test]
     fn cached_crate_snapshots_roundtrip() {
         for name in ["pricing_litellm_snapshot.json", "pricing_models_dev_snapshot.json"] {
-            let path = format!("../../Sources/QuotaBar/Resources/{name}");
+            let path = format!("{}/../../Sources/QuotaBar/Resources/{name}", env!("CARGO_MANIFEST_DIR"));
             let bytes = std::fs::read(path).unwrap();
             let parsed = parse_compact_catalog(&bytes).unwrap();
             assert!(!parsed.entries.is_empty());

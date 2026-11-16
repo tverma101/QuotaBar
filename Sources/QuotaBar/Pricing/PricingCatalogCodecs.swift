@@ -426,11 +426,13 @@ enum PricingCatalogCodecs {
 
     // MARK: - Compact format (bundled snapshots + disk cache)
 
+    /// The bundled snapshots were produced by a writer that matches Foundation's JSONDecoder
+    /// behavior on exact-half decimals. The reference Swift path preserves bit-exact equality
+    /// with those snapshots. The Rust path exists for inputs Foundation cannot handle at all;
+    /// it is not expected to be selected for shipped bytes.
     static func catalogFromCompact(_ data: Data) throws -> PricingCatalog {
-        // The bundled snapshots were produced by a writer that matches Foundation's JSONDecoder
-        // behavior on exact-half decimals. The reference Swift path preserves bit-exact equality
-        // with those snapshots. The Rust path is a fast fallback for inputs Swift cannot handle.
-        if let file = try? JSONDecoder().decode(CompactCatalog.self, from: data) {
+        do {
+            let file = try JSONDecoder().decode(CompactCatalog.self, from: data)
             var entries: [String: ModelRates] = [:]
             entries.reserveCapacity(file.models.count)
             for (key, model) in file.models {
@@ -456,8 +458,11 @@ enum PricingCatalogCodecs {
                 retiredKeys: Set(file.retiredKeys ?? []),
                 retiredKeysAreAuthoritative: file.retiredKeys != nil
             )
+        } catch {
+            AppLog.warn("pricing", "compact catalog Swift decode failed, trying Rust parser: \(error.localizedDescription)")
         }
         if let rust = CompactCatalogRustParser.parse(data) {
+            AppLog.warn("pricing", "compact catalog loaded via Rust fallback (Swift decode had failed)")
             return rust
         }
         throw PricingCodecError.notAnObject
