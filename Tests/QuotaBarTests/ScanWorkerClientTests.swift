@@ -304,19 +304,52 @@ final class ScanWorkerBatchTests: XCTestCase {
         XCTAssertNil(result.snapshots[claude.id], "cancelled member is omitted so the caller re-folds it in-process")
     }
 
-    func testBatchChildFailureReturnsEmptyResult() async {
+    func testBatchChildFailureFallsBackInProcess() async {
         for outcome in [
             CannedScanWorkerRunner.Outcome.exit(exitCode: 4, stderr: "quotabar: boom"),
-            CannedScanWorkerRunner.Outcome.timeout,
             CannedScanWorkerRunner.Outcome.spawnFailure,
         ] {
             let client = makeClient(runner: CannedScanWorkerRunner(outcome: outcome))
             let result = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
                 await client.fetchFoldSnapshots(providers: [codex.id: codex, claude.id: claude], paced: false)
             }
-            XCTAssertTrue(result.snapshots.isEmpty)
+            XCTAssertTrue(result.snapshots.isEmpty, "spawn/exit failures leave every member to the in-process fold")
             XCTAssertTrue(result.identityKeys.isEmpty)
         }
+    }
+
+    func testBatchTimeoutSurfacesPerMemberTimeoutErrors() async {
+        let client = makeClient(runner: CannedScanWorkerRunner(outcome: .timeout))
+        let result = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await client.fetchFoldSnapshots(providers: [codex.id: codex, claude.id: claude], paced: false)
+        }
+        XCTAssertEqual(result.snapshots.count, 2, "timeout must surface an error snapshot per member, not an in-process rescan")
+        XCTAssertEqual(result.snapshots[codex.id]?.errorCategory, result.snapshots[claude.id]?.errorCategory)
+        XCTAssertTrue(result.identityKeys.isEmpty)
+    }
+
+    func testBatchResponsePoisoningIsFiltered() async throws {
+        let payload = try encode(ScanWorkerCommand.Response(
+            schema: ScanWorkerCommand.schemaName,
+            snapshots: [
+                codex.id: snapshot(for: codex),
+                "evil": snapshot(for: Provider(id: "evil", displayName: "Evil", icon: .providerMark("codex"))),
+            ],
+            errors: ["evil": "unrequested"],
+            identityKeys: ["evil": "unrequested-key", codex.id: "codex-identity"]
+        ))
+        let runner = CannedScanWorkerRunner(outcome: .success(stdout: payload))
+        let client = makeClient(runner: runner)
+
+        let result = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await client.fetchFoldSnapshots(providers: [codex.id: codex], paced: false)
+        }
+
+        XCTAssertEqual(runner.lastEnvironment["QUOTABAR_IN_SCAN_WORKER"], "1")
+        XCTAssertEqual(result.snapshots.count, 1)
+        XCTAssertNotNil(result.snapshots[codex.id])
+        XCTAssertNil(result.snapshots["evil"], "unrequested provider IDs in the child response must be ignored")
+        XCTAssertEqual(result.identityKeys, [codex.id: "codex-identity"])
     }
 
     func testBatchFoldNotAvailableInMeterScopes() async {

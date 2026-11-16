@@ -20,6 +20,9 @@ final class WidgetDataStore {
     /// Whether a provider is currently enabled. Injected so the store consults the single
     /// `ProviderEnablementStore` without owning it; defaults to "all enabled" for tests and previews.
     private let isProviderEnabled: @MainActor (String) -> Bool
+    /// Overridable for tests: the batched fold delegation point for accounting passes. Production
+    /// always uses `ScanWorkerClient.shared`.
+    var scanWorker: ScanWorkerClient
     /// The user's widget order (already enablement-filtered) that drives the menu-bar value. Injected
     /// so the store reads `LayoutStore.visiblePlaced` without owning it; defaults to registry order.
     private let orderedDescriptors: @MainActor () -> [WidgetDescriptor]
@@ -317,7 +320,8 @@ final class WidgetDataStore {
         notificationSettings: (@MainActor () -> NotificationSettingsStore)? = nil,
         postNotification: (@MainActor (String, String, String, String) async -> Bool)? = nil,
         providerIdentityKeys: [String: String] = [:],
-        vmBoxHistoryDirectory: URL? = nil
+        vmBoxHistoryDirectory: URL? = nil,
+        scanWorker: ScanWorkerClient? = nil
     ) {
         precondition(slowProviderRefreshThreshold >= 0)
         precondition(providerRefreshTimeout > 0)
@@ -340,6 +344,7 @@ final class WidgetDataStore {
             }
         self.providerIdentityKeys = providerIdentityKeys
         self.vmBoxHistory = vmBoxHistoryDirectory.map(VMBoxUsageHistory.init(directory:))
+        self.scanWorker = scanWorker ?? .shared
         self.meterStyle = defaults.enumValue(forKey: Self.meterStyleKey, default: .remaining)
         self.resetDisplayMode = defaults.enumValue(forKey: Self.resetDisplayModeKey, default: .relative)
         self.alwaysShowPacing = defaults.bool(forKey: Self.alwaysShowPacingKey)
@@ -567,23 +572,60 @@ final class WidgetDataStore {
         // (account discovery, login shell, Keychain metadata queries, Swift-runtime startup) are
         // paid once per pass instead of once per provider. Providers the child can't cover fall
         // back to the in-process fold inside performRefresh, exactly as if delegation never ran.
+        //
+        // Members whose snapshot cache is TTL-fresh are left out of the child entirely — they hit
+        // the cache inside performRefresh as usual, so a panel-open pass within the window pays
+        // nothing. Members the pass forces or bypassed always fold (their cache is ignored anyway).
         var prefetchedFoldSnapshots: [String: ProviderSnapshot] = [:]
         var prefetchedFoldIdentityKeys: [String: String] = [:]
-        if ProviderRefreshContext.scope.suppressesLiveQuota, providerIDs.count > 1 {
+        var prefetchedFoldOrders: [String: UInt64] = [:]
+        // In-flight markers for the child window so the strip/spinners reflect the fold and the
+        // memory-pressure deferral sees it; cleared before member tasks run (they re-mark themselves).
+        var preMarkedInFlight: Set<String> = []
+        if ProviderRefreshContext.scope.suppressesLiveQuota, !providerIDs.isEmpty {
             let foldProviders = providerIDs.reduce(into: [String: Provider]()) { partial, id in
                 if let provider = providersByID[id]?.provider { partial[id] = provider }
             }
-            if foldProviders.count > 1 {
-                let fetched = await ScanWorkerClient.shared.fetchFoldSnapshots(
-                    providers: foldProviders,
+            var staleIDs = foldProviders.keys.filter { id in
+                force || bypassSnapshotCache
+                    || cache.hasStaleAccountStamp(providerID: id, currentIdentityKey: providerIdentityKeys[id])
+                    || cache.snapshot(providerID: id, freshnessInterval: nil) == nil
+            }
+            staleIDs.sort()
+            if !staleIDs.isEmpty {
+                let staleProviders = staleIDs.reduce(into: [String: Provider]()) { $0[$1] = foldProviders[$1] }
+                // Allocate the cache refresh orders BEFORE the child starts, so a result arriving
+                // 60s from now still loses to a newer write committed in between (the cross-process
+                // fence reads this order). Allocating inside performRefresh after the child returns
+                // would make every prefetched result look newer than any concurrent commit.
+                for id in staleIDs {
+                    if let order = cache.beginRefreshOrder(providerID: id) {
+                        prefetchedFoldOrders[id] = order
+                    }
+                }
+                // Mark the fold in flight on the UI-observed set only. The overlap-capable
+                // `runningProviderRefreshScopes` is deliberately untouched — meter passes may
+                // overlap a fold-only pass by design.
+                preMarkedInFlight = Set(staleIDs)
+                for id in preMarkedInFlight where !refreshingProviderIDs.contains(id) {
+                    refreshingProviderIDs.insert(id)
+                }
+                let fetched = await self.scanWorker.fetchFoldSnapshots(
+                    providers: staleProviders,
                     paced: ProviderRefreshContext.accountingCPUThrottleEnabled
                 )
                 prefetchedFoldSnapshots = fetched.snapshots
                 prefetchedFoldIdentityKeys = fetched.identityKeys
                 AppLog.info(
                     .refresh,
-                    "batched scan worker folded \(fetched.snapshots.count)/\(foldProviders.count) providers"
+                    "batched scan worker folded \(fetched.snapshots.count)/\(staleIDs.count) stale providers (of \(foldProviders.count) enabled)"
                 )
+                // Clear before members run: performRefresh reads `refreshingProviderIDs` as its
+                // in-flight gate, so leaving our placeholder set would make every member defer
+                // against its own marker. The window is covered by these markers; members mark
+                // themselves for the (instant) consuming phase as usual.
+                for id in preMarkedInFlight { refreshingProviderIDs.remove(id) }
+                preMarkedInFlight = []
             }
         }
         let startingHistoryRevision = localHistoryRevision
@@ -640,7 +682,8 @@ final class WidgetDataStore {
                         notifyHistoryChange: false,
                         bypassFailureBackoff: bypassFailureBackoff,
                         prefetchedFoldSnapshot: prefetchedFoldSnapshots[providerID],
-                        prefetchedFoldIdentityKey: prefetchedFoldIdentityKeys[providerID]
+                        prefetchedFoldIdentityKey: prefetchedFoldIdentityKeys[providerID],
+                        prefetchedRefreshOrder: prefetchedFoldOrders[providerID]
                     )
                 }
                 registerProviderRefreshTask(
@@ -1103,7 +1146,8 @@ final class WidgetDataStore {
         notifyHistoryChange: Bool,
         bypassFailureBackoff: Bool = false,
         prefetchedFoldSnapshot: ProviderSnapshot? = nil,
-        prefetchedFoldIdentityKey: String? = nil
+        prefetchedFoldIdentityKey: String? = nil,
+        prefetchedRefreshOrder: UInt64? = nil
     ) async -> RefreshOutcome {
         guard isProviderEnabled(providerID) else { return .skipped }
         let manualActionID = ProviderRefreshContext.manualActionID
@@ -1285,7 +1329,9 @@ final class WidgetDataStore {
         }
         // App and CLI share persisted snapshots but have independent in-process request generations.
         // The cache order fences a slower result if a newer refresh starts in the other process.
-        let cacheRefreshOrder = cache.beginRefreshOrder(providerID: providerID)
+        // A prefetched fold allocated its order before the scan-worker child started, so the fence
+        // can still reject it in favor of a newer commit; only in-process passes allocate here.
+        let cacheRefreshOrder = prefetchedRefreshOrder ?? cache.beginRefreshOrder(providerID: providerID)
         let start = monotonicNow()
         // A provider that never returns would otherwise hold the in-flight entry — and the spinner —
         // forever. Past the deadline, stop waiting and treat it as any other failed refresh.

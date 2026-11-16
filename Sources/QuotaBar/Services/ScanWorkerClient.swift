@@ -31,8 +31,10 @@ final class ScanWorkerClient {
 
     /// Wall-clock cap for a batched fold. A single provider keeps the original 110s; a batch pays
     /// one assembly and then the same per-provider work the separate children would do, so it gets
-    /// generous headroom rather than N independent timeouts.
-    nonisolated private static let batchFoldTimeout: TimeInterval = 240
+    /// generous headroom rather than N independent timeouts. A batch that still cannot finish in
+    /// the cap surfaces per-member timeout errors (matching the single-provider timeout contract)
+    /// instead of re-folding everything in-process on the app's heap.
+    nonisolated private static let batchFoldTimeout: TimeInterval = 300
 
     private let runner: any ProcessRunning
     /// Slightly below the provider refresh deadline so the client can still report a timeout
@@ -171,8 +173,8 @@ final class ScanWorkerClient {
 
     /// Fold every requested provider in ONE child process. Used by the accounting pass so account
     /// discovery, the login shell, Keychain metadata queries, and process startup are paid once
-    /// per pass instead of once per provider. Returns an empty result on any failure; callers
-    /// treat absent members as "fold in-process".
+    /// per pass instead of once per provider. Spawn/decode failures return an empty result
+    /// (callers fold in-process); a batched timeout returns per-member timeout error snapshots.
     func fetchFoldSnapshots(
         providers: [String: Provider],
         paced: Bool
@@ -246,11 +248,21 @@ final class ScanWorkerClient {
             }
             return result
         } catch ProcessRunnerError.timedOut {
+            let message = "Refresh timed out after \(Int(Self.batchFoldTimeout))s"
             AppLog.warn(
                 .refresh,
-                "batched scan worker timed out after \(Int(Self.batchFoldTimeout))s for \(providerIDs.joined(separator: ",")) — folding in-process"
+                "batched scan worker timed out after \(Int(Self.batchFoldTimeout))s for \(providerIDs.joined(separator: ","))"
             )
-            return FoldBatchResult()
+            // Match the single-provider timeout contract: an error snapshot per member, never an
+            // in-process rescan — the batch exists to keep the parse churn out of the app.
+            for (providerID, provider) in providers {
+                result.snapshots[providerID] = ProviderSnapshot.error(
+                    provider: provider,
+                    error: ScanWorkerFoldError(message: message),
+                    clearsPriorMenuBarQuotaState: false
+                )
+            }
+            return result
         } catch {
             guard !Task.isCancelled else { return FoldBatchResult() }
             logSpawnFailureOnce(providerID: providerIDs.first ?? "?", message: error.localizedDescription)

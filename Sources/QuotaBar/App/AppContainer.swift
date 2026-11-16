@@ -630,6 +630,10 @@ final class AppContainer {
                         lastHistoryRefreshUptime = nowUptime
                     }
                 }
+                // Set inside whichever pass block actually launches work (meters or accounting), so the
+                // pulse below runs right after fresh data lands — not on post-consumed flag values and
+                // not on every 1 Hz poll while a fold is in flight.
+                var passRan = false
                 let hasPriorityPass = Self.hasPriorityRefreshPass(
                     quotaRefreshDue: quotaRefreshDue,
                     panelPassPending: pendingPanelPass,
@@ -690,6 +694,7 @@ final class AppContainer {
                     let runAllMeters = pendingFullScopePass || pendingPanelPass
                         || (panelOpen && quotaRefreshDue)
                     if runAllMeters || quotaRefreshDue || pendingMenuBarMeterRetry {
+                        passRan = true
                         let requestsHistoryFold = pendingFullScopePass || pendingPanelPass || newlyDueHistoryPass
                         let meterScope: ProviderRefreshContext.Scope = runAllMeters ? .panelMeters : .menuBar
                         await ProviderRefreshContext.$scope.withValue(meterScope) {
@@ -743,6 +748,7 @@ final class AppContainer {
                         let maxConcurrentProviders = accountingScope == .panelAccounting
                             ? (serializeAccountingProviders ? 1 : nil)
                             : (overSoftMemoryLimit ? 1 : nil)
+                        passRan = true
                         accountingTask = Task { @MainActor in
                             await ProviderRefreshContext.$scope.withValue(accountingScope) {
                                 await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(
@@ -807,9 +813,6 @@ final class AppContainer {
                 // alone still alerts. Not on every wake: the loop polls once per second while a
                 // fold is in flight, and re-resolving every metric per second is needless churn.
                 let pulseNow = ProcessInfo.processInfo.systemUptime
-                let passRan = quotaRefreshDue || pendingPanelPass || pendingFullScopePass
-                    || pendingHistoryAccountingPass || pendingLocalAccountingPass
-                    || pendingMenuBarMeterRetry
                 if passRan || pulseNow - lastPulseUptime >= 30 {
                     lastPulseUptime = pulseNow
                     await dataStore.evaluateNotifications()
