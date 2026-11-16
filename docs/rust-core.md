@@ -36,6 +36,10 @@ Swift reference implementation, and the two are tested against each other.
   the Rust engine (`attemptRustFullParse`) and falls back to `fullParseAndCheckpointSwift` when
   any line declines. Incremental (tail) parsing stays in Swift; the checkpoint crosses the FFI
   one-way so the in-memory append cache can round-trip through either engine.
+- `Rust/quotabar-core/src/pricing.rs` — the compact pricing-catalog codec (`catalogFromCompact`),
+  **Swift-primary**: Swift's Foundation decoder runs first (byte-exact with the snapshots it
+  wrote); the Rust parser (`Sources/QuotaBar/Support/CompactCatalogRustParser.swift`) is called
+  only when Foundation cannot handle an input at all. `catalogFromCompact` throws if both fail.
 
 ## The fallback contract
 
@@ -87,6 +91,14 @@ corpora in those tests.
 
 Move a primitive only when it is (a) on a measured hot path, (b) safely expressible behind a
 small C ABI, and (c) covered by a parity test against its Swift oracle. Candidates next in line:
-the per-line parse in other JSONL providers (Codex, Grok, pi, Muse), and the pricing fold. Keep
-the C ABI additive — bump `qb_core_version` when the entry layout changes — and keep every new
+the per-line parse in other JSONL providers (Grok, pi, Muse), and the pricing fold. Keep the
+C ABI additive — bump `qb_core_version` when the entry layout changes — and keep every new
 FFI function returning a null result on any failure so Swift can always fall back loudly.
+
+Note the two FFI directions in use: parsers (Claude, Codex) are **Rust-primary** — the bridge
+runs first and Swift re-parses on decline; the compact-catalog codec is **Swift-primary** —
+Foundation runs first because exact-half decimal rounding differs between Apple's `strtod`
+(toward zero, as used by the snapshot writer) and `serde_json` (half-to-even), so the bundled
+snapshots are only byte-exact through Foundation. Rust is invoked only for inputs Foundation
+rejects, `retired` presence (not non-emptiness) is preserved across the FFI as the authoritative
+flag, and both paths are pinned by `Tests/QuotaBarTests/PricingCompactCatalogTests.swift`.

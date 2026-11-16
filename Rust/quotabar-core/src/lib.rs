@@ -15,6 +15,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 mod codex;
+mod pricing;
 
 const MAX_ENTRIES_PER_LINE: usize = 64;
 pub(crate) const NIL_STRING: u32 = u32::MAX;

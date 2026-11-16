@@ -123,8 +123,63 @@ void qb_codex_checkpoint_destroy(void *result);
 
 void qb_codex_parser_destroy(void *parser);
 
+/// Rust pricing catalog parser — parses the compact pricing catalog JSON.
+/// Field order must match `Rust/quotabar-core/src/pricing.rs` exactly.
+typedef struct {
+    uint32_t key_offset, key_length;    /* offsets into the strings blob */
+    double input_per_million;
+    double output_per_million;
+    double cache_write_per_million;
+    double cache_read_per_million;
+    double cache_write_1h_per_million;  /* NaN when absent */
+    double input_above_200k_per_million;     /* NaN when absent */
+    double output_above_200k_per_million;    /* NaN when absent */
+    double cache_write_above_200k_per_million; /* NaN when absent */
+    double cache_read_above_200k_per_million;  /* NaN when absent */
+    uint8_t cache_read_is_explicit;
+    double fast_multiplier;
+    uint8_t tier_count;
+    uint32_t tier_offset;               /* index into the tier array */
+} QbCompactEntry;
+
+typedef struct {
+    uint64_t threshold_prompt_tokens;
+    uint8_t includes_threshold;          /* 1 = threshold is inclusive (>=); 0 = strictly above */
+    double input_per_million;            /* NaN when untouched */
+    double output_per_million;
+    double cache_write_per_million;
+    double cache_read_per_million;
+    double cache_write_1h_per_million;
+} QbCompactTier;
+
+void *qb_pricing_compact_catalog_parse(const uint8_t *data, size_t length);
+uint32_t qb_pricing_compact_catalog_entry_count(const void *result);
+const QbCompactEntry *qb_pricing_compact_catalog_entries(const void *result);
+uint32_t qb_pricing_compact_catalog_tier_count(const void *result);
+const QbCompactTier *qb_pricing_compact_catalog_tiers(const void *result);
+uint32_t qb_pricing_compact_catalog_retrieved_at_offset(const void *result);
+uint32_t qb_pricing_compact_catalog_retrieved_at_length(const void *result);
+uint32_t qb_pricing_compact_catalog_retired_count(const void *result);
+uint32_t qb_pricing_compact_catalog_retired_offset(const void *result);
+const uint8_t *qb_pricing_compact_catalog_strings(const void *result, uint32_t *length);
+uint8_t qb_pricing_compact_catalog_retired_present(const void *result);
+void qb_pricing_compact_catalog_destroy(void *result);
+
+
 #ifdef __cplusplus
 }
+#endif
+
+#ifdef __cplusplus
+static_assert(sizeof(QbCompactTier) == 56, "QbCompactTier layout drifted");
+static_assert(sizeof(QbCompactEntry) == 104, "QbCompactEntry layout drifted");
+static_assert(alignof(QbCompactTier) == 8, "QbCompactTier alignment drifted");
+static_assert(alignof(QbCompactEntry) == 8, "QbCompactEntry alignment drifted");
+#else
+_Static_assert(sizeof(QbCompactTier) == 56, "QbCompactTier layout drifted");
+_Static_assert(sizeof(QbCompactEntry) == 104, "QbCompactEntry layout drifted");
+_Static_assert(_Alignof(QbCompactTier) == 8, "QbCompactTier alignment drifted");
+_Static_assert(_Alignof(QbCompactEntry) == 8, "QbCompactEntry alignment drifted");
 #endif
 
 #endif /* QUOTABAR_CORE_H */
