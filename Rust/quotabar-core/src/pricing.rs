@@ -294,7 +294,8 @@ pub extern "C" fn qb_pricing_compact_catalog_retired_count(result: *const Pricin
     unsafe { result.as_ref().map(|r| r.retired_count).unwrap_or(0) }
 }
 
-/// Bytes of retired keys, sorted lexicographically; count is qb_pricing_compact_catalog_retired_count.
+/// Offset of the first retired-key record in the string blob ([u32le length][bytes]*, count
+/// from qb_pricing_compact_catalog_retired_count). Keys are stored in catalog order, not sorted.
 #[no_mangle]
 pub extern "C" fn qb_pricing_compact_catalog_retired_offset(result: *const PricingCompactResult) -> u32 {
     unsafe { result.as_ref().map(|r| r.retired_offset).unwrap_or(0) }

@@ -127,7 +127,6 @@ void qb_codex_parser_destroy(void *parser);
 }
 #endif
 
-#endif /* QUOTABAR_CORE_H */
 
 /// Rust pricing catalog parser — parses the compact pricing catalog JSON.
 /// Field order must match `Rust/quotabar-core/src/pricing.rs` exactly.
@@ -169,3 +168,5 @@ uint32_t qb_pricing_compact_catalog_retired_count(const void *result);
 uint32_t qb_pricing_compact_catalog_retired_offset(const void *result);
 const uint8_t *qb_pricing_compact_catalog_strings(const void *result, uint32_t *length);
 void qb_pricing_compact_catalog_destroy(void *result);
+
+#endif /* QUOTABAR_CORE_H */
