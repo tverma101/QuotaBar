@@ -70,9 +70,7 @@ struct PopoverTopBar: View {
         @ViewBuilder trailing: () -> Trailing
     ) -> some View {
         ZStack {
-            Text(title)
-                .font(.headline)
-                .lineLimit(1)
+            AccountNameText(text: title, font: .headline)
                 .frame(maxWidth: .infinity)
 
             HStack(spacing: 0) {

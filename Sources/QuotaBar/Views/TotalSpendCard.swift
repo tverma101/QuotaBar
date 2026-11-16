@@ -17,6 +17,7 @@ struct TotalSpendCard: View {
     /// The selected period survives popover closes and relaunches, like the meter-style toggles.
     @AppStorage(TotalSpendSetting.periodKey) private var periodRawValue = TotalSpendPeriod.today.rawValue
     /// The selected metric (Cost / Cost/MTok / Tokens) survives the same way.
+    @AppStorage(AccountNamePrivacySetting.key) private var blurAccountNames = AccountNamePrivacySetting.defaultValue
     @AppStorage(TotalSpendSetting.metricKey) private var metricRawValue = TotalSpendMetric.cost.rawValue
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
 
@@ -117,7 +118,15 @@ struct TotalSpendCard: View {
     /// hardcoded list, so disabling a provider (or a new spend provider shipping) can't make the
     /// tooltip lie about what the total reflects.
     private var infoTooltip: String {
-        let names = providers.map(\.displayName)
+        // Account-scoped cards (“Codex — alice@example.com”) stay nameable only as their family
+        // while account names are blurred, matching everywhere else the names render.
+        let names = providers.map { candidate -> String in
+            guard blurAccountNames,
+                  let split = AccountNameText.splitAccountSuffix(candidate.displayName) else {
+                return candidate.displayName
+            }
+            return split.family
+        }
         let coverageNote: String
         switch metric {
         case .cost:
@@ -402,10 +411,11 @@ struct TotalSpendRingContent: View {
             Circle()
                 .fill(paletteMap[slice.provider.id] ?? TotalSpendPalette.color(for: slice.provider.id))
                 .frame(width: 8, height: 8)
-            Text(slice.provider.displayName)
-                .font(.system(size: density.supportingPointSize))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
+            AccountNameText(
+                text: slice.provider.displayName,
+                font: .system(size: density.supportingPointSize),
+                foregroundStyle: AnyShapeStyle(.primary)
+            )
             Spacer(minLength: 8)
             // Tokens always abbreviate in the legend (12.4M), matching spend rows elsewhere —
             // `.full` would spill every digit. Cost modes keep cents via `.row` / `.full`.

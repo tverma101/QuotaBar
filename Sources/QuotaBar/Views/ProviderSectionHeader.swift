@@ -79,11 +79,12 @@ struct ProviderSectionHeader: View {
                 // Name + plan keep their width and stay on one line; under width pressure (a long plan
                 // name like "Super Grok Heavy") the lower-priority stale tag truncates first instead of
                 // wrapping the name to a second line.
-                Text(provider.displayName)
-                    .font(.system(size: density.headerPointSize, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .layoutPriority(1)
+                AccountNameText(
+                    text: provider.displayName,
+                    font: .system(size: density.headerPointSize, weight: .semibold),
+                    foregroundStyle: AnyShapeStyle(.primary),
+                    layoutPriority: 1
+                )
                 if let plan {
                     ProviderPlanBadge(plan: plan)
                         .layoutPriority(1)

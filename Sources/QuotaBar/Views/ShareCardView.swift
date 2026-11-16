@@ -42,10 +42,11 @@ struct ShareCardView: View {
             ProviderIcon(source: provider.icon, inset: 0.04)
                 .frame(width: 22, height: 22)
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(provider.displayName)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
+                AccountNameText(
+                    text: provider.displayName,
+                    font: .system(size: 15, weight: .semibold),
+                    foregroundStyle: AnyShapeStyle(.primary)
+                )
                 if let plan, !plan.isEmpty {
                     Text(plan)
                         .font(.system(size: 12))

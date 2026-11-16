@@ -46,7 +46,7 @@ struct ProviderOrderRow: View {
         HStack(spacing: 10) {
             ReorderGrip()
             ProviderIcon(source: provider.icon).frame(width: 18, height: 18)
-            Text(provider.displayName).lineLimit(1)
+            AccountNameText(text: provider.displayName, lineLimit: 1)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)

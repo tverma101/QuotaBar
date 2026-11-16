@@ -22,6 +22,7 @@ struct SettingsScreen: View {
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
     @AppStorage(ReduceAnimationsSetting.key) private var reduceAnimations = ReduceAnimationsSetting.fallback
     @AppStorage(LogLevelSetting.key) private var logLevel = LogLevelSetting.fallback
+    @AppStorage(AccountNamePrivacySetting.key) private var blurAccountNames = AccountNamePrivacySetting.defaultValue
     @AppStorage(CodexAutoResetCoordinator.enabledKey) private var autoRedeemCodexResets = false
     /// Surfaced under the Advanced rows when copying the path or revealing the file fails.
     @State private var logActionError: String?
@@ -236,6 +237,16 @@ struct SettingsScreen: View {
                     .settingsSwitchStyle()
             }
             Text("While your screen is shared or recorded, the menu bar shows “QuotaBar” instead of your usage.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            row("Blur Account Names") {
+                Toggle("", isOn: $blurAccountNames)
+                    .settingsSwitchStyle()
+            }
+            Text("Account names on managed account cards (“Claude — Acme Corp”) stay blurred until you tap them. Turn off to always show account names. Applies to the dashboard, history, share cards, and menus in the popover.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
