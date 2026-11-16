@@ -136,7 +136,7 @@ struct HeaderView: View {
                     Button {
                         shareCard(group)
                     } label: {
-                        AccountNameText(text: group.provider.displayName, font: .system(size: 13))
+                        AccountNameText(text: group.provider.displayName, font: .system(size: 13), interactiveReveal: false)
                     }
                 }
             }

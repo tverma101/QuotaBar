@@ -674,7 +674,7 @@ final class WidgetDataStore {
                 metrics: [],
                 toggles: toggles,
                 now: now,
-                providerName: { [providersByID] id in providersByID[id]?.provider.displayName ?? id },
+                providerName: { [providersByID] id in AccountNamePrivacySetting.displayName(for: providersByID[id]?.provider.displayName ?? id) },
                 post: postNotification
             )
             return
@@ -700,7 +700,7 @@ final class WidgetDataStore {
             metrics: metrics,
             toggles: toggles,
             now: now,
-            providerName: { [providersByID] id in providersByID[id]?.provider.displayName ?? id },
+            providerName: { [providersByID] id in AccountNamePrivacySetting.displayName(for: providersByID[id]?.provider.displayName ?? id) },
             post: postNotification
         )
     }

@@ -18,7 +18,6 @@ struct TotalSpendCard: View {
     @AppStorage(TotalSpendSetting.periodKey) private var periodRawValue = TotalSpendPeriod.today.rawValue
     /// The selected metric (Cost / Cost/MTok / Tokens) survives the same way.
     @AppStorage(TotalSpendSetting.metricKey) private var metricRawValue = TotalSpendMetric.cost.rawValue
-    @AppStorage(AccountNamePrivacySetting.key) private var blurAccountNames = AccountNamePrivacySetting.defaultValue
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
 
     private var period: TotalSpendPeriod {
@@ -120,13 +119,14 @@ struct TotalSpendCard: View {
     private var infoTooltip: String {
         // Account-scoped cards (“Codex — alice@example.com”) stay nameable only as their family
         // while account names are blurred, matching everywhere else the names render.
+        var seen = Set<String>()
         let names = providers.map { candidate -> String in
-            guard blurAccountNames,
+            guard AccountNamePrivacySetting.isBlurEnabled(),
                   let split = AccountNameText.splitAccountSuffix(candidate.displayName) else {
                 return candidate.displayName
             }
             return split.family
-        }
+        }.filter { seen.insert($0).inserted }
         let coverageNote: String
         switch metric {
         case .cost:

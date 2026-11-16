@@ -110,13 +110,13 @@ struct WidgetGroupedListView: View {
             Button {
                 container.enablement.setEnabled(false, for: group.provider.id)
             } label: {
-                AccountNameText(text: "Hide \(group.provider.displayName)", font: .system(size: 13))
+                AccountNameText(text: "Hide \(group.provider.displayName)", font: .system(size: 13), interactiveReveal: false)
             }
             Divider()
             Button {
                 refreshProvider(group.provider.id)
             } label: {
-                AccountNameText(text: "Refresh \(group.provider.displayName)", font: .system(size: 13))
+                AccountNameText(text: "Refresh \(group.provider.displayName)", font: .system(size: 13), interactiveReveal: false)
             }
             Button("Customize…") {
                 openCustomize(for: group.provider.id)
@@ -372,7 +372,7 @@ struct WidgetGroupedListView: View {
             Button {
                 refreshProvider(providerID)
             } label: {
-                AccountNameText(text: "Refresh \(provider.displayName)", font: .system(size: 13))
+                AccountNameText(text: "Refresh \(provider.displayName)", font: .system(size: 13), interactiveReveal: false)
             }
         }
         Button("Customize…") {

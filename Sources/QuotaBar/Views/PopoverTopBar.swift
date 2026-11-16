@@ -110,7 +110,7 @@ struct PopoverTopBar: View {
         .glassButtonStyle()
         .buttonBorderShape(.circle)
         .controlSize(.large)
-        .hoverTooltip("Reset \(layout.provider(id: providerID)?.displayName ?? providerID)")
+        .hoverTooltip("Reset \(AccountNamePrivacySetting.displayName(for: layout.provider(id: providerID)?.displayName ?? providerID))")
         .accessibilityLabel("Reset")
     }
 
