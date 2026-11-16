@@ -18,9 +18,21 @@ private struct ScanWorkerSchemaError: LocalizedError {
 /// all return `nil` from `foldOnlySnapshot`, and the child's own per-provider error responses come
 /// back as error snapshots the store already knows how to surface. `QUOTABAR_DISABLE_SCAN_WORKER=1`
 /// turns the worker off entirely.
+///
+/// The accounting pass folds several providers through `runBatch`: `fetchFoldSnapshots` delegates
+/// the whole set to ONE child instead of one child per provider. Account discovery, the login
+/// shell, Keychain metadata queries, and Swift-runtime startup are per-process fixed costs — one
+/// child pays them once instead of N times. Any anomaly (spawn failure, timeout, missing or
+/// undecodable member, or a member the child skipped) falls that member back to the in-process
+/// fold, so batching can only add speed, never change results.
 @MainActor
 final class ScanWorkerClient {
     static let shared = ScanWorkerClient()
+
+    /// Wall-clock cap for a batched fold. A single provider keeps the original 110s; a batch pays
+    /// one assembly and then the same per-provider work the separate children would do, so it gets
+    /// generous headroom rather than N independent timeouts.
+    nonisolated private static let batchFoldTimeout: TimeInterval = 240
 
     private let runner: any ProcessRunning
     /// Slightly below the provider refresh deadline so the client can still report a timeout
@@ -145,6 +157,104 @@ final class ScanWorkerClient {
             guard !Task.isCancelled else { return await inProcessFallback() }
             logSpawnFailureOnce(providerID: provider.id, message: error.localizedDescription)
             return await inProcessFallback()
+        }
+    }
+
+    /// The outcome of delegating a whole fold batch to one child. `snapshots` contains one entry
+    /// per provider that produced a usable answer (including child-reported failures, which come
+    /// back as error snapshots — exactly like single-provider folds); providers absent from the
+    /// map — and absent from `errors` — must fall back to the in-process fold.
+    struct FoldBatchResult {
+        var snapshots: [String: ProviderSnapshot] = [:]
+        var identityKeys: [String: String] = [:]
+    }
+
+    /// Fold every requested provider in ONE child process. Used by the accounting pass so account
+    /// discovery, the login shell, Keychain metadata queries, and process startup are paid once
+    /// per pass instead of once per provider. Returns an empty result on any failure; callers
+    /// treat absent members as "fold in-process".
+    func fetchFoldSnapshots(
+        providers: [String: Provider],
+        paced: Bool
+    ) async -> FoldBatchResult {
+        var result = FoldBatchResult()
+        guard let executableURL = workerExecutableURL, !Task.isCancelled, !providers.isEmpty else {
+            return result
+        }
+        let scope = ProviderRefreshContext.scope
+        let pacedArgument = paced ? ["--paced"] : []
+        let scopeArgument: String
+        switch scope {
+        case .localAccounting: scopeArgument = "local-accounting"
+        case .panelAccounting: scopeArgument = "panel-accounting"
+        default:
+            return result
+        }
+        let providerIDs = providers.keys.sorted()
+        let arguments = [
+            "--scan-worker",
+            "--providers", providerIDs.joined(separator: ","),
+            "--scope", scopeArgument,
+        ] + pacedArgument
+        do {
+            let runResult = try await loadOffMainActor { [runner] in
+                try runner.run(
+                    executable: executableURL.path,
+                    arguments: arguments,
+                    // Merged over the inherited environment by the runner; the flag makes the
+                    // child's own fold paths run their scanners in-process.
+                    environment: ["QUOTABAR_IN_SCAN_WORKER": "1"],
+                    timeout: Self.batchFoldTimeout
+                )
+            }
+            guard runResult.succeeded, !runResult.stdout.isEmpty else {
+                let message = runResult.stderr.split(separator: "\n").last
+                    .map(String.init) ?? "scan worker exited with status \(runResult.exitCode)"
+                AppLog.warn(.refresh, "batched scan worker failed for \(providerIDs.joined(separator: ",")): \(message) — folding in-process")
+                return FoldBatchResult()
+            }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let response = try decoder.decode(ScanWorkerCommand.Response.self, from: Data(runResult.stdout.utf8))
+            guard response.schema == ScanWorkerCommand.schemaName else {
+                throw ScanWorkerSchemaError()
+            }
+            for (providerID, identityKey) in response.identityKeys {
+                if providers[providerID] != nil {
+                    result.identityKeys[providerID] = identityKey
+                }
+            }
+            for (providerID, message) in response.errors {
+                guard let provider = providers[providerID] else { continue }
+                // Fold-only failures never clear quota state: the store's merge recovers the meters
+                // from the prior snapshot, exactly like a single-provider fold failure.
+                result.snapshots[providerID] = ProviderSnapshot.error(
+                    provider: provider,
+                    error: ScanWorkerFoldError(message: message),
+                    clearsPriorMenuBarQuotaState: false
+                )
+            }
+            for (providerID, snapshot) in response.snapshots where result.snapshots[providerID] == nil {
+                guard providers[providerID] != nil else { continue }
+                if snapshot.errorCategory == .cancelled {
+                    // The child asked to skip (e.g. an account inventory it cannot resolve); the
+                    // caller re-folds this one provider in-process instead.
+                    AppLog.info(.refresh, "batched scan worker skipped \(providerID); folding in-process")
+                    continue
+                }
+                result.snapshots[providerID] = snapshot
+            }
+            return result
+        } catch ProcessRunnerError.timedOut {
+            AppLog.warn(
+                .refresh,
+                "batched scan worker timed out after \(Int(Self.batchFoldTimeout))s for \(providerIDs.joined(separator: ",")) — folding in-process"
+            )
+            return FoldBatchResult()
+        } catch {
+            guard !Task.isCancelled else { return FoldBatchResult() }
+            logSpawnFailureOnce(providerID: providerIDs.first ?? "?", message: error.localizedDescription)
+            return FoldBatchResult()
         }
     }
 

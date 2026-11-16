@@ -563,6 +563,29 @@ final class WidgetDataStore {
         }
         let start = monotonicNow()
         AppLog.info(.refresh, "batch start (\(providerIDs.count) providers, force=\(force), scope=\(Self.batchScopeLabel(ProviderRefreshContext.scope)))")
+        // One batched scan-worker child folds the whole provider set: the per-process fixed costs
+        // (account discovery, login shell, Keychain metadata queries, Swift-runtime startup) are
+        // paid once per pass instead of once per provider. Providers the child can't cover fall
+        // back to the in-process fold inside performRefresh, exactly as if delegation never ran.
+        var prefetchedFoldSnapshots: [String: ProviderSnapshot] = [:]
+        var prefetchedFoldIdentityKeys: [String: String] = [:]
+        if ProviderRefreshContext.scope.suppressesLiveQuota, providerIDs.count > 1 {
+            let foldProviders = providerIDs.reduce(into: [String: Provider]()) { partial, id in
+                if let provider = providersByID[id]?.provider { partial[id] = provider }
+            }
+            if foldProviders.count > 1 {
+                let fetched = await ScanWorkerClient.shared.fetchFoldSnapshots(
+                    providers: foldProviders,
+                    paced: ProviderRefreshContext.accountingCPUThrottleEnabled
+                )
+                prefetchedFoldSnapshots = fetched.snapshots
+                prefetchedFoldIdentityKeys = fetched.identityKeys
+                AppLog.info(
+                    .refresh,
+                    "batched scan worker folded \(fetched.snapshots.count)/\(foldProviders.count) providers"
+                )
+            }
+        }
         let startingHistoryRevision = localHistoryRevision
         var concurrency = max(1, maxConcurrentProviders ?? providerIDs.count)
         var outcomes: [RefreshOutcome] = []
@@ -584,15 +607,21 @@ final class WidgetDataStore {
             // Most menu-bar meters skip those scans, but Hermes still reads its local database in a
             // meters-only scope, so serialize that provider while allowing scan-light quota APIs together.
             let serializedHeavyProviders = Self.heavyProvidersToSerialize(in: ProviderRefreshContext.scope)
+            // Provider IDs may be account-scoped ("codex@…"); match on the family too or an
+            // account card slips past the heavy-provider cap and doubles the parse peak.
+            func isSerializedHeavy(_ providerID: String) -> Bool {
+                serializedHeavyProviders.contains(providerID)
+                    || serializedHeavyProviders.contains(ProviderAccountID.family(of: providerID))
+            }
             var chunk: [String] = []
             var includesHeavyProvider = false
             while chunk.count < concurrency, !pendingProviderIDs.isEmpty {
                 guard !Task.isCancelled else { break }
                 guard let nextIndex = pendingProviderIDs.firstIndex(where: { providerID in
-                    !serializedHeavyProviders.contains(providerID) || !includesHeavyProvider
+                    !isSerializedHeavy(providerID) || !includesHeavyProvider
                 }) else { break }
                 let providerID = pendingProviderIDs.remove(at: nextIndex)
-                if serializedHeavyProviders.contains(providerID) {
+                if isSerializedHeavy(providerID) {
                     includesHeavyProvider = true
                 }
                 chunk.append(providerID)
@@ -609,7 +638,9 @@ final class WidgetDataStore {
                         force: force,
                         bypassSnapshotCache: bypassSnapshotCache,
                         notifyHistoryChange: false,
-                        bypassFailureBackoff: bypassFailureBackoff
+                        bypassFailureBackoff: bypassFailureBackoff,
+                        prefetchedFoldSnapshot: prefetchedFoldSnapshots[providerID],
+                        prefetchedFoldIdentityKey: prefetchedFoldIdentityKeys[providerID]
                     )
                 }
                 registerProviderRefreshTask(
@@ -1070,7 +1101,9 @@ final class WidgetDataStore {
         force: Bool,
         bypassSnapshotCache: Bool,
         notifyHistoryChange: Bool,
-        bypassFailureBackoff: Bool = false
+        bypassFailureBackoff: Bool = false,
+        prefetchedFoldSnapshot: ProviderSnapshot? = nil,
+        prefetchedFoldIdentityKey: String? = nil
     ) async -> RefreshOutcome {
         guard isProviderEnabled(providerID) else { return .skipped }
         let manualActionID = ProviderRefreshContext.manualActionID
@@ -1257,8 +1290,16 @@ final class WidgetDataStore {
         // A provider that never returns would otherwise hold the in-flight entry — and the spinner —
         // forever. Past the deadline, stop waiting and treat it as any other failed refresh.
         let cacheIdentityResult = ProviderCacheIdentityResult()
-        let fetchedSnapshot = await ProviderRefreshContext.$cacheIdentityResult.withValue(cacheIdentityResult) {
-            await ProviderRefreshDeadline.snapshot(from: provider, timeout: providerRefreshTimeout)
+        var fetchedSnapshot: ProviderSnapshot? = nil
+        if let prefetchedFoldSnapshot {
+            // Batched scan-worker fold already produced this provider's snapshot; treat it as the
+            // runtime result (including its identity key, reported through the batch response).
+            if let prefetchedFoldIdentityKey { cacheIdentityResult.set(prefetchedFoldIdentityKey) }
+            fetchedSnapshot = prefetchedFoldSnapshot
+        } else {
+            fetchedSnapshot = await ProviderRefreshContext.$cacheIdentityResult.withValue(cacheIdentityResult) {
+                await ProviderRefreshDeadline.snapshot(from: provider, timeout: providerRefreshTimeout)
+            }
         }
         guard isCurrentProviderRequest(providerID: providerID, generation: requestGeneration) else {
             AppLog.debug(.refresh, "superseded provider request (\(providerID)); discarding stale result")
@@ -1630,9 +1671,13 @@ final class WidgetDataStore {
         return true
     }
 
-    /// Provider IDs / families whose refresh parses large on-disk JSONL corpora.
-    private static let heavyLocalLogProviders: Set<String> = [
+    /// Provider IDs / families whose refresh parses large on-disk JSONL corpora. Internal so the
+    /// scan-worker child can serialize them the same way the app serializes its own heavy providers.
+    nonisolated static let heavyLocalLogProviders: Set<String> = [
+        // Large on-disk corpora whose folds allocate real parse working sets: JSONL logs,
+        // protobuf-over-SQLite receipt stores, multi-thousand-row usage CSVs.
         "claude", "codex", "opencode", "grok", "muse", "pi", "hermes", "freebuff",
+        "cursor", "antigravity",
     ]
 
     private static func heavyProvidersToSerialize(in scope: ProviderRefreshContext.Scope) -> Set<String> {

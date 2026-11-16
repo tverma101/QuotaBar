@@ -325,7 +325,8 @@ final class AppContainer {
             dataStore: dataStore,
             telemetry: telemetry,
             transparency: self.transparency,
-            ledgerWatcher: ledgerWatcher
+            ledgerWatcher: ledgerWatcher,
+            isICloudSyncEnabled: { iCloudSync.enabled }
         )
         self.codexAutoReset.start()
         localAPI.start()
@@ -513,7 +514,8 @@ final class AppContainer {
         dataStore: WidgetDataStore,
         telemetry: TelemetryRecorder,
         transparency: PopoverTransparencyStore,
-        ledgerWatcher: CodexRouterLedgerWatcher
+        ledgerWatcher: CodexRouterLedgerWatcher,
+        isICloudSyncEnabled: @escaping @MainActor () -> Bool = { false }
     ) -> Task<Void, Never> {
         ProviderRefreshContext.withBackgroundContext {
             Task {
@@ -587,6 +589,11 @@ final class AppContainer {
             // "Today" tile with a fresh timestamp, so without this trigger the menu bar kept showing
             // yesterday's spend until the user opened the panel (or an external trigger landed).
             var lastRefreshDay = DailyUsageAccumulator.dayKey(from: Date())
+            /// Last uptime (seconds) at which notifications/telemetry ran. The periodic loop wakes
+            /// as often as once per second while a fold is in flight (to collect deferred work);
+            /// re-resolving every bounded metric that often is waste the fold's CPU budget does
+            /// not need. Re-evaluate on every pass and otherwise at a bounded cadence.
+            var lastPulseUptime: TimeInterval = -1_000_000
             defer {
                 accountingTask?.cancel()
                 dataStore.cancelProviderRefreshes(scopes: [.localAccounting, .panelAccounting])
@@ -596,12 +603,20 @@ final class AppContainer {
                 let quotaRefreshInterval = panelOpen
                     ? RefreshSetting.quotaInterval
                     : RefreshSetting.backgroundInterval
+                // Closed-panel history folds widen to the idle deadline (15 min): the background
+                // spend parse is the app's largest recurring CPU consumer, and a spend dashboard
+                // nobody is looking at does not need a five-minute rebuild. Panel opens always
+                // run a fresh two-phase pass; iCloud Sync (when provisioned and enabled) keeps the
+                // five-minute cadence so peer machines see fresh machine history.
+                let historyRefreshInterval = panelOpen || isICloudSyncEnabled()
+                    ? RefreshSetting.interval
+                    : RefreshSetting.backgroundHistoryInterval
                 let nowUptime = ProcessInfo.processInfo.systemUptime
                 let quotaRefreshDue = lastQuotaRefreshUptime.map {
                     nowUptime - $0 >= quotaRefreshInterval
                 } ?? true
                 let historyRefreshDue = lastHistoryRefreshUptime.map {
-                    nowUptime - $0 >= RefreshSetting.interval
+                    nowUptime - $0 >= historyRefreshInterval
                 } ?? true
                 let newlyDueHistoryPass = historyRefreshDue && !pendingHistoryAccountingPass
                 if historyRefreshDue {
@@ -787,14 +802,23 @@ final class AppContainer {
                     URLCache.shared.removeAllCachedResponses()
                     ProcessMemoryBudget.releaseAllocatorFreePages()
                 }
-                // Re-evaluate quota pace milestones every tick — after the refresh so it sees fresh data,
-                // and on every loop (not just on a fetch) so pace worsening from elapsed time alone still
-                // alerts even with the popover closed.
-                await dataStore.evaluateNotifications()
-                // Day-rollover beat: always emits `app_daily_active` once per local day; flushes
-                // prior-day provider rollups only while optional analytics are on. Runs on launch
-                // and every interval, so always-running instances still produce a daily-active signal.
-                telemetry.tick()
+                // Re-evaluate quota pace milestones every pass — after the refresh so it sees fresh
+                // data — and otherwise at a bounded cadence, so pace worsening from elapsed time
+                // alone still alerts. Not on every wake: the loop polls once per second while a
+                // fold is in flight, and re-resolving every metric per second is needless churn.
+                let pulseNow = ProcessInfo.processInfo.systemUptime
+                let passRan = quotaRefreshDue || pendingPanelPass || pendingFullScopePass
+                    || pendingHistoryAccountingPass || pendingLocalAccountingPass
+                    || pendingMenuBarMeterRetry
+                if passRan || pulseNow - lastPulseUptime >= 30 {
+                    lastPulseUptime = pulseNow
+                    await dataStore.evaluateNotifications()
+                    // Day-rollover beat: always emits `app_daily_active` once per local day; flushes
+                    // prior-day provider rollups only while optional analytics are on. Runs on launch
+                    // and every bounded interval, so always-running instances still produce a
+                    // daily-active signal.
+                    telemetry.tick()
+                }
                 // Live quota meters and full history folds have separate cadences while the panel is
                 // open. Closed-panel quota cadence still follows the power source.
                 let sleepInterval = transparency.popoverShown
@@ -804,19 +828,19 @@ final class AppContainer {
                 let quotaElapsed = lastQuotaRefreshUptime.map { waitNow - $0 } ?? 0
                 let quotaWaitRemaining = max(0, sleepInterval - quotaElapsed)
                 let historyElapsed = lastHistoryRefreshUptime.map { waitNow - $0 } ?? 0
-                let historyWaitRemaining = max(0, RefreshSetting.interval - historyElapsed)
+                let historyWaitRemaining = max(0, historyRefreshInterval - historyElapsed)
                 let hasRunnableAccounting = accountingTask == nil
                     && (pendingHistoryAccountingPass || pendingLocalAccountingPass)
                 let hasRunnableMeters = pendingFullScopePass || pendingPanelPass || pendingMenuBarMeterRetry
-                // A fold that outlives the five-minute history interval re-latches the next deadline
-                // while `accountingTask` is still running. Deriving the wait from that deadline alone
-                // then yields zero and the loop spins on an immediate timeout until the fold ends,
-                // burning a core. Nothing is runnable while the task runs, so poll its completion at
-                // a bounded cadence instead of at 0 s.
+                // A fold outliving its history interval used to make `deadlineWait` zero and the loop
+                // spin on an immediate timeout until the fold ended, burning a core. Nothing is
+                // runnable while the fold runs, and the fold's completion yields a wake of its own
+                // (`signalWorkCompletion`), so the poll does not need to run at 1 Hz at all — a
+                // coarse 5 s floor covers rounding and any wake that raced a deadline mutation.
                 let deadlineWait = min(quotaWaitRemaining, historyWaitRemaining)
                 let wakeTimeout = hasRunnableAccounting || hasRunnableMeters
                     ? 0
-                    : accountingTask == nil ? deadlineWait : max(deadlineWait, 1)
+                    : accountingTask == nil ? deadlineWait : max(deadlineWait, 5)
                 _ = await wakeSignal.waitForWake(timeout: wakeTimeout)
                 // Ledger appends invalidate only the enabled Codex/OpenCode accounting snapshots and
                 // schedule their narrow local fold. Meter snapshots and unrelated history providers

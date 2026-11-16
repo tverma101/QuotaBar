@@ -199,3 +199,135 @@ final class ScanWorkerClientTests: XCTestCase {
         XCTAssertEqual(result.providerID, provider.id)
     }
 }
+
+@MainActor
+final class ScanWorkerBatchTests: XCTestCase {
+    private let codex = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
+    private let claude = Provider(id: "claude", displayName: "Claude", icon: .providerMark("claude"))
+
+    private func makeClient(runner: CannedScanWorkerRunner) -> ScanWorkerClient {
+        ScanWorkerClient(
+            runner: runner,
+            timeout: 110,
+            executableURLOverride: URL(fileURLWithPath: "/tmp/fake.app/Contents/MacOS/QuotaBar")
+        )
+    }
+
+    private func snapshot(for provider: Provider) -> ProviderSnapshot {
+        ProviderSnapshot.make(
+            provider: provider, plan: nil, lines: [],
+            refreshedAt: TestLocalInstant.date(2026, 11, 10, 12)
+        )
+    }
+
+    private func encode(_ response: ScanWorkerCommand.Response) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return String(data: try encoder.encode(response), encoding: .utf8)!
+    }
+
+    func testBatchFoldSpawnsOneChildAndReturnsBothSnapshots() async throws {
+        let payload = try encode(ScanWorkerCommand.Response(
+            schema: ScanWorkerCommand.schemaName,
+            snapshots: [codex.id: snapshot(for: codex), claude.id: snapshot(for: claude)],
+            errors: [:],
+            identityKeys: [codex.id: "codex-identity", claude.id: "claude-identity"]
+        ))
+        let runner = CannedScanWorkerRunner(outcome: .success(stdout: payload))
+        let client = makeClient(runner: runner)
+
+        let result = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await client.fetchFoldSnapshots(
+                providers: [codex.id: codex, claude.id: claude],
+                paced: false
+            )
+        }
+
+        XCTAssertEqual(runner.spawnCount, 1, "one child must fold the whole batch")
+        XCTAssertEqual(result.snapshots.count, 2)
+        XCTAssertEqual(result.identityKeys[codex.id], "codex-identity")
+        XCTAssertEqual(result.identityKeys[claude.id], "claude-identity")
+        let joined = runner.lastArguments.joined(separator: " ")
+        XCTAssertTrue(joined.contains("claude,codex"), "child receives every provider id: \(joined)")
+        XCTAssertTrue(runner.lastArguments.contains("panel-accounting"))
+        XCTAssertFalse(runner.lastArguments.contains("--paced"))
+    }
+
+    func testBatchFoldPacedPassesThrough() async throws {
+        let payload = try encode(ScanWorkerCommand.Response(
+            schema: ScanWorkerCommand.schemaName, snapshots: [:], errors: [:], identityKeys: [:]
+        ))
+        let runner = CannedScanWorkerRunner(outcome: .success(stdout: payload))
+        let client = makeClient(runner: runner)
+
+        _ = await ProviderRefreshContext.$scope.withValue(.localAccounting) {
+            await client.fetchFoldSnapshots(providers: [codex.id: codex, claude.id: claude], paced: true)
+        }
+
+        XCTAssertTrue(runner.lastArguments.contains("--paced"))
+        XCTAssertTrue(runner.lastArguments.contains("local-accounting"))
+    }
+
+    func testBatchMemberErrorBecomesErrorSnapshotWithoutFallback() async throws {
+        let payload = try encode(ScanWorkerCommand.Response(
+            schema: ScanWorkerCommand.schemaName,
+            snapshots: [:],
+            errors: [codex.id: "local history unreadable"],
+            identityKeys: [:]
+        ))
+        let client = makeClient(runner: CannedScanWorkerRunner(outcome: .success(stdout: payload)))
+
+        let result = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await client.fetchFoldSnapshots(providers: [codex.id: codex], paced: false)
+        }
+
+        XCTAssertNotNil(result.snapshots[codex.id]?.errorCategory)
+    }
+
+    func testBatchMemberCancelledIsAbsentSoCallerFoldsInProcess() async throws {
+        let cancelled = ProviderSnapshot.error(
+            provider: claude, error: CancellationError(), clearsPriorMenuBarQuotaState: false
+        )
+        let payload = try encode(ScanWorkerCommand.Response(
+            schema: ScanWorkerCommand.schemaName,
+            snapshots: [codex.id: snapshot(for: codex), claude.id: cancelled],
+            errors: [:],
+            identityKeys: [:]
+        ))
+        let client = makeClient(runner: CannedScanWorkerRunner(outcome: .success(stdout: payload)))
+
+        let result = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await client.fetchFoldSnapshots(providers: [codex.id: codex, claude.id: claude], paced: false)
+        }
+
+        XCTAssertNotNil(result.snapshots[codex.id])
+        XCTAssertNil(result.snapshots[claude.id], "cancelled member is omitted so the caller re-folds it in-process")
+    }
+
+    func testBatchChildFailureReturnsEmptyResult() async {
+        for outcome in [
+            CannedScanWorkerRunner.Outcome.exit(exitCode: 4, stderr: "quotabar: boom"),
+            CannedScanWorkerRunner.Outcome.timeout,
+            CannedScanWorkerRunner.Outcome.spawnFailure,
+        ] {
+            let client = makeClient(runner: CannedScanWorkerRunner(outcome: outcome))
+            let result = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+                await client.fetchFoldSnapshots(providers: [codex.id: codex, claude.id: claude], paced: false)
+            }
+            XCTAssertTrue(result.snapshots.isEmpty)
+            XCTAssertTrue(result.identityKeys.isEmpty)
+        }
+    }
+
+    func testBatchFoldNotAvailableInMeterScopes() async {
+        let runner = CannedScanWorkerRunner(outcome: .success(stdout: "{}"))
+        let client = makeClient(runner: runner)
+
+        let result = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+            await client.fetchFoldSnapshots(providers: [codex.id: codex, claude.id: claude], paced: false)
+        }
+
+        XCTAssertEqual(runner.spawnCount, 0)
+        XCTAssertTrue(result.snapshots.isEmpty)
+    }
+}
