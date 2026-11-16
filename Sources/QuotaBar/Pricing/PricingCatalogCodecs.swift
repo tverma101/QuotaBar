@@ -427,32 +427,40 @@ enum PricingCatalogCodecs {
     // MARK: - Compact format (bundled snapshots + disk cache)
 
     static func catalogFromCompact(_ data: Data) throws -> PricingCatalog {
-        let file = try JSONDecoder().decode(CompactCatalog.self, from: data)
-        var entries: [String: ModelRates] = [:]
-        entries.reserveCapacity(file.models.count)
-        for (key, model) in file.models {
-            entries[key] = ModelRates(
-                inputPerMillion: model.i,
-                outputPerMillion: model.o,
-                cacheWritePerMillion: model.cw,
-                cacheReadPerMillion: model.cr,
-                cacheWrite1hPerMillion: model.cw1,
-                promptRateTiers: model.tiers ?? [],
-                utcPriceOverrides: model.utc,
-                inputAbove200kPerMillion: model.ia,
-                outputAbove200kPerMillion: model.oa,
-                cacheWriteAbove200kPerMillion: model.cwa,
-                cacheReadAbove200kPerMillion: model.cra,
-                cacheReadIsExplicit: model.cre ?? true,
-                fastMultiplier: model.fast ?? 1
+        // The bundled snapshots were produced by a writer that matches Foundation's JSONDecoder
+        // behavior on exact-half decimals. The reference Swift path preserves bit-exact equality
+        // with those snapshots. The Rust path is a fast fallback for inputs Swift cannot handle.
+        if let file = try? JSONDecoder().decode(CompactCatalog.self, from: data) {
+            var entries: [String: ModelRates] = [:]
+            entries.reserveCapacity(file.models.count)
+            for (key, model) in file.models {
+                entries[key] = ModelRates(
+                    inputPerMillion: model.i,
+                    outputPerMillion: model.o,
+                    cacheWritePerMillion: model.cw,
+                    cacheReadPerMillion: model.cr,
+                    cacheWrite1hPerMillion: model.cw1,
+                    promptRateTiers: model.tiers ?? [],
+                    utcPriceOverrides: model.utc,
+                    inputAbove200kPerMillion: model.ia,
+                    outputAbove200kPerMillion: model.oa,
+                    cacheWriteAbove200kPerMillion: model.cwa,
+                    cacheReadAbove200kPerMillion: model.cra,
+                    cacheReadIsExplicit: model.cre ?? true,
+                    fastMultiplier: model.fast ?? 1
+                )
+            }
+            return PricingCatalog(
+                entries: entries,
+                retrievedAt: file.retrievedAt,
+                retiredKeys: Set(file.retiredKeys ?? []),
+                retiredKeysAreAuthoritative: file.retiredKeys != nil
             )
         }
-        return PricingCatalog(
-            entries: entries,
-            retrievedAt: file.retrievedAt,
-            retiredKeys: Set(file.retiredKeys ?? []),
-            retiredKeysAreAuthoritative: file.retiredKeys != nil
-        )
+        if let rust = CompactCatalogRustParser.parse(data) {
+            return rust
+        }
+        throw PricingCodecError.notAnObject
     }
 
     static func compactData(from catalog: PricingCatalog) throws -> Data {
