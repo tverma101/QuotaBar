@@ -40,13 +40,21 @@ struct HeadlessProviderAssembly {
         // still needs the live capture warm before the identity read — a MainActor read never
         // triggers the capture itself, so identity would read one home while the providers'
         // off-main reads (which do trigger it) fetch usage from another.
-        let captured = await Task.detached(priority: .userInitiated) {
-            LoginShellEnvironment.shared.ensureCaptured()
-        }.value
-        if !captured {
-            await Task.detached(priority: .utility) {
-                _ = LoginShellEnvironment.shared.retryCaptureAfterFailure()
+        //
+        // With a snapshot present, skip the eager warm in the one-shot scan worker: identity keys
+        // resolve from the snapshot (frozen for the session), and off-main readers trigger the
+        // one-time capture on demand if a non-identity key is actually needed — so the spawn is
+        // paid only when a fold path truly reads one, not by every short-lived child. Freebuff's
+        // scheduled fold, for example, reads no shell exports at all.
+        if ShellEnvironmentSnapshotStore.launchSnapshot == nil {
+            let captured = await Task.detached(priority: .userInitiated) {
+                LoginShellEnvironment.shared.ensureCaptured()
             }.value
+            if !captured {
+                await Task.detached(priority: .utility) {
+                    _ = LoginShellEnvironment.shared.retryCaptureAfterFailure()
+                }.value
+            }
         }
         let registeredCodexHomes = CodexAccountRegistrationStore(defaults: defaults).registeredHomes
         let enablement = ProviderEnablementStore(defaults: defaults)

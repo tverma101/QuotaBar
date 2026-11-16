@@ -102,7 +102,29 @@ public enum ScanWorkerCommand {
             // provider deadline, mirroring the scheduler's pacing choice in the app.
             await ProviderRefreshContext.$scope.withValue(options.scope) {
                 await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(options.paced) {
-                    for providerID in options.providerIDs {
+                    // Light providers fold concurrently — MainActor interleaving overlaps their
+                    // network/SQLite waits; heavy local-corpora providers run one at a time so
+                    // their parse working sets never stack in the child's memory, mirroring the
+                    // app's heavy-provider serialization.
+                    func isHeavy(_ providerID: String) -> Bool {
+                        let family = ProviderAccountID.family(of: providerID)
+                        return WidgetDataStore.heavyLocalLogProviders.contains(family)
+                            || WidgetDataStore.heavyLocalLogProviders.contains(providerID)
+                    }
+                    let light = options.providerIDs.filter { !isHeavy($0) }
+                    let heavy = options.providerIDs.filter { isHeavy($0) }
+                    await withTaskGroup(of: Void.self) { group in
+                        for providerID in light {
+                            group.addTask {
+                                _ = await dataStore.refresh(
+                                    providerID: providerID,
+                                    force: true,
+                                    bypassSnapshotCache: true
+                                )
+                            }
+                        }
+                    }
+                    for providerID in heavy {
                         _ = await dataStore.refresh(
                             providerID: providerID,
                             force: true,
