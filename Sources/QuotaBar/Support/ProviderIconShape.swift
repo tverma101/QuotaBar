@@ -105,6 +105,7 @@ enum ProviderMarks {
         case "opencode": return "chevron.left.forwardslash.chevron.right"
         case "openrouter": return "point.3.connected.trianglepath.dotted"
         case "zai": return "z.signal"
+        case "tps": return "gauge"
         default: return "app.dashed"
         }
     }

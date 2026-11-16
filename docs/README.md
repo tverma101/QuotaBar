@@ -34,6 +34,7 @@ What each provider tracks, where its credentials come from, and what to do when 
 - [Hermes](providers/hermes.md)
 - [OpenCode](providers/opencode.md)
 - [OpenRouter](providers/openrouter.md)
+- [TPS Tracker](providers/tps.md)
 - [Z.ai](providers/zai.md)
 
 ## For developers

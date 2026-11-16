@@ -236,7 +236,7 @@ final class ProviderEnablementStoreTests: XCTestCase {
 
         let reloaded = ProviderEnablementStore(defaults: defaults)
 
-        XCTAssertEqual(reloaded.enabledIDs, Set(["claude", "codex", "cursor", "freebuff", "codex@work"]))
+        XCTAssertEqual(reloaded.enabledIDs, Set(["claude", "codex", "cursor", "freebuff", "tps", "codex@work"]))
         XCTAssertTrue(reloaded.userChoiceProviderIDs.isEmpty)
         XCTAssertNil(defaults.object(forKey: ProviderEnablementPersistence.pendingResetIntentKey))
         XCTAssertNil(defaults.object(forKey: ProviderEnablementPersistence.pendingChoiceIntentKey))

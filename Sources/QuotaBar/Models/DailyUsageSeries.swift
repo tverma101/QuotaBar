@@ -177,6 +177,9 @@ struct ModelUsageEntry: Hashable, Sendable, Codable {
     /// could not be reconciled. Optional so older persisted entries decode using their prior shape.
     var costIsComplete: Bool? = nil
     var tokenCountSaturated: Bool? = nil
+    /// Estimated generation speed for this model over the window (tokens/sec), when the source
+    /// can measure it (the TPS tracker's log fold). `nil` everywhere else.
+    var tokensPerSecond: Double? = nil
 
     var hasIncompleteCost: Bool {
         if let costIsComplete { return !costIsComplete }

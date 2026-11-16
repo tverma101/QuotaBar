@@ -1723,7 +1723,7 @@ final class WidgetDataStore {
         // Large on-disk corpora whose folds allocate real parse working sets: JSONL logs,
         // protobuf-over-SQLite receipt stores, multi-thousand-row usage CSVs.
         "claude", "codex", "opencode", "grok", "muse", "pi", "hermes", "freebuff",
-        "cursor", "antigravity",
+        "cursor", "antigravity", "tps",
     ]
 
     private static func heavyProvidersToSerialize(in scope: ProviderRefreshContext.Scope) -> Set<String> {

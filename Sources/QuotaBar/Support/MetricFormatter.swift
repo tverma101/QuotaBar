@@ -105,6 +105,12 @@ enum MetricFormatter {
         case .costPerMtok:
             // `$1.37` with two decimals under 1k; abbreviated above. Unit line is `MTok`.
             return TotalSpendRingCenter(primary: costPerMtokRingPrimary(value), unit: "MTok")
+        case .tps:
+            // Compact rate on the primary line; the unit row names the gauge.
+            return TotalSpendRingCenter(
+                primary: value.formatted(.number.precision(.fractionLength(value < 100 ? 1 : 0)).locale(locale)),
+                unit: "tokens/sec"
+            )
         }
     }
 

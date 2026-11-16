@@ -66,6 +66,14 @@ Local changes that matter when syncing shared code:
    and deduplicates migrated IDs. Reasoning-only Router records keep their measured lower bound
    without blocking independent OpenCode history. Completed Router prefixes remain usable through ordinary appends during the wider fold; rewrites and replacements still invalidate them. Preserve these format-compatibility fixes.
 
+## Local deltas — 2026-11-16
+
+Beyond the rebrand, the fork adds a Total Spend panel **TPS lens** (`AIProvider`-free; a TPS fold of every local-log
+corpus (Claude Code, Codex, Grok, Muse, Pi) surfaced through `TotalSpendCard`, never a dashboard card) and shared panel chrome
+(`ShareCardRenderer`, `TPSSpendPanel`, `TPSTotal`). Upstream rebuilt its panel around Priority in 0.8 —
+fork deltas in `TotalSpendCard`, `DashboardContentView`, `TotalSpendAggregator` and `MetricFormatter`
+conflict with that 0.8 work and need manual attention if upstream's spend UI is ever adapted.
+
 ## Selective sync — 2026-10-21
 
 Compared upstream `26132ff48d` (2026-10-18). Adapted these improvements without importing upstream branding, updates, provider activation, or pricing policy:

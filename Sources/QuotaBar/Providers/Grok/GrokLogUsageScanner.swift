@@ -134,6 +134,44 @@ actor GrokLogUsageScanner {
         return result
     }
 
+    /// TPS tracking: stream the completed turns for one-or-all cards through a visitor with the
+    /// same discovery, coordinator filter and cache identity the scan uses — no second fold.
+    /// `false` means the source was incomplete; callers keep last-good data.
+    @discardableResult
+    func foldUsageEntries(
+        daysBack: Int = 14,
+        now: Date = Date(),
+        visit: @Sendable (Entry) -> Void
+    ) async -> Bool {
+        let directory = grokHome().appendingPathComponent("sessions", isDirectory: true)
+        let identity = directory.resolvingSymlinksInPath().standardizedFileURL.path
+        let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
+        guard let discoveredFiles = JSONLScanning.jsonlFilesIfComplete(under: directory) else { return false }
+        DiagnosticGate.clearFailure("grok.sessions.enumeration")
+        var files: [JSONLScanning.DiscoveredFile] = []
+        for file in discoveredFiles where URL(fileURLWithPath: file.path).lastPathComponent == "updates.jsonl" {
+            guard let isCoordinator = isCoordinatorSession(file) else { return false }
+            if isCoordinator { files.append(file) }
+        }
+        let futureIdentity = "grok.sessions.\(identity)"
+        guard !files.isEmpty else { return true }
+        let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        for file in files where FutureTimestampRevisionGate.shouldDefer(
+            identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
+        ) {
+            return false
+        }
+        let complete = await scanner.foldItems(
+            from: files, since: since, cacheIdentity: identity,
+            parseFile: Self.parseFile(at:),
+            visit: visit,
+            fileStarted: { _ in },
+            fileCompleted: { _, _ in }
+        )
+        return complete && !Task.isCancelled
+    }
+
     private static func logFutureTimestamp() {
         DiagnosticGate.logOnce(for: futureTimestampDiagnosticKey) {
             AppLog.warn(LogTag.plugin("grok"), "session usage contains a timestamp more than five minutes ahead; preserving last-good history")

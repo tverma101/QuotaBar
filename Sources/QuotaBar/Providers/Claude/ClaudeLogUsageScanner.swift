@@ -340,6 +340,24 @@ actor ClaudeLogUsageScanner {
         return .complete(result)
     }
 
+    /// Stream the window's usage entries for one-shot readers (the TPS Tracker) with the same
+    /// roots, dedup, and parse cache the Claude fold uses — no second credential or parse path.
+    /// `false` means the source was incomplete; callers keep last-good data.
+    @discardableResult
+    func foldUsageEntries(
+        daysBack: Int = 14,
+        now: Date = Date(),
+        visit: @Sendable (Entry) -> Void
+    ) async -> Bool {
+        // Reuse the native card's whole-file parse cache: the default path-joined identity would
+        // cold-parse the same sessions under a second namespace.
+        let identity = Self.parseSourceIdentity(environment: environment, homeDirectory: homeDirectory)
+        return await foldParsedEntries(
+            daysBack: daysBack, now: now, roots: claudeRoots(),
+            cacheIdentityOverride: identity, visit: visit
+        )
+    }
+
     /// The parsed usage entries of the last `daysBack` days — the same incremental scan the card's
     /// `scan()` runs, but returning the raw entries instead of the aggregated series. The OpenCode
     /// gateway fold uses this so both consumers share one persistent parse cache: unchanged session

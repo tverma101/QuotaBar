@@ -4,7 +4,7 @@ import Observation
 /// Shared persisted defaults and crash-recovery for provider selection. A single pending intent lets
 /// launch finish a user toggle if the process exits between its enabled-list and choice-marker writes.
 enum ProviderEnablementPersistence {
-    static let initiallyEnabledProviderIDs: Set<String> = ["claude", "codex", "cursor", "freebuff"]
+    static let initiallyEnabledProviderIDs: Set<String> = ["claude", "codex", "cursor", "freebuff", "tps"]
     static let firstRunSeedPendingKey = "openusage.firstRunProviderSeedPending.v1"
     static let pendingChoiceIntentKey = "openusage.pendingProviderChoiceIntent.v1"
     static let pendingResetIntentKey = "openusage.pendingProviderResetIntent.v1"

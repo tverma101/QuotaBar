@@ -25,6 +25,9 @@ struct LayoutInitialState {
     let shouldPersistPins: Bool
     let shouldPersistExpanded: Bool
     let shouldPersistExpandOnEnable: Bool
+    /// One-shot marker: the experimental TPS rows were retracted from dashboards (the feature
+    /// lives in the Total Spend panel now); the owner's layout must never show the card again.
+    let shouldPersistTpsRowsRemoved: Bool
     let seededDefaultsToPersist: Set<String>?
     let seededAccountPinsToPersist: Set<String>?
     let seededDefaultPinsToPersist: Set<String>?
@@ -40,12 +43,18 @@ enum LayoutBootstrap {
         defaults: LayoutDefaultSet
     ) -> LayoutInitialState {
         let hasStoredLayout = persistence.hasStoredLayout
+        let tpsRowIDs: Set<String> = ["tps.overall", "tps.claude", "tps.codex"]
+        let retractTpsRows = hasStoredLayout && !persistence.loadTpsRowsRemoved()
         let savedPlaced = persistence.loadPlaced()?.filter { registry.descriptor(id: $0.descriptorID) != nil }
         let startingPlaced = savedPlaced ?? defaults.metricIDs
             .filter { registry.descriptor(id: $0) != nil }
             .map { PlacedWidget(descriptorID: $0) }
+        // One-shot: drop the TPS provider card's rows seeded for one launch before any other
+        // pass consumes them. Everything else about the provider stays (enablement, refresh).
+        let retractedStartingPlaced = retractTpsRows ? startingPlaced.filter { !tpsRowIDs.contains($0.descriptorID) } : startingPlaced
+        let tpsRowsRemoved = retractTpsRows && retractedStartingPlaced.count != startingPlaced.count
         let seededResult = seedNewDefaultMetrics(
-            into: startingPlaced,
+            into: retractedStartingPlaced,
             persistence: persistence,
             hasStoredLayout: hasStoredLayout,
             registry: registry,
@@ -61,7 +70,8 @@ enum LayoutBootstrap {
         // family ID (for example, `claude.session`) to an account-scoped ID (`claude@hash.session`);
         // once that happens the old family descriptor is absent from the registry, but its saved pin
         // still needs to migrate to the active account instead of being filtered out first.
-        let savedPinIDs = Set(persistence.loadPins() ?? defaults.pinnedMetricIDs)
+        let savedPinIDs = Set((persistence.loadPins() ?? defaults.pinnedMetricIDs)
+            .filter { !(retractTpsRows && tpsRowIDs.contains($0)) })
         var pinnedMetricIDs = Set(savedPinIDs.filter { registry.descriptor(id: $0) != nil })
         let accountPinMigration = migrateAccountPins(
             pinnedMetricIDs: pinnedMetricIDs,
@@ -84,7 +94,9 @@ enum LayoutBootstrap {
         var shouldPersistExpanded = false
         var expandedMetricIDs: Set<String>
         if let savedExpanded = persistence.loadExpandedMetrics() {
-            expandedMetricIDs = Set(savedExpanded.filter { registry.descriptor(id: $0) != nil })
+            let stripped = retractTpsRows ? savedExpanded.filter { !tpsRowIDs.contains($0) } : savedExpanded
+            if stripped.count != savedExpanded.count { shouldPersistExpanded = true }
+            expandedMetricIDs = Set(stripped.filter { registry.descriptor(id: $0) != nil })
         } else if hasStoredLayout {
             expandedMetricIDs = []
         } else {
@@ -137,10 +149,11 @@ enum LayoutBootstrap {
             expandedProviderIDs: expandedProviderIDs,
             defaultExpandedOnEnableIDs: defaultExpandedOnEnableIDs,
             menuBarStyle: persistence.loadMenuBarStyle(),
-            shouldPersistPlaced: seededResult.shouldPersistPlaced,
+            shouldPersistPlaced: seededResult.shouldPersistPlaced || tpsRowsRemoved,
             shouldPersistPins: accountPinMigration.shouldPersistPins || defaultPinSeed.shouldPersistPins,
             shouldPersistExpanded: shouldPersistExpanded,
             shouldPersistExpandOnEnable: savedOnEnable == nil || !promotedQueuedIDs.isEmpty,
+            shouldPersistTpsRowsRemoved: retractTpsRows,
             seededDefaultsToPersist: seededResult.shouldPersistSeededDefaults
                 ? seededResult.seededDefaults
                 : nil,

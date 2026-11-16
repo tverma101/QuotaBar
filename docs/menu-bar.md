@@ -29,7 +29,7 @@ The dashboard footer's **Options** menu → **Usage History** opens a read-only 
 
 Star a metric from any row's right-click menu, or from the always-visible star beside a metric in Customize.
 
-- On first launch the app ships with a default set of stars (Antigravity Session/Weekly, Claude Session/Weekly, Codex Session/Weekly, Cursor Models/Other Models, Freebuff Daily Hours, Copilot Credits, OpenRouter Credits, Z.ai Session/Weekly) so the strip shows numbers right away. Change them anytime; a provider's Reset restores its defaults, and Reset All restores the full set. Only providers that are turned on render in the strip; new installs start with Claude, Codex, Cursor, and Freebuff on, while other providers stay off until you enable them in Customize.
+- On first launch the app ships with a default set of stars (Antigravity Session/Weekly, Claude Session/Weekly, Codex Session/Weekly, Cursor Models/Other Models, Freebuff Daily Hours, Copilot Credits, OpenRouter Credits, Z.ai Session/Weekly) so the strip shows numbers right away. Change them anytime; a provider's Reset restores its defaults, and Reset All restores the full set. Only providers that are turned on render in the strip; new installs start with Claude, Codex, Cursor, Freebuff, and TPS Tracker on, while other providers stay off until you enable them in Customize.
 - At most **2 stars per provider**.
 - When a star isn't allowed, the star button stays clickable — clicking it shakes and shows the reason in a temporary pill over the bottom of Customize (for example, "Up to 2 stars per provider").
 

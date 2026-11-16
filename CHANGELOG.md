@@ -18,6 +18,7 @@ QuotaBar's first public downloadable build. It does not update automatically; us
 
 ## Unreleased
 
+- Add the experimental TPS lens to the Total Spend panel, estimating tokens per second from every local-log corpus with per-report timing (Claude Code, Codex, Grok, Muse, Pi, and Z.ai's ZCode SQLite stream): rate arcs, per-provider average, and a model TPS list up to 12 rows; on by default for new installs, off until enabled in Customize for existing ones.
 - Preserve last-known Antigravity history across restarts when a conversation database disappears, while readable sources keep updating.
 - Page the full OpenRouter model catalog, recheck fallback-priced names so new exact routes replace stale estimates, and stop per-model checks after three misses.
 - Keep optional provider cards off until selected in Customize, preserve Freebuff in the default set, and reset to those explicit defaults.

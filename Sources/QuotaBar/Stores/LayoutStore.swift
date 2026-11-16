@@ -267,6 +267,7 @@ final class LayoutStore {
         }
         if initial.shouldPersistExpanded { persistExpanded() }
         if let seededDefaults = initial.seededDefaultsToPersist { persistSeededDefaults(seededDefaults) }
+        if initial.shouldPersistTpsRowsRemoved { persistence.saveTpsRowsRemoved() }
         if initial.shouldPersistPins { persistPins() }
         if let seededAccountPins = initial.seededAccountPinsToPersist {
             persistSeededAccountPins(seededAccountPins)

@@ -138,6 +138,18 @@ enum ShareCardRenderer {
         return renderAndCopy(view, label: metric.title.lowercased(), layout: layout)
     }
 
+    /// The TPS lens of the Total Spend card. `nil` when the TPS fold never produced a readable
+    /// estimate — the failure signal mirrors the spend share's path, never a copied empty PNG.
+    @discardableResult
+    static func shareTPS(tps: TPSTotal?, appearance: ColorScheme, layout: LayoutStore) -> Bool {
+        guard let tps, !tps.isEmpty || tps.combinedRate != nil else {
+            signalFailure()
+            return false
+        }
+        let view = TPSShareCardView(tps: tps, appearance: appearance)
+        return renderAndCopy(view, label: "tps", layout: layout)
+    }
+
     /// Shared render→copy pipeline for both share actions. Pins the render to regular density (the rows
     /// read density via `@AppStorage`, so the saved value is swapped to `.regular` for the render and
     /// restored on exit) so the export ignores the user's popover density slider; rasterizes `view`;
