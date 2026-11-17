@@ -58,7 +58,9 @@ accounts.
 ## Where credentials come from
 
 Use OpenCode as usual. QuotaBar reads OpenCode's local data directory
-(`~/.local/share/opencode`, or `$OPENCODE_DATA_DIR` / `$XDG_DATA_HOME` if you've set them): the
+(`~/.local/share/opencode`, or `$OPENCODE_DATA_DIR` / `$XDG_DATA_HOME` if you've set them) and any
+private T3 Code opencode-instance trees it can find via `~/.t3/userdata/settings.json`
+(`providerInstances`); those each get folded in verbatim: the
 `opencode-go` entry in `auth.json` to detect Go usage, and the local SQLite logs for the numbers. There's no login
 prompt and no token to paste. Keys saved through the app's settings are read alongside the `auth.json`
 keys. Routine startup inventories those Go keys only while the OpenCode provider is enabled. Opening
@@ -87,6 +89,10 @@ The spend tiles combine every client that dials the OpenCode gateway on this Mac
 5. Hermes sessions billed to the OpenCode account (`billing_provider` `opencode-go` / `opencode`, or
    the OpenCode Go base URL, in `~/.hermes/state.db`) — Hermes talks to the gateway directly and never
    writes `opencode*.db`.
+6. Private T3 Code provider instances whose driver is `opencode` (e.g. `numes`, `agentrouter-opencode`,
+   `experiential`, `nous-portal`) — each serves its own provider through its own private OpenCode
+   tree (`<tree>/data/opencode/opencode*.db`) and is folded in automatically; their Zen-Go-style
+   free models land in the model breakdown under OpenCode, with $0 cost as recorded.
 
 When a spend period includes a gateway row priced from tokens, its dollar value carries the estimate
 marker. A period made only of OpenCode's recorded SQLite costs stays unmarked, even if an older day
@@ -198,6 +204,10 @@ its own row instead of being listed twice, once as Other and again under it.
   requests, including when only one key is currently known. Unreadable credentials clear cached caps
   because their account owner cannot be verified. Local spend history still refreshes when its database
   can be read, and the last confirmed local history stays available if the database scan fails.
+- **A T3 Code opencode-driver instance is missing its usage** — instance-specific data lives in its
+  private tree (`<tree>/data/opencode/opencode.db`). QuotaBar discovers those from T3 Code's userdata
+  and folds them in automatically; their models (e.g. `z-ai/glm-5.3-flash`, `deepseek/deepseek-v4.1-flash`)
+  show up in the model breakdown, with `$0` cost as recorded by the gateway.
 - **Some dollars are imputed** — Claude Code sessions routed through the gateway don't record a
   per-message cost, so their dollars are imputed from token counts; the tokens are always measured.
 - **A warning triangle names a model** — a model the pricing catalogs don't know was used through the
