@@ -392,6 +392,306 @@ enum LineOutcome {
 }
 
 fn parse_line(line: &[u8]) -> LineOutcome {
+    // Borrowed typed fast path: deserialize only the fields this parser reads — file contents and
+    // tool output inside the line are skipped at scan speed instead of building a `Map` tree of the
+    // whole object. Any shape the typed model cannot express (an escaped string, duplicate keys, a
+    // non-string `type`/`timestamp`, a `message` that is not an object, …) falls back to the Value
+    // implementation wholesale, which produces exactly the pre-fast-path result.
+    match serde_json::from_slice::<TypedLine<'_>>(line) {
+        Ok(typed) => typed_line_outcome(line, typed),
+        Err(_) => value_parse_line(line),
+    }
+}
+
+/// Tri-state JSON token for the fields whose null-vs-absent distinction matters: the inner
+/// `RawValue` is `None` when the field is absent and `Some` (including a literal `null`) when it
+/// is present. `Option<Box<RawValue>>` cannot express this — `Option` swallows a present null.
+struct RawField(Option<Box<serde_json::value::RawValue>>);
+
+impl RawField {
+    fn absent() -> Self { RawField(None) }
+
+    fn raw(&self) -> Option<&serde_json::value::RawValue> {
+        self.0.as_deref()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RawField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(RawField(Some(Box::<serde_json::value::RawValue>::deserialize(
+            deserializer,
+        )?)))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TypedLine<'a> {
+    #[serde(rename = "type", default = "RawField::absent")]
+    line_type: RawField,
+    #[serde(borrow)]
+    timestamp: Option<&'a str>,
+    #[serde(rename = "isSidechain", default = "RawField::absent")]
+    is_sidechain: RawField,
+    #[serde(rename = "costUSD")]
+    cost_usd: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default = "RawField::absent")]
+    version: RawField,
+    #[serde(rename = "sessionId", default = "RawField::absent")]
+    session_id: RawField,
+    #[serde(rename = "requestId", default = "RawField::absent")]
+    request_id: RawField,
+    message: Option<TypedMessage>,
+    /// Tracked only to reproduce the "assistant with a top-level `usage`" malformed rule;
+    /// any JSON value — including `null` — counts as present.
+    #[serde(default = "RawField::absent")]
+    usage: RawField,
+}
+
+#[derive(serde::Deserialize)]
+struct TypedMessage {
+    #[serde(default = "RawField::absent")]
+    id: RawField,
+    #[serde(default = "RawField::absent")]
+    model: RawField,
+    /// Absent, `null`, or an object — present counts even as `null`.
+    #[serde(default = "RawField::absent")]
+    usage: RawField,
+}
+
+fn raw_bool(raw: &str) -> Option<bool> {
+    match raw.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a `costUSD` raw literal. The whole line is already known-valid JSON, so the first
+/// non-blank bytes decide the literal's kind.
+fn raw_number_f64(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    let first = *s.as_bytes().first()?;
+    if !(first == b'-' || first == b'+' || first.is_ascii_digit() || first == b'.') {
+        return None;
+    }
+    s.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// The inner bytes of a raw JSON string token (no unescaping). `None` for anything that is
+/// not a JSON string — null, number, bool, array, object.
+fn raw_string_inner(raw: &serde_json::value::RawValue) -> Option<&[u8]> {
+    let s = raw.get().trim();
+    s.strip_prefix('"')?.strip_suffix('"').map(str::as_bytes)
+}
+
+/// Validation-only non-empty check for an optional token: absent is valid, present must be a
+/// non-empty string.
+fn valid_optional_string(raw: Option<&serde_json::value::RawValue>) -> bool {
+    match raw {
+        None => true,
+        Some(raw) => raw_string_inner(raw).map(|inner| !inner.is_empty()).unwrap_or(false),
+    }
+}
+
+/// Escape-free string payload for entry construction. Returns `None` for non-strings.
+fn raw_plain_string(raw: &serde_json::value::RawValue) -> Option<&str> {
+    std::str::from_utf8(raw_string_inner(raw)?).ok()
+}
+
+/// True when a raw literal embeds a JSON escape — the typed path hands those to the Value
+/// implementation, which unescapes correctly.
+fn raw_has_escape(raw: Option<&serde_json::value::RawValue>) -> bool {
+    raw.is_some_and(|r| r.get().as_bytes().contains(&b'\\'))
+}
+
+fn typed_is_valid_entry(line: &TypedLine<'_>, message: &TypedMessage) -> bool {
+    if let Some(raw_version) = line.version.raw() {
+        match raw_plain_string(raw_version) {
+            Some(v) if is_valid_semver(v) => {}
+            _ => return false,
+        }
+    }
+    if !valid_optional_string(line.session_id.raw())
+        || !valid_optional_string(line.request_id.raw())
+        || !valid_optional_string(message.id.raw())
+    {
+        return false;
+    }
+    if let Some(raw_sidechain) = line.is_sidechain.raw() {
+        if raw_bool(raw_sidechain.get()).is_none() {
+            return false;
+        }
+    }
+    if let Some(raw_model) = message.model.raw() {
+        match raw_plain_string(raw_model) {
+            Some(m) if !m.trim().is_empty() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn typed_line_outcome(line_bytes: &[u8], line: TypedLine<'_>) -> LineOutcome {
+    // Escape guard: any string we'd have to unescape sends the whole line to the Value
+    // implementation, which handles escapes correctly.
+    if raw_has_escape(line.line_type.raw())
+        || raw_has_escape(line.version.raw())
+        || raw_has_escape(line.session_id.raw())
+        || raw_has_escape(line.request_id.raw())
+        || line.message
+            .as_ref()
+            .is_some_and(|m| raw_has_escape(m.id.raw()) || raw_has_escape(m.model.raw()))
+    {
+        return value_parse_line(line_bytes);
+    }
+    if let Some(raw) = line.line_type.raw() {
+        if raw.get() != "\"assistant\"" {
+            return LineOutcome::Parsed {
+                malformed: false,
+                entries: Vec::new(),
+            };
+        }
+    }
+
+    let has_top_level_usage = line.usage.raw().is_some();
+    let message = match &line.message {
+        Some(m) => m,
+        None => {
+            let malformed = line.line_type.raw().is_some() && has_top_level_usage;
+            return LineOutcome::Parsed {
+                malformed,
+                entries: Vec::new(),
+            };
+        }
+    };
+    let usage_map: Map<String, Value> = match message.usage.raw() {
+        Some(raw) => {
+            let trimmed = raw.get().trim();
+            if !trimmed.starts_with('{') {
+                // message.usage present but not an object (including valid JSON null) —
+                // the Value path flags this malformed.
+                return LineOutcome::Parsed {
+                    malformed: true,
+                    entries: Vec::new(),
+                };
+            }
+            match serde_json::from_str(raw.get()) {
+                Ok(map) => map,
+                Err(_) => {
+                    return LineOutcome::Parsed {
+                        malformed: true,
+                        entries: Vec::new(),
+                    };
+                }
+            }
+        }
+        None => {
+            let malformed = line.line_type.raw().is_some() && has_top_level_usage;
+            return LineOutcome::Parsed {
+                malformed,
+                entries: Vec::new(),
+            };
+        }
+    };
+
+    let mut malformed = false;
+
+    let timestamp_string = match line.timestamp {
+        Some(s) => s,
+        None => {
+            return LineOutcome::Parsed {
+                malformed: true,
+                entries: Vec::new(),
+            }
+        }
+    };
+    let timestamp = match parse_canonical_utc(timestamp_string.as_bytes()) {
+        CanonicalTimestamp::Ok(t) => t,
+        CanonicalTimestamp::Invalid => {
+            return LineOutcome::Parsed {
+                malformed: true,
+                entries: Vec::new(),
+            }
+        }
+        CanonicalTimestamp::NotCanonical => return value_parse_line(line_bytes),
+    };
+
+    if !typed_is_valid_entry(&line, message) {
+        return LineOutcome::Parsed {
+            malformed: true,
+            entries: Vec::new(),
+        };
+    }
+
+    let Some(parsed_usage) = token_breakdown(&usage_map, &mut malformed) else {
+        return LineOutcome::Parsed {
+            malformed: true,
+            entries: Vec::new(),
+        };
+    };
+
+    let cost_usd: Option<f64> = match line.cost_usd.as_deref() {
+        None => None,
+        Some(raw) => {
+            let literal = raw.get().trim();
+            let first = literal.as_bytes().first().copied().unwrap_or(b' ');
+            let is_number_literal =
+                first == b'-' || first == b'+' || first.is_ascii_digit() || first == b'.';
+            if literal == "null" {
+                None
+            } else if !is_number_literal {
+                // bool/string/array/object cost — the Value path flags this malformed.
+                return LineOutcome::Parsed {
+                    malformed: true,
+                    entries: Vec::new(),
+                };
+            } else if let Some(value) = raw_number_f64(literal) {
+                if value < 0.0 || value > 1e12 {
+                    return LineOutcome::Parsed {
+                        malformed: true,
+                        entries: Vec::new(),
+                    };
+                }
+                Some(value)
+            } else {
+                // Numeric-looking but non-finite (e.g. 1e400) — Value path flags malformed.
+                return LineOutcome::Parsed {
+                    malformed: true,
+                    entries: Vec::new(),
+                };
+            }
+        }
+    };
+
+    let model = message
+        .model
+        .raw()
+        .and_then(raw_plain_string)
+        .filter(|m| *m != "<synthetic>")
+        .map(str::to_string);
+    let parent_message_id = message.id.raw().and_then(raw_plain_string).map(str::to_string);
+    let request_id = line.request_id.raw().and_then(raw_plain_string).map(str::to_string);
+    let is_sidechain = raw_bool(line.is_sidechain.raw().map(|r| r.get()).unwrap_or("false")) == Some(true);
+
+    finalize_entries(
+        timestamp,
+        cost_usd,
+        parsed_usage,
+        parent_message_id,
+        request_id,
+        is_sidechain,
+        model,
+        &usage_map,
+        malformed,
+    )
+}
+
+/// The Value implementation, retained unchanged as the fallback for every shape the typed
+/// fast path declines.
+fn value_parse_line(line: &[u8]) -> LineOutcome {
     let value: Value = match serde_json::from_slice(line) {
         Ok(v) => v,
         Err(_) => {
@@ -522,6 +822,34 @@ fn parse_line(line: &[u8]) -> LineOutcome {
         .map(str::to_string);
     let is_sidechain = matches!(object.get("isSidechain"), Some(Value::Bool(true)));
 
+    finalize_entries(
+        timestamp,
+        cost_usd,
+        parsed_usage,
+        parent_message_id,
+        request_id,
+        is_sidechain,
+        model,
+        usage,
+        malformed,
+    )
+}
+
+/// Shared tail for both line implementations: build the parent entry, then the advisor
+/// iterations nested under `usage.iterations`, then enforce the per-line entry bound.
+fn finalize_entries(
+    timestamp: f64,
+    cost_usd: Option<f64>,
+    parsed_usage: Breakdown,
+    parent_message_id: Option<String>,
+    request_id: Option<String>,
+    is_sidechain: bool,
+    model: Option<String>,
+    usage: &Map<String, Value>,
+    malformed: bool,
+) -> LineOutcome {
+    let mut malformed = malformed;
+    let parent_id = parent_message_id.clone();
     let parent = EntryOut {
         timestamp,
         cost_usd,
@@ -573,7 +901,7 @@ fn parse_line(line: &[u8]) -> LineOutcome {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
 
-                let message_id = parent_message_id
+                let message_id = parent_id
                     .as_ref()
                     .map(|id| format!("{id}:advisor:{advisor_index}"));
                 entries.push(EntryOut {
@@ -1006,3 +1334,4 @@ mod tests {
         assert!(matches!(parse_line(line.as_bytes()), LineOutcome::Fallback));
     }
 }
+

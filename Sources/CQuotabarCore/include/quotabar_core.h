@@ -165,6 +165,11 @@ const uint8_t *qb_pricing_compact_catalog_strings(const void *result, uint32_t *
 uint8_t qb_pricing_compact_catalog_retired_present(const void *result);
 void qb_pricing_compact_catalog_destroy(void *result);
 
+/// Find the first occurrence of `byte` in `haystack[0..length)` starting at `start`.
+/// Returns the absolute index, or -1 when absent. Implemented with the platform's vectorized
+/// `memchr(3)`; Swift's generic `Collection.firstIndex(of:)` scans byte by byte, which showed up
+/// as the second-largest line-splitting cost on the JSONL read hot path.
+intptr_t qb_find_byte(const uint8_t *haystack, size_t length, uint8_t byte, size_t start);
 
 #ifdef __cplusplus
 }
