@@ -1,4 +1,5 @@
 import Foundation
+import CQuotabarCore
 
 /// Reads a JSONL file without materializing the whole file in memory.
 ///
@@ -189,7 +190,9 @@ enum JSONLFileReader {
 
     /// Split one chunk into newline-delimited lines and hand each to `deliver`, carrying an
     /// unterminated tail into the next chunk. Split out of `readLines` so the caller can wrap a whole
-    /// chunk — read plus split — in one autorelease pool.
+    /// chunk — read plus split — in one autorelease pool. Newline searches go through the platform's
+    /// vectorized `memchr(3)`; Swift's `Collection.firstIndex(of:)` scanned byte by byte, which showed
+    /// up as real work on the read hot path.
     private static func splitAndDeliver(
         _ chunk: Data,
         carry: inout Data,
@@ -198,52 +201,60 @@ enum JSONLFileReader {
         maxLineBytes: Int,
         deliver: (Data.SubSequence) -> Void
     ) {
-        var segmentStart = chunk.startIndex
-        while segmentStart < chunk.endIndex,
-              let newline = chunk[segmentStart...].firstIndex(of: UInt8(ascii: "\n"))
-        {
-            if discarding {
-                // We already exceeded the bound in an earlier chunk. The newline ends that one
-                // rejected logical record; later records in this same chunk remain eligible.
-                discarding = false
-            } else if carry.isEmpty {
-                let line = chunk[segmentStart..<newline]
-                if line.count <= maxLineBytes {
-                    deliver(line)
-                } else {
-                    statistics.oversizedLinesSkipped += 1
-                }
-            } else {
-                let continuation = chunk[segmentStart..<newline]
-                if carry.count + continuation.count <= maxLineBytes {
-                    if !continuation.isEmpty {
-                        carry.append(contentsOf: continuation)
-                        statistics.bytesCopiedIntoCarry += continuation.count
-                        statistics.peakCarryBytes = max(statistics.peakCarryBytes, carry.count)
+        // `Data.withUnsafeBytes` exposes exactly the bytes in `[chunk.startIndex, chunk.endIndex)`,
+        // so a storage offset `s` maps to `Data` index `chunk.startIndex + s` — correct for slices.
+        let dataStart = chunk.startIndex
+        chunk.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            let total = raw.count
+            var segmentStart = 0
+            while segmentStart < total {
+                let located = qb_find_byte(base, total, UInt8(ascii: "\n"), segmentStart)
+                guard located >= 0 else { break }
+                let newline = Int(located)
+                if discarding {
+                    // We already exceeded the bound in an earlier chunk. The newline ends that one
+                    // rejected logical record; later records in this same chunk remain eligible.
+                    discarding = false
+                } else if carry.isEmpty {
+                    let line = chunk[dataStart + segmentStart..<dataStart + newline]
+                    if line.count <= maxLineBytes {
+                        deliver(line)
+                    } else {
+                        statistics.oversizedLinesSkipped += 1
                     }
-                    deliver(carry[...])
                 } else {
-                    statistics.oversizedLinesSkipped += 1
+                    let continuation = chunk[dataStart + segmentStart..<dataStart + newline]
+                    if carry.count + continuation.count <= maxLineBytes {
+                        if !continuation.isEmpty {
+                            carry.append(contentsOf: continuation)
+                            statistics.bytesCopiedIntoCarry += continuation.count
+                            statistics.peakCarryBytes = max(statistics.peakCarryBytes, carry.count)
+                        }
+                        deliver(carry[...])
+                    } else {
+                        statistics.oversizedLinesSkipped += 1
+                    }
+                    carry.removeAll(keepingCapacity: true)
                 }
-                carry.removeAll(keepingCapacity: true)
+                segmentStart = newline + 1
             }
-            segmentStart = chunk.index(after: newline)
-        }
 
-        if segmentStart < chunk.endIndex, !discarding {
-            let tail = chunk[segmentStart..<chunk.endIndex]
-            if carry.count + tail.count <= maxLineBytes {
-                carry.append(contentsOf: tail)
-                statistics.bytesCopiedIntoCarry += tail.count
-                statistics.peakCarryBytes = max(statistics.peakCarryBytes, carry.count)
-            } else {
-                // Drop the accumulated bytes immediately and ignore continuation chunks until
-                // the next newline. This is the memory safety boundary for malformed giant rows.
-                statistics.oversizedLinesSkipped += 1
-                carry.removeAll(keepingCapacity: true)
-                discarding = true
+            if segmentStart < total, !discarding {
+                let tail = chunk[dataStart + segmentStart..<chunk.endIndex]
+                if carry.count + tail.count <= maxLineBytes {
+                    carry.append(contentsOf: tail)
+                    statistics.bytesCopiedIntoCarry += tail.count
+                    statistics.peakCarryBytes = max(statistics.peakCarryBytes, carry.count)
+                } else {
+                    // Drop the accumulated bytes immediately and ignore continuation chunks until
+                    // the next newline. This is the memory safety boundary for malformed giant rows.
+                    statistics.oversizedLinesSkipped += 1
+                    carry.removeAll(keepingCapacity: true)
+                    discarding = true
+                }
             }
         }
-}
+    }
 
 }
