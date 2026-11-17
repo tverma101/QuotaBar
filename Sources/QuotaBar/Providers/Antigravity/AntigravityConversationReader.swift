@@ -32,25 +32,45 @@ enum AntigravityConversationReader {
         ".gemini/antigravity-ide"
     ]
 
-    /// Every conversation database under the local stores, in path order (stable for dedup).
-    static func conversationDatabases(home: URL) -> [URL] {
+    /// Every conversation database under the local stores, in path order (stable for dedup),
+    /// skipping any whose content cannot hold an in-window row. A database mutates its WAL on
+    /// every step, so a stale file (and no newer `-wal` companion) can only hold out-of-window
+    /// history — the planner query never needs to open it.
+    static func conversationDatabases(home: URL, sinceMs: Int64 = 0) -> [URL] {
         var found: [URL] = []
         for subpath in storeSubpaths {
             let conversations = home.appendingPathComponent(subpath)
                 .appendingPathComponent("conversations", isDirectory: true)
             guard let entries = try? FileManager.default.contentsOfDirectory(
                 at: conversations,
-                includingPropertiesForKeys: [.isRegularFileKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles]
             ) else { continue }
             for entry in entries {
                 let name = entry.lastPathComponent.lowercased()
                 guard name.hasSuffix(".db") else { continue }
                 guard isConversationDatabaseName(name: entry.lastPathComponent) else { continue }
+                if skipStale(entry, sinceMs: sinceMs) { continue }
                 found.append(entry)
             }
         }
         return found.sorted { $0.path < $1.path }
+    }
+
+    /// True when both the database and an active WAL companion cannot have been written inside the
+    /// window. Missing files are treated as stale (nothing to fold).
+    private static func skipStale(_ entry: URL, sinceMs: Int64) -> Bool {
+        func modifiedMs(_ url: URL) -> Int64? {
+            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
+                  let mtime = values.contentModificationDate else { return nil }
+            return Int64(mtime.timeIntervalSince1970 * 1000)
+        }
+        let walModifiedMs = modifiedMs(entry.appendingPathExtension("wal"))
+        let mainModifiedMs = modifiedMs(entry)
+        // A WAL that is newer than the window can carry in-flight steps; keep the database.
+        if let walModifiedMs, walModifiedMs >= sinceMs { return false }
+        // No WAL (or a stale WAL) and a stale main file: nothing in the window can exist.
+        return mainModifiedMs.map { $0 < sinceMs } ?? true
     }
 
     /// UUID-shaped database names only — `conversation_summaries.db` and friends are not conversations.
@@ -70,7 +90,7 @@ enum AntigravityConversationReader {
         )
         var seen = Set<String>()
         var results: [AntigravityResponse] = []
-        for path in conversationDatabases(home: home) {
+        for path in conversationDatabases(home: home, sinceMs: sinceMs) {
             guard let rows = readPlannerResponses(at: path, sinceMs: sinceMs) else { continue }
             for row in rows {
                 guard seen.insert(row.key).inserted else { continue }
