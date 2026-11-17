@@ -23,20 +23,21 @@ struct DashboardView: View {
     @Environment(\.reduceAnimations) private var reduceAnimations
     @State private var reorderLift: ReorderLift?
     /// The panel height SwiftUI drives — the single animation clock. `PanelHeightModifier` follows it
-    /// frame-by-frame onto the AppKit panel, so the window resize rides the same spring as the screen
-    /// slide (no second AppKit animation to fight). 0 means "not established yet": the panel keeps the
-    /// size the controller opened it at until the first measurement lands, then we snap un-animated.
+    /// frame-by-frame onto the AppKit panel, so the window resize rides the same animation as the
+    /// screen slide (no second AppKit animation to fight). 0 means "not established yet": the panel keeps
+    /// the size the controller opened it at until the first measurement lands, then we snap un-animated.
     @State private var animatedHeight: CGFloat = 0
     /// Whether `animatedHeight` has been seeded for this open. Until then the first measurement (or a
-    /// reopen) establishes it without animation; afterwards, changes spring.
+    /// reopen) establishes it without animation; afterwards, changes animate at the native pace.
     @State private var didEstablishHeight = false
     /// Popover auto-fit height computation: per-screen measured pieces summed into each screen's clamped
     /// morph target (`heightCoordinator.measuredIdeal` / `.target(for:)`). Written from the geometry
-    /// actions below. The animation itself — `animatedHeight`, the slide, the `withAnimation` spring —
+    /// actions below. The animation itself — `animatedHeight`, the slide, the native-pace
+    /// `withAnimation` —
     /// stays in this view; the coordinator holds only the deterministic measurement.
     @State private var heightCoordinator = PanelHeightCoordinator(topBarHeight: Self.topBarHeight)
     /// Horizontal screen-switch slide: 0 shows the outgoing screen, 1 the incoming one. Drives the
-    /// page offset so the screens slide between modes on one spring.
+    /// page offset so the screens slide between modes at the native pace.
     @State private var slideProgress: CGFloat = 1
     /// The `layout.screenSlideID` whose slide has begun animating. Until it catches up to the store's
     /// id, a freshly-started transition pins to the outgoing screen so the first frame never flashes
@@ -75,11 +76,11 @@ struct DashboardView: View {
             // Paint the page surface behind all content (and the footer). Opaque by default so the
             // popover reads as one solid panel; under Increase Transparency / the egg it clears so the
             // behind-window backdrop (or party gradient) shows through. Outermost so the footer, header,
-            // and scroll content all sit on it; separation from the footer comes from the native soft
-            // scroll-edge fade (not a distinct bar).
+            // and scroll content all sit on it; separation from the footer comes from the bars' fade/frost
+            // (not a distinct surface).
             .background(PopoverSurface())
             // Drive the host panel's height on SwiftUI's clock. At the body root, OUTSIDE `modeBody`'s
-            // `.animation(nil, value: layout.screenSlideID)`, so the height rides the active spring (the
+            // `.animation(nil, value: layout.screenSlideID)`, so the height rides the active animation (the
             // slide's, during a switch) instead of being snapped.
             .drivesPanelHeight(animatedHeight)
             .overlay(alignment: .topLeading) {
@@ -178,16 +179,16 @@ struct DashboardView: View {
                 if !isL1Visible { isPresentingResetAllConfirm = false }
             }
             // Each screen switch: pin to the outgoing screen for one render (`slideProgress = 0`),
-            // then spring to the incoming one on the next runloop tick. Deferring the animation one
+            // then animate to the incoming one on the next runloop tick. Deferring the animation one
             // tick is what makes it animate — setting 0 then 1 in the same closure collapses to a
             // no-op (SwiftUI animates from the last *committed* value). `slideProgress` drives the
-            // page offset so the screens slide between modes on one spring.
+            // page offset so the screens slide between modes at the native pace.
             .onChange(of: layout.screenSlideID) { _, id in
                 guard id != 0 else { return }
                 if reduceAnimations {
                     // Snap as one structural update. Mounting the normal two-page pager for even one
                     // frame would pair the destination header with the outgoing screen; scheduling the
-                    // spring would also keep that stale structure alive until its delayed completion.
+                    // screen animation would also keep that stale structure alive until its delayed completion.
                     animatedSlideID = id
                     slideProgress = 1
                     if let target = heightCoordinator.target(for: layout.screen) {
@@ -457,9 +458,9 @@ struct DashboardView: View {
     /// is keyed off `layout.screen` — the *destination* — not the per-page `screen`, so during a switch
     /// both mounted pages render identical chrome pinned to the
     /// same edges. The chrome therefore stays put while only the content offsets beneath it (the
-    /// "one fixed footer / top bar doesn't slide" behaviour). The soft scroll-edge styles and the
-    /// pinned bars attach to each page's scroll view (`PopoverScrollView`), the documented place for
-    /// them. Identity stays stable across the slide via the `ForEach` key in `modeBody`.
+    /// "one fixed footer / top bar doesn't slide" behaviour). The fade/frost bars attach to each
+    /// page's scroll view (`PopoverScrollView` ➜ `panelBars`), the documented place for them. Identity
+    /// stays stable across the slide via the `ForEach` key in `modeBody`.
     @ViewBuilder
     private func screenView(_ screen: PopoverScreen, includeChrome: Bool = true) -> some View {
         scrollBody(for: screen)
