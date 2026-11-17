@@ -71,6 +71,16 @@ struct OpenCodeUsageScanner: Sendable {
     /// The OpenCode-hosted providerIDs we track: the Go subscription and the Zen pay-as-you-go gateway.
     /// Both write an authoritative `cost`; other (BYO-key) providerIDs log `cost: 0` and are out of scope.
     static let hostedProviderIDs = ["opencode-go", "opencode"]
+
+    /// The providerIDs whose rows the fold captures: the Go subscription and Zen pay-as-you-go on
+    /// the shared instance, plus every providerID declared by T3 Code's private OpenCode instances
+    /// (numes, agentrouter-t3, experiential, nous-portal — each serves exactly its own provider).
+    /// Computed once per process; missing/unreadable T3 Code settings contribute nothing.
+    static let capturedProviderIDs: [String] = {
+        var ids = Set(hostedProviderIDs)
+        ids.formUnion(OpenCodePaths.t3CodePrivateDeclaredProviderIDs())
+        return ids.sorted()
+    }()
     static let goProviderID = "opencode-go"
     private static let zenProviderID = "opencode"
 
@@ -134,7 +144,18 @@ struct OpenCodeUsageScanner: Sendable {
             environment: ProcessEnvironmentReader(),
             homeDirectory: FileManager.default.homeDirectoryForCurrentUser
         )
-        return try OpenCodePaths.databaseFiles(in: dir)
+        var paths = try OpenCodePaths.databaseFiles(in: dir)
+        // T3 Code's private OpenCode instances (driver `opencode` with their own binary, e.g.
+        // numes/experiential/agentrouter/nous-portal) keep isolated data trees. Fold their
+        // databases in as additional sources — they are the same provider, just different trees.
+        // A missing/unreadable private tree contributes nothing and never throws.
+        for privateDir in OpenCodePaths.t3CodePrivateDataDirectories() {
+            if let privPaths = try? OpenCodePaths.databaseFiles(in: privateDir) {
+                let missing = privPaths.filter { !paths.contains($0) }
+                paths.append(contentsOf: missing)
+            }
+        }
+        return paths
     }
 
     /// A missing implicit Hermes installation is an optional source. An explicit HERMES_HOME is a

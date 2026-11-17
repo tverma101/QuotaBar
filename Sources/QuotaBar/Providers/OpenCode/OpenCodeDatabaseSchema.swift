@@ -121,7 +121,7 @@ enum OpenCodeDatabaseSQL {
         let source = sourceSQL(
             schema: schema.effective,
             cutoffMs: cutoffMs,
-            providers: OpenCodeUsageScanner.hostedProviderIDs
+            providers: OpenCodeUsageScanner.capturedProviderIDs
         )
         return """
         WITH source AS (
