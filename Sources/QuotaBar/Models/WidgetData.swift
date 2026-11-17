@@ -133,9 +133,7 @@ struct WidgetData: Hashable {
 
     /// How a session-window meter tells a not-yet-started window from an in-flight one.
     enum SessionStartSignal: Hashable {
-        /// Zero usage is the fresh signal. These providers report a reset instant even for an
-        /// untouched window (Antigravity's mapper rounds a fresh pool's fraction-derived percent
-        /// to 0; OpenCode reports 0 directly), so `used == 0` is what marks the window as fresh.
+        /// Antigravity supplies reset dates for untouched windows. Only exact zero usage marks them fresh.
         case zeroUsage
         /// A missing reset date is the fresh signal. Claude's five-hour block only exists once the
         /// first message is sent, so a reported `resets_at` proves the window started. Zero usage is
@@ -670,11 +668,9 @@ extension WidgetData {
         case .healthy: guard alwaysShowPacing else { return nil }
         case .closeToLimit, .runningOut: break
         }
-        guard let ctx = paceContext else { return nil }
-        let windowStart = ctx.resetsAt.addingTimeInterval(-ctx.period)
-        let elapsed = now.timeIntervalSince(windowStart)
-        guard elapsed >= Pace.minimumElapsed(periodDuration: ctx.period), now < ctx.resetsAt else { return nil }
-        let elapsedFraction = min(max(elapsed / ctx.period, 0), 1)
+        guard let ctx = paceContext,
+              let elapsedFraction = Pace.elapsedShare(resetsAt: ctx.resetsAt, periodDuration: ctx.period, now: now)
+        else { return nil }
         return displayMode == .remaining ? 1 - elapsedFraction : elapsedFraction
     }
 

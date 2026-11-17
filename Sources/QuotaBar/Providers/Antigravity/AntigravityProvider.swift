@@ -637,11 +637,13 @@ final class AntigravityProvider: ProviderRuntime {
     }
 
     private func loadCodeAssist(token: String) async throws -> CodeAssistLookup {
+        // Plan and project lookups prefer production; daily has the active counters for quota reads.
         switch try await usageClient.cloudCode(
             path: AntigravityUsageClient.loadCodeAssistPath,
             token: token,
             userAgent: "agy",
-            body: [:]
+            body: [:],
+            bases: AntigravityUsageClient.planProjectURLs
         ) {
         case .authFailed:
             return .authFailed

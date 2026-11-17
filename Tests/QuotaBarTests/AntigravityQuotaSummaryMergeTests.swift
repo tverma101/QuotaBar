@@ -96,7 +96,8 @@ final class AntigravityQuotaSummaryMergeTests: XCTestCase {
             case .forbidden: XCTAssertEqual(status, 403)
             default: XCTFail("Authentication classification changed")
             }
-            XCTAssertEqual(denied.requests.count, 1)
+            // The summary asks both hosts before classifying: daily can 401 a token production accepts.
+            XCTAssertEqual(denied.requests.count, 2)
         }
     }
 
@@ -111,6 +112,36 @@ final class AntigravityQuotaSummaryMergeTests: XCTestCase {
         } catch is CancellationError {
             XCTAssertEqual(http.requests.count, 2)
         } catch { XCTFail("Unexpected error: \(error)") }
+    }
+
+    @MainActor
+    func testPlanLookupPrefersTheProductionHost() async {
+        let http = RoutingHTTPClient { request in
+            if request.url.path == AntigravityUsageClient.quotaSummaryPath {
+                return Self.response(Self.complete)
+            }
+            if request.url.path == AntigravityUsageClient.loadCodeAssistPath {
+                if request.url.host == "cloudcode-pa.googleapis.com" {
+                    return Self.response(#"{"paidTier":{"id":"g1-ultra-lite-tier"}}"#)
+                }
+                return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+        let token = #"{"token":{"access_token":"test","expiry":"2099-01-01T00:00:00Z"}}"#
+        let provider = AntigravityProvider(
+            authStore: AntigravityAuthStore(keychain: FakeKeychain("go-keyring-base64:" + Data(token.utf8).base64EncodedString()), files: FakeFiles()),
+            usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
+            discovery: LanguageServerDiscovery(processRunner: MergeNoProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-plan-test" })
+        )
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.plan, "Ultra Lite")
+        let planHosts = http.requests
+            .filter { $0.url.path == AntigravityUsageClient.loadCodeAssistPath }
+            .compactMap { $0.url.host }
+        XCTAssertEqual(planHosts, ["cloudcode-pa.googleapis.com"], "plan and project lookups prefer production; daily answers quotas")
     }
 
     @MainActor

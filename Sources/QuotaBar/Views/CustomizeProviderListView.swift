@@ -92,7 +92,7 @@ struct CustomizeProviderListView: View {
                 }
             },
             onToggle: { container.enablement.setEnabled($0, for: row.id) },
-            onOpen: { withAnimation(Motion.spring) { layout.customizeProviderID = row.id } }
+            onOpen: { withAnimation(Motion.navigation) { layout.customizeProviderID = row.id } }
         )
         .opacity(activeProviderID == row.id ? 0 : 1)
         .reorderFrame(id: row.id, in: .named(reorderSpaceName))

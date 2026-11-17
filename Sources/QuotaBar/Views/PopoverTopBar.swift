@@ -58,7 +58,7 @@ struct PopoverTopBar: View {
 
     private func customizeBack() {
         if layout.customizeProviderID != nil {
-            withAnimation(Motion.spring) { layout.customizeProviderID = nil }
+            withAnimation(Motion.navigation) { layout.customizeProviderID = nil }
         } else {
             withAnimation(Motion.modeSwitch) { layout.screen = .dashboard }
         }
