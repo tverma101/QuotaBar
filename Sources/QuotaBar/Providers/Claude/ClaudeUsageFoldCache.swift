@@ -20,7 +20,7 @@ struct ClaudeUsageFoldCache<Value: Sendable>: Sendable {
         guard self.key == key, now >= observedAt else { return nil }
         let kind = key.pricingToken == nil ? "gateway" : "aggregate"
         let diagnosticKey = "claude.fold.source-changed.\(kind)." + JSONLScanCachePaths.stableFingerprint(key.identity)
-        guard JSONLScanning.filesStillMatch(key.files) else {
+        guard JSONLScanning.filesStillConsistent(key.files) else {
             if !Task.isCancelled {
                 DiagnosticGate.logOnce(for: diagnosticKey) {
                     AppLog.warn(LogTag.plugin("claude"), "session source changed before cached history could be reused; checking the source again")
