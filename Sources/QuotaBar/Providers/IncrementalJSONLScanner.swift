@@ -26,24 +26,38 @@ enum JSONLScanning {
         now.addingTimeInterval(5 * 60)
     }
 
-    /// Recheck after asynchronous ownership/cache work; a discovered revision can change while its
-    /// caller is suspended. Keep this identical for full folds and compact-result cache hits.
-    static func filesStillMatch(_ files: [DiscoveredFile]) -> Bool {
+    /// Consistency check for append-only corpora, replacing the strict `filesStillMatch` on fold
+    /// paths. On a live machine agents append to their session logs constantly, so a discovered
+    /// tree *grown since discovery* is the normal case, not a torn fold — `foldItems` would void
+    /// every completed scan on those machines and return false forever. The rule: a file whose
+    /// size strictly grew is an append; a file whose size is identical must have the identical
+    /// stat (in-place rewrite of an equal-size file is a torn source, not an append). What still
+    /// taints the fold: the file vanished, shrank, or changed bytes without growing. A rewrite
+    /// that only *grows* bytes past the observed size is tolerated; those shapes are caught
+    /// earlier by the append checkpoints (anchor sampling and fragment carry) and self-correct
+    /// on the next scan.
+    static func filesStillConsistent(_ files: [DiscoveredFile]) -> Bool {
         let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey]
         return files.allSatisfy { file in
             guard !Task.isCancelled else { return false }
             let url = URL(fileURLWithPath: file.path)
             guard let revision = AppendOnlyFileProbe.revision(at: url),
-                  file.size >= 0, revision.size == UInt64(file.size),
+                  file.size >= 0,
                   let values = try? url.resourceValues(forKeys: keys)
             else { return false }
-            return values.fileSize == file.size
-                && values.contentModificationDate == file.mtime
-                && values.attributeModificationDate == file.attributeMtime
-                && AppendOnlyFileProbe.revision(at: url) == revision
+            if revision.size > UInt64(file.size) {
+                // Appended since discovery — the normal case while an agent is running.
+                return true
+            }
+            guard values.fileSize == file.size,
+                  values.contentModificationDate == file.mtime else { return false }
+            if let attributeMtime = values.attributeModificationDate,
+               let observedAttribute = file.attributeMtime {
+                guard attributeMtime == observedAttribute else { return false }
+            }
+            return true
         }
     }
-
     /// Every `*.jsonl` regular file under `dir` (recursively), path-sorted so a keep-first dedup is
     /// deterministic. A missing optional root is a complete empty result; an existing root that cannot
     /// be read or fully enumerated returns nil so a multi-root caller cannot publish partial history.
@@ -487,7 +501,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         _ files: [JSONLScanning.DiscoveredFile],
         cacheIdentity: String
     ) -> Bool {
-        let changed = !JSONLScanning.filesStillMatch(files)
+        let changed = !JSONLScanning.filesStillConsistent(files)
         let diagnosticKey = "jsonl.scan.source-changed.\(JSONLScanCachePaths.stableFingerprint(logTag + "|" + cacheIdentity))"
         guard changed else {
             DiagnosticGate.clearFailure(diagnosticKey)
