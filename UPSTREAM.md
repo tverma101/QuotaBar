@@ -69,7 +69,8 @@ Local changes that matter when syncing shared code:
 ## Local deltas — 2026-11-16
 
 Beyond the rebrand, the fork adds a Total Spend panel **TPS lens** (`AIProvider`-free; a TPS fold of every local-log
-corpus (Claude Code, Codex, Grok, Muse, Pi) surfaced through `TotalSpendCard`, never a dashboard card) and shared panel chrome
+corpus (Claude Code, Codex, Grok, Muse, Pi, Z.ai, Antigravity) surfaced through `TotalSpendCard`,
+never a dashboard card) and shared panel chrome
 (`ShareCardRenderer`, `TPSSpendPanel`, `TPSTotal`). Upstream rebuilt its panel around Priority in 0.8 —
 fork deltas in `TotalSpendCard`, `DashboardContentView`, `TotalSpendAggregator` and `MetricFormatter`
 conflict with that 0.8 work and need manual attention if upstream's spend UI is ever adapted.

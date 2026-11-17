@@ -54,7 +54,7 @@ struct TokensPerSecondEstimate: Equatable, Sendable {
     }
 
     /// Canonical corpus order the lens renders (also the values-line emission order).
-    static let providerOrder: [String] = ["claude", "codex", "grok", "muse", "pi", "zai"]
+    static let providerOrder: [String] = ["claude", "codex", "grok", "muse", "pi", "zai", "antigravity"]
 
     var combined: TokensPerSecondCorpus {
         var total = TokensPerSecondCorpus()
@@ -190,7 +190,8 @@ enum TokensPerSecondMapper {
         "grok": "Grok",
         "muse": "Muse",
         "pi": "Pi",
-        "zai": "Z.ai"
+        "zai": "Z.ai",
+        "antigravity": "Antigravity"
     ]
 
     static func lines(_ estimate: TokensPerSecondEstimate) -> [MetricLine] {

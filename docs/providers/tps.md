@@ -10,7 +10,7 @@ The Total Spend ring at the top of the dashboard has a title pull-down: **Cost**
 **Tokens**, **TPS**. Pick **TPS** and the whole panel becomes TPS:
 
 - **Ring** — each provider's share of generation pace (rate-based arcs, same morph math as Cost/MTok).
-- **Center** — your combined estimate, token-weighted across every corpus.
+- **Center** — your combined estimate, token-weighted across every corpus (Claude, Codex, Grok, Muse, Pi, Z.ai, Antigravity).
 - **Legend** — per provider: its average tokens/sec, ranked fastest first (Claude, Codex, Grok,
   Muse, Pi today).
 - **Model TPS** — the models your machines actually generated from, ranked by output tokens, with
@@ -37,7 +37,7 @@ If the fold fails you get a loud error state in the panel with a Retry — never
 
 Output tokens per consecutive usage report, folded over the last 14 days:
 
-Six corpora are folded; JSONL ones reuse the same incremental parse caches their spend tiles use:
+Seven corpora are folded; JSONL ones reuse the same incremental parse caches their spend tiles use:
 
 - Claude Code writes one usage block per assistant message in `~/.claude/projects/**/*.jsonl`
   (or the `projects/` dir under each `CLAUDE_CONFIG_DIR` root, plus Claude desktop sandboxes).
@@ -50,6 +50,13 @@ Six corpora are folded; JSONL ones reuse the same incremental parse caches their
   `started_at`, `first_token_at`/`completed_at`, `output_tokens` and `model_id`. When the server
   reported first-token timing, the fold uses the stream interval verbatim (up to five minutes of
   generation per row); rows without a stream window fold through the same pair rule as the rest.
+- Antigravity (agy CLI, desktop app and IDE) keeps one SQLite conversation database per conversation
+  under `~/.gemini/antigravity*/conversations` (UUID-shaped `.db` files). The fold reads each one
+  read-only (immutable when no `-wal` exists), pulls `PLANNER_RESPONSE` steps and measures
+  `output_tokens` over the row's own `created_at → finished_generating_at` stream window when the
+  row has one (up to five minutes), falling back to the pair rule otherwise. Response ids dedupe
+  across stores (forked copies). Open, error and cancelled planner rows contribute tokens but no
+  timing — the Antigravity reader is derived from the Agent Speed project (MIT).
 
 For every pair of consecutive reports inside one source, QuotaBar takes the output-token delta
 divided by the elapsed seconds. Intervals shorter than 0.2 s (timer granularity) and longer than
@@ -90,5 +97,9 @@ corpus (e.g. no Grok install) is just an absent slice, never an error.
   one was unreadable this pass (the panel shows the error state with Retry).
 - **Model TPS section is missing** — no model accumulated paired reports in the window; it appears
   on its own once generation data exists.
+- **Antigravity slice is missing** — stored conversations are read from
+  `~/.gemini/antigravity{,-cli,-ide}/conversations/*.db`; fresh conversations appear on the next
+  accounting pass. A database that cannot be opened or has no readable planner rows contributes
+  nothing.
 - **Rate looks absurdly high or low** — it is an estimate over a 0.2–60 s interval band; compare
   the same model across similar sessions, or not at all. The chart caption reiterates the caveat.

@@ -17,6 +17,7 @@ actor TokensPerSecondScanner {
     private let pi: PiUsageScanner
     private let museSessionsRoot: @Sendable () -> URL
     private let zaiDatabasePath: @Sendable () -> String?
+    private let antigravityHome: @Sendable () -> URL
 
     init(
         claude: ClaudeLogUsageScanner = ClaudeLogUsageScanner(),
@@ -30,7 +31,8 @@ actor TokensPerSecondScanner {
         zaiDatabasePath: @escaping @Sendable () -> String? = {
             let path = (ZCodeUsageScanner.defaultSqlitePath as NSString).expandingTildeInPath
             return FileManager.default.fileExists(atPath: path) ? path : nil
-        }
+        },
+        antigravityHome: @escaping @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser }
     ) {
         self.claude = claude
         self.codex = codex
@@ -39,6 +41,7 @@ actor TokensPerSecondScanner {
         self.pi = pi
         self.museSessionsRoot = museSessionsRoot
         self.zaiDatabasePath = zaiDatabasePath
+        self.antigravityHome = antigravityHome
     }
 
     /// `nil` when any source changed mid-fold or could not be read; callers keep last-good data
@@ -105,6 +108,11 @@ actor TokensPerSecondScanner {
         guard await zaiFold(daysBack: daysBack, now: now, accumulators: accumulators), !Task.isCancelled
         else { return nil }
 
+        // Antigravity planner steps carry their own start/finish stream window; untimed or failed
+        // rows fold through the pair rule like every other corpus.
+        guard await antigravityFold(daysBack: daysBack, now: now, accumulators: accumulators), !Task.isCancelled
+        else { return nil }
+
         return TokensPerSecondEstimate.from(accumulators.accumulators)
     }
 
@@ -156,6 +164,41 @@ actor TokensPerSecondScanner {
         return true
     }
 
+    private func antigravityFold(
+        daysBack: Int,
+        now: Date,
+        accumulators: Accumulators
+    ) async -> Bool {
+        // The Antigravity stores are conversation databases on disk; fold them here (no new
+        // dependency on the Antigravity provider or its quota path). A store that cannot be read
+        // contributes nothing; a missing store is just 'no Antigravity data'.
+        let responses = AntigravityConversationReader.responses(
+            home: antigravityHome(),
+            daysBack: daysBack,
+            now: now
+        )
+        AppLog.debug(.refresh, "tps antigravity fold: \(responses.count) planner responses in the window")
+        for response in responses {
+            let timestamp = Date(timeIntervalSince1970: Double(response.endMs) / 1000)
+            let output = Int(clamping: response.outputTokens)
+            if let startMs = response.startMs, !response.failed {
+                let direct = Double(response.endMs - startMs) / 1000
+                if direct >= TokensPerSecond.minimumInterval,
+                   direct <= TokensPerSecond.maximumDirectInterval {
+                    accumulators["antigravity"].ingest(
+                        outputTokens: output,
+                        at: timestamp,
+                        model: response.model,
+                        directInterval: direct
+                    )
+                    continue
+                }
+            }
+            accumulators["antigravity"].ingest(outputTokens: output, at: timestamp, model: response.model)
+        }
+        return true
+    }
+
     private final class Accumulators: @unchecked Sendable {
         var accumulators: [String: TokensPerSecondAccumulator] = [
             "claude": TokensPerSecondAccumulator(),
@@ -163,7 +206,8 @@ actor TokensPerSecondScanner {
             "grok": TokensPerSecondAccumulator(),
             "muse": TokensPerSecondAccumulator(),
             "pi": TokensPerSecondAccumulator(),
-            "zai": TokensPerSecondAccumulator()
+            "zai": TokensPerSecondAccumulator(),
+            "antigravity": TokensPerSecondAccumulator()
         ]
 
         subscript(_ key: String) -> TokensPerSecondAccumulator {

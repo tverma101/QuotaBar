@@ -81,6 +81,9 @@ final class TPSTrackerProvider: ProviderRuntime {
                     roots.append(MusePaths.sessionsDirectory(homeDirectory: home))
                     roots.append(PiPaths.sessionsDirectory(environment: environment, homeDirectory: home))
                     roots.append(home.appendingPathComponent(".zcode/cli/db/db.sqlite"))
+                    for subpath in AntigravityConversationReader.storeSubpaths {
+                        roots.append(home.appendingPathComponent(subpath).appendingPathComponent("conversations"))
+                    }
                     return roots
                 }
             }
@@ -102,7 +105,8 @@ final class TPSTrackerProvider: ProviderRuntime {
             .values(id: "tps.grok", provider: provider, title: "Grok", metricLabel: "Grok"),
             .values(id: "tps.muse", provider: provider, title: "Muse", metricLabel: "Muse"),
             .values(id: "tps.pi", provider: provider, title: "Pi", metricLabel: "Pi"),
-            .values(id: "tps.zai", provider: provider, title: "Z.ai", metricLabel: "Z.ai")
+            .values(id: "tps.zai", provider: provider, title: "Z.ai", metricLabel: "Z.ai"),
+            .values(id: "tps.antigravity", provider: provider, title: "Antigravity", metricLabel: "Antigravity")
         ]
     }
 

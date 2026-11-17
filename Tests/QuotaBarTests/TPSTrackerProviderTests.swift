@@ -182,7 +182,11 @@ final class TPSTrackerProviderTests: XCTestCase {
                     FileManager.default.temporaryDirectory
                         .appendingPathComponent("openusage-no-muse-home")
                 },
-                zaiDatabasePath: zaiDatabasePath
+                zaiDatabasePath: zaiDatabasePath,
+                antigravityHome: {
+                    FileManager.default.temporaryDirectory
+                        .appendingPathComponent("openusage-no-antigravity-home")
+                }
             ),
             now: now
         )
@@ -229,7 +233,11 @@ final class TPSTrackerProviderTests: XCTestCase {
                 muse: muse,
                 pi: pi,
                 museSessionsRoot: { museHome.appendingPathComponent(".local/share/muse/sessions") },
-                zaiDatabasePath: zaiDatabasePath
+                zaiDatabasePath: zaiDatabasePath,
+                antigravityHome: {
+                    FileManager.default.temporaryDirectory
+                        .appendingPathComponent("openusage-no-antigravity-home")
+                }
             ),
             now: now
         )
@@ -412,7 +420,7 @@ final class TPSTrackerProviderTests: XCTestCase {
     func testOwnerConfirmedTPSDefaultsAreDataOnly() throws {
         let provider = TPSTrackerProvider()
         let ids = provider.widgetDescriptors.map(\.id)
-        XCTAssertEqual(ids, ["tps.overall", "tps.claude", "tps.codex", "tps.grok", "tps.muse", "tps.pi", "tps.zai"])
+        XCTAssertEqual(ids, ["tps.overall", "tps.claude", "tps.codex", "tps.grok", "tps.muse", "tps.pi", "tps.zai", "tps.antigravity"])
         // The TPS provider is a data source for the Total Spend panel — its rows ship off by
         // default everywhere; no dashboard placement, pin, or On Demand membership exists.
         let layoutSets = [
