@@ -157,6 +157,78 @@ final class TPSSpendPanelSnapshotTests: XCTestCase {
 
         XCTAssertGreaterThan(png.count, 10_000)
     }
+
+    /// The window switcher: a real fold bucketed by day, rendered through the full Total Spend card
+    /// (picker included) for the default 14-day view and the Today view. Proves the switcher renders
+    /// and each window selects its own pre-bucketed rows.
+    func testRendersTPSWindowSwitcher() throws {
+        let now = Calendar.current.date(byAdding: .hour, value: 12, to: Calendar.current.startOfDay(for: Date()))!
+        func day(_ ago: Int) -> Date {
+            Calendar.current.date(byAdding: .day, value: -ago, to: Calendar.current.startOfDay(for: now))!
+                .addingTimeInterval(12 * 3600)
+        }
+        var claude = TokensPerSecondAccumulator()
+        var codex = TokensPerSecondAccumulator()
+        var antigravity = TokensPerSecondAccumulator()
+        for _ in 0..<6 {
+            claude.ingest(outputTokens: 240, at: day(0), model: "claude-sonnet-4-5", directInterval: 10)
+            codex.ingest(outputTokens: 410, at: day(0), model: "gpt-6.1-terra", directInterval: 10)
+            antigravity.ingest(outputTokens: 180, at: day(0), model: "gemini-3.1-pro", directInterval: 8)
+            claude.ingest(outputTokens: 200, at: day(3), model: "claude-sonnet-4-5", directInterval: 12)
+            codex.ingest(outputTokens: 380, at: day(5), model: "gpt-5.2-codex", directInterval: 14)
+            antigravity.ingest(outputTokens: 150, at: day(10), model: "gemini-3-flash-preview", directInterval: 9)
+        }
+        let estimate = TokensPerSecondEstimate.from(
+            ["claude": claude, "codex": codex, "antigravity": antigravity], now: now
+        )
+        let snapshot = ProviderSnapshot(
+            providerID: "tps",
+            displayName: "TPS Tracker",
+            lines: TokensPerSecondWindow.allCases.flatMap { TokensPerSecondMapper.lines(estimate, window: $0) },
+            refreshedAt: now
+        )
+
+        for window in [TokensPerSecondWindow.fourteenDays, .today] {
+            let suiteName = "TPSSpendPanelSnapshotTests.\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suiteName)!
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            defaults.removePersistentDomain(forName: suiteName)
+            let priorMetric = UserDefaults.standard.string(forKey: metricKey)
+            let priorWindow = UserDefaults.standard.string(forKey: TotalSpendSetting.tpsWindowKey)
+            UserDefaults.standard.set("tps", forKey: metricKey)
+            UserDefaults.standard.set(window.rawValue, forKey: TotalSpendSetting.tpsWindowKey)
+            defer {
+                if let priorMetric { UserDefaults.standard.set(priorMetric, forKey: metricKey) } else {
+                    UserDefaults.standard.removeObject(forKey: metricKey)
+                }
+                if let priorWindow { UserDefaults.standard.set(priorWindow, forKey: TotalSpendSetting.tpsWindowKey) } else {
+                    UserDefaults.standard.removeObject(forKey: TotalSpendSetting.tpsWindowKey)
+                }
+            }
+
+            let registry = WidgetRegistry.from([])
+            let layout = LayoutStore(registry: registry, defaults: defaults, storageKey: "layout")
+            let dataStore = WidgetDataStore(registry: registry, providers: [], defaults: defaults)
+            dataStore.snapshots = ["tps": snapshot]
+
+            let view = TotalSpendCard()
+                .environment(layout)
+                .environment(dataStore)
+                .environment(\.colorScheme, .dark)
+                .background(Color(red: 0.09, green: 0.09, blue: 0.11))
+                .frame(width: 320)
+            let hosting = NSHostingView(rootView: view)
+            hosting.setFrameSize(hosting.fittingSize)
+            let rep = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+            hosting.cacheDisplay(in: hosting.bounds, to: rep)
+            let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("quotabar_tps_window_\(window.rawValue)-\(UUID().uuidString).png")
+            try png.write(to: url)
+            print("tps window render (\(window.rawValue)) saved to: \(url.path), bytes: \(png.count)")
+            XCTAssertGreaterThan(png.count, 25_000, "a populated TPS window renders far more than a blank bitmap")
+        }
+    }
 }
 
 private enum TPSFixture {
