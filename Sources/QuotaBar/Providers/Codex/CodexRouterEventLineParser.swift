@@ -55,6 +55,7 @@ enum CodexRouterEventLineParser {
         case accountId
         case accountFingerprint
         case serviceTier
+        case responseStartMs
     }
 
     private struct Fields {
@@ -85,6 +86,9 @@ enum CodexRouterEventLineParser {
         var accountFingerprintValid = true
         var serviceTier: String?
         var serviceTierValid = true
+        /// Presence-only: a response-start marker means a generation stream actually began. Native
+        /// image/search passthrough records omit it and never could carry token usage.
+        var responseStartMsSeen = false
         var seenFields: Set<Field> = []
         var duplicateFields: Set<Field> = []
         var recognizedFieldsUnique = true
@@ -118,6 +122,8 @@ enum CodexRouterEventLineParser {
                 let tier = string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 serviceTier = tier.nilIfEmpty
                 serviceTierValid = CodexRouterEventLineParser.knownServiceTiers.contains(tier)
+            case .responseStartMs:
+                responseStartMsSeen = true
             case .status, .inputTokens, .cachedInputTokens, .outputTokens, .reasoningTokens, .totalTokens,
                  .estimatedInputTokens:
                 break
@@ -153,6 +159,8 @@ enum CodexRouterEventLineParser {
                 estimatedInputTokens = integer
                 estimatedInputTokensValid = integer >= 0
                 numericCountFieldValidity[field] = integer >= 0
+            case .responseStartMs:
+                responseStartMsSeen = true
             case .at, .model, .accountId, .accountFingerprint:
                 break
             case .provider:
@@ -208,11 +216,15 @@ enum CodexRouterEventLineParser {
             case .serviceTier:
                 serviceTier = nil
                 serviceTierValid = false
+            case .responseStartMs:
+                responseStartMsSeen = true
             }
         }
 
         mutating func setNull(_ field: Field) {
             switch field {
+            case .responseStartMs:
+                responseStartMsSeen = true
             case .accountId:
                 // Optional identity fields may be explicitly null in legacy router rows.
                 accountIdValid = true
@@ -496,7 +508,8 @@ enum CodexRouterEventLineParser {
             accountId: accountId,
             accountFingerprint: accountFingerprint,
             serviceTier: serviceTier,
-            tokenCountSaturated: fields.tokenCountSaturated ? true : nil
+            tokenCountSaturated: fields.tokenCountSaturated ? true : nil,
+            hasResponseStartMsField: fields.responseStartMsSeen
         )
     }
 
@@ -525,6 +538,7 @@ enum CodexRouterEventLineParser {
             if matches(bytes, key, "serviceTier") { return .serviceTier }
         case 12 where matches(bytes, key, "outputTokens"): return .outputTokens
         case 15 where matches(bytes, key, "reasoningTokens"): return .reasoningTokens
+        case 15 where matches(bytes, key, "responseStartMs"): return .responseStartMs
         case 17 where matches(bytes, key, "cachedInputTokens"): return .cachedInputTokens
         case 18 where matches(bytes, key, "accountFingerprint"): return .accountFingerprint
         case 20 where matches(bytes, key, "estimatedInputTokens"): return .estimatedInputTokens
@@ -548,6 +562,7 @@ enum CodexRouterEventLineParser {
         case "accountFingerprint": return .accountFingerprint
         case "serviceTier": return .serviceTier
         case "estimatedInputTokens": return .estimatedInputTokens
+        case "responseStartMs": return .responseStartMs
         default: return nil
         }
     }
@@ -570,7 +585,7 @@ enum CodexRouterEventLineParser {
         switch field {
         case .at, .model, .provider, .accountId, .accountFingerprint, .serviceTier: return true
         case .status, .inputTokens, .cachedInputTokens, .outputTokens, .reasoningTokens, .totalTokens,
-             .estimatedInputTokens: return false
+             .estimatedInputTokens, .responseStartMs: return false
         }
     }
 
@@ -579,7 +594,7 @@ enum CodexRouterEventLineParser {
         case .inputTokens, .cachedInputTokens, .outputTokens, .reasoningTokens, .totalTokens,
              .estimatedInputTokens:
             return true
-        case .at, .model, .provider, .status, .accountId, .accountFingerprint, .serviceTier:
+        case .at, .model, .provider, .status, .accountId, .accountFingerprint, .serviceTier, .responseStartMs:
             return false
         }
     }
@@ -589,7 +604,7 @@ enum CodexRouterEventLineParser {
         case .inputTokens, .cachedInputTokens, .outputTokens, .reasoningTokens, .totalTokens:
             return true
         case .estimatedInputTokens, .at, .model, .provider, .status, .accountId, .accountFingerprint,
-             .serviceTier:
+             .serviceTier, .responseStartMs:
             return false
         }
     }

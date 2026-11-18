@@ -30,6 +30,23 @@ final class CodexRouterEventLineParserTests: XCTestCase {
         XCTAssertEqual(event.provider, "unknown")
     }
 
+    func testCapturesResponseStartPresenceToSeparateStreamingGapsFromPassthrough() throws {
+        // A generation stream started but usage was not metered: a genuine gap.
+        let streamingGap = try XCTUnwrap(parse(#"{"at":"2026-10-02T12:00:00Z","model":"gpt-6-luna","provider":"openai","status":200,"responseStartMs":336,"durationMs":3135}"#))
+        XCTAssertTrue(streamingGap.hasResponseStartMsField)
+        XCTAssertTrue(streamingGap.hasNoMeasuredUsageFields)
+
+        // Native image/search passthrough: no response-start marker, never could carry tokens.
+        let passthrough = try XCTUnwrap(parse(#"{"at":"2026-10-02T12:00:00Z","model":"gpt-6-luna","provider":"openai","status":200,"durationMs":876}"#))
+        XCTAssertFalse(passthrough.hasResponseStartMsField)
+        XCTAssertTrue(passthrough.hasNoMeasuredUsageFields)
+
+        // A measured turn also carries the marker.
+        let measured = try XCTUnwrap(parse(#"{"at":"2026-10-02T12:00:00Z","status":200,"inputTokens":10,"outputTokens":5,"responseStartMs":120}"#))
+        XCTAssertTrue(measured.hasResponseStartMsField)
+        XCTAssertFalse(measured.hasNoMeasuredUsageFields)
+    }
+
     func testSaturatesHugeIntegerAndTrimsCRLFWhitespace() throws {
         let event = try XCTUnwrap(parse(" {\"at\":\"2026-10-02T12:00:00Z\",\"inputTokens\":999999999999999999999}  \r\n"))
 

@@ -120,7 +120,8 @@ final class CodexRouterProductionCacheTests: XCTestCase {
 
     func testRequestsWithoutMeasurementsKeepKnownTokensAndPersistPartialDays() async throws {
         try await withLedger { ledger in
-            let missing = "{\"at\":\"\(TestLocalInstant.iso(2026, 10, 4, 10))\",\"model\":\"test-model\",\"provider\":\"openai\",\"status\":200}\n"
+            // A streaming gap: the response started (responseStartMs) but no usage was metered.
+            let missing = "{\"at\":\"\(TestLocalInstant.iso(2026, 10, 4, 10))\",\"model\":\"test-model\",\"provider\":\"openai\",\"status\":200,\"responseStartMs\":336}\n"
             try (line(tokens: 100) + missing).write(to: ledger, atomically: true, encoding: .utf8)
             let first = await scan(ledger)
             XCTAssertEqual(first?.series.daily.first?.totalTokens, 100)
@@ -138,6 +139,19 @@ final class CodexRouterProductionCacheTests: XCTestCase {
             let appended = await scan(ledger)
             XCTAssertEqual(appended?.series.daily.first?.totalTokens, 150)
             XCTAssertEqual(appended?.unmeasuredUsageDays, ["2026-10-04"])
+        }
+    }
+
+    func testNativePassthroughRowsWithoutResponseStartDoNotFlagPartialDays() async throws {
+        try await withLedger { ledger in
+            // Native image/search passthrough: success, no usage fields, and NO response-start marker —
+            // these never could carry tokens, so they must not flag the day unmeasured.
+            let passthrough = "{\"at\":\"\(TestLocalInstant.iso(2026, 10, 4, 10))\",\"model\":\"test-model\",\"provider\":\"openai\",\"status\":200,\"durationMs\":876}\n"
+            try (line(tokens: 100) + passthrough).write(to: ledger, atomically: true, encoding: .utf8)
+            let result = await scan(ledger)
+            XCTAssertEqual(result?.series.daily.first?.totalTokens, 100)
+            XCTAssertTrue(result?.unmeasuredUsageDays?.isEmpty != false,
+                          "a passthrough row that never started a generation stream is not a measurement gap")
         }
     }
 
