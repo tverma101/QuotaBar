@@ -4,11 +4,13 @@ import Foundation
 /// the TPS data source's `ProviderSnapshot` (the `TPSTrackerProvider` fold of every local corpus
 /// that carries per-report timing), never from spend tiles or history. Pure and synchronous.
 struct TPSTotal: Equatable, Sendable {
-    /// One provider's measured generation: its average rate and the output tokens the fold saw.
+    /// One provider's measured generation: its average rate, the output tokens the fold saw, and its
+    /// own models ranked by tokens — so the lens can show a per-provider breakdown, not one merged blob.
     struct Slice: Identifiable, Equatable, Sendable {
         let provider: Provider
         let rate: Double
         let tokens: Double
+        let models: [ModelRow]
         var id: String { provider.id }
     }
 
@@ -83,7 +85,8 @@ struct TPSTotal: Equatable, Sendable {
             slices.append(Slice(
                 provider: Provider(id: id, displayName: label, icon: .providerMark(id)),
                 rate: rate,
-                tokens: entry.tokens ?? 0
+                tokens: entry.tokens ?? 0,
+                models: modelRows(entry.breakdown?.models ?? [])
             ))
         }
         slices.sort { lhs, rhs in
@@ -94,13 +97,7 @@ struct TPSTotal: Equatable, Sendable {
         let breakdownModels = combined.breakdown?.models ?? []
         let combinedTokens = combined.tokens
             ?? breakdownModels.reduce(0) { $0 + Double($1.totalTokens) }
-        var models = breakdownModels.map {
-            ModelRow(name: $0.model, tokens: Double($0.totalTokens), rate: $0.tokensPerSecond)
-        }
-        models.sort { lhs, rhs in
-            if lhs.tokens != rhs.tokens { return lhs.tokens > rhs.tokens }
-            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-        }
+        let models = modelRows(breakdownModels)
         // A panel with rates but zero token mass (some corpora report only deltas) still has slices.
         let isEmpty = slices.isEmpty && models.isEmpty
         guard !isEmpty || combined.rate != nil else { return nil }
@@ -111,5 +108,15 @@ struct TPSTotal: Equatable, Sendable {
             combinedTokens: combinedTokens,
             windowLabel: window.windowLabel
         )
+    }
+
+    /// Model rows ranked by tokens (descending), then name — shared by the merged list and each
+    /// provider's own breakdown.
+    private static func modelRows(_ models: [ModelUsageEntry]) -> [ModelRow] {
+        models.map { ModelRow(name: $0.model, tokens: Double($0.totalTokens), rate: $0.tokensPerSecond) }
+            .sorted { lhs, rhs in
+                if lhs.tokens != rhs.tokens { return lhs.tokens > rhs.tokens }
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            }
     }
 }

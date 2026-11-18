@@ -16,9 +16,10 @@ The Total Spend ring at the top of the dashboard has a title pull-down: **Cost**
 - **Center** — your combined estimate for the selected window, token-weighted across every corpus
   (Claude, Codex, Grok, Muse, Pi, Z.ai, Antigravity).
 - **Legend** — per provider: its average tokens/sec in the window, ranked fastest first.
-- **Model TPS** — the models your machines actually generated from in the window, ranked by output
-  tokens, with each model's paired-report rate when there are enough of them. Up to 12 shown, with a
-  "… N more models" footer when there's more.
+- **Per-provider Model TPS** — below the overview, one block per provider (its color, name, and its
+  own tokens/sec), each listing that provider's models ranked by output tokens with their
+  paired-report rates. Up to 6 models per provider, with a "… N more models" footer when there's
+  more. Each provider's pace and model mix read separately instead of one merged list.
 
 The caption under the ring says what the number is: estimated from local logs, tool-call intervals
 excluded, not a benchmark. A window with too few qualifying intervals shows its empty state — a

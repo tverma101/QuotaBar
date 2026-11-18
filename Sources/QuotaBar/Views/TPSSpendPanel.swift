@@ -12,10 +12,14 @@ struct TPSSpendPanel: View {
         VStack(alignment: .leading, spacing: 12) {
             TotalSpendRingContent(projection: tps.projection())
             caption
-            if !tps.models.isEmpty {
+            if !tps.slices.isEmpty {
                 Divider()
                 modelHeader
-                modelList
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(tps.slices) { slice in
+                        providerSection(slice)
+                    }
+                }
             }
         }
     }
@@ -41,14 +45,37 @@ struct TPSSpendPanel: View {
         }
     }
 
-    private var modelList: some View {
-        VStack(spacing: 2) {
-            ForEach(tps.models.prefix(12)) { model in
-                modelRow(model)
+    /// One block per provider — its own rate and its own models — instead of a single merged list, so
+    /// each provider's generation pace and model mix read separately. Providers arrive ranked by rate.
+    private func providerSection(_ slice: TPSTotal.Slice) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(TotalSpendPalette.color(for: slice.provider.id))
+                    .frame(width: 8, height: 8)
+                Text(slice.provider.displayName)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Text(slice.rate, format: .number.precision(.fractionLength(1)))
+                    .monospacedDigit()
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Text("tok/s")
+                    .font(.system(size: 9, weight: .regular))
+                    .foregroundStyle(.tertiary)
             }
-            if tps.models.count > 12 {
-                moreRow(hidden: tps.models.count - 12)
+            .padding(.bottom, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(slice.models.prefix(6)) { model in
+                    modelRow(model)
+                }
+                if slice.models.count > 6 {
+                    moreRow(hidden: slice.models.count - 6)
+                }
             }
+            .padding(.leading, 15)
         }
     }
 
