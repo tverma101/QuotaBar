@@ -37,9 +37,13 @@ final class FreebuffExplainedGapTests: XCTestCase {
     }
 
     func testImportedLegacyHistoryWithoutUsageIsExplained() async throws {
-        let result = try await scan([receipt(id: "import-abc123", status: "completed", metrics: "{}")])
-        XCTAssertEqual(result.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
-        XCTAssertTrue(result.unexplainedPartialDays.isEmpty, "imported legacy history carries no metrics by design")
+        // The hosted scanner prefixes every receipt id with "cloud:", so an imported run arrives as
+        // "cloud:import-…" — it must still be explained, not treated as a live completed gap.
+        for id in ["import-abc123", "cloud:import-abc123"] {
+            let result = try await scan([receipt(id: id, status: "completed", metrics: "{}")])
+            XCTAssertEqual(result.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
+            XCTAssertTrue(result.unexplainedPartialDays.isEmpty, "imported legacy history carries no metrics by design (\(id))")
+        }
     }
 
     func testCompletedLiveRunMissingItsReceiptStillWarns() async throws {
