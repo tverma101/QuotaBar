@@ -61,6 +61,19 @@ final class ProviderLinksTests: XCTestCase {
         XCTAssertEqual(provider(links).visibleLinks.map(\.label), ["Status", "Console"])
     }
 
+    /// Owner decision: the Dashboard and API-key quick-link boxes are hidden; other links remain.
+    func testHidesDashboardAndApiKeyBoxes() {
+        let links = [
+            ProviderLink(label: "Status", url: "https://status.example.com/"),
+            ProviderLink(label: "Dashboard", url: "https://example.com/dashboard"),
+            ProviderLink(label: "API Keys", url: "https://example.com/keys"),
+            ProviderLink(label: "API Key", url: "https://example.com/key"),
+            ProviderLink(label: "  dashboard  ", url: "https://example.com/d2"),
+            ProviderLink(label: "Console", url: "https://console.example.com/")
+        ]
+        XCTAssertEqual(provider(links).visibleLinks.map(\.label), ["Status", "Console"])
+    }
+
     /// Every installed provider ships at most two quick links with standard labels.
     @MainActor
     func testInstalledProvidersRespectQuickLinkCap() {
