@@ -4,21 +4,22 @@ import Darwin
 /// Shares a small CPU allowance across token-history indexing and folding. A process-wide lock keeps
 /// simultaneous provider scans from multiplying the allowance; work runs in short synchronous slices
 /// and pauses according to process CPU time, so disk wait does not consume the CPU budget. Background
-/// menu-bar ticks target 7.5% of one core; explicitly throttled full-history reads target 25% so a
-/// user waiting on a refresh does not inherit the background deadline budget.
+/// work targets 1.8% of one core (measured over 30 s and 60 s windows); explicitly throttled
+/// full-history reads target 25% so a user waiting on a refresh does not inherit the background
+/// deadline budget.
 final class JSONLAccountingWorkPacer: @unchecked Sendable {
     static let shared = JSONLAccountingWorkPacer()
 
-    // Leave margin below the 10% contract for work between paced slices and sampling variation.
-    // Full-scope, explicit manual, and silent recovery for a superseded visible retry get the interactive
-    // allowance; 7.5% of wall cannot finish cold corpora inside the provider deadline. Background
-    // menu-bar ticks keep the original ceiling.
+    // Leave margin below the owner's 2% background ceiling for work between paced slices and
+    // sampling variation. Full-scope, explicit manual, and silent recovery for a superseded visible
+    // retry get the interactive allowance; 1.8% of wall cannot finish cold corpora inside the
+    // provider deadline, which is why closed-panel folds use the scan-worker's longer batch cap.
     static var targetCPUFraction: Double {
         ProviderRefreshContext.isManual
             || ProviderRefreshContext.scope.isFull
             || ProviderRefreshContext.accountingCPUInteractiveBudgetEnabled
             ? 0.25
-            : 0.075
+            : 0.018
     }
     // A pathological work slice must not hold the shared accounting lock past one provider deadline.
     private static let maxPacingDebtNanoseconds: Int64 = 120_000_000_000

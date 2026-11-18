@@ -39,6 +39,14 @@ To read logs *after the fact* instead of live, use `log show` with a time window
 log show --last 10m --info --predicate 'process == "QuotaBar"'
 ```
 
+## Measure CPU use
+
+`script/measure_cpu.sh [seconds]` samples the running app once per second and reports mean, median,
+p95, and peak CPU as a percentage of one core. It sums every process named `QuotaBar`, so the
+short-lived `--scan-worker` fold children are included, and discards `top`'s first lifetime-average
+sample. The default window is 300 seconds. See [CPU measurement & baseline](cpu-baseline.md) for
+what the number means and the current result.
+
 ## Log file
 
 In addition to the unified log above, the app writes a file log to

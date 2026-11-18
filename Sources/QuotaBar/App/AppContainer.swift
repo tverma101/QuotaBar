@@ -755,7 +755,10 @@ final class AppContainer {
                                     accountingScope == .localAccounting
                                 ) {
                                     await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(
-                                        accountingScope == .localAccounting
+                                        Self.pacesAccountingFold(
+                                            scope: accountingScope,
+                                            panelOpen: transparency.popoverShown
+                                        )
                                     ) {
                                         await dataStore.refreshAll(
                                             bypassSnapshotCache: bypassSnapshotCache,
@@ -765,7 +768,6 @@ final class AppContainer {
                                     }
                                 }
                             }
-                            accountingTask = nil
                             let keepWarm = transparency.popoverShown && !ProcessMemoryBudget.isOverSoftLimit
                             await PersistentJSONLScanCaches.unloadAfterRefreshCycle(keepRouterItemsResident: keepWarm)
                             await dataStore.unloadFreebuffAccountingCacheForMemoryPressure()
@@ -775,6 +777,11 @@ final class AppContainer {
                             }
                             URLCache.shared.removeAllCachedResponses()
                             ProcessMemoryBudget.releaseAllocatorFreePages()
+                            // Clear the marker only after cleanup. Clearing it first let the periodic
+                            // loop see deferred meter work while this task still awaited the cache
+                            // unloads, so it retried with a zero timeout and spun on the actor until
+                            // the completion signal (measured ~90% CPU for the tail of a fold).
+                            accountingTask = nil
                             wakeSignal.signalWorkCompletion()
                         }
                     }
@@ -841,9 +848,11 @@ final class AppContainer {
                 // (`signalWorkCompletion`), so the poll does not need to run at 1 Hz at all — a
                 // coarse 5 s floor covers rounding and any wake that raced a deadline mutation.
                 let deadlineWait = min(quotaWaitRemaining, historyWaitRemaining)
-                let wakeTimeout = hasRunnableAccounting || hasRunnableMeters
-                    ? 0
-                    : accountingTask == nil ? deadlineWait : max(deadlineWait, 5)
+                let wakeTimeout = Self.refreshWakeTimeout(
+                    accountingInFlight: accountingTask != nil,
+                    hasRunnableWork: hasRunnableAccounting || hasRunnableMeters,
+                    deadlineWait: deadlineWait
+                )
                 _ = await wakeSignal.waitForWake(timeout: wakeTimeout)
                 // Ledger appends invalidate only the enabled Codex/OpenCode accounting snapshots and
                 // schedule their narrow local fold. Meter snapshots and unrelated history providers
@@ -953,5 +962,39 @@ final class AppContainer {
     ) -> Bool {
         quotaRefreshDue || panelPassPending || fullScopePassPending
             || historyAccountingPassPending || localAccountingPassPending || menuBarMeterRetryPending
+    }
+
+    /// Whether this accounting fold must run under the background CPU allowance.
+    ///
+    /// Ledger folds are always background work. A scheduled history fold is background too while the
+    /// panel is closed, but a panel-open fold is feeding the screen the user is looking at, so it stays
+    /// unpaced to meet the provider deadline. Before this, every `.panelAccounting` fold — including
+    /// the fifteen-minute closed-panel one — ran unpaced and held roughly 7% of a core for its whole
+    /// duration, which no 30 s background window can call a 2% ceiling.
+    nonisolated static func pacesAccountingFold(
+        scope: ProviderRefreshContext.Scope,
+        panelOpen: Bool
+    ) -> Bool {
+        switch scope {
+        case .localAccounting: return true
+        case .panelAccounting: return !panelOpen
+        case .menuBar, .panelMeters, .full: return false
+        }
+    }
+
+    /// How long the periodic loop may wait before looking at its pending work again.
+    ///
+    /// A fold in flight owns the provider tasks its pending meter work needs. A pending meter retry
+    /// therefore stays deferred until the fold signals completion, and waking with a zero timeout made
+    /// the loop re-defer it in a tight spin for the whole fold (measured ~88% CPU across a 48 s fold).
+    /// Keep the coarse floor while accounting runs; the fold's completion wake still resumes the loop
+    /// immediately, so this only bounds the fallback poll.
+    nonisolated static func refreshWakeTimeout(
+        accountingInFlight: Bool,
+        hasRunnableWork: Bool,
+        deadlineWait: TimeInterval
+    ) -> TimeInterval {
+        if accountingInFlight { return max(deadlineWait, 5) }
+        return hasRunnableWork ? 0 : deadlineWait
     }
 }

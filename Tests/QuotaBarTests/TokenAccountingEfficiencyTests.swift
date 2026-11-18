@@ -9,8 +9,8 @@ final class TokenAccountingEfficiencyTests: XCTestCase {
     private static let syntheticRows = 8_192
     private static let syntheticBytes = 3_276_800
 
-    /// The background menu-bar contract: background accounting stays under 10% of one core, child
-    /// processes included. Menu-bar scope paces at the 7.5% ceiling.
+    /// The background contract: background accounting stays under 10% of one core, child processes
+    /// included. Menu-bar scope paces at the 1.8% ceiling.
     func testAutomaticMenuBarRefreshPacingIncludesReapedSQLiteStyleChildCPU() async throws {
         let measurement = try await Self.pacedChildProcessMeasurement(scope: .menuBar)
 

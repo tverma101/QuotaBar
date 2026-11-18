@@ -191,6 +191,25 @@ final class WidgetDataStore {
     /// scheduler as soon as the provider can accept them, so a consumed timer/ledger/panel intent is
     /// retried promptly without repeatedly polling the provider.
     @ObservationIgnored private var deferredRefreshRequests: [String: Set<DeferredRefreshRequest>] = [:]
+    /// Identifies the retry a deferred request will produce. The scheduler answers a ready request
+    /// with a scope-wide batch, which calls `beginProviderRequest` again, so the retried request has a
+    /// new generation and cannot be recognized by its exact `DeferredRefreshRequest` value. Rate-limit
+    /// on provider + scope instead.
+    private struct DeferredRefreshReadyKey: Hashable {
+        let providerID: String
+        let scope: ProviderRefreshContext.Scope
+        let bypassSnapshotCache: Bool
+        let bypassFailureBackoff: Bool
+    }
+
+    /// Last time this provider/scope was handed back to the scheduler. A request that loses the race
+    /// again immediately (a new task takes the provider between emission and execution) must not
+    /// re-emit on every task completion: that feedback loop spun the scheduler for a whole fold
+    /// (measured ~90% CPU across 48–74 s). The cooldown bounds retries to one per window while still
+    /// letting a genuinely free provider service the request. Manual actions bypass it, so a visible
+    /// Retry is never delayed by background housekeeping.
+    @ObservationIgnored private var deferredRefreshReadyAt: [DeferredRefreshReadyKey: Date] = [:]
+    private static let deferredRefreshReadyCooldown: TimeInterval = 5
     /// Wall-clock time of the most recent live quota attempt or due scheduler check. The footer uses
     /// it for its live "Next update in …" countdown. Fold-only and early cache-hit passes do not
     /// advance it, so they cannot make the meter countdown appear fresh while the quota schedule is due.
@@ -1009,9 +1028,26 @@ final class WidgetDataStore {
 
     private func emitReadyDeferredRefreshes(for providerID: String) {
         guard let requests = deferredRefreshRequests[providerID], !requests.isEmpty else { return }
+        let currentTime = now()
+        deferredRefreshReadyAt = deferredRefreshReadyAt.filter {
+            currentTime.timeIntervalSince($0.value) < 60
+        }
         let activeScopes = Array(runningProviderRefreshScopes[providerID, default: [:]].values)
         let ready = requests.filter { request in
-            activeScopes.isEmpty || Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
+            guard activeScopes.isEmpty || Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
+            else { return false }
+            guard request.manualActionID == nil else { return true }
+            let key = DeferredRefreshReadyKey(
+                providerID: providerID,
+                scope: request.scope,
+                bypassSnapshotCache: request.bypassSnapshotCache,
+                bypassFailureBackoff: request.bypassFailureBackoff
+            )
+            if let lastReady = deferredRefreshReadyAt[key],
+               currentTime.timeIntervalSince(lastReady) < Self.deferredRefreshReadyCooldown {
+                return false
+            }
+            return true
         }
         guard !ready.isEmpty else { return }
         deferredRefreshRequests[providerID] = requests.subtracting(ready)
@@ -1019,6 +1055,14 @@ final class WidgetDataStore {
             deferredRefreshRequests[providerID] = nil
         }
         for request in ready {
+            if request.manualActionID == nil {
+                deferredRefreshReadyAt[DeferredRefreshReadyKey(
+                    providerID: providerID,
+                    scope: request.scope,
+                    bypassSnapshotCache: request.bypassSnapshotCache,
+                    bypassFailureBackoff: request.bypassFailureBackoff
+                )] = currentTime
+            }
             AppLog.debug(.refresh, "deferred refresh ready \(providerID) (scope=\(Self.batchScopeLabel(request.scope)))")
             onDeferredRefreshReady?(request)
         }

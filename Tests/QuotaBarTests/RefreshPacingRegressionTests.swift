@@ -3,15 +3,15 @@ import XCTest
 @testable import QuotaBar
 
 /// Regression tests for the frozen-usage fix (Oct 2026): a priced-aggregate invalidation forces cold
-/// re-folds of the local corpora, and with the pacer's old hard-coded 7.5% ceiling those folds blew
-/// through the 120s provider deadline — every refresh timed out (`0 ok / 5 failed`) and the codex
-/// cards froze with stale data. These pin the layers that prevent a repeat: the scope-aware
-/// ceiling, the refresh loop's unpaced-full-pass wiring, and the pacer's disabled fast path.
+/// re-folds of the local corpora, and the old hard-coded background ceiling paced them through the
+/// 120s provider deadline — every refresh timed out (`0 ok / 5 failed`) and the codex cards froze with
+/// stale data. These pin the layers that prevent a repeat: the scope-aware ceiling, the refresh
+/// loop's unpaced-full-pass wiring, the closed-panel fold's paced wiring, and the disabled fast path.
 final class RefreshPacingRegressionTests: XCTestCase {
     /// The pacer's ceiling must follow the scope: 25% when the user is actively waiting (full scope —
-    /// panel open, manual refresh, CLI), 7.5% only for background menu-bar ticks. The regression was a
-    /// single hard-coded 0.075, which paced a ~40-100s cold fold into a >120s wall and tripped the
-    /// provider deadline on every pass.
+    /// panel open, manual refresh, CLI), 1.8% for background accounting so even a 30 s or 60 s window
+    /// stays under the owner's 2% ceiling. The earlier hard-coded background rate left closed-panel
+    /// folds unpaced and held ~7% of a core for a minute.
     func testTargetCPUFractionFollowsScope() {
         ProviderRefreshContext.$scope.withValue(.full) {
             XCTAssertEqual(
@@ -22,9 +22,9 @@ final class RefreshPacingRegressionTests: XCTestCase {
         }
         ProviderRefreshContext.$scope.withValue(.menuBar) {
             XCTAssertEqual(
-                JSONLAccountingWorkPacer.targetCPUFraction, 0.075,
+                JSONLAccountingWorkPacer.targetCPUFraction, 0.018,
                 accuracy: 0.0001,
-                "background menu-bar ticks keep the 7.5% battery ceiling"
+                "background accounting keeps the 1.8% ceiling"
             )
         }
         ProviderRefreshContext.$scope.withValue(.panelAccounting) {
@@ -122,6 +122,55 @@ final class RefreshPacingRegressionTests: XCTestCase {
         )
     }
 
+    /// Closed-panel history folds are background work and must take the paced path. A panel-open fold
+    /// feeds the visible dashboard, so it keeps the unpaced path (same as `.full`).
+    func testClosedPanelAccountingFoldIsPacedButPanelOpenIsNot() {
+        XCTAssertTrue(AppContainer.pacesAccountingFold(scope: .localAccounting, panelOpen: true))
+        XCTAssertTrue(AppContainer.pacesAccountingFold(scope: .localAccounting, panelOpen: false))
+        XCTAssertTrue(AppContainer.pacesAccountingFold(scope: .panelAccounting, panelOpen: false))
+        XCTAssertFalse(
+            AppContainer.pacesAccountingFold(scope: .panelAccounting, panelOpen: true),
+            "a panel-open fold must meet the provider deadline, not the background allowance"
+        )
+        XCTAssertFalse(AppContainer.pacesAccountingFold(scope: .full, panelOpen: false))
+    }
+
+    /// A fold in flight must keep the loop's coarse poll floor even when a meter pass is latched.
+    /// The meter work is deferred until the fold completes (its completion wake resumes the loop),
+    /// so a zero timeout only re-deferred it in a tight loop and burned a core for the fold's duration.
+    func testFoldInFlightNeverSpinsOnDeferredMeterWork() {
+        XCTAssertEqual(
+            AppContainer.refreshWakeTimeout(
+                accountingInFlight: true, hasRunnableWork: true, deadlineWait: 0
+            ),
+            5,
+            accuracy: 0.001,
+            "a fold that outlived its deadline must fall back to a 5 s poll, not spin"
+        )
+        XCTAssertEqual(
+            AppContainer.refreshWakeTimeout(
+                accountingInFlight: true, hasRunnableWork: true, deadlineWait: 30
+            ),
+            30,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            AppContainer.refreshWakeTimeout(
+                accountingInFlight: false, hasRunnableWork: true, deadlineWait: 30
+            ),
+            0,
+            accuracy: 0.001,
+            "no fold in flight: runnable work should start immediately"
+        )
+        XCTAssertEqual(
+            AppContainer.refreshWakeTimeout(
+                accountingInFlight: false, hasRunnableWork: false, deadlineWait: 30
+            ),
+            30,
+            accuracy: 0.001
+        )
+    }
+
     func testLedgerAccountingWorkIsPriorityDuringTriggerCooldown() {
         XCTAssertTrue(AppContainer.hasPriorityRefreshPass(
             quotaRefreshDue: false,
@@ -153,7 +202,7 @@ final class RefreshPacingRegressionTests: XCTestCase {
         XCTAssertTrue(produced, "the work item must actually run")
         XCTAssertLessThan(
             wall, 0.75,
-            "an unpaced slice must complete in roughly its own CPU time (\(workCPU)s); pacing sleeps would stretch it toward \(workCPU / 0.075)s"
+            "an unpaced slice must complete in roughly its own CPU time (\(workCPU)s); pacing sleeps would stretch it toward \(workCPU / 0.018)s"
         )
     }
 

@@ -34,7 +34,11 @@ final class ScanWorkerClient {
     /// generous headroom rather than N independent timeouts. A batch that still cannot finish in
     /// the cap surfaces per-member timeout errors (matching the single-provider timeout contract)
     /// instead of re-folding everything in-process on the app's heap.
-    nonisolated private static let batchFoldTimeout: TimeInterval = 300
+    ///
+    /// Closed-panel folds are paced at 1.8% of a core (see `JSONLAccountingWorkPacer`), so the same
+    /// four CPU-seconds a cold fold used to burn in under a minute now legitimately need a few
+    /// minutes. The cap is sized for that spread, not for a faster background refresh.
+    nonisolated private static let batchFoldTimeout: TimeInterval = 600
 
     private let runner: any ProcessRunning
     /// Slightly below the provider refresh deadline so the client can still report a timeout

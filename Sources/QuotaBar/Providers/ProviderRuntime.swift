@@ -95,8 +95,9 @@ enum ProviderRefreshContext {
     /// Defaults to `.full` so tests, CLI, and any unscoped call site keep today's behavior.
     @TaskLocal static var scope: Scope = .full
     /// Refresh entry points opt into the process-wide CPU allowance when appropriate: background
-    /// menu-bar ticks use the 7.5% budget, while explicit full-history reads and visible-retry recovery
-    /// use the 25% interactive budget. The panel-open periodic loop can opt out to meet provider deadlines.
+    /// menu-bar and closed-panel accounting work use the 1.8% budget, while explicit full-history
+    /// reads and visible-retry recovery use the 25% interactive budget. The panel-open periodic loop
+    /// opts out to meet provider deadlines.
     /// Focused unit tests stay unthrottled unless they explicitly measure the budget.
     @TaskLocal static var accountingCPUThrottleEnabled = false
     /// Silent recovery for an interrupted user retry has no Keychain permission, but its local work

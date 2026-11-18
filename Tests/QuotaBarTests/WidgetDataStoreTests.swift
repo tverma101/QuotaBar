@@ -188,6 +188,57 @@ final class WidgetDataStoreTests: XCTestCase {
         )])
     }
 
+    /// A deferred request that keeps losing the race must not wake the scheduler on every provider
+    /// completion. The retried request has a new generation, so the cooldown keys on provider + scope;
+    /// without that, a fold re-deferred the same meter pass thousands of times and held ~90% CPU.
+    func testDeferredRefreshReadyCooldownBoundsRepeatedRetries() async {
+        let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
+        let descriptor = WidgetDescriptor.percent(id: "test.session", provider: provider, title: "Session")
+        let runtime = GatedProviderRuntime(provider: provider, descriptors: [descriptor])
+        var clock = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(
+                userDefaults: makeUserDefaults("deferred-refresh-cooldown-cache"),
+                storageKey: "snapshots",
+                ttl: 300
+            ),
+            defaults: makeUserDefaults("deferred-refresh-cooldown-store"),
+            now: { clock }
+        )
+        var ready: [WidgetDataStore.DeferredRefreshRequest] = []
+        store.onDeferredRefreshReady = { ready.append($0) }
+
+        func foldAndDeferMeterPass() async {
+            let fold = Task {
+                await ProviderRefreshContext.$scope.withValue(.full) {
+                    await store.refresh(providerID: provider.id, force: true)
+                }
+            }
+            await waitUntil({ runtime.inFlightCount == 1 }, "the fold occupies the provider")
+            let outcome = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+                await store.refresh(providerID: provider.id, bypassSnapshotCache: true)
+            }
+            XCTAssertEqual(outcome, .inFlight)
+            runtime.resume()
+            _ = await fold.value
+        }
+
+        await foldAndDeferMeterPass()
+        XCTAssertEqual(ready.count, 1, "the first deferred meter pass is handed back to the scheduler")
+
+        await foldAndDeferMeterPass()
+        XCTAssertEqual(
+            ready.count, 1,
+            "a retry that is deferred again inside the cooldown must not wake the scheduler again"
+        )
+
+        clock = clock.addingTimeInterval(6)
+        await foldAndDeferMeterPass()
+        XCTAssertEqual(ready.count, 2, "past the cooldown the request is delivered again")
+    }
+
     func testForcedPanelMeterRetryOverlapsHeldAccountingFoldAndPreservesNewMeters() async throws {
         for foldScope in [ProviderRefreshContext.Scope.localAccounting, .panelAccounting] {
             let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
@@ -2608,6 +2659,36 @@ private final class SuspendedProviderRuntime: ProviderRuntime {
             refreshedAt: Date()
         ))
         continuation = nil
+    }
+}
+
+@MainActor
+private final class GatedProviderRuntime: ProviderRuntime {
+    let provider: Provider
+    let widgetDescriptors: [WidgetDescriptor]
+    private var continuations: [CheckedContinuation<ProviderSnapshot, Never>] = []
+    var inFlightCount: Int { continuations.count }
+
+    init(provider: Provider, descriptors: [WidgetDescriptor]) {
+        self.provider = provider
+        self.widgetDescriptors = descriptors
+    }
+
+    func refresh() async -> ProviderSnapshot {
+        await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func resume() {
+        guard !continuations.isEmpty else { return }
+        let continuation = continuations.removeFirst()
+        continuation.resume(returning: ProviderSnapshot.make(
+            provider: provider,
+            plan: nil,
+            lines: [],
+            refreshedAt: Date()
+        ))
     }
 }
 
