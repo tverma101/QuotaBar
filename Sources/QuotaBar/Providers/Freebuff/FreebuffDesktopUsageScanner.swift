@@ -80,7 +80,9 @@ actor FreebuffDesktopUsageScanner {
         /// history, and local Desktop turns (abort/interrupt/no-metrics facts the SDK never retries) are
         /// explained: the day stays an honest lower bound but raises no warning.
         var isUnexplainedPartial: Bool {
-            partial && runStatus == "completed" && id.hasPrefix("cloud:")
+            guard partial, runStatus == "completed", id.hasPrefix("cloud:") else { return false }
+            // Imported legacy history arrives as `cloud:import-…` and carries no token metrics by design.
+            return !id.hasPrefix("cloud:import-") && !id.hasPrefix("import-")
         }
     }
 
