@@ -32,15 +32,28 @@ enum AntigravityConversationReader {
         ".gemini/antigravity-ide"
     ]
 
+    /// Every conversation root: the canonical `~/.gemini` stores, the `~/.config/antigravity` parity
+    /// root, and T3 Code's private ACP instances — when T3 drives Antigravity, the recent usage is
+    /// written there, not under `~/.gemini`.
+    static func conversationRoots(home: URL) -> [URL] {
+        var roots = storeSubpaths.map {
+            home.appendingPathComponent($0).appendingPathComponent("conversations", isDirectory: true)
+        }
+        roots.append(home
+            .appendingPathComponent(".config/antigravity", isDirectory: true)
+            .appendingPathComponent("conversations", isDirectory: true))
+        roots.append(contentsOf: (try? AntigravityT3Support.conversationDirectories(home: home))?
+            .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? [])
+        return roots
+    }
+
     /// Every conversation database under the local stores, in path order (stable for dedup),
     /// skipping any whose content cannot hold an in-window row. A database mutates its WAL on
     /// every step, so a stale file (and no newer `-wal` companion) can only hold out-of-window
     /// history — the planner query never needs to open it.
     static func conversationDatabases(home: URL, sinceMs: Int64 = 0) -> [URL] {
         var found: [URL] = []
-        for subpath in storeSubpaths {
-            let conversations = home.appendingPathComponent(subpath)
-                .appendingPathComponent("conversations", isDirectory: true)
+        for conversations in conversationRoots(home: home) {
             guard let entries = try? FileManager.default.contentsOfDirectory(
                 at: conversations,
                 includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],

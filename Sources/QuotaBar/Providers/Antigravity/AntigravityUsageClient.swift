@@ -54,6 +54,17 @@ struct AntigravityUsageClient: Sendable {
     static let retrieveQuotaPath = "/v1internal:retrieveUserQuota"
     static let quotaSummaryPath = "/v1internal:retrieveUserQuotaSummary"
     static let googleOAuthURL = "https://oauth2.googleapis.com/token"
+    /// The hub client identity exposes the separate Argon quota and the paid tier; the bare IDE
+    /// identity omits them, and Google marks other callers `UNSUPPORTED_CLIENT`. Ported from
+    /// upstream openusage#1676 (e1ffa571), which verified Argon reports with this shape.
+    static let clientUserAgent: String = {
+        #if arch(arm64)
+        let arch = "arm64"
+        #else
+        let arch = "amd64"
+        #endif
+        return "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=\(arch))"
+    }()
     // Google OAuth "installed application" client credentials, extracted verbatim from the Antigravity
     // app bundle — the same pair the shipped app and the legacy Tauri plugin use. For installed-app OAuth
     // clients Google does not treat the "secret" as confidential (it ships in every copy of the client),
@@ -124,7 +135,7 @@ struct AntigravityUsageClient: Sendable {
     /// pool a complete body can prove. Failed hosts still withhold the freshness stamp when no
     /// answer was complete.
     func cloudCodeSummaries(token: String) async throws -> CloudCodeBatchOutcome {
-        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: "antigravity", body: [:], collectSummaries: true, bases: Self.cloudCodeURLs)
+        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: Self.clientUserAgent, body: [:], collectSummaries: true, bases: Self.cloudCodeURLs)
     }
 
     private func cloudCodeResponses(
@@ -199,12 +210,18 @@ struct AntigravityUsageClient: Sendable {
     /// Exchange a Google refresh token for a fresh access token. Distinguishes a rejected OAuth client
     /// (`invalid_client`) from a dead refresh token (`invalid_grant`) and transient failures so the
     /// caller does not report expired sign-in when QuotaBar's client configuration was rejected.
-    func refreshGoogleToken(_ refreshToken: String) async throws -> TokenRefreshOutcome {
+    /// T3 Code's file credentials carry their own client pair — a refresh token only refreshes with
+    /// the client it was issued to, so the caller supplies that pair instead of the bundled one.
+    func refreshGoogleToken(
+        _ refreshToken: String,
+        clientID: String = AntigravityUsageClient.googleClientID,
+        clientSecret: String = AntigravityUsageClient.googleClientSecret
+    ) async throws -> TokenRefreshOutcome {
         try Task.checkCancellation()
         guard let url = URL(string: Self.googleOAuthURL) else { return .unavailable }
         let form = [
-            "client_id=\(Self.googleClientID.urlFormEncoded)",
-            "client_secret=\(Self.googleClientSecret.urlFormEncoded)",
+            "client_id=\(clientID.urlFormEncoded)",
+            "client_secret=\(clientSecret.urlFormEncoded)",
             "refresh_token=\(refreshToken.urlFormEncoded)",
             "grant_type=refresh_token"
         ].joined(separator: "&")
