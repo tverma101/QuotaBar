@@ -75,12 +75,12 @@ actor FreebuffDesktopUsageScanner {
         /// The hosted run's terminal status, when known. Optional so older persisted turns decode.
         var runStatus: String?
 
-        /// A turn with no usage at all whose run failed or was cancelled never produced a complete
-        /// receipt by design; an `import-` run is the API's imported legacy history, which carries no
-        /// token metrics. Both are explained gaps: the day stays a lower bound, but no actionable
-        /// "missing receipt" warning fires. A completed live run that lost its receipt is NOT explained.
-        var hasExplainedMissingUsage: Bool {
-            usage == nil && (runStatus == "failed" || runStatus == "cancelled" || id.hasPrefix("import-"))
+        /// A partial turn is an actionable gap only when a hosted COMPLETED live run lost or incompletely
+        /// reported its receipt (a retry might still recover it). Failed/cancelled runs, imported legacy
+        /// history, and local Desktop turns (abort/interrupt/no-metrics facts the SDK never retries) are
+        /// explained: the day stays an honest lower bound but raises no warning.
+        var isUnexplainedPartial: Bool {
+            partial && runStatus == "completed" && id.hasPrefix("cloud:")
         }
     }
 
@@ -302,7 +302,7 @@ actor FreebuffDesktopUsageScanner {
                 guard let usage = turn.usage else {
                     if turn.partial {
                         partialDays.insert(day)
-                        if !turn.hasExplainedMissingUsage { unexplainedPartialDays.insert(day) }
+                        if turn.isUnexplainedPartial { unexplainedPartialDays.insert(day) }
                     }
                     continue
                 }
@@ -361,7 +361,7 @@ actor FreebuffDesktopUsageScanner {
                 }
                 if turn.partial {
                     partialDays.insert(day)
-                    unexplainedPartialDays.insert(day)
+                    if turn.isUnexplainedPartial { unexplainedPartialDays.insert(day) }
                 }
             }
         }
