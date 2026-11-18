@@ -125,7 +125,7 @@ final class PanelHeightController {
     }
 
     private func clampedHeight(_ rawHeight: CGFloat) -> CGFloat {
-        PanelGeometry.clampedHeight(rawHeight, maximum: maximumHeight())
+        min(rawHeight, maximumHeight())
     }
 
     private func maximumHeight() -> CGFloat {
@@ -163,7 +163,6 @@ final class PanelHeightController {
 enum PanelGeometry {
     static let topGap: CGFloat = 4
     static let screenMargin: CGFloat = 8
-    static let minimumHeight: CGFloat = 200
 
     static func clampedTopLeft(below buttonRect: NSRect, width: CGFloat, visibleFrame: NSRect?) -> NSPoint {
         var x = buttonRect.minX
@@ -182,13 +181,15 @@ enum PanelGeometry {
         return max(1, min(roomBelowAnchor, aestheticCap))
     }
 
-    static func clampedHeight(_ rawHeight: CGFloat, maximum: CGFloat) -> CGFloat {
-        min(max(rawHeight, minimumHeight), maximum)
-    }
-
+    /// Snaps the top edge and height to whole points. AppKit rounds a window's origin and size
+    /// separately, so a half-point status-item anchor plus the morph's fractional heights would land
+    /// the top edge on either of two points from frame to frame and visibly shake the panel. The top
+    /// rounds down so the gap below the status item never shrinks.
     static func frame(topLeft: NSPoint, width: CGFloat, height: CGFloat) -> NSRect {
-        NSRect(
-            origin: NSPoint(x: topLeft.x, y: topLeft.y - height),
+        let top = topLeft.y.rounded(.down)
+        let height = height.rounded()
+        return NSRect(
+            origin: NSPoint(x: topLeft.x, y: top - height),
             size: NSSize(width: width, height: height)
         )
     }

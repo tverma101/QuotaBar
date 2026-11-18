@@ -18,6 +18,9 @@ QuotaBar's first public downloadable build. It does not update automatically; us
 
 ## Unreleased
 
+- Add the experimental TPS lens to the Total Spend panel, estimating tokens per second from every local-log corpus with per-report timing (Claude Code, Codex, Grok, Muse, Pi, Z.ai's ZCode SQLite stream, and Antigravity's planner-response timing): rate arcs, per-provider average, and a model TPS list up to 12 rows; on by default for new installs, off until enabled in Customize for existing ones.
+- Show Antigravity's active Gemini quota readings (daily host, production fills omissions) and keep an in-flight session from reading as "Not started" while its reset countdown is due.
+- Size the panel to its screen with no minimum height, land every resize on whole points, and host the dashboard below the panel's content view; content under the top bar is hidden and content under the footer frosts (system soft edge on macOS 27, an in-window frost on macOS 26 and earlier); screen and page motion runs at the native pace.
 - Preserve last-known Antigravity history across restarts when a conversation database disappears, while readable sources keep updating.
 - Page the full OpenRouter model catalog, recheck fallback-priced names so new exact routes replace stale estimates, and stop per-model checks after three misses.
 - Keep optional provider cards off until selected in Customize, preserve Freebuff in the default set, and reset to those explicit defaults.
@@ -32,6 +35,7 @@ QuotaBar's first public downloadable build. It does not update automatically; us
 - Make Freebuff's signed-out warning actionable with the local CLI login command and a refresh step.
 - Restore Antigravity history for newer conversation databases by reading timestamps from correlated step metadata.
 - Reuse a Keychain prompt that is already on screen for the same item instead of probing the item again: sibling cards wait for that one dialog and retry silently from its grant, and a newer explicit refresh still fails closed rather than waiting behind the prompt it superseded.
+- Speed up the local-log accounting folds: the Claude Rust parser now deserializes only the fields it reads (borrowed, zero-copy; escapes and exotic shapes fall back to the exact previous implementation), newline scanning on the JSONL reader uses platform-vectorized memchr, and the Codex byte-marker gate is SIMD-accelerated.
 - Keep freshly fetched OpenCode Go meters when the panel's second (history) pass fails its local scan — a fold-only pass never asks the account endpoint, so it has no evidence that those meters are stale.
 - Clear the catch-all provider failure once any later pass succeeds, so a provider whose scopes all resolve to that bucket does not keep an error row and a Retry affordance forever.
 - Fail the whole OpenCode fold closed when Hermes can't be read, instead of publishing the readable subset as if it were the complete card.

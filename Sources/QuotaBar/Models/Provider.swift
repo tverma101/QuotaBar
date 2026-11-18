@@ -18,7 +18,9 @@ struct Provider: Identifiable, Hashable {
     }
 
     /// Links safe to render: trimmed, non-empty label and URL, and an `http(s)` scheme only. Mirrors the
-    /// legacy `visibleLinks` filter so a malformed entry never ships a dead or no-op button.
+    /// legacy `visibleLinks` filter so a malformed entry never ships a dead or no-op button. The
+    /// "Dashboard" and "API Keys" quick-link boxes are intentionally hidden (owner decision) — the
+    /// remaining links (Status, Console, Activity, Credits, …) still render.
     var visibleLinks: [ProviderLink] {
         links.compactMap { link in
             let label = link.label.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -26,7 +28,10 @@ struct Provider: Identifiable, Hashable {
             guard !label.isEmpty,
                   !url.isEmpty,
                   url.hasPrefix("https://") || url.hasPrefix("http://") else { return nil }
-            return ProviderLink(label: label, url: url)
+            switch label.lowercased() {
+            case "dashboard", "api keys", "api key": return nil
+            default: return ProviderLink(label: label, url: url)
+            }
         }
     }
 }

@@ -625,6 +625,10 @@ final class WidgetDataStore {
                 // against its own marker. The window is covered by these markers; members mark
                 // themselves for the (instant) consuming phase as usual.
                 for id in preMarkedInFlight { refreshingProviderIDs.remove(id) }
+                // Resume anything that deferred behind the fold child the instant the window closes,
+                // instead of waiting for a consumption-phase unregister (which a mid-loop cancellation
+                // could skip entirely for some providers).
+                for id in preMarkedInFlight { emitReadyDeferredRefreshes(for: id) }
                 preMarkedInFlight = []
             }
         }
@@ -1010,8 +1014,14 @@ final class WidgetDataStore {
     private func emitReadyDeferredRefreshes(for providerID: String) {
         guard let requests = deferredRefreshRequests[providerID], !requests.isEmpty else { return }
         let activeScopes = Array(runningProviderRefreshScopes[providerID, default: [:]].values)
+        // Mirror the admission gate exactly: a resumed non-forced pass runs iff the provider is not
+        // marked in flight, or its meter scope may overlap the running scopes. The batched fold child
+        // pre-marks providers while `runningProviderRefreshScopes` stays empty; emitting on "no running
+        // scopes" alone re-latched passes the gate instantly re-deferred — a millisecond spin that
+        // lasted the whole fold (up to minutes) and burned CPU on all-deferred batches.
         let ready = requests.filter { request in
-            activeScopes.isEmpty || Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
+            !refreshingProviderIDs.contains(providerID)
+                || Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
         }
         guard !ready.isEmpty else { return }
         deferredRefreshRequests[providerID] = requests.subtracting(ready)
@@ -1723,7 +1733,7 @@ final class WidgetDataStore {
         // Large on-disk corpora whose folds allocate real parse working sets: JSONL logs,
         // protobuf-over-SQLite receipt stores, multi-thousand-row usage CSVs.
         "claude", "codex", "opencode", "grok", "muse", "pi", "hermes", "freebuff",
-        "cursor", "antigravity",
+        "cursor", "antigravity", "tps",
     ]
 
     private static func heavyProvidersToSerialize(in scope: ProviderRefreshContext.Scope) -> Set<String> {

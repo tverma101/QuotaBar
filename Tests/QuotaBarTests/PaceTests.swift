@@ -42,6 +42,27 @@ final class PaceTests: XCTestCase {
         XCTAssertEqual(result?.projectedUsage ?? 0, 60, accuracy: 0.01)
     }
 
+    func testElapsedShareGatesMinimumAndResetBoundary() {
+        let reset = resetsAt(elapsed: 0.5, period: week)
+        XCTAssertEqual(Pace.elapsedShare(resetsAt: reset, periodDuration: week, now: now) ?? -1, 0.5, accuracy: 1e-9)
+        // Under 1% of a week has passed.
+        let barelyOpen = resetsAt(elapsed: 0.005, period: week)
+        XCTAssertNil(Pace.elapsedShare(resetsAt: barelyOpen, periodDuration: week, now: now))
+        // 1.1% of a week — over the gate.
+        let enough = resetsAt(elapsed: 0.011, period: week)
+        XCTAssertEqual(Pace.elapsedShare(resetsAt: enough, periodDuration: week, now: now) ?? -1, 0.011, accuracy: 1e-9)
+        // Under a minute has passed in a short window.
+        let session = now.addingTimeInterval(3600 - 50)
+        XCTAssertNil(Pace.elapsedShare(resetsAt: session, periodDuration: 3600, now: now))
+        let startedSession = now.addingTimeInterval(3600 - 70)
+        XCTAssertEqual(Pace.elapsedShare(resetsAt: startedSession, periodDuration: 3600, now: now) ?? -1, 70.0 / 3600, accuracy: 1e-9)
+        // After the reset.
+        let expired = now.addingTimeInterval(-60)
+        XCTAssertNil(Pace.elapsedShare(resetsAt: expired, periodDuration: week, now: now))
+        // A limit with no window length.
+        XCTAssertNil(Pace.elapsedShare(resetsAt: reset, periodDuration: 0, now: now))
+    }
+
     func testWindowAlreadyResetReturnsNil() {
         let past = now.addingTimeInterval(-60) // reset already happened
         XCTAssertNil(Pace.evaluate(used: 50, limit: 100, resetsAt: past, periodDuration: week, now: now))

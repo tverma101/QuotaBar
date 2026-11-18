@@ -71,6 +71,16 @@ struct OpenCodeUsageScanner: Sendable {
     /// The OpenCode-hosted providerIDs we track: the Go subscription and the Zen pay-as-you-go gateway.
     /// Both write an authoritative `cost`; other (BYO-key) providerIDs log `cost: 0` and are out of scope.
     static let hostedProviderIDs = ["opencode-go", "opencode"]
+
+    /// The providerIDs whose rows the fold captures: the Go subscription and Zen pay-as-you-go on
+    /// the shared instance, plus every providerID declared by T3 Code's private OpenCode instances
+    /// (numes, agentrouter-t3, experiential, nous-portal — each serves exactly its own provider).
+    /// Computed once per process; missing/unreadable T3 Code settings contribute nothing.
+    static let capturedProviderIDs: [String] = {
+        var ids = Set(hostedProviderIDs)
+        ids.formUnion(OpenCodePaths.t3CodePrivateDeclaredProviderIDs())
+        return ids.sorted()
+    }()
     static let goProviderID = "opencode-go"
     private static let zenProviderID = "opencode"
 
@@ -134,7 +144,18 @@ struct OpenCodeUsageScanner: Sendable {
             environment: ProcessEnvironmentReader(),
             homeDirectory: FileManager.default.homeDirectoryForCurrentUser
         )
-        return try OpenCodePaths.databaseFiles(in: dir)
+        var paths = try OpenCodePaths.databaseFiles(in: dir)
+        // T3 Code's private OpenCode instances (driver `opencode` with their own binary, e.g.
+        // numes/experiential/agentrouter/nous-portal) keep isolated data trees. Fold their
+        // databases in as additional sources — they are the same provider, just different trees.
+        // A missing/unreadable private tree contributes nothing and never throws.
+        for privateDir in OpenCodePaths.t3CodePrivateDataDirectories() {
+            if let privPaths = try? OpenCodePaths.databaseFiles(in: privateDir) {
+                let missing = privPaths.filter { !paths.contains($0) }
+                paths.append(contentsOf: missing)
+            }
+        }
+        return paths
     }
 
     /// A missing implicit Hermes installation is an optional source. An explicit HERMES_HOME is a
@@ -548,6 +569,13 @@ struct OpenCodeUsageScanner: Sendable {
                         AppLog.info(.refresh, "opencode database \(path) uses the \(layout) layout")
                     }
                 }
+                let memoKey = Self.sqliteRowsMemoKey(path: path, schema: schema, cutoffMs: cutoffMs)
+                if let memoKey, let memoRows = Self.cachedSqliteRows(key: memoKey) {
+                    // The database did not change since the last pass: reuse the parsed rows
+                    // (the query and the giant json_group_array payload dominate this stage).
+                    rows.append(contentsOf: memoRows)
+                    continue
+                }
                 guard let json = try JSONLAccountingWorkPacer.shared.perform({
                     try sqlite.queryValue(
                         path: path,
@@ -563,6 +591,9 @@ struct OpenCodeUsageScanner: Sendable {
                 }) else {
                     failures[path] = "usage rows contain malformed accounting values"
                     continue
+                }
+                if let memoKey {
+                    Self.storeSqliteRows(key: memoKey, rows: parsedRows)
                 }
                 rows.append(contentsOf: parsedRows)
             } catch {
@@ -1568,6 +1599,34 @@ struct OpenCodeUsageScanner: Sendable {
         var tokenCountSaturated: Bool
         var model: String
         var providerID: String
+    }
+
+    /// One entry per database path: the rows last parsed for a (path, schema, cutoff, revision)
+    /// stamp. Idle databases (the common panel-open case) then skip the query and the JSON parse
+    /// entirely; a new revision replaces the prior entry for that path. Process-lifetime memo,
+    /// like the monthly-cycle anchor memo below.
+    private static let sqliteRowsMemo = OSAllocatedUnfairLock<[String: [Row]]>(initialState: [:])
+
+    private static func sqliteRowsMemoKey(path: String, schema: OpenCodeDatabaseSchema, cutoffMs: Int) -> String? {
+        guard let revision = OpenCodeDatabaseSchemaProbe.revisionStamp(path: path) else { return nil }
+        // The layout is part of the key: the row source differs per layout, so a store that
+        // migrates under the same file stamp cannot reuse the other layout's rows.
+        return "\(path)|\(schema)|\(cutoffMs)|\(revision)"
+    }
+
+    private static func cachedSqliteRows(key: String) -> [Row]? {
+        sqliteRowsMemo.withLock { $0[key] }
+    }
+
+    private static func storeSqliteRows(key: String, rows: [Row]) {
+        // Keep at most one revision per path: the key starts with the path, so drop stale ones.
+        let prefix = key.split(separator: "|").first.map { "\($0)|" } ?? key
+        sqliteRowsMemo.withLock { cache in
+            for cacheKey in cache.keys where cacheKey.hasPrefix(prefix) {
+                cache.removeValue(forKey: cacheKey)
+            }
+            cache[key] = rows
+        }
     }
 
     /// Parse the `json_group_array(json_array(...))` payload: an array of

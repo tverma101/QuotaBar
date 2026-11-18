@@ -147,6 +147,59 @@ actor PiUsageScanner {
         return .complete(result)
     }
 
+    /// TPS tracking: stream every card's entries through a visitor with the same fold, gate and
+    /// dedup the scan uses — machine-local, no pricing dependency. `false` means the source was
+    /// incomplete; callers keep last-good data.
+    @discardableResult
+    func foldUsageEntries(
+        daysBack: Int = 14,
+        now: Date = Date(),
+        visit: @Sendable (Entry) -> Void
+    ) async -> Bool {
+        let directory = PiPaths.sessionsDirectory(
+            environment: environment,
+            homeDirectory: homeDirectory()
+        )
+        let cacheIdentity = directory.resolvingSymlinksInPath().path
+        let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
+        guard let files = JSONLScanning.jsonlFilesIfComplete(under: directory) else { return false }
+        let futureIdentity = "pi.sessions.\(cacheIdentity)"
+        guard !files.isEmpty else { return true }
+        let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
+        FutureTimestampRevisionGate.retain(identity: futureIdentity, paths: Set(files.map(\.path)))
+        for file in files where FutureTimestampRevisionGate.shouldDefer(
+            identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
+        ) {
+            return false
+        }
+        let bucket = FutureTimestampFoldBucket<Entry>()
+        let complete = await scanner.foldItems(
+            from: files, since: since, cacheIdentity: cacheIdentity,
+            parseFile: { url in Self.parseFile(at: url) },
+            visit: { entry in bucket.append(entry, timestamp: entry.timestamp, maximumTimestamp: maximumTimestamp) },
+            fileStarted: { bucket.begin($0) },
+            fileCompleted: { path, _ in bucket.finish(path) }
+        )
+        guard complete, !Task.isCancelled else { return false }
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
+        for (path, timestamp) in bucket.futureTimestamps {
+            guard let file = filesByPath[path],
+                  FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
+            else { return false }
+        }
+        guard bucket.futureTimestamps.isEmpty else {
+            Self.logFutureTimestamp(identity: futureIdentity)
+            return false
+        }
+        DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey(for: futureIdentity))
+        let deduped = Self.dedup(bucket.items)
+        guard !Task.isCancelled else { return false }
+        for entry in deduped where entry.timestamp >= since {
+            visit(entry)
+        }
+        return true
+    }
+
     private static func discoveryFailureKey(for identity: String) -> String {
         "pi.sessions.discovery.\(JSONLScanCachePaths.stableFingerprint(identity))"
     }

@@ -82,15 +82,43 @@ actor AntigravityDbUsageScanner {
 
     /// Antigravity keeps separate local conversation stores for the app, IDE, CLI, and compatible
     /// clients. Discover every sibling root so installing a different Antigravity client does not
-    /// leave its local spend and trend rows empty.
+    /// leave its local spend and trend rows empty. T3 Code's private ACP instances keep their stores
+    /// outside `~/.gemini` entirely; those roots are discovered too, the way T3's own reader does.
     static let defaultConversationDiscovery: @Sendable () throws -> ConversationDirectoryDiscovery = {
-        let geminiRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini", isDirectory: true)
+        try defaultConversationDiscovery(home: FileManager.default.homeDirectoryForCurrentUser)
+    }
+
+    static func defaultConversationDiscovery(home: URL) throws -> ConversationDirectoryDiscovery {
+        let fileManager = FileManager.default
+        let geminiRoot = home.appendingPathComponent(".gemini", isDirectory: true)
+        var directories: [String] = []
+        var failures: [String: String] = [:]
         do {
-            return try discoverConversationDirectories(in: geminiRoot)
+            let discovery = try discoverConversationDirectories(in: geminiRoot)
+            directories.append(contentsOf: discovery.directories)
+            failures.merge(discovery.failures) { _, new in new }
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return ConversationDirectoryDiscovery(directories: [], failures: [:])
+            // No ~/.gemini yet — the other roots may still hold conversations.
+        } catch {
+            // A broken ~/.gemini must not freeze readable sibling roots; record the failure so the
+            // scan keeps cached rows and surfaces the warning while the other roots still update.
+            failures[geminiRoot.path] = error.localizedDescription
         }
+        // T3 Code's reader also covers ~/.config/antigravity; match that root for parity.
+        let configConversations = home
+            .appendingPathComponent(".config/antigravity", isDirectory: true)
+            .appendingPathComponent("conversations", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: configConversations.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            directories.append(configConversations.path)
+        }
+        do {
+            directories.append(contentsOf: try AntigravityT3Support.conversationDirectories(home: home))
+        } catch {
+            failures[home.appendingPathComponent(AntigravityT3Support.profilesRootSubpath, isDirectory: true).path] =
+                error.localizedDescription
+        }
+        return ConversationDirectoryDiscovery(directories: directories.sorted(), failures: failures)
     }
 
     static func conversationDirectories(in geminiRoot: URL) throws -> [String] {

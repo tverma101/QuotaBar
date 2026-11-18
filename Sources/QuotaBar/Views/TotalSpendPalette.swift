@@ -14,6 +14,8 @@ enum TotalSpendPalette {
         "antigravity": 0x4285F4,                        // Google blue
         "freebuff": 0xF59E0B,                           // Freebuff warm amber / gold (#F59E0B)
         "copilot": 0xA855F7,                            // Copilot purple
+        "muse": 0xF97316,                               // Muse warm orange — stays clear of Codex/Pi
+        "pi": 0xEC4899,                                 // Pi rose
         "amp": 0xF34E3F,
         "kimi": 0x0A66FF,
         "minimax": 0xF5433C,

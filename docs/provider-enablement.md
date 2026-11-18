@@ -4,7 +4,7 @@ How QuotaBar chooses its starting provider cards and how you turn on the rest.
 
 ## First install
 
-A fresh install starts with Claude, Codex, Cursor, Freebuff, and any registered Codex account cards on. If the bare Claude card ID is unavailable because of saved account history, its preferred account-scoped card carries the Claude default. Every other provider starts off and stays off until you enable it in **Customize**. When you open Customize, QuotaBar checks supported local credential sources and marks matching provider rows. These checks stay on this Mac and never turn a provider on. See [Dashboard § First launch](dashboard.md#first-launch).
+A fresh install starts with Claude, Codex, Cursor, Freebuff, TPS Tracker, and any registered Codex account cards on. If the bare Claude card ID is unavailable because of saved account history, its preferred account-scoped card carries the Claude default. Every other provider starts off and stays off until you enable it in **Customize**. When you open Customize, QuotaBar checks supported local credential sources and marks matching provider rows. These checks stay on this Mac and never turn a provider on. See [Dashboard § First launch](dashboard.md#first-launch).
 
 ## When an update adds a new provider
 
@@ -16,7 +16,7 @@ Everything you set in Customize — providers on or off, metric layout, menu-bar
 
 The **Rescan** action in Customize checks again after you install or sign in to a provider. A row marked **Setup found** means QuotaBar found a local setup source; the provider still needs to be enabled by you and may need a refresh or additional configuration.
 
-The **Reset All Customization** button at the top of the Customize provider list restores the default set — Claude (using its preferred account-scoped card if needed), Codex, Cursor, Freebuff, and registered Codex accounts — and turns other providers off. It asks for confirmation first. See [Dashboard](dashboard.md) for the metric side of that reset.
+The **Reset All Customization** button at the top of the Customize provider list restores the default set — Claude (using its preferred account-scoped card if needed), Codex, Cursor, Freebuff, TPS Tracker, and registered Codex accounts — and turns other providers off. It asks for confirmation first. See [Dashboard](dashboard.md) for the metric side of that reset.
 
 ## How it works (for the curious)
 

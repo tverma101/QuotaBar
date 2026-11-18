@@ -31,12 +31,11 @@ enum Pace {
     /// or too early in the window for a stable projection). Mirrors `calculatePaceStatus`.
     static func evaluate(used: Double, limit: Double, resetsAt: Date, periodDuration: TimeInterval,
                          now: Date = Date()) -> Result? {
-        guard limit > 0, periodDuration > 0 else { return nil }
-        let elapsed = now.timeIntervalSince(resetsAt.addingTimeInterval(-periodDuration))
-        guard elapsed >= minimumElapsed(periodDuration: periodDuration), now < resetsAt else { return nil }
+        guard limit > 0, periodDuration > 0,
+              let share = elapsedShare(resetsAt: resetsAt, periodDuration: periodDuration, now: now) else { return nil }
 
         if used <= 0 { return Result(status: .ahead, projectedUsage: 0) }   // nothing spent → ahead
-        let projected = used / elapsed * periodDuration
+        let projected = used / share
         if used >= limit { return Result(status: .behind, projectedUsage: projected) } // maxed → behind
 
         let status: Status
@@ -44,6 +43,14 @@ enum Pace {
         else if projected <= limit { status = .onTrack }     // lands inside the last 10%
         else { status = .behind }
         return Result(status: status, projectedUsage: projected)
+    }
+
+    /// How much of the window has passed, or nil until a minute and 1% of it have, and once it resets.
+    static func elapsedShare(resetsAt: Date, periodDuration: TimeInterval, now: Date) -> Double? {
+        guard periodDuration > 0 else { return nil }
+        let elapsed = now.timeIntervalSince(resetsAt.addingTimeInterval(-periodDuration))
+        guard elapsed >= minimumElapsed(periodDuration: periodDuration), now < resetsAt else { return nil }
+        return elapsed / periodDuration
     }
 
     /// Projected seconds until the quota is exhausted, but only when we're `behind` and the run-out lands

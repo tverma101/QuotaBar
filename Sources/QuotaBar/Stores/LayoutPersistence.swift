@@ -35,6 +35,9 @@ final class LayoutPersistence {
     func loadExpandedMetrics() -> [String]? { defaults.stringArray(forKey: keys.expandedMetrics) }
     func loadExpandOnEnable() -> [String]? { defaults.stringArray(forKey: keys.expandOnEnable) }
     func loadExpandedProviders() -> [String]? { defaults.stringArray(forKey: keys.expandedProviders) }
+    /// One-shot marker for the retraction of the experimental TPS rows from dashboards.
+    func loadTpsRowsRemoved() -> Bool { defaults.bool(forKey: keys.tpsRowsRemoved) }
+    func saveTpsRowsRemoved() { defaults.set(true, forKey: keys.tpsRowsRemoved) }
     /// Metrics the user enabled by hand, as opposed to ones seeded from the default layout.
     func loadExplicitlyEnabledMetrics() -> Set<String> {
         Set(defaults.stringArray(forKey: keys.explicitlyEnabledMetrics) ?? [])
@@ -120,6 +123,9 @@ final class LayoutPersistence {
         let menuBarStyle: String
         let hiddenMenuBarProviderIDs: String
         let legacyHiddenMenuBarIconProviderIDs: String
+        /// One-shot marker: the experimental TPS rows (tps.overall/claude/codex) were retracted from
+        /// dashboards — they were seeded for one launch and are no longer a card.
+        let tpsRowsRemoved: String
 
         init(storageKey: String) {
             zcodePlacementSeeded = "\(storageKey).zcodePlacementSeeded"
@@ -137,6 +143,7 @@ final class LayoutPersistence {
             menuBarStyle = "\(storageKey).menuBarStyle"
             hiddenMenuBarProviderIDs = "\(storageKey).hiddenMenuBarProviderIDs"
             legacyHiddenMenuBarIconProviderIDs = "\(storageKey).hiddenMenuBarIconProviderIDs"
+            tpsRowsRemoved = "\(storageKey).tpsRowsRemoved.v1"
         }
     }
 }

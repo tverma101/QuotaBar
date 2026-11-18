@@ -21,7 +21,21 @@ const TASK_STARTED_MARKER: &[u8] = br#""type":"task_started""#;
 const THREAD_SETTINGS_MARKER: &[u8] = br#""type":"thread_settings_applied""#;
 
 fn contains_marker(line: &[u8], marker: &[u8]) -> bool {
-    line.windows(marker.len()).any(|window| window == marker)
+    // memchr for the leading byte (SIMD-accelerated), then memcmp the window — ~an order of
+    // magnitude cheaper than scanning the whole line for each of a marker set on lines that
+    // carry none of them (the bulk of a rollout file is tool output).
+    if marker.is_empty() {
+        return true;
+    }
+    let first = marker[0];
+    let mut cursor = memchr::memchr(first, line);
+    while let Some(pos) = cursor {
+        if line[pos..].starts_with(marker) {
+            return true;
+        }
+        cursor = memchr::memchr(first, &line[pos + 1..]).map(|next| pos + 1 + next);
+    }
+    false
 }
 
 /// Swift's `trimmingCharacters(in: .whitespaces)` trims space, tab and Unicode spaces but never

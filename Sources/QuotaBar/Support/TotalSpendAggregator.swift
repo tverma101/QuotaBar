@@ -32,6 +32,9 @@ enum TotalSpendMetric: String, CaseIterable, Identifiable, Sendable {
     case cost = "apiSpend"
     case costPerMtok
     case tokens
+    /// Estimated generation speed read from the local logs — the panel becomes all about TPS:
+    /// combined rate in the ring, per-provider rates in the legend, and a model-level breakdown.
+    case tps
 
     var id: String { rawValue }
 
@@ -40,6 +43,7 @@ enum TotalSpendMetric: String, CaseIterable, Identifiable, Sendable {
         case .cost: "Cost"
         case .costPerMtok: "Cost/MTok"
         case .tokens: "Tokens"
+        case .tps: "TPS"
         }
     }
 
@@ -49,6 +53,7 @@ enum TotalSpendMetric: String, CaseIterable, Identifiable, Sendable {
         case .cost: "No cost data for this period"
         case .costPerMtok: "No cost-per-token data for this period"
         case .tokens: "No token data for this period"
+        case .tps: "No TPS data yet — enable TPS Tracker in Customize, or run an agent, then refresh"
         }
     }
 
@@ -148,6 +153,9 @@ struct TotalSpend: Equatable {
                 guard !slice.tokenCountSaturated else { return nil }
                 guard let rate = slice.costPerMtok else { return nil }
                 return (slice, rate)
+            case .tps:
+                // TPS slices come from the TPS snapshot, not spend lines — see TPSTotal.
+                return nil
             }
         }
 
@@ -215,6 +223,9 @@ struct TotalSpend: Equatable {
             }
             center = weightedRate
             estimated = ranked.contains { $0.slice.estimated }
+        case .tps:
+            center = 0
+            estimated = false
         }
 
         let hasIncompleteCost: Bool
@@ -234,6 +245,9 @@ struct TotalSpend: Equatable {
             hasPartialData = aggregateTokenOverflowed || slices.contains(where: {
                 $0.isPartial || $0.tokenCountSaturated
             })
+        case .tps:
+            hasIncompleteCost = false
+            hasPartialData = false
         }
         return TotalSpendProjection(
             metric: metric,

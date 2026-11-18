@@ -14,6 +14,7 @@ struct DashboardContentView: View {
 
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
     @AppStorage(TotalSpendSetting.key) private var showTotalSpend = true
+    @AppStorage(TotalSpendSetting.metricKey) private var metricRawValue = TotalSpendMetric.cost.rawValue
 
     var body: some View {
         PopoverScrollView {
@@ -39,8 +40,11 @@ struct DashboardContentView: View {
     @ViewBuilder
     private var widgetContent: some View {
         // The cross-provider Total Spend ring stays visible whenever the user allows it and an enabled
-        // provider can track spend, even before fresh data arrives or when every metric row is hidden.
-        if showTotalSpend, layout.hasSpendCapableProvider {
+        // provider can track spend (or the TPS lens is selected) — even before fresh data arrives or
+        // when every metric row is hidden. The TPS lens is its own data source; it stays offered in
+        // TPS mode so the panel never strands the user with no card and no way back.
+        let isTPSMode = metricRawValue == TotalSpendMetric.tps.rawValue
+        if showTotalSpend, layout.hasSpendCapableProvider || isTPSMode {
             TotalSpendCard()
                 .padding(.bottom, density.sectionSpacing)
         }

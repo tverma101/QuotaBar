@@ -18,6 +18,8 @@ struct TotalSpendCard: View {
     @AppStorage(TotalSpendSetting.periodKey) private var periodRawValue = TotalSpendPeriod.today.rawValue
     /// The selected metric (Cost / Cost/MTok / Tokens) survives the same way.
     @AppStorage(TotalSpendSetting.metricKey) private var metricRawValue = TotalSpendMetric.cost.rawValue
+    /// The TPS lens's window (Today / 7 Days / 14 Days) survives the same way.
+    @AppStorage(TotalSpendSetting.tpsWindowKey) private var tpsWindowRawValue = TokensPerSecondWindow.fourteenDays.rawValue
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
 
     private var period: TotalSpendPeriod {
@@ -26,6 +28,10 @@ struct TotalSpendCard: View {
 
     private var metric: TotalSpendMetric {
         TotalSpendMetric(rawValue: metricRawValue) ?? .cost
+    }
+
+    private var tpsWindow: TokensPerSecondWindow {
+        TokensPerSecondWindow(rawValue: tpsWindowRawValue) ?? .fourteenDays
     }
 
     /// The spend-tile providers the card may aggregate — capability-based (see
@@ -55,6 +61,17 @@ struct TotalSpendCard: View {
     private var projection: TotalSpendProjection {
         total.projection(for: metric)
     }
+
+    // MARK: - TPS lens
+
+    /// The TPS snapshot's fold always recomputes on the panel's accounting cadence; in TPS mode the
+    /// card renders that snapshot instead of a spend projection. The window switcher picks one of
+    /// the fold's pre-bucketed day views — no re-read on switch.
+    private var tpsTotal: TPSTotal? {
+        TPSTotal.from(dataStore.snapshots["tps"], window: tpsWindow)
+    }
+
+    private var isTPS: Bool { metric == .tps }
 
     var body: some View {
         VStack(alignment: .leading, spacing: density.headerToCardSpacing) {
@@ -117,6 +134,10 @@ struct TotalSpendCard: View {
     /// hardcoded list, so disabling a provider (or a new spend provider shipping) can't make the
     /// tooltip lie about what the total reflects.
     private var infoTooltip: String {
+        // TPS reads only the local session logs, never the spend-capable set.
+        if isTPS {
+            return "Estimated from local session logs (\(tpsWindow.windowLabel.lowercased())). Intervals under 0.2 s and over 60 s are excluded, so rates are estimates, not benchmarks."
+        }
         // Account-scoped cards (“Codex — alice@example.com”) stay nameable only as their family
         // while account names are blurred, matching everywhere else the names render.
         var seen = Set<String>()
@@ -133,6 +154,8 @@ struct TotalSpendCard: View {
             coverageNote = "Dollar totals show known subtotals when cost data is incomplete; active-session usage can still grow."
         case .costPerMtok:
             coverageNote = "Providers with incomplete cost or saturated token totals are excluded from the rate."
+        case .tps:
+            coverageNote = "Estimated from local session logs only. Intervals under 0.2 s and over 60 s are excluded, so rates are estimates, not benchmarks."
         case .tokens:
             coverageNote = "Saturated token totals are lower bounds; active-session usage can still grow."
         }
@@ -141,12 +164,16 @@ struct TotalSpendCard: View {
 
     private var shareButton: some View {
         CopyFeedbackButton(accessibilityLabel: "Copy \(metric.title) Screenshot") {
-            ShareCardRenderer.shareTotalSpend(
-                total: total,
-                metric: metric,
-                appearance: colorScheme,
-                layout: layout
-            )
+            if isTPS {
+                ShareCardRenderer.shareTPS(tps: tpsTotal, appearance: colorScheme, layout: layout)
+            } else {
+                ShareCardRenderer.shareTotalSpend(
+                    total: total,
+                    metric: metric,
+                    appearance: colorScheme,
+                    layout: layout
+                )
+            }
         }
     }
 
@@ -154,12 +181,8 @@ struct TotalSpendCard: View {
 
     private var card: some View {
         VStack(spacing: 12) {
-            periodPicker
-            if projection.isEmpty {
-                emptyState
-            } else {
-                TotalSpendRingContent(projection: projection)
-            }
+            if isTPS { tpsWindowPicker } else { periodPicker }
+            content
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
@@ -167,14 +190,19 @@ struct TotalSpendCard: View {
         .cardSurface()
         .animation(Motion.spring, value: periodRawValue)
         .animation(Motion.spring, value: metricRawValue)
+        .animation(Motion.spring, value: tpsWindowRawValue)
         .contextMenu {
             Button("Share Screenshot") {
-                ShareCardRenderer.shareTotalSpend(
-                    total: total,
-                    metric: metric,
-                    appearance: colorScheme,
-                    layout: layout
-                )
+                if isTPS {
+                    ShareCardRenderer.shareTPS(tps: tpsTotal, appearance: colorScheme, layout: layout)
+                } else {
+                    ShareCardRenderer.shareTotalSpend(
+                        total: total,
+                        metric: metric,
+                        appearance: colorScheme,
+                        layout: layout
+                    )
+                }
             }
         }
     }
@@ -219,6 +247,106 @@ struct TotalSpendCard: View {
         .animation(Motion.spring, value: periodRawValue)
     }
 
+    /// The TPS lens's window switcher — the same capsule design language as the spend period picker.
+    /// Today / 7 Days / 14 Days are views of one fold, so switching is instant and never re-scans.
+    private var tpsWindowPicker: some View {
+        HStack(spacing: 2) {
+            ForEach(TokensPerSecondWindow.allCases) { candidate in
+                tpsWindowSegment(candidate)
+            }
+        }
+        .padding(3)
+        .background(.quinary, in: Capsule())
+        .frame(maxWidth: .infinity)
+    }
+
+    private func tpsWindowSegment(_ candidate: TokensPerSecondWindow) -> some View {
+        let isSelected = candidate == tpsWindow
+        return Button {
+            tpsWindowRawValue = candidate.rawValue
+        } label: {
+            Text(candidate.shortLabel)
+                .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
+                .foregroundStyle(isSelected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .background {
+            if isSelected {
+                Capsule()
+                    .fill(.background)
+                    .shadow(color: .black.opacity(0.12), radius: 2, y: 1)
+                    .matchedGeometryEffect(id: "tpsWindow", in: pickerNamespace)
+            }
+        }
+        .animation(Motion.spring, value: tpsWindowRawValue)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if isTPS {
+            if let tps = tpsTotal, !tps.isEmpty {
+                TPSSpendPanel(tps: tps)
+            } else if let error = dataStore.providerErrors["tps"] {
+                tpsErrorState(message: error)
+            } else {
+                emptyState
+            }
+        } else if projection.isEmpty {
+            emptyState
+        } else {
+            TotalSpendRingContent(projection: projection)
+        }
+    }
+
+    /// A failed TPS fold keeps whatever the last good snapshot carried — or says so out loud with a
+    /// Retry, never a silent zero.
+    private func tpsErrorState(message: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Theme.notice)
+            Text(message)
+                .font(.system(size: density.supportingPointSize))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button(action: retryTPS) {
+                Label("Refresh", systemImage: "arrow.clockwise")
+                    .font(.caption2.weight(.medium))
+            }
+            .buttonStyle(.borderless)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+    }
+
+    /// Mirror the dashboard's retry: a cheap meters-only pass (the local provider admits it), then
+    /// the real fold on the interactive budget — never a silent skip.
+    private func retryTPS() {
+        Task {
+            let attempt = await withManualRefresh {
+                let manualActionID = ProviderRefreshContext.manualActionID
+                let interactionGate = ProviderRefreshContext.credentialInteractionGate
+                let outcome = await withThrottledPanelMeters {
+                    await dataStore.refresh(providerID: "tps", force: true)
+                }
+                return (outcome, manualActionID, interactionGate)
+            }
+            guard attempt.0 == .refreshed || attempt.0 == .failed else { return }
+
+            Task { @MainActor in
+                _ = await dataStore.refreshProviderHistoryAfterRetry(
+                    providerID: "tps",
+                    manualActionID: attempt.1,
+                    credentialInteractionGate: attempt.2
+                )
+            }
+        }
+    }
+
     /// A metric/period combination with nothing to show mirrors the spend tiles' "No data" rule —
     /// never a fabricated zero ring.
     private var emptyState: some View {
@@ -227,7 +355,7 @@ struct TotalSpendCard: View {
             switch metric {
             case .cost: message = "No priced usage for this period"
             case .costPerMtok: message = "No complete cost-per-token data for this period"
-            case .tokens: message = metric.emptyMessage
+            case .tps, .tokens: message = metric.emptyMessage
             }
         } else {
             message = metric.emptyMessage
@@ -299,6 +427,8 @@ struct TotalSpendRingContent: View {
             if projection.hasActiveSessionData { notes.append("active-session usage can still grow") }
         case .costPerMtok:
             if projection.hasIncompleteCost { notes.append("providers with incomplete cost or saturated token counts are excluded") }
+        case .tps:
+            notes.append("estimated from local logs; tool-call intervals excluded")
         case .tokens:
             if projection.hasActiveSessionData { notes.append("active-session usage can still grow") }
             if projection.hasSaturatedTokenData { notes.append("saturated token totals are lower bounds") }
@@ -307,6 +437,8 @@ struct TotalSpendRingContent: View {
         switch projection.metric {
         case .cost:
             return "Total cost \(displayedCenter) across \(projection.slices.count) providers\(partial)"
+        case .tps:
+            return "Estimated tokens per second \(displayedCenter) across \(projection.slices.count) providers\(partial)"
         case .tokens:
             return "Total tokens \(displayedCenter) across \(projection.slices.count) providers"
         case .costPerMtok:
@@ -384,7 +516,11 @@ struct TotalSpendRingContent: View {
             case .tokens:
                 if projection.hasActiveSessionData { notes.append("Active-session usage can still grow") }
                 if projection.hasSaturatedTokenData { notes.append("Saturated token totals are lower bounds") }
+            case .tps:
+                break
             }
+        } else if projection.metric == .tps {
+            notes.append("Estimated from local logs; tool-call intervals excluded; not a benchmark")
         }
         return notes.isEmpty ? exact : "\(exact) · \(notes.joined(separator: " · "))"
     }
@@ -429,10 +565,11 @@ struct TotalSpendRingContent: View {
         }
     }
 
-    /// Legend amounts: tokens always abbreviated; dollar modes keep exact cents like before.
+    /// Legend amounts: tokens always abbreviated; dollar modes keep exact cents like before; TPS shows
+    /// each provider's average rate.
     private var legendValueStyle: MetricFormatter.Style {
         switch projection.metric {
-        case .tokens: .row
+        case .tokens, .tps: .row
         case .cost, .costPerMtok: .full
         }
     }
@@ -443,6 +580,9 @@ struct TotalSpendRingContent: View {
             return MetricFormatter.number(value, kind: .dollars, style: style)
         case .tokens:
             return MetricFormatter.number(value, kind: .count, style: style)
+        case .tps:
+            let rate = MetricFormatter.number(value, kind: .count, style: .row)
+            return "\(rate) tok/s"
         case .costPerMtok:
             return MetricFormatter.costPerMtok(value, style: style)
         }

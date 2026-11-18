@@ -340,6 +340,7 @@ enum ProviderCatalog {
             HermesProvider(),
             openCode,
             OpenRouterProvider(),
+            TPSTrackerProvider(),
             ZAIProvider()
         ]
         return providers

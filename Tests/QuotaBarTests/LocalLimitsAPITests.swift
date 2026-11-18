@@ -262,7 +262,9 @@ final class LocalLimitsAPITests: XCTestCase {
             "freebuff": [],
             "opencode": ["session", "weekly", "monthly"],
             "openrouter": ["credits", "balance", "keyLimit"],
-            "zai": ["session", "weekly", "webSearches"]
+            "zai": ["session", "weekly", "webSearches"],
+            // TPS rows carry no scalar limit resource; the experiment renders rates, not quotas.
+            "tps": []
         ]
 
         XCTAssertEqual(actual, expected)

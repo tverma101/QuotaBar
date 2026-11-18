@@ -4,7 +4,7 @@ The popover that opens from the menu bar icon. Providers are sections; each sect
 
 ## First launch
 
-A fresh install starts with Claude, Codex, Cursor, Freebuff, and any registered Codex account cards on. Other providers stay off until you enable them in **Customize**. Opening Customize checks for supported local setups and marks matching rows, but discovery never chooses or enables provider cards. A one-time card at the top of the dashboard points to **Customize** and stays until you close it with its ✕ button.
+A fresh install starts with Claude, Codex, Cursor, Freebuff, TPS Tracker, and any registered Codex account cards on. Other providers stay off until you enable them in **Customize**. Opening Customize checks for supported local setups and marks matching rows, but discovery never chooses or enables provider cards. A one-time card at the top of the dashboard points to **Customize** and stays until you close it with its ✕ button.
 
 Providers added by future updates also start off. Updates preserve your saved provider choices, and a provider never turns on just because its CLI or app is installed. See [Which Providers Are On](provider-enablement.md) for the full lifecycle.
 
@@ -18,7 +18,7 @@ A provider card can also show **quick-link buttons** pinned at the bottom of its
 
 ## Total Spend
 
-When any enabled provider tracks daily spend (Claude, Codex, Cursor, Grok, Freebuff, or OpenCode), a card sits above the provider sections. The title is a pull-down menu for **Cost**, **Cost/MTok**, or **Tokens** (Cost is the default; the choice sticks across restarts). A capsule switcher flips the period between **Today**, **Yesterday**, and **30 Days**. The ring, center total, and ranked legend follow the selected metric:
+When any enabled provider tracks daily spend (Claude, Codex, Cursor, Grok, Freebuff, or OpenCode), a card sits above the provider sections. The title is a pull-down menu for **Cost**, **Cost/MTok**, **Tokens**, or **TPS** (Cost is the default; the choice sticks across restarts). The **TPS** lens pivots the whole panel to tokens per second: rate arcs per provider, a combined estimate in the center, each provider's average rate in the legend, and a model list ranked by output tokens. It is drawn from the local logs only, and the period switcher is hidden there. A capsule switcher flips the period between **Today**, **Yesterday**, and **30 Days**. The ring, center total, and ranked legend follow the selected metric:
 
 - **Cost** — each segment is that provider's share of combined dollars (biggest spender first).
 - **Cost/MTok** — each segment is sized by that provider's dollars-per-million-tokens rate; the center is the blended rate across providers that have both spend and tokens; the legend lists each provider's own rate.
@@ -74,13 +74,13 @@ The image is a flexible-height PNG using the app's look — the provider's mark 
 
 ## Footer
 
-The bar pinned to the bottom of the popover. On the left: the app version, and a live "Next update in …" countdown you can click (or press **⌘R**) to refresh right away. On the right: an **Options** menu button. It holds everything in one place — **Customize**, **Settings**, **Share Screenshot** (submenu of providers), **Check for Updates…**, **About QuotaBar**, and **Quit QuotaBar**.
+The bar pinned to the bottom of the popover. Content scrolling underneath it blurs softly behind it — the system's soft scroll edge on macOS 27, an in-window frost before it — and shows nothing when nothing is under it; content scrolling under the top bar is hidden behind the panel instead. On the left: the app version, and a live "Next update in …" countdown you can click (or press **⌘R**) to refresh right away. On the right: an **Options** menu button. It holds everything in one place — **Customize**, **Settings**, **Share Screenshot** (submenu of providers), **Check for Updates…**, **About QuotaBar**, and **Quit QuotaBar**.
 
 ## Customize
 
 Open Customize from the footer's **Options** menu (or press **Return**). It's a two-level screen: a list of providers, then a provider's detail.
 
-The **provider list** shows every provider with a switch to turn it on or off, a count of its metrics, and a chevron into its detail. Turn a provider off and it stays in the list, greyed — its metrics hide from the dashboard and menu bar but keep their setup for when you turn it back on. Drag enabled providers by their grip to reorder; tap a row to open its detail. A fresh install starts with Claude, Codex, Cursor, Freebuff, and any registered Codex account cards on; this list is where you add the rest.
+The **provider list** shows every provider with a switch to turn it on or off, a count of its metrics, and a chevron into its detail. Turn a provider off and it stays in the list, greyed — its metrics hide from the dashboard and menu bar but keep their setup for when you turn it back on. Drag enabled providers by their grip to reorder; tap a row to open its detail. A fresh install starts with Claude, Codex, Cursor, Freebuff, TPS Tracker, and any registered Codex account cards on; this list is where you add the rest.
 
 A provider's **detail** has a back button and provider-specific Reset control in its top bar, followed by two metric sections: **Always Visible** (shown on the dashboard card) and **On Demand** (tucked behind the card's caret). Each metric row has a drag grip, its name, an always-visible star for the menu bar, and an on/off switch. Drag a metric into the other card—or onto one of that card's rows—to move it between Always Visible and On Demand. An empty card shows a dashed **Drag metrics here** target. You can star up to two metrics per provider. OpenRouter and Z.ai also show an **API Key** section here, where you can add, replace, reveal, or clear that provider's key.
 
@@ -90,7 +90,7 @@ The default reset layout keeps each provider's core quota meters and Usage Trend
 
 Made a change you didn't mean to? Press **⌘Z** to undo — it works anywhere in the popover (the dashboard and Customize alike) and steps back through your recent customization changes one at a time: hiding or showing a metric, reordering metrics or whole providers, starring or unstarring, and moving a metric across the divider all undo. Each step restores the exact previous arrangement. Undo is per-session (it starts fresh after a relaunch), and resetting clears it.
 
-When QuotaBar ships a new default metric, existing layouts get it once. If you turn it off, it stays off. A provider's **Reset** button (top right of its detail) restores that provider's default metrics, order, menu-bar stars, and which metrics start on demand, but leaves other providers and the provider order untouched. The **Reset All Customization** button (top right of the provider list) restores every provider's defaults, the default provider order, and the default enabled set (Claude, Codex, Cursor, Freebuff, and registered Codex accounts). Other providers stay off until you enable them in Customize. It asks for confirmation first because the full layout reset can't be undone.
+When QuotaBar ships a new default metric, existing layouts get it once. If you turn it off, it stays off. A provider's **Reset** button (top right of its detail) restores that provider's default metrics, order, menu-bar stars, and which metrics start on demand, but leaves other providers and the provider order untouched. The **Reset All Customization** button (top right of the provider list) restores every provider's defaults, the default provider order, and the default enabled set (Claude, Codex, Cursor, Freebuff, TPS Tracker, and registered Codex accounts). Other providers stay off until you enable them in Customize. It asks for confirmation first because the full layout reset can't be undone.
 
 ## Keyboard
 

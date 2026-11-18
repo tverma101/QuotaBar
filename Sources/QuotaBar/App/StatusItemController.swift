@@ -15,6 +15,20 @@ import SwiftUI
 final class MenuBarPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    /// Hosts the dashboard one level below the content view. Under the SwiftUI App lifecycle a hosting
+    /// view that is its window's content view resizes the window to its root size on every layout,
+    /// whatever its `sizingOptions` (`animatesWindowRootSize`), which fought `PanelHeightController` for
+    /// the frame until AppKit threw "more Update Constraints in Window passes than there are views".
+    /// The hosting view fills the content view AppKit already gave the panel instead.
+    func host(_ view: NSHostingView<some View>) {
+        guard let contentView else { return }
+        view.sizingOptions = []
+        view.layerContentsRedrawPolicy = .duringViewResize
+        view.frame = contentView.bounds
+        view.autoresizingMask = [.width, .height]
+        contentView.addSubview(view)
+    }
 }
 
 /// The single QuotaBar menu-bar entry. Its strip is the aggregate of the currently pinned metrics,
@@ -68,10 +82,10 @@ final class StatusItemController: NSObject {
         onInsidePanelClick: { [weak self] in self?.clearStrayFocus() },
         onDismiss: { [weak self] in self?.hidePanel() }
     )
-    private let hostingController: NSHostingController<AnyView>
     /// The panel's backdrop: an opaque tray by default, swapped to a behind-window vibrancy view when
     /// the transparency style is non-opaque. Built once and toggled, so it can't race the style observer.
     private let backdrop = PopoverBackdropView(cornerRadius: StatusItemController.cornerRadius)
+    private let host: NSHostingView<AnyView>
     /// Token for the appearance-change observer; held to follow the documented removal pattern.
     private var appearanceObserver: NSObjectProtocol?
     private var diagnosticControl: DiagnosticDashboardController?
@@ -86,10 +100,7 @@ final class StatusItemController: NSObject {
         // Start with an empty host so the dashboard Observation graph is not kept alive while the
         // panel is closed (same class of leak as japananh/aimonitor#88). Real content is attached
         // lazily in `showPanel` and torn down again in `hidePanel`.
-        let hosting = NSHostingController(rootView: AnyView(EmptyView()))
-        // The host view fills the panel. SwiftUI measures each screen and drives the panel height;
-        // content scrolls only when that height reaches the available-screen limit.
-        self.hostingController = hosting
+        let host = NSHostingView(rootView: AnyView(EmptyView()))
 
         let panel = MenuBarPanel(
             contentRect: NSRect(
@@ -103,6 +114,7 @@ final class StatusItemController: NSObject {
             defer: false
         )
         self.panel = panel
+        self.host = host
         self.heightController = PanelHeightController(panel: panel) { container.layout.screen }
 
         super.init()
@@ -224,7 +236,13 @@ final class StatusItemController: NSObject {
         // live by `appearanceObserver`.
         panel.appearance = AppearanceSetting.current.nsAppearance
 
-        let container = NSView()
+        // The panel's own content view hosts two subviews: the backdrop fills it (painted first, below),
+        // and the SwiftUI hosting view fills it above — one level below the content view, so SwiftUI can
+        // never size the window (see `MenuBarPanel.host(_:)`).
+        guard let contentView = panel.contentView else {
+            AppLog.error(.statusItem, "Panel has no content view at configure time")
+            return
+        }
 
         // Backdrop: by default an opaque tray so the data region never shows the desktop through it
         // (Liquid Glass stays reserved for the footer chrome, rendered in-window over this backing). The
@@ -234,35 +252,21 @@ final class StatusItemController: NSObject {
         // shows the backdrop, not a raw hole. Its opaque tray is `Theme.trayNSColor` (tracks light/dark
         // and the forced appearance override) matching the SwiftUI tray (`DashboardView.PopoverSurface`),
         // rounded via `cornerRadius`. `panel.appearance` (tracked by `appearanceObserver`) pins the mode.
-        let host = hostingController.view
-        host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
         // Redraw the SwiftUI content on every step of a height change instead of stretching the layer's
         // cached contents (the default `.onSetNeedsDisplay`), which keeps cards steady during a morph.
-        host.layerContentsRedrawPolicy = .duringViewResize
         host.layer?.cornerRadius = Self.cornerRadius
         host.layer?.cornerCurve = .continuous
         host.layer?.masksToBounds = true
 
-        container.addSubview(backdrop)
-        container.addSubview(host, positioned: .above, relativeTo: backdrop)
+        contentView.addSubview(backdrop)
         NSLayoutConstraint.activate([
-            backdrop.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            backdrop.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            backdrop.topAnchor.constraint(equalTo: container.topAnchor),
-            backdrop.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            host.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            host.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            host.topAnchor.constraint(equalTo: container.topAnchor),
-            host.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            backdrop.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            backdrop.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            backdrop.topAnchor.constraint(equalTo: contentView.topAnchor),
+            backdrop.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
         ])
-
-        // A plain container VC owns the backdrop; the hosting controller is its child so SwiftUI gets
-        // a proper view-controller hierarchy. Panel placement and height live in `heightController`.
-        let rootVC = NSViewController()
-        rootVC.view = container
-        rootVC.addChild(hostingController)
-        panel.contentViewController = rootVC
+        panel.host(host)
     }
 
     private func configureStatusItems() {
@@ -443,7 +447,7 @@ final class StatusItemController: NSObject {
 
         // Rebuild the dashboard tree only while visible. A closed panel keeps EmptyView so Observation
         // objects cannot accumulate off-screen for hours.
-        hostingController.rootView = makeDashboardRootView()
+        host.rootView = makeDashboardRootView()
 
         // Presentation is deliberately snapshot-only. Opening used to force a full, uncached
         // provider batch, so every menu-bar tap fanned out across all provider accounting and
@@ -464,7 +468,7 @@ final class StatusItemController: NSObject {
         }
 
         // Lay the content out first so the panel opens at the right size (no first-frame flash).
-        hostingController.view.layoutSubtreeIfNeeded()
+        host.layoutSubtreeIfNeeded()
 
         // `canBecomeKey` + `.nonactivatingPanel` makes this key without activating the app — no
         // activation race, so the dashboard receives keys on the first try.
@@ -506,7 +510,7 @@ final class StatusItemController: NSObject {
         container.transparency.setPopoverShown(false)
         // Detach the dashboard so no SwiftUI view keeps observing AppModel / WidgetDataStore while the
         // panel is ordered out. Keep the NSPanel itself for fast reopen.
-        hostingController.rootView = AnyView(EmptyView())
+        host.rootView = AnyView(EmptyView())
         panel.orderOut(nil)
         outsideClickMonitor.stop()
         highlight(nil)

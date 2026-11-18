@@ -163,7 +163,7 @@ actor CodexRouterUsageScanner {
         maxResidentItems: 128_000,
         retainResidentItems: true,
         logTag: LogTag.plugin("codex"),
-        persistence: JSONLScanCachePersistence(namespace: "codex-router", schemaVersion: 7)
+        persistence: JSONLScanCachePersistence(namespace: "codex-router", schemaVersion: 8)
     )
 
     /// Shared across every Codex card so two accounts do not re-parse the same ledger. Retention
@@ -317,7 +317,7 @@ actor CodexRouterUsageScanner {
                     accountIdentityKey: accountIdentityKey,
                     allowsUnscopedEvents: allowsUnscopedEvents
                 )
-                let cacheKey = "codex-router|\(scopeKey)"
+                let cacheKey = "codex-router-v2|\(scopeKey)"
                 let outcome = await persistentAggregateCache.scan(
                     key: cacheKey,
                     pricingStamp: LogUsagePricingStamp.of(pricing),
@@ -550,8 +550,13 @@ actor CodexRouterUsageScanner {
             // add reasoning on top when totalTokens is absent — that double-counted tokens.
             guard let total = event.measuredTokenTotal else {
                 if event.hasNoMeasuredUsageFields {
-                    fold.sawRows = true
-                    fold.accumulator.markUnmeasuredUsage(day: DailyUsageAccumulator.dayKey(from: event.timestamp, calendar: calendar))
+                    // Only a row whose generation stream actually started (response-start marker) is a
+                    // measurement gap. Native image/search passthrough records omit the marker and never
+                    // could carry tokens — exclude them rather than flagging the day unmeasured.
+                    if event.hasResponseStartMsField {
+                        fold.sawRows = true
+                        fold.accumulator.markUnmeasuredUsage(day: DailyUsageAccumulator.dayKey(from: event.timestamp, calendar: calendar))
+                    }
                     return
                 }
                 fold.sawInvalidUsageRow = true
@@ -1451,6 +1456,10 @@ actor CodexRouterUsageScanner {
         var serviceTier: String?
         /// The source count exceeded the parser's safe range and was retained as a lower bound.
         var tokenCountSaturated: Bool? = nil
+        /// A response-start marker was present: a generation stream actually began. Successful rows
+        /// without it are native image/search passthrough records that never could carry token usage,
+        /// so they must not flag the day as unmeasured. Default false so older cached events decode.
+        var hasResponseStartMsField: Bool = false
 
         var isMalformedRouterEvent: Bool {
             !hasValidStatusField || !hasValidTimestampField || !hasValidModelField || !hasValidAccountIdentityFields
@@ -1846,8 +1855,13 @@ actor CodexRouterUsageScanner {
             let hasCompleteCostBreakdown = event.hasCompleteMeasuredCostBreakdown
             guard let total = event.measuredTokenTotal else {
                 if event.hasNoMeasuredUsageFields {
-                    fold.sawRows = true
-                    fold.accumulator.markUnmeasuredUsage(day: DailyUsageAccumulator.dayKey(from: event.timestamp, calendar: calendar))
+                    // Only a row whose generation stream actually started (response-start marker) is a
+                    // measurement gap. Native image/search passthrough records omit the marker and never
+                    // could carry tokens — exclude them rather than flagging the day unmeasured.
+                    if event.hasResponseStartMsField {
+                        fold.sawRows = true
+                        fold.accumulator.markUnmeasuredUsage(day: DailyUsageAccumulator.dayKey(from: event.timestamp, calendar: calendar))
+                    }
                     return
                 }
                 fold.sawInvalidUsageRow = true
