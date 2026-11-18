@@ -82,8 +82,11 @@ receipt across restarts; active runs resume after the last event cursor. Memory-
 unloads the in-memory mirror; local accounting restores the saved receipts before publishing totals.
 History requests happen in the accounting pass, never on menu-bar timer refreshes. Failed pages keep the previous receipts and
 show a warning that totals may be incomplete, which stays visible across successful session polls.
-Runs with missing or incomplete token receipts also keep their day marked incomplete and show a
-history warning. Their missing tokens are unknown, never counted as zero or estimated from hours.
+Runs with missing or incomplete token receipts keep their day marked incomplete (a lower bound);
+their missing tokens are unknown, never counted as zero or estimated from hours. A completed live run
+that lost its receipt, or a run that reported only partial usage, raises a history warning. A run that
+failed or was cancelled never produced a complete receipt by design, and imported legacy history
+carries no token metrics — those days stay lower bounds but do not raise the warning.
 Older receipt caches are replayed once to recover counts that a later sparse update could have hidden.
 Incomplete runs are checked again at most once every five minutes even when their completed status
 and chat timestamp have not changed, so a late receipt can repair the subtotal. Removing a chat or

@@ -225,6 +225,7 @@ actor FreebuffHostedUsageScanner {
             cached.receipt.map { receipt in
                 var receipt = receipt
                 receipt.model = cached.run.model
+                receipt.runStatus = cached.run.status
                 return receipt
             }
         }.sorted { $0.id < $1.id }
