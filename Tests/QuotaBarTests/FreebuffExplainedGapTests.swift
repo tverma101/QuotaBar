@@ -49,12 +49,33 @@ final class FreebuffExplainedGapTests: XCTestCase {
         XCTAssertEqual(result.unexplainedPartialDays, [day], "a completed live run that lost its receipt is a real gap")
     }
 
-    func testReportedIncompleteUsageStillWarnsRegardlessOfStatus() async throws {
+    func testCompletedHostedRunIncompleteUsageStillWarns() async throws {
         let metrics = #"{"usage":{"inputTokens":100,"outputTokens":50},"usageIncomplete":true}"#
-        let result = try await scan([receipt(id: "cloud:run-1", status: "failed", metrics: metrics)])
+        let result = try await scan([receipt(id: "cloud:run-1", status: "completed", metrics: metrics)])
         let day = DailyUsageAccumulator.dayKey(from: now)
         XCTAssertEqual(result.partialDays, [day])
-        XCTAssertEqual(result.unexplainedPartialDays, [day], "a partial measurement is actionable even on a failed run")
+        XCTAssertEqual(result.unexplainedPartialDays, [day], "a completed live run's partial measurement is actionable")
+    }
+
+    func testFailedRunIncompleteUsageIsExplained() async throws {
+        let metrics = #"{"usage":{"inputTokens":100,"outputTokens":50},"usageIncomplete":true}"#
+        let result = try await scan([receipt(id: "cloud:run-1", status: "failed", metrics: metrics)])
+        XCTAssertEqual(result.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
+        XCTAssertTrue(result.unexplainedPartialDays.isEmpty, "a terminal failed run's partial usage is a permanent fact")
+    }
+
+    func testLocalDesktopNoUsageAndIncompleteTurnsAreExplained() async throws {
+        // Local Desktop turns carry no run status; their ids are <thread>:<seq>, not cloud:. The SDK
+        // stamps no-usage / usageIncomplete on abort/interrupt/provider-not-reporting — permanent local
+        // facts, not retry-recoverable gaps, so they stay lower bounds without the warning.
+        let noUsage = receipt(id: "thread-1:4", status: nil, metrics: "{}")
+        let incomplete = receipt(
+            id: "thread-1:5", status: nil,
+            metrics: #"{"usage":{"inputTokens":100,"outputTokens":50},"usageIncomplete":true}"#
+        )
+        let result = try await scan([noUsage, incomplete])
+        XCTAssertEqual(result.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
+        XCTAssertTrue(result.unexplainedPartialDays.isEmpty, "local abort/interrupt facts are explained gaps")
     }
 
     func testFullyMeasuredReceiptIsNeitherPartialNorUnexplained() async throws {
