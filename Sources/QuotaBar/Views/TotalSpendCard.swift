@@ -18,6 +18,8 @@ struct TotalSpendCard: View {
     @AppStorage(TotalSpendSetting.periodKey) private var periodRawValue = TotalSpendPeriod.today.rawValue
     /// The selected metric (Cost / Cost/MTok / Tokens) survives the same way.
     @AppStorage(TotalSpendSetting.metricKey) private var metricRawValue = TotalSpendMetric.cost.rawValue
+    /// The TPS lens's window (Today / 7 Days / 14 Days) survives the same way.
+    @AppStorage(TotalSpendSetting.tpsWindowKey) private var tpsWindowRawValue = TokensPerSecondWindow.fourteenDays.rawValue
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
 
     private var period: TotalSpendPeriod {
@@ -26,6 +28,10 @@ struct TotalSpendCard: View {
 
     private var metric: TotalSpendMetric {
         TotalSpendMetric(rawValue: metricRawValue) ?? .cost
+    }
+
+    private var tpsWindow: TokensPerSecondWindow {
+        TokensPerSecondWindow(rawValue: tpsWindowRawValue) ?? .fourteenDays
     }
 
     /// The spend-tile providers the card may aggregate — capability-based (see
@@ -59,9 +65,10 @@ struct TotalSpendCard: View {
     // MARK: - TPS lens
 
     /// The TPS snapshot's fold always recomputes on the panel's accounting cadence; in TPS mode the
-    /// card renders that snapshot instead of a spend projection.
+    /// card renders that snapshot instead of a spend projection. The window switcher picks one of
+    /// the fold's pre-bucketed day views — no re-read on switch.
     private var tpsTotal: TPSTotal? {
-        TPSTotal.from(dataStore.snapshots["tps"])
+        TPSTotal.from(dataStore.snapshots["tps"], window: tpsWindow)
     }
 
     private var isTPS: Bool { metric == .tps }
@@ -127,9 +134,9 @@ struct TotalSpendCard: View {
     /// hardcoded list, so disabling a provider (or a new spend provider shipping) can't make the
     /// tooltip lie about what the total reflects.
     private var infoTooltip: String {
-        // TPS reads only the local Claude Code and Codex logs, never the spend-capable set.
+        // TPS reads only the local session logs, never the spend-capable set.
         if isTPS {
-            return "Estimated from local Claude Code and Codex session logs (14-day window). Intervals under 0.2 s and over 60 s are excluded, so rates are estimates, not benchmarks."
+            return "Estimated from local session logs (\(tpsWindow.windowLabel.lowercased())). Intervals under 0.2 s and over 60 s are excluded, so rates are estimates, not benchmarks."
         }
         // Account-scoped cards (“Codex — alice@example.com”) stay nameable only as their family
         // while account names are blurred, matching everywhere else the names render.
@@ -148,7 +155,7 @@ struct TotalSpendCard: View {
         case .costPerMtok:
             coverageNote = "Providers with incomplete cost or saturated token totals are excluded from the rate."
         case .tps:
-            coverageNote = "Estimated from local logs only (Claude Code and Codex). Intervals under 0.2 s and over 60 s are excluded, so rates are estimates, not benchmarks."
+            coverageNote = "Estimated from local session logs only. Intervals under 0.2 s and over 60 s are excluded, so rates are estimates, not benchmarks."
         case .tokens:
             coverageNote = "Saturated token totals are lower bounds; active-session usage can still grow."
         }
@@ -174,7 +181,7 @@ struct TotalSpendCard: View {
 
     private var card: some View {
         VStack(spacing: 12) {
-            if !isTPS { periodPicker }
+            if isTPS { tpsWindowPicker } else { periodPicker }
             content
         }
         .padding(.horizontal, 14)
@@ -183,6 +190,7 @@ struct TotalSpendCard: View {
         .cardSurface()
         .animation(Motion.spring, value: periodRawValue)
         .animation(Motion.spring, value: metricRawValue)
+        .animation(Motion.spring, value: tpsWindowRawValue)
         .contextMenu {
             Button("Share Screenshot") {
                 if isTPS {
@@ -237,6 +245,44 @@ struct TotalSpendCard: View {
             }
         }
         .animation(Motion.spring, value: periodRawValue)
+    }
+
+    /// The TPS lens's window switcher — the same capsule design language as the spend period picker.
+    /// Today / 7 Days / 14 Days are views of one fold, so switching is instant and never re-scans.
+    private var tpsWindowPicker: some View {
+        HStack(spacing: 2) {
+            ForEach(TokensPerSecondWindow.allCases) { candidate in
+                tpsWindowSegment(candidate)
+            }
+        }
+        .padding(3)
+        .background(.quinary, in: Capsule())
+        .frame(maxWidth: .infinity)
+    }
+
+    private func tpsWindowSegment(_ candidate: TokensPerSecondWindow) -> some View {
+        let isSelected = candidate == tpsWindow
+        return Button {
+            tpsWindowRawValue = candidate.rawValue
+        } label: {
+            Text(candidate.shortLabel)
+                .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
+                .foregroundStyle(isSelected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .background {
+            if isSelected {
+                Capsule()
+                    .fill(.background)
+                    .shadow(color: .black.opacity(0.12), radius: 2, y: 1)
+                    .matchedGeometryEffect(id: "tpsWindow", in: pickerNamespace)
+            }
+        }
+        .animation(Motion.spring, value: tpsWindowRawValue)
     }
 
     @ViewBuilder

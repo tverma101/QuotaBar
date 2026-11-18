@@ -9,19 +9,23 @@ The estimates live in the **Total Spend panel** as its **TPS** lens — never as
 The Total Spend ring at the top of the dashboard has a title pull-down: **Cost**, **Cost/MTok**,
 **Tokens**, **TPS**. Pick **TPS** and the whole panel becomes TPS:
 
+- **Window switcher** — **Today / 7 Days / 14 Days**, the same capsule control the spend lenses use
+  for their periods. All three are views of one 14-day fold bucketed by day, so switching is
+  instant and never re-reads a log file. Your choice survives relaunches.
 - **Ring** — each provider's share of generation pace (rate-based arcs, same morph math as Cost/MTok).
-- **Center** — your combined estimate, token-weighted across every corpus (Claude, Codex, Grok, Muse, Pi, Z.ai, Antigravity).
-- **Legend** — per provider: its average tokens/sec, ranked fastest first (Claude, Codex, Grok,
-  Muse, Pi today).
-- **Model TPS** — the models your machines actually generated from, ranked by output tokens, with
-  each model's paired-report rate when there are enough of them. Up to 12 shown, with a
+- **Center** — your combined estimate for the selected window, token-weighted across every corpus
+  (Claude, Codex, Grok, Muse, Pi, Z.ai, Antigravity).
+- **Legend** — per provider: its average tokens/sec in the window, ranked fastest first.
+- **Model TPS** — the models your machines actually generated from in the window, ranked by output
+  tokens, with each model's paired-report rate when there are enough of them. Up to 12 shown, with a
   "… N more models" footer when there's more.
 
 The caption under the ring says what the number is: estimated from local logs, tool-call intervals
-excluded, not a benchmark.
+excluded, not a benchmark. A window with too few qualifying intervals shows its empty state — a
+quiet day is "no data yet", never a fabricated zero.
 
 The **Timing** stays put in TPS mode (it is a rolling window, not a day); the Today / Yesterday /
-30 Days switcher only shows for Cost, Cost/MTok and Tokens.
+30 Days switcher only shows for Cost, Cost/MTok and Tokens — TPS has its own window switcher above.
 
 ## Enabling and disabling
 
@@ -50,8 +54,11 @@ Seven corpora are folded; JSONL ones reuse the same incremental parse caches the
   `started_at`, `first_token_at`/`completed_at`, `output_tokens` and `model_id`. When the server
   reported first-token timing, the fold uses the stream interval verbatim (up to five minutes of
   generation per row); rows without a stream window fold through the same pair rule as the rest.
-- Antigravity (agy CLI, desktop app and IDE) keeps one SQLite conversation database per conversation
-  under `~/.gemini/antigravity*/conversations` (UUID-shaped `.db` files). The fold reads each one
+- Antigravity (agy CLI, desktop app, IDE, and T3 Code's private ACP instances) keeps one SQLite
+  conversation database per conversation under `~/.gemini/antigravity*/conversations`,
+  `~/.config/antigravity/conversations`, and
+  `~/.t3/userdata/providers/antigravity/*/antigravity-acp/conversations` (UUID-shaped `.db` files).
+  The fold reads each one
   read-only (immutable when no `-wal` exists), pulls `PLANNER_RESPONSE` steps and measures
   `output_tokens` over the row's own `created_at → finished_generating_at` stream window when the
   row has one (up to five minutes), falling back to the pair rule otherwise. Response ids dedupe
@@ -80,8 +87,9 @@ tick, never on a quota cadence, never in parallel with another heavy local fold.
 exports machineLocal history scope, so nothing about it participates in iCloud sync.
 
 Providers that can't carry per-report timing are intentionally absent: Hermes (period aggregates,
-no interval stream), Antigravity (protobuf conversation stores), Cursor (day-level CSV only), and the
-API-quota providers (Devin, Copilot, OpenRouter). OpenCode's router ledger is the same Codex stream
+no interval stream), Cursor (day-level CSV only), and the API-quota providers (Devin, Copilot,
+OpenRouter). Antigravity's protobuf conversation stores DO carry per-response timing and fold into
+the lens (see above). OpenCode's router ledger is the same Codex stream
 shown on the Codex slice, and it isn't double-counted.
 
 Failure handling: if a source changed mid-scan or could not be read completely, the panel keeps its
@@ -98,8 +106,12 @@ corpus (e.g. no Grok install) is just an absent slice, never an error.
 - **Model TPS section is missing** — no model accumulated paired reports in the window; it appears
   on its own once generation data exists.
 - **Antigravity slice is missing** — stored conversations are read from
-  `~/.gemini/antigravity{,-cli,-ide}/conversations/*.db`; fresh conversations appear on the next
-  accounting pass. A database that cannot be opened or has no readable planner rows contributes
-  nothing.
+  `~/.gemini/antigravity{,-cli,-ide}/conversations/*.db`, `~/.config/antigravity/conversations`, and
+  T3 Code's private instances under `~/.t3/userdata/providers/antigravity/*/antigravity-acp/conversations`;
+  fresh conversations appear on the next accounting pass. A database that cannot be opened or has
+  no readable planner rows contributes nothing.
+- **Today or 7 Days shows less than 14 Days** — the windows are views of the same fold; a quiet day
+  simply has fewer qualifying intervals. Below five intervals a corpus shows no rate for that
+  window, by design.
 - **Rate looks absurdly high or low** — it is an estimate over a 0.2–60 s interval band; compare
   the same model across similar sessions, or not at all. The chart caption reiterates the caveat.

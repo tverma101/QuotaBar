@@ -258,7 +258,11 @@ final class TPSTrackerProviderTests: XCTestCase {
             guard case .values(let label, let values, _, _, _, _) = line else { return nil }
             return (label, values)
         })
-        XCTAssertEqual(Set(values.keys), ["Est. TPS", "Claude", "Codex"])
+        // The full window keeps the bare labels; the lens's Today / 7 Days views ride alongside.
+        let bareLabels = Set(values.keys.filter { !$0.hasSuffix(" (Today)") && !$0.hasSuffix(" (7 Days)") })
+        XCTAssertEqual(bareLabels, ["Est. TPS", "Claude", "Codex"])
+        XCTAssertTrue(values.keys.contains("Claude (Today)"))
+        XCTAssertTrue(values.keys.contains("Codex (7 Days)"))
         for (label, rate) in [("Est. TPS", 20.0), ("Claude", 20.0), ("Codex", 20.0)] {
             let row = try XCTUnwrap(values[label])
             XCTAssertEqual(try XCTUnwrap(row.first).kind, .count)
@@ -293,8 +297,9 @@ final class TPSTrackerProviderTests: XCTestCase {
             guard case .values(let label, let values, _, _, _, _) = line else { return nil }
             return (label, values)
         })
+        let bareLabels = Set(values.keys.filter { !$0.hasSuffix(" (Today)") && !$0.hasSuffix(" (7 Days)") })
         XCTAssertEqual(
-            Set(values.keys),
+            bareLabels,
             ["Est. TPS", "Claude", "Codex", "Grok", "Muse", "Pi"],
             "every corpus with fixture logs must emit a row"
         )
@@ -336,8 +341,9 @@ final class TPSTrackerProviderTests: XCTestCase {
             guard case .values(let label, let values, _, _, _, _) = line else { return nil }
             return (label, values)
         })
+        let bareLabels = Set(values.keys.filter { !$0.hasSuffix(" (Today)") && !$0.hasSuffix(" (7 Days)") })
         XCTAssertEqual(
-            Set(values.keys),
+            bareLabels,
             ["Est. TPS", "Claude", "Codex", "Grok", "Muse", "Pi", "Z.ai"],
             "ZCode stream rows fold into the lens alongside the other corpora"
         )

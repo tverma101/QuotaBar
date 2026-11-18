@@ -81,9 +81,7 @@ final class TPSTrackerProvider: ProviderRuntime {
                     roots.append(MusePaths.sessionsDirectory(homeDirectory: home))
                     roots.append(PiPaths.sessionsDirectory(environment: environment, homeDirectory: home))
                     roots.append(home.appendingPathComponent(".zcode/cli/db/db.sqlite"))
-                    for subpath in AntigravityConversationReader.storeSubpaths {
-                        roots.append(home.appendingPathComponent(subpath).appendingPathComponent("conversations"))
-                    }
+                    roots.append(contentsOf: AntigravityConversationReader.conversationRoots(home: home))
                     return roots
                 }
             }
@@ -124,10 +122,13 @@ final class TPSTrackerProvider: ProviderRuntime {
         guard let estimate = await scanner.scan(daysBack: TokensPerSecond.windowDays, now: now()) else {
             return ProviderSnapshot.error(provider: provider, error: TPSTrackerError.sourceIncomplete)
         }
+        // One fold, three windows: the lens switches between Today / 7 Days / 14 Days without
+        // re-reading any logs. The full window keeps the historical bare labels.
+        let lines = TokensPerSecondWindow.allCases.flatMap { TokensPerSecondMapper.lines(estimate, window: $0) }
         return ProviderSnapshot.make(
             provider: provider,
             plan: nil,
-            lines: TokensPerSecondMapper.lines(estimate),
+            lines: lines,
             refreshedAt: now()
         )
     }

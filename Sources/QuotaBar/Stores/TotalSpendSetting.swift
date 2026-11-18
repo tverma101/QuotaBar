@@ -9,4 +9,6 @@ enum TotalSpendSetting {
     static let periodKey = "openusage.totalSpend.period"
     /// The card's selected metric (Cost / Cost/MTok / Tokens), persisted by `TotalSpendCard`.
     static let metricKey = "openusage.totalSpend.metric"
+    /// The TPS lens's selected window (Today / 7 Days / 14 Days), persisted by `TotalSpendCard`.
+    static let tpsWindowKey = "openusage.totalSpend.tpsWindow"
 }

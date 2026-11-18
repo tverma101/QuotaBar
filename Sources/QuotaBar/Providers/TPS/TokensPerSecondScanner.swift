@@ -113,7 +113,7 @@ actor TokensPerSecondScanner {
         guard await antigravityFold(daysBack: daysBack, now: now, accumulators: accumulators), !Task.isCancelled
         else { return nil }
 
-        return TokensPerSecondEstimate.from(accumulators.accumulators)
+        return TokensPerSecondEstimate.from(accumulators.accumulators, now: now)
     }
 
     /// One `model_usage` row per ZCode API call with `started_at`/`first_token_at`/`completed_at`

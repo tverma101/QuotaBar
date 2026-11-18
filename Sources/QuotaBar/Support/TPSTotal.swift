@@ -57,13 +57,17 @@ struct TPSTotal: Equatable, Sendable {
     }
 
     /// Build the lens's data from the TPS provider's snapshot. `nil` when the provider never ran
-    /// or its fold failed — the panel shows the empty state, never a fabricated zero.
-    static func from(_ snapshot: ProviderSnapshot?) -> TPSTotal? {
+    /// or its fold failed — the panel shows the empty state, never a fabricated zero. The window
+    /// selects which of the fold's pre-bucketed views to render; switching never re-folds.
+    static func from(
+        _ snapshot: ProviderSnapshot?,
+        window: TokensPerSecondWindow = .fourteenDays
+    ) -> TPSTotal? {
         guard let snapshot else { return nil }
         let lines = Dictionary(snapshot.lines.map { ($0.label, $0) }, uniquingKeysWith: { first, _ in first })
 
         func numbers(in label: String) -> (rate: Double?, tokens: Double?, breakdown: ModelUsageBreakdown?) {
-            guard case .values(_, let values, _, _, _, let breakdown)? = lines[label] else {
+            guard case .values(_, let values, _, _, _, let breakdown)? = lines[label + window.labelSuffix] else {
                 return (nil, nil, nil)
             }
             let rate = values.first { $0.label == "tok/s" }?.number
@@ -105,7 +109,7 @@ struct TPSTotal: Equatable, Sendable {
             models: models,
             combinedRate: combined.rate,
             combinedTokens: combinedTokens,
-            windowLabel: "Last 14 days"
+            windowLabel: window.windowLabel
         )
     }
 }
