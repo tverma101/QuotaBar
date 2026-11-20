@@ -330,12 +330,7 @@ struct OpenCodeUsageScanner: Sendable {
                     pricing: pricing
                 )
                 nativeCoverage.insert(key)
-                return OpenCodeUsageScanner.shouldFoldNativeCodexRow(
-                    row,
-                    accountIdentityKey: accountIdentityKey,
-                    completeRouterCoverage: routerCoverage,
-                    pricing: pricing
-                )
+                return !routerCoverage.contains(key)
             }
             OpenCodeUsageScanner.foldGatewayRows(
                 rowsToFold,
@@ -1425,23 +1420,6 @@ struct OpenCodeUsageScanner: Sendable {
                 // delayed bursts), so the day's total is partial until the session ends.
                 partialDays.insert(day)
             }
-            let cost: Double?
-            let providerID = row.burnsGoQuota ? Self.goProviderID : Self.zenProviderID
-            if let rate = effectiveRates[EffectiveRateKey(model: row.model, providerID: providerID)] {
-                // The gateway's own recorded average for this model — all of the row's tokens blend
-                // at it (the same proportion the provider's recorded dollars represent).
-                cost = rate * Double(row.tokens)
-            } else if let estimated = pricing.estimatedCostDollars(
-                model: row.model,
-                tokens: TokenBreakdown(
-                    input: row.input, cacheWrite5m: row.cacheWrite, cacheRead: row.cacheRead, output: row.output
-                ),
-                applyLongContextRates: !row.isAggregated
-            ) {
-                cost = estimated
-            } else {
-                cost = nil
-            }
             let apiEstimate = pricing.estimatedCostDollars(
                 model: row.model,
                 tokens: TokenBreakdown(
@@ -1449,6 +1427,15 @@ struct OpenCodeUsageScanner: Sendable {
                 ),
                 applyLongContextRates: !row.isAggregated
             )
+            let cost: Double?
+            let providerID = row.burnsGoQuota ? Self.goProviderID : Self.zenProviderID
+            if let rate = effectiveRates[EffectiveRateKey(model: row.model, providerID: providerID)] {
+                // The gateway's own recorded average for this model — all of the row's tokens blend
+                // at it (the same proportion the provider's recorded dollars represent).
+                cost = rate * Double(row.tokens)
+            } else {
+                cost = apiEstimate
+            }
             let hasEstimatedRouterInput = row.routerInputWasEstimated == true
             let hasIncompleteRouterBreakdown = row.routerCostBreakdownIsComplete == false
             let hasIncompleteRouterAccounting = hasEstimatedRouterInput

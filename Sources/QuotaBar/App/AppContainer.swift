@@ -850,7 +850,13 @@ final class AppContainer {
                             let keepWarm = transparency.popoverShown && !ProcessMemoryBudget.isOverSoftLimit
                             await PersistentJSONLScanCaches.unloadAfterRefreshCycle(keepRouterItemsResident: keepWarm)
                             await dataStore.unloadFreebuffAccountingCacheForMemoryPressure()
-                            if !transparency.popoverShown || ProcessMemoryBudget.isOverSoftLimit {
+                            if !transparency.popoverShown {
+                                await dataStore.unloadProviderCachesForMemoryPressure()
+                                await ModelPricingStore.shared.clearCaches()
+                            } else if ProcessMemoryBudget.isOverSoftUnloadCeiling {
+                                // Hysteresis gate: record the trigger footprint before unloading so
+                                // the ceiling is measured against the pre-unload peak.
+                                ProcessMemoryBudget.noteSoftLimitUnload()
                                 await dataStore.unloadProviderCachesForMemoryPressure()
                                 await ModelPricingStore.shared.clearCaches()
                             }
@@ -877,7 +883,13 @@ final class AppContainer {
                     // the live heap, the dominant settled-footprint fragmentation. Warm caches are the
                     // cheaper state; the soft budget and OS pressure still release them when they are
                     // actually too big.
-                    if !transparency.popoverShown || ProcessMemoryBudget.isOverSoftLimit {
+                    if !transparency.popoverShown {
+                        await dataStore.unloadProviderCachesForMemoryPressure()
+                        await ModelPricingStore.shared.clearCaches()
+                    } else if ProcessMemoryBudget.isOverSoftUnloadCeiling {
+                        // Hysteresis gate: record the trigger footprint before unloading so the
+                        // ceiling is measured against the pre-unload peak.
+                        ProcessMemoryBudget.noteSoftLimitUnload()
                         await dataStore.unloadProviderCachesForMemoryPressure()
                         await ModelPricingStore.shared.clearCaches()
                     } else {
