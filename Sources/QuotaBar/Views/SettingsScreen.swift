@@ -467,7 +467,7 @@ struct SettingsScreen: View {
         }
     }
 
-    /// A full-width glass button row, matching the "Check for Updates…" idiom.
+    /// A full-width glass button row, matching the wide settings-action idiom.
     /// Glass on macOS 26+, bordered fallback on macOS 15.
     private func logButton(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {

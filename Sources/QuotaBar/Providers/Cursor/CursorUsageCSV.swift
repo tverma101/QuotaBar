@@ -3,7 +3,7 @@ import Foundation
 /// One parsed row from Cursor's CSV usage export. `imputedCostDollars` is the locally priced dollar
 /// amount (server CSV tokens × the shared model pricing); `nil` when no pricing source knows the
 /// model — those rows contribute tokens but flag the day's cost as incomplete. Ported from
-/// `../cursorcat/Sources/CursorCat/API/UsageCSV.swift`, dropping the actual-cost / CostMode path for v1.
+/// the companion CursorCat parser, dropping the actual-cost / CostMode path for v1.
 struct CursorUsageCSVRow: Sendable, Equatable {
     var date: Date
     var model: String
