@@ -237,10 +237,24 @@ actor GrokLogUsageScanner {
     }
 
     nonisolated static func parseFile(at url: URL) -> [Entry]? {
+        // The Rust whole-file parser reads, splits, and parses without materializing Foundation
+        // objects; it declines the shapes it cannot emulate and the Swift reference below runs.
+        switch GrokRustParser.parseFile(at: url) {
+        case .success(let entries): return entries
+        case .failed: return nil
+        case .fallback: break
+        }
+        return parseFileSwift(at: url)
+    }
+
+    /// Reference implementation and runtime fallback for `parseFile(at:)` — kept identical to
+    /// the Rust port's semantics (pinned by GrokRustParserTests). Calls `parseLineSwift`
+    /// directly so the oracle never consults the Rust bridge it is meant to check.
+    nonisolated static func parseFileSwift(at url: URL) -> [Entry]? {
         var entries: [Entry] = []
         var malformed = false
         let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
-            switch parseLine(Data(line)) {
+            switch parseLineSwift(Data(line)) {
             case .entries(let parsed): entries.append(contentsOf: parsed)
             case .irrelevant: break
             case .malformed: malformed = true
@@ -259,6 +273,18 @@ actor GrokLogUsageScanner {
     private static let completedTurnMarker = Data("turn_completed".utf8)
 
     private static func parseLine(_ line: Data) -> LineResult {
+        if let rust = GrokRustParser.parseLine(line) {
+            switch rust {
+            case .entries(let parsed): return .entries(parsed)
+            case .irrelevant: return .irrelevant
+            case .malformed: return .malformed
+            }
+        }
+        return parseLineSwift(line)
+    }
+
+    /// Reference implementation — see `parseLine`. Kept as the fallback oracle for the Rust port.
+    private static func parseLineSwift(_ line: Data) -> LineResult {
         guard line.range(of: completedTurnMarker) != nil else { return .irrelevant }
         guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
             return .malformed

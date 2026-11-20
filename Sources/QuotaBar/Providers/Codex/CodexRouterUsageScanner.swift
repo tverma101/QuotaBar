@@ -1334,6 +1334,53 @@ actor CodexRouterUsageScanner {
         emitSince: Date,
         key: String
     ) -> [Event]? {
+        // Fast path: the quotabar-core Rust whole-file parser. It runs the same structural
+        // walker as the Swift reference parser and declines the whole file when a line
+        // carries a timestamp shape this library cannot emulate — the Swift parser then
+        // re-parses from scratch, so results never come from a mix of the two engines.
+        switch CodexRouterRustParser.parseFile(at: url) {
+        case .failed:
+            // Unreadable, cancelled, oversized, or a malformed line — nil exactly like the
+            // Swift path's `guard read.isComplete, !malformedLine`.
+            return nil
+        case .success(let events, let read):
+            // The file driver emits `.event` + `.malformedEvent` payloads in file order;
+            // `recentEvents` reproduces the per-line emitSince gate (malformed rows always
+            // kept, `.event` rows only when timestamp >= emitSince).
+            let collected = recentEvents(events, since: emitSince)
+            let offset = UInt64(read.statistics.bytesRead)
+            if let revision = AppendOnlyFileProbe.revision(at: url),
+               revision.size >= offset,
+               let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: offset) {
+                sharedTailCache.store(
+                    AppendOnlyFileTailCache<Event, ParserCheckpoint>.Entry(
+                        revision: revision,
+                        offset: offset,
+                        anchor: anchor,
+                        partialLine: read.finalPartial,
+                        isDiscardingOversizedLine: read.isDiscardingOversizedLine,
+                        parserState: ParserCheckpoint(emitSince: emitSince),
+                        items: collected
+                    ),
+                    for: key,
+                    parseKind: .full,
+                    bytesRead: read.statistics.bytesRead
+                )
+            }
+            return collected
+        case .fallback:
+            break
+        }
+        return fullParseAndCheckpointSwift(at: url, emitSince: emitSince, key: key)
+    }
+
+    /// The Swift reference whole-file path — oracle for the Rust driver and fallback when
+    /// Rust declines a file.
+    nonisolated private static func fullParseAndCheckpointSwift(
+        at url: URL,
+        emitSince: Date,
+        key: String
+    ) -> [Event]? {
         var collected: [Event] = []
         var malformedLine = false
         var timestampCache = CodexRouterEventLineParser.TimestampCache()

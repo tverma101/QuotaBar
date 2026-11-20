@@ -562,6 +562,74 @@ final class CursorProviderTests: XCTestCase {
         XCTAssertEqual(progress(snapshot.lines, "On-demand")?.used, 40)
     }
 
+    // Upstream OpenUsage #1693: an account whose Cursor, X and Grok plans are merged
+    // (`GetPlanInfo.isMerged`) has no credit grants, Stripe balance, or spend-limit endpoint.
+    // The dashboard reads its complat credit balance and monthly usage-status instead.
+    func testRefreshReadsUnifiedAccountFromComplatBalanceAndUsageStatus() async {
+        let accessToken = makeCursorJWT(sub: "google-oauth2|user_abc123")
+        let http = RoutingHTTPClient { request in
+            let url = request.url.absoluteString
+            if url.contains("GetCurrentPeriodUsage") {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data("""
+                {
+                  "enabled": true,
+                  "billingCycleEnd": 1772592000000,
+                  "planUsage": {"totalPercentUsed": 10.8}
+                }
+                """.utf8))
+            }
+            if url.contains("GetPlanInfo") {
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"isMerged":true,"planInfo":{"planName":"Ultra"}}"#.utf8))
+            }
+            if url.contains("GetComplatCreditBalance") {
+                XCTAssertEqual(request.method, "POST")
+                XCTAssertEqual(request.headers["Authorization"], "Bearer \(accessToken)")
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"usdRemainingCents":"581149"}"#.utf8))
+            }
+            if url.contains("usage-status") {
+                XCTAssertEqual(request.headers["Cookie"], "WorkosCursorSessionToken=user_abc123%3A%3A\(accessToken)")
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data("""
+                {
+                  "availability": "available",
+                  "monthlyUsage": {
+                    "additionalUsageOff": false,
+                    "limitCents": 10000,
+                    "usedCents": 2500,
+                    "periodStart": "2026-11-01T00:00:00.000Z",
+                    "resetsAt": "2026-12-01T00:00:00.000Z"
+                  }
+                }
+                """.utf8))
+            }
+            // A merged account must not ask for credit grants, Stripe balance, or the Grok Bot row.
+            if url.contains("GetCreditGrantsBalance") || url.contains("/api/auth/stripe")
+                || url.contains("GetSandUsageStatus") {
+                XCTFail("merged account must not fetch \(url)")
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+        let provider = CursorProvider(
+            authStore: CursorAuthStore(
+                sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]),
+                keychain: FakeKeychain()
+            ),
+            usageClient: CursorUsageClient(http: http),
+            now: { Date(timeIntervalSince1970: 1_800_000_000) }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.plan, "Ultra")
+        XCTAssertEqual(dollarValue(snapshot.lines, "Credits") ?? -1, 5811.49)
+        XCTAssertEqual(progress(snapshot.lines, "Total usage")?.used, 10.8)
+        let onDemand = progress(snapshot.lines, "On-demand")
+        XCTAssertEqual(onDemand?.used, 25)
+        XCTAssertEqual(onDemand?.limit, 100)
+        XCTAssertEqual(onDemand?.resetsAt, OpenUsageISO8601.date(from: "2026-12-01T00:00:00.000Z"))
+        XCTAssertNil(snapshot.lines.first(where: { $0.label == "Grok Bot usage" }))
+        XCTAssertNil(snapshot.lines.first(where: { $0.label == "Cursor Models" }))
+    }
+
     func testRefreshTokenCancellationStopsBeforeUsageRequestWhenOldTokenExists() async {
         let http = RoutingHTTPClient { request in
             XCTAssertEqual(request.url, CursorUsageClient.refreshURL)

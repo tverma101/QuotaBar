@@ -65,6 +65,11 @@ Local changes that matter when syncing shared code:
    undated records never become today's usage on launch. OpenCode reads both SQLite message layouts
    and deduplicates migrated IDs. Reasoning-only Router records keep their measured lower bound
    without blocking independent OpenCode history. Completed Router prefixes remain usable through ordinary appends during the wider fold; rewrites and replacements still invalidate them. Preserve these format-compatibility fixes.
+5. **Rust core accelerator layer** (`Rust/quotabar-core`, `docs/rust-core.md`). Hot-path parsers run
+   in Rust behind `CQuotabarCore`; each touched scanner's original implementation survives renamed
+   with a `Swift` suffix (e.g. `parseFileSwift`, `parseLineResultSwift`, `parseResultSwift`) as the
+   fallback and parity oracle — when syncing upstream parser fixes, apply them to the `*Swift`
+   bodies (never to the dispatcher) and re-run the `*RustParserTests` parity suites.
 
 ## Selective sync — 2026-10-21
 
@@ -95,6 +100,35 @@ QuotaBar is a maintained fork, so the old "do not edit this subtree" quarantine 
 The engineering conventions in `AGENTS.md` govern. The upstream notices — `LICENSE`,
 `CODE_OF_CONDUCT.md`, `SECURITY.md`, `CONTRIBUTING.md`, `TRADEMARK.md` — must not be removed or
 rewritten, and upstream attribution must be preserved.
+
+## Selective sync — 2026-11-19
+
+Compared upstream `4152e020` (`v0.8.1-beta.2`, ~241 commits past the `26132ff48d` baseline). Upstream's
+`7129ab29` accounts rewrite (#1444, "API-reported usage only") is skipped-architecture: the fork's
+local history/database scanners are intentional. Adapted fixes:
+
+- `e1ffa571` (#1676): Antigravity Cloud Code calls now send `antigravity/hub/<ver>` — Google hides
+  `paidTier`/Argon quota from callers it marks `UNSUPPORTED_CLIENT`.
+- `ee981593` (#1641): quota summaries prefer the daily host (active counters) with production filling
+  omissions; plan/project lookups prefer production; Antigravity `used` is no longer rounded so a
+  fresh window's <0.5% usage does not read "Not started".
+- `2114be569` (#1529): 429 and rate-limit-marked 403s classify as `rateLimited` (new
+  `AntigravityError.rateLimited` → `ErrorCategory.rateLimited`), not expired auth or access denied;
+  Copilot's main usage path applies its existing rate-limit detection to 403 too.
+- `61333460` (#1510): Antigravity plan/`loadCodeAssist` refusals no longer veto the quota read, and a
+  project-scoped quota refusal retries once without the project.
+- `bfb0fbb` (#1391): refresh-end snapshot rebuilds are deferred during a batch and flushed once at
+  batch end. The cache-persist half is skipped — the fork's cross-process blob commits per provider.
+- `7058825` (#1467): OpenRouter management keys (`is_management_key`) now sum account spend across
+  the `/keys` pages — the endpoint's own spend is always zero for a management key.
+- `44637bb`/`1bfd317` (#1465/#1693): merged (unified Cursor/X/Grok) accounts now read
+  `GetComplatCreditBalance` + dashboard `usage-status` instead of credit grants/Stripe/spend-limit,
+  skip the Grok Bot row, and keep the fork's org-seat usage-summary enrichment and SQLite membership.
+
+Already equivalent locally, no port needed: `28ffb97` (#1460 OAuth `state`, no authorize flow here),
+`d72b83b` (#1452 Codex credits $), `886b3c4` (#1463 Claude "spent"), `c354c8a` (#1464 proxy),
+`f0039b2` (#1390 one-pass scan, superseded by the Rust core), `5c9d9a7`/`bae20d9` (#1383/#1384,
+append-resume + off-main discovery already present).
 
 ## Popup adaptation — 2026-11-07
 

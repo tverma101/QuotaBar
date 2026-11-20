@@ -129,10 +129,24 @@ actor MuseUsageScanner {
 
     /// Streaming parser — a large session file never becomes one giant Data allocation.
     nonisolated static func parseFile(at url: URL) -> [Entry]? {
+        // The Rust whole-file parser reads, splits, and parses without materializing Foundation
+        // objects; it declines the shapes it cannot emulate and the Swift reference below runs.
+        switch MuseRustParser.parseFile(at: url) {
+        case .success(let entries): return entries
+        case .failed: return nil
+        case .fallback: break
+        }
+        return parseFileSwift(at: url)
+    }
+
+    /// Reference implementation and runtime fallback for `parseFile(at:)` — kept identical to
+    /// the Rust port's semantics (pinned by MuseRustParserTests). Calls `parseLineResultSwift`
+    /// directly so the oracle never consults the Rust bridge it is meant to check.
+    nonisolated static func parseFileSwift(at url: URL) -> [Entry]? {
         var entries: [Entry] = []
         var malformed = false
         let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
-            switch parseLineResult(line) {
+            switch parseLineResultSwift(line) {
             case .entry(let entry): entries.append(entry)
             case .irrelevant: break
             case .malformed: malformed = true
@@ -160,6 +174,19 @@ actor MuseUsageScanner {
     }
 
     private static func parseLineResult(_ line: Data.SubSequence) -> LineResult {
+        if let rust = MuseRustParser.parseLine(Data(line)) {
+            switch rust {
+            case .entry(let entry): return .entry(entry)
+            case .irrelevant: return .irrelevant
+            case .malformed: return .malformed
+            }
+        }
+        return parseLineResultSwift(line)
+    }
+
+    /// Reference implementation — see `parseLineResult`. Kept as the fallback oracle for the
+    /// Rust port.
+    private static func parseLineResultSwift(_ line: Data.SubSequence) -> LineResult {
         guard line.range(of: marker) != nil else { return .irrelevant }
         let lineData = Data(line)
         guard let object = (try? JSONSerialization.jsonObject(with: lineData)) as? [String: Any] else {

@@ -253,6 +253,22 @@ enum CodexRouterEventLineParser {
         _ line: Data.SubSequence,
         timestampCache: inout TimestampCache
     ) -> CodexRouterUsageScanner.Event? {
+        if let detail = CodexRouterRustParser.parseLineDetail(line) {
+            // `parse` returns the produced event — even one a `.malformedEvent`/non-2xx
+            // `.irrelevant` verdict would carry — as long as the timestamp parsed; a
+            // distant-past malformed event surfaces as nil exactly like the byte walk.
+            guard let event = detail.event, event.hasValidTimestampField else { return nil }
+            return event
+        }
+        return parseEventSwift(line, timestampCache: &timestampCache)
+    }
+
+    /// The Swift reference implementation of `parse` — the oracle the Rust bridge falls back
+    /// to for declined inputs, and the comparison target of the parity tests.
+    static func parseEventSwift(
+        _ line: Data.SubSequence,
+        timestampCache: inout TimestampCache
+    ) -> CodexRouterUsageScanner.Event? {
         var malformedEvent: CodexRouterUsageScanner.Event?
         return line.withUnsafeBytes { rawBytes in
             parse(
@@ -267,6 +283,23 @@ enum CodexRouterEventLineParser {
     /// checkpoint must never advance over a malformed candidate row because the next scan would then
     /// publish a smaller aggregate permanently.
     static func parseResult(
+        _ line: Data.SubSequence,
+        timestampCache: inout TimestampCache
+    ) -> LineResult {
+        if let outcome = CodexRouterRustParser.parseLine(line) {
+            switch outcome {
+            case .event(let event): return .event(event)
+            case .malformedEvent(let event): return .malformedEvent(event)
+            case .irrelevant: return .irrelevant
+            case .malformed: return .malformed
+            }
+        }
+        return parseResultSwift(line, timestampCache: &timestampCache)
+    }
+
+    /// The Swift reference implementation of `parseResult` — same oracle/fallback role as
+    /// `parseEventSwift`.
+    static func parseResultSwift(
         _ line: Data.SubSequence,
         timestampCache: inout TimestampCache
     ) -> LineResult {

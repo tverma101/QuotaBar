@@ -112,6 +112,14 @@ final class CopilotProvider: ProviderRuntime {
             if response.statusCode == 401 {
                 return ProviderSnapshot.error(provider: provider, error: CopilotAuthError.tokenInvalid)
             }
+            // GitHub sends rate limits as a 403 (or 429) — throttling is transient and is not the
+            // license/policy denial a plain 403 implies (upstream #1529).
+            if CopilotOrgBillingClient.isRateLimitResponse(response) {
+                return ProviderSnapshot.error(
+                    provider: provider,
+                    error: CopilotUsageError.rateLimited(retryAfterSeconds: ClaudeUsageMapper.parseRetryAfterSeconds(response, now: now()))
+                )
+            }
             if response.statusCode == 403 {
                 return ProviderSnapshot.error(provider: provider, error: CopilotAuthError.accessDenied)
             }

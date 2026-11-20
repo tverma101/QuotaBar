@@ -102,13 +102,15 @@ final class CodexRouterEventLineParserTests: XCTestCase {
     }
 
     func testTimestampCacheReusesDatesAndHonorsItsBound() throws {
+        // The cache is a Swift-side structure of the oracle — lines the Rust parser answers
+        // never reach it, so this test pins `parseEventSwift` explicitly.
         var cache = CodexRouterEventLineParser.TimestampCache(capacity: 1)
         let first = Data(#"{"at":"2026-10-02T12:00:00Z"}"#.utf8)
         let second = Data(#"{"at":"2026-10-02T13:00:00Z"}"#.utf8)
 
-        let initial = try XCTUnwrap(CodexRouterEventLineParser.parse(first[...], timestampCache: &cache))
-        let repeated = try XCTUnwrap(CodexRouterEventLineParser.parse(first[...], timestampCache: &cache))
-        let afterCapacity = try XCTUnwrap(CodexRouterEventLineParser.parse(second[...], timestampCache: &cache))
+        let initial = try XCTUnwrap(CodexRouterEventLineParser.parseEventSwift(first[...], timestampCache: &cache))
+        let repeated = try XCTUnwrap(CodexRouterEventLineParser.parseEventSwift(first[...], timestampCache: &cache))
+        let afterCapacity = try XCTUnwrap(CodexRouterEventLineParser.parseEventSwift(second[...], timestampCache: &cache))
 
         XCTAssertEqual(initial.timestamp, repeated.timestamp)
         XCTAssertEqual(afterCapacity.timestamp, ISO8601DateFormatter().date(from: "2026-10-02T13:00:00Z"))
@@ -121,8 +123,8 @@ final class CodexRouterEventLineParserTests: XCTestCase {
         let oversizedTimestamp = "2026-10-02T12:00:00." + String(repeating: "1", count: 128) + "Z"
         let data = Data(#"{"at":"\#(oversizedTimestamp)"}"#.utf8)
 
-        XCTAssertNotNil(CodexRouterEventLineParser.parse(data[...], timestampCache: &cache))
-        XCTAssertNotNil(CodexRouterEventLineParser.parse(data[...], timestampCache: &cache))
+        XCTAssertNotNil(CodexRouterEventLineParser.parseEventSwift(data[...], timestampCache: &cache))
+        XCTAssertNotNil(CodexRouterEventLineParser.parseEventSwift(data[...], timestampCache: &cache))
         XCTAssertEqual(cache.cachedTimestampCount, 0)
         XCTAssertEqual(cache.cacheHitCount, 0)
     }

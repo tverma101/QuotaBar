@@ -91,6 +91,17 @@ final class OpenRouterProvider: ProviderRuntime {
             let mapped = OpenRouterUsageMapper.keyMetrics(from: data)
             plan = mapped.plan
             lines += mapped.lines
+            // A management key carries no spend of its own; the account's period spend is the sum
+            // over the keys `/keys` lists, disabled and expired ones included.
+            if OpenRouterUsageMapper.isManagementKey(data) {
+                do {
+                    if let spend = try await listedKeysSpend(apiKey: auth.apiKey) {
+                        lines += OpenRouterUsageMapper.spendLines(spend)
+                    }
+                } catch {
+                    return ProviderSnapshot.error(provider: provider, error: error)
+                }
+            }
         }
 
         if !lines.isEmpty {
@@ -105,6 +116,29 @@ final class OpenRouterProvider: ProviderRuntime {
         }
         let error = credits.failureError ?? key.failureError ?? OpenRouterUsageError.invalidResponse
         return ProviderSnapshot.error(provider: provider, error: error)
+    }
+
+    /// Sum period spend across every page of `/keys`; nil when the listing cannot be read at all.
+    private func listedKeysSpend(apiKey: String) async throws -> OpenRouterSpend? {
+        var total = OpenRouterSpend.zero
+        var sawPage = false
+        for page in 0..<OpenRouterUsageClient.maxKeysPages {
+            do {
+                try Task.checkCancellation()
+                let response = try await usageClient.fetchKeysPage(apiKey: apiKey, offset: page * OpenRouterUsageClient.keysPageSize)
+                try Task.checkCancellation()
+                guard (200..<300).contains(response.statusCode),
+                      let parsed = try? OpenRouterUsageMapper.keysPageSpend(response.body)
+                else { break }
+                sawPage = true
+                total = parsed.spend.reduce(total, +)
+                if parsed.count < OpenRouterUsageClient.keysPageSize { break }
+            } catch {
+                try ProviderCancellation.rethrowIfCancellation(error)
+                break
+            }
+        }
+        return sawPage ? total : nil
     }
 
     /// Run one endpoint call and classify the outcome: a parsed data object on 2xx, an auth failure on

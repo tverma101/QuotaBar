@@ -277,10 +277,11 @@ enum AntigravityUsageMapper {
 
     static func line(pool: String, fraction: Double, resetTime: Date?, periodMs: Int) -> MetricLine {
         let clamped = max(0, min(1, fraction))
-        let used = (1 - clamped) * 100
+        // Keep sub-percent precision: rounding would read a barely-started window (e.g. 0.035% used)
+        // as 0 and mark it "Not started". Only an exact-zero read is fresh (upstream #1641).
         return .progress(
             label: pool,
-            used: used.rounded(), // keep whole percents so a fresh window reads 0 and "Not started" works
+            used: (1 - clamped) * 100,
             limit: 100,
             format: .percent,
             resetsAt: resetTime,

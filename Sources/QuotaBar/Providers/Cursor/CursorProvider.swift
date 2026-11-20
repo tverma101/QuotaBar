@@ -201,7 +201,7 @@ final class CursorProvider: ProviderRuntime {
         // The access token may have rotated during the usage fetch's refresh-and-retry; read the live one.
         let currentToken = authState.accessToken ?? accessToken
 
-        let (planInfoName, planInfoUnavailable) = try await fetchPlanName(accessToken: currentToken)
+        let (planInfoName, planInfoUnavailable, isMerged) = try await fetchPlanName(accessToken: currentToken)
         // Three answers that must stay apart:
         // - the routing plan decides which REST fallback serves the account,
         // - the display plan is the badge next to the provider name,
@@ -251,6 +251,32 @@ final class CursorProvider: ProviderRuntime {
                     message: "optional request-based usage fallback failed"
                 )
             }
+        }
+
+        // A merged account has no credit grants, Stripe balance, or spend-limit endpoint — the
+        // dashboard reads its complat credit balance and monthly usage-status instead, and has no
+        // separate Grok Bot row.
+        if isMerged {
+            let unified = CursorUnifiedBilling(
+                creditBalance: try await fetchOptionalJSONObject(label: "credit balance", request: {
+                    try await self.usageClient.fetchComplatCreditBalance(accessToken: currentToken)
+                }),
+                usageStatus: try await fetchOptionalJSONObject(label: "usage status", request: {
+                    try await self.usageClient.fetchUsageStatus(accessToken: currentToken)
+                })
+            )
+            var merged = try CursorUsageMapper.mapUsage(
+                usage: usage,
+                planName: planInfoName,
+                creditGrants: nil,
+                stripeBalanceCents: 0,
+                unified: unified
+            )
+            merged.plan = CursorUsageMapper.resolvedPlanLabel(
+                planInfoName: planInfoName,
+                membershipType: authState.membershipType
+            )
+            return try await snapshotWithOptionalSpend(merged, accessToken: currentToken)
         }
 
         let creditGrants = try await fetchCreditGrants(accessToken: currentToken)
@@ -591,22 +617,25 @@ final class CursorProvider: ProviderRuntime {
         return "auth.cursor.token-persist.\(sourceName)"
     }
 
-    private func fetchPlanName(accessToken: String) async throws -> (String?, Bool) {
+    /// Returns the plan name, whether the lookup failed, and whether the account's Cursor, X and Grok
+    /// plans are merged (`GetPlanInfo.isMerged`) — merged accounts answer with a different payload shape.
+    private func fetchPlanName(accessToken: String) async throws -> (String?, Bool, Bool) {
         guard let body = try await fetchOptionalJSONObject(label: "plan", request: {
             try await self.usageClient.fetchPlan(accessToken: accessToken)
         }) else {
-            return (nil, true)
+            return (nil, true, false)
         }
+        let isMerged = body["isMerged"] as? Bool == true
         guard let planInfo = body["planInfo"] as? [String: Any],
               let planName = (planInfo["planName"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .nilIfEmpty
         else {
             logOptionalWarning(kind: "schema", label: "plan", reason: "invalid", message: "optional plan response contained invalid plan metadata")
-            return (nil, true)
+            return (nil, true, isMerged)
         }
         clearOptionalWarnings(kind: "schema", label: "plan")
-        return (planName, false)
+        return (planName, false, isMerged)
     }
 
     private func fetchCreditGrants(accessToken: String) async throws -> [String: Any]? {

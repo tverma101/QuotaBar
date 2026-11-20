@@ -90,7 +90,13 @@ struct WidgetGroupedListView: View {
             provider: group.provider,
             plan: dataStore.plan(for: group.provider.id),
             warning: dataStore.headerNotice(for: group.provider.id),
-            refreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
+            // Ambient refresh passes never draw the header spinner: the snapshot the user is
+            // looking at just gets replaced when the pass lands. The spinner is reserved for
+            // work the user started (Refresh Now / Retry) and for the one honest case a
+            // background pass produces — first paint, when no snapshot exists at all.
+            refreshing: dataStore.userInitiatedRefreshingProviderIDs.contains(group.provider.id)
+                || (dataStore.refreshingProviderIDs.contains(group.provider.id)
+                    && dataStore.snapshots[group.provider.id] == nil),
             staleness: dataStore.stalenessHint(for: group.provider.id),
             cardIsHovered: hoveredProviderID == group.provider.id,
             onCopyScreenshot: { shareCard(group) },

@@ -20,8 +20,18 @@ struct AntigravityStepTimestampIndex: Equatable, Sendable {
     private var supportsDigest: Bool?
 
     mutating func insert(_ metadata: [UInt8], maximumEstimatedMemoryBytes: Int) throws {
-        guard let (identity, timestamp) = AntigravityProtoDecoder.stepIdentityAndTimestamp(from: metadata),
-              !ambiguous.contains(identity) else { return }
+        guard let (identity, timestamp) = AntigravityProtoDecoder.stepIdentityAndTimestamp(from: metadata) else { return }
+        try insert(identity: identity, timestamp: timestamp, maximumEstimatedMemoryBytes: maximumEstimatedMemoryBytes)
+    }
+
+    /// Identity/timestamp pairs decoded ahead of time (e.g. by the Rust bridge) skip the
+    /// protobuf walk; the ambiguity and day-collision rules are identical.
+    mutating func insert(
+        identity: AntigravityProtoDecoder.StepIdentity,
+        timestamp: Int64,
+        maximumEstimatedMemoryBytes: Int
+    ) throws {
+        guard !ambiguous.contains(identity) else { return }
         if let previous = timestamps[identity], previous != timestamp {
             // Retries can repeat the same identity at different instants. The accounting is daily:
             // retain the proven day when every candidate agrees, and reject cross-day ambiguity.
@@ -126,8 +136,21 @@ struct AntigravityStepTimestampIndex: Equatable, Sendable {
                     }
                     cursor = row.index
                     index.lastIndex = cursor
-                    if let hex = row.hex, let bytes = AntigravityDbUsageScanner.bytes(fromHex: hex) {
-                        try index.insert(bytes, maximumEstimatedMemoryBytes: maximumEstimatedMemoryBytes)
+                    if let hex = row.hex {
+                        switch AntigravityRustDecoder.stepMetadataIdentityAndTimestamp(fromHex: hex) {
+                        case .present(let identity, let timestamp):
+                            try index.insert(
+                                identity: identity,
+                                timestamp: timestamp,
+                                maximumEstimatedMemoryBytes: maximumEstimatedMemoryBytes
+                            )
+                        case .absent:
+                            break
+                        case .fallback:
+                            if let bytes = AntigravityDbUsageScanner.bytes(fromHex: hex) {
+                                try index.insert(bytes, maximumEstimatedMemoryBytes: maximumEstimatedMemoryBytes)
+                            }
+                        }
                     }
                 }
             }

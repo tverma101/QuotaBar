@@ -58,6 +58,10 @@ Two REST calls with a `Bearer` token against `https://openrouter.ai/api/v1`:
   (`limit` minus `limit_remaining` for the current window). If this call fails, the balance still
   renders from `/credits`. The Key Limit meter needs both numbers: when the response carries a cap
   but no remaining amount, the meter is hidden rather than reported as fully spent.
+- `GET /keys` — paged key listing, only used when `/key` marks the calling key a **management key**.
+  A management key cannot run inference, so it reports no spend of its own; the period spend rows are
+  then the sum over every listed key, disabled and expired ones included, since what they spent
+  before they stopped is still this period's spend.
 
 A period spend of `$0.00` is shown as a real, measured zero (the API reports it directly) rather than
 "No data". Credit values may be up to ~60 seconds stale on OpenRouter's side.

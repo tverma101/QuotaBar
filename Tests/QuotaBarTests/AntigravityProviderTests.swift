@@ -521,8 +521,8 @@ final class AntigravityProviderTests: XCTestCase {
         XCTAssertEqual(snapshot.plan, "Pro")
         // Legacy per-model data merges into the two pool meters (worst fraction per pool).
         XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Claude"])
-        XCTAssertEqual(used(snapshot.lines[0]), 60)
-        XCTAssertEqual(used(snapshot.lines[1]), 30)
+        XCTAssertEqual(used(snapshot.lines[0]) ?? .nan, 60, accuracy: 0.0001)
+        XCTAssertEqual(used(snapshot.lines[1]) ?? .nan, 30, accuracy: 0.0001)
         XCTAssertEqual(
             codeAssistCalls.next(),
             1,
@@ -598,6 +598,74 @@ final class AntigravityProviderTests: XCTestCase {
     }
 
     @MainActor
+    func testARefusedPlanLookupDoesNotVetoTheQuotaRead() async {
+        // Upstream #1510: the auxiliary plan/project lookup is nice-to-have; its refusal must not
+        // veto the real quota read or trigger an OAuth renewal.
+        let quotaJSON = #"{"buckets":[{"modelId":"gemini-3-pro-preview","remainingFraction":0.5}]}"#
+        let routing = RoutingHTTPClient { request in
+            switch request.url.path {
+            case AntigravityUsageClient.loadCodeAssistPath:
+                return HTTPResponse(statusCode: 401, headers: [:], body: Data())
+            case AntigravityUsageClient.retrieveQuotaPath:
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(quotaJSON.utf8))
+            default:
+                return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+            }
+        }
+        let provider = makeCloudCodeProvider(routing: routing)
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertEqual(snapshot.lines.map(\.label), ["Session"])
+        XCTAssertEqual(used(snapshot.lines[0]) ?? .nan, 50, accuracy: 0.0001)
+        XCTAssertFalse(routing.requests.contains { $0.url.host == "oauth2.googleapis.com" },
+                       "a plan-lookup refusal must not trigger an OAuth renewal")
+    }
+
+    @MainActor
+    func testAProjectScopedQuotaRefusalIsRetriedWithoutTheProject() async {
+        // Upstream #1510: refused *with* a project is asked once more without; only then it counts.
+        let quotaJSON = #"{"buckets":[{"modelId":"gemini-3-pro-preview","remainingFraction":0.5}]}"#
+        let routing = RoutingHTTPClient { request in
+            switch request.url.path {
+            case AntigravityUsageClient.loadCodeAssistPath:
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"cloudaicompanionProject":"p1"}"#.utf8))
+            case AntigravityUsageClient.retrieveQuotaPath:
+                let body = String(data: request.body ?? Data(), encoding: .utf8) ?? ""
+                if body.contains("project") {
+                    return HTTPResponse(statusCode: 403, headers: [:], body: Data())
+                }
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(quotaJSON.utf8))
+            default:
+                return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+            }
+        }
+        let provider = makeCloudCodeProvider(routing: routing)
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertEqual(snapshot.lines.map(\.label), ["Session"])
+        let quotaCalls = routing.requests.filter { $0.url.path == AntigravityUsageClient.retrieveQuotaPath }
+        XCTAssertGreaterThanOrEqual(quotaCalls.count, 2,
+                                    "a project-scoped refusal must be retried without the project")
+    }
+
+    @MainActor
+    func testDual429QuotaReadsReportRateLimited() async {
+        // Upstream #1529: throttling is transient — never an access denial or an OAuth refresh.
+        let routing = RoutingHTTPClient { _ in HTTPResponse(statusCode: 429, headers: [:], body: Data()) }
+        let provider = makeCloudCodeProvider(routing: routing)
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertTrue(snapshot.lines.contains { $0.isError })
+        XCTAssertEqual(snapshot.errorCategory, .rateLimited)
+        XCTAssertFalse(routing.requests.contains { $0.url.host == "oauth2.googleapis.com" })
+    }
+
+    @MainActor
     func testCloudCode404FromOneTokenDoesNotHideTransientFailureFromAnother() async throws {
         let wrapped = #"{"token":{"access_token":"ya29.kc","expiry":"2099-01-01T00:00:00Z","refresh_token":"1//r"}}"#
         let files = FakeFiles()
@@ -660,7 +728,7 @@ final class AntigravityProviderTests: XCTestCase {
         let snapshot = await provider.refresh()
 
         XCTAssertNil(snapshot.errorCategory)
-        XCTAssertEqual(used(snapshot.line(label: "Session")), 20)
+        XCTAssertEqual(used(snapshot.line(label: "Session")) ?? .nan, 20, accuracy: 0.0001)
         let summaryTokens = routing.requests
             .filter { $0.url.path == AntigravityUsageClient.quotaSummaryPath }
             .compactMap { $0.headers["Authorization"] }
@@ -707,7 +775,9 @@ final class AntigravityProviderTests: XCTestCase {
         XCTAssertLessThanOrEqual(planRequests.count, 1, "the independent plan lookup must not retry")
         XCTAssertEqual(routing.requests.count, quotaRequests.count + planRequests.count,
                        "cancellation must stop before alternate hosts and legacy endpoints")
-        XCTAssertTrue(routing.requests.allSatisfy { $0.url.host == "daily-cloudcode-pa.googleapis.com" })
+        // Quota reads prefer daily (live counters); plan/project lookups prefer production (#1641).
+        XCTAssertTrue(quotaRequests.allSatisfy { $0.url.host == "daily-cloudcode-pa.googleapis.com" })
+        XCTAssertTrue(planRequests.allSatisfy { $0.url.host == "cloudcode-pa.googleapis.com" })
     }
 
     @MainActor
@@ -870,7 +940,9 @@ final class AntigravityProviderTests: XCTestCase {
         // after it is cancelled, quota/models fallback requests must not be retried.
         let requests = routing.requests
         XCTAssertEqual(requests.filter { $0.url.host == "oauth2.googleapis.com" }.count, 1)
-        XCTAssertEqual(requests.filter { $0.url.path == AntigravityUsageClient.quotaSummaryPath }.count, 1)
+        // Both hosts are asked before a refusal counts — the loop reaching the second host is the
+        // normal pass, not a retry (#1510).
+        XCTAssertEqual(requests.filter { $0.url.path == AntigravityUsageClient.quotaSummaryPath }.count, 2)
         XCTAssertFalse(requests.contains { $0.url.path == AntigravityUsageClient.fetchModelsPath })
         XCTAssertFalse(requests.contains { $0.url.path == AntigravityUsageClient.retrieveQuotaPath })
     }

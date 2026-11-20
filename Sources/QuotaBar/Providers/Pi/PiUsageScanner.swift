@@ -168,7 +168,7 @@ actor PiUsageScanner {
     static func parseFile(_ data: Data) -> [Entry] {
         var entries: [Entry] = []
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            if case .entry(let entry) = parseLineResult(Data(line)) { entries.append(entry) }
+            if let entry = parseLine(Data(line)) { entries.append(entry) }
         }
         return entries
     }
@@ -176,10 +176,24 @@ actor PiUsageScanner {
     /// Streaming counterpart used by the incremental scanner so a large session file never becomes
     /// one giant Data allocation.
     nonisolated static func parseFile(at url: URL) -> [Entry]? {
+        // The Rust whole-file parser reads, splits, and parses without materializing Foundation
+        // objects; it declines the shapes it cannot emulate and the Swift reference below runs.
+        switch PiRustParser.parseFile(at: url) {
+        case .success(let entries): return entries
+        case .failed: return nil
+        case .fallback: break
+        }
+        return parseFileSwift(at: url)
+    }
+
+    /// Reference implementation and runtime fallback for `parseFile(at:)` — kept identical to
+    /// the Rust port's semantics (pinned by PiRustParserTests). Calls `parseLineSwift`
+    /// directly so the oracle never consults the Rust bridge it is meant to check.
+    nonisolated static func parseFileSwift(at url: URL) -> [Entry]? {
         var entries: [Entry] = []
         var malformed = false
         let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
-            switch parseLineResult(Data(line)) {
+            switch parseLineSwift(Data(line)) {
             case .entry(let entry): entries.append(entry)
             case .irrelevant: break
             case .malformed: malformed = true
@@ -197,12 +211,22 @@ actor PiUsageScanner {
         case malformed
     }
 
+    /// Rust-first dispatch for one line: `PiRustParser.parseLine` answers the common shapes, and
+    /// a nil outcome means a legal line the Rust parser declines (a non-canonical timestamp
+    /// string) — run the Swift reference implementation rather than answering differently.
     static func parseLine(_ data: Data) -> Entry? {
-        guard case .entry(let entry) = parseLineResult(data) else { return nil }
+        if let rust = PiRustParser.parseLine(data) {
+            switch rust {
+            case .entries(let entries): return entries.first
+            case .irrelevant, .malformed: return nil
+            }
+        }
+        guard case .entry(let entry) = parseLineSwift(data) else { return nil }
         return entry
     }
 
-    private static func parseLineResult(_ data: Data) -> LineResult {
+    /// Reference implementation — see `parseLine`. Kept as the fallback oracle for the Rust port.
+    private static func parseLineSwift(_ data: Data) -> LineResult {
         guard data.range(of: usageMarker) != nil else { return .irrelevant }
         guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return .malformed

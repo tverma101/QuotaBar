@@ -3,6 +3,10 @@ import Foundation
 struct OpenRouterUsageClient: Sendable {
     static let creditsURL = "https://openrouter.ai/api/v1/credits"
     static let keyURL = "https://openrouter.ai/api/v1/key"
+    static let keysURL = "https://openrouter.ai/api/v1/keys"
+    static let keysPageSize = 100
+    /// Bounds the page loop should OpenRouter ever ignore `offset`.
+    static let maxKeysPages = 50
 
     var http: any HTTPClient
 
@@ -19,6 +23,12 @@ struct OpenRouterUsageClient: Sendable {
     /// Best-effort key metadata: tier, optional per-key spend cap, and daily/weekly/monthly spend.
     func fetchKey(apiKey: String) async throws -> HTTPResponse {
         try await get(Self.keyURL, apiKey: apiKey)
+    }
+
+    /// One page of the account's key list. Disabled and expired keys count too: what they spent
+    /// before they stopped is still this period's spend.
+    func fetchKeysPage(apiKey: String, offset: Int) async throws -> HTTPResponse {
+        try await get("\(Self.keysURL)?include_disabled=true&include_expired=true&offset=\(offset)", apiKey: apiKey)
     }
 
     private func get(_ urlString: String, apiKey: String) async throws -> HTTPResponse {

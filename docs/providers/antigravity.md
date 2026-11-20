@@ -32,7 +32,7 @@ response arrives. Unknown buckets never join a visible pool; when every known me
 freshness still advances. Duplicate IDs use the more depleted value and keep the response marked
 incomplete. Temporary request failures retain the last-good meters and show the provider error.
 
-When using Cloud Code, QuotaBar consults the second host if the first omits shared quota meters. The first usable value for each meter wins. A response with all four usable shared meters avoids the extra request; Argon is optional. A failed or malformed supplemental response preserves measured limits and keeps omitted limits marked as older data.
+When using Cloud Code, quota summaries prefer the daily host — which carries the active counters — and the production host fills in buckets the daily host omits. The first usable value for each meter wins. Plan and project lookups prefer the production host. A refusal on one host does not end the probe: every host that can answer is consulted before an auth or permission failure is reported, and a usable answer always wins. A failed or malformed supplemental response preserves measured limits and keeps omitted limits marked as older data. Cloud Code calls identify as `antigravity/hub/<version>` because Google withholds the paid-tier and Argon quota from clients it does not recognize.
 
 While a pool's rolling 5-hour window has no usage yet, that meter reads **Not started** on the trailing label instead of a reset countdown; hover explains that the session begins after your first message. The weekly meters always show a normal reset countdown.
 
@@ -48,7 +48,7 @@ Opening Antigravity also lets QuotaBar use its local server without a new Keycha
 meters whose reported reset passed more than five minutes ago say **Awaiting Refresh** until current
 quota can be fetched; an old reset does not prove that the allowance is still depleted.
 
-If neither is available you'll see *Start Antigravity or run `agy` and try again.* An expired access token with no refresh token is reported as expired sign-in. A Cloud Code 403 is shown as an access denial and does not trigger an OAuth refresh.
+If neither is available you'll see *Start Antigravity or run `agy` and try again.* An expired access token with no refresh token is reported as expired sign-in. A Cloud Code 403 is shown as an access denial and does not trigger an OAuth refresh — unless it carries rate-limit markers (`retry-after`, an exhausted `x-ratelimit-remaining`, or a `RESOURCE_EXHAUSTED`-style body) or the answer is a plain 429, which is reported as throttling instead.
 
 When a refresh fails with a deterministic credential failure (an unreadable or denied Keychain item — not a transient network error), the provider backs off for half an hour instead of probing every meter tick; the manual **Refresh Now** action always probes immediately, and one successful refresh clears the backoff. If the meters stay stale across launches, grant access (**Refresh Now** → **Always Allow**) or disable the provider in Customize.
 
@@ -120,6 +120,7 @@ Malformed or oversized records remain partial until corrected or until they age 
 - **"Start Antigravity or run `agy`…"** — sign in to the Antigravity app (or run `agy`) so a usable token exists, then refresh.
 - **"Couldn't read Antigravity credentials…"** — unlock Keychain or sign in to Antigravity again. QuotaBar will not use its cached access token until the current login can be verified.
 - **"Google denied access to Antigravity usage"** — Cloud Code returned 403. Check that the signed-in account and project have access; QuotaBar does not treat this as an expired token.
+- **"Google is rate limiting Antigravity usage"** — Cloud Code answered 429, or 403 with rate-limit markers. The last meters stay visible and a later refresh recovers them automatically.
 - **"Antigravity did not provide a supported usage endpoint"** — the current account or Antigravity build does not expose a quota endpoint QuotaBar recognizes. Update Antigravity and refresh; if the message remains, that account may not expose usage through these endpoints.
 - **"Google rejected QuotaBar's Antigravity OAuth client configuration"** — Google returned `invalid_client` while exchanging the refresh token. This is an app-side client configuration issue, not an expired Antigravity sign-in; update QuotaBar and try again.
 - **The weekly meters show "No data"** — your Antigravity build doesn't expose the quota-summary endpoint yet (only newer builds do). The 5-hour meters still work from the older endpoints; updating Antigravity brings the weekly meters back.

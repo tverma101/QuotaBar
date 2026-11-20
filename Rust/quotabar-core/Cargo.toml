@@ -11,6 +11,10 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 serde_json = "1"
+# SIMD byte search for the shared whole-file reader's line splitting and the per-provider
+# marker pre-filters — the innermost loops over multi-GB JSONL corpora. serde_json alone cannot
+# find line boundaries before parsing.
+memchr = "2"
 
 [profile.release]
 lto = true

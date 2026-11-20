@@ -86,8 +86,11 @@ struct PopoverFooter: View {
         .disabled(isUpdating)
     }
 
+    /// The footer spinner and the Refresh Now disabled state track only refreshes the user
+    /// started — the periodic batch and ledger wakes replace snapshots silently, so an ambient
+    /// pass in flight when the panel opens shows no circles at all.
     private var isUpdating: Bool {
-        !dataStore.refreshingProviderIDs.isEmpty
+        !dataStore.userInitiatedRefreshingProviderIDs.isEmpty
     }
 
     private func refreshNow() {

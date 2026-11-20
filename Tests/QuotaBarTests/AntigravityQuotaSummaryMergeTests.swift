@@ -96,8 +96,61 @@ final class AntigravityQuotaSummaryMergeTests: XCTestCase {
             case .forbidden: XCTAssertEqual(status, 403)
             default: XCTFail("Authentication classification changed")
             }
-            XCTAssertEqual(denied.requests.count, 1)
+            // A refusal counts only once every answering host refused — both are asked (upstream #1510).
+            XCTAssertEqual(denied.requests.count, 2)
         }
+    }
+
+    func testASecondHostSuccessBeatsAFirstHostRefusal() async throws {
+        for status in [401, 403] {
+            let http = RoutingHTTPClient { request in
+                if request.url.host?.hasPrefix("daily-") == true {
+                    return HTTPResponse(statusCode: status, headers: [:], body: Data())
+                }
+                return Self.response(Self.complete)
+            }
+            let result = try await AntigravityUsageClient(http: http).cloudCodeSummaries(token: "test")
+            guard case .ok(let bodies, _) = result else { return XCTFail("A one-host refusal vetoed a live host") }
+            XCTAssertEqual(bodies.count, 1)
+            XCTAssertEqual(http.requests.count, 2)
+        }
+    }
+
+    func testDualHostRateLimitsReadAsRateLimitedNotDenied() async throws {
+        for headers in [
+            ["retry-after": "120"],
+            ["x-ratelimit-remaining": "0"]
+        ] {
+            let http = RoutingHTTPClient { _ in HTTPResponse(statusCode: 429, headers: headers, body: Data()) }
+            let result = try await AntigravityUsageClient(http: http).cloudCodeSummaries(token: "test")
+            guard case .rateLimited = result else { return XCTFail("Dual 429s were not rate limits (upstream #1529)") }
+            XCTAssertEqual(http.requests.count, 2)
+        }
+    }
+
+    func testA403CarryingRateLimitMarkersIsNotAForbidden() async throws {
+        let bodies = [
+            Data(#"{"error":{"status":"RESOURCE_EXHAUSTED"}}"#.utf8),
+            Data(#"{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}"#.utf8),
+            Data()
+        ]
+        for (index, body) in bodies.enumerated() {
+            let headers: [String: String] = index == 2 ? ["retry-after": "30"] : [:]
+            let http = RoutingHTTPClient { _ in HTTPResponse(statusCode: 403, headers: headers, body: body) }
+            let result = try await AntigravityUsageClient(http: http).cloudCodeSummaries(token: "test")
+            guard case .rateLimited = result else { return XCTFail("A rate-limit 403 read as access denied (upstream #1529)") }
+        }
+        // A plain 403 with no rate-limit markers stays a permission denial.
+        let http = RoutingHTTPClient { _ in HTTPResponse(statusCode: 403, headers: [:], body: Data(#"{"error":{"message":"forbidden"}}"#.utf8)) }
+        let result = try await AntigravityUsageClient(http: http).cloudCodeSummaries(token: "test")
+        guard case .forbidden = result else { return XCTFail("A plain 403 lost its denial classification") }
+    }
+
+    func testCloudCodeCallsUseTheHubClientUserAgent() async throws {
+        let http = RoutingHTTPClient { _ in Self.response(Self.complete) }
+        _ = try await AntigravityUsageClient(http: http).cloudCodeSummaries(token: "test")
+        let agent = try XCTUnwrap(http.requests.first?.headers["User-Agent"])
+        XCTAssertTrue(agent.hasPrefix("antigravity/hub/"), "Google drops paidTier for non-hub callers (upstream #1676)")
     }
 
     func testCancellationDuringSupplementDoesNotPublishPartialSuccess() async {

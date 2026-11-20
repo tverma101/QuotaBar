@@ -7,13 +7,19 @@ enum CloudCodeOutcome: Sendable {
     case notFound
     case authFailed
     case forbidden
+    case rateLimited
     case unavailable
 
     var isUnavailable: Bool {
         switch self {
         case .notFound, .unavailable: return true
-        case .ok, .authFailed, .forbidden: return false
+        case .ok, .authFailed, .forbidden, .rateLimited: return false
         }
+    }
+
+    var isOK: Bool {
+        if case .ok = self { return true }
+        return false
     }
 }
 
@@ -21,6 +27,7 @@ enum CloudCodeBatchOutcome: Sendable {
     case ok([Data], allHostsAnswered: Bool)
     case authFailed
     case forbidden
+    case rateLimited
     case notFound
     case unavailable
 }
@@ -38,10 +45,14 @@ enum TokenRefreshOutcome: Sendable {
 /// Google Cloud Code endpoints, and the Google OAuth token refresh.
 struct AntigravityUsageClient: Sendable {
     static let lsService = "exa.language_server_pb.LanguageServerService"
+    // Quota data prefers daily: production can answer "complete" with untouched pools while daily
+    // carries the active counters (upstream #1641).
     static let cloudCodeURLs = [
         "https://daily-cloudcode-pa.googleapis.com",
         "https://cloudcode-pa.googleapis.com"
     ]
+    // Plan and project lookups prefer production (upstream #1641).
+    static let planLookupURLs = Array(cloudCodeURLs.reversed())
     static let fetchModelsPath = "/v1internal:fetchAvailableModels"
     static let loadCodeAssistPath = "/v1internal:loadCodeAssist"
     static let retrieveQuotaPath = "/v1internal:retrieveUserQuota"
@@ -55,6 +66,17 @@ struct AntigravityUsageClient: Sendable {
     static let googleClientID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
     static let googleClientSecret = "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"
     static let lsMetadata = ["ideName": "antigravity", "extensionName": "antigravity", "ideVersion": "unknown", "locale": "en"]
+
+    /// The Antigravity client's own User-Agent shape. Google marks other callers `UNSUPPORTED_CLIENT`
+    /// and drops `paidTier`; the hub identity exposes the separate Argon weekly quota (upstream #1676).
+    static let clientUserAgent: String = {
+        #if arch(arm64)
+        let arch = "arm64"
+        #else
+        let arch = "amd64"
+        #endif
+        return "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=\(arch))"
+    }()
 
     /// Loopback session that trusts the LS's self-signed cert; remote calls use full validation.
     var lsHTTP: HTTPClient
@@ -97,14 +119,21 @@ struct AntigravityUsageClient: Sendable {
     }
 
     /// POST a Cloud Code endpoint, trying each base URL in turn. A 401 is evidence of invalid/expired
-    /// authentication; a 403 is a permission denial and must not trigger OAuth refresh. Both
-    /// short-circuit because the same request would fail on the other base. Other non-2xx / transport
-    /// errors fall through to the next base and finally `.unavailable`.
-    func cloudCode(path: String, token: String, userAgent: String, body: [String: String]) async throws -> CloudCodeOutcome {
-        switch try await cloudCodeResponses(path: path, token: token, userAgent: userAgent, body: body, collectSummaries: false) {
+    /// authentication; a 403 is a permission denial and must not trigger OAuth refresh. A refusal only
+    /// counts once every host that answered refused — a successful body from any host still wins.
+    /// Other non-2xx / transport errors fall through to the next base and finally `.unavailable`.
+    func cloudCode(
+        path: String,
+        token: String,
+        userAgent: String = Self.clientUserAgent,
+        body: [String: String],
+        urls: [String] = Self.cloudCodeURLs
+    ) async throws -> CloudCodeOutcome {
+        switch try await cloudCodeResponses(path: path, token: token, userAgent: userAgent, body: body, urls: urls, collectSummaries: false) {
         case .ok(let bodies, _): return .ok(bodies[0])
         case .authFailed: return .authFailed
         case .forbidden: return .forbidden
+        case .rateLimited: return .rateLimited
         case .notFound: return .notFound
         case .unavailable: return .unavailable
         }
@@ -113,17 +142,34 @@ struct AntigravityUsageClient: Sendable {
     /// A host can omit an entire quota pool. Consult the other host only when the first usable body
     /// cannot supply all shared meters; a failed supplemental host never discards measured limits.
     func cloudCodeSummaries(token: String) async throws -> CloudCodeBatchOutcome {
-        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: "antigravity", body: [:], collectSummaries: true)
+        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: Self.clientUserAgent, body: [:], urls: Self.cloudCodeURLs, collectSummaries: true)
+    }
+
+    /// GitHub-style rate limits arrive as a 403 carrying `x-ratelimit-remaining: 0` or `retry-after`,
+    /// and Google's quota denials surface as a 403 whose error names the quota. Neither is a permission
+    /// denial or a dead token, so they must never trigger OAuth refresh (upstream #1529).
+    static func isRateLimited(_ response: HTTPResponse) -> Bool {
+        if response.statusCode == 429 { return true }
+        guard response.statusCode == 403 else { return false }
+        if response.header("x-ratelimit-remaining") == "0" || response.header("retry-after") != nil { return true }
+        guard let text = String(data: response.body, encoding: .utf8) else { return false }
+        return text.contains("RESOURCE_EXHAUSTED")
+            || text.contains("rateLimitExceeded")
+            || text.contains("userRateLimitExceeded")
+            || text.contains("quotaExceeded")
     }
 
     private func cloudCodeResponses(
-        path: String, token: String, userAgent: String, body: [String: String], collectSummaries: Bool
+        path: String, token: String, userAgent: String, body: [String: String], urls: [String], collectSummaries: Bool
     ) async throws -> CloudCodeBatchOutcome {
         let payload = (try? JSONSerialization.data(withJSONObject: body)) ?? Data("{}".utf8)
         var sawNotFound = false
         var sawOtherFailure = false
+        var sawAuthFailed = false
+        var sawForbidden = false
+        var sawRateLimited = false
         var bodies: [Data] = []
-        for base in Self.cloudCodeURLs {
+        for base in urls {
             try Task.checkCancellation()
             guard let url = URL(string: base + path) else { continue }
             let request = HTTPRequest(
@@ -150,9 +196,20 @@ struct AntigravityUsageClient: Sendable {
                 continue
             }
             try Task.checkCancellation()
-            if response.statusCode == 401 || response.statusCode == 403 {
+            if response.statusCode == 401 {
                 if !bodies.isEmpty { return .ok(bodies, allHostsAnswered: false) }
-                return response.statusCode == 401 ? .authFailed : .forbidden
+                sawAuthFailed = true
+                continue
+            }
+            if response.statusCode == 403 {
+                if !bodies.isEmpty { return .ok(bodies, allHostsAnswered: false) }
+                if Self.isRateLimited(response) { sawRateLimited = true } else { sawForbidden = true }
+                continue
+            }
+            if response.statusCode == 429 {
+                if !bodies.isEmpty { return .ok(bodies, allHostsAnswered: false) }
+                sawRateLimited = true
+                continue
             }
             if (200..<300).contains(response.statusCode) {
                 bodies.append(response.body)
@@ -170,6 +227,11 @@ struct AntigravityUsageClient: Sendable {
         if !bodies.isEmpty {
             return .ok(bodies, allHostsAnswered: !sawNotFound && !sawOtherFailure)
         }
+        // A refusal stands only once every host that answered refused; a host that never answered
+        // cannot soften it (upstream #1510).
+        if sawAuthFailed { return .authFailed }
+        if sawForbidden { return .forbidden }
+        if sawRateLimited { return .rateLimited }
         return sawNotFound && !sawOtherFailure ? .notFound : .unavailable
     }
 

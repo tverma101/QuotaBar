@@ -17,8 +17,8 @@
 //! an input at all; `catalogFromCompact` throws `PricingCodecError.notAnObject` if both fail.
 
 use crate::{intern, NIL_STRING};
-use serde_json::Value;
 use serde_json::Map;
+use serde_json::Value;
 use std::ptr;
 
 // The C header (Sources/CQuotabarCore/include/quotabar_core.h) must agree on layout. If these
@@ -36,7 +36,7 @@ pub const QB_PRICING_MAX_RETIRED_KEYS: usize = 4096;
 pub struct QbCompactTier {
     pub threshold_prompt_tokens: u64,
     pub includes_threshold: u8,
-    pub input_per_million: f64,     // NaN = absent
+    pub input_per_million: f64, // NaN = absent
     pub output_per_million: f64,
     pub cache_write_per_million: f64,
     pub cache_read_per_million: f64,
@@ -60,7 +60,7 @@ pub struct QbCompactEntry {
     pub cache_read_is_explicit: u8,
     pub fast_multiplier: f64,
     pub tier_count: u8,
-    pub tier_offset: u32,       // index into the shared QbCompactTier array
+    pub tier_offset: u32, // index into the shared QbCompactTier array
 }
 
 pub struct PricingCompactResult {
@@ -69,7 +69,7 @@ pub struct PricingCompactResult {
     pub entries: Vec<QbCompactEntry>,
     pub tiers: Vec<QbCompactTier>,
     pub retired_count: u32,
-    pub retired_offset: u32,           // first retired key in blob (count entries, contiguous)
+    pub retired_offset: u32, // first retired key in blob (count entries, contiguous)
     /// Whether the catalog contained a "retired" key at all (even an empty array). Swift treats
     /// presence, not non-emptiness, as authoritative (`file.retiredKeys != nil`).
     pub retired_present: u8,
@@ -85,7 +85,10 @@ fn opt_f64(member: &Map<String, Value>, name: &str) -> Option<Option<f64>> {
 }
 
 fn parse_double(member: &Map<String, Value>, name: &str) -> Option<f64> {
-    member.get(name).and_then(|v| v.as_f64()).filter(|d| d.is_finite())
+    member
+        .get(name)
+        .and_then(|v| v.as_f64())
+        .filter(|d| d.is_finite())
 }
 
 fn intern_entry(
@@ -135,7 +138,9 @@ fn intern_entry(
 
     let tier_offset = tiers_blob.len() as u32;
     for tier in &tiers_json {
-        let Some(t) = tier.as_object() else { return None };
+        let Some(t) = tier.as_object() else {
+            return None;
+        };
         let threshold = match t.get("threshold_prompt_tokens").and_then(|v| v.as_u64()) {
             Some(v) => v,
             None => return None, // required (Swift's PromptRateTier throws on missing/wrong type)
@@ -197,13 +202,12 @@ pub fn parse_compact_catalog(data: &[u8]) -> Option<PricingCompactResult> {
     let mut tiers: Vec<QbCompactTier> = Vec::new();
     let mut entries: Vec<QbCompactEntry> = Vec::new();
 
-    let models = root
-        .get("models")
-        .and_then(|v| v.as_object())?
-        .clone();
+    let models = root.get("models").and_then(|v| v.as_object())?.clone();
 
     for (key, model) in &models {
-        let Some(model) = model.as_object() else { return None };
+        let Some(model) = model.as_object() else {
+            return None;
+        };
         entries.push(intern_entry(&mut strings, &mut tiers, key, model)?);
     }
 
@@ -227,8 +231,12 @@ pub fn parse_compact_catalog(data: &[u8]) -> Option<PricingCompactResult> {
             // Strings are u32-addressed by the C ABI; a >4 GiB blob cannot arise here
             // (snapshots are ~1 MB, the disk cache ~8 MB), so the cast is unrepresentable input,
             // never a silent truncation.
-            if strings.len() as u64 > u64::from(u32::MAX) { return None }
-            if arr.len() > QB_PRICING_MAX_RETIRED_KEYS { return None }
+            if strings.len() as u64 > u64::from(u32::MAX) {
+                return None;
+            }
+            if arr.len() > QB_PRICING_MAX_RETIRED_KEYS {
+                return None;
+            }
             if arr.is_empty() {
                 (0, 0, 1)
             } else {
@@ -277,11 +285,15 @@ pub extern "C" fn qb_pricing_compact_catalog_parse(
     } else {
         unsafe { std::slice::from_raw_parts(data, length) }
     };
-    parse_compact_catalog(bytes).map(|r| Box::into_raw(Box::new(r))).unwrap_or(ptr::null_mut())
+    parse_compact_catalog(bytes)
+        .map(|r| Box::into_raw(Box::new(r)))
+        .unwrap_or(ptr::null_mut())
 }
 
 #[no_mangle]
-pub extern "C" fn qb_pricing_compact_catalog_entry_count(result: *const PricingCompactResult) -> u32 {
+pub extern "C" fn qb_pricing_compact_catalog_entry_count(
+    result: *const PricingCompactResult,
+) -> u32 {
     if result.is_null() {
         return 0;
     }
@@ -299,7 +311,9 @@ pub extern "C" fn qb_pricing_compact_catalog_entries(
 }
 
 #[no_mangle]
-pub extern "C" fn qb_pricing_compact_catalog_tier_count(result: *const PricingCompactResult) -> u32 {
+pub extern "C" fn qb_pricing_compact_catalog_tier_count(
+    result: *const PricingCompactResult,
+) -> u32 {
     if result.is_null() {
         return 0;
     }
@@ -317,31 +331,46 @@ pub extern "C" fn qb_pricing_compact_catalog_tiers(
 }
 
 #[no_mangle]
-pub extern "C" fn qb_pricing_compact_catalog_retrieved_at_offset(result: *const PricingCompactResult) -> u32 {
-    unsafe { result.as_ref().map(|r| r.retrieved_at_offset).unwrap_or(NIL_STRING) }
+pub extern "C" fn qb_pricing_compact_catalog_retrieved_at_offset(
+    result: *const PricingCompactResult,
+) -> u32 {
+    unsafe {
+        result
+            .as_ref()
+            .map(|r| r.retrieved_at_offset)
+            .unwrap_or(NIL_STRING)
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn qb_pricing_compact_catalog_retrieved_at_length(result: *const PricingCompactResult) -> u32 {
+pub extern "C" fn qb_pricing_compact_catalog_retrieved_at_length(
+    result: *const PricingCompactResult,
+) -> u32 {
     unsafe { result.as_ref().map(|r| r.retrieved_at_length).unwrap_or(0) }
 }
 
 #[no_mangle]
-pub extern "C" fn qb_pricing_compact_catalog_retired_count(result: *const PricingCompactResult) -> u32 {
+pub extern "C" fn qb_pricing_compact_catalog_retired_count(
+    result: *const PricingCompactResult,
+) -> u32 {
     unsafe { result.as_ref().map(|r| r.retired_count).unwrap_or(0) }
 }
 
 /// 1 when the catalog contained a "retired" key at all (even an empty array); 0 otherwise.
 /// Swift treats presence as authoritative, matching the Swift decode path (`retiredKeys != nil`).
 #[no_mangle]
-pub extern "C" fn qb_pricing_compact_catalog_retired_present(result: *const PricingCompactResult) -> u8 {
+pub extern "C" fn qb_pricing_compact_catalog_retired_present(
+    result: *const PricingCompactResult,
+) -> u8 {
     unsafe { result.as_ref().map(|r| r.retired_present).unwrap_or(0) }
 }
 
 /// Offset of the first retired-key record in the string blob ([u32le length][bytes]*, count
 /// from qb_pricing_compact_catalog_retired_count). Keys are stored in catalog order, not sorted.
 #[no_mangle]
-pub extern "C" fn qb_pricing_compact_catalog_retired_offset(result: *const PricingCompactResult) -> u32 {
+pub extern "C" fn qb_pricing_compact_catalog_retired_offset(
+    result: *const PricingCompactResult,
+) -> u32 {
     unsafe { result.as_ref().map(|r| r.retired_offset).unwrap_or(0) }
 }
 
@@ -390,12 +419,21 @@ mod tests {
 
     #[test]
     fn cached_crate_snapshots_roundtrip() {
-        for name in ["pricing_litellm_snapshot.json", "pricing_models_dev_snapshot.json"] {
-            let path = format!("{}/../../Sources/QuotaBar/Resources/{name}", env!("CARGO_MANIFEST_DIR"));
+        for name in [
+            "pricing_litellm_snapshot.json",
+            "pricing_models_dev_snapshot.json",
+        ] {
+            let path = format!(
+                "{}/../../Sources/QuotaBar/Resources/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
             let bytes = std::fs::read(path).unwrap();
             let parsed = parse_compact_catalog(&bytes).unwrap();
             assert!(!parsed.entries.is_empty());
-            assert!(parsed.entries.iter().all(|e| e.input_per_million.is_finite() && e.output_per_million.is_finite()));
+            assert!(parsed
+                .entries
+                .iter()
+                .all(|e| e.input_per_million.is_finite() && e.output_per_million.is_finite()));
         }
     }
 }

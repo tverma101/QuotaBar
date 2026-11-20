@@ -1138,24 +1138,33 @@ actor AntigravityDbUsageScanner {
                     cached.tableFingerprint = Self.advancingFingerprint(cached.tableFingerprint, with: fingerprint)
                     cached.lastIndex = row.index
                     cached.rowCount += 1
-                    let blob: [UInt8]?
+                    let source: GenerationRowDecoder.Source
                     if let hex = row.hex {
-                        blob = Self.bytes(fromHex: hex)
+                        source = .hex(hex)
+                    } else if let projected = try projectOversized(path, row.index, row.byteCount) {
+                        cached.hasProjectedRows = true
+                        source = .bytes(projected)
                     } else {
-                        blob = try projectOversized(path, row.index, row.byteCount)
-                        if blob != nil { cached.hasProjectedRows = true }
-                    }
-                    guard let blob else {
                         // The generation bytes are unavailable, so its identifiers cannot validate
                         // an index-correlated step timestamp. Mark the first-observed day instead.
                         if observedAt >= since { cached.oversizedTimestamps.append(observedTimestamp) }
                         continue
                     }
-                    switch AntigravityProtoDecoder.decodeGenerationEvent(
-                        from: blob,
-                        stepMetadata: row.stepHex.flatMap(Self.bytes(fromHex:)),
-                        matchedStepTimestamp: stepIndex?.timestamp(for: blob)
-                    ) {
+                    var rowDecoder = GenerationRowDecoder(source: source)
+                    // The index lookup keys on the row's identity, resolved before the decode
+                    // exactly as `stepIndex?.timestamp(for: blob)` did.
+                    let matchedStepTimestamp = stepIndex.flatMap { index in
+                        rowDecoder.identity().flatMap { index.timestamp(for: $0) }
+                    }
+                    let decodeResult: AntigravityProtoDecoder.GenerationEventDecodeResult
+                    switch rowDecoder.decode(stepHex: row.stepHex, matchedStepTimestamp: matchedStepTimestamp) {
+                    case .decoded(let result):
+                        decodeResult = result
+                    case .unreadable:
+                        if observedAt >= since { cached.oversizedTimestamps.append(observedTimestamp) }
+                        continue
+                    }
+                    switch decodeResult {
                     case .ignored:
                         continue
                     case .invalidTokenCount(let timestamp):
@@ -1170,7 +1179,7 @@ actor AntigravityDbUsageScanner {
                         }
                     case .undatedUsage:
                         if observedAt >= since { cached.undatedUsageTimestamps.append(observedTimestamp) }
-                        if let identity = AntigravityProtoDecoder.generationStepIdentity(from: blob) {
+                        if let identity = rowDecoder.identity() {
                             cached.undatedIdentities.insert(identity)
                         }
                     case .event(let event):
@@ -1360,6 +1369,109 @@ actor AntigravityDbUsageScanner {
             hasher.update(data: Data([0]))
         }
         return Data(hasher.finalize())
+    }
+
+    /// Per-row decode context for `readDatabase`: the generation protobuf arrives as hex text
+    /// (or projected bytes for oversized blobs) and both the Swift-side blob materialization
+    /// and the step identity resolve lazily — most rows need neither. Decoding itself goes
+    /// through the Rust port first (`AntigravityRustDecoder`); the Swift reference decoder runs
+    /// only for the shapes the port declines, so the row's verdict is never different.
+    private struct GenerationRowDecoder {
+        enum Source {
+            case hex(String)
+            case bytes([UInt8])
+        }
+
+        enum Result {
+            case decoded(AntigravityProtoDecoder.GenerationEventDecodeResult)
+            /// The generation bytes are unavailable — identical to `bytes(fromHex:)` returning
+            /// nil or a failed projection: the caller's oversized path.
+            case unreadable
+        }
+
+        private let source: Source
+        private var blob: [UInt8]?
+        private var blobComputed = false
+        private var identityComputed = false
+        private var identityValue: AntigravityProtoDecoder.StepIdentity?
+
+        init(source: Source) {
+            self.source = source
+        }
+
+        /// The blob the Swift reference decoder needs, materialized only when the Rust decoder
+        /// declines. Nil when the hex cannot decode — exactly `bytes(fromHex:)` returning nil.
+        mutating func swiftBlob() -> [UInt8]? {
+            if !blobComputed {
+                blobComputed = true
+                switch source {
+                case .hex(let hex): blob = AntigravityDbUsageScanner.bytes(fromHex: hex)
+                case .bytes(let bytes): blob = bytes
+                }
+            }
+            return blob
+        }
+
+        /// `generationStepIdentity(from:)` via the Rust port, with the Swift extraction as the
+        /// fallback for shapes the port declines.
+        mutating func identity() -> AntigravityProtoDecoder.StepIdentity? {
+            if !identityComputed {
+                identityComputed = true
+                let outcome: AntigravityRustDecoder.IdentityOutcome
+                switch source {
+                case .hex(let hex):
+                    outcome = AntigravityRustDecoder.generationStepIdentity(fromHex: hex)
+                case .bytes(let bytes):
+                    outcome = AntigravityRustDecoder.generationStepIdentity(fromBytes: bytes)
+                }
+                switch outcome {
+                case .present(let identity):
+                    identityValue = identity
+                case .absent:
+                    break
+                case .fallback:
+                    identityValue = swiftBlob().flatMap(AntigravityProtoDecoder.generationStepIdentity(from:))
+                }
+            }
+            return identityValue
+        }
+
+        /// `decodeGenerationEvent(from:stepMetadata:matchedStepTimestamp:)` via the Rust port.
+        /// `matchedStepTimestamp` is looked up from `identity()` by the caller so the step
+        /// index dictionary stays in Swift.
+        mutating func decode(
+            stepHex: String?,
+            matchedStepTimestamp: Int64?
+        ) -> Result {
+            let outcome: AntigravityRustDecoder.GenerationOutcome
+            switch source {
+            case .hex(let hex):
+                outcome = AntigravityRustDecoder.decodeGeneration(
+                    fromHex: hex,
+                    stepHex: stepHex,
+                    matchedStepTimestamp: matchedStepTimestamp
+                )
+            case .bytes(let bytes):
+                outcome = AntigravityRustDecoder.decodeGeneration(
+                    fromBytes: bytes,
+                    stepHex: stepHex,
+                    matchedStepTimestamp: matchedStepTimestamp
+                )
+            }
+            switch outcome {
+            case .decoded(let result):
+                return .decoded(result)
+            case .unreadableBlob:
+                return .unreadable
+            case .fallback:
+                guard let blob = swiftBlob() else { return .unreadable }
+                return .decoded(AntigravityProtoDecoder.decodeGenerationEvent(
+                    from: blob,
+                    stepMetadata: stepHex.flatMap(AntigravityDbUsageScanner.bytes(fromHex:)),
+                    matchedStepTimestamp: matchedStepTimestamp
+                ))
+            }
+        }
     }
 
     private struct Row: Decodable {

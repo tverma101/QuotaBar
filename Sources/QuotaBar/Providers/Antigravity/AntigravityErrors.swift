@@ -22,6 +22,9 @@ enum AntigravityError: Error, LocalizedError, Equatable {
     case accessDenied
     /// Credentials are valid, but this Antigravity client/account exposes none of the known quota endpoints.
     case quotaEndpointUnavailable
+    /// Google throttled the quota reads (429, or a 403 carrying rate-limit markers). Throttling is
+    /// transient and is not evidence of a dead token or a permission denial (upstream #1529).
+    case rateLimited
     /// Credentials exist and look valid, but every endpoint was unreachable (network / server outage).
     /// Distinct from `notSignedIn` so a signed-in user isn't told to start Antigravity during an outage.
     case unavailable
@@ -44,6 +47,8 @@ enum AntigravityError: Error, LocalizedError, Equatable {
             return "Google denied access to Antigravity usage. Check that this account and project have access."
         case .quotaEndpointUnavailable:
             return "Antigravity did not provide a supported usage endpoint for this account or app version."
+        case .rateLimited:
+            return "Google is rate limiting Antigravity usage. Try again shortly."
         case .unavailable:
             return "Antigravity usage is temporarily unavailable. Try again shortly."
         }

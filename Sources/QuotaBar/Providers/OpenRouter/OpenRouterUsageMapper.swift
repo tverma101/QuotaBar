@@ -1,11 +1,55 @@
 import Foundation
 
-/// Builds metric lines from the OpenRouter `/credits` and `/key` payloads. Each endpoint maps
+/// Period spend summed from a `/api/v1/keys` page entry, in dollars.
+struct OpenRouterSpend: Equatable, Sendable {
+    var today: Double
+    var week: Double
+    var month: Double
+
+    static let zero = OpenRouterSpend(today: 0, week: 0, month: 0)
+
+    static func + (lhs: Self, rhs: Self) -> Self {
+        Self(today: lhs.today + rhs.today, week: lhs.week + rhs.week, month: lhs.month + rhs.month)
+    }
+}
+
+/// Builds metric lines from the OpenRouter `/credits`, `/key` and `/keys` payloads. Each endpoint maps
 /// independently so the provider can show whatever came back: `/credits` carries the balance, `/key`
-/// the tier and period spend, and either one failing still leaves the other's rows usable.
+/// the tier and period spend (or the management-key flag), `/keys` the per-key spend a management key
+/// needs, and either one failing still leaves the other's rows usable.
 enum OpenRouterUsageMapper {
     /// Diagnostic key for a per-key cap whose remaining amount never arrived.
     static let missingLimitRemainingDiagnosticKey = "openrouter.key.limit-remaining-missing"
+
+    /// A management key cannot run inference, so `/key` carries no spend for it; the account's spend
+    /// is the sum over the keys `/api/v1/keys` lists.
+    static func isManagementKey(_ data: [String: Any]) -> Bool {
+        data["is_management_key"] as? Bool == true
+    }
+
+    /// One `/api/v1/keys` page: `{ "data": [ { usage_daily, usage_weekly, usage_monthly }, … ] }`.
+    /// Returns the number of entries too, so the caller can stop paginating on a short page.
+    static func keysPageSpend(_ body: Data) throws -> (spend: [OpenRouterSpend], count: Int) {
+        guard let keys = ProviderParse.jsonObject(body)?["data"] as? [[String: Any]] else {
+            throw OpenRouterUsageError.invalidResponse
+        }
+        return (try keys.map(spend(from:)), keys.count)
+    }
+
+    /// Today / This Week / This Month value rows for a summed spend.
+    static func spendLines(_ spend: OpenRouterSpend) -> [MetricLine] {
+        [("Today", spend.today), ("This Week", spend.week), ("This Month", spend.month)].map { label, amount in
+            .values(label: label, values: [MetricValue(number: max(0, amount), kind: .dollars)])
+        }
+    }
+
+    private static func spend(from key: [String: Any]) throws -> OpenRouterSpend {
+        guard let today = ProviderParse.number(key["usage_daily"]),
+              let week = ProviderParse.number(key["usage_weekly"]),
+              let month = ProviderParse.number(key["usage_monthly"])
+        else { throw OpenRouterUsageError.invalidResponse }
+        return OpenRouterSpend(today: max(0, today), week: max(0, week), month: max(0, month))
+    }
 
     /// OpenRouter wraps every payload in `{ "data": { ... } }`.
     static func dataObject(_ body: Data) -> [String: Any]? {

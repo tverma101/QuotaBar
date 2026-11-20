@@ -119,6 +119,12 @@ final class WidgetDataStore {
     /// peer contribution can never echo back out and multiply on the next device.
     private(set) var localSnapshots: [String: ProviderSnapshot] = [:]
     var refreshingProviderIDs: Set<String> = []
+    /// Providers whose in-flight pass a user asked for — Refresh Now, a provider Retry, or a
+    /// context-menu Refresh (`ProviderRefreshContext.isManual`). The periodic loop, ledger wakes,
+    /// and prefetch folds run non-manual, so they never enter this set and no spinner appears for
+    /// work the user didn't start. `refreshingProviderIDs` stays the complete in-flight picture
+    /// used for dedup and cache ordering; this subset is only for activity display.
+    var userInitiatedRefreshingProviderIDs: Set<String> = []
     /// Running batches keyed by their complete execution policy, so a second caller asking for the same
     /// thing joins it instead of starting its own set of per-provider tasks. Manual action identity is
     /// part of the key: a new Refresh Now must not join work whose Keychain prompt budget it superseded.
@@ -238,6 +244,12 @@ final class WidgetDataStore {
     @ObservationIgnored private var peerHistoryDocuments: [UsageHistoryDocument] = []
     @ObservationIgnored private var vmBoxHistory: VMBoxUsageHistory?
     @ObservationIgnored private var vmBoxHistoryTask: Task<Void, Never>?
+    /// While a batch runs, per-provider results mark a rebuild pending instead of each re-rendering
+    /// the whole panel; a short coalescing window still publishes early results promptly, and one
+    /// flush at batch end publishes the rest together (upstream #1391).
+    @ObservationIgnored private var snapshotRebuildDeferrals = 0
+    @ObservationIgnored private var pendingSnapshotRebuild = false
+    @ObservationIgnored private var coalescedRebuildTask: Task<Void, Never>?
     @ObservationIgnored private var lastVMBoxHistory = VMBoxUsageHistory.Result()
     /// The merged daily fold is reused across quota-only refreshes. Its value arrays are shared with
     /// rendered snapshots through copy-on-write, while history, peer, enablement, and day changes
@@ -375,12 +387,12 @@ final class WidgetDataStore {
         self.localSnapshots = loaded
         self.snapshots = loaded
         if vmBoxHistory != nil {
-            rebuildRenderedSnapshots()
+            requestSnapshotRebuild()
             vmBoxHistoryTask = Task { [weak self] in
                 while !Task.isCancelled {
                     do { try await Task.sleep(for: .seconds(30)) } catch { return }
                     guard let self else { return }
-                    self.rebuildRenderedSnapshots()
+                    self.requestSnapshotRebuild()
                 }
             }
         }
@@ -531,6 +543,15 @@ final class WidgetDataStore {
         bypassFailureBackoff: Bool,
         maxConcurrentProviders: Int?
     ) async {
+        snapshotRebuildDeferrals += 1
+        defer {
+            snapshotRebuildDeferrals -= 1
+            if snapshotRebuildDeferrals == 0 {
+                coalescedRebuildTask?.cancel()
+                coalescedRebuildTask = nil
+                flushPendingSnapshotWork()
+            }
+        }
         // `Task {}` from MainActor context inherits the isolation (a task-group child can't capture
         // the non-Sendable store), so fire one task per provider in bounded groups, then await them all.
         let enabledIDs = registry.providers.map(\.id).filter { isProviderEnabled($0) }
@@ -610,6 +631,11 @@ final class WidgetDataStore {
                 for id in preMarkedInFlight where !refreshingProviderIDs.contains(id) {
                     refreshingProviderIDs.insert(id)
                 }
+                if ProviderRefreshContext.isManual {
+                    for id in preMarkedInFlight where !userInitiatedRefreshingProviderIDs.contains(id) {
+                        userInitiatedRefreshingProviderIDs.insert(id)
+                    }
+                }
                 let fetched = await self.scanWorker.fetchFoldSnapshots(
                     providers: staleProviders,
                     paced: ProviderRefreshContext.accountingCPUThrottleEnabled
@@ -625,6 +651,7 @@ final class WidgetDataStore {
                 // against its own marker. The window is covered by these markers; members mark
                 // themselves for the (instant) consuming phase as usual.
                 for id in preMarkedInFlight { refreshingProviderIDs.remove(id) }
+                for id in preMarkedInFlight { userInitiatedRefreshingProviderIDs.remove(id) }
                 preMarkedInFlight = []
             }
         }
@@ -1211,7 +1238,7 @@ final class WidgetDataStore {
                         invalidateMergedHistoryCache()
                     }
                     localSnapshots[providerID] = cached
-                    rebuildRenderedSnapshots()
+                    requestSnapshotRebuild()
                 }
                 return .cacheHit
             }
@@ -1318,12 +1345,18 @@ final class WidgetDataStore {
         if !refreshingProviderIDs.contains(providerID) {
             refreshingProviderIDs.insert(providerID)
         }
+        if ProviderRefreshContext.isManual, !userInitiatedRefreshingProviderIDs.contains(providerID) {
+            userInitiatedRefreshingProviderIDs.insert(providerID)
+        }
         defer {
             runningProviderRefreshScopes[providerID]?[taskID] = nil
             if runningProviderRefreshScopes[providerID]?.isEmpty == true {
                 runningProviderRefreshScopes[providerID] = nil
                 if refreshingProviderIDs.contains(providerID) {
                     refreshingProviderIDs.remove(providerID)
+                }
+                if userInitiatedRefreshingProviderIDs.contains(providerID) {
+                    userInitiatedRefreshingProviderIDs.remove(providerID)
                 }
             }
         }
@@ -1571,7 +1604,7 @@ final class WidgetDataStore {
                 localHistoryRevision &+= 1
                 invalidateMergedHistoryCache()
             }
-            rebuildRenderedSnapshots()
+            requestSnapshotRebuild()
             if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
             return .skipped
         case .unavailable:
@@ -1594,7 +1627,7 @@ final class WidgetDataStore {
                 invalidateMergedHistoryCache()
             }
         }
-        rebuildRenderedSnapshots()
+        requestSnapshotRebuild()
         if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
         if !persistedToBlob {
             recordProviderFailure("Refreshed usage couldn't be saved. Previous values are still shown.",
@@ -1692,7 +1725,7 @@ final class WidgetDataStore {
                 localHistoryRevision &+= 1
                 invalidateMergedHistoryCache()
             }
-            rebuildRenderedSnapshots()
+            requestSnapshotRebuild()
             if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
             return false
         case .unavailable:
@@ -1712,7 +1745,7 @@ final class WidgetDataStore {
                 invalidateMergedHistoryCache()
             }
         }
-        rebuildRenderedSnapshots()
+        requestSnapshotRebuild()
         if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
         return true
     }
@@ -1855,7 +1888,7 @@ final class WidgetDataStore {
     /// available to direct API reads, but disabled providers stop receiving peer contributions.
     func providerEnablementDidChange(changedProviderIDs: Set<String> = []) {
         invalidateMergedHistoryCache()
-        rebuildRenderedSnapshots()
+        requestSnapshotRebuild()
         let disabledProviderIDs = changedProviderIDs.filter { !isProviderEnabled($0) }
         let enabledProviderIDs = changedProviderIDs.filter { isProviderEnabled($0) }
         for providerID in disabledProviderIDs {
@@ -1911,14 +1944,14 @@ final class WidgetDataStore {
         peerHistoryDocuments = UsageHistoryDocument.newestByDevice(documents)
             .filter { $0.deviceID != ownDeviceID }
         invalidateMergedHistoryCache()
-        rebuildRenderedSnapshots()
+        requestSnapshotRebuild()
     }
 
     func clearPeerHistoryDocuments() {
         guard !peerHistoryDocuments.isEmpty else { return }
         peerHistoryDocuments = []
         invalidateMergedHistoryCache()
-        rebuildRenderedSnapshots()
+        requestSnapshotRebuild()
     }
 
     func localHistoryDocument(deviceID: String, deviceName: String, updatedAt: Date = Date()) -> UsageHistoryDocument {
@@ -1967,6 +2000,30 @@ final class WidgetDataStore {
             providers: providers,
             identities: identities.isEmpty ? nil : identities
         )
+    }
+
+    /// Rebuild now, or mark pending while a batch defers rebuilds. A 150ms coalescing task still
+    /// publishes the first results promptly; results landing inside the window share the one rebuild.
+    private func requestSnapshotRebuild() {
+        guard snapshotRebuildDeferrals > 0 else {
+            rebuildRenderedSnapshots()
+            return
+        }
+        pendingSnapshotRebuild = true
+        guard coalescedRebuildTask == nil else { return }
+        coalescedRebuildTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard let self, !Task.isCancelled else { return }
+            self.coalescedRebuildTask = nil
+            self.flushPendingSnapshotWork()
+        }
+    }
+
+    private func flushPendingSnapshotWork() {
+        if pendingSnapshotRebuild {
+            pendingSnapshotRebuild = false
+            rebuildRenderedSnapshots()
+        }
     }
 
     /// Recomputes `snapshots` from `localSnapshots` and the peer set, **assigning only when the result
@@ -2154,12 +2211,12 @@ final class WidgetDataStore {
             if let persistedSnapshot { localSnapshots[providerID] = persistedSnapshot }
         case .superseded(let newerSnapshot):
             localSnapshots[providerID] = newerSnapshot
-            rebuildRenderedSnapshots()
+            requestSnapshotRebuild()
             return false
         case .unavailable:
             break
         }
-        rebuildRenderedSnapshots()
+        requestSnapshotRebuild()
         return true
     }
 
@@ -2191,7 +2248,7 @@ final class WidgetDataStore {
             invalidateMergedHistoryCache()
         }
         AppLog.info(.cache, "account identity changed during refresh; cleared prior snapshot for \(providerID)")
-        rebuildRenderedSnapshots()
+        requestSnapshotRebuild()
         if notifyHistoryChange, historyChanged { onLocalHistoryChanged?() }
         return true
     }

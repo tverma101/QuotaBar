@@ -216,6 +216,9 @@ enum CopilotUsageError: Error, LocalizedError, Equatable {
     case invalidResponse
     case connectionFailed
     case requestFailed(Int)
+    /// GitHub throttled the read — a 429, or a 403 carrying rate-limit markers. A rate-limit 403 is
+    /// not a permission denial (upstream #1529).
+    case rateLimited(retryAfterSeconds: Int?)
     case quotaUnavailable
 
     var errorDescription: String? {
@@ -226,6 +229,10 @@ enum CopilotUsageError: Error, LocalizedError, Equatable {
             return "Couldn't reach GitHub. Check your connection."
         case .requestFailed(let status):
             return "Copilot usage request failed (HTTP \(status)). Try again later."
+        case .rateLimited(let retryAfterSeconds):
+            guard let retryAfterSeconds else { return "GitHub is rate limiting Copilot usage. Try again shortly." }
+            let minutes = max(1, (retryAfterSeconds + 59) / 60)
+            return "GitHub is rate limiting Copilot usage. Try again in \(minutes) min."
         case .quotaUnavailable:
             return "Copilot usage data is unavailable for this account."
         }

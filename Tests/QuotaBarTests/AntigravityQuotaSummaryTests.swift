@@ -46,7 +46,9 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
 
         guard let lines = bare else { return XCTFail("full summary did not parse") }
         XCTAssertEqual(lines.map(\.label), ["Session", "Weekly", "Claude", "Claude Weekly"])
-        XCTAssertEqual(lines.map { used($0) }, [25, 10, 60, 0])
+        for (metric, want) in zip(lines, [25.0, 10, 60, 0]) {
+            XCTAssertEqual(used(metric) ?? .nan, want, accuracy: 0.0001)
+        }
         XCTAssertEqual(resetsAt(lines[0]), OpenUsageISO8601.date(from: "2026-07-02T16:00:00Z"))
         XCTAssertEqual(resetsAt(lines[2]), OpenUsageISO8601.date(from: "2026-07-02T15:30:00Z"))
         XCTAssertEqual(lines.map { periodMs($0) }, [
@@ -169,7 +171,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
 
         let duplicateMissingValue = #"{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8},{"bucketId":"gemini-5h"}]}]}"#
         let incomplete = try XCTUnwrap(AntigravityUsageMapper.parseQuotaSummaryResult(Data(duplicateMissingValue.utf8)))
-        XCTAssertEqual(used(incomplete.lines.first), 20)
+        XCTAssertEqual(used(incomplete.lines.first) ?? .nan, 20, accuracy: 0.0001)
         XCTAssertFalse(incomplete.isComplete)
     }
 
@@ -284,7 +286,9 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.plan, "Pro")
         XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Weekly", "Claude", "Claude Weekly"])
-        XCTAssertEqual(snapshot.lines.map { used($0) }, [25, 10, 60, 0])
+        for (metric, want) in zip(snapshot.lines, [25.0, 10, 60, 0]) {
+            XCTAssertEqual(used(metric) ?? .nan, want, accuracy: 0.0001)
+        }
         XCTAssertFalse(routing.requests.contains { $0.url.path.contains("fetchAvailableModels") },
                        "a parsed summary must not touch the legacy model endpoints")
     }
@@ -465,7 +469,9 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let snapshot = await provider.refresh()
         // Summary values win — not the single 1%-used line the legacy GetUserStatus configs would pool to.
         XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Weekly", "Claude", "Claude Weekly"])
-        XCTAssertEqual(snapshot.lines.map { used($0) }, [25, 10, 60, 0])
+        for (metric, want) in zip(snapshot.lines, [25.0, 10, 60, 0]) {
+            XCTAssertEqual(used(metric) ?? .nan, want, accuracy: 0.0001)
+        }
         XCTAssertEqual(snapshot.plan, "Pro")
         XCTAssertFalse(routing.requests.contains { $0.url.path.hasSuffix("/GetCommandModelConfigs") })
     }
@@ -514,7 +520,9 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
 
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Claude"])
-        XCTAssertEqual(snapshot.lines.map { used($0) }, [50, 20])
+        for (metric, want) in zip(snapshot.lines, [50.0, 20]) {
+            XCTAssertEqual(used(metric) ?? .nan, want, accuracy: 0.0001)
+        }
         XCTAssertEqual(snapshot.plan, "Pro")
     }
 }

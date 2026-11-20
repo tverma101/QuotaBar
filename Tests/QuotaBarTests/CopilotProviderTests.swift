@@ -555,6 +555,20 @@ final class CopilotProviderTests: XCTestCase {
         XCTAssertNotEqual(snapshot.errorCategory, .authExpired)
     }
 
+    func testRateLimited403IsThrottlingNotAccessDenied() async {
+        // Upstream #1529: GitHub sends rate limits as a 403 — it must not read as a license denial.
+        for headers in [["retry-after": "60"], ["x-ratelimit-remaining": "0"]] {
+            let provider = CopilotProvider(
+                authStore: editorTokenStore(),
+                usageClient: CopilotUsageClient(http: FakeHTTPClient(response: HTTPResponse(statusCode: 403, headers: headers, body: Data())))
+            )
+
+            let snapshot = await provider.refresh()
+
+            XCTAssertEqual(snapshot.errorCategory, .rateLimited, "headers: \(headers)")
+        }
+    }
+
     func testMapsLinesAndSendsTokenHeaderOnSuccess() async throws {
         let http = FakeHTTPClient(response: ok(makePaidBody()))
         let provider = CopilotProvider(

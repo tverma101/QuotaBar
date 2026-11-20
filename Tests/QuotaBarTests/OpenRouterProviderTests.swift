@@ -339,6 +339,47 @@ final class OpenRouterProviderTests: XCTestCase {
         XCTAssertNil(snapshot.line(label: "Balance"))
     }
 
+    // Upstream OpenUsage #1467: a management key's `/key` response carries no spend of its own —
+    // the account's period spend is the sum over the keys `/keys` lists.
+    func testRefreshSumsListedKeysForAManagementKey() async throws {
+        let http = RoutingHTTPClient { request in
+            let url = request.url.absoluteString
+            if url == OpenRouterUsageClient.creditsURL {
+                return jsonResponse(["data": ["total_credits": 100, "total_usage": 40]])
+            }
+            if url == OpenRouterUsageClient.keyURL {
+                return jsonResponse(["data": ["is_free_tier": false, "is_management_key": true]])
+            }
+            if url.hasPrefix(OpenRouterUsageClient.keysURL) {
+                return jsonResponse(["data": [
+                    ["usage_daily": 1.5, "usage_weekly": 3, "usage_monthly": 10],
+                    ["usage_daily": 0.5, "usage_weekly": 2, "usage_monthly": 4]
+                ]])
+            }
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        }
+        let provider = OpenRouterProvider(
+            authStore: makeAuthStore(key: "sk-or-mgmt"),
+            usageClient: OpenRouterUsageClient(http: http),
+            now: { Date(timeIntervalSince1970: 1_800_000_000) }
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertEqual(http.requests.filter { $0.url.absoluteString.hasPrefix(OpenRouterUsageClient.keysURL) }.count, 1)
+        XCTAssertEqual(dollarValue(snapshot.lines, "Today"), 2)
+        XCTAssertEqual(dollarValue(snapshot.lines, "This Week"), 5)
+        XCTAssertEqual(dollarValue(snapshot.lines, "This Month"), 14)
+    }
+
+    private func dollarValue(_ lines: [MetricLine], _ label: String) -> Double? {
+        guard case .values(_, let values, _, _, _, _) = lines.first(where: { $0.label == label }) else {
+            return nil
+        }
+        return values.first(where: { $0.kind == .dollars })?.number
+    }
+
     func testRefreshWithoutKeyReportsNotLoggedIn() async {
         let provider = OpenRouterProvider(
             authStore: OpenRouterAuthStore(files: FakeFiles(), environment: FakeEnvironment()),

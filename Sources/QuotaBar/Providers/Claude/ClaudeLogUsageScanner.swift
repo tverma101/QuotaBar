@@ -818,13 +818,34 @@ actor ClaudeLogUsageScanner {
     }
 
     /// Streaming counterpart used by the incremental scanner so a large session file never becomes
-    /// one giant Data allocation.
+    /// one giant Data allocation. The quotabar-core Rust whole-file parser streams, splits, and
+    /// parses the file without materializing Foundation objects; it declines the file as a whole
+    /// for the shapes it does not support, and `parseFileSwift(at:)` re-parses from scratch — the
+    /// two engines never produce a mixed result for one file.
     nonisolated static func parseFile(at url: URL) -> [Entry]? {
+        switch ClaudeFileRustParser.parseFile(at: url) {
+        case .success(let entries, let malformed):
+            // A malformed usage row makes the whole file unusable — the same rule the Swift
+            // path applies through its per-line nil signal.
+            return malformed ? nil : entries
+        case .failed:
+            return nil
+        case .fallback:
+            break
+        }
+        return parseFileSwift(at: url)
+    }
+
+    /// The Swift reference implementation of `parseFile(at:)` — the runtime fallback for files
+    /// the Rust whole-file parser declines. Routes through the append cache like before, but
+    /// consults `parseEntriesSwift` for every line so the oracle never depends on the Rust
+    /// per-line bridge it is being compared against.
+    nonisolated static func parseFileSwift(at url: URL) -> [Entry]? {
         ClaudeSessionAppendCache.shared.parse(at: url) { line in
             autoreleasepool {
                 var entries: [Entry] = []
                 var malformedTokenCounts = false
-                appendEntries(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
+                appendEntriesSwift(from: line, to: &entries, malformedTokenCounts: &malformedTokenCounts)
                 return malformedTokenCounts ? nil : entries
             }
         }
@@ -839,6 +860,17 @@ actor ClaudeLogUsageScanner {
     ) {
         guard line.range(of: usageMarker) != nil else { return }
         entries.append(contentsOf: parseEntries(Data(line), malformedTokenCounts: &malformedTokenCounts))
+    }
+
+    /// `appendEntries`' oracle counterpart for `parseFileSwift(at:)`: the same marker gate and
+    /// accumulation, but always the Swift reference parser — never the Rust per-line bridge.
+    private static func appendEntriesSwift(
+        from line: Data.SubSequence,
+        to entries: inout [Entry],
+        malformedTokenCounts: inout Bool
+    ) {
+        guard line.range(of: usageMarker) != nil else { return }
+        entries.append(contentsOf: parseEntriesSwift(Data(line), malformedTokenCounts: &malformedTokenCounts))
     }
 
     /// Decode one JSONL line into an `Entry`, mirroring what ccusage's serde model accepts: `usage`

@@ -448,6 +448,7 @@ final class AntigravityProvider: ProviderRuntime {
         var sawForbidden = false
         var sawNoQuotaEndpoint = false
         var sawTransientFailure = false
+        var sawRateLimited = false
         for attempt in tokens {
             switch try await fetchCloudCode(token: attempt.value) {
             case .success(let result): return result
@@ -458,6 +459,7 @@ final class AntigravityProvider: ProviderRuntime {
                 }
             case .forbidden: sawForbidden = true
             case .notFound: sawNoQuotaEndpoint = true
+            case .rateLimited: sawRateLimited = true
             case .unavailable: sawTransientFailure = true
             }
         }
@@ -482,6 +484,7 @@ final class AntigravityProvider: ProviderRuntime {
                 case .authFailed: throw AntigravityError.authExpired
                 case .forbidden: throw AntigravityError.accessDenied
                 case .notFound: throw AntigravityError.quotaEndpointUnavailable
+                case .rateLimited: throw AntigravityError.rateLimited
                 // The refreshed token is valid, so a non-2xx here is a transient outage, not bad auth.
                 case .unavailable: throw AntigravityError.unavailable
                 }
@@ -499,6 +502,7 @@ final class AntigravityProvider: ProviderRuntime {
         // refresh is genuinely expired auth.
         if sawAuthFailure || hasKnownExpiredAccessToken { throw AntigravityError.authExpired }
         if sawForbidden { throw AntigravityError.accessDenied }
+        if sawRateLimited { throw AntigravityError.rateLimited }
         if sawNoQuotaEndpoint, !sawTransientFailure {
             throw AntigravityError.quotaEndpointUnavailable
         }
@@ -511,6 +515,7 @@ final class AntigravityProvider: ProviderRuntime {
         case success(StrategyResult)
         case authFailed
         case forbidden
+        case rateLimited
         case notFound
         case unavailable
     }
@@ -519,6 +524,7 @@ final class AntigravityProvider: ProviderRuntime {
         case response(plan: String?, project: String?)
         case authFailed
         case forbidden
+        case rateLimited
         case notFound
         case unavailable
 
@@ -539,11 +545,14 @@ final class AntigravityProvider: ProviderRuntime {
             var sawNotFound = false
             var sawTransientFailure = false
             var sawUnusableSuccess = false
+            var sawAssistRefusal: CodeAssistLookup?
             switch try await usageClient.cloudCodeSummaries(token: token) {
             case .authFailed:
                 return .authFailed
             case .forbidden:
                 return .forbidden
+            case .rateLimited:
+                return .rateLimited
             case .notFound:
                 sawNotFound = true
                 for index in AntigravityUsageClient.cloudCodeURLs.indices {
@@ -575,11 +584,13 @@ final class AntigravityProvider: ProviderRuntime {
             }
 
             // Legacy: fetchAvailableModels — the full Antigravity model set (Gemini + Claude + GPT-OSS).
-            switch try await usageClient.cloudCode(path: AntigravityUsageClient.fetchModelsPath, token: token, userAgent: "antigravity", body: [:]) {
+            switch try await usageClient.cloudCode(path: AntigravityUsageClient.fetchModelsPath, token: token, body: [:]) {
             case .authFailed:
                 return .authFailed
             case .forbidden:
                 return .forbidden
+            case .rateLimited:
+                return .rateLimited
             case .notFound:
                 sawNotFound = true
                 break
@@ -595,15 +606,18 @@ final class AntigravityProvider: ProviderRuntime {
             }
 
             // Fallback: the shared loadCodeAssist result supplies both the plan and project.
-            // Its request already ran alongside the summary/models lookups.
+            // Its request already ran alongside the summary/models lookups. A refusal there is not
+            // evidence about the quota endpoints — it only costs the plan/project extras, so the
+            // quota read still runs and its own outcome decides (upstream #1510).
             var plan: String?
             var project: String?
             switch try await codeAssistTask.value {
-            case .authFailed: return .authFailed
-            case .forbidden: return .forbidden
+            case .authFailed, .forbidden:
+                sawAssistRefusal = try await codeAssistTask.value
             case .response(let loadedPlan, let loadedProject):
                 plan = loadedPlan
                 project = loadedProject
+            case .rateLimited: sawTransientFailure = true
             case .notFound:
                 sawNotFound = true
             case .unavailable: sawTransientFailure = true
@@ -612,15 +626,17 @@ final class AntigravityProvider: ProviderRuntime {
             var quota = try await usageClient.cloudCode(
                 path: AntigravityUsageClient.retrieveQuotaPath,
                 token: token,
-                userAgent: "agy",
                 body: project.map { ["project": $0] } ?? [:]
             )
-            if project != nil, quota.isUnavailable {
-                quota = try await usageClient.cloudCode(path: AntigravityUsageClient.retrieveQuotaPath, token: token, userAgent: "agy", body: [:])
+            // A quota request refused *with* a project is asked once more without one; only then
+            // does the refusal count (upstream #1510).
+            if project != nil, !quota.isOK {
+                quota = try await usageClient.cloudCode(path: AntigravityUsageClient.retrieveQuotaPath, token: token, body: [:])
             }
             switch quota {
             case .authFailed: return .authFailed
             case .forbidden: return .forbidden
+            case .rateLimited: return .rateLimited
             case .notFound:
                 sawNotFound = true
             case .ok(let data):
@@ -629,6 +645,14 @@ final class AntigravityProvider: ProviderRuntime {
                 sawUnusableSuccess = true
             case .unavailable:
                 sawTransientFailure = true
+            }
+            if let sawAssistRefusal {
+                switch sawAssistRefusal {
+                case .authFailed: return .authFailed
+                case .forbidden: return .forbidden
+                case .rateLimited: return .rateLimited
+                default: break
+                }
             }
             return (sawNotFound || sawUnusableSuccess) && !sawTransientFailure ? .notFound : .unavailable
         } onCancel: {
@@ -640,13 +664,15 @@ final class AntigravityProvider: ProviderRuntime {
         switch try await usageClient.cloudCode(
             path: AntigravityUsageClient.loadCodeAssistPath,
             token: token,
-            userAgent: "agy",
-            body: [:]
+            body: [:],
+            urls: AntigravityUsageClient.planLookupURLs
         ) {
         case .authFailed:
             return .authFailed
         case .forbidden:
             return .forbidden
+        case .rateLimited:
+            return .rateLimited
         case .notFound:
             return .notFound
         case .ok(let data):

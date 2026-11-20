@@ -11,11 +11,20 @@
 //! `malformedTokenCounts` / `hasMalformedUsage` side channels.
 
 use serde_json::{Map, Value};
+use std::os::raw::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
+use crate::scanfile::{CancelCallback, QB_FILE_FAILED, QB_FILE_FALLBACK, QB_FILE_OK};
+
+mod antigravity;
 mod codex;
+mod codex_router;
+mod grok;
+mod muse;
+mod pi;
 mod pricing;
+mod scanfile;
 
 const MAX_ENTRIES_PER_LINE: usize = 64;
 pub(crate) const NIL_STRING: u32 = u32::MAX;
@@ -88,9 +97,7 @@ fn number(bytes: &[u8], range: std::ops::Range<usize>) -> u32 {
 pub(crate) fn parse_canonical_utc(s: &[u8]) -> CanonicalTimestamp {
     let (millis,) = match s.len() {
         20 if s[19] == b'Z' => (0,),
-        24 if s[19] == b'.' && s[23] == b'Z'
-            && s[20..23].iter().all(|&b| is_ascii_digit(b)) =>
-        {
+        24 if s[19] == b'.' && s[23] == b'Z' && s[20..23].iter().all(|&b| is_ascii_digit(b)) => {
             (number(s, 20..23),)
         }
         _ => return CanonicalTimestamp::NotCanonical,
@@ -120,8 +127,7 @@ pub(crate) fn parse_canonical_utc(s: &[u8]) -> CanonicalTimestamp {
         return CanonicalTimestamp::Invalid;
     }
 
-    let is_leap_year =
-        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let is_leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let maximum_day: i64 = match month {
         2 => {
             if is_leap_year {
@@ -143,8 +149,7 @@ pub(crate) fn parse_canonical_utc(s: &[u8]) -> CanonicalTimestamp {
     let year_of_era = adjusted_year - era * 400;
     let adjusted_month = month + if month > 2 { -3 } else { 9 };
     let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
-    let day_of_era =
-        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days_since_epoch = era * 146_097 + day_of_era - 719_468;
     let whole_seconds = days_since_epoch * 86_400 + hour * 3_600 + minute * 60 + second;
 
@@ -165,10 +170,9 @@ fn is_valid_semver_identifiers(value: &str, allow_numeric_leading_zero: bool) ->
         if bytes.is_empty() {
             return false;
         }
-        if !bytes
-            .iter()
-            .all(|&b| b.is_ascii_digit() || (65..=90).contains(&b) || (97..=122).contains(&b) || b == b'-')
-        {
+        if !bytes.iter().all(|&b| {
+            b.is_ascii_digit() || (65..=90).contains(&b) || (97..=122).contains(&b) || b == b'-'
+        }) {
             return false;
         }
         if !allow_numeric_leading_zero
@@ -386,7 +390,10 @@ struct EntryOut {
 }
 
 enum LineOutcome {
-    Parsed { malformed: bool, entries: Vec<EntryOut> },
+    Parsed {
+        malformed: bool,
+        entries: Vec<EntryOut>,
+    },
     /// Legal Swift input outside this module's supported shapes; caller re-runs the Swift path.
     Fallback,
 }
@@ -515,7 +522,10 @@ fn parse_line(line: &[u8]) -> LineOutcome {
         .get("model")
         .and_then(Value::as_str)
         .and_then(|m| (m != "<synthetic>").then(|| m.to_string()));
-    let parent_message_id = message.get("id").and_then(Value::as_str).map(str::to_string);
+    let parent_message_id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let request_id = object
         .get("requestId")
         .and_then(Value::as_str)
@@ -622,32 +632,22 @@ pub(crate) fn intern(blob: &mut Vec<u8>, s: &str) -> Option<(u32, u32)> {
     Some((offset, length))
 }
 
-fn build_result(outcome: LineOutcome) -> *mut ClaudeParseResult {
-    let LineOutcome::Parsed { malformed, entries } = outcome else {
-        return ptr::null_mut();
-    };
+/// Intern every string field of `entries` into one UTF-8 blob and produce the `#[repr(C)]`
+/// array. `None` means a blob offset overflowed u32 — the caller treats it as fallback.
+fn pack_entries(entries: &[EntryOut]) -> Option<(Vec<QbClaudeUsageEntry>, Vec<u8>)> {
     let mut strings: Vec<u8> = Vec::new();
     let mut ffi_entries: Vec<QbClaudeUsageEntry> = Vec::with_capacity(entries.len());
-    for entry in &entries {
+    for entry in entries {
         let (message_id_offset, message_id_length) = match &entry.message_id {
-            Some(s) => match intern(&mut strings, s) {
-                Some((o, l)) => (o, l),
-                None => return ptr::null_mut(),
-            },
+            Some(s) => intern(&mut strings, s)?,
             None => (NIL_STRING, 0),
         };
         let (request_id_offset, request_id_length) = match &entry.request_id {
-            Some(s) => match intern(&mut strings, s) {
-                Some((o, l)) => (o, l),
-                None => return ptr::null_mut(),
-            },
+            Some(s) => intern(&mut strings, s)?,
             None => (NIL_STRING, 0),
         };
         let (model_offset, model_length) = match &entry.model {
-            Some(s) => match intern(&mut strings, s) {
-                Some((o, l)) => (o, l),
-                None => return ptr::null_mut(),
-            },
+            Some(s) => intern(&mut strings, s)?,
             None => (NIL_STRING, 0),
         };
         ffi_entries.push(QbClaudeUsageEntry {
@@ -671,17 +671,30 @@ fn build_result(outcome: LineOutcome) -> *mut ClaudeParseResult {
             reserved: [0; 4],
         });
     }
-    Box::into_raw(Box::new(ClaudeParseResult {
-        malformed: u32::from(malformed),
-        entries: ffi_entries,
-        strings,
-    }))
+    Some((ffi_entries, strings))
+}
+
+fn build_result(outcome: LineOutcome) -> *mut ClaudeParseResult {
+    let LineOutcome::Parsed { malformed, entries } = outcome else {
+        return ptr::null_mut();
+    };
+    match pack_entries(&entries) {
+        Some((ffi_entries, strings)) => Box::into_raw(Box::new(ClaudeParseResult {
+            malformed: u32::from(malformed),
+            entries: ffi_entries,
+            strings,
+        })),
+        None => ptr::null_mut(),
+    }
 }
 
 /// ABI version of this library. Bump when the entry layout changes.
+///
+/// v3 adds whole-file parsing (`qb_*_parse_file` + `qb_cancel_callback` + `QB_FILE_*`) and the
+/// Grok/Pi/Muse/CodexRouter event + Antigravity generation-entry surfaces.
 #[no_mangle]
 pub extern "C" fn qb_core_version() -> u32 {
-    2
+    3
 }
 
 /// Parse one Claude usage line.
@@ -769,6 +782,240 @@ pub extern "C" fn qb_claude_result_strings(
 /// `result` must be a pointer returned by [`qb_claude_parse_usage_line`], destroyed at most once.
 #[no_mangle]
 pub unsafe extern "C" fn qb_claude_result_destroy(result: *mut ClaudeParseResult) {
+    if result.is_null() {
+        return;
+    }
+    unsafe { drop(Box::from_raw(result)) };
+}
+
+// ---------------------------------------------------------------------------
+// Whole-file driver (qb_claude_parse_file)
+// ---------------------------------------------------------------------------
+
+/// Byte gate mirroring `ClaudeLogUsageScanner.usageMarker` (`Data(#""usage""#.utf8)`): only lines
+/// carrying the literal `"usage"` reach the JSON parser; every other line is skipped.
+const USAGE_MARKER: &[u8] = b"\"usage\"";
+
+/// Whole-file result for `qb_claude_parse_file`. `status` is one of the shared `QB_FILE_*`
+/// codes; `malformed` is the OR of every line's `malformedTokenCounts` signal.
+pub struct ClaudeFileResult {
+    status: u32,
+    malformed: u32,
+    entries: Vec<QbClaudeUsageEntry>,
+    strings: Vec<u8>,
+    bytes_read: u64,
+    oversized_lines_skipped: u64,
+}
+
+struct ClaudeFileParser {
+    entries: Vec<EntryOut>,
+    malformed: bool,
+    fell_back: bool,
+}
+
+impl ClaudeFileParser {
+    /// `deliver` callback for `scan_file_lines`. Fallback aborts the scan immediately (the file
+    /// is re-parsed in Swift); a malformed line only sets the flag — the read continues to EOF so
+    /// its completeness is judged exactly the way `read.isComplete` is in Swift.
+    fn consume(&mut self, line: &[u8]) -> bool {
+        if memchr::memmem::find(line, USAGE_MARKER).is_none() {
+            return true;
+        }
+        match parse_line(line) {
+            LineOutcome::Parsed { malformed, entries } => {
+                if malformed {
+                    // The Swift per-line callback returns nil for a malformed line — its entries
+                    // are discarded, and the flag makes the whole file unusable.
+                    self.malformed = true;
+                } else {
+                    self.entries.extend(entries);
+                }
+                true
+            }
+            LineOutcome::Fallback => {
+                self.fell_back = true;
+                false
+            }
+        }
+    }
+}
+
+/// Parse one Claude session file end to end, mirroring `ClaudeLogUsageScanner.parseFile(at:)` via
+/// `ClaudeSessionAppendCache`: complete lines plus the trailing unterminated fragment all run the
+/// same marker gate + line parser; any malformed usage row, a read failure, an oversized line, or
+/// cancellation fails the file the way the Swift path returns nil.
+fn claude_parse_file_impl(
+    path: &[u8],
+    start_offset: u64,
+    end_offset: Option<u64>,
+    cancel_ctx: *mut c_void,
+    cancel: Option<CancelCallback>,
+) -> ClaudeFileResult {
+    let mut parser = ClaudeFileParser {
+        entries: Vec::new(),
+        malformed: false,
+        fell_back: false,
+    };
+    // The Swift path hands the trailing newline-less fragment to the same per-line parser
+    // (`parseFragment` → `parseLine`), so the final partial is delivered like any other line.
+    let stats = scanfile::scan_file_lines(
+        path,
+        start_offset,
+        end_offset,
+        true,
+        false,
+        cancel_ctx,
+        cancel,
+        scanfile::MAX_LINE_BYTES,
+        &mut |line, _is_final_partial| parser.consume(line),
+    );
+
+    let bare = |status: u32, malformed: bool| ClaudeFileResult {
+        status,
+        malformed: u32::from(malformed),
+        entries: Vec::new(),
+        strings: Vec::new(),
+        bytes_read: stats.bytes_read,
+        oversized_lines_skipped: stats.oversized_lines_skipped,
+    };
+
+    if parser.fell_back {
+        return bare(QB_FILE_FALLBACK, false);
+    }
+    // Mirror `read.isComplete, !malformed`: read success, no oversized lines, not left
+    // discarding — then the file-level malformed flag applies.
+    let complete = stats.succeeded
+        && stats.oversized_lines_skipped == 0
+        && !stats.is_discarding_oversized_line;
+    if !complete || parser.malformed {
+        return bare(QB_FILE_FAILED, parser.malformed);
+    }
+    match pack_entries(&parser.entries) {
+        Some((entries, strings)) => ClaudeFileResult {
+            status: QB_FILE_OK,
+            malformed: 0,
+            entries,
+            strings,
+            bytes_read: stats.bytes_read,
+            oversized_lines_skipped: stats.oversized_lines_skipped,
+        },
+        None => bare(QB_FILE_FALLBACK, false),
+    }
+}
+
+/// Parse one Claude session `.jsonl` file end to end: the Rust side streams, splits, and parses
+/// every line without materializing Foundation objects. `end_offset` of UINT64_MAX reads to EOF.
+/// `cancel` is invoked once per 64 KiB chunk. Returns a heap-allocated result (never NULL for a
+/// completed call); NULL itself is treated like `QB_FILE_FALLBACK`.
+#[no_mangle]
+pub extern "C" fn qb_claude_parse_file(
+    path: *const u8,
+    path_len: usize,
+    start_offset: u64,
+    end_offset: u64,
+    cancel: Option<CancelCallback>,
+    cancel_ctx: *mut c_void,
+) -> *mut ClaudeFileResult {
+    if path.is_null() {
+        return ptr::null_mut();
+    }
+    let path = unsafe { std::slice::from_raw_parts(path, path_len) };
+    let end = if end_offset == u64::MAX {
+        None
+    } else {
+        Some(end_offset)
+    };
+    match catch_unwind(AssertUnwindSafe(|| {
+        Box::into_raw(Box::new(claude_parse_file_impl(
+            path,
+            start_offset,
+            end,
+            cancel_ctx,
+            cancel,
+        )))
+    })) {
+        Ok(ptr) => ptr,
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// One of the shared `QB_FILE_*` codes; NULL reads as `QB_FILE_FALLBACK`.
+#[no_mangle]
+pub extern "C" fn qb_claude_file_result_status(result: *const ClaudeFileResult) -> u32 {
+    if result.is_null() {
+        return QB_FILE_FALLBACK;
+    }
+    unsafe { &*result }.status
+}
+
+/// Nonzero when any line in the file carried malformed usage data — the same flag that makes the
+/// Swift `parseFile(at:)` return nil (surfaced on `QB_FILE_FAILED` results for diagnostics).
+#[no_mangle]
+pub extern "C" fn qb_claude_file_result_malformed(result: *const ClaudeFileResult) -> u32 {
+    if result.is_null() {
+        return 0;
+    }
+    unsafe { &*result }.malformed
+}
+
+#[no_mangle]
+pub extern "C" fn qb_claude_file_result_entry_count(result: *const ClaudeFileResult) -> u32 {
+    if result.is_null() {
+        return 0;
+    }
+    unsafe { &*result }.entries.len() as u32
+}
+
+/// Pointer to the entry array; valid until [`qb_claude_file_result_destroy`].
+#[no_mangle]
+pub extern "C" fn qb_claude_file_result_entries(
+    result: *const ClaudeFileResult,
+) -> *const QbClaudeUsageEntry {
+    if result.is_null() {
+        return ptr::null();
+    }
+    unsafe { &*result }.entries.as_ptr()
+}
+
+/// Pointer to the UTF-8 string blob the entry offsets index into, plus its byte length.
+#[no_mangle]
+pub extern "C" fn qb_claude_file_result_strings(
+    result: *const ClaudeFileResult,
+    length: *mut u32,
+) -> *const u8 {
+    if result.is_null() {
+        if !length.is_null() {
+            unsafe { *length = 0 };
+        }
+        return ptr::null();
+    }
+    let result = unsafe { &*result };
+    if !length.is_null() {
+        unsafe { *length = result.strings.len() as u32 };
+    }
+    result.strings.as_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn qb_claude_file_result_bytes_read(result: *const ClaudeFileResult) -> u64 {
+    if result.is_null() {
+        return 0;
+    }
+    unsafe { &*result }.bytes_read
+}
+
+#[no_mangle]
+pub extern "C" fn qb_claude_file_result_oversized_lines(result: *const ClaudeFileResult) -> u64 {
+    if result.is_null() {
+        return 0;
+    }
+    unsafe { &*result }.oversized_lines_skipped
+}
+
+/// # Safety
+/// `result` must be a pointer returned by [`qb_claude_parse_file`], destroyed at most once.
+#[no_mangle]
+pub unsafe extern "C" fn qb_claude_file_result_destroy(result: *mut ClaudeFileResult) {
     if result.is_null() {
         return;
     }
@@ -881,7 +1128,9 @@ mod tests {
             ("\"costUSD\":0", false),
             ("\"costUSD\":1234.5", false),
         ] {
-            let line = format!(r#"{{"timestamp":"2026-02-20T12:00:00.000Z",{raw},"message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#);
+            let line = format!(
+                r#"{{"timestamp":"2026-02-20T12:00:00.000Z",{raw},"message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#
+            );
             let (malformed, _) = parse(&line);
             assert_eq!(malformed, expected, "cost case: {raw}");
         }
@@ -916,8 +1165,15 @@ mod tests {
 
     #[test]
     fn token_counts_reject_non_numbers_bools_and_fractional() {
-        for raw in ["\"input_tokens\":\"5\"", "\"input_tokens\":true", "\"input_tokens\":1.5", "\"input_tokens\":1000000000000001"] {
-            let line = format!(r#"{{"timestamp":"2026-02-20T12:00:00.000Z","message":{{"id":"m","usage":{{{raw},"output_tokens":2}}}}}}"#);
+        for raw in [
+            "\"input_tokens\":\"5\"",
+            "\"input_tokens\":true",
+            "\"input_tokens\":1.5",
+            "\"input_tokens\":1000000000000001",
+        ] {
+            let line = format!(
+                r#"{{"timestamp":"2026-02-20T12:00:00.000Z","message":{{"id":"m","usage":{{{raw},"output_tokens":2}}}}}}"#
+            );
             let (malformed, entries) = parse(&line);
             assert!(malformed, "token case: {raw}");
             assert!(entries.is_empty());
@@ -927,7 +1183,9 @@ mod tests {
     #[test]
     fn non_assistant_rows_are_skipped_silently() {
         for t in [r#""type":"user""#, r#""type":7"#] {
-            let line = format!(r#"{{"timestamp":"2026-02-20T12:00:00.000Z",{t},"message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#);
+            let line = format!(
+                r#"{{"timestamp":"2026-02-20T12:00:00.000Z",{t},"message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#
+            );
             let (malformed, entries) = parse(&line);
             assert!(!malformed);
             assert!(entries.is_empty());
@@ -945,13 +1203,17 @@ mod tests {
     #[test]
     fn timestamp_shapes() {
         // Canonical non-fractional UTC.
-        let (m, entries) = parse(r#"{"timestamp":"2026-02-20T12:00:00Z","message":{"id":"m","usage":{"input_tokens":1,"output_tokens":2}}}"#);
+        let (m, entries) = parse(
+            r#"{"timestamp":"2026-02-20T12:00:00Z","message":{"id":"m","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        );
         assert!(!m);
         assert_eq!(entries.len(), 1);
 
         // Canonical datetime with invalid month is malformed in Swift too (Foundation is never
         // consulted for canonical shapes).
-        let (m, entries) = parse(r#"{"timestamp":"2026-13-20T12:00:00Z","message":{"id":"m","usage":{"input_tokens":1,"output_tokens":2}}}"#);
+        let (m, entries) = parse(
+            r#"{"timestamp":"2026-13-20T12:00:00Z","message":{"id":"m","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        );
         assert!(m);
         assert!(entries.is_empty());
 
@@ -963,7 +1225,9 @@ mod tests {
             "2026-02-20T12:00:00+00:00",
             "2026-02-20T12:00:00.123456Z",
         ] {
-            let line = format!(r#"{{"timestamp":"{ts}","message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#);
+            let line = format!(
+                r#"{{"timestamp":"{ts}","message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#
+            );
             assert!(
                 matches!(parse_line(line.as_bytes()), LineOutcome::Fallback),
                 "expected fallback for {ts}"
@@ -999,10 +1263,136 @@ mod tests {
     fn entry_cap_forces_fallback() {
         let mut advisor_iters = String::new();
         for _ in 0..100 {
-            advisor_iters.push_str(r#"{"type":"advisor_message","input_tokens":1,"output_tokens":1},"#);
+            advisor_iters
+                .push_str(r#"{"type":"advisor_message","input_tokens":1,"output_tokens":1},"#);
         }
         let advisor_iters = advisor_iters.trim_end_matches(',');
-        let line = format!(r#"{{"timestamp":"2026-02-20T12:00:00.000Z","message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2,"iterations":[{advisor_iters}]}}}}}}"#);
+        let line = format!(
+            r#"{{"timestamp":"2026-02-20T12:00:00.000Z","message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2,"iterations":[{advisor_iters}]}}}}}}"#
+        );
         assert!(matches!(parse_line(line.as_bytes()), LineOutcome::Fallback));
+    }
+
+    // -------------------------------------------------------------------
+    // Whole-file driver (qb_claude_parse_file / claude_parse_file_impl)
+    // -------------------------------------------------------------------
+
+    fn write_temp_file(bytes: &[u8]) -> String {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "quotabar-claude-file-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = std::fs::File::create(&path).expect("create temp");
+        file.write_all(bytes).expect("write temp");
+        path.to_str().expect("utf8 temp path").to_string()
+    }
+
+    fn usage_line(id: &str, input: u64) -> String {
+        format!(
+            r#"{{"timestamp":"2026-02-20T12:00:00Z","requestId":"r{id}","message":{{"id":"{id}","model":"claude-test-model","usage":{{"input_tokens":{input},"output_tokens":5}}}}}}"#
+        )
+    }
+
+    fn parse_file(path: &str) -> ClaudeFileResult {
+        claude_parse_file_impl(path.as_bytes(), 0, None, std::ptr::null_mut(), None)
+    }
+
+    #[test]
+    fn file_parses_multiline_file_and_noise() {
+        let contents = format!(
+            "{{\"noise\":true}}\n{}\n{{\"usage\":\"not an object\"}}\n{}\n",
+            usage_line("m1", 10),
+            usage_line("m2", 20)
+        );
+        // `"usage":"not an object"` carries the marker so it reaches the parser — the JSON is
+        // valid but has no message.usage, a skipped non-malformed row.
+        let path = write_temp_file(contents.as_bytes());
+        let result = parse_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result.status, QB_FILE_OK);
+        assert_eq!(result.malformed, 0);
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.entries[0].input_tokens, 10);
+        assert_eq!(result.entries[1].input_tokens, 20);
+        assert_eq!(result.bytes_read, contents.len() as u64);
+    }
+
+    #[test]
+    fn file_trailing_unterminated_line_is_parsed() {
+        let contents = format!("{}\n{}", usage_line("m1", 10), usage_line("m2", 20));
+        let path = write_temp_file(contents.as_bytes());
+        let result = parse_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result.status, QB_FILE_OK);
+        assert_eq!(result.entries.len(), 2);
+    }
+
+    #[test]
+    fn file_empty_is_ok_with_no_entries() {
+        let path = write_temp_file(b"");
+        let result = parse_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result.status, QB_FILE_OK);
+        assert_eq!(result.entries.len(), 0);
+    }
+
+    #[test]
+    fn file_missing_fails() {
+        let result = parse_file("/nonexistent/quotabar-claude-test");
+        assert_eq!(result.status, QB_FILE_FAILED);
+        assert_eq!(result.malformed, 0);
+    }
+
+    #[test]
+    fn file_malformed_usage_row_fails_with_flag() {
+        // The marker gate admits the line (`"usage"` is present); the invalid JSON body is
+        // malformed in Swift too, so the whole file answers nil.
+        let contents = format!(
+            "{}\n{{\"usage\": not-json\n{}\n",
+            usage_line("m1", 10),
+            usage_line("m2", 20)
+        );
+        let path = write_temp_file(contents.as_bytes());
+        let result = parse_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result.status, QB_FILE_FAILED);
+        assert_eq!(result.malformed, 1);
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn file_non_canonical_timestamp_falls_back() {
+        let contents = format!(
+            "{}\n{}\n",
+            usage_line("m1", 10),
+            r#"{"timestamp":"2026-02-20T12:00:00+00:00","message":{"id":"m2","usage":{"input_tokens":1,"output_tokens":2}}}"#
+        );
+        let path = write_temp_file(contents.as_bytes());
+        let result = parse_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result.status, QB_FILE_FALLBACK);
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn file_cancelled_read_fails() {
+        extern "C" fn always_cancel(_ctx: *mut c_void) -> u8 {
+            1
+        }
+        let path = write_temp_file(format!("{}\n", usage_line("m1", 10)).as_bytes());
+        let result = claude_parse_file_impl(
+            path.as_bytes(),
+            0,
+            None,
+            std::ptr::null_mut(),
+            Some(always_cancel),
+        );
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result.status, QB_FILE_FAILED);
+        assert_eq!(result.malformed, 0);
     }
 }

@@ -201,6 +201,7 @@ extension CopilotUsageError: CategorizedError {
         case .connectionFailed: .network
         case .invalidResponse: .decoding
         case .requestFailed(let status): ErrorCategory.http(status)
+        case .rateLimited: .rateLimited
         case .quotaUnavailable: .notAvailable
         }
     }
@@ -284,6 +285,7 @@ extension AntigravityError: CategorizedError {
         case .authExpired: .authExpired
         case .accessDenied: .http4xx
         case .quotaEndpointUnavailable: .notAvailable
+        case .rateLimited: .rateLimited
         case .unavailable: .network
         }
     }
