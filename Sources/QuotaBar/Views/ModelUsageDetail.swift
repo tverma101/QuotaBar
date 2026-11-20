@@ -27,6 +27,9 @@ struct ModelUsageDetail: View {
         }
         .padding(14)
         .frame(width: Self.width)
+        // Hug the content vertically so collapsing Other shrinks the popover back — NSPopover
+        // grows to the largest measured height and never rescales on its own.
+        .fixedSize(horizontal: false, vertical: true)
         .onContinuousHover { phase in
             switch phase {
             case .active:

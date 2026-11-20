@@ -613,19 +613,23 @@ enum SpendTileMapper {
     }
 
     /// The entries arrive spend-ranked (priced dollars first, then unpriced by tokens), so the
-    /// first `namedModelCap` are the rows worth a full row each — every further model, priced
-    /// sliver or unpriced heavyweight alike, folds into Other's expandable contributors rather
-    /// than stretching the popover into a wall of tail rows.
+    /// first `namedModelCap` are the rows worth a full row each. Past the cap, priced slivers and
+    /// low-volume unpriced models fold into Other's expandable contributors. An unpriced model
+    /// escapes the fold only when its token volume is genuinely material — a tenth of the
+    /// leader's tokens and ten million outright — so heavy custom models stay visible without
+    /// stretching the popover into a wall of tail rows.
     private static func foldModelList(_ entries: [ModelUsageEntry]) -> [ModelUsageEntry] {
         var visible: [ModelUsageEntry] = []
         var other = ModelAccumulator()
+        let unpricedTokenFloor = max((entries.first?.totalTokens ?? 0) / 10, 10_000_000)
 
         for entry in entries {
             // Tokens the logs couldn't tie to a model (Grok) read as noise under their own
             // "Unattributed" row — the panel is an insight, not an accounting ledger, so they just
             // count into Other however large they are.
             let isUnattributed = entry.model.caseInsensitiveCompare(ModelUsageEntry.unattributedModelName) == .orderedSame
-            if isUnattributed || visible.count >= namedModelCap {
+            let unpricedHeavyweight = entry.costUSD == nil && entry.totalTokens >= unpricedTokenFloor
+            if isUnattributed || (visible.count >= namedModelCap && !unpricedHeavyweight) {
                 other.fold(entry)
             } else {
                 visible.append(entry)
