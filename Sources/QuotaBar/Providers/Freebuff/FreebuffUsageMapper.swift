@@ -103,11 +103,17 @@ enum FreebuffUsageMapper {
                 periodDurationMs: MetricPeriod.dayMs, to: &lines
             )
         }
-        if let balance = ProviderParse.number(freebucks?["balance"]), balance >= 0 {
-            lines.append(.values(
-                label: "Hours Balance",
-                values: [MetricValue(number: floor(balance / freebucksPerHour + 1e-9), kind: .count, label: "hours")]
-            ))
+        // `balance` is the combined spendable amount (daily.remaining + wallet.balance), so showing
+        // it beside Daily Hours double-counts the daily pool. Freebuff's clients show the wallet alone.
+        if let wallet = freebucks?["wallet"] as? [String: Any],
+           let balance = ProviderParse.number(wallet["balance"]), balance >= 0 {
+            let wholeHours = floor(balance / freebucksPerHour + 1e-9)
+            if wholeHours > 0 {
+                lines.append(.values(
+                    label: "Wallet",
+                    values: [MetricValue(number: wholeHours, kind: .count, label: "hours")]
+                ))
+            }
         }
 
         appendMonthlySpend(subscriptionUsage: subscriptionUsage, freebucks: freebucks, to: &lines)

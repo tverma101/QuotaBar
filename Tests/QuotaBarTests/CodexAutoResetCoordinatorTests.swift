@@ -207,6 +207,88 @@ final class CodexAutoResetCoordinatorTests: XCTestCase {
         XCTAssertEqual(claims, 0)
     }
 
+    func testReenablingAfterPreflightCancellationKeepsCreditEligible() async {
+        let defaults = defaults()
+        let due = credit("one", 45)
+        var claims = 0
+        let account = CodexAutoResetCoordinator.Account(
+            availableCredits: { [due] },
+            claim: { _, _, _ in
+                claims += 1
+                if claims == 1 {
+                    // The real claim service reports cancellation when the toggle is
+                    // turned off after the scheduler has started its preflight.
+                    defaults.set(false, forKey: CodexAutoResetCoordinator.enabledKey)
+                    return .cancelled
+                }
+                return .success
+            }
+        )
+        let first = CodexAutoResetCoordinator(
+            accounts: ["codex": account], defaults: defaults, now: { self.base }
+        )
+
+        await first.runOnce(for: "codex")
+        defaults.set(true, forKey: CodexAutoResetCoordinator.enabledKey)
+        let restarted = CodexAutoResetCoordinator(
+            accounts: ["codex": account], defaults: defaults, now: { self.base }
+        )
+        await restarted.runOnce(for: "codex")
+
+        XCTAssertEqual(claims, 2, "a canceled preflight must not mark a still-live credit terminal")
+    }
+
+    func testUncertainFailureRetriesSameRequestAsAnIdempotentReplay() async {
+        let defaults = defaults()
+        let due = credit("uncertain-credit", 45)
+        var claims: [(requestID: String, isRetry: Bool)] = []
+        let account = CodexAutoResetCoordinator.Account(
+            availableCredits: { [due] },
+            claim: { credit, requestID, _ in
+                claims.append((requestID, credit.isRetry))
+                return claims.count == 1 ? .failed : .success
+            }
+        )
+        let first = CodexAutoResetCoordinator(
+            accounts: ["codex": account], defaults: defaults, now: { self.base }
+        )
+        await first.runOnce(for: "codex")
+
+        let retry = CodexAutoResetCoordinator(
+            accounts: ["codex": account], defaults: defaults,
+            now: { self.base.addingTimeInterval(15) }
+        )
+        await retry.runOnce(for: "codex")
+
+        XCTAssertEqual(claims.count, 2)
+        XCTAssertEqual(claims[0].requestID, claims[1].requestID)
+        XCTAssertEqual(claims.map(\.isRetry), [false, true])
+    }
+
+    func testRestartAfterEnablingStartsImmediateLookup() async {
+        let defaults = defaults(enabled: false)
+        let lookedUp = expectation(description: "enabled worker checks credits immediately")
+        var lookups = 0
+        let subject = CodexAutoResetCoordinator(accounts: ["codex": .init(
+            availableCredits: {
+                lookups += 1
+                lookedUp.fulfill()
+                return []
+            },
+            claim: { _, _, _ in .failed }
+        )], defaults: defaults, now: { self.base })
+        defer { subject.stop() }
+
+        subject.start()
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(lookups, 0, "the disabled worker must stay idle")
+        defaults.set(true, forKey: CodexAutoResetCoordinator.enabledKey)
+        subject.restart()
+
+        await fulfillment(of: [lookedUp], timeout: 1)
+        XCTAssertEqual(lookups, 1)
+    }
+
     func testAuthorizationIsRecheckedImmediatelyBeforePost() async {
         let defaults = defaults()
         var calls = 0

@@ -84,7 +84,7 @@ final class CodexAutoResetClaimTests: XCTestCase {
             credit: .init(id: "target", expiresAt: expiry),
             redeemRequestID: UUID().uuidString, canRedeem: { false }
         )
-        XCTAssertEqual(outcome, .noCredit)
+        XCTAssertEqual(outcome, .cancelled)
         XCTAssertTrue(http.requests.isEmpty)
     }
 
@@ -187,7 +187,117 @@ final class CodexAutoResetClaimTests: XCTestCase {
             credit: CodexResetCredit(id: "old", expiresAt: expiry, isRetry: true),
             redeemRequestID: "old-request", canRedeem: { false }
         )
-        XCTAssertEqual(outcome, .noCredit)
+        XCTAssertEqual(outcome, .cancelled)
         XCTAssertTrue(http.requests.isEmpty)
+    }
+
+    func testConsentRevokedAfterFreshLookupDoesNotPost() async {
+        let expiry = Date().addingTimeInterval(40)
+        let (service, http) = service(body: fixture(["target"], expiry: expiry))
+        var checks = 0
+        let outcome = await service.claimAuto(
+            credit: .init(id: "target", expiresAt: expiry),
+            redeemRequestID: "request-id",
+            canRedeem: {
+                checks += 1
+                return checks < 3
+            }
+        )
+
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(http.requests.map(\.url), [CodexUsageClient.resetCreditsURL])
+    }
+
+    func testCancellationAfterConsumeWasSentKeepsAttemptUncertain() async {
+        let expiry = Date().addingTimeInterval(40)
+        let gate = SuspendedHTTPResponseGate()
+        let body = fixture(["target"], expiry: expiry)
+        let http = RoutingHTTPClient { request in
+            if request.url == CodexUsageClient.resetCreditsURL {
+                return HTTPResponse(statusCode: 200, headers: [:], body: body)
+            }
+            return try await gate.waitForConsumeResponse()
+        }
+        let service = CodexResetClaimService(
+            usageClient: CodexUsageClient(http: http),
+            credentialCandidates: { [("token", "account-X")] }
+        )
+
+        let claim = Task {
+            await service.claimAuto(
+                credit: .init(id: "target", expiresAt: expiry),
+                redeemRequestID: "same-request",
+                canRedeem: { true }
+            )
+        }
+        await gate.waitUntilConsumeStarts()
+        claim.cancel()
+        await gate.cancelPendingConsume()
+
+        let outcome = await claim.value
+        XCTAssertEqual(outcome, .failed)
+        XCTAssertEqual(http.requests.map(\.url), [
+            CodexUsageClient.resetCreditsURL, CodexUsageClient.consumeResetCreditURL
+        ])
+    }
+
+    func testResponseReceivedAfterCancellationResolvesTheClaim() async {
+        let expiry = Date().addingTimeInterval(40)
+        let gate = SuspendedHTTPResponseGate()
+        let body = fixture(["target"], expiry: expiry)
+        let http = RoutingHTTPClient { request in
+            if request.url == CodexUsageClient.resetCreditsURL {
+                return HTTPResponse(statusCode: 200, headers: [:], body: body)
+            }
+            return try await gate.waitForConsumeResponse()
+        }
+        let service = CodexResetClaimService(
+            usageClient: CodexUsageClient(http: http),
+            credentialCandidates: { [("token", "account-X")] }
+        )
+
+        let claim = Task {
+            await service.claimAuto(
+                credit: .init(id: "target", expiresAt: expiry),
+                redeemRequestID: "same-request",
+                canRedeem: { true }
+            )
+        }
+        await gate.waitUntilConsumeStarts()
+        claim.cancel()
+        await gate.completePendingConsume(
+            HTTPResponse(statusCode: 200, headers: [:], body: Data("{\"code\":\"reset\"}".utf8))
+        )
+
+        let outcome = await claim.value
+        XCTAssertEqual(outcome, .success)
+    }
+}
+
+private actor SuspendedHTTPResponseGate {
+    private var didStart = false
+    private var startWaiter: CheckedContinuation<Void, Never>?
+    private var responseWaiter: CheckedContinuation<HTTPResponse, Error>?
+
+    func waitForConsumeResponse() async throws -> HTTPResponse {
+        didStart = true
+        startWaiter?.resume()
+        startWaiter = nil
+        return try await withCheckedThrowingContinuation { responseWaiter = $0 }
+    }
+
+    func waitUntilConsumeStarts() async {
+        if didStart { return }
+        await withCheckedContinuation { startWaiter = $0 }
+    }
+
+    func cancelPendingConsume() {
+        responseWaiter?.resume(throwing: CancellationError())
+        responseWaiter = nil
+    }
+
+    func completePendingConsume(_ response: HTTPResponse) {
+        responseWaiter?.resume(returning: response)
+        responseWaiter = nil
     }
 }

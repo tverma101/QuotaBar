@@ -75,15 +75,22 @@ final class FreebuffProvider: ProviderRuntime {
                 // The owner asked for this segment to read as the active session clock — hours and
                 // minutes until the window resets — rather than the remaining allowance.
                 .showingResetTimerInMenuBar(),
-            .values(id: "freebuff.freebucksBalance", provider: provider, title: "Hours Balance",
-                    metricLabel: "Hours Balance", selection: .kind(.count))
+            .values(id: "freebuff.freebucksBalance", provider: provider, title: "Wallet",
+                    metricLabel: "Wallet", selection: .kind(.count))
                 .hidingWhenEmpty()
                 .exportingHistory(scope: .machineLocal, estimatedCost: true,
                                   sourceNote: Self.historySourceNote),
             .values(id: "freebuff.monthlySpend", provider: provider, title: "Monthly Spend",
                     metricLabel: "Monthly Spend", selection: .kind(.dollars), valueWord: "spent")
                 .hidingWhenEmpty()
-        ] + WidgetDescriptor.spendTiles(provider: provider)
+        ] + WidgetDescriptor.spendTiles(provider: provider) + [
+            .usageTrend(provider: provider)
+                .exportingHistory(
+                    scope: .machineLocal,
+                    estimatedCost: true,
+                    sourceNote: Self.historySourceNote
+                )
+        ]
     }
 
     func hasLocalCredentials() async -> Bool {
@@ -117,6 +124,14 @@ final class FreebuffProvider: ProviderRuntime {
                     modelSourceNote: Self.historySourceNote,
                     partialDays: scan.partialDays,
                     apiEstimateByDay: usage.apiEstimateByDay, estimatedCostDays: usage.estimatedCostDays
+                )
+                SpendTileMapper.appendUsageTrend(
+                    usage.series,
+                    to: &result.lines,
+                    now: scanNow,
+                    note: Self.historySourceNote,
+                    partialDays: scan.partialDays,
+                    partialNote: "incomplete Freebuff history is shown as a lower bound"
                 )
             }
         } catch is CancellationError {

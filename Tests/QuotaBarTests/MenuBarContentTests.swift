@@ -130,7 +130,7 @@ final class MenuBarContentTests: XCTestCase {
             limit: 1, suffix: "hours"
         )
         let balance = WidgetDescriptor.values(
-            id: "freebuff.freebucksBalance", provider: provider, title: "Hours Balance",
+            id: "freebuff.freebucksBalance", provider: provider, title: "Wallet",
             selection: .kind(.count)
         )
         let content = MenuBarContentBuilder.build(
@@ -176,7 +176,7 @@ final class MenuBarContentTests: XCTestCase {
         XCTAssertEqual(daily.sample.trayStyle, .resetCountdown, "the opt-in must reach the sample")
 
         let balance = WidgetDescriptor.values(
-            id: "freebuff.freebucksBalance", provider: provider, title: "Hours Balance",
+            id: "freebuff.freebucksBalance", provider: provider, title: "Wallet",
             selection: .kind(.count)
         )
         var balanceData = balance.sample
@@ -266,7 +266,7 @@ final class MenuBarContentTests: XCTestCase {
 
     func testUnboundedCountKeepsItsUnitInTheTray() {
         let balance = WidgetData(
-            title: "Hours Balance", icon: .providerMark("freebuff"), kind: .count, used: 0, limit: nil,
+            title: "Wallet", icon: .providerMark("freebuff"), kind: .count, used: 0, limit: nil,
             values: [MetricValue(number: 35, kind: .count, label: "hours")]
         )
         XCTAssertEqual(balance.menuBarValue, "35h")

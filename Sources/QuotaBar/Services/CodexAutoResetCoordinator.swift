@@ -251,9 +251,20 @@ final class CodexAutoResetCoordinator {
         case .noCredit:
             record.result = .noCredit
             lastErrorByAccount[accountID] = nil
+        case .cancelled:
+            // claimAuto returns this only before the consume POST. Don't spend the
+            // retry budget or make the live credit terminal when the user opts out
+            // during preflight; a later re-enable should be able to resume it.
+            record.result = .pending
+            record.attempts = max(0, record.attempts - 1)
+            record.lastAttemptAt = nil
         case .nothingToReset:
             record.result = .nothingToReset
             lastErrorByAccount[accountID] = nil
+        case .credentialAccess:
+            if record.attempts >= Self.maximumAttempts { record.result = .exhausted }
+            lastErrorByAccount[accountID] = "Couldn't access Codex credentials"
+            AppLog.error(LogTag.plugin("codex"), "auto reset: credential access failed for \(accountID)")
         case .failed:
             if record.attempts >= Self.maximumAttempts { record.result = .exhausted }
             lastErrorByAccount[accountID] = "Could not redeem expiring reset"

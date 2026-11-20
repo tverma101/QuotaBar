@@ -28,7 +28,7 @@ enum DefaultLayout {
         "freebuff.session", "freebuff.daily", "freebuff.weekly", "freebuff.fiveDay",
         "freebuff.monthly", "freebuff.premiumSessions", "freebuff.freePremiumSessions", "freebuff.freebucksDaily",
         "freebuff.freebucksBalance", "freebuff.monthlySpend",
-        "freebuff.today", "freebuff.yesterday", "freebuff.last30",
+        "freebuff.today", "freebuff.yesterday", "freebuff.last30", "freebuff.trend",
 
         "grok.weekly", "grok.trend",
         "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",

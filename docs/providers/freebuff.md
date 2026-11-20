@@ -44,9 +44,10 @@ Freebuff's session and model-catalogue endpoints.
 
 ## Metrics
 
-Current accounts show **Daily Hours** and **Hours Balance**, matching Freebuff's conversion of five
-Freebucks per hour. The balance includes the remaining daily pool and the wallet; it is not added to
-the daily pool again. Whole balance hours round down like Freebuff. Legacy daily/weekly/monthly
+Current accounts show **Daily Hours** and **Wallet**, matching Freebuff's conversion of five
+Freebucks per hour. The Wallet row reads only the wallet balance; the API's combined spendable balance
+also includes the remaining daily pool, so showing it beside Daily Hours would count those hours twice.
+Whole wallet hours round down like Freebuff, and a wallet below one whole hour is hidden. Legacy daily/weekly/monthly
 session caps are hidden when the current hours meter is present. Older servers without that meter
 keep their session windows. Monthly Spend appears only when the server supplies actual USD values.
 Hours and tokens are separate measurements; neither is converted into the other.
@@ -98,6 +99,10 @@ traffic. Model identities are cached locally without handles or tokens;
 unchanged catalogues refresh at most hourly, and a catalogue endpoint that keeps failing is retried
 at most hourly as well. Public OpenRouter rates use the app's existing pricing cache. A fresh
 installation needs Desktop usage before local history can appear.
+
+**Usage Trend** is enabled and Always Visible by default. It charts the same measured daily token
+history over the last 30 calendar days; incomplete receipt days are marked as lower bounds. Existing
+layouts receive this new row automatically without changing their other layout choices.
 
 QuotaBar sends a read-only `GET https://www.codebuff.com/api/v1/freebuff/session` request directly to
 the canonical API host, so a redirect cannot strip the login header and make a new login look expired.

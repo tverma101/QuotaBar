@@ -255,13 +255,17 @@ final class FreebuffUsageMapperTests: XCTestCase {
         let mapped = try FreebuffUsageMapper.map(response: response([
             "status": "none", "accessTier": "full",
             "freeWindows": ["dayUsed": 0, "dayLimit": 7, "weekUsed": 1, "weekLimit": 14],
-            "freebucks": ["balance": 228, "daily": ["limit": 165, "spent": 15, "remaining": 150]]
+            "freebucks": [
+                "balance": 228,
+                "daily": ["limit": 165, "spent": 15, "remaining": 150],
+                "wallet": ["balance": 78]
+            ]
         ]))
         XCTAssertNil(progress(mapped.lines, "Daily"))
         XCTAssertNil(progress(mapped.lines, "Weekly"))
         XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.used, 3)
         XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.limit, 33)
-        XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.number, 45)
+        XCTAssertEqual(values(mapped.lines, "Wallet")?.first?.number, 15)
     }
 
     func testUnavailableCurrentMeterDoesNotReviveLegacyCaps() throws {
@@ -283,7 +287,7 @@ final class FreebuffUsageMapperTests: XCTestCase {
                 "monthUsed": 21, "monthLimit": 100, "monthResetAt": "2026-11-01T07:00:00Z"
             ],
             "freebucks": [
-                "balance": 75,
+                "balance": 125,
                 "daily": ["limit": 100, "spent": 25, "remaining": 75, "resetAt": "2026-10-14T07:00:00Z"],
                 "wallet": ["balance": 50, "monthlyBonus": 0],
                 "monthly": ["limitUsd": 12, "spentUsd": 3.5, "remainingUsd": 8.5, "resetAt": "2026-11-01T07:00:00Z"]
@@ -296,7 +300,7 @@ final class FreebuffUsageMapperTests: XCTestCase {
         XCTAssertNil(progress(mapped.lines, "Monthly"))
         XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.used, 5)
         XCTAssertEqual(progress(mapped.lines, "Daily Hours")?.limit, 20)
-        XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.number, 15)
+        XCTAssertEqual(values(mapped.lines, "Wallet")?.first?.number, 10)
         XCTAssertEqual(progress(mapped.lines, "Monthly Spend")?.used, 3.5)
         XCTAssertEqual(progress(mapped.lines, "Monthly Spend")?.limit, 12)
     }
@@ -365,7 +369,7 @@ final class FreebuffUsageMapperTests: XCTestCase {
         ]))
 
         XCTAssertNil(mapped.lines.first { $0.label == "Monthly Spend" })
-        XCTAssertEqual(values(mapped.lines, "Hours Balance")?.first?.kind, .count)
+        XCTAssertNil(values(mapped.lines, "Wallet"), "A zero wallet should not be shown as available hours")
     }
 
     func testDeduplicatesModelsByOpaquePoolAndUsesMostDepletedPool() throws {

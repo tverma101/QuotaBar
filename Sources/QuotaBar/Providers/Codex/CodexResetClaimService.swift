@@ -504,9 +504,18 @@ final class CodexResetClaimService {
         consentCheck: (@MainActor () -> Bool)? = nil
     ) async -> ConsumeResult {
         var lastRejection: Int?
+        var consumeWasSent = false
         for credentials in candidates {
-            guard !Task.isCancelled else { return .cancelled }
-            guard consentCheck?() != false else { return .cancelled }
+            guard !Task.isCancelled else {
+                return consumeWasSent && consentCheck != nil ? .outcome(.failed) : .cancelled
+            }
+            guard consentCheck?() != false else {
+                return consumeWasSent ? .outcome(.failed) : .cancelled
+            }
+            // From this point a cancellation or lost response is ambiguous: the server may have
+            // accepted the idempotent claim. Keep the coordinator's attempt so it can replay the
+            // exact same (credit ID, request UUID) after the user re-enables auto-use.
+            consumeWasSent = true
             let response: HTTPResponse
             do {
                 response = try await usageClient.consumeResetCredit(
@@ -516,11 +525,15 @@ final class CodexResetClaimService {
                     redeemRequestID: redeemRequestID
                 )
             } catch {
-                if ProviderCancellation.isCancellation(error) { return .cancelled }
+                if ProviderCancellation.isCancellation(error) {
+                    return consentCheck == nil ? .cancelled : .outcome(.failed)
+                }
                 AppLog.error(LogTag.plugin("codex"), "reset claim: consume request failed: \(error.localizedDescription)")
                 return .outcome(.failed)
             }
-            guard !Task.isCancelled else { return .cancelled }
+            // A response received after cancellation still resolves the write authoritatively. Manual
+            // claims retain their prior cancellation behavior; auto-claims must persist known results.
+            if Task.isCancelled, consentCheck == nil { return .cancelled }
             if response.statusCode == 401 || response.statusCode == 403 {
                 lastRejection = response.statusCode
                 continue
