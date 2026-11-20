@@ -328,15 +328,16 @@ enum PersistentJSONLScanCaches {
     }
 
     /// Call after a heavy local-log provider (Codex / Claude / OpenCode / …) finishes: unload session
-    /// caches only when the process crosses its soft memory budget. These append caches are capped,
+    /// caches only when the process crosses its unload ceiling. These append caches are capped,
     /// and keeping them warm avoids reparsing unchanged session history between provider cards.
     static func unloadAfterHeavyProvider(providerID: String) async {
-        if ProcessMemoryBudget.isOverSoftLimit {
+        if ProcessMemoryBudget.isOverSoftUnloadCeiling {
             await flushPendingWrites()
+            ProcessMemoryBudget.noteSoftLimitUnload()
             CodexLogUsageScanner.unloadSharedTailCacheItems()
             ClaudeSessionAppendCache.shared.unloadRetainedItems()
-            // Soft limit is the one place routine paths may drop the router tail: RSS is already over
-            // budget. Prefer this over waiting for a kernel memory-pressure event.
+            // The ceiling is the one place routine paths may drop the router tail: RSS is already over
+            // the re-armed budget. Prefer this over waiting for a kernel memory-pressure event.
             CodexRouterUsageScanner.unloadSharedTailCacheItems()
             await CodexRouterUsageScanner.unloadSharedParsedItems()
             if let summary = ProcessMemoryBudget.footprintSummary() {
