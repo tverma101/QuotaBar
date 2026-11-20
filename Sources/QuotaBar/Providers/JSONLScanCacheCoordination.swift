@@ -313,9 +313,8 @@ enum PersistentJSONLScanCaches {
             CodexRouterUsageScanner.unloadSharedTailCacheItems()
             await CodexRouterUsageScanner.unloadSharedParsedItems()
         }
-        // The cycle's folds grew the malloc zone for their transient parse arrays; hand the freed
-        // pages back so the settled idle footprint tracks the live caches, not the cycle's peak.
-        ProcessMemoryBudget.releaseAllocatorFreePages()
+        // The cycle's folds grew the malloc zone for their transient parse arrays; callers hand the
+        // freed pages back at the end of the chain so one free-list walk covers every unload.
         if let summary = ProcessMemoryBudget.footprintSummary() {
             let checkpoints = ProcessMemoryBudget.checkpointReliefSummary
                 .map { ", checkpoints \($0)" } ?? ""

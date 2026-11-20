@@ -42,10 +42,9 @@ enum ProcessMemoryBudget {
     /// regrowing its scratch space. Returns the bytes actually released, for logging.
     @discardableResult
     static func releaseAllocatorFreePages() -> UInt64 {
-        var total: size_t = malloc_zone_pressure_relief(nil, 0)
-        if let defaultZone = malloc_default_zone() {
-            total += malloc_zone_pressure_relief(defaultZone, 0)
-        }
+        // `nil` already walks every zone including the default one; a second pass over the default
+        // zone finds nothing left to release.
+        let total: size_t = malloc_zone_pressure_relief(nil, 0)
         return total > 0 ? UInt64(total) : 0
     }
 
@@ -99,6 +98,39 @@ enum ProcessMemoryBudget {
     static var isOverSoftLimit: Bool {
         guard let bytes = physicalFootprintBytes() else { return false }
         return bytes >= softLimitBytes
+    }
+
+    /// How far above the footprint at the last soft-limit unload the next one triggers. A footprint
+    /// that merely hovers over `softLimitBytes` cannot re-trigger an expensive provider-cache unload
+    /// every cycle; the trigger only engages on real growth.
+    private static let softUnloadMarginBytes: UInt64 = 24 * 1024 * 1024
+    private static let softUnloadCeilingLock = NSLock()
+    /// Guarded by `softUnloadCeilingLock`; `nonisolated(unsafe)` only silences the check the lock
+    /// already covers. Starts at the plain soft limit so the first unload behaves as before.
+    private nonisolated(unsafe) static var softUnloadCeilingBytes: UInt64 = softLimitBytes
+
+    /// Soft-limit trigger for *expensive* cache unloads (provider databases whose cold rebuilds cost
+    /// tens of seconds). Hysteresis: after `noteSoftLimitUnload` the ceiling sits a margin above the
+    /// footprint seen at unload, so hovering near the soft limit stops the unload→cold-rebuild→
+    /// unload thrash loop. Cheap warm-cache decisions keep using `isOverSoftLimit`.
+    static var isOverSoftUnloadCeiling: Bool {
+        guard let bytes = physicalFootprintBytes() else { return false }
+        softUnloadCeilingLock.lock()
+        let ceiling = softUnloadCeilingBytes
+        softUnloadCeilingLock.unlock()
+        return bytes >= ceiling
+    }
+
+    /// Raise the soft-unload ceiling to a margin above the current footprint, clamped so it can
+    /// never exceed the hard limit. Call when an expensive provider-cache unload actually runs.
+    static func noteSoftLimitUnload() {
+        let current = physicalFootprintBytes() ?? softLimitBytes
+        softUnloadCeilingLock.lock()
+        softUnloadCeilingBytes = min(
+            max(softLimitBytes, current + softUnloadMarginBytes),
+            hardLimitBytes
+        )
+        softUnloadCeilingLock.unlock()
     }
 
     static var isOverHardLimit: Bool {
