@@ -41,7 +41,7 @@ time; it also reports unavailable iCloud, loading, write, and malformed-file sta
 |---|---|---|
 | Show Usage As | Used / Left | Whether bounded metrics read "48% used" or "52% left" — same toggle as clicking a headline. |
 | Reset Times | Countdown / Exact time | "Resets in 3h 25m" vs "Resets today at 6:38 PM" — same toggle as clicking a reset label. |
-| Auto-Use Expiring Codex Resets | Off | Redeem eligible Codex credits one minute before expiry for verified connected accounts. The Mac must be awake and QuotaBar running; see [auto-use behavior](codex-auto-reset.md). |
+| Auto-Use Expiring Codex Resets | Off | Redeem eligible Codex credits five minutes before expiry for verified connected accounts. The Mac must be awake and QuotaBar running; see [auto-use behavior](codex-auto-reset.md). |
 | Always Show Pacing | Off / On | Off (default) shows pacing only when a metric is close to or over its limit. On surfaces it on every metric with a reset window: on-track rows gain their projection ("~33% left at reset") and an even-pace tick marking where steady use would put you right now. Metrics without a reset window have no pace to show. |
 
 ## Snooze Subscriptions
@@ -72,7 +72,7 @@ All three alerts default off. The first time you turn one on, QuotaBar asks for 
 |---|---|---|
 | Hide From Screen Share | On / Off | Off (default). On replaces the menu bar strip with the QuotaBar icon and wordmark while your screen is being shared or recorded, and restores your starred metrics the moment the capture ends. See [Menu bar](menu-bar.md#hiding-usage-while-screen-sharing). |
 | Blur Account Names | On / Off | On (default). Account names on managed account cards (“Claude — Acme Corp”) render blurred in the dashboard, history, the Total Spend legend, share cards, and popover menus; tap a blurred name to reveal or re-hide it. Off always shows account names. |
-| Help make QuotaBar better by sharing anonymous usage analytics | On / Off | On (default) shares extra anonymous usage analytics — provider-refresh summaries and error categories. Off stops that extra sharing. Daily activity and crash reports are always sent. See [Privacy & Usage Data](privacy.md) for exactly what is and isn't sent. |
+| Help make QuotaBar better by sharing anonymous usage analytics | On / Off | On (default) shares extra anonymous usage analytics — provider-refresh summaries and error categories. Off stops that extra sharing. Daily activity is always sent. See [Privacy & Usage Data](privacy.md) for exactly what is and isn't sent. |
 
 ## Advanced
 
@@ -85,21 +85,9 @@ All three alerts default off. The first time you turn one on, QuotaBar asks for 
 
 See [Logging](logging.md) for the full behavior: subsystem tags, the file size cap, and the guarantee that secrets are never written.
 
-**Reset All Settings…** restores every setting on this screen to its default — appearance, usage display, snooze preferences, notifications, privacy, log level, the global shortcut (cleared), Launch at Login (turned off), iCloud sync (turned off), and the update preferences (stable channel, automatic checks on) — and also resets all customization, exactly like Customize's Reset All: default layout, order, and menu-bar stars, with Claude, Codex, Cursor, Freebuff, and registered Codex accounts on. Other providers stay off until you enable them in Customize. The reset cannot be undone.
+**Reset All Settings…** restores every setting on this screen to its default — appearance, usage display, snooze preferences, notifications, privacy, log level, the global shortcut (cleared), Launch at Login (turned off), and iCloud sync (turned off) — and also resets all customization, exactly like Customize's Reset All: default layout, order, and menu-bar stars, with Claude, Codex, Cursor, Freebuff, and registered Codex accounts on. Other providers stay off until you enable them in Customize. The reset cannot be undone.
 
 Not touched: provider logins and API keys, registered Codex home paths, cached usage data, and your extra-analytics choice. Registered Codex accounts remain available after the reset; removing one requires its explicit account action, and its Codex credentials and session history are never deleted by QuotaBar. Turning iCloud sync off as part of the reset works exactly like flipping its toggle off: this Mac's synced history is removed from the shared iCloud data, and your other Macs keep their own.
-
-## Updates
-
-The Updates section appears in official packaged builds that include the signed update feed. Local
-developer builds do not show it.
-
-| Setting | Options | What it does |
-|---|---|---|
-| Update Automatically | On / Off | Whether Sparkle checks for updates in the background. You can still check manually when this is off. |
-| Beta Updates | On / Off | Adds pre-release builds to the updates you can receive. Stable releases remain available either way. |
-| Check for Updates… | button | Starts a manual update check and opens Sparkle's update window. |
-
 
 ## Version
 
