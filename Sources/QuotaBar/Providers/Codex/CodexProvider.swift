@@ -23,10 +23,6 @@ final class CodexProvider: ProviderRuntime {
     let piUsageScanner: PiUsageScanner
     let expectedIdentityKey: String?
     private var lastResolvedAccountIdentityKey: String?
-    private var lastNativeScan: LogUsageScan?
-    /// Damaged-record count that accompanied `lastNativeScan`, so a local-accounting wake reusing
-    /// the cached scan keeps surfacing the same caveat.
-    private var lastNativeScanDamagedLines = 0
     private var lastProxyScan: LogUsageScan?
     /// Source revision the cached proxy fold was built from. Ledger wakes reuse that fold only while
     /// the FCC databases (and their WAL sidecars) are byte-for-byte unchanged.
@@ -426,10 +422,7 @@ final class CodexProvider: ProviderRuntime {
 
         let nativeScan: LogUsageScan?
         var nativeDamagedLines = 0
-        if isLocalAccountingWake, let cached = lastNativeScan {
-            nativeScan = cached
-            nativeDamagedLines = lastNativeScanDamagedLines
-        } else {
+        do {
             let nativeResult = await logUsageScanner.scanResult(
                 daysBack: UsageHistoryWindow.lifetimeDays(through: now),
                 now: now,
@@ -441,8 +434,6 @@ final class CodexProvider: ProviderRuntime {
             case .complete(let scan, let damagedLines):
                 nativeScan = scan
                 nativeDamagedLines = damagedLines
-                lastNativeScan = scan
-                lastNativeScanDamagedLines = damagedLines
                 DiagnosticGate.clearFailure(nativeIncompleteDiagnosticKey)
             case .deferredByFutureTimestamp:
                 DiagnosticGate.clearFailure(nativeIncompleteDiagnosticKey)

@@ -393,8 +393,10 @@ actor CodexRouterUsageScanner {
     ) async -> RouterFoldOutcome {
         let days = max(1, daysBack)
         let calendar = Calendar.current
-        let today = calendar.startOfDay(for: now)
-        let since = calendar.date(byAdding: .day, value: -(days - 1), to: today) ?? today
+        // `daysBack` counts days strictly before today (UsageHistoryWindow.previousDays), so the
+        // window starts `days` calendar days back — matching JSONLScanning.sinceDate and the
+        // persisted-aggregate window filter. An off-by-one here silently shrinks the fold by a day.
+        let since = JSONLScanning.sinceDate(daysBack: days, now: now)
         if readFile == nil, !usesInjectedScanner {
             // One unpaced pass seeds the on-disk aggregate inside the 120s provider deadline.
             // Later taps hit that aggregate and do not read the ledger. Leaving the 7.5% pacer on
