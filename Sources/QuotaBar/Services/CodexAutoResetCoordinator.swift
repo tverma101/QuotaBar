@@ -201,11 +201,11 @@ final class CodexAutoResetCoordinator {
             $0.expiresAt > current
                 && attempts[Self.key(accountID: owner, creditID: $0.id)]?.result.isTerminal != true
         }.map { credit in
-            let trigger = credit.expiresAt.addingTimeInterval(-Self.leadTime)
-            guard let prior = attempts[Self.key(accountID: owner, creditID: credit.id)]?.lastAttemptAt else {
-                return trigger
-            }
-            return max(trigger, prior.addingTimeInterval(Self.retryInterval))
+            Self.retryReadyAt(
+                trigger: credit.expiresAt.addingTimeInterval(-Self.leadTime),
+                lastAttemptAt: attempts[Self.key(accountID: owner, creditID: credit.id)]?.lastAttemptAt,
+                now: current
+            )
         }.min()
         if windowPassed { return .windowPassed(nextAttempt: next) }
         guard let next else { return .monitoring }
@@ -289,11 +289,11 @@ final class CodexAutoResetCoordinator {
                 && attempts[Self.key(accountID: ledgerAccountID, creditID: candidate.id)]?.result.isTerminal != true
         }
         func readyAt(_ credit: CodexResetCredit) -> Date {
-            let trigger = credit.expiresAt.addingTimeInterval(-Self.leadTime)
-            guard let prior = attempts[Self.key(accountID: ledgerAccountID, creditID: credit.id)]?.lastAttemptAt else {
-                return trigger
-            }
-            return max(trigger, prior.addingTimeInterval(Self.retryInterval))
+            Self.retryReadyAt(
+                trigger: credit.expiresAt.addingTimeInterval(-Self.leadTime),
+                lastAttemptAt: attempts[Self.key(accountID: ledgerAccountID, creditID: credit.id)]?.lastAttemptAt,
+                now: current
+            )
         }
         guard let credit = eligible.min(by: {
             let a = readyAt($0), b = readyAt($1)
@@ -314,8 +314,13 @@ final class CodexAutoResetCoordinator {
         )
         guard !record.result.isTerminal else { return Self.patrolInterval }
         if let lastAttempt = record.lastAttemptAt {
-            let wait = Self.retryInterval - now().timeIntervalSince(lastAttempt)
-            if wait > 0 { return min(max(1, wait), max(1, credit.expiresAt.timeIntervalSince(now()))) }
+            let elapsed = now().timeIntervalSince(lastAttempt)
+            // A stamp written before a backwards clock correction must not stretch the retry
+            // window; it is already elapsed, not a cooldown into the future.
+            if elapsed >= 0 {
+                let wait = Self.retryInterval - elapsed
+                if wait > 0 { return min(max(1, wait), max(1, credit.expiresAt.timeIntervalSince(now()))) }
+            }
         }
         if record.attempts >= Self.maximumAttempts {
             record.result = .exhausted
@@ -376,6 +381,14 @@ final class CodexAutoResetCoordinator {
         attempts[key] = record
         _ = persist()
         return outcome == .cancelled ? 1 : (record.result == .pending ? Self.retryInterval : 1)
+    }
+
+    /// When a credit may next be retried. The attempts file survives launches, so a stamp written
+    /// while the clock was ahead can sit in the future; treating it as elapsed keeps the retry due
+    /// instead of pushing it past the credit's expiry.
+    private static func retryReadyAt(trigger: Date, lastAttemptAt: Date?, now: Date) -> Date {
+        guard let lastAttemptAt, lastAttemptAt <= now else { return trigger }
+        return max(trigger, lastAttemptAt.addingTimeInterval(retryInterval))
     }
 
     /// Positive means wait; zero means the target time has arrived; nil means already expired.

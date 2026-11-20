@@ -136,6 +136,33 @@ final class CodexAutoResetCoordinatorTests: XCTestCase {
         XCTAssertEqual(third, 60)
     }
 
+    func testFuturePersistedAttemptStampAfterClockRollbackDoesNotSuppressRetry() async {
+        let defaults = defaults()
+        let banked = credit("credit-rollback", 45)
+        var claims = 0
+        let account = CodexAutoResetCoordinator.Account(
+            availableCredits: { [banked] },
+            claim: { _, _, _ in
+                claims += 1
+                return claims == 1 ? .failed : .success
+            }
+        )
+        let first = CodexAutoResetCoordinator(
+            accounts: ["codex": account], defaults: defaults, now: { self.base }
+        )
+        await first.runOnce(for: "codex")
+        XCTAssertEqual(claims, 1)
+
+        // The attempt stamp persists across launches. A clock corrected ten seconds backwards puts
+        // that stamp in the future; the retry must be due now, not pushed out to the credit expiry.
+        let restarted = CodexAutoResetCoordinator(
+            accounts: ["codex": account], defaults: defaults,
+            now: { self.base.addingTimeInterval(-10) }
+        )
+        await restarted.runOnce(for: "codex")
+        XCTAssertEqual(claims, 2, "a future attempt stamp must not suppress the retry")
+    }
+
     private func defaults(enabled: Bool = true) -> UserDefaults {
         let defaults = UserDefaults(suiteName: "CodexAutoResetTests-\(UUID().uuidString)")!
         defaults.set(enabled, forKey: CodexAutoResetCoordinator.enabledKey)

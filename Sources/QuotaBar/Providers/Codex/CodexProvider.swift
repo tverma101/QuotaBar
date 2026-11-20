@@ -432,7 +432,10 @@ final class CodexProvider: ProviderRuntime {
         }
 
         let proxyScan: LogUsageScan?
-        let proxyRevision = isLocalAccountingWake ? await proxyUsageScanner.sourceRevision() : nil
+        // Sampled before the fold, not after: a database that changes while the scan runs must
+        // invalidate this cached fold on the next wake. Stamping the post-scan revision recorded
+        // bytes the fold never saw as already read, so those rows stayed invisible to ledger wakes.
+        let proxyRevision = await proxyUsageScanner.sourceRevision()
         if isLocalAccountingWake, let cached = lastProxyScan, lastProxyScanRevision == proxyRevision {
             proxyScan = cached
         } else {
@@ -447,7 +450,7 @@ final class CodexProvider: ProviderRuntime {
             case .complete(let scan):
                 proxyScan = scan
                 lastProxyScan = scan
-                lastProxyScanRevision = await proxyUsageScanner.sourceRevision()
+                lastProxyScanRevision = proxyRevision
             case .incomplete:
                 return nil
             }

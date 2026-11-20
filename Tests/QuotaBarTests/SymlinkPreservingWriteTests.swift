@@ -86,6 +86,35 @@ final class SymlinkPreservingWriteTests: XCTestCase {
         }
     }
 
+    /// A relative link can pass through a symlinked directory. POSIX resolves `..` after following
+    /// the directory link, so `root/symdir/../target.txt` is `root/real/target.txt` here, not
+    /// `root/target.txt`. Lexically standardizing the hop path changes where the credential lands.
+    func testWriteResolvesParentSegmentsAfterFollowingADirectoryLink() throws {
+        let real = root.appendingPathComponent("real", isDirectory: true)
+        let nested = real.appendingPathComponent("subdir", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let realFile = real.appendingPathComponent("target.txt")
+        try Data("old".utf8).write(to: realFile)
+
+        let inner = nested.appendingPathComponent("link2")
+        try FileManager.default.createSymbolicLink(atPath: inner.path, withDestinationPath: "../target.txt")
+        let directoryLink = root.appendingPathComponent("symdir")
+        try FileManager.default.createSymbolicLink(atPath: directoryLink.path, withDestinationPath: "real/subdir")
+        let linked = root.appendingPathComponent("auth.json")
+        try FileManager.default.createSymbolicLink(atPath: linked.path, withDestinationPath: "symdir/link2")
+
+        try LocalTextFileAccessor().writeText(linked.path, "rotated")
+
+        XCTAssertEqual(
+            try String(contentsOf: realFile, encoding: .utf8), "rotated",
+            "a `..` after a followed directory link resolves against the real directory"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: root.appendingPathComponent("target.txt").path),
+            "lexical standardization must not redirect the write beside the outer link"
+        )
+    }
+
     /// The security property the original `O_NOFOLLOW` was protecting must be unchanged: the written file
     /// is still private, and the temp file is still never placed through a link.
     func testWrittenFileKeepsItsPrivateMode() throws {

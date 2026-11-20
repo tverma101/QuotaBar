@@ -39,12 +39,23 @@ actor FreebuffModelCatalog {
     }
 
     func refresh(auth: FreebuffAuth, client: FreebuffUsageClient, now: Date) async throws {
-        if let cache, now.timeIntervalSince(cache.fetchedAt) < Self.refreshInterval { return }
+        // The cache file outlives launches, so a stamp written while the clock was ahead would make
+        // the elapsed time negative and read as "inside the TTL", suppressing every refresh until
+        // the wall clock caught up. A negative elapsed time is expired, not fresh.
+        if let cache {
+            let elapsed = now.timeIntervalSince(cache.fetchedAt)
+            if elapsed >= 0, elapsed < Self.refreshInterval { return }
+        }
         // A failed attempt backs off like a successful one. Without this the catalogue was
         // re-requested on every refresh tick for as long as the endpoint stayed broken.
-        if let lastAttemptAt, now.timeIntervalSince(lastAttemptAt) < Self.retryInterval {
-            if let lastFailure { throw lastFailure }
-            return
+        // Same clock rule as the cache stamp above: a backward jump makes this in-session stamp sit
+        // in the future, and negative elapsed time must read as elapsed, not as a fresh cooldown.
+        if let lastAttemptAt {
+            let elapsed = now.timeIntervalSince(lastAttemptAt)
+            if elapsed >= 0, elapsed < Self.retryInterval {
+                if let lastFailure { throw lastFailure }
+                return
+            }
         }
         lastAttemptAt = now
         do {

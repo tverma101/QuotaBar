@@ -223,11 +223,13 @@ enum CodexUsageMapper {
         guard let window else { return nil }
         if let resetAt = ProviderParse.number(window["reset_at"]) {
             let date = Date(timeIntervalSince1970: resetAt)
-            guard date > now, date.timeIntervalSince(now) <= maximumResetHorizon else { return nil }
+            // A reset a few seconds in the past is a real boundary; only an unrepresentable distance
+            // is rejected, not the sign.
+            guard abs(date.timeIntervalSince(now)) <= maximumResetHorizon else { return nil }
             return date
         }
         if let resetAfter = ProviderParse.number(window["reset_after_seconds"]) {
-            guard resetAfter > 0, resetAfter <= maximumResetHorizon else { return nil }
+            guard abs(resetAfter) <= maximumResetHorizon else { return nil }
             return now.addingTimeInterval(resetAfter)
         }
         return nil
@@ -327,18 +329,20 @@ enum CodexUsageMapper {
 
     private static func parseExpiry(_ value: Any?, now: Date) -> Date? {
         let parsed: Date?
-        if let string = value as? String {
-            parsed = OpenUsageISO8601.date(from: string)
+        // ISO first, then the numeric fallback (which also accepts numeric strings). Falling back on
+        // a failed string parse preserves expiries that providers encode as epoch strings.
+        if let string = value as? String,
+           let date = OpenUsageISO8601.date(from: string) {
+            parsed = date
         } else if let seconds = ProviderParse.number(value) {
             parsed = Date(timeIntervalSince1970: seconds)
         } else {
             parsed = nil
         }
-        // Same untrusted-instant rule as reset windows: an expiry decades out would reach duration
-        // formatting and must not be trusted (or crash it).
+        // Same untrusted-instant rule as reset windows: bound the distance, not the sign. An expiry
+        // that just passed was accepted before this guard and must not vanish from the tooltip.
         guard let parsed,
-              parsed > now,
-              parsed.timeIntervalSince(now) <= maximumResetHorizon
+              abs(parsed.timeIntervalSince(now)) <= maximumResetHorizon
         else { return nil }
         return parsed
     }

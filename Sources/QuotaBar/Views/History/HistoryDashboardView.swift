@@ -12,15 +12,14 @@ struct HistoryDashboardView: View {
     @Environment(WidgetDataStore.self) private var dataStore
 
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
-    @State private var scrollPosition = ScrollPosition(edge: .top)
 
     var body: some View {
+        // Deliberately no `ScrollPosition` binding here. Unlike Settings (kept alive), the pager
+        // unmounts History when another screen is shown, so a fresh mount already starts at the top.
+        // A binding would write on every manual scroll, re-running `body` — and this screen's whole
+        // 30-day report fold — once per scroll event instead of once per data change.
         PopoverScrollView {
             content
-        }
-        .scrollPosition($scrollPosition)
-        .onChange(of: layout.screen) { _, screen in
-            if screen == .history { scrollPosition.scrollTo(edge: .top) }
         }
     }
 

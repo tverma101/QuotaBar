@@ -1248,12 +1248,141 @@ final class CodexProviderTests: XCTestCase {
         XCTAssertTrue(http.requests.isEmpty)
     }
 
+    /// A ledger wake may reuse the proxy fold only while the FCC databases are unchanged. The
+    /// revision must be sampled *before* the fold: a database that changed while the scan ran has
+    /// to invalidate the cached fold on the next wake. Sampling after the fold recorded those newer
+    /// bytes as already read, so rows committed during a scan stayed invisible until the next full
+    /// pass — the stale-usage symptom the revision gate exists to prevent.
+    func testLedgerWakeRefoldsProxyRowsCommittedDuringThePreviousScan() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-proxy-revision-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let database = directory.appendingPathComponent("usage.db")
+        try Data("db".utf8).write(to: database)
+        let firstStamp = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: firstStamp], ofItemAtPath: database.path)
+
+        let now = OpenUsageISO8601.date(from: "2026-09-03T12:00:00.000Z")!
+        let day = DailyUsageAccumulator.dayKey(from: now, calendar: .current)
+        func payload(input: Int, output: Int) -> String {
+            #"[{"local_day":"\#(day)","model":"openai/gpt-5.6-luna","input_tokens":\#(input),"output_tokens":\#(output),"cache_read_input_tokens":25,"cache_creation_input_tokens":5}]"#
+        }
+
+        let fixture = ProxyRevisionFixture(payload: payload(input: 100, output: 50), database: database, firstStamp: firstStamp)
+        let provider = CodexProvider(
+            authStore: CodexAuthStore(
+                environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
+                files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
+                keychain: FakeKeychain()
+            ),
+            usageClient: CodexUsageClient(http: FakeHTTPClient(response: HTTPResponse(
+                statusCode: 500, headers: [:], body: Data()
+            ))),
+            logUsageScanner: CodexLogFixture.scanner(home: nil),
+            proxyUsageScanner: CodexProxyUsageScanner(
+                sqlite: ProxyRevisionSQLite(fixture: fixture),
+                databasePaths: fixture.databasePaths
+            ),
+            routerUsageScanner: CodexRouterUsageScanner(ledgerPaths: { [] }, identityAliases: { [:] }),
+            expectedIdentityKey: "1118f6f1-8697-4e7b-9112-1771b3e36099",
+            allowsKeychainFallback: false,
+            allowsUnattributedPiUsage: false,
+            now: { now },
+            pricing: {
+                ModelPricing(
+                    supplement: PricingSupplement(),
+                    primary: PricingCatalog(entries: ["gpt-5.6-luna": ModelRates(
+                        inputPerMillion: 1000, outputPerMillion: 3000,
+                        cacheWritePerMillion: 1000, cacheReadPerMillion: 100
+                    )]),
+                    secondary: PricingCatalog(entries: [:])
+                )
+            }
+        )
+
+        let first = await ProviderRefreshContext.$scope.withValue(.localAccounting) {
+            await provider.refresh()
+        }
+        XCTAssertEqual(values(first.lines, "Today")?.last?.number, 180)
+
+        // The scan below committed rows after it read the payload; the database's mtime already
+        // moved on during that same scan (the fixture advances it on the scan's path request).
+        fixture.replacePayload(payload(input: 200, output: 100))
+        let second = await ProviderRefreshContext.$scope.withValue(.localAccounting) {
+            await provider.refresh()
+        }
+        // 200 input + 100 output + 25 cache-read + 5 cache-write = 330 tokens; the first wake
+        // folded only the 180-token payload that was on disk when its query ran.
+        XCTAssertEqual(
+            values(second.lines, "Today")?.last?.number, 330,
+            "rows committed while the previous scan ran must not be recorded as already folded"
+        )
+    }
+
     private func values(_ lines: [MetricLine], _ label: String) -> [MetricValue]? {
         guard case .values(_, let values, _, _, _, _) = lines.first(where: { $0.label == label }) else {
             return nil
         }
         return values
     }
+}
+
+/// Scriptable FCC source for the proxy-revision test: the payload a query sees and the database
+/// path list both come from here, and the second path request — the one the fold makes — advances
+/// the file's mtime, standing in for rows committed while that fold is running.
+private final class ProxyRevisionFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var payload: String
+    private var databasePathCalls = 0
+    private let database: URL
+    private let firstStamp: Date
+    private let secondStamp: Date
+
+    /// The schema the scanner requires; one row per required column, in the CLI's `PRAGMA` shape.
+    let schema = [
+        "request_id", "occurred_at", "local_day", "provider_id", "model", "wire_api",
+        "status", "duration_ms", "input_tokens", "output_tokens",
+        "cache_read_input_tokens", "cache_creation_input_tokens", "source", "account_fingerprint"
+    ].enumerated().map { "\($0.offset)|\($0.element)|TEXT|1||0" }.joined(separator: "\n")
+
+    init(payload: String, database: URL, firstStamp: Date) {
+        self.payload = payload
+        self.database = database
+        self.firstStamp = firstStamp
+        self.secondStamp = firstStamp.addingTimeInterval(60)
+    }
+
+    func currentPayload() -> String { lock.withLock { payload } }
+
+    func replacePayload(_ value: String) { lock.withLock { payload = value } }
+
+    var databasePaths: @Sendable () -> [String] {
+        { [self] in
+            lock.withLock {
+                databasePathCalls += 1
+                if databasePathCalls == 2 {
+                    try? FileManager.default.setAttributes(
+                        [.modificationDate: secondStamp], ofItemAtPath: database.path
+                    )
+                }
+                return [database.path]
+            }
+        }
+    }
+}
+
+private final class ProxyRevisionSQLite: SQLiteAccessing, @unchecked Sendable {
+    private let fixture: ProxyRevisionFixture
+
+    init(fixture: ProxyRevisionFixture) { self.fixture = fixture }
+
+    func queryValue(path: String, sql: String) throws -> String? {
+        if sql.hasPrefix("PRAGMA table_info") { return fixture.schema }
+        return fixture.currentPayload()
+    }
+
+    func execute(path: String, sql: String) throws {}
 }
 
 final class CodexUsageClientRefreshTests: XCTestCase {

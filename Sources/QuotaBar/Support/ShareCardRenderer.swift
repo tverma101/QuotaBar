@@ -64,6 +64,43 @@ enum ShareCardRenderer {
         return true
     }
 
+    /// The rows this export will render, resolved exactly once each: Always Visible rows in display
+    /// order, then the provider's On Demand rows only when its caret is open. Applies the same
+    /// `hidesWhenEmpty` filter the dashboard applies, so the export matches what the user is looking
+    /// at — a conditional row hidden on screen must not appear as an "— / No data" row in the PNG.
+    /// A collapsed provider's hidden On Demand rows are never resolved.
+    ///
+    /// Takes the two store reads as closures so the row-parity regression test can count resolutions
+    /// (production passes `WidgetDataStore.data(for:)` / `errorCategory(for:)` unchanged).
+    static func exportedRows(
+        for group: ProviderGroup,
+        isExpanded: Bool,
+        layout: LayoutStore,
+        errorCategory: (String) -> ErrorCategory?,
+        data: (WidgetDescriptor) -> WidgetData
+    ) -> (rows: [WidgetData], expandBoundaryIndex: Int?) {
+        func resolvedRows(_ widgets: [PlacedWidget]) -> [WidgetData] {
+            widgets.compactMap { widget in
+                guard let descriptor = layout.descriptor(for: widget) else { return nil }
+                let widgetData = data(descriptor)
+                guard ProviderSectionVisibility.shouldRenderMetricRow(
+                    providerID: descriptor.providerID,
+                    descriptorID: descriptor.id,
+                    hasData: widgetData.hasData,
+                    errorCategory: errorCategory(descriptor.providerID),
+                    explicitlyEnabled: layout.explicitlyEnabledMetricIDs.contains(descriptor.id)
+                ) && layout.showsRow(descriptor, hasData: widgetData.hasData) else { return nil }
+                return widgetData
+            }
+        }
+        let alwaysRows = resolvedRows(group.alwaysShownWidgets)
+        let expandedRows = isExpanded ? resolvedRows(group.expandedWidgets) : []
+        return (
+            alwaysRows + expandedRows,
+            isExpanded ? alwaysRows.count : nil
+        )
+    }
+
     /// Orchestrates a Share Screenshot action end to end: resolve the provider's visible rows from the data
     /// store, build the card with the effective appearance, render it, and copy the PNG to the clipboard.
     /// On a successful copy it asks the layout store to surface a transient "Copied to clipboard" pill —
@@ -83,35 +120,19 @@ enum ShareCardRenderer {
         appearance: ColorScheme
     ) -> Bool {
         let isExpanded = layout.isProviderExpanded(group.provider.id)
-        // Apply the same `hidesWhenEmpty` filter the dashboard applies, so the export matches what the
-        // user is looking at. It did not: a conditional row hidden on screen was still exported,
-        // rendering as an "— / No data" row in the shared PNG that is not in the screenshot the user
-        // took of their own panel. The `ShareCardView` doc comment claimed it mirrored the card.
-        // Same predicate the dashboard uses, via the same `showsRow` rule.
-        let data = { (widget: PlacedWidget) -> WidgetData? in
-            guard let descriptor = layout.descriptor(for: widget) else { return nil }
-            return dataStore.data(for: descriptor)
-        }
-        let kept = group.visibleRows {
-            guard let descriptor = layout.descriptor(for: $0) else { return false }
-            let widgetData = dataStore.data(for: descriptor)
-            return ProviderSectionVisibility.shouldRenderMetricRow(
-                providerID: descriptor.providerID,
-                descriptorID: descriptor.id,
-                hasData: widgetData.hasData,
-                errorCategory: dataStore.errorCategory(for: descriptor.providerID),
-                explicitlyEnabled: layout.explicitlyEnabledMetricIDs.contains(descriptor.id)
-            ) && layout.showsRow(descriptor, hasData: widgetData.hasData)
-        }
-        let alwaysRows = kept.alwaysShown.compactMap(data)
-        let expandedRows = kept.expanded.compactMap(data)
-        let rows = isExpanded ? alwaysRows + expandedRows : alwaysRows
+        let exported = exportedRows(
+            for: group,
+            isExpanded: isExpanded,
+            layout: layout,
+            errorCategory: { dataStore.errorCategory(for: $0) },
+            data: { dataStore.data(for: $0) }
+        )
         let view = ShareCardView(
             provider: group.provider,
             plan: dataStore.plan(for: group.provider.id),
-            rows: rows,
+            rows: exported.rows,
             appearance: appearance,
-            expandBoundaryIndex: isExpanded ? alwaysRows.count : nil
+            expandBoundaryIndex: exported.expandBoundaryIndex
         )
         return renderAndCopy(view, label: group.provider.id, layout: layout)
     }

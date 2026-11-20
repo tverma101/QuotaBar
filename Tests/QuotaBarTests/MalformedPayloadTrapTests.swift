@@ -103,6 +103,79 @@ final class MalformedPayloadTrapTests: XCTestCase {
         XCTAssertNil(progress(mapped.lines, "Fable")?.resetsAt)
     }
 
+    /// The sanitizer must reject only unrepresentable instants, not reshape valid ones. A reset a
+    /// minute in the past is a real boundary (the response is stale or the window just rolled), and
+    /// providers have shipped epoch instants as numeric strings; both were accepted before the bound
+    /// was added and must stay accepted.
+    func testClaudeResetDatesKeepNumericStringsAndRecentPastInstants() throws {
+        let futureString = String(Int(now.timeIntervalSince1970) + 3_600)
+        let recentPast = Int(now.timeIntervalSince1970) - 60
+        let response = HTTPResponse(statusCode: 200, headers: [:], body: Data("""
+        {
+          "five_hour": { "utilization": 10, "resets_at": "\(futureString)" },
+          "seven_day": { "utilization": 20, "resets_at": \(recentPast) }
+        }
+        """.utf8))
+
+        let mapped = try ClaudeUsageMapper.mapUsageResponse(
+            response,
+            credentials: ClaudeOAuth(subscriptionType: "pro"),
+            now: now
+        )
+
+        XCTAssertEqual(
+            progress(mapped.lines, "Session")?.resetsAt?.timeIntervalSince1970,
+            Double(futureString)
+        )
+        XCTAssertEqual(
+            progress(mapped.lines, "Weekly")?.resetsAt?.timeIntervalSince1970,
+            Double(recentPast)
+        )
+    }
+
+    func testCodexResetCreditsKeepNumericStringsAndRecentPastExpiries() {
+        let futureString = String(Int(now.timeIntervalSince1970) + 3_600)
+        let recentPast = Int(now.timeIntervalSince1970) - 60
+        let resetCredits = HTTPResponse(
+            statusCode: 200,
+            headers: [:],
+            body: Data("""
+            {"available_count":2,"credits":[
+              {"status":"available","expires_at":"\(futureString)"},
+              {"status":"available","expires_at":\(recentPast)}
+            ]}
+            """.utf8)
+        )
+
+        let resets = CodexUsageMapper.readResetCredits(
+            body: [:],
+            resetCredits: resetCredits,
+            now: now
+        )
+
+        XCTAssertEqual(
+            resets?.expiries.map { $0.timeIntervalSince1970 } ?? [],
+            [Double(recentPast), Double(futureString)]
+        )
+    }
+
+    func testCodexResetWindowInTheRecentPastIsPreserved() throws {
+        let recentPast = Int(now.timeIntervalSince1970) - 60
+        let body = Data("""
+        {"rate_limit":{"primary_window":{"used_percent":12,"reset_at":\(recentPast)}}}
+        """.utf8)
+
+        let mapped = try CodexUsageMapper.mapUsageResponse(
+            HTTPResponse(statusCode: 200, headers: [:], body: body),
+            now: now
+        )
+
+        XCTAssertEqual(
+            progress(mapped.lines, "Session")?.resetsAt?.timeIntervalSince1970,
+            Double(recentPast)
+        )
+    }
+
     // MARK: - Cursor
 
     func testCursorHugeBillingCycleDoesNotTrap() throws {

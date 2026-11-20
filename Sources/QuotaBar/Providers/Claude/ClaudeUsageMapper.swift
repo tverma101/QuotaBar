@@ -201,18 +201,23 @@ enum ClaudeUsageMapper {
 
     private static func resetDate(_ value: Any?, now: Date) -> Date? {
         let parsed: Date?
+        // Try ISO first, then the numeric fallback (which also accepts numbers encoded as strings —
+        // providers have shipped epoch instants that way). A failed string parse must not stop the
+        // fallback: doing so silently dropped a reset the old parser accepted.
         if let text = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !text.isEmpty {
-            parsed = OpenUsageISO8601.date(from: text)
+           !text.isEmpty,
+           let date = OpenUsageISO8601.date(from: text) {
+            parsed = date
         } else if let number = ProviderParse.number(value), number.isFinite {
             let milliseconds = abs(number) < 1e10 ? number * 1000 : number
             parsed = Date(timeIntervalSince1970: milliseconds / 1000)
         } else {
             parsed = nil
         }
+        // Bound the distance, not the sign: a reset a few seconds in the past is a real boundary
+        // (the window just rolled, or the response is stale) and was accepted before this guard.
         guard let parsed,
-              parsed > now,
-              parsed.timeIntervalSince(now) <= maximumResetHorizon
+              abs(parsed.timeIntervalSince(now)) <= maximumResetHorizon
         else { return nil }
         return parsed
     }
