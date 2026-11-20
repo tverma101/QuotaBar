@@ -1,21 +1,18 @@
 import SwiftUI
 
-/// Hover detail for a spend period: a flat ranked list of models, each with name/cost and
-/// share-percent/token lines over a proportional bar. The Other row lists each contributor's name,
-/// tokens and price rather than an unexplained extra-model count. The header carries only the period name — the hovered row right below
-/// already shows the period total, so repeating it here would duplicate (and wrap on) long figures.
+/// Hover detail for a spend period: a flat ranked list of the leading models, each with
+/// name/cost and share-percent/token lines over a proportional bar — the period's top models are
+/// named outright and the rest fold into Other, whose contributors (name, tokens and price each)
+/// stay collapsed behind a chevron until expanded. The header carries only the period name — the
+/// hovered row right below already shows the period total, so repeating it here would duplicate
+/// (and wrap on) long figures.
 /// Mirrors `UsageTrendDetail`'s calm — header + flat list + source note.
 struct ModelUsageDetail: View {
     let title: String
     let breakdown: ModelUsageBreakdown
-    /// Collapses the model list behind a tap for windows whose full breakdown is a wall of rows
-    /// (the Last 30 Days spend tile). The header and a one-line total stay visible; tapping the
-    /// button reveals the full per-model detail.
-    var loadOnTap: Bool = false
     var onHoverChange: (Bool) -> Void
 
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
-    @State private var revealed = false
     @State private var otherExpanded = false
 
     private static let width: CGFloat = 280
@@ -23,17 +20,18 @@ struct ModelUsageDetail: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
-            if loadOnTap, !revealed {
-                collapsedSummary
-            } else {
-                fullList
-            }
+            fullList
             if let note = breakdown.sourceNote {
                 PopoverSourceNote(text: note)
             }
         }
         .padding(14)
         .frame(width: Self.width)
+        // Hug the content vertically so collapsing Other shrinks the popover back — NSPopover
+        // grows to the largest measured height and never rescales on its own.
+        .fixedSize(horizontal: false, vertical: true)
+        // Each presentation gets a fresh identity (presentation .id in the popover presenter), so
+        // @State like otherExpanded resets per open — every open starts at the concise folded list.
         .onContinuousHover { phase in
             switch phase {
             case .active:
@@ -48,41 +46,6 @@ struct ModelUsageDetail: View {
         Text(title)
             .font(.system(size: density.headerPointSize, weight: .semibold))
             .foregroundStyle(.primary)
-    }
-
-    /// The Last 30 Days tile's resting state: the period's aggregate figures plus the deferred
-    /// disclosure. Everything the popover is for is one tap away — it just isn't unfolded up front.
-    private var collapsedSummary: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
-                if let cost = breakdown.totalCostUSD {
-                    let incomplete = breakdown.models.contains { $0.hasIncompleteCost }
-                    Text((incomplete ? "≥" : "") + MetricFormatter.number(cost, kind: .dollars, style: .row))
-                        .monospacedDigit()
-                }
-                Spacer(minLength: 8)
-                Text(MetricFormatter.string(
-                    for: MetricValue(
-                        number: Double(breakdown.totalTokens),
-                        kind: .count,
-                        label: "tokens",
-                        tokenCountSaturated: breakdown.tokenCountSaturated
-                    ),
-                    style: .row
-                ))
-                .monospacedDigit()
-            }
-            .font(.system(size: density.supportingPointSize))
-            .foregroundStyle(.secondary)
-
-            Button("Show Model Breakdown") {
-                revealed = true
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .font(.system(size: density.supportingPointSize))
-            .frame(maxWidth: .infinity)
-        }
     }
 
     private var fullList: some View {

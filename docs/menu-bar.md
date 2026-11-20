@@ -8,14 +8,15 @@ Right-click (or control-click) the QuotaBar menu bar icon for a quick menu with 
 
 ## Usage History
 
-Hovering a spend value shows its model breakdown. Tapping the value toggles the same breakdown
+Hovering a spend value shows its model breakdown. Tapping the value opens the same breakdown
 without the hover wait, and the value's touch area reaches a little past the text so the tap lands
-easily. Several small models stay together as **Other**,
+easily. The top three models keep their own rows and the rest stay together as **Other**,
 which lists each one's name, measured tokens, and cost or **Unpriced** once. A single small model,
 or the one model that accounts for Other's whole price, keeps its own row, so the same tokens and
 cost are not shown twice. Missing older model labels remain explicit usage categories rather than
 being counted as additional named models. When Other has more contributors than fit, the list
-scrolls inside the popover.
+scrolls inside the popover. The breakdown stays put while you tap around the panel; it closes once
+the pointer leaves it, another breakdown takes its place, or the panel itself closes.
 
 The dashboard footer's **Options** menu → **Usage History** opens a read-only report built from the same local usage data the spend tiles show, so the two can never disagree:
 

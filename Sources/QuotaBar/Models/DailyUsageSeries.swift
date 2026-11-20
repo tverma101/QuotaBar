@@ -158,8 +158,8 @@ enum UsageHistoryWindow {
 }
 
 /// Token/cost totals for one model before a period collapses it into a spend row. Costs stay unrounded
-/// here; `SpendTileMapper` snaps them to cents once for the displayed Today / Yesterday / Last 30 Days
-/// breakdown, matching the spend-row totals.
+/// here; `MetricFormatter` rounds at render for the Today / Yesterday / Last 30 Days breakdown, matching
+/// the spend-row totals.
 ///
 /// `variants` carries the raw slugs folded into this entry when a provider groups by base model —
 /// Cursor's thinking-effort/fast CSV slugs (`claude-opus-4-8-thinking-max` under `claude-opus-4-8`) —
@@ -395,7 +395,8 @@ extension ProviderUsageHistory {
 }
 
 /// A period-scoped, UI-ready breakdown attached to the same `.values` line as the spend row it explains.
-/// The header total mirrors that row's values; individual model costs are rounded at this display boundary.
+/// `totalTokens`/`totalCostUSD` carry the period totals for detail surfaces; individual model rows carry
+/// their own values, rounded by `MetricFormatter` at render.
 struct ModelUsageBreakdown: Hashable, Sendable, Codable {
     var totalTokens: Int
     /// True when the period total was clamped during aggregation. Individual model rows can each be
