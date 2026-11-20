@@ -94,6 +94,7 @@ final class ScanWorkerClient {
             "--scan-worker",
             "--providers", provider.id,
             "--scope", scopeArgument,
+            "--return-only",
         ] + (paced ? ["--paced"] : [])
         do {
             // The runner blocks its calling thread for the child's whole lifetime; keep that wait
@@ -197,6 +198,7 @@ final class ScanWorkerClient {
             "--scan-worker",
             "--providers", providerIDs.joined(separator: ","),
             "--scope", scopeArgument,
+            "--return-only",
         ] + pacedArgument
         do {
             let runResult = try await loadOffMainActor { [runner] in

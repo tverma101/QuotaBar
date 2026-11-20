@@ -745,8 +745,16 @@ final class AppContainer {
                         if accountingScope == .panelAccounting {
                             lastHistoryRefreshUptime = ProcessInfo.processInfo.systemUptime
                         }
+                        // Closed-panel accounting is background bookkeeping: pace the scan-worker
+                        // children (--paced caps each at a fraction of a core) and cap concurrency so
+                        // the periodic history sweep cannot stack one 100%-core child per provider.
+                        // Panel-open passes stay unpaced for responsiveness.
+                        let panelClosed = !panelOpen
+                        let throttleAccounting = accountingScope == .localAccounting || panelClosed
                         let maxConcurrentProviders = accountingScope == .panelAccounting
-                            ? (serializeAccountingProviders ? 1 : nil)
+                            ? (serializeAccountingProviders
+                                ? 1
+                                : (panelClosed ? 2 : nil))
                             : (overSoftMemoryLimit ? 1 : nil)
                         passRan = true
                         accountingTask = Task { @MainActor in
@@ -755,7 +763,7 @@ final class AppContainer {
                                     accountingScope == .localAccounting
                                 ) {
                                     await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(
-                                        accountingScope == .localAccounting
+                                        throttleAccounting
                                     ) {
                                         await dataStore.refreshAll(
                                             bypassSnapshotCache: bypassSnapshotCache,

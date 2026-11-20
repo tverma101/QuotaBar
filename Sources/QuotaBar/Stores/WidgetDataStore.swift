@@ -373,7 +373,7 @@ final class WidgetDataStore {
             }
         }
         self.localSnapshots = loaded
-        self.snapshots = loaded
+        self.snapshots = Self.removingExpiredZCodePromotions(from: loaded, through: retentionDate)
         if vmBoxHistory != nil {
             rebuildRenderedSnapshots()
             vmBoxHistoryTask = Task { [weak self] in
@@ -625,6 +625,10 @@ final class WidgetDataStore {
                 // against its own marker. The window is covered by these markers; members mark
                 // themselves for the (instant) consuming phase as usual.
                 for id in preMarkedInFlight { refreshingProviderIDs.remove(id) }
+                // Resume anything that deferred behind the fold child the instant the window closes,
+                // instead of waiting for a consumption-phase unregister (which a mid-loop cancellation
+                // could skip entirely for some providers).
+                for id in preMarkedInFlight { emitReadyDeferredRefreshes(for: id) }
                 preMarkedInFlight = []
             }
         }
@@ -1010,8 +1014,14 @@ final class WidgetDataStore {
     private func emitReadyDeferredRefreshes(for providerID: String) {
         guard let requests = deferredRefreshRequests[providerID], !requests.isEmpty else { return }
         let activeScopes = Array(runningProviderRefreshScopes[providerID, default: [:]].values)
+        // Mirror the admission gate exactly: a resumed non-forced pass runs iff the provider is not
+        // marked in flight, or its meter scope may overlap the running scopes. The batched fold child
+        // pre-marks providers while `runningProviderRefreshScopes` stays empty; emitting on "no running
+        // scopes" alone re-latched passes the gate instantly re-deferred — a millisecond spin that
+        // lasted the whole fold (up to minutes) and burned CPU on all-deferred batches.
         let ready = requests.filter { request in
-            activeScopes.isEmpty || Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
+            !refreshingProviderIDs.contains(providerID)
+                || Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
         }
         guard !ready.isEmpty else { return }
         deferredRefreshRequests[providerID] = requests.subtracting(ready)
@@ -1993,7 +2003,10 @@ final class WidgetDataStore {
         }
         let peerDocuments = UsageHistoryDocument.newestByDevice(peerHistoryDocuments + vmBox.documents)
         guard !peerDocuments.isEmpty else {
-            let rendered = applyingVMBoxWarnings(vmBox.warnings, to: applyingVMBoxZCodeTotal(vmBox.documents, to: localSnapshots))
+            let rendered = Self.removingExpiredZCodePromotions(
+                from: applyingVMBoxWarnings(vmBox.warnings, to: applyingVMBoxZCodeTotal(vmBox.documents, to: localSnapshots)),
+                through: renderDate
+            )
             if snapshots != rendered { snapshots = rendered }
             return
         }
@@ -2040,7 +2053,31 @@ final class WidgetDataStore {
         }
         rendered = applyingVMBoxZCodeTotal(vmBox.documents, to: rendered)
         rendered = applyingVMBoxWarnings(vmBox.warnings, to: rendered)
+        rendered = Self.removingExpiredZCodePromotions(from: rendered, through: renderDate)
         if snapshots != rendered { snapshots = rendered }
+    }
+
+    /// Drops a cached Z.ai promotional row once its expiry has passed — or when an older build
+    /// saved only the display string and no machine-readable deadline — even when the live quota
+    /// request that would normally retire it cannot run (for example when quota is unavailable,
+    /// such as a Keychain-blocked meter pass). This is render-only — the stored snapshot keeps the
+    /// row — and keys on the provider plus the "Expires …" detail the producer writes for promo
+    /// deadlines, so ordinary reset countdowns and every other provider are unaffected.
+    static func removingExpiredZCodePromotions(
+        from values: [String: ProviderSnapshot], through date: Date
+    ) -> [String: ProviderSnapshot] {
+        guard var snapshot = values["zai"] else { return values }
+        let visible = snapshot.lines.filter { line in
+            guard case .progress(_, _, _, _, let expiry, _, _, let detail?) = line,
+                  detail.hasPrefix("Expires ") else { return true }
+            // Older builds saved only the display string. Wait for a fresh entitlement rather than showing it indefinitely.
+            return expiry.map { $0 > date } ?? false
+        }
+        guard visible.count != snapshot.lines.count else { return values }
+        snapshot.lines = visible
+        var result = values
+        result["zai"] = snapshot
+        return result
     }
 
     private func applyingVMBoxWarnings(_ warnings: [String: String], to values: [String: ProviderSnapshot]) -> [String: ProviderSnapshot] {

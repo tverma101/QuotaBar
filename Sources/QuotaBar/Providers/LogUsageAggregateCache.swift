@@ -126,13 +126,15 @@ enum LogUsageAggregatePaths {
 /// the fold finished but produced a complete-but-empty history (not persisted, so the next call
 /// recomputes rather than serving a stale empty aggregate).
 enum AggregateComputeResult: Sendable {
-    case complete(LogUsageScan?, validUntil: Date?)
+    case complete(LogUsageScan?, validUntil: Date?, damagedLines: Int = 0)
+    case deferredByFutureTimestamp
     case incomplete
 }
 
 /// What callers should do with the fold result.
 enum AggregateCacheOutcome: Sendable {
-    case complete(LogUsageScan?)
+    case complete(LogUsageScan?, damagedLines: Int)
+    case deferredByFutureTimestamp
     case incomplete
 }
 
@@ -156,6 +158,7 @@ actor LogUsageAggregateCache {
         /// Once `now` reaches it, the aggregate is stale by time alone: an event that was "not yet
         /// eligible" then has become eligible now.
         var validUntil: Date?
+        var damagedLines: Int?
     }
 
     private let directory: URL
@@ -189,16 +192,19 @@ actor LogUsageAggregateCache {
            entry.validUntil.map({ now < $0 }) ?? true,
            now.timeIntervalSince(entry.computedAt) <= Self.maxReuseAge
         {
-            return .complete(Self.windowFiltered(entry.scan, daysBack: days, now: now))
+            return .complete(Self.windowFiltered(entry.scan, daysBack: days, now: now),
+                             damagedLines: entry.damagedLines ?? 0)
         }
         switch await compute() {
+        case .deferredByFutureTimestamp:
+            return .deferredByFutureTimestamp
         case .incomplete:
             return .incomplete
-        case .complete(let fresh, let validUntil):
+        case .complete(let fresh, let validUntil, let damagedLines):
             guard let fresh else {
                 // A complete fold with no rows persists nothing useful; the empty result is not a
                 // failure, it is just not cacheable.
-                return .complete(nil)
+                return .complete(nil, damagedLines: damagedLines)
             }
             let entry = Entry(
                 schemaVersion: Self.schemaVersion,
@@ -208,11 +214,12 @@ actor LogUsageAggregateCache {
                 fingerprints: fingerprints,
                 computedAt: now,
                 scan: fresh,
-                validUntil: validUntil
+                validUntil: validUntil,
+                damagedLines: damagedLines
             )
             entries[key] = entry
             persist(entry)
-            return .complete(fresh)
+            return .complete(fresh, damagedLines: damagedLines)
         }
     }
 

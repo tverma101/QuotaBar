@@ -4,11 +4,12 @@ import XCTest
 final class ScanWorkerCommandOptionsTests: XCTestCase {
     func testParsesProvidersScopeAndPacing() throws {
         let options = try ScanWorkerCommand.Options.parse(
-            ["--scan-worker", "--providers", "codex,claude", "--scope", "local-accounting", "--paced"]
+            ["--scan-worker", "--providers", "codex,claude", "--scope", "local-accounting", "--paced", "--return-only"]
         )
         XCTAssertEqual(options.providerIDs, ["codex", "claude"])
         XCTAssertEqual(options.scope, .localAccounting)
         XCTAssertTrue(options.paced)
+        XCTAssertTrue(options.returnOnly)
     }
 
     func testDefaultsArePanelAccountingUnpaced() throws {
@@ -17,7 +18,38 @@ final class ScanWorkerCommandOptionsTests: XCTestCase {
         )
         XCTAssertEqual(options.scope, .panelAccounting)
         XCTAssertFalse(options.paced)
+        XCTAssertFalse(options.returnOnly)
         XCTAssertEqual(options.providerIDs, ["freebuff"])
+    }
+
+    @MainActor
+    func testDelegatedFoldLeavesParentAsTheSnapshotWriter() async throws {
+        // The delegated worker must not open a second snapshot transaction: the parent reserved
+        // the refresh order and is the only writer allowed to publish the fold's result.
+        let suiteName = "quotabar-scan-worker-test-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let cache = ProviderSnapshotCache(userDefaults: defaults)
+        let order = try XCTUnwrap(cache.beginRefreshOrder(providerID: "opencode"))
+
+        let options = try ScanWorkerCommand.Options.parse(["--providers", "opencode", "--return-only"])
+        let response = await ScanWorkerCommand.collectUnpublishedSnapshots(
+            options: options,
+            providers: [UnpublishedWorkerTestProvider()],
+            defaultIdentityKeys: ["opencode": "fallback"]
+        )
+
+        let snapshot = try XCTUnwrap(response.snapshots["opencode"])
+        XCTAssertNotNil(snapshot.usageHistory)
+        XCTAssertEqual(response.identityKeys["opencode"], "actual")
+        XCTAssertTrue(response.errors.isEmpty)
+        XCTAssertTrue(cache.loadSnapshots(providerIDs: ["opencode"]).isEmpty)
+        XCTAssertTrue(cache.isCurrentRefresh(
+            providerID: "opencode",
+            order: order,
+            scope: .panelAccounting,
+            hasHistoryDomain: true
+        ))
     }
 
     func testRejectsMissingProviders() {
@@ -32,5 +64,24 @@ final class ScanWorkerCommandOptionsTests: XCTestCase {
         XCTAssertThrowsError(try ScanWorkerCommand.Options.parse(
             ["--scan-worker", "--providers", "codex", "--force"]
         ))
+    }
+}
+
+@MainActor
+private final class UnpublishedWorkerTestProvider: ProviderRuntime {
+    let provider = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
+    let widgetDescriptors: [WidgetDescriptor] = []
+
+    func hasLocalCredentials() async -> Bool { false }
+
+    func refresh() async -> ProviderSnapshot {
+        ProviderRefreshContext.cacheIdentityResult?.set("actual")
+        return .make(
+            provider: provider,
+            plan: nil,
+            lines: [],
+            refreshedAt: Date(),
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: []))
+        )
     }
 }
