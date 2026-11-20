@@ -340,7 +340,9 @@ struct WidgetRowView: View {
     /// and an optional secondary line ("on-device estimate") beneath it.
     private var unboundedRow: some View {
         unboundedRowContent
-            .onChange(of: data.modelBreakdown) { _, _ in modelHover.dismiss() }
+            .onChange(of: data.modelBreakdown) { _, _ in
+                if !modelHover.isPinned { modelHover.dismiss() }
+            }
             // A refresh can replace the reset credits (count and expiries) while the popover is open;
             // drop it so it never lingers over a stale timeline — except while the claim flow has the
             // popover pinned: the claim's own forced refresh is what changes the credits, and dismissing

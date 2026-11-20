@@ -106,6 +106,10 @@ final class HoverPopoverController: NSObject, NSPopoverDelegate {
     /// and its hosting controller stay unallocated until a popover actually opens.
     private var createdPopover: NSPopover?
     private var host: NSHostingController<AnyView>?
+    /// Bumped on each fresh presentation and applied as `.id` to the hosted view. The hosting
+    /// controller survives `performClose`, so without a new identity the popover's @State —
+    /// expanded rows, claim banners, pending request IDs — would reopen with its previous values.
+    private var presentationGeneration = 0
 
     /// The popover, materialized on first access. Internal (not private) so tests can reach the
     /// AppKit object; production paths must use `createdPopover`/`ensurePopover()` instead, so a
@@ -147,7 +151,8 @@ final class HoverPopoverController: NSObject, NSPopoverDelegate {
             return
         }
         let (popover, host) = ensurePopover()
-        host.rootView = AnyView(content.animationReduction(reduceAnimations))
+        if !popover.isShown { presentationGeneration += 1 }
+        host.rootView = AnyView(content.animationReduction(reduceAnimations).id(presentationGeneration))
         popover.animates = !reduceAnimations
         host.view.layoutSubtreeIfNeeded()
         let size = host.view.fittingSize
