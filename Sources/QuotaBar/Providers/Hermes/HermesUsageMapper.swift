@@ -10,7 +10,7 @@ enum HermesUsageMapper {
     static let sourceNote = "From your Hermes state database"
 
     /// Models above this count fold into "Other" (mirrors the spend tiles' `namedModelCap`).
-    private static let namedModelCap = 5
+    private static let namedModelCap = 3
 
     static func lines(scan: HermesUsageScan, now: Date) -> [MetricLine] {
         var lines: [MetricLine] = []

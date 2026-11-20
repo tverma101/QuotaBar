@@ -2,8 +2,11 @@ import AppKit
 import SwiftUI
 
 extension View {
-    /// SwiftUI does not expose the backing `NSPopover.animates` flag, so reduced motion crosses the
-    /// AppKit boundary only for presentation. The normal path stays on SwiftUI's standard popover.
+    /// SwiftUI's `.popover` exposes neither `NSPopover.animates` (reduced motion) nor
+    /// `NSPopover.behavior`, and the default `.transient` behavior closes the popover on any click
+    /// outside it — including taps elsewhere in the panel that were meant to keep it. Every hover
+    /// popover therefore presents through the AppKit controller below; SwiftUI remains the source
+    /// of truth through `isPresented`.
     func motionAwareHoverPopover<PopoverContent: View>(
         isPresented: Binding<Bool>,
         reduceAnimations: Bool,
@@ -22,31 +25,28 @@ private struct MotionAwareHoverPopoverModifier<PopoverContent: View>: ViewModifi
     let reduceAnimations: Bool
     @ViewBuilder let popoverContent: () -> PopoverContent
 
-    @ViewBuilder
     func body(content: Content) -> some View {
-        if reduceAnimations {
-            content.background {
-                ReducedMotionPopoverPresenter(
-                    isPresented: $isPresented,
-                    reduceAnimations: reduceAnimations,
-                    popoverContent: popoverContent
-                )
-            }
-        } else {
-            content.popover(isPresented: $isPresented, arrowEdge: .top, content: popoverContent)
+        content.background {
+            HoverPopoverPresenter(
+                isPresented: $isPresented,
+                reduceAnimations: reduceAnimations,
+                popoverContent: popoverContent
+            )
         }
     }
 }
 
-/// An invisible anchor that owns the one AppKit presentation detail SwiftUI does not expose:
-/// `NSPopover.animates`. SwiftUI remains the source of truth through `isPresented`.
-private struct ReducedMotionPopoverPresenter<PopoverContent: View>: NSViewRepresentable {
+/// An invisible anchor that owns the AppKit presentation details SwiftUI does not expose:
+/// `NSPopover.animates` and `.applicationDefined` behavior (the hover coordinator in
+/// `HoverPopoverState` is the sole owner of dismissal — hover-out grace, single-popover
+/// supersede, panel close).
+private struct HoverPopoverPresenter<PopoverContent: View>: NSViewRepresentable {
     @Binding var isPresented: Bool
     let reduceAnimations: Bool
     @ViewBuilder let popoverContent: () -> PopoverContent
 
-    func makeCoordinator() -> ReducedMotionPopoverController {
-        ReducedMotionPopoverController(isPresented: $isPresented)
+    func makeCoordinator() -> HoverPopoverController {
+        HoverPopoverController(isPresented: $isPresented)
     }
 
     func makeNSView(context: Context) -> PopoverAnchorView {
@@ -74,7 +74,7 @@ private struct ReducedMotionPopoverPresenter<PopoverContent: View>: NSViewRepres
         )
     }
 
-    static func dismantleNSView(_ nsView: PopoverAnchorView, coordinator: ReducedMotionPopoverController) {
+    static func dismantleNSView(_ nsView: PopoverAnchorView, coordinator: HoverPopoverController) {
         nsView.onWindowChange = nil
         coordinator.dismissWithoutUpdatingBinding()
     }
@@ -96,8 +96,8 @@ private struct ReducedMotionPopoverPresenter<PopoverContent: View>: NSViewRepres
 
 /// Owns the AppKit objects and delegate lifecycle outside the generic SwiftUI representable.
 @MainActor
-final class ReducedMotionPopoverController: NSObject, NSPopoverDelegate {
-    private static let live = NSHashTable<ReducedMotionPopoverController>.weakObjects()
+final class HoverPopoverController: NSObject, NSPopoverDelegate {
+    private static let live = NSHashTable<HoverPopoverController>.weakObjects()
 
     var isPresented: Binding<Bool>
     let popover: NSPopover
@@ -109,8 +109,11 @@ final class ReducedMotionPopoverController: NSObject, NSPopoverDelegate {
         self.isPresented = isPresented
         self.popover = NSPopover()
         super.init()
-        popover.animates = false
-        popover.behavior = .transient
+        // `.transient` would close on any click outside the popover — a tap on another panel row or
+        // a near-miss inside the popover then tears the surface down. Dismissal is owned by the
+        // hover coordinator (hover-out grace, one-popover-at-a-time, panel close), so AppKit only
+        // still closes it when the positioning view's window goes away.
+        popover.behavior = .applicationDefined
         popover.contentViewController = host
         popover.delegate = self
         Self.live.add(self)
@@ -118,6 +121,7 @@ final class ReducedMotionPopoverController: NSObject, NSPopoverDelegate {
 
     func update(content: AnyView, reduceAnimations: Bool, anchor: NSView) {
         host.rootView = AnyView(content.animationReduction(reduceAnimations))
+        popover.animates = !reduceAnimations
         guard isPresented.wrappedValue else {
             synchronize(with: anchor)
             return
