@@ -44,7 +44,8 @@ signing identity keeps the CLI login and its existing Keychain grant. Background
 
 QuotaBar reads Keychain without prompting during scheduled refreshes. A manual refresh can prompt for
 an interaction-required item when no environment fallback is available. Credentials are sent only to
-Freebuff's canonical API host for its session, model catalogue, and read-only hosted history.
+Freebuff's canonical API host for its session quota call — and, only when the hosted-detail opt-in
+in [Metrics](#metrics) is enabled, its model catalogue and read-only hosted history.
 
 ## Metrics
 
@@ -60,6 +61,13 @@ keep their session windows. Monthly Spend appears only when the server supplies 
 Hours and tokens are separate measurements; neither is converted into the other.
 
 **Usage Trend** shows a daily sparkline of measured token volume across the last 30 days. It is enabled, Always Visible, and unpinned by default.
+
+**Hosted history and the model catalogue are an opt-in.** The hosted-receipt and catalogue
+calls enumerate the account's runs and model data in bulk; QuotaBar ships with them off and
+reads only the session quota endpoint plus local Desktop history, so token totals come from
+local data alone. Owners can re-enable the full hosted history on their own machine with
+`defaults write com.tverma101.quotabar quotabar.freebuffHostedDetail -bool true`. The rest of
+this section describes behavior with that flag on.
 
 **Today**, **Yesterday**, and **Last 30 Days** combine measured hosted-run tokens with older Freebuff
 Desktop history on this Mac. Current **On This Device** sessions also keep their receipts in hosted
