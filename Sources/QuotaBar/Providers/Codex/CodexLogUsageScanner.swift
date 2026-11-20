@@ -680,7 +680,7 @@ actor CodexLogUsageScanner {
                     emitSince: context.cacheSince,
                     retentionDays: context.retentionDays
                 )
-                if let events = outcome.events {
+                if outcome.events != nil {
                     damage.note(url.path, outcome.damagedLines)
                 }
                 return outcome.events
