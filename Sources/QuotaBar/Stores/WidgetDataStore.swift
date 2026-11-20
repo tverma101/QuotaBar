@@ -139,6 +139,9 @@ final class WidgetDataStore {
         let scope: ProviderRefreshContext.Scope
         let manualActionID: UInt64?
         let maxConcurrentProviders: Int?
+        /// A deferred-request resume covers only its own providers; it must not join a wider pass
+        /// (a joiner would fold providers nobody asked for) nor let a wider caller join it.
+        let onlyProviderIDs: Set<String>?
     }
 
     /// Quota requests and local history folds are independent work. A failure in one must not
@@ -464,7 +467,8 @@ final class WidgetDataStore {
         force: Bool = false,
         bypassSnapshotCache: Bool = false,
         bypassFailureBackoff: Bool = false,
-        maxConcurrentProviders: Int? = nil
+        maxConcurrentProviders: Int? = nil,
+        onlyProviderIDs: Set<String>? = nil
     ) async {
         let scope = ProviderRefreshContext.scope
         let batchKey = RefreshBatchKey(
@@ -473,7 +477,8 @@ final class WidgetDataStore {
             bypassFailureBackoff: bypassFailureBackoff,
             scope: scope,
             manualActionID: ProviderRefreshContext.manualActionID,
-            maxConcurrentProviders: maxConcurrentProviders.map { max(1, $0) }
+            maxConcurrentProviders: maxConcurrentProviders.map { max(1, $0) },
+            onlyProviderIDs: onlyProviderIDs
         )
         if let active = activeBatches[batchKey] {
             AppLog.debug(.refresh, "batch join (force=\(force), bypassCache=\(bypassSnapshotCache) already in flight)")
@@ -490,7 +495,8 @@ final class WidgetDataStore {
                 force: force,
                 bypassSnapshotCache: bypassSnapshotCache,
                 bypassFailureBackoff: bypassFailureBackoff,
-                maxConcurrentProviders: maxConcurrentProviders
+                maxConcurrentProviders: maxConcurrentProviders,
+                onlyProviderIDs: onlyProviderIDs
             )
         }
         activeBatches[batchKey] = task
@@ -529,7 +535,8 @@ final class WidgetDataStore {
         force: Bool,
         bypassSnapshotCache: Bool,
         bypassFailureBackoff: Bool,
-        maxConcurrentProviders: Int?
+        maxConcurrentProviders: Int?,
+        onlyProviderIDs: Set<String>? = nil
     ) async {
         // `Task {}` from MainActor context inherits the isolation (a task-group child can't capture
         // the non-Sendable store), so fire one task per provider in bounded groups, then await them all.
@@ -552,6 +559,9 @@ final class WidgetDataStore {
                 registry.historyDescriptorsByProvider[$0] != nil
                     && providersByID[$0]?.panelMetersRefreshIncludesHistory != true
             }
+        }
+        if let onlyProviderIDs {
+            providerIDs = providerIDs.filter { onlyProviderIDs.contains($0) }
         }
         if providerIDs.isEmpty {
             AppLog.info(.refresh, "batch skip (0 providers for scope=\(Self.batchScopeLabel(ProviderRefreshContext.scope)), force=\(force))")

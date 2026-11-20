@@ -557,9 +557,12 @@ final class AppContainer {
             var lastHistoryRefreshUptime: TimeInterval?
             /// Latched by an external trigger; all enabled meters refresh first, followed by a fold.
             var pendingFullScopePass = false
-            /// A due `.menuBar` request skipped behind a conflicting provider task. Retry just the
-            /// pinned meter scope as soon as that task completes; this does not widen into history work.
-            var pendingMenuBarMeterRetry = false
+            /// Deferred-request resumes grouped by scope. A skipped provider refresh used to latch
+            /// its scope's whole scheduled pass — so one deferred Freebuff fold re-folded all nine
+            /// providers, re-deferred the members still busy, and chained the next full pass. Each
+            /// resume instead folds only the deferred provider set, keeping its own bypass flags.
+            var pendingNarrowResumes: [ProviderRefreshContext.Scope:
+                (providerIDs: Set<String>, bypassSnapshotCache: Bool, bypassFailureBackoff: Bool)] = [:]
             /// Latched by a closed-panel ledger wake and consumed by the next pass, which then runs
             /// `.localAccounting` scope: the codex/opencode local folds recompute without re-reading
             /// live quota APIs, so Today tracks routed turns even while the panel is closed.
@@ -640,7 +643,7 @@ final class AppContainer {
                     fullScopePassPending: pendingFullScopePass,
                     historyAccountingPassPending: pendingHistoryAccountingPass,
                     localAccountingPassPending: pendingLocalAccountingPass,
-                    menuBarMeterRetryPending: pendingMenuBarMeterRetry
+                    narrowResumesPending: !pendingNarrowResumes.isEmpty
                 )
                 if dropNextRefreshPass && !hasPriorityPass {
                     // A trigger arrived inside the gate's cooldown. The trigger's own debounce
@@ -653,7 +656,7 @@ final class AppContainer {
                     AppLog.info(.refresh, "background refresh pass skipped (inside trigger cooldown)")
                 } else if !quotaRefreshDue && !pendingPanelPass && !pendingFullScopePass
                     && !pendingHistoryAccountingPass && !pendingLocalAccountingPass
-                    && !pendingMenuBarMeterRetry {
+                    && pendingNarrowResumes.isEmpty {
                     // A timeout/notification race can leave a stale wake token in the shared stream
                     // after its cause has already been drained. With no deadline or latched work,
                     // consume the token without starting an early/default menu-bar pass.
@@ -693,16 +696,44 @@ final class AppContainer {
                     // corpus cannot hold later subscription meter deadlines.
                     let runAllMeters = pendingFullScopePass || pendingPanelPass
                         || (panelOpen && quotaRefreshDue)
-                    if runAllMeters || quotaRefreshDue || pendingMenuBarMeterRetry {
+                    let hasNarrowMeterResume = pendingNarrowResumes[.menuBar] != nil
+                        || pendingNarrowResumes[.panelMeters] != nil
+                    if runAllMeters || quotaRefreshDue || hasNarrowMeterResume {
                         passRan = true
                         let requestsHistoryFold = pendingFullScopePass || pendingPanelPass || newlyDueHistoryPass
-                        let meterScope: ProviderRefreshContext.Scope = runAllMeters ? .panelMeters : .menuBar
-                        await ProviderRefreshContext.$scope.withValue(meterScope) {
-                            await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(true) {
-                                await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
-                                    await dataStore.refreshAll(
-                                        maxConcurrentProviders: overSoftMemoryLimit ? 1 : nil
-                                    )
+                        if runAllMeters || quotaRefreshDue {
+                            let meterScope: ProviderRefreshContext.Scope = runAllMeters ? .panelMeters : .menuBar
+                            await ProviderRefreshContext.$scope.withValue(meterScope) {
+                                await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(true) {
+                                    await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                                        await dataStore.refreshAll(
+                                            maxConcurrentProviders: overSoftMemoryLimit ? 1 : nil
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        // A scheduled pass already refreshed every provider its scope selects, so it
+                        // covers that scope's deferred resumes (a .panelMeters pass selects all
+                        // enabled providers, covering .menuBar resumes too). Drain the rest narrowly.
+                        if runAllMeters {
+                            pendingNarrowResumes.removeValue(forKey: .panelMeters)
+                            pendingNarrowResumes.removeValue(forKey: .menuBar)
+                        } else if quotaRefreshDue {
+                            pendingNarrowResumes.removeValue(forKey: .menuBar)
+                        }
+                        for resumeScope in [ProviderRefreshContext.Scope.menuBar, .panelMeters] {
+                            guard let resume = pendingNarrowResumes.removeValue(forKey: resumeScope)
+                            else { continue }
+                            await ProviderRefreshContext.$scope.withValue(resumeScope) {
+                                await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(true) {
+                                    await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
+                                        await dataStore.refreshAll(
+                                            bypassSnapshotCache: resume.bypassSnapshotCache,
+                                            bypassFailureBackoff: resume.bypassFailureBackoff,
+                                            onlyProviderIDs: resume.providerIDs
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -726,50 +757,88 @@ final class AppContainer {
                                 pendingLocalAccountingPass = false
                             }
                         }
-                        pendingMenuBarMeterRetry = false
                     }
 
+                    let hasNarrowAccountingResume = pendingNarrowResumes[.localAccounting] != nil
+                        || pendingNarrowResumes[.panelAccounting] != nil
                     if accountingTask == nil,
-                       pendingHistoryAccountingPass || pendingLocalAccountingPass {
-                        let accountingScope: ProviderRefreshContext.Scope = pendingHistoryAccountingPass
+                       pendingHistoryAccountingPass || pendingLocalAccountingPass || hasNarrowAccountingResume {
+                        let scheduledScope: ProviderRefreshContext.Scope? = pendingHistoryAccountingPass
                             ? .panelAccounting
-                            : .localAccounting
-                        let bypassSnapshotCache = accountingScope == .panelAccounting
+                            : (pendingLocalAccountingPass ? .localAccounting : nil)
+                        let bypassSnapshotCache = scheduledScope == .panelAccounting
                             && pendingForcedHistoryAccountingPass
-                        let bypassFailureBackoff = accountingScope == .panelAccounting
+                        let bypassFailureBackoff = scheduledScope == .panelAccounting
                             && pendingHistoryFailureBackoffBypass
                         pendingHistoryAccountingPass = false
                         pendingLocalAccountingPass = false
                         pendingForcedHistoryAccountingPass = false
                         pendingHistoryFailureBackoffBypass = false
-                        if accountingScope == .panelAccounting {
+                        if scheduledScope == .panelAccounting {
                             lastHistoryRefreshUptime = ProcessInfo.processInfo.systemUptime
                         }
+                        // A scheduled pass folds every provider its scope selects, so it already covers
+                        // those scopes' deferred resumes (panelAccounting covers the localAccounting
+                        // subset too). Collect whatever remains to run as narrow provider subsets.
+                        if scheduledScope == .panelAccounting {
+                            pendingNarrowResumes.removeValue(forKey: .localAccounting)
+                            pendingNarrowResumes.removeValue(forKey: .panelAccounting)
+                        } else if scheduledScope == .localAccounting {
+                            pendingNarrowResumes.removeValue(forKey: .localAccounting)
+                        }
+                        let narrowResumes: [(scope: ProviderRefreshContext.Scope, providerIDs: Set<String>, bypassSnapshotCache: Bool, bypassFailureBackoff: Bool)] =
+                            [ProviderRefreshContext.Scope.localAccounting, .panelAccounting].compactMap { scope in
+                                pendingNarrowResumes.removeValue(forKey: scope).map {
+                                    (scope, $0.providerIDs, $0.bypassSnapshotCache, $0.bypassFailureBackoff)
+                                }
+                            }
                         // Closed-panel accounting is background bookkeeping: pace the scan-worker
                         // children (--paced caps each at a fraction of a core) and cap concurrency so
                         // the periodic history sweep cannot stack one 100%-core child per provider.
                         // Panel-open passes stay unpaced for responsiveness.
                         let panelClosed = !panelOpen
-                        let throttleAccounting = accountingScope == .localAccounting || panelClosed
-                        let maxConcurrentProviders = accountingScope == .panelAccounting
-                            ? (serializeAccountingProviders
-                                ? 1
-                                : (panelClosed ? 2 : nil))
-                            : (overSoftMemoryLimit ? 1 : nil)
                         passRan = true
                         accountingTask = Task { @MainActor in
-                            await ProviderRefreshContext.$scope.withValue(accountingScope) {
-                                await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(
-                                    accountingScope == .localAccounting
-                                ) {
-                                    await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(
-                                        throttleAccounting
+                            if let scheduledScope {
+                                await ProviderRefreshContext.$scope.withValue(scheduledScope) {
+                                    await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(
+                                        scheduledScope == .localAccounting
                                     ) {
-                                        await dataStore.refreshAll(
-                                            bypassSnapshotCache: bypassSnapshotCache,
-                                            bypassFailureBackoff: bypassFailureBackoff,
-                                            maxConcurrentProviders: maxConcurrentProviders
-                                        )
+                                        await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(
+                                            scheduledScope == .localAccounting || panelClosed
+                                        ) {
+                                            await dataStore.refreshAll(
+                                                bypassSnapshotCache: bypassSnapshotCache,
+                                                bypassFailureBackoff: bypassFailureBackoff,
+                                                maxConcurrentProviders: scheduledScope == .panelAccounting
+                                                    ? (serializeAccountingProviders
+                                                        ? 1
+                                                        : (panelClosed ? 2 : nil))
+                                                    : (overSoftMemoryLimit ? 1 : nil)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            for resume in narrowResumes {
+                                await ProviderRefreshContext.$scope.withValue(resume.scope) {
+                                    await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(
+                                        resume.scope == .localAccounting
+                                    ) {
+                                        await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(
+                                            resume.scope == .localAccounting || panelClosed
+                                        ) {
+                                            await dataStore.refreshAll(
+                                                bypassSnapshotCache: resume.bypassSnapshotCache,
+                                                bypassFailureBackoff: resume.bypassFailureBackoff,
+                                                maxConcurrentProviders: resume.scope == .panelAccounting
+                                                    ? (serializeAccountingProviders
+                                                        ? 1
+                                                        : (panelClosed ? 2 : nil))
+                                                    : (overSoftMemoryLimit ? 1 : nil),
+                                                onlyProviderIDs: resume.providerIDs
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -841,8 +910,12 @@ final class AppContainer {
                 let historyElapsed = lastHistoryRefreshUptime.map { waitNow - $0 } ?? 0
                 let historyWaitRemaining = max(0, historyRefreshInterval - historyElapsed)
                 let hasRunnableAccounting = accountingTask == nil
-                    && (pendingHistoryAccountingPass || pendingLocalAccountingPass)
-                let hasRunnableMeters = pendingFullScopePass || pendingPanelPass || pendingMenuBarMeterRetry
+                    && (pendingHistoryAccountingPass || pendingLocalAccountingPass
+                        || pendingNarrowResumes[.localAccounting] != nil
+                        || pendingNarrowResumes[.panelAccounting] != nil)
+                let hasRunnableMeters = pendingFullScopePass || pendingPanelPass
+                    || pendingNarrowResumes[.menuBar] != nil
+                    || pendingNarrowResumes[.panelMeters] != nil
                 // A fold outliving its history interval used to make `deadlineWait` zero and the loop
                 // spin on an immediate timeout until the fold ended, burning a core. Nothing is
                 // runnable while the fold runs, and the fold's completion yields a wake of its own
@@ -900,32 +973,26 @@ final class AppContainer {
                 }
                 for request in wakeSignal.takePendingDeferredRefreshes() {
                     switch request.scope {
-                    case .menuBar:
-                        pendingMenuBarMeterRetry = true
-                    case .panelMeters:
-                        pendingPanelPass = true
-                    case .localAccounting:
-                        pendingLocalAccountingPass = true
-                    case .panelAccounting:
-                        if request.manualActionID != nil {
-                            // A visible retry may have deferred its provider-local fold behind
-                            // conflicting work. Resume that exact request with its original Keychain
-                            // action context; a global scheduled pass would be silent and lose the
-                            // one-dialog budget that phase one established.
-                            Task { @MainActor in
-                                _ = await dataStore.resumeDeferredManualHistoryRetry(request)
-                            }
-                        } else {
-                            pendingHistoryAccountingPass = true
-                            if request.bypassSnapshotCache {
-                                pendingForcedHistoryAccountingPass = true
-                            }
-                            if request.bypassFailureBackoff {
-                                pendingHistoryFailureBackoffBypass = true
-                            }
+                    case .panelAccounting where request.manualActionID != nil:
+                        // A visible retry may have deferred its provider-local fold behind
+                        // conflicting work. Resume that exact request with its original Keychain
+                        // action context; a global scheduled pass would be silent and lose the
+                        // one-dialog budget that phase one established.
+                        Task { @MainActor in
+                            _ = await dataStore.resumeDeferredManualHistoryRetry(request)
                         }
                     case .full:
                         pendingFullScopePass = true
+                    case .menuBar, .panelMeters, .localAccounting, .panelAccounting:
+                        // Resume only the deferred provider in its original scope. Latching the
+                        // scope's scheduled pass here re-folded every enabled provider for one
+                        // deferred member — the dominant source of redundant accounting batches.
+                        var group = pendingNarrowResumes[request.scope]
+                            ?? (providerIDs: [], bypassSnapshotCache: false, bypassFailureBackoff: false)
+                        group.providerIDs.insert(request.providerID)
+                        group.bypassSnapshotCache = group.bypassSnapshotCache || request.bypassSnapshotCache
+                        group.bypassFailureBackoff = group.bypassFailureBackoff || request.bypassFailureBackoff
+                        pendingNarrowResumes[request.scope] = group
                     }
                     AppLog.info(
                         .refresh,
@@ -957,9 +1024,9 @@ final class AppContainer {
         fullScopePassPending: Bool,
         historyAccountingPassPending: Bool,
         localAccountingPassPending: Bool,
-        menuBarMeterRetryPending: Bool = false
+        narrowResumesPending: Bool = false
     ) -> Bool {
         quotaRefreshDue || panelPassPending || fullScopePassPending
-            || historyAccountingPassPending || localAccountingPassPending || menuBarMeterRetryPending
+            || historyAccountingPassPending || localAccountingPassPending || narrowResumesPending
     }
 }

@@ -281,6 +281,64 @@ final class RefreshBatchCoalescingTests: XCTestCase {
         )
     }
 
+    /// A deferred-request resume folds only its own provider. The scheduler calls
+    /// `refreshAll(onlyProviderIDs:)` for these resumes; without the subset, a single deferred
+    /// Freebuff fold re-ran the whole nine-provider batch and re-armed the deferral loop.
+    func testOnlyProviderIDsRestrictsTheBatchToThatSubset() async throws {
+        let runtimes = ["a", "b", "c"].map { id in
+            ControlledRuntime(provider: Provider(id: id, displayName: id.uppercased(), icon: .providerMark("codex")))
+        }
+        let store = makeStore(runtimes: runtimes)
+
+        let batch = Task { await store.refreshAll(force: true, onlyProviderIDs: ["b"]) }
+        await runtimes[1].waitForEntries(1)
+        runtimes[1].resolve(1, with: snapshot(runtimes[1].provider, plan: "B"))
+        await batch.value
+
+        XCTAssertEqual(runtimes[0].calls.count, 0, "provider outside the subset must not refresh")
+        XCTAssertEqual(runtimes[1].calls.count, 1)
+        XCTAssertEqual(runtimes[2].calls.count, 0, "provider outside the subset must not refresh")
+    }
+
+    /// A wider caller arriving while a narrow batch is in flight must start its own pass, not join
+    /// the narrow one — otherwise a deferred single-provider resume would swallow a scheduled pass.
+    /// The reverse holds too: a narrow resume never joins a wide batch's registration. Forced callers
+    /// wait on an in-flight provider and then re-enter it, so a second `refresh()` entry is the proof
+    /// that the caller ran its own pass instead of joining.
+    func testNarrowAndWideBatchesDoNotCoalesce() async throws {
+        let runtimes = ["a", "b"].map { id in
+            ControlledRuntime(provider: Provider(id: id, displayName: id.uppercased(), icon: .providerMark("codex")))
+        }
+        let store = makeStore(runtimes: runtimes)
+
+        // Wide batch in flight; the narrow resume must not join it.
+        let wide = Task { await store.refreshAll(force: true) }
+        await runtimes[0].waitForEntries(1)
+        await runtimes[1].waitForEntries(1)
+        let narrowOverWide = Task { await store.refreshAll(force: true, onlyProviderIDs: ["a"]) }
+        runtimes[0].resolve(1, with: snapshot(runtimes[0].provider, plan: "A"))
+        runtimes[1].resolve(1, with: snapshot(runtimes[1].provider, plan: "B"))
+        await wide.value
+        // The narrow batch owns a distinct registration, so it waited on "a" and now re-enters it.
+        // resolve stashes the result ahead of the entry so nothing here can hang.
+        runtimes[0].resolve(2, with: snapshot(runtimes[0].provider, plan: "A2"))
+        await narrowOverWide.value
+        XCTAssertEqual(runtimes[0].calls.count, 2, "the narrow batch must re-enter its provider, not join the wide pass")
+        XCTAssertEqual(runtimes[1].calls.count, 1, "the narrow batch never touches providers outside its subset")
+
+        // Narrow batch in flight; the wide caller must not join it — "b" would otherwise never refresh.
+        let narrow = Task { await store.refreshAll(force: true, onlyProviderIDs: ["a"]) }
+        await runtimes[0].waitForEntries(3)
+        let wideOverNarrow = Task { await store.refreshAll(force: true) }
+        runtimes[0].resolve(3, with: snapshot(runtimes[0].provider, plan: "A3"))
+        await narrow.value
+        runtimes[0].resolve(4, with: snapshot(runtimes[0].provider, plan: "A4"))
+        runtimes[1].resolve(2, with: snapshot(runtimes[1].provider, plan: "B2"))
+        await wideOverNarrow.value
+        XCTAssertEqual(runtimes[0].calls.count, 4)
+        XCTAssertEqual(runtimes[1].calls.count, 2, "the wide batch must run its own pass over the narrow one")
+    }
+
     // MARK: - Helpers
 
     private func makeStore(runtime: some ProviderRuntime) -> WidgetDataStore {
