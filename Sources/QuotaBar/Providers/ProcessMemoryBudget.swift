@@ -112,13 +112,16 @@ enum ProcessMemoryBudget {
     /// Soft-limit trigger for *expensive* cache unloads (provider databases whose cold rebuilds cost
     /// tens of seconds). Hysteresis: after `noteSoftLimitUnload` the ceiling sits a margin above the
     /// footprint seen at unload, so hovering near the soft limit stops the unload→cold-rebuild→
-    /// unload thrash loop. Cheap warm-cache decisions keep using `isOverSoftLimit`.
+    /// unload thrash loop. Falling back under the plain soft limit re-arms the trigger so a later
+    /// pressure episode still unloads. Cheap warm-cache decisions keep using `isOverSoftLimit`.
     static var isOverSoftUnloadCeiling: Bool {
         guard let bytes = physicalFootprintBytes() else { return false }
         softUnloadCeilingLock.lock()
-        let ceiling = softUnloadCeilingBytes
-        softUnloadCeilingLock.unlock()
-        return bytes >= ceiling
+        defer { softUnloadCeilingLock.unlock() }
+        if bytes < softLimitBytes, softUnloadCeilingBytes != softLimitBytes {
+            softUnloadCeilingBytes = softLimitBytes
+        }
+        return bytes >= softUnloadCeilingBytes
     }
 
     /// Raise the soft-unload ceiling to a margin above the current footprint, clamped so it can
