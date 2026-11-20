@@ -450,7 +450,7 @@ final class SpendTileMapperTests: XCTestCase {
             [DailyUsageEntry(date: "2026-06-26", totalTokens: 1_000, costUSD: 6)],
             models: [DailyModelUsageEntry(date: "2026-06-26", models: [
                 ModelUsageEntry(model: "grok-build", totalTokens: 600, costUSD: 6),
-                // 40% of tokens — well above the 5% floor, still folds.
+                // Unattributed always folds, whatever its token share.
                 ModelUsageEntry(model: ModelUsageEntry.unattributedModelName, totalTokens: 400, costUSD: nil)
             ])]
         )
