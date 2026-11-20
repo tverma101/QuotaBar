@@ -136,7 +136,10 @@ final class FreebuffProvider: ProviderRuntime {
             var incompleteHistory = auth == nil
             if auth == nil { result.historyWarning = authError?.localizedDescription }
             if let auth {
-                if scope == .localAccounting {
+                // The hosted history and catalogue endpoints enumerate receipts and model
+                // data in bulk. They stay opt-in (`quotabar.freebuffHostedDetail` default)
+                // so public builds read only the session quota call plus local data.
+                if scope == .localAccounting || !FreebuffHostedDetailGate.isEnabled {
                     hostedReceipts = try await hostedScanner.cachedReceipts(auth: auth)
                 } else {
                     do {
@@ -156,7 +159,7 @@ final class FreebuffProvider: ProviderRuntime {
                 if scope != .localAccounting, !hasHistory {
                     hasHistory = try await historyScanner.hasHistory(now: scanNow)
                 }
-                if scope != .localAccounting, hasHistory {
+                if scope != .localAccounting, hasHistory, FreebuffHostedDetailGate.isEnabled {
                     do {
                         try await modelCatalog.refresh(auth: auth, client: usageClient, now: scanNow)
                         DiagnosticGate.clearFailure("auth.freebuff.catalog.failure")
@@ -254,6 +257,17 @@ final class FreebuffProvider: ProviderRuntime {
     }
 
     private static let historySourceNote = "Measured Freebuff hosted runs and legacy Desktop tokens on this Mac."
+
+    /// Opt-in gate for Freebuff's hosted history/catalogue endpoints. The session quota
+    /// call reads the signed-in account's own quota like every provider here; the hosted
+    /// history and model-catalogue endpoints enumerate receipts and catalogue data in
+    /// bulk, so they stay off unless the owner enables them locally:
+    /// `defaults write com.tverma101.quotabar quotabar.freebuffHostedDetail -bool true`
+    enum FreebuffHostedDetailGate {
+        static var isEnabled: Bool {
+            UserDefaults.standard.bool(forKey: "quotabar.freebuffHostedDetail")
+        }
+    }
 
     private static func usageFailureDiagnosticKey(_ error: Error) -> String {
         usageFailureDiagnosticPrefix + String(reflecting: type(of: error))
