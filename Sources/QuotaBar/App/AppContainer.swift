@@ -575,9 +575,7 @@ final class AppContainer {
             /// A scheduled history deadline must perform a new fold even when its cached snapshot has
             /// no carry marker. This is separate from `force`, which changes merge and backoff rules.
             var pendingForcedHistoryAccountingPass = false
-            /// A visible retry can queue its history fold behind a meters pass; retain the retry's
-            /// explicit backoff bypass when that deferred request is routed through this loop.
-            var pendingHistoryFailureBackoffBypass = false
+
             var accountingTask: Task<Void, Never>?
             /// Rate limit for trigger-caused passes, and whether a pass must be dropped because the
             /// previous one has not cleared the cooldown yet.
@@ -704,24 +702,26 @@ final class AppContainer {
                         let requestsHistoryFold = pendingFullScopePass || pendingPanelPass || newlyDueHistoryPass
                         if runAllMeters || quotaRefreshDue {
                             let meterScope: ProviderRefreshContext.Scope = runAllMeters ? .panelMeters : .menuBar
+                            // A scheduled pass already refreshes every provider its scope selects, so it
+                            // covers that scope's deferred resumes (a .panelMeters pass selects all
+                            // enabled providers, covering .menuBar resumes too). Their bypass requests
+                            // fold into the covering pass rather than being dropped.
+                            let coveredScopes: [ProviderRefreshContext.Scope] = runAllMeters
+                                ? [.panelMeters, .menuBar] : [.menuBar]
+                            let covered = coveredScopes.compactMap { pendingNarrowResumes.removeValue(forKey: $0) }
+                            let coveredBypassSnapshotCache = covered.contains { $0.bypassSnapshotCache }
+                            let coveredBypassFailureBackoff = covered.contains { $0.bypassFailureBackoff }
                             await ProviderRefreshContext.$scope.withValue(meterScope) {
                                 await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(true) {
                                     await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(true) {
                                         await dataStore.refreshAll(
+                                            bypassSnapshotCache: coveredBypassSnapshotCache,
+                                            bypassFailureBackoff: coveredBypassFailureBackoff,
                                             maxConcurrentProviders: overSoftMemoryLimit ? 1 : nil
                                         )
                                     }
                                 }
                             }
-                        }
-                        // A scheduled pass already refreshed every provider its scope selects, so it
-                        // covers that scope's deferred resumes (a .panelMeters pass selects all
-                        // enabled providers, covering .menuBar resumes too). Drain the rest narrowly.
-                        if runAllMeters {
-                            pendingNarrowResumes.removeValue(forKey: .panelMeters)
-                            pendingNarrowResumes.removeValue(forKey: .menuBar)
-                        } else if quotaRefreshDue {
-                            pendingNarrowResumes.removeValue(forKey: .menuBar)
                         }
                         for resumeScope in [ProviderRefreshContext.Scope.menuBar, .panelMeters] {
                             guard let resume = pendingNarrowResumes.removeValue(forKey: resumeScope)
@@ -768,25 +768,27 @@ final class AppContainer {
                         let scheduledScope: ProviderRefreshContext.Scope? = pendingHistoryAccountingPass
                             ? .panelAccounting
                             : (pendingLocalAccountingPass ? .localAccounting : nil)
-                        let bypassSnapshotCache = scheduledScope == .panelAccounting
+                        var bypassSnapshotCache = scheduledScope == .panelAccounting
                             && pendingForcedHistoryAccountingPass
-                        let bypassFailureBackoff = scheduledScope == .panelAccounting
-                            && pendingHistoryFailureBackoffBypass
+                        var bypassFailureBackoff = false
                         pendingHistoryAccountingPass = false
                         pendingLocalAccountingPass = false
                         pendingForcedHistoryAccountingPass = false
-                        pendingHistoryFailureBackoffBypass = false
                         if scheduledScope == .panelAccounting {
                             lastHistoryRefreshUptime = ProcessInfo.processInfo.systemUptime
                         }
                         // A scheduled pass folds every provider its scope selects, so it already covers
                         // those scopes' deferred resumes (panelAccounting covers the localAccounting
-                        // subset too). Collect whatever remains to run as narrow provider subsets.
-                        if scheduledScope == .panelAccounting {
-                            pendingNarrowResumes.removeValue(forKey: .localAccounting)
-                            pendingNarrowResumes.removeValue(forKey: .panelAccounting)
-                        } else if scheduledScope == .localAccounting {
-                            pendingNarrowResumes.removeValue(forKey: .localAccounting)
+                        // subset too). Their bypass requests fold into the covering pass rather than
+                        // being dropped; whatever remains drains as narrow provider subsets.
+                        let coveredScopes: [ProviderRefreshContext.Scope] = scheduledScope == .panelAccounting
+                            ? [.localAccounting, .panelAccounting]
+                            : (scheduledScope == .localAccounting ? [.localAccounting] : [])
+                        for coveredScope in coveredScopes {
+                            guard let covered = pendingNarrowResumes.removeValue(forKey: coveredScope)
+                            else { continue }
+                            bypassSnapshotCache = bypassSnapshotCache || covered.bypassSnapshotCache
+                            bypassFailureBackoff = bypassFailureBackoff || covered.bypassFailureBackoff
                         }
                         let narrowResumes: [(scope: ProviderRefreshContext.Scope, providerIDs: Set<String>, bypassSnapshotCache: Bool, bypassFailureBackoff: Bool)] =
                             [ProviderRefreshContext.Scope.localAccounting, .panelAccounting].compactMap { scope in
