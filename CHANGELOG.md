@@ -18,6 +18,7 @@ QuotaBar's first public downloadable build. It does not update automatically; us
 
 ## Unreleased
 
+- Resume deferred provider refreshes in narrow per-provider batches instead of re-running the full accounting pass — a single skipped provider no longer re-folds every provider's history.
 - Preserve last-known Antigravity history across restarts when a conversation database disappears, while readable sources keep updating.
 - Page the full OpenRouter model catalog, recheck fallback-priced names so new exact routes replace stale estimates, and stop per-model checks after three misses.
 - Keep optional provider cards off until selected in Customize, preserve Freebuff in the default set, and reset to those explicit defaults.
