@@ -45,10 +45,6 @@ struct WidgetData: Hashable {
     /// Period-scoped model spend/tokens for the Today / Yesterday / Last 30 Days hover popover. Nil for
     /// non-spend rows and for periods where the provider has no model-level data.
     var modelBreakdown: ModelUsageBreakdown?
-    /// True only for the Last 30 Days spend tiles, where unfolding every model up front is a wall
-    /// of rows: the value popover shows the period's aggregate figures with a tap-to-reveal instead
-    /// of the full list. Today / Yesterday render their short lists immediately.
-    var revealsBreakdownOnTap: Bool = false
     var periodDurationMs: Int?
     var valueTextOverride: String?
     /// Optional secondary figure shown after the headline on a bounded row (e.g. a percent meter's

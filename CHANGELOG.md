@@ -18,6 +18,8 @@ QuotaBar's first public downloadable build. It does not update automatically; us
 
 ## Unreleased
 
+- Open the spend model breakdown directly on hover or tap for every period — the Last 30 Days tile no longer hides its list behind a Show Model Breakdown button.
+- Keep the breakdown to the period's top three models with the rest folded under an expandable Other row, and keep the popover open through taps inside the panel until the pointer leaves it.
 - Resume deferred provider refreshes in narrow per-provider batches instead of re-running the full accounting pass — a single skipped provider no longer re-folds every provider's history.
 - Preserve last-known Antigravity history across restarts when a conversation database disappears, while readable sources keep updating.
 - Page the full OpenRouter model catalog, recheck fallback-priced names so new exact routes replace stale estimates, and stop per-model checks after three misses.

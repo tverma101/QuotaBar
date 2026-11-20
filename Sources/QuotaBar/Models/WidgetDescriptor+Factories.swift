@@ -112,9 +112,6 @@ extension WidgetDescriptor {
         return descriptors.map { descriptor in
             var sample = descriptor.sample
             sample.valueTooltipNote = valueTooltipNote
-            if descriptor.id.hasSuffix(".last30") {
-                sample.revealsBreakdownOnTap = true
-            }
             var copy = descriptor
             copy.sample = sample
             copy.isSpendTile = true
