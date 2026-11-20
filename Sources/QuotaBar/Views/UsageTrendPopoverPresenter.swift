@@ -100,32 +100,55 @@ final class HoverPopoverController: NSObject, NSPopoverDelegate {
     private static let live = NSHashTable<HoverPopoverController>.weakObjects()
 
     var isPresented: Binding<Bool>
-    let popover: NSPopover
 
-    private let host = NSHostingController(rootView: AnyView(EmptyView()))
+    /// `nil` until the first presentation: every `motionAwareHoverPopover` site builds one of these
+    /// coordinators at mount (one per hoverable row), but most are never hovered, so the NSPopover
+    /// and its hosting controller stay unallocated until a popover actually opens.
+    private var createdPopover: NSPopover?
+    private var host: NSHostingController<AnyView>?
+
+    /// The popover, materialized on first access. Internal (not private) so tests can reach the
+    /// AppKit object; production paths must use `createdPopover`/`ensurePopover()` instead, so a
+    /// never-presented site never allocates one.
+    var popover: NSPopover {
+        ensurePopover().popover
+    }
+
     private var ignoreNextClose = false
 
     init(isPresented: Binding<Bool>) {
         self.isPresented = isPresented
-        self.popover = NSPopover()
         super.init()
-        // `.transient` would close on any click outside the popover — a tap on another panel row or
-        // a near-miss inside the popover then tears the surface down. Dismissal is owned by the
-        // hover coordinator (hover-out grace, one-popover-at-a-time, panel close), so AppKit only
-        // still closes it when the positioning view's window goes away.
-        popover.behavior = .applicationDefined
-        popover.contentViewController = host
-        popover.delegate = self
         Self.live.add(self)
     }
 
+    /// The popover + content host pair, allocated on first use. `.transient` would close on any
+    /// click outside the popover — a tap on another panel row or a near-miss inside the popover then
+    /// tears the surface down. Dismissal is owned by the hover coordinator (hover-out grace,
+    /// one-popover-at-a-time, panel close), so AppKit only still closes it when the positioning
+    /// view's window goes away.
+    private func ensurePopover() -> (popover: NSPopover, host: NSHostingController<AnyView>) {
+        if let createdPopover, let host { return (createdPopover, host) }
+        let host = NSHostingController(rootView: AnyView(EmptyView()))
+        let popover = NSPopover()
+        popover.behavior = .applicationDefined
+        popover.contentViewController = host
+        popover.delegate = self
+        self.host = host
+        self.createdPopover = popover
+        return (popover, host)
+    }
+
     func update(content: AnyView, reduceAnimations: Bool, anchor: NSView) {
-        host.rootView = AnyView(content.animationReduction(reduceAnimations))
-        popover.animates = !reduceAnimations
+        // `updateNSView` only reaches this while presented; bail before `ensurePopover` so a
+        // close-path call can never allocate the popover just to tear it down.
         guard isPresented.wrappedValue else {
             synchronize(with: anchor)
             return
         }
+        let (popover, host) = ensurePopover()
+        host.rootView = AnyView(content.animationReduction(reduceAnimations))
+        popover.animates = !reduceAnimations
         host.view.layoutSubtreeIfNeeded()
         let size = host.view.fittingSize
         if size.width > 0, size.height > 0 {
@@ -137,24 +160,24 @@ final class HoverPopoverController: NSObject, NSPopoverDelegate {
     /// Closing the panel still dismisses AppKit hover presentations synchronously: even with the
     /// dashboard host torn down to EmptyView, a live NSPopover can otherwise linger one frame.
     static func dismissAll() {
-        for controller in live.allObjects where controller.popover.isShown {
-            controller.popover.performClose(nil)
+        for controller in live.allObjects where controller.createdPopover?.isShown == true {
+            controller.createdPopover?.performClose(nil)
         }
     }
 
     func synchronize(with anchor: NSView) {
         guard isPresented.wrappedValue else {
-            if popover.isShown { popover.performClose(nil) }
+            if let createdPopover, createdPopover.isShown { createdPopover.performClose(nil) }
             return
         }
-        guard anchor.window != nil, !popover.isShown else { return }
-        popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+        guard anchor.window != nil, createdPopover?.isShown != true else { return }
+        ensurePopover().popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
     }
 
     func dismissWithoutUpdatingBinding() {
-        guard popover.isShown else { return }
+        guard let createdPopover, createdPopover.isShown else { return }
         ignoreNextClose = true
-        popover.performClose(nil)
+        createdPopover.performClose(nil)
     }
 
     func popoverDidClose(_ notification: Notification) {
