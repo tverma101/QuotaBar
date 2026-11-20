@@ -19,7 +19,12 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 host_triple="$(rustc -vV | awk '/^host:/ {print $2}')"
-if [[ "${QUOTABAR_RUST_UNIVERSAL:-0}" == "1" ]]; then
+if [[ -n "${QUOTABAR_RUST_TARGET:-}" ]]; then
+    # Explicit cross-target, e.g. x86_64-pc-windows-msvc or x86_64-unknown-linux-gnu.
+    # Cross-linking still needs that target's linker on PATH; `cargo check --target` verifies
+    # the code compiles without one.
+    targets=("$QUOTABAR_RUST_TARGET")
+elif [[ "${QUOTABAR_RUST_UNIVERSAL:-0}" == "1" ]]; then
     targets=(aarch64-apple-darwin x86_64-apple-darwin)
 else
     targets=("$host_triple")
@@ -35,14 +40,20 @@ done
 
 out_dir="$crate_dir/target/release"
 mkdir -p "$out_dir"
+
+# MSVC emits quotabar_core.lib; every other staticlib target emits libquotabar_core.a.
+lib_name="libquotabar_core.a"
+if [[ "${targets[0]}" == *-windows-* ]]; then
+    lib_name="quotabar_core.lib"
+fi
 archives=()
 for target in "${targets[@]}"; do
-    archives+=("$crate_dir/target/$target/release/libquotabar_core.a")
+    archives+=("$crate_dir/target/$target/release/$lib_name")
 done
 
 if [[ ${#archives[@]} -eq 1 ]]; then
-    cp "${archives[0]}" "$out_dir/libquotabar_core.a"
+    cp "${archives[0]}" "$out_dir/$lib_name"
 else
     lipo -create "${archives[@]}" -output "$out_dir/libquotabar_core.a"
 fi
-echo "==> Rust core ready: $out_dir/libquotabar_core.a (${targets[*]})"
+echo "==> Rust core ready: $out_dir/$lib_name (${targets[*]})"

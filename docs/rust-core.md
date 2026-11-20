@@ -74,6 +74,12 @@ cloning, or via the two entry points above.
 `QUOTABAR_RUST_UNIVERSAL=1 script/build_rust_core.sh` builds arm64 + x86_64 and lipo-combines
 them (used by `RELEASE=1` release builds); missing Rust targets are installed via `rustup target add`.
 
+The crate is portable — it exposes a C ABI with no platform dependencies, so it compiles for
+Windows and Linux unchanged. `QUOTABAR_RUST_TARGET=<triple> script/build_rust_core.sh` builds a
+specific target (e.g. `x86_64-pc-windows-msvc`, which emits `quotabar_core.lib`); cross-*linking*
+still needs the target toolchain on PATH, but `cargo check --target <triple>` verifies
+compilation without it.
+
 Rust sources are formatted with rustfmt conventions; `cargo test --release` in the crate runs
 its unit tests (shared with nothing — the crate must not depend on Swift).
 
