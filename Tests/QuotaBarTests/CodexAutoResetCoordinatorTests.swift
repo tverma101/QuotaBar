@@ -225,8 +225,13 @@ final class CodexAutoResetCoordinatorTests: XCTestCase {
         await restarted.runOnce(for: "codex")
         later = base.addingTimeInterval(30)
         await restarted.runOnce(for: "codex")
+        later = base.addingTimeInterval(45)
         await restarted.runOnce(for: "codex")
-        XCTAssertEqual(ids.count, 3)
+        later = base.addingTimeInterval(60)
+        await restarted.runOnce(for: "codex")
+        later = base.addingTimeInterval(75)
+        await restarted.runOnce(for: "codex")
+        XCTAssertEqual(ids.count, 5)
         XCTAssertEqual(Set(ids).count, 1)
     }
 

@@ -8,6 +8,7 @@ import SwiftUI
 enum ResetClaimOutcome: Equatable, Sendable {
     case success
     case nothingToReset
+    /// The credit is gone — already consumed elsewhere, or it expired before our POST landed.
     case noCredit
     case credentialAccess
     case cancelled

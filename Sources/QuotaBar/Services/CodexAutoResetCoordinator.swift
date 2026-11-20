@@ -231,7 +231,7 @@ final class CodexAutoResetCoordinator {
         let ledgerAccountID = attemptOwner(for: accountID)
         guard let credits = await account.availableCredits() else {
             let close = lastKnownCredits[accountID]?.contains {
-                $0.expiresAt > now() && $0.expiresAt.timeIntervalSince(now()) <= 300
+                $0.expiresAt > now() && $0.expiresAt.timeIntervalSince(now()) <= Self.leadTime
             } ?? false
             if lastErrorByAccount[accountID] == nil {
                 AppLog.warn(LogTag.plugin("codex"), "auto reset: credit lookup unavailable for \(accountID)")
