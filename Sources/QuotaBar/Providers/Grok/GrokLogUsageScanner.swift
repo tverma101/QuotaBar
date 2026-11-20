@@ -231,7 +231,7 @@ actor GrokLogUsageScanner {
     static func parseFile(_ data: Data) -> [Entry] {
         var entries: [Entry] = []
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            if case .entries(let parsed) = parseLine(Data(line)) { entries.append(contentsOf: parsed) }
+            if case .entries(let parsed) = parseLine(line) { entries.append(contentsOf: parsed) }
         }
         return entries
     }
@@ -240,7 +240,7 @@ actor GrokLogUsageScanner {
         var entries: [Entry] = []
         var malformed = false
         let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
-            switch parseLine(Data(line)) {
+            switch parseLine(line) {
             case .entries(let parsed): entries.append(contentsOf: parsed)
             case .irrelevant: break
             case .malformed: malformed = true
@@ -258,9 +258,12 @@ actor GrokLogUsageScanner {
 
     private static let completedTurnMarker = Data("turn_completed".utf8)
 
-    private static func parseLine(_ line: Data) -> LineResult {
+    private static func parseLine(_ line: Data.SubSequence) -> LineResult {
+        // The marker pre-filter runs on the slice so the per-line Data copy only happens for
+        // lines that can actually carry usage (the same gate the Muse scanner applies).
         guard line.range(of: completedTurnMarker) != nil else { return .irrelevant }
-        guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
+        let lineData = Data(line)
+        guard let object = (try? JSONSerialization.jsonObject(with: lineData)) as? [String: Any] else {
             return .malformed
         }
         let params = object["params"] as? [String: Any]
