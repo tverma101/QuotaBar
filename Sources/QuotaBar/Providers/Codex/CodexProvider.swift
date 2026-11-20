@@ -474,7 +474,9 @@ final class CodexProvider: ProviderRuntime {
             case .complete(let scan):
                 proxyScan = scan
                 lastProxyScan = scan
-                lastProxyScanRevision = await proxyUsageScanner.sourceRevision()
+                // Stamp the revision captured before the fold, not a fresh stat after it — a
+                // mid-scan append must force one more scan rather than be recorded as covered.
+                lastProxyScanRevision = proxyRevision
             case .incomplete:
                 return (nil, nil)
             }

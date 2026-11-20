@@ -370,7 +370,9 @@ actor CodexRouterUsageScanner {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty?
             .lowercased() ?? "-"
-        return "\(identity)|allows-unscoped=\(allowsUnscopedEvents)"
+        // Timezone is part of the identity: day buckets are calendar-bound, so traveling must
+        // not serve an aggregate folded under a different zone.
+        return "\(identity)|allows-unscoped=\(allowsUnscopedEvents)|tz=\(TimeZone.current.identifier)"
     }
 
     /// The un-gated scan body: the incremental tail/parse machinery plus per-account folding.
@@ -1842,11 +1844,12 @@ actor CodexRouterUsageScanner {
         )
         let prior: CodexRouterAggregateIndex.Record?
         switch lookup {
-        case let .hit(cached, damagedLines):
+        case let .hit(cached, damagedLines, nextFutureEventAt):
             guard !Task.isCancelled,
                   identityAliasesStillMatch(aliasSnapshot, hasLedgerSources: !discovery.files.isEmpty)
             else { return incomplete("cached-identity-changed") }
-            return RouterFoldOutcome(result: .complete(cached, damagedLines: damagedLines), nextFutureEventAt: nil)
+            return RouterFoldOutcome(result: .complete(cached, damagedLines: damagedLines),
+                                     nextFutureEventAt: nextFutureEventAt)
         case .append(let record):
             prior = record
         case .rebuild:

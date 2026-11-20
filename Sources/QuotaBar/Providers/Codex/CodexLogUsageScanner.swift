@@ -433,7 +433,7 @@ actor CodexLogUsageScanner {
         }
     }
 
-    private static func aggregateScopeKey(homes: [URL], peerHomes: [URL]) -> String {
+    private static func aggregateScopeKey(homes: [URL], peerHomes: [URL], sharedAttribution: SharedAttribution?) -> String {
         let homesKey = homes
             .map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
             .sorted()
@@ -442,7 +442,11 @@ actor CodexLogUsageScanner {
             .map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
             .sorted()
             .joined(separator: ",")
-        return "homes=\(homesKey)|peers=\(peersKey)"
+        // Attribution changes which files enter the fold, and timezone changes how events bucket
+        // into days — both belong to the aggregate's identity, not just its source fingerprints.
+        let attributionKey = sharedAttribution
+            .map { "\($0.home)|\($0.identity)|\($0.keepsUnattributed)" } ?? "-"
+        return "homes=\(homesKey)|peers=\(peersKey)|shared=\(attributionKey)|tz=\(TimeZone.current.identifier)"
     }
 
     /// Completeness-aware scan used by providers that merge Codex logs with other sources.
@@ -480,7 +484,8 @@ actor CodexLogUsageScanner {
             ]
             let scopeKey = Self.aggregateScopeKey(
                 homes: homes,
-                peerHomes: peerHomesOverride ?? peerHomes
+                peerHomes: peerHomesOverride ?? peerHomes,
+                sharedAttribution: sharedAttribution
             )
             let cacheKey = "codex-native|\(scopeKey)"
             let outcome = await aggregateCache.scan(
