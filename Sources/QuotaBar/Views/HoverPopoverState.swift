@@ -112,16 +112,20 @@ final class HoverPopoverState {
         overInline = false
         overDetail = false
         pinned = false
+        // Only a real close arms the post-dismiss tap guard — a dismiss on a row whose popover
+        // never opened must not swallow the next deliberate tap.
+        if isPresented { lastDismissAt = ContinuousClock.now }
         isPresented = false
-        lastDismissAt = ContinuousClock.now
     }
 
     /// Single choke point for becoming presented: one hover popover at a time. With in-panel taps no
     /// longer closing the popover (`NSPopover`'s behavior is `.applicationDefined` — see the
-    /// presenter), two rows would otherwise stack details that only ever left on hover-out.
+    /// presenter), two rows would otherwise stack details that only ever left on hover-out. A pinned
+    /// popover (e.g. an in-flight reset claim) is never superseded — the pin exists precisely so
+    /// pointer movement cannot tear down confirm/result UI.
     private func present() {
         isPresented = true
-        for other in Self.live.allObjects where other !== self && other.isPresented {
+        for other in Self.live.allObjects where other !== self && other.isPresented && !other.isPinned {
             other.dismiss()
         }
     }

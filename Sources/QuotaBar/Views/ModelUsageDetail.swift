@@ -30,6 +30,9 @@ struct ModelUsageDetail: View {
         // Hug the content vertically so collapsing Other shrinks the popover back — NSPopover
         // grows to the largest measured height and never rescales on its own.
         .fixedSize(horizontal: false, vertical: true)
+        // The popover's hosting tree survives presentation, so Other would reopen expanded without
+        // this reset — each open should start at the concise folded list.
+        .onDisappear { otherExpanded = false }
         .onContinuousHover { phase in
             switch phase {
             case .active:

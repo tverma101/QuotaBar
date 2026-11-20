@@ -81,8 +81,9 @@ enum HermesUsageMapper {
         var otherCost: Double?
         var otherModels: [ModelUsageVariant] = []
         var otherHasPartial = false
-        // Same fold policy as the spend tiles: Unattributed always folds, and an unpriced tail
-        // model folds unless its token volume is material (tenth of the leader's, ≥10M outright).
+        // Same fold policy as the spend tiles (Unattributed always folds; an unpriced tail model
+        // folds unless its token volume is material — tenth of the leader's, ≥10M outright), though
+        // Hermes ranks named rows by tokens while spend tiles rank by cost first.
         let unpricedTokenFloor = max((models.first?.tokens ?? 0) / 10, 10_000_000)
 
         for model in models {
@@ -106,7 +107,9 @@ enum HermesUsageMapper {
                     costUSD: model.costUSD,
                     costIsComplete: model.isPartial ? false : nil
                 ))
-                otherHasPartial = otherHasPartial || model.isPartial
+                // A folded unpriced model leaves Other's dollar total a lower bound, same as a
+                // partially-priced one — the collapsed row must not read as a complete spend.
+                otherHasPartial = otherHasPartial || model.isPartial || model.costUSD == nil
             } else {
                 named.append(entry)
             }
