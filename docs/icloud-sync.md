@@ -71,7 +71,7 @@ file exists:
 
 ```bash
 file=$(find "$HOME/Library/Mobile Documents" \
-  -type f -path '*openusage*/QuotaBar/History/v1/*.json' -print -quit)
+  -type f -path '*iCloud~com~tverma101~quotabar*/QuotaBar/History/v1/*.json' -print -quit)
 
 if [[ -n "$file" ]]; then
   jq . "$file"
