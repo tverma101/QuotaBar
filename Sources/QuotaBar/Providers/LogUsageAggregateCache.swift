@@ -190,6 +190,9 @@ actor LogUsageAggregateCache {
            entry.daysBack == days,
            entry.fingerprints == fingerprints,
            entry.validUntil.map({ now < $0 }) ?? true,
+           // A clock moved backward past the compute instant makes the entry untrustworthy in
+           // the same way the inner index's latestIncludedEventAt check does — rebuild.
+           now >= entry.computedAt,
            now.timeIntervalSince(entry.computedAt) <= Self.maxReuseAge
         {
             return .complete(Self.windowFiltered(entry.scan, daysBack: days, now: now),

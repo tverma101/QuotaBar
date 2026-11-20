@@ -74,7 +74,10 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
     }
 
     enum Lookup {
-        case hit(result: LogUsageScan?, damagedLines: Int)
+        /// `nextFutureEventAt` rides along so callers gating a second persisted aggregate can keep
+        /// the earliest-eligibility bound the record carried — otherwise a fold seeded through a
+        /// warm index loses its "stop serving when this future event arrives" deadline.
+        case hit(result: LogUsageScan?, damagedLines: Int, nextFutureEventAt: Date?)
         case append(Record)
         case rebuild
     }
@@ -174,7 +177,8 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
             record.key.pricingToken = key.pricingToken
             save(record)
         }
-        return .hit(result: record.result, damagedLines: record.damagedLines ?? 0)
+        return .hit(result: record.result, damagedLines: record.damagedLines ?? 0,
+                    nextFutureEventAt: record.nextFutureEventAt)
     }
 
     /// Persists a fold record. A save that would write bytes identical to the resident record is
