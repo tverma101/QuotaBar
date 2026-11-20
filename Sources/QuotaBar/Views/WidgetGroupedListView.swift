@@ -68,8 +68,15 @@ private struct ProviderSectionView: View {
             isRefreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
             hasStaleness: dataStore.stalenessHint(for: group.provider.id) != nil
         )
-        if showSection {
-            sectionBody(resolved)
+        Group {
+            if showSection {
+                sectionBody(resolved)
+            }
+        }
+        // A section that hides mid-hover still owns the flag observer — otherwise a panel close
+        // while hidden leaves `isCardHovered` stuck true and the copy control appears unhovered.
+        .onChange(of: transparency?.popoverShown) { _, shown in
+            if shown == false { isCardHovered = false }
         }
     }
 
@@ -87,9 +94,6 @@ private struct ProviderSectionView: View {
         }
         .contentShape(Rectangle())
         .onHover { isCardHovered = $0 }
-        .onChange(of: transparency?.popoverShown) { _, shown in
-            if shown == false { isCardHovered = false }
-        }
         .background(DiagnosticProviderAnchor(providerID: group.provider.id))
         .reorderFrame(id: group.provider.id, in: .named(reorderSpaceName))
     }

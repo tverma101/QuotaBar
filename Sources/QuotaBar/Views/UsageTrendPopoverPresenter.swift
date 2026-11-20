@@ -146,7 +146,7 @@ final class HoverPopoverController: NSObject, NSPopoverDelegate {
     func update(content: AnyView, reduceAnimations: Bool, anchor: NSView) {
         // `updateNSView` only reaches this while presented; bail before `ensurePopover` so a
         // close-path call can never allocate the popover just to tear it down.
-        guard isPresented.wrappedValue else {
+        guard isPresented.wrappedValue, anchor.window != nil else {
             synchronize(with: anchor)
             return
         }
