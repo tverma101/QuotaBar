@@ -18,11 +18,14 @@ struct CodexResetCredit: Hashable, Sendable {
 @Observable
 final class CodexAutoResetCoordinator {
     static let enabledKey = "codexAutoRedeemExpiringResets"
-    static let leadTime: TimeInterval = 60
+    /// Redeem five minutes before expiry. A thin (seconds-scale) window lets a sleep/wake slip or
+    /// a slow endpoint consume the whole redemption opportunity; five minutes leaves room for the
+    /// retry budget and a delayed wake while staying well inside the credit's lifetime.
+    static let leadTime: TimeInterval = 300
     static let wakeNotification = Notification.Name("QuotaBar.CodexResetWake")
     private static let patrolInterval: TimeInterval = 300
     private static let retryInterval: TimeInterval = 15
-    private static let maximumAttempts = 3
+    private static let maximumAttempts = 5
     private static let storageKey = "codexAutoRedeemAttempts.v3"
 
     /// The unregistered default Codex card still has a launch-time verified account identity.
@@ -184,8 +187,11 @@ final class CodexAutoResetCoordinator {
         // straddle an expiry boundary and report `scheduled` and `windowPassed` for the same credit.
         let current = now()
         let owner = attemptOwner(for: accountID)
+        // `noCredit` is a definitive server answer (the credit was already gone), not an
+        // unconfirmed redemption — only pending/uncertain and exhausted records count here.
         let windowPassed = attempts.values.contains {
-            $0.accountID == owner && $0.result != .success && $0.result != .nothingToReset && $0.expiry <= current
+            $0.accountID == owner && $0.result != .success && $0.result != .nothingToReset
+                && $0.result != .noCredit && $0.expiry <= current
                 && $0.expiry > current.addingTimeInterval(-86_400)
         }
         if let error = lastErrorByAccount[accountID] {
@@ -227,10 +233,10 @@ final class CodexAutoResetCoordinator {
             let close = lastKnownCredits[accountID]?.contains {
                 $0.expiresAt > now() && $0.expiresAt.timeIntervalSince(now()) <= 300
             } ?? false
-            if lastErrorByAccount[accountID] != "Could not check reset credits" {
+            if lastErrorByAccount[accountID] == nil {
                 AppLog.warn(LogTag.plugin("codex"), "auto reset: credit lookup unavailable for \(accountID)")
+                lastErrorByAccount[accountID] = "Could not check reset credits"
             }
-            lastErrorByAccount[accountID] = "Could not check reset credits"
             let failures = (creditLookupFailures[accountID] ?? 0) + 1
             creditLookupFailures[accountID] = failures
             // Exponential backoff capped at the normal patrol cadence: 15 s, 30 s, 60 s, … 300 s.

@@ -204,7 +204,7 @@ struct SettingsScreen: View {
                         container.codexAutoReset.restart()
                     }
             }
-            Text("When enabled, use an available Codex reset 1 minute before expiry, on each connected account. Requires QuotaBar to be running and the Mac awake.")
+            Text("When enabled, use an available Codex reset 5 minutes before expiry, on each connected account. Requires QuotaBar to be running and the Mac awake.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)

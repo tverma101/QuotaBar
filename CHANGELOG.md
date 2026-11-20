@@ -72,6 +72,12 @@ QuotaBar's first public downloadable build. It does not update automatically; us
 - Replay Reset All's default provider set after a crash between clearing old choices and writing defaults.
 - Rebuild OpenCode account descriptors after native auth.json changes, and queue concurrent Codex/OpenCode catalog reloads instead of dropping either update.
 - Keep OpenCode multi-account quotas hidden during partial credential reads and recover malformed provider-reset intents to safe defaults.
+- Redeem expiring Codex reset credits five minutes before expiry instead of one, giving the retry budget room to land inside the window.
+- Fold unpriced tail models into Other by default while keeping genuinely heavy unpriced models (a tenth of the leader's tokens and 10M outright) visible as named rows.
+- Serve persisted usage aggregates only while their timezone, validity bounds, and source fingerprints still hold — a timezone change or clock rollback recomputes instead of mis-bucketing days.
+- Propagate deferred-refresh bypass flags into the covering scheduled pass so forced refolds are honored instead of dropped.
+- Cut per-refresh CPU and memory: slice-based Grok/pi log parsing, per-source sqlite/LevelDB stamp caches, Hermes scan stamps, single-parse Devin SQL, deferred scan-worker identity probes, skip-catalog worker refreshes, memory-pressure hysteresis for expensive provider caches, and lazier popover/spend-aggregation work in the panel.
+- Turn crash-report autocapture off so uncaught-exception payloads can't carry local file paths off the Mac, and remove owner-specific names and internal scratch notes from the public tree.
 - Fingerprint the complete OpenCode Go-key inventory so rotated or unreadable credentials cannot inherit cached caps, while preserving local history.
 - Continue OpenCode local accounting through unreadable Go-key files, clear rotated account caps on catalog replacement, and isolate replacement schedulers from manual Keychain permission.
 - Hide Cursor's missing aggregate meter and require both OpenRouter credit totals before showing a balance; preserve Z.ai's active-plan no-data rows while clearing stale quotas when the plan disappears.
