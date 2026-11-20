@@ -72,6 +72,70 @@ struct HermesUsageScanner: Sendable {
     var databasePaths: @Sendable () throws -> [String]
     var calendar: Calendar
 
+    /// The last completed scan, held against the database files' stamps so the eight sqlite3
+    /// subprocesses only respawn when Hermes actually wrote. A reference box keeps the Sendable
+    /// scanner freely copyable — the ZCode scanner's in-memory stamp-cache pattern.
+    private let scanCache = ScanCache()
+
+    /// One database file's identity for cache validation — inode, size, and modification time,
+    /// the same stamp the Devin session reader uses. Hermes' WAL writes never touch the main
+    /// file's mtime, so the `-wal` and `-shm` companions are stamped too; a missing companion
+    /// is a nil stamp, not an error.
+    private struct FileStamp: Equatable {
+        var inode: NSNumber
+        var size: UInt64
+        var modified: Date
+    }
+
+    private struct DatabaseRevision: Equatable {
+        var database: FileStamp
+        var wal: FileStamp?
+        var shm: FileStamp?
+    }
+
+    private final class ScanCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var path: String?
+        private var revision: DatabaseRevision?
+        private var scannedAt: Date?
+        private var validUntil: Date?
+        private var result: HermesUsageScan?
+
+        /// The cached scan for `path` while the revision matches and `now` stays inside the
+        /// cached result's window: `scannedAt..<validUntil`. An earlier `now` misses on purpose —
+        /// the scan answers are only known-valid at or after the instant they were computed.
+        func cached(path: String, revision: DatabaseRevision, now: Date) -> HermesUsageScan? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard self.path == path,
+                  self.revision == revision,
+                  let scannedAt, let validUntil, let result,
+                  now >= scannedAt, now < validUntil
+            else { return nil }
+            return result
+        }
+
+        func store(_ result: HermesUsageScan, path: String, revision: DatabaseRevision, scannedAt: Date, validUntil: Date) {
+            lock.lock()
+            self.result = result
+            self.path = path
+            self.revision = revision
+            self.scannedAt = scannedAt
+            self.validUntil = validUntil
+            lock.unlock()
+        }
+
+        func clear() {
+            lock.lock()
+            result = nil
+            path = nil
+            revision = nil
+            scannedAt = nil
+            validUntil = nil
+            lock.unlock()
+        }
+    }
+
     init(
         sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
         databasePaths: @escaping @Sendable () throws -> [String] = HermesUsageScanner.defaultDatabasePaths,
@@ -103,6 +167,13 @@ struct HermesUsageScanner: Sendable {
             throw HermesUsageError.databaseUnreadable(detail: error.localizedDescription)
         }
         guard let path = paths.first else { return nil }
+
+        // The scan costs eight sqlite3 spawns; a completed scan stays valid while the database
+        // files keep the same revision and the period windows haven't rolled.
+        let revision = Self.databaseRevision(atPath: path)
+        if let revision, let cached = scanCache.cached(path: path, revision: revision, now: now) {
+            return cached
+        }
 
         let starts = periodStarts(now: now)
         var periods: [HermesPeriodUsage] = []
@@ -180,12 +251,49 @@ struct HermesUsageScanner: Sendable {
             throw HermesUsageError.databaseUnreadable(detail: "daily query returned no result")
         }
 
-        return HermesUsageScan(
+        let result = HermesUsageScan(
             periods: periods,
             daily: parsedDaily.series,
             modelUsageByPeriod: modelUsage,
             partialDays: parsedDaily.partialDays
         )
+        if let revision, let boundary = nextWindowBoundary(now: now) {
+            scanCache.store(result, path: path, revision: revision, scannedAt: now, validUntil: boundary)
+        }
+        return result
+    }
+
+    /// `state.db` plus its WAL companions. Only a stampable main file yields a revision — a path
+    /// that can't be stat'd simply never caches, which is the pre-cache behavior.
+    private static func databaseRevision(atPath path: String) -> DatabaseRevision? {
+        guard let database = fileStamp(atPath: path) else { return nil }
+        return DatabaseRevision(
+            database: database,
+            wal: fileStamp(atPath: path + "-wal"),
+            shm: fileStamp(atPath: path + "-shm")
+        )
+    }
+
+    private static func fileStamp(atPath path: String) -> FileStamp? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let inode = attributes[.systemFileNumber] as? NSNumber,
+              let size = attributes[.size] as? UInt64,
+              let modified = attributes[.modificationDate] as? Date
+        else { return nil }
+        return FileStamp(inode: inode, size: size, modified: modified)
+    }
+
+    /// The day, week, and month windows all start at local midnights, so the next local midnight
+    /// is the earliest instant a scan's answers can change without a database write — the stamp
+    /// cache rolls there even when the files stand still.
+    private func nextWindowBoundary(now: Date) -> Date? {
+        calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now))
+    }
+
+    /// Drop the in-memory scan cache under memory pressure — the same unload hook the ZCode
+    /// scanner exposes (wired into the memory-pressure pass by the provider).
+    func unloadCachesForMemoryPressure() {
+        scanCache.clear()
     }
 
     // MARK: - Period boundaries (local calendar)
