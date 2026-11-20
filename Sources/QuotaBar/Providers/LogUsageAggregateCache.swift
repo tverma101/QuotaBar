@@ -141,7 +141,9 @@ enum AggregateCacheOutcome: Sendable {
 actor LogUsageAggregateCache {
     static let shared = LogUsageAggregateCache(directory: LogUsageAggregatePaths.defaultDirectory)
 
-    private static let schemaVersion = 2
+    /// v3: the Codex router/proxy folds moved to the shared `sinceDate` window convention — entries
+    /// folded under the old `startOfDay - (days-1)` convention are one day short and must recompute.
+    private static let schemaVersion = 3
     /// Reuse bound. Retention windows are ≥ 35 days while request windows are ≤ ~33, so anything
     /// reused within this horizon still covers the full requested window. Beyond it, recompute.
     static let maxReuseAge: TimeInterval = 36 * 3600
@@ -265,8 +267,25 @@ actor LogUsageAggregateCache {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let data = try PropertyListEncoder().encode(entry)
             try data.write(to: fileURL(for: entry.key), options: .atomic)
+            pruneStaleFiles()
         } catch {
             AppLog.warn(.cache, "could not persist usage aggregate: \(error.localizedDescription)")
+        }
+    }
+
+    /// Drops aggregate files older than the reuse horizon — schema bumps and scope-key changes
+    /// orphan entries that no key will ever match again, so they must not accumulate forever.
+    private func pruneStaleFiles() {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }
+        let cutoff = Date().addingTimeInterval(-Self.maxReuseAge)
+        for url in files where url.lastPathComponent.hasPrefix("aggregate-") {
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            if let modified, modified < cutoff {
+                try? FileManager.default.removeItem(at: url)
+            }
         }
     }
 
