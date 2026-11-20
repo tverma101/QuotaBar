@@ -65,6 +65,11 @@ keys. Routine startup inventories those Go keys only while the OpenCode provider
 **OpenCode Go Keys** in Customize or making a CLI request for OpenCode also reads them for that action.
 The keys are used only in the request to OpenCode's usage endpoint and are never persisted in logs.
 
+`$OPENCODE_DATA_DIR` is treated as an explicit choice and always wins. `$XDG_DATA_HOME` is only used
+when that directory actually holds OpenCode data (`auth.json` or a database); a data root inherited
+from a launcher that sandboxes its own OpenCode runs has neither, so QuotaBar falls back to
+`~/.local/share/opencode` rather than reading that empty sandbox copy and reporting no local history.
+
 ## The meters and spend tiles
 
 The account meters show ONLY the official subscription numbers: the percentages are OpenCode's own
@@ -95,6 +100,10 @@ dollars.
 
 If any configured usage source cannot be read completely, QuotaBar keeps the last complete spend
 history instead of publishing a partial subtotal; it records which source failed in the diagnostic log.
+A source that keeps GROWING during the read (Claude Code, Codex, and the other CLIs append to their
+newest session while you work) is not an incomplete source: the fold counted the bytes that existed
+when it started, and the appended turns belong to the next refresh. Each prefix it read is checked by
+digest, so a rewrite, a truncation, or a replacement still keeps the last complete history.
 The Router source list and verified prefix are checked again after the wider fold. Malformed events,
 rotation, truncation, changed prefix samples, and same-size rewrites retain the prior history. Ordinary
 appends leave the measured prefix valid; the next refresh consumes the new tail.
@@ -111,7 +120,12 @@ priced subtotal as a lower bound and marks it Partial. The local Go fallback met
 to 100% and keeps its window totals finite.
 
 OpenCode's SQLite logs use a reported total when it is positive, or derive the total from valid token
-components when the stored total is zero or missing. The fallback requires a token object with valid
+components when the stored total is zero or missing. A free hosted turn — a model OpenCode bills at
+`$0` — answers real turns with no reported total but keeps its live token counters (`input`,
+`output`, `reasoning`, `cache`), so a completed free turn (it finished with tool calls, a normal stop,
+or a length stop) counts its counters and carries its recorded `$0`. Only a turn that never completed
+(no finish reason, or an error) is treated as carrying no usage.
+The fallback requires a token object with valid
 input and output counts. If a row has malformed token or cost values, or a Router JSONL record is too
 large to parse safely, that fold keeps the previous complete history. Pi and Muse session records with
 invalid counters, impossible cache buckets, or mismatched reported totals also keep the previous history.
@@ -184,6 +198,8 @@ its own row instead of being listed twice, once as Other and again under it.
 - **Everything shows "No data"** — QuotaBar needs OpenCode's local database at
   `~/.local/share/opencode/opencode*.db`. Run an OpenCode session, then refresh. (An active Go account
   confirmed by the account endpoint can show cap meters before your first local message.)
+  A day spent only on free Zen models still counts: those turns keep their measured token counts and
+  their recorded `$0`, so no spend appears but the card is not empty.
 - **No Session / Weekly / Monthly meters** — those are Go-plan caps and require a successful current
   account response. Network/server/rate-limit failures, rejected keys, incomplete responses, and
   unconfirmed entitlements hide the cap meters. Local Go history does not prove an active subscription;

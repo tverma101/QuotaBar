@@ -3,6 +3,40 @@ import XCTest
 @testable import QuotaBar
 
 final class IncrementalJSONLScannerTests: XCTestCase {
+    /// A CLI keeps appending to its newest session while QuotaBar reads the corpus. Growth only adds
+    /// turns for the next pass, so it must not invalidate the current one; a truncation or rewrite
+    /// can change history the pass already counted, so it still must.
+    func testAppendTolerantPassAcceptsGrowthButRejectsRewriteAndTruncation() throws {
+        let base = try makeDirectory("AppendStaleness")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let path = base.appendingPathComponent("session.jsonl")
+        try "{\"n\":1}\n".write(to: path, atomically: true, encoding: .utf8)
+        let digest = try XCTUnwrap(JSONLScanning.prefixDigest(path: path.path, size: 7))
+        let discovered = JSONLScanning.DiscoveredFile(path: path.path, size: 7, mtime: Date())
+        XCTAssertTrue(JSONLScanning.discoveredPrefixesStillIntact([discovered], digests: [path.path: digest]))
+
+        // The running CLI appends a new turn: everything the pass read is still there.
+        let handle = try FileHandle(forWritingTo: path)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"n\":2}\n".utf8))
+        try handle.synchronize()
+        XCTAssertTrue(
+            JSONLScanning.discoveredPrefixesStillIntact([discovered], digests: [path.path: digest]),
+            "append-only growth must not fail an append-tolerant pass"
+        )
+        // The default path stays strict: growth alone still invalidates it.
+        XCTAssertFalse(JSONLScanning.filesStillMatch([discovered]))
+
+        // A same-size in-place rewrite must still invalidate the pass.
+        try "{\"n\":9}\n".write(to: path, atomically: false, encoding: .utf8)
+        XCTAssertFalse(
+            JSONLScanning.discoveredPrefixesStillIntact([discovered], digests: [path.path: digest]),
+            "a same-size rewrite must not pass"
+        )
+        XCTAssertNil(JSONLScanning.prefixDigest(path: path.path, size: 7 + 8), "a truncated source has no prefix")
+    }
+
     func testPersistedCacheSurvivesFreshScannerInstanceAndIsScopedByIdentity() async throws {
         let base = try makeDirectory("Persistence")
         defer { try? FileManager.default.removeItem(at: base) }

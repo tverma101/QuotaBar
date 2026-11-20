@@ -1000,7 +1000,13 @@ actor CodexLogUsageScanner {
                 visit(event)
             },
             fileStarted: { bucket.begin($0) },
-            fileCompleted: { path, _ in bucket.finish(path) }
+            fileCompleted: { path, _ in bucket.finish(path) },
+            // The OpenCode card folds Codex rollouts while Codex keeps appending to its newest
+            // session. Growth only adds turns for the next refresh, and the prefixes this fold read
+            // are verified by digest, so an append cannot change what it counted. Demanding
+            // byte-for-byte source identity here failed the whole combined card whenever the user
+            // was actively coding.
+            toleratesAppendsDuringScan: true
         )
         guard complete else { return false }
         // Index once instead of scanning the whole file list per future-timestamp entry.

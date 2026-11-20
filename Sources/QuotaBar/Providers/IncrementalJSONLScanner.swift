@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// The `Item`-independent half of the incremental scan machinery: file discovery and the scan-window
@@ -41,6 +42,43 @@ enum JSONLScanning {
                 && values.contentModificationDate == file.mtime
                 && values.attributeModificationDate == file.attributeMtime
                 && AppendOnlyFileProbe.revision(at: url) == revision
+        }
+    }
+
+    /// A cheap fingerprint of the first `size` bytes of a file — the part a pass actually read.
+    /// Returns nil when the file is shorter than that prefix, so a truncation can never look intact.
+    static func prefixDigest(path: String, size: Int) -> Data? {
+        guard size >= 0, let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: size), data.count == size else { return nil }
+        return Data(SHA256.hash(data: data))
+    }
+
+    /// Whether every source a pass read still holds, byte for byte, the prefix it read.
+    ///
+    /// Unlike `filesStillMatch`, this tolerates append-only growth: the pass read the bytes that
+    /// existed at discovery, and an append only adds turns that belong to the next pass. Every CLI on
+    /// this machine keeps appending to its newest session while QuotaBar reads a multi-file corpus,
+    /// so demanding an unchanged size made a whole combined fold fail whenever the user was actively
+    /// coding — exactly when it matters. Each discovered prefix is compared by a SHA-256 digest of
+    /// its exact bytes, so a same-size in-place rewrite, a truncation, or a regrow past the old
+    /// length is still caught. The digests are computed inside the scan's accounting work pacer, so
+    /// the re-read is bounded like every other local read.
+    ///
+    /// Cache lookups keep the stricter `filesStillMatch`: warm history is reused VERBATIM, so any
+    /// change since it was captured — every append included — must invalidate it.
+    static func discoveredPrefixesStillIntact(
+        _ files: [DiscoveredFile],
+        digests: [String: Data]
+    ) -> Bool {
+        files.allSatisfy { file in
+            guard !Task.isCancelled else { return false }
+            guard let expected = digests[file.path],
+                  let actual = JSONLAccountingWorkPacer.shared.perform({
+                      prefixDigest(path: file.path, size: file.size)
+                  })
+            else { return false }
+            return actual == expected
         }
     }
 
@@ -234,7 +272,8 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         from files: [JSONLScanning.DiscoveredFile],
         since: Date,
         cacheIdentity: String = "default",
-        parseFile: @Sendable @escaping (URL) -> [Item]?
+        parseFile: @Sendable @escaping (URL) -> [Item]?,
+        toleratesAppendsDuringScan: Bool = false
     ) async -> [Item]? {
         precondition(!cacheIdentity.isEmpty)
         guard await acquire(cacheIdentity) else { return nil }
@@ -244,6 +283,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         let retainItems = retainsResidentItemsNow
         await loadCacheIfNeeded(identity: cacheIdentity, retainItems: retainItems)
         guard !Task.isCancelled else { return nil }
+        // Fingerprint the bytes this pass is about to read, before it reads them. Sizes alone cannot
+        // distinguish an append from a same-size rewrite (see `discoveredPrefixesStillIntact`).
+        let discoveredDigests = toleratesAppendsDuringScan ? Self.prefixDigests(of: files) : [:]
         // Keep other same-parser scans' files in the shared partition until they age out of the window.
         // This lets multi-account cards with disjoint roots share one actor safely; only the current
         // call's input paths are returned below.
@@ -271,7 +313,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         // result and leave the last-good cache untouched; publishing the readable subset made a
         // transient filesystem error look like usage had disappeared from the failed file.
         guard parseResults.allSatisfy({ $0.items != nil }) else { return nil }
-        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return nil }
+        guard discoveredFilesStillMatch(files, digests: discoveredDigests, cacheIdentity: cacheIdentity) else {
+            return nil
+        }
         var newlyCached: [(path: String, cached: CachedFile)] = []
         for result in parseResults {
             let (file, parsed) = (result.file, result.items)
@@ -335,7 +379,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         }
         caches[cacheIdentity] = nextCache
         trimResidentItems(protecting: cacheIdentity)
-        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return nil }
+        guard discoveredFilesStillMatch(files, digests: discoveredDigests, cacheIdentity: cacheIdentity) else {
+            return nil
+        }
         return Task.isCancelled ? nil : items
     }
 
@@ -352,7 +398,8 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         visit: @Sendable (Item) -> Void,
         skipPrefixCounts: [String: Int] = [:],
         fileStarted: (@Sendable (String) -> Void)? = nil,
-        fileCompleted: (@Sendable (String, Int) -> Void)? = nil
+        fileCompleted: (@Sendable (String, Int) -> Void)? = nil,
+        toleratesAppendsDuringScan: Bool = false
     ) async -> Bool {
         precondition(!cacheIdentity.isEmpty)
         guard await acquire(cacheIdentity) else { return false }
@@ -362,6 +409,8 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         let retainItems = retainsResidentItemsNow
         await loadCacheIfNeeded(identity: cacheIdentity, retainItems: retainItems)
         guard !Task.isCancelled else { return false }
+        // See `items`: the digest is taken before the read, so growth after it cannot hide a rewrite.
+        let discoveredDigests = toleratesAppendsDuringScan ? Self.prefixDigests(of: files) : [:]
         guard let plan = await planScanCache(
             identity: cacheIdentity,
             files: files,
@@ -385,7 +434,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         // Do not publish a partial fold or replace stale cache records until every changed file has
         // been read and parsed. Callers treat false as an incomplete source and keep last-good data.
         guard parseResults.allSatisfy({ $0.items != nil }) else { return false }
-        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return false }
+        guard discoveredFilesStillMatch(
+            files, digests: discoveredDigests, cacheIdentity: cacheIdentity
+        ) else { return false }
         var newlyCached: [(path: String, cached: CachedFile)] = []
         for result in parseResults {
             let (file, parsed) = (result.file, result.items)
@@ -477,17 +528,38 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
                 }
             }
         }
-        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return false }
+        guard discoveredFilesStillMatch(
+            files, digests: discoveredDigests, cacheIdentity: cacheIdentity
+        ) else { return false }
         caches[cacheIdentity] = nextCache
         trimResidentItems(protecting: cacheIdentity)
         return !Task.isCancelled
     }
 
+    /// The SHA-256 of each discovered file's `size`-byte prefix, or nil for a file that cannot be
+    /// hashed. An unhashable source makes the pass incomplete rather than silently unverified.
+    private static func prefixDigests(of files: [JSONLScanning.DiscoveredFile]) -> [String: Data] {
+        var digests: [String: Data] = [:]
+        digests.reserveCapacity(files.count)
+        for file in files {
+            guard let digest = JSONLScanning.prefixDigest(path: file.path, size: file.size) else { continue }
+            digests[file.path] = digest
+        }
+        return digests
+    }
+
+    /// A pass that opted into append tolerance compares the discovered prefixes by digest; every
+    /// other pass keeps the exact size/mtime/ctime identity check. The strict check is the security
+    /// boundary for sources whose history can be rewritten in place under the same size, so it stays
+    /// the default.
     private func discoveredFilesStillMatch(
         _ files: [JSONLScanning.DiscoveredFile],
+        digests: [String: Data],
         cacheIdentity: String
     ) -> Bool {
-        let changed = !JSONLScanning.filesStillMatch(files)
+        let changed = digests.isEmpty
+            ? !JSONLScanning.filesStillMatch(files)
+            : !JSONLScanning.discoveredPrefixesStillIntact(files, digests: digests)
         let diagnosticKey = "jsonl.scan.source-changed.\(JSONLScanCachePaths.stableFingerprint(logTag + "|" + cacheIdentity))"
         guard changed else {
             DiagnosticGate.clearFailure(diagnosticKey)

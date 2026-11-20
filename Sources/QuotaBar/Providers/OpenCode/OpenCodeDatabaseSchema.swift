@@ -138,7 +138,8 @@ enum OpenCodeDatabaseSQL {
                  END,
                  \(tokenTotalSQL),
                  model_id,
-                 provider_id))
+                 provider_id,
+                 finish))
         FROM source;
         """
     }
@@ -244,6 +245,7 @@ enum OpenCodeDatabaseSQL {
                    json_extract(data,'$.tokens.cache.write') AS cache_write_tokens,
                    COALESCE(json_extract(data,'$.model.id'), json_extract(data,'$.modelID')) AS model_id,
                    COALESCE(json_extract(data,'$.model.providerID'), json_extract(data,'$.providerID')) AS provider_id,
+                   json_extract(data,'$.finish') AS finish,
                    1 AS tokens_absent_is_zero
         FROM session_message
         WHERE type = 'assistant'
@@ -275,6 +277,7 @@ enum OpenCodeDatabaseSQL {
                    json_extract(data,'$.tokens.cache.write') AS cache_write_tokens,
                    COALESCE(json_extract(data,'$.modelID'), json_extract(data,'$.model.id')) AS model_id,
                    COALESCE(json_extract(data,'$.providerID'), json_extract(data,'$.model.providerID')) AS provider_id,
+                   json_extract(data,'$.finish') AS finish,
                    0 AS tokens_absent_is_zero
         FROM message
         WHERE json_extract(data,'$.role') = 'assistant'

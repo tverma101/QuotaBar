@@ -3,17 +3,36 @@ import Foundation
 /// Where OpenCode keeps its local data on this machine, shared by the auth store (reads `auth.json`)
 /// and the usage scanner (reads the SQLite logs). Resolution mirrors OpenCode itself: an explicit
 /// `OPENCODE_DATA_DIR` wins, then `$XDG_DATA_HOME/opencode`, then the default `~/.local/share/opencode`.
+///
+/// `XDG_DATA_HOME` is inherited, not chosen: a launcher that runs OpenCode inside its own sandbox
+/// (or any app exporting it before opening QuotaBar) points it at a private data root. That root does
+/// hold `opencode/`, so trusting it blindly read a database with no OpenCode-hosted usage and the card
+/// reported no local history while the user's real sessions sat untouched next door. Only honour an
+/// inherited `XDG_DATA_HOME` when OpenCode has been signed in there, otherwise fall through to the
+/// default location. `OPENCODE_DATA_DIR` is an explicit request and always wins.
 enum OpenCodePaths {
     static func dataDirectory(environment: EnvironmentReading, homeDirectory: URL) -> String {
         if let override = environment.value(for: "OPENCODE_DATA_DIR")?
             .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
             return expandHome(override).trimmingTrailingSlashes
         }
-        if let xdg = environment.value(for: "XDG_DATA_HOME")?
-            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
-            return expandHome(xdg).trimmingTrailingSlashes + "/opencode"
+        let xdgCandidate = environment.value(for: "XDG_DATA_HOME")?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            .map { expandHome($0).trimmingTrailingSlashes + "/opencode" }
+        if let xdgCandidate, holdsOpenCodeData(in: xdgCandidate) {
+            return xdgCandidate
         }
         return homeDirectory.appendingPathComponent(".local/share/opencode").path
+    }
+
+    /// Whether a candidate root is where the user actually signs in to OpenCode: it holds the
+    /// `auth.json` OpenCode writes on login. A data root created by a launcher that sandboxes its own
+    /// OpenCode runs has no login of its own, however many databases it accumulates, so it never
+    /// shadows the user's real installation.
+    static func holdsOpenCodeData(in dataDirectory: String) -> Bool {
+        FileManager.default.fileExists(
+            atPath: authFilePath(dataDirectory: expandHome(dataDirectory))
+        )
     }
 
     static func authFilePath(dataDirectory: String) -> String {

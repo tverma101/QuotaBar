@@ -404,6 +404,7 @@ actor ClaudeLogUsageScanner {
         roots: [URL],
         cacheIdentityOverride: String? = nil,
         hostedGatewayOnly: Bool = false,
+        toleratesAppendsDuringScan: Bool = false,
         visit: @Sendable (Entry) -> Void
     ) async -> Bool {
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
@@ -455,7 +456,8 @@ actor ClaudeLogUsageScanner {
                 deduplication.append(entry)
             },
             fileStarted: { bucket.begin($0) },
-            fileCompleted: { path, _ in bucket.finish(path) }
+            fileCompleted: { path, _ in bucket.finish(path) },
+            toleratesAppendsDuringScan: toleratesAppendsDuringScan
         )
         guard complete, !Task.isCancelled else { return false }
         let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })

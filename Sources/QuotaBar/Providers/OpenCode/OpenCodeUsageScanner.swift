@@ -749,9 +749,15 @@ struct OpenCodeUsageScanner: Sendable {
             let roots = claudeRoots()
             for scanner in scanners {
                 guard !Task.isCancelled else { return nil }
+                // The OpenCode fold reads Claude sessions while Claude Code keeps appending to its
+                // newest one. A combined per-provider fold that demanded byte-for-byte source
+                // identity failed whenever the user was actively working, which is exactly when it
+                // matters. Growth only adds turns for the next pass, and the prefixes it read are
+                // verified by digest, so an append cannot change what this fold counted.
                 let complete = await scanner.foldParsedEntries(
                     daysBack: daysBack, now: now, roots: roots,
-                    cacheIdentityOverride: claudeCacheIdentity(), hostedGatewayOnly: true
+                    cacheIdentityOverride: claudeCacheIdentity(), hostedGatewayOnly: true,
+                    toleratesAppendsDuringScan: true
                 ) { entry in
                     gatewayFold.foldClaude(entry)
                 }
@@ -1592,9 +1598,20 @@ struct OpenCodeUsageScanner: Sendable {
             let tokenCountSaturated = rawTokens > 1e15
             let tokens = Int(min(rawTokens, 1e15))
             let cost = ProviderParse.number(entry[1]).flatMap { $0 >= 0 ? $0 : nil }
-            // Completed zero-token, zero-cost bookkeeping rows carry no usage and must not let a
-            // skewed timestamp discard otherwise complete history. Keep cost-only rows meaningful.
-            if tokens == 0, (cost ?? 0) == 0 { continue }
+            let reportedCost = entry[1] is NSNumber
+            let finish = entry.count >= 6 ? (entry[5] as? String) : nil
+            // A hosted turn that recorded no tokens and a zero cost is not always empty. OpenCode's
+            // free models answer real turns at `cost: 0` and that price is genuine, so dropping them
+            // read as "No data" on a machine that had used those models all day. A completed
+            // interaction (tool calls, a normal stop, or a length stop) therefore stays and
+            // contributes its recorded $0. Only a turn that never completed — no finish reason, or an
+            // error — is dropped: it carries no usage, and it must not let a skewed timestamp discard
+            // otherwise complete history.
+            if tokens == 0, (cost ?? 0) == 0 {
+                let completedInteraction = reportedCost
+                    && (finish == "tool-calls" || finish == "stop" || finish == "length")
+                guard completedInteraction else { continue }
+            }
             guard ms <= maximumTimestampMs else { return nil }
             let model: String
             if entry[3] is NSNull {

@@ -372,4 +372,74 @@ final class OpenCodeV2SchemaTests: XCTestCase {
         XCTAssertEqual(totalTokens(scan), 15)
         XCTAssertEqual(totalCost(scan), 1.0, accuracy: 0.0001)
     }
+
+    /// A v2 assistant turn that also carries its finish reason — the shape OpenCode writes today.
+    private func v2FinishedRow(
+        id: String,
+        at iso: String,
+        model: String,
+        provider: String,
+        cost: String,
+        tokens: String,
+        finish: String
+    ) -> String {
+        """
+        INSERT INTO session_message (id,session_id,type,seq,time_created,time_updated,data)
+        VALUES ('\(id)','ses_1','assistant',1,\(epochMs(iso)),\(epochMs(iso)),
+        '{"time":{"created":\(epochMs(iso))},"model":{"id":"\(model)","providerID":"\(provider)"},"cost":\(cost),"tokens":\(tokens),"finish":"\(finish)"}');
+        """
+    }
+
+    /// A free hosted model writes `cost: 0` and live `tokens` counters but no `tokens.total`. Before
+    /// this fix those completed turns were dropped as "no usage at all", so a machine that had used
+    /// free models all day showed "No data" instead of its real token counts.
+    func testFreeModelTurnsKeepTheirCountersAndRecordedZeroCost() async throws {
+        let freeTokens = "{\"input\":16843,\"output\":123,\"reasoning\":0,\"cache\":{\"read\":729,\"write\":0}}"
+        let path = try makeDatabase(
+            v2TableSQL
+                + v2FinishedRow(
+                    id: "msg_1", at: "2026-07-12T10:00:00.000Z", model: "minimax-m3.1-flash-free",
+                    provider: "opencode", cost: "0", tokens: freeTokens, finish: "tool-calls"
+                )
+                + v2FinishedRow(
+                    id: "msg_2", at: "2026-07-12T11:00:00.000Z", model: "minimax-m3.1-flash-free",
+                    provider: "opencode", cost: "0", tokens: freeTokens, finish: "stop"
+                )
+        )
+
+        let scan = try await scan(path)
+        XCTAssertEqual(totalTokens(scan), 2 * 17695, "free turns still carry their measured counters")
+        XCTAssertEqual(totalCost(scan), 0, accuracy: 0.0001, "the recorded $0 stays a complete cost")
+
+        let model = try XCTUnwrap(modelRow(scan, "minimax-m3.1-flash-free"))
+        XCTAssertEqual(model.totalTokens, 2 * 17695)
+        XCTAssertEqual(model.costUSD ?? -1, 0, accuracy: 0.0001)
+
+        let day = try XCTUnwrap(scan.logScan.series.daily.first)
+        XCTAssertEqual(day.costUSD ?? -1, 0, accuracy: 0.0001)
+        XCTAssertTrue(day.costIsComplete)
+        XCTAssertNil(scan.logScan.estimatedCostDays, "a recorded $0 is never an estimate")
+    }
+
+    /// A turn that never completed (an error, or no finish reason at all) still carries no usage and
+    /// must not fail the scan or add spend.
+    func testUnfinishedZeroCostTurnsStayOutOfTheTotals() async throws {
+        let path = try makeDatabase(
+            v2TableSQL
+                + v2FinishedRow(
+                    id: "paid", at: "2026-07-12T12:00:00.000Z", model: "glm-5.2",
+                    provider: "opencode-go", cost: "1.25", tokens: "{\"input\":100,\"output\":50}",
+                    finish: "stop"
+                )
+                + v2FinishedRow(
+                    id: "errored", at: "2026-07-12T10:00:00.000Z", model: "kimi-k3.1-pro",
+                    provider: "opencode-go", cost: "0", tokens: "null", finish: "error"
+                )
+        )
+
+        let scan = try await scan(path)
+        XCTAssertEqual(totalTokens(scan), 150)
+        XCTAssertEqual(totalCost(scan), 1.25, accuracy: 0.0001)
+        XCTAssertEqual(scan.logScan.series.daily.count, 1)
+    }
 }
