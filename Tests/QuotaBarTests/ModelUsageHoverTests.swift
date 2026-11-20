@@ -306,6 +306,21 @@ final class ModelUsageHoverTests: XCTestCase {
         XCTAssertFalse(first.isPresented, "one hover surface at a time — the new popover supersedes the open one")
     }
 
+    func testHoverPopoverStatePinnedPopoverSurvivesSupersede() {
+        let pinned = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        let other = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        pinned.presentForTap()
+        pinned.setPinned(true)
+        other.presentForTap()
+        XCTAssertTrue(other.isPresented)
+        XCTAssertTrue(pinned.isPresented, "a pinned confirm/claim popover is not torn down by another row")
+
+        pinned.setPinned(false)
+        let third = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        third.presentForTap()
+        XCTAssertFalse(pinned.isPresented, "once unpinned the popover supersedes normally again")
+    }
+
     func testHoverPopoverStateTapRightAfterDismissalDoesNotReopen() async {
         let state = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
         state.presentForTap()

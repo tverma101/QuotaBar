@@ -78,7 +78,9 @@ enum HermesUsageMapper {
 
         var named: [ModelUsageEntry] = []
         var otherTokens = 0
+        var otherSaturated = false
         var otherCost: Double?
+        var otherCostOverflowed = false
         var otherModels: [ModelUsageVariant] = []
         var otherHasPartial = false
         // Same fold policy as the spend tiles (Unattributed always folds; an unpriced tail model
@@ -97,9 +99,18 @@ enum HermesUsageMapper {
                 costIsComplete: model.isPartial ? false : nil
             )
             if isUnattributed || (named.count >= namedModelCap && !unpricedHeavyweight) {
+                if model.tokens > 0 && otherTokens > Int.max - model.tokens { otherSaturated = true }
                 otherTokens = ProviderParse.addingSaturating(otherTokens, model.tokens)
-                if let cost = model.costUSD {
-                    otherCost = (otherCost ?? 0) + cost
+                // Same cost policy as the spend-tile accumulator: a non-finite or overflowing
+                // dollar sum stops being a total at all and marks Other incomplete instead of
+                // rendering a clipped number.
+                if let cost = model.costUSD, !otherCostOverflowed {
+                    if cost.isFinite, cost >= 0, ((otherCost ?? 0) + cost).isFinite {
+                        otherCost = (otherCost ?? 0) + cost
+                    } else {
+                        otherCostOverflowed = true
+                        otherHasPartial = true
+                    }
                 }
                 otherModels.append(ModelUsageVariant(
                     model: name,
@@ -109,7 +120,7 @@ enum HermesUsageMapper {
                 ))
                 // A folded unpriced model leaves Other's dollar total a lower bound, same as a
                 // partially-priced one — the collapsed row must not read as a complete spend.
-                otherHasPartial = otherHasPartial || model.isPartial || model.costUSD == nil
+                otherHasPartial = otherHasPartial || model.isPartial || (model.costUSD == nil && model.tokens > 0)
             } else {
                 named.append(entry)
             }
@@ -120,7 +131,8 @@ enum HermesUsageMapper {
                 totalTokens: otherTokens,
                 costUSD: otherCost,
                 variants: otherModels,
-                costIsComplete: otherHasPartial ? false : nil
+                costIsComplete: otherHasPartial ? false : nil,
+                tokenCountSaturated: otherSaturated ? true : nil
             ).presentedRows())
         }
         guard !named.isEmpty else { return nil }

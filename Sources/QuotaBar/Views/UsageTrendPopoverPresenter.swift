@@ -104,6 +104,10 @@ final class HoverPopoverController: NSObject, NSPopoverDelegate {
 
     private let host = NSHostingController(rootView: AnyView(EmptyView()))
     private var ignoreNextClose = false
+    /// Bumped on each fresh presentation and applied as `.id` to the hosted view. The hosting
+    /// controller survives `performClose`, so without a new identity the popover's @State —
+    /// expanded rows, claim banners, pending request IDs — would reopen with its previous values.
+    private var presentationGeneration = 0
 
     init(isPresented: Binding<Bool>) {
         self.isPresented = isPresented
@@ -120,12 +124,13 @@ final class HoverPopoverController: NSObject, NSPopoverDelegate {
     }
 
     func update(content: AnyView, reduceAnimations: Bool, anchor: NSView) {
-        host.rootView = AnyView(content.animationReduction(reduceAnimations))
-        popover.animates = !reduceAnimations
         guard isPresented.wrappedValue else {
             synchronize(with: anchor)
             return
         }
+        if !popover.isShown { presentationGeneration += 1 }
+        host.rootView = AnyView(content.animationReduction(reduceAnimations).id(presentationGeneration))
+        popover.animates = !reduceAnimations
         host.view.layoutSubtreeIfNeeded()
         let size = host.view.fittingSize
         if size.width > 0, size.height > 0 {
