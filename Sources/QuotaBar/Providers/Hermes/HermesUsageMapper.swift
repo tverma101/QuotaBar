@@ -81,18 +81,21 @@ enum HermesUsageMapper {
         var otherCost: Double?
         var otherModels: [ModelUsageVariant] = []
         var otherHasPartial = false
+        // Same fold policy as the spend tiles: Unattributed always folds, and an unpriced tail
+        // model folds unless its token volume is material (tenth of the leader's, ≥10M outright).
+        let unpricedTokenFloor = max((models.first?.tokens ?? 0) / 10, 10_000_000)
 
         for model in models {
             let name = model.model.nilIfEmpty ?? ModelUsageEntry.unattributedModelName
+            let isUnattributed = name.caseInsensitiveCompare(ModelUsageEntry.unattributedModelName) == .orderedSame
+            let unpricedHeavyweight = model.costUSD == nil && model.tokens >= unpricedTokenFloor
             let entry = ModelUsageEntry(
                 model: name,
                 totalTokens: model.tokens,
                 costUSD: model.costUSD,
                 costIsComplete: model.isPartial ? false : nil
             )
-            if named.count < namedModelCap {
-                named.append(entry)
-            } else {
+            if isUnattributed || (named.count >= namedModelCap && !unpricedHeavyweight) {
                 otherTokens = ProviderParse.addingSaturating(otherTokens, model.tokens)
                 if let cost = model.costUSD {
                     otherCost = (otherCost ?? 0) + cost
@@ -104,6 +107,8 @@ enum HermesUsageMapper {
                     costIsComplete: model.isPartial ? false : nil
                 ))
                 otherHasPartial = otherHasPartial || model.isPartial
+            } else {
+                named.append(entry)
             }
         }
         if otherTokens > 0 || (otherCost ?? 0) > 0 {
