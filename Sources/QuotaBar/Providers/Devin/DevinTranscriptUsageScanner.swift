@@ -51,6 +51,17 @@ actor DevinTranscriptUsageScanner {
     /// (database or enumeration failure, a damaged or mid-rewrite transcript, a future timestamp);
     /// the provider then keeps its last-good history instead of publishing a partial fold.
     func scan(daysBack: Int = UsageHistoryWindow.previousDays, now: Date = Date(), pricing: ModelPricing) async -> LogUsageScan? {
+        await scan(daysBack: daysBack, now: now, pricing: { pricing })
+    }
+
+    /// The same fold with the pricing snapshot resolved on demand: `pricing` runs only once
+    /// metered rows exist to price, so a scan-worker child that finds no Devin sessions or
+    /// transcripts never pays the model-catalog decode.
+    func scan(
+        daysBack: Int = UsageHistoryWindow.previousDays,
+        now: Date = Date(),
+        pricing: @Sendable () async -> ModelPricing
+    ) async -> LogUsageScan? {
         let directory = transcriptsDirectory.resolvingSymlinksInPath().standardizedFileURL
         let identity = directory.path
         let since = JSONLScanning.sinceDate(daysBack: daysBack, now: now)
@@ -64,7 +75,7 @@ actor DevinTranscriptUsageScanner {
                     throw SQLiteError.queryFailed("Devin session usage contained a future timestamp")
                 }
                 DiagnosticGate.clearFailure(databaseDiagnosticKey)
-                let result = Self.aggregate(entries: entries, since: since, pricing: pricing)
+                let result = Self.aggregate(entries: entries, since: since, pricing: await pricing())
                 return Task.isCancelled ? nil : result
             }
             DiagnosticGate.clearFailure(databaseDiagnosticKey)
@@ -123,7 +134,13 @@ actor DevinTranscriptUsageScanner {
             return nil
         }
         DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey)
-        let result = Self.aggregate(entries: bucket.items, since: since, pricing: pricing)
+        // A complete fold can legitimately hold no metered rows; an empty result still returns,
+        // but there is nothing to price so the catalog stays unread.
+        let result = Self.aggregate(
+            entries: bucket.items,
+            since: since,
+            pricing: bucket.items.isEmpty ? .empty : await pricing()
+        )
         guard !Task.isCancelled else { return nil }
         return result
     }

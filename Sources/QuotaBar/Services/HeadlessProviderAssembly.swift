@@ -16,12 +16,30 @@ struct HeadlessProviderAssembly {
     let settingsDomainName: String
     let providers: [ProviderRuntime]
     let registry: WidgetRegistry
+    /// Keys resolved during assembly. When `identityKeyProviderIDs` narrowed the build, the keys
+    /// that need their own credential probe stayed deferred — `providerIdentityKey(for:)` resolves
+    /// either source to the same value, so consumers never have to know which happened.
     let providerIdentityKeys: [String: String]
+    /// Identity-key probes assembly skipped because the caller named the cards it would refresh.
+    /// Each loader runs exactly one provider's credential read (Cursor's sqlite3 queries,
+    /// Antigravity's Keychain query) on first access — the deferred cost a one-shot scan worker
+    /// avoids for providers its parent never asked it to fold.
+    private let deferredIdentityKeyLoaders: [String: @Sendable () async -> String]
+
+    /// The launch identity key for `providerID`: the value resolved at assembly, or the provider's
+    /// own deferred probe when assembly skipped it. Nil means the provider stamps no account
+    /// identity, matching the dictionary's absent-key contract.
+    func providerIdentityKey(for providerID: String) async -> String? {
+        if let key = providerIdentityKeys[providerID] { return key }
+        guard let loader = deferredIdentityKeyLoaders[providerID] else { return nil }
+        return await loader()
+    }
 
     static func assemble(
         defaults: UserDefaults,
         settingsDomainName: String,
-        forceEnabledFamilies: Set<String>
+        forceEnabledFamilies: Set<String>,
+        identityKeyProviderIDs: Set<String>? = nil
     ) async throws -> HeadlessProviderAssembly {
         // The CLI and the scan worker share the app's provider settings, so migrate them before a
         // store interprets the enabled/disabled lists. If migration stops partway through, fail
@@ -109,11 +127,26 @@ struct HeadlessProviderAssembly {
             }
         )
         var providerIdentityKeys = accountAssembly.identityKeysByCard
-        providerIdentityKeys["cursor"] = await loadOffMainActor {
-            CursorAuthStore().cacheIdentityKeyForLaunch()
-        }
-        providerIdentityKeys["antigravity"] = await loadOffMainActor {
-            AntigravityAuthStore().cacheIdentityKeyForLaunch()
+        var deferredIdentityKeyLoaders: [String: @Sendable () async -> String] = [:]
+        // Cursor's key costs sqlite3 reads and Antigravity's a silent Keychain query — real
+        // per-provider probes, not shared discovery. A caller that names the cards it will
+        // refresh leaves them deferred behind `providerIdentityKey(for:)`: a one-shot scan
+        // worker's own fold usually reports the live identity first, so the probe fires only
+        // when something actually asks. `nil` keeps the CLI's catalog-wide read.
+        if identityKeyProviderIDs == nil {
+            providerIdentityKeys["cursor"] = await loadOffMainActor {
+                CursorAuthStore().cacheIdentityKeyForLaunch()
+            }
+            providerIdentityKeys["antigravity"] = await loadOffMainActor {
+                AntigravityAuthStore().cacheIdentityKeyForLaunch()
+            }
+        } else {
+            deferredIdentityKeyLoaders["cursor"] = {
+                await loadOffMainActor { CursorAuthStore().cacheIdentityKeyForLaunch() }
+            }
+            deferredIdentityKeyLoaders["antigravity"] = {
+                await loadOffMainActor { AntigravityAuthStore().cacheIdentityKeyForLaunch() }
+            }
         }
         if let openCodeAccountInventory {
             providerIdentityKeys["opencode"] = openCodeAccountInventory.cacheIdentityKey
@@ -124,7 +157,8 @@ struct HeadlessProviderAssembly {
             settingsDomainName: settingsDomainName,
             providers: providers,
             registry: registry,
-            providerIdentityKeys: providerIdentityKeys
+            providerIdentityKeys: providerIdentityKeys,
+            deferredIdentityKeyLoaders: deferredIdentityKeyLoaders
         )
     }
 }
