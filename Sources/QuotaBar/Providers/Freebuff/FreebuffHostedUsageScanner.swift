@@ -205,7 +205,7 @@ actor FreebuffHostedUsageScanner {
         // Memory pressure drops the decoded mirror, not the persisted accounting evidence.
         // An offline/local fold must restore it before publishing totals without hosted usage.
         reloadIfChangedOnDisk()
-        if cache == nil { cache = try Self.loadCache(cacheURL) }
+        if cache == nil { cache = try? Self.loadCache(cacheURL) }
         guard let cache, cache.accountKey == Self.accountKey(auth) else { return [] }
         return Self.receipts(cache)
     }

@@ -265,6 +265,8 @@ final class TotalSpendAggregationCache {
         let key = Key(
             period: period,
             day: DailyUsageAccumulator.dayKey(from: now, calendar: calendar),
+            calendarID: calendar.identifier,
+            timeZoneID: calendar.timeZone.identifier,
             inputs: providers.map { provider in
                 Input(
                     provider: provider,
@@ -294,6 +296,10 @@ final class TotalSpendAggregationCache {
         /// The local day the period windows against — the same inputs on a different day are
         /// different inputs (dormant histories and the 30-day window move with the calendar).
         let day: String
+        /// Same inputs under a different calendar/timezone produce different buckets, so the key
+        /// must carry the zone identity — matching `UsageHistoryWindow.DayKeysCacheKey`.
+        let calendarID: Calendar.Identifier
+        let timeZoneID: String
         let inputs: [Input]
     }
 

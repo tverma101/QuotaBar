@@ -125,9 +125,13 @@ enum ProcessMemoryBudget {
     }
 
     /// Raise the soft-unload ceiling to a margin above the current footprint, clamped so it can
-    /// never exceed the hard limit. Call when an expensive provider-cache unload actually runs.
+    /// never exceed the hard limit — an unload already near the hard limit therefore re-arms almost
+    /// immediately, which is deliberate: at peak pressure every unload is max-aggressive. Call when
+    /// an expensive provider-cache unload actually runs.
     static func noteSoftLimitUnload() {
-        let current = physicalFootprintBytes() ?? softLimitBytes
+        // A failed probe must not write a low fallback ceiling — the gate that just passed may have
+        // read a footprint far above the soft limit, and collapsing the ceiling would unload early.
+        guard let current = physicalFootprintBytes() else { return }
         softUnloadCeilingLock.lock()
         softUnloadCeilingBytes = min(
             max(softLimitBytes, current + softUnloadMarginBytes),

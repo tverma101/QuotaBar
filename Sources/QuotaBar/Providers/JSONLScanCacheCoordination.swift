@@ -302,7 +302,12 @@ enum PersistentJSONLScanCaches {
     /// release both caches.
     static func unloadAfterRefreshCycle(keepRouterItemsResident: Bool = false) async {
         await flushPendingWrites()
-        if ProcessMemoryBudget.isOverSoftLimit {
+        // The parsed Router index and session tails are expensive caches in the same class as the
+        // provider databases — a flat soft-limit unload every pass forced each ledger append to
+        // re-decode them. They ride the same hysteresis ceiling so a hover near the soft limit
+        // keeps them resident instead of thrashing.
+        if ProcessMemoryBudget.isOverSoftUnloadCeiling {
+            ProcessMemoryBudget.noteSoftLimitUnload()
             CodexLogUsageScanner.unloadSharedTailCacheItems()
             ClaudeSessionAppendCache.shared.unloadRetainedItems()
             CodexRouterUsageScanner.unloadSharedTailCacheItems()

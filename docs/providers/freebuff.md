@@ -65,8 +65,10 @@ Hours and tokens are separate measurements; neither is converted into the other.
 **Hosted history and the model catalogue are an opt-in.** The hosted-receipt and catalogue
 calls enumerate the account's runs and model data in bulk; QuotaBar ships with them off and
 reads only the session quota endpoint plus local Desktop history, so token totals come from
-local data alone. Owners can re-enable the full hosted history on their own machine with
-`defaults write com.tverma101.quotabar quotabar.freebuffHostedDetail -bool true`. The rest of
+local data — including any hosted receipts a previous opt-in already saved to this machine.
+Owners can re-enable the full hosted history on their own machine with
+`defaults write com.tverma101.quotabar quotabar.freebuffHostedDetail -bool true` (use
+`com.tverma101.quotabar.dev` while testing a dev build). The rest of
 this section describes behavior with that flag on.
 
 **Today**, **Yesterday**, and **Last 30 Days** combine measured hosted-run tokens with older Freebuff
