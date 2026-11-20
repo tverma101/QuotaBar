@@ -684,7 +684,8 @@ final class LayoutStoreTests: XCTestCase {
             "claude.extra", "claude.today", "claude.yesterday", "claude.last30",
             "codex.session", "codex.weekly", "codex.spark", "codex.sparkWeekly", "codex.trend",
             "codex.credits", "codex.rateLimitResets", "codex.today", "codex.yesterday", "codex.last30",
-            "devin.daily", "devin.weekly", "devin.extra",
+            "devin.daily", "devin.weekly", "devin.extra", "devin.trend",
+            "devin.today", "devin.yesterday", "devin.last30",
             "grok.weekly", "grok.trend",
             "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",
             // Cursor spend tiles + usage trend are enabled, joining its live meters in the default layout.
@@ -723,8 +724,10 @@ final class LayoutStoreTests: XCTestCase {
             "codex.spark", "codex.sparkWeekly",
             "codex.credits", "codex.rateLimitResets", "codex.today", "codex.yesterday", "codex.last30"
         ])
-        XCTAssertEqual(primaryByProvider["devin"], ["devin.daily", "devin.weekly"])
-        XCTAssertEqual(expandedByProvider["devin"], ["devin.extra"])
+        XCTAssertEqual(primaryByProvider["devin"], ["devin.daily", "devin.weekly", "devin.trend"])
+        XCTAssertEqual(expandedByProvider["devin"], [
+            "devin.extra", "devin.today", "devin.yesterday", "devin.last30"
+        ])
         XCTAssertEqual(primaryByProvider["grok"], ["grok.weekly", "grok.trend"])
         XCTAssertEqual(expandedByProvider["grok"], [
             "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30"

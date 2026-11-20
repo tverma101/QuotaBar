@@ -17,11 +17,6 @@ app and macOS version, which providers and metrics you have enabled, and which m
 to the menu bar or tucked behind the "show more" caret. A random ID (not tied to you or any account)
 lets the project owner count daily active users without identifying anyone.
 
-- **Crash reports** — if the app crashes, it saves a report and sends it the next time you open the
-  app: the technical stack trace (which parts of *QuotaBar's own code* were running when it crashed)
-  plus the app and macOS version. This contains no account details, credentials, or usage values —
-  just where in the app the crash happened.
-
 ## What the toggle shares
 
 When extra analytics are on, the app also sends, for each provider refreshed that day, at most one
@@ -31,7 +26,7 @@ provider-refresh event:
   of errors that happened (for example "not logged in", "network", or an HTTP status group), and how
   many manual refreshes you triggered.
 
-Turning the toggle off stops these extra events. Daily activity and crash reports continue, as long as
+Turning the toggle off stops these extra events. Daily activity continues, as long as
 a token is configured at all.
 
 ## What is never shared
@@ -39,6 +34,8 @@ a token is configured at all.
 - No account details, names, emails, or credentials.
 - No actual usage **values** (no spend amounts, token counts, or limits).
 - No error **messages** or file paths — only coarse error categories as counts.
+- No crash reports — exception autocapture stays off because its `$exception` payloads can embed
+  local file paths, which must never leave this Mac, even when a token is configured.
 
 ## Account names on screen
 
@@ -81,13 +78,16 @@ the usage metadata needed for local totals, including any per-event cost already
 but not raw JSONL lines or conversation text. They are private to your macOS account and are never sent
 to PostHog, a provider, or iCloud. Old source-file records are dropped as the scan window advances, and
 identity caches that have not been used for 35 days are removed. QuotaBar's pricing engine runs after
-the cache is read, so its computed aggregates and totals are not persisted in this cache.
+the cache is read, so its computed aggregates and totals are not persisted in this cache. Separately,
+finished per-day usage totals (tokens, costs, and per-model sums — no event rows) are kept in
+`~/Library/Application Support/QuotaBar/log-usage-aggregates/` so a refresh over unchanged sources can
+skip re-folding entirely; the same account privacy applies.
 
 If you explicitly turn on [iCloud Sync](icloud-sync.md), QuotaBar writes normalized daily tokens,
 spend, and model totals to its private iCloud container so your own Macs can show one combined summary.
 Credentials, account limits, provider responses, and raw logs are never written there. This is separate
 from anonymous usage analytics: iCloud Sync defaults off and uses your iCloud account, while the
-analytics toggle controls extra PostHog events, not daily activity or crash reports.
+analytics toggle controls extra PostHog events, not daily activity.
 
 ## How it works
 
@@ -103,7 +103,7 @@ analytics toggle controls extra PostHog events, not daily activity or crash repo
   commit but must never belong to a project owner who has not agreed to receive the data.
 - When enabled, data is fully anonymous: the app never identifies you to the analytics service and
   creates no user profile.
-- Daily activity and crash reports are always enabled once a token exists, regardless of the
+- Daily activity is always enabled once a token exists, regardless of the
   extra-analytics switch.
 - Counts are rolled up locally and sent as daily summaries, so the app's normal 5-minute refresh never
   turns into a flood of network calls.
@@ -113,5 +113,5 @@ analytics toggle controls extra PostHog events, not daily activity or crash repo
 ## Turning extra analytics off
 
 Open **Settings → Privacy** and switch **Help make QuotaBar better by sharing anonymous usage analytics**
-off. Extra usage analytics stop. Daily activity and crash reports continue, if a token is configured
+off. Extra usage analytics stop. Daily activity continues, if a token is configured
 at all. To send nothing whatsoever, build without a token — which is the default.

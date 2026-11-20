@@ -519,7 +519,7 @@ enum SpendTileMapper {
             let list = variants
                 .map { key, value in
                     ModelUsageVariant(model: value.vote.best ?? key, totalTokens: value.tokens,
-                                      costUSD: value.costUSD.map(SpendTileMapper.roundToCents),
+                                      costUSD: value.costUSD,
                                       costIsComplete: value.costIsComplete ? nil : false,
                                       tokenCountSaturated: value.tokenCountSaturated ? true : nil)
                 }
@@ -527,7 +527,7 @@ enum SpendTileMapper {
             // One variant carrying the row's own name is no breakdown — nil keeps the tooltip on plain figures.
             let isTrivial = list.count == 1 && list[0].model.lowercased() == model.lowercased()
             return ModelUsageEntry(model: model, totalTokens: tokens,
-                                   costUSD: costUSD.map(SpendTileMapper.roundToCents),
+                                   costUSD: costUSD,
                                    variants: isTrivial ? nil : list,
                                    costIsComplete: costIsComplete ? nil : false,
                                    tokenCountSaturated: tokenCountSaturated ? true : nil)
@@ -568,8 +568,17 @@ enum SpendTileMapper {
             }
         }
 
+        guard !byModel.isEmpty else { return nil }
+        let modeledTokens = byModel.values.reduce(0) { ProviderParse.addingSaturating($0, $1.tokens) }
+        if totalTokens > modeledTokens {
+            let name = ModelUsageEntry.unattributedModelName
+            byModel[name.lowercased(), default: ModelAccumulator()].add(
+                ModelUsageEntry(model: name, totalTokens: totalTokens - modeledTokens, costUSD: nil),
+                spelledAs: name
+            )
+        }
         let sorted = byModel.map { key, accumulator in accumulator.entry(model: accumulator.displayName ?? key) }
-            .sorted(by: modelSortPrecedes)
+            .sorted(by: ModelUsageEntry.ranksBefore)
         let folded = foldModelList(sorted)
         guard !folded.isEmpty else { return nil }
         return ModelUsageBreakdown(
@@ -601,42 +610,13 @@ enum SpendTileMapper {
         return trimmed.isEmpty ? ModelUsageEntry.unattributedModelName : trimmed
     }
 
-    private static func modelSortPrecedes(_ lhs: ModelUsageEntry, _ rhs: ModelUsageEntry) -> Bool {
-        let lhsCost = lhs.costUSD ?? 0
-        let rhsCost = rhs.costUSD ?? 0
-        if lhsCost != rhsCost { return lhsCost > rhsCost }
-        if lhs.totalTokens != rhs.totalTokens { return lhs.totalTokens > rhs.totalTokens }
-        return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
-    }
-
     /// Models below this share of the period fold into Other — a stack of sub-5% slivers is noise,
     /// and the Other row lists its leading contributors.
     private static let minVisibleShare = 0.05
 
     private static func foldModelList(_ entries: [ModelUsageEntry]) -> [ModelUsageEntry] {
-        // The threshold uses the same basis as the panel's percent labels (cost shares only when
-        // every model is priced, token shares otherwise — see `ModelUsageDetail.share`). A model is
-        // only minor enough to fold when it is a sliver on BOTH bases: its display share and its
-        // raw token share. The token floor is what keeps a cheap-but-heavy model visible — tokens
-        // are the measured quantity and cost is the imputed one, so a model holding half the
-        // period's tokens must never disappear behind "Other" just because its cost share is small
-        // (the bug that hid 488M glm tokens under a 3% Other row).
-        let allCostsComplete = entries.allSatisfy { $0.costUSD != nil && !$0.hasIncompleteCost }
-        let largestCost = entries.compactMap(\.costUSD).max() ?? 0
-        // Normalize by the largest entry before summing so a finite set of prices cannot overflow
-        // the denominator and make every model appear to have a zero share.
-        let normalizedCostTotal = largestCost > 0 && largestCost.isFinite
-            ? entries.reduce(0.0) { $0 + (($1.costUSD ?? 0) / largestCost) }
-            : 0
-        let canUseCostShares = allCostsComplete && normalizedCostTotal.isFinite && normalizedCostTotal > 0
+        let spendShares = ModelSpendShares(entries)
         let tokenTotal = entries.reduce(0) { ProviderParse.addingSaturating($0, $1.totalTokens) }
-        func share(_ entry: ModelUsageEntry) -> Double {
-            if canUseCostShares {
-                return ((entry.costUSD ?? 0) / largestCost) / normalizedCostTotal
-            }
-            guard tokenTotal > 0 else { return 0 }
-            return Double(entry.totalTokens) / Double(tokenTotal)
-        }
         func tokenShareLeader(_ entry: ModelUsageEntry) -> Bool {
             guard tokenTotal > 0 else { return false }
             return Double(entry.totalTokens) / Double(tokenTotal) >= minVisibleShare
@@ -653,7 +633,7 @@ enum SpendTileMapper {
             let isUnattributed = entry.model.caseInsensitiveCompare(ModelUsageEntry.unattributedModelName) == .orderedSame
             if isUnattributed {
                 other.fold(entry)
-            } else if share(entry) < minVisibleShare && !tokenShareLeader(entry) {
+            } else if (spendShares?.share(of: entry) ?? 0) < minVisibleShare && !tokenShareLeader(entry) {
                 other.fold(entry)
             } else if entry.costUSD == nil {
                 visible.append(entry)
@@ -675,7 +655,7 @@ enum SpendTileMapper {
             // that model's tokens and cost twice: once on Other, again as its only contributor.
             visible.append(contentsOf: other.entry(model: ModelUsageEntry.otherModelName).presentedRows())
         }
-        return visible
+        return visible.sorted(by: ModelUsageEntry.ranksBefore)
     }
 
     private static func addingFiniteCost(_ current: Double?, _ addition: Double) -> Double? {
@@ -684,9 +664,4 @@ enum SpendTileMapper {
         return total.isFinite ? total : nil
     }
 
-    private static func roundToCents(_ value: Double) -> Double {
-        let scaled = value * 100
-        guard value.isFinite, scaled.isFinite else { return value }
-        return scaled.rounded() / 100
-    }
 }

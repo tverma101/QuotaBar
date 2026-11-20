@@ -107,6 +107,7 @@ final class ScanWorkerClientTests: XCTestCase {
         XCTAssertEqual(runner.spawnCount, 1)
         XCTAssertEqual(runner.lastEnvironment["QUOTABAR_IN_SCAN_WORKER"], "1")
         XCTAssertTrue(runner.lastArguments.contains("--scan-worker"))
+        XCTAssertTrue(runner.lastArguments.contains("--return-only"))
     }
 
     func testChildErrorBecomesErrorSnapshotWithoutRescan() async throws {

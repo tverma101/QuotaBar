@@ -119,6 +119,7 @@ Malformed or oversized records remain partial until corrected or until they age 
 
 - **"Start Antigravity or run `agy`…"** — sign in to the Antigravity app (or run `agy`) so a usable token exists, then refresh.
 - **"Couldn't read Antigravity credentials…"** — unlock Keychain or sign in to Antigravity again. QuotaBar will not use its cached access token until the current login can be verified.
+- **"Antigravity needs permission to read its Keychain item"** — use the Antigravity card's **Refresh** action and approve the macOS Keychain prompt. Local history can still refresh without this permission.
 - **"Google denied access to Antigravity usage"** — Cloud Code returned 403. Check that the signed-in account and project have access; QuotaBar does not treat this as an expired token.
 - **"Antigravity did not provide a supported usage endpoint"** — the current account or Antigravity build does not expose a quota endpoint QuotaBar recognizes. Update Antigravity and refresh; if the message remains, that account may not expose usage through these endpoints.
 - **"Google rejected QuotaBar's Antigravity OAuth client configuration"** — Google returned `invalid_client` while exchanging the refresh token. This is an app-side client configuration issue, not an expired Antigravity sign-in; update QuotaBar and try again.

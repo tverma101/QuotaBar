@@ -128,13 +128,14 @@ final class ZstdDecompressorTests: XCTestCase {
         let result = await scanner.scanResult(daysBack: 3650, now: Date().addingTimeInterval(-3600), pricing: TestPricing.bundled)
 
         switch result {
-        case .complete(let scan):
+        case .complete(let scan, let damagedLines):
+            XCTAssertEqual(damagedLines, 0)
             XCTAssertEqual(
                 scan?.series.daily.reduce(0) { $0 + $1.totalTokens },
                 450,
                 "\(String(describing: scan))"
             )
-        case .incomplete:
+        case .deferredByFutureTimestamp, .incomplete:
             XCTFail("the fold must complete when zstd is available")
         }
     }
