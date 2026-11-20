@@ -176,7 +176,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         self.readFailureReporter = UsageLogReadFailureReporter(logTag: logTag, warning: readFailureWarning)
         self.persistence = persistence
         self.logTag = logTag
-        if let persistence {
+        // A one-shot scan worker exits after its fold; pruning stale cache identities on every
+        // provider init would repeat launch-time maintenance the app already owns.
+        if let persistence, ProcessInfo.processInfo.environment["QUOTABAR_IN_SCAN_WORKER"] == nil {
             let cutoff = Date().addingTimeInterval(-JSONLScanCachePaths.staleIdentityRetention)
             Task.detached(priority: .utility) {
                 await JSONLScanCacheWriter.shared.pruneStaleIdentities(
