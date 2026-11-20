@@ -213,7 +213,9 @@ final class CodexAutoResetCoordinatorTests: XCTestCase {
     func testRequestIDPersistsAcrossRestartsAndBoundedRetries() async {
         let defaults = defaults()
         var ids: [String] = []
-        let banked = credit("credit-X", 55)
+        // Expiry at +90s keeps the credit live through all five 15-second-spaced retries
+        // (last claim lands at +60) so the bound — not the expiry guard — ends the attempts.
+        let banked = credit("credit-X", 90)
         let accounts: [String: CodexAutoResetCoordinator.Account] = ["codex": .init(
             availableCredits: { [banked] },
             claim: { _, id, _ in ids.append(id); return .failed }
@@ -233,6 +235,7 @@ final class CodexAutoResetCoordinatorTests: XCTestCase {
         await restarted.runOnce(for: "codex")
         XCTAssertEqual(ids.count, 5)
         XCTAssertEqual(Set(ids).count, 1)
+        XCTAssertEqual(restarted.lastErrorByAccount["codex"], "Could not redeem expiring reset")
     }
 
     func testDisabledToggleDoesNotLookUpOrClaim() async {
