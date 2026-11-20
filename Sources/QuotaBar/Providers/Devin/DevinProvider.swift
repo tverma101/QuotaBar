@@ -249,13 +249,14 @@ final class DevinProvider: ProviderRuntime {
     /// Local spend tiles from the CLI's session database, falling back to exported transcripts
     /// when the database is missing or holds no metered calls. A nil scan means the local usage
     /// source could not be completely read — the provider keeps its last-good history rather than
-    /// publishing a partial fold.
+    /// publishing a partial fold. The pricing snapshot resolves inside the scan only when metered
+    /// rows exist, so a fold that finds nothing never pays the catalog decode.
     private func appendLocalUsage(to lines: inout [MetricLine], now: Date) async -> ProviderUsageHistory? {
         guard !Task.isCancelled else { return nil }
         guard let scan = await transcriptUsageScanner.scan(
             daysBack: UsageHistoryWindow.lifetimeDays(through: now),
             now: now,
-            pricing: await pricing()
+            pricing: pricing
         ) else { return nil }
         let note = "From local Devin sessions; dollar amounts are estimates"
         SpendTileMapper.appendTokenUsage(

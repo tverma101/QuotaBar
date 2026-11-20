@@ -88,6 +88,14 @@ final class ZAIProvider: ProviderRuntime {
             quota = await refreshQuota()
         }
         guard quota.errorCategory != .cancelled, !Task.isCancelled else { return quota }
+
+        // Menu-bar and panel-meter passes only need the live quota meters. Skip the local ZCode
+        // sqlite/LevelDB scan; the data store merges prior spend tiles, Weekend Build, and usage
+        // history onto this snapshot (the same scope split Grok and Devin apply).
+        if ProviderRefreshContext.scope.skipsLocalAccounting {
+            return quota
+        }
+
         do {
             let currentNow = now()
             let modelPricing = await pricing()

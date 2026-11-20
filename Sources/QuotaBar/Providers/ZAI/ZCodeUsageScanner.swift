@@ -64,10 +64,22 @@ final class ZCodeUsageScanner: @unchecked Sendable {
     let leveldbPath: String
 
     private let lock = NSLock()
-    private var cachedResult: ZCodeUsageResult?
+    /// The local sqlite history's share of a result. Cached on the database file's own stamp and
+    /// the pricing token so a LevelDB-only change never re-runs the sqlite queries.
+    private struct SqlitePart {
+        var totalTokens: Double?
+        var planName: String?
+        var logScan: LogUsageScan?
+        var damagedRows: Int = 0
+    }
+    private var cachedSqlitePart: SqlitePart?
     private var cachedSqliteStamp: (size: UInt64, mtime: TimeInterval)?
+    private var cachedSqlitePricingToken: String?
+    /// The LevelDB entitlement's share on its own stamp. `hasCachedEntitlement` distinguishes
+    /// "scanned, found nothing" from "never scanned" — a cached nil is a real answer.
+    private var cachedEntitlement: (planName: String?, weekendBuild: ZCodeAllowance?)?
+    private var hasCachedEntitlement = false
     private var cachedLevelDBStamp: (size: UInt64, mtime: TimeInterval)?
-    private var cachedPricingToken: String?
 
     init(
         sqlite: any SQLiteAccessing = SQLiteCLIAccessor(allowsReadWriteFallback: true),
@@ -97,38 +109,64 @@ final class ZCodeUsageScanner: @unchecked Sendable {
         let expanded = (path as NSString).expandingTildeInPath
         // Stamps are optional per source: a missing sqlite file must not blind the LevelDB
         // entitlement scan (and vice versa), so the cache compares each source independently.
+        // One directory listing feeds both the LevelDB stamp and the entitlement scan — the
+        // .log/.ldb files used to be stat'd twice per refresh.
         let currentSqliteStamp = Self.sqliteStamp(at: expanded)
-        let currentLevelDBStamp = levelDBStamp()
-        let currentPricingToken = pricing.aggregateCacheToken
-
-        if let cached = lock.withLock({ () -> ZCodeUsageResult? in
-            guard cachedSqliteStamp?.size == currentSqliteStamp?.size,
-                  cachedSqliteStamp?.mtime == currentSqliteStamp?.mtime,
-                  cachedLevelDBStamp?.size == currentLevelDBStamp?.size,
-                  cachedLevelDBStamp?.mtime == currentLevelDBStamp?.mtime,
-                  cachedPricingToken == currentPricingToken else {
-                return nil
-            }
-            if let now, let allowance = cachedResult?.weekendBuild {
-                if let exp = allowance.expiresAt, exp <= now { return nil }
-                if let eff = allowance.effectiveAt, eff <= now, allowance.used == 0 { return nil }
-            }
-            return cachedResult
-        }) {
-            return cached
-        }
-
-        try Task.checkCancellation()
+        let levelDBFiles = loadLevelDBFiles()
+        let currentLevelDBStamp = Self.levelDBStamp(levelDBFiles)
 
         // Local sqlite history is one source; the LevelDB entitlement is another. Neither is
         // required: a missing or unreadable source yields its part as nil instead of hiding the
         // other source's data (a fresh Weekend Build plan has no sqlite db yet, for example).
-        var totalTokens: Double? = nil
-        var planName: String? = nil
-        var logScan: LogUsageScan? = nil
-        var damagedRows = 0
+        let sqlitePart = try sqliteUsage(stamp: currentSqliteStamp, pricing: pricing)
+        try Task.checkCancellation()
+        let entitlement = levelDBEntitlement(
+            stamp: currentLevelDBStamp,
+            files: levelDBFiles,
+            now: now
+        )
 
-        if currentSqliteStamp != nil {
+        var planName = sqlitePart.planName
+        if planName == nil, let entitlementPlan = entitlement?.planName {
+            planName = entitlementPlan
+        }
+
+        if sqlitePart.totalTokens == nil && sqlitePart.logScan == nil && entitlement == nil {
+            // Neither source yielded anything readable — no result to build (and nothing to cache).
+            return nil
+        }
+
+        return ZCodeUsageResult(
+            totalTokens: sqlitePart.totalTokens,
+            planName: planName,
+            logScan: sqlitePart.logScan,
+            weekendBuild: entitlement?.weekendBuild,
+            damagedRows: sqlitePart.damagedRows
+        )
+    }
+
+    /// The sqlite-history share of the result, cached against the database file's own stamp and
+    /// the pricing token. The queries are skipped entirely while the database file is absent (a
+    /// nil stamp), the same source-gating the prior all-or-nothing cache applied.
+    private func sqliteUsage(
+        stamp: (size: UInt64, mtime: TimeInterval)?,
+        pricing: ModelPricing
+    ) throws -> SqlitePart {
+        let pricingToken = pricing.aggregateCacheToken
+        if let cached = lock.withLock({ () -> SqlitePart? in
+            guard let cachedSqlitePart,
+                  cachedSqliteStamp?.size == stamp?.size,
+                  cachedSqliteStamp?.mtime == stamp?.mtime,
+                  cachedSqlitePricingToken == pricingToken else {
+                return nil
+            }
+            return cachedSqlitePart
+        }) {
+            return cached
+        }
+
+        var part = SqlitePart()
+        if stamp != nil {
             // Valid-row total + damaged-row count instead of a blanket 'invalid' sentinel: one
             // corrupt row in model_usage must not throw away the whole card's history. Damaged
             // rows are excluded from the total and reported (damagedRows > 0 → historyWarning).
@@ -150,51 +188,63 @@ final class ZCodeUsageScanner: @unchecked Sendable {
                 let parts = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
                 guard parts.count >= 2 else { throw ZCodeUsageError.invalidUsage }
                 if let total = Double(parts[0]), total.isFinite, total >= 0 {
-                    totalTokens = total > 0 ? total : nil
+                    part.totalTokens = total > 0 ? total : nil
                 } else if !parts[0].isEmpty {
                     throw ZCodeUsageError.invalidUsage
                 }
-                damagedRows = Int(parts[1]) ?? 0
+                part.damagedRows = Int(parts[1]) ?? 0
                 if parts.count > 2 {
                     let providerID = parts[2...].joined(separator: "|")
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     if providerID.contains("start-plan") {
-                        planName = "Start Plan"
+                        part.planName = "Start Plan"
                     } else if providerID.contains("coding-plan") {
-                        planName = "Coding Plan"
+                        part.planName = "Coding Plan"
                     }
                 }
             }
 
             // Daily series for spend tiles (Today, Yesterday, Last 30 Days)
-            logScan = readDailySeries(pricing: pricing)
+            part.logScan = readDailySeries(pricing: pricing)
         }
 
-        // Read live entitlement from LevelDB (e.g. Weekend Build total token allowance)
-        let entitlement = scanLevelDBEntitlement(leveldbPath: leveldbPath, now: now)
-        if planName == nil, let entitlementPlan = entitlement?.planName {
-            planName = entitlementPlan
-        }
-
-        if totalTokens == nil && logScan == nil && entitlement == nil {
-            // Neither source yielded anything readable — no result to build (and nothing to cache).
-            return nil
-        }
-
-        let result = ZCodeUsageResult(
-            totalTokens: totalTokens,
-            planName: planName,
-            logScan: logScan,
-            weekendBuild: entitlement?.weekendBuild,
-            damagedRows: damagedRows
-        )
         lock.withLock {
-            cachedResult = result
-            cachedSqliteStamp = currentSqliteStamp
-            cachedLevelDBStamp = currentLevelDBStamp
-            cachedPricingToken = currentPricingToken
+            cachedSqlitePart = part
+            cachedSqliteStamp = stamp
+            cachedSqlitePricingToken = pricingToken
         }
-        return result
+        return part
+    }
+
+    /// The LevelDB entitlement share, cached against the leveldb stamp. The expiry recheck mirrors
+    /// the previous all-or-nothing cache: an allowance that expired (or became active) since the
+    /// stamp was taken forces a fresh derivation even though the files did not move.
+    private func levelDBEntitlement(
+        stamp: (size: UInt64, mtime: TimeInterval)?,
+        files: [LevelDBFile]?,
+        now: Date?
+    ) -> (planName: String?, weekendBuild: ZCodeAllowance?)? {
+        let cached: (hit: Bool, value: (planName: String?, weekendBuild: ZCodeAllowance?)?) = lock.withLock {
+            guard hasCachedEntitlement,
+                  cachedLevelDBStamp?.size == stamp?.size,
+                  cachedLevelDBStamp?.mtime == stamp?.mtime else {
+                return (false, nil)
+            }
+            if let now, let allowance = cachedEntitlement?.weekendBuild {
+                if let exp = allowance.expiresAt, exp <= now { return (false, nil) }
+                if let eff = allowance.effectiveAt, eff <= now, allowance.used == 0 { return (false, nil) }
+            }
+            return (true, cachedEntitlement)
+        }
+        if cached.hit { return cached.value }
+
+        let entitlement = scanLevelDBEntitlement(files: files, now: now)
+        lock.withLock {
+            cachedEntitlement = entitlement
+            hasCachedEntitlement = true
+            cachedLevelDBStamp = stamp
+        }
+        return entitlement
     }
 
     /// The per-day model usage series read from the local sqlite history, for spend tiles and the
@@ -281,10 +331,12 @@ final class ZCodeUsageScanner: @unchecked Sendable {
 
     func unloadCachesForMemoryPressure() {
         lock.withLock {
-            cachedResult = nil
+            cachedSqlitePart = nil
             cachedSqliteStamp = nil
+            cachedSqlitePricingToken = nil
+            cachedEntitlement = nil
+            hasCachedEntitlement = false
             cachedLevelDBStamp = nil
-            cachedPricingToken = nil
         }
     }
 
@@ -295,7 +347,15 @@ final class ZCodeUsageScanner: @unchecked Sendable {
         return (size, mdate.timeIntervalSinceReferenceDate)
     }
 
-    private func levelDBStamp() -> (size: UInt64, mtime: TimeInterval)? {
+    /// One LevelDB `.log`/`.ldb` file with the attributes the stamp and the scan ordering need —
+    /// fetched once per `usage()` call so the directory is never stat'd twice.
+    private struct LevelDBFile {
+        var url: URL
+        var modified: TimeInterval
+        var size: UInt64
+    }
+
+    private func loadLevelDBFiles() -> [LevelDBFile]? {
         let expanded = (leveldbPath as NSString).expandingTildeInPath
         let url = URL(fileURLWithPath: expanded)
         guard let files = try? FileManager.default.contentsOfDirectory(
@@ -303,14 +363,25 @@ final class ZCodeUsageScanner: @unchecked Sendable {
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: .skipsHiddenFiles
         ) else { return nil }
-        var maxMtime: TimeInterval = 0
-        var totalSize: UInt64 = 0
+        var levelFiles: [LevelDBFile] = []
         for file in files where file.pathExtension == "log" || file.pathExtension == "ldb" {
             let vals = try? file.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-            let mtime = vals?.contentModificationDate?.timeIntervalSinceReferenceDate ?? 0
-            let sz = UInt64(vals?.fileSize ?? 0)
-            if mtime > maxMtime { maxMtime = mtime }
-            totalSize += sz
+            levelFiles.append(LevelDBFile(
+                url: file,
+                modified: vals?.contentModificationDate?.timeIntervalSinceReferenceDate ?? 0,
+                size: UInt64(vals?.fileSize ?? 0)
+            ))
+        }
+        return levelFiles
+    }
+
+    private static func levelDBStamp(_ files: [LevelDBFile]?) -> (size: UInt64, mtime: TimeInterval)? {
+        guard let files else { return nil }
+        var maxMtime: TimeInterval = 0
+        var totalSize: UInt64 = 0
+        for file in files {
+            if file.modified > maxMtime { maxMtime = file.modified }
+            totalSize += file.size
         }
         return totalSize > 0 ? (totalSize, maxMtime) : nil
     }
@@ -324,23 +395,11 @@ final class ZCodeUsageScanner: @unchecked Sendable {
     static let maxEntitlementJSONBytes = 25_000
 
     private func scanLevelDBEntitlement(
-        leveldbPath: String,
+        files: [LevelDBFile]?,
         now: Date? = nil
     ) -> (planName: String?, weekendBuild: ZCodeAllowance?)? {
-        let expanded = (leveldbPath as NSString).expandingTildeInPath
-        let url = URL(fileURLWithPath: expanded)
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: url,
-            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
-            options: .skipsHiddenFiles
-        ) else { return nil }
-
-        let levelFiles = files.filter { $0.pathExtension == "log" || $0.pathExtension == "ldb" }
-        let sorted = levelFiles.sorted {
-            let d1 = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let d2 = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return d1 > d2
-        }
+        guard let files else { return nil }
+        let sorted = files.sorted { $0.modified > $1.modified }
 
         let keyPrefix = Data(Self.entitlementKeyPrefix.utf8)
         let jsonMarker = Data(Self.entitlementJSONMarker.utf8)
@@ -352,7 +411,7 @@ final class ZCodeUsageScanner: @unchecked Sendable {
         var bestCachedAt: Double = -1
         autoreleasepool {
             for file in sorted {
-                guard let data = try? Data(contentsOf: file) else { continue }
+                guard let data = try? Data(contentsOf: file.url) else { continue }
                 var searchStart = data.startIndex
                 while searchStart < data.endIndex,
                       let keyRange = data.range(of: keyPrefix, in: searchStart..<data.endIndex) {

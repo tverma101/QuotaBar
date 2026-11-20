@@ -287,8 +287,8 @@ final class WidgetDataStore {
         if let zai = providersByID["zai"] as? ZAIProvider {
             await zai.unloadLocalAccountingCachesForMemoryPressure()
         }
-        // Unloading frees blocks into the malloc zone; relief is what returns the pages.
-        ProcessMemoryBudget.releaseAllocatorFreePages()
+        // Callers relieve the malloc zone at the end of the chain so one free-list walk covers
+        // every unload in the cycle.
     }
 
     /// Releases Freebuff's derived accounting caches on every refresh cycle, below the memory budget.
@@ -303,8 +303,6 @@ final class WidgetDataStore {
         if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
             await freebuff.unloadLocalAccountingCachesForMemoryPressure()
         }
-        // Unloading frees blocks into the malloc zone; relief is what returns the pages.
-        ProcessMemoryBudget.releaseAllocatorFreePages()
     }
 
     init(

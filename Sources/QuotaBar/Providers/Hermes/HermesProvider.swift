@@ -79,6 +79,10 @@ final class HermesProvider: ProviderRuntime {
         )
     }
 
+    func unloadLocalAccountingCachesForMemoryPressure() async {
+        usageScanner.unloadCachesForMemoryPressure()
+    }
+
     /// Hermes' daily rows have no serving-model detail to price at public API rates. Mark every
     /// token-bearing day incomplete so Usage History does not present other providers' estimates as
     /// a complete cross-provider total.

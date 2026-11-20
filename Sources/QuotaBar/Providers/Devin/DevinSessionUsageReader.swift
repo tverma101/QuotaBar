@@ -22,17 +22,29 @@ struct DevinSessionUsageReader {
     /// One row per metered assistant call: `request_id` partitions the streamed copies and
     /// `copy_rank = 1` keeps the newest `row_id`. Token counters arrive as JSON values, so each
     /// count column is paired with a `json_type` column four positions later.
+    ///
+    /// `fields` pulls every needed path out of `chat_message` in ONE parse (a multi-path
+    /// `json_extract` yields a JSON array whose missing paths come back as `null` elements), then
+    /// the metered CTE unpacks them from that small array — instead of re-parsing the whole
+    /// document once per column and once per WHERE clause.
     private static let query = """
-    WITH metered AS MATERIALIZED (
-        SELECT row_id, created_at, json_extract(chat_message, '$.metadata.request_id') AS request_id,
-               json_extract(chat_message, '$.metadata.created_at') AS generated_at,
-               json_extract(chat_message, '$.metadata.generation_model') AS model,
-               json_extract(chat_message, '$.metadata.metrics') AS metrics
+    WITH extracted AS MATERIALIZED (
+        SELECT row_id, created_at,
+               json_extract(chat_message,
+                   '$.role', '$.metadata.request_id', '$.metadata.created_at',
+                   '$.metadata.generation_model', '$.metadata.metrics') AS fields
         FROM message_nodes
-        WHERE json_extract(chat_message, '$.role') = 'assistant'
-          AND json_type(chat_message, '$.metadata.metrics') = 'object'
-          AND (json_type(chat_message, '$.metadata.metrics.input_tokens') IS NOT NULL
-            OR json_type(chat_message, '$.metadata.metrics.output_tokens') IS NOT NULL)
+    ), metered AS MATERIALIZED (
+        SELECT row_id, created_at,
+               json_extract(fields, '$[1]') AS request_id,
+               json_extract(fields, '$[2]') AS generated_at,
+               json_extract(fields, '$[3]') AS model,
+               json_extract(fields, '$[4]') AS metrics
+        FROM extracted
+        WHERE json_extract(fields, '$[0]') = 'assistant'
+          AND json_type(fields, '$[4]') = 'object'
+          AND (json_type(fields, '$[4].input_tokens') IS NOT NULL
+            OR json_type(fields, '$[4].output_tokens') IS NOT NULL)
     ), unique_calls AS (
         SELECT *, row_number() OVER (PARTITION BY request_id,
             CASE WHEN request_id IS NULL OR request_id = '' THEN row_id ELSE 0 END ORDER BY row_id DESC) AS copy_rank

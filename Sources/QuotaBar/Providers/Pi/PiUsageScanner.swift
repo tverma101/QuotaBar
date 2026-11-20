@@ -168,7 +168,7 @@ actor PiUsageScanner {
     static func parseFile(_ data: Data) -> [Entry] {
         var entries: [Entry] = []
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            if case .entry(let entry) = parseLineResult(Data(line)) { entries.append(entry) }
+            if case .entry(let entry) = parseLineResult(line) { entries.append(entry) }
         }
         return entries
     }
@@ -179,7 +179,7 @@ actor PiUsageScanner {
         var entries: [Entry] = []
         var malformed = false
         let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
-            switch parseLineResult(Data(line)) {
+            switch parseLineResult(line) {
             case .entry(let entry): entries.append(entry)
             case .irrelevant: break
             case .malformed: malformed = true
@@ -202,9 +202,12 @@ actor PiUsageScanner {
         return entry
     }
 
-    private static func parseLineResult(_ data: Data) -> LineResult {
-        guard data.range(of: usageMarker) != nil else { return .irrelevant }
-        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+    private static func parseLineResult(_ line: Data.SubSequence) -> LineResult {
+        // The marker pre-filter runs on the slice so the per-line Data copy only happens for
+        // lines that can actually carry usage (the same gate the Muse scanner applies).
+        guard line.range(of: usageMarker) != nil else { return .irrelevant }
+        let lineData = Data(line)
+        guard let object = (try? JSONSerialization.jsonObject(with: lineData)) as? [String: Any] else {
             return .malformed
         }
         guard object["type"] as? String == "message" else { return .irrelevant }
