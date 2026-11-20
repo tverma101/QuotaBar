@@ -126,10 +126,11 @@ actor CodexRouterUsageScanner {
             "ledger": LogUsageSourceFingerprint.of(ledgerFiles),
             "pool": LogUsageSourceFingerprint.of(poolFiles),
         ]
-        let cacheKey = "codex-router|\(Self.aggregateScopeKey(
+        let scopeKey = Self.aggregateScopeKey(
             accountIdentityKey: accountIdentityKey,
             allowsUnscopedEvents: allowsUnscopedEvents
-        ))"
+        )
+        let cacheKey = "codex-router|\(scopeKey)"
         return await aggregateCache.scan(
             key: cacheKey,
             pricingStamp: LogUsagePricingStamp.of(pricing),
