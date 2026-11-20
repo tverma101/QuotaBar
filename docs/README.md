@@ -11,7 +11,7 @@ What the app does and how it behaves. These pages describe **behavior, not visua
 - [Refreshing & caching](refreshing.md) — when data updates and what happens when a fetch fails
 - [iCloud Sync](icloud-sync.md) — how spend history is combined across Macs
 - [Model pricing](pricing.md) — how spend tiles price tokens, and where the rates come from
-- [Privacy & usage data](privacy.md) — daily activity, crash reports, and optional usage analytics
+- [Privacy & usage data](privacy.md) — daily activity and optional usage analytics
 
 ## Integrations
 

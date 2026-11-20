@@ -3,7 +3,7 @@
 QuotaBar can route all provider requests through an optional proxy.
 
 - Supported: `socks5://`, `http://`, `https://`
-- Config file: `~/.openusage/config.json`
+- Config file: `~/.quotabar/config.json`
 - Default: off
 - UI: none — file only
 

@@ -107,7 +107,7 @@ final class CopilotAuthStoreTests: XCTestCase {
     }
 
     func testRepeatedKeychainPermissionFailureUsesOneSilentRead() throws {
-        let username = "tejas"
+        let username = "fixture-user"
         let key = KeychainItemKey(service: CopilotAuthStore.ghKeychainService, account: username)
         KeychainPermissionGate.shared.reset(key)
         defer { KeychainPermissionGate.shared.reset(key) }
@@ -136,7 +136,7 @@ final class CopilotAuthStoreTests: XCTestCase {
         // The file carries both the token and the Keychain account; reading it twice per load meant
         // two file reads on every refresh.
         let files = CountingCopilotFiles([
-            CopilotAuthStore.ghHostsPath: "github.com:\n  user: tejas\n"
+            CopilotAuthStore.ghHostsPath: "github.com:\n  user: fixture-user\n"
         ])
         let store = CopilotAuthStore(files: files, keychain: FakeKeychain())
 

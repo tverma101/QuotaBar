@@ -4,7 +4,7 @@ import SwiftUI
 /// The dashboard footer's trailing control: a single **Options ⌄** menu button in Liquid Glass. The
 /// earlier split button ("Customize" + separate chevron) confused people — two tap targets in one
 /// capsule read as one — so everything now lives in one obvious menu: Customize / Settings / Share
-/// Screenshot / Check for Updates / About / Quit. Customize leads the menu because it's the screen
+/// Screenshot / About / Quit. Customize leads the menu because it's the screen
 /// users reach for most; Settings stays one click away (and always via ⌘,).
 ///
 /// The capsule is a `.buttonStyle(.plain)` `Menu` with one `interactiveGlass(in: Capsule())` treatment

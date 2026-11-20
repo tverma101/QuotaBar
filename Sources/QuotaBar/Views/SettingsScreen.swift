@@ -8,8 +8,7 @@ import UserNotifications
 /// Customize. It replaces the old separate Settings window, which forced the popover closed every
 /// time it opened. Sections are Customize-style cards (caption header over a rounded card of rows)
 /// so the popover keeps one visual language; controls sit on each row's trailing edge like
-/// System Settings. The footer already shows the version; the release build adds an "Updates" section
-/// (auto-check, beta channel, and a full-width manual check button).
+/// System Settings. The footer shows the version.
 struct SettingsScreen: View {
     @Environment(AppContainer.self) private var container
     @Environment(LayoutStore.self) private var layout
@@ -467,7 +466,7 @@ struct SettingsScreen: View {
         }
     }
 
-    /// A full-width glass button row, matching the "Check for Updates…" idiom.
+    /// A full-width glass button row.
     /// Glass on macOS 26+, bordered fallback on macOS 15.
     private func logButton(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {

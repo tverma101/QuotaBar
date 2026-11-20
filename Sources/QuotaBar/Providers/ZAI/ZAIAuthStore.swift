@@ -22,7 +22,7 @@ enum ZAIAuthError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .missingKey:
-            return "No Z.ai API key. Set ZAI_API_KEY or add it to ~/.config/openusage/zai.json."
+            return "No Z.ai API key. Set ZAI_API_KEY or add it to ~/.config/quotabar/zai.json."
         case .credentialsUnreadable:
             return "Couldn't read the saved Z.ai API key. Check the config file permissions, then refresh again."
         case .invalidKey:
@@ -48,6 +48,7 @@ struct ZAIAuthStore: Sendable {
     /// Config files checked in order; first readable key wins. JSON (`apiKey` / `api_key` / `key`) or a
     /// plain-text file containing only the key.
     static let configPaths = [
+        "~/.config/quotabar/zai.json",
         "~/.config/openusage/zai.json",
         "~/.config/zai/key.json"
     ]
