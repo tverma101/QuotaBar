@@ -193,7 +193,9 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
         // parse, a false negative would drop real usage.
         guard mayNameOpenCodeProvider(line) else { return .irrelevant }
         let event: CodexRouterUsageScanner.Event
-        switch CodexRouterEventLineParser.parseResult(line, timestampCache: &timestampCache) {
+        // Rust handles the line parse on the hot path; it hands exotic shapes back to the Swift
+        // reference parser, so the fold's classification below is unchanged either way.
+        switch CodexRouterLineRustParser.parseResult(line, timestampCache: &timestampCache) {
         case .event(let parsed): event = parsed
         case .malformedEvent(let parsed):
             guard let malformedRow = disabledMalformedRow(

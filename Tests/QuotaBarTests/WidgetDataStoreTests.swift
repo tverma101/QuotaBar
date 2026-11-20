@@ -475,6 +475,50 @@ final class WidgetDataStoreTests: XCTestCase {
         XCTAssertEqual(runtime.observedScopes, [.panelMeters])
     }
 
+    func testFoldPlaceholderDoesNotReEmitDeferredRequestUntilItClears() async throws {
+        // A batched scan-worker window marks its members in flight with no running scope. The
+        // deferral treats that as blocked; the emitter used to treat it as ready, so the same
+        // request was re-emitted and re-deferred for the entire child fold (1,766 empty batches
+        // in one second on 2026-11-17). Readiness must use the deferral's own rule.
+        let provider = Provider(id: "test", displayName: "Test", icon: .providerMark("codex"))
+        let descriptor = WidgetDescriptor.percent(id: "test.session", provider: provider, title: "Session")
+        let runtime = SuspendedProviderRuntime(provider: provider, descriptors: [descriptor])
+        let defaults = makeUserDefaults("deferred-placeholder-emission")
+        let store = WidgetDataStore(
+            registry: WidgetRegistry(providers: [provider], descriptors: [descriptor]),
+            providers: [runtime],
+            cache: ProviderSnapshotCache(userDefaults: defaults, storageKey: "snapshots", ttl: 600),
+            defaults: defaults
+        )
+        var ready: [WidgetDataStore.DeferredRefreshRequest] = []
+        store.onDeferredRefreshReady = { ready.append($0) }
+
+        store.refreshingProviderIDs.insert(provider.id)
+        let deferred = await ProviderRefreshContext.$scope.withValue(.menuBar) {
+            await store.refresh(providerID: provider.id)
+        }
+        XCTAssertEqual(deferred, .inFlight)
+        await Task.yield()
+        XCTAssertTrue(
+            ready.isEmpty,
+            "a fold placeholder must not read as ready and re-emit the request it just deferred"
+        )
+
+        // The child window closes. The next completed refresh is the opportunity that resumes it,
+        // once — not once per unregister while the window was open.
+        store.refreshingProviderIDs.remove(provider.id)
+        let completion = Task {
+            await ProviderRefreshContext.$scope.withValue(.menuBar) {
+                await store.refresh(providerID: provider.id)
+            }
+        }
+        await waitUntil({ runtime.didStart }, "the follow-up refresh started")
+        runtime.resume()
+        _ = await completion.value
+
+        XCTAssertEqual(ready.map(\.providerID), [provider.id])
+    }
+
     func testSupersededVisibleMeterRetrySilentlyCompletesItsHistoryFold() async throws {
         let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
         let now = Date(timeIntervalSince1970: 1_800_000_000)

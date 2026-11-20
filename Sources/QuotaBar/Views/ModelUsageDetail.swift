@@ -8,9 +8,10 @@ import SwiftUI
 struct ModelUsageDetail: View {
     let title: String
     let breakdown: ModelUsageBreakdown
-    /// Collapses the model list behind a tap for windows whose full breakdown is a wall of rows
-    /// (the Last 30 Days spend tile). The header and a one-line total stay visible; tapping the
-    /// button reveals the full per-model detail.
+    /// Long windows (the Last 30 Days spend tile) would otherwise open a wall of rows. They show the
+    /// ranked head of the list immediately — model usage is the point of the popover, so it should not
+    /// sit behind a button — and keep the smaller tail behind one compact ``Show N More Models`` link
+    /// that loads it on demand.
     var loadOnTap: Bool = false
     var onHoverChange: (Bool) -> Void
 
@@ -18,15 +19,14 @@ struct ModelUsageDetail: View {
     @State private var revealed = false
 
     private static let width: CGFloat = 280
+    /// Rows shown before the tail is collapsed on a `loadOnTap` window. The list is already ranked,
+    /// so this keeps the biggest models and hides only the smaller ones.
+    static let collapsedModelLimit = 3
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
-            if loadOnTap, !revealed {
-                collapsedSummary
-            } else {
-                fullList
-            }
+            modelList
             if let note = breakdown.sourceNote {
                 PopoverSourceNote(text: note)
             }
@@ -49,42 +49,10 @@ struct ModelUsageDetail: View {
             .foregroundStyle(.primary)
     }
 
-    /// The Last 30 Days tile's resting state: the period's aggregate figures plus the deferred
-    /// disclosure. Everything the popover is for is one tap away — it just isn't unfolded up front.
-    private var collapsedSummary: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(MetricFormatter.string(
-                    for: MetricValue(
-                        number: Double(breakdown.totalTokens),
-                        kind: .count,
-                        label: "tokens",
-                        tokenCountSaturated: breakdown.tokenCountSaturated
-                    ),
-                    style: .row
-                ))
-                .monospacedDigit()
-                Spacer(minLength: 8)
-                if let cost = breakdown.totalCostUSD {
-                    let incomplete = breakdown.models.contains { $0.hasIncompleteCost }
-                    Text((incomplete ? "≥" : "") + MetricFormatter.number(cost, kind: .dollars, style: .row))
-                        .monospacedDigit()
-                }
-            }
-            .font(.system(size: density.supportingPointSize))
-            .foregroundStyle(.secondary)
-
-            Button("Show Model Breakdown") {
-                revealed = true
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .font(.system(size: density.supportingPointSize))
-            .frame(maxWidth: .infinity)
-        }
-    }
-
-    private var fullList: some View {
+    /// The ranked model list, with the smaller tail collapsed on a `loadOnTap` window until the
+    /// reader asks for it. Shares stay computed over every model, so revealing the tail never shifts
+    /// the percentages of the rows above it.
+    private var modelList: some View {
         let models = breakdown.models.flatMap { $0.presentedRows() }
         let aggregateTokenCountSaturated = breakdown.tokenCountSaturated == true
         let sharesAreReliable = Self.sharesAreReliable(
@@ -96,8 +64,12 @@ struct ModelUsageDetail: View {
             aggregateTokenCountSaturated: aggregateTokenCountSaturated
         )
         let percents = Self.wholePercents(shares)
+        let visibleCount = loadOnTap && !revealed
+            ? min(Self.collapsedModelLimit, models.count)
+            : models.count
+        let hiddenCount = models.count - visibleCount
         return VStack(alignment: .leading, spacing: 0) {
-            ForEach(models.indices, id: \.self) { index in
+            ForEach(0..<visibleCount, id: \.self) { index in
                 modelRow(
                     models[index],
                     share: sharesAreReliable ? shares[index] : nil,
@@ -110,7 +82,20 @@ struct ModelUsageDetail: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if hiddenCount > 0 {
+                Button(Self.showMoreTitle(hiddenCount: hiddenCount)) {
+                    revealed = true
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: density.supportingPointSize - 1, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.top, 7)
+            }
         }
+    }
+
+    static func showMoreTitle(hiddenCount: Int) -> String {
+        hiddenCount == 1 ? "Show 1 More Model" : "Show \(hiddenCount) More Models"
     }
 
     /// Model name / cost on top, share percent / tokens beneath. The Other row can add a compact

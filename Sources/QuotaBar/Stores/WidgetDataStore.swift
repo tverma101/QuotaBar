@@ -191,6 +191,12 @@ final class WidgetDataStore {
     /// scheduler as soon as the provider can accept them, so a consumed timer/ledger/panel intent is
     /// retried promptly without repeatedly polling the provider.
     @ObservationIgnored private var deferredRefreshRequests: [String: Set<DeferredRefreshRequest>] = [:]
+    /// Floor between two emissions for one provider. A request that becomes ready again inside the
+    /// window is coalesced into one delayed emission instead of waking the scheduler on every
+    /// unregister, so a readiness mistake cannot degrade into a re-emit spin.
+    private static let deferredEmissionCooldown: TimeInterval = 1
+    @ObservationIgnored private var lastDeferredEmissionUptime: [String: TimeInterval] = [:]
+    @ObservationIgnored private var scheduledDeferredEmissions: [String: Task<Void, Never>] = [:]
     /// Wall-clock time of the most recent live quota attempt or due scheduler check. The footer uses
     /// it for its live "Next update in …" countdown. Fold-only and early cache-hit passes do not
     /// advance it, so they cannot make the meter countdown appear fresh while the quota schedule is due.
@@ -1007,13 +1013,32 @@ final class WidgetDataStore {
         emitReadyDeferredRefreshes(for: providerID)
     }
 
+    /// The inverse of `performRefresh`'s deferral rule, and the only thing the emitter may consult.
+    ///
+    /// The two must agree. A batched scan-worker window marks its members in flight with no running
+    /// scope; the deferral treats that as blocked (`mayOverlapMeterRefresh` is false for an empty
+    /// scope list) while the old emitter treated it as ready. A menu-bar tick that landed in that
+    /// window therefore re-emitted and re-deferred the same request for the whole child fold — 1,766
+    /// empty batches inside one second on 2026-11-17.
+    private func deferralBlocks(_ request: DeferredRefreshRequest) -> Bool {
+        guard refreshingProviderIDs.contains(request.providerID) else { return false }
+        let activeScopes = Array(runningProviderRefreshScopes[request.providerID, default: [:]].values)
+        guard !activeScopes.isEmpty else { return true }
+        return !Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
+    }
+
     private func emitReadyDeferredRefreshes(for providerID: String) {
         guard let requests = deferredRefreshRequests[providerID], !requests.isEmpty else { return }
-        let activeScopes = Array(runningProviderRefreshScopes[providerID, default: [:]].values)
-        let ready = requests.filter { request in
-            activeScopes.isEmpty || Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
-        }
+        let ready = requests.filter { !deferralBlocks($0) }
         guard !ready.isEmpty else { return }
+        let now = monotonicNow()
+        let sinceLast = now - (lastDeferredEmissionUptime[providerID] ?? -TimeInterval.infinity)
+        let wait = Self.deferredEmissionCooldown - sinceLast
+        guard wait <= 0 else {
+            scheduleDeferredEmission(for: providerID, after: wait)
+            return
+        }
+        lastDeferredEmissionUptime[providerID] = now
         deferredRefreshRequests[providerID] = requests.subtracting(ready)
         if deferredRefreshRequests[providerID]?.isEmpty == true {
             deferredRefreshRequests[providerID] = nil
@@ -1021,6 +1046,20 @@ final class WidgetDataStore {
         for request in ready {
             AppLog.debug(.refresh, "deferred refresh ready \(providerID) (scope=\(Self.batchScopeLabel(request.scope)))")
             onDeferredRefreshReady?(request)
+        }
+    }
+
+    /// One delayed re-check per provider. Repeated readiness inside the cooldown must not queue more
+    /// than one wake, and a cancelled scheduler must not strand the retained request.
+    private func scheduleDeferredEmission(for providerID: String, after wait: TimeInterval) {
+        guard scheduledDeferredEmissions[providerID] == nil else { return }
+        scheduledDeferredEmissions[providerID] = Task { @MainActor [weak self] in
+            defer {
+                if let self { self.scheduledDeferredEmissions[providerID] = nil }
+            }
+            try? await Task.sleep(for: .seconds(max(0.01, wait)), tolerance: .milliseconds(50))
+            guard !Task.isCancelled, let self else { return }
+            self.emitReadyDeferredRefreshes(for: providerID)
         }
     }
 
@@ -1043,6 +1082,9 @@ final class WidgetDataStore {
             for task in tasks.values { task.cancel() }
         }
         deferredRefreshRequests.removeAll()
+        for task in scheduledDeferredEmissions.values { task.cancel() }
+        scheduledDeferredEmissions.removeAll()
+        lastDeferredEmissionUptime.removeAll()
     }
 
     private func cancelProviderRefreshes(batchID: UUID) {
@@ -2226,6 +2268,9 @@ final class WidgetDataStore {
     func invalidateQuotaStateForAccountSelectionChange(providerID: String) {
         providerRequestGenerations[providerID, default: 0] &+= 1
         deferredRefreshRequests[providerID] = nil
+        scheduledDeferredEmissions[providerID]?.cancel()
+        scheduledDeferredEmissions[providerID] = nil
+        lastDeferredEmissionUptime[providerID] = nil
         activeProviderRefreshTasks[providerID]?.values.forEach { $0.cancel() }
         clearPriorQuotaState(for: providerID)
         cache.invalidateSessionFreshness(providerIDs: [providerID])

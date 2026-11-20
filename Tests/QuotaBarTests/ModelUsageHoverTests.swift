@@ -189,6 +189,33 @@ final class ModelUsageHoverTests: XCTestCase {
         XCTAssertTrue(contributors[1].hasIncompleteCost)
     }
 
+    func testLongWindowCollapsedDetailIsShorterThanTheFullList() throws {
+        let models = (0..<8).map { index in
+            ModelUsageEntry(model: "Model \(index)", totalTokens: 1_000_000 - index * 100_000,
+                            costUSD: Double(8 - index))
+        }
+        let breakdown = ModelUsageBreakdown(totalTokens: 5_000_000, totalCostUSD: 36, models: models)
+        let collapsed = ImageRenderer(content: ModelUsageDetail(
+            title: "Last 30 Days", breakdown: breakdown, loadOnTap: true, onHoverChange: { _ in }
+        ))
+        let full = ImageRenderer(content: ModelUsageDetail(
+            title: "Last 30 Days", breakdown: breakdown, onHoverChange: { _ in }
+        ))
+        let collapsedImage = try XCTUnwrap(collapsed.cgImage)
+        let fullImage = try XCTUnwrap(full.cgImage)
+        XCTAssertLessThan(
+            collapsedImage.height, fullImage.height,
+            "a long window opens on its head, not on every row"
+        )
+    }
+
+    func testLongWindowCollapsesOnlyTheSmallerModelTail() {
+        // The Last 30 Days popover opens on real model usage; only the ranked tail is deferred.
+        XCTAssertEqual(ModelUsageDetail.collapsedModelLimit, 3)
+        XCTAssertEqual(ModelUsageDetail.showMoreTitle(hiddenCount: 1), "Show 1 More Model")
+        XCTAssertEqual(ModelUsageDetail.showMoreTitle(hiddenCount: 4), "Show 4 More Models")
+    }
+
     func testOtherContributorDetailsRenderInABoundedNativePopover() throws {
         let variants = ["GPT-6.1 Terra", "Older Freebuff Usage", "Claude Haiku 5.5", "GLM 5.3 Flash",
                         "Muse Spark 1.3", "MiMo v2.6 Flash", "upstage/solar-pro4"].map {

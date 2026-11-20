@@ -121,6 +121,69 @@ uint32_t qb_codex_checkpoint_service_tier_length(const void *result);
 const uint8_t *qb_codex_checkpoint_strings(const void *result, uint32_t *length);
 void qb_codex_checkpoint_destroy(void *result);
 
+// ---------------------------------------------------------------------------
+// CodexRouter ledger-line parser (port of CodexRouterEventLineParser)
+// ---------------------------------------------------------------------------
+
+// Result kinds reported by qb_router_line_kind. There is no "malformed" kind: a line whose
+// structure this library cannot settle returns NULL from qb_router_parse_line, which means the
+// Swift parser must decide (it re-checks the line with JSONSerialization to separate an unrelated
+// object from a damaged event row).
+#define QB_ROUTER_KIND_EVENT 0
+#define QB_ROUTER_KIND_MALFORMED_EVENT 1
+#define QB_ROUTER_KIND_IRRELEVANT 2
+
+typedef struct {
+    double timestamp;
+    int64_t status;
+    int64_t input_tokens;
+    int64_t cached_input_tokens;
+    int64_t output_tokens;
+    int64_t reasoning_tokens;
+    /* INT64_MIN when `totalTokens` is nil. */
+    int64_t total_tokens;
+    /* Offsets into the blob returned by qb_router_line_strings; QB_NIL_STRING_OFFSET means nil. */
+    uint32_t model_offset;
+    uint32_t model_length;
+    uint32_t provider_offset;
+    uint32_t provider_length;
+    uint32_t account_id_offset;
+    uint32_t account_id_length;
+    uint32_t account_fingerprint_offset;
+    uint32_t account_fingerprint_length;
+    uint32_t service_tier_offset;
+    uint32_t service_tier_length;
+    uint8_t kind;
+    uint8_t has_valid_status_field;
+    uint8_t has_valid_timestamp_field;
+    uint8_t has_valid_model_field;
+    uint8_t has_unique_status_field;
+    uint8_t has_unique_provider_field;
+    uint8_t has_unique_model_field;
+    uint8_t has_unique_account_identity_fields;
+    uint8_t has_valid_numeric_count_fields;
+    uint8_t has_unique_recognized_fields;
+    uint8_t has_input_tokens_field;
+    uint8_t has_output_tokens_field;
+    uint8_t has_valid_cached_input_tokens_field;
+    uint8_t has_valid_total_tokens_field;
+    uint8_t has_valid_estimated_input_tokens_field;
+    uint8_t has_estimated_input_tokens;
+    uint8_t has_valid_account_identity_fields;
+    uint8_t has_valid_provider_field;
+    uint8_t has_valid_service_tier_field;
+    uint8_t token_count_saturated;
+    uint8_t reserved[4];
+} QbRouterLine;
+
+/* Parse one ledger line. NULL means "the Swift parser must decide". */
+void *qb_router_parse_line(const uint8_t *line, size_t line_len);
+uint8_t qb_router_line_kind(const void *result);
+/* NULL for QB_ROUTER_KIND_IRRELEVANT. */
+const QbRouterLine *qb_router_line_entry(const void *result);
+const uint8_t *qb_router_line_strings(const void *result, uint32_t *length);
+void qb_router_line_destroy(void *result);
+
 void qb_codex_parser_destroy(void *parser);
 
 /// Rust pricing catalog parser — parses the compact pricing catalog JSON.
@@ -171,11 +234,13 @@ void qb_pricing_compact_catalog_destroy(void *result);
 #endif
 
 #ifdef __cplusplus
+static_assert(sizeof(QbRouterLine) == 120, "QbRouterLine layout drifted");
 static_assert(sizeof(QbCompactTier) == 56, "QbCompactTier layout drifted");
 static_assert(sizeof(QbCompactEntry) == 104, "QbCompactEntry layout drifted");
 static_assert(alignof(QbCompactTier) == 8, "QbCompactTier alignment drifted");
 static_assert(alignof(QbCompactEntry) == 8, "QbCompactEntry alignment drifted");
 #else
+_Static_assert(sizeof(QbRouterLine) == 120, "QbRouterLine layout drifted");
 _Static_assert(sizeof(QbCompactTier) == 56, "QbCompactTier layout drifted");
 _Static_assert(sizeof(QbCompactEntry) == 104, "QbCompactEntry layout drifted");
 _Static_assert(_Alignof(QbCompactTier) == 8, "QbCompactTier alignment drifted");
