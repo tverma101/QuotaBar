@@ -122,13 +122,35 @@ final class ModelUsageHoverTests: XCTestCase {
         XCTAssertEqual(ModelUsageDetail.shares(for: models), [0.75, 0.25])
     }
 
-    func testSharesUseTokensForEveryModelWhenOneIsUnpriced() {
+    func testFreebuffScreenshotSharesUseKnownSpendEvenWithOlderUnpricedUsage() {
         let models = [
-            ModelUsageEntry(model: "alpha", totalTokens: 25, costUSD: 9),
-            ModelUsageEntry(model: "beta", totalTokens: 75, costUSD: nil)
+            ModelUsageEntry(model: "DeepSeek V4.1 Flash", totalTokens: 22_000_000_000, costUSD: 168.45),
+            ModelUsageEntry(model: "Older Freebuff Usage", totalTokens: 2_100_000_000, costUSD: nil),
+            ModelUsageEntry(model: "Other", totalTokens: 136_300_000, costUSD: 7.76, costIsComplete: false)
         ]
 
+        let shares = ModelUsageDetail.shares(for: models)
+        XCTAssertEqual(ModelUsageDetail.wholePercents(shares), [96, 0, 4])
+        XCTAssertEqual(models.sorted(by: ModelUsageEntry.ranksBefore).map(\.model),
+                       ["DeepSeek V4.1 Flash", "Other", "Older Freebuff Usage"])
+        XCTAssertEqual(models.reduce(0) { $0 + $1.totalTokens }, 24_236_300_000)
+    }
+
+    func testWithoutPositiveSpendSharesUseMeasuredTokens() {
+        let models = [
+            ModelUsageEntry(model: "free", totalTokens: 25, costUSD: 0),
+            ModelUsageEntry(model: "unpriced", totalTokens: 75, costUSD: nil)
+        ]
         XCTAssertEqual(ModelUsageDetail.shares(for: models), [0.25, 0.75])
+    }
+
+    func testSpendSharesStillWorkWhenTokenTotalSaturates() {
+        let models = [
+            ModelUsageEntry(model: "alpha", totalTokens: .max, costUSD: 1e308, tokenCountSaturated: true),
+            ModelUsageEntry(model: "beta", totalTokens: 1, costUSD: 1e308)
+        ]
+        XCTAssertTrue(ModelUsageDetail.sharesAreReliable(for: models, aggregateTokenCountSaturated: true))
+        XCTAssertEqual(ModelUsageDetail.shares(for: models, aggregateTokenCountSaturated: true), [0.5, 0.5])
     }
 
     func testSharesAreZeroWhenThereIsNoCostOrTokenTotal() {
@@ -183,10 +205,9 @@ final class ModelUsageHoverTests: XCTestCase {
         let other = ModelUsageEntry(model: "Other", totalTokens: 772, costUSD: 7, variants: variants,
                                     costIsComplete: false)
         let contributors = ModelUsageDetail.otherContributors(for: other)
-        XCTAssertEqual(contributors.map(\.model), names)
-        XCTAssertEqual(contributors.map(\.totalTokens), variants.map(\.totalTokens))
-        XCTAssertNil(contributors[1].costUSD)
-        XCTAssertTrue(contributors[1].hasIncompleteCost)
+        XCTAssertEqual(contributors, variants.filter { $0.costUSD != nil } + [variants[1]])
+        XCTAssertNil(contributors.last?.costUSD)
+        XCTAssertTrue(contributors.last?.hasIncompleteCost == true)
     }
 
     func testOtherContributorDetailsRenderInABoundedNativePopover() throws {

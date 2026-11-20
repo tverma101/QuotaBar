@@ -57,7 +57,7 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
         var anchor: Data
     }
 
-    struct Record: Codable, Sendable {
+    struct Record: Codable, Equatable, Sendable {
         var schema: Int
         var key: Key
         var files: [FileCheckpoint]
@@ -68,10 +68,13 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
         /// What this fold priced. Absent for records written before the dependency snapshot existed;
         /// those must rebuild rather than be trusted against a changed catalogue.
         var pricingDependencies: CodexRouterPricingDependencySet?
+        /// Ledger rows skipped for damage while this fold was built. `nil` for records written
+        /// before damage counting existed — treated as zero.
+        var damagedLines: Int?
     }
 
     enum Lookup {
-        case hit(LogUsageScan?)
+        case hit(result: LogUsageScan?, damagedLines: Int)
         case append(Record)
         case rebuild
     }
@@ -171,12 +174,19 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
             record.key.pricingToken = key.pricingToken
             save(record)
         }
-        return .hit(record.result)
+        return .hit(result: record.result, damagedLines: record.damagedLines ?? 0)
     }
 
+    /// Persists a fold record. A save that would write bytes identical to the resident record is
+    /// skipped: every completed fold used to pay two atomic file writes even when nothing changed.
     func save(_ record: Record) {
         let id = Self.fingerprint(record.key)
         let diagnosticKey = "codex.router.aggregate.save.\(id)"
+        let existing = lock.withLock { memory[id] }
+        if let existing, existing == record {
+            remember(record, id: id)
+            return
+        }
         remember(record, id: id)
         do {
             try CodexRouterAggregatePersistence.write(record, id: id)

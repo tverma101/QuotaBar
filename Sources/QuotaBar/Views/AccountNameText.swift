@@ -25,7 +25,7 @@ struct AccountNameText: View {
     /// Returns nil when the name carries no account suffix (ordinary single-account cards).
     /// Splits at the *first* `" — "` so an account label containing its own dashes stays intact
     /// in the blurred part.
-    static func splitAccountSuffix(_ text: String) -> (family: String, account: String)? {
+    nonisolated static func splitAccountSuffix(_ text: String) -> (family: String, account: String)? {
         guard let range = text.range(of: " — ") else { return nil }
         let account = String(text[range.upperBound...])
         guard !account.isEmpty else { return nil }

@@ -245,12 +245,15 @@ final class ZCodeProviderIntegrationTests: XCTestCase {
         guard let weekendLine = snapshot.line(label: "Weekend Build") else {
             return XCTFail("Missing Weekend Build line")
         }
-        guard case .progress(_, let used, let limit, let format, _, _, _, let detail) = weekendLine else {
+        guard case .progress(_, let used, let limit, let format, let expiry, _, _, let detail) = weekendLine else {
             return XCTFail("Weekend Build line is not a progress line")
         }
         XCTAssertEqual(used, 194_069_327)
         XCTAssertEqual(limit, 500_000_000)
         XCTAssertEqual(format, ProgressFormat.count(suffix: "tokens"), "Weekend Build MUST NOT be formatted as percentage")
+        // The published deadline carries the grant's expiry instant so render-time expiry
+        // filtering can retire the row even when the quota refresh cannot run.
+        XCTAssertEqual(expiry, OpenUsageISO8601.date(from: "2026-11-09T01:00:00.000Z"))
         XCTAssertTrue(detail?.hasPrefix("Expires") == true, "A live promotional grant carries its expiry: \(detail ?? "nil")")
 
         // Spend tiles must be emitted for Today

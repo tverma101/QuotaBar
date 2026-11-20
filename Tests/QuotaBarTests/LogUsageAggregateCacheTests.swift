@@ -47,8 +47,8 @@ final class LogUsageAggregateCacheTests: XCTestCase {
         compute: @Sendable () async -> AggregateComputeResult
     ) async -> LogUsageScan? {
         switch await cache.scan(key: key, pricingStamp: pricingStamp, daysBack: daysBack, fingerprints: fingerprints, now: now, compute: compute) {
-        case .complete(let scan): return scan
-        case .incomplete: return nil
+        case .complete(let scan, _): return scan
+        case .deferredByFutureTimestamp, .incomplete: return nil
         }
     }
 

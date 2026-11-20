@@ -77,7 +77,16 @@ final class ZAIProvider: ProviderRuntime {
     }
 
     func refresh() async -> ProviderSnapshot {
-        let quota = await refreshQuota()
+        // Fold-only scopes (.localAccounting / .panelAccounting) recompute local ZCode history but
+        // must not touch the live Coding Plan quota API — the Keychain-gated meter path stays a
+        // menu-bar/panel concern, and the store merge carries the last quota snapshot forward.
+        let foldsHistoryOnly = ProviderRefreshContext.scope.suppressesLiveQuota
+        let quota: ProviderSnapshot
+        if foldsHistoryOnly {
+            quota = .make(provider: provider, plan: nil, lines: [], refreshedAt: now())
+        } else {
+            quota = await refreshQuota()
+        }
         guard quota.errorCategory != .cancelled, !Task.isCancelled else { return quota }
         do {
             let currentNow = now()
@@ -110,11 +119,11 @@ final class ZAIProvider: ProviderRuntime {
             } else if result.plan == nil, let localPlan = usage.planName {
                 result.plan = localPlan
             }
-            if quota.lines.allSatisfy({ !$0.isError }) {
+            if !foldsHistoryOnly, quota.lines.allSatisfy({ !$0.isError }) {
                 DiagnosticGate.clearFailure("auth.zai.quota-with-zcode.failure")
             }
 
-            if let weekend = usage.weekendBuild {
+            if !foldsHistoryOnly, let weekend = usage.weekendBuild {
                 // If it has expired relative to currentNow, do not display it (auto-remove).
                 if let expiresAt = weekend.expiresAt, expiresAt <= currentNow {
                     // Expired: auto-remove, do not append to result.lines
@@ -126,7 +135,7 @@ final class ZAIProvider: ProviderRuntime {
                         resetsAt = effectiveAt
                     } else if let expiresAt = weekend.expiresAt {
                         detail = Formatters.deadlineLabel("Expires", at: expiresAt, mode: .relative, now: currentNow)
-                        resetsAt = weekend.resetsAt
+                        resetsAt = expiresAt
                     } else {
                         resetsAt = weekend.resetsAt
                     }

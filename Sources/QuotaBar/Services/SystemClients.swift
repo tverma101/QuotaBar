@@ -218,26 +218,29 @@ protocol SQLiteAccessing: Sendable {
 struct SQLiteCLIAccessor: SQLiteAccessing {
     var processRunner: ProcessRunning
     var allowsReadWriteFallback: Bool
+    var queryTimeout: TimeInterval
 
     init(
         processRunner: ProcessRunning = SystemProcessRunner(),
-        allowsReadWriteFallback: Bool = true
+        allowsReadWriteFallback: Bool = true,
+        queryTimeout: TimeInterval = 5
     ) {
         self.processRunner = processRunner
         self.allowsReadWriteFallback = allowsReadWriteFallback
+        self.queryTimeout = queryTimeout
     }
 
     func queryValue(path: String, sql: String) throws -> String? {
         // A normal sqlite3 open can create a missing database. Credential probes must be read-only and
         // side-effect free, so absence returns nil before a process is launched.
         guard try databaseExists(path) else { return nil }
-        var result = try run(path: path, sql: sql, readOnly: true)
+        var result = try run(path: path, sql: sql, readOnly: true, timeout: queryTimeout)
         if !result.succeeded, allowsReadWriteFallback {
             // A WAL-mode database under an active writer can refuse a readonly open with
             // SQLITE_CANTOPEN (14) — the shared-memory lock it needs is held. Retry read-write: the
             // query is a SELECT (no side effects), and the existence guard above already prevents
             // creating a missing database.
-            result = try run(path: path, sql: sql, readOnly: false)
+            result = try run(path: path, sql: sql, readOnly: false, timeout: queryTimeout)
         }
         guard result.succeeded else {
             throw SQLiteError.queryFailed(result.stderr)
@@ -259,7 +262,8 @@ struct SQLiteCLIAccessor: SQLiteAccessing {
         path: String,
         sql: String,
         readOnly: Bool = false,
-        sendSQLOnStandardInput: Bool = false
+        sendSQLOnStandardInput: Bool = false,
+        timeout: TimeInterval = 5
     ) throws -> ProcessResult {
         var arguments = ["-batch", "-noheader"]
         if readOnly { arguments.append("-readonly") }
@@ -273,7 +277,7 @@ struct SQLiteCLIAccessor: SQLiteAccessing {
             arguments: arguments,
             environment: [:],
             standardInput: sendSQLOnStandardInput ? Data(sql.utf8) : nil,
-            timeout: 5
+            timeout: timeout
         )
     }
 
