@@ -139,6 +139,18 @@ describe("gemini-apps plugin", () => {
     expect(result.lines.find((line) => line.label === "Source").value).toBe("GEMINI_COOKIE")
   })
 
+  it("reads a pasted session cookie from provider credentials", async () => {
+    const ctx = makeCtx()
+    ctx.util.readProviderCredential = () => ({
+      accessToken: "SID=sid-value; SAPISID=sapisid-value; __Secure-1PSID=psid-value",
+    })
+    mockGeminiHttp(ctx)
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((line) => line.label === "Current").used).toBe(13)
+    expect(result.lines.find((line) => line.label === "Source").value).toBe("credentials")
+  })
+
   it("throws when the usage page is a login redirect", async () => {
     const ctx = makeCtx()
     mockChromeCookies(ctx)

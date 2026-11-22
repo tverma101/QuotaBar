@@ -14,6 +14,8 @@
     "~/snap/firefox/common/.mozilla/firefox",
     "~/Library/Application Support/Firefox/Profiles",
     "~/Library/Application Support/LibreWolf/Profiles",
+    "~/AppData/Roaming/Mozilla/Firefox/Profiles",
+    "~/AppData/Roaming/LibreWolf/Profiles",
   ]
 
   function readString(value) {

@@ -78,6 +78,14 @@
     const chrome = readChromeCookies(ctx)
     if (chrome) return { map: chrome, source: "Chrome" }
 
+    // On Windows Chrome cookies are app-bound encrypted and cannot be read;
+    // the user pastes a session cookie via Set credentials instead.
+    const credential = ctx.util.readProviderCredential && ctx.util.readProviderCredential()
+    if (credential && credential.accessToken) {
+      const pasted = parseCookieHeader(credential.accessToken)
+      if (pasted) return { map: pasted, source: "credentials" }
+    }
+
     const envMap = parseCookieHeader(getEnv(ctx, "GEMINI_COOKIE"))
     if (envMap) return { map: envMap, source: "GEMINI_COOKIE" }
 
@@ -398,11 +406,11 @@
   function probe(ctx) {
     const cookies = loadCookies(ctx)
     if (!cookies) {
-      throw "Gemini Apps auth missing. Log into gemini.google.com in Chrome."
+      throw "Gemini Apps auth missing. Log into gemini.google.com in Chrome, or paste a session cookie in Set credentials."
     }
     ctx.host.log.info("cookie names=" + Object.keys(cookies.map).sort().join(","))
     if (!hasGeminiSession(cookies.map)) {
-      throw "Gemini Apps auth missing. Log into gemini.google.com in Chrome."
+      throw "Gemini Apps auth missing. Log into gemini.google.com in Chrome, or paste a session cookie in Set credentials."
     }
 
     const page = fetchUsagePage(ctx, cookies)

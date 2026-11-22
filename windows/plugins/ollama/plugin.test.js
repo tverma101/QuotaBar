@@ -238,6 +238,22 @@ describe("ollama plugin", () => {
     )
   })
 
+  it("reads Firefox cookie from the Windows profile root", async () => {
+    const ctx = makeCtx()
+    ctx.host.fs.writeText("~/AppData/Roaming/Mozilla/Firefox/Profiles/abc.default-release/cookies.sqlite", "db")
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "session-value" }]))
+    mockSettings(ctx)
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+
+    expect(result.lines.find((line) => line.label === "Session").used).toBe(0.6)
+    expect(ctx.host.sqlite.query).toHaveBeenCalledWith(
+      "~/AppData/Roaming/Mozilla/Firefox/Profiles/abc.default-release/cookies.sqlite",
+      expect.stringContaining("__Secure-session")
+    )
+  })
+
   it("throws session expired on redirect", async () => {
     const ctx = makeCtx()
     mockEnv(ctx, { OLLAMA_SESSION_COOKIE: "session-value" })

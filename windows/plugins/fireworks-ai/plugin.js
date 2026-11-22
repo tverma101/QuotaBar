@@ -361,7 +361,7 @@
     const nowMs = ctx.util.parseDateMs(ctx.nowIso) || Date.now()
     const apiKey = loadApiKey(ctx)
     if (!apiKey) {
-      throw 'No Fireworks API key found. Save it in macOS Keychain as "OpenUsage Fireworks AI API Key" or set FIREWORKS_API_KEY, then restart OpenUsage.'
+      throw 'No Fireworks API key found. Paste it in Set credentials, save it in your OS credential store as "OpenUsage Fireworks AI API Key", or set FIREWORKS_API_KEY.'
     }
     ctx.host.log.info("api key loaded from " + apiKey.source)
     const account = pickAccount(listAccounts(ctx, apiKey.value))
