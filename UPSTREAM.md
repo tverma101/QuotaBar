@@ -104,3 +104,11 @@ Adapted upstream `214ba770`: the screenshot action appears while the pointer is 
 
 Adapted upstream `8a883219` to carry Claude Extra Usage's billing currency and minor-unit scale through
 the dashboard and local limits API. Existing USD output and the fork's uncapped-row behavior are retained.
+
+## Portable desktop preview (Linux/Windows)
+
+`Desktop/` is an independent preview port of QuotaBar for Linux and Windows — a fresh
+minimal Tauri 2 shell plus a static HTML/CSS/JS panel, with provider fetching rewritten
+in Rust under `Desktop/src-tauri`. It does not reuse the legacy Tauri edition preserved
+on `tauri-legacy`, shares no updater or telemetry, and does not affect the macOS app.
+See `docs/linux-windows.md`.

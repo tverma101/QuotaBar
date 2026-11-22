@@ -2,7 +2,7 @@
 
 Track your AI coding subscriptions from the macOS menu bar.
 
-QuotaBar shows how much of your AI coding plans you've used: session and weekly limits, credits, and spend, all in one popover. Pin your most important metrics straight into the menu bar.
+QuotaBar shows how much of your AI coding plans you've used: session and weekly limits, credits, and spend, all in one popover. Pin your most important metrics straight into the menu bar. A [Linux and Windows preview](docs/linux-windows.md) is available to build from source.
 
 > **This is an independent fork, not the official OpenUsage.**
 > QuotaBar is derived from [OpenUsage](https://github.com/robinebers/openusage) by Robin Ebers, which is
@@ -64,7 +64,7 @@ Most providers read the credentials already on your machine (keychain, auth file
 
 ## Documentation
 
-Behavior docs live in [docs/](docs/README.md): the [dashboard](docs/dashboard.md), [menu bar pins](docs/menu-bar.md), [settings](docs/settings.md), [refresh & caching](docs/refreshing.md), the [CLI](docs/cli.md), the [local HTTP API](docs/local-http-api.md), the [proxy](docs/proxy.md), and one page per provider.
+Behavior docs live in [docs/](docs/README.md): the [dashboard](docs/dashboard.md), [menu bar pins](docs/menu-bar.md), [settings](docs/settings.md), [refresh & caching](docs/refreshing.md), the [CLI](docs/cli.md), the [local HTTP API](docs/local-http-api.md), the [proxy](docs/proxy.md), the [Linux/Windows preview](docs/linux-windows.md), and one page per provider.
 
 For working on the code, see the developer docs: [architecture](docs/architecture.md), [adding a provider](docs/adding-a-provider.md), and [debugging & capturing logs](docs/debugging.md).
 

@@ -1,0 +1,71 @@
+name: Desktop CI
+
+# Linux/Windows preview build under Desktop/. Runs only when the preview or
+# this workflow changes — the macOS Swift app is covered by ci.yml.
+on:
+    push:
+        branches: [main]
+        paths:
+            - 'Desktop/**'
+            - '.github/workflows/desktop-ci.yml'
+    pull_request:
+        branches: [main]
+        paths:
+            - 'Desktop/**'
+            - '.github/workflows/desktop-ci.yml'
+
+permissions:
+    contents: read
+
+jobs:
+    test-and-bundle:
+        name: Test and bundle (${{ matrix.os }})
+        runs-on: ${{ matrix.os }}
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - os: ubuntu-24.04
+                      bundle: deb
+                    - os: windows-2022
+                      bundle: nsis
+        timeout-minutes: 45
+        defaults:
+            run:
+                shell: bash
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Install Node 22
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+
+            - name: Install Linux system dependencies
+              if: runner.os == 'Linux'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y \
+                      build-essential pkg-config \
+                      libwebkit2gtk-4.1-dev libgtk-3-dev \
+                      libayatana-appindicator3-dev librsvg2-dev
+
+            - name: Unit-test the provider library
+              run: cargo test --locked --no-default-features --manifest-path Desktop/src-tauri/Cargo.toml
+
+            - name: Test the UI model
+              run: node --test ui-tests/*.test.mjs
+              working-directory: Desktop
+
+            - name: Syntax-check the UI bundle
+              run: node --check ui/app.mjs && node --check ui/model.mjs
+              working-directory: Desktop
+
+            - name: Build the installer (${{ matrix.bundle }})
+              run: npx --yes @tauri-apps/cli@2.12.6 build --bundles ${{ matrix.bundle }}
+              working-directory: Desktop

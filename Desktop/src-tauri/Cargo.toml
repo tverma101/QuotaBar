@@ -1,0 +1,33 @@
+[package]
+name = "quotabar-desktop"
+version = "0.7.0"
+edition = "2021"
+description = "QuotaBar desktop preview for Linux and Windows"
+license = "MIT"
+
+[features]
+default = ["shell"]
+# `shell` pulls in the Tauri runtime and the system-tray window app. Building and
+# testing the provider library alone (`--no-default-features`) needs no GUI
+# toolchain, which is what CI unit-test legs and headless checks use.
+shell = ["dep:tauri", "dep:tauri-build"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls-native-roots",
+] }
+tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
+
+[[bin]]
+name = "quotabar-desktop"
+path = "src/main.rs"
+required-features = ["shell"]

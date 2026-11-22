@@ -1,0 +1,12 @@
+{
+    "$schema": "../gen/schemas/desktop-schema.json",
+    "identifier": "default",
+    "description": "Minimum bridge access for the QuotaBar dashboard window: app-defined commands are always callable; the webview only needs the core event listener used for tray-triggered refreshes.",
+    "windows": [
+        "main"
+    ],
+    "permissions": [
+        "core:event:allow-listen",
+        "core:event:allow-unlisten"
+    ]
+}

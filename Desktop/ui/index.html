@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QuotaBar</title>
+    <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <svg class="gauge" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M3.543 17.078A9 9 0 1 1 20.457 17.078L18.105 16.222A6.5 6.5 0 1 0 5.895 16.222Z"/>
+                <path d="M16.3 7.2L12.93 14.59L11.07 13.41Z"/>
+                <path d="M12 12.1a1.9 1.9 0 1 0 0 3.8 1.9 1.9 0 0 0 0-3.8Z"/>
+            </svg>
+            <h1>QuotaBar</h1>
+            <span id="demo-badge" class="badge" hidden>Demo</span>
+        </div>
+        <div class="topbar-actions">
+            <button id="nav-dashboard" class="nav-btn" type="button" aria-pressed="true">Dashboard</button>
+            <button id="nav-customize" class="nav-btn" type="button" aria-pressed="false">Customize</button>
+            <button id="refresh-all" class="primary" type="button">Refresh</button>
+        </div>
+    </header>
+
+    <p id="bridge-warning" class="bridge-warning" hidden>
+        The QuotaBar desktop bridge is unavailable — this page must run inside the QuotaBar app.
+    </p>
+
+    <main id="dashboard" class="dashboard" aria-label="Usage dashboard"></main>
+
+    <section id="customize" class="customize" hidden aria-label="Customize providers">
+        <h2 class="customize-title">Providers</h2>
+        <p class="hint">
+            Choose which providers refresh with live data. Credentials stay on this device and
+            are used only for the matching provider request.
+        </p>
+        <ul id="customize-list" class="customize-list"></ul>
+    </section>
+
+    <div id="status-line" class="status-line" role="status" aria-live="polite"></div>
+
+    <script type="module" src="app.mjs"></script>
+</body>
+</html>
