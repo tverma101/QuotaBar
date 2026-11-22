@@ -7,6 +7,7 @@ import { useHistoryInsights } from "@/hooks/use-history-insights"
 import { usePersistUsageHistory } from "@/hooks/use-persist-usage-history"
 import { useNowTicker } from "@/hooks/use-now-ticker"
 import { useAppUiStore } from "@/stores/app-ui-store"
+import { usePlatform } from "@/hooks/app/use-platform"
 import type { PluginDisplayState } from "@/lib/plugin-types"
 import { buildUsageInsights } from "@/lib/usage-insights"
 import type { DisplayMode, PluginSettings, ResetTimerDisplayMode, TimeFormatMode } from "@/lib/settings"
@@ -43,6 +44,8 @@ export function OverviewPage({
     useHistoryInsights(persistEnabled)
   const { checkSpendSpike } = useSpendSpikeAlert()
   const setActiveView = useAppUiStore((state) => state.setActiveView)
+  const platform = usePlatform()
+  const compactPopover = platform === "windows"
 
   const probeStamp = plugins.map((p) => p.lastUpdatedAt ?? 0).join(",")
   useEffect(() => {
@@ -75,7 +78,7 @@ export function OverviewPage({
   }
 
   return (
-    <div className="motion-stagger">
+    <div className="motion-stagger space-y-3">
       <div className="motion-card" style={{ ["--i" as string]: 0 }}>
       <UsageInsightsBanner
         insights={insights}
@@ -97,6 +100,10 @@ export function OverviewPage({
         <ProviderCard
           name={plugin.meta.name}
           plan={plugin.data?.plan}
+          links={compactPopover ? plugin.meta.links : undefined}
+          popover={compactPopover}
+          iconUrl={compactPopover ? plugin.meta.iconUrl : undefined}
+          onTitleClick={compactPopover ? () => setActiveView(plugin.meta.id) : undefined}
           showSeparator={index < plugins.length - 1}
           loading={plugin.loading}
           error={plugin.error}

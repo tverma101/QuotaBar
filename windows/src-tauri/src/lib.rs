@@ -466,6 +466,37 @@ fn hide_panel(app_handle: tauri::AppHandle) {
 }
 
 #[tauri::command]
+fn quit_app(app_handle: tauri::AppHandle) {
+    app_handle.exit(0);
+}
+
+/// Resize the popover window to the content height the frontend measured, then re-anchor
+/// it to the tray so its bottom edge stays flush above the taskbar (macOS-style sizing).
+#[tauri::command]
+fn resize_panel(app_handle: tauri::AppHandle, height: f64) {
+    use tauri::Manager;
+
+    let Some(window) = app_handle.get_webview_window("main") else {
+        return;
+    };
+
+    let max = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|m| (m.size().height as f64 * 0.76) as u32)
+        .unwrap_or(720);
+    let h = (height.round() as u32).clamp(300, max);
+    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize {
+        width: 400.0,
+        height: h as f64,
+    }));
+
+    #[cfg(target_os = "windows")]
+    popover_platform::move_main_near_tray(&app_handle);
+}
+
+#[tauri::command]
 #[allow(unused_variables)] // `enabled` / `window` only used on macOS and Windows
 fn set_liquid_glass_enabled(app_handle: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     use tauri::Manager;
@@ -1498,6 +1529,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             init_panel,
             hide_panel,
+            quit_app,
+            resize_panel,
             set_liquid_glass_enabled,
             open_devtools,
             start_probe_batch,

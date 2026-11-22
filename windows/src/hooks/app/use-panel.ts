@@ -194,6 +194,18 @@ export function usePanel({
         }
       }
 
+      if (platformRef.current === "windows") {
+        // Natural content height = fixed chrome (top bar + footer + padding) +
+        // the scroll region's full content height. The backend clamps and
+        // re-anchors the window to the tray.
+        const scroll = scrollRef.current
+        const chrome = container.offsetHeight - (scroll ? scroll.offsetHeight : 0)
+        const contentHeight =
+          chrome + (scroll ? scroll.scrollHeight : container.scrollHeight) + 2
+        invoke("resize_panel", { height: Math.max(contentHeight, 240) }).catch(console.error)
+        return
+      }
+
       // macOS undecorated popover: keep syncing outer window to content height + fixed width.
       if (platformRef.current !== "macos") {
         return

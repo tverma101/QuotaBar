@@ -3,6 +3,8 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 
 type PluginErrorProps = {
   message: string
+  /** Slim single-line row for the popover card layout. */
+  compact?: boolean
 }
 
 function formatMessage(message: string) {
@@ -21,7 +23,15 @@ function formatMessage(message: string) {
   )
 }
 
-export function PluginError({ message }: PluginErrorProps) {
+export function PluginError({ message, compact }: PluginErrorProps) {
+  if (compact) {
+    return (
+      <div className="flex items-start gap-1.5 py-1 text-xs text-destructive">
+        <AlertCircle className="mt-px h-3.5 w-3.5 shrink-0" />
+        <span className="select-text cursor-text leading-snug">{formatMessage(message)}</span>
+      </div>
+    )
+  }
   return (
     <Alert
       variant="destructive"

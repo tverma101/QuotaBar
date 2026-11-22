@@ -15,6 +15,8 @@ interface PanelFooterProps {
   showAbout: boolean;
   onShowAbout: () => void;
   onCloseAbout: () => void;
+  /** Optional control rendered at the far right of the footer (macOS-style Options button). */
+  trailing?: React.ReactNode;
 }
 
 function VersionDisplay({
@@ -96,6 +98,7 @@ export function PanelFooter({
   showAbout,
   onShowAbout,
   onCloseAbout,
+  trailing,
 }: PanelFooterProps) {
   const now = useNowTicker({
     enabled: Boolean(autoUpdateNextAt),
@@ -123,24 +126,27 @@ export function PanelFooter({
           onUpdateCheck={onUpdateCheck}
           onVersionClick={onShowAbout}
         />
-        {autoUpdateNextAt !== null && onRefreshAll ? (
-          <button
-            type="button"
-            onClick={(event) => {
-              event.currentTarget.blur()
-              fireMotionShock()
-              onRefreshAll()
-            }}
-            className="text-xs text-muted-foreground tabular-nums hover:text-foreground transition-colors cursor-pointer motion-tick"
-            title="Refresh now"
-          >
-            {countdownLabel}
-          </button>
-        ) : (
-          <span className="text-xs text-muted-foreground tabular-nums">
-            {countdownLabel}
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {autoUpdateNextAt !== null && onRefreshAll ? (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.currentTarget.blur()
+                fireMotionShock()
+                onRefreshAll()
+              }}
+              className="text-xs text-muted-foreground tabular-nums hover:text-foreground transition-colors cursor-pointer motion-tick"
+              title="Refresh now"
+            >
+              {countdownLabel}
+            </button>
+          ) : (
+            <span className="text-xs text-muted-foreground tabular-nums">
+              {countdownLabel}
+            </span>
+          )}
+          {trailing}
+        </div>
       </div>
       {showAbout && (
         <AboutDialog version={version} onClose={onCloseAbout} />

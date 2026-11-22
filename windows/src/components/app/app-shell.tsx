@@ -1,6 +1,7 @@
 import { useShallow } from "zustand/react/shallow"
 import { invoke, isTauri } from "@tauri-apps/api/core"
-import { X } from "lucide-react"
+import { Menu, MenuItem, PredefinedMenuItem } from "@tauri-apps/api/menu"
+import { ChevronDown, ChevronLeft, X } from "lucide-react"
 import { AppContent, type AppContentActionProps } from "@/components/app/app-content"
 import { OnboardingWizard } from "@/components/onboarding-wizard"
 import type { UILayout } from "@/lib/settings"
@@ -98,6 +99,9 @@ export function AppShell({
   // macOS and Windows run the same frameless tray popover (borderless window,
   // click-away dismiss); Linux keeps the native-title-bar layout.
   const popoverChrome = isTauri() && (platform === "macos" || platform === "windows")
+  // Windows-only: single-column popover (no nav rail), back bar on sub-views,
+  // Options menu in the footer — mirroring the macOS QuotaBar panel.
+  const compactPopover = isTauri() && platform === "windows"
   const macPopoverChrome = platform === "macos"
   const panelMotionRef = useMotionPointer(!reduceAnimations)
 
@@ -105,6 +109,55 @@ export function AppShell({
     if (view === "polls") bumpPollsVisit()
     setActiveView(view)
   }
+
+  // macOS parity: the popover footer exposes a single Options menu instead of
+  // a nav rail (Customize/Settings/About/Quit, mirroring the macOS popover).
+  const openOptionsMenu = () => {
+    ;(async () => {
+      const settingsItem = await MenuItem.new({
+        id: "opt-settings",
+        text: "Settings",
+        action: () => onViewChange("settings"),
+      })
+      const aboutItem = await MenuItem.new({
+        id: "opt-about",
+        text: "About QuotaBar",
+        action: () => setShowAbout(true),
+      })
+      const quitItem = await MenuItem.new({
+        id: "opt-quit",
+        text: "Quit QuotaBar",
+        action: () => {
+          invoke("quit_app").catch(console.error)
+        },
+      })
+      const separator = await PredefinedMenuItem.new({ item: "Separator" })
+      const separator2 = await PredefinedMenuItem.new({ item: "Separator" })
+      const menu = await Menu.new({
+        items: [settingsItem, separator, aboutItem, separator2, quitItem],
+      })
+      try {
+        await menu.popup()
+      } finally {
+        await Promise.allSettled([
+          menu.close(),
+          settingsItem.close(),
+          aboutItem.close(),
+          quitItem.close(),
+          separator.close(),
+          separator2.close(),
+        ])
+      }
+    })().catch(console.error)
+  }
+
+  const onHome = activeView === "home"
+  const topBarTitle =
+    activeView === "settings"
+      ? "Settings"
+      : activeView === "polls"
+        ? "Polls"
+        : (selectedPlugin?.meta.name ?? "")
 
   return (
     <div ref={containerRef} className="app-popover-shell w-full bg-transparent">
@@ -124,15 +177,17 @@ export function AppShell({
       >
         <MotionField />
         <div className="flex flex-1 min-h-0 flex-row">
-          <SideNav
-            activeView={activeView}
-            onViewChange={onViewChange}
-            plugins={navPlugins}
-            onPluginContextAction={onPluginContextAction}
-            isPluginRefreshAvailable={isPluginRefreshAvailable}
-            onReorder={onNavReorder}
-            pollsBadge={pollsBadge}
-          />
+          {compactPopover ? null : (
+            <SideNav
+              activeView={activeView}
+              onViewChange={onViewChange}
+              plugins={navPlugins}
+              onPluginContextAction={onPluginContextAction}
+              isPluginRefreshAvailable={isPluginRefreshAvailable}
+              onReorder={onNavReorder}
+              pollsBadge={pollsBadge}
+            />
+          )}
           <div className="app-main-pane relative flex-1 flex flex-col px-3 pt-2 pb-1.5 min-w-0">
             {popoverChrome ? (
               <button
@@ -145,6 +200,21 @@ export function AppShell({
               >
                 <X className="h-4 w-4" strokeWidth={2.5} />
               </button>
+            ) : null}
+            {compactPopover && !onHome ? (
+              <div className="relative mb-1 flex h-7 shrink-0 items-center">
+                <button
+                  type="button"
+                  className="flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
+                  aria-label="Back"
+                  onClick={() => onViewChange("home")}
+                >
+                  <ChevronLeft className="h-4 w-4" strokeWidth={2.5} />
+                </button>
+                <span className="pointer-events-none absolute inset-x-8 truncate text-center text-[13px] font-semibold">
+                  {topBarTitle}
+                </span>
+              </div>
             ) : null}
             <div className="relative flex min-h-0 flex-1 flex-col">
               {showOnboardingWizard ? (
@@ -177,6 +247,21 @@ export function AppShell({
               showAbout={showAbout}
               onShowAbout={() => setShowAbout(true)}
               onCloseAbout={() => setShowAbout(false)}
+              trailing={
+                compactPopover && onHome ? (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.currentTarget.blur()
+                      openOptionsMenu()
+                    }}
+                    className="flex h-6 items-center gap-1 rounded-full border border-border/60 bg-card/60 px-2.5 text-[11px] font-semibold text-foreground hover:bg-accent transition-colors"
+                  >
+                    Options
+                    <ChevronDown className="h-3 w-3" strokeWidth={2.5} />
+                  </button>
+                ) : undefined
+              }
             />
           </div>
         </div>

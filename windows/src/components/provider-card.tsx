@@ -1,6 +1,6 @@
-import { Fragment, useMemo } from "react"
+import { Fragment, useMemo, useState } from "react"
 import { useShallow } from "zustand/react/shallow"
-import { AlertCircle, ExternalLink, Hourglass, RefreshCw } from "lucide-react"
+import { AlertCircle, ChevronDown, ChevronUp, ExternalLink, Hourglass, RefreshCw } from "lucide-react"
 import { openUrl } from "@tauri-apps/plugin-opener"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -46,6 +46,11 @@ interface ProviderCardProps {
   onResetTimerDisplayModeToggle?: () => void
   showAccountIdentity?: boolean
   layout?: "default" | "detailFill"
+  /** macOS-style popover section: small icon+name header above a rounded inset
+   * card whose detail-scope lines hide behind a centered caret. */
+  popover?: boolean
+  iconUrl?: string
+  onTitleClick?: () => void
 }
 
 const PACE_VISUALS: Record<PaceStatus, { dotClass: string }> = {
@@ -126,6 +131,9 @@ export function ProviderCard({
   onResetTimerDisplayModeToggle,
   showAccountIdentity = true,
   layout = "default",
+  popover = false,
+  iconUrl,
+  onTitleClick,
 }: ProviderCardProps) {
   const cooldownRemainingMs = useMemo(() => {
     if (!lastManualRefreshAt) return 0
@@ -211,6 +219,22 @@ export function ProviderCard({
     [links]
   )
 
+  // On-demand (detail-scope) lines revealed by the popover's centered caret,
+  // mirroring the macOS card's On Demand section.
+  const detailLines = useMemo(() => {
+    if (!popover || scopeFilter !== "overview") return []
+    const detail = lines.filter((line) => detailScopeLabels.has(line.label))
+    if (allowedLabels == null) return detail
+    if (allowedLabels.length === 0) return []
+    return detail
+  }, [popover, scopeFilter, lines, detailScopeLabels, allowedLabels])
+  const [expanded, setExpanded] = useState(false)
+  const displayDetailLines = useMemo(
+    () => detailLines.filter((line) => !(line.type === "text" && line.label.toLowerCase() === "account")),
+    [detailLines]
+  )
+  const hasExpandedContent = displayDetailLines.length > 0 || visibleLinks.length > 0
+
   const accountIdentity = useMemo(() => {
     const accountLine = filteredLines.find(
       (line) => line.type === "text" && line.label.toLowerCase() === "account"
@@ -237,6 +261,246 @@ export function ProviderCard({
       return `Available in ${minutes}m ${seconds}s`
     }
     return `Available in ${seconds}s`
+  }
+
+  const rows = (rowsLines: MetricLine[]) => (
+    <div className={popover ? "space-y-2.5" : "space-y-4"}>
+      {groupLinesByType(rowsLines).map((group, gi) =>
+        group.kind === "text" ? (
+          <div key={gi} className="space-y-1">
+            {group.lines.map((line, li) => (
+              <MetricLineRenderer
+                key={`${line.label}-${gi}-${li}`}
+                line={line}
+                displayMode={displayMode}
+                resetTimerDisplayMode={resetTimerDisplayMode}
+                timeFormatMode={timeFormatMode}
+                onResetTimerDisplayModeToggle={onResetTimerDisplayModeToggle}
+                now={now}
+                refreshing={isRefreshingWithData}
+                pluginId={pluginId}
+                onRetry={onRetry}
+              />
+            ))}
+          </div>
+        ) : (
+          <Fragment key={gi}>
+            {group.lines.map((line, li) => (
+              <MetricLineRenderer
+                key={`${line.label}-${gi}-${li}`}
+                line={line}
+                displayMode={displayMode}
+                resetTimerDisplayMode={resetTimerDisplayMode}
+                timeFormatMode={timeFormatMode}
+                onResetTimerDisplayModeToggle={onResetTimerDisplayModeToggle}
+                now={now}
+                refreshing={isRefreshingWithData}
+                pluginId={pluginId}
+                onRetry={onRetry}
+              />
+            ))}
+          </Fragment>
+        )
+      )}
+    </div>
+  )
+
+  const badges = (showAccountIdentity && accountIdentity) || plan ? (
+    <div className="flex min-w-0 shrink items-center justify-end gap-1.5 overflow-hidden">
+      {showAccountIdentity && accountIdentity && (
+        <Badge
+          variant="secondary"
+          className="min-w-0 max-w-[9rem] shrink truncate"
+          title={accountIdentity}
+        >
+          {accountIdentity}
+        </Badge>
+      )}
+      {plan && (
+        <Badge
+          variant="outline"
+          className="min-w-0 max-w-[11rem] shrink truncate"
+          title={plan}
+        >
+          {plan}
+        </Badge>
+      )}
+    </div>
+  ) : null
+
+  const retryButton = onRetry ? (
+    loading ? (
+      <Button
+        variant="ghost"
+        size="icon-xs"
+        className="ml-1 pointer-events-none opacity-50"
+        style={{ transform: "translateZ(0)", backfaceVisibility: "hidden" }}
+        tabIndex={-1}
+      >
+        <RefreshCw className="h-3 w-3 motion-spin-boost animate-spin" />
+      </Button>
+    ) : inCooldown ? (
+      <Tooltip>
+        <TooltipTrigger
+          className="ml-1"
+          render={(props) => (
+            <span {...props} className={props.className}>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="pointer-events-none opacity-50"
+                style={{ transform: "translateZ(0)", backfaceVisibility: "hidden" }}
+                tabIndex={-1}
+              >
+                <Hourglass className="h-3 w-3" />
+              </Button>
+            </span>
+          )}
+        />
+        <TooltipContent side="top">
+          {formatRemainingTime()}
+        </TooltipContent>
+      </Tooltip>
+    ) : (
+      <Tooltip>
+        <TooltipTrigger
+          className="ml-1"
+          render={(props) => (
+            <Button
+              {...props}
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Retry"
+              onClick={(e) => {
+                e.currentTarget.blur()
+                onRetry()
+              }}
+              className="opacity-0 hover:opacity-100 focus-visible:opacity-100"
+              style={{ transform: "translateZ(0)", backfaceVisibility: "hidden" }}
+            >
+              <RefreshCw className="h-3 w-3" />
+            </Button>
+          )}
+        />
+        {lastUpdatedAt != null && (
+          <TooltipContent side="top">
+            Updated {formatRelativeTime(Date.now() - lastUpdatedAt)}
+          </TooltipContent>
+        )}
+      </Tooltip>
+    )
+  ) : null
+
+  const linksRow = visibleLinks.length > 0 ? (
+    <div className="mb-2 -mt-0.5 flex flex-wrap gap-1.5">
+      {visibleLinks.map((link) => (
+        <Button
+          key={`${link.label}-${link.url}`}
+          variant="outline"
+          size="xs"
+          className="h-6 max-w-full text-[11px]"
+          onClick={() => {
+            openUrl(link.url).catch(console.error)
+          }}
+        >
+          <span className="truncate">{link.label}</span>
+          <ExternalLink className="size-3 opacity-70" />
+        </Button>
+      ))}
+    </div>
+  ) : null
+
+  if (popover) {
+    // macOS "System Settings" inset group: provider header line above one
+    // rounded card of metric rows; On Demand lines + links sit behind the caret.
+    return (
+      <section className="w-full min-w-0">
+        <div className="mb-1 flex min-w-0 items-center gap-1.5 px-1">
+          {iconUrl ? (
+            <img src={iconUrl} alt="" className="h-3.5 w-3.5 shrink-0 rounded-[3px]" />
+          ) : null}
+          {onTitleClick ? (
+            <button
+              type="button"
+              onClick={onTitleClick}
+              className="min-w-0 truncate text-left text-[13px] font-semibold hover:text-primary transition-colors"
+              title={name}
+            >
+              {name}
+            </button>
+          ) : (
+            <h2 className="min-w-0 truncate text-[13px] font-semibold" title={name}>
+              {name}
+            </h2>
+          )}
+          <div className="ml-auto flex min-w-0 items-center gap-1">
+            {badges}
+            {retryButton}
+          </div>
+        </div>
+        <div className="rounded-[10px] border border-border/50 bg-card/80 px-2.5 py-1.5 shadow-xs">
+          {warning ? (
+            <div className="mb-1 flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
+              <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+              <span>{warning}</span>
+            </div>
+          ) : null}
+          {error && !hasStaleData && <PluginError message={error} compact />}
+          {error && hasStaleData && (
+            <Tooltip>
+              <TooltipTrigger
+                render={(props) => (
+                  <div
+                    {...props}
+                    className="flex items-center gap-1.5 mb-1 text-xs text-destructive"
+                  >
+                    <AlertCircle className="h-3 w-3 flex-shrink-0" />
+                    <span className="truncate">{error}</span>
+                  </div>
+                )}
+              />
+              <TooltipContent side="top" className="max-w-xs break-words text-xs">
+                {error}
+              </TooltipContent>
+            </Tooltip>
+          )}
+
+          {loading && !hasStaleData && !error && (
+            <SkeletonLines lines={filteredSkeletonLines} />
+          )}
+
+          {hasStaleData && rows(displayLines)}
+
+          {!loading && !error && filteredLines.length === 0 && !hasStaleData && (
+            <p className="py-1 text-xs text-muted-foreground">
+              No metrics selected in Settings. Open Settings and choose which lines to show for this provider.
+            </p>
+          )}
+
+          {hasExpandedContent && (
+            <button
+              type="button"
+              aria-label={expanded ? "Show less" : "Show more"}
+              onClick={() => setExpanded((v) => !v)}
+              className="mt-0.5 flex w-full items-center justify-center py-1 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              {expanded ? (
+                <ChevronUp className="h-3 w-3" strokeWidth={2.5} />
+              ) : (
+                <ChevronDown className="h-3 w-3" strokeWidth={2.5} />
+              )}
+            </button>
+          )}
+
+          {expanded && hasExpandedContent ? (
+            <div className="border-t border-border/40 pt-1.5">
+              {displayDetailLines.length > 0 && rows(displayDetailLines)}
+              {linksRow}
+            </div>
+          ) : null}
+        </div>
+      </section>
+    )
   }
 
   return (
