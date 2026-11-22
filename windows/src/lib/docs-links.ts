@@ -1,6 +1,6 @@
 import { FORK_GITHUB_REPO } from "@/lib/fork-meta"
 
-const MULTI_ACCOUNT_CREDENTIALS_DOC = "docs/providers/multi-account-credentials.md"
+const MULTI_ACCOUNT_CREDENTIALS_DOC = "windows/docs/providers/multi-account-credentials.md"
 
 /**
  * GitHub “blob” view of the multi-account credential tutorial (`HEAD` = repo default branch).

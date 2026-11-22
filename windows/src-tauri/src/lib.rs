@@ -32,11 +32,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
-/// Aptabase app key (dashboard: https://aptabase.com) — QuotaBar analytics.
-/// Empty in this fork: the imported implementation carried another project's key.
-/// Set a QuotaBar-owned key before enabling telemetry.
-const APTABASE_APP_KEY: &str = "";
-const APTABASE_API_URL: &str = "https://us.aptabase.com/api/v0/events";
 #[cfg(target_os = "macos")]
 use tauri_plugin_liquid_glass::{GlassMaterialVariant, LiquidGlassConfig, LiquidGlassExt};
 use tauri_plugin_log::{Target, TargetKind};
@@ -75,8 +70,6 @@ fn load_start_hidden(app: &tauri::AppHandle) -> bool {
         }
     }
 }
-const DAILY_ACTIVE_TRACKED_DAY_KEY: &str = "analytics.daily_active_day";
-const DAILY_ACTIVE_EVENT_NAME: &str = "app_started";
 const MAX_CONCURRENT_PROBES: usize = 4;
 
 fn probe_worker_count(plugin_count: usize) -> usize {
@@ -191,139 +184,6 @@ fn ensure_quotabar_user_config_file() {
     }
 }
 
-fn today_utc_ymd() -> String {
-    chrono::Utc::now().format("%Y-%m-%d").to_string()
-}
-
-fn should_track_daily_active(last_tracked_day: Option<&str>, today: &str) -> bool {
-    match last_tracked_day {
-        Some(day) => day != today,
-        None => true,
-    }
-}
-
-fn send_aptabase_event(event_name: &'static str, app_version: String) {
-    if APTABASE_APP_KEY.is_empty() {
-        return;
-    }
-    std::thread::spawn(move || {
-        let sys = os_diagnostics::collect_aptabase_system_props();
-        let now_dur = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let session_id = format!(
-            "{}{:08}",
-            now_dur.as_secs(),
-            now_dur.subsec_nanos() % 100_000_000
-        );
-        let user_agent = format!(
-            "{}/{} {}/{} {}",
-            sys.os_name, sys.os_version, sys.engine_name, sys.engine_version, sys.locale
-        );
-        let payload = serde_json::json!([{
-            "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "sessionId": session_id,
-            "eventName": event_name,
-            "systemProps": {
-                "isDebug": sys.is_debug,
-                "osName": sys.os_name,
-                "osVersion": sys.os_version,
-                "locale": sys.locale,
-                "engineName": sys.engine_name,
-                "engineVersion": sys.engine_version,
-                "appVersion": app_version,
-                "sdkVersion": "tauri-plugin-aptabase@1.0.0"
-            },
-            "props": serde_json::Value::Null
-        }]);
-        let Ok(client) = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent(user_agent)
-            .build()
-        else {
-            return;
-        };
-        let _ = client
-            .post(APTABASE_API_URL)
-            .header("App-Key", APTABASE_APP_KEY)
-            .json(&payload)
-            .send();
-    });
-}
-
-#[cfg(desktop)]
-fn track_daily_active_if_needed(app_handle: &tauri::AppHandle) {
-    use tauri_plugin_store::StoreExt;
-
-    let today = today_utc_ymd();
-
-    let store = match app_handle.store("settings.json") {
-        Ok(store) => store,
-        Err(error) => {
-            log::warn!(
-                "Failed to access settings store for daily analytics gate: {}",
-                error
-            );
-            return;
-        }
-    };
-
-    let last_tracked_day = store
-        .get(DAILY_ACTIVE_TRACKED_DAY_KEY)
-        .and_then(|value| value.as_str().map(|value| value.to_string()));
-
-    if !should_track_daily_active(last_tracked_day.as_deref(), &today) {
-        return;
-    }
-
-    send_aptabase_event(
-        DAILY_ACTIVE_EVENT_NAME,
-        app_handle.package_info().version.to_string(),
-    );
-
-    store.set(
-        DAILY_ACTIVE_TRACKED_DAY_KEY,
-        serde_json::Value::String(today),
-    );
-    if let Err(error) = store.save() {
-        log::warn!("Failed to save daily analytics tracked day: {}", error);
-    }
-}
-
-#[cfg(not(desktop))]
-fn track_daily_active_if_needed(app_handle: &tauri::AppHandle) {
-    send_aptabase_event(
-        DAILY_ACTIVE_EVENT_NAME,
-        app_handle.package_info().version.to_string(),
-    );
-}
-
-#[cfg(desktop)]
-fn seconds_until_next_utc_day(now: chrono::DateTime<chrono::Utc>) -> u64 {
-    use chrono::Timelike;
-    let seconds_since_midnight =
-        u64::from(now.hour()) * 3600 + u64::from(now.minute()) * 60 + u64::from(now.second());
-    let seconds_until_next_day = 86_400_u64.saturating_sub(seconds_since_midnight);
-    if seconds_until_next_day == 0 {
-        86_400
-    } else {
-        seconds_until_next_day
-    }
-}
-
-#[cfg(desktop)]
-fn spawn_daily_active_rollover_tracker(app_handle: tauri::AppHandle) {
-    std::thread::spawn(move || {
-        loop {
-            let sleep_for = std::time::Duration::from_secs(seconds_until_next_utc_day(
-                chrono::Utc::now(),
-            ));
-            std::thread::sleep(sleep_for);
-            track_daily_active_if_needed(&app_handle);
-        }
-    });
-}
-
 #[cfg(desktop)]
 fn managed_shortcut_slot() -> &'static Mutex<Option<String>> {
     static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -433,7 +293,16 @@ pub struct ProbeBatchComplete {
 
 #[tauri::command]
 fn init_panel(app_handle: tauri::AppHandle) {
+    // Windows and Linux initialize before first show in setup.
+    #[cfg(target_os = "macos")]
     panel::init(&app_handle).expect("Failed to initialize panel");
+    #[cfg(not(target_os = "macos"))]
+    let _ = app_handle;
+}
+
+#[tauri::command]
+fn show_panel(app_handle: tauri::AppHandle) {
+    panel::show_panel(&app_handle);
 }
 
 #[tauri::command]
@@ -480,20 +349,29 @@ fn resize_panel(app_handle: tauri::AppHandle, height: f64) {
         return;
     };
 
+    if !height.is_finite() {
+        return;
+    }
+    let scale = window.scale_factor().unwrap_or(1.0);
     let max = window
         .current_monitor()
         .ok()
         .flatten()
-        .map(|m| (m.size().height as f64 * 0.76) as u32)
-        .unwrap_or(720);
-    let h = (height.round() as u32).clamp(300, max);
-    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize {
-        width: 400.0,
-        height: h as f64,
-    }));
+        .map(|m| (f64::from(m.work_area().size.height) / scale * 0.76).floor())
+        .unwrap_or(720.0);
+    let size = tauri::LogicalSize::new(400.0, height.round().clamp(300.0, max.max(300.0)));
+    if window.inner_size().ok() == Some(size.to_physical::<u32>(scale)) {
+        return;
+    }
+    if let Err(error) = window.set_size(size) {
+        log::warn!("Cannot size the QuotaBar window: {error}");
+        return;
+    }
 
     #[cfg(target_os = "windows")]
-    popover_platform::move_main_near_tray(&app_handle);
+    if window.is_visible().unwrap_or(false) {
+        popover_platform::move_main_near_tray(&app_handle);
+    }
 }
 
 #[tauri::command]
@@ -1520,7 +1398,6 @@ pub fn run() {
                 .level_for("hyper", log::LevelFilter::Warn)
                 .level_for("reqwest", log::LevelFilter::Warn)
                 .level_for("tao", log::LevelFilter::Info)
-                .level_for("tauri_plugin_updater", log::LevelFilter::Info)
                 .build(),
         )
         .plugin(tauri_plugin_process::init())
@@ -1528,6 +1405,7 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             init_panel,
+            show_panel,
             hide_panel,
             quit_app,
             resize_panel,
@@ -1579,10 +1457,6 @@ pub fn run() {
 
             ensure_quotabar_user_config_file();
 
-            track_daily_active_if_needed(app.handle());
-            #[cfg(desktop)]
-            spawn_daily_active_rollover_tracker(app.handle().clone());
-
             let app_data_dir = app.path().app_data_dir().expect("no app data dir");
             // `tauri dev` often has no packaged `resource_dir()` (returns Err) — do not panic;
             // `initialize_plugins` falls back to repo `plugins/` via `find_dev_plugins_dir()` and/or
@@ -1623,9 +1497,6 @@ pub fn run() {
                     log::info!("startHidden is set; leaving the main window in the tray");
                 }
             }
-
-            app.handle()
-                .plugin(tauri_plugin_updater::Builder::new().build())?;
 
             // Register global shortcut from stored settings
             #[cfg(desktop)]
@@ -1682,41 +1553,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        DAILY_ACTIVE_TRACKED_DAY_KEY, resolve_cursor_usage_stats_target,
-        seconds_until_next_utc_day, should_show_main_window_on_launch, should_track_daily_active,
-        start_hidden_from_setting,
+        resolve_cursor_usage_stats_target, should_show_main_window_on_launch, start_hidden_from_setting,
     };
-    use chrono::TimeZone;
     use quotabar_core::provider_accounts::{self, ProviderAccount, ProviderCredential};
-
-    #[test]
-    fn should_track_when_no_previous_day() {
-        assert!(should_track_daily_active(None, "2026-02-12"));
-    }
-
-    #[test]
-    fn should_not_track_when_same_day() {
-        assert!(!should_track_daily_active(Some("2026-02-12"), "2026-02-12"));
-    }
-
-    #[test]
-    fn should_track_when_day_changes() {
-        assert!(should_track_daily_active(Some("2026-02-11"), "2026-02-12"));
-    }
-
-    #[test]
-    fn daily_active_key_is_not_version_scoped() {
-        assert_eq!(DAILY_ACTIVE_TRACKED_DAY_KEY, "analytics.daily_active_day");
-        assert!(!DAILY_ACTIVE_TRACKED_DAY_KEY.contains("0.6.2"));
-        assert!(!DAILY_ACTIVE_TRACKED_DAY_KEY.contains("0.6.3"));
-    }
-
-    #[test]
-    fn rollover_sleep_waits_for_next_utc_day_boundary() {
-        let now = chrono::Utc.with_ymd_and_hms(2026, 2, 12, 23, 59, 50).unwrap();
-
-        assert_eq!(seconds_until_next_utc_day(now), 10);
-    }
 
     #[test]
     fn missing_non_default_cursor_account_stays_isolated() {

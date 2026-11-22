@@ -1,6 +1,6 @@
 # QuotaBar
 
-Track your AI coding subscriptions from the macOS menu bar.
+Track your AI coding subscriptions from the macOS menu bar or Windows system tray.
 
 QuotaBar shows how much of your AI coding plans you've used: session and weekly limits, credits, and spend, all in one popover. Pin your most important metrics straight into the menu bar.
 
@@ -11,27 +11,32 @@ QuotaBar shows how much of your AI coding plans you've used: session and weekly 
 > Report QuotaBar issues in this repository; report OpenUsage issues
 > [upstream](https://github.com/robinebers/openusage/issues).
 
-## Requirements
+## Download and Set Up
 
-- macOS 15 (Sequoia) or later
-- Windows 10/11: see [`windows/`](windows/README.md) for the in-progress Tauri port
+Open [GitHub Releases](https://github.com/tverma101/QuotaBar/releases) and choose an installer from **Assets**. If your installer is missing, use the source build instructions below.
 
-## Building and running
+| Platform | Installer | First Launch |
+| --- | --- | --- |
+| macOS 15 or later, Apple Silicon or Intel | `.dmg` | Drag QuotaBar to Applications, open it, and click the gauge in the menu bar. |
+| Windows 11 x64 | `-setup.exe` | Run the setup program, then open **QuotaBar** from Start. Click the gauge in the taskbar notification area. Check the hidden icon overflow if needed. |
+
+Claude, Codex, Cursor, and Freebuff are enabled on a fresh install. Sign in through the corresponding provider tool, then refresh QuotaBar. Manage additional providers in **Customize** on macOS and **Options → Settings → Providers** on Windows. Provider and metric availability varies by platform.
+
+To update, open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and install the newer build. On macOS, replace the app in Applications. On Windows, run the newer installer for the same user.
+
+## Build From Source
+
+On macOS, install Xcode 26 or later and stable Rust. Run from the repository root:
 
 ```sh
-swift build                     # build
-swift test                      # run the test suite
-./script/build_and_run.sh run   # stage a signed dev bundle in dist/ and launch it
-./script/build_and_run.sh install # replace the matching QuotaBar identity in /Applications and launch it
+CODESIGN_IDENTITY=- ALLOW_ADHOC_SIGNING=1 ./script/build_and_run.sh verify
 ```
 
-There is **no auto-update mechanism**. Sparkle and the appcast feed were removed, and the upstream
-feed is served from a public repository this fork has no claim on, so builds must not point at it.
-Reinstall with `./script/build_and_run.sh install`. The installer verifies the existing and staged app
-identities match before replacing the bundle, so a development install cannot silently replace a release
-identity (or the reverse).
+The development build runs from `dist/`. Use an Apple Development signing identity if you need macOS permissions to persist across builds. See [Testing](docs/testing.md) for the test suites.
 
-## Supported Providers
+On Windows, follow the [Windows build and setup guide](windows/README.md).
+
+## macOS Providers
 
 - **[Antigravity](docs/providers/antigravity.md)** — shared Gemini and Claude pool quotas, 5-hour and weekly windows
 - **[Claude](docs/providers/claude.md)** — session, weekly, model-specific limits, extra usage, local daily spend
@@ -48,7 +53,7 @@ identity (or the reverse).
 
 Most providers read the credentials already on your machine (keychain, auth files, app state) — no extra login. OpenRouter and Z.ai are the exceptions: they have no local credential to reuse, so you supply an API key (see [OpenRouter setup](docs/providers/openrouter.md) or [Z.ai setup](docs/providers/zai.md)). Credentials are used only for the corresponding provider requests. QuotaBar's separate anonymous summaries and public pricing downloads are documented under [Privacy & usage data](docs/privacy.md).
 
-## Features
+## macOS Features
 
 - **Menu bar pins.** Pin metrics to the menu bar (up to 2 per provider); render as compact text or mini bars. The strip hides metrics with no data instead of showing placeholders.
 - **Dashboard popover.** Provider-grouped meters with live reset countdowns and pace indicators. Click usage or reset values to flip their display everywhere; right-click a row to hide or star it, refresh its provider, or open Customize.
@@ -69,38 +74,13 @@ Behavior docs live in [docs/](docs/README.md): the [dashboard](docs/dashboard.md
 
 For working on the code, see the developer docs: [architecture](docs/architecture.md), [adding a provider](docs/adding-a-provider.md), and [debugging & capturing logs](docs/debugging.md).
 
-## Requirements
-
-- macOS 15 (Sequoia) or later
-- Universal binary — runs natively on both Apple Silicon and Intel Macs
-
-The Today / Yesterday / Last 30 Days spend tiles are computed natively from local CLI logs (Claude,
-Codex, and Grok) or Cursor's usage export — no Node.js or other runtime needed. Dollars are estimated
-with [dynamically refreshed model pricing](docs/pricing.md).
-
-
-
 ## Architecture
 
 SwiftPM package, SwiftUI content hosted in an AppKit-owned `NSStatusItem` + custom key-capable `NSPanel`, Swift 6 strict concurrency. The app and CLI share one module: providers implement a small `ProviderRuntime` protocol (auth store → usage client → mapper → `ProviderSnapshot`), and both surfaces read the same normalized data — see the [architecture overview](docs/architecture.md) for how the pieces fit together and [AGENTS.md](AGENTS.md) for engineering conventions.
 
 ## Releasing
 
-There is no automated release pipeline. A local development build can be staged with:
-
-```sh
-./script/build_and_run.sh build          # stage a signed bundle in dist/
-```
-
-For distribution, run the script from the exact release tag with a Developer ID certificate:
-
-```sh
-RELEASE=1 CODESIGN_IDENTITY="Developer ID Application: <name> (<team>)" ./script/build_and_run.sh build
-```
-
-That stages a universal arm64 + x86_64 app whose version comes from the tag. The Developer ID signed
-bundle still needs to be packaged as a DMG, notarized, and stapled before distribution. There is no
-auto-update; users replace the app in `/Applications` manually.
+See [Preparing a Release](docs/releasing.md) for platform builds, smoke tests, and GitHub publishing.
 
 ### iCloud Sync
 

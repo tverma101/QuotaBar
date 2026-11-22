@@ -104,18 +104,19 @@ fn place_linux_pointer_popover<R: Runtime>(window: &WebviewWindow<R>) {
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
-/// Windows fallback when tray geometry is unavailable: place near the top edge of the
-/// current monitor so it still reads as a tray popover.
+/// Use the lower-right of the monitor work area until the tray reports its position.
 #[cfg(target_os = "windows")]
 fn place_windows_monitor_fallback<R: Runtime>(window: &WebviewWindow<R>) {
     match (window.current_monitor(), window.outer_size()) {
         (Ok(Some(monitor)), Ok(outer)) => {
-            let pos = monitor.position();
-            let size = monitor.size();
+            let work_area = monitor.work_area();
+            let pos = work_area.position;
+            let size = work_area.size;
             let margin = 12i32;
             let width = outer.width as i32;
-            let x = pos.x + ((size.width as i32 - width) / 2);
-            let y = pos.y + margin;
+            let height = outer.height as i32;
+            let x = pos.x + (size.width as i32 - width - margin).max(0);
+            let y = pos.y + (size.height as i32 - height - margin).max(0);
             let _ = window.set_position(PhysicalPosition::new(x, y));
         }
         _ => {

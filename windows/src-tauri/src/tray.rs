@@ -436,8 +436,8 @@ pub fn create(app_handle: &AppHandle) -> tauri::Result<()> {
                     let _ = app_handle.emit("tray:show-about", ());
                 }
                 "restart" => {
-                    log::info!("restart or apply-update requested via tray");
-                    let _ = app_handle.emit("tray:restart-or-update", ());
+                    log::info!("restart requested via tray");
+                    app_handle.request_restart();
                 }
                 "quit" => {
                     log::info!("quit requested via tray");

@@ -1,7 +1,6 @@
 import { useShallow } from "zustand/react/shallow"
 import { OverviewPage } from "@/pages/overview"
 import { ProviderDetailPage } from "@/pages/provider-detail"
-import { PollsPage } from "@/pages/polls"
 import { SettingsPage, type ProviderAccountCredentialInput } from "@/pages/settings"
 import type { DisplayPluginState } from "@/hooks/app/use-app-plugin-views"
 import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
@@ -9,7 +8,6 @@ import type { TraySettingsPreview } from "@/hooks/app/use-tray-icon"
 import { useAppPluginStore } from "@/stores/app-plugin-store"
 import { useAppPreferencesStore } from "@/stores/app-preferences-store"
 import { useAppUiStore } from "@/stores/app-ui-store"
-import { useProductPollsStore } from "@/stores/product-polls-store"
 import type {
   AutoUpdateIntervalMinutes,
   DisplayMode,
@@ -76,7 +74,8 @@ export type AppContentActionProps = {
 
 export type AppContentProps = AppContentDerivedProps &
   AppContentActionProps & {
-    viewOverride?: "home" | "settings" | "polls"
+    compactSettings?: boolean
+    viewOverride?: "home" | "settings"
   }
 
 export function AppContent({
@@ -119,6 +118,7 @@ export function AppContent({
   onShowAccountIdentityChange,
   onSetTrayReadout,
   cursorRequestsLineAvailable,
+  compactSettings = false,
   viewOverride,
 }: AppContentProps) {
   const { activeView } = useAppUiStore(
@@ -127,7 +127,6 @@ export function AppContent({
     }))
   )
   const resolvedView = viewOverride ?? activeView
-  const pollsVisitNonce = useProductPollsStore((state) => state.pollsVisitNonce)
 
   const pluginSettings = useAppPluginStore((state) => state.pluginSettings)
 
@@ -201,14 +200,6 @@ export function AppContent({
     )
   }
 
-  if (resolvedView === "polls") {
-    return (
-      <div key={`polls-${pollsVisitNonce}`} className="motion-view">
-        <PollsPage />
-      </div>
-    )
-  }
-
   if (resolvedView === "settings") {
     return (
       <div key="settings" className="motion-view">
@@ -272,6 +263,7 @@ export function AppContent({
         onSetTrayReadout={onSetTrayReadout}
         cursorRequestsLineAvailable={cursorRequestsLineAvailable}
         presentation={uiLayout === "modern" ? "modern" : "classic"}
+        compactSettings={compactSettings}
       />
       </div>
     )

@@ -1,6 +1,5 @@
 import { useEffect } from "react"
-import { isTauri } from "@tauri-apps/api/core"
-import { getCurrentWindow } from "@tauri-apps/api/window"
+import { invoke, isTauri } from "@tauri-apps/api/core"
 
 /** Focus the main window when the user clicks a system notification. */
 export function useNotificationFocus() {
@@ -15,10 +14,7 @@ export function useNotificationFocus() {
         const { onAction } = await import("@tauri-apps/plugin-notification")
         const listener = await onAction(() => {
           if (disposed) return
-          const window = getCurrentWindow()
-          void window.show().catch(() => {})
-          void window.unminimize().catch(() => {})
-          void window.setFocus().catch(() => {})
+          void invoke("show_panel").catch(console.error)
         })
         if (disposed) {
           void listener.unregister()

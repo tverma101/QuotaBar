@@ -13,12 +13,8 @@ import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
 import { useAppVersion } from "@/hooks/app/use-app-version"
 import { usePanel } from "@/hooks/app/use-panel"
 import { usePlatform } from "@/hooks/app/use-platform"
-import { useTrayRestartBridge } from "@/hooks/app/use-tray-restart-bridge"
-import type { UpdateStatus } from "@/hooks/use-app-update"
 import { useAppPreferencesStore } from "@/stores/app-preferences-store"
 import { useAppUiStore } from "@/stores/app-ui-store"
-import { useProductPollsBadge } from "@/hooks/app/use-product-polls"
-import { useProductPollsStore } from "@/stores/product-polls-store"
 import { useMotionPointer } from "@/hooks/app/use-motion-pointer"
 import { MotionField } from "@/components/motion-field"
 
@@ -32,9 +28,6 @@ type AppShellProps = {
   onPluginContextAction: (pluginId: string, action: PluginContextAction) => void
   isPluginRefreshAvailable: (pluginId: string) => boolean
   onNavReorder: (orderedIds: string[]) => void
-  updateStatus: UpdateStatus
-  onUpdateInstall: () => void
-  onUpdateCheck: () => void
   appContentProps: AppContentActionProps
 
   showOnboardingWizard: boolean
@@ -52,9 +45,6 @@ export function AppShell({
   onPluginContextAction,
   isPluginRefreshAvailable,
   onNavReorder,
-  updateStatus,
-  onUpdateInstall,
-  onUpdateCheck,
   appContentProps,
   showOnboardingWizard,
   onOnboardingComplete,
@@ -92,9 +82,6 @@ export function AppShell({
   })
 
   const appVersion = useAppVersion()
-  const pollsBadge = useProductPollsBadge(appVersion)
-  const bumpPollsVisit = useProductPollsStore((s) => s.bumpPollsVisit)
-  useTrayRestartBridge(updateStatus, onUpdateInstall)
   const platform = usePlatform()
   // macOS and Windows run the same frameless tray popover (borderless window,
   // click-away dismiss); Linux keeps the native-title-bar layout.
@@ -105,11 +92,6 @@ export function AppShell({
   const macPopoverChrome = platform === "macos"
   const panelMotionRef = useMotionPointer(!reduceAnimations)
 
-  const onViewChange = (view: Parameters<typeof setActiveView>[0]) => {
-    if (view === "polls") bumpPollsVisit()
-    setActiveView(view)
-  }
-
   // macOS parity: the popover footer exposes a single Options menu instead of
   // a nav rail (Customize/Settings/About/Quit, mirroring the macOS popover).
   const openOptionsMenu = () => {
@@ -117,7 +99,7 @@ export function AppShell({
       const settingsItem = await MenuItem.new({
         id: "opt-settings",
         text: "Settings",
-        action: () => onViewChange("settings"),
+        action: () => setActiveView("settings"),
       })
       const aboutItem = await MenuItem.new({
         id: "opt-about",
@@ -155,12 +137,10 @@ export function AppShell({
   const topBarTitle =
     activeView === "settings"
       ? "Settings"
-      : activeView === "polls"
-        ? "Polls"
-        : (selectedPlugin?.meta.name ?? "")
+      : (selectedPlugin?.meta.name ?? "")
 
   return (
-    <div ref={containerRef} className="app-popover-shell w-full bg-transparent">
+    <div ref={containerRef} className="app-popover-shell w-full bg-transparent" tabIndex={-1}>
       {/* SVG filter definitions for the liquid-distort effect; rendered off-screen */}
       <LiquidGlassFilter active={themeMode === "glass"} />
       {macPopoverChrome ? <div className="tray-arrow" aria-hidden="true" /> : null}
@@ -180,12 +160,11 @@ export function AppShell({
           {compactPopover ? null : (
             <SideNav
               activeView={activeView}
-              onViewChange={onViewChange}
+              onViewChange={setActiveView}
               plugins={navPlugins}
               onPluginContextAction={onPluginContextAction}
               isPluginRefreshAvailable={isPluginRefreshAvailable}
               onReorder={onNavReorder}
-              pollsBadge={pollsBadge}
             />
           )}
           <div className="app-main-pane relative flex-1 flex flex-col px-3 pt-2 pb-1.5 min-w-0">
@@ -207,7 +186,7 @@ export function AppShell({
                   type="button"
                   className="flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
                   aria-label="Back"
-                  onClick={() => onViewChange("home")}
+                  onClick={() => setActiveView("home")}
                 >
                   <ChevronLeft className="h-4 w-4" strokeWidth={2.5} />
                 </button>
@@ -229,6 +208,7 @@ export function AppShell({
                     {...appContentProps}
                     displayPlugins={displayPlugins}
                     settingsPlugins={settingsPlugins}
+                    compactSettings={compactPopover}
                     selectedPlugin={selectedPlugin}
                   />
                 </div>
@@ -240,9 +220,6 @@ export function AppShell({
             <PanelFooter
               version={appVersion}
               autoUpdateNextAt={autoUpdateNextAt}
-              updateStatus={updateStatus}
-              onUpdateInstall={onUpdateInstall}
-              onUpdateCheck={onUpdateCheck}
               onRefreshAll={onRefreshAll}
               showAbout={showAbout}
               onShowAbout={() => setShowAbout(true)}

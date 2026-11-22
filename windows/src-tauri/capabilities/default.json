@@ -15,7 +15,6 @@
     "notification:default",
     "store:default",
     "clipboard-manager:allow-write-text",
-    "updater:default",
     "process:allow-restart",
     "global-shortcut:default",
     "autostart:default",

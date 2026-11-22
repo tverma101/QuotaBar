@@ -15,13 +15,10 @@ import { useSettingsTheme } from "@/hooks/app/use-settings-theme"
 import { useReduceAnimations } from "@/hooks/app/use-reduce-animations"
 import { useSettingsUIScale } from "@/hooks/app/use-settings-ui-scale"
 import { useTrayIcon } from "@/hooks/app/use-tray-icon"
-import { useProductPolls } from "@/hooks/app/use-product-polls"
 import { useUsageAlert } from "@/hooks/app/use-usage-alert"
 import { useNotificationFocus } from "@/hooks/app/use-notification-focus"
-import { useAppUpdate } from "@/hooks/use-app-update"
 import {
   buildProviderInstanceId,
-  enableDetectedProvidersOnOnboarding,
   getBaseProviderId,
   getProviderInstanceLabel,
   insertProviderInstanceInOrder,
@@ -180,7 +177,6 @@ function App() {
   const pluginSettingsRef = useRef(pluginSettings)
   pluginSettingsRef.current = pluginSettings
 
-  const { updateStatus, triggerInstall, checkForUpdates } = useAppUpdate()
 
   const { scheduleTrayIconUpdate, traySettingsPreview } = useTrayIcon({
     pluginsMeta,
@@ -238,7 +234,6 @@ function App() {
   useSettingsTheme(themeMode)
   useSettingsUIScale(uiScale)
   useReduceAnimations()
-  useProductPolls({ onboardingComplete })
 
   const {
     handleThemeModeChange,
@@ -372,23 +367,12 @@ function App() {
 
   const handleOnboardingComplete = useCallback(
     (layout: UILayout) => {
-      const nextPluginSettings =
-        pluginSettings != null
-          ? enableDetectedProvidersOnOnboarding(pluginSettings, pluginStates)
-          : null
       void getVersion()
-        .then((appVersion) => {
-          const saves: Promise<void>[] = [saveUILayout(layout), saveDualUiOnboardingComplete(appVersion)]
-          if (nextPluginSettings) {
-            saves.push(savePluginSettings(nextPluginSettings))
-          }
-          return Promise.all(saves)
-        })
+        .then((appVersion) =>
+          Promise.all([saveUILayout(layout), saveDualUiOnboardingComplete(appVersion)])
+        )
         .then(() => {
           setUILayout(layout)
-          if (nextPluginSettings) {
-            setPluginSettings(nextPluginSettings)
-          }
           setOnboardingComplete(true)
           setActiveView("settings")
         })
@@ -396,7 +380,7 @@ function App() {
           console.error("Failed to save onboarding completion:", error)
         })
     },
-    [pluginSettings, pluginStates, setActiveView, setOnboardingComplete, setPluginSettings, setUILayout],
+    [setActiveView, setOnboardingComplete, setUILayout],
   )
 
   const handleOnboardingSkip = useCallback(() => {
@@ -671,9 +655,6 @@ function App() {
     displayPlugins,
     settingsPlugins,
     autoUpdateNextAt,
-    updateStatus,
-    onUpdateInstall: triggerInstall,
-    onUpdateCheck: checkForUpdates,
     showOnboardingWizard,
     onOnboardingComplete: handleOnboardingComplete,
     onOnboardingSkip: handleOnboardingSkip,

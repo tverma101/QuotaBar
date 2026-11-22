@@ -1,5 +1,5 @@
 import { useCallback } from "react"
-import { BarChart3, CircleHelp, Settings } from "lucide-react"
+import { CircleHelp, Settings } from "lucide-react"
 import { openUrl } from "@tauri-apps/plugin-opener"
 import { FORK_REPO_URL } from "@/lib/fork-meta"
 import { invoke } from "@tauri-apps/api/core"
@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils"
 import { useDarkMode } from "@/hooks/use-dark-mode"
 import { ProviderIcon } from "@/components/provider-icon"
 
-type ActiveView = "home" | "settings" | "polls" | string
+type ActiveView = "home" | "settings" | string
 
 type PluginContextAction = "reload" | "remove"
 
@@ -42,8 +42,6 @@ interface SideNavProps {
   onPluginContextAction?: (pluginId: string, action: PluginContextAction) => void
   isPluginRefreshAvailable?: (pluginId: string) => boolean
   onReorder?: (orderedIds: string[]) => void
-  /** Soft badge when an unanswered product poll is available. */
-  pollsBadge?: boolean
 }
 
 interface NavButtonProps {
@@ -52,7 +50,6 @@ interface NavButtonProps {
   onContextMenu?: (e: React.MouseEvent) => void
   children: React.ReactNode
   "aria-label"?: string
-  badge?: boolean
 }
 
 function NavButton({
@@ -61,7 +58,6 @@ function NavButton({
   onContextMenu,
   children,
   "aria-label": ariaLabel,
-  badge,
 }: NavButtonProps) {
   return (
     <button
@@ -79,12 +75,6 @@ function NavButton({
       data-active={isActive}
     >
       {children}
-      {badge ? (
-        <span
-          className="absolute top-1.5 right-1.5 size-2 rounded-full bg-primary motion-ping"
-          aria-hidden
-        />
-      ) : null}
     </button>
   )
 }
@@ -140,7 +130,6 @@ export function SideNav({
   onPluginContextAction,
   isPluginRefreshAvailable,
   onReorder,
-  pollsBadge = false,
 }: SideNavProps) {
   const isDark = useDarkMode()
 
@@ -249,16 +238,6 @@ export function SideNav({
           </SortableContext>
         </DndContext>
       </div>
-
-      {/* Polls */}
-      <NavButton
-        isActive={activeView === "polls"}
-        onClick={() => onViewChange("polls")}
-        aria-label={pollsBadge ? "Polls (new)" : "Polls"}
-        badge={pollsBadge}
-      >
-        <BarChart3 className="size-10" />
-      </NavButton>
 
       {/* Help */}
       <NavButton

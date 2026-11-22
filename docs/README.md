@@ -38,6 +38,8 @@ What each provider tracks, where its credentials come from, and what to do when 
 
 ## For developers
 
+- [Preparing a Release](releasing.md)
+
 How the app is built and how to extend it.
 
 - [Testing](testing.md) — run all CI suites locally, or a focused efficiency subset

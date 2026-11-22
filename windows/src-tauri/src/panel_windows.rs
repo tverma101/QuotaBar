@@ -1,3 +1,4 @@
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Duration;
 
@@ -9,12 +10,21 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::popover_platform;
 
+struct BlurWatcher(SyncSender<()>);
+
 /// Show the panel anchored to the tray when possible.
 pub fn show_panel(app_handle: &AppHandle) {
     if let Some(window) = app_handle.get_webview_window("main") {
-        let _ = window.show();
+        if let Err(error) = window.show() {
+            log::warn!("Cannot show the QuotaBar window: {error}");
+            return;
+        }
         popover_platform::move_main_near_tray(app_handle);
         let _ = window.set_focus();
+        if let Some(watcher) = app_handle.try_state::<BlurWatcher>() {
+            // Coalesce repeated opens while the same window is already being watched.
+            let _ = watcher.0.try_send(());
+        }
     }
 }
 
@@ -26,9 +36,7 @@ pub fn toggle_panel(app_handle: &AppHandle) {
             let _ = window.hide();
         } else {
             log::debug!("toggle_panel: showing window");
-            let _ = window.show();
-            popover_platform::move_main_near_tray(app_handle);
-            let _ = window.set_focus();
+            show_panel(app_handle);
         }
     }
 }
@@ -63,22 +71,26 @@ unsafe fn foreground_is_panel(foreground: HWND, panel: HWND) -> bool {
 /// panel's `window_did_resign_key` handler). `WindowEvent::Focused` is unusable
 /// here because focus moving into the WebView2 child reports a blur; poll the
 /// real foreground window instead.
-fn spawn_blur_watcher(app_handle: AppHandle, panel: usize) {
-    thread::spawn(move || loop {
-        let panel = panel as HWND;
-        thread::sleep(Duration::from_millis(250));
-        let Some(window) = app_handle.get_webview_window("main") else {
-            return;
-        };
-        if !window.is_visible().unwrap_or(false) {
-            continue;
-        }
-        let foreground = unsafe { GetForegroundWindow() };
-        if foreground.is_null() {
-            continue;
-        }
-        if !unsafe { foreground_is_panel(foreground, panel) } {
-            let _ = window.hide();
+fn spawn_blur_watcher(app_handle: AppHandle, panel: usize, shown: Receiver<()>) {
+    thread::spawn(move || {
+        // Block while hidden. Provider refresh and the local API run independently.
+        while shown.recv().is_ok() {
+            loop {
+                thread::sleep(Duration::from_millis(250));
+                let Some(window) = app_handle.get_webview_window("main") else {
+                    return;
+                };
+                if !window.is_visible().unwrap_or(false) {
+                    break;
+                }
+                let foreground = unsafe { GetForegroundWindow() };
+                if !foreground.is_null()
+                    && !unsafe { foreground_is_panel(foreground, panel as HWND) }
+                {
+                    let _ = window.hide();
+                    break;
+                }
+            }
         }
     });
 }
@@ -111,7 +123,10 @@ pub fn init(app_handle: &tauri::AppHandle) -> tauri::Result<()> {
         });
 
         if let Ok(hwnd) = window.hwnd() {
-            spawn_blur_watcher(app_handle.clone(), hwnd.0 as usize);
+            let (send, shown) = mpsc::sync_channel(1);
+            if app_handle.manage(BlurWatcher(send)) {
+                spawn_blur_watcher(app_handle.clone(), hwnd.0 as usize, shown);
+            }
         }
     }
 

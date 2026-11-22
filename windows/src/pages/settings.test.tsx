@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react"
 import type { ReactNode } from "react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -373,7 +373,7 @@ describe("SettingsPage", () => {
     await user.click(screen.getByRole("button", { name: "Add account" }))
     await user.click(screen.getByRole("button", { name: "Step-by-step: where to copy tokens (opens GitHub)" }))
     expect(openUrl).toHaveBeenCalledWith(
-      "https://github.com/tverma101/QuotaBar/blob/HEAD/docs/providers/multi-account-credentials.md"
+      "https://github.com/tverma101/QuotaBar/blob/HEAD/windows/docs/providers/multi-account-credentials.md"
     )
   })
 
@@ -588,6 +588,19 @@ describe("SettingsPage", () => {
     })
     await userEvent.click(screen.getByText("Start on login"))
     expect(onStartOnLoginChange).toHaveBeenCalledWith(true)
+  })
+
+  it("groups compact settings without hiding classic controls", async () => {
+    const user = userEvent.setup()
+    renderSettings({ ...defaultProps, compactSettings: true })
+
+    const settingsSections = screen.getByRole("navigation", { name: "Settings sections" })
+    expect(screen.queryByRole("checkbox", { name: "Start hidden" })).toBeNull()
+    const advanced = within(settingsSections).getByRole("button", { name: "Advanced" })
+    await user.click(advanced)
+    expect(advanced).toHaveAttribute("aria-pressed", "true")
+    expect(screen.getByRole("checkbox", { name: "Start hidden" })).toBeVisible()
+    expect(screen.queryByText("Allow product polls")).toBeNull()
   })
 
   it("toggles start hidden checkbox", async () => {

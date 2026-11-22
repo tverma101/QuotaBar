@@ -1,53 +1,36 @@
 # QuotaBar for Windows
 
-QuotaBar on Windows: the same menu-bar usage widgets as the macOS app, rebuilt on
-[Tauri 2](https://tauri.app) (Rust + React) so it runs on Windows (and Linux).
+QuotaBar shows AI coding subscription limits, reset times, credits, and spend in the Windows notification area. See [GitHub Releases](https://github.com/tverma101/QuotaBar/releases) for the Windows 11 x64 setup executable.
 
-This directory is a vendored and rebranded copy of
-[CrossUsage](https://github.com/barramee27/crossusage) — the existing Tauri port of the
-same OpenUsage codebase QuotaBar's macOS app descends from. See
-[PROVENANCE.md](PROVENANCE.md) for the exact import, the local deltas, and how to
-resync from upstream.
+## Install and Set Up
 
-## Layout
+1. Run the `-setup.exe` and open **QuotaBar** from Start. The installer uses the current user's profile and installs WebView2 if it is missing.
+2. Click the gauge in the taskbar notification area to reopen the dashboard. You may find it under the hidden icons arrow. Right-click the icon for Settings, About, Restart, and Quit.
+3. Open **Options → Settings → Providers** to change which providers are tracked. Claude, Codex, Cursor, and Freebuff start enabled. Sign in through the relevant provider tool if a card needs credentials.
+4. Set **Start on Login** or **Start Hidden** under **Advanced**. Usage normally refreshes every 15 minutes, including when the panel is closed.
 
-- `src/` — React/TypeScript settings window and popover UI.
-- `src-tauri/` — Tauri shell (tray, window, updater hooks).
-- `crates/quotabar-core` — plugin engine (QuickJS), usage model, scanners.
-- `crates/quotabar-cli` — `quotabar-cli`, the headless CLI sidecar.
-- `plugins/` — per-provider JS plugins (`plugin.js` + `plugin.json` + `icon.svg`).
+To update, open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and run the newer installer under the same Windows account.
 
-## Build and run
+| Data | Default Location |
+| --- | --- |
+| Installed app and bundled CLI | `%LOCALAPPDATA%\QuotaBar` |
+| Settings and app data | `%APPDATA%\com.tverma101.quotabar` |
+| CLI configuration | `%APPDATA%\quotabar\config.toml` |
+| Optional proxy configuration | `%USERPROFILE%\.quotabar\config.json` |
 
-Requirements: Rust (stable, windows-gnu toolchain), [Bun](https://bun.sh), and the
-WebView2 runtime (present on Windows 11; install `webview2-runtime` otherwise).
+The dashboard and [local HTTP API](docs/local-http-api.md) share the app's provider results. History and provider availability depend on the provider's Windows support.
 
-```sh
-bun install
-bash scripts/prepare-cli-sidecar.sh   # builds the quotabar-cli sidecar once
-bun run tauri:dev:win                 # dev build + run
-```
+## Build From Source
+
+Install [Tauri's Windows prerequisites](https://v2.tauri.app/start/prerequisites/), Node.js, Bun, Git for Windows, and stable Rust with the MSVC toolchain. Run from this directory:
 
 ```sh
-bun run test                          # Vitest (UI + plugins)
-cargo test -p quotabar-cli            # core/CLI tests
-bun run build                         # typecheck + Vite build
+bun install --frozen-lockfile
+bun run tauri:dev:win
+bun run test
+bun run tauri:build --bundles nsis -- --locked
 ```
 
-## Providers
+The `-setup.exe` is under `target/release/bundle/nsis/`. For a public build, follow the [release instructions](../docs/releasing.md).
 
-Default-enabled providers match the macOS app: Claude, Codex, Cursor, Freebuff.
-Every other bundled plugin is available from Settings but starts disabled; new
-plugins append alphabetically after the established three.
-
-## Differences from macOS QuotaBar
-
-- Provider plugins run in a QuickJS sandbox inside the app; a plugin reads the
-  same on-disk credentials the macOS auth stores use where the layout is
-  platform-neutral (e.g. Freebuff's `~/.config/manicode/credentials.json`,
-  `CODEBUFF_API_KEY`).
-- No auto-update feed: the updater block in `src-tauri/tauri.conf.json` points at
-  this repo's releases but stays inert until a QuotaBar-owned signing key exists
-  (same rule as the macOS app).
-- Anonymous usage analytics (Aptabase) and CrossUsage's product polls are off:
-  those endpoints are owned by the CrossUsage project, not QuotaBar.
+The desktop port uses Tauri and a local QuickJS provider runtime. See [provenance](PROVENANCE.md) for attribution and upstream synchronization details.

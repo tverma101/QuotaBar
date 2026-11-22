@@ -16,12 +16,10 @@ import { Button } from "@/components/ui/button"
 import type { DisplayPluginState } from "@/hooks/app/use-app-plugin-views"
 import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
 import { useAppVersion } from "@/hooks/app/use-app-version"
-import { useTrayRestartBridge } from "@/hooks/app/use-tray-restart-bridge"
 import { useWeeklyRollup } from "@/hooks/use-weekly-rollup"
 import { useHistoryInsights } from "@/hooks/use-history-insights"
 import { usePersistUsageHistory } from "@/hooks/use-persist-usage-history"
 import { useNowTicker } from "@/hooks/use-now-ticker"
-import type { UpdateStatus } from "@/hooks/use-app-update"
 import { buildMetricDescriptors, findMetricLine } from "@/lib/metric-registry"
 import { parseMetricId } from "@/lib/metric-id"
 import {
@@ -40,21 +38,15 @@ import { useAppPreferencesStore } from "@/stores/app-preferences-store"
 import { useAppUiStore } from "@/stores/app-ui-store"
 import { useModernLayoutStore } from "@/stores/modern-layout-store"
 import type { UILayout } from "@/lib/settings"
-import { useProductPollsBadge } from "@/hooks/app/use-product-polls"
-import { useProductPollsStore } from "@/stores/product-polls-store"
-import { PollsPage } from "@/pages/polls"
 import { useMotionPointer } from "@/hooks/app/use-motion-pointer"
 
-type ModernScreen = "dashboard" | "customize" | "polls" | "settings"
+type ModernScreen = "dashboard" | "customize" | "settings"
 
 type ModernShellProps = {
   onRefreshAll: () => void
   displayPlugins: DisplayPluginState[]
   settingsPlugins: SettingsPluginState[]
   autoUpdateNextAt: number | null
-  updateStatus: UpdateStatus
-  onUpdateInstall: () => void
-  onUpdateCheck: () => void
   appContentProps: AppContentActionProps
   showOnboardingWizard: boolean
   onOnboardingComplete: (layout: UILayout) => void
@@ -67,9 +59,6 @@ export function ModernShell({
   displayPlugins,
   settingsPlugins,
   autoUpdateNextAt,
-  updateStatus,
-  onUpdateInstall,
-  onUpdateCheck,
   appContentProps,
   showOnboardingWizard,
   onOnboardingComplete,
@@ -79,10 +68,6 @@ export function ModernShell({
   const { t } = useTranslation()
   const [screen, setScreen] = useState<ModernScreen>("dashboard")
   const appVersion = useAppVersion()
-  const pollsBadge = useProductPollsBadge(appVersion)
-  const bumpPollsVisit = useProductPollsStore((s) => s.bumpPollsVisit)
-  const pollsVisitNonce = useProductPollsStore((s) => s.pollsVisitNonce)
-  useTrayRestartBridge(updateStatus, onUpdateInstall)
 
   const { themeMode, displayMode, resetTimerDisplayMode, modernDensity, displayCurrency, exchangeRatesRevision, showTotalSpend, reduceAnimations } =
     useAppPreferencesStore(
@@ -281,7 +266,6 @@ export function ModernShell({
             [
               ["dashboard", t("modern.dashboard")],
               ["customize", t("modern.customize")],
-              ["polls", t("modern.polls")],
               ["settings", t("modern.settings")],
             ] as const
           ).map(([id, label]) => (
@@ -294,24 +278,11 @@ export function ModernShell({
               data-active={screen === id}
               onClick={() => {
                 if (id === "settings") setActiveView("settings")
-                else if (id === "polls") {
-                  bumpPollsVisit()
-                  setActiveView("polls")
-                } else setActiveView("home")
+                else setActiveView("home")
                 setScreen(id)
               }}
             >
               {label}
-              {id === "polls" && pollsBadge ? (
-                <span
-                  className={
-                    screen === id
-                      ? "absolute top-1 right-1 size-1.5 rounded-full bg-primary-foreground motion-ping"
-                      : "absolute top-1 right-1 size-1.5 rounded-full bg-primary motion-ping"
-                  }
-                  aria-hidden
-                />
-              ) : null}
             </Button>
           ))}
         </nav>
@@ -386,12 +357,6 @@ export function ModernShell({
               </div>
             ) : null}
 
-            {screen === "polls" ? (
-              <div key={`polls-${pollsVisitNonce}`} className="motion-view">
-                <PollsPage />
-              </div>
-            ) : null}
-
             {screen === "settings" ? (
               <div key="settings" className="motion-view">
               <AppContent
@@ -408,9 +373,6 @@ export function ModernShell({
           <PanelFooter
             version={appVersion}
             autoUpdateNextAt={autoUpdateNextAt}
-            updateStatus={updateStatus}
-            onUpdateInstall={onUpdateInstall}
-            onUpdateCheck={onUpdateCheck}
             onRefreshAll={onRefreshAll}
             showAbout={showAbout}
             onShowAbout={() => setShowAbout(true)}

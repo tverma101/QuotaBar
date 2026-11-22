@@ -1,0 +1,48 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+    paths: ['windows/**', '.github/workflows/windows-ci.yml']
+  pull_request:
+    branches: [main]
+    paths: ['windows/**', '.github/workflows/windows-ci.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    name: Test and Build Windows Installer
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test Frontend and Providers
+        run: bun run test
+
+      - name: Build x64 Installer
+        run: bun run tauri:build --bundles nsis -- --locked
+
+      - name: Upload Windows QA Installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: quotabar-windows-x64-qa
+          path: windows/target/**/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 7

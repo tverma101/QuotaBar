@@ -22,13 +22,10 @@ website, and CrossUsage branding assets.
    homepage, and all user-facing strings.
 2. **Icons** — `src-tauri/icons/` regenerated from `assets/AppIcon.icon/Assets/quotabar-gauge.svg`
    via `scripts/render-icon.html` / `render-tray-icon.html` (headless-Chrome raster pipeline).
-3. **Analytics disabled** — `APTABASE_APP_KEY` in `src-tauri/src/lib.rs` is empty; the imported
-   key belonged to the CrossUsage project. Do not point QuotaBar at a feed or dashboard it does
-   not own (same rule as the macOS app: no update feed, no third-party telemetry).
-4. **Product polls default off** — `DEFAULT_PRODUCT_POLLS_ENABLED = false` in
-   `src/lib/settings.ts`; the polls API domain is CrossUsage-owned.
-5. **Updater endpoint** — points at `tverma101/QuotaBar` releases but retains the imported
-   minisign pubkey; it is inert until a QuotaBar-owned signing key is configured.
+3. **Release services** — QuotaBar ships without the imported analytics tracker, product polls, and
+   signing key. About links to GitHub Releases for downloads and manual updates.
+4. **Windows setup** — a per-user installer bundles the CLI and providers. Settings use the user's
+   roaming app-data directory. The compact panel groups settings into sections.
 
 ## Update procedure
 

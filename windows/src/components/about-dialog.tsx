@@ -210,10 +210,12 @@ export function AboutDialog({ version, onClose }: AboutDialogProps) {
 
         <div className="text-sm text-muted-foreground space-y-1 overflow-y-auto min-h-0">
           <p>
+            <ExternalLink href={`${FORK_REPO_URL}/releases`}>Downloads and Updates</ExternalLink>
+          </p>
+          <p>
             Fork of{" "}
-            <ExternalLink href={UPSTREAM_REPO_URL}>OpenUsage</ExternalLink> — original by{" "}
+            <ExternalLink href={UPSTREAM_REPO_URL}>the upstream project</ExternalLink> by{" "}
             <ExternalLink href="https://itsbyrob.in/x">Robin Ebers</ExternalLink>.
-            Cross-platform focus (Linux &amp; Windows) in this repo.
           </p>
           <p>
             Source:{" "}

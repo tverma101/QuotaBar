@@ -58,8 +58,6 @@ import {
   type UsageAlertThreshold,
 } from "@/lib/settings";
 import { hydrateModernLayoutStore } from "@/stores/modern-layout-store";
-import { setProductPollsEnabled } from "@/hooks/app/use-product-polls";
-import { useProductPollsStore } from "@/stores/product-polls-store";
 import { DEFAULT_LOG_LEVEL, isLogLevel, LOG_LEVEL_OPTIONS, type LogLevel } from "@/lib/log-level";
 import { formatLogTailClipboard } from "@/lib/support-issue-paste";
 import type { UsageHistoryRow } from "@/lib/usage-history";
@@ -726,37 +724,6 @@ function InsightsSection() {
   );
 }
 
-function ProductPollsSection() {
-  const enabled = useProductPollsStore((s) => s.enabled);
-  const hydrated = useProductPollsStore((s) => s.hydrated);
-
-  const onChange = async (checked: boolean) => {
-    try {
-      await setProductPollsEnabled(checked);
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  return (
-    <section>
-      <h3 className="text-lg font-semibold mb-0">Product polls</h3>
-      <p className="text-sm text-muted-foreground mb-2">
-        Occasional in-app questions from the QuotaBar team. Votes are anonymous (opaque install id + your choice).
-        Off = never fetch or send votes. See the Polls page.
-      </p>
-      <label className="flex items-center gap-2 text-sm select-none text-foreground">
-        <Checkbox
-          checked={enabled}
-          disabled={!hydrated}
-          onCheckedChange={(checked) => void onChange(checked === true)}
-        />
-        Allow product polls
-      </label>
-    </section>
-  );
-}
-
 function ReduceAnimationsSection() {
   const { t } = useTranslation();
   const reduceAnimations = useAppPreferencesStore((s) => s.reduceAnimations);
@@ -811,7 +778,6 @@ function ResetAllSettingsSection({ onResetComplete }: { onResetComplete: () => v
         }
       }
       await hydrateModernLayoutStore();
-      await setProductPollsEnabled(true);
       if (isTauri() && !DEFAULT_START_ON_LOGIN) {
         try {
           await disableAutostart();
@@ -1254,6 +1220,7 @@ interface SettingsPageProps {
   cursorRequestsLineAvailable: boolean | null;
   onSetTrayReadout: (pluginId: string, lineLabel: string) => void;
   presentation?: "classic" | "modern";
+  compactSettings?: boolean;
 }
 
 export function SettingsPage({
@@ -1316,6 +1283,7 @@ export function SettingsPage({
   cursorRequestsLineAvailable,
   onSetTrayReadout,
   presentation = "classic",
+  compactSettings = false,
 }: SettingsPageProps) {
   const { t } = useTranslation();
   const {
@@ -1331,10 +1299,11 @@ export function SettingsPage({
     modernTabs,
   } = useTranslatedSettingsOptions();
   const isModern = presentation === "modern";
+  const tabbed = isModern || compactSettings;
   type ModernSettingsTab = "general" | "tray" | "appearance" | "providers" | "advanced";
   const [modernTab, setModernTab] = useState<ModernSettingsTab>("general");
   const showModernSection = (tab: ModernSettingsTab | ModernSettingsTab[]) => {
-    if (!isModern) return true;
+    if (!tabbed) return true;
     const tabs = Array.isArray(tab) ? tab : [tab];
     return tabs.includes(modernTab);
   };
@@ -1520,7 +1489,7 @@ export function SettingsPage({
   return (
     <div
       className={cn(
-        isModern
+        tabbed
           ? "space-y-2 pb-2 [&_section]:rounded-xl [&_section]:border [&_section]:border-border/50 [&_section]:bg-card/30 [&_section]:px-3 [&_section]:py-2.5 [&_h3]:text-sm [&_h3]:font-semibold [&_section>p.text-sm]:text-xs [&_section>p.text-sm]:text-muted-foreground [&_section>p.text-sm]:mb-2"
           : "py-3 space-y-4",
       )}
@@ -1533,9 +1502,9 @@ export function SettingsPage({
           {devMockSaveNotice}
         </div>
       ) : null}
-      {isModern ? (
+      {tabbed ? (
         <nav
-          className="flex gap-1 overflow-x-auto scrollbar-none sticky top-0 z-10 -mx-1 px-1 py-1 bg-background/90 backdrop-blur border-b border-border/40"
+          className="flex flex-wrap gap-1 sticky top-0 z-10 -mx-1 px-1 py-1 bg-background/95 border-b border-border/40"
           aria-label="Settings sections"
         >
           {modernTabs.map((tab) => (
@@ -1544,6 +1513,7 @@ export function SettingsPage({
               type="button"
               size="sm"
               variant={modernTab === tab.id ? "default" : "ghost"}
+              aria-pressed={modernTab === tab.id}
               className="shrink-0"
               onClick={() => setModernTab(tab.id)}
             >
@@ -1915,7 +1885,6 @@ export function SettingsPage({
         </label>
       </section>
       <InsightsSection />
-      <ProductPollsSection />
       <LocalApiSection />
       <UsageHistorySection key={usageHistorySectionKey} />
       <section>

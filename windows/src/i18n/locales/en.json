@@ -47,7 +47,7 @@
     "settingsTabTray": "Tray",
     "settingsTabLook": "Look",
     "settingsTabProviders": "Providers",
-    "settingsTabAdvanced": "More"
+    "settingsTabAdvanced": "Advanced"
   },
   "footer": {
     "downloadingUpdate": "Downloading update {{progress}}%",

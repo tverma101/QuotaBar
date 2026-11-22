@@ -7,6 +7,7 @@ pub fn show_panel(app_handle: &AppHandle) {
     if let Some(window) = app_handle.get_webview_window("main") {
         // `tauri-plugin-positioner` needs a current monitor; that is only reliable after `show()`.
         let _ = window.show();
+        let _ = window.unminimize();
         popover_platform::move_main_near_tray(app_handle);
         let _ = window.set_focus();
     }

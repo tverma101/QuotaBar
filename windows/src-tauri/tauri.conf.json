@@ -27,18 +27,18 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://api.github.com https://open.er-api.com; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-src 'none'; base-uri 'none'"
     },
     "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "publisher": "tverma101 <nirasushi221@gmail.com>",
+    "publisher": "QuotaBar",
     "homepage": "https://github.com/tverma101/QuotaBar",
-    "shortDescription": "Fork of OpenUsage — tray app to track AI coding subscriptions (credit: Robin Ebers / robinebers/openusage).",
-    "longDescription": "QuotaBar is a community fork of OpenUsage (https://github.com/robinebers/openusage), the open-source AI subscription usage tracker created by Robin Ebers (https://github.com/robinebers, https://itsbyrob.in/x). This repository (https://github.com/tverma101/QuotaBar) focuses on Linux and Windows native builds; upstream remains the macOS-first home of OpenUsage. Please credit Robin Ebers and the OpenUsage project when discussing or redistributing derivative work.",
-    "copyright": "QuotaBar fork contributors; original OpenUsage © Robin Ebers and contributors",
+    "shortDescription": "Track AI coding subscriptions from the system tray.",
+    "longDescription": "QuotaBar tracks AI coding subscription limits, reset times, and usage from the system tray.",
+    "copyright": "QuotaBar fork contributors; original OpenUsage \u00a9 Robin Ebers and contributors",
     "license": "MIT",
     "linux": {
       "deb": {
@@ -81,19 +81,12 @@
     "externalBin": [
       "binaries/quotabar-cli"
     ],
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "windows": {
       "nsis": {
-        "startMenuFolder": "QuotaBar"
+        "startMenuFolder": "QuotaBar",
+        "installMode": "currentUser"
       }
-    }
-  },
-  "plugins": {
-    "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU1RUQwMzNGOTE5MDU0QjYKUldTMlZKQ1JQd1B0VmZra213ay83czZLWDhCTWFhazdVaHdQUFQ5eTU3MEVTdHlqb2IzUEdvSG4K",
-      "endpoints": [
-        "https://github.com/tverma101/QuotaBar/releases/latest/download/latest.json"
-      ]
     }
   }
 }
