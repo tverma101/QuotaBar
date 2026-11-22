@@ -14,6 +14,7 @@ QuotaBar shows how much of your AI coding plans you've used: session and weekly 
 ## Requirements
 
 - macOS 15 (Sequoia) or later
+- Windows 10/11: see [`windows/`](windows/README.md) for the in-progress Tauri port
 
 ## Building and running
 

@@ -1,0 +1,2998 @@
+import { beforeEach, describe, expect, it, vi } from "vitest"
+import { makeCtx } from "../test-helpers.js"
+
+const loadPlugin = async () => {
+  await import("./plugin.js")
+  return globalThis.__openusage_plugin
+}
+
+function makeJwt(payload) {
+  const jwtPayload = Buffer.from(JSON.stringify(payload), "utf8")
+    .toString("base64")
+    .replace(/=+$/g, "")
+  return `a.${jwtPayload}.c`
+}
+
+describe("cursor plugin", () => {
+  beforeEach(() => {
+    delete globalThis.__openusage_plugin
+    vi.resetModules()
+  })
+
+  it("uses injected provider account credentials before sqlite/keychain discovery", async () => {
+    const ctx = makeCtx()
+    const accountToken = makeJwt({ exp: 9999999999, sub: "user_123" })
+    ctx.host.credentials = {
+      get: vi.fn(() => JSON.stringify({ accessToken: accountToken })),
+      update: vi.fn(),
+    }
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([
+      { key: "cursorAuth/accessToken", value: makeJwt({ exp: 9999999999, sub: "local" }) },
+    ]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({
+        enabled: true,
+        planUsage: { totalSpend: 1200, limit: 2400 },
+      }),
+    })
+    const plugin = await loadPlugin()
+
+    plugin.probe(ctx)
+
+    expect(ctx.host.http.request.mock.calls[0][0].headers.Authorization).toBe(
+      "Bearer " + accountToken
+    )
+  })
+
+  it("skips Cursor HTTP when QuotaBar dev mock provider credentials are injected", async () => {
+    const ctx = makeCtx()
+    ctx.host.credentials = {
+      get: vi.fn(() =>
+        JSON.stringify({
+          accessToken: "quotabar-dev-mock-access-token",
+          refreshToken: "quotabar-dev-mock-refresh-token",
+          sessionKey: "quotabar-dev-mock-session:Work",
+        })
+      ),
+      update: vi.fn(),
+    }
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+
+    expect(ctx.host.http.request).not.toHaveBeenCalled()
+    expect(result.plan).toBe("Dev mock")
+    expect(result.lines.some((line) => line.label === "Data source")).toBe(true)
+    expect(result.lines.some((line) => line.label === "Total usage")).toBe(true)
+    expect(result.lines.some((line) => line.label === "Credits")).toBe(true)
+    expect(result.lines.some((line) => line.label === "Requests")).toBe(true)
+  })
+
+  it("throws when no token", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([]))
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Not logged in")
+  })
+
+  it("loads tokens from keychain when sqlite has none", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([]))
+    ctx.host.keychain.readGenericPassword.mockImplementation((service) => {
+      if (service === "cursor-access-token") return "keychain-access-token"
+      if (service === "cursor-refresh-token") return "keychain-refresh-token"
+      return null
+    })
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({
+        enabled: true,
+        planUsage: { totalSpend: 1200, limit: 2400 },
+      }),
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+    expect(ctx.host.keychain.readGenericPassword).toHaveBeenCalledWith("cursor-access-token")
+    expect(ctx.host.keychain.readGenericPassword).toHaveBeenCalledWith("cursor-refresh-token")
+  })
+
+  it("refreshes keychain access token and persists to keychain source", async () => {
+    const ctx = makeCtx()
+    const expiredPayload = Buffer.from(JSON.stringify({ exp: 1 }), "utf8")
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const expiredAccessToken = `a.${expiredPayload}.c`
+    const freshPayload = Buffer.from(JSON.stringify({ exp: 9999999999 }), "utf8")
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const refreshedAccessToken = `a.${freshPayload}.c`
+
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([]))
+    ctx.host.keychain.readGenericPassword.mockImplementation((service) => {
+      if (service === "cursor-access-token") return expiredAccessToken
+      if (service === "cursor-refresh-token") return "keychain-refresh-token"
+      return null
+    })
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("/oauth/token")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({ access_token: refreshedAccessToken }),
+        }
+      }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({
+          enabled: true,
+          planUsage: { totalSpend: 1200, limit: 2400 },
+        }),
+      }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+    expect(ctx.host.keychain.writeGenericPassword).toHaveBeenCalledWith(
+      "cursor-access-token",
+      refreshedAccessToken
+    )
+    expect(ctx.host.sqlite.exec).not.toHaveBeenCalled()
+  })
+
+  it("prefers sqlite tokens when sqlite and keychain both have tokens", async () => {
+    const ctx = makeCtx()
+    const sqlitePayload = Buffer.from(JSON.stringify({ exp: 9999999999 }), "utf8")
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const sqliteToken = `a.${sqlitePayload}.c`
+    const keychainPayload = Buffer.from(JSON.stringify({ exp: 9999999999, sub: "keychain" }), "utf8")
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const keychainToken = `a.${keychainPayload}.c`
+
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      if (String(sql).includes("cursorAuth/accessToken")) {
+        return JSON.stringify([{ value: sqliteToken }])
+      }
+      if (String(sql).includes("cursorAuth/refreshToken")) {
+        return JSON.stringify([{ value: "sqlite-refresh-token" }])
+      }
+      return JSON.stringify([])
+    })
+    ctx.host.keychain.readGenericPassword.mockImplementation((service) => {
+      if (service === "cursor-access-token") return keychainToken
+      if (service === "cursor-refresh-token") return "keychain-refresh-token"
+      return null
+    })
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        expect(opts.headers.Authorization).toBe("Bearer " + sqliteToken)
+      }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({
+          enabled: true,
+          planUsage: { totalSpend: 1200, limit: 2400 },
+        }),
+      }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+    expect(ctx.host.keychain.readGenericPassword).toHaveBeenCalledWith("cursor-access-token")
+    expect(ctx.host.keychain.readGenericPassword).toHaveBeenCalledWith("cursor-refresh-token")
+  })
+
+  it("prefers keychain when sqlite looks free and token subjects differ", async () => {
+    const ctx = makeCtx()
+    const sqlitePayload = Buffer.from(
+      JSON.stringify({ exp: 9999999999, sub: "google-oauth2|sqlite-user" }),
+      "utf8"
+    )
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const sqliteToken = `a.${sqlitePayload}.c`
+
+    const keychainPayload = Buffer.from(
+      JSON.stringify({ exp: 9999999999, sub: "auth0|keychain-user" }),
+      "utf8"
+    )
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const keychainToken = `a.${keychainPayload}.c`
+
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      if (String(sql).includes("cursorAuth/accessToken")) {
+        return JSON.stringify([{ value: sqliteToken }])
+      }
+      if (String(sql).includes("cursorAuth/refreshToken")) {
+        return JSON.stringify([{ value: "sqlite-refresh-token" }])
+      }
+      if (String(sql).includes("cursorAuth/stripeMembershipType")) {
+        return JSON.stringify([{ value: "free" }])
+      }
+      return JSON.stringify([])
+    })
+    ctx.host.keychain.readGenericPassword.mockImplementation((service) => {
+      if (service === "cursor-access-token") return keychainToken
+      if (service === "cursor-refresh-token") return "keychain-refresh-token"
+      return null
+    })
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        expect(opts.headers.Authorization).toBe("Bearer " + keychainToken)
+      }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({
+          enabled: true,
+          planUsage: { totalSpend: 1200, limit: 2400 },
+        }),
+      }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+  })
+
+  it("throws on sqlite errors when reading token", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockImplementation(() => {
+      throw new Error("boom")
+    })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Not logged in")
+    expect(ctx.host.log.warn).toHaveBeenCalled()
+  })
+
+  it("throws on disabled usage", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({ enabled: false }),
+    })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("No active Cursor subscription.")
+  })
+
+  it("throws on missing plan usage data", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({ enabled: true }),
+    })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("No active Cursor subscription.")
+  })
+
+  it("accepts team usage when enabled flag is missing", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1770064133000",
+            billingCycleEnd: "1772483333000",
+            planUsage: { totalSpend: 8474, limit: 2000, bonusSpend: 6474 },
+            spendLimitUsage: {
+              pooledLimit: 60000,
+              pooledRemaining: 19216,
+            },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({ planInfo: { planName: "Team" } }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBe("Team")
+    const totalLine = result.lines.find((line) => line.label === "Total usage")
+    expect(totalLine).toBeTruthy()
+    expect(totalLine.format).toEqual({ kind: "dollars" })
+    expect(totalLine.used).toBe(84.74)
+    expect(totalLine.limit).toBe(20)
+    expect(result.lines.find((line) => line.label === "Bonus spend")).toBeTruthy()
+  })
+
+  it("throws on missing total usage limit", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({
+        enabled: true,
+        planUsage: { totalSpend: 1200 }, // missing limit
+      }),
+    })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Total usage limit missing")
+  })
+
+
+  it("accepts percent-only free plan usage when limit is omitted", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            billingCycleStart: "1772707936000",
+            billingCycleEnd: "1775386336000",
+            planUsage: {
+              remainingBonus: false,
+              autoPercentUsed: 0,
+              apiPercentUsed: 0,
+              totalPercentUsed: 0,
+            },
+            spendLimitUsage: {
+              limitType: "user",
+            },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+
+            planInfo: {
+              planName: "Free",
+              price: "Free",
+              billingCycleEnd: "1775386336000",
+            },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetCreditGrantsBalance")) {
+        return { status: 200, bodyText: "{}" }
+      }
+      if (String(opts.url).includes("cursor.com/api/auth/stripe")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            membershipType: "free",
+            customerBalance: 0,
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        throw new Error("unexpected REST usage fallback")
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBe("Free")
+    const totalLine = result.lines.find((line) => line.label === "Total usage")
+    expect(totalLine).toBeTruthy()
+    expect(totalLine.format).toEqual({ kind: "percent" })
+    expect(totalLine.used).toBe(0)
+    expect(totalLine.limit).toBe(100)
+  })
+
+  it("renders percent-only usage when plan info is unavailable", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            billingCycleStart: "1772556293029",
+            billingCycleEnd: "1775234693029",
+            planUsage: {
+              totalPercentUsed: 42,
+            },
+            spendLimitUsage: {
+              limitType: "team",
+              pooledRemaining: 1000,
+            },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return { status: 503, bodyText: "" }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        throw new Error("unexpected REST usage fallback")
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Cursor request-based usage data unavailable")
+  })
+
+  it("falls back to computed percent when totalSpend missing and no totalPercentUsed", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({
+        enabled: true,
+        planUsage: { limit: 2400, remaining: 1200 },
+      }),
+    })
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const planLine = result.lines.find((l) => l.label === "Total usage")
+    expect(planLine).toBeTruthy()
+    expect(planLine.format).toEqual({ kind: "percent" })
+    // computed = (2400 - 1200) / 2400 * 100 = 50
+    expect(planLine.used).toBe(50)
+  })
+
+  it("renders usage + plan info", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 1200, limit: 2400, bonusSpend: 100 },
+            spendLimitUsage: { individualLimit: 5000, individualRemaining: 1000 },
+            billingCycleEnd: Date.now(),
+          }),
+        }
+      }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({ planInfo: { planName: "pro plan" } }),
+      }
+    })
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBeTruthy()
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+  })
+
+  it("omits plan badge for blank plan names", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 1200, limit: 2400 },
+          }),
+        }
+      }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({ planInfo: { planName: "   " } }),
+      }
+    })
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBeFalsy()
+  })
+
+  it("uses pooled spend limits when individual values missing", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 1200, limit: 2400 },
+            spendLimitUsage: { pooledLimit: 2000, pooledRemaining: 500 },
+          }),
+        }
+      }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({ planInfo: { planName: "pro plan" } }),
+      }
+    })
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((line) => line.label === "On-demand")).toBeTruthy()
+  })
+
+  it("throws on token expired", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockReturnValue({ status: 401, bodyText: "" })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Token expired")
+  })
+
+  it("throws on http errors", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockReturnValue({ status: 500, bodyText: "" })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("HTTP 500")
+  })
+
+  it("throws on usage request errors", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation(() => {
+      throw new Error("boom")
+    })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Usage request failed")
+  })
+
+  it("throws on parse errors", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: "not-json",
+    })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Usage response invalid")
+  })
+
+  it("handles enterprise account with request-based usage", async () => {
+    const ctx = makeCtx()
+
+    // Build a JWT with a sub claim containing a user ID
+    const jwtPayload = Buffer.from(
+      JSON.stringify({ sub: "google-oauth2|user_abc123", exp: 9999999999 }),
+      "utf8"
+    )
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const accessToken = `a.${jwtPayload}.c`
+
+    ctx.host.sqlite.query.mockReturnValue(
+      JSON.stringify([{ value: accessToken }])
+    )
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        // Enterprise returns no enabled/planUsage
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1770539602363",
+            billingCycleEnd: "1770539602363",
+            displayThreshold: 100,
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: { planName: "Enterprise", price: "Custom" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage-summary")) {
+        return { status: 200, bodyText: "{}" }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              numRequests: 422,
+              numRequestsTotal: 422,
+              numTokens: 171664819,
+              maxRequestUsage: 500,
+              maxTokenUsage: null,
+            },
+            startOfMonth: "2026-02-01T06:12:57.000Z",
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBe("Enterprise")
+    const totalLine = result.lines.find((l) => l.label === "Total usage")
+    expect(totalLine).toBeTruthy()
+    expect(totalLine.used).toBe(422)
+    expect(totalLine.limit).toBe(500)
+    expect(totalLine.format).toEqual({ kind: "count", suffix: "requests" })
+    const reqLine = result.lines.find((l) => l.label === "Requests")
+    expect(reqLine).toBeTruthy()
+    expect(reqLine.used).toBe(422)
+    expect(reqLine.limit).toBe(500)
+    expect(reqLine.format).toEqual({ kind: "count", suffix: "requests" })
+  })
+
+  it("maps enterprise included requests plus usage-summary Auto/API/on-demand", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1770539602363",
+            billingCycleEnd: "1770539602363",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: { planName: "Enterprise" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage-summary")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "2026-02-01T00:00:00.000Z",
+            billingCycleEnd: "2026-03-01T00:00:00.000Z",
+            membershipType: "enterprise",
+            individualUsage: {
+              plan: {
+                autoPercentUsed: 18.5,
+                apiPercentUsed: 42,
+              },
+              onDemand: {
+                enabled: true,
+                used: 2500,
+                limit: 10000,
+                remaining: 7500,
+              },
+            },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              numRequests: 120,
+              maxRequestUsage: 500,
+            },
+            startOfMonth: "2026-02-01T06:12:57.000Z",
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBe("Enterprise")
+
+    const totalLine = result.lines.find((l) => l.label === "Total usage")
+    expect(totalLine).toBeTruthy()
+    expect(totalLine.used).toBe(120)
+    expect(totalLine.limit).toBe(500)
+    expect(totalLine.format).toEqual({ kind: "count", suffix: "requests" })
+    expect(totalLine.resetsAt).toBe("2026-03-01T00:00:00.000Z")
+    expect(totalLine.periodDurationMs).toBe(
+      Date.parse("2026-03-01T00:00:00.000Z") - Date.parse("2026-02-01T00:00:00.000Z")
+    )
+
+    const reqLine = result.lines.find((l) => l.label === "Requests")
+    expect(reqLine).toBeTruthy()
+    expect(reqLine.used).toBe(120)
+    expect(reqLine.limit).toBe(500)
+
+    const autoLine = result.lines.find((l) => l.label === "Cursor Models")
+    expect(autoLine).toBeTruthy()
+    expect(autoLine.used).toBe(18.5)
+    expect(autoLine.limit).toBe(100)
+    expect(autoLine.format).toEqual({ kind: "percent" })
+
+    const apiLine = result.lines.find((l) => l.label === "Other Models")
+    expect(apiLine).toBeTruthy()
+    expect(apiLine.used).toBe(42)
+    expect(apiLine.format).toEqual({ kind: "percent" })
+
+    const onDemand = result.lines.find((l) => l.label === "On-demand")
+    expect(onDemand).toBeTruthy()
+    expect(onDemand.used).toBe(25)
+    expect(onDemand.limit).toBe(100)
+    expect(onDemand.format).toEqual({ kind: "dollars" })
+  })
+
+  it("uses usage-summary pooled Total usage when enterprise has no request allowance", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1770539602363",
+            billingCycleEnd: "1770539602363",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: { planName: "Enterprise" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage-summary")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "2026-07-01T00:00:00.000Z",
+            billingCycleEnd: "2026-08-01T00:00:00.000Z",
+            limitType: "team",
+            individualUsage: {
+              plan: {
+                autoPercentUsed: 5,
+                apiPercentUsed: 10,
+              },
+            },
+            teamUsage: {
+              pooled: {
+                enabled: true,
+                used: 3479810,
+                limit: 60000000,
+                remaining: 56520190,
+              },
+              onDemand: {
+                enabled: true,
+                used: 0,
+                limit: 5000000,
+                remaining: 5000000,
+              },
+            },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              numRequests: 0,
+              maxRequestUsage: null,
+            },
+            startOfMonth: "2026-07-01T00:00:00.000Z",
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+
+    const totalLine = result.lines.find((l) => l.label === "Total usage")
+    expect(totalLine).toBeTruthy()
+    expect(totalLine.format).toEqual({ kind: "dollars" })
+    expect(totalLine.used).toBe(34798.1)
+    expect(totalLine.limit).toBe(600000)
+    expect(result.lines.find((l) => l.label === "Requests")).toBeUndefined()
+
+    const autoLine = result.lines.find((l) => l.label === "Cursor Models")
+    expect(autoLine.used).toBe(5)
+    const apiLine = result.lines.find((l) => l.label === "Other Models")
+    expect(apiLine.used).toBe(10)
+
+    const onDemand = result.lines.find((l) => l.label === "On-demand")
+    expect(onDemand).toBeTruthy()
+    expect(onDemand.used).toBe(0)
+    expect(onDemand.limit).toBe(50000)
+    expect(onDemand.format).toEqual({ kind: "dollars" })
+  })
+
+  it("falls back to enterprise request-based usage when planUsage.limit is missing", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            billingCycleStart: "1770539602363",
+            billingCycleEnd: "1770539602363",
+            planUsage: {
+              totalSpend: 1234,
+              totalPercentUsed: 12,
+            },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: { planName: "Enterprise" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              numRequests: 211,
+              maxRequestUsage: 500,
+            },
+            startOfMonth: "2026-02-01T06:12:57.000Z",
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBe("Enterprise")
+    const reqLine = result.lines.find((line) => line.label === "Requests")
+    expect(reqLine).toBeTruthy()
+    expect(reqLine.used).toBe(211)
+    expect(reqLine.limit).toBe(500)
+  })
+
+  it("falls back to REST usage for team-inferred account with percent-only and unavailable plan info", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            billingCycleStart: "1772556293029",
+            billingCycleEnd: "1775234693029",
+            planUsage: {
+              totalPercentUsed: 35,
+            },
+            spendLimitUsage: {
+              limitType: "team",
+              pooledLimit: 5000,
+            },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return { status: 503, bodyText: "" }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              numRequests: 150,
+              maxRequestUsage: 500,
+            },
+            startOfMonth: "2026-02-01T06:12:57.000Z",
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const reqLine = result.lines.find((l) => l.label === "Requests")
+    expect(reqLine).toBeTruthy()
+    expect(reqLine.used).toBe(150)
+    expect(reqLine.limit).toBe(500)
+    expect(reqLine.format).toEqual({ kind: "count", suffix: "requests" })
+  })
+
+  it("handles team account with request-based usage", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+
+    ctx.host.sqlite.query.mockReturnValue(
+      JSON.stringify([{ value: accessToken }])
+    )
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1772124774973",
+            billingCycleEnd: "1772124774973",
+            displayThreshold: 100,
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: {
+              planName: "Team",
+              includedAmountCents: 2000,
+              price: "$40/mo",
+              billingCycleEnd: "1773077797000",
+            },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              numRequests: 39,
+              numRequestsTotal: 39,
+              numTokens: 12345,
+              maxRequestUsage: 500,
+              maxTokenUsage: null,
+            },
+            startOfMonth: "2026-02-09T17:36:37.000Z",
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBe("Team")
+    const reqLine = result.lines.find((l) => l.label === "Requests")
+    expect(reqLine).toBeTruthy()
+    expect(reqLine.used).toBe(39)
+    expect(reqLine.limit).toBe(500)
+    expect(reqLine.format).toEqual({ kind: "count", suffix: "requests" })
+  })
+
+  it("throws when enterprise REST usage API fails", async () => {
+    const ctx = makeCtx()
+
+    const jwtPayload = Buffer.from(
+      JSON.stringify({ sub: "google-oauth2|user_abc123", exp: 9999999999 }),
+      "utf8"
+    )
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const accessToken = `a.${jwtPayload}.c`
+
+    ctx.host.sqlite.query.mockReturnValue(
+      JSON.stringify([{ value: accessToken }])
+    )
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1770539602363",
+            billingCycleEnd: "1770539602363",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: { planName: "Enterprise" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return { status: 500, bodyText: "" }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Enterprise usage data unavailable")
+  })
+
+  it("throws team request-based unavailable when REST usage API fails", async () => {
+    const ctx = makeCtx()
+
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+
+    ctx.host.sqlite.query.mockReturnValue(
+      JSON.stringify([{ value: accessToken }])
+    )
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1772124774973",
+            billingCycleEnd: "1772124774973",
+            displayThreshold: 100,
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: { planName: "Team" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return { status: 500, bodyText: "" }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Team request-based usage data unavailable")
+  })
+
+  it("throws team request-based unavailable when REST usage request throws", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1772124774973",
+            billingCycleEnd: "1772124774973",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({ planInfo: { planName: "Team" } }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        throw new Error("rest usage boom")
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Team request-based usage data unavailable")
+  })
+
+  it("falls back to REST request usage when plan info is unavailable", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1772124774973",
+            billingCycleEnd: "1772124774973",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return { status: 503, bodyText: "" }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              numRequests: 31,
+              maxRequestUsage: 500,
+            },
+            startOfMonth: "2026-02-09T17:36:37.000Z",
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBeNull()
+    const reqLine = result.lines.find((l) => l.label === "Requests")
+    expect(reqLine).toBeTruthy()
+    expect(reqLine.used).toBe(31)
+    expect(reqLine.limit).toBe(500)
+  })
+
+  it("surfaces request-based unavailable when plan info is unavailable and REST fallback fails", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1772124774973",
+            billingCycleEnd: "1772124774973",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        throw new Error("plan info timeout")
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return { status: 500, bodyText: "" }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Cursor request-based usage data unavailable")
+  })
+
+  it("does not use request-based fallback for disabled team accounts", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    let restUsageCalled = false
+
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: false,
+            billingCycleStart: "1772124774973",
+            billingCycleEnd: "1772124774973",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({ planInfo: { planName: "Team" } }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        restUsageCalled = true
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": { numRequests: 1, maxRequestUsage: 500 },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("No active Cursor subscription.")
+    expect(restUsageCalled).toBe(false)
+  })
+
+  it("still throws no subscription for non-enterprise accounts without planUsage", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({ enabled: false }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({ planInfo: { planName: "Pro" } }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("No active Cursor subscription.")
+  })
+
+  it("handles plan fetch failure gracefully", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 0, limit: 100 },
+          }),
+        }
+      }
+      // Plan fetch fails
+      throw new Error("plan fail")
+    })
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+  })
+
+  it("outputs Credits first when available", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 1200, limit: 2400 },
+            spendLimitUsage: { individualLimit: 5000, individualRemaining: 1000 },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetCreditGrantsBalance")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            hasCreditGrants: true,
+            totalCents: 10000,
+            usedCents: 500,
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    
+    // Credits should be first in the lines array
+    expect(result.lines[0].label).toBe("Credits")
+    expect(result.lines[1].label).toBe("Total usage")
+    // On-demand should come after
+    const onDemandIndex = result.lines.findIndex((l) => l.label === "On-demand")
+    expect(onDemandIndex).toBeGreaterThan(1)
+  })
+
+  it("combines credit grants with Stripe customer balance for Credits line", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      const url = String(opts.url)
+      if (url.includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 1200, limit: 2400 },
+          }),
+        }
+      }
+      if (url.includes("GetCreditGrantsBalance")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            hasCreditGrants: true,
+            totalCents: "1000000",
+            usedCents: "264729",
+          }),
+        }
+      }
+      if (url.includes("/api/auth/stripe")) {
+        expect(opts.headers.Cookie).toBe(
+          "WorkosCursorSessionToken=user_abc123%3A%3A" + accessToken
+        )
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            customerBalance: -991544,
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const creditsLine = result.lines.find((line) => line.label === "Credits")
+
+    expect(creditsLine).toBeTruthy()
+    expect(creditsLine.used).toBeCloseTo(2647.29, 2)
+    expect(creditsLine.limit).toBeCloseTo(19915.44, 2)
+  })
+
+  it("shows Credits line from Stripe balance when grants are unavailable", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      const url = String(opts.url)
+      if (url.includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 1200, limit: 2400 },
+          }),
+        }
+      }
+      if (url.includes("GetCreditGrantsBalance")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({ hasCreditGrants: false }),
+        }
+      }
+      if (url.includes("/api/auth/stripe")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            customerBalance: -50000,
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const creditsLine = result.lines.find((line) => line.label === "Credits")
+
+    expect(result.lines[0].label).toBe("Credits")
+    expect(creditsLine).toBeTruthy()
+    expect(creditsLine.used).toBe(0)
+    expect(creditsLine.limit).toBe(500)
+  })
+
+  it("accepts Stripe customer balance when returned as numeric string", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      const url = String(opts.url)
+      if (url.includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 1200, limit: 2400 },
+          }),
+        }
+      }
+      if (url.includes("GetCreditGrantsBalance")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({ hasCreditGrants: false }),
+        }
+      }
+      if (url.includes("/api/auth/stripe")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            customerBalance: "-50000",
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const creditsLine = result.lines.find((line) => line.label === "Credits")
+
+    expect(result.lines[0].label).toBe("Credits")
+    expect(creditsLine).toBeTruthy()
+    expect(creditsLine.used).toBe(0)
+    expect(creditsLine.limit).toBe(500)
+  })
+
+  it("outputs Total usage first when Credits not available", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 1200, limit: 2400 },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetCreditGrantsBalance")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({ hasCreditGrants: false }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    
+    // Total usage should be first when Credits not available
+    expect(result.lines[0].label).toBe("Total usage")
+  })
+
+  it("emits Cursor Models and Other Models percent lines when available", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            billingCycleEnd: Date.now(),
+            planUsage: {
+              limit: 40000,
+              remaining: 32000,
+              totalPercentUsed: 20,
+              autoPercentUsed: 12.5,
+              apiPercentUsed: 7.5,
+            },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const totalLine = result.lines.find((line) => line.label === "Total usage")
+    const autoLine = result.lines.find((line) => line.label === "Cursor Models")
+    const apiLine = result.lines.find((line) => line.label === "Other Models")
+
+    expect(totalLine).toBeTruthy()
+    expect(totalLine.used).toBe(20)
+    expect(totalLine.format).toEqual({ kind: "percent" })
+    expect(autoLine).toBeTruthy()
+    expect(autoLine.used).toBe(12.5)
+    expect(autoLine.format).toEqual({ kind: "percent" })
+    expect(apiLine).toBeTruthy()
+    expect(apiLine.used).toBe(7.5)
+    expect(apiLine.format).toEqual({ kind: "percent" })
+  })
+
+  it("falls back to computed percent when totalPercentUsed is not finite", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({
+        enabled: true,
+        planUsage: { limit: 2400, remaining: 1200, totalPercentUsed: Number.POSITIVE_INFINITY },
+      }),
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const totalLine = result.lines.find((l) => l.label === "Total usage")
+    expect(totalLine).toBeTruthy()
+    expect(totalLine.used).toBe(50)
+  })
+
+  it("omits Cursor Models and Other Models when percent fields missing", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({
+        enabled: true,
+        planUsage: { limit: 40000, remaining: 32000, totalPercentUsed: 20 },
+      }),
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+    expect(result.lines.find((line) => line.label === "Cursor Models")).toBeUndefined()
+    expect(result.lines.find((line) => line.label === "Other Models")).toBeUndefined()
+  })
+
+  it("maps eligible Grok Bot usage after Other Models", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetSandUsageStatus")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            usagePercent: 12.5,
+            hasNonZeroIncludedLimit: true,
+            includedLimitZero: false,
+            usesPooledEnterpriseAllowance: false,
+            currentPeriodStart: "2026-08-21T00:00:00.000Z",
+            nextResetTimestampUtc: "2026-08-28T00:00:00.000Z",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            billingCycleEnd: Date.now(),
+            planUsage: {
+              limit: 40000,
+              remaining: 32000,
+              totalPercentUsed: 20,
+              autoPercentUsed: 12.5,
+              apiPercentUsed: 7.5,
+            },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const labels = result.lines.map((line) => line.label)
+    const grokLine = result.lines.find((line) => line.label === "Grok Bot usage")
+    const sandCall = ctx.host.http.request.mock.calls.find((call) =>
+      String(call[0].url).includes("GetSandUsageStatus")
+    )
+
+    expect(sandCall[0].method).toBe("POST")
+    expect(sandCall[0].bodyText).toBe("{}")
+    expect(grokLine).toBeTruthy()
+    expect(grokLine.used).toBe(12.5)
+    expect(grokLine.limit).toBe(100)
+    expect(grokLine.format).toEqual({ kind: "percent" })
+    expect(grokLine.resetsAt).toBe("2026-08-28T00:00:00.000Z")
+    expect(grokLine.periodDurationMs).toBe(7 * 24 * 60 * 60 * 1000)
+    expect(labels.indexOf("Total usage")).toBeLessThan(labels.indexOf("Cursor Models"))
+    expect(labels.indexOf("Cursor Models")).toBeLessThan(labels.indexOf("Other Models"))
+    expect(labels.indexOf("Other Models")).toBeLessThan(labels.indexOf("Grok Bot usage"))
+  })
+
+  it("inserts Grok Bot usage after Total when model lines are missing", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetSandUsageStatus")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            usagePercent: 40,
+            nextResetTimestampUtc: "2026-08-28T00:00:00.000Z",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { limit: 40000, remaining: 32000, totalPercentUsed: 20 },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const labels = result.lines.map((line) => line.label)
+    expect(labels.indexOf("Total usage")).toBeLessThan(labels.indexOf("Grok Bot usage"))
+    expect(labels).not.toContain("Cursor Models")
+    expect(labels).not.toContain("Other Models")
+  })
+
+  it("skips Grok Bot usage for pooled enterprise allowance", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetSandUsageStatus")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            usagePercent: 30,
+            usesPooledEnterpriseAllowance: true,
+            hasNonZeroIncludedLimit: true,
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { limit: 40000, remaining: 32000, totalPercentUsed: 20 },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+    expect(result.lines.find((line) => line.label === "Grok Bot usage")).toBeUndefined()
+  })
+
+  it("keeps primary Cursor usage when Grok Bot fetch fails", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetSandUsageStatus")) {
+        throw new Error("sand down")
+      }
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: {
+              limit: 40000,
+              remaining: 32000,
+              totalPercentUsed: 20,
+              autoPercentUsed: 8,
+            },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+    expect(result.lines.find((line) => line.label === "Cursor Models")).toBeTruthy()
+    expect(result.lines.find((line) => line.label === "Grok Bot usage")).toBeUndefined()
+  })
+
+  it("team account uses dollars format for Total usage", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 1200, limit: 2400 },
+            spendLimitUsage: { limitType: "team", pooledLimit: 5000, pooledRemaining: 3000 },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const totalLine = result.lines.find((line) => line.label === "Total usage")
+    expect(totalLine).toBeTruthy()
+    expect(totalLine.format).toEqual({ kind: "dollars" })
+    expect(totalLine.used).toBe(12)
+  })
+
+  it("refreshes token when expired and persists new access token", async () => {
+    const ctx = makeCtx()
+
+    const expiredPayload = Buffer.from(JSON.stringify({ exp: 1 }), "utf8")
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const accessToken = `a.${expiredPayload}.c`
+
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      if (String(sql).includes("cursorAuth/accessToken")) {
+        return JSON.stringify([{ value: accessToken }])
+      }
+      if (String(sql).includes("cursorAuth/refreshToken")) {
+        return JSON.stringify([{ value: "refresh" }])
+      }
+      return JSON.stringify([])
+    })
+
+    const newPayload = Buffer.from(JSON.stringify({ exp: 9999999999 }), "utf8")
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const newToken = `a.${newPayload}.c`
+
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("/oauth/token")) {
+        return { status: 200, bodyText: JSON.stringify({ access_token: newToken }) }
+      }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({ enabled: true, planUsage: { totalSpend: 0, limit: 100 } }),
+      }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+    expect(ctx.host.sqlite.exec).toHaveBeenCalled()
+  })
+
+  it("throws session expired when refresh requires logout and no access token exists", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      if (String(sql).includes("cursorAuth/accessToken")) {
+        return JSON.stringify([])
+      }
+      if (String(sql).includes("cursorAuth/refreshToken")) {
+        return JSON.stringify([{ value: "refresh" }])
+      }
+      return JSON.stringify([])
+    })
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("/oauth/token")) {
+        return { status: 200, bodyText: JSON.stringify({ shouldLogout: true }) }
+      }
+      return { status: 500, bodyText: "" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Session expired")
+  })
+
+  it("continues with existing access token when refresh fails", async () => {
+    const ctx = makeCtx()
+
+    const payload = Buffer.from(JSON.stringify({ exp: 1 }), "utf8")
+      .toString("base64")
+      .replace(/=+$/g, "")
+    const accessToken = `a.${payload}.c`
+
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      if (String(sql).includes("cursorAuth/accessToken")) {
+        return JSON.stringify([{ value: accessToken }])
+      }
+      if (String(sql).includes("cursorAuth/refreshToken")) {
+        return JSON.stringify([{ value: "refresh" }])
+      }
+      return JSON.stringify([])
+    })
+
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("/oauth/token")) {
+        // Force refresh to throw string error.
+        return { status: 401, bodyText: JSON.stringify({ shouldLogout: true }) }
+      }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({ enabled: true, planUsage: { totalSpend: 0, limit: 100 } }),
+      }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).not.toThrow()
+  })
+
+  it("handles invalid sqlite JSON for access token when refresh token is available", async () => {
+    const ctx = makeCtx()
+    const refreshedToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      if (String(sql).includes("cursorAuth/accessToken")) return "{}"
+      if (String(sql).includes("cursorAuth/refreshToken")) return JSON.stringify([{ value: "refresh" }])
+      return JSON.stringify([])
+    })
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("/oauth/token")) {
+        return { status: 200, bodyText: JSON.stringify({ access_token: refreshedToken }) }
+      }
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return { status: 200, bodyText: JSON.stringify({ enabled: true, planUsage: { totalSpend: 0, limit: 100 } }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+  })
+
+  it("throws not logged in when only refresh token exists but refresh returns no access token", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      if (String(sql).includes("cursorAuth/accessToken")) return JSON.stringify([])
+      if (String(sql).includes("cursorAuth/refreshToken")) return JSON.stringify([{ value: "refresh" }])
+      return JSON.stringify([])
+    })
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("/oauth/token")) {
+        return { status: 200, bodyText: JSON.stringify({}) }
+      }
+      return { status: 500, bodyText: "" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Not logged in")
+  })
+
+  it("throws token expired when usage remains unauthorized after refresh retry", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      if (String(sql).includes("cursorAuth/accessToken")) {
+        return JSON.stringify([{ value: makeJwt({ sub: "google-oauth2|u", exp: 9999999999 }) }])
+      }
+      if (String(sql).includes("cursorAuth/refreshToken")) return JSON.stringify([{ value: "refresh" }])
+      return JSON.stringify([])
+    })
+
+    let usageCalls = 0
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        usageCalls += 1
+        if (usageCalls === 1) return { status: 401, bodyText: "" }
+        return { status: 403, bodyText: "" }
+      }
+      if (String(opts.url).includes("/oauth/token")) {
+        return { status: 200, bodyText: JSON.stringify({ access_token: makeJwt({ sub: "google-oauth2|u", exp: 9999999999 }) }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Token expired")
+  })
+
+  it("throws usage request failed after refresh when retried usage request errors", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      if (String(sql).includes("cursorAuth/accessToken")) {
+        return JSON.stringify([{ value: makeJwt({ sub: "google-oauth2|u", exp: 9999999999 }) }])
+      }
+      if (String(sql).includes("cursorAuth/refreshToken")) return JSON.stringify([{ value: "refresh" }])
+      return JSON.stringify([])
+    })
+
+    let usageCalls = 0
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        usageCalls += 1
+        if (usageCalls === 1) return { status: 401, bodyText: "" }
+        throw new Error("boom")
+      }
+      if (String(opts.url).includes("/oauth/token")) {
+        return { status: 200, bodyText: JSON.stringify({ access_token: makeJwt({ sub: "google-oauth2|u", exp: 9999999999 }) }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Usage request failed after refresh")
+  })
+
+  it("throws enterprise unavailable when token payload has no sub", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return { status: 200, bodyText: JSON.stringify({ billingCycleStart: "1770539602363" }) }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return { status: 200, bodyText: JSON.stringify({ planInfo: { planName: "Enterprise" } }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Enterprise usage data unavailable")
+  })
+
+  it("supports enterprise JWT sub values without provider prefix", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1770539602363",
+            billingCycleEnd: "1770539602363",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: { planName: "Enterprise" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              numRequests: 3,
+              maxRequestUsage: 10,
+            },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBe("Enterprise")
+    const reqLine = result.lines.find((l) => l.label === "Requests")
+    expect(reqLine).toBeTruthy()
+    expect(reqLine.used).toBe(3)
+    expect(reqLine.limit).toBe(10)
+  })
+
+  it("falls back to REST Connect-shaped planUsage when GetCurrentPeriodUsage returns 400", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return { status: 400, bodyText: "{}" }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            billingCycleStart: "1768399334000",
+            billingCycleEnd: "1771077734000",
+            planUsage: {
+              totalSpend: 1200,
+              limit: 2400,
+              totalPercentUsed: 50,
+            },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const planLine = result.lines.find((line) => line.label === "Total usage")
+    expect(planLine).toBeTruthy()
+    expect(planLine.used).toBe(50)
+  })
+
+  it("retries REST without query when first URL fails and unwraps data + string numbers", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    let usageCalls = 0
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return { status: 400, bodyText: "{}" }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        usageCalls += 1
+        if (String(opts.url).includes("user=")) {
+          return { status: 404, bodyText: "" }
+        }
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            data: {
+              enabled: true,
+              billingCycleStart: "1768399334000",
+              billingCycleEnd: "1771077734000",
+              planUsage: {
+                limit: "2400",
+                remaining: "1200",
+                totalPercentUsed: "50",
+              },
+            },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(usageCalls).toBeGreaterThanOrEqual(2)
+    const planLine = result.lines.find((line) => line.label === "Total usage")
+    expect(planLine).toBeTruthy()
+    expect(planLine.used).toBe(50)
+  })
+
+  const USAGE_SUMMARY_DISABLED_BODY = JSON.stringify({
+    code: "invalid_argument",
+    message: "Error",
+    details: [
+      {
+        type: "aiserver.v1.ErrorDetails",
+        debug: {
+          error: "ERROR_BAD_REQUEST",
+          details: {
+            title: "Bad Request",
+            detail: "Usage summary is not enabled",
+            isRetryable: false,
+          },
+          isExpected: true,
+        },
+      },
+    ],
+  })
+
+  it("uses GetUsageLimitStatusAndActiveGrants when GetCurrentPeriodUsage returns usage-summary disabled", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return { status: 400, bodyText: USAGE_SUMMARY_DISABLED_BODY }
+      }
+      if (String(opts.url).includes("GetUsageLimitStatusAndActiveGrants")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            billingCycleStart: "1768399334000",
+            billingCycleEnd: "1771077734000",
+            planUsage: {
+              totalSpend: 1200,
+              limit: 2400,
+              totalPercentUsed: 50,
+            },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return { status: 200, bodyText: JSON.stringify({ planInfo: { planName: "Pro" } }) }
+      }
+      if (String(opts.url).includes("GetCreditGrantsBalance")) {
+        return { status: 200, bodyText: JSON.stringify({ hasCreditGrants: false }) }
+      }
+      if (String(opts.url).includes("cursor.com/api/auth/stripe")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            membershipType: "pro",
+            subscriptionStatus: "active",
+            customerBalance: 0,
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return { status: 200, bodyText: JSON.stringify({}) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBe("Pro")
+    const planLine = result.lines.find((line) => line.label === "Total usage")
+    expect(planLine).toBeTruthy()
+    expect(planLine.used).toBe(50)
+  })
+
+  it("returns Account line from Stripe when usage summary disabled and metrics unavailable", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return { status: 400, bodyText: USAGE_SUMMARY_DISABLED_BODY }
+      }
+      if (String(opts.url).includes("GetUsageLimitStatusAndActiveGrants")) {
+        return { status: 500, bodyText: "" }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return { status: 200, bodyText: JSON.stringify({}) }
+      }
+      if (String(opts.url).includes("cursor.com/api/auth/stripe")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            membershipType: "pro",
+            subscriptionStatus: "active",
+            customerBalance: 0,
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const accountLine = result.lines.find((line) => line.label === "Account")
+    expect(accountLine).toBeTruthy()
+    expect(String(accountLine.value)).toMatch(/Plan: pro/)
+    expect(String(accountLine.value)).toMatch(/Usage summary is not enabled|usage summary/)
+  })
+
+  it("throws usage-summary-specific message when all fallbacks fail", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return { status: 400, bodyText: USAGE_SUMMARY_DISABLED_BODY }
+      }
+      if (String(opts.url).includes("GetUsageLimitStatusAndActiveGrants")) {
+        return { status: 500, bodyText: "" }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return { status: 200, bodyText: JSON.stringify({}) }
+      }
+      if (String(opts.url).includes("cursor.com/api/auth/stripe")) {
+        return { status: 200, bodyText: JSON.stringify({ customerBalance: 0 }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow(/Usage summary is not enabled/)
+  })
+
+  it("throws descriptive message when GetCurrentPeriodUsage returns 400 and REST has no usable data", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return { status: 400, bodyText: "{}" }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({}),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow(/Cursor Connect API rejected usage \(HTTP 400\/403\).*had no usable data/s)
+  })
+
+  it("uses zero default for missing remaining and omits zero on-demand limits", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { limit: 2400 },
+            spendLimitUsage: {},
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const planLine = result.lines.find((line) => line.label === "Total usage")
+    expect(planLine).toBeTruthy()
+    expect(planLine.used).toBe(100)
+    expect(result.lines.find((line) => line.label === "On-demand")).toBeUndefined()
+  })
+
+  it("rethrows string errors from retry wrapper", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.util.retryOnceOnAuth = vi.fn(() => {
+      throw "retry failed"
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("retry failed")
+  })
+
+  it("skips malformed credit grants payload and still returns total usage", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 1200, limit: 2400 },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetCreditGrantsBalance")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            hasCreditGrants: true,
+            totalCents: "oops",
+            usedCents: "10",
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((line) => line.label === "Credits")).toBeUndefined()
+    expect(result.lines.find((line) => line.label === "Total usage")).toBeTruthy()
+  })
+
+  it("uses expired access token when refresh token is missing", async () => {
+    const ctx = makeCtx()
+    const expiredToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 1 })
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      if (String(sql).includes("cursorAuth/accessToken")) {
+        return JSON.stringify([{ value: expiredToken }])
+      }
+      if (String(sql).includes("cursorAuth/refreshToken")) return JSON.stringify([])
+      return JSON.stringify([])
+    })
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { totalSpend: 0, limit: 100 },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).not.toThrow()
+  })
+
+  it("throws enterprise unavailable when sub resolves to empty user id", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return { status: 200, bodyText: JSON.stringify({ billingCycleStart: "1770539602363" }) }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return { status: 200, bodyText: JSON.stringify({ planInfo: { planName: "Enterprise" } }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Enterprise usage data unavailable")
+  })
+
+  it("uses zero included requests when enterprise usage omits numRequests", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1770539602363",
+            billingCycleEnd: "1770539602363",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: { planName: "Enterprise" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              maxRequestUsage: 10,
+            },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const reqLine = result.lines.find((line) => line.label === "Requests")
+    expect(reqLine).toBeTruthy()
+    expect(reqLine.used).toBe(0)
+    expect(reqLine.limit).toBe(10)
+  })
+
+  it("throws enterprise unavailable when gpt-4 request limit is not positive", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1770539602363",
+            billingCycleEnd: "1770539602363",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: { planName: "Enterprise" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              numRequests: 42,
+              maxRequestUsage: 0,
+            },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Enterprise usage data unavailable")
+  })
+
+  it("omits enterprise plan label when formatter returns null", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ sub: "google-oauth2|user_abc123", exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.fmt.planLabel = vi.fn(() => null)
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            billingCycleStart: "1770539602363",
+            billingCycleEnd: "1770539602363",
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            planInfo: { planName: "Enterprise" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            "gpt-4": {
+              numRequests: 3,
+              maxRequestUsage: 10,
+            },
+          }),
+        }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.plan).toBeNull()
+    expect(result.lines.find((line) => line.label === "Requests")).toBeTruthy()
+  })
+
+  it("wraps non-string retry wrapper errors as usage request failure", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.util.retryOnceOnAuth = vi.fn(() => {
+      throw new Error("wrapper blew up")
+    })
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Usage request failed. Check your connection.")
+  })
+
+  it("attaches activity trend from cursorLogs and persists usageDaily", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({
+        enabled: true,
+        planUsage: { totalPercentUsed: 42 },
+      }),
+    })
+    ctx.host.cursorLogs.queryDaily = vi.fn(() => ({
+      status: "ok",
+      data: {
+        daily: [{ date: "2026-05-20", totalTokens: 4000, estimated: true }],
+      },
+    }))
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+
+    expect(ctx.host.cursorLogs.queryDaily).toHaveBeenCalled()
+    expect(ctx.host.usageDaily.ingest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "cursor_transcripts",
+        displayName: "Cursor",
+        daily: [{ date: "2026-05-20", totalTokens: 4000, estimated: true }],
+      })
+    )
+    const chart = result.lines.find((line) => line.type === "barChart" && line.label === "Activity trend")
+    expect(chart).toBeTruthy()
+    expect(chart.points).toHaveLength(1)
+    expect(chart.points[0].value).toBe(4000)
+  })
+
+  it("attaches MTD usage line from cursorUsageExport", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({
+        enabled: true,
+        planUsage: { totalPercentUsed: 42 },
+      }),
+    })
+    ctx.host.cursorUsageExport.queryMtd = vi.fn(() => ({
+      status: "ok",
+      data: { totalTokens: 1_200_000, inputTokens: 800_000, outputTokens: 400_000, costUsd: 4.8, source: "csv" },
+    }))
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+
+    expect(ctx.host.cursorUsageExport.queryMtd).toHaveBeenCalled()
+    const mtd = result.lines.find((line) => line.type === "text" && line.label === "MTD usage")
+    expect(mtd).toBeTruthy()
+    expect(mtd.value).toContain("800.0K tokens in")
+    expect(mtd.value).toContain("400.0K tokens out")
+    expect(mtd.value).toContain("$4.80")
+    expect(mtd.value).not.toContain("≈")
+    expect(mtd.subtitle).toBe("On-demand usage billed by Cursor")
+  })
+
+  describe("MTD usage line: billed vs estimated", () => {
+    async function probeWithMtd(mtdData) {
+      const ctx = makeCtx()
+      const accessToken = makeJwt({ exp: 9999999999 })
+      ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+      ctx.host.http.request.mockReturnValue({
+        status: 200,
+        bodyText: JSON.stringify({ enabled: true, planUsage: { totalPercentUsed: 42 } }),
+      })
+      ctx.host.cursorUsageExport.queryMtd = vi.fn(() => ({ status: "ok", data: mtdData }))
+      const plugin = await loadPlugin()
+      const result = plugin.probe(ctx)
+      return result.lines.find((line) => line.type === "text" && line.label === "MTD usage")
+    }
+
+    const base = { totalTokens: 1_200_000, inputTokens: 800_000, outputTokens: 400_000, costUsd: 4.8 }
+
+    it("marks events-sourced cost as an estimate", async () => {
+      const mtd = await probeWithMtd({ ...base, source: "events" })
+      expect(mtd.value).toContain("≈$4.80")
+      expect(mtd.subtitle).toBe("Estimated at API rates · not billed")
+    })
+
+    it("claims neither when the host reports no source", async () => {
+      const mtd = await probeWithMtd(base)
+      expect(mtd.value).toContain("$4.80")
+      expect(mtd.value).not.toContain("≈")
+      expect(mtd.subtitle).toBe("From Cursor usage export")
+    })
+
+    it("keeps the plain subtitle when there is no cost", async () => {
+      const mtd = await probeWithMtd({ ...base, costUsd: 0, source: "csv" })
+      expect(mtd.subtitle).toBe("From Cursor dashboard export (billing data)")
+    })
+  })
+
+  // Today/Yesterday/Last 30 Days: feeds QuotaBar's Total Spend card, which the
+  // Claude/Codex plugins already populate from local session logs. Cursor has no
+  // such logs, but queryDaily's billing export gives the same per-day series that
+  // already feeds the activity chart.
+  describe("daily cost lines (Today/Yesterday/Last 30 Days)", () => {
+    function ymd(offsetDays) {
+      const d = new Date()
+      d.setDate(d.getDate() + offsetDays)
+      const y = d.getFullYear()
+      const m = String(d.getMonth() + 1).padStart(2, "0")
+      const day = String(d.getDate()).padStart(2, "0")
+      return `${y}${m}${day}`
+    }
+
+    // `source` mirrors what the host reports: "csv" (billed), "events" (estimate),
+    // or undefined for a host that predates the field.
+    function setupProbe(ctx, dailyRows, source) {
+      const accessToken = makeJwt({ exp: 9999999999 })
+      ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+      ctx.host.http.request.mockReturnValue({
+        status: 200,
+        bodyText: JSON.stringify({ enabled: true, planUsage: { totalPercentUsed: 10 } }),
+      })
+      const data = { daily: dailyRows }
+      if (source !== undefined) data.source = source
+      ctx.host.cursorUsageExport.queryDaily = vi.fn(() => ({ status: "ok", data }))
+    }
+
+    const threeDays = () => [
+      { date: ymd(0), totalTokens: 1000, inputTokens: 900, outputTokens: 100, costUsd: 12.5 },
+      { date: ymd(-1), totalTokens: 2000, inputTokens: 1800, outputTokens: 200, costUsd: 8.25 },
+      { date: ymd(-10), totalTokens: 500, inputTokens: 400, outputTokens: 100, costUsd: 3.0 },
+    ]
+
+    it("adds Today/Yesterday/Last 30 Days cost lines from the billing export", async () => {
+      const ctx = makeCtx()
+      setupProbe(ctx, threeDays(), "csv")
+
+      const plugin = await loadPlugin()
+      const result = plugin.probe(ctx)
+
+      const byLabel = Object.fromEntries(result.lines.map((l) => [l.label, l]))
+      expect(byLabel.Today.value).toBe("$12.50")
+      expect(byLabel.Yesterday.value).toBe("$8.25")
+      expect(byLabel["Last 30 Days"].value).toBe("$23.75")
+      expect(byLabel.Today.subtitle).toBe("On-demand usage billed by Cursor")
+    })
+
+    it("labels events-sourced cost as an estimate, so it is not mistaken for a charge", async () => {
+      const ctx = makeCtx()
+      setupProbe(ctx, threeDays(), "events")
+
+      const plugin = await loadPlugin()
+      const result = plugin.probe(ctx)
+
+      const byLabel = Object.fromEntries(result.lines.map((l) => [l.label, l]))
+      expect(byLabel.Today.value).toBe("≈$12.50")
+      expect(byLabel["Last 30 Days"].value).toBe("≈$23.75")
+      for (const label of ["Today", "Yesterday", "Last 30 Days"]) {
+        expect(byLabel[label].subtitle).toBe("Estimated at API rates · not billed")
+      }
+    })
+
+    it("stays estimate-labeled even when the estimated cost is zero", async () => {
+      const ctx = makeCtx()
+      setupProbe(ctx, [{ date: ymd(-10), totalTokens: 5, inputTokens: 4, outputTokens: 1, costUsd: 0 }], "events")
+
+      const plugin = await loadPlugin()
+      const result = plugin.probe(ctx)
+
+      const today = result.lines.find((l) => l.label === "Today")
+      expect(today.value).toBe("≈$0.00")
+      expect(today.subtitle).toBe("Estimated at API rates · not billed")
+    })
+
+    it("claims neither billed nor estimated when the host reports no source", async () => {
+      const ctx = makeCtx()
+      setupProbe(ctx, threeDays())
+
+      const plugin = await loadPlugin()
+      const result = plugin.probe(ctx)
+
+      const today = result.lines.find((l) => l.label === "Today")
+      expect(today.value).toBe("$12.50")
+      expect(today.subtitle).toBe("From Cursor usage export")
+    })
+
+    it("sums multiple rows on the same date instead of overwriting", async () => {
+      const ctx = makeCtx()
+      setupProbe(ctx, [
+        { date: ymd(0), totalTokens: 100, inputTokens: 90, outputTokens: 10, costUsd: 1.5 },
+        { date: ymd(0), totalTokens: 200, inputTokens: 180, outputTokens: 20, costUsd: 2.5 },
+      ])
+
+      const plugin = await loadPlugin()
+      const result = plugin.probe(ctx)
+
+      const today = result.lines.find((l) => l.label === "Today")
+      expect(today.value).toBe("$4.00")
+    })
+
+    it("shows $0.00, not a missing line, for a day absent from the export", async () => {
+      const ctx = makeCtx()
+      setupProbe(ctx, [{ date: ymd(-10), totalTokens: 500, inputTokens: 400, outputTokens: 100, costUsd: 3.0 }], "csv")
+
+      const plugin = await loadPlugin()
+      const result = plugin.probe(ctx)
+
+      const byLabel = Object.fromEntries(result.lines.map((l) => [l.label, l]))
+      expect(byLabel.Today.value).toBe("$0.00")
+      expect(byLabel.Yesterday.value).toBe("$0.00")
+      expect(byLabel["Last 30 Days"].value).toBe("$3.00")
+      // No cost yet today/yesterday, but the export overall is real billing data — still labeled billed, not estimated.
+      expect(byLabel.Today.subtitle).toBe("On-demand usage billed by Cursor")
+    })
+
+    it("omits the cost lines entirely when the export has no rows", async () => {
+      const ctx = makeCtx()
+      setupProbe(ctx, [])
+
+      const plugin = await loadPlugin()
+      const result = plugin.probe(ctx)
+
+      expect(result.lines.some((l) => l.label === "Today")).toBe(false)
+      expect(result.lines.some((l) => l.label === "Yesterday")).toBe(false)
+      expect(result.lines.some((l) => l.label === "Last 30 Days")).toBe(false)
+    })
+
+    it("still ingests into usageDaily for the activity chart alongside the new cost lines", async () => {
+      const ctx = makeCtx()
+      setupProbe(ctx, [{ date: ymd(0), totalTokens: 100, inputTokens: 90, outputTokens: 10, costUsd: 1.5 }])
+
+      const plugin = await loadPlugin()
+      plugin.probe(ctx)
+
+      expect(ctx.host.usageDaily.ingest).toHaveBeenCalledWith(
+        expect.objectContaining({ source: "cursor_billing" })
+      )
+    })
+
+    it("does not add cost lines when cursorUsageExport.queryDaily is unavailable", async () => {
+      const ctx = makeCtx()
+      const accessToken = makeJwt({ exp: 9999999999 })
+      ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+      ctx.host.http.request.mockReturnValue({
+        status: 200,
+        bodyText: JSON.stringify({ enabled: true, planUsage: { totalPercentUsed: 10 } }),
+      })
+      delete ctx.host.cursorUsageExport.queryDaily
+
+      const plugin = await loadPlugin()
+      const result = plugin.probe(ctx)
+
+      expect(result.lines.some((l) => l.label === "Today")).toBe(false)
+    })
+  })
+
+  it("keeps Connect usage when usage export MTD throws", async () => {
+    const ctx = makeCtx()
+    const accessToken = makeJwt({ exp: 9999999999 })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: accessToken }]))
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({
+        enabled: true,
+        planUsage: { totalPercentUsed: 42 },
+      }),
+    })
+    ctx.host.cursorUsageExport.queryMtd = vi.fn(() => {
+      throw new Error("export boom")
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+
+    expect(result.lines.find((line) => line.label === "Total usage")?.used).toBe(42)
+    expect(result.lines.find((line) => line.label === "MTD usage")).toBeFalsy()
+    expect(ctx.host.log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("usage export MTD attach failed")
+    )
+  })
+
+  it("prefers structured team model pools over legacy $20 allowance (#1337)", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            billingCycleStart: 1770000000000,
+            billingCycleEnd: 1772592000000,
+            planUsage: {
+              totalSpend: 1022,
+              includedSpend: 1022,
+              remaining: 978,
+              limit: 2000,
+              autoPercentUsed: 2.6476190476190475,
+              apiPercentUsed: 11.65,
+              totalPercentUsed: 4.088,
+            },
+            spendLimitUsage: { limitType: "team", pooledUsed: 0 },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return { status: 200, bodyText: JSON.stringify({ planInfo: { planName: "Team" } }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const total = result.lines.find((l) => l.label === "Total usage")
+    expect(total).toBeTruthy()
+    expect(total.format).toEqual({ kind: "percent" })
+    expect(total.used).toBeCloseTo(4.088, 5)
+    expect(result.lines.find((l) => l.label === "Cursor Models")?.used).toBeCloseTo(2.647619, 5)
+    expect(result.lines.find((l) => l.label === "Other Models")?.used).toBeCloseTo(11.65, 5)
+  })
+
+  it("omits Total usage on team premium seat with model pools when totalPercentUsed is absent", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: {
+              limit: 2000,
+              totalSpend: 666,
+              autoPercentUsed: 0.3728571428571429,
+              apiPercentUsed: 2.025,
+            },
+            spendLimitUsage: { limitType: "team", pooledUsed: 0 },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return { status: 200, bodyText: JSON.stringify({ planInfo: { planName: "Team" } }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((l) => l.label === "Total usage")).toBeUndefined()
+    expect(result.lines.find((l) => l.label === "Cursor Models")?.used).toBeCloseTo(0.372857, 5)
+    expect(result.lines.find((l) => l.label === "Other Models")?.used).toBeCloseTo(2.025, 5)
+  })
+
+  it("does not trigger request fallback when team model pools exist without limit", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: { autoPercentUsed: 0, apiPercentUsed: 0 },
+            spendLimitUsage: { limitType: "team" },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return { status: 200, bodyText: JSON.stringify({ planInfo: { planName: "Team" } }) }
+      }
+      if (String(opts.url).includes("cursor.com/api/usage")) {
+        throw new Error("unexpected REST usage fallback")
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    expect(result.lines.find((l) => l.label === "Cursor Models")?.used).toBe(0)
+    expect(result.lines.find((l) => l.label === "Other Models")?.used).toBe(0)
+  })
+
+  it("keeps legacy dollar meter for $5000 team pool when model pools are zero placeholders beside positive spend", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("GetCurrentPeriodUsage")) {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({
+            enabled: true,
+            planUsage: {
+              limit: 500000,
+              totalSpend: 234500,
+              autoPercentUsed: 0,
+              apiPercentUsed: 0,
+              totalPercentUsed: 0,
+            },
+            spendLimitUsage: { limitType: "team", pooledUsed: 0 },
+          }),
+        }
+      }
+      if (String(opts.url).includes("GetPlanInfo")) {
+        return { status: 200, bodyText: JSON.stringify({ planInfo: { planName: "Team" } }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+    const total = result.lines.find((l) => l.label === "Total usage")
+    expect(total).toBeTruthy()
+    expect(total.format).toEqual({ kind: "dollars" })
+    expect(total.used).toBe(2345)
+    expect(total.limit).toBe(5000)
+  })
+})
+
+// Cursor 3.2x+ stores the desktop app's tokens in state.vscdb encrypted
+// ("cursor-safe-storage:v1:<base64>"). `agent login` writes plaintext ones to
+// <app data>/Cursor/auth.json.
+describe("cursor plugin: encrypted state.vscdb tokens and the CLI auth file", () => {
+  const CIPHERTEXT = "cursor-safe-storage:v1:" + "A".repeat(80)
+  const CLI_AUTH_PATH = "~/AppData/Roaming/Cursor/auth.json"
+
+  beforeEach(() => {
+    delete globalThis.__openusage_plugin
+    vi.resetModules()
+  })
+
+  // state.vscdb answers per key; `values` maps key -> stored value (or omit for none).
+  function mockStateDb(ctx, values) {
+    ctx.host.sqlite.query.mockImplementation((db, sql) => {
+      for (const [key, value] of Object.entries(values)) {
+        if (String(sql).includes("'" + key + "'")) return JSON.stringify([{ value }])
+      }
+      return JSON.stringify([])
+    })
+  }
+
+  function writeCliAuth(ctx, accessToken, refreshToken) {
+    ctx.host.fs.writeText(CLI_AUTH_PATH, JSON.stringify({ accessToken, refreshToken }))
+    ctx.host.fs.writeText.mockClear() // only count writes the plugin itself makes
+  }
+
+  function mockApi(ctx, { refreshedToken } = {}) {
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (String(opts.url).includes("/oauth/token")) {
+        return { status: 200, bodyText: JSON.stringify({ access_token: refreshedToken || "unused" }) }
+      }
+      return {
+        status: 200,
+        bodyText: JSON.stringify({ enabled: true, planUsage: { totalPercentUsed: 10 } }),
+      }
+    })
+  }
+
+  const bearerOf = (call) => call[0].headers.Authorization
+
+  it("never sends ciphertext as a token; uses the CLI file instead", async () => {
+    const ctx = makeCtx()
+    const cliAccess = makeJwt({ exp: 9999999999, sub: "user_cli" })
+    mockStateDb(ctx, { "cursorAuth/accessToken": CIPHERTEXT, "cursorAuth/refreshToken": CIPHERTEXT })
+    writeCliAuth(ctx, cliAccess, makeJwt({ exp: 9999999999 }))
+    mockApi(ctx)
+
+    const plugin = await loadPlugin()
+    plugin.probe(ctx)
+
+    const sent = ctx.host.http.request.mock.calls.map(bearerOf).filter(Boolean)
+    expect(sent.length).toBeGreaterThan(0)
+    for (const header of sent) {
+      expect(header).toBe("Bearer " + cliAccess)
+      expect(header).not.toContain("cursor-safe-storage")
+    }
+  })
+
+  it("finds lowercase ~/.config/cursor/auth.json on case-sensitive Linux", async () => {
+    const ctx = makeCtx()
+    const cliAccess = makeJwt({ exp: 9999999999, sub: "user_linux_cli" })
+    mockStateDb(ctx, { "cursorAuth/accessToken": CIPHERTEXT, "cursorAuth/refreshToken": CIPHERTEXT })
+    ctx.host.fs.writeText(
+      "~/.config/cursor/auth.json",
+      JSON.stringify({ accessToken: cliAccess, refreshToken: makeJwt({ exp: 9999999999 }) }),
+    )
+    ctx.host.fs.writeText.mockClear()
+    mockApi(ctx)
+
+    const plugin = await loadPlugin()
+    plugin.probe(ctx)
+
+    const sent = ctx.host.http.request.mock.calls.map(bearerOf).filter(Boolean)
+    expect(sent.length).toBeGreaterThan(0)
+    for (const header of sent) {
+      expect(header).toBe("Bearer " + cliAccess)
+    }
+  })
+
+  it("reports a clear, actionable error when the only auth is ciphertext", async () => {
+    const ctx = makeCtx()
+    mockStateDb(ctx, { "cursorAuth/accessToken": CIPHERTEXT, "cursorAuth/refreshToken": CIPHERTEXT })
+    mockApi(ctx)
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow(/encrypted.*agent login/)
+    // No request may carry the ciphertext.
+    expect(ctx.host.http.request).not.toHaveBeenCalled()
+  })
+
+  it("does not read the stable CLI auth file for Cursor Nightly", async () => {
+    // The Nightly plugin is generated from this one; it identifies itself through this global.
+    globalThis.__OPENUSAGE_PLUGIN_REGISTRATION_ID__ = "cursor-nightly"
+    try {
+      const ctx = makeCtx()
+      mockStateDb(ctx, { "cursorAuth/accessToken": CIPHERTEXT, "cursorAuth/refreshToken": CIPHERTEXT })
+      writeCliAuth(ctx, makeJwt({ exp: 9999999999, sub: "user_cli" }), makeJwt({ exp: 9999999999 }))
+      mockApi(ctx)
+
+      const plugin = await loadPlugin()
+      let message = ""
+      try {
+        plugin.probe(ctx)
+      } catch (e) {
+        message = String(e)
+      }
+      // No request may use the CLI file's tokens, and the hint must not send a Nightly user to `agent login`.
+      expect(ctx.host.http.request).not.toHaveBeenCalled()
+      expect(message).toContain("Cursor Nightly keeps its sign-in encrypted")
+      expect(message).not.toContain("agent login")
+    } finally {
+      delete globalThis.__OPENUSAGE_PLUGIN_REGISTRATION_ID__
+    }
+  })
+
+  it("keeps preferring readable state.vscdb tokens over the CLI file", async () => {
+    const ctx = makeCtx()
+    const dbAccess = makeJwt({ exp: 9999999999, sub: "user_db" })
+    mockStateDb(ctx, { "cursorAuth/accessToken": dbAccess, "cursorAuth/refreshToken": makeJwt({ exp: 9999999999 }) })
+    writeCliAuth(ctx, makeJwt({ exp: 9999999999, sub: "user_cli" }), makeJwt({ exp: 9999999999 }))
+    mockApi(ctx)
+
+    const plugin = await loadPlugin()
+    plugin.probe(ctx)
+
+    for (const header of ctx.host.http.request.mock.calls.map(bearerOf).filter(Boolean)) {
+      expect(header).toBe("Bearer " + dbAccess)
+    }
+  })
+
+  it("works with only the CLI file and no state.vscdb auth at all", async () => {
+    const ctx = makeCtx()
+    const cliAccess = makeJwt({ exp: 9999999999, sub: "user_cli" })
+    mockStateDb(ctx, {})
+    writeCliAuth(ctx, cliAccess, makeJwt({ exp: 9999999999 }))
+    mockApi(ctx)
+
+    const plugin = await loadPlugin()
+    const result = plugin.probe(ctx)
+
+    expect(result.lines.length).toBeGreaterThan(0)
+    expect(ctx.host.http.request.mock.calls.map(bearerOf).filter(Boolean)[0]).toBe("Bearer " + cliAccess)
+  })
+
+  it("does not write a refreshed token into Cursor's store or over the CLI file", async () => {
+    const ctx = makeCtx()
+    const expired = makeJwt({ exp: 1, sub: "user_cli" })
+    const refreshed = makeJwt({ exp: 9999999999, sub: "user_cli" })
+    mockStateDb(ctx, { "cursorAuth/accessToken": CIPHERTEXT, "cursorAuth/refreshToken": CIPHERTEXT })
+    writeCliAuth(ctx, expired, makeJwt({ exp: 9999999999 }))
+    mockApi(ctx, { refreshedToken: refreshed })
+
+    const plugin = await loadPlugin()
+    plugin.probe(ctx)
+
+    // It did refresh and use the new token...
+    expect(ctx.host.http.request.mock.calls.some((c) => String(c[0].url).includes("/oauth/token"))).toBe(true)
+    expect(ctx.host.http.request.mock.calls.map(bearerOf).filter(Boolean).pop()).toBe("Bearer " + refreshed)
+    // ...but wrote it nowhere: not into the encrypted state DB, not over auth.json.
+    expect(ctx.host.sqlite.exec).not.toHaveBeenCalled()
+    expect(ctx.host.fs.writeText).not.toHaveBeenCalled()
+  })
+})

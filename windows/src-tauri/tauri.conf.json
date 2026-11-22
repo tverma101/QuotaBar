@@ -1,0 +1,99 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "QuotaBar",
+  "mainBinaryName": "quotabar",
+  "version": "0.1.0",
+  "identifier": "com.tverma101.quotabar",
+  "build": {
+    "beforeDevCommand": "node scripts/tauri-before-dev.cjs",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "bun run bundle:plugins && bun run build && bash scripts/prepare-cli-sidecar.sh",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "QuotaBar",
+        "width": 600,
+        "height": 800,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "visible": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "macOSPrivateApi": true
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "tverma101 <nirasushi221@gmail.com>",
+    "homepage": "https://github.com/tverma101/QuotaBar",
+    "shortDescription": "Fork of OpenUsage — tray app to track AI coding subscriptions (credit: Robin Ebers / robinebers/openusage).",
+    "longDescription": "QuotaBar is a community fork of OpenUsage (https://github.com/robinebers/openusage), the open-source AI subscription usage tracker created by Robin Ebers (https://github.com/robinebers, https://itsbyrob.in/x). This repository (https://github.com/tverma101/QuotaBar) focuses on Linux and Windows native builds; upstream remains the macOS-first home of OpenUsage. Please credit Robin Ebers and the OpenUsage project when discussing or redistributing derivative work.",
+    "copyright": "QuotaBar fork contributors; original OpenUsage © Robin Ebers and contributors",
+    "license": "MIT",
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libayatana-appindicator3-1 | libappindicator3-1",
+          "libgtk-3-0",
+          "xdg-desktop-portal",
+          "xdg-desktop-portal-gtk | xdg-desktop-portal-gnome | xdg-desktop-portal-cosmic"
+        ]
+      }
+    },
+    "macOS": {
+      "dmg": {
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        },
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        }
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/bundled_plugins/**/*",
+      "resources/WINDOWS-PORTABLE.txt",
+      "icons/tray-icon.png"
+    ],
+    "externalBin": [
+      "binaries/quotabar-cli"
+    ],
+    "createUpdaterArtifacts": true,
+    "windows": {
+      "nsis": {
+        "startMenuFolder": "QuotaBar"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU1RUQwMzNGOTE5MDU0QjYKUldTMlZKQ1JQd1B0VmZra213ay83czZLWDhCTWFhazdVaHdQUFQ5eTU3MEVTdHlqb2IzUEdvSG4K",
+      "endpoints": [
+        "https://github.com/tverma101/QuotaBar/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

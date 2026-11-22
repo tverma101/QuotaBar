@@ -1,0 +1,297 @@
+import { useShallow } from "zustand/react/shallow"
+import { OverviewPage } from "@/pages/overview"
+import { ProviderDetailPage } from "@/pages/provider-detail"
+import { PollsPage } from "@/pages/polls"
+import { SettingsPage, type ProviderAccountCredentialInput } from "@/pages/settings"
+import type { DisplayPluginState } from "@/hooks/app/use-app-plugin-views"
+import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
+import type { TraySettingsPreview } from "@/hooks/app/use-tray-icon"
+import { useAppPluginStore } from "@/stores/app-plugin-store"
+import { useAppPreferencesStore } from "@/stores/app-preferences-store"
+import { useAppUiStore } from "@/stores/app-ui-store"
+import { useProductPollsStore } from "@/stores/product-polls-store"
+import type {
+  AutoUpdateIntervalMinutes,
+  DisplayMode,
+  GlobalShortcut,
+  MenubarIconStyle,
+  ModernDensity,
+  ResetTimerDisplayMode,
+  ThemeMode,
+  TimeFormatMode,
+  AppLocale,
+  DisplayCurrency,
+  UILayout,
+  UIScale,
+  UsageAlertSound,
+  UsageAlertThreshold,
+} from "@/lib/settings"
+
+type AppContentDerivedProps = {
+  displayPlugins: DisplayPluginState[]
+  settingsPlugins: SettingsPluginState[]
+  selectedPlugin: DisplayPluginState | null
+}
+
+export type AppContentActionProps = {
+  onRetryPlugin: (id: string) => void
+  onReorder: (orderedIds: string[]) => void
+  onToggle: (id: string) => void
+  onTrayLineToggle: (id: string, lineLabel: string, checked: boolean) => void
+  onDashboardMetricToggle: (metricId: string, checked: boolean, allLabels: string[]) => void
+  onProviderDashboardMetrics: (pluginId: string, allLabels: string[], enabled: boolean) => void
+  onAddProviderAccount: (baseProviderId: string, input: ProviderAccountCredentialInput) => void
+  onUpdateProviderAccountCredentials: (id: string, input: ProviderAccountCredentialInput) => void
+  onRenameProviderAccount: (id: string, label: string) => void
+  onRemoveProviderAccount: (id: string) => void
+  onAutoUpdateIntervalChange: (value: AutoUpdateIntervalMinutes) => void
+  onThemeModeChange: (mode: ThemeMode) => void
+  onUILayoutChange: (layout: UILayout) => void
+  onModernDensityChange: (density: ModernDensity) => void
+  onDisplayModeChange: (mode: DisplayMode) => void
+  onResetTimerDisplayModeChange: (mode: ResetTimerDisplayMode) => void
+  onResetTimerDisplayModeToggle: () => void
+  onTimeFormatModeChange: (mode: TimeFormatMode) => void
+  onAppLocaleChange: (locale: AppLocale) => void
+  onDisplayCurrencyChange: (currency: DisplayCurrency) => void
+  onMenubarIconStyleChange: (value: MenubarIconStyle) => void
+  onPreferMenubarWeeklyLimitChange: (value: boolean) => void
+  traySettingsPreview: TraySettingsPreview
+  onGlobalShortcutChange: (value: GlobalShortcut) => void
+  onStartHiddenChange: (value: boolean) => void
+  onStartOnLoginChange: (value: boolean) => void
+  startOnLoginError?: string | null
+  onUsageAlertEnabledChange: (value: boolean) => void
+  onUsageAlertThresholdChange: (value: UsageAlertThreshold) => void
+  onUsageAlertCustomThresholdChange: (value: number | null) => void
+  onUsageAlertSoundChange: (value: UsageAlertSound) => void
+  onUsagePaceAlertEnabledChange: (value: boolean) => void
+  onUsageSpikeAlertEnabledChange: (value: boolean) => void
+  onUsageSpikeAlertThresholdPctChange: (value: import("@/lib/settings").UsageSpikeAlertThresholdPct) => void
+  onUIScaleChange: (value: UIScale) => void
+  onShowAccountIdentityChange: (value: boolean) => void
+  onSetTrayReadout: (pluginId: string, lineLabel: string) => void
+  cursorRequestsLineAvailable: boolean | null
+}
+
+export type AppContentProps = AppContentDerivedProps &
+  AppContentActionProps & {
+    viewOverride?: "home" | "settings" | "polls"
+  }
+
+export function AppContent({
+  displayPlugins,
+  settingsPlugins,
+  selectedPlugin,
+  onRetryPlugin,
+  onReorder,
+  onToggle,
+  onTrayLineToggle,
+  onAddProviderAccount,
+  onUpdateProviderAccountCredentials,
+  onRenameProviderAccount,
+  onRemoveProviderAccount,
+  onAutoUpdateIntervalChange,
+  onThemeModeChange,
+  onUILayoutChange,
+  onModernDensityChange,
+  onDisplayModeChange,
+  onResetTimerDisplayModeChange,
+  onResetTimerDisplayModeToggle,
+  onTimeFormatModeChange,
+  onAppLocaleChange,
+  onDisplayCurrencyChange,
+  onMenubarIconStyleChange,
+  onPreferMenubarWeeklyLimitChange,
+  traySettingsPreview,
+  onGlobalShortcutChange,
+  onStartHiddenChange,
+  onStartOnLoginChange,
+  startOnLoginError,
+  onUsageAlertEnabledChange,
+  onUsageAlertThresholdChange,
+  onUsageAlertCustomThresholdChange,
+  onUsageAlertSoundChange,
+  onUsagePaceAlertEnabledChange,
+  onUsageSpikeAlertEnabledChange,
+  onUsageSpikeAlertThresholdPctChange,
+  onUIScaleChange,
+  onShowAccountIdentityChange,
+  onSetTrayReadout,
+  cursorRequestsLineAvailable,
+  viewOverride,
+}: AppContentProps) {
+  const { activeView } = useAppUiStore(
+    useShallow((state) => ({
+      activeView: state.activeView,
+    }))
+  )
+  const resolvedView = viewOverride ?? activeView
+  const pollsVisitNonce = useProductPollsStore((state) => state.pollsVisitNonce)
+
+  const pluginSettings = useAppPluginStore((state) => state.pluginSettings)
+
+  const {
+    displayMode,
+    resetTimerDisplayMode,
+    timeFormatMode,
+    appLocale,
+    displayCurrency,
+    menubarIconStyle,
+    preferMenubarWeeklyLimit,
+    autoUpdateInterval,
+    globalShortcut,
+    themeMode,
+    startHidden,
+    startOnLogin,
+    usageAlertEnabled,
+    usageAlertThreshold,
+    customUsageAlertThreshold,
+    usageAlertSound,
+    usagePaceAlertEnabled,
+    usageSpikeAlertEnabled,
+    usageSpikeAlertThresholdPct,
+    uiScale,
+    showAccountIdentity,
+    uiLayout,
+    modernDensity,
+  } = useAppPreferencesStore(
+    useShallow((state) => ({
+      displayMode: state.displayMode,
+      resetTimerDisplayMode: state.resetTimerDisplayMode,
+      timeFormatMode: state.timeFormatMode,
+      appLocale: state.appLocale,
+      displayCurrency: state.displayCurrency,
+      menubarIconStyle: state.menubarIconStyle,
+      preferMenubarWeeklyLimit: state.preferMenubarWeeklyLimit,
+      autoUpdateInterval: state.autoUpdateInterval,
+      globalShortcut: state.globalShortcut,
+      themeMode: state.themeMode,
+      startHidden: state.startHidden,
+      startOnLogin: state.startOnLogin,
+      usageAlertEnabled: state.usageAlertEnabled,
+      usageAlertThreshold: state.usageAlertThreshold,
+      customUsageAlertThreshold: state.customUsageAlertThreshold,
+      usageAlertSound: state.usageAlertSound,
+      usagePaceAlertEnabled: state.usagePaceAlertEnabled,
+      usageSpikeAlertEnabled: state.usageSpikeAlertEnabled,
+      usageSpikeAlertThresholdPct: state.usageSpikeAlertThresholdPct,
+      uiScale: state.uiScale,
+      showAccountIdentity: state.showAccountIdentity,
+      uiLayout: state.uiLayout,
+      modernDensity: state.modernDensity,
+    }))
+  )
+
+  if (resolvedView === "home") {
+    return (
+      <div key="home" className="motion-view">
+      <OverviewPage
+        plugins={displayPlugins}
+        pluginSettings={pluginSettings}
+        preferWeeklyLimit={preferMenubarWeeklyLimit}
+        onRetryPlugin={onRetryPlugin}
+        displayMode={displayMode}
+        resetTimerDisplayMode={resetTimerDisplayMode}
+        timeFormatMode={timeFormatMode}
+        onResetTimerDisplayModeToggle={onResetTimerDisplayModeToggle}
+        showAccountIdentity={showAccountIdentity}
+      />
+      </div>
+    )
+  }
+
+  if (resolvedView === "polls") {
+    return (
+      <div key={`polls-${pollsVisitNonce}`} className="motion-view">
+        <PollsPage />
+      </div>
+    )
+  }
+
+  if (resolvedView === "settings") {
+    return (
+      <div key="settings" className="motion-view">
+      <SettingsPage
+        plugins={settingsPlugins}
+        onReorder={onReorder}
+        onToggle={onToggle}
+        onTrayLineToggle={onTrayLineToggle}
+        onAddProviderAccount={onAddProviderAccount}
+        onUpdateProviderAccountCredentials={onUpdateProviderAccountCredentials}
+        onRenameProviderAccount={onRenameProviderAccount}
+        onRemoveProviderAccount={onRemoveProviderAccount}
+        autoUpdateInterval={autoUpdateInterval}
+        onAutoUpdateIntervalChange={onAutoUpdateIntervalChange}
+        themeMode={themeMode}
+        onThemeModeChange={onThemeModeChange}
+        uiLayout={uiLayout}
+        onUILayoutChange={onUILayoutChange}
+        modernDensity={modernDensity}
+        onModernDensityChange={onModernDensityChange}
+        displayMode={displayMode}
+        onDisplayModeChange={onDisplayModeChange}
+        resetTimerDisplayMode={resetTimerDisplayMode}
+        onResetTimerDisplayModeChange={onResetTimerDisplayModeChange}
+        timeFormatMode={timeFormatMode}
+        onTimeFormatModeChange={onTimeFormatModeChange}
+        appLocale={appLocale}
+        onAppLocaleChange={onAppLocaleChange}
+        displayCurrency={displayCurrency}
+        onDisplayCurrencyChange={onDisplayCurrencyChange}
+        menubarIconStyle={menubarIconStyle}
+        onMenubarIconStyleChange={onMenubarIconStyleChange}
+        preferMenubarWeeklyLimit={preferMenubarWeeklyLimit}
+        onPreferMenubarWeeklyLimitChange={onPreferMenubarWeeklyLimitChange}
+        traySettingsPreview={traySettingsPreview}
+        globalShortcut={globalShortcut}
+        onGlobalShortcutChange={onGlobalShortcutChange}
+        startHidden={startHidden}
+        onStartHiddenChange={onStartHiddenChange}
+        startOnLogin={startOnLogin}
+        onStartOnLoginChange={onStartOnLoginChange}
+        startOnLoginError={startOnLoginError}
+        usageAlertEnabled={usageAlertEnabled}
+        onUsageAlertEnabledChange={onUsageAlertEnabledChange}
+        usageAlertThreshold={usageAlertThreshold}
+        onUsageAlertThresholdChange={onUsageAlertThresholdChange}
+        customUsageAlertThreshold={customUsageAlertThreshold}
+        onUsageAlertCustomThresholdChange={onUsageAlertCustomThresholdChange}
+        usageAlertSound={usageAlertSound}
+        onUsageAlertSoundChange={onUsageAlertSoundChange}
+        usagePaceAlertEnabled={usagePaceAlertEnabled}
+        onUsagePaceAlertEnabledChange={onUsagePaceAlertEnabledChange}
+        usageSpikeAlertEnabled={usageSpikeAlertEnabled}
+        onUsageSpikeAlertEnabledChange={onUsageSpikeAlertEnabledChange}
+        usageSpikeAlertThresholdPct={usageSpikeAlertThresholdPct}
+        onUsageSpikeAlertThresholdPctChange={onUsageSpikeAlertThresholdPctChange}
+        uiScale={uiScale}
+        onUIScaleChange={onUIScaleChange}
+        showAccountIdentity={showAccountIdentity}
+        onShowAccountIdentityChange={onShowAccountIdentityChange}
+        onSetTrayReadout={onSetTrayReadout}
+        cursorRequestsLineAvailable={cursorRequestsLineAvailable}
+        presentation={uiLayout === "modern" ? "modern" : "classic"}
+      />
+      </div>
+    )
+  }
+
+  const handleRetry = selectedPlugin
+    ? () => onRetryPlugin(selectedPlugin.meta.id)
+    : /* v8 ignore next */ undefined
+
+  return (
+    <div key={selectedPlugin?.meta.id ?? "detail"} className="motion-view">
+    <ProviderDetailPage
+      plugin={selectedPlugin}
+      onRetry={handleRetry}
+      displayMode={displayMode}
+      resetTimerDisplayMode={resetTimerDisplayMode}
+      timeFormatMode={timeFormatMode}
+      onResetTimerDisplayModeToggle={onResetTimerDisplayModeToggle}
+      showAccountIdentity={showAccountIdentity}
+    />
+    </div>
+  )
+}
