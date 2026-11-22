@@ -1,5 +1,4 @@
 import { useCallback, useEffect } from "react"
-import { getVersion } from "@tauri-apps/api/app"
 import { invoke, isTauri } from "@tauri-apps/api/core"
 import {
   disable as disableAutostart,
@@ -190,13 +189,7 @@ export function useSettingsBootstrap({
 
         let onboardingDone = false
         try {
-          let appVersion = "0.0.0"
-          try {
-            appVersion = await getVersion()
-          } catch (versionError) {
-            console.error("Failed to get app version for onboarding:", versionError)
-          }
-          onboardingDone = await resolveOnboardingComplete(migratedSettings, appVersion)
+          onboardingDone = await resolveOnboardingComplete()
         } catch (error) {
           console.error("Failed to resolve onboarding state:", error)
         }

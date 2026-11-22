@@ -111,7 +111,7 @@ const SHOW_ACCOUNT_IDENTITY_KEY = "showAccountIdentity";
 const PERSIST_USAGE_HISTORY_KEY = "persistUsageHistory";
 const USAGE_HISTORY_RETENTION_DAYS_KEY = "usageHistoryRetentionDays";
 const ONBOARDING_COMPLETE_V1_KEY = "onboardingCompleteV1";
-/** App version string when user last completed the dual-UI onboarding wizard. */
+/** App version recorded by earlier builds when the user finished onboarding. */
 const DUAL_UI_ONBOARDING_VERSION_KEY = "dualUiOnboardingVersion";
 const UI_LAYOUT_KEY = "uiLayout";
 const MODERN_LAYOUT_KEY = "modernLayout";
@@ -1107,20 +1107,12 @@ export async function saveUsageHistoryRetentionDays(value: number): Promise<void
   await store.save();
 }
 
-/**
- * Whether to skip the onboarding wizard.
- * Show wizard when `dualUiOnboardingVersion` !== current app version (first install or after update).
- * Settings.json is preserved — only the version key is written on completion.
- */
-export async function resolveOnboardingComplete(
-  _storedPluginSettings: PluginSettings,
-  appVersion: string,
-): Promise<boolean> {
+/** Keep onboarding complete across updates and recognize older saved preferences. */
+export async function resolveOnboardingComplete(): Promise<boolean> {
+  const completed = await store.get<unknown>(ONBOARDING_COMPLETE_V1_KEY);
+  if (typeof completed === "boolean") return completed;
   const seenVersion = await store.get<unknown>(DUAL_UI_ONBOARDING_VERSION_KEY);
-  if (typeof seenVersion === "string" && seenVersion === appVersion) {
-    return true;
-  }
-  return false;
+  return typeof seenVersion === "string" && seenVersion.trim().length > 0;
 }
 
 export async function saveDualUiOnboardingComplete(appVersion: string): Promise<void> {

@@ -911,20 +911,24 @@ describe("settings", () => {
   })
 
   describe("resolveOnboardingComplete", () => {
-    const pluginSettings = { order: ["cursor"], disabled: [] as string[] }
-
-    it("returns false when dualUiOnboardingVersion is missing", async () => {
-      await expect(resolveOnboardingComplete(pluginSettings, "1.1.0")).resolves.toBe(false)
+    it("runs onboarding on a fresh profile", async () => {
+      await expect(resolveOnboardingComplete()).resolves.toBe(false)
     })
 
-    it("returns false when stored version differs from app version", async () => {
+    it("keeps older completed onboarding after an update", async () => {
       storeState.set("dualUiOnboardingVersion", "1.0.0")
-      await expect(resolveOnboardingComplete(pluginSettings, "1.1.0")).resolves.toBe(false)
+      await expect(resolveOnboardingComplete()).resolves.toBe(true)
     })
 
-    it("returns true when stored version matches app version", async () => {
-      storeState.set("dualUiOnboardingVersion", "1.1.0")
-      await expect(resolveOnboardingComplete(pluginSettings, "1.1.0")).resolves.toBe(true)
+    it("honors the saved completion flag without a version", async () => {
+      storeState.set("onboardingCompleteV1", true)
+      await expect(resolveOnboardingComplete()).resolves.toBe(true)
+    })
+
+    it("honors an explicitly incomplete flag", async () => {
+      storeState.set("dualUiOnboardingVersion", "1.0.0")
+      storeState.set("onboardingCompleteV1", false)
+      await expect(resolveOnboardingComplete()).resolves.toBe(false)
     })
   })
 

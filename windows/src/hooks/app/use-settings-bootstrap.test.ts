@@ -35,7 +35,6 @@ const {
   normalizePluginSettingsMock,
   savePluginSettingsMock,
   resolveOnboardingCompleteMock,
-  getVersionMock,
 } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
   isTauriMock: vi.fn(),
@@ -70,16 +69,11 @@ const {
   normalizePluginSettingsMock: vi.fn(),
   savePluginSettingsMock: vi.fn(),
   resolveOnboardingCompleteMock: vi.fn(),
-  getVersionMock: vi.fn(),
 }))
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: invokeMock,
   isTauri: isTauriMock,
-}))
-
-vi.mock("@tauri-apps/api/app", () => ({
-  getVersion: getVersionMock,
 }))
 
 vi.mock("@tauri-apps/plugin-autostart", () => ({
@@ -240,8 +234,6 @@ describe("useSettingsBootstrap", () => {
     normalizePluginSettingsMock.mockReset()
     savePluginSettingsMock.mockReset()
     resolveOnboardingCompleteMock.mockReset()
-    getVersionMock.mockReset()
-    getVersionMock.mockResolvedValue("1.1.0")
 
     isTauriMock.mockReturnValue(true)
     isAutostartEnabledMock.mockResolvedValue(true)
@@ -325,10 +317,7 @@ describe("useSettingsBootstrap", () => {
     renderHook(() => useSettingsBootstrap(args))
 
     await waitFor(() => {
-      expect(resolveOnboardingCompleteMock).toHaveBeenCalledWith(
-        { order: ["codex"], disabled: [] },
-        "1.1.0",
-      )
+      expect(resolveOnboardingCompleteMock).toHaveBeenCalledWith()
       expect(args.setOnboardingComplete).toHaveBeenCalledWith(false)
     })
   })
