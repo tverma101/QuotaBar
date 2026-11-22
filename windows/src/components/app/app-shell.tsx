@@ -95,7 +95,10 @@ export function AppShell({
   const bumpPollsVisit = useProductPollsStore((s) => s.bumpPollsVisit)
   useTrayRestartBridge(updateStatus, onUpdateInstall)
   const platform = usePlatform()
-  const macPopoverChrome = isTauri() && platform === "macos"
+  // macOS and Windows run the same frameless tray popover (borderless window,
+  // click-away dismiss); Linux keeps the native-title-bar layout.
+  const popoverChrome = isTauri() && (platform === "macos" || platform === "windows")
+  const macPopoverChrome = platform === "macos"
   const panelMotionRef = useMotionPointer(!reduceAnimations)
 
   const onViewChange = (view: Parameters<typeof setActiveView>[0]) => {
@@ -108,6 +111,7 @@ export function AppShell({
       {/* SVG filter definitions for the liquid-distort effect; rendered off-screen */}
       <LiquidGlassFilter active={themeMode === "glass"} />
       {macPopoverChrome ? <div className="tray-arrow" aria-hidden="true" /> : null}
+      {/* Windows popover anchors above/beside the taskbar, so no top arrow. */}
       <div
         ref={panelMotionRef}
         className="app-panel-surface relative w-full overflow-hidden rounded-[18px] select-none flex flex-col"
@@ -130,7 +134,7 @@ export function AppShell({
             pollsBadge={pollsBadge}
           />
           <div className="app-main-pane relative flex-1 flex flex-col px-3 pt-2 pb-1.5 min-w-0">
-            {macPopoverChrome ? (
+            {popoverChrome ? (
               <button
                 type="button"
                 className="absolute right-2 top-1 z-30 flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"

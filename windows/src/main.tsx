@@ -33,8 +33,9 @@ console.warn = (...args: unknown[]) => {
 };
 
 /**
- * macOS only: undecorated tray popover look (transparent html/body; see `index.css`).
- * Linux/Windows use native title bar from Rust `panel_*::init` — no blur-to-hide.
+ * macOS only: content-sized undecorated popover (transparent html/body; see `index.css`).
+ * Windows is also a frameless tray popover but keeps a fixed window and fills it
+ * (the `html:not(.tauri-popover)` layout); Linux keeps the native title bar.
  */
 if (isTauri()) {
   void (async () => {
