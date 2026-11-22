@@ -3741,29 +3741,19 @@ mod tests {
     fn cursor_paths_resolve_state_db_accepts_zero_args_from_js() {
         let rt = Runtime::new().expect("runtime");
         let ctx = Context::full(&rt).expect("context");
+        let app_data = tempfile::tempdir().expect("app data fixture");
+        let app_data_path = app_data.path().to_path_buf();
         ctx.with(|ctx| {
-            let app_data = std::env::temp_dir();
-            inject_host_api(&ctx, "cursor", "cursor", None, &app_data, "0.0.0")
-                .expect("inject host api");
-
-            let message: String = ctx
-                .eval(
-                    r#"
-                    try {
-                        var res = __openusage_ctx.host.cursorPaths.resolveStateDb();
-                        res === null || typeof res === "string" ? "ok" : "unexpected:" + typeof res;
-                    } catch (e) {
-                        String(e);
-                    }
-                    "#,
-                )
-                .expect("js eval");
-
-            assert_eq!(
-                message, "ok",
-                "zero-arg cursorPaths.resolveStateDb() should succeed without arity TypeError, got: {}",
-                message
-            );
+            for plugin_id in ["cursor", "test-without-cursor"] {
+                inject_host_api(&ctx, plugin_id, plugin_id, None, &app_data_path, "0.0.0")
+                    .expect("inject host api");
+                let expected = crate::cursor_paths::resolve_cursor_state_db_for_plugin_id(plugin_id)
+                    .map(|path| path.to_string_lossy().into_owned());
+                let result: Option<String> = ctx
+                    .eval("__openusage_ctx.host.cursorPaths.resolveStateDb()")
+                    .expect("resolveStateDb must accept a zero-argument call");
+                assert_eq!(result, expected, "{plugin_id}");
+            }
         });
     }
 

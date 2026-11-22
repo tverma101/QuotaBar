@@ -46,6 +46,9 @@ jobs:
       - name: Test Frontend and Providers
         run: bun run test
 
+      - name: Test Native CLI and Provider Runtime
+        run: cargo test --locked --release -p quotabar-core -p quotabar-cli
+
       - name: Build x64 Installer
         shell: pwsh
         run: |
@@ -60,9 +63,6 @@ jobs:
             $buildArgs += @('--config', $config)
           }
           bun run tauri:build @buildArgs -- --locked
-
-      - name: Test Native CLI and Provider Runtime
-        run: cargo test --locked --release -p quotabar-core -p quotabar-cli
 
       - name: Upload Windows QA Installer
         uses: actions/upload-artifact@v7
