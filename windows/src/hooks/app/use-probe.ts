@@ -36,10 +36,17 @@ export function useProbe({
   } = useProbeState({ onProbeResult })
 
   const handleBatchComplete = useCallback(
-    (pluginIds: string[]) => {
-      finalizeStaleProbeLoading(pluginIds)
+    (pluginIds: string[] | null) => {
+      // Unknown (backend-initiated) batch: clear loading on everything still
+      // waiting, since the events that would have resolved it were dropped.
+      const ids =
+        pluginIds ??
+        Object.keys(pluginStatesRef.current).filter(
+          (id) => pluginStatesRef.current[id]?.loading
+        )
+      finalizeStaleProbeLoading(ids)
     },
-    [finalizeStaleProbeLoading]
+    [finalizeStaleProbeLoading, pluginStatesRef]
   )
   const resolveProbeTargets = useCallback((pluginIds?: string[]) => {
     const settings =

@@ -181,8 +181,10 @@ describe("useProbeEvents", () => {
     resultListener?.({ payload: { batchId: "other", output } })
     completeListener?.({ payload: { batchId: "other" } })
 
-    expect(onResult).not.toHaveBeenCalled()
-    expect(onBatchComplete).not.toHaveBeenCalled()
+    // Unknown (backend-initiated) batches still deliver results; batch-complete
+    // reports null so callers can finalize plugins stuck in loading.
+    expect(onResult).toHaveBeenCalledWith(output)
+    expect(onBatchComplete).toHaveBeenCalledWith(null)
   })
 
   it("rejects when invoke fails", async () => {
