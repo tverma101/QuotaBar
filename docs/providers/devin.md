@@ -6,7 +6,7 @@ Tracks your Devin quota using the login from the Devin CLI or the Devin app.
 
 | Metric | Meaning |
 |---|---|
-| Weekly | Weekly quota used (falls back to the daily figure when Devin reports no weekly quota) |
+| Weekly | Weekly quota used (falls back to the daily figure only when Devin reports neither a weekly percentage nor a usable weekly reset; a valid reset with no percentage means the window is exhausted) |
 | Daily | Daily quota used (hidden by default when Devin does not return a daily quota; an explicit Customize opt-in keeps the empty state visible) |
 | Extra Balance | Overage/extra-usage balance in dollars |
 
@@ -28,7 +28,7 @@ If the CLI credentials fail but the app is signed in with a different account, t
 - **"Devin's service returned an error (HTTP …)"** — Devin's API answered with an error status. QuotaBar logs the status; try again in a moment.
 - **"Devin returned quota data QuotaBar couldn't read"** — the response no longer matches the expected shape. QuotaBar logs this so the change can be diagnosed.
 - **"Couldn't reach Devin"** — the request never completed. Check the connection and try again.
-- **Weekly shows the daily figure** — when Devin reports no separate weekly quota, the daily quota is shown in the Weekly row so it stays meaningful.
+- **Weekly shows the daily figure** — only when Devin reports neither a weekly percentage nor a usable weekly reset does the daily quota fill the Weekly row (with no reset time of its own). A valid weekly reset with an absent percentage instead means the weekly window is exhausted, so the row reads 100% used.
 
 ## Under the hood
 

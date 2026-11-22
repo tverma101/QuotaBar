@@ -104,3 +104,11 @@ Adapted upstream `214ba770`: the screenshot action appears while the pointer is 
 
 Adapted upstream `8a883219` to carry Claude Extra Usage's billing currency and minor-unit scale through
 the dashboard and local limits API. Existing USD output and the fork's uncapped-row behavior are retained.
+
+## Devin weekly-quota exhausted-window adaptation
+
+Adapted upstream `6a28acec`: a missing weekly percentage paired with a valid future weekly
+reset is treated as an exhausted window (100% used), not "no weekly quota" — proto3 JSON
+omits zero values. The hidden-daily fallback in `DevinUsageMapper` now applies only when
+both the percentage and a usable reset are absent, and present-but-unreadable percentages
+fail as invalid responses.

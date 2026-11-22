@@ -136,14 +136,76 @@ final class DevinUsageMapperTests: XCTestCase {
         planStatus["planInfo"] = planInfo
         planStatus["dailyQuotaRemainingPercent"] = 30
         planStatus.removeValue(forKey: "weeklyQuotaRemainingPercent")
+        planStatus.removeValue(forKey: "weeklyQuotaResetAtUnix")
         userStatus["planStatus"] = planStatus
 
-        let mapped = try DevinUsageMapper.mapUserStatus(userStatus)
+        let mapped = try DevinUsageMapper.mapUserStatus(userStatus, now: now)
 
         XCTAssertNil(progress(mapped.lines, "Daily quota"))
         // The hidden daily quota fills the missing Weekly row and is still flipped from "remaining"
         // to "used": 30% remaining -> 70% used (not passed through raw as 30).
         XCTAssertEqual(progress(mapped.lines, "Weekly quota")?.used, 70)
+        XCTAssertNil(progress(mapped.lines, "Weekly quota")?.resetsAt,
+                     "the fallback row never borrows the weekly reset instant")
+    }
+
+    func testValidWeeklyResetWithAbsentPercentageMeansExhaustedWindow() throws {
+        for hideDailyQuota in [true, false] {
+            var userStatus = makeUserStatus()
+            var planStatus = userStatus["planStatus"] as! [String: Any]
+            var planInfo = planStatus["planInfo"] as! [String: Any]
+            planInfo["hideDailyQuota"] = hideDailyQuota
+            planStatus["planInfo"] = planInfo
+            planStatus["dailyQuotaRemainingPercent"] = 100
+            // Proto3 JSON omits zero values: percentage gone, valid future reset stays.
+            planStatus.removeValue(forKey: "weeklyQuotaRemainingPercent")
+            userStatus["planStatus"] = planStatus
+
+            let mapped = try DevinUsageMapper.mapUserStatus(userStatus, now: now)
+
+            XCTAssertEqual(progress(mapped.lines, "Weekly quota")?.used, 100,
+                           "hideDailyQuota=\(hideDailyQuota): 0%% remaining -> exhausted")
+            XCTAssertEqual(progress(mapped.lines, "Weekly quota")?.limit, 100)
+            XCTAssertEqual(progress(mapped.lines, "Weekly quota")?.resetsAt,
+                           Date(timeIntervalSince1970: 1_774_166_400))
+            XCTAssertEqual(progress(mapped.lines, "Weekly quota")?.periodDurationMs,
+                           DevinUsageMapper.weekPeriodMs)
+            if hideDailyQuota {
+                XCTAssertNil(progress(mapped.lines, "Daily quota"))
+            }
+        }
+    }
+
+    func testInvalidWeeklyPercentageThrowsInvalidResponse() {
+        for invalid: Any in ["abc", true, NSNull(), Double.nan] {
+            var userStatus = makeUserStatus()
+            var planStatus = userStatus["planStatus"] as! [String: Any]
+            planStatus["weeklyQuotaRemainingPercent"] = invalid
+            userStatus["planStatus"] = planStatus
+
+            XCTAssertThrowsError(try DevinUsageMapper.mapUserStatus(userStatus, now: now)) { error in
+                XCTAssertEqual(error as? DevinUsageError, .invalidResponse,
+                               "present-but-unreadable weekly percentage \(invalid) must fail")
+            }
+        }
+    }
+
+    func testStaleWeeklyResetWithAbsentPercentageStillUsesDailyFallback() throws {
+        var userStatus = makeUserStatus()
+        var planStatus = userStatus["planStatus"] as! [String: Any]
+        var planInfo = planStatus["planInfo"] as! [String: Any]
+        planInfo["hideDailyQuota"] = true
+        planStatus["planInfo"] = planInfo
+        planStatus["dailyQuotaRemainingPercent"] = 30
+        planStatus.removeValue(forKey: "weeklyQuotaRemainingPercent")
+        // A past reset is not a valid reset, so it cannot mark the window exhausted.
+        planStatus["weeklyQuotaResetAtUnix"] = String(Int(now.timeIntervalSince1970) - 1)
+        userStatus["planStatus"] = planStatus
+
+        let mapped = try DevinUsageMapper.mapUserStatus(userStatus, now: now)
+
+        XCTAssertEqual(progress(mapped.lines, "Weekly quota")?.used, 70)
+        XCTAssertNil(progress(mapped.lines, "Weekly quota")?.resetsAt)
     }
 
     func testThrowsQuotaUnavailableWhenNoDisplayableFieldsExist() {
