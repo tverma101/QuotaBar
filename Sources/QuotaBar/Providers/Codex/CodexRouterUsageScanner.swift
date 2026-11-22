@@ -2,7 +2,10 @@ import Darwin
 import Foundation
 
 enum CodexRouterUsageScanResult: Sendable {
-    case complete(LogUsageScan?)
+    /// The fold finished. `damagedLines` counts ledger rows skipped for damage (unparseable JSON,
+    /// structurally invalid usage) — the ledger is append-only, so aborting on one damaged row used
+    /// to freeze the whole router fold forever with a full multi-MB rebuild every refresh.
+    case complete(LogUsageScan?, damagedLines: Int)
     case incomplete
 }
 
@@ -82,6 +85,8 @@ actor CodexRouterUsageScanner {
         /// If the system clock moves back before an already included event, rebuild instead of
         /// serving a cached current-day total that now lies in the future.
         var latestIncludedEventAt: Date?
+        /// Ledger rows skipped for damage while this aggregate was built.
+        var damagedLines: Int = 0
     }
 
     private enum AggregateCacheLookup {
@@ -144,9 +149,12 @@ actor CodexRouterUsageScanner {
 
     private var aggregateCache: AggregateCache?
 
-    /// Empty checkpoint: router lines are independent (no cross-line parser state).
+    /// Near-empty checkpoint: router lines are independent (no cross-line parser state), but the
+    /// damaged-row count rides along so a checkpoint hit keeps reporting the ledger's damage
+    /// instead of silently forgetting it.
     private struct ParserCheckpoint: Sendable, Equatable {
         var emitSince: Date? = nil
+        var damagedLines: Int = 0
     }
 
     private static let sharedTailCache = AppendOnlyFileTailCache<Event, ParserCheckpoint>(
@@ -179,6 +187,13 @@ actor CodexRouterUsageScanner {
 
     static func unloadSharedTailCacheItems() {
         sharedTailCache.unloadRetainedItems()
+    }
+
+    /// Memory-pressure hook: the retained fold result is a priced `LogUsageScan` covering the full
+    /// retention window. It is recomputable from the durable aggregate index, so drop it and let the
+    /// next scan rebuild — matching the shared tail/parsed-item unloads above.
+    func unloadLocalAccountingCachesForMemoryPressure() {
+        aggregateCache = nil
     }
 
     static func clearSharedTailCacheForTesting(path: String, retentionDays: Int = 35) {
@@ -266,7 +281,7 @@ actor CodexRouterUsageScanner {
             now: now,
             pricing: pricing
         ) {
-        case .complete(let scan): return scan
+        case .complete(let scan, _): return scan
         case .incomplete: return nil
         }
     }
@@ -380,7 +395,7 @@ actor CodexRouterUsageScanner {
             guard !Task.isCancelled,
                   sourcesAndAliasesStillMatch(preflight)
             else { return .incomplete }
-            return .complete(cachedResult)
+            return .complete(cachedResult, damagedLines: aggregateCache?.damagedLines ?? 0)
         }
         let sourceFiles = preflight.sourceFiles
         let sourceRevisions = preflight.sourceRevisions
@@ -400,7 +415,7 @@ actor CodexRouterUsageScanner {
                     expectedAliasIds: expectedAliasIds,
                     allowsUnscopedEvents: allowsUnscopedEvents
                 ) {
-                    fold.sawInvalidUsageRow = true
+                    fold.noteDamagedLine()
                 }
                 return
             }
@@ -445,7 +460,7 @@ actor CodexRouterUsageScanner {
                     fold.accumulator.markUnmeasuredUsage(day: DailyUsageAccumulator.dayKey(from: event.timestamp, calendar: calendar))
                     return
                 }
-                fold.sawInvalidUsageRow = true
+                fold.noteDamagedLine()
                 return
             }
             guard total > 0 else { return }
@@ -546,7 +561,6 @@ actor CodexRouterUsageScanner {
         // Unit tests inject an in-memory ledger, but still use the production byte parser so the
         // assertions cover exactly the parser used by automatic indexing.
         if let readFile {
-            var malformedEventLine = false
             for path in ledgerPaths() {
                 guard !Task.isCancelled else { return .incomplete }
                 guard let contents = readFile(path) else { continue }
@@ -560,11 +574,10 @@ actor CodexRouterUsageScanner {
                     case .event(let event): visitOne(event)
                     case .malformedEvent(let event): visitOne(event)
                     case .irrelevant: break
-                    case .malformed: malformedEventLine = true
+                    case .malformed: fold.noteDamagedLine()
                     }
                 }
             }
-            guard !malformedEventLine else { return .incomplete }
         } else {
             guard let files = sourceFiles else { return .incomplete }
             // Keep ~35 days of parsed rows in the append checkpoint so multi-account refreshes
@@ -582,7 +595,7 @@ actor CodexRouterUsageScanner {
                 deltas.reserveCapacity(changedSources.count)
                 var everyTailReadSucceeded = !changedSources.isEmpty
                 for (previous, source) in changedSources {
-                    guard let events = Self.parseAppendedEvents(
+                    guard let appended = Self.parseAppendedEvents(
                         at: URL(fileURLWithPath: source.path),
                         from: previous,
                         emitSince: emitSince,
@@ -591,7 +604,8 @@ actor CodexRouterUsageScanner {
                         everyTailReadSucceeded = false
                         break
                     }
-                    deltas.append((source.path, events))
+                    fold.noteDamagedLines(appended.damagedLines)
+                    deltas.append((source.path, appended.events))
                 }
                 if everyTailReadSucceeded {
                     usedTailOnlyUpdate = true
@@ -613,11 +627,15 @@ actor CodexRouterUsageScanner {
                     since: cacheSince,
                     cacheIdentity: Self.sharedCacheIdentity(retentionDays: retentionDays),
                     parseFile: { url in
-                        Self.parseFileIncrementally(
+                        let outcome = Self.parseFileIncrementally(
                             at: url,
                             emitSince: emitSince,
                             retentionDays: retentionDays
                         )
+                        if outcome.events != nil {
+                            fold.noteParseDamage(path: url.path, cumulativeCount: outcome.damagedLines)
+                        }
+                        return outcome.events
                     },
                     visit: { event in
                         if event.isMalformedRouterEvent || event.timestamp >= since {
@@ -634,8 +652,9 @@ actor CodexRouterUsageScanner {
         }
 
         // A cancelled tail fold must not publish a partial aggregate for an unchanged source revision.
-        guard !Task.isCancelled, !fold.sawInvalidUsageRow else { return .incomplete }
+        guard !Task.isCancelled else { return .incomplete }
 
+        let totalDamagedLines = (incrementalBase?.damagedLines ?? 0) + fold.damagedLines
         let result = JSONLAccountingWorkPacer.shared.perform { () -> LogUsageScan? in
             let deltaResult: LogUsageScan?
             if fold.sawRows {
@@ -664,24 +683,53 @@ actor CodexRouterUsageScanner {
                     itemCountsByPath: fold.itemCountsByPath,
                     result: result,
                     nextFutureEventAt: nextFutureEventAt,
-                    latestIncludedEventAt: latestIncludedEventAt
+                    latestIncludedEventAt: latestIncludedEventAt,
+                    damagedLines: totalDamagedLines
                 )
                 return true
             }
             guard sourceStayedStable else { return .incomplete }
         }
-        return .complete(result)
+        return .complete(result, damagedLines: totalDamagedLines)
     }
 
     /// Escaping fold visits cannot capture `inout` accumulators; this tiny box owns them.
     private final class AggregateFoldState: @unchecked Sendable {
         var sawRows = false
-        var sawInvalidUsageRow = false
+        /// Ledger rows skipped for damage (unparseable row, or a structurally invalid usage row
+        /// belonging to this account). Counted, not fatal: one damaged row must not freeze the
+        /// whole append-only ledger's fold forever.
+        private let damageLock = NSLock()
+        private var parseDamageByPath: [String: Int] = [:]
+        private(set) var damagedLines = 0
         var accumulator = DailyUsageAccumulator()
         var itemCountsByPath: [String: Int] = [:]
         var nextFutureEventAt: Date?
         var latestIncludedEventAt: Date?
         let pricingCache = RouterModelPricingCache()
+
+        /// One damaged row seen while visiting events (serial per fold).
+        func noteDamagedLine() {
+            damageLock.withLock { damagedLines += 1 }
+        }
+
+        /// A batch of damaged rows counted outside a visit (a damaged-run parse).
+        func noteDamagedLines(_ count: Int) {
+            guard count > 0 else { return }
+            damageLock.withLock { damagedLines += count }
+        }
+
+        /// A parse reported the file's cumulative damage. The per-path max wins so a mid-pass
+        /// re-invoked parse (resident items unloaded, checkpoint hit returning the same count)
+        /// can never double-count one file's damage.
+        func noteParseDamage(path: String, cumulativeCount: Int) {
+            damageLock.withLock {
+                let known = parseDamageByPath[path] ?? 0
+                guard cumulativeCount > known else { return }
+                parseDamageByPath[path] = cumulativeCount
+                damagedLines += cumulativeCount - known
+            }
+        }
     }
 
     /// Pricing resolution is stable for a slug within one scan, except the reserve fallback whose
@@ -954,13 +1002,14 @@ actor CodexRouterUsageScanner {
     }
 
     /// Read only bytes after the prior EOF when the file still proves to be an append of the same
-    /// prefix. Otherwise stream a full parse and replace the checkpoint.
+    /// prefix. Otherwise stream a full parse and replace the checkpoint. Damaged rows are skipped
+    /// and counted; `events` is `nil` only when the file could not be read.
     nonisolated private static func parseFileIncrementally(
         at url: URL,
         emitSince: Date,
         retentionDays: Int
-    ) -> [Event]? {
-        guard acquireSharedTailCacheLock() else { return nil }
+    ) -> (events: [Event]?, damagedLines: Int) {
+        guard acquireSharedTailCacheLock() else { return (nil, 0) }
         defer { sharedTailCacheLock.unlock() }
         let key = sharedTailCacheKey(for: url, retentionDays: retentionDays)
         let currentRevision = AppendOnlyFileProbe.revision(at: url)
@@ -976,7 +1025,7 @@ actor CodexRouterUsageScanner {
         {
             if cached.itemsAvailable {
                 let recent = Self.recentEvents(cached.items, since: emitSince)
-                return Task.isCancelled ? nil : recent
+                return (Task.isCancelled ? nil : recent, cached.parserState.damagedLines)
             }
             // Checkpoint valid but items were unloaded (memory pressure). Must full-reparse —
             // returning [] would silently drop history. Routine refresh paths no longer unload
@@ -999,7 +1048,7 @@ actor CodexRouterUsageScanner {
            AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor
         {
             var collected: [Event] = []
-            var malformedLine = false
+            var damagedLines = 0
             var timestampCache = CodexRouterEventLineParser.TimestampCache()
             var read = JSONLFileReader.readLines(
                 at: url,
@@ -1017,10 +1066,10 @@ actor CodexRouterUsageScanner {
                 case .malformedEvent(let event):
                     collected.append(event)
                 case .malformed:
-                    malformedLine = true
+                    damagedLines += 1
                 }
             }
-            guard read.isComplete, !malformedLine else { return nil }
+            guard read.isComplete else { return (nil, 0) }
             guard AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor else {
                 return fullParseAndCheckpoint(
                     at: url,
@@ -1043,7 +1092,7 @@ actor CodexRouterUsageScanner {
                     collected.append(event)
                     read.finalPartial = Data()
                 case .malformed:
-                    return nil
+                    damagedLines += 1
                 }
             }
 
@@ -1055,7 +1104,7 @@ actor CodexRouterUsageScanner {
                let anchor = AppendOnlyFileProbe.anchor(at: url, endingAt: newOffset)
             {
                 var merged = Self.recentEvents(cached.items, since: emitSince)
-                guard !Task.isCancelled else { return nil }
+                guard !Task.isCancelled else { return (nil, 0) }
                 merged.append(contentsOf: collected)
                 sharedTailCache.store(
                     AppendOnlyFileTailCache<Event, ParserCheckpoint>.Entry(
@@ -1064,14 +1113,17 @@ actor CodexRouterUsageScanner {
                         anchor: anchor,
                         partialLine: read.finalPartial,
                         isDiscardingOversizedLine: read.isDiscardingOversizedLine,
-                        parserState: ParserCheckpoint(emitSince: emitSince),
+                        parserState: ParserCheckpoint(
+                            emitSince: emitSince,
+                            damagedLines: cached.parserState.damagedLines + damagedLines
+                        ),
                         items: merged
                     ),
                     for: key,
                     parseKind: .tail,
                     bytesRead: read.statistics.bytesRead
                 )
-                return merged
+                return (merged, cached.parserState.damagedLines + damagedLines)
             }
             return fullParseAndCheckpoint(
                 at: url,
@@ -1089,13 +1141,13 @@ actor CodexRouterUsageScanner {
 
     /// Parse an append for the resident account-fold cache without rebuilding the full historical
     /// `[Event]` array. The aggregate cache already owns the old fold; this updates only the byte
-    /// checkpoint and hands back the newly appended rows.
+    /// checkpoint and hands back the newly appended rows. Damaged rows are skipped and counted.
     nonisolated private static func parseAppendedEvents(
         at url: URL,
         from previousSource: SourceRevision,
         emitSince: Date,
         retentionDays: Int
-    ) -> [Event]? {
+    ) -> (events: [Event], damagedLines: Int)? {
         guard acquireSharedTailCacheLock() else { return nil }
         defer { sharedTailCacheLock.unlock() }
         let key = sharedTailCacheKey(for: url, retentionDays: retentionDays)
@@ -1120,7 +1172,7 @@ actor CodexRouterUsageScanner {
            cached.parserState.emitSince == emitSince,
            AppendOnlyFileProbe.anchor(at: url, endingAt: previousRevision.size) == previousSource.prefixAnchor,
            AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor {
-            return cached.appendedItems
+            return (cached.appendedItems, 0)
         }
 
         guard cached.revision == previousRevision,
@@ -1132,7 +1184,7 @@ actor CodexRouterUsageScanner {
         else { return nil }
 
         var collected: [Event] = []
-        var malformedLine = false
+        var damagedLines = 0
         var timestampCache = CodexRouterEventLineParser.TimestampCache()
         var read = JSONLFileReader.readLines(
             at: url,
@@ -1150,10 +1202,10 @@ actor CodexRouterUsageScanner {
             case .malformedEvent(let event):
                 collected.append(event)
             case .malformed:
-                malformedLine = true
+                damagedLines += 1
             }
         }
-        guard read.isComplete, !malformedLine,
+        guard read.isComplete,
               AppendOnlyFileProbe.anchor(at: url, endingAt: cached.offset) == cached.anchor
         else { return nil }
 
@@ -1170,7 +1222,7 @@ actor CodexRouterUsageScanner {
                 collected.append(event)
                 read.finalPartial = Data()
             case .malformed:
-                return nil
+                damagedLines += 1
             }
         }
 
@@ -1201,7 +1253,7 @@ actor CodexRouterUsageScanner {
             bytesRead: read.statistics.bytesRead,
             retainItems: false
         )
-        return collected
+        return (collected, damagedLines)
     }
 
     nonisolated private static func acquireSharedTailCacheLock() -> Bool {
@@ -1220,9 +1272,9 @@ actor CodexRouterUsageScanner {
         at url: URL,
         emitSince: Date,
         key: String
-    ) -> [Event]? {
+    ) -> (events: [Event]?, damagedLines: Int) {
         var collected: [Event] = []
-        var malformedLine = false
+        var damagedLines = 0
         var timestampCache = CodexRouterEventLineParser.TimestampCache()
         var read = JSONLFileReader.readLines(
             at: url,
@@ -1237,10 +1289,10 @@ actor CodexRouterUsageScanner {
             case .malformedEvent(let event):
                 collected.append(event)
             case .malformed:
-                malformedLine = true
+                damagedLines += 1
             }
         }
-        guard read.isComplete, !malformedLine else { return nil }
+        guard read.isComplete else { return (nil, 0) }
         if !read.finalPartial.isEmpty,
            CodexRouterEventLineParser.looksLikeCompleteObject(read.finalPartial[...]) {
             switch parseLine(read.finalPartial[...], timestampCache: &timestampCache) {
@@ -1253,7 +1305,7 @@ actor CodexRouterUsageScanner {
                 collected.append(event)
                 read.finalPartial = Data()
             case .malformed:
-                return nil
+                damagedLines += 1
             }
         }
         let offset = UInt64(read.statistics.bytesRead)
@@ -1267,7 +1319,7 @@ actor CodexRouterUsageScanner {
                     anchor: anchor,
                     partialLine: read.finalPartial,
                     isDiscardingOversizedLine: read.isDiscardingOversizedLine,
-                    parserState: ParserCheckpoint(emitSince: emitSince),
+                    parserState: ParserCheckpoint(emitSince: emitSince, damagedLines: damagedLines),
                     items: collected
                 ),
                 for: key,
@@ -1275,7 +1327,7 @@ actor CodexRouterUsageScanner {
                 bytesRead: read.statistics.bytesRead
             )
         }
-        return collected
+        return (collected, damagedLines)
     }
 
     nonisolated private static func parseLine(
@@ -1683,11 +1735,11 @@ actor CodexRouterUsageScanner {
         )
         let prior: CodexRouterAggregateIndex.Record?
         switch lookup {
-        case .hit(let cached):
+        case let .hit(cached, damagedLines):
             guard !Task.isCancelled,
                   identityAliasesStillMatch(aliasSnapshot, hasLedgerSources: !discovery.files.isEmpty)
             else { return incomplete("cached-identity-changed") }
-            return .complete(cached)
+            return .complete(cached, damagedLines: damagedLines)
         case .append(let record):
             prior = record
         case .rebuild:
@@ -1704,7 +1756,7 @@ actor CodexRouterUsageScanner {
                     expectedAliasIds: expectedAliasIds,
                     allowsUnscopedEvents: allowsUnscopedEvents
                 ) {
-                    fold.sawInvalidUsageRow = true
+                    fold.noteDamagedLine()
                 }
                 return
             }
@@ -1736,7 +1788,7 @@ actor CodexRouterUsageScanner {
                     fold.accumulator.markUnmeasuredUsage(day: DailyUsageAccumulator.dayKey(from: event.timestamp, calendar: calendar))
                     return
                 }
-                fold.sawInvalidUsageRow = true
+                fold.noteDamagedLine()
                 return
             }
             guard total > 0 else { return }
@@ -1835,7 +1887,6 @@ actor CodexRouterUsageScanner {
             }
             let start = tail ? (saved?.offset ?? 0) : 0
             var timestampCache = CodexRouterEventLineParser.TimestampCache()
-            var malformedEventLine = false
             var read = JSONLFileReader.readLines(
                 at: url,
                 chunkSize: 256 * 1024,
@@ -1849,10 +1900,10 @@ actor CodexRouterUsageScanner {
                 case .event(let event): visit(event)
                 case .malformedEvent(let event): visit(event)
                 case .irrelevant: break
-                case .malformed: malformedEventLine = true
+                case .malformed: fold.noteDamagedLine()
                 }
             }
-            guard read.isComplete, !malformedEventLine, !fold.sawInvalidUsageRow else { return incomplete("read-incomplete-parse-\(read.isComplete)-\(malformedEventLine)-\(fold.sawInvalidUsageRow)") }
+            guard read.isComplete else { return incomplete("read-incomplete-parse-\(read.isComplete)") }
             if !read.finalPartial.isEmpty,
                CodexRouterEventLineParser.looksLikeCompleteObject(read.finalPartial[...]) {
                 switch CodexRouterEventLineParser.parseResult(read.finalPartial[...], timestampCache: &timestampCache) {
@@ -1865,7 +1916,9 @@ actor CodexRouterUsageScanner {
                 case .irrelevant:
                     read.finalPartial = Data()
                 case .malformed:
-                    return incomplete("partial-line-malformed")
+                    // The final fragment is not a complete object; it stays checkpoint carry and is
+                    // re-examined on the next append. Count it, don't fail the fold.
+                    fold.noteDamagedLine()
                 }
             }
             let newOffset = start + UInt64(max(0, read.statistics.bytesRead))
@@ -1882,7 +1935,7 @@ actor CodexRouterUsageScanner {
             checkpoints.append(checkpoint)
             index.noteParse(path: file.path, full: !tail, bytes: read.statistics.bytesRead)
         }
-        guard !Task.isCancelled, !fold.sawInvalidUsageRow else { return incomplete("cancelled-or-invalid-row") }
+        guard !Task.isCancelled else { return incomplete("cancelled") }
         beforeAggregateValidationForTesting?()
         let currentDiscovery = Self.discoveredLedgers(
             paths: paths,
@@ -1913,6 +1966,9 @@ actor CodexRouterUsageScanner {
         let foldDependencies = fold.pricingCache.dependencySnapshot()
         let dependencies = prior?.pricingDependencies.map { $0.merged(with: foldDependencies) }
             ?? foldDependencies
+        // Same principle for damage: the saved record carries the whole ledger's count so a
+        // checkpoint hit keeps surfacing the caveat.
+        let totalDamagedLines = (prior?.damagedLines ?? 0) + fold.damagedLines
         index.save(CodexRouterAggregateIndex.Record(
             schema: CodexRouterAggregateIndex.schema,
             key: key,
@@ -1921,9 +1977,10 @@ actor CodexRouterUsageScanner {
             nextFutureEventAt: nextFuture,
             latestIncludedEventAt: latestIncluded,
             complete: true,
-            pricingDependencies: dependencies
+            pricingDependencies: dependencies,
+            damagedLines: totalDamagedLines
         ))
-        return .complete(result)
+        return .complete(result, damagedLines: totalDamagedLines)
     }
 
 }

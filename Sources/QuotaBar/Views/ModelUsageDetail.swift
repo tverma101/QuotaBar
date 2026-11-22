@@ -1,8 +1,9 @@
 import SwiftUI
 
 /// Hover detail for a spend period: a flat ranked list of models, each with name/cost and
-/// share-percent/token lines over a proportional bar. The Other row lists each contributor's name,
-/// tokens and price rather than an unexplained extra-model count. The header carries only the period name — the hovered row right below
+/// share-percent/token lines over a proportional bar. The Other row keeps the ranked list honest
+/// without dumping its whole tail on the reader: its contributors (name, tokens and price each)
+/// stay collapsed behind a chevron until expanded. The header carries only the period name — the hovered row right below
 /// already shows the period total, so repeating it here would duplicate (and wrap on) long figures.
 /// Mirrors `UsageTrendDetail`'s calm — header + flat list + source note.
 struct ModelUsageDetail: View {
@@ -11,6 +12,10 @@ struct ModelUsageDetail: View {
     var onHoverChange: (Bool) -> Void
 
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
+    /// Other rows whose contributor lists are currently revealed. Kept per presentation (not
+    /// persisted like the dashboard's per-provider carets): reopening a popover collapses again,
+    /// so a quick value glance never has to wade past the long tail.
+    @State private var expandedOthers: Set<String> = []
 
     private static let width: CGFloat = 280
 
@@ -63,16 +68,22 @@ struct ModelUsageDetail: View {
             .foregroundStyle(.primary)
     }
 
-    /// Model name / cost on top, share percent / tokens beneath. The Other row can add a compact
-    /// contributor line below its label; the percent line answers what the bar can't say precisely.
+    /// Model name / cost on top, share percent / tokens beneath. The Other row adds a chevron next
+    /// to its name that reveals its compact contributor list below; the percent line answers what
+    /// the bar can't say precisely.
     private func modelRow(_ model: ModelUsageEntry, share: Double?, percent: Int?) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
+        let contributors = Self.otherContributors(for: model)
+        let isExpanded = expandedOthers.contains(model.model)
+        return VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                VStack(alignment: .leading, spacing: 1) {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text(model.model)
                         .font(.system(size: density.supportingPointSize, weight: .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
+                    if !contributors.isEmpty {
+                        otherExpandToggle(model, isExpanded: isExpanded)
+                    }
                 }
                 Spacer(minLength: 8)
                 if model.costUSD != nil {
@@ -121,8 +132,7 @@ struct ModelUsageDetail: View {
             .frame(height: density.meterHeight)
             .padding(.top, 2)
 
-            let contributors = Self.otherContributors(for: model)
-            if !contributors.isEmpty {
+            if !contributors.isEmpty && isExpanded {
                 Group {
                     if contributors.count <= 8 {
                         contributorRows(contributors)
@@ -140,6 +150,29 @@ struct ModelUsageDetail: View {
             }
         }
         .padding(.vertical, density.textRowPadding)
+    }
+
+    /// Chevron revealing an Other row's contributor list — the same idiom as the dashboard's
+    /// per-provider caret (`WidgetGroupedListView.expandToggle`). Collapsed by default so the
+    /// ranked list stays scannable; the chevron signals that the folded tail is one tap away.
+    private func otherExpandToggle(_ model: ModelUsageEntry, isExpanded: Bool) -> some View {
+        Button {
+            withAnimation(Motion.spring) {
+                if isExpanded {
+                    expandedOthers.remove(model.model)
+                } else {
+                    expandedOthers.insert(model.model)
+                }
+            }
+        } label: {
+            Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                .font(.system(size: density.supportingPointSize - 3, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 12, height: 12)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isExpanded ? "Show less" : "Show more")
     }
 
     private func contributorRows(_ contributors: [ModelUsageVariant]) -> some View {

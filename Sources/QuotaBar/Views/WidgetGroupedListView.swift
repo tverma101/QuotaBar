@@ -27,9 +27,9 @@ struct WidgetGroupedListView: View {
         // Provider-section spacing is noticeably wider than the in-card row rhythm (so groups
         // still read as groups); the exact step comes from the density setting.
         //
-        // `displayGroups` is a computed property that rebuilds dictionaries + filters per access;
-        // capture it once per body evaluation so the `.animation` identity doesn't recompute the
-        // whole thing a second time.
+        // `displayGroups` is memoized on the store (it used to rebuild dictionaries + filters
+        // per access); capture it once per body evaluation so the `.animation` identity reads the
+        // same array the ForEach does.
         let groups = layout.displayGroups
         return VStack(alignment: .leading, spacing: density.sectionSpacing) {
             ForEach(groups) { group in
@@ -51,12 +51,14 @@ struct WidgetGroupedListView: View {
         // the panel's initial mount. One resolution now drives both the visibility decision and the
         // rendered card.
         let resolved = resolveRows(for: group)
+        let headerInfo = dataStore.providerHeaderInfo[group.provider.id]
+            ?? dataStore.headerInfo(for: group.provider.id)
         let showSection = ProviderSectionVisibility.shouldRender(
             hasVisibleMetric: resolved.hasVisibleRow,
-            hasPlan: dataStore.plan(for: group.provider.id) != nil,
-            hasNotice: dataStore.headerNotice(for: group.provider.id) != nil,
+            hasPlan: headerInfo.plan != nil,
+            hasNotice: headerInfo.warningMessage != nil,
             isRefreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
-            hasStaleness: dataStore.stalenessHint(for: group.provider.id) != nil
+            hasStaleness: headerInfo.stalenessHint != nil
         )
         if showSection {
             sectionBody(group, resolved: resolved)
@@ -86,15 +88,17 @@ struct WidgetGroupedListView: View {
     }
 
     private func header(_ group: ProviderGroup) -> some View {
-        ProviderSectionHeader(
+        let headerInfo = dataStore.providerHeaderInfo[group.provider.id]
+            ?? dataStore.headerInfo(for: group.provider.id)
+        return ProviderSectionHeader(
             provider: group.provider,
-            plan: dataStore.plan(for: group.provider.id),
-            warning: dataStore.headerNotice(for: group.provider.id),
+            plan: headerInfo.plan,
+            warning: headerInfo.warningMessage,
             refreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
-            staleness: dataStore.stalenessHint(for: group.provider.id),
+            staleness: headerInfo.stalenessHint,
             cardIsHovered: hoveredProviderID == group.provider.id,
             onCopyScreenshot: { shareCard(group) },
-            onRefresh: dataStore.errorMessage(for: group.provider.id) == nil
+            onRefresh: headerInfo.errorMessage == nil
                 ? nil
                 : { retryProvider(group.provider.id) }
         )
@@ -161,7 +165,10 @@ struct WidgetGroupedListView: View {
         var id: String {
             switch self {
             case .metric(let row):
-                "metric:\(row.descriptor.id)"
+                // The raw descriptor id is unique here — the sentinel ids below can't collide with
+                // real "provider.metric" ids — so no "metric:" prefix (or its per-render
+                // interpolation) is needed.
+                row.descriptor.id
             case .divider:
                 "expanded-divider"
             case .links:
@@ -247,7 +254,7 @@ struct WidgetGroupedListView: View {
     private func resolvedRows(_ widgets: [PlacedWidget]) -> [ResolvedRow] {
         widgets.compactMap { widget -> ResolvedRow? in
             guard let descriptor = layout.descriptor(for: widget) else { return nil }
-            let data = dataStore.data(for: descriptor)
+            let data = dataStore.widgetDataByDescriptorID[descriptor.id] ?? dataStore.data(for: descriptor)
             if !ProviderSectionVisibility.shouldRenderMetricRow(
                 providerID: descriptor.providerID,
                 descriptorID: descriptor.id,
@@ -467,7 +474,8 @@ struct WidgetGroupedListView: View {
     private func makeMetricLift(for descriptor: WidgetDescriptor, value: DragGesture.Value) -> ReorderLift? {
         ReorderLift.make(
             id: descriptor.id,
-            payload: .dashboardMetric(data: dataStore.data(for: descriptor)),
+            payload: .dashboardMetric(data: dataStore.widgetDataByDescriptorID[descriptor.id]
+                ?? dataStore.data(for: descriptor)),
             value: value,
             frames: frameStore.frames
         )

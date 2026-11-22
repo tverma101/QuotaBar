@@ -24,6 +24,9 @@ final class CodexProvider: ProviderRuntime {
     let expectedIdentityKey: String?
     private var lastResolvedAccountIdentityKey: String?
     private var lastNativeScan: LogUsageScan?
+    /// Damaged-record count that accompanied `lastNativeScan`, so a local-accounting wake reusing
+    /// the cached scan keeps surfacing the same caveat.
+    private var lastNativeScanDamagedLines = 0
     private var lastProxyScan: LogUsageScan?
     private var lastPiScan: LogUsageScan?
     let allowsKeychainFallback: Bool
@@ -217,16 +220,28 @@ final class CodexProvider: ProviderRuntime {
         )
     }
 
+    /// Memory-pressure hook, mirroring Antigravity/Freebuff/ZAI: the retained per-scan
+    /// `LogUsageScan`s (native sessions, FCC proxy, pi) and the router fold's aggregate are all
+    /// recomputable — the fold re-derives them from the durable caches on the next pass.
+    func unloadLocalAccountingCachesForMemoryPressure() async {
+        lastNativeScan = nil
+        lastNativeScanDamagedLines = 0
+        lastProxyScan = nil
+        lastPiScan = nil
+        await routerUsageScanner.unloadLocalAccountingCachesForMemoryPressure()
+    }
+
     /// The in-process fold-only body, kept verbatim as the scan worker's fallback (and the child's
     /// own path): the router ledger and native sessions fold without re-reading live quota APIs.
     private func foldOnlySnapshotInProcess() async -> ProviderSnapshot {
         var lines: [MetricLine] = []
         let accountIdentityKey = expectedIdentityKey ?? lastResolvedAccountIdentityKey
         let usageHistory: ProviderUsageHistory?
+        var historyWarning: String?
         if let accountIdentityKey {
             let modelPricing = await pricing()
             guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-            usageHistory = await appendLocalUsage(
+            (usageHistory, historyWarning) = await appendLocalUsage(
                 to: &lines,
                 now: now(),
                 pricing: modelPricing,
@@ -244,7 +259,8 @@ final class CodexProvider: ProviderRuntime {
             plan: nil,
             lines: lines,
             refreshedAt: now(),
-            usageHistory: usageHistory
+            usageHistory: usageHistory,
+            historyWarning: historyWarning
         )
     }
 
@@ -304,12 +320,13 @@ final class CodexProvider: ProviderRuntime {
         // the rate-limit API. Skip the expensive local JSONL / FCC / CodexRouter history scan;
         // the data store merges prior token/history lines onto this snapshot.
         let usageHistory: ProviderUsageHistory?
+        var historyWarning: String?
         if ProviderRefreshContext.scope.skipsLocalAccounting {
             usageHistory = nil
         } else {
             let pricing = await pricing()
             try Task.checkCancellation()
-            usageHistory = await appendLocalUsage(
+            (usageHistory, historyWarning) = await appendLocalUsage(
                 to: &mapped.lines,
                 now: now(),
                 pricing: pricing,
@@ -323,7 +340,8 @@ final class CodexProvider: ProviderRuntime {
             plan: mapped.plan,
             lines: mapped.lines,
             refreshedAt: now(),
-            usageHistory: usageHistory
+            usageHistory: usageHistory,
+            historyWarning: historyWarning
         )
     }
 
@@ -334,6 +352,7 @@ final class CodexProvider: ProviderRuntime {
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         var lines: [MetricLine] = []
         let usageHistory: ProviderUsageHistory?
+        var historyWarning: String?
         if ProviderRefreshContext.scope.skipsLocalAccounting {
             // Meters-only pass: do not scrape local history just to paint a warning card; keep
             // prior spend/history via the data-store merge.
@@ -342,7 +361,7 @@ final class CodexProvider: ProviderRuntime {
             if let accountIdentityKey = expectedIdentityKey ?? lastResolvedAccountIdentityKey {
                 let modelPricing = await pricing()
                 guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-                usageHistory = await appendLocalUsage(
+                (usageHistory, historyWarning) = await appendLocalUsage(
                     to: &lines,
                     now: now(),
                     pricing: modelPricing,
@@ -359,7 +378,8 @@ final class CodexProvider: ProviderRuntime {
             lines: lines,
             refreshedAt: now(),
             usageHistory: usageHistory,
-            warning: "Live Codex limits unavailable: \(error.localizedDescription)"
+            warning: "Live Codex limits unavailable: \(error.localizedDescription)",
+            historyWarning: historyWarning
         )
     }
 
@@ -368,8 +388,8 @@ final class CodexProvider: ProviderRuntime {
         now: Date,
         pricing: ModelPricing,
         accountIdentityKey: String?
-    ) async -> ProviderUsageHistory? {
-        guard !Task.isCancelled else { return nil }
+    ) async -> (history: ProviderUsageHistory?, historyWarning: String?) {
+        guard !Task.isCancelled else { return (nil, nil) }
         // Unscoped legacy router rows (no account fingerprint) are only safe on the
         // single/default card. Multi-account cards always carry expectedIdentityKey and
         // therefore require a matching stamp — see CodexRouterUsageScanner.
@@ -392,11 +412,13 @@ final class CodexProvider: ProviderRuntime {
             now: now,
             pricing: pricing
         )
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled else { return (nil, nil) }
         let routerScan: LogUsageScan?
+        var routerDamagedLines = 0
         switch routerResult {
-        case .complete(let scan):
+        case .complete(let scan, let damagedLines):
             routerScan = scan
+            routerDamagedLines = damagedLines
             DiagnosticGate.clearFailure(routerIncompleteDiagnosticKey)
         case .incomplete:
             DiagnosticGate.logOnce(for: routerIncompleteDiagnosticKey) {
@@ -405,15 +427,17 @@ final class CodexProvider: ProviderRuntime {
                     "Codex Router scan was incomplete; keeping the previous combined usage history"
                 )
             }
-            return nil
+            return (nil, nil)
         }
         // Native sessions may contain days that never passed through Codex Router. Their per-file
         // aggregates skip unchanged events, so preserving gap-fill history needs no repeated fold.
         let isLocalAccountingWake = ProviderRefreshContext.scope == .localAccounting
 
         let nativeScan: LogUsageScan?
+        var nativeDamagedLines = 0
         if isLocalAccountingWake, let cached = lastNativeScan {
             nativeScan = cached
+            nativeDamagedLines = lastNativeScanDamagedLines
         } else {
             let nativeResult = await logUsageScanner.scanResult(
                 daysBack: UsageHistoryWindow.lifetimeDays(through: now),
@@ -421,12 +445,17 @@ final class CodexProvider: ProviderRuntime {
                 pricing: pricing,
                 peerHomes: peerHomes()
             )
-            guard !Task.isCancelled else { return nil }
+            guard !Task.isCancelled else { return (nil, nil) }
             switch nativeResult {
-            case .complete(let scan):
+            case .complete(let scan, let damagedLines):
                 nativeScan = scan
+                nativeDamagedLines = damagedLines
                 lastNativeScan = scan
+                lastNativeScanDamagedLines = damagedLines
                 DiagnosticGate.clearFailure(nativeIncompleteDiagnosticKey)
+            case .deferredByFutureTimestamp:
+                DiagnosticGate.clearFailure(nativeIncompleteDiagnosticKey)
+                return (nil, "Codex history is paused: a session file holds a timestamp in the future.")
             case .incomplete:
                 DiagnosticGate.logOnce(for: nativeIncompleteDiagnosticKey) {
                     AppLog.warn(
@@ -434,7 +463,7 @@ final class CodexProvider: ProviderRuntime {
                         "Codex session discovery or fold was incomplete; keeping the previous combined usage history"
                     )
                 }
-                return nil
+                return (nil, nil)
             }
         }
 
@@ -448,13 +477,13 @@ final class CodexProvider: ProviderRuntime {
                 now: now,
                 pricing: pricing
             )
-            guard !Task.isCancelled else { return nil }
+            guard !Task.isCancelled else { return (nil, nil) }
             switch proxyResult {
             case .complete(let scan):
                 proxyScan = scan
                 lastProxyScan = scan
             case .incomplete:
-                return nil
+                return (nil, nil)
             }
         }
 
@@ -470,7 +499,7 @@ final class CodexProvider: ProviderRuntime {
                     pricing: pricing
                 )
                 : .complete(nil)
-            guard !Task.isCancelled else { return nil }
+            guard !Task.isCancelled else { return (nil, nil) }
             switch piResult {
             case .complete(let scan):
                 piScan = scan
@@ -483,7 +512,7 @@ final class CodexProvider: ProviderRuntime {
                         "Codex pi session discovery was incomplete; keeping the previous combined usage history"
                     )
                 }
-                return nil
+                return (nil, nil)
             }
         }
         // Multi-account cards (expectedIdentityKey set): prefer CodexRouter stamped metering as
@@ -529,7 +558,7 @@ final class CodexProvider: ProviderRuntime {
             usedRouter = logsProxyAndRouter.usedSupplement
         }
         guard let scan = DailyUsageAccumulator.merged([coreScan, piScan]) else {
-            return nil
+            return (nil, nil)
         }
 
         let sourceNames = [
@@ -565,7 +594,19 @@ final class CodexProvider: ProviderRuntime {
             apiEstimateByDay: scan.apiEstimateByDay
         )
         SpendTileMapper.appendUsageTrend(scan.series, to: &lines, now: now, note: note)
-        return usageHistory
+        // Damaged records are skipped, not fatal — but the caveat must be visible instead of the
+        // numbers silently drifting low.
+        let damagedLines = routerDamagedLines + nativeDamagedLines
+        let historyWarning: String?
+        if damagedLines > 0 {
+            DiagnosticGate.logOnce(for: "codex.damaged-records.\(provider.id)") {
+                AppLog.warn(LogTag.plugin("codex"), "Codex skipped \(damagedLines) damaged log records")
+            }
+            historyWarning = "Codex skipped \(damagedLines) damaged log record\(damagedLines == 1 ? "" : "s"); recent totals may be slightly low."
+        } else {
+            historyWarning = nil
+        }
+        return (usageHistory, historyWarning)
     }
 
     private func fetchResetCreditsBestEffort(accessToken: String, accountID: String?) async throws -> HTTPResponse? {

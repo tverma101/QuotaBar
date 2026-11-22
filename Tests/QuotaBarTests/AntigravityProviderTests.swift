@@ -1071,6 +1071,74 @@ final class AntigravityProviderTests: XCTestCase {
     }
 
     @MainActor
+    func testExpiredAccessTokenWithFailingDerivedTokenStillRefreshesOAuth() async throws {
+        // The Keychain access token is expired and the derived cached token hits a transient
+        // outage. That is still expired-auth evidence worth an OAuth refresh — the outage must not
+        // be misreported as a dead sign-in without even trying the refresh credential.
+        let wrapped = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2000-01-01T00:00:00Z"}}"#
+        let files = FakeFiles()
+        let authStore = AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: files)
+        let source = try XCTUnwrap(authStore.loadKeychainToken())
+        XCTAssertTrue(try authStore.cacheToken("ya29.cached", expiresIn: 3_600, matching: source))
+        let routing = RoutingHTTPClient { request in
+            let token = request.headers["Authorization"]?.replacingOccurrences(of: "Bearer ", with: "")
+            if request.url.host == "oauth2.googleapis.com" {
+                return HTTPResponse(
+                    statusCode: 200,
+                    headers: [:],
+                    body: Data(#"{"access_token":"ya29.new","expires_in":3600}"#.utf8)
+                )
+            }
+            if token == "ya29.new", request.url.path == AntigravityUsageClient.quotaSummaryPath {
+                let body = #"{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8}]}]}"#
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(body.utf8))
+            }
+            return HTTPResponse(statusCode: 503, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: authStore,
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertEqual(used(snapshot.line(label: "Session")), 20)
+        XCTAssertEqual(
+            routing.requests.filter { $0.url.host == "oauth2.googleapis.com" }.count,
+            1,
+            "a known-expired access token must attempt the refresh credential"
+        )
+    }
+
+    @MainActor
+    func testExpiredAccessTokenDerivedOutageWithFailedRefreshReportsUnavailable() async throws {
+        // Same layout, but the OAuth refresh is down too. The failed refresh is transient, so the
+        // snapshot reports .network — not .authExpired.
+        let wrapped = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2000-01-01T00:00:00Z"}}"#
+        let files = FakeFiles()
+        let authStore = AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: files)
+        let source = try XCTUnwrap(authStore.loadKeychainToken())
+        XCTAssertTrue(try authStore.cacheToken("ya29.cached", expiresIn: 3_600, matching: source))
+        let routing = RoutingHTTPClient { _ in
+            HTTPResponse(statusCode: 503, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: authStore,
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .network)
+        XCTAssertEqual(routing.requests.filter { $0.url.host == "oauth2.googleapis.com" }.count, 1)
+    }
+
+    @MainActor
     func testRefreshAfterSuccessfulRefreshTreatsOutageAsUnavailable() async {
         // First fetch 401 -> OAuth refresh succeeds -> retry fetch 503. The refreshed token is valid, so
         // this is a transient outage (.network), not authExpired.

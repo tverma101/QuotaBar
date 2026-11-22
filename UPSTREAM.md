@@ -99,3 +99,11 @@ rewritten, and upstream attribution must be preserved.
 ## Popup adaptation — 2026-11-07
 
 Adapted upstream `214ba770`: the screenshot action appears while the pointer is over a provider card. The existing single dashboard and customization controls remain in place.
+
+## Devin weekly-quota exhausted-window adaptation
+
+Adapted upstream `6a28acec`: a missing weekly percentage paired with a valid future weekly
+reset is treated as an exhausted window (100% used), not "no weekly quota" — proto3 JSON
+omits zero values. The hidden-daily fallback in `DevinUsageMapper` now applies only when
+both the percentage and a usable reset are absent, and present-but-unreadable percentages
+fail as invalid responses.

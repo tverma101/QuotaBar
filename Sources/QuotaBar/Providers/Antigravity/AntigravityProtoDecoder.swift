@@ -106,7 +106,15 @@ enum AntigravityProtoDecoder {
     /// used for singular usage messages: duplicates are rejected so partial accounting is never
     /// published after silently ignoring one protobuf occurrence.
     private static func matchingFields(_ requested: UInt32, in bytes: [UInt8]) -> [WireValue]? {
-        var values: [WireValue] = []
+        matchingFields([requested], in: bytes).map { $0[requested] ?? [] }
+    }
+
+    /// One validating walk that collects several fields at once, keyed by field number.
+    private static func matchingFields(
+        _ requested: Set<UInt32>,
+        in bytes: [UInt8]
+    ) -> [UInt32: [WireValue]]? {
+        var values: [UInt32: [WireValue]] = [:]
         var offset = 0
         while offset < bytes.count {
             guard let tag = decodeVarint(bytes, at: offset),
@@ -115,7 +123,9 @@ enum AntigravityProtoDecoder {
             switch tag.value & 0x7 {
             case 0:
                 guard let value = decodeVarint(bytes, at: tag.nextOffset) else { return nil }
-                if number == requested { values.append(.varint(value.value)) }
+                if requested.contains(number) {
+                    values[number, default: []].append(.varint(value.value))
+                }
                 offset = value.nextOffset
             case 2:
                 guard let length = decodeVarint(bytes, at: tag.nextOffset),
@@ -123,14 +133,14 @@ enum AntigravityProtoDecoder {
                       let count = Int(exactly: length.value)
                 else { return nil }
                 let end = length.nextOffset + count
-                if number == requested {
-                    values.append(.bytes(Array(bytes[length.nextOffset..<end])))
+                if requested.contains(number) {
+                    values[number, default: []].append(.bytes(Array(bytes[length.nextOffset..<end])))
                 }
                 offset = end
             case 1, 5:
                 let width = tag.value & 0x7 == 1 ? 8 : 4
                 guard bytes.count - tag.nextOffset >= width else { return nil }
-                if number == requested { values.append(.fixed) }
+                if requested.contains(number) { values[number, default: []].append(.fixed) }
                 offset = tag.nextOffset + width
             default:
                 return nil
@@ -201,15 +211,14 @@ enum AntigravityProtoDecoder {
     /// generations omit these auxiliary IDs on both sides, so keep the legacy indexed timestamp
     /// behavior when neither side supplies one.
     private static func correlatedStepTimestamp(
-        generation: [UInt8],
-        wrapped: [UInt8],
+        generationUUID: IdentifierEvidence,
+        usageFields: [WireValue],
         stepMetadata: [UInt8]
     ) -> Int64? {
         guard identifiersAreCompatible(
-                identifierEvidence(4, in: generation),
+                generationUUID,
                 identifierEvidence(12, in: stepMetadata)
               ),
-              let usageFields = matchingFields(4, in: wrapped),
               usageFields.count == 1,
               case .bytes(let usage) = usageFields[0],
               identifiersAreCompatible(
@@ -223,6 +232,10 @@ enum AntigravityProtoDecoder {
 
     private static func identifierEvidence(_ number: UInt32, in bytes: [UInt8]) -> IdentifierEvidence {
         guard let fields = matchingFields(number, in: bytes) else { return .invalid }
+        return identifierEvidence(fields)
+    }
+
+    private static func identifierEvidence(_ fields: [WireValue]) -> IdentifierEvidence {
         guard !fields.isEmpty else { return .absent }
         guard fields.count == 1,
               case .bytes(let value) = fields[0],
@@ -264,26 +277,57 @@ enum AntigravityProtoDecoder {
         return event
     }
 
+    /// The decode outcome plus the row's step identity, populated only on `.undatedUsage` so the
+    /// caller can resolve the row against a step index without reparsing the blob.
+    struct GenerationDecoding: Sendable {
+        let result: GenerationEventDecodeResult
+        let undatedStepIdentity: StepIdentity?
+    }
+
     static func decodeGenerationEvent(
         from blob: [UInt8],
         stepMetadata: [UInt8]? = nil,
         matchedStepTimestamp: Int64? = nil
     ) -> GenerationEventDecodeResult {
-        guard let wrappers = matchingFields(1, in: blob) else {
-            return .malformedUsage(timestampSeconds: nil)
+        decodeGeneration(
+            from: blob,
+            stepMetadata: stepMetadata,
+            matchedStepTimestamp: matchedStepTimestamp
+        ).result
+    }
+
+    static func decodeGeneration(
+        from blob: [UInt8],
+        stepMetadata: [UInt8]? = nil,
+        matchedStepTimestamp: Int64? = nil
+    ) -> GenerationDecoding {
+        func result(_ result: GenerationEventDecodeResult) -> GenerationDecoding {
+            GenerationDecoding(result: result, undatedStepIdentity: nil)
         }
-        guard !wrappers.isEmpty else { return .ignored }
+        // One validating walk per message collects every field the decode needs; the old code
+        // re-scanned the blob and the wrapped event once per requested field.
+        guard let generation = matchingFields([1, 4], in: blob) else {
+            return result(.malformedUsage(timestampSeconds: nil))
+        }
+        let wrappers = generation[1] ?? []
+        guard !wrappers.isEmpty else { return result(.ignored) }
         guard wrappers.count == 1,
               case .bytes(let wrapped) = wrappers[0]
-        else { return .malformedUsage(timestampSeconds: nil) }
+        else { return result(.malformedUsage(timestampSeconds: nil)) }
 
+        guard let wrappedFields = matchingFields([19, 9, 4], in: wrapped) else {
+            return result(.malformedUsage(timestampSeconds: matchedStepTimestamp))
+        }
+        let usageFields = wrappedFields[4] ?? []
         let fallbackTimestamp = matchedStepTimestamp ?? stepMetadata.flatMap {
-            correlatedStepTimestamp(generation: blob, wrapped: wrapped, stepMetadata: $0)
+            correlatedStepTimestamp(
+                generationUUID: identifierEvidence(generation[4] ?? []),
+                usageFields: usageFields,
+                stepMetadata: $0
+            )
         }
 
-        guard let modelFields = matchingFields(19, in: wrapped) else {
-            return .malformedUsage(timestampSeconds: fallbackTimestamp)
-        }
+        let modelFields = wrappedFields[19] ?? []
         let modelBytes: [UInt8]?
         if modelFields.count == 1,
            case .bytes(let bytes) = modelFields[0]
@@ -297,16 +341,17 @@ enum AntigravityProtoDecoder {
         let decodedModel = modelBytes.flatMap { String(bytes: $0, encoding: .utf8) }
         let model = decodedModel?.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard let timestampFields = matchingFields(9, in: wrapped), timestampFields.count <= 1 else {
-            return .malformedUsage(timestampSeconds: fallbackTimestamp)
+        let timestampFields = wrappedFields[9] ?? []
+        guard timestampFields.count <= 1 else {
+            return result(.malformedUsage(timestampSeconds: fallbackTimestamp))
         }
         let embeddedTimestamp: Int64?
         if let timestampField = timestampFields.first {
             guard case .bytes(let timestampBytes) = timestampField else {
-                return .malformedUsage(timestampSeconds: fallbackTimestamp)
+                return result(.malformedUsage(timestampSeconds: fallbackTimestamp))
             }
             guard let timestampMessages = matchingFields(4, in: timestampBytes) else {
-                return .malformedUsage(timestampSeconds: fallbackTimestamp)
+                return result(.malformedUsage(timestampSeconds: fallbackTimestamp))
             }
             if timestampMessages.count == 1,
                case .bytes(let wallClock) = timestampMessages[0]
@@ -320,15 +365,12 @@ enum AntigravityProtoDecoder {
         }
         let timestamp = embeddedTimestamp ?? fallbackTimestamp
 
-        guard let usageFields = matchingFields(4, in: wrapped) else {
-            return .malformedUsage(timestampSeconds: timestamp)
-        }
-        guard !usageFields.isEmpty else { return .ignored }
+        guard !usageFields.isEmpty else { return result(.ignored) }
         guard usageFields.count == 1,
               case .bytes(let usage) = usageFields[0],
               let counts = tokenCounts(in: usage)
         else {
-            return .malformedUsage(timestampSeconds: timestamp)
+            return result(.malformedUsage(timestampSeconds: timestamp))
         }
 
         let rawSystemPrompt = counts.systemPrompt
@@ -341,7 +383,7 @@ enum AntigravityProtoDecoder {
               rawOutput <= ceiling,
               rawCacheRead <= ceiling
         else {
-            return .invalidTokenCount(timestampSeconds: timestamp)
+            return result(.invalidTokenCount(timestampSeconds: timestamp))
         }
 
         let systemPromptTokens = Int(rawSystemPrompt)
@@ -351,7 +393,7 @@ enum AntigravityProtoDecoder {
 
         let billableInputTokens = systemPromptTokens.addingReportingOverflow(inputTokens)
         guard !billableInputTokens.overflow else {
-            return .invalidTokenCount(timestampSeconds: timestamp)
+            return result(.invalidTokenCount(timestampSeconds: timestamp))
         }
         let inputAndCache = billableInputTokens.partialValue.addingReportingOverflow(cacheReadTokens)
         let total = inputAndCache.partialValue.addingReportingOverflow(outputTokens)
@@ -359,19 +401,25 @@ enum AntigravityProtoDecoder {
               billableInputTokens.partialValue <= maximumTokenCount,
               total.partialValue <= maximumTokenCount
         else {
-            return .invalidTokenCount(timestampSeconds: timestamp)
+            return result(.invalidTokenCount(timestampSeconds: timestamp))
         }
-        guard total.partialValue > 0 else { return .ignored }
+        guard total.partialValue > 0 else { return result(.ignored) }
 
-        guard let timestamp else { return .undatedUsage }
+        guard let timestamp else {
+            let identity = stepIdentity(
+                identifierEvidence(generation[4] ?? []),
+                identifierEvidence(7, in: usage)
+            )
+            return GenerationDecoding(result: .undatedUsage, undatedStepIdentity: identity)
+        }
 
-        return .event(GenerationEvent(
+        return result(.event(GenerationEvent(
             model: model.flatMap { $0.isEmpty ? nil : $0 } ?? GenerationEvent.unknownModel,
             inputTokens: billableInputTokens.partialValue,
             outputTokens: outputTokens,
             cacheReadTokens: cacheReadTokens,
             timestampSeconds: timestamp
-        ))
+        )))
     }
 
     /// Decode the whole usage message so a present counter with the wrong wire type or malformed

@@ -982,6 +982,35 @@ final class CodexLogUsageScannerTests: XCTestCase {
                       "the session fallback model prices, so no warning triangle")
     }
 
+    /// A torn token_count record (a crash mid-write) is damaged data: the scan completes with the
+    /// readable rows instead of freezing all Codex history forever, and reports the damage so the
+    /// card can caveat its totals.
+    func testTornTokenCountLineIsSkippedAndCountedAsDamage() async throws {
+        let day = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-3600))
+        let valid = CodexLogFixture.tokenCount(
+            timestamp: day, last: CodexLogFixture.usage(input: 100, output: 50), model: "gpt-5.2"
+        )
+        // Cut mid-JSON just past the token_count marker so the parser classifies the line as
+        // damaged. Cut relative to the marker itself: fixture JSON key order is not guaranteed.
+        let markerEnd = valid.range(of: "token_count")!.upperBound
+        let tornEnd = valid.index(markerEnd, offsetBy: 10, limitedBy: valid.endIndex) ?? valid.endIndex
+        let torn = String(valid[..<tornEnd])
+        XCTAssertTrue(torn.contains("token_count"),
+                      "the torn line must reach the marker to count as damaged usage data")
+        let home = try CodexLogFixture.makeHome(files: [
+            "sessions/rollout-a.jsonl": torn + "\n" + valid
+        ])
+        let scanner = CodexLogFixture.scanner(home: home)
+
+        let result = await scanner.scanResult(now: Date(), pricing: fixedRates())
+        guard case .complete(let scan, let damagedLines) = result else {
+            return XCTFail("a torn record must not turn the scan incomplete")
+        }
+        XCTAssertEqual(scan?.series.daily.reduce(0) { $0 + $1.totalTokens }, 150,
+                       "the readable token_count row still counts")
+        XCTAssertEqual(damagedLines, 1)
+    }
+
     /// Manual parity harness against the real logs on this machine: prints per-day totals to compare
     /// with `ccusage codex daily --json --offline`. Gated like the other live tests.
     func testParityAgainstRealLocalLogs() async throws {
@@ -1197,33 +1226,36 @@ final class CodexLogUsageScannerTests: XCTestCase {
         XCTAssertTrue(retried?.isEmpty == true, "the retry must use the complete peer hardlink set")
     }
 
-    func testScanResultDistinguishesIncompleteDiscoveryFromCompleteEmptySource() async throws {
-        let incompleteHome = try CodexLogFixture.makeHome(files: [
+    func testStrayNonDirectoryArchiveEntryIsSkippedNotFatal() async throws {
+        // A stray *file* named archived_sessions (editor artifact, partial move, …) is not usage
+        // data and never heals — it must not freeze the whole card's history. Discovery skips the
+        // pseudo-source and the scan completes like any other history read.
+        let strayHome = try CodexLogFixture.makeHome(files: [
             "sessions/readable.jsonl": "{\"type\":\"session_meta\"}\n"
         ])
-        defer { try? FileManager.default.removeItem(at: incompleteHome) }
+        defer { try? FileManager.default.removeItem(at: strayHome) }
         try "unreadable-root".write(
-            to: incompleteHome.appendingPathComponent("archived_sessions"),
+            to: strayHome.appendingPathComponent("archived_sessions"),
             atomically: true,
             encoding: .utf8
         )
-        let incompleteScanner = CodexLogFixture.scanner(home: incompleteHome)
-        let incomplete = await incompleteScanner.scanResult(now: Date(), pricing: .empty)
-        guard case .incomplete = incomplete else {
-            return XCTFail("a partial Codex root must remain distinguishable from empty history")
+        let strayScanner = CodexLogFixture.scanner(home: strayHome)
+        let stray = await strayScanner.scanResult(now: Date(), pricing: .empty)
+        guard case .complete = stray else {
+            return XCTFail("a stray non-directory archive entry must not turn discovery incomplete")
         }
 
         let emptyHome = try CodexLogFixture.makeHome()
         defer { try? FileManager.default.removeItem(at: emptyHome) }
         let emptyScanner = CodexLogFixture.scanner(home: emptyHome)
         let empty = await emptyScanner.scanResult(now: Date(), pricing: .empty)
-        guard case .complete(let scan) = empty else {
+        guard case .complete(let scan, _) = empty else {
             return XCTFail("a completed empty Codex scan is valid empty history")
         }
         XCTAssertNil(scan)
     }
 
-    func testSessionFileDiscoveryRejectsAnIncompleteExistingRoot() throws {
+    func testSessionFileDiscoverySkipsStrayNonDirectoryArchiveEntry() throws {
         let home = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-partial-root-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: home) }
@@ -1234,15 +1266,18 @@ final class CodexLogUsageScannerTests: XCTestCase {
             atomically: true,
             encoding: .utf8
         )
-        // Codex normally uses this path as a directory. If it exists as an unreadable/non-directory
-        // entry, the readable `sessions` tree is only a partial view and must not publish as complete.
+        // Codex normally uses this path as a directory. A stray *file* there is not usage data and
+        // never heals; discovery skips the pseudo-source and keeps the readable sessions tree.
         try "unreadable-root".write(
             to: home.appendingPathComponent("archived_sessions"),
             atomically: true,
             encoding: .utf8
         )
 
-        XCTAssertNil(CodexLogUsageScanner.sessionFilesIfComplete(homes: [home]))
+        let files = CodexLogUsageScanner.sessionFilesIfComplete(homes: [home])
+        XCTAssertEqual(files?.count, 1, "the readable sessions tree must still be discovered")
+        XCTAssertTrue(files?.first?.path.hasSuffix("sessions/2026/readable.jsonl") == true,
+                      "unexpected discovery result: \(files?.first?.path ?? "nil")")
     }
 
 }

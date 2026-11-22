@@ -27,6 +27,16 @@ extension View {
     func hoverTooltip(_ text: String?) -> some View {
         modifier(HoverTooltipModifier(text: text))
     }
+
+    /// Deferred-text form of `hoverTooltip(_:)`: `text` is built inside the modifier, so a
+    /// tooltip-disabled subtree (share-card exports) skips the string work entirely — the string
+    /// argument form evaluates it before the modifier can check. Use this for tooltips that cost
+    /// something to build (date formatting, sorted joins). Presentation is identical; the text is
+    /// still resolved once per live render — the nil-gated anchor fast path and the accessibility
+    /// hint both need it — so only the disabled path saves work.
+    func hoverTooltip(_ text: @escaping () -> String?) -> some View {
+        modifier(DeferredHoverTooltipModifier(text: text))
+    }
 }
 
 /// Per-target nesting depth so a nested control's tooltip beats its container's when a hover sits in
@@ -161,6 +171,63 @@ private struct HoverTooltipModifier: ViewModifier {
     /// Reflect the current hover state into the presenter: show this target's text while hovered, drop
     /// it when there's no text. A no-op when not hovered (so a text change off-hover does nothing).
     private func syncPresenter() {
+        guard isHovering else { return }
+        if let resolved {
+            TooltipPresenter.shared.enter(id: id, text: resolved, depth: depth, anchor: anchor)
+        } else {
+            TooltipPresenter.shared.exit(id: id)
+        }
+    }
+}
+
+/// `HoverTooltipModifier` with the text behind a closure (see `hoverTooltip(_ text: () -> String?)`).
+/// Same machinery — the builder is resolved once per body pass where a decorated target is possible.
+private struct DeferredHoverTooltipModifier: ViewModifier {
+    let text: () -> String?
+    @Environment(\.tooltipDepth) private var depth
+    @Environment(\.hoverTooltipsDisabled) private var disabled
+    @State private var id = UUID()
+    @State private var anchor = TooltipAnchor()
+    @State private var isHovering = false
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if disabled {
+            content
+        } else {
+            decorated(content)
+        }
+    }
+
+    @ViewBuilder
+    private func decorated(_ content: Content) -> some View {
+        let resolved = text().flatMap { $0.isEmpty ? nil : $0 }
+        if resolved == nil {
+            content
+        } else {
+            content
+                .environment(\.tooltipDepth, depth + 1)
+                .background { TooltipAnchorView(anchor: anchor) }
+                .accessibilityHint(resolved ?? "")
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active:
+                        isHovering = true
+                        syncPresenter(resolved)
+                    case .ended:
+                        isHovering = false
+                        TooltipPresenter.shared.exit(id: id)
+                    }
+                }
+                .onChange(of: resolved) { _, new in syncPresenter(new) }
+                .onDisappear {
+                    isHovering = false
+                    TooltipPresenter.shared.exit(id: id)
+                }
+        }
+    }
+
+    private func syncPresenter(_ resolved: String?) {
         guard isHovering else { return }
         if let resolved {
             TooltipPresenter.shared.enter(id: id, text: resolved, depth: depth, anchor: anchor)

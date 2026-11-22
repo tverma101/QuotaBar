@@ -33,6 +33,9 @@ enum DevinUsageMapper {
 
         let dailyRemaining = ProviderParse.number(planStatus["dailyQuotaRemainingPercent"])
         let weeklyRemaining = ProviderParse.number(planStatus["weeklyQuotaRemainingPercent"])
+        if planStatus["weeklyQuotaRemainingPercent"] != nil, weeklyRemaining == nil {
+            throw DevinUsageError.invalidResponse
+        }
         let dailyReset = hideDailyQuota ? nil : unixSecondsToDate(planStatus["dailyQuotaResetAtUnix"], now: now)
         let weeklyReset = unixSecondsToDate(planStatus["weeklyQuotaResetAtUnix"], now: now)
         let extraUsageBalance = dollarsFromMicros(planStatus["overageBalanceMicros"])
@@ -48,7 +51,8 @@ enum DevinUsageMapper {
             ))
         }
 
-        if let weeklyRemaining {
+        // Proto3 JSON omits zero values. A valid weekly reset identifies an exhausted window.
+        if let weeklyRemaining = weeklyRemaining ?? (weeklyReset != nil ? 0 : nil) {
             lines.append(quotaLine(
                 label: "Weekly quota",
                 remaining: weeklyRemaining,
@@ -57,12 +61,11 @@ enum DevinUsageMapper {
             ))
         } else if hideDailyQuota,
                   let dailyRemaining {
-            // No weekly quota in the response: surface the (hidden) daily quota in the Weekly row so
-            // the tile stays meaningful. Still flipped from remaining→used, just like every quota row.
+            // No weekly percentage or valid reset: surface the hidden daily quota in the Weekly row.
             lines.append(quotaLine(
                 label: "Weekly quota",
                 remaining: dailyRemaining,
-                resetsAt: weeklyReset,
+                resetsAt: nil,
                 periodDurationMs: weekPeriodMs
             ))
         }

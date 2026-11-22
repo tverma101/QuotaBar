@@ -44,7 +44,9 @@ struct TotalSpendCard: View {
     }
 
     private var total: TotalSpend {
-        TotalSpendAggregator.total(
+        // The store precomputes one total per period at snapshot publish; the live aggregator call is
+        // the fallback before the first publish.
+        dataStore.totalSpendByPeriod[period] ?? TotalSpendAggregator.total(
             for: period,
             providers: providers,
             snapshots: dataStore.snapshots,
@@ -73,7 +75,7 @@ struct TotalSpendCard: View {
             Image(systemName: "info.circle")
                 .imageScale(.small)
                 .foregroundStyle(.secondary)
-                .hoverTooltip(infoTooltip)
+                .hoverTooltip { infoTooltip }
             Spacer(minLength: 8)
             shareButton
         }
@@ -354,7 +356,7 @@ struct TotalSpendRingContent: View {
                 .lineLimit(1)
         }
         .padding(.horizontal, 10)
-        .hoverTooltip(centerTooltip)
+        .hoverTooltip { centerTooltip }
     }
 
     private var centerTooltip: String {

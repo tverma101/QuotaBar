@@ -428,6 +428,9 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
     ) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
         let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         let key = url.path
+        // An implicitly discovered ledger that disappears never reaches this function again, so its
+        // fingerprint file (and its `.lock` sidecar) would persist forever without a directory sweep.
+        OpenCodeRouterLedgerAggregate.removeOrphanedPersistedAggregates()
         let policyFingerprint = Self.accountPolicyFingerprint(
             enabledIdentityKeys: enabledIdentityKeys,
             identifiersToIdentityKeys: identifiersToIdentityKeys
@@ -496,6 +499,7 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
                 url: url,
                 current: current,
                 since: since,
+                retentionCutoff: retentionCutoff,
                 detailedGoCutoff: detailedGoCutoff,
                 maximumTimestamp: maximumTimestamp,
                 shouldCheckFuture: { accountId, accountFingerprint in
@@ -641,7 +645,16 @@ final class OpenCodeRouterLedger: @unchecked Sendable {
         shouldCheckFuture: (OpenCodeUsageScanner.ClaudeGatewayRow) -> Bool
     ) -> [OpenCodeUsageScanner.ClaudeGatewayRow]? {
         guard !rows.contains(where: { $0.isMalformed && shouldCheckFuture($0) }) else { return nil }
-        return rows.filter { !$0.isMalformed && $0.date >= since }
+        // Aggregated rows are whole local-day buckets materialized at noon; a `since` later than
+        // noon the same day must compare day-for-day or the boundary bucket is dropped entirely.
+        let sinceDay = DailyUsageAccumulator.dayKey(from: since)
+        return rows.filter { row in
+            guard !row.isMalformed else { return false }
+            if row.isAggregated {
+                return DailyUsageAccumulator.dayKey(from: row.date) >= sinceDay
+            }
+            return row.date >= since
+        }
     }
 
     /// True when the file still carries the modification stamp recorded with the stored checkpoint.

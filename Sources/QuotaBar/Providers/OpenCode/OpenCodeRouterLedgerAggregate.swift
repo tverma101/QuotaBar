@@ -352,6 +352,7 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
         url: URL,
         current: AppendOnlyFileRevision,
         since: Date,
+        retentionCutoff: Date,
         detailedGoCutoff: Date,
         maximumTimestamp: Date,
         shouldCheckFuture: @escaping (String?, String?) -> Bool = { _, _ in true }
@@ -408,8 +409,9 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
                     shouldCheckFuture(row.accountId, row.accountFingerprint)
                 }
             ) {
-            case .row(let row): appended.append(row)
-            case .irrelevant: break
+            case .row(let row) where row.isMalformed || row.date >= retentionCutoff:
+                appended.append(row)
+            case .row, .irrelevant: break
             case .futureTimestamp(let timestamp):
                 if rejectedFutureTimestamp.map({ timestamp > $0 }) ?? true {
                     rejectedFutureTimestamp = timestamp
@@ -430,10 +432,10 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
                     shouldCheckFuture(row.accountId, row.accountFingerprint)
                 }
             ) {
-            case .row(let row):
+            case .row(let row) where row.isMalformed || row.date >= retentionCutoff:
                 appended.append(row)
                 read.finalPartial = Data()
-            case .irrelevant:
+            case .row, .irrelevant:
                 read.finalPartial = Data()
             case .futureTimestamp(let timestamp):
                 if rejectedFutureTimestamp.map({ timestamp > $0 }) ?? true {
@@ -594,8 +596,10 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
                 tokenCountSaturated: row.tokenCountSaturated == true
             )
         }
+        // The index is already coherent here: either the removal above invalidated it and the
+        // first `addBucket` rebuilt it (later calls maintain it), or nothing invalidated it at all.
+        // Clearing it again would force a second rebuild on the next `addRow`.
         if buckets.count != oldBucketCount || goRows.count != oldGoCount {
-            hasBucketIndex = false
             return true
         }
         return false
@@ -709,7 +713,7 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
 
     static func removePersistedAggregate(path: String) {
         _ = withAggregateFileLock(path: path) {
-            try? FileManager.default.removeItem(at: fileURL(path: path))
+            removePersistedPair(path: path)
         }
     }
 
@@ -721,7 +725,7 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
             guard let current = loadUnlocked(path: path), current.sourceSnapshot == expected,
                   !OpenCodeRouterLedger.sourceSnapshotIsCurrent(current.sourceSnapshot, atPath: path)
             else { return }
-            try? FileManager.default.removeItem(at: fileURL(path: path))
+            removePersistedPair(path: path)
         }
     }
 
@@ -732,8 +736,43 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         _ = withAggregateFileLock(path: path) {
             guard FileManager.default.fileExists(atPath: url.path), loadUnlocked(path: path) == nil else { return }
-            try? FileManager.default.removeItem(at: url)
+            removePersistedPair(path: path)
         }
+    }
+
+    /// Drop aggregates whose recorded source ledger is gone, plus lock sidecars left behind.
+    /// An implicitly discovered ledger that vanishes keeps its fingerprint file forever otherwise —
+    /// nothing else enumerates this directory. Best-effort; a corrupt blob is left for the per-path
+    /// invalid-removal path.
+    static func removeOrphanedPersistedAggregates(
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) {
+        let directory = JSONLScanCachePaths.defaultDirectory
+            .appendingPathComponent("opencode-router-aggregate", isDirectory: true)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return }
+        let present = Set(names)
+        for name in names {
+            if name.hasSuffix(".json") {
+                let url = directory.appendingPathComponent(name)
+                guard let data = try? Data(contentsOf: url),
+                      let file = try? JSONDecoder().decode(File.self, from: data),
+                      !fileExists(file.path)
+                else { continue }
+                try? FileManager.default.removeItem(at: url)
+                try? FileManager.default.removeItem(at: url.appendingPathExtension("lock"))
+            } else if name.hasSuffix(".json.lock"), !present.contains(String(name.dropLast(5))) {
+                try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+            }
+        }
+    }
+
+    /// Remove the aggregate blob and its lock sidecar together — call while holding the sidecar's
+    /// flock. The lock file is deleted too: `withAggregateFileLock` creates it on first use and no
+    /// other path removes it, so every scanned ledger otherwise leaves one behind permanently.
+    private static func removePersistedPair(path: String) {
+        let url = fileURL(path: path)
+        try? FileManager.default.removeItem(at: url)
+        try? FileManager.default.removeItem(at: url.appendingPathExtension("lock"))
     }
 
     private static func withAggregateFileLock<Result>(
@@ -808,7 +847,7 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
          routerCostBreakdownIsComplete.map { $0 ? "1" : "0" } ?? "?"].joined(separator: "\u{1f}")
     }
 
-    private static func noon(_ day: String, timeZoneIdentifier: String) -> Date? {
+    static func noon(_ day: String, timeZoneIdentifier: String) -> Date? {
         let parts = day.split(separator: "-")
         guard parts.count == 3,
               let year = Int(parts[0]),
@@ -822,6 +861,10 @@ final class OpenCodeRouterLedgerAggregate: @unchecked Sendable {
         components.month = month
         components.day = day
         components.hour = 12
+        if let date = components.date { return date }
+        // A calendar day the zone skipped entirely (Pacific/Apia jumped over 2011-12-30) yields nil;
+        // emit the next representable midday so the bucket is not silently dropped.
+        components.day = day + 1
         return components.date
     }
 

@@ -81,6 +81,7 @@ final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
     private(set) var contentFingerprintSQLs: [String] = []
     private var stepMetadataQueryCount = 0
     let failingPaths: Set<String>
+    private var lateFailingPaths: Set<String> = []
     let failingStepMetadataProbePaths: Set<String>
     let failingStepMetadataOpenPaths: Set<String>
     let transientStepMetadataProbePaths: Set<String>
@@ -133,7 +134,7 @@ final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
         defer { lock.unlock() }
 
         queryCounts[path, default: 0] += 1
-        if failingPaths.contains(path) {
+        if failingPaths.contains(path) || lateFailingPaths.contains(path) {
             throw SQLiteError.queryFailed("database locked")
         }
         if sql.contains("pragma_table_info('steps')") {
@@ -283,6 +284,11 @@ final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
 
     func append(_ row: AntigravityFixtureRow, to path: String) {
         lock.withLock { rowsByPath[path, default: []].append(row) }
+    }
+
+    /// Start failing a path after an earlier healthy scan seeded its cache.
+    func fail(_ path: String) {
+        lock.withLock { _ = lateFailingPaths.insert(path) }
     }
 
     func replaceRows(_ rows: [AntigravityFixtureRow], at path: String) {
@@ -2058,5 +2064,74 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         XCTAssertEqual(quotaLabels(merged), ["Session"], "An omitted pool must not retain its previous quota value")
         XCTAssertEqual(merged.plan, "Pro", "Quota replacement must preserve independently fetched plan state")
         XCTAssertNil(merged.clearsPriorMenuBarQuotaState)
+    }
+
+    func testPersistedCacheReloadReplaysNewlyDatedUndatedGenerations() async throws {
+        let fixture = try makeDatabaseDirectory()
+        let timestamp = UInt64(now.timeIntervalSince1970) - 3_600
+        let blob = antigravityGenerationBlob(model: "gemini-3.6-flash", input: 10, output: 2, timestamp: nil)
+        let sqlite = AntigravityFakeSQLite(rowsByPath: [fixture.paths[0]: [
+            .init(index: 0, blob: blob),
+            .init(index: 10, blob: nil, stepMetadata:
+                antigravityStepMetadata(timestamp: timestamp, stepUUID: "other", botID: "other"))
+        ]])
+        let first = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+            projectOversized: { _, _, _ in nil })
+        _ = await first.scan(now: now, pricing: pricing)
+
+        // A fresh process reloads the derivation record, whose step timestamp index was never
+        // persisted. An appended step that finally dates the recorded undated generation must
+        // still replay the generation rows.
+        sqlite.append(.init(index: 11, blob: nil,
+            stepMetadata: antigravityStepMetadata(timestamp: timestamp)), to: fixture.paths[0])
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(2)],
+            ofItemAtPath: fixture.paths[0]
+        )
+        let reloaded = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+            projectOversized: { _, _, _ in nil })
+        let recovered = await reloaded.scan(now: now, pricing: pricing)
+
+        XCTAssertEqual(recovered?.series.daily.first?.totalTokens, 12)
+        XCTAssertEqual(sqlite.queriedCursors, [-1, -1],
+                       "the reloaded record must replay generations once the rebuilt step index dates them")
+    }
+
+    func testUnreadableDatabaseMarksOnlyItsCoveredDaysAndToday() async throws {
+        let fixture = try makeDatabaseDirectory(fileNames: ["a.db", "b.db"])
+        let coveredDay = now.addingTimeInterval(-3 * 86_400)
+        let liveDay = now.addingTimeInterval(-86_400)
+        let sqlite = AntigravityFakeSQLite(rowsByPath: [
+            fixture.paths[0]: [.init(index: 0, blob: antigravityGenerationBlob(
+                model: "gemini-3.6-flash", input: 10, output: 5,
+                timestamp: UInt64(coveredDay.timeIntervalSince1970)
+            ))],
+            fixture.paths[1]: [.init(index: 0, blob: antigravityGenerationBlob(
+                model: "gemini-3.6-flash", input: 20, output: 10,
+                timestamp: UInt64(liveDay.timeIntervalSince1970)
+            ))]
+        ])
+        let scanner = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path }
+        )
+        let initial = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertNil(initial?.unmeasuredUsageDays)
+
+        sqlite.fail(fixture.paths[0])
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(2)],
+            ofItemAtPath: fixture.paths[0]
+        )
+        let degradedResult = await scanner.scan(now: now, pricing: pricing)
+        let degraded = try XCTUnwrap(degradedResult)
+
+        // The dead database keeps its last-good day and today marked; the day the healthy sibling
+        // alone covers stays fully measured instead of being branded partial forever.
+        XCTAssertEqual(
+            degraded.unmeasuredUsageDays,
+            [DailyUsageAccumulator.dayKey(from: coveredDay), DailyUsageAccumulator.dayKey(from: now)]
+        )
     }
 }
