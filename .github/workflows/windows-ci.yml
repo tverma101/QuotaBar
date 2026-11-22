@@ -7,9 +7,14 @@ on:
   pull_request:
     branches: [main]
     paths: ['windows/**', '.github/workflows/windows-ci.yml']
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   installer:
@@ -30,6 +35,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: windows
+          cache-bin: false
+
       - name: Install Frontend Dependencies
         run: bun install --frozen-lockfile
 
@@ -37,7 +47,22 @@ jobs:
         run: bun run test
 
       - name: Build x64 Installer
-        run: bun run tauri:build --bundles nsis -- --locked
+        shell: pwsh
+        run: |
+          $buildArgs = @('--bundles', 'nsis')
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            if ($env:GITHUB_REF_NAME -notmatch '^v\d+\.\d+\.\d+(?:-beta\.\d+)?$') {
+              throw "The Windows installer requires a valid QuotaBar release tag."
+            }
+            $config = Join-Path $env:RUNNER_TEMP 'quotabar-release.json'
+            @{ version = $env:GITHUB_REF_NAME.Substring(1) } |
+              ConvertTo-Json -Compress | Set-Content -Encoding Ascii $config
+            $buildArgs += @('--config', $config)
+          }
+          bun run tauri:build @buildArgs -- --locked
+
+      - name: Test Native CLI and Provider Runtime
+        run: cargo test --locked --release -p quotabar-core -p quotabar-cli
 
       - name: Upload Windows QA Installer
         uses: actions/upload-artifact@v7
@@ -45,4 +70,5 @@ jobs:
           name: quotabar-windows-x64-qa
           path: windows/target/**/bundle/nsis/*-setup.exe
           if-no-files-found: error
+          compression-level: 0
           retention-days: 7

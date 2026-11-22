@@ -1,7 +1,6 @@
 name: CI
 
 on:
-  # The Swift edition ships from `main`. The frozen Tauri edition is preserved on `tauri-legacy`.
   push:
     branches: [main, codex/token-accounting-cpu-benchmark]
   pull_request:
@@ -9,6 +8,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -29,14 +32,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Rust core
-        run: bash script/build_rust_core.sh
-
-      - name: Build
-        run: swift build -j 2 --disable-index-store
-
-      - name: Run test suites
-        run: bash script/test_suites.sh
+      - name: Build and run test suites
+        run: bash script/test_suites.sh --build
 
       # This dedicated public branch runs the deterministic synthetic-ledger benchmark on GitHub's
       # isolated macOS runner. It never copies or uploads a user's local usage ledger.

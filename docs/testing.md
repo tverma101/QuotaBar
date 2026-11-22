@@ -7,11 +7,10 @@ The SwiftPM package contains XCTest and Swift Testing cases. There are also Pyth
 From the repository root on macOS 15 or later:
 
 ```sh
-swift build -j 2 --disable-index-store
-bash script/test_suites.sh
+bash script/test_suites.sh --build
 ```
 
-`test_suites.sh` checks the CI workflow, exercises the shell measurement driver using a fake `swift` executable, runs every `*Tests.py` unittest file, then runs the complete SwiftPM test set (XCTest and Swift Testing). It fails if any command fails. All tests run without provider credentials unless they are explicitly opted into live validation.
+`test_suites.sh` builds and tests the Rust core, checks the CI workflow, exercises the shell measurement driver using a fake `swift` executable, runs every `*Tests.py` unittest file, then runs the complete SwiftPM test set. Use `--build` to verify the app and CLI build before the tests. The Rust library and its tests use the same Cargo build directory. All tests run without provider credentials unless they are explicitly opted into live validation.
 
 The default is two Swift build/test jobs, with indexing disabled to lower peak memory use on smaller Macs. Override concurrency with `QUOTABAR_TEST_JOBS=1 bash script/test_suites.sh` if needed. Lower concurrency reduces memory pressure; it does not fix a real compiler or assertion failure.
 

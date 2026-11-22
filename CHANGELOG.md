@@ -2,12 +2,12 @@
 
 ## v0.7.2-beta.1
 
-QuotaBar comes to the Windows system tray alongside the native macOS menu-bar app. Both editions keep the dashboard, refresh controls, and provider settings close at hand.
+This beta ships the Windows x64 installer. The native macOS app is available to build from source at the same tag.
 
 ### New Features
 
 - Windows x64 tray app with a per-user installer, provider settings, and a bundled CLI. [#50](https://github.com/tverma101/QuotaBar/pull/50) by @tverma101
-- Open GitHub from About QuotaBar to download an installer or update either edition. [#50](https://github.com/tverma101/QuotaBar/pull/50) by @tverma101
+- Open GitHub Releases from About QuotaBar for downloads and manual updates. [#50](https://github.com/tverma101/QuotaBar/pull/50) by @tverma101
 - Group Codex accounts under one menu-bar icon. [#22](https://github.com/tverma101/QuotaBar/pull/22) by @tverma101
 - Show provider usage imported from VM Box on macOS. [#29](https://github.com/tverma101/QuotaBar/pull/29) by @tverma101
 - Blur macOS account names by default and reveal them on click. [#38](https://github.com/tverma101/QuotaBar/pull/38) by @tverma101
@@ -28,9 +28,9 @@ QuotaBar comes to the Windows system tray alongside the native macOS menu-bar ap
 
 ### Installation and Updates
 
-- **macOS 15 or later, Apple Silicon or Intel.** Open the DMG and drag QuotaBar to Applications. Open it from Applications, then click its menu-bar icon.
-- **Windows 11 x64.** Run the setup executable and open QuotaBar from Start. The dashboard is available from the gauge in the notification area.
-- For updates, open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and install the newer build. Replace the app in Applications on macOS or run the new installer as the same Windows user.
+- **Windows 11 x64.** Run the setup executable and open QuotaBar from Start. The dashboard is available from the gauge in the notification area. The installer is unsigned, so Windows may show a publisher or SmartScreen prompt.
+- **macOS 15 or later.** Install Xcode 26 or later and stable Rust, check out this release tag, and follow the [source build instructions](https://github.com/tverma101/QuotaBar/blob/v0.7.2-beta.1/README.md#build-from-source).
+- For updates, open **About QuotaBar → Downloads and Updates**. Quit QuotaBar before installing a newer Windows build. On macOS, check out the newer tag and rebuild.
 
 ## v0.7.1
 

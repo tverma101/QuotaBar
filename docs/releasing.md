@@ -37,7 +37,7 @@ Before publishing, install from that image on a clean Mac user profile with Gate
 
 ## Windows
 
-On Windows x64, check out the same approved tag used for the DMG. Build the per-user setup executable from PowerShell in `windows/`:
+Run the **Windows CI** workflow manually on the approved release tag. Download the `quotabar-windows-x64-qa` artifact from that run. To build locally, check out the same tag on Windows x64 and run these commands from PowerShell in `windows/`:
 
 ```powershell
 $tag = git describe --exact-match --tags HEAD
@@ -55,4 +55,4 @@ Sign the setup executable with the release publisher's Windows code-signing iden
 
 ## GitHub
 
-Attach the verified DMG and Windows setup executable to the approved tag, add platform-specific installation instructions, and mark beta releases as pre-releases. State the Windows signature status in the notes. Verify both download links while signed out.
+Attach the verified installers for the platforms shipping in the release. Mark beta releases as pre-releases. State the Windows signature status, and link to the source build instructions for any platform without a download. Verify each public download link while signed out.

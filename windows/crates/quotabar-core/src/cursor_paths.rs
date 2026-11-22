@@ -45,11 +45,22 @@ fn expand_home(path: &str) -> PathBuf {
 }
 
 fn platform_roots() -> Vec<PathBuf> {
-    vec![
+    let platform_root = if cfg!(target_os = "linux") {
+        dirs::config_dir()
+    } else {
+        dirs::data_dir()
+    };
+    let mut roots: Vec<_> = platform_root.into_iter().collect();
+    for fallback in [
         expand_home("~/.config"),
         expand_home("~/Library/Application Support"),
         expand_home("~/AppData/Roaming"),
-    ]
+    ] {
+        if !roots.contains(&fallback) {
+            roots.push(fallback);
+        }
+    }
+    roots
 }
 
 /// `state.vscdb` for one install only (stable **or** nightly — never merged).
@@ -179,18 +190,16 @@ mod tests {
 
     #[test]
     fn resolves_lowercase_linux_cli_auth_file() {
-        let root = std::env::temp_dir().join(format!(
-            "quotabar-cursor-cli-auth-test-{}",
-            std::process::id()
-        ));
-        let lowercase_dir = root.join("cursor");
+        let root = tempfile::tempdir().expect("create test root");
+        let lowercase_dir = root.path().join("cursor");
         let auth_file = lowercase_dir.join("auth.json");
+        let fixture = r#"{"accessToken":"tok"}"#;
         std::fs::create_dir_all(&lowercase_dir).expect("create lowercase cursor dir");
-        std::fs::write(&auth_file, r#"{"accessToken":"tok"}"#).expect("write auth.json");
+        std::fs::write(&auth_file, fixture).expect("write auth.json");
 
-        let found = resolve_cursor_cli_auth_file_in_roots(&[root.clone()]);
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert_eq!(found, Some(auth_file));
+        let found = resolve_cursor_cli_auth_file_in_roots(&[root.path().to_path_buf()])
+            .expect("find the Cursor CLI auth file");
+        // NTFS and default APFS can resolve the same file through either spelling.
+        assert_eq!(std::fs::read_to_string(found).expect("read auth.json"), fixture);
     }
 }
