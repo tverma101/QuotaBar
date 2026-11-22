@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import QuotaBar
 
@@ -42,5 +43,41 @@ final class PopoverKeyReaderTests: XCTestCase {
                 popoverWindowID: ObjectIdentifier(popover)
             )
         )
+    }
+
+    func testBareEscapeMapsToEscape() {
+        XCTAssertEqual(PopoverKeyReader.keyAction(keyCode: 53, modifiers: []), .escape)
+    }
+
+    func testBareReturnMapsToCustomize() {
+        XCTAssertEqual(PopoverKeyReader.keyAction(keyCode: 36, modifiers: []), .customize)
+    }
+
+    func testKeypadEnterMapsToCustomize() {
+        // Keypad Enter arrives as keyCode 76 with .numericPad set; it navigates like Return.
+        XCTAssertEqual(PopoverKeyReader.keyAction(keyCode: 76, modifiers: [.numericPad]), .customize)
+    }
+
+    func testModifiedNavigationKeysAreIgnored() {
+        // ⌘⏎, ⌥Esc, ⇧⏎, ⌃Enter and friends belong to other controls, not popover navigation.
+        for modifier: NSEvent.ModifierFlags in [.command, .option, .control, .shift] {
+            XCTAssertNil(PopoverKeyReader.keyAction(keyCode: 53, modifiers: modifier))
+            XCTAssertNil(PopoverKeyReader.keyAction(keyCode: 36, modifiers: modifier))
+            XCTAssertNil(PopoverKeyReader.keyAction(keyCode: 76, modifiers: [.numericPad, modifier]))
+        }
+    }
+
+    func testCommandCommaMapsToSettings() {
+        XCTAssertEqual(PopoverKeyReader.keyAction(keyCode: 43, modifiers: [.command]), .settings)
+    }
+
+    func testCommandZMapsToUndo() {
+        XCTAssertEqual(PopoverKeyReader.keyAction(keyCode: 6, modifiers: [.command]), .undo)
+    }
+
+    func testBareCommaAndShiftCommandZAreIgnored() {
+        // A bare comma is typing, and ⇧⌘Z is redo — neither is a popover shortcut.
+        XCTAssertNil(PopoverKeyReader.keyAction(keyCode: 43, modifiers: []))
+        XCTAssertNil(PopoverKeyReader.keyAction(keyCode: 6, modifiers: [.command, .shift]))
     }
 }

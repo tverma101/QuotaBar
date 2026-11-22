@@ -31,8 +31,7 @@ Verify the tree is releasable. A release must not ship with a known-red suite:
 
 ```sh
 git switch main && git pull
-swift build -j 2 --disable-index-store --scratch-path /tmp/qb-scratch
-swift test  -j 2 --disable-index-store --scratch-path /tmp/qb-scratch
+bash script/test_suites.sh
 ```
 
 `--disable-index-store` is not optional on memory-constrained machines; see `AGENTS.md`.
@@ -110,15 +109,14 @@ identity before packaging:
 codesign -dv --verbose=4 dist/QuotaBar.app 2>&1 | rg 'Authority|Identifier'
 ```
 
-**Notarization requires a provisioning profile.** Note that the Keychain access-group entitlement is
-only emitted when a matching profile is installed — adding an unauthorized `keychain-access-groups`
-entry makes the app fail to launch with `RBSRequestErrorDomain Code=5` (POSIX 163). See `AGENTS.md`
-and `Sources/QuotaBar/Services/SystemClients.swift` before changing entitlements during a release.
+A provisioning profile is not required for notarization. A matching profile is only needed to enable
+iCloud Sync and its associated Keychain access group. See [Preparing a macOS
+release](../../../docs/releasing.md) for the DMG and Gatekeeper checks.
 
 ### 7. Publish the release and attach the notes
 
 ```sh
-gh release create v{version} dist/QuotaBar-<version>.dmg \
+gh release create v{version} dist/QuotaBar.dmg \
   --title "QuotaBar <version>" \
   --notes-file /tmp/notes-v{version}.md \
   --prerelease            # beta only; omit for stable
@@ -132,11 +130,11 @@ there is no appcast to route between them.
 ```sh
 gh release view v{version} --json isDraft,isPrerelease,assets,body \
   --jq '{isDraft, isPrerelease, assets:[.assets[].name], bodyLen:(.body|length)}'
-spctl -a -vv -t install dist/QuotaBar-<version>.dmg   # must be accepted / notarized
+spctl --assess --type open --context context:primary-signature --verbose=2 dist/QuotaBar.dmg
 ```
 
 Require `isDraft=false`, `isPrerelease=true` for beta or `false` for stable, a
-`QuotaBar-<version>.dmg` asset, `bodyLen>0`, and `spctl` accepting the DMG.
+`QuotaBar.dmg` asset, `bodyLen>0`, and `spctl` accepting the DMG.
 
 Because there is no auto-update, **say so in the release notes** and tell users to replace the app
 bundle in `/Applications` by hand. An install is not self-updating.

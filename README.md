@@ -11,24 +11,25 @@ QuotaBar shows how much of your AI coding plans you've used: session and weekly 
 > Report QuotaBar issues in this repository; report OpenUsage issues
 > [upstream](https://github.com/robinebers/openusage/issues).
 
-## Requirements
+## Download and Set Up
 
-- macOS 15 (Sequoia) or later
+QuotaBar runs on **macOS 15 (Sequoia) or later**. macOS release builds are universal (Apple Silicon and Intel). The download and setup instructions here apply to macOS.
 
-## Building and running
+1. Open [GitHub Releases](https://github.com/tverma101/QuotaBar/releases). If there is no release with a QuotaBar `.dmg` under **Assets**, there is no installable download yet. GitHub's **Source code** archives are not installers; use the source build instructions below instead.
+2. Open the `.dmg`, drag **QuotaBar** into **Applications**, and open it from there. Click the **QuotaBar icon in the menu bar** to open the dashboard.
+3. Open **Customize** to see which provider setups QuotaBar found on your Mac. Enable the providers you want. If a card asks you to sign in or add a key, use its [provider setup guide](docs/README.md#providers), then return to Customize and choose **Rescan**.
+
+QuotaBar does not update itself. To update a release build, quit QuotaBar and replace the app in Applications using the new `.dmg`.
+
+## Build From Source
+
+To build on a Mac, install [Xcode 26 or later](https://developer.apple.com/xcode/) (Swift 6.2 and the macOS 26 SDK) and [stable Rust via rustup](https://rustup.rs/). From the repository root:
 
 ```sh
-swift build                     # build
-swift test                      # run the test suite
-./script/build_and_run.sh run   # stage a signed dev bundle in dist/ and launch it
-./script/build_and_run.sh install # replace the matching QuotaBar identity in /Applications and launch it
+CODESIGN_IDENTITY=- ALLOW_ADHOC_SIGNING=1 ./script/build_and_run.sh verify
 ```
 
-There is **no auto-update mechanism**. Sparkle and the appcast feed were removed, and the upstream
-feed is served from a public repository this fork has no claim on, so builds must not point at it.
-Reinstall with `./script/build_and_run.sh install`. The installer verifies the existing and staged app
-identities match before replacing the bundle, so a development install cannot silently replace a release
-identity (or the reverse).
+This builds the Rust core, stages an ad-hoc-signed development app in `dist/`, and launches it without replacing anything in Applications. Use an Apple Development signing identity instead if you need macOS permissions to persist across builds. See [Testing](docs/testing.md) for the test suites.
 
 ## Supported Providers
 
@@ -45,7 +46,7 @@ identity (or the reverse).
 - **[OpenRouter](docs/providers/openrouter.md)** — credit balance, daily/weekly/monthly spend (API key)
 - **[Z.ai](docs/providers/zai.md)** — session, weekly, web-search quotas (GLM Coding Plan, API key)
 
-Most providers read the credentials already on your machine (keychain, auth files, app state) — no extra login. OpenRouter and Z.ai are the exceptions: they have no local credential to reuse, so you supply an API key (see [OpenRouter setup](docs/providers/openrouter.md) or [Z.ai setup](docs/providers/zai.md)). Credentials are used only for the corresponding provider requests. QuotaBar's separate anonymous summaries and public pricing downloads are documented under [Privacy & usage data](docs/privacy.md).
+Most providers read the credentials already on your machine (keychain, auth files, app state) — no extra login. OpenRouter and Z.ai are the exceptions: they have no local credential to reuse, so you supply an API key (see [OpenRouter setup](docs/providers/openrouter.md) or [Z.ai setup](docs/providers/zai.md)). Credentials are used only for the corresponding provider requests. See [Privacy & usage data](docs/privacy.md) for network requests and telemetry behavior.
 
 ## Features
 
@@ -60,7 +61,9 @@ Most providers read the credentials already on your machine (keychain, auth file
 - **[Proxy support](docs/proxy.md).** Route provider requests through SOCKS5 or HTTP(S) via `~/.quotabar/config.json`.
 - **Native settings.** Launch at login, global shortcut, icon style, theme, density, 12/24-hour time — see [Settings](docs/settings.md).
 
-
+The Today / Yesterday / Last 30 Days spend tiles are computed natively from local CLI logs (Claude,
+Codex, and Grok) or Cursor's usage export — no Node.js or other runtime needed. Dollars are estimated
+with [dynamically refreshed model pricing](docs/pricing.md).
 
 ## Documentation
 
@@ -68,38 +71,13 @@ Behavior docs live in [docs/](docs/README.md): the [dashboard](docs/dashboard.md
 
 For working on the code, see the developer docs: [architecture](docs/architecture.md), [adding a provider](docs/adding-a-provider.md), and [debugging & capturing logs](docs/debugging.md).
 
-## Requirements
-
-- macOS 15 (Sequoia) or later
-- Universal binary — runs natively on both Apple Silicon and Intel Macs
-
-The Today / Yesterday / Last 30 Days spend tiles are computed natively from local CLI logs (Claude,
-Codex, and Grok) or Cursor's usage export — no Node.js or other runtime needed. Dollars are estimated
-with [dynamically refreshed model pricing](docs/pricing.md).
-
-
-
 ## Architecture
 
 SwiftPM package, SwiftUI content hosted in an AppKit-owned `NSStatusItem` + custom key-capable `NSPanel`, Swift 6 strict concurrency. The app and CLI share one module: providers implement a small `ProviderRuntime` protocol (auth store → usage client → mapper → `ProviderSnapshot`), and both surfaces read the same normalized data — see the [architecture overview](docs/architecture.md) for how the pieces fit together and [AGENTS.md](AGENTS.md) for engineering conventions.
 
 ## Releasing
 
-There is no automated release pipeline. A local development build can be staged with:
-
-```sh
-./script/build_and_run.sh build          # stage a signed bundle in dist/
-```
-
-For distribution, run the script from the exact release tag with a Developer ID certificate:
-
-```sh
-RELEASE=1 CODESIGN_IDENTITY="Developer ID Application: <name> (<team>)" ./script/build_and_run.sh build
-```
-
-That stages a universal arm64 + x86_64 app whose version comes from the tag. The Developer ID signed
-bundle still needs to be packaged as a DMG, notarized, and stapled before distribution. There is no
-auto-update; users replace the app in `/Applications` manually.
+Releases are built and published manually. See [Preparing a macOS release](docs/releasing.md).
 
 ### iCloud Sync
 

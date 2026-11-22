@@ -63,16 +63,29 @@ struct PopoverKeyReader: NSViewRepresentable {
         eventWindowID == popoverWindowID
     }
 
+    enum KeyAction: Equatable, Sendable {
+        case escape, customize, settings, undo
+    }
+
+    nonisolated static func keyAction(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> KeyAction? {
+        let shortcutModifiers = modifiers.intersection([.command, .option, .control, .shift])
+        switch keyCode {
+        case 53 where shortcutModifiers.isEmpty: return .escape
+        // 36 is Return, 76 is keypad Enter (which arrives with .numericPad set — ignored here).
+        case 36, 76:
+            return shortcutModifiers.isEmpty ? .customize : nil
+        case 43 where shortcutModifiers == [.command]: return .settings
+        case 6 where shortcutModifiers == [.command]: return .undo
+        default: return nil
+        }
+    }
+
     final class MonitorView: NSView {
         var onEscape: (@MainActor () -> Bool)?
         var onReturn: (@MainActor () -> Bool)?
         var onSettings: (@MainActor () -> Bool)?
         var onUndo: (@MainActor () -> Bool)?
         private var monitor: Any?
-        private static let escapeKeyCode: UInt16 = 53
-        private static let returnKeyCode: UInt16 = 36
-        private static let commaKeyCode: UInt16 = 43
-        private static let zKeyCode: UInt16 = 6
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
@@ -82,29 +95,7 @@ struct PopoverKeyReader: NSViewRepresentable {
             }
             guard window != nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                let keyCode = event.keyCode
-                guard keyCode == MonitorView.escapeKeyCode
-                    || keyCode == MonitorView.returnKeyCode
-                    || keyCode == MonitorView.commaKeyCode
-                    || keyCode == MonitorView.zKeyCode else {
-                    return event
-                }
-                let isReturn = keyCode == MonitorView.returnKeyCode
-                let isComma = keyCode == MonitorView.commaKeyCode
-                let isUndo = keyCode == MonitorView.zKeyCode
-                // Only bare Return navigates; ⌘⏎, ⌥⏎, etc. belong to other controls.
-                if isReturn,
-                   !event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty {
-                    return event
-                }
-                // Only plain ⌘, navigates; a bare comma (typing) or ⌥⌘, etc. belong elsewhere.
-                if isComma,
-                   event.modifierFlags.intersection([.command, .option, .control, .shift]) != [.command] {
-                    return event
-                }
-                // Only plain ⌘Z undoes; a bare z (typing) or ⇧⌘Z (redo) belong elsewhere.
-                if isUndo,
-                   event.modifierFlags.intersection([.command, .option, .control, .shift]) != [.command] {
+                guard let action = PopoverKeyReader.keyAction(keyCode: event.keyCode, modifiers: event.modifierFlags) else {
                     return event
                 }
                 let eventWindowID = event.window.map(ObjectIdentifier.init)
@@ -124,20 +115,20 @@ struct PopoverKeyReader: NSViewRepresentable {
                     if window.firstResponder is NSText || ShortcutRecorderField.isRecordingActive {
                         return false
                     }
-                    if isComma {
+                    switch action {
+                    case .settings:
                         return self.onSettings?() ?? false
-                    }
-                    if isUndo {
+                    case .undo:
                         return self.onUndo?() ?? false
-                    }
-                    if isReturn {
+                    case .customize:
                         return self.onReturn?() ?? false
-                    }
-                    if self.onEscape?() == true {
+                    case .escape:
+                        if self.onEscape?() == true {
+                            return true
+                        }
+                        MenuBarPopover.dismiss(fallback: window)
                         return true
                     }
-                    MenuBarPopover.dismiss(fallback: window)
-                    return true
                 }
                 return consumed ? nil : event
             }

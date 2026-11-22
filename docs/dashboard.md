@@ -96,11 +96,13 @@ When QuotaBar ships a new default metric, existing layouts get it once. If you t
 
 | Key | Action |
 |---|---|
-| Return | From the dashboard, open Customize; from a provider detail, return to the provider list; from the provider list or Settings, return to the dashboard |
+| Return / Keypad Enter | From the dashboard, open Customize; from a provider detail, return to the provider list; from the provider list or Settings, return to the dashboard |
 | Esc | From a provider detail, return to the provider list; from the provider list or Settings, return to the dashboard; from the dashboard, close the popover |
 | ⌘Z | Undo the last customization change (app-wide; repeat to step back) |
 | ⌘R | Refresh now from the dashboard or Settings (skips the cache) |
 | ⌘, | Open / close Settings (in the popover) |
+
+Escape, Return, and keypad Enter navigate only when pressed without Shift, Control, Option, or Command.
 
 A global shortcut (recorded in Settings) toggles the popover from anywhere.
 
