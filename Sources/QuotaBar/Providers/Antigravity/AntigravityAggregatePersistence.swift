@@ -2,12 +2,13 @@ import Darwin
 import Foundation
 
 /// Disk mirror of one Antigravity conversation database's derived scan state — parsed generation
-/// events plus the priced daily aggregate — validated against the database's file stamps before
-/// use. A fresh process (the scan-worker child, or this app after a memory-pressure unload)
-/// reloads the record instead of re-reading SQLite and re-decoding protobufs. Records carry the
-/// raw events so a changed database can verify its prefix and fold only appended rows, exactly
-/// like the in-memory cache path. The step timestamp index is the only excluded state; a scan
-/// rebuilds it from SQLite the first time it needs to resolve undated rows.
+/// events, the priced daily aggregate, and the step timestamp index — validated against the
+/// database's file stamps before use. A fresh process (the scan-worker child, or this app after a
+/// memory-pressure unload) reloads the record instead of re-reading SQLite and re-decoding
+/// protobufs. Records carry the raw events so a changed database can verify its prefix and fold
+/// only appended rows, exactly like the in-memory cache path; the persisted step index is verified
+/// the same way (its table fingerprint against the live prefix digest) so reuse never skips the
+/// correctness check — it only skips the per-page table scan.
 enum AntigravityAggregatePersistence {
     static let schema = 1
     /// Refuse to cache pathological histories that would dominate the log-scan-cache directory.

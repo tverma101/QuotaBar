@@ -40,6 +40,8 @@ What each provider tracks, where its credentials come from, and what to do when 
 
 How the app is built and how to extend it.
 
+- [Testing](testing.md) — run all CI suites locally, or a focused efficiency subset
+- [Rust core](rust-core.md) — the small set of Rust-backed primitives and the Swift fallback contract
 - [Architecture](architecture.md) — composition root, stores, the provider pipeline, the AppKit bridge
 - [Adding a provider](adding-a-provider.md) — the metric contract and the register/test/document steps
 - [Debugging & capturing logs](debugging.md) — running a local build and streaming logs

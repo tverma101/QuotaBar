@@ -20,6 +20,10 @@ enum FreebuffDesktopTurnPersistence {
         var revision: [FreebuffDesktopUsageScanner.Revision]
         var rows: [FreebuffDesktopUsageScanner.DerivedTurn]
         var unreadableRows: Int
+        /// Aggregate over the source rows captured at derive time. A stamp-level revision bump
+        /// with an unchanged fingerprint proves WAL churn only — the rows still describe the
+        /// live projection exactly. Nil on records written before the gate existed.
+        var contentFingerprint: String?
     }
 
     static func fileURL(path: String) -> URL {
@@ -36,13 +40,23 @@ enum FreebuffDesktopTurnPersistence {
         revision: [FreebuffDesktopUsageScanner.Revision]
     ) -> Record? {
         guard !revision.isEmpty else { return nil }
-        return autoreleasepool {
+        return load(path: path).flatMap { $0.revision == revision ? $0 : nil }
+    }
+
+    /// Decode the record without a revision check. The fingerprint caller then decides whether
+    /// the stored rows still describe the live projection — a stale revision alone no longer
+    /// discards them.
+    static func readAnyRevision(path: String) -> Record? {
+        load(path: path)
+    }
+
+    private static func load(path: String) -> Record? {
+        autoreleasepool {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .secondsSince1970
             guard let data = try? Data(contentsOf: fileURL(path: path)),
                   let record = try? decoder.decode(Record.self, from: data),
-                  record.schema == schema,
-                  record.revision == revision
+                  record.schema == schema
             else { return nil }
             return record
         }

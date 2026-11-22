@@ -105,7 +105,7 @@ actor CodexLogUsageScanner {
                 && (!parsedTotal.isPresent || reported == recomputed)
         }
 
-        private init(
+        fileprivate init(
             input: Int,
             cached: Int,
             output: Int,
@@ -1433,7 +1433,10 @@ actor CodexLogUsageScanner {
                 )
             }
 
-            consumeCompleteFinalJSONIfPossible(&read, parser: &parser)
+            _ = consumeCompleteFinalJSONIfPossible(&read) { line in
+                parser.consume(line)
+                return true
+            }
 
             let newOffset = cached.offset + UInt64(read.statistics.bytesRead)
             if let after = AppendOnlyFileProbe.stamp(at: url),
@@ -1477,22 +1480,75 @@ actor CodexLogUsageScanner {
     ) -> (events: [Event]?, damagedLines: Int) {
         _ = retentionDays
         let before = AppendOnlyFileProbe.stamp(at: url)
-        var parser = FileParser(emitSince: emitSince)
+
+        // Fast path: the quotabar-core Rust parser. It runs the same state machine as the Swift
+        // reference parser and declines the whole file when a line carries a timestamp this
+        // library cannot emulate — the Swift parser then re-parses from scratch, so results never
+        // come from a mix of the two engines.
+        if let attempt = attemptRustFullParse(at: url, emitSince: emitSince) {
+            switch attempt {
+            case .incomplete:
+                sharedTailCache.remove(key)
+                return (nil, 0)
+            case .parsed(let events, let checkpoint, let read):
+                let finished = finishFullParse(
+                    at: url, before: before, read: read, key: key,
+                    checkpoint: checkpoint, events: events
+                )
+                return (finished, checkpoint.damagedLines)
+            }
+        }
+        return fullParseAndCheckpointSwift(
+            at: url, emitSince: emitSince, before: before, key: key
+        )
+    }
+
+    private enum RustFullParseOutcome {
+        case parsed(events: [Event], checkpoint: ParserCheckpoint, read: JSONLFileReader.ReadResult)
+        case incomplete
+    }
+
+    /// Returns nil when the Rust engine declines any line — the caller must then re-parse the
+    /// file with the Swift implementation.
+    nonisolated private static func attemptRustFullParse(
+        at url: URL,
+        emitSince: Date
+    ) -> RustFullParseOutcome? {
+        guard let parser = CodexRolloutRustParser.Handle(emitSince: emitSince) else { return nil }
+        var declined = false
         var read = JSONLFileReader.readLines(
             at: url,
             chunkSize: 64 * 1024,
             deliverFinalPartial: false
         ) { line in
+            guard !declined else { return }
             autoreleasepool {
+                if !parser.consume(line) { declined = true }
+            }
+        }
+        guard read.isComplete else { return .incomplete }
+        if !declined {
+            declined = !consumeCompleteFinalJSONIfPossible(&read) { line in
                 parser.consume(line)
             }
         }
-        guard read.isComplete else {
-            sharedTailCache.remove(key)
-            return (nil, 0)
-        }
-        consumeCompleteFinalJSONIfPossible(&read, parser: &parser)
-        let events = parser.finish()
+        guard !declined else { return nil }
+        guard let events = parser.finish() else { return nil }
+        guard var checkpoint = rustCheckpoint(from: parser.checkpoint()) else { return nil }
+        checkpoint.damagedLines = parser.damagedLineCount
+        return .parsed(events: events, checkpoint: checkpoint, read: read)
+    }
+
+    /// Tail-cache epilogue shared by the Rust and Swift full-parse paths: re-stamp the file, and
+    /// keep the parse state only when identity still proves the bytes we read are current.
+    private static func finishFullParse(
+        at url: URL,
+        before: AppendOnlyFileStamp?,
+        read: JSONLFileReader.ReadResult,
+        key: String,
+        checkpoint: ParserCheckpoint,
+        events: [Event]
+    ) -> [Event] {
         let offset = UInt64(read.statistics.bytesRead)
 
         if let before,
@@ -1511,7 +1567,7 @@ actor CodexLogUsageScanner {
                     anchor: anchor,
                     partialLine: read.finalPartial,
                     isDiscardingOversizedLine: read.isDiscardingOversizedLine,
-                    parserState: parser.checkpoint(),
+                    parserState: checkpoint,
                     items: events
                 ),
                 for: key,
@@ -1521,22 +1577,103 @@ actor CodexLogUsageScanner {
         } else {
             sharedTailCache.remove(key)
         }
-        return (events, parser.damagedLineCount)
+        return events
+    }
+
+    /// Rust checkpoint → Swift tail-cache checkpoint. Nil on any unreadable string.
+    private static func rustCheckpoint(from state: CodexRolloutRustParser.Checkpoint?) -> ParserCheckpoint? {
+        guard let state else { return nil }
+        let previousTotals = state.hasPreviousTotals
+            ? RawUsage(
+                input: Int(state.previousInput),
+                cached: Int(state.previousCached),
+                output: Int(state.previousOutput),
+                reasoning: Int(state.previousReasoning),
+                total: Int(state.previousTotal),
+                hasReportedTotal: state.previousHasReportedTotal,
+                isValid: state.previousIsValid,
+                hasCompleteCostBreakdown: state.previousHasCompleteCostBreakdown
+            )
+            : nil
+        let replayGate: ChildReplayGate?
+        switch state.replayGateKind {
+        case .untilStartedAt:
+            replayGate = .untilStartedAt(state.replayGateStartedAt)
+        case .untilSelfTimed:
+            replayGate = .untilSelfTimedTaskStarted
+        case .none:
+            replayGate = nil
+        }
+        return ParserCheckpoint(
+            previousTotals: previousTotals,
+            currentModel: state.currentModel,
+            currentTierIsFast: state.currentTierIsFast,
+            currentServiceTier: state.serviceTier,
+            currentServiceTierIsValid: state.currentServiceTierIsValid,
+            sawSessionMeta: state.sawSessionMeta,
+            replayGate: replayGate
+        )
+    }
+
+    nonisolated private static func fullParseAndCheckpointSwift(
+        at url: URL,
+        emitSince: Date,
+        before: AppendOnlyFileStamp?,
+        key: String
+    ) -> (events: [Event]?, damagedLines: Int) {
+        var parser = FileParser(emitSince: emitSince)
+        var read = JSONLFileReader.readLines(
+            at: url,
+            chunkSize: 64 * 1024,
+            deliverFinalPartial: false
+        ) { line in
+            autoreleasepool {
+                parser.consume(line)
+            }
+        }
+        guard read.isComplete else {
+            sharedTailCache.remove(key)
+            return (nil, 0)
+        }
+        _ = consumeCompleteFinalJSONIfPossible(&read) { line in
+            parser.consume(line)
+            return true
+        }
+        let events = parser.finish()
+        let finished = finishFullParse(
+            at: url, before: before, read: read, key: key,
+            checkpoint: parser.checkpoint(), events: events
+        )
+        return (finished, parser.damagedLineCount)
     }
 
     /// JSONL permits a complete final record without a newline. Keep an invalid final fragment as
     /// append carry, but consume a syntactically complete JSON object immediately so metrics do not
     /// lag one turn merely because the writer omitted the trailing newline.
+    /// Returns false when the engine declines the line (Rust fallback).
     nonisolated private static func consumeCompleteFinalJSONIfPossible(
         _ read: inout JSONLFileReader.ReadResult,
-        parser: inout FileParser
-    ) {
+        consume: (Data.SubSequence) -> Bool
+    ) -> Bool {
         guard !read.isDiscardingOversizedLine,
               !read.finalPartial.isEmpty,
               (try? JSONSerialization.jsonObject(with: read.finalPartial)) != nil
-        else { return }
-        parser.consume(read.finalPartial[...])
-        read.finalPartial.removeAll(keepingCapacity: false)
+        else { return true }
+        if consume(read.finalPartial[...]) {
+            read.finalPartial.removeAll(keepingCapacity: false)
+            return true
+        }
+        return false
+    }
+
+    /// Internal wrapper so tests can compare the Rust engine against the Swift reference parser
+    /// line by line (FFI parity coverage).
+    static func parseFileForTesting(_ data: Data, emitSince: Date? = nil) -> (events: [Event], damagedLines: Int) {
+        var parser = FileParser(emitSince: emitSince)
+        for line in data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true) {
+            parser.consume(line)
+        }
+        return (parser.finish(), parser.damagedLineCount)
     }
 
     private struct FileParser {

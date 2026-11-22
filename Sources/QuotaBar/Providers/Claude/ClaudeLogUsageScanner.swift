@@ -319,8 +319,11 @@ actor ClaudeLogUsageScanner {
             fileCompleted: { path, _ in bucket.finish(path) }
         )
         guard complete, !Task.isCancelled else { return .incomplete }
+        // Index once: a linear lookup per future-timestamp file made this O(files × future entries)
+        // on a scan that already walks every session file.
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         for (path, timestamp) in bucket.futureTimestamps {
-            guard let file = files.first(where: { $0.path == path }),
+            guard let file = filesByPath[path],
                   FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
             else { return .incomplete }
         }
@@ -379,8 +382,9 @@ actor ClaudeLogUsageScanner {
             fileCompleted: { path, _ in bucket.finish(path) }
         )
         guard complete else { return [] }
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         for (path, timestamp) in bucket.futureTimestamps {
-            guard let file = files.first(where: { $0.path == path }),
+            guard let file = filesByPath[path],
                   FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
             else { return [] }
         }
@@ -454,8 +458,9 @@ actor ClaudeLogUsageScanner {
             fileCompleted: { path, _ in bucket.finish(path) }
         )
         guard complete, !Task.isCancelled else { return false }
+        let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         for (path, timestamp) in bucket.futureTimestamps {
-            guard let file = files.first(where: { $0.path == path }),
+            guard let file = filesByPath[path],
                   FutureTimestampRevisionGate.record(timestamp, identity: futureIdentity, file: file)
             else { return false }
         }
@@ -847,7 +852,30 @@ actor ClaudeLogUsageScanner {
     /// A Claude log line can carry nested advisor work in `usage.iterations`. The top-level usage
     /// remains the main-model entry; only advisor-message iterations become additional entries,
     /// matching ccusage without recounting the ordinary message iterations that feed that total.
+    ///
+    /// The quotabar-core Rust parser (docs/rust-core.md) handles the canonical shapes with the
+    /// same semantics and far less CPU; it declines the shapes it does not support (null from the
+    /// bridge), and this function then falls back to the Swift reference implementation — never
+    /// to a different answer.
     private static func parseEntries(_ data: Data, malformedTokenCounts: inout Bool) -> [Entry] {
+        if let rust = ClaudeUsageLineRustParser.parse(data) {
+            malformedTokenCounts = rust.malformed
+            return rust.entries
+        }
+        return parseEntriesSwift(data, malformedTokenCounts: &malformedTokenCounts)
+    }
+
+    /// Internal wrapper so tests can compare the Rust result against the Swift reference path
+    /// line by line (FFI parity coverage).
+    static func parseEntriesSwiftForTesting(_ data: Data) -> (entries: [Entry], malformed: Bool) {
+        var malformed = false
+        let entries = parseEntriesSwift(data, malformedTokenCounts: &malformed)
+        return (entries, malformed)
+    }
+
+    /// The Swift reference implementation (also the runtime fallback for lines the Rust core
+    /// declines).
+    private static func parseEntriesSwift(_ data: Data, malformedTokenCounts: inout Bool) -> [Entry] {
         guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             malformedTokenCounts = true
             return []

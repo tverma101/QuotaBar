@@ -211,13 +211,20 @@ protocol SQLiteAccessing: Sendable {
 struct SQLiteCLIAccessor: SQLiteAccessing {
     var processRunner: ProcessRunning
     var allowsReadWriteFallback: Bool
+    /// Wall-clock cap on each sqlite3 subprocess. The five-second default suits credential probes
+    /// and small stores; scanners reading large usage databases pass a wider budget — OpenCode's
+    /// `opencode*.db` can hold hundreds of MB of JSON message blobs whose queries legitimately
+    /// outrun five seconds under a cold page cache or CPU contention.
+    var queryTimeout: TimeInterval
 
     init(
         processRunner: ProcessRunning = SystemProcessRunner(),
-        allowsReadWriteFallback: Bool = true
+        allowsReadWriteFallback: Bool = true,
+        queryTimeout: TimeInterval = 5
     ) {
         self.processRunner = processRunner
         self.allowsReadWriteFallback = allowsReadWriteFallback
+        self.queryTimeout = queryTimeout
     }
 
     func queryValue(path: String, sql: String) throws -> String? {
@@ -266,7 +273,7 @@ struct SQLiteCLIAccessor: SQLiteAccessing {
             arguments: arguments,
             environment: [:],
             standardInput: sendSQLOnStandardInput ? Data(sql.utf8) : nil,
-            timeout: 5
+            timeout: queryTimeout
         )
     }
 

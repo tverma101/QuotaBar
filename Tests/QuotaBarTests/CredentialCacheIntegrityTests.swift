@@ -76,6 +76,36 @@ final class CredentialSystemClientIntegrityTests: XCTestCase {
         XCTAssertTrue(runner.lastArguments.contains("-readonly"))
     }
 
+    func testSQLiteQueryDefaultsToFiveSecondStatementTimeout() throws {
+        // Credential probes and small stores keep the tight cap; a wedged lookup must fail fast.
+        let database = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenUsageTests.default-timeout.\(UUID().uuidString).sqlite")
+        try Data().write(to: database)
+        defer { try? FileManager.default.removeItem(at: database) }
+        let runner = TimeoutRecordingProcessRunner()
+
+        _ = try SQLiteCLIAccessor(processRunner: runner)
+            .queryValue(path: database.path, sql: "SELECT 42")
+
+        XCTAssertEqual(runner.lastTimeout, 5)
+    }
+
+    func testSQLiteQueryPassesTheConfiguredStatementTimeoutThrough() throws {
+        // Usage scanners on large provider databases (e.g. OpenCode's multi-hundred-MB store)
+        // widen the cap instead of changing their SQL; the configured value must reach the
+        // subprocess unchanged so legitimately heavy queries stop timing out.
+        let database = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenUsageTests.raised-timeout.\(UUID().uuidString).sqlite")
+        try Data().write(to: database)
+        defer { try? FileManager.default.removeItem(at: database) }
+        let runner = TimeoutRecordingProcessRunner()
+
+        _ = try SQLiteCLIAccessor(processRunner: runner, queryTimeout: 30)
+            .queryValue(path: database.path, sql: "SELECT 42")
+
+        XCTAssertEqual(runner.lastTimeout, 30)
+    }
+
     func testSQLiteExecuteKeepsCredentialSQLOffTheProcessArgumentList() throws {
         let database = FileManager.default.temporaryDirectory
             .appendingPathComponent("OpenUsageTests.private-sql.\(UUID().uuidString).sqlite")
@@ -361,6 +391,20 @@ private final class ReadOnlyFailingProcessRunner: ProcessRunning, @unchecked Sen
             )
         }
         return ProcessResult(exitCode: 0, stdout: "42", stderr: "")
+    }
+}
+
+private final class TimeoutRecordingProcessRunner: ProcessRunning, @unchecked Sendable {
+    private(set) var lastTimeout: TimeInterval = 0
+
+    func run(
+        executable: String,
+        arguments: [String],
+        environment: [String: String],
+        timeout: TimeInterval
+    ) throws -> ProcessResult {
+        lastTimeout = timeout
+        return ProcessResult(exitCode: 0, stdout: "", stderr: "")
     }
 }
 

@@ -96,11 +96,63 @@ final class ScanWorkerClient {
         case .panelAccounting: scopeArgument = "panel-accounting"
         default: return
         }
+        // A single serialized child pays the SUM of every provider's fold, and one slow provider
+        // could burn the whole process budget so the parent lost every sibling's result too.
+        // Round-robin the list across up to three concurrent children: wall time becomes the
+        // slowest third instead of the total, heavy providers spread across children, and the
+        // spawn count stays well below one process per provider. Each child paces itself.
+        let groupCount = min(3, providerIDs.count)
+        // Heavy folds lead their child: a worker's shared batch budget truncates tail providers,
+        // so a slow fold placed late would inherit a shrunken deadline and lose to it every pass.
+        // Cheap providers tolerate the leftover slice — or the solo retry — far better.
+        let heavyFirst: Set<String> = ["antigravity", "opencode", "freebuff", "devin", "zai"]
+        let ordered = providerIDs.sorted {
+            heavyFirst.contains(ProviderAccountID.family(of: $0))
+                && !heavyFirst.contains(ProviderAccountID.family(of: $1))
+        }
+        let groups: [[String]] = (0..<groupCount).map { index in
+            ordered.enumerated().compactMap { $0.offset % groupCount == index ? $0.element : nil }
+        }
+        async let first = runBatchChild(providerIDs: groups[0], scopeArgument: scopeArgument, paced: paced, executableURL: executableURL)
+        async let second = groupCount > 1 ? runBatchChild(providerIDs: groups[1], scopeArgument: scopeArgument, paced: paced, executableURL: executableURL) : nil
+        async let third = groupCount > 2 ? runBatchChild(providerIDs: groups[2], scopeArgument: scopeArgument, paced: paced, executableURL: executableURL) : nil
+        let stashedAt = Date()
+        for response in await [first, second, third] {
+            guard let response else { continue }
+            for providerID in providerIDs
+            where response.snapshots[providerID] != nil || response.errors[providerID] != nil {
+                // Providers absent from the response (the child's batch budget ran out before
+                // their turn) get no stash — `foldOnlySnapshot` then spawns a solo worker with
+                // the full timeout instead of degrading to an in-process fold.
+                prefetched[providerID] = StashedFold(
+                    snapshot: response.snapshots[providerID],
+                    error: response.errors[providerID],
+                    identityKey: response.identityKeys[providerID],
+                    stashedAt: stashedAt
+                )
+            }
+        }
+    }
+
+    /// Spawn one batch child for a provider subset and decode its response. Returns nil on every
+    /// failure mode (timeout, spawn error, schema mismatch) — callers then treat those providers
+    /// as unstashed and retry them solo.
+    private func runBatchChild(
+        providerIDs: [String],
+        scopeArgument: String,
+        paced: Bool,
+        executableURL: URL
+    ) async -> ScanWorkerCommand.Response? {
         let arguments = [
             "--scan-worker",
             "--providers", providerIDs.joined(separator: ","),
             "--scope", scopeArgument,
             "--return-only",
+            // One slow fold must not starve its child: each provider gets a bounded slice, and
+            // the worker stops early enough to still emit partial results before the process
+            // timeout. 60 s clears the largest measured provider fold under load (~48 s paced).
+            "--per-provider-timeout", "60",
+            "--batch-budget", "100",
         ] + (paced ? ["--paced"] : [])
         do {
             let result = try await loadOffMainActor { [runner, timeout] in
@@ -115,7 +167,7 @@ final class ScanWorkerClient {
                 let message = result.stderr.split(separator: "\n").last
                     .map(String.init) ?? "scan worker exited with status \(result.exitCode)"
                 AppLog.warn(.refresh, "scan worker batch fold failed: \(message)")
-                return
+                return nil
             }
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
@@ -123,19 +175,12 @@ final class ScanWorkerClient {
             guard response.schema == ScanWorkerCommand.schemaName else {
                 throw ScanWorkerSchemaError()
             }
-            let stashedAt = Date()
-            for providerID in providerIDs {
-                prefetched[providerID] = StashedFold(
-                    snapshot: response.snapshots[providerID],
-                    error: response.errors[providerID],
-                    identityKey: response.identityKeys[providerID],
-                    stashedAt: stashedAt
-                )
-            }
+            return response
         } catch {
             if !Task.isCancelled {
                 logSpawnFailureOnce(providerID: providerIDs.joined(separator: ","), message: error.localizedDescription)
             }
+            return nil
         }
     }
 

@@ -269,6 +269,47 @@ final class ZCodeUsageScannerTests: XCTestCase {
         XCTAssertEqual(usage.logScan?.series.daily.first?.totalTokens, 120,
                        "the REAL row must not take its whole day+model group down with it")
     }
+
+    /// The scan-worker child is a fresh process every fold: the persisted record must let an
+    /// unchanged fold answer without spawning sqlite3 again, just like the in-memory cache does
+    /// inside one process.
+    func testFreshProcessServesUnchangedFoldFromPersistedRecord() throws {
+        let records = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quotabar-zcode-persist-\(UUID().uuidString)")
+        ZCodeUsageCachePersistence.directoryOverride = records
+        defer {
+            ZCodeUsageCachePersistence.directoryOverride = nil
+            try? FileManager.default.removeItem(at: records)
+        }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quotabar-zcode-persist-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let sqlitePath = directory.appendingPathComponent("db.sqlite").path
+        try Data().write(to: URL(fileURLWithPath: sqlitePath))
+
+        let counting = ZCodeCountingSQLite()
+        let first = ZCodeUsageScanner(
+            sqlite: counting, path: sqlitePath,
+            leveldbPath: "/nonexistent-quotabar-zcode-test/leveldb"
+        )
+        _ = try first.usage()
+        let scanned = counting.queries
+        XCTAssertGreaterThan(scanned, 0)
+
+        let worker = ZCodeUsageScanner(
+            sqlite: counting, path: sqlitePath,
+            leveldbPath: "/nonexistent-quotabar-zcode-test/leveldb"
+        )
+        let usage = try XCTUnwrap(worker.usage())
+        XCTAssertEqual(counting.queries, scanned,
+                       "a fresh process with unchanged stamps must not respawn sqlite3")
+        XCTAssertEqual(usage.totalTokens, 120)
+
+        try Data("wal-bytes".utf8).write(to: directory.appendingPathComponent("db.sqlite-wal"))
+        _ = try worker.usage()
+        XCTAssertGreaterThan(counting.queries, scanned,
+                             "a stamp change must invalidate the persisted record too")
+    }
 }
 
 /// Counts sqlite reads so a test can tell a cache hit from a real rescan.

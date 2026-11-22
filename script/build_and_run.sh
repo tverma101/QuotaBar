@@ -184,6 +184,13 @@ fi
 
 BUILD_JOBS="${BUILD_JOBS:-2}"
 if [ "$RELEASE" = "1" ]; then
+  echo "==> Rust core (universal arm64 + x86_64)"
+  QUOTABAR_RUST_UNIVERSAL=1 bash "$ROOT_DIR/script/build_rust_core.sh"
+else
+  echo "==> Rust core"
+  bash "$ROOT_DIR/script/build_rust_core.sh"
+fi
+if [ "$RELEASE" = "1" ]; then
   ARM64_SCRATCH="$ROOT_DIR/.build/$CONFIG-arm64"
   X86_64_SCRATCH="$ROOT_DIR/.build/$CONFIG-x86_64"
   echo "==> swift build ($CONFIG arm64, $BUILD_JOBS jobs, index store disabled)"

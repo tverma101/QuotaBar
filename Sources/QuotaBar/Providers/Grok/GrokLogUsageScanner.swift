@@ -1,6 +1,7 @@
 import Foundation
 import CoreFoundation
 import Darwin
+import os
 
 /// Builds Grok's daily usage from completed turns in the CLI's durable session transcripts.
 /// `logs/unified.jsonl` is a capped debug log, so it cannot back historical spend or reliable model
@@ -102,6 +103,9 @@ actor GrokLogUsageScanner {
             return nil
         }
         let bucket = FutureTimestampFoldBucket<Entry>()
+        // Dedup during the fold (first occurrence wins, same as `Self.dedup` afterwards): the
+        // second full-size entries array a post-fold dedup would build never materializes.
+        let dedupKeys = OSAllocatedUnfairLock<Set<String>>(initialState: [])
         let complete = await scanner.foldItems(
             from: files,
             since: since,
@@ -109,6 +113,10 @@ actor GrokLogUsageScanner {
             parseFile: Self.parseFile(at:),
             visit: { entry in
                 guard entry.tokens.totalTokens > 0 || (entry.carriedCost ?? 0) > 0 else { return }
+                if let eventID = entry.eventID,
+                   !dedupKeys.withLock({ $0.insert(eventID + "\0" + entry.model).inserted }) {
+                    return
+                }
                 bucket.append(entry, timestamp: entry.timestamp, maximumTimestamp: maximumTimestamp)
             },
             fileStarted: { bucket.begin($0) },
@@ -125,9 +133,8 @@ actor GrokLogUsageScanner {
             return nil
         }
         DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey)
-        let deduped = Self.dedup(bucket.items)
         guard !Task.isCancelled else { return nil }
-        let result = Self.aggregate(entries: deduped, since: since, pricing: pricing)
+        let result = Self.aggregate(entries: bucket.items, since: since, pricing: pricing)
         guard !Task.isCancelled else { return nil }
         return result
     }

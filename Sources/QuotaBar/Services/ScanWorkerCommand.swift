@@ -21,13 +21,21 @@ public enum ScanWorkerCommand {
     struct Options: Equatable {
         struct InvalidArguments: LocalizedError {
             var errorDescription: String? {
-                "Usage: QuotaBar --scan-worker --providers <id[,id...]> [--scope local-accounting|panel-accounting] [--paced] [--return-only]"
+                "Usage: QuotaBar --scan-worker --providers <id[,id...]> [--scope local-accounting|panel-accounting] [--paced] [--return-only] [--per-provider-timeout <s>] [--batch-budget <s>]"
             }
         }
         var providerIDs: [String] = []
         var scope: ProviderRefreshContext.Scope = .panelAccounting
         var paced = false
         var returnOnly = false
+        /// Cap on one provider's fold inside a multi-provider batch. Below the child process's own
+        /// wall timeout so one slow fold returns an error entry instead of the parent killing the
+        /// child and losing every sibling's completed snapshot.
+        var perProviderTimeout: TimeInterval?
+        /// Total wall budget for a batch fold. When the loop runs out, unattempted providers are
+        /// simply absent from the response — the caller then folds them in-process instead of
+        /// reporting a failure for work that never ran.
+        var batchBudget: TimeInterval?
 
         static func parse(_ arguments: [String]) throws -> Options {
             var options = Options()
@@ -41,6 +49,18 @@ public enum ScanWorkerCommand {
                     options.paced = true
                 case "--return-only":
                     options.returnOnly = true
+                case "--per-provider-timeout":
+                    index += 1
+                    guard index < arguments.count,
+                          let seconds = TimeInterval(arguments[index]), seconds > 0
+                    else { throw InvalidArguments() }
+                    options.perProviderTimeout = seconds
+                case "--batch-budget":
+                    index += 1
+                    guard index < arguments.count,
+                          let seconds = TimeInterval(arguments[index]), seconds > 0
+                    else { throw InvalidArguments() }
+                    options.batchBudget = seconds
                 case "--providers":
                     index += 1
                     guard index < arguments.count else { throw InvalidArguments() }
@@ -162,15 +182,28 @@ public enum ScanWorkerCommand {
     ) async -> Response {
         let byID = Dictionary(uniqueKeysWithValues: providers.map { ($0.provider.id, $0) })
         var response = Response(schema: schemaName, snapshots: [:], errors: [:], identityKeys: [:])
+        let batchStart = Date()
         for id in options.providerIDs {
             guard let provider = byID[id], !Task.isCancelled else { continue }
+            // A batch child dies at the parent's process timeout; providers still waiting when the
+            // budget is spent are omitted entirely so the caller retries them rather than
+            // surfacing an error for folds that never started.
+            let remaining = options.batchBudget.map { $0 - Date().timeIntervalSince(batchStart) }
+            if let remaining, remaining < 5 { break }
             let identity = ProviderCacheIdentityResult()
+            let timeout = min(
+                options.perProviderTimeout ?? WidgetDataStore.defaultProviderRefreshTimeout,
+                remaining ?? .greatestFiniteMagnitude
+            )
             let snapshot = await ProviderRefreshContext.$scope.withValue(options.scope) {
                 await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(options.paced) {
-                    await ProviderRefreshContext.$cacheIdentityResult.withValue(identity) {
-                        await ProviderRefreshDeadline.snapshot(
-                            from: provider, timeout: WidgetDataStore.defaultProviderRefreshTimeout
-                        )
+                    // A scan-worker is a short-lived child its parent blocks on — the background
+                    // 7.5% pace just stretches the same CPU seconds ~3x longer. Use the
+                    // interactive allowance so the fold finishes while the caller still waits.
+                    await ProviderRefreshContext.$accountingCPUInteractiveBudgetEnabled.withValue(options.paced) {
+                        await ProviderRefreshContext.$cacheIdentityResult.withValue(identity) {
+                            await ProviderRefreshDeadline.snapshot(from: provider, timeout: timeout)
+                        }
                     }
                 }
             }

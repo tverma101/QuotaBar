@@ -75,8 +75,9 @@ final class AntigravityAggregatePersistenceTests: XCTestCase {
     }
 
     /// The disk record round-trips the full derived state: stamps, events, aggregate, and the
-    /// incomplete-day bookkeeping arrays survive encode/decode, and the step timestamp index is
-    /// deliberately absent from the record.
+    /// incomplete-day bookkeeping arrays survive encode/decode. Records written before the step
+    /// timestamp index was persisted decode cleanly with a nil index; the next changed scan then
+    /// rebuilds it once and re-persists.
     func testRoundTripsDerivedCacheRecord() throws {
         let fixture = try makeDatabaseDirectory()
         let cache = AntigravityDbUsageScanner.CachedDatabase(

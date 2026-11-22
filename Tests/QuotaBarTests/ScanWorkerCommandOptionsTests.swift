@@ -52,6 +52,30 @@ final class ScanWorkerCommandOptionsTests: XCTestCase {
         ))
     }
 
+    func testParsesBatchBudgetFlags() throws {
+        let options = try ScanWorkerCommand.Options.parse(
+            ["--scan-worker", "--providers", "claude,devin", "--return-only",
+             "--per-provider-timeout", "40", "--batch-budget", "100"]
+        )
+        XCTAssertEqual(options.perProviderTimeout, 40)
+        XCTAssertEqual(options.batchBudget, 100)
+        XCTAssertNil(try ScanWorkerCommand.Options.parse(
+            ["--scan-worker", "--providers", "claude"]
+        ).perProviderTimeout)
+    }
+
+    func testRejectsInvalidBatchBudgetFlags() {
+        XCTAssertThrowsError(try ScanWorkerCommand.Options.parse(
+            ["--scan-worker", "--providers", "claude", "--per-provider-timeout", "abc"]
+        ))
+        XCTAssertThrowsError(try ScanWorkerCommand.Options.parse(
+            ["--scan-worker", "--providers", "claude", "--batch-budget", "-5"]
+        ))
+        XCTAssertThrowsError(try ScanWorkerCommand.Options.parse(
+            ["--scan-worker", "--providers", "claude", "--per-provider-timeout"]
+        ))
+    }
+
     func testRejectsMissingProviders() {
         XCTAssertThrowsError(try ScanWorkerCommand.Options.parse(["--scan-worker"]))
         XCTAssertThrowsError(try ScanWorkerCommand.Options.parse(["--scan-worker", "--providers", ""]))

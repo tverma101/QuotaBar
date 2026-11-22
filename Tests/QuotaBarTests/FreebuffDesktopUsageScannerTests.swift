@@ -6,9 +6,13 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
     private final class SQLite: SQLiteAccessing, @unchecked Sendable {
         var rows: [[String: Any]] = []
         var rowsByPath: [String: [[String: Any]]] = [:]
+        var fingerprintResponses: [String: String] = [:]
         var calls = 0
         func queryValue(path: String, sql: String) throws -> String? {
             calls += 1
+            if sql.contains("SUM(m.rowid)") {
+                return fingerprintResponses[path]
+            }
             XCTAssertTrue(sql.contains("m.role = 'assistant'"))
             XCTAssertFalse(sql.contains("parts_json"), "never read transcript content for accounting")
             return String(decoding: try JSONSerialization.data(withJSONObject: rowsByPath[path] ?? rows), as: UTF8.self)
@@ -39,7 +43,7 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         XCTAssertEqual(result?.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
         let again = try await scanner.scan(now: now)
         XCTAssertEqual(again?.usage.series.daily.first?.totalTokens, 300)
-        XCTAssertEqual(sqlite.calls, 1, "unchanged DB/WAL revisions avoid another sqlite subprocess")
+        XCTAssertEqual(sqlite.calls, 2, "unchanged DB/WAL revisions avoid another sqlite subprocess")
     }
 
     func testInconsistentReceiptFailsInsteadOfPublishingPlausibleTotals() async throws {
@@ -268,13 +272,13 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         )
 
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 3)
+        XCTAssertEqual(sqlite.calls, 6)
 
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 3, "the completed daily fold survives eviction of raw turn rows")
+        XCTAssertEqual(sqlite.calls, 6, "the completed daily fold survives eviction of raw turn rows")
 
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 3, "unchanged project revisions reuse the aggregate without SQLite")
+        XCTAssertEqual(sqlite.calls, 6, "unchanged project revisions reuse the aggregate without SQLite")
     }
 
     func testProjectDatabaseListIsResolvedOncePerInterval() async throws {
@@ -308,17 +312,46 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         sqlite.rowsByPath = [first.path: [try row("turn:1")], second.path: [try row("turn:2")]]
         let scanner = FreebuffDesktopUsageScanner(sqlite: sqlite, databasePaths: { [first.path, second.path] })
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 2)
+        XCTAssertEqual(sqlite.calls, 4)
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 2)
+        XCTAssertEqual(sqlite.calls, 4)
         sqlite.rowsByPath[first.path] = [["id": "turn:1",
                                         "timestamp": String(now.addingTimeInterval(-60).timeIntervalSince1970 * 1000),
                                         "metrics": #"{"usage":{"inputTokens":200,"outputTokens":50,"totalTokens":250}}"#]]
         try Data("newly committed rows".utf8).write(to: URL(fileURLWithPath: first.path + "-wal"))
         let result = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 3, "a single active project must not reread every other database")
+        XCTAssertEqual(sqlite.calls, 6, "a single active project must not reread every other database")
         XCTAssertEqual(result?.usage.series.daily.first?.totalTokens, 400,
                        "an updated cumulative turn replaces its earlier value instead of adding it again")
+    }
+
+    /// WAL churn (a checkpoint or metadata write) bumps the stamp revision without touching usage
+    /// rows. The stored content fingerprint proves it: the next scan pays one aggregate probe
+    /// instead of the full row read, and only a real usage change falls back to the full read.
+    func testUnchangedUsageFingerprintSkipsTheRowReadOnWALChurn() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = directory.appendingPathComponent("first.db")
+        try Data().write(to: first)
+        let sqlite = SQLite()
+        sqlite.rowsByPath = [first.path: [try row("turn:1")]]
+        sqlite.fingerprintResponses = [first.path: "3:42:900|0:0:0"]
+        let scanner = FreebuffDesktopUsageScanner(sqlite: sqlite, databasePaths: { [first.path] })
+
+        _ = try await scanner.scan(now: now)
+        XCTAssertEqual(sqlite.calls, 2, "first scan: row read plus fingerprint capture")
+
+        // Churn the WAL while usage rows stay identical.
+        try Data("checkpoint".utf8).write(to: URL(fileURLWithPath: first.path + "-wal"))
+        _ = try await scanner.scan(now: now)
+        XCTAssertEqual(sqlite.calls, 3, "unchanged usage rows re-verify by fingerprint, not re-read")
+
+        // A real usage change must still cost the full read.
+        sqlite.fingerprintResponses[first.path] = "4:55:1200|0:0:0"
+        try Data("more churn".utf8).write(to: URL(fileURLWithPath: first.path + "-wal"))
+        _ = try await scanner.scan(now: now)
+        XCTAssertEqual(sqlite.calls, 6, "a changed fingerprint falls back to the full read")
     }
 
     private final class SessionChatsSQLite: SQLiteAccessing, @unchecked Sendable {
