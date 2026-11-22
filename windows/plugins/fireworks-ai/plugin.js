@@ -1,7 +1,7 @@
 (function () {
   const API_BASE = "https://api.fireworks.ai/v1"
   const ACCOUNTS_URL = API_BASE + "/accounts?pageSize=200"
-  const KEYCHAIN_SERVICE = "OpenUsage Fireworks AI API Key"
+  const KEYCHAIN_SERVICE = "QuotaBar Fireworks AI API Key"
   const ENV_VAR = "FIREWORKS_API_KEY"
   const BILLING_WINDOW_DAYS = 30
   const TIER_BY_CAP = { 50: "Tier 1", 500: "Tier 2", 5000: "Tier 3", 50000: "Tier 4" }
@@ -172,7 +172,7 @@
         headers: {
           Authorization: "Bearer " + apiKey,
           Accept: "application/json",
-          "User-Agent": "OpenUsage/" + String(ctx.app && ctx.app.version ? ctx.app.version : "0.0.0"),
+          "User-Agent": "QuotaBar/" + String(ctx.app && ctx.app.version ? ctx.app.version : "0.0.0"),
         },
         timeoutMs: 15000,
       })
@@ -361,7 +361,7 @@
     const nowMs = ctx.util.parseDateMs(ctx.nowIso) || Date.now()
     const apiKey = loadApiKey(ctx)
     if (!apiKey) {
-      throw 'No Fireworks API key found. Paste it in Set credentials, save it in your OS credential store as "OpenUsage Fireworks AI API Key", or set FIREWORKS_API_KEY.'
+      throw 'No Fireworks API key found. Paste it in Set credentials, save it in your OS credential store as "QuotaBar Fireworks AI API Key", or set FIREWORKS_API_KEY.'
     }
     ctx.host.log.info("api key loaded from " + apiKey.source)
     const account = pickAccount(listAccounts(ctx, apiKey.value))

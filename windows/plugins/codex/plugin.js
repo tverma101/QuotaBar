@@ -323,7 +323,7 @@
     const headers = {
       Authorization: "Bearer " + accessToken,
       Accept: "application/json",
-      "User-Agent": "OpenUsage",
+      "User-Agent": "QuotaBar",
     }
     if (accountId) {
       headers["ChatGPT-Account-Id"] = accountId
@@ -340,7 +340,7 @@
     const headers = {
       Authorization: "Bearer " + accessToken,
       Accept: "application/json",
-      "User-Agent": "OpenUsage",
+      "User-Agent": "QuotaBar",
       "OpenAI-Beta": "codex-1",
       originator: "Codex Desktop",
     }

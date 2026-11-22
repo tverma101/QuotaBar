@@ -6,8 +6,8 @@
   const SESSION_MS = 5 * 60 * 60 * 1000
   const WEEK_MS = 7 * 24 * 60 * 60 * 1000
   const MONTH_MS = 30 * 24 * 60 * 60 * 1000
-  const KEYCHAIN_SESSION_SERVICE = "OpenUsage Ollama Session"
-  const KEYCHAIN_COOKIE_SERVICE = "OpenUsage Ollama Cookie"
+  const KEYCHAIN_SESSION_SERVICE = "QuotaBar Ollama Session"
+  const KEYCHAIN_COOKIE_SERVICE = "QuotaBar Ollama Cookie"
   const FIREFOX_PROFILE_ROOTS = [
     "~/.mozilla/firefox",
     "~/.librewolf",
@@ -351,7 +351,7 @@
         headers: {
           Accept: "text/html",
           Cookie: SESSION_COOKIE_NAME + "=" + cookie.value,
-          "User-Agent": "OpenUsage",
+          "User-Agent": "QuotaBar",
         },
         timeoutMs: 10000,
       })

@@ -61,7 +61,7 @@
           Authorization: "Bearer " + apiKey,
           "Content-Type": "application/json",
           Accept: "application/json",
-          "User-Agent": "OpenUsage",
+          "User-Agent": "QuotaBar",
         },
         timeoutMs: 10000,
       })

@@ -70,7 +70,7 @@
         headers: {
           Authorization: "Bearer " + apiKeyInfo.value,
           Accept: "application/json",
-          "User-Agent": "OpenUsage",
+          "User-Agent": "QuotaBar",
         },
         timeoutMs: 10000,
       })

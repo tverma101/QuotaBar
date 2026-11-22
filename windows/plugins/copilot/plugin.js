@@ -1,5 +1,7 @@
 (function () {
-  const KEYCHAIN_SERVICE = "OpenUsage-copilot";
+  const KEYCHAIN_SERVICE = "QuotaBar-copilot";
+  // Pre-rebrand entries stored by OpenUsage builds are still readable.
+  const LEGACY_KEYCHAIN_SERVICE = "OpenUsage-copilot";
   const GH_KEYCHAIN_SERVICE = "gh:github.com";
   const USAGE_URL = "https://api.github.com/copilot_internal/user";
   const PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
@@ -45,17 +47,25 @@
   }
 
   function loadTokenFromKeychain(ctx) {
+    let raw = null;
     try {
-      const raw = ctx.host.keychain.readGenericPassword(KEYCHAIN_SERVICE);
-      if (raw) {
-        const parsed = ctx.util.tryParseJson(raw);
-        if (parsed && parsed.token) {
-          ctx.host.log.info("token loaded from OpenUsage keychain");
-          return { token: parsed.token, source: "keychain" };
-        }
-      }
+      raw = ctx.host.keychain.readGenericPassword(KEYCHAIN_SERVICE);
     } catch (e) {
-      ctx.host.log.info("OpenUsage keychain read failed: " + String(e));
+      ctx.host.log.info("QuotaBar keychain read failed: " + String(e));
+    }
+    if (!raw) {
+      try {
+        raw = ctx.host.keychain.readGenericPassword(LEGACY_KEYCHAIN_SERVICE);
+      } catch (e) {
+        return null;
+      }
+    }
+    if (raw) {
+      const parsed = ctx.util.tryParseJson(raw);
+      if (parsed && parsed.token) {
+        ctx.host.log.info("token loaded from QuotaBar keychain");
+        return { token: parsed.token, source: "keychain" };
+      }
     }
     return null;
   }
@@ -211,7 +221,7 @@
       headers: {
         Authorization: "token " + token,
         Accept: "application/vnd.github+json",
-        "User-Agent": "OpenUsage",
+        "User-Agent": "QuotaBar",
         "X-GitHub-Api-Version": "2022-11-28",
       },
       timeoutMs: 15000,
@@ -226,7 +236,7 @@
       headers: {
         Authorization: "token " + token,
         Accept: "application/vnd.github+json",
-        "User-Agent": "OpenUsage",
+        "User-Agent": "QuotaBar",
         "X-GitHub-Api-Version": "2022-11-28",
       },
       timeoutMs: 15000,

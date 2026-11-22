@@ -345,7 +345,7 @@
         Authorization: "Bearer " + accessToken,
         "Content-Type": "application/json",
         Accept: "application/json",
-        "User-Agent": "OpenUsage",
+        "User-Agent": "QuotaBar",
       },
       bodyText: JSON.stringify({ useCache: true }),
       timeoutMs: 10000,
@@ -358,7 +358,7 @@
         headers: {
           Authorization: "Bearer " + accessToken,
           Accept: "application/json",
-          "User-Agent": "OpenUsage",
+          "User-Agent": "QuotaBar",
         },
         timeoutMs: 10000,
       })

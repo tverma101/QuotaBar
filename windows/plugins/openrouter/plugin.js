@@ -2,6 +2,7 @@
   const CREDITS_URL = "https://openrouter.ai/api/v1/credits";
   const KEY_URL = "https://openrouter.ai/api/v1/key";
   const CONFIG_PATHS = [
+    "~/.config/quotabar/openrouter.json",
     "~/.config/openusage/openrouter.json",
     "~/.config/openrouter/key.json",
   ];
@@ -157,7 +158,7 @@
   function probe(ctx) {
     const apiKey = loadApiKey(ctx);
     if (!apiKey) {
-      throw "No OpenRouter API key. Set OPENROUTER_API_KEY or add ~/.config/openusage/openrouter.json.";
+      throw "No OpenRouter API key. Set OPENROUTER_API_KEY or add ~/.config/quotabar/openrouter.json.";
     }
 
     let creditsResp = null;

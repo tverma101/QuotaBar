@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { makeCtx } from "../test-helpers.js"
 
-const KEYCHAIN_SERVICE = "OpenUsage Fireworks AI API Key"
+const KEYCHAIN_SERVICE = "QuotaBar Fireworks AI API Key"
 const BILLING_CSV = `usage_type,model_name,prompt_tokens,completion_tokens,start_time,end_time
 TEXT_COMPLETION_INFERENCE_USAGE,accounts/fireworks/models/kimi-k2p5,70000000,33890000,2026-01-03T00:00:00Z,2026-02-02T00:00:00Z`
 
