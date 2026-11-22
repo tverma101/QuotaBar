@@ -91,6 +91,10 @@ struct HeaderView: View {
             Label("Usage History", systemImage: "clock.arrow.circlepath")
         }
 
+        Button { toggle(.generationSpeed) } label: {
+            Label("Generation Speed", systemImage: "speedometer")
+        }
+
         Button { toggle(.settings) } label: {
             Label("Settings", systemImage: "gearshape")
         }

@@ -1,10 +1,14 @@
 import Foundation
 import os
 
-/// One provider-independent piece of the Usage History report: a single calendar day's measured
-/// tokens, the known plan-priced subtotal, and the public-API-rate comparison computed at fold time.
-/// Cost is nil when the day's rows were all unpriced (dash), never a fabricated zero. Incomplete
-/// subtotals remain visible and `hasIncompleteCost` tells the UI to label them Partial.
+enum HistoryCostMode: String, CaseIterable {
+    case reportedOnly = "Reported Only"
+    case apiEstimates = "API Estimates"
+}
+
+/// One provider-independent piece of the Usage History report: a calendar day's measured tokens,
+/// the selected cost source, and an optional public-API-rate comparison. Cost is nil when the
+/// selected source has no amount; incomplete subtotals remain visible and marked Partial.
 struct HistoryDayPoint: Identifiable, Equatable, Sendable {
     /// `yyyy-MM-dd` day key — stable identity across refreshes.
     let date: String
@@ -19,9 +23,7 @@ struct HistoryDayPoint: Identifiable, Equatable, Sendable {
 }
 
 /// One model's 30-day totals inside a provider section. `slug` is the display spelling the provider's
-/// logs use. A row the pricing layer cannot price yet shows tokens with a dashed cost: the automatic
-/// discovery path (unknown-slug → public-catalogue revalidation) prices it on a later fold, and the
-/// cost backfills with no user action.
+/// logs use. Cost is omitted when the selected source cannot be safely attributed to that model.
 struct HistoryModelRow: Identifiable, Equatable, Sendable {
     let providerID: String
     let slug: String
@@ -35,8 +37,8 @@ struct HistoryModelRow: Identifiable, Equatable, Sendable {
     var id: String { "\(providerID)|\(slug.lowercased())" }
 }
 
-/// One provider's 30-day totals plus its per-model rows (cost desc). Sections appear in the
-/// caller's enabled-provider order and only for providers that actually have history.
+/// One provider's 30-day totals for the selected cost source plus its per-model rows (cost desc).
+/// Sections appear in the caller's enabled-provider order and only for providers with history.
 struct HistoryProviderSection: Identifiable, Equatable, Sendable {
     let providerID: String
     let displayName: String
@@ -51,9 +53,8 @@ struct HistoryProviderSection: Identifiable, Equatable, Sendable {
     var id: String { providerID }
 }
 
-/// A period total (Today / 7 Days / 30 Days): measured tokens, the known plan-priced subtotal, and
-/// the honest fold-time API-rate estimate. Incomplete costs remain visible with the partial flag.
-/// Nil cost means no priced rows; nil estimate means no row's tokens could be priced at API rates.
+/// A period total (Today / 7 Days / 30 Days): measured tokens and the selected cost source.
+/// Incomplete costs remain visible with the partial flag.
 struct HistoryPeriodTotal: Equatable, Sendable {
     let tokens: Int
     let tokenCountSaturated: Bool
@@ -131,6 +132,54 @@ enum HistoryDashboardAggregator {
         /// `estimatedCost`). Histories with mixed sources also carry `estimatedCostDays`, which adds
         /// the hero's "(Est.)" mark only when an included day contains an imputed amount.
         var estimatedCostByProviderID: [String: Bool] = [:]
+    }
+
+    static func report(
+        _ input: Input,
+        costMode: HistoryCostMode,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> HistoryReport {
+        var projected = input
+        projected.estimatedCostByProviderID = [:]
+        for (providerID, original) in input.historyByProviderID {
+            var history = original
+            var estimateDays: Set<String> = []
+            history.series.daily = original.series.daily.map { source in
+                var day = source
+                switch costMode {
+                case .reportedOnly:
+                    day.costUSD = source.reportedCost?.dollars
+                    day.costIsComplete = (source.reportedCost?.coveredTokens ?? 0) >= source.totalTokens
+                        && !source.tokenCountSaturated
+                case .apiEstimates:
+                    day.costUSD = original.apiEstimateByDay?[source.date]
+                    day.costIsComplete = original.apiEstimateIncompleteDays?.contains(source.date) != true
+                        && original.unknownModelsByDay[source.date]?.isEmpty != false
+                        && !source.tokenCountSaturated
+                    if day.costUSD != nil { estimateDays.insert(source.date) }
+                }
+                // Coverage was computed for the selected source, not the mixed legacy subtotal.
+                day.hasUnexplainedIncompleteCost = false
+                return day
+            }
+            // Devin and Freebuff model amounts share their public-rate comparisons. Other model rows
+            // retain tokens without borrowing mixed-provenance dollars.
+            if costMode != .apiEstimates || !["devin", "freebuff"].contains(providerID) {
+                history.modelUsage?.daily = original.modelUsage?.daily.map { day in
+                    DailyModelUsageEntry(date: day.date, models: day.models.filter { $0.totalTokens > 0 }.map { source in
+                        ModelUsageEntry(model: source.model, totalTokens: source.totalTokens,
+                                        costUSD: nil, tokenCountSaturated: source.tokenCountSaturated)
+                    })
+                } ?? []
+            }
+            history.unknownModelsByDay = [:]
+            history.apiEstimateByDay = nil
+            history.apiEstimateIncompleteDays = nil
+            history.estimatedCostDays = estimateDays
+            projected.historyByProviderID[providerID] = history
+        }
+        return report(projected, now: now, calendar: calendar)
     }
 
     /// Folds the window's histories. `now` anchors the 30-day window and the Today/7-day buckets;

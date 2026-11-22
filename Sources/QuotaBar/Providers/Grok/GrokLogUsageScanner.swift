@@ -434,7 +434,13 @@ actor GrokLogUsageScanner {
             }
             // Unpriced rows count their tokens with a dashed cost (owner policy), so the totals stay
             // complete and a later reveal can price them.
-            accumulator.add(day: day, tokens: entry.tokens.totalTokens, cost: cost, model: entry.model)
+            accumulator.add(
+                day: day,
+                tokens: entry.tokens.totalTokens,
+                cost: cost,
+                model: entry.model,
+                reportedCost: entry.carriedCost
+            )
         }
         return accumulator.build()
     }

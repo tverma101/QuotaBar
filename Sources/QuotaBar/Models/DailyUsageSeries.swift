@@ -27,6 +27,13 @@ struct DailyUsageEntry: Hashable, Sendable, Codable {
     var hasUnexplainedIncompleteCost: Bool?
     /// True when the source token total exceeded `Int.max` and was clipped to a lower bound.
     var tokenCountSaturated: Bool
+    var reportedCost: ReportedUsageCost?
+
+    /// Named unknowns or an active session can explain a legacy gap, not an explicit mismatch.
+    func hasUnexplainedCostGap(hasUnknownModels: Bool, isPartial: Bool) -> Bool {
+        if let hasUnexplainedIncompleteCost { return hasUnexplainedIncompleteCost }
+        return !costIsComplete && !hasUnknownModels && !isPartial
+    }
 
     init(
         date: String,
@@ -34,7 +41,8 @@ struct DailyUsageEntry: Hashable, Sendable, Codable {
         costUSD: Double?,
         costIsComplete: Bool = true,
         hasUnexplainedIncompleteCost: Bool? = nil,
-        tokenCountSaturated: Bool? = nil
+        tokenCountSaturated: Bool? = nil,
+        reportedCost: ReportedUsageCost? = nil
     ) {
         self.date = date
         self.totalTokens = totalTokens
@@ -42,10 +50,12 @@ struct DailyUsageEntry: Hashable, Sendable, Codable {
         self.costIsComplete = costIsComplete
         self.hasUnexplainedIncompleteCost = hasUnexplainedIncompleteCost
         self.tokenCountSaturated = tokenCountSaturated ?? (totalTokens == .max)
+        self.reportedCost = reportedCost
     }
 
     private enum CodingKeys: String, CodingKey {
         case date, totalTokens, costUSD, costIsComplete, hasUnexplainedIncompleteCost, tokenCountSaturated
+        case reportedCost
     }
 
     init(from decoder: Decoder) throws {
@@ -62,6 +72,32 @@ struct DailyUsageEntry: Hashable, Sendable, Codable {
         )
         tokenCountSaturated = try values.decodeIfPresent(Bool.self, forKey: .tokenCountSaturated)
             ?? (totalTokens == .max)
+        reportedCost = try values.decodeIfPresent(ReportedUsageCost.self, forKey: .reportedCost)
+    }
+}
+
+struct ReportedUsageCost: Hashable, Sendable, Codable {
+    var dollars: Double
+    var coveredTokens: Int
+}
+
+struct ReportedUsageCostAccumulator {
+    private(set) var byDay: [String: ReportedUsageCost] = [:]
+    private var overflowedDays: Set<String> = []
+
+    mutating func add(day: String, dollars: Double?, tokens: Int) {
+        guard let dollars, dollars.isFinite, dollars >= 0,
+              tokens >= 0, !overflowedDays.contains(day) else { return }
+        let prior = byDay[day] ?? ReportedUsageCost(dollars: 0, coveredTokens: 0)
+        let total = prior.dollars + dollars
+        guard total.isFinite else {
+            byDay.removeValue(forKey: day)
+            overflowedDays.insert(day)
+            return
+        }
+        byDay[day] = ReportedUsageCost(
+            dollars: total, coveredTokens: ProviderParse.addingSaturating(prior.coveredTokens, tokens)
+        )
     }
 }
 

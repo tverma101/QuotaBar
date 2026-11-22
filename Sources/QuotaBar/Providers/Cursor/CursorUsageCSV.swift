@@ -2,13 +2,14 @@ import Foundation
 
 /// One parsed row from Cursor's CSV usage export. `imputedCostDollars` is the locally priced dollar
 /// amount (server CSV tokens × the shared model pricing); `nil` when no pricing source knows the
-/// model — those rows contribute tokens but flag the day's cost as incomplete. Ported from
-/// the companion CursorCat parser, dropping the actual-cost / CostMode path for v1.
+/// model — those rows contribute tokens but flag the day's cost as incomplete. Numeric provider
+/// amounts from the optional Cost column stay separate from local estimates.
 struct CursorUsageCSVRow: Sendable, Equatable {
     var date: Date
     var model: String
     var tokens: TokenBreakdown
     var imputedCostDollars: Double?
+    var reportedCostDollars: Double? = nil
 }
 
 struct CursorUsageCSVParseResult: Sendable, Equatable {
@@ -32,6 +33,7 @@ enum CursorUsageCSV {
         static let input = "Input (w/o Cache Write)"
         static let cacheRead = "Cache Read"
         static let output = "Output Tokens"
+        static let cost = "Cost"
         static let required = [date, model, cacheWrite, input, cacheRead, output]
     }
 
@@ -114,9 +116,10 @@ enum CursorUsageCSV {
                 rejectedRowCount += 1
                 return
             }
-            // A zero-token row is valid export structure but carries no usage. Keeping it would let
-            // a $0 mapped row falsely move a provider's lifetime "since" date backward.
-            guard rowTokenCount > 0 else { return }
+            let reportedCost = parseReportedCost(r[Column.cost])
+            // Ignore idle zero-token rows; a positive exported Cost still represents a reportable
+            // charge even when the row has no measured tokens.
+            guard rowTokenCount > 0 || (reportedCost ?? 0) > 0 else { return }
             guard date <= maximumTimestamp else {
                 hasFutureTimestamp = true
                 return
@@ -141,7 +144,8 @@ enum CursorUsageCSV {
                     date: date,
                     model: model,
                     tokens: tokens,
-                    imputedCostDollars: nil
+                    imputedCostDollars: nil,
+                    reportedCostDollars: reportedCost
                 ))
                 return
             }
@@ -150,11 +154,12 @@ enum CursorUsageCSV {
                 date: date,
                 model: model,
                 tokens: tokens,
-                imputedCostDollars: pricing.estimatedCursorCostDollars(
+                imputedCostDollars: rowTokenCount == 0 ? nil : pricing.estimatedCursorCostDollars(
                     model: model,
                     tokens: tokens,
                     applyLongContextRates: false
-                )
+                ),
+                reportedCostDollars: reportedCost
             ))
         }
         if summary.wasCancelled || Task<Never, Never>.isCancelled { throw CancellationError() }
@@ -169,6 +174,17 @@ enum CursorUsageCSV {
             rejectedRowCount: rejectedRowCount,
             unpricedGrokBotRowCount: unpricedGrokBotRowCount
         )
+    }
+
+    private static func parseReportedCost(_ raw: String?) -> Double? {
+        guard let raw else { return nil }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let amount = value.hasPrefix("$") ? value.dropFirst() : value[...]
+        guard !amount.isEmpty,
+              amount.utf8.allSatisfy({ (48...57).contains($0) || $0 == 46 }),
+              let dollars = Double(amount), dollars.isFinite, dollars >= 0
+        else { return nil }
+        return dollars
     }
 
     private static func parseDate(_ raw: String) -> Date? {

@@ -69,6 +69,11 @@ final class CodexProvider: ProviderRuntime {
         self.pricing = pricing
     }
 
+    func unloadLocalAccountingCachesForMemoryPressure() {
+        lastProxyScan = nil
+        lastProxyScanRevision = nil
+    }
+
     var widgetDescriptors: [WidgetDescriptor] {
         [
             .percent(id: "\(provider.id).session", provider: provider, title: "Session")

@@ -80,7 +80,8 @@ final class ModelPricing: Sendable {
         secondary: PricingCatalog,
         openRouter: PricingCatalog
     ) -> String {
-        var parts: [String] = ["pricing-v3"]
+        // Bump when cost semantics change so unchanged rates cannot reuse stale dollars.
+        var parts: [String] = ["pricing-v4"]
         func rateStamp(_ rates: ModelRates) -> String {
             let base = [
                 String(rates.inputPerMillion), String(rates.outputPerMillion),

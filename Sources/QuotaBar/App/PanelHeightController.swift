@@ -153,6 +153,7 @@ final class PanelHeightController {
         switch screen {
         case .dashboard: "openusage.panel.height.dashboard"
         case .history: "openusage.panel.height.history"
+        case .generationSpeed: "quotabar.panel.height.generationSpeed"
         case .customize: "openusage.panel.height.customize"
         case .settings: "openusage.panel.height.settings"
         }

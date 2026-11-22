@@ -8,7 +8,7 @@ import Foundation
 /// every active-session pass, so the composed whole-scan result cannot be shared across
 /// processes; the per-database rows are the stable unit, and pricing applies at fold time.
 enum FreebuffDesktopTurnPersistence {
-    static let schema = 1
+    static let schema = 2
     /// Refuse to cache pathological histories that would dominate the log-scan-cache directory.
     static let maximumRecordBytes = 64 * 1_024 * 1_024
     private static let mutationLock = NSLock()

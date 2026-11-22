@@ -51,6 +51,27 @@ final class CursorCSVParserTests: XCTestCase {
         XCTAssertNil(parsed.rows[1].imputedCostDollars)
     }
 
+    func testExportKeepsOnlyNumericReportedDollarsIncludingZeroAndCostOnlyRows() throws {
+        let csv = """
+        Date,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Cost
+        2026-01-01T00:00:00Z,example,0,100,0,1,$1.25
+        2026-01-01T00:00:01Z,example,0,100,0,1,Included
+        2026-01-01T00:00:02Z,example,0,100,0,1,$0.00
+        2026-01-01T00:00:03Z,example,0,0,0,0,$2.50
+        2026-01-01T00:00:04Z,example,0,100,0,1,EUR 1.50
+        """
+        let parsed = try CursorUsageCSV.parse(csv: csv, pricing: .empty)
+        XCTAssertEqual(parsed.rows.map(\.reportedCostDollars), [1.25, nil, 0, 2.50, nil])
+
+        var lines: [MetricLine] = []
+        let history = try CursorUsageMapper.appendSpendLines(
+            rows: parsed.rows, now: parsed.rows[0].date, pricing: .empty, to: &lines
+        )
+        // The rows are only seconds apart; sum across day keys to work in all time zones.
+        XCTAssertEqual(history.series.daily.compactMap { $0.reportedCost?.dollars }.reduce(0, +), 3.75)
+        XCTAssertEqual(history.series.daily.compactMap { $0.reportedCost?.coveredTokens }.reduce(0, +), 202)
+    }
+
     func testUsageCSVDoesNotTreatAggregatedRowsAsSingleLongContextRequests() throws {
         var rates = ModelRates(
             inputPerMillion: 3,
@@ -296,20 +317,37 @@ final class CursorSpendRangeTests: XCTestCase {
 
         // The unpriced row keeps counting tokens and joins the breakdown with a nil cost. The tile
         // shows the known subtotal beside the unknown-model warning.
+        let subtotal = 1.004 + 2.006
         XCTAssertEqual(values(lines, "Today"), [
-            MetricValue(number: 3.01, kind: .dollars, estimated: true, isLowerBound: true),
+            MetricValue(number: subtotal, kind: .dollars, estimated: true, isLowerBound: true),
             MetricValue(number: 600, kind: .count, label: "tokens")
         ])
         XCTAssertEqual(unknown(lines, "Today"), ["unpriced-cursor-model"])
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
         XCTAssertEqual(breakdown.sourceNote, "From your Cursor usage export")
-        XCTAssertEqual(breakdown.totalCostUSD, 3.01, "the breakdown header keeps the known dollar subtotal")
+        XCTAssertEqual(breakdown.totalCostUSD, subtotal, "the breakdown header keeps the known dollar subtotal")
         XCTAssertEqual(breakdown.models.map(\.model), ["gpt-5.5", "composer-1", "unpriced-cursor-model"])
         XCTAssertEqual(breakdown.models.map(\.totalTokens), [200, 100, 300])
         let modelCost = try XCTUnwrap(breakdown.models[0].costUSD)
         XCTAssertEqual(modelCost, 2.006, accuracy: 0.000001, "spend shares use the unrounded model cost")
         XCTAssertEqual(MetricFormatter.number(modelCost, kind: .dollars, style: .row), "$2.01")
         XCTAssertNil(breakdown.models[2].costUSD, "the unpriced row claims no cost")
+    }
+
+    func testSubCentDailyCostsAccumulateBeforeDisplayRounding() throws {
+        let now = TestLocalInstant.date(2026, 10, 27, 12)
+        let yesterday = TestLocalInstant.date(2026, 10, 26, 12)
+        let rows = [now, yesterday].map { makeRow(date: $0, cost: 0.004, tokens: 100, model: "composer-1") }
+        var lines: [MetricLine] = []
+        let history = try CursorUsageMapper.appendSpendLines(rows: rows, now: now, pricing: .empty, to: &lines)
+
+        XCTAssertEqual(history.series.daily.map(\.costUSD), [0.004, 0.004])
+        XCTAssertEqual(history.estimatedCostDays, ["2026-10-26", "2026-10-27"])
+        let dollars = try XCTUnwrap(values(lines, "Last 30 Days")?.first { $0.kind == .dollars })
+        XCTAssertEqual(dollars.number, 0.008, accuracy: 1e-12)
+        XCTAssertEqual(MetricFormatter.number(dollars.number, kind: .dollars, style: .row), "$0.01")
+        let breakdown = try XCTUnwrap(modelBreakdown(lines, "Last 30 Days"))
+        XCTAssertEqual(try XCTUnwrap(breakdown.models.first?.costUSD), dollars.number, accuracy: 1e-12)
     }
 
     func testModelBreakdownGroupsThinkingEffortSlugsIntoFamilies() throws {

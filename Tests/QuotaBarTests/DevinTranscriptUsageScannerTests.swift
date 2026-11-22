@@ -320,6 +320,33 @@ final class DevinTranscriptUsageScannerTests: XCTestCase {
         XCTAssertNil(usage)
     }
 
+    func testNeonEffortSlugUsesExactPublicRouteAndIsNotReportedCost() throws {
+        let rates = try PricingCatalogCodecs.catalogFromOpenRouter(Data(
+            #"{"data":[{"id":"google/gemini-4-neon","pricing":{"prompt":"0.000003","completion":"0.000015","input_cache_read":"0.00000015"}}],"total_count":1,"links":{"next":null}}"#.utf8
+        ))
+        let pricing = ModelPricing(
+            supplement: PricingSupplement(),
+            primary: PricingCatalog(),
+            secondary: PricingCatalog(),
+            openRouter: rates
+        )
+        let now = TestLocalInstant.date(2026, 11, 21, 12)
+        let entry = DevinTranscriptUsageScanner.Entry(
+            timestamp: now,
+            model: "gemini-4-neon-xhigh",
+            tokens: TokenBreakdown(input: 1_000_000, cacheRead: 1_000_000, output: 1_000_000)
+        )
+        let scan = DevinTranscriptUsageScanner.aggregate(entries: [entry], since: .distantPast, pricing: pricing)
+        let day = try XCTUnwrap(scan.series.daily.first)
+        XCTAssertEqual(try XCTUnwrap(scan.apiEstimateByDay?[day.date]), 18.15, accuracy: 0.000001)
+        XCTAssertEqual(day.totalTokens, 3_000_000)
+        XCTAssertNil(day.reportedCost)
+
+        let missingRoute = DevinTranscriptUsageScanner.aggregate(entries: [entry], since: .distantPast, pricing: .empty)
+        XCTAssertNil(missingRoute.apiEstimateByDay)
+        XCTAssertEqual(missingRoute.series.daily.first?.totalTokens, 3_000_000)
+    }
+
     private func scan(home: URL, now: Date, daysBack: Int = 30) async -> LogUsageScan? {
         await DevinTranscriptUsageScanner(
             transcriptsDirectory: home.appendingPathComponent("transcripts", isDirectory: true),

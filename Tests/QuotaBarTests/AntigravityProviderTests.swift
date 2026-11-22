@@ -74,8 +74,8 @@ final class AntigravityProviderTests: XCTestCase {
         // Pro and Flash share one pool since Antigravity's 2026-05-19 quota merge, so all Gemini
         // models collapse into a single "Session" meter (worst fraction wins across the whole pool).
         XCTAssertEqual(lines.map(\.label), ["Session", "Claude"])
-        XCTAssertEqual(used(lines[0]), 50)  // worst Gemini fraction (Pro Low 0.5) -> 50% used
-        XCTAssertEqual(used(lines[1]), 70)  // worst non-Gemini (Claude 0.3) -> 70% used
+        XCTAssertEqual(used(lines[0]) ?? -1, 50, accuracy: 0.0001)  // worst Gemini fraction (Pro Low 0.5) -> 50% used
+        XCTAssertEqual(used(lines[1]) ?? -1, 70, accuracy: 0.0001)  // worst non-Gemini (Claude 0.3) -> 70% used
     }
 
     func testBuildLinesDedupKeepsWorstFractionAndItsReset() {
@@ -87,7 +87,7 @@ final class AntigravityProviderTests: XCTestCase {
         ]
         let lines = AntigravityUsageMapper.buildLines(configs)
         XCTAssertEqual(lines.count, 1)
-        XCTAssertEqual(used(lines[0]), 80)              // worst fraction 0.2
+        XCTAssertEqual(used(lines[0]) ?? -1, 80, accuracy: 0.0001) // worst fraction 0.2
         XCTAssertEqual(resetsAt(lines[0]), earlier)     // reset of the kept (worst) entry
     }
 
@@ -99,7 +99,7 @@ final class AntigravityProviderTests: XCTestCase {
         ]
         let lines = AntigravityUsageMapper.buildLines(configs)
         XCTAssertEqual(lines.map(\.label), ["Session"])
-        XCTAssertEqual(used(lines[0]), 40)
+        XCTAssertEqual(used(lines[0]) ?? -1, 40, accuracy: 0.0001)
     }
 
     func testBuildLinesClampsOutOfRangeFractions() {
@@ -158,8 +158,8 @@ final class AntigravityProviderTests: XCTestCase {
         XCTAssertEqual(parsed?.plan, "Pro")
         let lines = AntigravityUsageMapper.buildLines(parsed?.configs ?? [])
         XCTAssertEqual(lines.map(\.label), ["Session", "Claude"])
-        XCTAssertEqual(used(lines[0]), 50)
-        XCTAssertEqual(used(lines[1]), 0)
+        XCTAssertEqual(used(lines[0]) ?? -1, 50, accuracy: 0.0001)
+        XCTAssertEqual(used(lines[1]) ?? -1, 0, accuracy: 0.0001)
         XCTAssertNotNil(resetsAt(lines[0]))
     }
 
@@ -206,7 +206,7 @@ final class AntigravityProviderTests: XCTestCase {
         let lines = AntigravityUsageMapper.buildLines(AntigravityUsageMapper.parseQuotaBuckets(Data(json.utf8)))
         // Pro and Flash buckets pool into the one "Session" meter; the worst fraction (0.5) wins.
         XCTAssertEqual(lines.map(\.label), ["Session"])
-        XCTAssertEqual(used(lines[0]), 50)
+        XCTAssertEqual(used(lines[0]) ?? -1, 50, accuracy: 0.0001)
     }
 
     // MARK: - Language server discovery (pure parsing)
@@ -521,8 +521,8 @@ final class AntigravityProviderTests: XCTestCase {
         XCTAssertEqual(snapshot.plan, "Pro")
         // Legacy per-model data merges into the two pool meters (worst fraction per pool).
         XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Claude"])
-        XCTAssertEqual(used(snapshot.lines[0]), 60)
-        XCTAssertEqual(used(snapshot.lines[1]), 30)
+        XCTAssertEqual(used(snapshot.lines[0]) ?? -1, 60, accuracy: 0.0001)
+        XCTAssertEqual(used(snapshot.lines[1]) ?? -1, 30, accuracy: 0.0001)
         XCTAssertEqual(
             codeAssistCalls.next(),
             1,
@@ -660,7 +660,7 @@ final class AntigravityProviderTests: XCTestCase {
         let snapshot = await provider.refresh()
 
         XCTAssertNil(snapshot.errorCategory)
-        XCTAssertEqual(used(snapshot.line(label: "Session")), 20)
+        XCTAssertEqual(used(snapshot.line(label: "Session")) ?? -1, 20, accuracy: 0.0001)
         let summaryTokens = routing.requests
             .filter { $0.url.path == AntigravityUsageClient.quotaSummaryPath }
             .compactMap { $0.headers["Authorization"] }
@@ -705,9 +705,10 @@ final class AntigravityProviderTests: XCTestCase {
         let planRequests = routing.requests.filter { $0.url.path == AntigravityUsageClient.loadCodeAssistPath }
         XCTAssertEqual(quotaRequests.count, 1, "cancellation must not retry the quota request: \(routing.requests.map { $0.url.absoluteString })")
         XCTAssertLessThanOrEqual(planRequests.count, 1, "the independent plan lookup must not retry")
+        XCTAssertTrue(planRequests.allSatisfy { $0.url.host == "cloudcode-pa.googleapis.com" },
+                      "the plan lookup prefers production")
         XCTAssertEqual(routing.requests.count, quotaRequests.count + planRequests.count,
                        "cancellation must stop before alternate hosts and legacy endpoints")
-        XCTAssertTrue(routing.requests.allSatisfy { $0.url.host == "daily-cloudcode-pa.googleapis.com" })
     }
 
     @MainActor
@@ -866,11 +867,13 @@ final class AntigravityProviderTests: XCTestCase {
 
         XCTAssertEqual(snapshot.errorCategory, .cancelled)
         // The plan lookup is launched alongside the first quota request, but the auth-failure branch
-        // can cancel it before the mock records its request. The OAuth exchange itself is required;
-        // after it is cancelled, quota/models fallback requests must not be retried.
+        // can cancel it before the mock records its request. The summary asks both hosts before
+        // classifying a 401 (daily can refuse a token production accepts), so both are asked before
+        // the OAuth branch. The OAuth exchange itself is required; once it is cancelled, quota/models
+        // fallback requests must not be retried.
         let requests = routing.requests
         XCTAssertEqual(requests.filter { $0.url.host == "oauth2.googleapis.com" }.count, 1)
-        XCTAssertEqual(requests.filter { $0.url.path == AntigravityUsageClient.quotaSummaryPath }.count, 1)
+        XCTAssertEqual(requests.filter { $0.url.path == AntigravityUsageClient.quotaSummaryPath }.count, 2)
         XCTAssertFalse(requests.contains { $0.url.path == AntigravityUsageClient.fetchModelsPath })
         XCTAssertFalse(requests.contains { $0.url.path == AntigravityUsageClient.retrieveQuotaPath })
     }
@@ -1068,6 +1071,74 @@ final class AntigravityProviderTests: XCTestCase {
         let provider = makeCloudCodeProvider(routing: routing, keychainExpiry: "2000-01-01T00:00:00Z")
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.errorCategory, .network)
+    }
+
+    @MainActor
+    func testExpiredAccessTokenWithFailingDerivedTokenStillRefreshesOAuth() async throws {
+        // The Keychain access token is expired and the derived cached token hits a transient
+        // outage. That is still expired-auth evidence worth an OAuth refresh — the outage must not
+        // be misreported as a dead sign-in without even trying the refresh credential.
+        let wrapped = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2000-01-01T00:00:00Z"}}"#
+        let files = FakeFiles()
+        let authStore = AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: files)
+        let source = try XCTUnwrap(authStore.loadKeychainToken())
+        XCTAssertTrue(try authStore.cacheToken("ya29.cached", expiresIn: 3_600, matching: source))
+        let routing = RoutingHTTPClient { request in
+            let token = request.headers["Authorization"]?.replacingOccurrences(of: "Bearer ", with: "")
+            if request.url.host == "oauth2.googleapis.com" {
+                return HTTPResponse(
+                    statusCode: 200,
+                    headers: [:],
+                    body: Data(#"{"access_token":"ya29.new","expires_in":3600}"#.utf8)
+                )
+            }
+            if token == "ya29.new", request.url.path == AntigravityUsageClient.quotaSummaryPath {
+                let body = #"{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8}]}]}"#
+                return HTTPResponse(statusCode: 200, headers: [:], body: Data(body.utf8))
+            }
+            return HTTPResponse(statusCode: 503, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: authStore,
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertEqual(used(snapshot.line(label: "Session")) ?? -1, 20, accuracy: 0.0001)
+        XCTAssertEqual(
+            routing.requests.filter { $0.url.host == "oauth2.googleapis.com" }.count,
+            1,
+            "a known-expired access token must attempt the refresh credential"
+        )
+    }
+
+    @MainActor
+    func testExpiredAccessTokenDerivedOutageWithFailedRefreshReportsUnavailable() async throws {
+        // Same layout, but the OAuth refresh is down too. The failed refresh is transient, so the
+        // snapshot reports .network — not .authExpired.
+        let wrapped = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2000-01-01T00:00:00Z"}}"#
+        let files = FakeFiles()
+        let authStore = AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: files)
+        let source = try XCTUnwrap(authStore.loadKeychainToken())
+        XCTAssertTrue(try authStore.cacheToken("ya29.cached", expiresIn: 3_600, matching: source))
+        let routing = RoutingHTTPClient { _ in
+            HTTPResponse(statusCode: 503, headers: [:], body: Data())
+        }
+        let provider = AntigravityProvider(
+            authStore: authStore,
+            usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
+            discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
+            dbUsageScanner: AntigravityDbUsageScanner(conversationsDirectory: { "/nonexistent-antigravity-tests" })
+        )
+
+        let snapshot = await provider.refresh()
+
+        XCTAssertEqual(snapshot.errorCategory, .network)
+        XCTAssertEqual(routing.requests.filter { $0.url.host == "oauth2.googleapis.com" }.count, 1)
     }
 
     @MainActor

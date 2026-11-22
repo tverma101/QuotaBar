@@ -5,19 +5,21 @@ import Observation
 enum PopoverScreen: Hashable, Sendable {
     case dashboard
     case history
+    case generationSpeed
     case customize
     case settings
 
     /// Left-to-right order for the popover's horizontal screen-switch slide: the dashboard is home on
-    /// the left, then the read-only Usage History report, with Customize and Settings to its right.
+    /// the left, then the read-only Usage History and Generation Speed reports, then Customize and Settings.
     /// The slide reads its direction from these ranks — a higher-ranked target enters from the
     /// trailing edge, a lower one from the leading edge.
     var slideRank: Int {
         switch self {
         case .dashboard: 0
         case .history: 1
-        case .customize: 2
-        case .settings: 3
+        case .generationSpeed: 2
+        case .customize: 3
+        case .settings: 4
         }
     }
 }

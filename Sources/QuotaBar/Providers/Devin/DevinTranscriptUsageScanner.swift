@@ -329,13 +329,19 @@ actor DevinTranscriptUsageScanner {
         JSONLAccountingWorkPacer.shared.forEach(entries) { entry in
             guard entry.timestamp >= since else { return }
             let day = DailyUsageAccumulator.dayKey(from: entry.timestamp)
-            // A step can bundle more than one model call, so its prompt total is not a single
-            // request's context size — per-request long-context tiers must not apply to the sum.
-            let estimate = pricing.estimatedCostDollars(
-                model: entry.model,
-                tokens: entry.tokens,
-                applyLongContextRates: false
-            )
+            let estimate: Double?
+            switch entry.model.lowercased() {
+            case "gemini-4-neon", "gemini-4-neon-xhigh":
+                let route = "google/gemini-4-neon"
+                let rates = pricing.openRouter.entries[route]
+                if rates == nil { _ = pricing.resolve(model: route) } // Queue a catalog recheck, not a fallback price.
+                estimate = rates?.costDollars(for: entry.tokens, applyLongContextRates: false)
+            default:
+                // A step can bundle several calls; its prompt total is not a single context size.
+                estimate = pricing.estimatedCostDollars(
+                    model: entry.model, tokens: entry.tokens, applyLongContextRates: false
+                )
+            }
             accumulator.recordApiEstimate(
                 day: day,
                 cost: estimate,

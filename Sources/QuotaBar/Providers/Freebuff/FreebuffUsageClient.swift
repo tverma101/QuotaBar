@@ -1,63 +1,40 @@
 import Foundation
 
 struct FreebuffUsageClient: Sendable {
-    // The bare host redirects to www. URLSession drops Authorization across that host change,
-    // making a freshly connected CLI token look expired. Call the canonical API host directly.
-    static let sessionURL = "https://www.codebuff.com/api/v1/freebuff/session"
-    static let modelCatalogURL = "https://www.codebuff.com/api/v1/freebuff/models"
-
-    var http: any HTTPClient
-    var timeZone: @Sendable () -> String
-
-    init(
-        http: any HTTPClient = URLSessionHTTPClient(),
-        timeZone: @escaping @Sendable () -> String = { TimeZone.current.identifier }
-    ) {
-        self.http = http
-        self.timeZone = timeZone
+    enum Operation: Equatable, Sendable {
+        case session
+        case modelCatalog
+        case history(path: String, cursor: String?)
     }
 
-    /// Read-only equivalent of the Freebuff CLI's GET session poll. The POST route admits a session
-    /// and must never be used for usage monitoring.
+    typealias Transport = @Sendable (Operation, FreebuffAuth) async throws -> HTTPResponse
+    private let transport: Transport?
+    var hasTransport: Bool { transport != nil }
+    let supportsHostedDetail: Bool
+
+    init(transport: Transport? = nil, supportsHostedDetail: Bool = true) {
+        self.transport = transport
+        self.supportsHostedDetail = transport != nil && supportsHostedDetail
+    }
+
     func fetchSession(auth: FreebuffAuth) async throws -> HTTPResponse {
-        // Request Desktop purchase metadata without an instance or heartbeat: observation only.
-        try await fetch(urlString: Self.sessionURL, auth: auth,
-                        extraHeaders: ["x-freebuff-multi-session": "1"])
+        try await fetch(.session, auth: auth)
     }
 
     func fetchModelCatalog(auth: FreebuffAuth) async throws -> HTTPResponse {
-        try await fetch(urlString: Self.modelCatalogURL, auth: auth,
-                        extraHeaders: ["x-freebuff-catalog-protocol": "1"])
+        guard supportsHostedDetail else { throw FreebuffUsageError.liveAccessUnavailable }
+        return try await fetch(.modelCatalog, auth: auth)
     }
 
-    /// Shared hosted history also backs Desktop's “On This Device” execution mode.
     func fetchHistory(path: String, cursor: String?, auth: FreebuffAuth) async throws -> HTTPResponse {
-        var url = URLComponents(string: "https://www.codebuff.com/api/v1/cloud/history/" + path)!
-        // Events are bounded at 500 by the history API. Use that supported page size for the
-        // initial backfill; active runs subsequently fetch only bytes after their saved cursor.
-        url.queryItems = [URLQueryItem(name: "limit", value: path.hasSuffix("/events") ? "500" : "100")]
-        if let cursor { url.queryItems?.append(URLQueryItem(name: "cursor", value: cursor)) }
-        // Older bearer clients intentionally receive a list without device-execution chats.
-        // Match the current shared history client so Local/On This Device usage is included.
-        return try await fetch(urlString: url.url!.absoluteString, auth: auth,
-                               extraHeaders: ["x-freebuff-device-chats": "1"])
+        guard supportsHostedDetail else { throw FreebuffUsageError.liveAccessUnavailable }
+        return try await fetch(.history(path: path, cursor: cursor), auth: auth)
     }
 
-    private func fetch(urlString: String, auth: FreebuffAuth, extraHeaders: [String: String] = [:]) async throws -> HTTPResponse {
-        guard let url = URL(string: urlString) else {
-            throw FreebuffUsageError.invalidResponse
-        }
+    private func fetch(_ operation: Operation, auth: FreebuffAuth) async throws -> HTTPResponse {
+        guard let transport else { throw FreebuffUsageError.liveAccessUnavailable }
         do {
-            return try await http.send(HTTPRequest(
-                method: "GET",
-                url: url,
-                headers: [
-                    "Authorization": "Bearer \(auth.token)",
-                    "Accept": "application/json",
-                    "x-fb-timezone": timeZone()
-                ].merging(extraHeaders, uniquingKeysWith: { _, new in new }),
-                timeout: 15
-            ))
+            return try await transport(operation, auth)
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as URLError where error.code == .cancelled {
@@ -75,6 +52,7 @@ enum FreebuffUsageError: Error, LocalizedError, Equatable {
     case requestFailed(Int)
     case quotaUnavailable
     case localHistoryUnreadable
+    case liveAccessUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -88,6 +66,8 @@ enum FreebuffUsageError: Error, LocalizedError, Equatable {
             return "Freebuff usage data is not available for this account yet."
         case .localHistoryUnreadable:
             return "QuotaBar couldn't read Freebuff Desktop's measured token history. Refresh again after the current turn finishes."
+        case .liveAccessUnavailable:
+            return "Live Freebuff quotas and session timers are unavailable. QuotaBar shows saved measurements only."
         }
     }
 }

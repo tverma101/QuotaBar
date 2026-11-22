@@ -49,6 +49,12 @@ struct PopoverTopBar: View {
             } trailing: {
                 EmptyView()
             }
+        case .generationSpeed:
+            navigationBar(title: "Generation Speed") {
+                withAnimation(Motion.modeSwitch) { layout.screen = .dashboard }
+            } trailing: {
+                EmptyView()
+            }
         }
     }
 

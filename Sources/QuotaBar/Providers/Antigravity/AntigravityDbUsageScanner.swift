@@ -84,13 +84,34 @@ actor AntigravityDbUsageScanner {
     /// clients. Discover every sibling root so installing a different Antigravity client does not
     /// leave its local spend and trend rows empty.
     static let defaultConversationDiscovery: @Sendable () throws -> ConversationDirectoryDiscovery = {
-        let geminiRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini", isDirectory: true)
+        try discoverAllConversationDirectories(home: FileManager.default.homeDirectoryForCurrentUser)
+    }
+
+    static func discoverAllConversationDirectories(home: URL) throws -> ConversationDirectoryDiscovery {
+        let geminiRoot = home.appendingPathComponent(".gemini", isDirectory: true)
+        let base: ConversationDirectoryDiscovery
         do {
-            return try discoverConversationDirectories(in: geminiRoot)
+            base = try discoverConversationDirectories(in: geminiRoot)
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return ConversationDirectoryDiscovery(directories: [], failures: [:])
+            base = ConversationDirectoryDiscovery(directories: [], failures: [:])
         }
+        var directories = Set(base.directories)
+        var failures = base.failures
+        let config = home.appendingPathComponent(".config/antigravity/conversations", isDirectory: true)
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: config.path)
+            if attributes[.type] as? FileAttributeType == .typeDirectory { directories.insert(config.path) }
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+        } catch {
+            failures[config.path] = error.localizedDescription
+        }
+        do {
+            directories.formUnion(try AntigravityT3Support.conversationDirectories(home: home))
+        } catch {
+            failures[home.appendingPathComponent(AntigravityT3Support.profilesRootSubpath).path] = error.localizedDescription
+        }
+        let canonical = Set(directories.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
+        return ConversationDirectoryDiscovery(directories: canonical.sorted(), failures: failures)
     }
 
     static func conversationDirectories(in geminiRoot: URL) throws -> [String] {

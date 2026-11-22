@@ -79,10 +79,8 @@ actor FreebuffModelCatalog {
     /// Exact normalized names and explicit supplement aliases only; preserve every version/variant
     /// word. Ambiguous routes remain unpriced. No fuzzy lookup or opaque-key-to-model guessing.
     static func pricingRoute(for model: String, entries: [String: Entry], pricing: ModelPricing) -> String? {
-        if pricing.openRouter.entries[model] != nil || pricing.supplement.pricing[model] != nil {
-            return model
-        }
-        return pricingRoutes(entries: entries, pricing: pricing)[model]
+        var identity = FreebuffModelIdentity(entries: entries, pricing: pricing)
+        return identity.resolve(model, pricing: pricing).route
     }
 
     static func pricingRoutes(entries: [String: Entry], pricing: ModelPricing) -> [String: String] {
@@ -90,50 +88,32 @@ actor FreebuffModelCatalog {
             normalized(String($0.split(separator: "/").last ?? Substring($0)))
         }
         var routes: [String: String] = entries.compactMapValues { entry -> String? in
-            if let matches = index[normalized(entry.displayName)], matches.count == 1 {
-                return matches.first
-            }
-            // Freebuff removed its Flash Fast serving mode: the catalogue still lists the old key,
-            // but hosted receipts only ever carry the plain Flash slug, so the base model serves
-            // that usage. Collapse the removed mode onto its base name so it prices as the model
-            // that actually served it, never at the retired Fast-tier estimate rates.
-            if let base = removedModeBaseName(entry.displayName),
-               let matches = index[normalized(base)], matches.count == 1 {
-                return matches.first
-            }
+            guard fastBaseName(entry.displayName) == nil else { return nil }
+            if let matches = index[normalized(entry.displayName)], matches.count == 1,
+               fastBaseName(matches[0]) == nil { return matches[0] }
             return nil
         }
-        // OpenRouter has no separate DeepSeek Flash Fast route. A verified model-specific alias
-        // may point to a curated public route rate instead; only consider it after exact OpenRouter
-        // matching, so the public route keeps precedence and unrelated variants stay unpriced.
+        // Curated fallback aliases do not prove a Fast serving route either.
         for (model, entry) in entries where routes[model] == nil {
-            // A removed Fast mode resolves through its base model's alias, keeping the retired
-            // Fast-tier canonical unreachable from catalogue names.
-            let name = removedModeBaseName(entry.displayName) ?? entry.displayName
-            guard let canonical = pricing.supplement.canonicalName(for: name),
+            guard fastBaseName(entry.displayName) == nil,
+                  let canonical = pricing.supplement.canonicalName(for: entry.displayName),
+                  fastBaseName(canonical) == nil,
                   pricing.supplement.pricing[canonical] != nil else { continue }
             routes[model] = canonical
         }
         return routes
     }
 
-    /// The base model name when a display name carries Freebuff's removed "Fast" serving mode, or
-    /// nil for every other name. Mode words sit behind a trailing snapshot date
-    /// (`DeepSeek V4.1 Flash Fast 10/17`), so the date is stripped first — the same date-then-mode
-    /// order `groupName` uses. Slow remains a real, separately-served mode and is never stripped.
-    static func removedModeBaseName(_ displayName: String) -> String? {
-        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let dateStripped = trimmed.replacingOccurrences(
-            of: #"\s+\d{1,2}/\d{1,2}$"#,
-            with: "", options: [.regularExpression, .caseInsensitive]
-        )
-        guard dateStripped.range(of: #"\s+Fast$"#, options: [.regularExpression, .caseInsensitive]) != nil
-        else { return nil }
-        let base = dateStripped.replacingOccurrences(
-            of: #"\s+Fast$"#,
-            with: "", options: [.regularExpression, .caseInsensitive]
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-        return base.isEmpty ? nil : base
+    /// Recognizes a tier suffix, not words like Flash or FastAPI. Some labels end in a build date.
+    private static let fastSuffix = try! NSRegularExpression(
+        pattern: #"(?i)[\s_-]+fast(?:[\s_-]+(?:\d{1,2}/\d{1,2}|\d{4}))?$"#
+    )
+
+    static func fastBaseName(_ name: String) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let match = fastSuffix.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
+              let range = Range(match.range, in: trimmed) else { return nil }
+        return String(trimmed[..<range.lowerBound])
     }
 
     private static func normalized(_ name: String) -> String {

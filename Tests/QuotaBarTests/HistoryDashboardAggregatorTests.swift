@@ -70,6 +70,44 @@ final class HistoryDashboardAggregatorTests: XCTestCase {
         )
     }
 
+    func testSpendModesNeverSubstituteOrDoubleCountDollars() throws {
+        let day = dayKey(offsetFromToday: 0)
+        let recorded = ProviderUsageHistory(series: .init(daily: [
+            .init(date: day, totalTokens: 200, costUSD: 90,
+                  reportedCost: .init(dollars: 2, coveredTokens: 100))
+        ]), apiEstimateByDay: [day: 12])
+        let estimateOnly = ProviderUsageHistory(series: .init(daily: [
+            .init(date: day, totalTokens: 300, costUSD: 50)
+        ]), apiEstimateByDay: [day: 7])
+        let input = HistoryDashboardAggregator.Input(enabledProviderIDs: ["cursor", "devin"],
+            displayNameByProviderID: [:], historyByProviderID: ["cursor": recorded, "devin": estimateOnly])
+        let reported = HistoryDashboardAggregator.report(input, costMode: .reportedOnly, now: now, calendar: calendar)
+        let estimates = HistoryDashboardAggregator.report(input, costMode: .apiEstimates, now: now, calendar: calendar)
+        XCTAssertEqual(reported.today.tokens, 500)
+        XCTAssertEqual(reported.today.cost, 2)
+        XCTAssertTrue(reported.today.hasIncompleteCost)
+        XCTAssertNil(reported.sections.first(where: { $0.providerID == "devin" })?.cost)
+        XCTAssertEqual(estimates.today.tokens, 500)
+        XCTAssertEqual(estimates.today.cost, 19)
+        XCTAssertTrue(estimates.today.hasEstimatedCost)
+        let encoded = try JSONEncoder().encode(recorded)
+        XCTAssertEqual(
+            try JSONDecoder().decode(ProviderUsageHistory.self, from: encoded).series.daily.first?.reportedCost,
+            .init(dollars: 2, coveredTokens: 100)
+        )
+    }
+
+    func testReportedCostsSurviveDailyUsageAccumulatorMerges() throws {
+        let day = dayKey(offsetFromToday: 0)
+        var reported = DailyUsageAccumulator()
+        reported.add(day: day, tokens: 100, cost: 80, model: "reported", reportedCost: 2)
+        var estimated = DailyUsageAccumulator()
+        estimated.add(day: day, tokens: 100, cost: 66, model: "estimated")
+
+        let merged = try XCTUnwrap(DailyUsageAccumulator.merged([reported.build(), estimated.build()]))
+        XCTAssertEqual(merged.series.daily.first?.reportedCost, .init(dollars: 2, coveredTokens: 100))
+    }
+
     // MARK: - Window
 
     func testWindowCoversExactly30DaysIncludingToday() {

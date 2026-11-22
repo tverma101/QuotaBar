@@ -111,6 +111,7 @@ enum UsageHistoryAggregator {
             tokenCountSaturated: Bool
         )] = [:]
         var apiEstimates: [String: Double] = [:]
+        var reportedCosts = ReportedUsageCostAccumulator()
         var apiEstimateOverflowedDays: Set<String> = []
         var apiEstimateIncompleteDays: Set<String> = []
         var estimatedCostDays: Set<String> = []
@@ -157,6 +158,12 @@ enum UsageHistoryAggregator {
                             value.hasKnownIncompleteCostCause = true
                         }
                     }
+                }
+                if let reported = day.reportedCost {
+                    reportedCosts.add(day: day.date, dollars: reported.dollars, tokens: reported.coveredTokens)
+                }
+                if day.totalTokens > 0, history.apiEstimateByDay?[day.date] == nil {
+                    apiEstimateIncompleteDays.insert(day.date)
                 }
                 days[day.date] = value
             }
@@ -210,7 +217,8 @@ enum UsageHistoryAggregator {
                     || value.hasUnclassifiedIncompleteCost
                     ? true
                     : (value.hasKnownIncompleteCostCause ? false : value.hasUnexplainedIncompleteCost),
-                tokenCountSaturated: value.tokenCountSaturated
+                tokenCountSaturated: value.tokenCountSaturated,
+                reportedCost: reportedCosts.byDay[date]
             )
         }.sorted { $0.date > $1.date })
 

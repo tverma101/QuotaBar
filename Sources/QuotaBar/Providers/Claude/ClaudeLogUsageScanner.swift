@@ -455,7 +455,8 @@ actor ClaudeLogUsageScanner {
                 deduplication.append(entry)
             },
             fileStarted: { bucket.begin($0) },
-            fileCompleted: { path, _ in bucket.finish(path) }
+            fileCompleted: { path, _ in bucket.finish(path) },
+            toleratesGatewayAppends: hostedGatewayOnly
         )
         guard complete, !Task.isCancelled else { return false }
         let filesByPath = Dictionary(files.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
@@ -1248,7 +1249,13 @@ actor ClaudeLogUsageScanner {
                 tokens: entry.tokens.totalTokens
             )
 
-            accumulator.add(day: day, tokens: entry.tokens.totalTokens, cost: cost, model: modelName)
+            accumulator.add(
+                day: day,
+                tokens: entry.tokens.totalTokens,
+                cost: cost,
+                model: modelName,
+                reportedCost: entry.costUSD
+            )
         }
 
         return accumulator.build()

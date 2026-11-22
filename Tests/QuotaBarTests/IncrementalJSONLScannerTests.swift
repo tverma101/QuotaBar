@@ -503,6 +503,73 @@ final class IncrementalJSONLScannerTests: XCTestCase {
         XCTAssertEqual(residentAfterRelaunch, 0)
     }
 
+    func testHostedGatewayFoldAcceptsGrowthButRejectsRewriteAndReplacement() async throws {
+        for (change, tolerate, expected) in [
+            ("append", true, true), ("append", false, false),
+            ("rewrite", true, false), ("rewrite-and-grow", true, false),
+            ("replace", true, false), ("truncate", true, false)
+        ] {
+            let directory = try makeDirectory("Gateway-\(change)")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let file = try makeFile(named: "usage.jsonl", contents: "1\n", in: directory, mtime: Date())
+            let scanner = IncrementalJSONLScanner<Int>(persistence: makePersistence(in: directory))
+            let complete = await scanner.foldItems(
+                from: [file], since: .distantPast,
+                parseFile: { url in
+                    do {
+                        switch change {
+                        case "append":
+                            let writer = try FileHandle(forWritingTo: url)
+                            defer { try? writer.close() }
+                            try writer.seekToEnd()
+                            try writer.write(contentsOf: Data("2\n".utf8))
+                        case "rewrite": try Data("2\n".utf8).write(to: url)
+                        case "rewrite-and-grow": try Data("3\n2\n".utf8).write(to: url)
+                        case "replace": try Data("1\n2\n".utf8).write(to: url, options: .atomic)
+                        default: try Data().write(to: url)
+                        }
+                    } catch { return nil }
+                    return [1]
+                },
+                visit: { _ in }, toleratesGatewayAppends: tolerate
+            )
+            XCTAssertEqual(complete, expected, change)
+            if expected {
+                let rediscovered = JSONLScanning.jsonlFiles(under: directory)
+                let updated = await scanner.items(
+                    from: rediscovered, since: .distantPast,
+                    parseFile: { url in
+                        (try? String(contentsOf: url, encoding: .utf8)).map {
+                            $0.split(separator: "\n").compactMap { Int($0) }
+                        }
+                    }
+                )
+                XCTAssertEqual(updated, [1, 2])
+            }
+            await scanner.waitForPendingWritesForTesting()
+        }
+    }
+
+    func testHostedGatewayFoldAcceptsAnAppendBetweenDiscoveryAndFold() async throws {
+        let directory = try makeDirectory("Gateway-AfterDiscovery")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = try makeFile(named: "usage.jsonl", contents: "1\n", in: directory, mtime: Date())
+        let discovered = try XCTUnwrap(JSONLScanning.jsonlFilesIfComplete(
+            under: directory, gatewayAppendWitnessesSince: .distantPast
+        ))
+        let url = URL(fileURLWithPath: file.path)
+        let writer = try FileHandle(forWritingTo: url)
+        try writer.seekToEnd()
+        try writer.write(contentsOf: Data("2\n".utf8))
+        try writer.close()
+        let scanner = IncrementalJSONLScanner<Int>()
+        let complete = await scanner.foldItems(
+            from: discovered, since: .distantPast, parseFile: { _ in [1, 2] },
+            visit: { _ in }, toleratesGatewayAppends: true
+        )
+        XCTAssertTrue(complete)
+    }
+
     private func makeDirectory(_ suffix: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OpenUsageScanner\(suffix)-\(UUID().uuidString)", isDirectory: true)

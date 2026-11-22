@@ -114,17 +114,29 @@ final class FreebuffProvider: ProviderRuntime {
     private func refreshInProcess() async -> ProviderSnapshot {
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         let scope = ProviderRefreshContext.scope
+        let canFetch = usageClient.hasTransport
         var auth: FreebuffAuth?
         var authError: (any Error)?
-        do {
-            auth = try await loadOffMainActor { [authStore] in try authStore.loadAuth() }
-            if auth == nil { authError = FreebuffAuthError.notLoggedIn }
-        } catch {
-            if ProviderCancellation.isCancellation(error) { return cancelledRefreshSnapshot(provider: provider) }
-            authError = error
+        if canFetch || !scope.skipsLocalAccounting {
+            do {
+                auth = try await loadOffMainActor { [authStore] in try authStore.loadAuth() }
+                if auth == nil { authError = FreebuffAuthError.notLoggedIn }
+            } catch {
+                if ProviderCancellation.isCancellation(error) { return cancelledRefreshSnapshot(provider: provider) }
+                authError = error
+            }
         }
         let snapshot: ProviderSnapshot
-        if scope.suppressesLiveQuota {
+        if !canFetch {
+            quotaObservation = nil
+            // Empty live value rows replace cached wallet and session values during partial snapshot merges.
+            snapshot = .make(provider: provider, plan: nil, lines: [
+                .values(label: "Hours Balance", values: []),
+                .values(label: "Monthly Spend", values: []),
+                .values(label: "Active Sessions", values: [], expiriesAt: [])
+            ], refreshedAt: now(), warning: FreebuffUsageError.liveAccessUnavailable.localizedDescription,
+                             clearsPriorMenuBarQuotaState: true, activeSessions: [])
+        } else if scope.suppressesLiveQuota {
             snapshot = .make(provider: provider, plan: nil, lines: [], refreshedAt: now())
         } else if let auth {
             snapshot = await refreshQuota(auth: auth)
@@ -136,13 +148,11 @@ final class FreebuffProvider: ProviderRuntime {
         do {
             let scanNow = now()
             var hostedReceipts: [FreebuffUsageReceipt] = []
-            var incompleteHistory = auth == nil
-            if auth == nil { result.historyWarning = authError?.localizedDescription }
+            var incompleteHistory = !canFetch || auth == nil
+            if auth == nil, canFetch { result.historyWarning = authError?.localizedDescription }
             if let auth {
-                // The hosted history and catalogue endpoints enumerate receipts and model
-                // data in bulk. They stay opt-in (`quotabar.freebuffHostedDetail` default)
-                // so public builds read only the session quota call plus local data.
-                if scope == .localAccounting || !hostedDetailEnabled {
+                // The application can restore saved receipts, but never requests new ones without a transport.
+                if !canFetch || scope == .localAccounting || !hostedDetailEnabled {
                     hostedReceipts = try await hostedScanner.cachedReceipts(auth: auth)
                 } else {
                     do {
@@ -158,12 +168,12 @@ final class FreebuffProvider: ProviderRuntime {
                         result.historyWarning = "Freebuff's hosted token history couldn't be refreshed. Totals may be incomplete."
                     }
                 }
-                var hasHistory = !hostedReceipts.isEmpty
-                if scope != .localAccounting, !hasHistory {
-                    hasHistory = try await historyScanner.hasHistory(now: scanNow)
+                var shouldRefreshCatalog = canFetch && scope != .localAccounting && hostedDetailEnabled
+                    && !ProviderRefreshContext.skipModelCatalogRefresh
+                if shouldRefreshCatalog, hostedReceipts.isEmpty {
+                    shouldRefreshCatalog = try await historyScanner.hasHistory(now: scanNow)
                 }
-                if scope != .localAccounting, hasHistory, hostedDetailEnabled,
-                   !ProviderRefreshContext.skipModelCatalogRefresh {
+                if shouldRefreshCatalog {
                     do {
                         try await modelCatalog.refresh(auth: auth, client: usageClient, now: scanNow)
                         DiagnosticGate.clearFailure("auth.freebuff.catalog.failure")
@@ -185,7 +195,7 @@ final class FreebuffProvider: ProviderRuntime {
                 let usage = scan.usage
                 let firstDay = DailyUsageAccumulator.dayKey(from: Calendar.current.date(byAdding: .day, value: -29, to: scanNow)!)
                 let today = DailyUsageAccumulator.dayKey(from: scanNow)
-                if scan.partialDays.contains(where: { $0 >= firstDay && $0 <= today }) {
+                if scan.unexplainedPartialDays.contains(where: { $0 >= firstDay && $0 <= today }) {
                     DiagnosticGate.logOnce(for: "auth.freebuff.history.missing-receipts") {
                         AppLog.warn(LogTag.auth("freebuff"), "token history contains incomplete or missing usage receipts")
                     }
@@ -199,6 +209,7 @@ final class FreebuffProvider: ProviderRuntime {
                 result.usageHistory = ProviderUsageHistory(
                     series: usage.series, modelUsage: usage.modelUsage,
                     unknownModelsByDay: usage.unknownModelsByDay, apiEstimateByDay: usage.apiEstimateByDay,
+                    apiEstimateIncompleteDays: usage.apiEstimateIncompleteDays,
                     partialDays: scan.partialDays, estimatedCostDays: usage.estimatedCostDays
                 )
                 SpendTileMapper.appendTokenUsage(
@@ -260,17 +271,12 @@ final class FreebuffProvider: ProviderRuntime {
         }
     }
 
-    private static let historySourceNote = "Measured Freebuff hosted runs and legacy Desktop tokens on this Mac."
+    private static let historySourceNote = "Measured Desktop tokens and any previously saved receipts. Flash estimates use DeepSeek's standard API rates, not Freebuff charges."
 
-    /// Opt-in gate for Freebuff's hosted history/catalogue endpoints. The session quota
-    /// call reads the signed-in account's own quota like every provider here; the hosted
-    /// history and model-catalogue endpoints enumerate receipts and catalogue data in
-    /// bulk, so they stay off unless the owner enables them locally:
-    /// `defaults write com.tverma101.quotabar quotabar.freebuffHostedDetail -bool true`
-    /// (use `com.tverma101.quotabar.dev` while testing a dev build).
+    /// Enables hosted detail only when the caller also supplies an authorized service transport.
     static let hostedDetailDefaultsKey = "quotabar.freebuffHostedDetail"
     var hostedDetailEnabled: Bool {
-        defaults.bool(forKey: Self.hostedDetailDefaultsKey)
+        usageClient.supportsHostedDetail && defaults.bool(forKey: Self.hostedDetailDefaultsKey)
     }
 
     private static func usageFailureDiagnosticKey(_ error: Error) -> String {

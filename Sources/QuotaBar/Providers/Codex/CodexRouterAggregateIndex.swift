@@ -14,7 +14,8 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
     /// catalogue change that cannot touch the fold's numbers no longer costs a full ledger read.
     /// Also bump this when hardcoded Codex pricing rules change; catalogue dependencies cover rates,
     /// identities and dated resolution, rather than every implementation detail of the cost formula.
-    static let schema = 15
+    /// v17: cached-input selection now checks explicit lanes before falling back to input.
+    static let schema = 17
     static let maxResidentRecords = 32
 
     struct Key: Codable, Equatable, Sendable {

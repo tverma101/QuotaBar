@@ -49,7 +49,17 @@ enum AntigravityAggregatePersistence {
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .secondsSince1970
                 let data = try encoder.encode(record)
-                guard data.count <= maximumRecordBytes else { return }
+                guard data.count <= maximumRecordBytes else {
+                    DiagnosticGate.logOnce(
+                        for: "provider.antigravity.derivation-record-oversized.\(JSONLScanCachePaths.stableFingerprint(path))"
+                    ) {
+                        AppLog.warn(
+                            LogTag.plugin("antigravity"),
+                            "antigravity derivation record for \(JSONLScanCachePaths.stableFingerprint(path)) is \(data.count / 1_048_576) MB; not persisting it"
+                        )
+                    }
+                    return
+                }
                 let directory = url.deletingLastPathComponent()
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 // The kernel lock orders app/scan-worker writers on the same file, mirroring the
@@ -59,11 +69,15 @@ enum AntigravityAggregatePersistence {
                     directory.appendingPathComponent(".antigravity-db-derivations.lock").path,
                     O_CREAT | O_RDWR | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR)
                 )
-                guard descriptor >= 0 else { return }
+                guard descriptor >= 0 else {
+                    throw SQLiteError.queryFailed("antigravity derivation lock file could not be opened (errno \(errno))")
+                }
                 defer { Darwin.close(descriptor) }
-                guard flock(descriptor, LOCK_EX) == 0 else { return }
+                guard flock(descriptor, LOCK_EX) == 0 else {
+                    throw SQLiteError.queryFailed("antigravity derivation lock could not be acquired (errno \(errno))")
+                }
                 defer { flock(descriptor, LOCK_UN) }
-                try? data.write(to: url, options: .atomic)
+                try data.write(to: url, options: .atomic)
             } catch {
                 // The in-memory cache still holds (or re-derives) the state; a failed disk mirror
                 // only costs the next process a SQLite re-read. Log it so persistent failures are

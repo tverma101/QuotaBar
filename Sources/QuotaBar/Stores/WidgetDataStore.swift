@@ -287,6 +287,9 @@ final class WidgetDataStore {
         if let zai = providersByID["zai"] as? ZAIProvider {
             await zai.unloadLocalAccountingCachesForMemoryPressure()
         }
+        for provider in providersByID.values {
+            (provider as? CodexProvider)?.unloadLocalAccountingCachesForMemoryPressure()
+        }
         // Callers relieve the malloc zone at the end of the chain so one free-list walk covers
         // every unload in the cycle.
     }

@@ -803,6 +803,11 @@ final class AppContainer {
                         let panelClosed = !panelOpen
                         passRan = true
                         accountingTask = Task { @MainActor in
+                            if scheduledScope == .panelAccounting {
+                                // Fold workers use disk catalogs and may exit before a fetch can finish.
+                                // The long-lived app owns due revalidation for subsequent folds.
+                                _ = await ModelPricingStore.shared.current()
+                            }
                             if let scheduledScope {
                                 await ProviderRefreshContext.$scope.withValue(scheduledScope) {
                                     await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(

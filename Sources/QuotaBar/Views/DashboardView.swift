@@ -516,6 +516,8 @@ struct DashboardView: View {
             )
         case .history:
             HistoryDashboardView()
+        case .generationSpeed:
+            GenerationSpeedDashboardView()
         case .settings:
             SettingsScreen()
         }

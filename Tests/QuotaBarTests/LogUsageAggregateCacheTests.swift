@@ -225,6 +225,33 @@ final class LogUsageAggregateScannerIntegrationTests: XCTestCase {
         return String(decoding: data, as: UTF8.self)
     }
 
+    func testRouterRepricesUnchangedLedgerWhenOnlyOpenRouterRatesChange() async throws {
+        let ledger = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quotabar-router-pricing-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: ledger) }
+        try (routerLine(at: "2026-04-29T08:00:00.000Z", tokens: 100) + "\n")
+            .write(to: ledger, atomically: true, encoding: .utf8)
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { [ledger.path] }, identityAliases: { [:] }, persistentAggregateCache: makeCache()
+        )
+        func pricing(_ input: Double, retrievedAt: String) -> ModelPricing {
+            ModelPricing(supplement: PricingSupplement(), primary: PricingCatalog(), secondary: PricingCatalog(),
+                         openRouter: PricingCatalog(entries: ["gpt-5.6-terra": ModelRates(
+                            inputPerMillion: input, outputPerMillion: 1,
+                            cacheWritePerMillion: input, cacheReadPerMillion: input
+                         )], retrievedAt: retrievedAt))
+        }
+        let first = await scanner.scan(accountIdentityKey: nil, allowsUnscopedEvents: true,
+                                       daysBack: 30, now: now, pricing: pricing(1, retrievedAt: "2026-04-29"))
+        let repriced = await scanner.scan(accountIdentityKey: nil, allowsUnscopedEvents: true,
+                                          daysBack: 30, now: now, pricing: pricing(3, retrievedAt: "2026-04-30"))
+        XCTAssertEqual(try XCTUnwrap(first?.series.daily.first?.costUSD), 0.0001, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(repriced?.series.daily.first?.costUSD), 0.0003, accuracy: 1e-12)
+        XCTAssertEqual(repriced?.series.daily.first?.totalTokens, 100)
+        XCTAssertEqual(LogUsagePricingStamp.of(pricing(3, retrievedAt: "2026-04-30")),
+                       LogUsagePricingStamp.of(pricing(3, retrievedAt: "2026-05-01")))
+    }
+
     func testRouterLedgerWarmScanDoesNotReparseAndAppendTruncateRecompute() async throws {
         let ledger = FileManager.default.temporaryDirectory
             .appendingPathComponent("openusage-router-ledger-\(UUID().uuidString).jsonl")

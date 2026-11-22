@@ -302,9 +302,9 @@ enum CursorUsageMapper {
     /// Append the shared Today / Yesterday / Last 30 Days spend tiles from Cursor's CSV rows. The rows
     /// are aggregated into one local-calendar-day `DailyUsageSeries` and handed to `SpendTileMapper`
     /// — the same builder the Claude/Codex/Grok tiles use — so the output is identical apart from the
-    /// source note. Cursor's costs are calculated locally from the exported token counts, so the dollar
-    /// values carry the estimate icon. Callers only invoke this when the CSV fetched and parsed, so a
-    /// failure appends nothing and the tiles read "No data".
+    /// source note. Spend-line costs are calculated locally from exported token counts, while reported
+    /// Cost column amounts stay separate for the Usage History screen. Callers only invoke this when
+    /// the CSV fetched and parsed, so a failure appends nothing and the tiles read "No data".
     ///
     /// Model breakdown rows group by base model, not raw CSV slug: Cursor exports one slug per thinking
     /// effort / fast combination (`claude-opus-4-8-thinking-max`, `gpt-5.5-extra-high-fast`, …), and a
@@ -321,6 +321,7 @@ enum CursorUsageMapper {
     ) throws -> ProviderUsageHistory {
         let calendar = Calendar.current
         var costByDay: [String: Double] = [:]
+        var reportedCosts = ReportedUsageCostAccumulator()
         var tokensByDay: [String: Int] = [:]
         var apiEstimateByDay: [String: Double] = [:]
         var apiEstimateIncompleteDays: Set<String> = []
@@ -346,9 +347,11 @@ enum CursorUsageMapper {
             let day = DailyUsageAccumulator.dayKey(from: row.date, calendar: calendar)
             let model = row.model.trimmingCharacters(in: .whitespacesAndNewlines)
             let modelName = model.isEmpty ? ModelUsageEntry.unattributedModelName : model
+            reportedCosts.add(day: day, dollars: row.reportedCostDollars, tokens: row.tokens.totalTokens)
             // Public-API-rate comparison for the row's tokens (regardless of how the CSV cost was
             // imputed — Cursor's own dollars are the displayed estimate).
-            let apiEstimate = model.isEmpty || CursorUsageCSV.isOpaqueGrokBotProductLabel(model)
+            let apiEstimate = row.tokens.totalTokens == 0 || model.isEmpty
+                || CursorUsageCSV.isOpaqueGrokBotProductLabel(model)
                 ? nil
                 : pricing.estimatedCostDollars(
                 model: model,
@@ -419,18 +422,19 @@ enum CursorUsageMapper {
             )
         }
 
-        // Sum raw dollars per day, then snap to whole cents once — rounding per row would accumulate
-        // sub-cent drift across a busy day. A day with only unpriced rows carries nil cost (dash).
+        // Retain full precision for period totals and model shares; only presentation rounds.
+        // A day with only unpriced rows carries nil cost (dash).
         let daily = tokensByDay.keys.sorted(by: >).map { day in
             DailyUsageEntry(
                 date: day,
                 totalTokens: tokensByDay[day] ?? 0,
-                costUSD: costByDay[day].map(Self.roundToCents),
+                costUSD: costByDay[day],
                 costIsComplete: !incompleteCostDays.contains(day),
                 hasUnexplainedIncompleteCost: unexplainedIncompleteCostDays.contains(day)
                     ? true : (overflowedCostDays.contains(day) || productLabeledIncompleteCostDays.contains(day)
                         ? false : nil),
-                tokenCountSaturated: tokenCountSaturatedDays.contains(day)
+                tokenCountSaturated: tokenCountSaturatedDays.contains(day),
+                reportedCost: reportedCosts.byDay[day]
             )
         }
         let series = DailyUsageSeries(daily: daily)
@@ -456,7 +460,8 @@ enum CursorUsageMapper {
             modelUsage: modelUsage,
             unknownModelsByDay: unknownModelsByDay,
             apiEstimateByDay: apiEstimateByDay.isEmpty ? nil : apiEstimateByDay,
-            apiEstimateIncompleteDays: apiEstimateIncompleteDays
+            apiEstimateIncompleteDays: apiEstimateIncompleteDays,
+            estimatedCostDays: Set(costByDay.keys)
         )
     }
 
@@ -477,12 +482,6 @@ enum CursorUsageMapper {
         guard addition.isFinite, addition >= 0 else { return nil }
         let total = (current ?? 0) + addition
         return total.isFinite ? total : nil
-    }
-
-    private static func roundToCents(_ value: Double) -> Double {
-        let scaled = value * 100
-        guard value.isFinite, scaled.isFinite else { return value }
-        return scaled.rounded() / 100
     }
 
     private struct ModelAccumulator {

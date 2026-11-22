@@ -12,6 +12,12 @@ enum JSONLScanning {
         var size: Int
         var mtime: Date
         var attributeMtime: Date? = nil
+        var gatewayAppendWitness: GatewayAppendWitness? = nil
+    }
+
+    struct GatewayAppendWitness: Equatable, Sendable {
+        let revision: AppendOnlyFileRevision
+        let prefix: Data
     }
 
     /// Start of the day `daysBack` days before `now` — the lower bound of the scan window.
@@ -29,19 +35,73 @@ enum JSONLScanning {
     /// Recheck after asynchronous ownership/cache work; a discovered revision can change while its
     /// caller is suspended. Keep this identical for full folds and compact-result cache hits.
     static func filesStillMatch(_ files: [DiscoveredFile]) -> Bool {
+        files.allSatisfy { fileStillMatches($0) }
+    }
+
+    static func fileStillMatches(_ file: DiscoveredFile) -> Bool {
         let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey]
-        return files.allSatisfy { file in
-            guard !Task.isCancelled else { return false }
-            let url = URL(fileURLWithPath: file.path)
-            guard let revision = AppendOnlyFileProbe.revision(at: url),
-                  file.size >= 0, revision.size == UInt64(file.size),
-                  let values = try? url.resourceValues(forKeys: keys)
-            else { return false }
-            return values.fileSize == file.size
-                && values.contentModificationDate == file.mtime
-                && values.attributeModificationDate == file.attributeMtime
-                && AppendOnlyFileProbe.revision(at: url) == revision
+        guard !Task.isCancelled else { return false }
+        let url = URL(fileURLWithPath: file.path)
+        guard let revision = AppendOnlyFileProbe.revision(at: url),
+              file.size >= 0, revision.size == UInt64(file.size),
+              let values = try? url.resourceValues(forKeys: keys)
+        else { return false }
+        return values.fileSize == file.size
+            && values.contentModificationDate == file.mtime
+            && values.attributeModificationDate == file.attributeMtime
+            && AppendOnlyFileProbe.revision(at: url) == revision
+    }
+
+    // Gateway logs can grow during a fold. Sample the discovered prefix using the same
+    // bounded probe as the append caches; compressed archives and old files stay strict.
+    static func gatewayAppendWitnesses(
+        for files: [DiscoveredFile], since: Date
+    ) -> [String: GatewayAppendWitness] {
+        var witnesses: [String: GatewayAppendWitness] = [:]
+        for file in files where file.mtime >= since && file.path.hasSuffix(".jsonl") {
+            guard !Task.isCancelled else { break }
+            // Discovery-time witnesses cover appends while the rest of a source tree is being enumerated.
+            witnesses[file.path] = file.gatewayAppendWitness ?? gatewayAppendWitness(for: file)
         }
+        return witnesses
+    }
+
+    private static func gatewayAppendWitness(for file: DiscoveredFile) -> GatewayAppendWitness? {
+        let url = URL(fileURLWithPath: file.path)
+        guard let stamp = AppendOnlyFileProbe.stamp(at: url),
+              fileStillMatches(file),
+              let prefix = AppendOnlyFileProbe.anchor(at: url, endingAt: stamp.revision.size),
+              let after = AppendOnlyFileProbe.stamp(at: url),
+              after.revision.device == stamp.revision.device, after.revision.inode == stamp.revision.inode,
+              after.revision.size >= stamp.revision.size,
+              after.revision.size > stamp.revision.size || after.modificationTimes == stamp.modificationTimes
+        else { return nil }
+        return GatewayAppendWitness(revision: stamp.revision, prefix: prefix)
+    }
+
+    static func gatewayAppendedPaths(
+        in files: [DiscoveredFile], witnesses: [String: GatewayAppendWitness]
+    ) -> Set<String>? {
+        var appended: Set<String> = []
+        for file in files {
+            guard !Task.isCancelled else { return nil }
+            if fileStillMatches(file) { continue }
+            let url = URL(fileURLWithPath: file.path)
+            guard let witness = witnesses[file.path],
+                  let before = AppendOnlyFileProbe.stamp(at: url),
+                  before.revision.device == witness.revision.device,
+                  before.revision.inode == witness.revision.inode,
+                  before.revision.size > witness.revision.size,
+                  AppendOnlyFileProbe.anchor(at: url, endingAt: witness.revision.size) == witness.prefix,
+                  let after = AppendOnlyFileProbe.stamp(at: url),
+                  after.revision.device == before.revision.device,
+                  after.revision.inode == before.revision.inode,
+                  after.revision.size >= before.revision.size,
+                  after.revision.size > before.revision.size
+                    || after.modificationTimes == before.modificationTimes else { return nil }
+            appended.insert(file.path)
+        }
+        return appended
     }
 
     /// Every `*.jsonl` regular file under `dir` (recursively), path-sorted so a keep-first dedup is
@@ -50,7 +110,11 @@ enum JSONLScanning {
     /// `includeCompressedJSONL` additionally yields `*.jsonl.zst` archives (Codex compacts finished
     /// sessions this way); callers that opt in must route them through a decompressor — the file
     /// bytes are not JSONL until expanded.
-    static func jsonlFilesIfComplete(under dir: URL, includeCompressedJSONL: Bool = false) -> [DiscoveredFile]? {
+    static func jsonlFilesIfComplete(
+        under dir: URL,
+        includeCompressedJSONL: Bool = false,
+        gatewayAppendWitnessesSince: Date? = nil
+    ) -> [DiscoveredFile]? {
         guard !Task.isCancelled else { return nil }
         return JSONLAccountingWorkPacer.shared.perform {
             // `FileManager.enumerator` silently yields nothing when `dir` itself is a symlink.
@@ -84,12 +148,24 @@ enum JSONLScanning {
                 guard url.pathExtension == "jsonl" || (includeCompressedJSONL && compressed) else { continue }
                 guard let values = try? url.resourceValues(forKeys: keySet) else { return nil }
                 guard values.isRegularFile == true else { continue }
-                files.append(DiscoveredFile(
+                var file = DiscoveredFile(
                     path: url.path,
                     size: values.fileSize ?? 0,
                     mtime: values.contentModificationDate ?? .distantPast,
                     attributeMtime: values.attributeModificationDate
-                ))
+                )
+                if let since = gatewayAppendWitnessesSince, !compressed, file.mtime >= since {
+                    // Resource values prefetched by the enumerator can predate this file's turn.
+                    let freshURL = URL(fileURLWithPath: file.path)
+                    if let fresh = try? freshURL.resourceValues(forKeys: keySet),
+                       let size = fresh.fileSize, let mtime = fresh.contentModificationDate {
+                        file.size = size
+                        file.mtime = mtime
+                        file.attributeMtime = fresh.attributeModificationDate
+                        file.gatewayAppendWitness = gatewayAppendWitness(for: file)
+                    }
+                }
+                files.append(file)
             }
             guard !enumerationFailed else { return nil }
             return files.sorted { $0.path < $1.path }
@@ -354,9 +430,13 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         visit: @Sendable (Item) -> Void,
         skipPrefixCounts: [String: Int] = [:],
         fileStarted: (@Sendable (String) -> Void)? = nil,
-        fileCompleted: (@Sendable (String, Int) -> Void)? = nil
+        fileCompleted: (@Sendable (String, Int) -> Void)? = nil,
+        toleratesGatewayAppends: Bool = false
     ) async -> Bool {
         precondition(!cacheIdentity.isEmpty)
+        let witnesses = toleratesGatewayAppends
+            ? JSONLScanning.gatewayAppendWitnesses(for: files, since: since)
+            : [:]
         guard await acquire(cacheIdentity) else { return false }
         defer { release(cacheIdentity) }
         guard !Task.isCancelled else { return false }
@@ -387,7 +467,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         // Do not publish a partial fold or replace stale cache records until every changed file has
         // been read and parsed. Callers treat false as an incomplete source and keep last-good data.
         guard parseResults.allSatisfy({ $0.items != nil }) else { return false }
-        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return false }
+        guard let appendedDuringRead = validatedAppendedPaths(
+            files, witnesses: witnesses, cacheIdentity: cacheIdentity
+        ) else { return false }
         var newlyCached: [(path: String, cached: CachedFile)] = []
         for result in parseResults {
             let (file, parsed) = (result.file, result.items)
@@ -400,7 +482,10 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
             )
             nextCache[file.path] = cached
             unloadedResidentPaths[cacheIdentity]?.remove(file.path)
-            newlyCached.append((file.path, cached))
+            // Parsing may see new turns, so only stable reads are cached.
+            if !appendedDuringRead.contains(file.path) {
+                newlyCached.append((file.path, cached))
+            }
         }
         for (path, cached) in currentCache where nextCache[path] == nil {
             unloadedResidentPaths[cacheIdentity]?.remove(path)
@@ -437,19 +522,25 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         // large corpus that runs long hit this. Unvisited items are simply re-hydrated on demand by
         // the next scan, so dropping them costs one re-read, not correctness.
         defer {
-            if !retainItems {
-                let unvisited = nextCache.keys.filter { nextCache[$0]?.items.isEmpty == false }
-                for path in unvisited {
-                    if var cached = nextCache[path] {
-                        cached.items = []
-                        nextCache[path] = cached
-                        if retainResidentItems {
-                            unloadedResidentPaths[cacheIdentity, default: []].insert(path)
+            if !retainItems || !appendedDuringRead.isEmpty {
+                for path in appendedDuringRead {
+                    nextCache.removeValue(forKey: path)
+                }
+                if !retainItems {
+                    let unvisited = nextCache.keys.filter { nextCache[$0]?.items.isEmpty == false }
+                    for path in unvisited {
+                        if var cached = nextCache[path] {
+                            cached.items = []
+                            nextCache[path] = cached
+                            if retainResidentItems {
+                                unloadedResidentPaths[cacheIdentity, default: []].insert(path)
+                            }
                         }
                     }
                 }
                 caches[cacheIdentity] = nextCache
             }
+            trimResidentItems(protecting: cacheIdentity)
         }
 
         for file in files {
@@ -479,9 +570,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
                 }
             }
         }
-        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return false }
-        caches[cacheIdentity] = nextCache
-        trimResidentItems(protecting: cacheIdentity)
+        guard validatedAppendedPaths(
+            files, witnesses: witnesses, cacheIdentity: cacheIdentity
+        ) != nil else { return false }
         return !Task.isCancelled
     }
 
@@ -489,16 +580,23 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         _ files: [JSONLScanning.DiscoveredFile],
         cacheIdentity: String
     ) -> Bool {
-        let changed = !JSONLScanning.filesStillMatch(files)
+        validatedAppendedPaths(files, witnesses: [:], cacheIdentity: cacheIdentity) != nil
+    }
+
+    private func validatedAppendedPaths(
+        _ files: [JSONLScanning.DiscoveredFile],
+        witnesses: [String: JSONLScanning.GatewayAppendWitness],
+        cacheIdentity: String
+    ) -> Set<String>? {
         let diagnosticKey = "jsonl.scan.source-changed.\(JSONLScanCachePaths.stableFingerprint(logTag + "|" + cacheIdentity))"
-        guard changed else {
+        if let appended = JSONLScanning.gatewayAppendedPaths(in: files, witnesses: witnesses) {
             DiagnosticGate.clearFailure(diagnosticKey)
-            return true
+            return appended
         }
         DiagnosticGate.logOnce(for: diagnosticKey) {
             AppLog.warn(logTag, "session source changed during its scan; preserving last-good history")
         }
-        return false
+        return nil
     }
 
     /// Wait for the real debounced tasks rather than bypassing them. Tests configure a tiny debounce,

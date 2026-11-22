@@ -1,11 +1,7 @@
 import SwiftUI
 
-/// The Usage History screen: a 30-day, cross-provider report built from the same per-provider
-/// `usageHistory` the dashboard's spend tiles render, so the two can never disagree. Header cards
-/// (Today / 7 Days / 30 Days: tokens + plan-priced cost), the "At Public API Rates" what-if total
-/// from fold-time estimates, a 30-bar daily token trend, and one section per enabled provider with
-/// per-model rows. A codename model (e.g. "space-bunny") shows tokens with a dashed cost until the
-/// automatic pricing discovery prices it — then the cost backfills with no user action.
+/// The Usage History screen: measured tokens and provider-reported charges or a separate API-rate
+/// estimate view, built from the same per-provider histories the dashboard's spend tiles render.
 struct HistoryDashboardView: View {
     var now: () -> Date = Date.init
     @Environment(LayoutStore.self) private var layout
@@ -13,6 +9,7 @@ struct HistoryDashboardView: View {
 
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
     @State private var scrollPosition = ScrollPosition(edge: .top)
+    @State private var costMode: HistoryCostMode = .reportedOnly
 
     var body: some View {
         PopoverScrollView {
@@ -26,37 +23,49 @@ struct HistoryDashboardView: View {
 
     // MARK: - Report
 
-    /// Folds the enabled providers' snapshots into the report — in memory, every render. The same
-    /// inputs the dashboard cards read, so no second source of truth exists to drift.
+    /// Projects the enabled providers' cached histories onto the selected cost source.
     private var report: HistoryReport {
         let enabledIDs = layout.orderedProviderIDs().filter { layout.isProviderEnabled($0) }
         var names: [String: String] = [:]
         var histories: [String: ProviderUsageHistory] = [:]
-        var estimatedCosts: [String: Bool] = [:]
         for id in enabledIDs {
             names[id] = layout.provider(id: id)?.displayName ?? id
             histories[id] = dataStore.snapshots[id]?.usageHistory
-            estimatedCosts[id] = dataStore.historyDescriptorsByProvider[id]?.estimatedCost
         }
-        return HistoryDashboardAggregator.report(.init(
-            enabledProviderIDs: enabledIDs,
-            displayNameByProviderID: names,
-            historyByProviderID: histories,
-            estimatedCostByProviderID: estimatedCosts
-        ), now: now())
+        return HistoryDashboardAggregator.report(
+            .init(
+                enabledProviderIDs: enabledIDs,
+                displayNameByProviderID: names,
+                historyByProviderID: histories
+            ),
+            costMode: costMode,
+            now: now()
+        )
     }
 
     @ViewBuilder
     private var content: some View {
         let report = report
         VStack(alignment: .leading, spacing: density.sectionSpacing) {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("Cost Source", selection: $costMode) {
+                    ForEach(HistoryCostMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .accessibilityLabel("Cost Source")
+                Text(costMode == .reportedOnly
+                     ? "Only dollar amounts recorded by providers. Missing costs are not estimated."
+                     : "What the measured tokens would cost at published API rates, not a bill.")
+                    .font(.system(size: density.supportingPointSize - 1))
+                    .foregroundStyle(.secondary)
+            }
             if report.isEmpty {
                 emptyState
             } else {
                 lifetimeHeroCard(report)
-                if report.showsAPIEstimateCard {
-                    estimateCard(report)
-                }
                 periodCard(report)
                 trendCard(report)
                 ForEach(report.sections) { section in
@@ -88,12 +97,8 @@ struct HistoryDashboardView: View {
 
     // MARK: - Lifetime hero
 
-    /// The screen's answer to "what have I used in total": every recorded day's tokens and plan-priced
-    /// cost, dated by the earliest day the logs still hold. Sits above the period row so the screen
-    /// leads with the one figure the dashboard's cards can't show. When the dollars are fold-imputed
-    /// (subscription logs carry no per-message cost, so they were priced at public API rates) the
-    /// figure carries an "(Est.)" mark — the tiles' ⓘ convention, so the headline is never presented
-    /// as recorded billing.
+    /// The selected dollar source for every recorded day's measured tokens, dated by the earliest day
+    /// the logs still hold.
     private func lifetimeHeroCard(_ report: HistoryReport) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -136,8 +141,7 @@ struct HistoryDashboardView: View {
 
     // MARK: - Period totals
 
-    /// Today / 7 Days / 30 Days: tokens always, plan-priced cost or a dash. One card, three columns,
-    /// like the system's own summary rows.
+    /// Today / 7 Days / 30 Days: tokens always, with the selected cost source or a dash.
     private func periodCard(_ report: HistoryReport) -> some View {
         HStack(alignment: .top, spacing: 0) {
             periodColumn("Today", total: report.today)
@@ -174,30 +178,6 @@ struct HistoryDashboardView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
-    }
-
-    /// The "if it were all API" what-if total across the same recorded span as the lifetime hero —
-    /// the reveal feature's payoff: once discovery prices a codename, this total restates with real
-    /// rates. Shown only when it differs from the hero's displayed total (`showsAPIEstimateCard`):
-    /// when the two figures coincide — subscription logs with no per-message cost — the row would
-    /// duplicate the hero while reading as a different fact.
-    private func estimateCard(_ report: HistoryReport) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text("At Public API Rates (Est.)")
-                .font(.system(size: density.supportingPointSize, weight: .medium))
-                .foregroundStyle(.primary)
-            Spacer(minLength: 8)
-            Text(report.apiEstimateTotal.map { MetricFormatter.number($0, kind: .dollars, style: .row) } ?? "\u{2014}")
-                .font(.system(size: density.headerPointSize, weight: .semibold))
-                .foregroundStyle(.primary)
-                .monospacedDigit()
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .cardSurface()
     }
 
     // MARK: - Trend
@@ -282,7 +262,9 @@ struct HistoryDashboardView: View {
             .padding(.bottom, 6)
 
             if section.hasIncompleteCost {
-                Text("Some usage is still changing or could not be priced completely.")
+                Text(costMode == .reportedOnly
+                     ? "Some usage has no recorded dollar amount."
+                     : "Some usage is still changing or could not be priced completely.")
                     .font(.system(size: density.supportingPointSize - 1))
                     .foregroundStyle(.tertiary)
                     .padding(.horizontal, 12)
@@ -296,8 +278,7 @@ struct HistoryDashboardView: View {
         .cardSurface()
     }
 
-    /// One model: name on top, tokens beneath, plan-priced cost (or dash) trailing. An unpriced row
-    /// reads its dash until discovery prices it — there is no manual affordance by design.
+    /// One model: name on top, tokens beneath, the selected cost source (or dash) trailing.
     private func modelRow(_ row: HistoryModelRow) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {

@@ -35,13 +35,10 @@ enum FreebuffDesktopUsageSQL {
           CAST(r.created_at AS TEXT), ''
         ) AS timestamp,
         json_object(
-          'usage', json(json_set(
-            json_extract(r.manager_json, '$.usage'),
-            '$.model', json_extract(r.manager_json, '$.model')
-          )),
+          'usage', json_extract(r.manager_json, '$.usage'),
           'usageIncomplete', COALESCE(json_extract(r.manager_json, '$.usageIncomplete'), 0)
         ) || '' AS metrics,
-        \(selectedModel) AS selectedModel
+        COALESCE(NULLIF(json_extract(r.manager_json, '$.model'), ''), \(selectedModel)) AS selectedModel
       FROM auto_run_decision_receipts r JOIN threads t ON t.id = r.thread_id
       WHERE t.harness_id = 'codebuff'
         AND json_extract(r.manager_json, '$.harnessId') = 'codebuff'

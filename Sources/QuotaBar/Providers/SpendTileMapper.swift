@@ -44,13 +44,10 @@ enum SpendTileMapper {
         }
         let unexplainedIncompleteDays = Set(usage.daily.compactMap { entry -> String? in
             guard let day = dayKey(fromUsageDate: entry.date) else { return nil }
-            if entry.hasUnexplainedIncompleteCost == true
-                || (!entry.costIsComplete && entry.hasUnexplainedIncompleteCost == nil
-                    && unknownModelsByDay[day]?.isEmpty != false && !partialDays.contains(day))
-            {
-                return day
-            }
-            return nil
+            return entry.hasUnexplainedCostGap(
+                hasUnknownModels: unknownModelsByDay[day]?.isEmpty == false,
+                isPartial: partialDays.contains(day)
+            ) ? day : nil
         })
 
         if let entry = usage.daily.first(where: { dayKey(fromUsageDate: $0.date) == today }), hasUsage(entry) {
@@ -128,14 +125,7 @@ enum SpendTileMapper {
         // Keep the priced subtotal when incompleteness is explained by named unknown models. Other
         // incomplete accounting (for example, a provider-reported token mismatch) remains hidden until
         // its source can produce a trustworthy subtotal and a matching warning.
-        let hasUnexplainedIncompleteCost = windowed.contains { entry in
-            guard !entry.costIsComplete,
-                  let day = dayKey(fromUsageDate: entry.date)
-            else { return false }
-            return entry.hasUnexplainedIncompleteCost == true
-                || (entry.hasUnexplainedIncompleteCost == nil && unknownModelsByDay[day]?.isEmpty != false
-                    && !partialDays.contains(day))
-        }
+        let hasUnexplainedIncompleteCost = !windowKeys.isDisjoint(with: unexplainedIncompleteDays)
         let costSamples = windowed.compactMap { entry -> Double? in
             guard let day = dayKey(fromUsageDate: entry.date) else { return nil }
             return displayableCost(entry, day: day, unknownModelsByDay: unknownModelsByDay,
@@ -322,11 +312,10 @@ enum SpendTileMapper {
         partialDays: Set<String>
     ) -> Double? {
         guard let cost = entry.costUSD, cost.isFinite, cost >= 0 else { return nil }
-        guard entry.costIsComplete
-            || entry.hasUnexplainedIncompleteCost == false
-            || partialDays.contains(day)
-            || (entry.hasUnexplainedIncompleteCost != true && unknownModelsByDay[day]?.isEmpty == false)
-        else { return nil }
+        guard !entry.hasUnexplainedCostGap(
+            hasUnknownModels: unknownModelsByDay[day]?.isEmpty == false,
+            isPartial: partialDays.contains(day)
+        ) else { return nil }
         return cost
     }
 

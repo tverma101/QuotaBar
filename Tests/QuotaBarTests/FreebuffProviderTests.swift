@@ -416,21 +416,14 @@ final class FreebuffUsageMapperTests: XCTestCase {
 
 @MainActor
 final class FreebuffProviderTests: XCTestCase {
-    func testUsageClientUsesReadOnlySessionGetAndTimezone() async throws {
-        let http = FakeHTTPClient(response: HTTPResponse(statusCode: 404, headers: [:], body: Data()))
-        let client = FreebuffUsageClient(http: http, timeZone: { "America/New_York" })
-        _ = try await client.fetchSession(auth: FreebuffAuth(token: "test-token"))
-
-        let request = try XCTUnwrap(http.requests.first)
-        XCTAssertEqual(request.method, "GET")
-        XCTAssertEqual(request.url.absoluteString, "https://www.codebuff.com/api/v1/freebuff/session",
-                       "use the canonical host directly so a redirect cannot strip Authorization")
-        XCTAssertEqual(request.headers["Authorization"], "Bearer test-token")
-        XCTAssertEqual(request.headers["x-fb-timezone"], "America/New_York")
-        XCTAssertEqual(request.headers["x-freebuff-multi-session"], "1")
-        XCTAssertNil(request.headers["x-freebuff-instance-id"])
-        XCTAssertNil(request.headers["x-freebuff-heartbeat"], "monitoring must never keep a session alive")
-        XCTAssertNil(request.body)
+    func testUsageClientPassesSessionToExplicitTransport() async throws {
+        let client = FreebuffUsageClient(transport: { operation, auth in
+            XCTAssertEqual(operation, .session)
+            XCTAssertEqual(auth.token, "fixture-only")
+            return HTTPResponse(statusCode: 404, headers: [:], body: Data())
+        })
+        let response = try await client.fetchSession(auth: FreebuffAuth(token: "fixture-only"))
+        XCTAssertEqual(response.statusCode, 404)
     }
 
     func testUsageTransportFailureMapsToFriendlyNetworkError() async {

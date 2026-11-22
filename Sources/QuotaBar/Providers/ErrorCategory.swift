@@ -178,6 +178,7 @@ extension FreebuffUsageError: CategorizedError {
         case .requestFailed(let status): ErrorCategory.http(status)
         case .quotaUnavailable: .notAvailable
         case .localHistoryUnreadable: .decoding
+        case .liveAccessUnavailable: .notAvailable
         }
     }
 }

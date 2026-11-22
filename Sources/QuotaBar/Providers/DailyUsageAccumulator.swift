@@ -12,6 +12,7 @@ import Foundation
 struct DailyUsageAccumulator {
     private var tokensByDay: [String: Int] = [:]
     private var costByDay: [String: Double] = [:]
+    private var reportedCosts = ReportedUsageCostAccumulator()
     private var estimatedCostDays: Set<String> = []
     private var apiEstimateByDay: [String: Double] = [:]
     private var apiEstimateIncompleteDays: Set<String> = []
@@ -85,7 +86,8 @@ struct DailyUsageAccumulator {
         model: String,
         canonical: String? = nil,
         costIsComplete: Bool = true,
-        tokenCountSaturated: Bool = false
+        tokenCountSaturated: Bool = false,
+        reportedCost: Double? = nil
     ) {
         let priorTokens = tokensByDay[day, default: 0]
         if tokens > 0 && priorTokens > Int.max - tokens {
@@ -93,6 +95,7 @@ struct DailyUsageAccumulator {
         }
         if tokenCountSaturated { tokenCountSaturatedDays.insert(day) }
         tokensByDay[day] = ProviderParse.addingSaturating(priorTokens, tokens)
+        reportedCosts.add(day: day, dollars: reportedCost, tokens: tokens)
         if let cost {
             if overflowedCostDays.contains(day) {
                 incompleteCostDays.insert(day)
@@ -240,6 +243,9 @@ struct DailyUsageAccumulator {
         }
         for day in scan.series.daily
         where minDayKey.map({ day.date >= $0 }) ?? true {
+            if let reported = day.reportedCost {
+                reportedCosts.add(day: day.date, dollars: reported.dollars, tokens: reported.coveredTokens)
+            }
             if !day.costIsComplete {
                 incompleteCostDays.insert(day.date)
             }
@@ -537,7 +543,8 @@ struct DailyUsageAccumulator {
                 costUSD: costByDay[day],
                 costIsComplete: !incompleteCostDays.contains(day),
                 hasUnexplainedIncompleteCost: hasUnexplainedIncompleteCost,
-                tokenCountSaturated: tokenCountSaturatedDays.contains(day)
+                tokenCountSaturated: tokenCountSaturatedDays.contains(day),
+                reportedCost: reportedCosts.byDay[day]
             )
         }
         let modelUsage = ModelUsageSeries(daily: modelsByDay.keys.sorted(by: >).map { day in

@@ -535,3 +535,25 @@ func waitUntil(
         try? await Task.sleep(for: poll)
     }
 }
+
+/// Fixture transport: Freebuff ships no live endpoint, so tests route the client's operations to a
+/// fake host through an injected `HTTPClient`.
+extension FreebuffUsageClient {
+    init(http: any HTTPClient) {
+        self.init { operation, _ in
+            var url = URLComponents()
+            url.scheme = "https"
+            url.host = "freebuff.invalid"
+            switch operation {
+            case .session:
+                url.path = "/session"
+            case .modelCatalog:
+                url.path = "/catalog"
+            case .history(let path, let cursor):
+                url.path = "/history/" + path
+                if let cursor { url.queryItems = [URLQueryItem(name: "cursor", value: cursor)] }
+            }
+            return try await http.send(HTTPRequest(method: "GET", url: url.url!, headers: [:]))
+        }
+    }
+}

@@ -442,25 +442,48 @@ final class ModelPricingTests: XCTestCase {
         let catalog = try PricingCatalogCodecs.catalogFromModelsDev(source)
         let rates = try XCTUnwrap(catalog.entries["tiered"])
 
-        XCTAssertTrue(rates.cacheReadIsExplicit)
+        XCTAssertFalse(rates.cacheReadIsExplicit)
         XCTAssertEqual(rates.costDollars(for: TokenBreakdown(input: 1_000, cacheRead: 2_000)), 0.004, accuracy: 0.000_001)
     }
 
-    func testLiteLLMTierOnlyCacheReadRateIsExplicitAndSurvivesCompaction() throws {
+    func testLiteLLMTierOnlyCacheReadRateSurvivesCompactionWithoutBaseDiscount() throws {
         let source = Data(#"{"tiered":{"input_cost_per_token":0.000001,"output_cost_per_token":0.000002,"cache_read_input_token_cost_above_272k_tokens":0.0000002}}"#.utf8)
 
         let catalog = try PricingCatalogCodecs.catalogFromLiteLLM(source)
         let original = try XCTUnwrap(catalog.entries["tiered"])
-        XCTAssertTrue(original.cacheReadIsExplicit)
+        XCTAssertFalse(original.cacheReadIsExplicit)
 
         let compact = try PricingCatalogCodecs.compactData(from: catalog)
         let restored = try XCTUnwrap(PricingCatalogCodecs.catalogFromCompact(compact).entries["tiered"])
-        XCTAssertTrue(restored.cacheReadIsExplicit)
+        XCTAssertFalse(restored.cacheReadIsExplicit)
         XCTAssertEqual(
             restored.costDollars(for: TokenBreakdown(cacheRead: 272_001)),
             272_001 * 0.2 / 1_000_000,
             accuracy: 0.000_001
         )
+    }
+
+    func testTierCacheReadDoesNotTurnFallbackIntoAnIncorrectBaseRate() throws {
+        let source = Data(#"""
+        {"data":[{"id":"vendor/model","pricing":{
+          "prompt":"0.000001","completion":"0.000002","overrides":[
+            {"min_prompt_tokens":1000,"prompt":"0.000003"},
+            {"min_prompt_tokens":2000,"prompt":"0.000004","input_cache_read":"0"},
+            {"utc_days":["monday"],"prompt":"0.000005"},
+            {"utc_days":["tuesday"],"prompt":"0.000005","input_cache_read":"0.0000005"}
+          ]}}],"total_count":1,"links":{"next":null}}
+        """#.utf8)
+        let catalog = try PricingCatalogCodecs.catalogFromOpenRouter(source)
+        let restored = try PricingCatalogCodecs.catalogFromCompact(PricingCatalogCodecs.compactData(from: catalog))
+        let rates = try XCTUnwrap(restored.entries["vendor/model"])
+        let formatter = ISO8601DateFormatter()
+        let monday = try XCTUnwrap(formatter.date(from: "2026-10-26T12:00:00Z"))
+        let tuesday = try XCTUnwrap(formatter.date(from: "2026-10-27T12:00:00Z"))
+        XCTAssertFalse(rates.cacheReadIsExplicit)
+        XCTAssertEqual(rates.costDollars(for: TokenBreakdown(cacheRead: 1000)), 0.003, accuracy: 1e-12)
+        XCTAssertEqual(rates.costDollars(for: TokenBreakdown(cacheRead: 2000)), 0, accuracy: 1e-12)
+        XCTAssertEqual(rates.costDollars(for: TokenBreakdown(cacheRead: 100), at: monday), 0.0005, accuracy: 1e-12)
+        XCTAssertEqual(rates.costDollars(for: TokenBreakdown(cacheRead: 100), at: tuesday), 0.00005, accuracy: 1e-12)
     }
 
     func testInvalidPublishedCostsAreRejectedInsteadOfPoisoningSpend() throws {
