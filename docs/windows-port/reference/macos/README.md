@@ -1,6 +1,6 @@
 # QuotaBar macOS visual reference
 
-Swift baseline: [8422c3f](https://github.com/tverma101/QuotaBar/tree/8422c3f5b454e1668d716af4a11014596bcae55a), as named in the [feature inventory](../../FEATURES.md). Captured on arm64 macOS 26.6.2 (25G83). See [manifest.tsv](manifest.tsv) for the exact PNG dimensions and capture scale.
+Captured from Swift revision [8422c3f](https://github.com/tverma101/QuotaBar/tree/8422c3f5b454e1668d716af4a11014596bcae55a) on arm64 macOS 26.6.2 (25G83). The [feature inventory](../../FEATURES.md) now tracks the newer revision `9141aa3`; the PNGs were not recaptured at that revision. See [manifest.tsv](manifest.tsv) for exact PNG dimensions and capture scale.
 
 ## Inputs
 
