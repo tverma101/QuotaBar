@@ -26,7 +26,7 @@ import { ProviderIcon } from "@/components/provider-icon";
 import { GlobalShortcutSection } from "@/components/global-shortcut-section";
 import { LanguageRegionSection } from "@/components/settings/language-region-section";
 import { ScreenShareSection } from "@/components/settings/screen-share-section";
-import { CodexEnrollment } from "@/components/settings/codex-enrollment";
+import { CodexEnrollment, type RegisteredCodexAccount } from "@/components/settings/codex-enrollment";
 import { CodexAutoResetSetting } from "@/components/settings/codex-auto-reset-setting";
 import { getBarFillLayout } from "@/lib/tray-bars-icon";
 import { getTrayIconSizePx } from "@/lib/tray-icon-size";
@@ -1500,6 +1500,16 @@ export function SettingsPage({
     setAccountForm(null);
   };
 
+  function addRegisteredCodexAccount({ instanceId, label }: RegisteredCodexAccount) {
+    onAddProviderAccount("codex", {
+      label,
+      registeredInstanceId: instanceId,
+      accessToken: "",
+      refreshToken: "",
+      sessionKey: "",
+    });
+  }
+
   return (
     <div
       className={cn(
@@ -1538,6 +1548,12 @@ export function SettingsPage({
       ) : null}
       {showModernSection("general") ? (
       <>
+      {isTauri() && plugins.some((plugin) => plugin.id === "codex") ? (
+        <div className={cn("space-y-1", modernDensity === "compact" && "space-y-0.5")}>
+          <h4 className="px-2 text-xs font-semibold text-muted-foreground">Codex Accounts</h4>
+          <CodexEnrollment label="" onRegistered={addRegisteredCodexAccount} presentation="settings" />
+        </div>
+      ) : null}
       <LanguageRegionSection
         appLocale={appLocale}
         displayCurrency={displayCurrency}
@@ -2247,14 +2263,8 @@ export function SettingsPage({
                         {isTauri() && accountForm.mode === "add" && accountForm.baseProviderId === "codex" ? (
                           <CodexEnrollment
                             label={accountForm.label}
-                            onRegistered={({ instanceId, label }) => {
-                              onAddProviderAccount("codex", {
-                                label,
-                                registeredInstanceId: instanceId,
-                                accessToken: "",
-                                refreshToken: "",
-                                sessionKey: "",
-                              });
+                            onRegistered={(account) => {
+                              addRegisteredCodexAccount(account);
                               setAccountForm(null);
                             }}
                           />

@@ -1,16 +1,21 @@
 import { useState } from "react"
 import { invoke } from "@tauri-apps/api/core"
+import { UserRoundPlus } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { cn } from "@/lib/utils"
 
-type RegisteredCodexAccount = { instanceId: string; label: string }
+export type RegisteredCodexAccount = { instanceId: string; label: string }
 
 export function CodexEnrollment({
   label,
   onRegistered,
+  presentation = "inline",
 }: {
   label: string
   onRegistered: (account: RegisteredCodexAccount) => void
+  presentation?: "inline" | "settings"
 }) {
+  const isSettings = presentation === "settings"
   const [operation, setOperation] = useState<"sign-in" | "existing" | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -36,9 +41,11 @@ export function CodexEnrollment({
   }
 
   return (
-    <div className="mb-3 space-y-2">
+    <div className={cn(isSettings ? "space-y-1 rounded-xl bg-muted/50 px-3 pt-3 pb-2" : "mb-3 space-y-2")}>
       <p className="text-xs text-muted-foreground">
-        Sign in through Codex in your browser, or connect an existing Codex home. No credentials need to be copied.
+        {isSettings
+          ? "QuotaBar uses Codex’s own browser sign-in. Each additional account gets its own CODEX_HOME and usage card; QuotaBar never sees or stores your credentials."
+          : "Sign in through Codex in your browser, or connect an existing Codex home. No credentials need to be copied."}
       </p>
       {operation === "sign-in" ? (
         <div className="flex items-center justify-between gap-2">
@@ -48,11 +55,21 @@ export function CodexEnrollment({
           }}>Cancel</Button>
         </div>
       ) : (
-        <Button type="button" size="sm" variant="outline" className="w-full" disabled={!!operation}
-          onClick={() => void enroll("sign-in")}>Sign In to Codex…</Button>
+        <Button type="button" size="sm" variant="outline" className={cn("w-full", isSettings && "mt-3 h-7")} disabled={!!operation}
+          onClick={() => void enroll("sign-in")}>
+          {isSettings ? <UserRoundPlus aria-hidden="true" /> : null}
+          Sign In to Codex…
+        </Button>
       )}
-      <Button type="button" size="sm" variant="outline" className="w-full" disabled={!!operation}
+      <Button type="button" size="sm" variant={isSettings ? "secondary" : "outline"} className={cn("w-full", isSettings && "h-6 text-xs")} disabled={!!operation}
         onClick={() => void enroll("existing")}>Use Existing Codex Home…</Button>
+      {isSettings ? (
+        <p className="pt-1 text-xs text-muted-foreground">
+          Codex opens your default browser and completes OAuth. When it finishes, QuotaBar reloads its account
+          catalog and starts the new usage card automatically. Removing a registration never deletes Codex
+          credentials or history.
+        </p>
+      ) : null}
       {error ? <p role="alert" className="text-xs text-destructive">{error}</p> : null}
     </div>
   )
