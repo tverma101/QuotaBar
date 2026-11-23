@@ -17,6 +17,7 @@ import { useSettingsUIScale } from "@/hooks/app/use-settings-ui-scale"
 import { useTrayIcon } from "@/hooks/app/use-tray-icon"
 import { useUsageAlert } from "@/hooks/app/use-usage-alert"
 import { useNotificationFocus } from "@/hooks/app/use-notification-focus"
+import { usePanelHideReset } from "@/hooks/app/use-panel-hide-reset"
 import {
   buildProviderInstanceId,
   getBaseProviderId,
@@ -154,6 +155,7 @@ function App() {
   const scheduleProbeTrayUpdateRef = useRef<() => void>(() => {})
   const { checkUsageAlert } = useUsageAlert()
   useNotificationFocus()
+  usePanelHideReset()
   const handleProbeResult = useCallback((output: PluginOutput) => {
     scheduleProbeTrayUpdateRef.current()
     checkUsageAlert(output)

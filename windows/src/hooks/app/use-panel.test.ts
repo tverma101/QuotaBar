@@ -38,7 +38,7 @@ vi.mock("@tauri-apps/api/window", () => ({
   },
 }))
 
-import { usePanel } from "@/hooks/app/use-panel"
+import { naturalContentHeight, usePanel } from "@/hooks/app/use-panel"
 
 describe("usePanel", () => {
   beforeEach(() => {
@@ -340,5 +340,30 @@ describe("usePanel", () => {
 
     document.body.removeChild(container)
     requestAnimationFrameSpy.mockRestore()
+  })
+})
+
+describe("naturalContentHeight", () => {
+  const rect = (top: number, bottom: number) => ({ top, bottom }) as DOMRect
+
+  it("measures the content, not the stretched scroll viewport", () => {
+    const scroll = document.createElement("div")
+    const wrapper = document.createElement("div")
+    const a = document.createElement("section")
+    const b = document.createElement("section")
+    wrapper.append(a, b)
+    scroll.append(wrapper)
+    Object.defineProperty(scroll, "scrollHeight", { value: 900 })
+    wrapper.getBoundingClientRect = () => rect(40, 940)
+    a.getBoundingClientRect = () => rect(40, 140)
+    b.getBoundingClientRect = () => rect(140, 260.4)
+
+    expect(naturalContentHeight(scroll)).toBe(221)
+  })
+
+  it("falls back to scrollHeight without a content wrapper", () => {
+    const scroll = document.createElement("div")
+    Object.defineProperty(scroll, "scrollHeight", { value: 512 })
+    expect(naturalContentHeight(scroll)).toBe(512)
   })
 })

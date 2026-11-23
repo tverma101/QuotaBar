@@ -201,6 +201,7 @@ export function AppShell({
               ) : null}
               <div
                 ref={scrollRef}
+                data-panel-scroll
                 className="min-h-0 flex-1 overflow-y-auto scrollbar-none"
               >
                 <div className="min-h-full min-w-0">
