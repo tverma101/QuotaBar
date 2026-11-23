@@ -76,6 +76,7 @@ export type AppContentProps = AppContentDerivedProps &
   AppContentActionProps & {
     compactSettings?: boolean
     viewOverride?: "home" | "settings"
+    accountProviderId?: string
   }
 
 export function AppContent({
@@ -120,6 +121,7 @@ export function AppContent({
   cursorRequestsLineAvailable,
   compactSettings = false,
   viewOverride,
+  accountProviderId,
 }: AppContentProps) {
   const { activeView } = useAppUiStore(
     useShallow((state) => ({
@@ -264,6 +266,7 @@ export function AppContent({
         cursorRequestsLineAvailable={cursorRequestsLineAvailable}
         presentation={uiLayout === "modern" ? "modern" : "classic"}
         compactSettings={compactSettings}
+        accountProviderId={accountProviderId}
       />
       </div>
     )

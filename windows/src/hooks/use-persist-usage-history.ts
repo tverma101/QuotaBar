@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react"
 import { loadPersistUsageHistory } from "@/lib/settings"
 
-export function usePersistUsageHistory() {
+export function usePersistUsageHistory(reloadKey?: string) {
   const [enabled, setEnabled] = useState(false)
 
   useEffect(() => {
@@ -14,7 +14,7 @@ export function usePersistUsageHistory() {
     return () => {
       mounted = false
     }
-  }, [])
+  }, [reloadKey])
 
   return enabled
 }

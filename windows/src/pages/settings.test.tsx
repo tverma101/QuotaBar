@@ -603,6 +603,31 @@ describe("SettingsPage", () => {
     expect(screen.queryByText("Allow product polls")).toBeNull()
   })
 
+  it("keeps iCloud Sync visibly off and unavailable without hiding Windows controls", () => {
+    renderSettings({ ...defaultProps, presentation: "modern" })
+
+    const sync = screen.getByRole("region", { name: "iCloud Sync" })
+    const toggle = within(sync).getByRole("checkbox", { name: "Sync Across Macs" })
+    expect(toggle).not.toBeChecked()
+    expect(toggle).toHaveAttribute("aria-disabled", "true")
+    expect(toggle).toHaveAccessibleDescription(/unavailable on Windows/)
+    expect(screen.getByRole("checkbox", { name: "Start hidden" })).toBeVisible()
+  })
+
+  it("scopes the Customize account panel to the requested provider", () => {
+    renderSettings({
+      ...defaultProps,
+      presentation: "modern",
+      accountProviderId: "a",
+      plugins: [...defaultProps.plugins, { ...defaultProps.plugins[0], id: "b", name: "Beta" }],
+    })
+
+    expect(screen.getByText("Alpha")).toBeVisible()
+    expect(screen.queryByText("Beta")).toBeNull()
+    expect(screen.getByRole("button", { name: "Set credentials" })).toBeVisible()
+    expect(screen.queryByText("iCloud Sync")).toBeNull()
+  })
+
   it("toggles start hidden checkbox", async () => {
     const onStartHiddenChange = vi.fn()
     renderSettings({

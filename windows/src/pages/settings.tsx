@@ -1221,6 +1221,7 @@ interface SettingsPageProps {
   onSetTrayReadout: (pluginId: string, lineLabel: string) => void;
   presentation?: "classic" | "modern";
   compactSettings?: boolean;
+  accountProviderId?: string;
 }
 
 export function SettingsPage({
@@ -1284,6 +1285,7 @@ export function SettingsPage({
   onSetTrayReadout,
   presentation = "classic",
   compactSettings = false,
+  accountProviderId,
 }: SettingsPageProps) {
   const { t } = useTranslation();
   const {
@@ -1299,12 +1301,14 @@ export function SettingsPage({
     modernTabs,
   } = useTranslatedSettingsOptions();
   const isModern = presentation === "modern";
-  const tabbed = isModern || compactSettings;
+  const tabbed = !isModern && compactSettings && !accountProviderId;
+  const visiblePlugins = accountProviderId ? plugins.filter((plugin) => plugin.id === accountProviderId) : plugins;
   type ModernSettingsTab = "general" | "tray" | "appearance" | "providers" | "advanced";
   const [modernTab, setModernTab] = useState<ModernSettingsTab>("general");
   const showModernSection = (tab: ModernSettingsTab | ModernSettingsTab[]) => {
-    if (!tabbed) return true;
     const tabs = Array.isArray(tab) ? tab : [tab];
+    if (accountProviderId) return tabs.includes("providers");
+    if (!tabbed) return true;
     return tabs.includes(modernTab);
   };
   const [accountForm, setAccountForm] = useState<AccountFormState | null>(null);
@@ -1489,7 +1493,7 @@ export function SettingsPage({
   return (
     <div
       className={cn(
-        tabbed
+        tabbed || isModern
           ? "space-y-2 pb-2 [&_section]:rounded-xl [&_section]:border [&_section]:border-border/50 [&_section]:bg-card/30 [&_section]:px-3 [&_section]:py-2.5 [&_h3]:text-sm [&_h3]:font-semibold [&_section>p.text-sm]:text-xs [&_section>p.text-sm]:text-muted-foreground [&_section>p.text-sm]:mb-2"
           : "py-3 space-y-4",
       )}
@@ -1530,6 +1534,16 @@ export function SettingsPage({
         onAppLocaleChange={onAppLocaleChange}
         onDisplayCurrencyChange={onDisplayCurrencyChange}
       />
+      <section aria-labelledby="sync-settings-title">
+        <h3 id="sync-settings-title" className="text-lg font-semibold">iCloud Sync</h3>
+        <label className="flex items-center justify-between gap-2 py-2 text-sm">
+          Sync Across Macs
+          <Checkbox checked={false} disabled className="opacity-50" aria-describedby="sync-settings-notice" />
+        </label>
+        <p id="sync-settings-notice" className="text-xs text-muted-foreground">
+          iCloud usage history sync is unavailable on Windows. Usage history stays on this device.
+        </p>
+      </section>
       <section>
         <h3 className="text-lg font-semibold mb-0">{t("settings.autoRefresh.title")}</h3>
         <p className="text-sm text-muted-foreground mb-2">
@@ -2192,9 +2206,9 @@ export function SettingsPage({
       ) : null}
       {showModernSection("providers") ? (
       <section>
-        <h3 className="text-lg font-semibold mb-0">Plugins</h3>
+        <h3 className="text-lg font-semibold mb-0">{accountProviderId ? "Account" : "Plugins"}</h3>
         <p className="text-sm text-muted-foreground mb-2">
-          Your AI coding lineup
+          {accountProviderId ? "Manage this provider’s credentials." : "Your AI coding lineup"}
         </p>
         <div className="bg-muted/50 rounded-lg p-1 space-y-1">
           {shouldApplyProviderAccountDevMock() ? (
@@ -2210,10 +2224,10 @@ export function SettingsPage({
             onDragEnd={handleDragEnd}
           >
             <SortableContext
-              items={plugins.map((p) => p.id)}
+              items={visiblePlugins.map((p) => p.id)}
               strategy={verticalListSortingStrategy}
             >
-              {plugins.map((plugin) => (
+              {visiblePlugins.map((plugin) => (
                 <SortablePluginItem
                   key={plugin.id}
                   plugin={plugin}

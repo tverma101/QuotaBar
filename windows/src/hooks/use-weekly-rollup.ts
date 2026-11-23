@@ -7,13 +7,14 @@ import {
   type WeeklyRollupResult,
 } from "@/lib/weekly-rollup"
 
-export function useWeeklyRollup(persistEnabled: boolean) {
+export function useWeeklyRollup(persistEnabled: boolean, visibleOnly = false) {
   const [dailyRows, setDailyRows] = useState<UsageDailyRow[]>([])
   const [rollup, setRollup] = useState<WeeklyRollupResult | null>(null)
   const [rollup30, setRollup30] = useState<WeeklyRollupResult | null>(null)
   const debounceRef = useRef<number | null>(null)
 
   const reload = useCallback(async () => {
+    if (visibleOnly && document.hidden) return
     if (!isTauri() || !persistEnabled) {
       setDailyRows([])
       setRollup(null)
@@ -31,22 +32,26 @@ export function useWeeklyRollup(persistEnabled: boolean) {
       setRollup(null)
       setRollup30(null)
     }
-  }, [persistEnabled])
+  }, [persistEnabled, visibleOnly])
+
+  const cancelReload = useCallback(() => {
+    if (debounceRef.current === null) return
+    window.clearTimeout(debounceRef.current)
+    debounceRef.current = null
+  }, [])
 
   const scheduleReload = useCallback(() => {
-    if (debounceRef.current !== null) clearTimeout(debounceRef.current)
+    cancelReload()
     debounceRef.current = window.setTimeout(() => {
       debounceRef.current = null
       void reload()
     }, 32_000)
-  }, [reload])
+  }, [cancelReload, reload])
 
   useEffect(() => {
     void reload()
-    return () => {
-      if (debounceRef.current !== null) clearTimeout(debounceRef.current)
-    }
-  }, [reload])
+    return cancelReload
+  }, [cancelReload, reload])
 
-  return { dailyRows, rollup, rollup30, reload, scheduleReload }
+  return { dailyRows, rollup, rollup30, reload, scheduleReload, cancelReload }
 }

@@ -1,308 +1,207 @@
 import {
-  DndContext,
-  KeyboardSensor,
-  PointerSensor,
-  closestCenter,
-  type DragEndEvent,
-  useSensor,
-  useSensors,
+  DndContext, KeyboardSensor, PointerSensor, closestCenter,
+  useDroppable, useSensor, useSensors, type DragEndEvent,
 } from "@dnd-kit/core"
 import {
-  SortableContext,
-  arrayMove,
-  sortableKeyboardCoordinates,
-  useSortable,
-  verticalListSortingStrategy,
+  SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy,
 } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
-import { GripVertical } from "lucide-react"
-import { Button } from "@/components/ui/button"
+import { ChevronRight, GripVertical, Settings, Star } from "lucide-react"
+import type { ReactNode } from "react"
+import { useShallow } from "zustand/react/shallow"
 import { Checkbox } from "@/components/ui/checkbox"
-import { useTotalSpendVisibilityToggle } from "@/components/modern/total-spend-card"
+import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
 import type { MetricDescriptor } from "@/lib/metric-registry"
 import { cn } from "@/lib/utils"
+import { useModernLayoutStore } from "@/stores/modern-layout-store"
+
+const card = "rounded-xl border border-border/50 bg-card divide-y divide-border/40"
 
 type CustomizeViewProps = {
+  providers: SettingsPluginState[]
   descriptors: MetricDescriptor[]
-  providerOrder: string[]
-  metricOrderByProvider: Record<string, string[]>
   placedMetricIds: string[]
+  providerId: string | null
+  onOpenProvider: (id: string) => void
+  onSettings: () => void
+  onToggleProvider: (id: string) => void
   onTogglePlaced: (metricId: string, enabled: boolean) => void
-  onSetProviderMetricsEnabled: (pluginId: string, metricIds: string[], enabled: boolean) => void
+  onSetProviderMetricsEnabled: (id: string, enabled: boolean) => void
   onProviderReorder: (order: string[]) => void
-  onMetricReorder: (pluginId: string, order: string[]) => void
-  compact?: boolean
+  recordUndo: (undo: () => void) => void
 }
 
-function orderDescriptors(
-  descriptors: MetricDescriptor[],
-  providerOrder: string[],
-  metricOrderByProvider: Record<string, string[]>,
-): { pluginId: string; items: MetricDescriptor[] }[] {
-  const byProvider = new Map<string, MetricDescriptor[]>()
-  for (const d of descriptors) {
-    const list = byProvider.get(d.pluginId) ?? []
-    list.push(d)
-    byProvider.set(d.pluginId, list)
+const alwaysDrop = "bucket:always"
+const demandDrop = "bucket:on-demand"
+
+export function moveCustomizeMetric(
+  always: string[], demand: string[], active: string, over: string,
+): { order: string[]; onDemand: string[] } | null {
+  if (active === over) return null
+  const source = always.includes(active) ? always : demand.includes(active) ? demand : null
+  const target = over === alwaysDrop || always.includes(over) ? always
+    : over === demandDrop || demand.includes(over) ? demand : null
+  if (!source || !target) return null
+  if (target === source && target.includes(over)) {
+    const next = arrayMove(target, target.indexOf(active), target.indexOf(over))
+    return source === always ? { order: [...next, ...demand], onDemand: demand }
+      : { order: [...always, ...next], onDemand: next }
   }
-
-  const order =
-    providerOrder.length > 0
-      ? providerOrder.filter((id) => byProvider.has(id))
-      : Array.from(byProvider.keys())
-
-  for (const id of byProvider.keys()) {
-    if (!order.includes(id)) order.push(id)
-  }
-
-  return order.map((pluginId) => {
-    const items = byProvider.get(pluginId) ?? []
-    const metricOrder = metricOrderByProvider[pluginId]
-    if (!metricOrder?.length) return { pluginId, items }
-    const rank = new Map(metricOrder.map((id, i) => [id, i]))
-    const sorted = [...items].sort(
-      (a, b) => (rank.get(a.id) ?? 999) - (rank.get(b.id) ?? 999),
-    )
-    return { pluginId, items: sorted }
-  })
+  const nextAlways = always.filter((id) => id !== active)
+  const nextDemand = demand.filter((id) => id !== active)
+  const bucket = target === always ? nextAlways : nextDemand
+  const index = bucket.indexOf(over)
+  bucket.splice(index < 0 ? bucket.length : index, 0, active)
+  return { order: [...nextAlways, ...nextDemand], onDemand: nextDemand }
 }
 
-function metricKindLabel(descriptor: MetricDescriptor): string {
-  if (descriptor.bounded) return "quota"
-  if (descriptor.manifest.type === "barChart") return "chart"
-  if (descriptor.runtimeOnly) return "extra"
-  return "info"
-}
-
-function SortableMetricRow({
-  descriptor,
-  isPlaced,
-  compact,
-  onTogglePlaced,
-}: {
-  descriptor: MetricDescriptor
-  isPlaced: boolean
-  compact?: boolean
-  onTogglePlaced: (enabled: boolean) => void
+function SortableRow({ id, label, disabled, children }: {
+  id: string; label: string; disabled?: boolean; children: ReactNode
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id: descriptor.id,
+    id, disabled: Boolean(disabled),
   })
-
   return (
-    <li
-      ref={setNodeRef}
-      style={{
-        transform: CSS.Transform.toString(transform),
-        transition,
-      }}
-      className={cn(
-        "flex items-center gap-2 px-3 bg-card/40",
-        compact ? "py-1.5 text-xs" : "py-2 text-sm",
-        isDragging && "opacity-60 ring-1 ring-border rounded-md",
-      )}
-    >
-      <button
-        type="button"
-        className="touch-none cursor-grab active:cursor-grabbing text-muted-foreground hover:text-foreground shrink-0"
-        aria-label={`Reorder ${descriptor.lineLabel}`}
-        {...attributes}
-        {...listeners}
-      >
-        <GripVertical className="h-3.5 w-3.5" />
+    <li ref={setNodeRef} style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={cn("flex min-h-8 items-center gap-2 px-3 py-1.5 text-xs", isDragging && "relative z-10 bg-card shadow-sm")}>
+      <button type="button" disabled={disabled} aria-label={`Reorder ${label}`}
+        className="touch-none text-muted-foreground hover:text-foreground disabled:opacity-40"
+        {...attributes} {...listeners}>
+        <GripVertical aria-hidden="true" className="size-4" />
       </button>
-      <Checkbox
-        checked={isPlaced}
-        onCheckedChange={(checked) => onTogglePlaced(checked === true)}
-        aria-label={`Show ${descriptor.lineLabel} on dashboard`}
-      />
-      <span className="flex-1 truncate">{descriptor.lineLabel}</span>
-      <span className="text-[10px] text-muted-foreground shrink-0">{metricKindLabel(descriptor)}</span>
+      {children}
     </li>
   )
 }
 
-function SortableProviderBlock({
-  pluginId,
-  items,
-  placed,
-  compact,
-  onTogglePlaced,
-  onSetProviderMetricsEnabled,
-  onMetricReorder,
-  dragHandleProps,
-}: {
-  pluginId: string
-  items: MetricDescriptor[]
-  placed: Set<string>
-  compact?: boolean
-  onTogglePlaced: (metricId: string, enabled: boolean) => void
-  onSetProviderMetricsEnabled: (pluginId: string, metricIds: string[], enabled: boolean) => void
-  onMetricReorder: (pluginId: string, order: string[]) => void
-  dragHandleProps: { attributes: object; listeners: object | undefined }
+function MetricBucket({ title, id, ids, children }: {
+  title: string; id: string; ids: string[]; children: ReactNode
 }) {
-  const metricIds = items.map((d) => d.id)
-  const allPlaced = metricIds.length > 0 && metricIds.every((id) => placed.has(id))
-  const displayName = items[0]?.displayName ?? pluginId
-
-  const handleMetricDragEnd = (event: DragEndEvent) => {
-    const { active, over } = event
-    if (!over || active.id === over.id) return
-    const oldIndex = metricIds.indexOf(String(active.id))
-    const newIndex = metricIds.indexOf(String(over.id))
-    if (oldIndex < 0 || newIndex < 0) return
-    onMetricReorder(pluginId, arrayMove(metricIds, oldIndex, newIndex))
-  }
-
-  const sensors = useSensors(
-    useSensor(PointerSensor),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  )
-
+  const { setNodeRef, isOver } = useDroppable({ id, disabled: ids.length !== 0 })
   return (
-    <section className="rounded-lg border bg-card/60 overflow-hidden">
-      <div
-        className={cn(
-          "flex items-center gap-2 px-3 py-2 border-b border-border/60 bg-muted/30",
-          compact ? "text-sm" : "text-base",
+    <section className="space-y-1">
+      <h2 className="px-2 text-xs font-semibold text-muted-foreground">{title}</h2>
+      <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+        {ids.length > 0 ? <ul className={card}>{children}</ul> : (
+          <div ref={setNodeRef} className={cn(card, "p-2", isOver && "ring-1 ring-primary")}>
+            <p className="grid h-[30px] place-items-center rounded-lg border border-dashed text-xs text-muted-foreground">Drag metrics here</p>
+          </div>
         )}
-      >
-        <button
-          type="button"
-          className="touch-none cursor-grab active:cursor-grabbing text-muted-foreground hover:text-foreground shrink-0"
-          aria-label={`Reorder ${displayName} card`}
-          {...dragHandleProps.attributes}
-          {...dragHandleProps.listeners}
-        >
-          <GripVertical className="h-4 w-4" />
-        </button>
-        <h3 className="font-semibold truncate flex-1">{displayName}</h3>
-        <div className="flex gap-1 shrink-0">
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-7 text-xs px-2"
-            onClick={() => onSetProviderMetricsEnabled(pluginId, metricIds, !allPlaced)}
-          >
-            {allPlaced ? "Hide all" : "Show all"}
-          </Button>
-        </div>
-      </div>
-      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleMetricDragEnd}>
-        <SortableContext items={metricIds} strategy={verticalListSortingStrategy}>
-          <ul className="divide-y divide-border/50">
-            {items.map((d) => (
-              <SortableMetricRow
-                key={d.id}
-                descriptor={d}
-                isPlaced={placed.has(d.id)}
-                compact={compact}
-                onTogglePlaced={(enabled) => onTogglePlaced(d.id, enabled)}
-              />
-            ))}
-          </ul>
-        </SortableContext>
-      </DndContext>
+      </SortableContext>
     </section>
   )
 }
 
-function SortableProviderSection(props: {
-  pluginId: string
-  items: MetricDescriptor[]
-  placed: Set<string>
-  compact?: boolean
-  onTogglePlaced: (metricId: string, enabled: boolean) => void
-  onSetProviderMetricsEnabled: (pluginId: string, metricIds: string[], enabled: boolean) => void
-  onMetricReorder: (pluginId: string, order: string[]) => void
-}) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id: props.pluginId,
-  })
-
-  return (
-    <div
-      ref={setNodeRef}
-      style={{ transform: CSS.Transform.toString(transform), transition }}
-      className={isDragging ? "opacity-70" : undefined}
-    >
-      <SortableProviderBlock
-        {...props}
-        dragHandleProps={{ attributes, listeners }}
-      />
-    </div>
-  )
-}
-
 export function CustomizeView({
-  descriptors,
-  providerOrder,
-  metricOrderByProvider,
-  placedMetricIds,
-  onTogglePlaced,
-  onSetProviderMetricsEnabled,
-  onProviderReorder,
-  onMetricReorder,
-  compact,
+  providers, descriptors, placedMetricIds, providerId, onOpenProvider, onSettings,
+  onToggleProvider, onTogglePlaced, onSetProviderMetricsEnabled, onProviderReorder, recordUndo,
 }: CustomizeViewProps) {
-  const placed = new Set(placedMetricIds)
-  const groups = orderDescriptors(descriptors, providerOrder, metricOrderByProvider)
-  const providerIds = groups.map((g) => g.pluginId)
-  const { showTotalSpend, setShowTotalSpend } = useTotalSpendVisibilityToggle()
-
+  const layout = useModernLayoutStore(useShallow((s) => ({
+    metricOrder: s.metricOrderByProvider,
+    onDemand: s.onDemandMetricIds,
+    pinned: s.pinnedMetricIds,
+    pinNotice: s.pinLimitNotice,
+    togglePin: s.togglePin,
+    setPlacement: s.setMetricPlacement,
+  })))
   const sensors = useSensors(
-    useSensor(PointerSensor),
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   )
+  const provider = providers.find(({ id }) => id === providerId)
+  const orderedProviders = [...providers.filter(({ enabled }) => enabled), ...providers.filter(({ enabled }) => !enabled)]
+  const enabledIds = providers.filter(({ enabled }) => enabled).map(({ id }) => id)
 
-  const handleProviderDragEnd = (event: DragEndEvent) => {
-    const { active, over } = event
-    if (!over || active.id === over.id) return
-    const oldIndex = providerIds.indexOf(String(active.id))
-    const newIndex = providerIds.indexOf(String(over.id))
-    if (oldIndex < 0 || newIndex < 0) return
-    onProviderReorder(arrayMove(providerIds, oldIndex, newIndex))
-  }
-
-  if (descriptors.length === 0) {
+  if (!provider) {
+    const handleProviderDragEnd = ({ active, over }: DragEndEvent) => {
+      if (!over || active.id === over.id) return
+      const oldIndex = enabledIds.indexOf(String(active.id))
+      const newIndex = enabledIds.indexOf(String(over.id))
+      if (oldIndex < 0 || newIndex < 0) return
+      const reordered = arrayMove(enabledIds, oldIndex, newIndex)
+      const previous = providers.map(({ id }) => id)
+      recordUndo(() => onProviderReorder(previous))
+      let next = 0
+      onProviderReorder(providers.map(({ id, enabled }) => enabled ? reordered[next++] : id))
+    }
     return (
-      <p className="text-sm text-muted-foreground text-center py-8">
-        Enable providers in Settings to customize metrics.
-      </p>
+      <div className="space-y-2 pb-2">
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleProviderDragEnd}>
+          <SortableContext items={enabledIds} strategy={verticalListSortingStrategy}>
+            <ul className={card}>
+              {orderedProviders.map(({ id, name, enabled }) => (
+                <SortableRow key={id} id={id} label={name} disabled={!enabled}>
+                  <button type="button" onClick={() => onOpenProvider(id)} className="flex flex-1 items-center gap-2 text-left">
+                    <span className="flex-1 truncate font-medium">{name}</span>
+                    <ChevronRight aria-hidden="true" className="size-3.5 text-muted-foreground" />
+                  </button>
+                  <Checkbox checked={enabled} aria-label={`Enable ${name}`} onCheckedChange={() => {
+                    recordUndo(() => onToggleProvider(id))
+                    onToggleProvider(id)
+                  }} />
+                </SortableRow>
+              ))}
+            </ul>
+          </SortableContext>
+        </DndContext>
+        <button type="button" onClick={onSettings} className={cn(card, "flex w-full items-center gap-2 p-3 text-left text-xs")}>
+          <Settings aria-hidden="true" className="size-4" />
+          <span><strong>Settings</strong><br /><span className="text-muted-foreground">Notifications, Appearance and More</span></span>
+        </button>
+      </div>
     )
   }
 
+  const byId = new Map(descriptors.filter((d) => d.pluginId === provider.id).map((d) => [d.id, d]))
+  const existingOrder = (layout.metricOrder[provider.id] ?? []).filter((id) => byId.has(id))
+  const order = [...existingOrder, ...[...byId.keys()].filter((id) => !existingOrder.includes(id))]
+  const demand = order.filter((id) => layout.onDemand.includes(id))
+  const always = order.filter((id) => !layout.onDemand.includes(id))
+  const move = (active: string, over: string) => {
+    const next = moveCustomizeMetric(always, demand, active, over)
+    if (!next) return
+    recordUndo(() => layout.setPlacement(provider.id, order, demand))
+    layout.setPlacement(provider.id, next.order, next.onDemand)
+  }
+  const renderMetrics = (ids: string[]) => ids.map((id) => {
+    const metric = byId.get(id)!
+    const pinned = layout.pinned.includes(id)
+    const placed = placedMetricIds.includes(id)
+    return (
+      <SortableRow key={id} id={id} label={metric.lineLabel}>
+        <span className="flex-1 truncate">{metric.lineLabel}</span>
+        {(metric.bounded || pinned) && (
+          <button type="button" className="text-muted-foreground hover:text-foreground"
+            aria-label={`Pin ${metric.lineLabel}`} aria-pressed={pinned}
+            onClick={() => {
+              if (layout.togglePin(id)) recordUndo(() => layout.togglePin(id))
+            }}>
+            <Star className={cn("size-4", pinned && "fill-amber-400 text-amber-500")} aria-hidden="true" />
+          </button>
+        )}
+        <Checkbox checked={placed} disabled={!provider.enabled} aria-label={`Show ${metric.lineLabel}`}
+          onCheckedChange={(checked) => {
+            recordUndo(() => onTogglePlaced(id, placed))
+            onTogglePlaced(id, checked === true)
+          }} />
+      </SortableRow>
+    )
+  })
+
   return (
-    <div className="space-y-3 pb-2">
-      <label className="flex items-center gap-2 text-sm select-none px-0.5">
-        <Checkbox
-          checked={showTotalSpend}
-          onCheckedChange={(checked) => setShowTotalSpend(checked === true)}
-        />
-        Show Total Spend card
-      </label>
-      <p className="text-xs text-muted-foreground px-0.5">
-        Drag to reorder dashboard cards and rows. Metric toggles stay in sync with Classic provider lines.
-      </p>
-      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleProviderDragEnd}>
-        <SortableContext items={providerIds} strategy={verticalListSortingStrategy}>
-          <div className="space-y-2">
-            {groups.map((group) => (
-              <SortableProviderSection
-                key={group.pluginId}
-                pluginId={group.pluginId}
-                items={group.items}
-                placed={placed}
-                compact={compact}
-                onTogglePlaced={onTogglePlaced}
-                onSetProviderMetricsEnabled={onSetProviderMetricsEnabled}
-                onMetricReorder={onMetricReorder}
-              />
-            ))}
-          </div>
-        </SortableContext>
+    <div className="space-y-2 pb-2">
+      {provider.enabled && order.length > 0 && (
+        <button type="button" className="rounded-md border px-2 py-1 text-xs hover:bg-muted"
+          onClick={() => onSetProviderMetricsEnabled(provider.id, !order.every((id) => placedMetricIds.includes(id)))}>
+          {order.every((id) => placedMetricIds.includes(id)) ? "Hide All" : "Show All"}
+        </button>
+      )}
+      <DndContext sensors={sensors} collisionDetection={closestCenter}
+        onDragEnd={({ active, over }) => { if (over) move(String(active.id), String(over.id)) }}>
+        <MetricBucket title="Always Visible" id={alwaysDrop} ids={always}>{renderMetrics(always)}</MetricBucket>
+        <MetricBucket title="On Demand" id={demandDrop} ids={demand}>{renderMetrics(demand)}</MetricBucket>
       </DndContext>
+      {layout.pinNotice && <p role="status" className="px-2 text-xs text-muted-foreground">{layout.pinNotice}</p>}
     </div>
   )
 }
