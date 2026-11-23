@@ -4,6 +4,7 @@ use crate::provider_accounts::ProviderAccountContext;
 use rquickjs::{Array, Context, Ctx, Error, Object, Promise, Runtime, Value};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const PROBE_TIMEOUT_SECS: u64 = 30;
@@ -99,12 +100,23 @@ pub fn run_probe_with_account(
     app_version: &str,
     account: Option<ProviderAccountContext>,
 ) -> PluginOutput {
+    run_probe_in_batch(plugin, app_data_dir, app_version, account, None)
+}
+
+pub fn run_probe_in_batch(
+    plugin: &LoadedPlugin,
+    app_data_dir: &PathBuf,
+    app_version: &str,
+    account: Option<ProviderAccountContext>,
+    opencode_go_batch: Option<Arc<host_api::OpenCodeGoProbeBatch>>,
+) -> PluginOutput {
     run_probe_with_account_timeout(
         plugin,
         app_data_dir,
         app_version,
         account,
         Duration::from_secs(PROBE_TIMEOUT_SECS),
+        opencode_go_batch,
     )
 }
 
@@ -114,6 +126,7 @@ fn run_probe_with_account_timeout(
     app_version: &str,
     account: Option<ProviderAccountContext>,
     timeout: Duration,
+    opencode_go_batch: Option<Arc<host_api::OpenCodeGoProbeBatch>>,
 ) -> PluginOutput {
     let fallback = error_output(plugin, "runtime error".to_string());
     let timeout_message = format!("probe timed out after {}s", timeout.as_secs());
@@ -158,7 +171,7 @@ fn run_probe_with_account_timeout(
             account.as_ref(),
             &app_data,
             app_version,
-            deadline,
+            host_api::ProbeNetwork { deadline, opencode_go_batch },
         )
         .is_err()
         {
@@ -363,7 +376,7 @@ pub fn run_plugin_action(
             account.as_ref(),
             &app_data,
             app_version,
-            deadline,
+            host_api::ProbeNetwork { deadline, opencode_go_batch: None },
         )
         .map_err(|_| "host api injection failed".to_string())?;
         host_api::patch_http_wrapper(&ctx).map_err(|_| "http wrapper failed".to_string())?;
@@ -1056,6 +1069,63 @@ mod tests {
             }),
             store_path: None,
         }
+    }
+
+    #[test]
+    fn groups_local_and_configured_opencode_credentials_within_a_batch() {
+        let script = format!(
+            "{}\nconst probe = globalThis.__openusage_plugin.probe;\n{}",
+            include_str!("../../../../plugins/opencode-go/plugin.js"),
+            r#"
+            globalThis.__openusage_plugin.probe = function (ctx) {
+                ctx.host.env.get = () => null;
+                ctx.host.fs.exists = path => path.endsWith("/auth.json");
+                ctx.host.fs.readText = () => '{"opencode-go":{"key":"same-test-key"}}';
+                ctx.host.opencodeGateway = undefined;
+                return probe(ctx);
+            };
+            "#,
+        );
+        let plugin = test_plugin_with_id("opencode-go", "OpenCode Go", &script);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let batch = Arc::new(host_api::OpenCodeGoProbeBatch::default());
+        let response = |percent| serde_json::json!({
+            "usage": {
+                "rolling": { "percent": percent },
+                "weekly": { "percent": 0 },
+                "monthly": { "percent": 0 }
+            }
+        }).to_string();
+        let first = response(12);
+        let other = response(34);
+        let fresh = response(56);
+        host_api::install_http_mock(vec![(200, &first), (200, &other), (200, &fresh)]);
+        let run = |context, batch| run_probe_in_batch(&plugin, &dir, "0.0.0", context, Some(batch));
+        let local = run(None, Arc::clone(&batch));
+        let alias = run(
+            Some(account("opencode-go:work", "opencode-go", "Work", "same-test-key")),
+            Arc::clone(&batch),
+        );
+        let second_alias = run(
+            Some(account("opencode-go:copy", "opencode-go", "Copy", "same-test-key")),
+            Arc::clone(&batch),
+        );
+        let distinct = run(
+            Some(account("opencode-go:personal", "opencode-go", "Personal", "other-test-key")),
+            batch,
+        );
+        let next = run(None, Arc::new(host_api::OpenCodeGoProbeBatch::default()));
+        let used = |out: PluginOutput| match out.lines.first() {
+            Some(MetricLine::Progress { used, .. }) => *used,
+            other => panic!("expected OpenCode meter, got {other:?}"),
+        };
+        assert_eq!(alias.provider_id, "opencode-go:work");
+        assert_eq!(
+            [used(local), used(alias), used(second_alias), used(distinct), used(next)],
+            [12.0, 12.0, 12.0, 34.0, 56.0]
+        );
+        assert_eq!(host_api::take_http_mock_requests().len(), 3);
     }
 
     #[test]
