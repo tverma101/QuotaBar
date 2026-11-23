@@ -509,13 +509,15 @@
 
     var pooled = {}
     for (var gi = 0; gi < groups.length; gi++) {
-      var buckets = groups[gi] && groups[gi].buckets
+      var group = groups[gi]
+      if (!group || group.displayName === "Gemini 4 Argon") continue
+      var buckets = group.buckets
       if (!Array.isArray(buckets)) continue
       for (var bi = 0; bi < buckets.length; bi++) {
         var bucket = buckets[bi]
         if (!bucket || typeof bucket !== "object") continue
         var id = typeof bucket.bucketId === "string" ? bucket.bucketId : ""
-        if (!id || pooled[id]) continue
+        if (!id) continue
         var spec = null
         for (var si = 0; si < SUMMARY_BUCKETS.length; si++) {
           if (SUMMARY_BUCKETS[si].bucketId === id) {
@@ -526,6 +528,7 @@
         if (!spec) continue
         var frac = bucket.remainingFraction
         if (typeof frac !== "number" || !Number.isFinite(frac)) continue
+        if (pooled[id] && pooled[id].fraction <= frac) continue
         pooled[id] = {
           fraction: frac,
           resetTime: bucket.resetTime || undefined,
@@ -535,8 +538,24 @@
       }
     }
 
+    var argon = groups.filter(function (group) { return group && group.displayName === "Gemini 4 Argon" })
+    var weekly = []
+    if (argon.every(function (group) { return Array.isArray(group.buckets) })) {
+      argon.forEach(function (group) {
+        weekly = weekly.concat(group.buckets.filter(function (bucket) { return bucket && bucket.window === "weekly" }))
+      })
+    }
+    var argonBucket = weekly.length === 1 ? weekly[0] : null
+    var hasArgon = argonBucket && typeof argonBucket.bucketId === "string" && argonBucket.bucketId.trim() &&
+      !SUMMARY_BUCKETS.some(function (spec) { return spec.bucketId === argonBucket.bucketId }) &&
+      (argonBucket.disabled == null || argonBucket.disabled === false) &&
+      Number.isFinite(argonBucket.remainingFraction)
+
     var lines = []
     for (var i = 0; i < SUMMARY_BUCKETS.length; i++) {
+      if (i === 2 && hasArgon) {
+        lines.push(modelLine(ctx, "Argon Weekly", argonBucket.remainingFraction, argonBucket.resetTime, QUOTA_WEEKLY_MS))
+      }
       var entry = pooled[SUMMARY_BUCKETS[i].bucketId]
       if (!entry) continue
       lines.push(modelLine(ctx, entry.label, entry.fraction, entry.resetTime, entry.periodMs))
@@ -559,8 +578,11 @@
     var deduped = {}
     for (var i = 0; i < configs.length; i++) {
       var c = configs[i]
+      var modelId = c.modelId || (c.modelOrAlias && c.modelOrAlias.model)
+      if (modelId === "MODEL_PLACEHOLDER_M421") continue
       var label = (typeof c.label === "string") ? c.label.trim() : ""
       if (!label) continue
+      if (/^gemini[ -]4[ -]argon(?:[ -]|$)/i.test(label)) continue
       var qi = c.quotaInfo
       var frac = (qi && typeof qi.remainingFraction === "number") ? qi.remainingFraction : 0
       var rtime = (qi && qi.resetTime) || undefined
@@ -595,12 +617,13 @@
 
   // --- Cloud Code API ---
 
-  function requestCloudCodeJson(ctx, path, token, userAgent, body) {
-    for (var i = 0; i < CLOUD_CODE_URLS.length; i++) {
+  function requestCloudCodeJson(ctx, path, token, userAgent, body, bases) {
+    bases = bases || CLOUD_CODE_URLS
+    for (var i = 0; i < bases.length; i++) {
       try {
         var resp = ctx.host.http.request({
           method: "POST",
-          url: CLOUD_CODE_URLS[i] + path,
+          url: bases[i] + path,
           headers: {
             Accept: "application/json",
             "Content-Type": "application/json",
@@ -611,34 +634,48 @@
           timeoutMs: 15000,
         })
         if (!resp || typeof resp.status !== "number" || !Number.isFinite(resp.status)) {
-          ctx.host.log.warn("Cloud Code returned invalid response shape (" + CLOUD_CODE_URLS[i] + ")")
+          ctx.host.log.warn("Cloud Code returned invalid response shape (" + bases[i] + ")")
           continue
         }
         if (ctx.util.isAuthStatus(resp.status)) return { _authFailed: true }
         if (resp.status >= 200 && resp.status < 300) {
           var json = ctx.util.tryParseJson(resp.bodyText)
           if (!json || typeof json !== "object") {
-            ctx.host.log.warn("Cloud Code returned invalid JSON (" + CLOUD_CODE_URLS[i] + ")")
+            ctx.host.log.warn("Cloud Code returned invalid JSON (" + bases[i] + ")")
             continue
           }
           return json
         }
       } catch (e) {
-        ctx.host.log.warn("Cloud Code request failed (" + CLOUD_CODE_URLS[i] + "): " + String(e))
+        ctx.host.log.warn("Cloud Code request failed (" + bases[i] + "): " + String(e))
       }
     }
     return null
   }
 
-  function hasQuotaSummary(ctx, data) {
-    var lines = parseQuotaSummary(ctx, data)
-    return lines !== null && lines.length > 0
+  function requestCloudCodeSummary(ctx, token, userAgent) {
+    var byLabel = {}
+    for (var i = 0; i < CLOUD_CODE_URLS.length; i++) {
+      var data = requestCloudCodeJson(ctx, RETRIEVE_QUOTA_SUMMARY_PATH, token, userAgent, {}, [CLOUD_CODE_URLS[i]])
+      if (data && data._authFailed) {
+        if (!Object.keys(byLabel).length) return data
+        break
+      }
+      var lines = parseQuotaSummary(ctx, data) || []
+      lines.forEach(function (line) {
+        if (!byLabel[line.label]) byLabel[line.label] = line
+      })
+      if (SUMMARY_BUCKETS.every(function (spec) { return byLabel[spec.label] })) break
+    }
+    var labels = SUMMARY_BUCKETS.map(function (spec) { return spec.label })
+    labels.splice(2, 0, "Argon Weekly")
+    return labels.map(function (label) { return byLabel[label] }).filter(Boolean)
   }
 
   function probeCloudCode(ctx, token) {
-    var summaryData = requestCloudCodeJson(ctx, RETRIEVE_QUOTA_SUMMARY_PATH, token, "antigravity", {})
-    if (summaryData && summaryData._authFailed) return summaryData
-    if (hasQuotaSummary(ctx, summaryData)) return summaryData
+    var summaryLines = requestCloudCodeSummary(ctx, token, "antigravity")
+    if (summaryLines._authFailed) return summaryLines
+    if (summaryLines.length > 0) return { summaryLines: summaryLines }
 
     // Older Cloud Code deployments can still lack quota summaries. Preserve the
     // established model endpoint only as a compatibility fallback.
@@ -666,6 +703,7 @@
       var rtime = (qi && qi.resetTime) || undefined
       configs.push({
         label: displayName,
+        modelId: modelId,
         quotaInfo: { remainingFraction: frac, resetTime: rtime },
       })
     }
@@ -696,6 +734,7 @@
       var frac = (typeof bucket.remainingFraction === "number") ? bucket.remainingFraction : 0
       configs.push({
         label: modelId,
+        modelId: modelId,
         quotaInfo: { remainingFraction: frac, resetTime: bucket.resetTime || undefined },
       })
     }
@@ -704,10 +743,9 @@
 
   function probeAgyCloudCode(ctx, token) {
     // Older client identities omitted Gemini buckets on the tested account.
-    var summaryData = requestCloudCodeJson(ctx, RETRIEVE_QUOTA_SUMMARY_PATH, token, "antigravity/cli/1.5.0", {})
-    if (summaryData && summaryData._authFailed) return summaryData
-    var summaryLines = parseQuotaSummary(ctx, summaryData)
-    if (summaryLines && summaryLines.length > 0) return { plan: null, lines: summaryLines }
+    var summaryLines = requestCloudCodeSummary(ctx, token, "antigravity/cli/1.5.0")
+    if (summaryLines._authFailed) return summaryLines
+    if (summaryLines.length > 0) return { plan: null, lines: summaryLines }
 
     // `agy` used these endpoints before retrieveUserQuotaSummary was available.
     // Keep them only for older installations that return no usable summary.
@@ -774,7 +812,7 @@
 
     if (summaryData) {
       var summaryLines = parseQuotaSummary(ctx, summaryData)
-      if (summaryLines !== null) {
+      if (summaryLines && summaryLines.length > 0) {
         return {
           plan: readPlanFromUserStatus(data, hasUserStatus),
           lines: summaryLines,
@@ -1060,8 +1098,7 @@
     }
 
     if (ccData && !ccData._authFailed) {
-      var summaryLines = parseQuotaSummary(ctx, ccData)
-      if (summaryLines && summaryLines.length > 0) return { plan: null, lines: summaryLines }
+      if (ccData.summaryLines) return { plan: null, lines: ccData.summaryLines }
       var configs = parseCloudCodeModels(ccData)
       var lines = buildModelLines(ctx, configs)
       if (lines.length > 0) return { plan: null, lines: lines }

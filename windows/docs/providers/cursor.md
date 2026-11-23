@@ -14,6 +14,11 @@
 
 ## Plugin metrics
 
+When live usage identifies a team seat, QuotaBar can fill missing On-demand spend from the
+signed-in account's usage summary without replacing live model-pool readings. A confirmed
+Enterprise or Team membership can also correct a generic Pro plan badge.
+If a confirmed Team plan reports only its used percentage, QuotaBar shows it without requiring a dollar limit.
+
 | Metric | Source field | Scope | Format | Notes |
 |---|---|---|---|---|
 | Credits | `GetCreditGrantsBalance` + `/api/auth/stripe.customerBalance` | overview | dollars | Combined total: active grant total + Stripe prepaid balance (negative `customerBalance`). Used stays based on grant usage. |

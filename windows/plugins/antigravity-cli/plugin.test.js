@@ -100,6 +100,27 @@ describe("antigravity-cli plugin", () => {
     expect(ctx.host.http.request).toHaveBeenCalledTimes(1)
   })
 
+  it("merges an enabled Argon weekly quota from the supplemental host", async () => {
+    const ctx = makeCtx()
+    setKeychain(ctx, "token")
+    mockResponses(ctx, {
+      [RETRIEVE_QUOTA_SUMMARY_URL]: () => json(200, { groups: [{ buckets: [
+        { bucketId: "gemini-weekly", remainingFraction: 0.8 },
+      ] }] }),
+      [RETRIEVE_QUOTA_SUMMARY_FALLBACK_URL]: () => json(200, { groups: [
+        { buckets: [{ bucketId: "gemini-weekly", remainingFraction: 0.4 }] },
+        { displayName: "Gemini 4 Argon", buckets: [
+          { bucketId: "argon-week", window: "weekly", remainingFraction: 0.45, disabled: false },
+        ] },
+      ] }),
+    })
+
+    const result = (await loadPlugin()).probe(ctx)
+    expect(result.lines.map(({ label, used }) => [label, used])).toEqual([
+      ["Weekly", 20], ["Argon Weekly", 55],
+    ])
+  })
+
   it("falls back from daily quota summary host to standard quota summary host", async () => {
     const ctx = makeCtx()
     setKeychain(ctx, "token")
