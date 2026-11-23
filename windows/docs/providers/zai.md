@@ -2,6 +2,8 @@
 
 Tracks [Z.ai](https://z.ai) (Zhipu AI) usage quotas for GLM coding plans.
 
+On Windows, the Z.ai card can also show ZCode's local usage without a quota API key. QuotaBar reads the CLI SQLite file at `%USERPROFILE%\.zcode\cli\db\db.sqlite` and checks `%APPDATA%\ZCode\session\Local Storage\leveldb` for the desktop app's cached build grant. It doesn't write to either location. Expired grants disappear; usage with no known model price still counts toward token totals.
+
 > These API endpoints are not documented in Z.ai's public API reference. They are used internally by the subscription
 > management UI and work with both OAuth tokens and API keys.
 

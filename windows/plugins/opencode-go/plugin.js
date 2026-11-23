@@ -1,7 +1,6 @@
 (function () {
   const PROVIDER_ID = "opencode-go";
-  const AUTH_PATH = "~/.local/share/opencode/auth.json";
-  const DB_PATH = "~/.local/share/opencode/opencode.db";
+  const DEFAULT_ROOT = "~/.local/share/opencode";
   const USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
   const LEGACY_CREDENTIALS_IMPORT_MIGRATION_ID = "20260805200742_import_legacy_credentials";
   const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
@@ -13,27 +12,6 @@
     weekly: 30,
     monthly: 60,
   };
-
-  const HISTORY_EXISTS_SQL = `
-    SELECT 1 AS present
-    FROM message
-    WHERE json_valid(data)
-      AND json_extract(data, '$.providerID') = 'opencode-go'
-      AND json_extract(data, '$.role') = 'assistant'
-      AND json_type(data, '$.cost') IN ('integer', 'real')
-    LIMIT 1
-  `;
-
-  const HISTORY_ROWS_SQL = `
-    SELECT
-      CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS INTEGER) AS createdMs,
-      CAST(json_extract(data, '$.cost') AS REAL) AS cost
-    FROM message
-    WHERE json_valid(data)
-      AND json_extract(data, '$.providerID') = 'opencode-go'
-      AND json_extract(data, '$.role') = 'assistant'
-      AND json_type(data, '$.cost') IN ('integer', 'real')
-  `;
 
   function readNumber(value) {
     const n = Number(value);
@@ -148,9 +126,21 @@
     return toIso((oldest === null ? nowMs : oldest) + FIVE_HOURS_MS);
   }
 
+  function dataRoot(ctx) {
+    const explicit = (ctx.host.env.get("OPENCODE_DATA_DIR") || "").trim();
+    const xdg = (ctx.host.env.get("XDG_DATA_HOME") || "").trim();
+    return (explicit || (xdg ? xdg.replace(/[\\/]+$/, "") + "/opencode" : DEFAULT_ROOT)).replace(/[\\/]+$/, "");
+  }
+
+  function databasePaths(ctx, root) {
+    if (!ctx.host.fs.exists(root)) return [];
+    return ctx.host.fs.listDir(root).filter(name => /^opencode[^\\/]*\.db$/.test(name))
+      .sort().map(name => root + "/" + name);
+  }
+
   function queryRows(ctx, sql, dbPath) {
     try {
-      const raw = ctx.host.sqlite.query(dbPath || DB_PATH, sql);
+      const raw = ctx.host.sqlite.query(dbPath, sql);
       const rows = Array.isArray(raw) ? raw : ctx.util.tryParseJson(raw);
       if (!Array.isArray(rows)) {
         ctx.host.log.warn("sqlite query returned non-array result");
@@ -163,19 +153,20 @@
     }
   }
 
-  function loadAuthKey(ctx) {
+  function loadAuthKey(ctx, root, paths) {
     const providerKey = ctx.util.providerApiKey && ctx.util.providerApiKey()
     if (providerKey) {
       ctx.host.log.info("api key loaded from provider account")
       return providerKey
     }
-    const dbResult = loadGoKeyFromDatabases(ctx);
+    const dbResult = loadGoKeyFromDatabases(ctx, paths);
     if (dbResult.key) return dbResult.key;
     if (dbResult.imported) return null;
 
-    if (ctx.host.fs.exists(AUTH_PATH)) {
+    const authPath = root + "/auth.json";
+    if (ctx.host.fs.exists(authPath)) {
       try {
-        const text = ctx.host.fs.readText(AUTH_PATH);
+        const text = ctx.host.fs.readText(authPath);
         const parsed = ctx.util.tryParseJson(text);
         if (!parsed || typeof parsed !== "object") {
           ctx.host.log.warn("opencode auth file is not valid json");
@@ -191,14 +182,13 @@
     return null;
   }
 
-  function loadGoKeyFromDatabases(ctx) {
+  function loadGoKeyFromDatabases(ctx, paths) {
     const migrationSql =
       "SELECT 1 AS present FROM migration WHERE id = '" +
       LEGACY_CREDENTIALS_IMPORT_MIGRATION_ID +
       "' LIMIT 1";
     const sql =
       "SELECT json_extract(value,'$.key') AS key FROM credential WHERE integration_id = 'opencode-go' AND (active IS NULL OR active = 1) ORDER BY active DESC, time_updated DESC, id DESC LIMIT 1";
-    const paths = [DB_PATH, DB_PATH.replace(/opencode\.db$/, "opencode-next.db")];
     let anyImported = false;
     for (let i = 0; i < paths.length; i += 1) {
       if (!ctx.host.fs.exists(paths[i])) continue;
@@ -215,27 +205,50 @@
     return { imported: anyImported, key: null };
   }
 
-  function hasHistory(ctx) {
-    const result = queryRows(ctx, HISTORY_EXISTS_SQL);
-    if (!result.ok) return { ok: false, present: false };
-    return { ok: true, present: result.rows.length > 0 };
-  }
-
-  function loadHistory(ctx) {
-    const result = queryRows(ctx, HISTORY_ROWS_SQL);
-    if (!result.ok) return result;
-
+  function loadHistory(ctx, paths) {
     const rows = [];
-    for (let i = 0; i < result.rows.length; i += 1) {
-      const row = result.rows[i];
-      if (!row || typeof row !== "object") continue;
-      const createdMs = readNumber(row.createdMs);
-      const cost = readNumber(row.cost);
-      if (createdMs === null || createdMs <= 0) continue;
-      if (cost === null || cost < 0) continue;
-      rows.push({ createdMs, cost });
+    const seen = new Set();
+    const usage = "json_object('cost', data -> '$.cost', 'tokens', data -> '$.tokens') AS usage";
+    const nestedProvider = "json_extract(data,'$.model.providerID')";
+    const legacyProvider = "json_extract(data,'$.providerID')";
+    for (const path of paths) {
+      const schema = queryRows(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('message','session_message')", path);
+      if (!schema.ok) return { ok: false, rows: [] };
+      const tables = new Set(schema.rows.map(row => row.name));
+      const queries = [];
+      if (tables.has("session_message")) {
+        queries.push(`
+          SELECT id, time_created AS createdMs, ${usage},
+            COALESCE(${nestedProvider},${legacyProvider}) AS providerId FROM session_message
+          WHERE type='assistant' AND json_valid(data)
+            AND providerId IN ('opencode-go','opencode')`);
+      }
+      if (tables.has("message")) {
+        queries.push(`
+          SELECT id, COALESCE(json_extract(data,'$.time.created'),time_created) AS createdMs, ${usage},
+            COALESCE(${legacyProvider},${nestedProvider}) AS providerId FROM message
+          WHERE json_valid(data) AND json_extract(data,'$.role')='assistant'
+            AND providerId IN ('opencode-go','opencode')`);
+      }
+      for (const sql of queries) {
+        const result = queryRows(ctx, sql, path);
+        if (!result.ok) return { ok: false, rows: [] };
+        for (const row of result.rows) {
+          if (row.id && seen.has(row.id)) continue;
+          const parsed = ctx.util.tryParseJson(row.usage);
+          const createdMs = row.createdMs;
+          if (!parsed || !Number.isFinite(createdMs) || createdMs <= 0) continue;
+          const cost = Number.isFinite(parsed.cost) && parsed.cost >= 0 ? parsed.cost : null;
+          const usage = parsed.tokens;
+          const buckets = usage && [usage.input, usage.output, usage.reasoning ?? 0, usage.cache?.read ?? 0, usage.cache?.write ?? 0];
+          const tokens = Number.isSafeInteger(usage?.total) && usage.total > 0 ? usage.total :
+            buckets?.every(n => Number.isSafeInteger(n) && n >= 0) ? buckets.reduce((sum, n) => sum + n, 0) : 0;
+          if (cost === null && !tokens) continue;
+          if (row.id) seen.add(row.id);
+          rows.push({ createdMs, cost, tokens, go: row.providerId === "opencode-go" });
+        }
+      }
     }
-
     return { ok: true, rows };
   }
 
@@ -293,6 +306,52 @@
         color: "#a3a3a3",
       }),
     ];
+  }
+
+  function appendHistory(ctx, lines, rows, nowMs) {
+    const daily = new Map();
+    const dayKey = ms => {
+      const date = new Date(ms);
+      return [date.getFullYear(), date.getMonth() + 1, date.getDate()]
+        .map(part => String(part).padStart(2, "0")).join("-");
+    };
+    for (const row of rows) {
+      if (row.createdMs > nowMs + 300000) continue;
+      const day = dayKey(row.createdMs);
+      const record = daily.get(day) || { date: day, totalTokens: 0, totalCost: 0, unpriced: false };
+      record.totalTokens += row.tokens;
+      record.totalCost += row.cost ?? 0;
+      record.unpriced ||= row.cost === null && row.tokens > 0;
+      daily.set(day, record);
+    }
+    const days = [...daily.values()].sort((a, b) => a.date.localeCompare(b.date));
+    if (!days.length) return;
+    ctx.host.usageDaily.ingest({ displayName: "OpenCode Go", daily: days.map(({ date, totalTokens, totalCost, unpriced }) =>
+      ({ date, totalTokens, totalCost: unpriced ? null : totalCost })) });
+    const today = new Date(nowMs);
+    const yesterday = new Date(nowMs);
+    yesterday.setDate(today.getDate() - 1);
+    const cutoff = new Date(nowMs);
+    cutoff.setDate(today.getDate() - 29);
+    const recent = days.filter(day => day.date >= dayKey(cutoff));
+    for (const [label, entries] of [
+      ["Today", [daily.get(dayKey(nowMs))]],
+      ["Yesterday", [daily.get(dayKey(yesterday.getTime()))]],
+      ["Last 30 Days", recent],
+    ]) {
+      const available = entries.filter(Boolean);
+      if (!available.length) continue;
+      const tokens = available.reduce((total, row) => total + row.totalTokens, 0);
+      const cost = available.reduce((total, row) => total + row.totalCost, 0);
+      const value = tokens.toLocaleString() + " tokens";
+      lines.push(ctx.line.text({ label,
+        value: available.some(row => row.unpriced) ? value : "$" + cost.toFixed(2) + " · " + value }));
+    }
+    if (recent.length) lines.push(ctx.line.barChart({
+      label: "Usage Trend", note: "From your OpenCode logs",
+      points: recent.map(day => ({ label: Number(day.date.slice(5, 7)) + "/" + Number(day.date.slice(8)),
+        value: day.totalTokens, valueLabel: day.totalTokens.toLocaleString() + " tokens" })),
+    }));
   }
 
   function clampReportedPercent(value) {
@@ -370,20 +429,13 @@
     for (let i = 0; i < windows.length; i += 1) {
       const spec = windows[i];
       const raw = parsed.usage[spec.key];
-      if (!raw || typeof raw !== "object") {
-        throw "OpenCode Go usage API returned an invalid response.";
-      }
+      if (!raw || typeof raw !== "object" || (raw.status && raw.status !== "ok" && raw.status !== "rate-limited")) return null;
       const percent = clampReportedPercent(raw.percent);
-      if (percent === null) {
-        throw "OpenCode Go usage API returned an invalid response.";
-      }
+      if (raw.percent == null || percent === null) return null;
       const rawResetsAt =
         typeof raw.resetsAt === "string" && raw.resetsAt.trim() ? raw.resetsAt.trim() : null;
       const reportedResetMs = rawResetsAt ? Date.parse(rawResetsAt) : NaN;
-      if (!rawResetsAt || !Number.isFinite(reportedResetMs)) {
-        throw "OpenCode Go usage API returned an invalid response.";
-      }
-      let resetsAt = new Date(reportedResetMs).toISOString();
+      let resetsAt = Number.isFinite(reportedResetMs) ? new Date(reportedResetMs).toISOString() : null;
       if (spec.dropsPlaceholderReset && percent === 0) {
         const distanceFromFullPeriodMs = Math.abs(
           reportedResetMs - referenceTimeMs - spec.periodMs,
@@ -409,25 +461,43 @@
   }
 
   function probe(ctx) {
-    const authKey = loadAuthKey(ctx);
+    const root = dataRoot(ctx);
+    const ownsLocalHistory = !ctx.account?.instanceId || ctx.account.instanceId === PROVIDER_ID;
+    const paths = ownsLocalHistory ? databasePaths(ctx, root) : [];
+    const authKey = ownsLocalHistory ? loadAuthKey(ctx, root, paths) : ctx.util.providerApiKey?.();
+    let official = null;
+    let accountError = null;
     if (authKey) {
-      return { plan: "Go", lines: fetchGoMeters(ctx, authKey) };
+      try {
+        official = fetchGoMeters(ctx, authKey);
+      } catch (error) {
+        accountError = error;
+      }
     }
-
-    const history = hasHistory(ctx);
-    if (!history.ok || !history.present) {
+    const history = ownsLocalHistory ? loadHistory(ctx, paths) : { ok: true, rows: [] };
+    if (history.ok && ownsLocalHistory && ctx.host.opencodeGateway) {
+      const projected = ctx.util.tryParseJson(ctx.host.opencodeGateway.scan());
+      if (!Array.isArray(projected)) {
+        history.ok = false;
+        history.rows = [];
+      } else {
+        for (const row of projected) history.rows.push(row);
+      }
+    }
+    if (!authKey && history.ok && !history.rows.length) {
       throw "OpenCode Go not detected. Log in with OpenCode Go or use it locally first.";
     }
-
-    const rowsResult = loadHistory(ctx);
-    if (!rowsResult.ok) {
-      return { plan: "Go", lines: buildSoftEmptyLines(ctx) };
+    if (accountError && !history.rows.length) throw accountError;
+    const now = readNowMs();
+    const go = official ? [] : history.rows.filter(row => row.go && row.cost !== null && row.createdMs <= now);
+    const lines = official || (go.length ? buildProgressLines(ctx, go, now) : []);
+    if (history.ok) appendHistory(ctx, lines, history.rows, now);
+    else lines.push(ctx.line.badge({ label: "History", text: "Couldn't Read Local OpenCode Usage", color: "#d69b43" }));
+    if (accountError) {
+      lines.push(ctx.line.badge({ label: "Status", text: String(accountError), color: "#d69b43" }));
     }
-
-    return {
-      plan: "Go",
-      lines: buildProgressLines(ctx, rowsResult.rows, readNowMs()),
-    };
+    const plan = authKey || go.length || history.rows.some(row => row.go) ? "Go" : history.rows.length ? "Zen" : null;
+    return { plan, lines: lines.length ? lines : buildSoftEmptyLines(ctx) };
   }
 
   globalThis.__openusage_plugin = { id: PROVIDER_ID, probe };

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "hermes",
+  "name": "Hermes",
+  "version": "0.0.1",
+  "entry": "plugin.js",
+  "icon": "icon.svg",
+  "lines": [
+    { "type": "text", "label": "Today", "scope": "overview" },
+    { "type": "text", "label": "This Week", "scope": "overview" },
+    { "type": "text", "label": "This Month", "scope": "overview" },
+    { "type": "barChart", "label": "Usage Trend", "scope": "detail" }
+  ]
+}
