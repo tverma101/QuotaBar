@@ -1,0 +1,1408 @@
+(function () {
+  const DEFAULT_CLAUDE_HOME = "~/.claude"
+  const CRED_FILE_NAME = ".credentials.json"
+  const KEYCHAIN_SERVICE_PREFIX = "Claude Code"
+  const PROD_BASE_API_URL = "https://api.anthropic.com"
+  const PROD_REFRESH_URL = "https://platform.claude.com/v1/oauth/token"
+  const PROD_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+  const NON_PROD_CLIENT_ID = "22422756-60c9-4084-8eb7-27705fd5cf9a"
+  const SCOPES =
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+  const REFRESH_BUFFER_MS = 5 * 60 * 1000 // refresh 5 minutes before expiration
+
+  // Rate-limit state persisted across probe() calls (module scope survives re-invocations).
+  const MIN_USAGE_FETCH_INTERVAL_MS = 5 * 60 * 1000  // never poll more than once per 5 min
+  const DEFAULT_RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000 // fallback when no Retry-After header
+  const RESET_GRANTS_CHECK_INTERVAL_MS = 60 * 60 * 1000 // ask for cedar_ember at most once per hour (#1367)
+  let rateLimitedUntilMs = 0  // epoch ms; 0 = not rate-limited
+  let lastUsageFetchMs = 0    // epoch ms of the most-recent API attempt
+  let cachedUsageData = null  // last successful API response body (parsed JSON)
+  // Cache belongs to the access+refresh credential pair — clear on login change (#953).
+  let cachedUsageLoginKey = null
+  // Live plan from GET /api/oauth/profile: once per access token, including failed lookups (#1262).
+  let cachedLivePlan = null
+  let cachedLivePlanTokenKey = null
+  // Hourly reset-grants check state (#1367).
+  let resetGrantsLoginKey = null
+  let resetGrantsCheckedAtMs = 0
+  let cachedResetGrantsBlock = null
+
+  function utf8DecodeBytes(bytes) {
+    // Prefer native TextDecoder when available (QuickJS may not expose it).
+    if (typeof TextDecoder !== "undefined") {
+      try {
+        return new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(bytes))
+      } catch {}
+    }
+
+    // Minimal UTF-8 decoder (replacement char on invalid sequences).
+    let out = ""
+    for (let i = 0; i < bytes.length; ) {
+      const b0 = bytes[i] & 0xff
+      if (b0 < 0x80) {
+        out += String.fromCharCode(b0)
+        i += 1
+        continue
+      }
+
+      // 2-byte
+      if (b0 >= 0xc2 && b0 <= 0xdf) {
+        if (i + 1 >= bytes.length) {
+          out += "\ufffd"
+          break
+        }
+        const b1 = bytes[i + 1] & 0xff
+        if ((b1 & 0xc0) !== 0x80) {
+          out += "\ufffd"
+          i += 1
+          continue
+        }
+        const cp = ((b0 & 0x1f) << 6) | (b1 & 0x3f)
+        out += String.fromCharCode(cp)
+        i += 2
+        continue
+      }
+
+      // 3-byte
+      if (b0 >= 0xe0 && b0 <= 0xef) {
+        if (i + 2 >= bytes.length) {
+          out += "\ufffd"
+          break
+        }
+        const b1 = bytes[i + 1] & 0xff
+        const b2 = bytes[i + 2] & 0xff
+        const validCont = (b1 & 0xc0) === 0x80 && (b2 & 0xc0) === 0x80
+        const notOverlong = !(b0 === 0xe0 && b1 < 0xa0)
+        const notSurrogate = !(b0 === 0xed && b1 >= 0xa0)
+        if (!validCont || !notOverlong || !notSurrogate) {
+          out += "\ufffd"
+          i += 1
+          continue
+        }
+        const cp = ((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f)
+        out += String.fromCharCode(cp)
+        i += 3
+        continue
+      }
+
+      // 4-byte
+      if (b0 >= 0xf0 && b0 <= 0xf4) {
+        if (i + 3 >= bytes.length) {
+          out += "\ufffd"
+          break
+        }
+        const b1 = bytes[i + 1] & 0xff
+        const b2 = bytes[i + 2] & 0xff
+        const b3 = bytes[i + 3] & 0xff
+        const validCont = (b1 & 0xc0) === 0x80 && (b2 & 0xc0) === 0x80 && (b3 & 0xc0) === 0x80
+        const notOverlong = !(b0 === 0xf0 && b1 < 0x90)
+        const notTooHigh = !(b0 === 0xf4 && b1 > 0x8f)
+        if (!validCont || !notOverlong || !notTooHigh) {
+          out += "\ufffd"
+          i += 1
+          continue
+        }
+        const cp =
+          ((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f)
+        const n = cp - 0x10000
+        out += String.fromCharCode(0xd800 + ((n >> 10) & 0x3ff), 0xdc00 + (n & 0x3ff))
+        i += 4
+        continue
+      }
+
+      out += "\ufffd"
+      i += 1
+    }
+    return out
+  }
+
+  function stripBom(text) {
+    const s = String(text == null ? "" : text)
+    return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s
+  }
+
+  function tryParseCredentialJSON(ctx, text) {
+    if (!text) return null
+    // Reject BOM-prefixed malformed credentials: strip BOM, then require valid JSON object.
+    const normalized = stripBom(text).replace(/^\uFEFF/, "").trim()
+    if (!normalized) return null
+    const parsed = ctx.util.tryParseJson(normalized)
+    if (parsed && typeof parsed === "object") return parsed
+
+    // Some macOS keychain items are returned by `security ... -w` as hex-encoded UTF-8 bytes.
+    // Example prefix: "7b0a" ( "{\\n" ).
+    // Support both plain hex and "0x..." forms.
+    let hex = normalized
+    if (hex.startsWith("0x") || hex.startsWith("0X")) hex = hex.slice(2)
+    if (!hex || hex.length % 2 !== 0) return null
+    if (!/^[0-9a-fA-F]+$/.test(hex)) return null
+    try {
+      const bytes = []
+      for (let i = 0; i < hex.length; i += 2) {
+        bytes.push(parseInt(hex.slice(i, i + 2), 16))
+      }
+      const decoded = utf8DecodeBytes(bytes)
+      const decodedParsed = ctx.util.tryParseJson(stripBom(decoded).trim())
+      if (decodedParsed && typeof decodedParsed === "object") return decodedParsed
+    } catch {}
+
+    return null
+  }
+
+  function credentialLoginKey(ctx, oauth) {
+    const access = oauth && oauth.accessToken ? String(oauth.accessToken) : ""
+    const refresh = oauth && oauth.refreshToken ? String(oauth.refreshToken) : ""
+    const material = access + "\0" + refresh
+    if (ctx.host.crypto && typeof ctx.host.crypto.sha256Hex === "function") {
+      return ctx.host.crypto.sha256Hex(material)
+    }
+    return material
+  }
+
+  function activateUsageCache(ctx, oauth) {
+    const key = credentialLoginKey(ctx, oauth)
+    if (cachedUsageLoginKey === key) return
+    cachedUsageLoginKey = key
+    cachedUsageData = null
+    rateLimitedUntilMs = 0
+    lastUsageFetchMs = 0
+    cachedLivePlan = null
+    cachedLivePlanTokenKey = null
+  }
+
+  function readEnvText(ctx, name) {
+    try {
+      const value = ctx.host.env.get(name)
+      if (value === null || value === undefined) return null
+      const text = String(value).trim()
+      return text || null
+    } catch {
+      return null
+    }
+  }
+
+  function readEnvFlag(ctx, name) {
+    const value = readEnvText(ctx, name)
+    if (!value) return false
+    const lower = value.toLowerCase()
+    return lower !== "0" && lower !== "false" && lower !== "no" && lower !== "off"
+  }
+
+  function getClaudeHomePath(ctx) {
+    return readEnvText(ctx, "CLAUDE_CONFIG_DIR") || DEFAULT_CLAUDE_HOME
+  }
+
+  function getClaudeHomeOverride(ctx) {
+    return readEnvText(ctx, "CLAUDE_CONFIG_DIR")
+  }
+
+  function getClaudeCredentialsPath(ctx) {
+    return getClaudeHomePath(ctx) + "/" + CRED_FILE_NAME
+  }
+
+  function getOauthConfig(ctx) {
+    let baseApiUrl = PROD_BASE_API_URL
+    let refreshUrl = PROD_REFRESH_URL
+    let clientId = PROD_CLIENT_ID
+    let oauthFileSuffix = ""
+
+    const isAntUser = readEnvText(ctx, "USER_TYPE") === "ant"
+    if (isAntUser && readEnvFlag(ctx, "USE_LOCAL_OAUTH")) {
+      const localApiBase = readEnvText(ctx, "CLAUDE_LOCAL_OAUTH_API_BASE")
+      baseApiUrl = (localApiBase || "http://localhost:8000").replace(/\/+$/, "")
+      refreshUrl = baseApiUrl + "/v1/oauth/token"
+      clientId = NON_PROD_CLIENT_ID
+      oauthFileSuffix = "-local-oauth"
+    } else if (isAntUser && readEnvFlag(ctx, "USE_STAGING_OAUTH")) {
+      baseApiUrl = "https://api-staging.anthropic.com"
+      refreshUrl = "https://platform.staging.ant.dev/v1/oauth/token"
+      clientId = NON_PROD_CLIENT_ID
+      oauthFileSuffix = "-staging-oauth"
+    }
+
+    const customOauthBase = readEnvText(ctx, "CLAUDE_CODE_CUSTOM_OAUTH_URL")
+    if (customOauthBase) {
+      const base = customOauthBase.replace(/\/+$/, "")
+      baseApiUrl = base
+      refreshUrl = base + "/v1/oauth/token"
+      oauthFileSuffix = "-custom-oauth"
+    }
+
+    const clientIdOverride = readEnvText(ctx, "CLAUDE_CODE_OAUTH_CLIENT_ID")
+    if (clientIdOverride) {
+      clientId = clientIdOverride
+    }
+
+    return {
+      baseApiUrl: baseApiUrl,
+      usageUrl: baseApiUrl + "/api/oauth/usage",
+      resetGrantsUrl: baseApiUrl + "/api/oauth/usage?cedar_ember=1&skip_spend=1",
+      profileUrl: baseApiUrl + "/api/oauth/profile",
+      refreshUrl: refreshUrl,
+      clientId: clientId,
+      oauthFileSuffix: oauthFileSuffix,
+    }
+  }
+
+  function buildClaudeBaseKeychainService(ctx) {
+    return KEYCHAIN_SERVICE_PREFIX + getOauthConfig(ctx).oauthFileSuffix + "-credentials"
+  }
+
+  function computeKeychainHashSuffix(ctx) {
+    // Mirrors upstream Claude Code (decompiled from the binary):
+    //   const suffix = !process.env.CLAUDE_CONFIG_DIR
+    //     ? ""
+    //     : "-" + sha256(CLAUDE_CONFIG_DIR.normalize("NFC")).slice(0, 8)
+    // The hash is ONLY appended when CLAUDE_CONFIG_DIR is explicitly set;
+    // when unset, upstream uses the legacy unhashed service name.
+    const explicitConfigDir = readEnvText(ctx, "CLAUDE_CONFIG_DIR")
+    if (!explicitConfigDir) return null
+    const sha256Hex = ctx.host && ctx.host.crypto && ctx.host.crypto.sha256Hex
+    if (typeof sha256Hex !== "function") return null
+    // Match upstream's `.normalize("NFC")` exactly.
+    const normalized =
+      typeof explicitConfigDir.normalize === "function"
+        ? explicitConfigDir.normalize("NFC")
+        : explicitConfigDir
+    const digest = sha256Hex(normalized)
+    if (typeof digest !== "string" || digest.length < 8) return null
+    return digest.slice(0, 8)
+  }
+
+  function getClaudeKeychainServiceCandidates(ctx) {
+    const base = buildClaudeBaseKeychainService(ctx)
+    const candidates = []
+    const hash = computeKeychainHashSuffix(ctx)
+    if (hash) candidates.push(base + "-" + hash)  // hashed (CLAUDE_CONFIG_DIR set)
+    candidates.push(base)                          // legacy / default
+    return candidates
+  }
+
+  function readKeychainCredentialText(ctx, service) {
+    const keychain = ctx.host.keychain
+    if (!keychain) return null
+
+    if (typeof keychain.readGenericPasswordForCurrentUser === "function") {
+      try {
+        const value = keychain.readGenericPasswordForCurrentUser(service)
+        if (value) {
+          return { value, source: "keychain-current-user" }
+        }
+      } catch (e) {
+        ctx.host.log.info("current-user keychain read failed, trying legacy lookup: " + String(e))
+      }
+    }
+
+    if (typeof keychain.readGenericPassword !== "function") return null
+
+    try {
+      const value = keychain.readGenericPassword(service)
+      if (value) {
+        return { value, source: "keychain-legacy" }
+      }
+    } catch (e) {
+      ctx.host.log.info("keychain read failed (may not exist): " + String(e))
+    }
+
+    return null
+  }
+
+  function loadFileCredentials(ctx) {
+    const credFile = getClaudeCredentialsPath(ctx)
+    if (ctx.host.fs.exists(credFile)) {
+      try {
+        const text = ctx.host.fs.readText(credFile)
+        const parsed = tryParseCredentialJSON(ctx, text)
+        if (parsed) {
+          const oauth = parsed.claudeAiOauth
+          if (oauth && oauth.accessToken) {
+            ctx.host.log.info("credentials loaded from file")
+            return { oauth, source: "file", fullData: parsed }
+          }
+        }
+        ctx.host.log.warn("credentials file exists but no valid oauth data")
+      } catch (e) {
+        ctx.host.log.warn("credentials file read failed: " + String(e))
+      }
+    }
+
+    return null
+  }
+
+  function loadKeychainCredentials(ctx) {
+    // Iterate hashed-then-legacy service names.
+    for (const service of getClaudeKeychainServiceCandidates(ctx)) {
+      const keychainResult = readKeychainCredentialText(ctx, service)
+      if (keychainResult && keychainResult.value) {
+        const parsed = tryParseCredentialJSON(ctx, keychainResult.value)
+        if (parsed) {
+          const oauth = parsed.claudeAiOauth
+          if (oauth && oauth.accessToken) {
+            ctx.host.log.info("credentials loaded from keychain (service=" + service + ")")
+            return { oauth, source: keychainResult.source, serviceName: service, fullData: parsed }
+          }
+        }
+        ctx.host.log.warn("keychain has data for " + service + " but no valid oauth")
+        // Continue: a stale legacy entry shouldn't shadow a valid hashed one.
+      }
+    }
+
+    return null
+  }
+
+  function loadStoredCredentials(ctx, suppressMissingWarn) {
+    // Recent Claude Code versions keep the current macOS session in Keychain and
+    // can leave a stale credentials file behind, so Keychain must win when valid.
+    const keychainCredentials = loadKeychainCredentials(ctx)
+    if (keychainCredentials) return keychainCredentials
+
+    const fileCredentials = loadFileCredentials(ctx)
+    if (fileCredentials) return fileCredentials
+
+    if (!suppressMissingWarn) {
+      ctx.host.log.warn("no credentials found")
+    }
+    return null
+  }
+
+  function loadCredentials(ctx) {
+    const injected = readInjectedCredential(ctx)
+    if (injected) return injected
+
+    const envAccessToken = readEnvText(ctx, "CLAUDE_CODE_OAUTH_TOKEN")
+    const stored = loadStoredCredentials(ctx, !!envAccessToken)
+    if (!envAccessToken) {
+      return stored
+    }
+
+    // Prefer a profile-scoped interactive login over an inference-only env token (#865).
+    // CLAUDE_CODE_OAUTH_TOKEN (e.g. `claude setup-token`) 403s on /api/oauth/usage and must not
+    // shadow a stored login that can fetch live limits.
+    if (stored && hasProfileScope(stored)) {
+      return stored
+    }
+
+    const oauth = stored && stored.oauth ? Object.assign({}, stored.oauth) : {}
+    oauth.accessToken = envAccessToken
+    return {
+      oauth: oauth,
+      source: "environment",
+      serviceName: stored ? stored.serviceName : null,
+      fullData: stored ? stored.fullData : null,
+      inferenceOnly: true,
+    }
+  }
+
+  function readInjectedCredential(ctx) {
+    try {
+      if (!ctx.host.credentials || typeof ctx.host.credentials.get !== "function") return null
+      const raw = ctx.host.credentials.get()
+      if (!raw) return null
+      const credential = ctx.util.tryParseJson(String(raw))
+      if (!credential) return null
+      const accessToken = String(credential.accessToken || credential.sessionKey || "").trim()
+      const refreshToken = String(credential.refreshToken || "").trim()
+      if (!accessToken && !refreshToken) return null
+      return {
+        oauth: {
+          accessToken,
+          refreshToken,
+          expiresAt: typeof credential.expiresAt === "number" ? credential.expiresAt : null,
+          scopes: ["user:profile"],
+        },
+        source: "provider-account",
+        serviceName: null,
+        fullData: { claudeAiOauth: {} },
+      }
+    } catch (e) {
+      ctx.host.log.warn("provider account credential read failed: " + String(e))
+      return null
+    }
+  }
+
+  function hasProfileScope(creds) {
+    if (!creds || creds.inferenceOnly) {
+      return false
+    }
+    const scopes = creds.oauth && creds.oauth.scopes
+    if (Array.isArray(scopes) && scopes.length > 0) {
+      return scopes.indexOf("user:profile") !== -1
+    }
+    return true
+  }
+
+  function saveCredentials(ctx, source, serviceName, fullData) {
+    if (source === "provider-account") {
+      try {
+        if (ctx.host.credentials && typeof ctx.host.credentials.update === "function") {
+          const oauth = fullData && fullData.claudeAiOauth ? fullData.claudeAiOauth : {}
+          ctx.host.credentials.update(JSON.stringify({
+            accessToken: oauth.accessToken || null,
+            refreshToken: oauth.refreshToken || null,
+            expiresAt: oauth.expiresAt || null,
+          }))
+        }
+      } catch (e) {
+        ctx.host.log.error("Failed to update provider account credentials: " + String(e))
+      }
+      return
+    }
+    // MUST use minified JSON - macOS `security -w` hex-encodes values with newlines,
+    // which Claude Code can't read back, causing it to invalidate the session.
+    const text = JSON.stringify(fullData)
+    if (source === "file") {
+      try {
+        ctx.host.fs.writeText(getClaudeCredentialsPath(ctx), text)
+      } catch (e) {
+        ctx.host.log.error("Failed to write Claude credentials file: " + String(e))
+      }
+      return
+    }
+    if (!serviceName) {
+      ctx.host.log.error("Refusing keychain write: missing service name (source=" + source + ")")
+      return
+    }
+    if (source === "keychain-current-user") {
+      try {
+        if (typeof ctx.host.keychain.writeGenericPasswordForCurrentUser === "function") {
+          ctx.host.keychain.writeGenericPasswordForCurrentUser(serviceName, text)
+        } else {
+          ctx.host.keychain.writeGenericPassword(serviceName, text)
+        }
+      } catch (e) {
+        ctx.host.log.error("Failed to write Claude credentials keychain: " + String(e))
+      }
+    } else if (source === "keychain-legacy" || source === "keychain") {
+      try {
+        ctx.host.keychain.writeGenericPassword(serviceName, text)
+      } catch (e) {
+        ctx.host.log.error("Failed to write Claude credentials keychain: " + String(e))
+      }
+    }
+  }
+
+  function needsRefresh(ctx, oauth, nowMs) {
+    return ctx.util.needsRefreshByExpiry({
+      nowMs,
+      expiresAtMs: oauth.expiresAt,
+      bufferMs: REFRESH_BUFFER_MS,
+    })
+  }
+
+  function refreshToken(ctx, creds) {
+    const { oauth, source, fullData } = creds
+    if (!oauth.refreshToken) {
+      ctx.host.log.warn("refresh skipped: no refresh token")
+      return null
+    }
+
+    const oauthConfig = getOauthConfig(ctx)
+    ctx.host.log.info("attempting token refresh")
+    try {
+      const resp = ctx.util.request({
+        method: "POST",
+        url: oauthConfig.refreshUrl,
+        headers: { "Content-Type": "application/json" },
+        bodyText: JSON.stringify({
+          grant_type: "refresh_token",
+          refresh_token: oauth.refreshToken,
+          client_id: oauthConfig.clientId,
+          scope: SCOPES,
+        }),
+        timeoutMs: 15000,
+      })
+
+      if (resp.status === 400 || resp.status === 401) {
+        let errorCode = null
+        const body = ctx.util.tryParseJson(resp.bodyText)
+        if (body) errorCode = body.error || body.error_description
+        ctx.host.log.error("refresh failed: status=" + resp.status + " error=" + String(errorCode))
+        if (errorCode === "invalid_grant") {
+          throw "Session expired. Run `claude` to log in again."
+        }
+        throw "Token expired. Run `claude` to log in again."
+      }
+      if (resp.status < 200 || resp.status >= 300) {
+        ctx.host.log.warn("refresh returned unexpected status: " + resp.status)
+        return null
+      }
+
+      const body = ctx.util.tryParseJson(resp.bodyText)
+      if (!body) {
+        ctx.host.log.warn("refresh response not valid JSON")
+        return null
+      }
+      const newAccessToken = body.access_token
+      if (!newAccessToken) {
+        ctx.host.log.warn("refresh response missing access_token")
+        return null
+      }
+
+      // Update oauth credentials
+      const previousLoginKey = credentialLoginKey(ctx, oauth)
+      oauth.accessToken = newAccessToken
+      if (body.refresh_token) oauth.refreshToken = body.refresh_token
+      if (typeof body.expires_in === "number") {
+        oauth.expiresAt = Date.now() + body.expires_in * 1000
+      }
+      const nextLoginKey = credentialLoginKey(ctx, oauth)
+      if (cachedUsageLoginKey === previousLoginKey) {
+        cachedUsageLoginKey = nextLoginKey
+      }
+      if (resetGrantsLoginKey === previousLoginKey) {
+        resetGrantsLoginKey = nextLoginKey
+      }
+
+      // Persist updated credentials back to the same source we read from.
+      fullData.claudeAiOauth = oauth
+      saveCredentials(ctx, source, creds.serviceName, fullData)
+
+      ctx.host.log.info("refresh succeeded, new token expires in " + (body.expires_in || "unknown") + "s")
+      return newAccessToken
+    } catch (e) {
+      if (typeof e === "string") throw e
+      ctx.host.log.error("refresh exception: " + String(e))
+      return null
+    }
+  }
+
+  function fetchUsage(ctx, accessToken) {
+    const oauthConfig = getOauthConfig(ctx)
+    return ctx.util.request({
+      method: "GET",
+      url: oauthConfig.usageUrl,
+      headers: {
+        Authorization: "Bearer " + accessToken.trim(),
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-cli/2.1.280 (external, cli)",
+      },
+      timeoutMs: 10000,
+    })
+  }
+
+  function fetchResetGrants(ctx, accessToken) {
+    const oauthConfig = getOauthConfig(ctx)
+    return ctx.util.request({
+      method: "GET",
+      url: oauthConfig.resetGrantsUrl,
+      headers: {
+        Authorization: "Bearer " + accessToken.trim(),
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-cli/2.1.280 (external, cli)",
+      },
+      timeoutMs: 10000,
+    })
+  }
+
+  function resolveResetGrantsBlock(ctx, accessToken, oauth, data, nowMs) {
+    if (data && data.cedar_ember && typeof data.cedar_ember === "object") {
+      return data.cedar_ember
+    }
+    const loginKey = credentialLoginKey(ctx, oauth)
+    if (resetGrantsLoginKey !== loginKey) {
+      resetGrantsLoginKey = loginKey
+      resetGrantsCheckedAtMs = 0
+      cachedResetGrantsBlock = null
+    }
+    if (resetGrantsCheckedAtMs > 0 && nowMs - resetGrantsCheckedAtMs < RESET_GRANTS_CHECK_INTERVAL_MS) {
+      return cachedResetGrantsBlock
+    }
+    resetGrantsCheckedAtMs = nowMs
+    try {
+      const resp = fetchResetGrants(ctx, accessToken)
+      if (!resp || resp.status < 200 || resp.status >= 300) {
+        ctx.host.log.warn("reset grants lookup failed; retrying in an hour: status=" + String(resp && resp.status))
+        return cachedResetGrantsBlock
+      }
+      const parsed = ctx.util.tryParseJson(resp.bodyText)
+      cachedResetGrantsBlock =
+        parsed && parsed.cedar_ember && typeof parsed.cedar_ember === "object"
+          ? parsed.cedar_ember
+          : null
+    } catch (e) {
+      ctx.host.log.warn("reset grants lookup failed; retrying in an hour: " + String(e))
+    }
+    return cachedResetGrantsBlock
+  }
+
+  function fetchProfile(ctx, accessToken) {
+    const oauthConfig = getOauthConfig(ctx)
+    return ctx.util.request({
+      method: "GET",
+      url: oauthConfig.profileUrl,
+      headers: {
+        Authorization: "Bearer " + accessToken.trim(),
+        Accept: "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/2.1.69",
+      },
+      timeoutMs: 10000,
+    })
+  }
+
+  function formatPlan(ctx, subscriptionType, rateLimitTier) {
+    const raw = typeof subscriptionType === "string" ? subscriptionType.trim() : ""
+    if (!raw) return null
+    const basePlan = ctx.fmt.planLabel(raw)
+    if (!basePlan) return null
+    let tierSuffix = ""
+    const rlt = String(rateLimitTier || "")
+    const tierMatch = rlt.match(/(\d+)x/)
+    if (tierMatch) {
+      tierSuffix = " " + tierMatch[1] + "x"
+    }
+    return basePlan + tierSuffix
+  }
+
+  function formatLivePlan(ctx, profile, oauth) {
+    const org = profile && typeof profile === "object" ? profile.organization : null
+    if (!org || typeof org !== "object") return null
+    let subscriptionType = org.organization_type || org.organizationType
+    if (typeof subscriptionType === "string" && subscriptionType.indexOf("claude_") === 0) {
+      subscriptionType = subscriptionType.slice("claude_".length)
+    }
+    return formatPlan(
+      ctx,
+      subscriptionType || (oauth && oauth.subscriptionType),
+      org.rate_limit_tier || org.rateLimitTier || (oauth && oauth.rateLimitTier)
+    )
+  }
+
+  function lookupLivePlan(ctx, accessToken, oauth) {
+    if (cachedLivePlanTokenKey === accessToken) return cachedLivePlan
+    cachedLivePlanTokenKey = accessToken
+    cachedLivePlan = null
+    try {
+      const resp = fetchProfile(ctx, accessToken)
+      if (!resp || resp.status < 200 || resp.status >= 300) {
+        ctx.host.log.warn("profile fetch failed: status=" + String(resp && resp.status))
+        return null
+      }
+      const profile = ctx.util.tryParseJson(resp.bodyText)
+      cachedLivePlan = formatLivePlan(ctx, profile, oauth)
+    } catch (e) {
+      ctx.host.log.warn("profile fetch failed: " + String(e))
+    }
+    return cachedLivePlan
+  }
+
+  function parseRetryAfterSeconds(headers) {
+    if (!headers) return null
+    const raw = headers["retry-after"] ?? headers["Retry-After"]
+    if (raw === undefined || raw === null) return null
+    const str = String(raw).trim()
+    if (!str) return null
+    // Retry-After can be a delay-seconds or HTTP-date (RFC 7231).
+    // 0 means "retry immediately" — return 0 as a valid value.
+    const seconds = parseInt(str, 10)
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds
+    const dateMs = Date.parse(str)
+    if (Number.isFinite(dateMs)) {
+      const delay = Math.ceil((dateMs - Date.now()) / 1000)
+      return delay > 0 ? delay : 0
+    }
+    return null
+  }
+
+  function fmtRateLimitMinutes(seconds) {
+    if (seconds <= 0) return "now"
+    const mins = Math.ceil(seconds / 60)
+    return mins + "m"
+  }
+
+  function dailyHasUsage(daily) {
+    if (!Array.isArray(daily) || daily.length === 0) return false
+    for (let i = 0; i < daily.length; i++) {
+      const tokens = Number(daily[i] && daily[i].totalTokens)
+      if (Number.isFinite(tokens) && tokens > 0) return true
+    }
+    return false
+  }
+
+  function queryTokenUsage(ctx, homePath) {
+    const since = new Date()
+    // Inclusive range: today + previous 30 days = 31 calendar days.
+    since.setDate(since.getDate() - 30)
+    const y = since.getFullYear()
+    const m = since.getMonth() + 1
+    const d = since.getDate()
+    const sinceStr = "" + y + (m < 10 ? "0" : "") + m + (d < 10 ? "0" : "") + d
+
+    const queryOpts = { since: sinceStr }
+    if (homePath) {
+      queryOpts.homePath = homePath
+    }
+
+    if (!ctx.host.claudeLogs || typeof ctx.host.claudeLogs.queryDaily !== "function") {
+      return { status: "no_runner", data: null }
+    }
+    try {
+      const native = ctx.host.claudeLogs.queryDaily(queryOpts)
+      if (!native || typeof native !== "object" || typeof native.status !== "string") {
+        ctx.host.log.warn("claudeLogs returned invalid shape")
+        return { status: "runner_failed", data: null }
+      }
+      if (native.status !== "ok") {
+        ctx.host.log.info("claudeLogs status=" + String(native.status))
+        return { status: native.status, data: null }
+      }
+      if (!native.data || !Array.isArray(native.data.daily)) {
+        ctx.host.log.warn("claudeLogs ok but daily missing")
+        return { status: "runner_failed", data: null }
+      }
+      return { status: "ok", data: native.data }
+    } catch (e) {
+      ctx.host.log.warn("claudeLogs native scan failed: " + String(e))
+      return { status: "runner_failed", data: null }
+    }
+  }
+
+  function fmtTokens(n) {
+    const abs = Math.abs(n)
+    const sign = n < 0 ? "-" : ""
+    const units = [
+      { threshold: 1e9, divisor: 1e9, suffix: "B" },
+      { threshold: 1e6, divisor: 1e6, suffix: "M" },
+      { threshold: 1e3, divisor: 1e3, suffix: "K" },
+    ]
+    for (let i = 0; i < units.length; i++) {
+      const unit = units[i]
+      if (abs >= unit.threshold) {
+        const scaled = abs / unit.divisor
+        const formatted = scaled >= 10
+          ? Math.round(scaled).toString()
+          : scaled.toFixed(1).replace(/\.0$/, "")
+        return sign + formatted + unit.suffix
+      }
+    }
+    return sign + Math.round(abs).toString()
+  }
+
+  function dayKeyFromDate(date) {
+    const year = date.getFullYear()
+    const month = date.getMonth() + 1
+    const day = date.getDate()
+    return year + "-" + (month < 10 ? "0" : "") + month + "-" + (day < 10 ? "0" : "") + day
+  }
+
+  function dayKeyFromUsageDate(rawDate) {
+    if (typeof rawDate !== "string") return null
+    const value = rawDate.trim()
+    if (!value) return null
+
+    const isoMatch = value.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+    if (isoMatch) {
+      return isoMatch[1] + "-" + isoMatch[2] + "-" + isoMatch[3]
+    }
+
+    const isoDatePrefixMatch = value.match(/^(\d{4})-(\d{2})-(\d{2})(?:[Tt\s]|$)/)
+    if (isoDatePrefixMatch) {
+      return isoDatePrefixMatch[1] + "-" + isoDatePrefixMatch[2] + "-" + isoDatePrefixMatch[3]
+    }
+
+    const compactMatch = value.match(/^(\d{4})(\d{2})(\d{2})$/)
+    if (compactMatch) {
+      return compactMatch[1] + "-" + compactMatch[2] + "-" + compactMatch[3]
+    }
+
+    const ms = Date.parse(value)
+    if (!Number.isFinite(ms)) return null
+    return dayKeyFromDate(new Date(ms))
+  }
+
+  function usageCostUsd(day) {
+    if (!day || typeof day !== "object") return null
+
+    if (day.totalCost != null) {
+      const totalCost = Number(day.totalCost)
+      if (Number.isFinite(totalCost)) return totalCost
+    }
+
+    if (day.costUSD != null) {
+      const costUSD = Number(day.costUSD)
+      if (Number.isFinite(costUSD)) return costUSD
+    }
+
+    return null
+  }
+
+  function costAndTokensLabel(data, opts) {
+    const includeZeroTokens = !!(opts && opts.includeZeroTokens)
+    const parts = []
+    if (data.costUSD != null) parts.push("$" + data.costUSD.toFixed(2))
+    if (data.tokens > 0 || (includeZeroTokens && data.tokens === 0)) {
+      parts.push(fmtTokens(data.tokens) + " tokens")
+    }
+    return parts.join(" \u00b7 ")
+  }
+
+  function modelTokenCount(modelUsage) {
+    if (!modelUsage || typeof modelUsage !== "object") return 0
+    const total = Number(modelUsage.totalTokens)
+    if (Number.isFinite(total) && total > 0) return total
+
+    const fields = [
+      "inputTokens",
+      "cachedInputTokens",
+      "cacheCreationTokens",
+      "cacheReadTokens",
+      "outputTokens",
+      "reasoningOutputTokens",
+    ]
+    let sum = 0
+    for (let i = 0; i < fields.length; i++) {
+      const n = Number(modelUsage[fields[i]])
+      if (Number.isFinite(n) && n > 0) sum += n
+    }
+    return sum
+  }
+
+  function collectModelUsage(daily) {
+    const totals = {}
+    let totalTokens = 0
+    for (let i = 0; i < daily.length; i++) {
+      const day = daily[i]
+      const models = day && day.models
+      if (models && typeof models === "object") {
+        const names = Object.keys(models)
+        for (let j = 0; j < names.length; j++) {
+          const name = names[j]
+          const tokens = modelTokenCount(models[name])
+          if (tokens <= 0) continue
+          totals[name] = (totals[name] || 0) + tokens
+          totalTokens += tokens
+        }
+      }
+
+      const breakdowns = day && day.modelBreakdowns
+      if (Array.isArray(breakdowns)) {
+        for (let j = 0; j < breakdowns.length; j++) {
+          const breakdown = breakdowns[j]
+          const name = String(
+            (breakdown && (breakdown.modelName || breakdown.name || breakdown.model)) || ""
+          ).trim()
+          if (!name) continue
+          const tokens = modelTokenCount(breakdown)
+          if (tokens <= 0) continue
+          totals[name] = (totals[name] || 0) + tokens
+          totalTokens += tokens
+        }
+      }
+    }
+
+    if (totalTokens <= 0) return []
+    return Object.keys(totals)
+      .map((name) => ({ name, tokens: totals[name], percent: (totals[name] / totalTokens) * 100 }))
+      .sort((a, b) => b.tokens - a.tokens || a.name.localeCompare(b.name))
+  }
+
+  function percentLabel(value) {
+    if (value > 0 && value < 0.1) return "<0.1%"
+    const rounded = Math.round(value * 10) / 10
+    return (rounded % 1 === 0 ? String(Math.round(rounded)) : String(rounded)) + "%"
+  }
+
+  function pushModelUsageLines(lines, ctx, daily) {
+    const models = collectModelUsage(daily)
+    for (let i = 0; i < models.length; i++) {
+      const model = models[i]
+      lines.push(ctx.line.text({
+        label: model.name,
+        value: percentLabel(model.percent),
+      }))
+    }
+  }
+
+  function usageDayLabel(rawDate) {
+    const key = dayKeyFromUsageDate(rawDate)
+    if (!key) return String(rawDate || "").slice(0, 10) || "Usage"
+    const month = Number(key.slice(5, 7))
+    const day = Number(key.slice(8, 10))
+    return month + "/" + day
+  }
+
+  function collectUsageChartPoints(daily) {
+    const points = []
+    for (let i = 0; i < daily.length; i++) {
+      const day = daily[i]
+      const tokens = Number(day && day.totalTokens)
+      if (!Number.isFinite(tokens) || tokens < 0) continue
+      const key = dayKeyFromUsageDate(day.date)
+      if (!key) continue
+      points.push({
+        key: key,
+        label: usageDayLabel(day.date),
+        value: tokens,
+        valueLabel: fmtTokens(tokens) + " tokens",
+      })
+    }
+    return points
+      .sort((a, b) => a.key.localeCompare(b.key))
+      .slice(-31)
+      .map((point) => ({
+        label: point.label,
+        value: point.value,
+        valueLabel: point.valueLabel,
+      }))
+  }
+
+  function pushUsageChartLine(lines, ctx, daily) {
+    const points = collectUsageChartPoints(daily)
+    if (points.length === 0) return
+    lines.push(ctx.line.barChart({
+      label: "Usage Trend",
+      points: points,
+      note: "Estimated from local Claude logs at API rates.",
+      color: "#DE7356",
+    }))
+  }
+
+  function persistUsageDaily(ctx, daily, displayName) {
+    if (!ctx.host.usageDaily || typeof ctx.host.usageDaily.ingest !== "function") return
+    if (!daily || !daily.length) return
+    try {
+      ctx.host.usageDaily.ingest({ displayName: displayName, daily: daily })
+    } catch (e) { /* ignore */ }
+  }
+
+  function modelBreakdownForPeriod(daily) {
+    const totals = {}
+    for (let i = 0; i < daily.length; i++) {
+      const day = daily[i]
+      const models = day && day.models
+      if (!models || typeof models !== "object") continue
+      const names = Object.keys(models)
+      for (let j = 0; j < names.length; j++) {
+        const name = names[j]
+        const usage = models[name]
+        const tokens = modelTokenCount(usage)
+        if (tokens <= 0) continue
+        if (!totals[name]) totals[name] = { tokens: 0, costUsd: undefined }
+        totals[name].tokens += tokens
+        const cost = usage && usage.totalCost != null ? Number(usage.totalCost) : undefined
+        if (Number.isFinite(cost) && cost > 0) {
+          totals[name].costUsd = (totals[name].costUsd || 0) + cost
+        }
+      }
+    }
+    const names = Object.keys(totals)
+    if (names.length === 0) return undefined
+    let sumPct = 0
+    const rows = names.map((name) => {
+      const row = totals[name]
+      return {
+        model: name,
+        tokens: row.tokens,
+        costUsd: row.costUsd,
+      }
+    }).sort((a, b) => b.tokens - a.tokens || a.model.localeCompare(b.model))
+    const totalTokens = rows.reduce((sum, row) => sum + row.tokens, 0)
+    if (totalTokens <= 0) return undefined
+    for (let i = 0; i < rows.length; i++) {
+      const pct = (rows[i].tokens / totalTokens) * 100
+      rows[i].percent = i === rows.length - 1 ? Math.max(0, 100 - sumPct) : Math.round(pct * 10) / 10
+      sumPct += rows[i].percent
+      if (rows[i].costUsd == null || rows[i].costUsd <= 0) {
+        delete rows[i].costUsd
+      }
+    }
+    return rows
+  }
+
+  function modelBreakdownForDay(dayEntry) {
+    if (!dayEntry || !dayEntry.models || typeof dayEntry.models !== "object") return undefined
+    const names = Object.keys(dayEntry.models)
+    if (names.length === 0) return undefined
+    let total = 0
+    const rows = []
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i]
+      const usage = dayEntry.models[name]
+      const tokens = modelTokenCount(usage)
+      if (tokens <= 0) continue
+      total += tokens
+      const cost = usage && usage.totalCost != null ? Number(usage.totalCost) : undefined
+      rows.push({ model: name, tokens: tokens, costUsd: Number.isFinite(cost) ? cost : undefined })
+    }
+    if (total <= 0 || rows.length === 0) return undefined
+    let sumPct = 0
+    for (let i = 0; i < rows.length; i++) {
+      const pct = (rows[i].tokens / total) * 100
+      rows[i].percent = i === rows.length - 1 ? Math.max(0, 100 - sumPct) : Math.round(pct * 10) / 10
+      sumPct += rows[i].percent
+    }
+    return rows.sort((a, b) => b.tokens - a.tokens || a.model.localeCompare(b.model))
+  }
+
+  function pushDayUsageLine(lines, ctx, label, dayEntry) {
+    const tokens = Number(dayEntry && dayEntry.totalTokens) || 0
+    const cost = usageCostUsd(dayEntry)
+    const modelBreakdown = modelBreakdownForDay(dayEntry)
+    if (tokens > 0) {
+      lines.push(ctx.line.text({
+        label: label,
+        value: costAndTokensLabel({ tokens: tokens, costUSD: cost }),
+        modelBreakdown: modelBreakdown,
+      }))
+      return
+    }
+
+    lines.push(ctx.line.text({
+      label: label,
+      value: costAndTokensLabel({ tokens: 0, costUSD: 0 }, { includeZeroTokens: true }),
+      modelBreakdown: modelBreakdown,
+    }))
+  }
+
+  function appendLocalSpendLines(lines, ctx, homePath, opts) {
+    const requireUsage = !!(opts && opts.requireUsage)
+    const usageResult = queryTokenUsage(ctx, homePath)
+    if (usageResult.status !== "ok" || !usageResult.data || !Array.isArray(usageResult.data.daily)) {
+      return false
+    }
+    if (requireUsage && !dailyHasUsage(usageResult.data.daily)) {
+      return false
+    }
+    const usage = usageResult.data
+    const now = new Date()
+    const todayKey = dayKeyFromDate(now)
+    const yesterday = new Date(now.getTime())
+    yesterday.setDate(yesterday.getDate() - 1)
+    const yesterdayKey = dayKeyFromDate(yesterday)
+
+    let todayEntry = null
+    let yesterdayEntry = null
+    for (let i = 0; i < usage.daily.length; i++) {
+      const usageDayKey = dayKeyFromUsageDate(usage.daily[i].date)
+      if (usageDayKey === todayKey) {
+        todayEntry = usage.daily[i]
+        continue
+      }
+      if (usageDayKey === yesterdayKey) {
+        yesterdayEntry = usage.daily[i]
+      }
+    }
+
+    pushDayUsageLine(lines, ctx, "Today", todayEntry)
+    pushDayUsageLine(lines, ctx, "Yesterday", yesterdayEntry)
+
+    let totalTokens = 0
+    let totalCostNanos = 0
+    let hasCost = false
+    for (let i = 0; i < usage.daily.length; i++) {
+      const day = usage.daily[i]
+      const dayTokens = Number(day.totalTokens)
+      if (Number.isFinite(dayTokens)) {
+        totalTokens += dayTokens
+      }
+      const dayCost = usageCostUsd(day)
+      if (dayCost != null) {
+        totalCostNanos += Math.round(dayCost * 1e9)
+        hasCost = true
+      }
+    }
+    if (totalTokens > 0) {
+      lines.push(ctx.line.text({
+        label: "Last 30 Days",
+        value: costAndTokensLabel({ tokens: totalTokens, costUSD: hasCost ? totalCostNanos / 1e9 : null }),
+        modelBreakdown: modelBreakdownForPeriod(usage.daily),
+      }))
+    }
+
+    pushUsageChartLine(lines, ctx, usage.daily)
+    pushModelUsageLines(lines, ctx, usage.daily)
+    persistUsageDaily(ctx, usage.daily, "Claude")
+    return true
+  }
+
+  function appendClaudeResetGrants(ctx, block, lines) {
+    if (!block || typeof block !== "object") return
+    let count = 0
+    const expiries = []
+    const now = Date.now()
+    if (block.eligible === true && Array.isArray(block.grants)) {
+      for (let i = 0; i < block.grants.length; i += 1) {
+        const grant = block.grants[i]
+        const left = grant && Number(grant.resets_left)
+        if (!Number.isFinite(left) || left < 1) continue
+        const resets = Math.floor(left)
+        const ends = grant.ends_at ? Date.parse(grant.ends_at) : NaN
+        if (Number.isFinite(ends) && ends <= now) continue
+        count += resets
+        if (Number.isFinite(ends)) {
+          for (let n = 0; n < resets; n += 1) expiries.push(ends)
+        }
+      }
+    }
+    expiries.sort(function (a, b) { return a - b })
+    lines.push(ctx.line.text({
+      label: "Rate Limit Resets",
+      value: count + " available",
+      resetCreditExpiries: expiries.map(function (ms) { return new Date(ms).toISOString() }),
+    }))
+  }
+
+  function probe(ctx) {
+    const homePath = getClaudeHomeOverride(ctx)
+    const creds = loadCredentials(ctx)
+    if (!creds || !creds.oauth || !creds.oauth.accessToken || !creds.oauth.accessToken.trim()) {
+      const lines = []
+      if (appendLocalSpendLines(lines, ctx, homePath, { requireUsage: true })) {
+        ctx.host.log.info("no OAuth credentials; showing local spend tiles")
+        return { plan: null, lines: lines, warning: "Not logged in" }
+      }
+      ctx.host.log.error("probe failed: not logged in")
+      throw "Not logged in. Run `claude` to authenticate."
+    }
+
+    const nowMs = Date.now()
+    let accessToken = creds.oauth.accessToken
+    const canFetchLiveUsage = hasProfileScope(creds)
+    if (canFetchLiveUsage) {
+      activateUsageCache(ctx, creds.oauth)
+    }
+
+    let data = null
+    let lines = []
+    let warning = null
+    let rateLimited = false
+    let retryAfterSeconds = null
+    if (canFetchLiveUsage) {
+      if (nowMs < rateLimitedUntilMs) {
+        // Still within a rate-limit window from a previous probe call — skip the
+        // API request entirely and surface the remaining wait time to the user.
+        rateLimited = true
+        retryAfterSeconds = Math.ceil((rateLimitedUntilMs - nowMs) / 1000)
+        data = cachedUsageData
+        ctx.host.log.info("usage fetch skipped: rate-limited for " + retryAfterSeconds + "s more")
+      } else {
+        // Rate-limit window has expired (or was never set).  Check whether we were
+        // previously rate-limited so we can bypass the min-interval guard: a short
+        // Retry-After (< 5 min) must not be swallowed by the normal poll throttle.
+        const wasRateLimited = rateLimitedUntilMs > 0
+        rateLimitedUntilMs = 0
+
+        if (!wasRateLimited && nowMs - lastUsageFetchMs < MIN_USAGE_FETCH_INTERVAL_MS) {
+          // Polled too recently in normal operation — reuse last cached response.
+          data = cachedUsageData
+          ctx.host.log.info(
+            "usage fetch skipped: last fetch was " +
+            Math.round((nowMs - lastUsageFetchMs) / 1000) + "s ago (min interval " +
+            MIN_USAGE_FETCH_INTERVAL_MS / 1000 + "s)"
+          )
+        } else {
+        // Proactively refresh if token is expired or about to expire
+        if (needsRefresh(ctx, creds.oauth, nowMs)) {
+          ctx.host.log.info("token needs refresh (expired or expiring soon)")
+          const refreshed = refreshToken(ctx, creds)
+          if (refreshed) {
+            accessToken = refreshed
+          } else {
+            ctx.host.log.warn("proactive refresh failed, trying with existing token")
+          }
+        }
+
+        lastUsageFetchMs = nowMs
+        let resp
+        let didRefresh = false
+        try {
+          resp = ctx.util.retryOnceOnAuth({
+            request: (token) => {
+              try {
+                return fetchUsage(ctx, token || accessToken)
+              } catch (e) {
+                ctx.host.log.error("usage request exception: " + String(e))
+                if (didRefresh) {
+                  throw "Usage request failed after refresh. Try again."
+                }
+                throw "Usage request failed. Check your connection."
+              }
+            },
+            refresh: () => {
+              ctx.host.log.info("usage returned 401, attempting refresh")
+              didRefresh = true
+              return refreshToken(ctx, creds)
+            },
+          })
+        } catch (e) {
+          if (typeof e === "string") throw e
+          ctx.host.log.error("usage request failed: " + String(e))
+          throw "Usage request failed. Check your connection."
+        }
+
+        if (ctx.util.isAuthStatus(resp.status)) {
+          ctx.host.log.error("usage returned auth error after all retries: status=" + resp.status)
+          throw "Token expired. Run `claude` to log in again."
+        }
+
+        if (resp.status === 429) {
+          rateLimited = true
+          retryAfterSeconds = parseRetryAfterSeconds(resp.headers)
+          const backoffMs = retryAfterSeconds !== null
+            ? retryAfterSeconds * 1000
+            : DEFAULT_RATE_LIMIT_BACKOFF_MS
+          rateLimitedUntilMs = nowMs + backoffMs
+          data = cachedUsageData
+          ctx.host.log.warn(
+            "usage rate limited (429), backing off for " +
+            Math.round(backoffMs / 1000) + "s"
+          )
+        } else if (resp.status < 200 || resp.status >= 300) {
+          ctx.host.log.error("usage returned error: status=" + resp.status)
+          throw "Usage request failed (HTTP " + String(resp.status) + "). Try again later."
+        } else {
+          ctx.host.log.info("usage fetch succeeded")
+          data = ctx.util.tryParseJson(resp.bodyText)
+          if (data === null) {
+            throw "Usage response invalid. Try again later."
+          }
+          cachedUsageData = data
+          rateLimitedUntilMs = 0
+          const activeToken = creds.oauth.accessToken || accessToken
+          resolveResetGrantsBlock(ctx, activeToken, creds.oauth, data, nowMs)
+          lookupLivePlan(ctx, activeToken, creds.oauth)
+        }
+        } // end fetch else-branch
+      }
+    } else {
+      ctx.host.log.info("skipping live usage fetch for inference-only token")
+    }
+
+    let plan = formatPlan(ctx, creds.oauth.subscriptionType, creds.oauth.rateLimitTier)
+    const planToken = creds.oauth.accessToken || accessToken
+    if (cachedLivePlanTokenKey === planToken && cachedLivePlan) {
+      plan = cachedLivePlan
+    }
+
+    if (data) {
+      if (data.five_hour && typeof data.five_hour.utilization === "number") {
+        lines.push(ctx.line.progress({
+          label: "Session",
+          used: data.five_hour.utilization,
+          limit: 100,
+          format: { kind: "percent" },
+          resetsAt: ctx.util.toIso(data.five_hour.resets_at),
+          periodDurationMs: 5 * 60 * 60 * 1000, // 5 hours
+          sessionStartSignal: "missingResetDate",
+        }))
+      }
+      if (data.seven_day && typeof data.seven_day.utilization === "number") {
+        lines.push(ctx.line.progress({
+          label: "Weekly",
+          used: data.seven_day.utilization,
+          limit: 100,
+          format: { kind: "percent" },
+          resetsAt: ctx.util.toIso(data.seven_day.resets_at),
+          periodDurationMs: 7 * 24 * 60 * 60 * 1000 // 7 days
+        }))
+      }
+      if (Array.isArray(data.limits)) {
+        for (let li = 0; li < data.limits.length; li++) {
+          const entry = data.limits[li]
+          if (!entry || typeof entry !== "object") continue
+          if (entry.kind !== "weekly_scoped") continue
+          const scope = entry.scope
+          const model = scope && scope.model
+          const displayName = model && typeof model.display_name === "string" ? model.display_name.trim() : ""
+          if (displayName !== "Fable") continue
+          if (typeof entry.percent !== "number") continue
+          lines.push(ctx.line.progress({
+            label: "Fable",
+            used: entry.percent,
+            limit: 100,
+            format: { kind: "percent" },
+            resetsAt: ctx.util.toIso(entry.resets_at),
+            periodDurationMs: 7 * 24 * 60 * 60 * 1000 // 7 days
+          }))
+          break
+        }
+      }
+      if (data.seven_day_sonnet && typeof data.seven_day_sonnet.utilization === "number") {
+        lines.push(ctx.line.progress({
+          label: "Sonnet",
+          used: data.seven_day_sonnet.utilization,
+          limit: 100,
+          format: { kind: "percent" },
+          resetsAt: ctx.util.toIso(data.seven_day_sonnet.resets_at),
+          periodDurationMs: 7 * 24 * 60 * 60 * 1000 // 7 days
+        }))
+      }
+      if (data.seven_day_omelette && typeof data.seven_day_omelette.utilization === "number") {
+        lines.push(ctx.line.progress({
+          label: "Claude Design",
+          used: data.seven_day_omelette.utilization,
+          limit: 100,
+          format: { kind: "percent" },
+          resetsAt: ctx.util.toIso(data.seven_day_omelette.resets_at),
+          periodDurationMs: 7 * 24 * 60 * 60 * 1000 // 7 days
+        }))
+      }
+
+      const resetGrantsBlock =
+        (data && data.cedar_ember && typeof data.cedar_ember === "object"
+          ? data.cedar_ember
+          : null) || cachedResetGrantsBlock
+      appendClaudeResetGrants(ctx, resetGrantsBlock, lines)
+
+      if (data.extra_usage && data.extra_usage.is_enabled) {
+        const used = data.extra_usage.used_credits
+        const limit = data.extra_usage.monthly_limit
+        if (typeof used === "number" && typeof limit === "number" && limit > 0) {
+          lines.push(ctx.line.progress({
+            label: "Extra usage spent",
+            used: ctx.fmt.dollars(used),
+            limit: ctx.fmt.dollars(limit),
+            format: { kind: "dollars" }
+          }))
+        } else if (typeof used === "number" && used > 0) {
+          lines.push(ctx.line.text({ label: "Extra usage spent", value: "$" + String(ctx.fmt.dollars(used)) }))
+        }
+      }
+    }
+
+    appendLocalSpendLines(lines, ctx, homePath)
+
+    if (rateLimited) {
+      const retryText = retryAfterSeconds !== null
+        ? fmtRateLimitMinutes(retryAfterSeconds)
+        : null
+      const waitText = retryText
+        ? "Rate limited, retry in ~" + retryText
+        : "Rate limited, try again later"
+      lines.unshift(ctx.line.badge({ label: "Status", text: waitText, color: "#f59e0b" }))
+      const noteText = retryText
+        ? "Live usage rate limited — retry in ~" + retryText
+        : "Live usage rate limited — data may be stale"
+      lines.push(ctx.line.text({ label: "Note", value: noteText }))
+      warning = retryText
+        ? "Updates blocked by Anthropic — retry in ~" + retryText
+        : "Updates blocked by Anthropic rate limit"
+    } else if (!canFetchLiveUsage) {
+      warning = "Token missing user:profile scope — live limits unavailable"
+    } else if (lines.length === 0) {
+      lines.push(ctx.line.badge({ label: "Status", text: "No usage data", color: "#a3a3a3" }))
+    }
+
+    return { plan: plan, lines: lines, warning: warning }
+  }
+
+  // _resetState is a testing hook — resets module-scope rate-limit state between tests.
+  // The production host never calls this.
+  function _resetState() {
+    rateLimitedUntilMs = 0
+    lastUsageFetchMs = 0
+    cachedUsageData = null
+    cachedUsageLoginKey = null
+    cachedLivePlan = null
+    cachedLivePlanTokenKey = null
+    resetGrantsLoginKey = null
+    resetGrantsCheckedAtMs = 0
+    cachedResetGrantsBlock = null
+  }
+
+  globalThis.__openusage_plugin = { id: "claude", probe, _resetState }
+})()

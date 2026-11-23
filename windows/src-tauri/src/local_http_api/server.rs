@@ -1,0 +1,628 @@
+use super::cache::{cache_state, enabled_snapshots_ordered};
+use quotabar_core::limits_export::{provider_limits_from_lines, LimitsDocument};
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+const BIND_ADDR: &str = "127.0.0.1:6736";
+const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ConnectionLimiter {
+    active: Arc<AtomicUsize>,
+    max: usize,
+}
+
+struct ConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl ConnectionLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            max,
+        }
+    }
+
+    fn acquire(&self) -> Option<ConnectionPermit> {
+        loop {
+            let active = self.active.load(Ordering::Acquire);
+            if active >= self.max {
+                return None;
+            }
+            if self
+                .active
+                .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(ConnectionPermit {
+                    active: Arc::clone(&self.active),
+                });
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP server
+// ---------------------------------------------------------------------------
+
+pub fn start_server() {
+    std::thread::spawn(|| {
+        let listener = match TcpListener::bind(BIND_ADDR) {
+            Ok(l) => {
+                log::info!("local HTTP API listening on {}", BIND_ADDR);
+                l
+            }
+            Err(e) => {
+                log::warn!(
+                    "failed to bind local HTTP API on {}: {} — feature disabled for this session",
+                    BIND_ADDR,
+                    e
+                );
+                return;
+            }
+        };
+
+        let limiter = ConnectionLimiter::new(MAX_CONCURRENT_CONNECTIONS);
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut stream) => {
+                    let Some(permit) = limiter.acquire() else {
+                        log::warn!(
+                            "local HTTP API connection limit reached (max={})",
+                            MAX_CONCURRENT_CONNECTIONS
+                        );
+                        let _ = stream.set_write_timeout(Some(CONNECTION_TIMEOUT));
+                        let _ = stream.write_all(response_service_unavailable().as_bytes());
+                        let _ = stream.flush();
+                        continue;
+                    };
+                    std::thread::spawn(move || handle_connection(stream, permit));
+                }
+                Err(e) => log::debug!("local HTTP API accept error: {}", e),
+            }
+        }
+    });
+}
+
+fn handle_connection(mut stream: TcpStream, _permit: ConnectionPermit) {
+    let _ = stream.set_read_timeout(Some(CONNECTION_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CONNECTION_TIMEOUT));
+
+    // Read request (up to 4 KB is plenty for a request line + headers)
+    let mut buf = [0u8; 4096];
+    let n = match stream.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+
+    if is_browser_cross_origin_request(&request) {
+        let _ = stream.write_all(response_forbidden("browser_request_not_allowed").as_bytes());
+        let _ = stream.flush();
+        return;
+    }
+
+    // Parse request line: "METHOD /path HTTP/1.x\r\n..."
+    let first_line = request.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let raw_path = parts.next().unwrap_or("");
+
+    // Strip query string and trailing slash (but keep root "/v1/usage" intact)
+    let path = raw_path.split('?').next().unwrap_or(raw_path);
+    let path = if path.len() > 1 {
+        path.trim_end_matches('/')
+    } else {
+        path
+    };
+
+    let response = route(method, path, raw_path);
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Browsers attach Sec-Fetch-Site / Origin on cross-origin fetches; curl and scripts do not.
+/// We block those instead of bearer auth so `curl http://127.0.0.1:6736/v1/usage` stays zero-config.
+fn is_browser_cross_origin_request(request: &str) -> bool {
+    if let Some(site) = header_value(request, "Sec-Fetch-Site") {
+        if site.eq_ignore_ascii_case("cross-site") {
+            return true;
+        }
+    }
+    if let Some(origin) = header_value(request, "Origin") {
+        if !origin.is_empty() && !origin_is_loopback(origin) {
+            return true;
+        }
+    }
+    false
+}
+
+fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    for line in request.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim().eq_ignore_ascii_case(name) {
+                return Some(value.trim());
+            }
+        }
+    }
+    None
+}
+
+fn origin_is_loopback(origin: &str) -> bool {
+    let lower = origin.to_ascii_lowercase();
+    lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("https://127.0.0.1")
+        || lower.starts_with("https://localhost")
+}
+
+fn route(method: &str, path: &str, raw_path: &str) -> String {
+    if path == "/v1/usage" {
+        return match method {
+            "GET" => handle_get_usage_collection(),
+            "OPTIONS" => response_no_content(),
+            _ => response_method_not_allowed(),
+        };
+    }
+
+    if let Some(provider_id) = path.strip_prefix("/v1/usage/") {
+        if !provider_id.is_empty() && !provider_id.contains('/') {
+            return match method {
+                "GET" => handle_get_usage_single(provider_id),
+                "OPTIONS" => response_no_content(),
+                _ => response_method_not_allowed(),
+            };
+        }
+    }
+
+    if path == "/v1/limits" {
+        return match method {
+            "GET" => handle_get_limits_collection(),
+            "OPTIONS" => response_no_content(),
+            _ => response_method_not_allowed(),
+        };
+    }
+
+    if let Some(provider_id) = path.strip_prefix("/v1/limits/") {
+        if !provider_id.is_empty() && !provider_id.contains('/') {
+            return match method {
+                "GET" => handle_get_limits_single(provider_id),
+                "OPTIONS" => response_no_content(),
+                _ => response_method_not_allowed(),
+            };
+        }
+    }
+
+    if path == "/v1/history/quota" {
+        return match method {
+            "GET" => handle_get_history_quota(raw_path),
+            "OPTIONS" => response_no_content(),
+            _ => response_method_not_allowed(),
+        };
+    }
+
+    if path == "/v1/history/daily" {
+        return match method {
+            "GET" => handle_get_history_daily(raw_path),
+            "OPTIONS" => response_no_content(),
+            _ => response_method_not_allowed(),
+        };
+    }
+
+    if path == "/v1/insights" {
+        return match method {
+            "GET" => handle_get_insights(raw_path),
+            "OPTIONS" => response_no_content(),
+            _ => response_method_not_allowed(),
+        };
+    }
+
+    response_not_found("not_found")
+}
+
+fn parse_limit_query(raw_path: &str, default: u32) -> u32 {
+    let query = raw_path.split('?').nth(1).unwrap_or("");
+    for part in query.split('&') {
+        let mut kv = part.splitn(2, '=');
+        if kv.next() == Some("limit") {
+            if let Some(v) = kv.next() {
+                if let Ok(n) = v.parse::<u32>() {
+                    return n.clamp(1, 2000);
+                }
+            }
+        }
+    }
+    default
+}
+
+fn handle_get_history_quota(raw_path: &str) -> String {
+    let limit = parse_limit_query(raw_path, 80);
+    let dir = {
+        let state = cache_state().lock().expect("cache state poisoned");
+        state.app_data_dir.clone()
+    };
+    if !quotabar_core::usage_history::persist_usage_history_enabled(&dir) {
+        return response_json(200, "OK", "[]");
+    }
+    match quotabar_core::usage_history::list_recent(&dir, limit) {
+        Ok(rows) => {
+            let body = serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string());
+            response_json(200, "OK", &body)
+        }
+        Err(e) => {
+            let body = json_error_body(&e.to_string());
+            response_json(500, "Internal Server Error", &body)
+        }
+    }
+}
+
+fn handle_get_history_daily(raw_path: &str) -> String {
+    let limit = parse_limit_query(raw_path, 120);
+    let dir = {
+        let state = cache_state().lock().expect("cache state poisoned");
+        state.app_data_dir.clone()
+    };
+    if !quotabar_core::usage_history::persist_usage_history_enabled(&dir) {
+        return response_json(200, "OK", "[]");
+    }
+    match quotabar_core::usage_daily::list_recent(&dir, limit, None) {
+        Ok(rows) => {
+            let body = serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string());
+            response_json(200, "OK", &body)
+        }
+        Err(e) => {
+            let body = json_error_body(&e.to_string());
+            response_json(500, "Internal Server Error", &body)
+        }
+    }
+}
+
+fn handle_get_insights(raw_path: &str) -> String {
+    let limit = parse_limit_query(raw_path, 5);
+    let dir = {
+        let state = cache_state().lock().expect("cache state poisoned");
+        state.app_data_dir.clone()
+    };
+    match quotabar_core::usage_history::insights_summary(&dir, limit) {
+        Ok(summary) => {
+            let body = serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string());
+            response_json(200, "OK", &body)
+        }
+        Err(e) => {
+            let body = json_error_body(&e.to_string());
+            response_json(500, "Internal Server Error", &body)
+        }
+    }
+}
+
+fn handle_get_usage_collection() -> String {
+    let snapshots = {
+        let state = cache_state().lock().expect("cache state poisoned");
+        enabled_snapshots_ordered(&state)
+    };
+    let body = serde_json::to_string_pretty(&snapshots).unwrap_or_else(|_| "[]".to_string());
+    response_json(200, "OK", &body)
+}
+
+fn handle_get_usage_single(provider_id: &str) -> String {
+    let state = cache_state().lock().expect("cache state poisoned");
+
+    let is_known = state.known_plugin_ids.iter().any(|id| id == provider_id);
+    if !is_known {
+        return response_not_found("provider_not_found");
+    }
+
+    match state.snapshots.get(provider_id) {
+        Some(snapshot) => {
+            let body = serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| "{}".to_string());
+            response_json(200, "OK", &body)
+        }
+        None => response_no_content(),
+    }
+}
+
+fn handle_get_limits_collection() -> String {
+    let snapshots = {
+        let state = cache_state().lock().expect("cache state poisoned");
+        enabled_snapshots_ordered(&state)
+    };
+    let mut providers = BTreeMap::new();
+    for snap in snapshots {
+        providers.insert(
+            snap.provider_id.clone(),
+            provider_limits_from_lines(
+                &snap.display_name,
+                snap.plan.as_deref(),
+                &snap.lines,
+                Some(&snap.fetched_at),
+                None,
+            ),
+        );
+    }
+    let doc = LimitsDocument {
+        schema: quotabar_core::limits_export::LIMITS_SCHEMA.to_string(),
+        providers,
+        errors: Vec::new(),
+    };
+    let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
+    response_json(200, "OK", &body)
+}
+
+fn handle_get_limits_single(provider_id: &str) -> String {
+    let state = cache_state().lock().expect("cache state poisoned");
+
+    let is_known = state.known_plugin_ids.iter().any(|id| id == provider_id);
+    if !is_known {
+        return response_not_found("provider_not_found");
+    }
+
+    match state.snapshots.get(provider_id) {
+        Some(snap) => {
+            let mut providers = BTreeMap::new();
+            providers.insert(
+                snap.provider_id.clone(),
+                provider_limits_from_lines(
+                    &snap.display_name,
+                    snap.plan.as_deref(),
+                    &snap.lines,
+                    Some(&snap.fetched_at),
+                    None,
+                ),
+            );
+            let doc = LimitsDocument {
+                schema: quotabar_core::limits_export::LIMITS_SCHEMA.to_string(),
+                providers,
+                errors: Vec::new(),
+            };
+            let body = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
+            response_json(200, "OK", &body)
+        }
+        None => response_no_content(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP response builders
+// ---------------------------------------------------------------------------
+
+fn json_error_body(message: &str) -> String {
+    serde_json::json!({ "error": message }).to_string()
+}
+
+fn response_json(status: u16, reason: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {} {}\r\nConnection: close\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+        status,
+        reason,
+        body.len(),
+        body,
+    )
+}
+
+fn response_no_content() -> String {
+    "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+}
+
+fn response_forbidden(error_code: &str) -> String {
+    let body = json_error_body(error_code);
+    response_json(403, "Forbidden", &body)
+}
+
+fn response_not_found(error_code: &str) -> String {
+    let body = json_error_body(error_code);
+    response_json(404, "Not Found", &body)
+}
+
+fn response_method_not_allowed() -> String {
+    let body = r#"{"error":"method_not_allowed"}"#;
+    response_json(405, "Method Not Allowed", body)
+}
+
+fn response_service_unavailable() -> String {
+    let body = r#"{"error":"server_busy"}"#;
+    response_json(503, "Service Unavailable", body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::cache::{CachedPluginSnapshot, cache_state};
+    use super::*;
+    use serial_test::serial;
+
+    fn make_snapshot(id: &str, name: &str) -> CachedPluginSnapshot {
+        CachedPluginSnapshot {
+            provider_id: id.to_string(),
+            display_name: name.to_string(),
+            plan: Some("Pro".to_string()),
+            warning: None,
+            lines: vec![],
+            fetched_at: "2026-03-26T08:15:30Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn route_get_history_quota_returns_200() {
+        let resp = route("GET", "/v1/history/quota", "/v1/history/quota");
+        assert!(resp.starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn route_get_history_daily_returns_200() {
+        let resp = route("GET", "/v1/history/daily", "/v1/history/daily?limit=50");
+        assert!(resp.starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn route_get_insights_returns_200() {
+        let resp = route("GET", "/v1/insights", "/v1/insights?limit=5");
+        assert!(resp.starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn route_get_usage_returns_200() {
+        let resp = route("GET", "/v1/usage", "/v1/usage");
+        assert!(resp.starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn route_get_limits_returns_200() {
+        let resp = route("GET", "/v1/limits", "/v1/limits");
+        assert!(resp.starts_with("HTTP/1.1 200"));
+        assert!(resp.contains("quotabar.limits.v1"));
+    }
+
+    #[test]
+    fn route_unknown_path_returns_404() {
+        let resp = route("GET", "/v2/something", "/v2/something");
+        assert!(resp.starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn route_post_returns_405() {
+        let resp = route("POST", "/v1/usage", "/v1/usage");
+        assert!(resp.starts_with("HTTP/1.1 405"));
+    }
+
+    #[test]
+    fn route_options_returns_204() {
+        let resp = route("OPTIONS", "/v1/usage", "/v1/usage");
+        assert!(resp.starts_with("HTTP/1.1 204"));
+        assert!(!resp.contains("Access-Control-Allow-Origin"));
+    }
+
+    #[test]
+    #[serial]
+    fn route_unknown_provider_returns_404() {
+        {
+            let mut state = cache_state().lock().unwrap();
+            state.known_plugin_ids = vec!["claude".to_string()];
+            state.snapshots.clear();
+        }
+
+        let resp = route("GET", "/v1/usage/nonexistent", "/v1/usage/nonexistent");
+        assert!(resp.starts_with("HTTP/1.1 404"));
+        assert!(resp.contains("provider_not_found"));
+    }
+
+    #[test]
+    #[serial]
+    fn route_known_uncached_provider_returns_204() {
+        {
+            let mut state = cache_state().lock().unwrap();
+            state.known_plugin_ids = vec!["claude".to_string()];
+            state.snapshots.clear();
+        }
+
+        let resp = route("GET", "/v1/usage/claude", "/v1/usage/claude");
+        assert!(resp.starts_with("HTTP/1.1 204"));
+    }
+
+    #[test]
+    #[serial]
+    fn route_known_cached_provider_returns_200() {
+        {
+            let mut state = cache_state().lock().unwrap();
+            state.known_plugin_ids = vec!["claude".to_string()];
+            state
+                .snapshots
+                .insert("claude".to_string(), make_snapshot("claude", "Claude"));
+        }
+
+        let resp = route("GET", "/v1/usage/claude", "/v1/usage/claude");
+        assert!(resp.starts_with("HTTP/1.1 200"));
+        assert!(resp.contains("fetchedAt"));
+    }
+
+    #[test]
+    fn route_options_on_provider_returns_204() {
+        let resp = route("OPTIONS", "/v1/usage/claude", "/v1/usage/claude");
+        assert!(resp.starts_with("HTTP/1.1 204"));
+    }
+
+    #[test]
+    fn response_json_omits_cors_headers() {
+        let resp = response_json(200, "OK", "[]");
+        assert!(!resp.contains("Access-Control-Allow-Origin"));
+        assert!(resp.contains("Content-Type: application/json; charset=utf-8"));
+    }
+
+    #[test]
+    fn is_browser_cross_origin_request_blocks_sec_fetch_site() {
+        let req = "GET /v1/usage HTTP/1.1\r\nHost: 127.0.0.1:6736\r\nSec-Fetch-Site: cross-site\r\n\r\n";
+        assert!(is_browser_cross_origin_request(req));
+    }
+
+    #[test]
+    fn is_browser_cross_origin_request_blocks_foreign_origin() {
+        let req = "GET /v1/usage HTTP/1.1\r\nHost: 127.0.0.1:6736\r\nOrigin: https://evil.example\r\n\r\n";
+        assert!(is_browser_cross_origin_request(req));
+    }
+
+    #[test]
+    fn is_browser_cross_origin_request_allows_curl_like_request() {
+        let req = "GET /v1/usage HTTP/1.1\r\nHost: 127.0.0.1:6736\r\nUser-Agent: curl/8.5.0\r\n\r\n";
+        assert!(!is_browser_cross_origin_request(req));
+    }
+
+    #[test]
+    fn is_browser_cross_origin_request_allows_loopback_origin() {
+        let req = "GET /v1/usage HTTP/1.1\r\nHost: 127.0.0.1:6736\r\nOrigin: http://127.0.0.1:3000\r\n\r\n";
+        assert!(!is_browser_cross_origin_request(req));
+    }
+
+    #[test]
+    fn connection_limiter_rejects_above_capacity_and_releases_on_drop() {
+        let limiter = ConnectionLimiter::new(2);
+        let first = limiter.acquire().expect("first permit");
+        let second = limiter.acquire().expect("second permit");
+
+        assert!(limiter.acquire().is_none());
+        assert_eq!(limiter.active_count(), 2);
+
+        drop(first);
+
+        let third = limiter.acquire().expect("permit after release");
+        assert_eq!(limiter.active_count(), 2);
+
+        drop(second);
+        drop(third);
+        assert_eq!(limiter.active_count(), 0);
+    }
+
+    #[test]
+    fn response_service_unavailable_returns_503_json() {
+        let resp = response_service_unavailable();
+
+        assert!(resp.starts_with("HTTP/1.1 503"));
+        assert!(resp.contains(r#""error":"server_busy""#));
+        assert!(!resp.contains("Access-Control-Allow-Origin"));
+    }
+
+    #[test]
+    fn json_error_body_escapes_quotes_and_newlines() {
+        let body = json_error_body("bad\"quote\nline");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(parsed["error"], "bad\"quote\nline");
+    }
+
+}

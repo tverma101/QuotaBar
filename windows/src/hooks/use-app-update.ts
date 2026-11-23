@@ -1,0 +1,154 @@
+import { useState, useEffect, useCallback, useRef } from "react"
+import { isTauri } from "@tauri-apps/api/core"
+import { check, type Update } from "@tauri-apps/plugin-updater"
+import { relaunch } from "@tauri-apps/plugin-process"
+
+export type UpdateStatus =
+  | { status: "idle" }
+  | { status: "checking" }
+  | { status: "up-to-date" }
+  | { status: "downloading"; progress: number } // 0-100, or -1 if indeterminate
+  | { status: "installing" }
+  | { status: "ready"; version: string }
+  | { status: "error"; message: string }
+
+interface UseAppUpdateReturn {
+  updateStatus: UpdateStatus
+  triggerInstall: () => void
+  checkForUpdates: () => void
+}
+
+/** In Vite dev (`tauri dev`), the updater endpoint often 404s until releases ship `latest.json`. Set `VITE_UPDATER_IN_DEV=true` to test updates locally. Vitest sets `VITE_UPDATER_IN_DEV` via `vite.config.ts` so hook tests still run. */
+const UPDATER_CHECKS_ENABLED =
+  import.meta.env.PROD || import.meta.env.VITE_UPDATER_IN_DEV === "true"
+
+export function useAppUpdate(): UseAppUpdateReturn {
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ status: "idle" })
+  const statusRef = useRef<UpdateStatus>({ status: "idle" })
+  const updateRef = useRef<Update | null>(null)
+  const mountedRef = useRef(true)
+  const inFlightRef = useRef({ checking: false, downloading: false, installing: false })
+  const upToDateTimeoutRef = useRef<number | null>(null)
+
+  const setStatus = useCallback((next: UpdateStatus) => {
+    statusRef.current = next
+    if (!mountedRef.current) return
+    setUpdateStatus(next)
+  }, [])
+
+  const checkForUpdates = useCallback(async () => {
+    if (!isTauri()) return
+    if (!UPDATER_CHECKS_ENABLED) return
+    if (inFlightRef.current.checking || inFlightRef.current.downloading || inFlightRef.current.installing) return
+    // Keep a ready banner sticky until install — but allow a later check to clear it
+    // when the channel reports no update (#882 resolved banner).
+    const stickyReady = statusRef.current.status === "ready"
+
+    // Clear any pending up-to-date timeout
+    if (upToDateTimeoutRef.current !== null) {
+      clearTimeout(upToDateTimeoutRef.current)
+      upToDateTimeoutRef.current = null
+    }
+    inFlightRef.current.checking = true
+    if (!stickyReady) setStatus({ status: "checking" })
+    try {
+      const update = await check()
+      inFlightRef.current.checking = false
+      if (!mountedRef.current) return
+      if (!update) {
+        updateRef.current = null
+        setStatus({ status: "up-to-date" })
+        upToDateTimeoutRef.current = window.setTimeout(() => {
+          upToDateTimeoutRef.current = null
+          if (mountedRef.current) setStatus({ status: "idle" })
+        }, 3000)
+        return
+      }
+      if (update) {
+        updateRef.current = update
+        if (stickyReady && statusRef.current.status === "ready") {
+          // Same ready version still available — leave the banner alone.
+          if (update.version === statusRef.current.version) return
+        }
+        inFlightRef.current.downloading = true
+        setStatus({ status: "downloading", progress: -1 })
+
+        let totalBytes: number | null = null
+        let downloadedBytes = 0
+
+        try {
+          await update.download((event) => {
+            if (!mountedRef.current) return
+            if (event.event === "Started") {
+              totalBytes = event.data.contentLength ?? null
+              downloadedBytes = 0
+              setStatus({
+                status: "downloading",
+                progress: totalBytes ? 0 : -1,
+              })
+            } else if (event.event === "Progress") {
+              downloadedBytes += event.data.chunkLength
+              if (totalBytes && totalBytes > 0) {
+                const pct = Math.min(100, Math.round((downloadedBytes / totalBytes) * 100))
+                setStatus({ status: "downloading", progress: pct })
+              }
+            }
+          })
+          if (mountedRef.current) {
+            setStatus({ status: "ready", version: update.version })
+          }
+        } catch (err) {
+          console.error("Update download failed:", err)
+          setStatus({ status: "error", message: "Download failed" })
+        } finally {
+          inFlightRef.current.downloading = false
+        }
+      }
+    } catch (err) {
+      inFlightRef.current.checking = false
+      if (!mountedRef.current) return
+      console.error("Update check failed:", err)
+      setStatus({ status: "error", message: "Update check failed" })
+    }
+  }, [setStatus])
+
+  useEffect(() => {
+    mountedRef.current = true
+    void checkForUpdates()
+
+    // Check every 15 minutes
+    const intervalId = setInterval(() => {
+      void checkForUpdates()
+    }, 15 * 60 * 1000)
+
+    return () => {
+      mountedRef.current = false
+      clearInterval(intervalId)
+      if (upToDateTimeoutRef.current !== null) {
+        clearTimeout(upToDateTimeoutRef.current)
+      }
+    }
+  }, [checkForUpdates])
+
+  const triggerInstall = useCallback(async () => {
+    const update = updateRef.current
+    if (!update) return
+    if (statusRef.current.status !== "ready") return
+    if (inFlightRef.current.installing || inFlightRef.current.downloading) return
+
+    try {
+      inFlightRef.current.installing = true
+      setStatus({ status: "installing" })
+      await update.install()
+      await relaunch()
+      setStatus({ status: "idle" })
+    } catch (err) {
+      console.error("Update install failed:", err)
+      setStatus({ status: "error", message: "Install failed" })
+    } finally {
+      inFlightRef.current.installing = false
+    }
+  }, [setStatus])
+
+  return { updateStatus, triggerInstall, checkForUpdates }
+}

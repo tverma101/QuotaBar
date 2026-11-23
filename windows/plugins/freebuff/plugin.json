@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "freebuff",
+  "name": "Freebuff",
+  "version": "0.0.1",
+  "entry": "plugin.js",
+  "icon": "icon.svg",
+  "brandColor": "#7c3aed",
+  "links": [
+    { "label": "Dashboard", "url": "https://www.codebuff.com" }
+  ],
+  "lines": [
+    { "type": "progress", "label": "Daily", "scope": "overview", "primaryOrder": 1 },
+    { "type": "progress", "label": "5-Day", "scope": "overview" },
+    { "type": "progress", "label": "Monthly", "scope": "overview" },
+    { "type": "progress", "label": "Premium Sessions", "scope": "detail" },
+    { "type": "progress", "label": "Free Premium Sessions", "scope": "detail" },
+    { "type": "progress", "label": "Daily Hours", "scope": "overview" },
+    { "type": "values", "label": "Hours Balance", "scope": "overview" },
+    { "type": "progress", "label": "Monthly Spend", "scope": "detail" },
+    { "type": "values", "label": "Active Sessions", "scope": "detail" }
+  ]
+}

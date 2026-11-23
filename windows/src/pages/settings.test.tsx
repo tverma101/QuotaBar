@@ -1,0 +1,667 @@
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react"
+import type { ReactNode } from "react"
+import userEvent from "@testing-library/user-event"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+const tauriMocks = vi.hoisted(() => ({
+  invoke: vi.fn(() => Promise.resolve()),
+  isTauri: vi.fn(() => false),
+}))
+
+const settingsMocks = vi.hoisted(() => ({
+  resetAllUserPreferences: vi.fn(() => Promise.resolve()),
+  loadPersistUsageHistory: vi.fn(() => Promise.resolve(false)),
+  loadUsageHistoryRetentionDays: vi.fn(() => Promise.resolve(90)),
+}))
+
+const autostartMocks = vi.hoisted(() => ({
+  disable: vi.fn(() => Promise.resolve()),
+}))
+
+let latestOnDragEnd: ((event: any) => void) | undefined
+
+vi.mock("@dnd-kit/core", () => ({
+  DndContext: ({ children, onDragEnd }: { children: ReactNode; onDragEnd?: (event: any) => void }) => {
+    latestOnDragEnd = onDragEnd
+    return <div data-testid="dnd-context">{children}</div>
+  },
+  closestCenter: vi.fn(),
+  PointerSensor: class { },
+  KeyboardSensor: class { },
+  useSensor: vi.fn((_sensor: any, options?: any) => ({ sensor: _sensor, options })),
+  useSensors: vi.fn((...sensors: any[]) => sensors),
+}))
+
+vi.mock("@dnd-kit/sortable", () => ({
+  arrayMove: (items: any[], from: number, to: number) => {
+    const next = [...items]
+    const [moved] = next.splice(from, 1)
+    next.splice(to, 0, moved)
+    return next
+  },
+  SortableContext: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  sortableKeyboardCoordinates: vi.fn(),
+  useSortable: () => ({
+    attributes: {},
+    listeners: {},
+    setNodeRef: vi.fn(),
+    transform: null,
+    transition: undefined,
+    isDragging: false,
+  }),
+  verticalListSortingStrategy: vi.fn(),
+}))
+
+vi.mock("@dnd-kit/utilities", () => ({
+  CSS: { Transform: { toString: () => "" } },
+}))
+
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(() => Promise.resolve()),
+}))
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: tauriMocks.invoke,
+  isTauri: tauriMocks.isTauri,
+}))
+
+vi.mock("@tauri-apps/plugin-autostart", () => ({
+  disable: autostartMocks.disable,
+}))
+
+vi.mock("@/lib/settings", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/settings")>()
+  return {
+    ...actual,
+    resetAllUserPreferences: settingsMocks.resetAllUserPreferences,
+    loadPersistUsageHistory: settingsMocks.loadPersistUsageHistory,
+    loadUsageHistoryRetentionDays: settingsMocks.loadUsageHistoryRetentionDays,
+  }
+})
+
+import { openUrl } from "@tauri-apps/plugin-opener"
+import { SettingsPage } from "@/pages/settings"
+import { I18nProvider } from "@/components/i18n-provider"
+
+function renderSettings(props: React.ComponentProps<typeof SettingsPage>) {
+  return render(
+    <I18nProvider>
+      <SettingsPage {...props} />
+    </I18nProvider>,
+  )
+}
+
+const defaultProps = {
+  plugins: [{ id: "a", baseProviderId: "a", name: "Alpha", enabled: true, primaryCandidates: [], trayReadoutLabels: [], trayLines: [] }],
+  onReorder: vi.fn(),
+  onToggle: vi.fn(),
+  onTrayLineToggle: vi.fn(),
+  onAddProviderAccount: vi.fn(),
+  onUpdateProviderAccountCredentials: vi.fn(),
+  onRenameProviderAccount: vi.fn(),
+  onRemoveProviderAccount: vi.fn(),
+  autoUpdateInterval: 15 as const,
+  onAutoUpdateIntervalChange: vi.fn(),
+  themeMode: "system" as const,
+  onThemeModeChange: vi.fn(),
+  uiLayout: "classic" as const,
+  onUILayoutChange: vi.fn(),
+  modernDensity: "regular" as const,
+  onModernDensityChange: vi.fn(),
+  displayMode: "used" as const,
+  onDisplayModeChange: vi.fn(),
+  resetTimerDisplayMode: "relative" as const,
+  onResetTimerDisplayModeChange: vi.fn(),
+  timeFormatMode: "auto" as const,
+  onTimeFormatModeChange: vi.fn(),
+  appLocale: "auto" as const,
+  onAppLocaleChange: vi.fn(),
+  displayCurrency: "auto" as const,
+  onDisplayCurrencyChange: vi.fn(),
+  menubarIconStyle: "provider" as const,
+  onMenubarIconStyleChange: vi.fn(),
+  preferMenubarWeeklyLimit: false,
+  onPreferMenubarWeeklyLimitChange: vi.fn(),
+  traySettingsPreview: {
+    bars: [{ id: "a", items: [{ label: "Primary", fraction: 0.7 }] }],
+    providerBars: [{ id: "a", items: [{ label: "Primary", fraction: 0.7 }] }],
+    providerIconUrl: "icon-a",
+    providerIconUrls: { a: "icon-a" },
+    providerPercentText: "70%",
+  },
+  globalShortcut: null,
+  onGlobalShortcutChange: vi.fn(),
+  startHidden: false,
+  onStartHiddenChange: vi.fn(),
+  startOnLogin: false,
+  onStartOnLoginChange: vi.fn(),
+  usageAlertEnabled: false,
+  onUsageAlertEnabledChange: vi.fn(),
+  usageAlertThreshold: 20 as const,
+  onUsageAlertThresholdChange: vi.fn(),
+  customUsageAlertThreshold: null,
+  onUsageAlertCustomThresholdChange: vi.fn(),
+  usageAlertSound: "Basso" as const,
+  onUsageAlertSoundChange: vi.fn(),
+  usagePaceAlertEnabled: true,
+  onUsagePaceAlertEnabledChange: vi.fn(),
+  usageSpikeAlertEnabled: false,
+  onUsageSpikeAlertEnabledChange: vi.fn(),
+  usageSpikeAlertThresholdPct: 50 as const,
+  onUsageSpikeAlertThresholdPctChange: vi.fn(),
+  uiScale: "normal" as const,
+  onUIScaleChange: vi.fn(),
+  showAccountIdentity: true,
+  onShowAccountIdentityChange: vi.fn(),
+  cursorRequestsLineAvailable: null,
+  onSetTrayReadout: vi.fn(),
+}
+
+afterEach(() => {
+  cleanup()
+})
+
+beforeEach(() => {
+  tauriMocks.invoke.mockResolvedValue(undefined)
+  tauriMocks.isTauri.mockReturnValue(false)
+  settingsMocks.resetAllUserPreferences.mockResolvedValue(undefined)
+  settingsMocks.loadPersistUsageHistory.mockResolvedValue(false)
+  settingsMocks.loadUsageHistoryRetentionDays.mockResolvedValue(90)
+  autostartMocks.disable.mockResolvedValue(undefined)
+})
+
+describe("SettingsPage", () => {
+  it("toggles plugins", async () => {
+    const onToggle = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      plugins: [
+          { id: "b", baseProviderId: "b", name: "Beta", enabled: false, primaryCandidates: [], trayReadoutLabels: [], trayLines: [] },
+        ],
+      onToggle,
+    })
+    const checkboxes = screen.getAllByRole("checkbox")
+    await userEvent.click(checkboxes[checkboxes.length - 1])
+    expect(onToggle).toHaveBeenCalledWith("b")
+  })
+
+  it("reorders plugins on drag end", () => {
+    const onReorder = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      plugins: [
+          { id: "a", baseProviderId: "a", name: "Alpha", enabled: true, primaryCandidates: [], trayReadoutLabels: [], trayLines: [] },
+          { id: "b", baseProviderId: "b", name: "Beta", enabled: true, primaryCandidates: [], trayReadoutLabels: [], trayLines: [] },
+        ],
+      onReorder,
+    })
+    latestOnDragEnd?.({ active: { id: "a" }, over: { id: "b" } })
+    expect(onReorder).toHaveBeenCalledWith(["b", "a"])
+  })
+
+  it("ignores invalid drag end", () => {
+    const onReorder = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onReorder,
+    })
+    latestOnDragEnd?.({ active: { id: "a" }, over: null })
+    latestOnDragEnd?.({ active: { id: "a" }, over: { id: "a" } })
+    expect(onReorder).not.toHaveBeenCalled()
+  })
+
+  it("shows account controls and submits inline account forms", async () => {
+    const user = userEvent.setup()
+    const onAddProviderAccount = vi.fn()
+    const onUpdateProviderAccountCredentials = vi.fn()
+    const onRenameProviderAccount = vi.fn()
+    const onRemoveProviderAccount = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      plugins: [
+          { id: "claude", baseProviderId: "claude", name: "Claude", enabled: true, primaryCandidates: [], trayReadoutLabels: [], trayLines: [] },
+          {
+            id: "claude:work",
+            baseProviderId: "claude",
+            instanceLabel: "Work",
+            name: "Claude (Work)",
+            enabled: true,
+            primaryCandidates: [],
+            trayReadoutLabels: [],
+            trayLines: [],
+          },
+        ],
+      onAddProviderAccount,
+      onUpdateProviderAccountCredentials,
+      onRenameProviderAccount,
+      onRemoveProviderAccount,
+    })
+
+    await user.click(screen.getByRole("button", { name: "Add account" }))
+    await user.type(screen.getByLabelText("Access token"), "claude-work-token")
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await user.click(screen.getAllByRole("button", { name: "Set credentials" })[1])
+    await user.clear(screen.getByLabelText("Account label"))
+    await user.type(screen.getByLabelText("Account label"), "Work")
+    await user.type(screen.getByLabelText("Access token"), "updated-token")
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await user.click(screen.getAllByRole("button", { name: "Rename" })[1])
+    await user.clear(screen.getByLabelText("Account label"))
+    await user.type(screen.getByLabelText("Account label"), "Personal")
+    await user.click(screen.getByRole("button", { name: "Save" }))
+
+    await user.click(screen.getByRole("button", { name: "Remove account" }))
+
+    expect(onAddProviderAccount).toHaveBeenCalledWith("claude", {
+      label: "Work",
+      accessToken: "claude-work-token",
+      refreshToken: "",
+      sessionKey: "",
+    })
+    expect(onUpdateProviderAccountCredentials).toHaveBeenCalledWith("claude:work", {
+      label: "Work",
+      accessToken: "updated-token",
+      refreshToken: "",
+      sessionKey: "",
+    })
+    expect(onRenameProviderAccount).toHaveBeenCalledWith("claude:work", "Personal")
+    expect(onRemoveProviderAccount).toHaveBeenCalledWith("claude:work")
+    expect(screen.getAllByRole("button", { name: "Add account" })).toHaveLength(1)
+    expect(screen.getAllByRole("button", { name: "Remove account" })).toHaveLength(1)
+  })
+
+  it("renames the base account and clears the label when empty", async () => {
+    const user = userEvent.setup()
+    const onRenameProviderAccount = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      plugins: [
+        { id: "claude", baseProviderId: "claude", name: "Claude", enabled: true, primaryCandidates: [], trayReadoutLabels: [], trayLines: [] },
+      ],
+      onRenameProviderAccount,
+    })
+
+    expect(screen.queryByRole("button", { name: "Remove account" })).not.toBeInTheDocument()
+    await user.click(screen.getByRole("button", { name: "Rename" }))
+    expect(screen.getByText("Leave empty to show the provider name only.")).toBeInTheDocument()
+    await user.type(screen.getByLabelText("Account label"), "Work CIP")
+    await user.click(screen.getByRole("button", { name: "Save" }))
+    expect(onRenameProviderAccount).toHaveBeenCalledWith("claude", "Work CIP")
+
+    await user.click(screen.getByRole("button", { name: "Rename" }))
+    await user.clear(screen.getByLabelText("Account label"))
+    await user.click(screen.getByRole("button", { name: "Save" }))
+    expect(onRenameProviderAccount).toHaveBeenLastCalledWith("claude", "")
+  })
+
+  it("does not show the raw provider id under a labeled base account", () => {
+    renderSettings({
+      ...defaultProps,
+      plugins: [
+        {
+          id: "claude",
+          baseProviderId: "claude",
+          instanceLabel: "Work CIP",
+          name: "Claude (Work CIP)",
+          enabled: true,
+          primaryCandidates: [],
+          trayReadoutLabels: [],
+          trayLines: [],
+        },
+        {
+          id: "claude:work",
+          baseProviderId: "claude",
+          instanceLabel: "Work",
+          name: "Claude (Work)",
+          enabled: true,
+          primaryCandidates: [],
+          trayReadoutLabels: [],
+          trayLines: [],
+        },
+      ],
+    })
+
+    expect(screen.getByText("Claude (Work CIP)")).toBeInTheDocument()
+    expect(screen.getByText("Claude (Work)")).toBeInTheDocument()
+    expect(screen.getByText("claude")).toBeInTheDocument()
+    expect(screen.getAllByText("claude")).toHaveLength(1)
+  })
+
+  it("does not prefill credentials with a base display label", async () => {
+    const user = userEvent.setup()
+    const onUpdateProviderAccountCredentials = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      plugins: [
+        {
+          id: "claude",
+          baseProviderId: "claude",
+          instanceLabel: "Work CIP",
+          name: "Claude (Work CIP)",
+          enabled: true,
+          primaryCandidates: [],
+          trayReadoutLabels: [],
+          trayLines: [],
+        },
+      ],
+      onUpdateProviderAccountCredentials,
+    })
+
+    await user.click(screen.getByRole("button", { name: "Set credentials" }))
+    expect(screen.getByLabelText("Account label")).toHaveValue("Claude")
+    await user.type(screen.getByLabelText("Access token"), "tok")
+    await user.click(screen.getByRole("button", { name: "Save" }))
+    expect(onUpdateProviderAccountCredentials).toHaveBeenCalledWith("claude", {
+      label: "Claude",
+      accessToken: "tok",
+      refreshToken: "",
+      sessionKey: "",
+    })
+  })
+
+  it("opens GitHub tutorial when adding a Claude account", async () => {
+    const user = userEvent.setup()
+    vi.mocked(openUrl).mockClear()
+    renderSettings({
+      ...defaultProps,
+      plugins: [
+          { id: "claude", baseProviderId: "claude", name: "Claude", enabled: true, primaryCandidates: [], trayReadoutLabels: [], trayLines: [] },
+        ],
+    })
+    await user.click(screen.getByRole("button", { name: "Add account" }))
+    await user.click(screen.getByRole("button", { name: "Step-by-step: where to copy tokens (opens GitHub)" }))
+    expect(openUrl).toHaveBeenCalledWith(
+      "https://github.com/tverma101/QuotaBar/blob/HEAD/windows/docs/providers/multi-account-credentials.md"
+    )
+  })
+
+  it("updates auto-update interval", async () => {
+    const onAutoUpdateIntervalChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onAutoUpdateIntervalChange,
+    })
+    await userEvent.click(screen.getByText("30 min"))
+    expect(onAutoUpdateIntervalChange).toHaveBeenCalledWith(30)
+  })
+
+  it("shows auto-update helper text", () => {
+    renderSettings({ ...defaultProps })
+    expect(screen.getByText("How obsessive are you")).toBeInTheDocument()
+  })
+
+  it("renders app theme section with theme options", () => {
+    renderSettings({ ...defaultProps })
+    expect(screen.getByText("App Theme")).toBeInTheDocument()
+    expect(screen.getByText("How it looks around here")).toBeInTheDocument()
+    expect(screen.getByText("System")).toBeInTheDocument()
+    expect(screen.getByText("Light")).toBeInTheDocument()
+    expect(screen.getByText("Dark")).toBeInTheDocument()
+    expect(screen.getByText("Glass")).toBeInTheDocument()
+  })
+
+  it("updates theme mode", async () => {
+    const onThemeModeChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onThemeModeChange,
+    })
+    await userEvent.click(screen.getByText("Dark"))
+    expect(onThemeModeChange).toHaveBeenCalledWith("dark")
+  })
+
+  it("updates glass theme mode", async () => {
+    const onThemeModeChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onThemeModeChange,
+    })
+    await userEvent.click(screen.getByText("Glass"))
+    expect(onThemeModeChange).toHaveBeenCalledWith("glass")
+  })
+
+  it("updates display mode", async () => {
+    const onDisplayModeChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onDisplayModeChange,
+    })
+    await userEvent.click(screen.getByRole("radio", { name: "Left" }))
+    expect(onDisplayModeChange).toHaveBeenCalledWith("left")
+  })
+
+  it("updates reset timer display mode", async () => {
+    const onResetTimerDisplayModeChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onResetTimerDisplayModeChange,
+    })
+    await userEvent.click(screen.getByRole("radio", { name: /Absolute/ }))
+    expect(onResetTimerDisplayModeChange).toHaveBeenCalledWith("absolute")
+  })
+
+  it("renders renamed usage section heading", () => {
+    renderSettings({ ...defaultProps })
+    expect(screen.getByText("Usage Mode")).toBeInTheDocument()
+  })
+
+  it("renders reset timers section heading", () => {
+    renderSettings({ ...defaultProps })
+    expect(screen.getByText("Reset Timers")).toBeInTheDocument()
+  })
+
+  it("renders time format section heading", () => {
+    renderSettings({ ...defaultProps })
+    expect(screen.getByText("Time Format")).toBeInTheDocument()
+    expect(screen.getByText("12-hour or 24-hour clock")).toBeInTheDocument()
+  })
+
+  it("updates time format mode to 12h", async () => {
+    const onTimeFormatModeChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onTimeFormatModeChange,
+    })
+    await userEvent.click(screen.getByRole("radio", { name: "12-hour" }))
+    expect(onTimeFormatModeChange).toHaveBeenCalledWith("12h")
+  })
+
+  it("updates time format mode to 24h", async () => {
+    const onTimeFormatModeChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onTimeFormatModeChange,
+    })
+    await userEvent.click(screen.getByRole("radio", { name: "24-hour" }))
+    expect(onTimeFormatModeChange).toHaveBeenCalledWith("24h")
+  })
+
+  it("renders menubar icon section", () => {
+    renderSettings({ ...defaultProps })
+    expect(screen.getByText("Tray / menu bar icon")).toBeInTheDocument()
+    expect(
+      screen.getByText(/What shows next to the clock/i),
+    ).toBeInTheDocument()
+  })
+
+  it("clicking Battery bars triggers onMenubarIconStyleChange(\"bars\")", async () => {
+    const onMenubarIconStyleChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onMenubarIconStyleChange,
+    })
+    await userEvent.click(screen.getByRole("radio", { name: "Battery bars" }))
+    expect(onMenubarIconStyleChange).toHaveBeenCalledWith("bars")
+  })
+
+  it("clicking Pie chart triggers onMenubarIconStyleChange(\"donut\")", async () => {
+    const onMenubarIconStyleChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onMenubarIconStyleChange,
+    })
+    await userEvent.click(screen.getByRole("radio", { name: "Pie chart" }))
+    expect(onMenubarIconStyleChange).toHaveBeenCalledWith("donut")
+  })
+
+  it("opens tray readout dialog with per-plugin meters", async () => {
+    const onMenubarIconStyleChange = vi.fn()
+    const onSetTrayReadout = vi.fn()
+    const user = userEvent.setup()
+    renderSettings({
+      ...defaultProps,
+      menubarIconStyle: "bars",
+      plugins: [
+        {
+          id: "claude",
+          baseProviderId: "claude",
+          name: "Claude",
+          enabled: true,
+          primaryCandidates: ["Session"],
+          trayReadoutLabels: ["Session", "Weekly", "Fable", "Sonnet", "Claude Design", "Extra usage spent"],
+          trayLines: ["Session"],
+        },
+        {
+          id: "antigravity",
+          baseProviderId: "antigravity",
+          name: "Antigravity",
+          enabled: true,
+          primaryCandidates: ["Session", "Weekly"],
+          trayReadoutLabels: [
+            "Session",
+            "Weekly",
+            "Session — Claude and GPT Models",
+            "Weekly — Claude and GPT Models",
+          ],
+          trayLines: ["Session"],
+        },
+      ],
+      onMenubarIconStyleChange,
+      onSetTrayReadout,
+    })
+    await user.click(screen.getByRole("radio", { name: "Pie chart" }))
+    expect(screen.getByRole("dialog", { name: "Tray readout" })).toBeInTheDocument()
+    await user.click(screen.getByRole("radio", { name: "Antigravity" }))
+    expect(screen.getByRole("radio", { name: "Session — Claude and GPT Models" })).toBeInTheDocument()
+    await user.click(screen.getByRole("radio", { name: /^Weekly$/ }))
+    await user.click(screen.getByRole("button", { name: "Apply" }))
+    expect(onSetTrayReadout).toHaveBeenCalledWith("antigravity", "Weekly")
+    expect(onMenubarIconStyleChange).toHaveBeenCalledWith("donut")
+  })
+
+  it("clicking Logo fill and All logos triggers tray style changes", async () => {
+    const onMenubarIconStyleChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onMenubarIconStyleChange,
+    })
+    await userEvent.click(screen.getByRole("radio", { name: "Logo fill" }))
+    await userEvent.click(screen.getByRole("radio", { name: "All logos" }))
+    expect(onMenubarIconStyleChange).toHaveBeenCalledWith("logoBar")
+    expect(onMenubarIconStyleChange).toHaveBeenCalledWith("logoGrid")
+  })
+
+  it("does not render removed bar icon controls", () => {
+    renderSettings({ ...defaultProps })
+    expect(screen.queryByText("Bar Icon")).not.toBeInTheDocument()
+    expect(screen.queryByText("Show percentage")).not.toBeInTheDocument()
+  })
+
+  it("toggles menubar weekly limit preference", async () => {
+    const onPreferMenubarWeeklyLimitChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onPreferMenubarWeeklyLimitChange,
+    })
+
+    await userEvent.click(screen.getByText("Prefer weekly limits when available"))
+    expect(onPreferMenubarWeeklyLimitChange).toHaveBeenCalledWith(true)
+  })
+
+  it("toggles start on login checkbox", async () => {
+    const onStartOnLoginChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onStartOnLoginChange,
+    })
+    await userEvent.click(screen.getByText("Start on login"))
+    expect(onStartOnLoginChange).toHaveBeenCalledWith(true)
+  })
+
+  it("groups compact settings without hiding classic controls", async () => {
+    const user = userEvent.setup()
+    renderSettings({ ...defaultProps, compactSettings: true })
+
+    const settingsSections = screen.getByRole("navigation", { name: "Settings sections" })
+    expect(screen.queryByRole("checkbox", { name: "Start hidden" })).toBeNull()
+    const advanced = within(settingsSections).getByRole("button", { name: "Advanced" })
+    await user.click(advanced)
+    expect(advanced).toHaveAttribute("aria-pressed", "true")
+    expect(screen.getByRole("checkbox", { name: "Start hidden" })).toBeVisible()
+    expect(screen.queryByText("Allow product polls")).toBeNull()
+  })
+
+  it("toggles start hidden checkbox", async () => {
+    const onStartHiddenChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      onStartHiddenChange,
+    })
+    await userEvent.click(screen.getByRole("checkbox", { name: "Start hidden" }))
+    expect(onStartHiddenChange).toHaveBeenCalledWith(true)
+  })
+
+  it("toggles account identity visibility", async () => {
+    const onShowAccountIdentityChange = vi.fn()
+    renderSettings({
+      ...defaultProps,
+      showAccountIdentity: false,
+      onShowAccountIdentityChange,
+    })
+    await userEvent.click(screen.getByText("Show account identity"))
+    expect(onShowAccountIdentityChange).toHaveBeenCalledWith(true)
+  })
+
+  it("clears the OS global shortcut when resetting all settings", async () => {
+    tauriMocks.isTauri.mockReturnValue(true)
+    vi.spyOn(window, "confirm").mockReturnValue(true)
+    renderSettings({ ...defaultProps })
+
+    await userEvent.click(screen.getByRole("button", { name: "Reset all settings" }))
+
+    await waitFor(() => {
+      expect(settingsMocks.resetAllUserPreferences).toHaveBeenCalled()
+      expect(tauriMocks.invoke).toHaveBeenCalledWith("update_global_shortcut", {
+        shortcut: null,
+      })
+    })
+  })
+
+  it("reloads usage-history controls after reset so persist matches defaults", async () => {
+    settingsMocks.loadPersistUsageHistory.mockResolvedValue(true)
+    vi.spyOn(window, "confirm").mockReturnValue(true)
+    renderSettings({ ...defaultProps })
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("checkbox", {
+          name: "Save usage snapshots after successful refreshes",
+        }),
+      ).toBeChecked()
+    })
+
+    settingsMocks.loadPersistUsageHistory.mockResolvedValue(false)
+    await userEvent.click(screen.getByRole("button", { name: "Reset all settings" }))
+
+    await waitFor(() => {
+      expect(settingsMocks.resetAllUserPreferences).toHaveBeenCalled()
+      expect(
+        screen.getByRole("checkbox", {
+          name: "Save usage snapshots after successful refreshes",
+        }),
+      ).not.toBeChecked()
+    })
+  })
+})

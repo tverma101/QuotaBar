@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.7.2-beta.1
+
+This beta ships the Windows x64 installer. The native macOS app is available to build from source at the same tag.
+
+### New Features
+
+- Windows x64 tray app with a per-user installer, provider settings, and a bundled CLI. [#50](https://github.com/tverma101/QuotaBar/pull/50) by @tverma101
+- Open GitHub Releases from About QuotaBar for downloads and manual updates. [#50](https://github.com/tverma101/QuotaBar/pull/50) by @tverma101
+- Group Codex accounts under one menu-bar icon. [#22](https://github.com/tverma101/QuotaBar/pull/22) by @tverma101
+- Show provider usage imported from VM Box on macOS. [#29](https://github.com/tverma101/QuotaBar/pull/29) by @tverma101
+- Blur macOS account names by default and reveal them on click. [#38](https://github.com/tverma101/QuotaBar/pull/38) by @tverma101
+
+### Bug Fixes
+
+- Preserve provider ordering and established settings. [#26](https://github.com/tverma101/QuotaBar/pull/26) by @tverma101
+- Show Claude Extra Usage in the provider's billing currency. [#27](https://github.com/tverma101/QuotaBar/pull/27) by @tverma101
+- Keep the last known Antigravity history when the conversation database is temporarily unavailable. [#28](https://github.com/tverma101/QuotaBar/pull/28) by @tverma101
+- Restore recent accounting and provider refresh fixes, including support for compressed Codex logs. [#36](https://github.com/tverma101/QuotaBar/pull/36) by @tverma101
+
+### Chores
+
+- Reduce macOS accounting overhead with Rust parsing for Claude and Codex logs and a compact pricing fallback. [#34](https://github.com/tverma101/QuotaBar/pull/34), [#35](https://github.com/tverma101/QuotaBar/pull/35), [#37](https://github.com/tverma101/QuotaBar/pull/37) by @tverma101
+- Cut CPU work when the macOS panel is closed. [#39](https://github.com/tverma101/QuotaBar/pull/39) by @tverma101
+- Restore coverage across the test suites and add a Windows installer build to CI. [#30](https://github.com/tverma101/QuotaBar/pull/30), [#50](https://github.com/tverma101/QuotaBar/pull/50) by @tverma101
+- Update the macOS PostHog SDK to 3.94.4. [#32](https://github.com/tverma101/QuotaBar/pull/32) by @dependabot
+
+### Installation and Updates
+
+- **Windows 11 x64.** Run the setup executable and open QuotaBar from Start. The dashboard is available from the gauge in the notification area. The installer is unsigned, so Windows may show a publisher or SmartScreen prompt.
+- **macOS 15 or later.** Install Xcode 26 or later and stable Rust, check out this release tag, and follow the [source build instructions](https://github.com/tverma101/QuotaBar/blob/v0.7.2-beta.1/README.md#build-from-source).
+- For updates, open **About QuotaBar → Downloads and Updates**. Quit QuotaBar before installing a newer Windows build. On macOS, check out the newer tag and rebuild.
+
 ## v0.7.1
 
 QuotaBar's first public downloadable build. It does not update automatically; users replace the app in `/Applications` manually.

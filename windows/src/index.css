@@ -1,0 +1,684 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./motion.css";
+@import "./motion-fx.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --radius-4xl: calc(var(--radius) + 16px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-page-accent: var(--page-accent);
+  --color-green-500: var(--green-500);
+  --color-yellow-500: var(--yellow-500);
+  --color-red-500: var(--red-500);
+}
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.13 0.028 261.692);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.13 0.028 261.692);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.13 0.028 261.692);
+  --primary: oklch(0.21 0.034 264.665);
+  --primary-foreground: oklch(0.985 0.002 247.839);
+  --secondary: oklch(0.967 0.003 264.542);
+  --secondary-foreground: oklch(0.21 0.034 264.665);
+  --muted: oklch(0.967 0.003 264.542);
+  --muted-foreground: oklch(0.551 0.027 264.364);
+  --accent: oklch(0.967 0.003 264.542);
+  --accent-foreground: oklch(0.21 0.034 264.665);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.928 0.006 264.531);
+  --input: oklch(0.928 0.006 264.531);
+  --ring: oklch(0.707 0.022 261.325);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0.002 247.839);
+  --sidebar-foreground: oklch(0.13 0.028 261.692);
+  --sidebar-primary: oklch(0.21 0.034 264.665);
+  --sidebar-primary-foreground: oklch(0.985 0.002 247.839);
+  --sidebar-accent: oklch(0.967 0.003 264.542);
+  --sidebar-accent-foreground: oklch(0.21 0.034 264.665);
+  --sidebar-border: oklch(0.928 0.006 264.531);
+  --sidebar-ring: oklch(0.707 0.022 261.325);
+
+  /* Tailwind green/yellow/red-500 (light: stock defaults) */
+  --green-500: oklch(0.723 0.219 142.37);
+  --yellow-500: oklch(0.795 0.184 86.047);
+  --red-500: oklch(0.637 0.237 25.331);
+}
+
+:root.dark {
+  --background: #1c1c1e;
+  --foreground: #ededed;
+  --card: #1c1c1e;
+  --card-foreground: #ededed;
+  --popover: #2c2c2e;
+  --popover-foreground: #ededed;
+  --primary: #ededed;
+  --primary-foreground: #0a0a0a;
+  --secondary: #252527;
+  --secondary-foreground: #ededed;
+  --muted: #2a2a2c;
+  --muted-foreground: #888888;
+  --accent: #252527;
+  --accent-foreground: #ededed;
+  --destructive: #ef4444;
+  --border: rgba(255, 255, 255, 0.08);
+  --input: rgba(255, 255, 255, 0.08);
+  --ring: #555555;
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: #2a2a2c;
+  --sidebar-foreground: #ededed;
+  --sidebar-primary: #ededed;
+  --sidebar-primary-foreground: #0a0a0a;
+  --sidebar-accent: #2a2a2c;
+  --sidebar-accent-foreground: #ededed;
+  --sidebar-border: rgba(255, 255, 255, 0.08);
+  --sidebar-ring: #555555;
+
+  /* Accent highlight (lime) */
+  --page-accent: #BFFF00;
+
+  /* Tailwind green/yellow/red-500 derived from page-accent lime
+     #BFFF00 ≈ oklch(0.93 0.27 128) — hue-rotate, keep chroma family */
+  --green-500: oklch(0.93 0.27 128);
+  --yellow-500: oklch(0.90 0.21 85);
+  --red-500: oklch(0.70 0.24 29);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  /* WebKitGTK (Tauri Linux): native <select> / inputs follow color-scheme; without this, dropdown chrome can stay light while text follows the app theme → white-on-white. */
+  html.dark {
+    color-scheme: dark;
+  }
+  html:not(.dark) {
+    color-scheme: light;
+  }
+}
+
+/* UI scale: reduce font size and spacing globally */
+html.small {
+  font-size: 14px;
+}
+html.compact {
+  font-size: 11px;
+}
+
+/* Panel-specific styles for transparent Tauri window */
+html,
+body,
+#root {
+  background: transparent;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.app-panel-surface {
+  background: var(--card);
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.16);
+}
+
+.app-popover-shell {
+  position: relative;
+  padding-top: 10px;
+}
+
+/* Native title bar (Linux/Windows): no arrow spacer above the panel. */
+html:not(.tauri-popover) .app-popover-shell {
+  padding-top: 0;
+}
+
+/*
+ * Without macOS maxHeight on `.app-panel-surface`, the flex column height was
+ * content-sized, so `h-full` on the main scroll region matched content height
+ * and wheel scrolling never activated. Fill the webview and let the panel grow
+ * with flex so `overflow-y: auto` has a bounded box.
+ */
+html:not(.tauri-popover) #root {
+  display: flex;
+  flex-direction: column;
+}
+
+html:not(.tauri-popover) .app-popover-shell {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+html:not(.tauri-popover) .app-panel-surface {
+  flex: 1;
+  min-height: 0;
+}
+
+.tray-arrow {
+  position: absolute;
+  top: 2px;
+  left: 50%;
+  width: 14px;
+  height: 14px;
+  transform: translateX(-50%) rotate(45deg);
+  background: var(--card);
+  border-top: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  border-top-left-radius: 2px;
+  box-shadow: -4px -4px 10px rgba(15, 23, 42, 0.08);
+  z-index: 3;
+}
+
+.app-panel-surface::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px var(--border);
+  pointer-events: none;
+}
+
+:root.dark .app-panel-surface {
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.36);
+}
+
+:root.dark .tray-arrow {
+  box-shadow: -5px -5px 12px rgba(0, 0, 0, 0.24);
+}
+
+.app-side-nav {
+  background: var(--muted);
+}
+
+:root.dark .app-side-nav {
+  background: var(--card);
+}
+
+.app-main-pane {
+  background: var(--card);
+}
+
+:root.dark .app-main-pane {
+  background: var(--muted);
+}
+
+.app-scroll-fade {
+  background: linear-gradient(to top, var(--card), transparent);
+}
+
+:root.dark .app-scroll-fade {
+  background: linear-gradient(to top, var(--muted), transparent);
+}
+
+/* ─── Liquid Glass (Linux / WebKitGTK: CSS backdrop-filter only) ─────────────
+   macOS can use native Liquid Glass on the window via the Tauri plugin; Linux
+   has no public Apple material API — appearance here is layered CSS only.
+   Expect a composited desktop (Wayland/X11 + compositor); without blur support,
+   we fall back to solid --card / --muted surfaces (see @supports block below).
+   Strategy: backdrop blur + translucent fill + rim inset shadows + specular
+   ::before + slow ::after shimmer; hierarchy: panel > side-nav / main > cards.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+:root.glass {
+  /* Ultra-subtle grain on the outer panel only; 0 = off (default). Try 0.012–0.018 on Linux if desired. */
+  --glass-noise-opacity: 0;
+
+  /* Outer shell — strongest blur / depth */
+  --glass-panel-blur: 28px;
+  --glass-panel-sat: 185%;
+  --glass-panel-bright: 1.02;
+  --glass-panel-fill: rgba(255, 255, 255, 0.88);
+  --glass-panel-border: rgba(255, 255, 255, 0.38);
+  --glass-panel-rim-top: rgba(255, 255, 255, 0.55);
+  --glass-panel-rim-bottom: rgba(0, 0, 0, 0.05);
+  --glass-panel-ambient-1: rgba(15, 23, 42, 0.14);
+  --glass-panel-ambient-2: rgba(0, 0, 0, 0.06);
+  --glass-panel-spec-a: rgba(255, 255, 255, 0.22);
+  --glass-panel-spec-b: rgba(255, 255, 255, 0.05);
+  --glass-panel-spec-angle: 145deg;
+  --glass-panel-shimmer-mid: rgba(255, 255, 255, 0.075);
+  --glass-panel-shimmer-opacity: 0.85;
+
+  /* Side nav — slightly more blur than main for separation */
+  --glass-nav-blur: 40px;
+  --glass-nav-sat: 188%;
+  --glass-nav-contrast: 1.12;
+  --glass-nav-fill: rgba(255, 255, 255, 0.86);
+  --glass-nav-border: rgba(255, 255, 255, 0.26);
+  --glass-nav-inset-v: rgba(255, 255, 255, 0.16);
+  --glass-nav-inset-h: rgba(255, 255, 255, 0.20);
+
+  /* Main pane — softer than panel, clearer than cards */
+  --glass-main-blur: 36px;
+  --glass-main-sat: 165%;
+  --glass-main-contrast: 1.08;
+  --glass-main-fill: rgba(255, 255, 255, 0.84);
+  --glass-main-inset-x: rgba(255, 255, 255, 0.22);
+  --glass-main-inset-y: rgba(255, 255, 255, 0.14);
+
+  /* Provider cards — lightest blur, inset in the hierarchy */
+  --glass-card-blur: 16px;
+  --glass-card-sat: 168%;
+  --glass-card-fill: rgba(255, 255, 255, 0.90);
+  --glass-card-fill-hover: rgba(255, 255, 255, 0.96);
+  --glass-card-border: rgba(255, 255, 255, 0.28);
+  --glass-card-rim: rgba(255, 255, 255, 0.45);
+  --glass-card-rim-hover: rgba(255, 255, 255, 0.55);
+  --glass-card-ambient: rgba(15, 23, 42, 0.08);
+  --glass-card-ambient-hover: rgba(0, 0, 0, 0.10);
+  --glass-card-spec-a: rgba(255, 255, 255, 0.16);
+  --glass-card-spec-b: transparent;
+
+  /* Scroll mask */
+  --glass-scroll-a: rgba(255, 255, 255, 0.50);
+  --glass-scroll-b: rgba(255, 255, 255, 0.16);
+}
+
+:root.dark.glass {
+  --muted-foreground: #b8b8b8;
+
+  --glass-panel-blur: 30px;
+  --glass-panel-sat: 155%;
+  --glass-panel-bright: 0.98;
+  --glass-panel-fill: rgba(18, 18, 24, 0.92);
+  --glass-panel-border: rgba(255, 255, 255, 0.16);
+  --glass-panel-rim-top: rgba(255, 255, 255, 0.12);
+  --glass-panel-rim-bottom: rgba(0, 0, 0, 0.18);
+  --glass-panel-ambient-1: rgba(0, 0, 0, 0.42);
+  --glass-panel-ambient-2: rgba(0, 0, 0, 0.22);
+  --glass-panel-spec-a: rgba(255, 255, 255, 0.09);
+  --glass-panel-spec-b: rgba(255, 255, 255, 0.02);
+  --glass-panel-spec-angle: 135deg;
+  --glass-panel-shimmer-mid: rgba(255, 255, 255, 0.04);
+  --glass-panel-shimmer-opacity: 0.65;
+
+  --glass-nav-blur: 44px;
+  --glass-nav-sat: 170%;
+  --glass-nav-contrast: 1.08;
+  --glass-nav-fill: rgba(25, 25, 30, 0.92);
+  --glass-nav-border: rgba(255, 255, 255, 0.12);
+  --glass-nav-inset-v: rgba(255, 255, 255, 0.07);
+  --glass-nav-inset-h: rgba(255, 255, 255, 0.10);
+
+  --glass-main-sat: 145%;
+  --glass-main-contrast: 1.04;
+  --glass-main-fill: rgba(22, 22, 28, 0.90);
+  --glass-main-inset-x: rgba(255, 255, 255, 0.10);
+  --glass-main-inset-y: rgba(255, 255, 255, 0.08);
+
+  --glass-card-fill: rgba(34, 34, 42, 0.92);
+  --glass-card-fill-hover: rgba(50, 50, 60, 0.96);
+  --glass-card-border: rgba(255, 255, 255, 0.14);
+  --glass-card-rim: rgba(255, 255, 255, 0.12);
+  --glass-card-rim-hover: rgba(255, 255, 255, 0.16);
+  --glass-card-ambient: rgba(0, 0, 0, 0.28);
+  --glass-card-ambient-hover: rgba(0, 0, 0, 0.32);
+  --glass-card-spec-a: rgba(255, 255, 255, 0.07);
+  --glass-card-spec-b: transparent;
+
+  --glass-scroll-a: rgba(0, 0, 0, 0.40);
+  --glass-scroll-b: rgba(0, 0, 0, 0.12);
+}
+
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  :root.glass .app-panel-surface {
+    background:
+      repeating-linear-gradient(
+        0deg,
+        transparent 0 2px,
+        rgba(255, 255, 255, calc(var(--glass-noise-opacity) * 0.55)) 2px 3px
+      ),
+      repeating-linear-gradient(
+        90deg,
+        transparent 0 2px,
+        rgba(0, 0, 0, calc(var(--glass-noise-opacity) * 0.45)) 2px 3px
+      ),
+      var(--glass-panel-fill);
+    backdrop-filter: blur(var(--glass-panel-blur)) saturate(var(--glass-panel-sat))
+      brightness(var(--glass-panel-bright));
+    -webkit-backdrop-filter: blur(var(--glass-panel-blur)) saturate(var(--glass-panel-sat))
+      brightness(var(--glass-panel-bright));
+    box-shadow:
+      inset 0 1px 0 var(--glass-panel-rim-top),
+      inset 0 -1px 0 var(--glass-panel-rim-bottom),
+      0 12px 40px var(--glass-panel-ambient-1),
+      0 2px 8px var(--glass-panel-ambient-2);
+    border: 1px solid var(--glass-panel-border);
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+  }
+
+  /* Keep chrome + content above ::before / ::after glass layers */
+  :root.glass .app-panel-surface > * {
+    position: relative;
+    z-index: 3;
+  }
+
+  /* Static specular sheen — diagonal gradient from top-left */
+  :root.glass .app-panel-surface::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: linear-gradient(
+      var(--glass-panel-spec-angle),
+      var(--glass-panel-spec-a) 0%,
+      var(--glass-panel-spec-b) 45%,
+      transparent 72%
+    );
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* Slow-moving light sweep */
+  :root.glass .app-panel-surface::after {
+    content: "";
+    position: absolute;
+    inset: -150%;
+    background: linear-gradient(
+      105deg,
+      transparent 42%,
+      var(--glass-panel-shimmer-mid) 50%,
+      transparent 58%
+    );
+    animation: glass-shimmer 14s ease-in-out infinite;
+    pointer-events: none;
+    z-index: 2;
+    opacity: var(--glass-panel-shimmer-opacity);
+  }
+
+  :root.glass .app-side-nav {
+    background: var(--glass-nav-fill);
+    backdrop-filter: blur(var(--glass-nav-blur)) saturate(var(--glass-nav-sat))
+      contrast(var(--glass-nav-contrast));
+    -webkit-backdrop-filter: blur(var(--glass-nav-blur)) saturate(var(--glass-nav-sat))
+      contrast(var(--glass-nav-contrast));
+    border-right: 1px solid var(--glass-nav-border);
+    box-shadow:
+      inset -1px 0 0 var(--glass-nav-inset-v),
+      inset 0 1px 0 var(--glass-nav-inset-h);
+    position: relative;
+    overflow: hidden;
+  }
+
+  :root.glass .app-main-pane {
+    background: var(--glass-main-fill);
+    backdrop-filter: blur(var(--glass-main-blur)) saturate(var(--glass-main-sat))
+      contrast(var(--glass-main-contrast));
+    -webkit-backdrop-filter: blur(var(--glass-main-blur)) saturate(var(--glass-main-sat))
+      contrast(var(--glass-main-contrast));
+    box-shadow:
+      inset 1px 0 0 var(--glass-main-inset-x),
+      inset 0 1px 0 var(--glass-main-inset-y);
+  }
+
+  :root.glass .app-scroll-fade {
+    background: linear-gradient(
+      to top,
+      var(--glass-scroll-a),
+      var(--glass-scroll-b),
+      transparent
+    );
+  }
+
+  :root.glass .liquid-glass-card {
+    background: var(--glass-card-fill);
+    backdrop-filter: blur(var(--glass-card-blur)) saturate(var(--glass-card-sat));
+    -webkit-backdrop-filter: blur(var(--glass-card-blur)) saturate(var(--glass-card-sat));
+    border: 1px solid var(--glass-card-border);
+    border-radius: 14px;
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+    box-shadow:
+      inset 0 1px 0 var(--glass-card-rim),
+      0 3px 12px var(--glass-card-ambient);
+    transition: background 0.22s ease, box-shadow 0.22s ease, border-color 0.22s ease;
+  }
+
+  :root.glass .liquid-glass-card:hover {
+    background: var(--glass-card-fill-hover);
+    box-shadow:
+      inset 0 1px 0 var(--glass-card-rim-hover),
+      0 4px 16px var(--glass-card-ambient-hover);
+  }
+
+  :root.glass .liquid-glass-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: linear-gradient(
+      135deg,
+      var(--glass-card-spec-a) 0%,
+      var(--glass-card-spec-b) 55%
+    );
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  :root.glass .liquid-glass-card > * {
+    position: relative;
+    z-index: 1;
+  }
+}
+
+/* No backdrop-filter: avoid broken transparency — match non-glass solid surfaces */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  :root.glass .app-panel-surface {
+    background: var(--card);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    border: 1px solid var(--border);
+    box-shadow: 0 18px 48px rgba(15, 23, 42, 0.18);
+    position: relative;
+    overflow: hidden;
+  }
+
+  :root.glass .app-panel-surface > * {
+    position: relative;
+    z-index: 1;
+  }
+
+  :root.glass .app-panel-surface::before,
+  :root.glass .app-panel-surface::after {
+    display: none;
+  }
+
+  :root.dark.glass .app-panel-surface {
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.42);
+  }
+
+  :root.glass .app-side-nav {
+    background: var(--muted);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    border-right: 1px solid var(--border);
+    box-shadow: none;
+  }
+
+  :root.dark.glass .app-side-nav {
+    background: var(--card);
+  }
+
+  :root.glass .app-main-pane {
+    background: var(--card);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    box-shadow: none;
+  }
+
+  :root.dark.glass .app-main-pane {
+    background: var(--muted);
+  }
+
+  :root.glass .app-scroll-fade {
+    background: linear-gradient(to top, var(--card), transparent);
+  }
+
+  :root.dark.glass .app-scroll-fade {
+    background: linear-gradient(to top, var(--muted), transparent);
+  }
+
+  :root.glass .liquid-glass-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: none;
+  }
+
+  :root.glass .liquid-glass-card::before {
+    display: none;
+  }
+
+  :root.dark.glass .liquid-glass-card {
+    background: var(--muted);
+  }
+}
+
+/* Hide scrollbar track globally */
+.scrollbar-none {
+  scrollbar-width: none;          /* Firefox */
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;                  /* Chrome / Safari / WebKit */
+}
+
+/* Border beam for the update button */
+.update-border-beam {
+  position: relative;
+  isolation: isolate;
+}
+.update-border-beam::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: conic-gradient(
+    from var(--beam-angle),
+    transparent 70%,
+    var(--destructive) 90%,
+    transparent 100%
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: beam-rotate 2.5s linear infinite;
+}
+@property --beam-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+@keyframes beam-rotate {
+  to {
+    --beam-angle: 360deg;
+  }
+}
+
+/* Undecorated tray popover: no painted backdrop outside the app (see `tauri-popover` in main.tsx). */
+html.tauri-popover,
+html.tauri-popover body {
+  background-color: transparent !important;
+}
+
+/* Shimmer animation for progress bars refreshing with stale data */
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+.animate-shimmer {
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-shimmer {
+    animation: none;
+  }
+}
+
+/* Remove focus rings - this is a menu bar app, not keyboard-navigated */
+*:focus,
+*:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+  --tw-ring-shadow: 0 0 #0000 !important;
+  --tw-ring-offset-shadow: 0 0 #0000 !important;
+  border-color: transparent !important;
+}
+
+/* ─── Liquid Glass shimmer animation ─────────────────────────────────────────
+   glass-shimmer: A single soft beam of reflected light sweeping slowly across
+   the glass surface. The oversized inset (-150%) ensures the gradient edge is
+   never visible — only the feathered center passes over the element.
+   ─────────────────────────────────────────────────────────────────────────── */
+@keyframes glass-shimmer {
+  0%   { transform: translate(-28%, -28%); }
+  100% { transform: translate(28%, 28%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root.glass .app-panel-surface::after {
+    animation: none;
+    opacity: 0.35;
+  }
+}
+

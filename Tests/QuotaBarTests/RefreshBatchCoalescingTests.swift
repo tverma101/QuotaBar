@@ -308,7 +308,10 @@ final class RefreshBatchCoalescingTests: XCTestCase {
             registry: WidgetRegistry(providers: providers, descriptors: descriptors),
             providers: runtimes,
             cache: ProviderSnapshotCache(userDefaults: suite, storageKey: "snapshots", ttl: 600),
-            defaults: suite
+            defaults: suite,
+            // The test holds all three providers open at once. A fully loaded XCTest process can
+            // exceed the app's memory budget and intentionally serialize the batch.
+            isOverSoftMemoryLimit: { false }
         )
     }
 

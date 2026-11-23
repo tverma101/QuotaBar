@@ -85,21 +85,13 @@ All three alerts default off. The first time you turn one on, QuotaBar asks for 
 
 See [Logging](logging.md) for the full behavior: subsystem tags, the file size cap, and the guarantee that secrets are never written.
 
-**Reset All Settings…** restores every setting on this screen to its default — appearance, usage display, snooze preferences, notifications, privacy, log level, the global shortcut (cleared), Launch at Login (turned off), iCloud sync (turned off), and the update preferences (stable channel, automatic checks on) — and also resets all customization, exactly like Customize's Reset All: default layout, order, and menu-bar stars, with Claude, Codex, Cursor, Freebuff, and registered Codex accounts on. Other providers stay off until you enable them in Customize. The reset cannot be undone.
+**Reset All Settings…** restores every setting on this screen to its default — appearance, usage display, snooze preferences, notifications, privacy, log level, the global shortcut (cleared), Launch at Login (turned off), iCloud sync (turned off) — and also resets all customization, exactly like Customize's Reset All: default layout, order, and menu-bar stars, with Claude, Codex, Cursor, Freebuff, and registered Codex accounts on. Other providers stay off until you enable them in Customize. The reset cannot be undone.
 
 Not touched: provider logins and API keys, registered Codex home paths, cached usage data, and your extra-analytics choice. Registered Codex accounts remain available after the reset; removing one requires its explicit account action, and its Codex credentials and session history are never deleted by QuotaBar. Turning iCloud sync off as part of the reset works exactly like flipping its toggle off: this Mac's synced history is removed from the shared iCloud data, and your other Macs keep their own.
 
 ## Updates
 
-The Updates section appears in official packaged builds that include the signed update feed. Local
-developer builds do not show it.
-
-| Setting | Options | What it does |
-|---|---|---|
-| Update Automatically | On / Off | Whether Sparkle checks for updates in the background. You can still check manually when this is off. |
-| Beta Updates | On / Off | Adds pre-release builds to the updates you can receive. Stable releases remain available either way. |
-| Check for Updates… | button | Starts a manual update check and opens Sparkle's update window. |
-
+Open **Options → About QuotaBar → Downloads and Updates** to find the current installers on GitHub. Quit QuotaBar before replacing the macOS app in Applications.
 
 ## Version
 
