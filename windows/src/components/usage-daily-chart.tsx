@@ -16,6 +16,8 @@ const CHART_STROKES = [
 function sourceLabel(source: string): string {
   if (source === "cursor_transcripts") return "estimated from agent transcripts"
   if (source === "local_logs" || source === "ccusage") return "from local CLI logs"
+  if (source === "vmbox") return "includes VM Box usage"
+  if (source === "vmbox_stale") return "includes last known VM Box usage"
   return source
 }
 
