@@ -53,6 +53,8 @@ bun run tauri:build --bundles nsis --config $config -- --locked
 
 Use the default MSVC Rust toolchain for releases. On a GNU Rust development VM, select the GNU
 target explicitly with `--target x86_64-pc-windows-gnu` to build a local QA installer.
+If using the shell artifact collector after a GNU build with a tag-based version override, set
+`QUOTABAR_INSTALLER_VERSION` to the same version without the leading `v`.
 
 The CI installer is a QA artifact. Before publishing, Authenticode-sign the installer and both bundled
 executables with the release publisher's Windows code-signing identity. Sign the app and CLI before
