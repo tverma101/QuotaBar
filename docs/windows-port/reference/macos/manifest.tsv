@@ -1,0 +1,78 @@
+file	surface	state	appearance	density	pixel_width	pixel_height	scale
+customize-claude-dark-compact@1x.png	Customize: Claude	populated	dark	compact	320	528	1x
+customize-claude-dark-compact@2x.png	Customize: Claude	populated	dark	compact	640	1056	2x
+customize-claude-dark-default@1x.png	Customize: Claude	populated	dark	default	320	614	1x
+customize-claude-dark-default@2x.png	Customize: Claude	populated	dark	default	640	1228	2x
+customize-claude-light-compact@1x.png	Customize: Claude	populated	light	compact	320	528	1x
+customize-claude-light-compact@2x.png	Customize: Claude	populated	light	compact	640	1056	2x
+customize-claude-light-default@1x.png	Customize: Claude	populated	light	default	320	614	1x
+customize-claude-light-default@2x.png	Customize: Claude	populated	light	default	640	1228	2x
+customize-dark-compact@1x.png	customize	populated	dark	compact	320	663	1x
+customize-dark-compact@2x.png	customize	populated	dark	compact	640	1326	2x
+customize-dark-default@1x.png	customize	populated	dark	default	320	781	1x
+customize-dark-default@2x.png	customize	populated	dark	default	640	1562	2x
+customize-light-compact@1x.png	customize	populated	light	compact	320	663	1x
+customize-light-compact@2x.png	customize	populated	light	compact	640	1326	2x
+customize-light-default@1x.png	customize	populated	light	default	320	781	1x
+customize-light-default@2x.png	customize	populated	light	default	640	1562	2x
+dashboard-dark-compact@1x.png	dashboard	populated	dark	compact	320	922	1x
+dashboard-dark-compact@2x.png	dashboard	populated	dark	compact	640	1844	2x
+dashboard-dark-default@1x.png	dashboard	populated	dark	default	320	922	1x
+dashboard-dark-default@2x.png	dashboard	populated	dark	default	640	1844	2x
+dashboard-empty-dark@1x.png	dashboard	empty	dark	default	320	922	1x
+dashboard-empty-dark@2x.png	dashboard	empty	dark	default	640	1844	2x
+dashboard-empty-light@1x.png	dashboard	empty	light	default	320	922	1x
+dashboard-empty-light@2x.png	dashboard	empty	light	default	640	1844	2x
+dashboard-error-dark@1x.png	dashboard	error	dark	default	320	922	1x
+dashboard-error-dark@2x.png	dashboard	error	dark	default	640	1844	2x
+dashboard-error-light@1x.png	dashboard	error	light	default	320	922	1x
+dashboard-error-light@2x.png	dashboard	error	light	default	640	1844	2x
+dashboard-light-compact@1x.png	dashboard	populated	light	compact	320	922	1x
+dashboard-light-compact@2x.png	dashboard	populated	light	compact	640	1844	2x
+dashboard-light-default@1x.png	dashboard	populated	light	default	320	922	1x
+dashboard-light-default@2x.png	dashboard	populated	light	default	640	1844	2x
+dashboard-loading-dark@1x.png	dashboard	loading	dark	default	320	922	1x
+dashboard-loading-dark@2x.png	dashboard	loading	dark	default	640	1844	2x
+dashboard-loading-light@1x.png	dashboard	loading	light	default	320	922	1x
+dashboard-loading-light@2x.png	dashboard	loading	light	default	640	1844	2x
+dashboard-reduced-motion-dark@1x.png	dashboard	reduced-motion	dark	default	320	922	1x
+dashboard-reduced-motion-dark@2x.png	dashboard	reduced-motion	dark	default	640	1844	2x
+dashboard-transparent-dark@1x.png	dashboard	transparent	dark	default	320	922	1x
+dashboard-transparent-dark@2x.png	dashboard	transparent	dark	default	640	1844	2x
+history-dark-compact@1x.png	history	populated	dark	compact	320	723	1x
+history-dark-compact@2x.png	history	populated	dark	compact	640	1446	2x
+history-dark-default@1x.png	history	populated	dark	default	320	796	1x
+history-dark-default@2x.png	history	populated	dark	default	640	1592	2x
+history-empty-dark@1x.png	history	empty	dark	default	320	250	1x
+history-empty-dark@2x.png	history	empty	dark	default	640	498	2x
+history-empty-light@1x.png	history	empty	light	default	320	250	1x
+history-empty-light@2x.png	history	empty	light	default	640	498	2x
+history-light-compact@1x.png	history	populated	light	compact	320	723	1x
+history-light-compact@2x.png	history	populated	light	compact	640	1446	2x
+history-light-default@1x.png	history	populated	light	default	320	796	1x
+history-light-default@2x.png	history	populated	light	default	640	1592	2x
+options-with-copy-feedback-dark@2x.png	Dashboard Options menu (shell context)	open	dark	default	560	490	2x
+settings-bottom-dark@2x.png	settings	bottom	dark	default	640	1844	2x
+settings-bottom-light@2x.png	settings	bottom	light	default	640	1844	2x
+settings-dark-compact@1x.png	settings	populated	dark	compact	320	922	1x
+settings-dark-compact@2x.png	settings	populated	dark	compact	640	1844	2x
+settings-dark-default@1x.png	settings	populated	dark	default	320	922	1x
+settings-dark-default@2x.png	settings	populated	dark	default	640	1844	2x
+settings-light-compact@1x.png	settings	populated	light	compact	320	922	1x
+settings-light-compact@2x.png	settings	populated	light	compact	640	1844	2x
+settings-light-default@1x.png	settings	populated	light	default	320	922	1x
+settings-light-default@2x.png	settings	populated	light	default	640	1844	2x
+settings-middle-dark@2x.png	settings	middle	dark	default	640	1844	2x
+settings-middle-light@2x.png	settings	middle	light	default	640	1844	2x
+share-claude-dark@4x.png	clipboard share: Claude	populated	dark	default	1440	1556	4x
+share-total-spend-dark@4x.png	clipboard share: Total Spend	populated	dark	default	1440	896	4x
+share-total-spend-light@4x.png	clipboard share: Total Spend	populated	light	default	1440	896	4x
+strip-bars-alpha.png	status-item alpha asset	bars	untinted	default	32	30	2x renderer
+strip-bars-shell@1x.png	macOS status-item shell	bars	light	default	200	30	1x
+strip-bars-shell@2x.png	macOS status-item shell	bars	light	default	400	60	2x
+strip-fallback-alpha.png	status-item alpha asset	fallback	untinted	default	36	36	2x renderer
+strip-fallback-shell@1x.png	macOS status-item shell	fallback	light	default	200	30	1x
+strip-fallback-shell@2x.png	macOS status-item shell	fallback	light	default	400	60	2x
+strip-text-alpha.png	status-item alpha asset	text	untinted	default	249	33	2x renderer
+strip-text-shell@1x.png	macOS status-item shell	text	light	default	200	30	1x
+strip-text-shell@2x.png	macOS status-item shell	text	light	default	400	60	2x
