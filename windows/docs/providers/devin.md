@@ -145,7 +145,7 @@ Response fields used:
 
 A present-but-unparsable weekly percentage is quota-unavailable (schema drift), not an exhausted window. Despite remaining-percent field names, tiles show percent **used** (`100 - remaining`).
 
-Expired or implausible reset timestamps are omitted without hiding the measured quota.
+Expired or implausible reset timestamps are not shown. A positive weekly reset still identifies an exhausted window when the weekly percentage is omitted, even if that reset time is not shown.
 
 ## Plugin Strategy
 

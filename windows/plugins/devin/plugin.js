@@ -267,9 +267,8 @@
     }
   }
 
-  function unixSecondsToIso(ctx, value) {
-    var seconds = readFiniteNumber(value)
-    if (seconds === null) return null
+  function unixSecondsToIso(ctx, seconds) {
+    if (seconds === null || seconds <= 0) return null
     var resetMs = seconds * 1000
     var now = ctx.util.parseDateMs(ctx.nowIso) ?? Date.now()
     if (resetMs <= now || resetMs - now > 2 * 365 * DAY_MS) return null
@@ -316,11 +315,14 @@
     if (hasOwn(planStatus, "weeklyQuotaRemainingPercent") && weeklyRemaining === null) {
       throw QUOTA_HINT
     }
-    var dailyReset = !hideDailyQuota ? unixSecondsToIso(ctx, planStatus.dailyQuotaResetAtUnix) : null
-    var weeklyReset = unixSecondsToIso(ctx, planStatus.weeklyQuotaResetAtUnix)
+    var dailyReset = !hideDailyQuota
+      ? unixSecondsToIso(ctx, readFiniteNumber(planStatus.dailyQuotaResetAtUnix))
+      : null
+    var weeklyResetSeconds = readFiniteNumber(planStatus.weeklyQuotaResetAtUnix)
+    var weeklyReset = unixSecondsToIso(ctx, weeklyResetSeconds)
     var extraUsageBalance = formatDollarsFromMicros(planStatus.overageBalanceMicros)
     // Proto3 JSON omits zeros. A weekly reset with no percentage is an exhausted window (0 remaining).
-    if (weeklyRemaining === null && weeklyReset) weeklyRemaining = 0
+    if (weeklyRemaining === null && weeklyResetSeconds > 0) weeklyRemaining = 0
 
     var dailyLine = !hideDailyQuota
       ? buildQuotaLine(ctx, "Daily quota", dailyRemaining, dailyReset, DAY_MS)
