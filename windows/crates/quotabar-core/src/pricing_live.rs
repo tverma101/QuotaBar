@@ -1,4 +1,5 @@
 use super::{DEFAULT_PRICING, ModelPricing, ModelRates, PromptRateTier, UTC_DAYS, UtcRateOverride};
+use super::fallback::{self, Source};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -22,6 +23,7 @@ struct Refresh {
     attempted: Option<Instant>,
     failed: bool,
     misses: HashMap<String, u8>,
+    fallback_due: [Option<Instant>; 3],
 }
 
 static REFRESH: OnceLock<Mutex<Refresh>> = OnceLock::new();
@@ -34,6 +36,7 @@ pub fn enable_live_pricing(directory: &Path) {
         attempted: None,
         failed: false,
         misses: HashMap::new(),
+        fallback_due: [None; 3],
     }));
     schedule_refresh(pricing, None);
 }
@@ -46,39 +49,80 @@ pub(super) fn schedule_refresh(pricing: &ModelPricing, name: Option<&str>) {
         return;
     }
     let elapsed = state.attempted.map(|time| time.elapsed());
-    if state.failed && elapsed.is_some_and(|age| age < FAILURE_BACKOFF) {
-        return;
-    }
     let hourly = elapsed.is_none_or(|age| age >= if state.failed { FAILURE_BACKOFF } else { FRESH_FOR });
-    let discovery = elapsed.is_some_and(|age| age >= DISCOVERY_INTERVAL)
+    let discovery = !state.failed && elapsed.is_some_and(|age| age >= DISCOVERY_INTERVAL)
         && name.is_some_and(|name| {
             !name.is_empty()
                 && name.len() <= super::MAX_CACHED_MODEL_BYTES
-                && !pricing.supplement.pricing.contains_key(name)
+                && !pricing.fallback.read().unwrap().supplement(&pricing.supplement).pricing.contains_key(name)
                 && !pricing.open_router.read().unwrap().contains_key(name)
                 && state.misses.get(name).copied().unwrap_or_default() < 3
                 && (state.misses.contains_key(name) || state.misses.len() < 512)
         });
-    if !hourly && !discovery {
+    let now = Instant::now();
+    let refresh_open_router = hourly || discovery;
+    let due = Source::ALL.map(|source| state.fallback_due[source as usize].is_none_or(|at| at <= now));
+    if !refresh_open_router && !due.iter().any(|due| *due) {
         return;
     }
     let discovered = name.filter(|_| discovery).map(str::to_owned);
     let directory = state.directory.clone();
     state.running = true;
-    state.attempted = Some(Instant::now());
+    if refresh_open_router {
+        state.attempted = Some(now);
+    }
+    for source in Source::ALL.into_iter().filter(|source| due[*source as usize]) {
+        state.fallback_due[source as usize] = Some(now + FAILURE_BACKOFF);
+    }
     drop(state);
 
     let spawned = std::thread::Builder::new().name("pricing-catalog".into()).spawn(move || {
         let pricing = DEFAULT_PRICING.get().unwrap();
-        let result = fetch().and_then(|catalog| {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build();
+        if let Err(error) = &client {
+            log::warn!("Could not create pricing HTTP client: {error}");
+        }
+        if let Ok(client) = &client {
+            if refresh_open_router {
+                refresh_routes(client, &directory, discovered, pricing);
+            }
+            for source in Source::ALL.into_iter().filter(|source| due[*source as usize]) {
+                let result = fallback::refresh(source, client, &directory, pricing);
+                let mut state = REFRESH.get().unwrap().lock().unwrap();
+                state.fallback_due[source as usize] = Some(Instant::now() + if result.is_ok() { FRESH_FOR } else { FAILURE_BACKOFF });
+                if let Err(error) = result {
+                    log::warn!("{source:?} price refresh failed; using last good rates: {error}");
+                }
+            }
+        }
+        let mut state = REFRESH.get().unwrap().lock().unwrap();
+        state.running = false;
+        if refresh_open_router && client.is_err() {
+            state.failed = true;
+        }
+    });
+    if let Err(error) = spawned {
+        let mut state = REFRESH.get().unwrap().lock().unwrap();
+        state.running = false;
+        if refresh_open_router {
+            state.failed = true;
+        }
+        log::warn!("Could not start pricing refresh: {error}");
+    }
+}
+
+fn refresh_routes(client: &reqwest::blocking::Client, directory: &Path, discovered: Option<String>, pricing: &ModelPricing) {
+        let result = fetch(client).and_then(|catalog| {
             let changed = *pricing.open_router.read().unwrap() != catalog;
             if changed {
-                write_cache(&directory, &catalog)?;
+                write_atomic(&cache_path(directory), &serde_json::to_vec(&catalog)?)?;
             }
             Ok((catalog, changed))
         });
         let mut state = REFRESH.get().unwrap().lock().unwrap();
-        state.running = false;
         state.failed = result.is_err();
         match result {
             Ok((catalog, changed)) => {
@@ -87,21 +131,11 @@ pub(super) fn schedule_refresh(pricing: &ModelPricing, name: Option<&str>) {
                     *state.misses.entry(name).or_default() += 1;
                 }
                 if changed {
-                    let mut resolved = pricing.resolved.lock().unwrap();
-                    *pricing.open_router.write().unwrap() = catalog;
-                    pricing.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    resolved.clear();
+                    pricing.catalog_changed(|| *pricing.open_router.write().unwrap() = catalog);
                 }
             }
             Err(error) => log::warn!("OpenRouter price refresh failed; using last good rates: {error}"),
         }
-    });
-    if let Err(error) = spawned {
-        let mut state = REFRESH.get().unwrap().lock().unwrap();
-        state.running = false;
-        state.failed = true;
-        log::warn!("Could not start pricing refresh: {error}");
-    }
 }
 
 fn cache_path(directory: &Path) -> PathBuf {
@@ -126,13 +160,12 @@ pub(super) fn load_cache(directory: &Path) -> Catalog {
     }
 }
 
-fn write_cache(directory: &Path, catalog: &Catalog) -> anyhow::Result<()> {
-    let path = cache_path(directory);
+pub(super) fn write_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     let result = (|| -> anyhow::Result<()> {
-        std::fs::write(&temp, serde_json::to_vec(catalog)?)?;
-        std::fs::rename(&temp, &path)?;
+        std::fs::write(&temp, data)?;
+        std::fs::rename(&temp, path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -141,11 +174,7 @@ fn write_cache(directory: &Path, catalog: &Catalog) -> anyhow::Result<()> {
     result
 }
 
-fn fetch() -> anyhow::Result<Catalog> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+fn fetch(client: &reqwest::blocking::Client) -> anyhow::Result<Catalog> {
     read_pages(|offset| {
         let mut bytes = Vec::new();
         client.get(format!("{URL}?limit={PAGE_LIMIT}&offset={offset}"))
