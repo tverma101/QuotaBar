@@ -261,6 +261,15 @@ The shared quota groups expose `Session`, `Weekly`, `Session — Claude and GPT 
 
 Returns 401/403 if the token is invalid or expired — triggers reactive refresh.
 
+## Local Usage History
+
+Antigravity and Antigravity CLI read local conversation databases under
+`~/.gemini/antigravity*/conversations` for token estimates. This is device-local usage, not
+history attributed to a signed-in account. A database linked from multiple locations counts
+once. QuotaBar reuses a bounded in-memory snapshot only while the database and its SQLite
+write-ahead log have the same file identities and revisions. A replaced database does not
+inherit the old file's usage.
+
 ## Plugin Strategy
 
 1. Probe the Antigravity app/IDE language server.

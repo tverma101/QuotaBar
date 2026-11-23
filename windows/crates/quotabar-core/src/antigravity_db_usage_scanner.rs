@@ -1,6 +1,6 @@
 //! Reads token accounting from Antigravity local conversation SQLite DBs
 //! (`~/.gemini/antigravity*/conversations/*.db`).
-//! Discovered by FelixIsaac in openusage#1058/#1120. Simple re-scan (no WAL fingerprint cache).
+//! Discovered by FelixIsaac in openusage#1058/#1120.
 
 use crate::antigravity_proto::{self, GenerationEvent};
 use crate::log_usage_types::{
@@ -10,15 +10,111 @@ use crate::log_usage_types::{
 use crate::model_pricing::{ModelPricing, default_pricing};
 use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{Connection, OpenFlags, params};
-use std::collections::{BTreeMap, HashSet};
+use same_file::Handle;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 pub const MAXIMUM_BLOB_BYTES: i64 = 1_048_576;
 const BATCH_SIZE: i64 = 8;
+const CACHE_BYTES: usize = 8 * 1024 * 1024;
+const CACHE_DATABASES: usize = 64;
 
 static WARNED_OVERSIZED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static FOLDS: Mutex<FoldCache> = Mutex::new(FoldCache {
+    entries: VecDeque::new(),
+    bytes: 0,
+});
+
+#[derive(PartialEq, Eq)]
+struct FileRevision {
+    identity: Arc<Handle>,
+    bytes: u64,
+    modified_at: SystemTime,
+}
+
+impl FileRevision {
+    fn read(path: &Path) -> io::Result<Self> {
+        let identity = Arc::new(Handle::from_file(fs::File::open(path)?)?);
+        let metadata = identity.as_file().metadata()?;
+        Ok(Self {
+            identity,
+            bytes: metadata.len(),
+            modified_at: metadata.modified()?,
+        })
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct DatabaseRevision {
+    main: FileRevision,
+    wal: Option<FileRevision>,
+}
+
+impl DatabaseRevision {
+    fn read(path: &Path) -> io::Result<Self> {
+        let main = FileRevision::read(path)?;
+        let mut wal_path = path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        let wal = match FileRevision::read(Path::new(&wal_path)) {
+            Ok(wal) => Some(wal),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        Ok(Self { main, wal })
+    }
+}
+
+struct CachedFold {
+    revision: DatabaseRevision,
+    events: Arc<[GenerationEvent]>,
+    bytes: usize,
+}
+
+struct FoldCache {
+    entries: VecDeque<CachedFold>,
+    bytes: usize,
+}
+
+impl FoldCache {
+    fn get(&mut self, revision: &DatabaseRevision) -> Option<Arc<[GenerationEvent]>> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| &entry.revision == revision)?;
+        let entry = self.entries.remove(index)?;
+        let events = Arc::clone(&entry.events);
+        self.entries.push_back(entry);
+        Some(events)
+    }
+
+    fn insert(&mut self, revision: DatabaseRevision, events: Arc<[GenerationEvent]>) {
+        let bytes = std::mem::size_of_val(events.as_ref())
+            .saturating_add(events.iter().map(|event| event.model.capacity()).sum());
+        if bytes > CACHE_BYTES || self.get(&revision).is_some() {
+            return;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.revision.main.identity == revision.main.identity)
+        {
+            self.bytes -= self.entries.remove(index).expect("located cached fold").bytes;
+        }
+        while self.entries.len() >= CACHE_DATABASES || self.bytes + bytes > CACHE_BYTES {
+            self.bytes -= self.entries.pop_front().expect("cache is over budget").bytes;
+        }
+        self.bytes += bytes;
+        self.entries.push_back(CachedFold {
+            revision,
+            events,
+            bytes,
+        });
+    }
+}
 
 pub fn query_daily_since(
     since_compact: &str,
@@ -103,20 +199,54 @@ fn scan(
         return None;
     }
     let since = since_local_midnight(days_back);
-    let mut events = Vec::new();
+    let mut folds = Vec::new();
+    let mut identities = HashSet::new();
     for path in &paths {
-        match read_database(path) {
-            Ok((db_events, oversized)) => {
-                events.extend(db_events);
-                if oversized {
-                    warn_oversized(path);
-                }
-            }
-            Err(_) => warn_unreadable_usage_file(path),
+        if let Some(events) = read_fold(path, &mut identities) {
+            folds.push(events);
         }
     }
-    let rows = aggregate(&events, since, pricing);
+    let rows = aggregate(folds.iter().flat_map(|fold| fold.iter()), since, pricing);
     if rows.is_empty() { None } else { Some(rows) }
+}
+
+fn read_fold(path: &Path, identities: &mut HashSet<Arc<Handle>>) -> Option<Arc<[GenerationEvent]>> {
+    let before = DatabaseRevision::read(path).ok();
+    if let Some(revision) = &before {
+        if identities.contains(&revision.main.identity) {
+            return None;
+        }
+        if let Some(events) = FOLDS.lock().ok().and_then(|mut cache| cache.get(revision)) {
+            identities.insert(Arc::clone(&revision.main.identity));
+            return Some(events);
+        }
+    }
+    let (events, oversized, immutable) = match read_database(path) {
+        Ok(result) => result,
+        Err(_) => {
+            warn_unreadable_usage_file(path);
+            return None;
+        }
+    };
+    if oversized {
+        warn_oversized(path);
+    }
+    let events: Arc<[GenerationEvent]> = events.into();
+    if let Some(before) = before {
+        let Ok(after) = DatabaseRevision::read(path) else {
+            return None;
+        };
+        if before.main.identity != after.main.identity {
+            return None;
+        }
+        identities.insert(Arc::clone(&before.main.identity));
+        if !oversized && !immutable && before == after {
+            if let Ok(mut cache) = FOLDS.lock() {
+                cache.insert(before, Arc::clone(&events));
+            }
+        }
+    }
+    Some(events)
 }
 
 fn database_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
@@ -134,9 +264,9 @@ fn database_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     Ok(paths)
 }
 
-fn open_readonly(path: &Path) -> Result<Connection, rusqlite::Error> {
+fn open_readonly(path: &Path) -> Result<(Connection, bool), rusqlite::Error> {
     match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(c) => Ok(c),
+        Ok(c) => Ok((c, false)),
         Err(e) => {
             let encoded = path
                 .to_string_lossy()
@@ -147,6 +277,7 @@ fn open_readonly(path: &Path) -> Result<Connection, rusqlite::Error> {
                 &uri,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
             )
+            .map(|c| (c, true))
             .map_err(|_| e)
         }
     }
@@ -160,14 +291,15 @@ fn page_sql() -> String {
     )
 }
 
-fn read_database(path: &Path) -> Result<(Vec<GenerationEvent>, bool), rusqlite::Error> {
-    let conn = open_readonly(path)?;
+fn read_database(path: &Path) -> Result<(Vec<GenerationEvent>, bool, bool), rusqlite::Error> {
+    let (conn, immutable) = open_readonly(path)?;
+    let tx = conn.unchecked_transaction()?;
     let sql = page_sql();
+    let mut stmt = tx.prepare(&sql)?;
     let mut last_index: i64 = -1;
     let mut events = Vec::new();
     let mut oversized = false;
     loop {
-        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![last_index], |row| {
             let idx: i64 = row.get(0)?;
             let data: Option<Vec<u8>> = row.get(1)?;
@@ -197,7 +329,7 @@ fn read_database(path: &Path) -> Result<(Vec<GenerationEvent>, bool), rusqlite::
             break;
         }
     }
-    Ok((events, oversized))
+    Ok((events, oversized, immutable))
 }
 
 fn warn_oversized(path: &Path) {
@@ -215,8 +347,8 @@ fn i32_tokens(n: i64) -> Option<i32> {
     i32::try_from(n).ok().filter(|&v| v >= 0)
 }
 
-fn aggregate(
-    events: &[GenerationEvent],
+fn aggregate<'a>(
+    events: impl IntoIterator<Item = &'a GenerationEvent>,
     since: DateTime<Utc>,
     pricing: &ModelPricing,
 ) -> Vec<DailyUsageRow> {
@@ -408,5 +540,40 @@ mod tests {
         let (status, rows) = query_daily_since("", Some(tmp.path().to_str().unwrap()));
         assert_eq!(status, LogScanStatus::NoData);
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn unchanged_database_reuses_fold_but_replaced_database_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("conversation.db");
+        let now = Utc::now().timestamp() as u64;
+        let seed = |path: &Path, output| {
+            seed_db(path, &[(1, Some(encode_generation_blob(
+                "gemini-3.6-flash", 10, 90, output, 5, now,
+            )))]);
+        };
+        seed(&db, 40);
+        let original = read_fold(&db, &mut HashSet::new()).unwrap();
+        let unchanged = read_fold(&db, &mut HashSet::new()).unwrap();
+        assert!(Arc::ptr_eq(&original, &unchanged));
+
+        let old = tmp.path().join("old.db");
+        fs::rename(&db, old).unwrap();
+        seed(&db, 20);
+        let replacement = read_fold(&db, &mut HashSet::new()).unwrap();
+        assert_eq!(replacement[0].output_tokens, 20);
+        assert!(!Arc::ptr_eq(&original, &replacement));
+    }
+
+    #[test]
+    fn duplicate_database_file_is_counted_once() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("conversation.db");
+        let alias = tmp.path().join("alias.db");
+        seed_db(&db, &[]);
+        fs::hard_link(&db, &alias).unwrap();
+        let mut identities = HashSet::new();
+        assert!(read_fold(&db, &mut identities).is_some());
+        assert!(read_fold(&alias, &mut identities).is_none());
     }
 }
