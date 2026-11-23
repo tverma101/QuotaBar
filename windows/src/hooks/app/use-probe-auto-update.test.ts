@@ -24,6 +24,59 @@ describe("useProbeAutoUpdate", () => {
     vi.restoreAllMocks()
   })
 
+  it("catches up once when the wall clock moves past multiple deadlines during sleep", () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 10, 20, 12))
+    const startBatch = vi.fn().mockResolvedValue(undefined)
+    const { result } = renderHook(() =>
+      useProbeAutoUpdate({
+        pluginSettings: { order: ["codex", "disabled"], disabled: ["disabled"] },
+        autoUpdateInterval: 15,
+        setLoadingForPlugins: vi.fn(),
+        setErrorForPlugins: vi.fn(),
+        isPluginLoading: vi.fn(() => false),
+        startBatch,
+      })
+    )
+
+    const resumedAt = new Date(2026, 10, 22, 12).getTime()
+    act(() => {
+      vi.setSystemTime(resumedAt)
+      window.dispatchEvent(new Event("focus"))
+      document.dispatchEvent(new Event("visibilitychange"))
+    })
+
+    expect(startBatch).toHaveBeenCalledExactlyOnceWith(["codex"])
+    expect(result.current.autoUpdateNextAt).toBe(resumedAt + 15 * 60_000)
+  })
+
+  it("refreshes at local midnight without postponing the metering deadline", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 10, 20, 23, 58))
+    const startBatch = vi.fn().mockResolvedValue(undefined)
+    const { result } = renderHook(() =>
+      useProbeAutoUpdate({
+        pluginSettings: { order: ["codex"], disabled: [] },
+        autoUpdateInterval: 15,
+        setLoadingForPlugins: vi.fn(),
+        setErrorForPlugins: vi.fn(),
+        isPluginLoading: vi.fn(() => false),
+        startBatch,
+      })
+    )
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2 * 60_000)
+    })
+    expect(startBatch).toHaveBeenCalledExactlyOnceWith(["codex"])
+    expect(result.current.autoUpdateNextAt).toBe(new Date(2026, 10, 21, 0, 13).getTime())
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(13 * 60_000)
+    })
+    expect(startBatch).toHaveBeenCalledTimes(2)
+  })
+
   it("keeps auto-update cleared when plugin settings are missing", () => {
     const { result } = renderHook(() =>
       useProbeAutoUpdate({

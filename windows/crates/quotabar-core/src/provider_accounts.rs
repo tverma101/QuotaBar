@@ -3,8 +3,8 @@ use crate::provider_accounts_crypto::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 const STORE_FILE: &str = "provider_accounts.json";
@@ -81,6 +81,26 @@ pub fn load_store(app_data_dir: &Path) -> io::Result<ProviderAccountsStore> {
 }
 
 pub fn load_store_path(path: &Path) -> io::Result<ProviderAccountsStore> {
+    let _lock = lock_store(path)?;
+    load_store_locked(path)
+}
+
+fn lock_store(path: &Path) -> io::Result<File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid provider accounts path"))?;
+    fs::create_dir_all(parent)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+fn load_store_locked(path: &Path) -> io::Result<ProviderAccountsStore> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(ProviderAccountsStore::default()),
@@ -92,7 +112,7 @@ pub fn load_store_path(path: &Path) -> io::Result<ProviderAccountsStore> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid provider accounts path"))?;
     let (store, migrated_from_legacy) = decode_store_text(&text, app_data_dir)?;
     if migrated_from_legacy {
-        save_store_path(path, &store)?;
+        save_store_locked(path, &store)?;
     }
     Ok(store)
 }
@@ -137,17 +157,37 @@ pub fn save_store(app_data_dir: &Path, store: &ProviderAccountsStore) -> io::Res
 }
 
 pub fn save_store_path(path: &Path, store: &ProviderAccountsStore) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let _lock = lock_store(path)?;
+    save_store_locked(path, store)
+}
+
+fn save_store_locked(path: &Path, store: &ProviderAccountsStore) -> io::Result<()> {
     let app_data_dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid provider accounts path"))?;
     let plaintext = serde_json::to_string(store).map_err(io::Error::other)?;
     let encrypted = provider_accounts_crypto::encrypt_store_plaintext(&plaintext, app_data_dir)?;
     let text = serde_json::to_string_pretty(&encrypted).map_err(io::Error::other)?;
-    fs::write(path, text)?;
-    restrict_private_file_permissions(path)
+    let tmp = path.with_extension("json.tmp");
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&tmp)?;
+        restrict_private_file_permissions(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(unix)]
@@ -173,15 +213,19 @@ pub fn upsert_account(app_data_dir: &Path, mut account: ProviderAccount) -> io::
     account.credential.refresh_token = account.credential.refresh_token.and_then(normalize_secret);
     account.credential.session_key = account.credential.session_key.and_then(normalize_secret);
 
-    let mut store = load_store(app_data_dir)?;
+    let path = store_path(app_data_dir);
+    let _lock = lock_store(&path)?;
+    let mut store = load_store_locked(&path)?;
     store.accounts.insert(account.instance_id.clone(), account);
-    save_store(app_data_dir, &store)
+    save_store_locked(&path, &store)
 }
 
 pub fn delete_account(app_data_dir: &Path, instance_id: &str) -> io::Result<()> {
-    let mut store = load_store(app_data_dir)?;
+    let path = store_path(app_data_dir);
+    let _lock = lock_store(&path)?;
+    let mut store = load_store_locked(&path)?;
     store.accounts.remove(instance_id);
-    save_store(app_data_dir, &store)
+    save_store_locked(&path, &store)
 }
 
 pub fn update_credential_at_path(
@@ -189,13 +233,14 @@ pub fn update_credential_at_path(
     instance_id: &str,
     update: ProviderCredential,
 ) -> io::Result<Option<ProviderCredential>> {
-    let mut store = load_store_path(store_path)?;
+    let _lock = lock_store(store_path)?;
+    let mut store = load_store_locked(store_path)?;
     let Some(account) = store.accounts.get_mut(instance_id) else {
         return Ok(None);
     };
     account.credential.merge_update(update);
     let credential = account.credential.clone();
-    save_store_path(store_path, &store)?;
+    save_store_locked(store_path, &store)?;
     Ok(Some(credential))
 }
 
@@ -222,6 +267,37 @@ mod tests {
         let path = std::env::temp_dir().join(format!("quotabar-provider-accounts-{name}-{nonce}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_account_updates_do_not_replace_unrelated_rows() {
+        provider_accounts_crypto::set_test_master_key(Some([5_u8; 32]));
+        let dir = temp_dir("concurrent-upserts");
+        let workers = 8;
+        let start = std::sync::Barrier::new(workers);
+        std::thread::scope(|scope| {
+            for index in 0..workers {
+                let start = &start;
+                let dir = &dir;
+                scope.spawn(move || {
+                    start.wait();
+                    upsert_account(
+                        dir,
+                        ProviderAccount {
+                            instance_id: format!("claude:{index}"),
+                            base_provider_id: "claude".into(),
+                            label: format!("Account {index}"),
+                            credential: ProviderCredential::default(),
+                        },
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(load_store(&dir).unwrap().accounts.len(), workers);
+        let _ = fs::remove_dir_all(dir);
+        provider_accounts_crypto::set_test_master_key(None);
     }
 
     #[test]
