@@ -1082,7 +1082,7 @@ describe("App", () => {
     })
     const retry = await screen.findByRole("button", { name: "Retry" })
     await userEvent.click(retry)
-    expect(state.startBatchMock).toHaveBeenCalledWith(["a"])
+    expect(state.startBatchMock).toHaveBeenCalledWith(["a"], true)
   })
 
   it("reloads plugin from sidebar context menu", async () => {
@@ -1102,7 +1102,7 @@ describe("App", () => {
     expect(reloadConfig?.enabled).toBe(true)
     reloadAction()
 
-    await waitFor(() => expect(state.startBatchMock).toHaveBeenCalledWith(["b"]))
+    await waitFor(() => expect(state.startBatchMock).toHaveBeenCalledWith(["b"], true))
   })
 
   it("respects manual refresh cooldown for sidebar context menu reload", async () => {
@@ -1128,7 +1128,7 @@ describe("App", () => {
     const firstReloadConfig = menuState.iconMenuItemConfigs.find((item) => item.id === "ctx-reload-b")
     expect(firstReloadConfig?.enabled).toBe(true)
     reloadAction()
-    await waitFor(() => expect(state.startBatchMock).toHaveBeenCalledWith(["b"]))
+    await waitFor(() => expect(state.startBatchMock).toHaveBeenCalledWith(["b"], true))
 
     state.probeHandlers?.onResult({
       providerId: "b",
@@ -1715,7 +1715,7 @@ describe("App", () => {
 
     // The retry should still work (startBatch called) but resetAutoUpdateSchedule
     // should hit the enabledIds.length === 0 branch
-    expect(state.startBatchMock).toHaveBeenCalledWith(["a"])
+    expect(state.startBatchMock).toHaveBeenCalledWith(["a"], true)
   })
 
   it("clears global shortcut via clear button and invokes update_global_shortcut with null", async () => {

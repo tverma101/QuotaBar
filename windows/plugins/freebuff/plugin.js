@@ -11,13 +11,17 @@
   var FREEBUCKS_PER_HOUR = 5
   var ERR_INVALID_RESPONSE = "Freebuff returned unreadable usage data. Try again later."
   var LOGIN_HINT = "Run freebuff login (or ~/.config/manicode/freebuff login), then refresh."
+  var HISTORY_URL = "https://www.codebuff.com/api/v1/cloud/history/"
+  var HISTORY_COOLDOWN = 5 * 60 * 1000
+  var MAX_HISTORY_RECEIPTS = 10000
+  var MAX_HISTORY_BYTES = 2 * 1024 * 1024
 
   function isAbsolutePath(p) {
     return /^([a-zA-Z]:[\\/]|\\\\|\/)/.test(p)
   }
 
   function homeDir(ctx) {
-    var home = ctx.host.env.get("HOME") || ctx.host.env.get("USERPROFILE")
+    var home = ctx.host.fs.homeDir || ctx.host.env.get("HOME") || ctx.host.env.get("USERPROFILE")
     return typeof home === "string" && home.trim() ? home.trim() : null
   }
 
@@ -366,12 +370,230 @@
     return { plan: tier || capitalize(accessTier) || null, lines: lines, warning: warning }
   }
 
+  function historyTokenCount(usage) {
+    if (!usage) return null
+    var input = usage.inputTokens
+    var output = usage.outputTokens
+    var total = input + output
+    if (!Number.isSafeInteger(input) || input < 0 || !Number.isSafeInteger(output) || output < 0 ||
+        !Number.isSafeInteger(total) || (usage.totalTokens != null && usage.totalTokens !== total) ||
+        (usage.cachedInputTokens != null && (!Number.isSafeInteger(usage.cachedInputTokens) ||
+          usage.cachedInputTokens < 0 || usage.cachedInputTokens > input)) ||
+        (usage.reasoningOutputTokens != null && (!Number.isSafeInteger(usage.reasoningOutputTokens) ||
+          usage.reasoningOutputTokens < 0 || usage.reasoningOutputTokens > output))) return null
+    return total
+  }
+
+  function refreshHostedHistory(ctx, token, state, cutoff) {
+    var budget = 20
+    function pages(path, cursor, visit) {
+      var seen = new Set()
+      if (cursor) seen.add(cursor)
+      while (true) {
+        if (--budget < 0) throw "Freebuff history refresh reached its request budget."
+        var url = HISTORY_URL + path + "?limit=" + (path.endsWith("/events") ? "500" : "100")
+        if (cursor) url += "&cursor=" + encodeURIComponent(cursor)
+        var resp = ctx.util.request({
+          method: "GET", url: url, timeoutMs: 1000,
+          headers: { Authorization: "Bearer " + token, Accept: "application/json", "x-freebuff-device-chats": "1" },
+        })
+        if (resp.status < 200 || resp.status >= 300) throw "Freebuff hosted history is unavailable."
+        var page = ctx.util.tryParseJson(resp.bodyText)
+        if (!page || !Array.isArray(page.items) || (page.nextCursor !== null && !nonempty(page.nextCursor)) ||
+            (page.nextCursor && seen.has(page.nextCursor))) throw "Freebuff hosted history returned an invalid page."
+        visit(page)
+        cursor = page.nextCursor
+        if (cursor === null) break
+        seen.add(cursor)
+      }
+    }
+    function active(run) { return run && (run.status === "queued" || run.status === "running") }
+    function readRun(run, chatId) {
+      if (!run || !nonempty(run.id)) throw ERR_INVALID_RESPONSE
+      var id = "cloud:" + run.id
+      if ((run.agent && run.agent !== "codebuff") || (typeof run.model === "string" && run.model.startsWith("byok:"))) {
+        delete state.runs[id]
+        return
+      }
+      var stamp = Date.parse(run.finishedAt || run.createdAt)
+      if (!Number.isFinite(stamp)) throw ERR_INVALID_RESPONSE
+      if (!active(run) && stamp < cutoff) return
+      var receipt = state.runs[id]
+      if (receipt && receipt.stamp === stamp && receipt.status === run.status && !active(run) &&
+          !receipt.partial && !receipt.pending && receipt.tokens !== null) return
+      if (!receipt) {
+        if (Object.keys(state.runs).length >= MAX_HISTORY_RECEIPTS) throw ERR_INVALID_RESPONSE
+        receipt = state.runs[id] = { chatId: chatId, tokens: null, partial: true, cursor: null }
+      }
+      receipt.stamp = stamp
+      receipt.status = run.status
+      receipt.pending = true
+      pages("runs/" + encodeURIComponent(run.id) + "/events", receipt.cursor, function (page) {
+        var tokens = receipt.tokens
+        var partial = receipt.incomplete === true
+        for (var i = 0; i < page.items.length; i++) {
+          var event = page.items[i]
+          if (!event || event.kind !== "metrics") continue
+          if (!event.payload || typeof event.payload !== "object") throw ERR_INVALID_RESPONSE
+          if (event.payload.usage != null) {
+            tokens = historyTokenCount(event.payload.usage)
+            if (tokens === null) throw ERR_INVALID_RESPONSE
+          }
+          if (typeof event.payload.usageIncomplete === "boolean") partial = event.payload.usageIncomplete
+        }
+        receipt.tokens = tokens
+        receipt.incomplete = partial
+        receipt.partial = tokens === null || partial
+        receipt.cursor = nonempty(page.endCursor) || page.nextCursor || receipt.cursor
+      })
+      receipt.pending = false
+    }
+    var pendingChats = new Set()
+    for (var id of Object.keys(state.runs)) {
+      var prior = state.runs[id]
+      if (!active(prior) && prior.stamp < cutoff) delete state.runs[id]
+      else if (active(prior) || prior.partial || prior.pending) pendingChats.add(prior.chatId)
+    }
+    var observed = new Set()
+    pages("chats", null, function (page) {
+      for (var chat of page.items) {
+        if (!chat || !nonempty(chat.id) || !nonempty(chat.updatedAt)) throw ERR_INVALID_RESPONSE
+        var id = "chat:" + chat.id
+        if (!observed.has(id) && observed.size >= MAX_HISTORY_RECEIPTS) throw ERR_INVALID_RESPONSE
+        observed.add(id)
+        if (state.chats[id] === chat.updatedAt && !active(chat.latestRun) && !pendingChats.has(chat.id)) continue
+        pages("chats/" + encodeURIComponent(chat.id) + "/runs", null, function (runs) {
+          for (var run of runs.items) readRun(run, chat.id)
+        })
+        state.chats[id] = chat.updatedAt
+        if (Object.keys(state.chats).length > MAX_HISTORY_RECEIPTS) throw ERR_INVALID_RESPONSE
+      }
+    })
+    for (var id of Object.keys(state.chats)) if (!observed.has(id)) delete state.chats[id]
+  }
+
+  function readDesktopHistory(ctx, cutoff) {
+    var home = homeDir(ctx)
+    var appData = ctx.host.env.get("APPDATA")
+    var roots = [home && home + "/.config/freebuff-desktop/projects"]
+    if (isAbsolutePath(appData || "")) roots.push(appData.replace(/[\\/]+$/, "") + "/freebuff-desktop/projects")
+    var receipts = []
+    var query = function (db, sql) { return JSON.parse(ctx.host.sqlite.query(db, sql)) }
+    for (var root of roots) {
+      if (!root || !ctx.host.fs.exists(root)) continue
+      for (var project of ctx.host.fs.listDir(root)) {
+        if (!project || /[\\/]/.test(project) || project === ".." || project === ".") continue
+        var db = root + "/" + project + "/desktop-v2.db"
+        if (!ctx.host.fs.exists(db)) continue
+        var managers = query(db, "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'auto_run_decision_receipts'")
+        var sql = "WITH receipts AS (" +
+          "SELECT CASE WHEN substr(m.request_id, 1, 6) = 'cloud:' THEN m.request_id ELSE m.thread_id || ':' || m.seq END AS id," +
+          "m.ts AS stamp, m.metrics_json AS metrics FROM messages m JOIN threads t ON t.id = m.thread_id" +
+          " WHERE t.harness_id = 'codebuff' AND m.role = 'assistant'"
+        if (managers.length) {
+          sql += " UNION ALL SELECT 'mission-manager:' || r.thread_id || ':' || r.id," +
+            "COALESCE(json_extract(r.manager_json, '$.startedAt'), r.created_at)," +
+            "json_object('usage', json_extract(r.manager_json, '$.usage')," +
+            "'usageIncomplete', json_extract(r.manager_json, '$.usageIncomplete'))" +
+            " FROM auto_run_decision_receipts r JOIN threads t ON t.id = r.thread_id" +
+            " WHERE t.harness_id = 'codebuff'" +
+            " AND json_extract(r.manager_json, '$.harnessId') = 'codebuff'" +
+            " AND json_type(r.manager_json, '$.usage') = 'object'"
+        }
+        var rows = query(db, sql + "), bounded AS (" +
+          "SELECT id, stamp, CASE WHEN length(metrics) <= 65536 AND json_valid(metrics) THEN metrics END AS usage" +
+          " FROM receipts WHERE length(id) BETWEEN 1 AND 256 AND CAST(stamp AS REAL) >= " + cutoff +
+          " ORDER BY CAST(stamp AS REAL) DESC LIMIT " + (MAX_HISTORY_RECEIPTS + 1) + ")" +
+          " SELECT id, stamp, json_extract(usage, '$.usage.inputTokens') AS inputTokens," +
+          " json_extract(usage, '$.usage.outputTokens') AS outputTokens," +
+          " json_extract(usage, '$.usage.totalTokens') AS totalTokens," +
+          " json_extract(usage, '$.usage.cachedInputTokens') AS cachedInputTokens," +
+          " json_extract(usage, '$.usage.reasoningOutputTokens') AS reasoningOutputTokens," +
+          " json_extract(usage, '$.usageIncomplete') AS usageIncomplete FROM bounded")
+        if (receipts.length + rows.length > MAX_HISTORY_RECEIPTS) throw "Freebuff Desktop history exceeded its receipt budget."
+        for (var row of rows) {
+          var stamp = Number(row.stamp)
+          if (!nonempty(row.id) || !Number.isFinite(stamp)) continue
+          var tokens = historyTokenCount(row)
+          receipts.push({ id: row.id, stamp: stamp, tokens: tokens, partial: tokens === null || row.usageIncomplete === 1 })
+        }
+      }
+    }
+    return receipts
+  }
+
+  function appendHistory(ctx, result, token) {
+    var fs = ctx.host.fs
+    var path = ctx.app.pluginDataDir + "/history-v1.json"
+    var account = ctx.host.crypto.sha256Hex(token)
+    var now = Date.parse(ctx.nowIso)
+    var today = new Date(now)
+    today.setHours(0, 0, 0, 0)
+    var yesterday = new Date(today)
+    yesterday.setDate(today.getDate() - 1)
+    var window = new Date(today)
+    window.setDate(today.getDate() - 29)
+    var state = { account: account, runs: {}, chats: {}, desktop: [] }
+    if (fs.exists(path)) {
+      try {
+        var raw = fs.readText(path)
+        var cached = raw && raw.length <= MAX_HISTORY_BYTES && ctx.util.tryParseJson(raw)
+        if (cached && cached.account === account && cached.runs && cached.chats && Array.isArray(cached.desktop)) state = cached
+      } catch (e) { ctx.host.log.warn("Freebuff history cache could not be loaded.") }
+    }
+    if (ctx.app.refreshHistory && (!state.attempt || now < state.attempt || now - state.attempt >= HISTORY_COOLDOWN)) {
+      state.attempt = now
+      try {
+        refreshHostedHistory(ctx, token, state, Number(window) - DAY_MS)
+        state.hostedError = false
+      } catch (e) {
+        ctx.host.log.warn("Freebuff hosted history refresh did not complete.")
+        state.hostedError = true
+      }
+      try {
+        state.desktop = readDesktopHistory(ctx, Number(window) - DAY_MS)
+        state.desktopError = false
+      } catch (e) {
+        ctx.host.log.warn("Freebuff Desktop history refresh did not complete.")
+        state.desktopError = true
+      }
+      try {
+        var encoded = JSON.stringify(state)
+        if (encoded.length > MAX_HISTORY_BYTES) throw "Freebuff history cache exceeded its budget."
+        fs.writeText(path, encoded)
+      } catch (e) { ctx.host.log.warn("Freebuff history cache could not be saved.") }
+    }
+    var totals = [null, null, null]
+    var incomplete = !!(state.hostedError || state.desktopError)
+    var seen = new Set()
+    function count(id, receipt) {
+      if (seen.has(id) || receipt.stamp < Number(window) || receipt.stamp > now) return
+      if (receipt.partial || receipt.pending) incomplete = true
+      if (!Number.isSafeInteger(receipt.tokens) || receipt.tokens < 0) return
+      seen.add(id)
+      totals[2] = (totals[2] || 0) + receipt.tokens
+      if (receipt.stamp >= Number(today)) totals[0] = (totals[0] || 0) + receipt.tokens
+      else if (receipt.stamp >= Number(yesterday)) totals[1] = (totals[1] || 0) + receipt.tokens
+    }
+    for (var id of Object.keys(state.runs)) count(id, state.runs[id])
+    for (var row of state.desktop) count(row.id, row)
+    var labels = ["Today", "Yesterday", "Last 30 Days"]
+    for (var i = 0; i < labels.length; i++) {
+      if (totals[i] !== null) result.lines.push(ctx.line.text({ label: labels[i], value: totals[i] + " tokens" }))
+    }
+    if (incomplete) {
+      var warning = "Freebuff usage history is incomplete; measured totals may be lower than actual usage."
+      result.warning = result.warning ? result.warning + " " + warning : warning
+    }
+  }
+
   function probe(ctx) {
     var auth = loadAuth(ctx)
     var root = fetchSession(ctx, auth.token)
     var mapped = mapSession(ctx, root)
     var result = { plan: mapped.plan, lines: mapped.lines }
     if (mapped.warning) result.warning = mapped.warning
+    appendHistory(ctx, result, auth.token)
     return result
   }
 

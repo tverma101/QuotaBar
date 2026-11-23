@@ -266,9 +266,11 @@ Returns 401/403 if the token is invalid or expired — triggers reactive refresh
 Antigravity and Antigravity CLI read local conversation databases under
 `~/.gemini/antigravity*/conversations` for token estimates. This is device-local usage, not
 history attributed to a signed-in account. A database linked from multiple locations counts
-once. QuotaBar reuses a bounded in-memory snapshot only while the database and its SQLite
-write-ahead log have the same file identities and revisions. A replaced database does not
-inherit the old file's usage.
+once. QuotaBar reuses bounded in-memory snapshots while the database and write-ahead log
+have the same file identities and revisions. Small unchanged databases can also reuse an
+app-local checkpoint after restart, verified against the source contents. For generations
+without their own timestamp, QuotaBar matches conversation step identifiers and does not
+use a match that points to more than one local day.
 
 ## Plugin Strategy
 

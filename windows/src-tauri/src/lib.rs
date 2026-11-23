@@ -83,6 +83,7 @@ struct PendingProbe {
     batch_id: String,
     plugin: plugin_engine::manifest::LoadedPlugin,
     account: provider_accounts::ProviderAccountContext,
+    refresh_history: bool,
 }
 
 struct ProbeCoord {
@@ -575,6 +576,7 @@ async fn start_probe_batch(
     batch_id: Option<String>,
     plugin_ids: Option<Vec<String>>,
     probe_targets: Option<Vec<ProbeTarget>>,
+    refresh_history: Option<bool>,
 ) -> Result<ProbeBatchStarted, String> {
     let batch_id = batch_id
         .and_then(|id| {
@@ -725,12 +727,15 @@ async fn start_probe_batch(
         for (plugin, account) in selected_plugins {
             let id = account.instance_id.clone();
             if coord.in_flight.contains(&id) {
+                let refresh_history = refresh_history.unwrap_or(false)
+                    || coord.pending.get(&id).is_some_and(|pending| pending.refresh_history);
                 coord.pending.insert(
                     id.clone(),
                     PendingProbe {
                         batch_id: batch_id.clone(),
                         plugin,
                         account,
+                        refresh_history,
                     },
                 );
                 deferred.push(id);
@@ -802,12 +807,12 @@ async fn start_probe_batch(
                     queue.pop_front()
                 };
 
-                let (plugin, account_context, bid) = match item {
+                let (plugin, account_context, bid, history) = match item {
                     Some((plugin, account_context)) => {
-                        (plugin, account_context, queue_batch_id.clone())
+                        (plugin, account_context, queue_batch_id.clone(), refresh_history.unwrap_or(false))
                     }
                     None => match take_follow_up(None) {
-                        Some(pending) => (pending.plugin, pending.account, pending.batch_id),
+                        Some(pending) => (pending.plugin, pending.account, pending.batch_id, pending.refresh_history),
                         None => break,
                     },
                 };
@@ -820,6 +825,7 @@ async fn start_probe_batch(
                     &bid,
                     plugin,
                     account_context,
+                    history,
                 );
             }
 
@@ -846,6 +852,7 @@ fn run_and_emit_probe(
     batch_id: &str,
     plugin: plugin_engine::manifest::LoadedPlugin,
     account_context: provider_accounts::ProviderAccountContext,
+    refresh_history: bool,
 ) {
     let plugin_id = account_context.instance_id.clone();
     let probe_display_name = if account_context.label.trim().is_empty() {
@@ -858,11 +865,12 @@ fn run_and_emit_probe(
         )
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        plugin_engine::runtime::run_probe_with_account(
+        plugin_engine::runtime::run_probe_with_history(
             &plugin,
             data_dir,
             version,
             Some(account_context),
+            refresh_history,
         )
     }));
 
@@ -931,6 +939,7 @@ fn run_and_emit_probe(
             &pending.batch_id,
             pending.plugin,
             pending.account,
+            pending.refresh_history,
         );
     }
 }

@@ -18,6 +18,9 @@
     { "type": "progress", "label": "Daily Hours", "scope": "overview" },
     { "type": "values", "label": "Hours Balance", "scope": "overview" },
     { "type": "progress", "label": "Monthly Spend", "scope": "detail" },
-    { "type": "values", "label": "Active Sessions", "scope": "detail" }
+    { "type": "values", "label": "Active Sessions", "scope": "detail" },
+    { "type": "values", "label": "Today", "scope": "overview" },
+    { "type": "values", "label": "Yesterday", "scope": "overview" },
+    { "type": "values", "label": "Last 30 Days", "scope": "overview" }
   ]
 }

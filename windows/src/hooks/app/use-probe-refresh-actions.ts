@@ -10,7 +10,7 @@ type UseProbeRefreshActionsArgs = {
   resetAutoUpdateSchedule: () => void
   setLoadingForPlugins: (ids: string[]) => void
   setErrorForPlugins: (ids: string[], error: string) => void
-  startBatch: (pluginIds?: string[]) => Promise<string[] | undefined>
+  startBatch: (pluginIds?: string[], refreshHistory?: true) => Promise<string[] | undefined>
 }
 
 export function useProbeRefreshActions({
@@ -29,7 +29,7 @@ export function useProbeRefreshActions({
       }
 
       setLoadingForPlugins(ids)
-      startBatch(ids).catch((error) => {
+      startBatch(ids, true).catch((error) => {
         for (const id of ids) {
           manualRefreshIdsRef.current.delete(id)
         }

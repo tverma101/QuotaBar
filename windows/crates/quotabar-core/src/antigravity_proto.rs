@@ -1,8 +1,8 @@
 //! Decodes generation-accounting fields in Antigravity's undocumented conversation protobufs.
 //! Ported from OpenUsage 0.7.10 `AntigravityProtoDecoder` (FelixIsaac, openusage#1058/#1120).
-//! Do not invent protobuf fields beyond model 19, usage 4, and timestamp 9 on the wrapped event.
+//! Newer databases also record timestamps in conversation steps.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GenerationEvent {
     pub model: String,
     pub input_tokens: i64,
@@ -18,6 +18,68 @@ impl GenerationEvent {
 enum WireValue {
     Varint(u64),
     Bytes(Vec<u8>),
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StepIdentity {
+    pub(crate) uuid: Option<String>,
+    pub(crate) bot_id: Option<String>,
+}
+
+fn unique_field(number: u32, bytes: &[u8]) -> Option<Option<WireValue>> {
+    let mut offset = 0;
+    let mut found = None;
+    while offset < bytes.len() {
+        let (field, value, end) = wire_field(bytes, offset, number)?;
+        if field == number {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(value?);
+        }
+        offset = end;
+    }
+    Some(found)
+}
+
+fn unique_bytes(number: u32, bytes: &[u8]) -> Option<Option<Vec<u8>>> {
+    match unique_field(number, bytes)? {
+        Some(WireValue::Bytes(value)) => Some(Some(value)),
+        Some(WireValue::Varint(_)) => None,
+        None => Some(None),
+    }
+}
+
+fn identifier(number: u32, bytes: &[u8]) -> Option<Option<String>> {
+    match unique_bytes(number, bytes)? {
+        Some(raw) => {
+            let value = String::from_utf8(raw).ok()?;
+            (!value.trim().is_empty()).then_some(Some(value))
+        }
+        None => Some(None),
+    }
+}
+
+pub(crate) fn generation_identity(blob: &[u8]) -> Option<StepIdentity> {
+    let wrapped = unique_bytes(1, blob)??;
+    let usage = unique_bytes(4, &wrapped)??;
+    Some(StepIdentity {
+        uuid: identifier(4, blob)?,
+        bot_id: identifier(7, &usage)?,
+    })
+}
+
+pub(crate) fn step_identity_timestamp(blob: &[u8]) -> Option<(StepIdentity, i64)> {
+    let bot_id = match unique_bytes(9, blob)? {
+        Some(usage) => identifier(7, &usage)?,
+        None => None,
+    };
+    let timestamp = unique_bytes(1, blob)??;
+    let Some(WireValue::Varint(timestamp)) = unique_field(1, &timestamp)? else {
+        return None;
+    };
+    let timestamp = i64::try_from(timestamp).ok().filter(|&v| v > 0)?;
+    Some((StepIdentity { uuid: identifier(12, blob)?, bot_id }, timestamp))
 }
 
 /// Protobuf unsigned varint. At most 10 bytes; the 10th payload nibble must be 0 or 1.
@@ -47,18 +109,25 @@ pub fn decode_varint(bytes: &[u8], offset: usize) -> Option<(u64, usize)> {
 fn field(requested: u32, bytes: &[u8]) -> Option<WireValue> {
     let mut offset = 0;
     while offset < bytes.len() {
-        let (tag, next) = decode_varint(bytes, offset)?;
-        let number = u32::try_from(tag >> 3).ok()?;
-        if number == 0 {
-            return None;
+        let (number, value, end) = wire_field(bytes, offset, requested)?;
+        if number == requested {
+            return value;
         }
-        match tag & 0x7 {
+        offset = end;
+    }
+    None
+}
+
+fn wire_field(bytes: &[u8], offset: usize, requested: u32) -> Option<(u32, Option<WireValue>, usize)> {
+    let (tag, next) = decode_varint(bytes, offset)?;
+    let number = u32::try_from(tag >> 3).ok()?;
+    if number == 0 {
+        return None;
+    }
+    let (value, end) = match tag & 0x7 {
             0 => {
                 let (value, after) = decode_varint(bytes, next)?;
-                if number == requested {
-                    return Some(WireValue::Varint(value));
-                }
-                offset = after;
+                ((number == requested).then_some(WireValue::Varint(value)), after)
             }
             2 => {
                 let (len, start) = decode_varint(bytes, next)?;
@@ -68,22 +137,18 @@ fn field(requested: u32, bytes: &[u8]) -> Option<WireValue> {
                 }
                 let count = usize::try_from(len).ok()?;
                 let end = start + count;
-                if number == requested {
-                    return Some(WireValue::Bytes(bytes[start..end].to_vec()));
-                }
-                offset = end;
+                ((number == requested).then(|| WireValue::Bytes(bytes[start..end].to_vec())), end)
             }
             1 | 5 => {
                 let width = if tag & 0x7 == 1 { 8 } else { 4 };
                 if bytes.len().saturating_sub(next) < width {
                     return None;
                 }
-                offset = next + width;
+                (None, next + width)
             }
             _ => return None,
-        }
-    }
-    None
+    };
+    Some((number, value, end))
 }
 
 fn bytes_field(number: u32, bytes: &[u8]) -> Option<Vec<u8>> {
@@ -103,6 +168,13 @@ fn varint_field(number: u32, bytes: &[u8]) -> Option<u64> {
 /// `gen_metadata.data` wraps its event in field 1: model 19, token counts 4, timestamp 9.
 /// An absent model stays visibly unpriced instead of silently borrowing another Gemini rate.
 pub fn generation_event(blob: &[u8]) -> Option<GenerationEvent> {
+    generation_event_with_timestamp(blob, || None)
+}
+
+pub(crate) fn generation_event_with_timestamp(
+    blob: &[u8],
+    fallback: impl FnOnce() -> Option<i64>,
+) -> Option<GenerationEvent> {
     let wrapped = bytes_field(1, blob)?;
     let decoded_model = bytes_field(19, &wrapped).and_then(|raw| String::from_utf8(raw).ok());
     let model = decoded_model
@@ -120,13 +192,7 @@ pub fn generation_event(blob: &[u8]) -> Option<GenerationEvent> {
         return None;
     }
 
-    let timing = bytes_field(9, &wrapped)?;
-    let wall_clock = bytes_field(4, &timing)?;
-    let timestamp = varint_field(1, &wall_clock)?;
-    let timestamp_seconds = i64::try_from(timestamp).ok()?;
-    if timestamp_seconds <= 0 {
-        return None;
-    }
+    let timestamp_seconds = embedded_timestamp(&wrapped).or_else(fallback)?;
 
     Some(GenerationEvent {
         model,
@@ -135,6 +201,12 @@ pub fn generation_event(blob: &[u8]) -> Option<GenerationEvent> {
         cache_read_tokens: cache_read,
         timestamp_seconds,
     })
+}
+
+fn embedded_timestamp(wrapped: &[u8]) -> Option<i64> {
+    let timing = bytes_field(9, wrapped)?;
+    let wall = bytes_field(4, &timing)?;
+    i64::try_from(varint_field(1, &wall)?).ok().filter(|&v| v > 0)
 }
 
 #[cfg(test)]
@@ -160,7 +232,7 @@ fn encode_key(field: u32, wire: u8) -> Vec<u8> {
 }
 
 #[cfg(test)]
-fn encode_bytes_field(field: u32, data: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_bytes_field(field: u32, data: &[u8]) -> Vec<u8> {
     let mut out = encode_key(field, 2);
     out.extend(encode_varint(data.len() as u64));
     out.extend_from_slice(data);
@@ -168,7 +240,7 @@ fn encode_bytes_field(field: u32, data: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-fn encode_varint_field(field: u32, value: u64) -> Vec<u8> {
+pub(crate) fn encode_varint_field(field: u32, value: u64) -> Vec<u8> {
     let mut out = encode_key(field, 0);
     out.extend(encode_varint(value));
     out
