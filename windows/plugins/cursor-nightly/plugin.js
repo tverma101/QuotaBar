@@ -1483,6 +1483,7 @@ globalThis.__OPENUSAGE_PLUGIN_REGISTRATION_ID__ = "cursor-nightly";
           inputTokens: row.inputTokens,
           outputTokens: row.outputTokens,
           costUsd: row.costUsd,
+          apiEstimateUsd: row.apiEstimateUsd,
         }
       })
       if (ctx.host.usageDaily && typeof ctx.host.usageDaily.ingest === "function") {

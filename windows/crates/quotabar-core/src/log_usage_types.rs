@@ -112,6 +112,7 @@ mod tests {
             total_tokens: 15,
             total_cost: Some(1.0),
             cost_usd: Some(1.0),
+            api_estimate_usd: Some(2.0),
             models: BTreeMap::from([(
                 "m".into(),
                 ModelDayUsage {
@@ -133,6 +134,7 @@ mod tests {
             total_tokens: 30,
             total_cost: Some(0.5),
             cost_usd: Some(0.5),
+            api_estimate_usd: None,
             models: BTreeMap::from([(
                 "m".into(),
                 ModelDayUsage {
@@ -149,6 +151,7 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].total_tokens, 45);
         assert_eq!(merged[0].total_cost, Some(1.5));
+        assert_eq!(merged[0].api_estimate_usd, Some(2.0));
         assert_eq!(merged[0].models["m"].total_tokens, 45);
         assert_eq!(merged[0].models["m"].total_cost, Some(1.5));
     }
@@ -216,6 +219,8 @@ pub struct DailyUsageRow {
     pub total_cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_estimate_usd: Option<f64>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, ModelDayUsage>,
 }
@@ -286,6 +291,7 @@ pub fn merge_daily_rows(a: Vec<DailyUsageRow>, b: Vec<DailyUsageRow>) -> Vec<Dai
             existing.total_tokens += row.total_tokens;
             existing.total_cost = sum_opt_f64(existing.total_cost, row.total_cost);
             existing.cost_usd = sum_opt_f64(existing.cost_usd, row.cost_usd);
+            existing.api_estimate_usd = sum_opt_f64(existing.api_estimate_usd, row.api_estimate_usd);
             for (model, usage) in row.models {
                 match existing.models.get_mut(&model) {
                     Some(e) => {

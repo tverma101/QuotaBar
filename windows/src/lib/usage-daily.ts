@@ -7,6 +7,7 @@ export type UsageDailyRow = {
   inputTokens: number | null
   outputTokens: number | null
   costUsd: number | null
+  apiEstimateUsd?: number | null
   source: string
   ingestedAtMs: number
 }

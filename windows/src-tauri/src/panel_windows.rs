@@ -104,8 +104,8 @@ pub fn init(app_handle: &tauri::AppHandle) -> tauri::Result<()> {
         // Content-driven height: `resize_panel` resizes to whatever the webview
         // reports, so the minimum only guards a degenerate near-zero state.
         let _ = window.set_min_size(Some(tauri::Size::Logical(tauri::LogicalSize {
-            width: 360.0,
-            height: 300.0,
+            width: 320.0,
+            height: 250.0,
         })));
         let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize {
             width: 400.0,

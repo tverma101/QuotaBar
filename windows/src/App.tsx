@@ -303,6 +303,7 @@ function App() {
     handleSetTrayReadout,
     handleDashboardMetricToggle,
     handleProviderDashboardMetrics,
+    handleResetCustomization,
   } = useSettingsPluginActions({
     pluginSettings,
     pluginsMeta,
@@ -704,6 +705,7 @@ function App() {
     return (
       <ModernShell
         {...shellProps}
+        onResetCustomization={handleResetCustomization}
         preferWeeklyLimit={preferMenubarWeeklyLimit}
       />
     )

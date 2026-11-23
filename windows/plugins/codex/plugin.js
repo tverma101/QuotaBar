@@ -751,6 +751,13 @@
         ctx.host.log.warn("codexLogs ok but daily missing")
         return { status: "runner_failed", data: null }
       }
+      if (native.data.daily.length && typeof ctx.host.usageDaily?.ingest === "function") {
+        try {
+          ctx.host.usageDaily.ingest({ displayName: "Codex", daily: native.data.daily })
+        } catch (e) {
+          ctx.host.log.warn("Codex daily history ingest failed: " + String(e))
+        }
+      }
       return { status: "ok", data: native.data }
     } catch (e) {
       ctx.host.log.warn("codexLogs native scan failed: " + String(e))

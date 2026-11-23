@@ -113,6 +113,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             input_tokens INTEGER,
             output_tokens INTEGER,
             cost_usd REAL,
+            api_estimate_usd REAL,
             source TEXT NOT NULL DEFAULT 'ccusage',
             ingested_at_ms INTEGER NOT NULL,
             PRIMARY KEY (instance_id, day_key)
@@ -125,6 +126,23 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE usage_daily ADD COLUMN source TEXT NOT NULL DEFAULT 'ccusage'",
         [],
     );
+    let has_api_estimate = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_daily') WHERE name = 'api_estimate_usd')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_api_estimate {
+        if let Err(error) = conn.execute("ALTER TABLE usage_daily ADD COLUMN api_estimate_usd REAL", []) {
+            let migrated = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_daily') WHERE name = 'api_estimate_usd')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !migrated {
+                return Err(error);
+            }
+        }
+    }
     Ok(())
 }
 

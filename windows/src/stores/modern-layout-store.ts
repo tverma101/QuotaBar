@@ -18,6 +18,10 @@ type ModernLayoutStore = ModernLayoutState & {
   hydrated: boolean
   pinLimitNotice: string | null
   setFromPersisted: (state: ModernLayoutState) => void
+  resetCustomization: (
+    descriptors: MetricDescriptor[], pluginSettings: PluginSettings,
+    onDemandMetricIds: string[], pinnedMetricIds: string[],
+  ) => void
   ensureInitialized: (
     descriptors: MetricDescriptor[],
     pluginSettings: PluginSettings,
@@ -83,6 +87,21 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
 
   setFromPersisted: (state) => {
     set({ ...state, hydrated: true })
+  },
+
+  resetCustomization: (descriptors, pluginSettings, onDemandMetricIds, pinnedMetricIds) => {
+    set({
+      ...EMPTY_MODERN_LAYOUT,
+      providerOrder: providerOrderFromPluginSettings(pluginSettings, descriptors),
+      metricOrderByProvider: defaultMetricOrderByProvider(descriptors),
+      pinnedMetricIds,
+      onDemandMetricIds,
+      pinsCustomized: true,
+      trayFocusProviderId: parseMetricId(pinnedMetricIds[0] ?? "")?.pluginId ?? null,
+      initialized: true,
+      pinLimitNotice: null,
+    })
+    get().persist()
   },
 
   ensureInitialized: (descriptors, pluginSettings, seedPinnedFromTray = []) => {

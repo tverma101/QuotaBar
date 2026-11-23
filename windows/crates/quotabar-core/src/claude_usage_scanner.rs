@@ -530,6 +530,7 @@ fn should_replace(candidate: &ClaudeEntry, existing: &ClaudeEntry) -> bool {
 fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPricing) -> Vec<DailyUsageRow> {
     let mut tokens_by_day: BTreeMap<String, i32> = BTreeMap::new();
     let mut cost_by_day: BTreeMap<String, f64> = BTreeMap::new();
+    let mut api_estimate_by_day: BTreeMap<String, f64> = BTreeMap::new();
     let mut priced_days: HashSet<String> = HashSet::new();
     let mut models_by_day: BTreeMap<String, BTreeMap<String, (i32, f64)>> = BTreeMap::new();
     let mut input_by_day: BTreeMap<String, i32> = BTreeMap::new();
@@ -549,14 +550,11 @@ fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPrici
             .filter(|m| !m.is_empty())
             .unwrap_or("unattributed");
 
-        let cost = if let Some(carried) = entry.cost_usd {
-            carried
-        } else if let Some(model) = entry.model.as_deref().filter(|m| !m.trim().is_empty()) {
-            match pricing.estimated_cost_dollars(model, &entry.tokens) {
-                Some(c) => c,
-                None => continue,
-            }
-        } else {
+        let estimate = pricing.estimated_cost_dollars(model_name, &entry.tokens);
+        if let Some(estimate) = estimate {
+            *api_estimate_by_day.entry(day.clone()).or_default() += estimate;
+        }
+        let Some(cost) = entry.cost_usd.or(estimate) else {
             continue;
         };
 
@@ -615,6 +613,7 @@ fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPrici
                 total_tokens: *tokens_by_day.get(&day).unwrap_or(&0),
                 total_cost,
                 cost_usd: total_cost,
+                api_estimate_usd: api_estimate_by_day.get(&day).copied(),
                 models,
             }
         })

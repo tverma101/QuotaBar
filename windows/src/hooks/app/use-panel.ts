@@ -15,6 +15,7 @@ type UsePanelArgs = {
   showAbout: boolean
   setShowAbout: (value: boolean) => void
   displayPlugins: DisplayPluginState[]
+  narrowWindowsPanel?: boolean
 }
 
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -34,6 +35,7 @@ export function usePanel({
   showAbout,
   setShowAbout,
   displayPlugins,
+  narrowWindowsPanel = false,
 }: UsePanelArgs) {
   const containerRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -203,7 +205,7 @@ export function usePanel({
         const chrome = container.offsetHeight - (scroll ? scroll.offsetHeight : 0)
         const contentHeight =
           chrome + (scroll ? scroll.scrollHeight : container.scrollHeight) + 2
-        invoke("resize_panel", { height: Math.max(contentHeight, 240) }).catch(console.error)
+        invoke("resize_panel", { height: contentHeight, narrow: narrowWindowsPanel }).catch(console.error)
         return
       }
 
@@ -231,7 +233,7 @@ export function usePanel({
     observer.observe(container)
 
     return () => observer.disconnect()
-  }, [activeView, displayPlugins])
+  }, [activeView, displayPlugins, narrowWindowsPanel])
 
   useEffect(() => {
     const el = scrollRef.current

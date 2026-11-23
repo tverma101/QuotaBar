@@ -462,6 +462,7 @@ fn aggregate_entries(
                 total_tokens,
                 total_cost,
                 cost_usd: total_cost,
+                api_estimate_usd: None,
                 models,
             }
         })

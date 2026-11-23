@@ -337,6 +337,7 @@ fn aggregate(
                 total_tokens: *tokens_by_day.get(&day).unwrap_or(&0),
                 total_cost,
                 cost_usd: total_cost,
+                api_estimate_usd: None,
                 models,
             }
         })

@@ -30,4 +30,17 @@ describe("buildHistoryReport", () => {
     expect(report.days[1]).toMatchObject({ key: "2026-10-03", tokens: 0 })
     expect(report.accounts.map(({ id, tokens }) => [id, tokens])).toEqual([["home", 40], ["work", 70]])
   })
+
+  it("sums known public-rate estimates across the same lifetime scope as cost", () => {
+    const report = buildHistoryReport([
+      { ...row("work", "2026-01-01", 30, 2), apiEstimateUsd: 1 },
+      row("work", "2026-10-31", 20, null),
+      { ...row("work", "2026-10-31", 20, 4), apiEstimateUsd: 3 },
+      { ...row("disabled", "2026-10-31", 20, 4), apiEstimateUsd: 5 },
+      { ...row("work", "2026-11-01", 20, 4), apiEstimateUsd: 6 },
+    ], ["work"], new Date(2026, 9, 31))
+    expect(report.lifetime.cost).toBe(6)
+    expect(report.apiEstimate).toBe(4)
+    expect(buildHistoryReport([], ["work"], new Date(2026, 9, 31)).apiEstimate).toBeNull()
+  })
 })

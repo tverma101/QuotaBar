@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react"
 import { invoke, isTauri } from "@tauri-apps/api/core"
 import { ChevronLeft } from "lucide-react"
+import { ResetCustomizationButton } from "@/components/modern/reset-customization-button"
 import { useShallow } from "zustand/react/shallow"
 import { LiquidGlassFilter } from "@/components/liquid-glass-filter"
 import { OnboardingWizard } from "@/components/onboarding-wizard"
@@ -57,6 +58,7 @@ function quitApp() {
 
 type ModernShellProps = {
   onRefreshAll: () => void
+  onResetCustomization: () => void
   displayPlugins: DisplayPluginState[]
   settingsPlugins: SettingsPluginState[]
   autoUpdateNextAt: number | null
@@ -69,6 +71,7 @@ type ModernShellProps = {
 
 export function ModernShell({
   onRefreshAll,
+  onResetCustomization,
   displayPlugins,
   settingsPlugins,
   autoUpdateNextAt,
@@ -160,6 +163,7 @@ export function ModernShell({
   actions.current = appContentProps
   const { containerRef, scrollRef, maxPanelHeightPx } = usePanel({
     activeView, setActiveView, showAbout, setShowAbout, displayPlugins,
+    narrowWindowsPanel: !isDashboard,
   })
 
   useEffect(() => {
@@ -329,7 +333,8 @@ export function ModernShell({
       <LiquidGlassFilter active={themeMode === "glass"} />
       <div
         ref={panelMotionRef}
-        className="app-panel-surface relative w-full overflow-hidden rounded-[18px] select-none flex flex-col min-h-[320px]"
+        className={cn("app-panel-surface relative w-full overflow-hidden rounded-[18px] select-none flex flex-col",
+          isDashboard ? "min-h-[320px]" : "min-h-[250px]")}
         data-ui-layout="modern"
         style={maxPanelHeightPx ? { maxHeight: `min(100dvh, ${maxPanelHeightPx}px)` } : { maxHeight: "100dvh" }}
       >
@@ -342,6 +347,12 @@ export function ModernShell({
             <h1 className="pointer-events-none absolute inset-x-8 truncate text-center text-[13px] font-semibold">
               {editingProvider?.name ?? screenTitles[screen]}
             </h1>
+            {screen === "customize" && !editingProvider && (
+              <ResetCustomizationButton onReset={() => {
+                undoStack.current = []
+                onResetCustomization()
+              }} />
+            )}
           </header>
         )}
 

@@ -340,6 +340,7 @@ fn aggregate(
             total_tokens: acc.tokens,
             total_cost: Some(acc.cost),
             cost_usd: Some(acc.cost),
+            api_estimate_usd: None,
             models: acc
                 .models
                 .into_iter()

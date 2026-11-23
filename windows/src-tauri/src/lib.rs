@@ -342,7 +342,7 @@ fn quit_app(app_handle: tauri::AppHandle) {
 /// Resize the popover window to the content height the frontend measured, then re-anchor
 /// it to the tray so its bottom edge stays flush above the taskbar (macOS-style sizing).
 #[tauri::command]
-fn resize_panel(app_handle: tauri::AppHandle, height: f64) {
+fn resize_panel(app_handle: tauri::AppHandle, height: f64, narrow: Option<bool>) {
     use tauri::Manager;
 
     let Some(window) = app_handle.get_webview_window("main") else {
@@ -359,7 +359,12 @@ fn resize_panel(app_handle: tauri::AppHandle, height: f64) {
         .flatten()
         .map(|m| (f64::from(m.work_area().size.height) / scale * 0.76).floor())
         .unwrap_or(720.0);
-    let size = tauri::LogicalSize::new(400.0, height.round().clamp(300.0, max.max(300.0)));
+    let (width, min_height): (f64, f64) = if narrow == Some(true) {
+        (320.0, 250.0)
+    } else {
+        (400.0, 300.0)
+    };
+    let size = tauri::LogicalSize::new(width, height.round().clamp(min_height, max.max(min_height)));
     if window.inner_size().ok() == Some(size.to_physical::<u32>(scale)) {
         return;
     }

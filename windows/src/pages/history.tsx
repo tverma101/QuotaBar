@@ -1,16 +1,20 @@
 import { useMemo } from "react"
-import { History } from "lucide-react"
+import { History, Sparkles } from "lucide-react"
 import type { DisplayPluginState } from "@/hooks/app/use-app-plugin-views"
 import { useHistoryReportDays } from "@/hooks/use-history-report-days"
 import { useNowTicker } from "@/hooks/use-now-ticker"
 import { buildHistoryReport, type HistoryTotal } from "@/lib/history-report"
 import { formatMoney, getEffectiveIntlLocale } from "@/lib/locale-format"
 
-const card = "rounded-xl border border-border/50 bg-card text-card-foreground"
+const card = "rounded-xl bg-muted/60 text-card-foreground"
+
+function historyMoney(value: number): string {
+  return formatMoney(value, { compact: true })
+}
 
 function cost(total: HistoryTotal): string {
   if (total.cost == null) return "—"
-  return formatMoney(total.cost) + (total.partial ? "+" : "")
+  return historyMoney(total.cost) + (total.partial ? "+" : "")
 }
 
 function tokens(count: number): string {
@@ -42,6 +46,8 @@ export function HistoryView({
   const report = useMemo(() => buildHistoryReport(rows, ids, new Date(localDay)), [rows, ids, localDay])
   const pluginsById = useMemo(() => new Map(plugins.map((plugin) => [plugin.meta.id, plugin])), [plugins])
   const peak = Math.max(...report.days.map((day) => day.tokens))
+  const estimate = report.apiEstimate == null ? null : historyMoney(report.apiEstimate)
+  const lifetimeCost = report.lifetime.cost == null ? null : historyMoney(report.lifetime.cost)
 
   if (!report.since) {
     return (
@@ -59,7 +65,7 @@ export function HistoryView({
   }
 
   return (
-    <div className="space-y-2 pb-2 text-xs">
+    <div className="space-y-3.5 pb-2 text-xs">
       <section className={card + " space-y-1 p-3.5"}>
         <div className="flex items-baseline justify-between gap-2">
           <h2 className="text-sm font-semibold">Lifetime</h2>
@@ -69,8 +75,14 @@ export function HistoryView({
           <strong className="text-xl">{cost(report.lifetime)}</strong>
           <span className="text-muted-foreground">{tokens(report.lifetime.tokens)}</span>
         </div>
-        <p className="text-muted-foreground">Saved usage only. Costs may be estimates.</p>
       </section>
+      {estimate !== null && estimate !== lifetimeCost && (
+        <section className={card + " flex items-center gap-2 px-3 py-2.5"}>
+          <Sparkles aria-hidden="true" className="size-3.5 text-muted-foreground" />
+          <h2 className="flex-1 font-medium">At Public API Rates (Est.)</h2>
+          <strong className="text-sm tabular-nums">{estimate}</strong>
+        </section>
+      )}
       <section aria-label="Period totals" className={card + " grid grid-cols-3"}>
         {([["Today", report.today], ["7 Days", report.last7], ["30 Days", report.last30]] as const).map(([label, total]) => (
           <div key={label} className="space-y-0.5 p-3 tabular-nums">
@@ -87,7 +99,7 @@ export function HistoryView({
         </div>
         <ul className="flex h-9 items-end gap-0.5" aria-label="30-day token trend">
           {report.days.map((day) => (
-            <li key={day.key} className={"flex-1 rounded-full " + (day.tokens > 0 ? "bg-primary" : "bg-muted")}
+            <li key={day.key} className={"flex-1 rounded-full " + (day.tokens > 0 ? "bg-[#008bff]" : "bg-foreground/10")}
               style={{ height: day.tokens > 0 ? Math.max(3, 36 * day.tokens / peak) : 2 }}>
               <span className="sr-only">{dayLabel(day.key)}: {tokens(day.tokens)}</span>
             </li>

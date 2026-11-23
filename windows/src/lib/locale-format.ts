@@ -65,6 +65,7 @@ export function formatMoney(
     sourceCurrency?: DisplayCurrencyCode
     locale?: string
     displayCurrency?: DisplayCurrencyCode
+    compact?: boolean
   },
 ): string {
   if (!Number.isFinite(amount)) return "—"
@@ -74,6 +75,14 @@ export function formatMoney(
   let value = amount
   if (source === "USD" && target !== "USD") {
     value = convertFromUsd(amount, target)
+  }
+  if (options?.compact && Math.abs(value) >= 1000) {
+    return new Intl.NumberFormat(locale, {
+      style: "currency",
+      currency: target,
+      notation: "compact",
+      maximumFractionDigits: 1,
+    }).format(value)
   }
   const fractionDigits = currencyFractionDigits(target)
   return new Intl.NumberFormat(locale, {

@@ -114,6 +114,17 @@ describe("settings", () => {
     await expect(loadPluginSettings()).resolves.toEqual(DEFAULT_PLUGIN_SETTINGS)
   })
 
+  it("updates Windows preferences in memory without bypassing the native store debounce", async () => {
+    await Promise.all([
+      saveThemeMode("light"),
+      savePluginSettings({ ...DEFAULT_PLUGIN_SETTINGS, order: ["cursor", "codex"] }),
+    ])
+    await saveThemeMode("dark")
+    await expect(loadThemeMode()).resolves.toBe("dark")
+    expect((await loadPluginSettings()).order).toEqual(["cursor", "codex"])
+    expect(storeSaveMock).not.toHaveBeenCalled()
+  })
+
   it("sanitizes stored settings", async () => {
     storeState.set("plugins", { order: ["a"], disabled: "nope" })
     await expect(loadPluginSettings()).resolves.toEqual({

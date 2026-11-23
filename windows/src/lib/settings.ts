@@ -249,6 +249,7 @@ export const TIME_FORMAT_OPTIONS: { value: TimeFormatMode; label: string }[] = [
   { value: "24h", label: "24-hour" },
 ];
 
+// Tauri batches settings writes on the native side and saves the store on exit.
 const store = new LazyStore(SETTINGS_STORE_PATH);
 
 // QuotaBar's owner-selected defaults (AGENTS.md): Claude, Codex, Cursor, Freebuff.
@@ -285,7 +286,6 @@ export async function loadPluginSettings(): Promise<PluginSettings> {
 
 export async function savePluginSettings(settings: PluginSettings): Promise<void> {
   await store.set(PLUGIN_SETTINGS_KEY, settings);
-  await store.save();
 }
 
 // TODO(remove after 2026-09-01): One-time Windsurf -> Devin settings migration.
@@ -330,7 +330,6 @@ export async function saveAutoUpdateInterval(
   interval: AutoUpdateIntervalMinutes
 ): Promise<void> {
   await store.set(AUTO_UPDATE_SETTINGS_KEY, interval);
-  await store.save();
 }
 
 export function normalizePluginSettings(
@@ -483,6 +482,20 @@ export function enableDetectedProvidersOnOnboarding(
   }
 }
 
+export function resetPluginCustomization(settings: PluginSettings, plugins: PluginMeta[]): PluginSettings {
+  const ordered = [...plugins].sort((a, b) => a.name.localeCompare(b.name));
+  const reset = normalizePluginSettings(
+    { ...settings, order: DEFAULT_PLUGIN_SETTINGS.order, disabled: [], trayLines: {} },
+    ordered,
+  );
+  return {
+    ...reset,
+    disabled: reset.order.filter((id) =>
+      !DEFAULT_ENABLED_PLUGINS.has(id) && getBaseProviderId(id, reset) !== "codex"
+    ),
+  };
+}
+
 export function arePluginSettingsEqual(
   a: PluginSettings,
   b: PluginSettings
@@ -549,7 +562,6 @@ export async function loadThemeMode(): Promise<ThemeMode> {
 
 export async function saveThemeMode(mode: ThemeMode): Promise<void> {
   await store.set(THEME_MODE_KEY, mode);
-  await store.save();
 }
 
 function isDisplayMode(value: unknown): value is DisplayMode {
@@ -564,7 +576,6 @@ export async function loadDisplayMode(): Promise<DisplayMode> {
 
 export async function saveDisplayMode(mode: DisplayMode): Promise<void> {
   await store.set(DISPLAY_MODE_KEY, mode);
-  await store.save();
 }
 
 function isResetTimerDisplayMode(value: unknown): value is ResetTimerDisplayMode {
@@ -582,7 +593,6 @@ export async function loadResetTimerDisplayMode(): Promise<ResetTimerDisplayMode
 
 export async function saveResetTimerDisplayMode(mode: ResetTimerDisplayMode): Promise<void> {
   await store.set(RESET_TIMER_DISPLAY_MODE_KEY, mode);
-  await store.save();
 }
 
 function isTimeFormatMode(value: unknown): value is TimeFormatMode {
@@ -600,7 +610,6 @@ export async function loadTimeFormatMode(): Promise<TimeFormatMode> {
 
 export async function saveTimeFormatMode(mode: TimeFormatMode): Promise<void> {
   await store.set(TIME_FORMAT_MODE_KEY, mode);
-  await store.save();
 }
 
 function isAppLocale(value: unknown): value is AppLocale {
@@ -615,7 +624,6 @@ export async function loadAppLocale(): Promise<AppLocale> {
 
 export async function saveAppLocale(locale: AppLocale): Promise<void> {
   await store.set(APP_LOCALE_KEY, locale);
-  await store.save();
 }
 
 function isDisplayCurrency(value: unknown): value is DisplayCurrency {
@@ -633,7 +641,6 @@ export async function loadDisplayCurrency(): Promise<DisplayCurrency> {
 
 export async function saveDisplayCurrency(currency: DisplayCurrency): Promise<void> {
   await store.set(DISPLAY_CURRENCY_KEY, currency);
-  await store.save();
 }
 
 function isMenubarIconStyle(value: unknown): value is MenubarIconStyle {
@@ -651,7 +658,6 @@ export async function loadMenubarIconStyle(): Promise<MenubarIconStyle> {
 
 export async function saveMenubarIconStyle(style: MenubarIconStyle): Promise<void> {
   await store.set(MENUBAR_ICON_STYLE_KEY, style);
-  await store.save();
 }
 
 export async function loadPreferMenubarWeeklyLimit(): Promise<boolean> {
@@ -662,7 +668,6 @@ export async function loadPreferMenubarWeeklyLimit(): Promise<boolean> {
 
 export async function savePreferMenubarWeeklyLimit(value: boolean): Promise<void> {
   await store.set(PREFER_MENUBAR_WEEKLY_LIMIT_KEY, value);
-  await store.save();
 }
 
 type LegacyStoreWithDelete = {
@@ -874,7 +879,6 @@ export async function loadGlobalShortcut(): Promise<GlobalShortcut> {
 
 export async function saveGlobalShortcut(shortcut: GlobalShortcut): Promise<void> {
   await store.set(GLOBAL_SHORTCUT_KEY, shortcut);
-  await store.save();
 }
 
 export async function loadStartOnLogin(): Promise<boolean> {
@@ -885,7 +889,6 @@ export async function loadStartOnLogin(): Promise<boolean> {
 
 export async function saveStartOnLogin(value: boolean): Promise<void> {
   await store.set(START_ON_LOGIN_KEY, value);
-  await store.save();
 }
 
 export async function loadStartHidden(): Promise<boolean> {
@@ -896,7 +899,6 @@ export async function loadStartHidden(): Promise<boolean> {
 
 export async function saveStartHidden(value: boolean): Promise<void> {
   await store.set(START_HIDDEN_KEY, value);
-  await store.save();
 }
 
 export function isUsageAlertThreshold(value: unknown): value is UsageAlertThreshold {
@@ -915,7 +917,6 @@ export async function loadUsageAlertEnabled(): Promise<boolean> {
 
 export async function saveUsageAlertEnabled(value: boolean): Promise<void> {
   await store.set(USAGE_ALERT_ENABLED_KEY, value);
-  await store.save();
 }
 
 export async function loadUsageAlertThreshold(): Promise<UsageAlertThreshold> {
@@ -926,7 +927,6 @@ export async function loadUsageAlertThreshold(): Promise<UsageAlertThreshold> {
 
 export async function saveUsageAlertThreshold(value: UsageAlertThreshold): Promise<void> {
   await store.set(USAGE_ALERT_THRESHOLD_KEY, value);
-  await store.save();
 }
 
 export async function loadUsageAlertCustomThreshold(): Promise<number | null> {
@@ -941,12 +941,10 @@ export async function loadUsageAlertCustomThreshold(): Promise<number | null> {
 export async function saveUsageAlertCustomThreshold(value: number | null): Promise<void> {
   if (value == null) {
     await deleteStoreKey(USAGE_ALERT_CUSTOM_THRESHOLD_KEY);
-    await store.save();
     return;
   }
   const clamped = Math.max(1, Math.min(99, Math.round(value)));
   await store.set(USAGE_ALERT_CUSTOM_THRESHOLD_KEY, clamped);
-  await store.save();
 }
 
 export async function loadUsageAlertSound(): Promise<UsageAlertSound> {
@@ -957,7 +955,6 @@ export async function loadUsageAlertSound(): Promise<UsageAlertSound> {
 
 export async function saveUsageAlertSound(value: UsageAlertSound): Promise<void> {
   await store.set(USAGE_ALERT_SOUND_KEY, value);
-  await store.save();
 }
 
 export async function loadUsagePaceAlertEnabled(): Promise<boolean> {
@@ -968,7 +965,6 @@ export async function loadUsagePaceAlertEnabled(): Promise<boolean> {
 
 export async function saveUsagePaceAlertEnabled(value: boolean): Promise<void> {
   await store.set(USAGE_PACE_ALERT_ENABLED_KEY, value);
-  await store.save();
 }
 
 export function isUsageSpikeAlertThresholdPct(
@@ -985,7 +981,6 @@ export async function loadUsageSpikeAlertEnabled(): Promise<boolean> {
 
 export async function saveUsageSpikeAlertEnabled(value: boolean): Promise<void> {
   await store.set(USAGE_SPIKE_ALERT_ENABLED_KEY, value);
-  await store.save();
 }
 
 export async function loadUsageSpikeAlertThresholdPct(): Promise<UsageSpikeAlertThresholdPct> {
@@ -998,7 +993,6 @@ export async function saveUsageSpikeAlertThresholdPct(
   value: UsageSpikeAlertThresholdPct,
 ): Promise<void> {
   await store.set(USAGE_SPIKE_ALERT_THRESHOLD_PCT_KEY, value);
-  await store.save();
 }
 
 export function isUIScale(value: unknown): value is UIScale {
@@ -1013,7 +1007,6 @@ export async function loadUIScale(): Promise<UIScale> {
 
 export async function saveUIScale(value: UIScale): Promise<void> {
   await store.set(UI_SCALE_KEY, value);
-  await store.save();
 }
 
 export async function loadReduceAnimations(): Promise<boolean> {
@@ -1023,7 +1016,6 @@ export async function loadReduceAnimations(): Promise<boolean> {
 
 export async function saveReduceAnimations(value: boolean): Promise<void> {
   await store.set(REDUCE_ANIMATIONS_KEY, value);
-  await store.save();
 }
 
 export async function loadShowTrayIcon(): Promise<boolean> {
@@ -1034,7 +1026,6 @@ export async function loadShowTrayIcon(): Promise<boolean> {
 
 export async function saveShowTrayIcon(value: boolean): Promise<void> {
   await store.set(SHOW_TRAY_ICON_KEY, value);
-  await store.save();
 }
 
 export async function loadShowTrayInsight(): Promise<boolean> {
@@ -1045,7 +1036,6 @@ export async function loadShowTrayInsight(): Promise<boolean> {
 
 export async function saveShowTrayInsight(value: boolean): Promise<void> {
   await store.set(SHOW_TRAY_INSIGHT_KEY, value);
-  await store.save();
 }
 
 export async function loadShowTotalSpend(): Promise<boolean> {
@@ -1056,7 +1046,6 @@ export async function loadShowTotalSpend(): Promise<boolean> {
 
 export async function saveShowTotalSpend(value: boolean): Promise<void> {
   await store.set(SHOW_TOTAL_SPEND_KEY, value);
-  await store.save();
 }
 
 export async function loadTotalSpendMetric(): Promise<string> {
@@ -1069,7 +1058,6 @@ export async function loadTotalSpendMetric(): Promise<string> {
 
 export async function saveTotalSpendMetric(value: string): Promise<void> {
   await store.set(TOTAL_SPEND_METRIC_KEY, value);
-  await store.save();
 }
 
 export async function loadShowAccountIdentity(): Promise<boolean> {
@@ -1080,7 +1068,6 @@ export async function loadShowAccountIdentity(): Promise<boolean> {
 
 export async function saveShowAccountIdentity(value: boolean): Promise<void> {
   await store.set(SHOW_ACCOUNT_IDENTITY_KEY, value);
-  await store.save();
 }
 
 /** When true, successful probes write normalized snapshots to local SQLite. */
@@ -1146,7 +1133,6 @@ export async function loadUILayout(): Promise<UILayout> {
 
 export async function saveUILayout(value: UILayout): Promise<void> {
   await store.set(UI_LAYOUT_KEY, value);
-  await store.save();
 }
 
 export async function loadModernLayout(): Promise<ModernLayoutState> {
@@ -1167,7 +1153,6 @@ export async function loadModernDensity(): Promise<ModernDensity> {
 
 export async function saveModernDensity(value: ModernDensity): Promise<void> {
   await store.set(MODERN_DENSITY_KEY, value);
-  await store.save();
 }
 
 // --- Product polls (consent-first; default ON) ---

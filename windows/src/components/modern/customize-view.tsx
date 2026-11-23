@@ -6,16 +6,24 @@ import {
   SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy,
 } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
-import { ChevronRight, GripVertical, Settings, Star } from "lucide-react"
+import { Switch } from "@base-ui/react/switch"
+import { ChevronRight, GripHorizontal, Settings, Star } from "lucide-react"
 import type { ReactNode } from "react"
 import { useShallow } from "zustand/react/shallow"
-import { Checkbox } from "@/components/ui/checkbox"
 import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
 import type { MetricDescriptor } from "@/lib/metric-registry"
 import { cn } from "@/lib/utils"
 import { useModernLayoutStore } from "@/stores/modern-layout-store"
 
-const card = "rounded-xl border border-border/50 bg-card divide-y divide-border/40"
+const card = "rounded-xl bg-muted/70"
+
+function CustomizeSwitch(props: Switch.Root.Props) {
+  return (
+    <Switch.Root {...props} className="relative h-5 w-11 shrink-0 rounded-full bg-foreground/10 outline-none focus-visible:ring-2 focus-visible:ring-ring data-checked:bg-[#007aff] data-disabled:opacity-50">
+      <Switch.Thumb className="absolute left-0.5 top-0.5 h-4 w-6 rounded-full bg-white shadow-sm transition-transform data-checked:translate-x-4 motion-reduce:transition-none" />
+    </Switch.Root>
+  )
+}
 
 type CustomizeViewProps = {
   providers: SettingsPluginState[]
@@ -63,11 +71,11 @@ function SortableRow({ id, label, disabled, children }: {
   })
   return (
     <li ref={setNodeRef} style={{ transform: CSS.Transform.toString(transform), transition }}
-      className={cn("flex min-h-8 items-center gap-2 px-3 py-1.5 text-xs", isDragging && "relative z-10 bg-card shadow-sm")}>
+      className={cn("relative flex min-h-8 items-center gap-2 px-3 py-1.5 text-xs", isDragging && "z-10 bg-card shadow-sm")}>
       <button type="button" disabled={disabled} aria-label={`Reorder ${label}`}
         className="touch-none text-muted-foreground hover:text-foreground disabled:opacity-40"
         {...attributes} {...listeners}>
-        <GripVertical aria-hidden="true" className="size-4" />
+        <GripHorizontal aria-hidden="true" className="size-4" />
       </button>
       {children}
     </li>
@@ -109,10 +117,11 @@ export function CustomizeView({
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   )
   const provider = providers.find(({ id }) => id === providerId)
-  const orderedProviders = [...providers.filter(({ enabled }) => enabled), ...providers.filter(({ enabled }) => !enabled)]
   const enabledIds = providers.filter(({ enabled }) => enabled).map(({ id }) => id)
 
   if (!provider) {
+    const counts = new Map<string, number>()
+    for (const { pluginId } of descriptors) counts.set(pluginId, (counts.get(pluginId) ?? 0) + 1)
     const handleProviderDragEnd = ({ active, over }: DragEndEvent) => {
       if (!over || active.id === over.id) return
       const oldIndex = enabledIds.indexOf(String(active.id))
@@ -129,16 +138,19 @@ export function CustomizeView({
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleProviderDragEnd}>
           <SortableContext items={enabledIds} strategy={verticalListSortingStrategy}>
             <ul className={card}>
-              {orderedProviders.map(({ id, name, enabled }) => (
+              {providers.map(({ id, name, enabled }) => (
                 <SortableRow key={id} id={id} label={name} disabled={!enabled}>
-                  <button type="button" onClick={() => onOpenProvider(id)} className="flex flex-1 items-center gap-2 text-left">
-                    <span className="flex-1 truncate font-medium">{name}</span>
-                    <ChevronRight aria-hidden="true" className="size-3.5 text-muted-foreground" />
+                  <button type="button" onClick={() => onOpenProvider(id)} className={cn("flex min-h-9 flex-1 flex-col justify-center text-left leading-tight after:absolute after:inset-y-0 after:right-0 after:w-6", !enabled && "opacity-60")}>
+                    <span className="truncate text-sm font-semibold">{name}</span>
+                    <span className="text-[11px] text-muted-foreground">{counts.get(id) ?? 0} metrics</span>
+                    <ChevronRight aria-hidden="true" className="absolute right-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                   </button>
-                  <Checkbox checked={enabled} aria-label={`Enable ${name}`} onCheckedChange={() => {
-                    recordUndo(() => onToggleProvider(id))
-                    onToggleProvider(id)
-                  }} />
+                  <div className="mr-4 flex">
+                    <CustomizeSwitch checked={enabled} aria-label={`Enable ${name}`} onCheckedChange={() => {
+                      recordUndo(() => onToggleProvider(id))
+                      onToggleProvider(id)
+                    }} />
+                  </div>
                 </SortableRow>
               ))}
             </ul>
@@ -176,10 +188,10 @@ export function CustomizeView({
             onClick={() => {
               if (layout.togglePin(id)) recordUndo(() => layout.togglePin(id))
             }}>
-            <Star className={cn("size-4", pinned && "fill-amber-400 text-amber-500")} aria-hidden="true" />
+            <Star className={cn("size-4", pinned && "fill-[#007aff] text-[#007aff]")} aria-hidden="true" />
           </button>
         )}
-        <Checkbox checked={placed} disabled={!provider.enabled} aria-label={`Show ${metric.lineLabel}`}
+        <CustomizeSwitch checked={placed} disabled={!provider.enabled} aria-label={`Show ${metric.lineLabel}`}
           onCheckedChange={(checked) => {
             recordUndo(() => onTogglePlaced(id, placed))
             onTogglePlaced(id, checked === true)

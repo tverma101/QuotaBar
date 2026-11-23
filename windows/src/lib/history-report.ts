@@ -32,11 +32,16 @@ export function buildHistoryReport(
   const accounts = new Set(accountIds)
   const eligible = rows.filter((row) =>
     accounts.has(row.instanceId) && row.dayKey <= end &&
-    (row.totalTokens != null || row.inputTokens != null || row.outputTokens != null || row.costUsd != null),
+    (row.totalTokens != null || row.inputTokens != null || row.outputTokens != null ||
+      row.costUsd != null || row.apiEstimateUsd != null),
   )
   const recent = eligible.filter((row) => row.dayKey >= dayKeys[0])
   const byDay = new Map<string, UsageDailyRow[]>()
   const byAccount = new Map<string, UsageDailyRow[]>()
+  let apiEstimate: number | null = null
+  for (const row of eligible) {
+    if (row.apiEstimateUsd != null) apiEstimate = (apiEstimate ?? 0) + row.apiEstimateUsd
+  }
   for (const row of recent) {
     const dayRows = byDay.get(row.dayKey) ?? []
     dayRows.push(row)
@@ -52,6 +57,7 @@ export function buildHistoryReport(
       null,
     ),
     lifetime: total(eligible),
+    apiEstimate,
     today: total(byDay.get(end) ?? []),
     last7: total(recent.filter((row) => row.dayKey >= dayKeys[23])),
     last30: total(recent),

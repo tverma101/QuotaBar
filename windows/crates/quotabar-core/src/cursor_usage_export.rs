@@ -122,6 +122,7 @@ pub struct RowAgg {
     pub output: u64,
     pub total_tokens: u64,
     pub cost_usd: f64,
+    pub api_estimate_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +285,7 @@ pub fn parse_usage_csv(text: &str, since: &str, until: &str) -> Result<Vec<CsvUs
 
 pub fn aggregate_by_day(rows: &[CsvUsageRow]) -> HashMap<String, RowAgg> {
     let mut m: HashMap<String, RowAgg> = HashMap::new();
+    let pricing = default_pricing();
     for row in rows {
         let e = m.entry(row.day_key.clone()).or_default();
         e.input_no_cache += row.input_no_cache;
@@ -292,6 +294,28 @@ pub fn aggregate_by_day(rows: &[CsvUsageRow]) -> HashMap<String, RowAgg> {
         e.output += row.output_tokens;
         e.total_tokens += row.total_tokens;
         e.cost_usd += row.cost_usd;
+        let model = row.model.trim();
+        let slug = model.to_ascii_lowercase().replace([' ', '_'], "-");
+        if ["grok-bot", "grokbot", "sand"].iter().any(|prefix| {
+            slug == *prefix || slug.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('-'))
+        }) {
+            continue;
+        }
+        if let Some(rates) = pricing.resolve(model) {
+            let tokens = TokenBreakdown {
+                input: row.input_no_cache.min(i32::MAX as u64) as i32,
+                cache_write5m: row.input_cache_write.min(i32::MAX as u64) as i32,
+                cache_write1h: 0,
+                cache_read: row.cache_read.min(i32::MAX as u64) as i32,
+                output: row.output_tokens.min(i32::MAX as u64) as i32,
+                is_fast: false,
+            };
+            let estimate = rates.cost_dollars_with_options(&tokens, false);
+            let total = e.api_estimate_usd.unwrap_or(0.0) + estimate;
+            if total.is_finite() && estimate >= 0.0 {
+                e.api_estimate_usd = Some(total);
+            }
+        }
     }
     m
 }
@@ -304,6 +328,8 @@ pub struct DailyBillingRow {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_estimate_usd: Option<f64>,
 }
 
 /// Per-day rows plus where they came from, so callers can tell billed from estimated.
@@ -345,6 +371,7 @@ pub fn query_daily_billing_for_account(
             input_tokens: agg.input_no_cache + agg.input_cache_write + agg.cache_read,
             output_tokens: agg.output,
             cost_usd: agg.cost_usd,
+            api_estimate_usd: agg.api_estimate_usd,
         })
         .collect();
     out.sort_by(|a, b| a.date.cmp(&b.date));
@@ -1809,12 +1836,14 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cost_usd: 1.0,
+                api_estimate_usd: Some(2.0),
             }],
             source: UsageSource::Events,
         };
         let v = serde_json::to_value(&billing).unwrap();
         assert_eq!(v["source"], "events");
         assert_eq!(v["daily"][0]["costUsd"], 1.0);
+        assert_eq!(v["daily"][0]["apiEstimateUsd"], 2.0);
 
         let mtd = CursorMtdTotals {
             total_tokens: 15,

@@ -27,6 +27,10 @@ time; it also reports unavailable iCloud, loading, write, and malformed-file sta
 On Windows, **Sync Across Macs** is unavailable and usage history stays on the device.
 In the Modern panel, open **Options → Usage History** for saved totals and account history, or
 **Options → Customize** to choose which provider metrics are always visible or shown on demand.
+**Reset All** in Customize restores default providers, metric placement, order, and pins without
+removing registered accounts or changing other settings. Usage History shows **At Public API
+Rates (Est.)** when a separate public-rate estimate is available and differs from the displayed
+lifetime cost. The comparison is not a bill.
 
 ## Appearance
 

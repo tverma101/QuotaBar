@@ -17,6 +17,7 @@ pub struct UsageDailyRow {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
+    pub api_estimate_usd: Option<f64>,
     pub source: String,
     pub ingested_at_ms: i64,
 }
@@ -38,6 +39,7 @@ struct DailyEntry {
     output_tokens: Option<i64>,
     cost_usd: Option<f64>,
     total_cost: Option<f64>,
+    api_estimate_usd: Option<f64>,
 }
 
 fn normalize_day_key(raw: &str) -> Option<String> {
@@ -111,8 +113,8 @@ pub fn ingest_json(app_data_dir: &Path, instance_id: &str, payload_json: &str) -
         conn.execute(
             r"INSERT INTO usage_daily (
                 instance_id, day_key, display_name, total_tokens, input_tokens,
-                output_tokens, cost_usd, source, ingested_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                output_tokens, cost_usd, source, ingested_at_ms, api_estimate_usd
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(instance_id, day_key) DO UPDATE SET
                 display_name = excluded.display_name,
                 total_tokens = excluded.total_tokens,
@@ -120,7 +122,8 @@ pub fn ingest_json(app_data_dir: &Path, instance_id: &str, payload_json: &str) -
                 output_tokens = excluded.output_tokens,
                 cost_usd = excluded.cost_usd,
                 source = excluded.source,
-                ingested_at_ms = excluded.ingested_at_ms",
+                ingested_at_ms = excluded.ingested_at_ms,
+                api_estimate_usd = excluded.api_estimate_usd",
             params![
                 instance_id,
                 day_key,
@@ -131,6 +134,7 @@ pub fn ingest_json(app_data_dir: &Path, instance_id: &str, payload_json: &str) -
                 entry_cost(entry),
                 source,
                 now_ms,
+                entry.api_estimate_usd.filter(|value| value.is_finite() && *value >= 0.0),
             ],
         )?;
     }
@@ -164,7 +168,7 @@ pub fn list_recent_before(
     if let Some(id) = instance_id {
         let mut stmt = conn.prepare_cached(
             "SELECT instance_id, day_key, display_name, total_tokens, input_tokens,
-                    output_tokens, cost_usd, source, ingested_at_ms
+                    output_tokens, cost_usd, source, ingested_at_ms, api_estimate_usd
              FROM usage_daily WHERE instance_id = ?1 AND day_key < COALESCE(?2, '9999-12-31')
              ORDER BY day_key DESC LIMIT ?3",
         )?;
@@ -175,7 +179,7 @@ pub fn list_recent_before(
     } else {
         let mut stmt = conn.prepare_cached(
             "SELECT instance_id, day_key, display_name, total_tokens, input_tokens,
-                    output_tokens, cost_usd, source, ingested_at_ms
+                    output_tokens, cost_usd, source, ingested_at_ms, api_estimate_usd
              FROM usage_daily WHERE day_key < COALESCE(?1, '9999-12-31')
              ORDER BY day_key DESC, instance_id ASC LIMIT ?2",
         )?;
@@ -198,6 +202,7 @@ fn map_daily_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UsageDailyRow> {
         cost_usd: r.get(6)?,
         source: r.get(7)?,
         ingested_at_ms: r.get(8)?,
+        api_estimate_usd: r.get(9)?,
     })
 }
 
@@ -237,7 +242,7 @@ mod tests {
         let payload = r#"{
             "displayName":"Claude",
             "daily":[
-                {"date":"2026-05-01","totalTokens":100,"inputTokens":40,"outputTokens":60,"totalCost":1.5},
+                {"date":"2026-05-01","totalTokens":100,"inputTokens":40,"outputTokens":60,"totalCost":1.5,"apiEstimateUsd":0.75},
                 {"date":"20260502","totalTokens":200,"costUSD":2.0}
             ]
         }"#;
@@ -247,6 +252,7 @@ mod tests {
         let may1 = rows.iter().find(|r| r.day_key == "2026-05-01").expect("may1");
         assert_eq!(may1.total_tokens, Some(100));
         assert!((may1.cost_usd.unwrap() - 1.5).abs() < f64::EPSILON);
+        assert_eq!(may1.api_estimate_usd, Some(0.75));
 
         let payload2 = r#"{"daily":[{"date":"2026-05-01","totalTokens":150}]}"#;
         ingest_json(dir.path(), "claude", payload2).unwrap();
@@ -254,6 +260,7 @@ mod tests {
         assert_eq!(rows2.len(), 2);
         let updated = rows2.iter().find(|r| r.day_key == "2026-05-01").expect("updated");
         assert_eq!(updated.total_tokens, Some(150));
+        assert_eq!(updated.api_estimate_usd, None);
     }
 
     #[test]

@@ -7,7 +7,9 @@ import {
 } from "@/lib/modern-layout"
 import { parseMetricId } from "@/lib/metric-id"
 import { applyTrayReadoutLines } from "@/lib/tray-readout-pick"
-import { getProviderInstanceMeta, savePluginSettings, type PluginSettings } from "@/lib/settings"
+import { getProviderInstanceMeta, resetPluginCustomization, savePluginSettings, type PluginSettings } from "@/lib/settings"
+import { buildMetricDescriptors } from "@/lib/metric-registry"
+import { defaultMetricCustomization } from "@/lib/customization-defaults"
 import { useModernLayoutStore } from "@/stores/modern-layout-store"
 
 const TRAY_SETTINGS_DEBOUNCE_MS = 2000
@@ -33,6 +35,28 @@ export function useSettingsPluginActions({
   startBatch,
   scheduleTrayIconUpdate,
 }: UseSettingsPluginActionsArgs) {
+  const handleResetCustomization = useCallback(() => {
+    if (!pluginSettings) return
+    const reset = resetPluginCustomization(pluginSettings, pluginsMeta)
+    const descriptors = buildMetricDescriptors(pluginsMeta, reset, undefined, true)
+    const { trayLines, onDemandMetricIds, pinnedMetricIds } = defaultMetricCustomization(reset, descriptors)
+    const next = { ...reset, trayLines }
+    const previouslyDisabled = new Set(pluginSettings.disabled)
+    const newlyEnabled = next.order.filter((id) => previouslyDisabled.has(id) && !next.disabled.includes(id))
+    useModernLayoutStore.getState().resetCustomization(descriptors, next, onDemandMetricIds, pinnedMetricIds)
+    setPluginSettings(next)
+    scheduleTrayIconUpdate("settings", TRAY_SETTINGS_DEBOUNCE_MS)
+    void savePluginSettings(next).catch((error) => {
+      console.error("Failed to save customization reset:", error)
+    })
+    if (!newlyEnabled.length) return
+    setLoadingForPlugins(newlyEnabled)
+    void startBatch(newlyEnabled).catch((error) => {
+      console.error("Failed to start probe for reset providers:", error)
+      setErrorForPlugins(newlyEnabled, "Failed to start probe")
+    })
+  }, [pluginSettings, pluginsMeta, setPluginSettings, scheduleTrayIconUpdate, setLoadingForPlugins, setErrorForPlugins, startBatch])
+
   const handleReorder = useCallback((orderedIds: string[]) => {
     if (!pluginSettings) return
     // orderedIds may be a subset (e.g. nav-only, excluding disabled plugins).
@@ -226,6 +250,7 @@ export function useSettingsPluginActions({
   )
 
   return {
+    handleResetCustomization,
     handleReorder,
     handleToggle,
     handleTrayLineToggle,
