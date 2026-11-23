@@ -6,6 +6,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 VERSION="$(node -p "require('./package.json').version")"
+INSTALLER_PRODUCT="$(node -p "require('./src-tauri/tauri.conf.json').productName")"
+INSTALLER_VERSION="${QUOTABAR_INSTALLER_VERSION:-$(node -p "require('./src-tauri/tauri.conf.json').version")}"
 OUT="$ROOT/release-artifacts/quotabar-${VERSION}"
 mkdir -p "$OUT"
 
@@ -13,9 +15,8 @@ echo "Collecting QuotaBar ${VERSION} bundles into $OUT"
 
 copy_glob () {
   local pattern="$1"
-  shopt -s nullglob
-  local files=( $pattern )
-  shopt -u nullglob
+  local files=()
+  mapfile -t files < <(compgen -G "$pattern" || true)
   if [ ${#files[@]} -eq 0 ]; then
     echo "  (skip) no files: $pattern"
     return 0
@@ -33,7 +34,7 @@ copy_glob "$ROOT/target/release/bundle/rpm/quotabar-${VERSION}-"*.rpm
 copy_glob "$ROOT/target/release/bundle/appimage/quotabar_${VERSION}_amd64.AppImage"
 
 # Windows (GNU cross-target) — MinGW Tauri binary delay-loads WebView2Loader.dll from the exe directory.
-copy_glob "$ROOT/target/x86_64-pc-windows-gnu/release/bundle/nsis/quotabar_${VERSION}_x64-setup.exe"
+copy_glob "$ROOT/target/x86_64-pc-windows-gnu/release/bundle/nsis/${INSTALLER_PRODUCT}_${INSTALLER_VERSION}_x64-setup.exe"
 copy_glob "$ROOT/target/x86_64-pc-windows-gnu/release/quotabar.exe"
 copy_glob "$ROOT/target/x86_64-pc-windows-gnu/release/WebView2Loader.dll"
 
@@ -62,7 +63,7 @@ Typical filenames (Tauri uses productName "quotabar" + version ${VERSION}):
   - Debian:    quotabar_${VERSION}_amd64.deb
   - RPM:       quotabar-${VERSION}-1.x86_64.rpm (release may vary)
   - AppImage:  quotabar_${VERSION}_amd64.AppImage
-  - Windows:   quotabar_${VERSION}_x64-setup.exe (NSIS installer)
+  - Windows:   ${INSTALLER_PRODUCT}_${INSTALLER_VERSION}_x64-setup.exe (NSIS installer)
   - Windows:   quotabar.exe + WebView2Loader.dll (same folder — required for GNU/MinGW portable exe)
   - Windows:   quotabar_${VERSION}_windows_amd64_onefile*.exe (optional true single-file; see build-gui-portable-onefile-windows-gnu.sh)
   - CLI:       quotabar-cli (bundled with the GUI by the Tauri build)
