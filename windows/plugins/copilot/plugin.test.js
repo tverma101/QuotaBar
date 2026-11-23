@@ -305,6 +305,29 @@ describe("copilot plugin", () => {
       .toEqual(["token editor", "token gh-active"]);
   });
 
+  it("tries another editor file before GitHub CLI when the first editor token is rejected", async () => {
+    const ctx = makePluginTestContext();
+    ctx.host.env.get.mockImplementation(name => ({
+      LOCALAPPDATA: "C:/local", GH_CONFIG_DIR: "C:/gh",
+    })[name]);
+    ctx.host.fs.writeText("C:/local/github-copilot/apps.json", JSON.stringify({
+      "github.com:editor": { oauth_token: "editor-stale" },
+    }));
+    ctx.host.fs.writeText("~/.config/github-copilot/hosts.json", JSON.stringify({
+      "github.com": { oauth_token: "editor-active" },
+    }));
+    ctx.host.fs.writeText("C:/gh/hosts.yml", "github.com:\n    oauth_token: gh-active\n");
+    ctx.host.http.request.mockImplementation(({ headers }) =>
+      headers.Authorization === "token editor-active"
+        ? { status: 200, bodyText: JSON.stringify(makeUsageResponse()) }
+        : { status: 401, bodyText: "" }
+    );
+    const plugin = await loadPlugin();
+    expect(plugin.probe(ctx).plan).toBe("Pro");
+    expect(ctx.host.http.request.mock.calls.map(([req]) => req.headers.Authorization))
+      .toEqual(["token editor-stale", "token editor-active"]);
+  });
+
   it("returns plan label from copilot_plan", async () => {
     const ctx = makePluginTestContext();
     setKeychainToken(ctx, "tok");

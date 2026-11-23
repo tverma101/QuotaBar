@@ -7,7 +7,7 @@ Tracks GitHub Copilot usage quotas for both paid and free tier users.
 The plugin looks for a GitHub token in this order:
 
 1. **Selected account** — An explicitly saved credential is used on its own.
-2. **Copilot editor** — `apps.json` or `hosts.json` in `%LOCALAPPDATA%\github-copilot` or `~/.config/github-copilot`.
+2. **Copilot editor** — `apps.json` or `hosts.json` in `%LOCALAPPDATA%\github-copilot` or `~/.config/github-copilot`. If GitHub rejects a token, QuotaBar tries the remaining editor tokens before moving to GitHub CLI.
 3. **GitHub CLI config** — `hosts.yml` in `GH_CONFIG_DIR`, or the standard Windows or home config directory.
 4. **Credential store** — QuotaBar's legacy cache, followed by the GitHub CLI credential for the configured GitHub.com user.
 5. **State file** — Legacy fallback.

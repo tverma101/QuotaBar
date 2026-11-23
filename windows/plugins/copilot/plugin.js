@@ -94,7 +94,7 @@
     return null;
   }
 
-  function loadEditorToken(ctx) {
+  function* editorTokens(ctx) {
     const local = ctx.host.env.get("LOCALAPPDATA");
     const roots = local ? [local + "/github-copilot"] : [];
     roots.push("~/.config/github-copilot");
@@ -106,12 +106,11 @@
           if (host !== "github.com" && !host.startsWith("github.com:")) continue;
           const token = entry && entry.oauth_token;
           if (typeof token === "string" && token.trim()) {
-            return { token: token.trim(), source: "editor" };
+            yield { token: token.trim(), source: "editor" };
           }
         }
       }
     }
-    return null;
   }
 
   function readGhConfig(ctx) {
@@ -169,7 +168,7 @@
       }
       return
     }
-    yield loadEditorToken(ctx);
+    yield* editorTokens(ctx);
     const gh = readGhConfig(ctx);
     if (gh && gh.oauth_token) yield { token: gh.oauth_token, source: "gh-config" };
     yield loadTokenFromKeychain(ctx);
