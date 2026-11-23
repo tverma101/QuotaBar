@@ -7,6 +7,8 @@ QuotaBar shows AI coding subscription limits, reset times, credits, and spend in
 1. Run the `-setup.exe` and open **QuotaBar** from Start. The installer uses the current user's profile and installs WebView2 if it is missing.
 2. Click the gauge in the taskbar notification area to reopen the dashboard. You may find it under the hidden icons arrow. Right-click the icon for Settings, About, Restart, and Quit.
 3. Open **Options → Settings → Providers** to change which providers are tracked. Claude, Codex, Cursor, and Freebuff start enabled. Sign in through the relevant provider tool if a card needs credentials.
+
+In the Modern layout, **Options → Customize** also lets you enable providers, choose which metrics stay visible or appear on demand, and pin supported metrics. **Options → Usage History** summarizes the local daily usage retained for enabled accounts when local usage history is turned on. iCloud Sync is unavailable on Windows.
 4. Set **Start on Login** or **Start Hidden** under **Advanced**. Usage normally refreshes every 15 minutes, including when the panel is closed.
 
 To update, open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and run the newer installer under the same Windows account. Your selected dashboard layout and provider settings carry over.

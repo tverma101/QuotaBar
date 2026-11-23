@@ -1155,15 +1155,17 @@ fn list_usage_daily(
     state: tauri::State<'_, Mutex<AppState>>,
     limit: Option<u32>,
     instance_id: Option<String>,
+    before_day: Option<String>,
 ) -> Result<Vec<quotabar_core::usage_daily::UsageDailyRow>, String> {
     let dir = {
         let locked = state.lock().map_err(|e| e.to_string())?;
         locked.app_data_dir.clone()
     };
-    quotabar_core::usage_daily::list_recent(
+    quotabar_core::usage_daily::list_recent_before(
         &dir,
         limit.unwrap_or(120),
         instance_id.as_deref(),
+        before_day.as_deref(),
     )
     .map_err(|e| e.to_string())
 }

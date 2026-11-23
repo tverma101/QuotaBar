@@ -1,3 +1,5 @@
+import { useState } from "react"
+import { ChevronDown } from "lucide-react"
 import type { PluginMeta } from "@/lib/plugin-types"
 import { metricIdPrefix, parseMetricId } from "@/lib/metric-id"
 import { WidgetRow } from "@/components/modern/widget-row"
@@ -21,9 +23,10 @@ type WidgetGroupedListProps = {
   className?: string
   onRefreshPlugin?: (pluginId: string) => void
   onFocusProvider?: (pluginId: string) => void
+  onDemandMetricIds?: string[]
 }
 
-export function WidgetGroupedList({ groups, compact, className, onRefreshPlugin, onFocusProvider }: WidgetGroupedListProps) {
+export function WidgetGroupedList({ groups, compact, className, onRefreshPlugin, onFocusProvider, onDemandMetricIds }: WidgetGroupedListProps) {
   if (groups.length === 0) {
     return (
       <div className="text-center text-muted-foreground py-8 text-sm">
@@ -41,6 +44,7 @@ export function WidgetGroupedList({ groups, compact, className, onRefreshPlugin,
           compact={compact}
           onRefreshPlugin={onRefreshPlugin}
           onFocusProvider={onFocusProvider}
+          onDemandMetricIds={onDemandMetricIds}
           index={index}
         />
       ))}
@@ -53,17 +57,23 @@ function ProviderCard({
   compact,
   onRefreshPlugin,
   onFocusProvider,
+  onDemandMetricIds,
   index = 0,
 }: {
   group: ProviderWidgetGroup
   compact?: boolean
   onRefreshPlugin?: (pluginId: string) => void
   onFocusProvider?: (pluginId: string) => void
+  onDemandMetricIds?: string[]
   index?: number
 }) {
-  const bounded = group.metrics.filter((m) => m.bounded && m.kind === "progress")
-  const charts = group.metrics.filter((m) => m.kind === "barChart")
-  const unbounded = group.metrics.filter((m) => !m.bounded && m.kind !== "barChart")
+  const [expanded, setExpanded] = useState(false)
+  const always = group.metrics.filter((m) => !onDemandMetricIds?.includes(m.metricId))
+  const hasHidden = always.length > 0 && always.length < group.metrics.length
+  const visible = hasHidden && !expanded ? always : group.metrics
+  const bounded = visible.filter((m) => m.bounded && m.kind === "progress")
+  const charts = visible.filter((m) => m.kind === "barChart")
+  const unbounded = visible.filter((m) => !m.bounded && m.kind !== "barChart")
 
   return (
     <section
@@ -99,6 +109,13 @@ function ProviderCard({
             </span>
           ) : null}
         </div>
+        {hasHidden && (
+          <button type="button" aria-label={`Show On Demand Metrics for ${group.name}`} aria-expanded={expanded}
+            className="rounded p-1 hover:bg-muted"
+            onClick={(event) => { event.stopPropagation(); setExpanded(!expanded) }}>
+            <ChevronDown className={cn("size-4", expanded && "rotate-180")} aria-hidden="true" />
+          </button>
+        )}
       </header>
       <div className={cn("px-3", compact ? "py-1" : "py-2")}>
         {bounded.map((m) => (

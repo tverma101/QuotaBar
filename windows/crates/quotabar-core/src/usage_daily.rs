@@ -143,6 +143,15 @@ pub fn list_recent(
     limit: u32,
     instance_id: Option<&str>,
 ) -> rusqlite::Result<Vec<UsageDailyRow>> {
+    list_recent_before(app_data_dir, limit, instance_id, None)
+}
+
+pub fn list_recent_before(
+    app_data_dir: &Path,
+    limit: u32,
+    instance_id: Option<&str>,
+    before_day: Option<&str>,
+) -> rusqlite::Result<Vec<UsageDailyRow>> {
     let path = usage_history_db_path(app_data_dir);
     if !path.exists() {
         return Ok(vec![]);
@@ -156,10 +165,10 @@ pub fn list_recent(
         let mut stmt = conn.prepare_cached(
             "SELECT instance_id, day_key, display_name, total_tokens, input_tokens,
                     output_tokens, cost_usd, source, ingested_at_ms
-             FROM usage_daily WHERE instance_id = ?1
-             ORDER BY day_key DESC LIMIT ?2",
+             FROM usage_daily WHERE instance_id = ?1 AND day_key < COALESCE(?2, '9999-12-31')
+             ORDER BY day_key DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![id, lim], map_daily_row)?;
+        let rows = stmt.query_map(params![id, before_day, lim], map_daily_row)?;
         for row in rows {
             out.push(row?);
         }
@@ -167,9 +176,10 @@ pub fn list_recent(
         let mut stmt = conn.prepare_cached(
             "SELECT instance_id, day_key, display_name, total_tokens, input_tokens,
                     output_tokens, cost_usd, source, ingested_at_ms
-             FROM usage_daily ORDER BY day_key DESC, instance_id ASC LIMIT ?1",
+             FROM usage_daily WHERE day_key < COALESCE(?1, '9999-12-31')
+             ORDER BY day_key DESC, instance_id ASC LIMIT ?2",
         )?;
-        let rows = stmt.query_map([lim], map_daily_row)?;
+        let rows = stmt.query_map(params![before_day, lim], map_daily_row)?;
         for row in rows {
             out.push(row?);
         }
@@ -244,5 +254,21 @@ mod tests {
         assert_eq!(rows2.len(), 2);
         let updated = rows2.iter().find(|r| r.day_key == "2026-05-01").expect("updated");
         assert_eq!(updated.total_tokens, Some(150));
+    }
+
+    #[test]
+    fn pages_daily_rows_for_one_account_without_repeating_the_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_settings(dir.path(), true);
+        let payload = r#"{"daily":[{"date":"2026-05-01","totalTokens":100},{"date":"2026-05-02","totalTokens":200}]}"#;
+        ingest_json(dir.path(), "claude", payload).unwrap();
+        ingest_json(dir.path(), "claude-work", payload).unwrap();
+
+        let first = list_recent(dir.path(), 1, Some("claude")).unwrap();
+        assert_eq!(first[0].day_key, "2026-05-02");
+        let second =
+            list_recent_before(dir.path(), 1, Some("claude"), Some(&first[0].day_key)).unwrap();
+        assert_eq!(second[0].day_key, "2026-05-01");
+        assert_eq!(second[0].instance_id, "claude");
     }
 }

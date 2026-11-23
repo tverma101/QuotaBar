@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 vi.mock("@/lib/settings", () => ({
   loadModernLayout: vi.fn(),
@@ -8,7 +8,8 @@ vi.mock("@/lib/settings", () => ({
 import { metricId } from "@/lib/metric-id"
 import { EMPTY_MODERN_LAYOUT } from "@/lib/modern-layout"
 import type { MetricDescriptor } from "@/lib/metric-registry"
-import { useModernLayoutStore } from "@/stores/modern-layout-store"
+import { flushModernLayout, useModernLayoutStore } from "@/stores/modern-layout-store"
+import { saveModernLayout } from "@/lib/settings"
 
 const claudeSession = metricId("claude", "Session")
 const claudeWeekly = metricId("claude", "Weekly")
@@ -34,6 +35,8 @@ const descriptors = [
 ]
 
 describe("modern-layout-store tray readout", () => {
+  afterEach(() => flushModernLayout())
+
   beforeEach(() => {
     useModernLayoutStore.setState({
       ...EMPTY_MODERN_LAYOUT,
@@ -89,5 +92,25 @@ describe("modern-layout-store tray readout", () => {
       cursorCredits,
     ])
     expect(state.pinnedMetricIds).not.toContain(claudeWeekly)
+  })
+
+  it("coalesces rapid layout changes into one save with the latest state", async () => {
+    vi.useFakeTimers()
+    try {
+      const layout = useModernLayoutStore.getState()
+      layout.setMetricPlacement("claude", [claudeSession, claudeWeekly], [claudeWeekly])
+      layout.setMetricPlacement("claude", [claudeWeekly, claudeSession], [claudeSession])
+      expect(saveModernLayout).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(150)
+
+      expect(saveModernLayout).toHaveBeenCalledTimes(1)
+      expect(saveModernLayout).toHaveBeenCalledWith(expect.objectContaining({
+        metricOrderByProvider: { claude: [claudeWeekly, claudeSession] },
+        onDemandMetricIds: [claudeSession],
+      }))
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
