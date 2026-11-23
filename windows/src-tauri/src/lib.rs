@@ -12,6 +12,7 @@ use quotabar_core::{plugin_engine, provider_accounts};
 #[cfg(target_os = "windows")]
 use panel_windows as panel;
 mod codex_registration;
+mod codex_auto_reset;
 mod local_http_api;
 mod log_path;
 mod os_diagnostics;
@@ -1473,6 +1474,8 @@ pub fn run() {
             open_devtools,
             start_probe_batch,
             codex_claim_reset_credit,
+            codex_auto_reset::codex_auto_reset_enabled,
+            codex_auto_reset::set_codex_auto_reset_enabled,
             codex_registration::sign_in_to_codex,
             codex_registration::cancel_codex_sign_in,
             codex_registration::register_codex_home,
@@ -1548,6 +1551,7 @@ pub fn run() {
                 app_data_dir,
                 app_version: app.package_info().version.to_string(),
             }));
+            codex_auto_reset::start(app.handle().clone());
 
             tray::create(app.handle())?;
 

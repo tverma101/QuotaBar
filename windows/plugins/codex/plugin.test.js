@@ -148,6 +148,46 @@ describe("codex plugin", () => {
     redeemRequestId: "test-request",
   }
 
+  it("auto-claims only the exact expiring credit after consent, replaying the original request", async () => {
+    const ctx = makeAccountCtx({
+      instanceId: "codex:work",
+      credential: { accessToken: makeJwt({ "https://api.openai.com/auth": { chatgpt_account_id: "work" } }) },
+    })
+    const expiryMs = Date.now() + 30_000
+    const args = { accountId: "work", expiryMs, id: "target", requestId: "original" }
+    const credits = [
+      { id: "other", expires_at: new Date(expiryMs).toISOString() },
+      { id: "target", expires_at: new Date(expiryMs).toISOString() },
+    ]
+    ctx.host.http.request.mockImplementation(({ method }) => ({
+      status: 200,
+      bodyText: JSON.stringify(method === "GET" ? { credits } : { code: "already_redeemed" }),
+    }))
+    const plugin = await loadPlugin()
+    const claim = (overrides, yes = true) => plugin.claimAutomaticReset(ctx, { ...args, ...overrides }, () => yes)
+    const posts = () => ctx.host.http.request.mock.calls.filter(([request]) => request.method === "POST")
+    expect(claim({ expiryMs: expiryMs + 60_000 })).toBe("cancelled")
+    expect(claim({ expiryMs: expiryMs - 60_000 })).toBe("no_credit")
+    expect(claim({ accountId: "default" })).toBe("failed")
+    expect(ctx.host.http.request).not.toHaveBeenCalled()
+    expect(claim({ id: "missing" })).toBe("no_credit")
+    expect(claim({}, false)).toBe("cancelled")
+    expect(posts()).toHaveLength(0)
+    expect(JSON.parse(plugin.listAutomaticResets(ctx, args))).toEqual([
+      { id: "other", expiryMs }, { id: "target", expiryMs },
+    ])
+    expect(claim({})).toBe("success")
+    credits.pop()
+    expect(claim({ retry: true })).toBe("success")
+    expect(posts()).toHaveLength(2)
+    for (const [request] of posts()) {
+      expect(request.headers.Authorization).toBe(`Bearer ${makeJwt({ "https://api.openai.com/auth": { chatgpt_account_id: "work" } })}`)
+      expect(request.headers["ChatGPT-Account-Id"]).toBe("work")
+      expect(JSON.parse(request.bodyText)).toEqual({ credit_id: "target", redeem_request_id: "original" })
+    }
+    expect(ctx.host.keychain.readGenericPassword).not.toHaveBeenCalled()
+  })
+
   it("does not request or consume an already expired reset credit", async () => {
     const ctx = makeAccountCtx({ instanceId: "codex:work", credential: { accessToken: "work-token" } })
     const plugin = await loadPlugin()

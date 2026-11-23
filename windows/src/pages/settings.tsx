@@ -27,6 +27,7 @@ import { GlobalShortcutSection } from "@/components/global-shortcut-section";
 import { LanguageRegionSection } from "@/components/settings/language-region-section";
 import { ScreenShareSection } from "@/components/settings/screen-share-section";
 import { CodexEnrollment } from "@/components/settings/codex-enrollment";
+import { CodexAutoResetSetting } from "@/components/settings/codex-auto-reset-setting";
 import { getBarFillLayout } from "@/lib/tray-bars-icon";
 import { getTrayIconSizePx } from "@/lib/tray-icon-size";
 import {
@@ -783,6 +784,11 @@ function ResetAllSettingsSection({ onResetComplete }: { onResetComplete: () => v
           await invoke("set_hide_from_screen_share", { enabled: false });
         } catch (e) {
           console.error("clear Hide From Screen Share after reset:", e);
+        }
+        try {
+          await invoke("set_codex_auto_reset_enabled", { value: false });
+        } catch (e) {
+          console.error("clear Codex automatic resets after reset:", e);
         }
       }
       await hydrateModernLayoutStore();
@@ -1631,6 +1637,7 @@ export function SettingsPage({
           </div>
         </div>
       </section>
+      {isTauri() ? <CodexAutoResetSetting /> : null}
       <section>
         <h3 className="text-lg font-semibold mb-0">{t("settings.timeFormat.title")}</h3>
         <p className="text-sm text-muted-foreground mb-2">
