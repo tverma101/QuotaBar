@@ -1,18 +1,22 @@
 import { act, renderHook } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-const { getEnabledPluginIdsMock } = vi.hoisted(() => ({
+const { getEnabledPluginIdsMock, listenMock } = vi.hoisted(() => ({
   getEnabledPluginIdsMock: vi.fn(),
+  listenMock: vi.fn(),
 }))
 
 vi.mock("@/lib/settings", () => ({
   getEnabledPluginIds: getEnabledPluginIdsMock,
 }))
 
+vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }))
+
 import { useProbeAutoUpdate } from "@/hooks/app/use-probe-auto-update"
 
 describe("useProbeAutoUpdate", () => {
   beforeEach(() => {
+    listenMock.mockReset().mockResolvedValue(vi.fn())
     getEnabledPluginIdsMock.mockReset()
     getEnabledPluginIdsMock.mockImplementation((settings: { order: string[]; disabled: string[] }) =>
       settings.order.filter((id) => !settings.disabled.includes(id))
@@ -22,6 +26,32 @@ describe("useProbeAutoUpdate", () => {
   afterEach(() => {
     vi.useRealTimers()
     vi.restoreAllMocks()
+  })
+
+  it("handles native resume without waiting for focus and does not run twice", () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 10, 20, 12))
+    const startBatch = vi.fn().mockResolvedValue(undefined)
+    renderHook(() =>
+      useProbeAutoUpdate({
+        pluginSettings: { order: ["codex"], disabled: [] },
+        autoUpdateInterval: 15,
+        setLoadingForPlugins: vi.fn(),
+        setErrorForPlugins: vi.fn(),
+        isPluginLoading: vi.fn(() => false),
+        startBatch,
+      })
+    )
+
+    const [event, resume] = listenMock.mock.lastCall!
+    expect(event).toBe("refresh:power-resume")
+    act(() => {
+      vi.setSystemTime(new Date(2026, 10, 20, 12, 40))
+      resume()
+    })
+    expect(startBatch).toHaveBeenCalledExactlyOnceWith(["codex"])
+    act(() => window.dispatchEvent(new Event("focus")))
+    expect(startBatch).toHaveBeenCalledTimes(1)
   })
 
   it("catches up once when the wall clock moves past multiple deadlines during sleep", () => {

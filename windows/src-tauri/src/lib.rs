@@ -1364,6 +1364,8 @@ pub fn run() {
             ensure_quotabar_user_config_file();
 
             let app_data_dir = app.path().app_data_dir().expect("no app data dir");
+            #[cfg(target_os = "windows")]
+            quotabar_core::model_pricing::enable_live_pricing(&app_data_dir);
             // `tauri dev` often has no packaged `resource_dir()` (returns Err) — do not panic;
             // `initialize_plugins` falls back to repo `plugins/` via `find_dev_plugins_dir()` and/or
             // copies from bundled resources when a root exists (release / portable).

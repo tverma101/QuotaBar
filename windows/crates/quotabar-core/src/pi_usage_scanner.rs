@@ -258,7 +258,7 @@ fn aggregate(
                     &crate::codex_usage_scanner::event_day_key(&entry.timestamp),
                 );
                 let total_input = entry.tokens.input + entry.tokens.cache_read;
-                match crate::codex_pricing::estimated_cost_dollars(
+                match crate::codex_pricing::estimated_cost_dollars_at(
                     pricing,
                     &crate::codex_pricing::CodexCostInput {
                         model: &fallback,
@@ -269,6 +269,7 @@ fn aggregate(
                         is_fast: entry.tokens.is_fast,
                         is_ultrafast: false,
                     },
+                    Some(entry.timestamp),
                 ) {
                     Some(c) => c,
                     None => continue,
@@ -277,7 +278,7 @@ fn aggregate(
         } else if let Some(carried) = entry.carried_cost.filter(|c| *c > 0.0) {
             carried
         } else if !trimmed.is_empty() {
-            match pricing.estimated_cost_dollars(trimmed, &entry.tokens) {
+            match pricing.estimated_cost_dollars_at(trimmed, &entry.tokens, entry.timestamp) {
                 Some(c) => c,
                 None => continue,
             }
