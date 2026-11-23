@@ -63,8 +63,11 @@ fn log_probe_deadline_skip(plugin_id: &str, operation: &str) {
     );
 }
 
-const WHITELISTED_ENV_VARS: [&str; 27] = [
+const WHITELISTED_ENV_VARS: [&str; 30] = [
     "CODEX_HOME",
+    "HERMES_HOME",
+    "OPENCODE_DATA_DIR",
+    "XDG_DATA_HOME",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CROFAI_API_KEY",
@@ -732,6 +735,52 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     inject_codex_logs(ctx, &host, deadline)?;
     inject_antigravity_logs(ctx, &host, deadline)?;
     inject_grok_logs(ctx, &host, deadline)?;
+    if base_plugin_id == "opencode-go" && instance_id == base_plugin_id {
+        let gateway = Object::new(ctx.clone())?;
+        let settings_path = app_data_dir.join("settings.json");
+        gateway.set("scan", Function::new(ctx.clone(), move || {
+            if deadline.has_elapsed() {
+                return "null".to_string();
+            }
+            let settings = std::fs::read_to_string(&settings_path).ok()
+                .and_then(|raw| serde_json::from_str::<JsonValue>(&raw).ok());
+            let hermes_enabled = settings.as_ref().is_some_and(|settings| {
+                let plugins = &settings["plugins"];
+                let has_hermes = |key: &str| plugins[key].as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id == "hermes"));
+                has_hermes("order") && !has_hermes("disabled")
+            });
+            let hermes = match crate::hermes_gateway::scan(hermes_enabled) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    log::warn!("Hermes gateway history could not be read: {error}");
+                    return "null".to_string();
+                }
+            };
+            match crate::muse_usage::scan(|| deadline.has_elapsed()) {
+                Ok(mut rows) => {
+                    rows.extend(hermes);
+                    serde_json::to_string(&rows).unwrap_or_else(|_| "null".to_string())
+                }
+                Err(error) => {
+                    log::warn!("Muse history could not be read: {error}");
+                    "null".to_string()
+                }
+            }
+        })?)?;
+        host.set("opencodeGateway", gateway)?;
+    }
+    if base_plugin_id == "zai" {
+        let zcode = Object::new(ctx.clone())?;
+        zcode.set("scan", Function::new(ctx.clone(), move || {
+            if deadline.has_elapsed() {
+                "{}".to_string()
+            } else {
+                crate::zcode_usage::scan().to_string()
+            }
+        })?)?;
+        host.set("zcode", zcode)?;
+    }
     inject_cursor_usage_export(ctx, &host, account, deadline)?;
     inject_fireworks(ctx, &host, base_plugin_id)?;
 

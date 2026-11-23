@@ -183,17 +183,16 @@
     return quota.limits
   }
 
-  function probe(ctx) {
-    const apiKey = loadApiKey(ctx)
-    if (!apiKey) {
-      throw "No ZAI_API_KEY found. Set up environment variable first."
-    }
+  function probeQuota(ctx, apiKey) {
 
     const sub = fetchSubscription(ctx, apiKey)
     const plan = sub && sub.productName ? ctx.fmt.planLabel(sub.productName) : null
 
     const quota = fetchQuota(ctx, apiKey)
     const lines = []
+    if (quota.success === false && typeof quota.msg === "string" && quota.msg.toLowerCase().includes("coding plan")) {
+      throw "This Z.ai account does not have a Coding Plan."
+    }
 
     const limits = extractLimits(quota)
     if (limits === null) {
@@ -224,6 +223,127 @@
     }
 
     return { plan, lines }
+  }
+
+  function buildAllowance(snapshot, now) {
+    const promos = new Map()
+    const expiry = new Map()
+    for (const detail of snapshot?.subscription?.details || []) {
+      const id = detail.productId
+      if (typeof id !== "string") continue
+      const expires = Date.parse(detail.expireTime)
+      expiry.set(id, expires)
+      const name = String(detail.productName || "")
+      if (detail.billingCycle !== "one_time" && !/build|wk/.test(id) && !/build/i.test(name)) continue
+      const effective = (detail.entitlements || []).map(item => Date.parse(item.effectiveTime)).find(Number.isFinite) ??
+        Date.parse(detail.beginTime)
+      const label = /global build/i.test(name) ? "Global Build" :
+        /weekend build/i.test(name) ? "Weekend Build" : name.replace(/^zcode /i, "") || "Weekend Build"
+      promos.set(id, { label, expires, effective })
+    }
+    const candidates = []
+    const plausibleReset = ms => Number.isFinite(ms) && ms > now && ms - now <= 2 * 365 * 86400000
+    for (const window of snapshot?.quota?.limits || []) {
+      const id = String(window.planId || "")
+      const once = window.period === "one_time"
+      if (!once && !/build|wk/.test(id) && !promos.has(id)) continue
+      const promo = promos.get(id)
+      promos.delete(id)
+      if (!Number.isFinite(window.unit) || window.unit <= 0) continue
+      const expires = expiry.get(id)
+      const expiryFromReset = once && Number.isFinite(window.nextResetTime) && window.nextResetTime > 0 ?
+        window.nextResetTime : NaN
+      candidates.push({
+        label: promo?.label || "Weekend Build",
+        expires: Number.isFinite(expires) ? expires : expiryFromReset,
+        effective: promo?.effective,
+        used: Number.isFinite(window.usage) ? Math.max(0, window.usage) : 0,
+        limit: window.unit,
+        remaining: Number.isFinite(window.remaining) ? Math.max(0, window.remaining) : 0,
+        reset: !once && plausibleReset(window.nextResetTime) ? window.nextResetTime : null,
+      })
+    }
+    for (const promo of promos.values()) {
+      candidates.push({ ...promo, used: 0, limit: 500000000, remaining: 500000000, reset: null })
+    }
+    const valid = candidates.filter(row => !Number.isFinite(row.expires) || row.expires > now)
+    const active = row => !(row.effective > now)
+    return valid.find(row => active(row) && row.remaining > 0) || valid.find(active) ||
+      valid.find(row => row.effective > now)
+  }
+
+  function localDay(date) {
+    return [date.getFullYear(), date.getMonth() + 1, date.getDate()]
+      .map(n => String(n).padStart(2, "0")).join("-")
+  }
+
+  function appendLocalHistory(ctx, lines, daily, now) {
+    const today = new Date(now)
+    const yesterday = new Date(now)
+    const cutoff = new Date(now)
+    yesterday.setDate(today.getDate() - 1)
+    cutoff.setDate(today.getDate() - 29)
+    const days = daily.filter(row => row.date <= localDay(today))
+    if (!days.length) return
+    ctx.host.usageDaily.ingest({ displayName: "Z.ai", daily: days })
+    const recent = days.filter(row => row.date >= localDay(cutoff))
+    const tokensLabel = tokens => tokens.toLocaleString() + " tokens"
+    for (const [label, rows] of [
+      ["Today", recent.filter(row => row.date === localDay(today))],
+      ["Yesterday", recent.filter(row => row.date === localDay(yesterday))],
+      ["Last 30 Days", recent],
+    ]) {
+      if (!rows.length) continue
+      const tokens = rows.reduce((sum, row) => sum + row.totalTokens, 0)
+      const cost = rows.every(row => row.totalCost != null) ?
+        "~$" + rows.reduce((sum, row) => sum + row.totalCost, 0).toFixed(2) + " · " : ""
+      lines.push(ctx.line.text({ label, value: cost + tokensLabel(tokens) }))
+    }
+    if (recent.length) lines.push(ctx.line.barChart({
+      label: "Usage Trend",
+      note: "From your ZCode usage history",
+      points: recent.map(row => ({
+        label: Number(row.date.slice(5, 7)) + "/" + Number(row.date.slice(8)),
+        value: row.totalTokens,
+        valueLabel: tokensLabel(row.totalTokens),
+      })),
+    }))
+  }
+
+  function probe(ctx) {
+    const apiKey = loadApiKey(ctx)
+    const ownsLocalHistory = !ctx.account?.instanceId || ctx.account.instanceId === PROVIDER_ID
+    const local = ownsLocalHistory && ctx.host.zcode ? ctx.util.tryParseJson(ctx.host.zcode.scan()) : null
+    const daily = local?.daily || []
+    const now = new Date(ctx.nowIso || Date.now()).getTime()
+    const allowance = buildAllowance(local?.entitlement, now)
+    let result
+    try {
+      if (!apiKey) throw "No ZAI_API_KEY found. Set up environment variable first."
+      result = probeQuota(ctx, apiKey)
+    } catch (error) {
+      if (!daily.length && !allowance) throw error
+      result = { plan: null, lines: [] }
+      if (apiKey) {
+        ctx.host.log.warn("Quota refresh failed: " + String(error))
+        result.lines.push(ctx.line.badge({ label: "Status", text: String(error), color: "#d69b43" }))
+      }
+    }
+    const level = local?.entitlement?.quota?.level
+    result.plan ||= local?.plan || (level ? level + " Plan" : null)
+    if (allowance) {
+      const next = allowance.effective > now ? allowance.effective : allowance.reset
+      result.lines.push(ctx.line.progress({
+        label: allowance.label, used: allowance.used, limit: allowance.limit,
+        format: { kind: "count", suffix: "tokens" },
+        resetsAt: next ? new Date(next).toISOString() : null,
+      }))
+    }
+    appendLocalHistory(ctx, result.lines, daily, now)
+    if (local?.damagedRows > 0) {
+      result.lines.push(ctx.line.badge({ label: "History", text: "Skipped Invalid ZCode Usage Rows", color: "#d69b43" }))
+    }
+    return result
   }
 
   globalThis.__openusage_plugin = { id: "zai", probe }
