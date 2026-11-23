@@ -156,29 +156,60 @@ fn codex_homes(home_path: Option<&str>) -> Vec<PathBuf> {
 }
 
 fn session_files(homes: &[PathBuf]) -> Vec<DiscoveredFile> {
+    let default_home = dirs::home_dir().map(|home| home.join(".codex"));
+    session_files_with_default(homes, default_home.as_deref())
+}
+
+fn session_files_with_default(homes: &[PathBuf], default_home: Option<&Path>) -> Vec<DiscoveredFile> {
+    let default_home = default_home.and_then(|home| fs::canonicalize(home).ok());
+    let mut homes: Vec<_> = homes.iter()
+        .map(|home| fs::canonicalize(home).unwrap_or_else(|_| home.clone()))
+        .collect();
+    homes.sort_by_key(|home| Some(home) != default_home.as_ref());
     let mut files = Vec::new();
     let mut seen_relative: HashSet<(String, String)> = HashSet::new();
-    for home in homes {
-        let home_resolved = fs::canonicalize(home).unwrap_or_else(|_| home.clone());
+    let mut seen_dirs = HashSet::new();
+    let mut seen_rollouts = HashSet::new();
+    let mut seen_files = HashSet::new();
+    for home_resolved in homes {
+        let mut home_files = Vec::new();
         for sub in ["sessions", "archived_sessions"] {
             let dir = home_resolved.join(sub);
             let dir = fs::canonicalize(&dir).unwrap_or(dir);
-            if !dir.is_dir() {
+            if !dir.is_dir() || !seen_dirs.insert(dir.clone()) {
                 continue;
             }
             let home_key = home_resolved.to_string_lossy().to_string();
-            collect_session_files(&dir, &dir, &home_key, sub, &mut files, &mut seen_relative);
+            collect_session_files(&dir, &dir, &home_key, sub, &mut home_files, &mut seen_relative);
         }
-        if !home_resolved.join("sessions").is_dir() && !home_resolved.join("archived_sessions").is_dir() {
+        if !home_resolved.join("sessions").is_dir() && !home_resolved.join("archived_sessions").is_dir()
+            && seen_dirs.insert(home_resolved.clone())
+        {
             let home_key = home_resolved.to_string_lossy().to_string();
             collect_session_files(
                 &home_resolved,
                 &home_resolved,
                 &home_key,
                 "",
-                &mut files,
+                &mut home_files,
                 &mut seen_relative,
             );
+        }
+        for file in home_files {
+            let name = file.path.file_name().unwrap_or_default().to_string_lossy();
+            let is_rollout = name.starts_with("rollout-");
+            if is_rollout && seen_rollouts.contains(name.as_ref()) {
+                continue;
+            }
+            if let Ok(identity) = same_file::Handle::from_path(&file.path) {
+                if !seen_files.insert(identity) {
+                    continue;
+                }
+            }
+            if is_rollout {
+                seen_rollouts.insert(name.into_owned());
+            }
+            files.push(file);
         }
     }
     cap_log_files_by_mtime(&mut files, |f| f.mtime, |f| f.size);
@@ -197,9 +228,11 @@ fn collect_session_files(
     let Ok(rd) = fs::read_dir(dir) else {
         return;
     };
-    for entry in rd.flatten() {
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
         let path = entry.path();
-        if path.is_dir() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             collect_session_files(root, &path, home_key, source, out, seen);
         } else if path.extension().is_some_and(|e| e == "jsonl") {
             // Dedup by home + path relative to resolved sessions root (symlink-safe).
@@ -797,6 +830,51 @@ mod tests {
         assert!(names.contains("b.jsonl"));
         assert_eq!(files.len(), 2, "archived duplicate of sessions/a.jsonl skipped");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn multi_home_readout_prefers_default_rollouts_and_counts_distinct_archives() {
+        let root = tempfile::tempdir().unwrap();
+        let default = root.path().join(".codex");
+        let managed = root.path().join("managed");
+        for dir in [default.join("sessions"), managed.join("sessions"), managed.join("archived_sessions")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let timestamp = Utc::now().to_rfc3339();
+        let log = |path: PathBuf, model: &str, input: i32| {
+            let turn = json!({"type": "turn_context", "payload": {"model": model}});
+            let event = json!({
+                "timestamp": timestamp, "type": "event_msg",
+                "payload": {"type": "token_count", "info": {
+                    "last_token_usage": {"input_tokens": input, "output_tokens": 10}
+                }}
+            });
+            fs::write(path, format!("{turn}\n{event}\n")).unwrap();
+        };
+        let canonical = default.join("sessions/rollout-shared.jsonl");
+        log(canonical.clone(), "gpt-5", 100);
+        log(managed.join("sessions/rollout-shared.jsonl"), "gpt-5", 1_000);
+        fs::hard_link(&canonical, managed.join("sessions/hardlink.jsonl")).unwrap();
+        log(managed.join("archived_sessions/rollout-own.jsonl"), "gpt-5-mini", 200);
+        let alias = default.join(".");
+        let files = session_files_with_default(&[managed.clone(), alias, default.clone()], Some(&default));
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|file| file.path == fs::canonicalize(&canonical).unwrap()));
+        let rows = aggregate(
+            &dedup_events(files.iter().flat_map(|file| parse_file(&file.path)).collect()),
+            since_local_midnight(1),
+            default_pricing(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input_tokens, 300);
+        assert_eq!(rows[0].output_tokens, 20);
+        assert_eq!(rows[0].total_tokens, 320);
+        assert!((rows[0].total_cost.unwrap() - 0.000295).abs() < 1e-9);
+        assert_eq!(rows[0].models["gpt-5"].total_tokens, 110);
+        assert_eq!(rows[0].models["gpt-5-mini"].total_tokens, 210);
+        let isolated = scan_homes(&[default], 1, default_pricing()).unwrap();
+        assert_eq!(isolated[0].total_tokens, 110);
+        assert!(!isolated[0].models.contains_key("gpt-5-mini"));
     }
 
     #[test]
