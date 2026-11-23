@@ -171,6 +171,9 @@ fn receipt_target<'a>(
     verified_identities: &'a BTreeMap<String, String>,
 ) -> Option<&'a str> {
     match family {
+        "opencode" if !providers.contains_key(family) && providers.contains_key("opencode-go") => {
+            Some("opencode-go")
+        }
         "zai" | "antigravity" | "opencode" => Some(family),
         "claude" | "codex" => {
             let account = receipt.vmbox_accounts.get(family).filter(|key| !key.is_empty())?;
@@ -317,7 +320,7 @@ mod tests {
             "deviceID": device,
             "deviceName": "Fixture VM",
             "updatedAt": at,
-            "providers": { "zai": provider, "claude": provider, "codex": provider, "cursor": provider },
+            "providers": { "zai": provider, "claude": provider, "codex": provider, "cursor": provider, "opencode": provider },
             "vmboxAccounts": { "claude": "canonical-work", "codex": "canonical-personal" },
         })).unwrap()
     }
@@ -386,6 +389,24 @@ mod tests {
         let rows = cache.read_rows(&providers, &verified, None, now());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].instance_id, "codex:personal");
+    }
+
+    #[test]
+    fn opencode_receipts_use_the_windows_plugin_id_without_double_counting() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("vmbox-a.json"), fixture("vmbox-one", now(), 20)).unwrap();
+        let mut cache = ReceiptCache::new(temp.path().into());
+        let mut providers = BTreeMap::from([("opencode-go".into(), "OpenCode Go".into())]);
+        let verified = BTreeMap::new();
+        let rows = cache.read_rows(&providers, &verified, None, now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].instance_id, "opencode-go");
+        assert_eq!(rows[0].total_tokens, Some(20));
+
+        providers.insert("opencode".into(), "OpenCode".into());
+        let rows = cache.read_rows(&providers, &verified, None, now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].instance_id, "opencode");
     }
 
     #[test]

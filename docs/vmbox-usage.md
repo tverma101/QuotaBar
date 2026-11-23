@@ -14,7 +14,8 @@ When a VM goes offline, its last received totals remain visible with an outdated
 
 On Windows, deliver the receipt files to `%USERPROFILE%\.local\share\vmbox\usage`. QuotaBar reads
 them on demand when showing daily history, at most once every 30 seconds. Claude and Codex totals
-appear after a local authenticated refresh verifies exactly one matching account. The daily chart
+appear after a local authenticated refresh verifies exactly one matching account. OpenCode receipts
+appear under OpenCode Go when that provider is installed. The daily chart
 labels imported and last-known VM totals. The Windows import never changes quota balances or writes
 VM totals into the local history database or API cache.
 
