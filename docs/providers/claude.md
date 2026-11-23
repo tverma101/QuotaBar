@@ -91,6 +91,10 @@ usage objects do not count as assistant usage or block the scan; invalid token c
 The Windows scanner also counts advisor tokens without a known model under **Unattributed**;
 it does not estimate a cost for those tokens.
 
+On Windows, local spend includes Cowork session logs from supported Claude Desktop data
+locations, including the packaged app. A Claude Code home override selects the Code homes
+without disabling Cowork history. Reading these logs does not connect a Desktop login.
+
 On Windows, an additional account uses its own login and does not inherit the default Claude
 account's local spend. VM Box history matches an account using its verified Claude profile IDs,
 not its card label.

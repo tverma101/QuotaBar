@@ -84,15 +84,14 @@ fn days_back_from_since(since: DateTime<Utc>) -> i32 {
 }
 
 fn scan(days_back: i32, home_path: Option<&str>, pricing: &ModelPricing) -> Option<Vec<DailyUsageRow>> {
-    let roots = claude_roots(home_path);
-    if roots.is_empty() {
-        return None;
-    }
-    let files = usage_files(&roots);
+    scan_roots(&claude_roots(home_path), since_local_midnight(days_back), pricing)
+}
+
+fn scan_roots(roots: &[PathBuf], since: DateTime<Utc>, pricing: &ModelPricing) -> Option<Vec<DailyUsageRow>> {
+    let files = usage_files(roots);
     if files.is_empty() {
         return None;
     }
-    let since = since_local_midnight(days_back);
     let mut entries = Vec::new();
     if let Ok(mut guard) = FILE_CACHE.lock() {
         let cache = guard.get_or_insert_with(HashMap::new);
@@ -127,24 +126,36 @@ fn scan(days_back: i32, home_path: Option<&str>, pricing: &ModelPricing) -> Opti
 }
 
 fn claude_roots(home_path: Option<&str>) -> Vec<PathBuf> {
+    let configured = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    let configured = home_path.filter(|s| !s.trim().is_empty()).or(configured.as_deref());
+    let home = dirs::home_dir();
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok().filter(|s| !s.is_empty());
+    #[cfg(windows)]
+    let desktop = windows_desktop_roots(dirs::config_dir().as_deref(), dirs::data_local_dir().as_deref());
+    #[cfg(not(windows))]
+    let desktop: Vec<_> = home.iter().map(|home| home.join("Library/Application Support/Claude")).collect();
+    claude_roots_for(configured, home.as_deref(), xdg.as_deref(), &desktop)
+}
+
+fn claude_roots_for(
+    configured: Option<&str>,
+    home: Option<&Path>,
+    xdg: Option<&str>,
+    desktop: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
 
-    fn push_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<String>, url: PathBuf) {
+    fn push_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, url: PathBuf) {
         if url.join("projects").is_dir() {
-            let key = url.to_string_lossy().to_string();
+            let key = fs::canonicalize(&url).unwrap_or_else(|_| url.clone());
             if seen.insert(key) {
                 roots.push(url);
             }
         }
     }
 
-    let env_or_arg = home_path
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok());
-
-    if let Some(raw) = env_or_arg.filter(|s| !s.trim().is_empty()) {
+    if let Some(raw) = configured.filter(|s| !s.trim().is_empty()) {
         for part in raw.split(',') {
             let part = part.trim();
             if part.is_empty() {
@@ -158,33 +169,39 @@ fn claude_roots(home_path: Option<&str>) -> Vec<PathBuf> {
             }
             push_root(&mut roots, &mut seen, url);
         }
+        if roots.is_empty() {
+            log::debug!("configured Claude roots contain no projects directories");
+        }
+    } else if let Some(home) = home {
+        let xdg = xdg.map(expand_tilde).unwrap_or_else(|| home.join(".config"));
+        push_root(&mut roots, &mut seen, xdg.join("claude"));
+        push_root(&mut roots, &mut seen, home.join(".claude"));
     }
-
-    if roots.is_empty() {
-        if let Some(home) = dirs::home_dir() {
-            let xdg = std::env::var("XDG_CONFIG_HOME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|s| expand_tilde(&s))
-                .unwrap_or_else(|| home.join(".config"));
-            push_root(&mut roots, &mut seen, xdg.join("claude"));
-            push_root(&mut roots, &mut seen, home.join(".claude"));
-            for sandbox in cowork_claude_dirs(&home) {
-                push_root(&mut roots, &mut seen, sandbox);
-            }
+    for dir in desktop {
+        for sandbox in cowork_claude_dirs(&dir.join("local-agent-mode-sessions")) {
+            push_root(&mut roots, &mut seen, sandbox);
         }
     }
 
     roots
 }
 
-fn cowork_claude_dirs(home: &Path) -> Vec<PathBuf> {
-    let base = home.join("Library/Application Support/Claude/local-agent-mode-sessions");
-    if !base.is_dir() {
-        return vec![];
+#[cfg(any(windows, test))]
+fn windows_desktop_roots(roaming: Option<&Path>, local: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(local) = local {
+        roots.push(local.join("Claude-Data/claude_pzs8sxrjxfjjc"));
+        roots.push(local.join("Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude"));
     }
+    if let Some(roaming) = roaming {
+        roots.push(roaming.join("Claude"));
+    }
+    roots
+}
+
+fn cowork_claude_dirs(base: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    let Ok(groups) = fs::read_dir(&base) else {
+    let Ok(groups) = fs::read_dir(base) else {
         return vec![];
     };
     for group in groups.flatten() {
@@ -192,19 +209,15 @@ fn cowork_claude_dirs(home: &Path) -> Vec<PathBuf> {
             continue;
         };
         for sub in subs.flatten() {
-            let mut sessions: Vec<PathBuf> = fs::read_dir(sub.path())
-                .ok()
-                .map(|rd| rd.flatten().map(|e| e.path()).collect())
-                .unwrap_or_default();
-            for holder in sessions.clone() {
-                if holder.file_name().is_some_and(|n| n == "agent") {
-                    if let Ok(agent_children) = fs::read_dir(&holder) {
-                        sessions.extend(agent_children.flatten().map(|e| e.path()));
-                    }
+            let Ok(sessions) = fs::read_dir(sub.path()) else {
+                continue;
+            };
+            for session in sessions.flatten() {
+                let path = session.path();
+                if session.file_name() == "agent" && let Ok(children) = fs::read_dir(&path) {
+                    dirs.extend(children.flatten().map(|entry| entry.path().join(".claude")));
                 }
-            }
-            for session in sessions {
-                dirs.push(session.join(".claude"));
+                dirs.push(path.join(".claude"));
             }
         }
     }
@@ -589,6 +602,55 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn windows_cowork_and_multi_home_logs_fold_into_one_readout() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("user");
+        let roaming = tmp.path().join("roaming");
+        let local = tmp.path().join("local");
+        let desktop = windows_desktop_roots(Some(&roaming), Some(&local));
+        let cli = [tmp.path().join("code-one"), tmp.path().join("code-two")];
+        let make_log = |root: &Path, id: &str, input: i32| {
+            let projects = root.join("projects/test");
+            fs::create_dir_all(&projects).unwrap();
+            let line = serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-07-12T12:00:00Z",
+                "requestId": id,
+                "costUSD": 0.0,
+                "message": {
+                    "id": id,
+                    "model": "claude-sonnet-4-20250514",
+                    "usage": { "input_tokens": input, "output_tokens": 1 }
+                }
+            });
+            fs::write(projects.join("session.jsonl"), line.to_string()).unwrap();
+        };
+        make_log(&cli[0], "first", 10);
+        make_log(&cli[1], "shared", 20);
+        make_log(&home.join(".claude"), "default", 1000);
+        for (index, base) in desktop.iter().enumerate() {
+            let group = base.join("local-agent-mode-sessions/account/org");
+            make_log(&group.join("local_session/.claude"), "shared", 20);
+            make_log(&group.join("agent/local_session/.claude"), &format!("desktop-{index}"), 5);
+        }
+        let configured = format!("{}, {}", cli[0].display(), cli[1].join("projects").display());
+        let roots = claude_roots_for(Some(&configured), Some(&home), None, &desktop);
+        assert_eq!(roots.len(), 8);
+        let since = parse_since("2026-07-11");
+        let rows = scan_roots(&roots, since, default_pricing()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input_tokens, 45);
+        assert_eq!(rows[0].output_tokens, 5);
+        assert_eq!(rows[0].total_tokens, 50);
+        assert_eq!(rows[0].total_cost, Some(0.0));
+        assert_eq!(rows[0].models["claude-sonnet-4-20250514"].total_tokens, 50);
+        let missing = tmp.path().join("missing");
+        let roots = claude_roots_for(missing.to_str(), Some(&home), None, &desktop);
+        assert_eq!(roots.len(), 6);
+        assert!(!roots.contains(&home.join(".claude")));
+    }
 
     #[test]
     fn parses_usage_line_and_aggregates() {
