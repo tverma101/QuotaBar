@@ -214,7 +214,7 @@ Settings UI only — **credential injection not wired yet**. Usage still comes f
 
 1. Create key at [openrouter.ai/keys](https://openrouter.ai/keys).
 2. **Add account** → **Access token** = `sk-or-…` key (common multi-account use case: personal + work keys).
-3. Env fallback: `OPENROUTER_API_KEY`, `OPENROUTER_KEY`; or `~/.config/openusage/openrouter.json`.
+3. Without a saved key, QuotaBar checks the local OpenRouter config files before `OPENROUTER_API_KEY` and `OPENROUTER_KEY`. Missing credit totals or cap remaining amounts do not show as measured balances or limits.
 
 ### Perplexity
 

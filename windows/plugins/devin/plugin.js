@@ -135,12 +135,14 @@
   }
 
   function resolveCredentialsPath(ctx) {
+    var local = ctx.host.env.get("LOCALAPPDATA")
+    var paths = local ? [local + "/devin/credentials.toml"].concat(CREDENTIALS_PATHS) : CREDENTIALS_PATHS
     if (ctx.host.fs && typeof ctx.host.fs.firstExisting === "function") {
-      var found = ctx.host.fs.firstExisting(CREDENTIALS_PATHS)
+      var found = ctx.host.fs.firstExisting(paths)
       if (found) return found
     }
-    for (var i = 0; i < CREDENTIALS_PATHS.length; i++) {
-      if (ctx.host.fs.exists(CREDENTIALS_PATHS[i])) return CREDENTIALS_PATHS[i]
+    for (var i = 0; i < paths.length; i++) {
+      if (ctx.host.fs.exists(paths[i])) return paths[i]
     }
     return null
   }
@@ -268,7 +270,10 @@
   function unixSecondsToIso(ctx, value) {
     var seconds = readFiniteNumber(value)
     if (seconds === null) return null
-    return ctx.util.toIso(seconds * 1000)
+    var resetMs = seconds * 1000
+    var now = ctx.util.parseDateMs(ctx.nowIso) ?? Date.now()
+    if (resetMs <= now || resetMs - now > 2 * 365 * DAY_MS) return null
+    return ctx.util.toIso(resetMs)
   }
 
   function formatDollarsFromMicros(value) {
@@ -364,6 +369,9 @@
       attempts.push(authFingerprint(credentials))
       var credentialsAttempt = tryAuth(ctx, credentials)
       if (credentialsAttempt.output) return credentialsAttempt.output
+      if (credentials.source === "provider-account") {
+        throw credentialsAttempt.authFailure ? LOGIN_HINT : QUOTA_HINT
+      }
       if (credentialsAttempt.authFailure) sawAuthFailure = true
     }
 

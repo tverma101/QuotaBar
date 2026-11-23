@@ -9,11 +9,11 @@ Tracks [Z.ai](https://z.ai) (Zhipu AI) usage quotas for GLM coding plans.
 
 - **Protocol:** REST (plain JSON)
 - **Base URL:** `https://api.z.ai/`
-- **Auth:** API key via environment variable (`ZAI_API_KEY`, fallback `GLM_API_KEY`)
+- **Auth:** saved account API key, then `~/.config/openusage/zai.json` or `~/.config/zai/key.json`, then `ZAI_API_KEY` or `GLM_API_KEY`
 - **Session utilization:** percentage (0-100)
 - **Weekly utilization:** percentage (0-100)
 - **Web searches:** count-based (used / limit)
-- **Reset periods:** 5 hours (session), 7 days (weekly), monthly (web searches, from subscription renewal date)
+- **Reset periods:** session and weekly from the quota response; monthly for web searches
 
 ## Setup
 
@@ -83,7 +83,6 @@ Returns the user's active subscription(s). Used to extract the plan name.
 Used fields:
 
 - `productName` — plan display name (e.g. "GLM Coding Max")
-- `nextRenewTime` — monthly reset date for web search quota (ISO date, e.g. "2026-03-12")
 
 ### GET /api/monitor/usage/quota/limit
 
@@ -150,7 +149,7 @@ Returns session token usage and web search quotas.
 - `percentage` — usage as percentage (0-100)
 - `nextResetTime` — epoch milliseconds of next reset
 - `unit: 3, number: 5` — 5-hour rolling period (session)
-- `unit: 6, number: 7` — 7-day rolling period (weekly)
+- `unit: 6, number: 1` — 7-day rolling period (weekly)
 
 **TIME_LIMIT:**
 
@@ -159,15 +158,15 @@ Returns session token usage and web search quotas.
 - `remaining` — calls remaining
 - `percentage` — usage as percentage (0-100)
 - `usageDetails` — per-model breakdown (search-prime, web-reader, zread)
-- `unit: 5, number: 1` — monthly period (no `nextResetTime`; resets on the 1st of each month at 00:00 UTC)
+- `unit: 5, number: 1` — monthly period; an explicit future `nextResetTime` supplies the countdown
 
 ## Displayed Lines
 
 | Line         | Description                                                                  |
 |--------------|------------------------------------------------------------------------------|
-| Session      | Token usage as percentage (0-100%) with 5h reset timer                       |
-| Weekly       | Token usage as percentage (0-100%) with 7-day reset timer                   |
-| Web Searches | Web search/reader call count (used / limit), resets on the 1st of each month |
+| Session      | Percentage used in a sub-daily coding window |
+| Weekly       | Percentage used in a multi-day coding window |
+| Web Searches | Web search/reader calls (used / limit), omitted for a zero allowance |
 
 ## Errors
 
