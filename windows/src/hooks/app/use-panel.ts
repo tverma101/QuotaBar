@@ -28,6 +28,21 @@ function isEditableTarget(target: EventTarget | null): boolean {
   return false
 }
 
+/**
+ * Height the scroll region's content needs, ignoring the min-height stretch of
+ * its wrapper (scrollHeight never drops below the current viewport).
+ */
+export function naturalContentHeight(scroll: HTMLElement): number {
+  const wrapper = scroll.firstElementChild
+  if (!wrapper) return scroll.scrollHeight
+  const top = wrapper.getBoundingClientRect().top
+  let bottom = 0
+  for (const child of Array.from(wrapper.children)) {
+    bottom = Math.max(bottom, child.getBoundingClientRect().bottom - top)
+  }
+  return Math.ceil(bottom)
+}
+
 export function usePanel({
   activeView,
   setActiveView,
@@ -107,11 +122,9 @@ export function usePanel({
       }
       unlisteners.push(u2)
 
-      // Closing the panel resets navigation and scroll, like the macOS panel.
+      // View and scroll reset on hide is shared by both layouts (usePanelHideReset).
       const u3 = await listen("panel:did-hide", () => {
         setShowAbout(false)
-        setActiveView("home")
-        scrollRef.current?.scrollTo({ top: 0 })
       })
       if (cancelled) {
         u3()
@@ -190,7 +203,7 @@ export function usePanel({
         const scroll = scrollRef.current
         const chrome = container.offsetHeight - (scroll ? scroll.offsetHeight : 0)
         const contentHeight =
-          chrome + (scroll ? scroll.scrollHeight : container.scrollHeight) + 2
+          chrome + (scroll ? naturalContentHeight(scroll) : container.scrollHeight) + 2
         try {
           const maxHeight = await invoke<number | null>("resize_panel", { height: contentHeight })
           if (typeof maxHeight === "number" && maxPanelHeightPxRef.current !== maxHeight) {
@@ -249,6 +262,12 @@ export function usePanel({
       resizeWindow()
     })
     observer.observe(container)
+    // The scroll region stretches to the window, so watch the content itself to
+    // also catch it shrinking.
+    const content = scrollRef.current?.firstElementChild
+    if (content) {
+      for (const child of Array.from(content.children)) observer.observe(child)
+    }
 
     return () => observer.disconnect()
   }, [activeView, displayPlugins])

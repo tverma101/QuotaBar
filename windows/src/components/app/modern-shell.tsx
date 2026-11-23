@@ -296,6 +296,7 @@ export function ModernShell({
           ) : null}
 
           <div
+            data-panel-scroll
             className={cn(
               "min-h-0 flex-1 overflow-y-auto scrollbar-none",
               compact ? "text-sm" : "text-base",
