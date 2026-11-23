@@ -15,6 +15,9 @@ use std::sync::{Mutex, OnceLock, RwLock};
 mod live;
 pub use live::enable_live_pricing;
 
+#[path = "pricing_fallback.rs"]
+mod fallback;
+
 #[path = "pricing_rates.rs"]
 mod rates;
 pub use rates::ModelRates;
@@ -46,6 +49,10 @@ struct SupplementFile {
     pricing: HashMap<String, SupplementRates>,
     fast_multipliers: HashMap<String, f64>,
     alias_rules: Vec<AliasRuleFile>,
+    updated_at: Option<String>,
+    #[serde(default)]
+    retired_pricing_keys: Vec<String>,
+    retired_alias_patterns: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +108,7 @@ pub struct ModelPricing {
     primary: HashMap<String, ModelRates>,
     secondary: HashMap<String, ModelRates>,
     open_router: RwLock<HashMap<String, ModelRates>>,
+    fallback: RwLock<fallback::Fallback>,
     discovers: bool,
     generation: AtomicU64,
     resolved: Mutex<HashMap<String, Option<ModelRates>>>,
@@ -113,6 +121,8 @@ pub fn default_pricing() -> &'static ModelPricing {
         let mut pricing = ModelPricing::from_bundled();
         if let Some(path) = crate::paths::app_data_dir() {
             *pricing.open_router.get_mut().unwrap() = live::load_cache(&path);
+            let cache = fallback::Fallback::load(&path, &pricing);
+            *pricing.fallback.get_mut().unwrap() = cache;
         }
         pricing.discovers = true;
         pricing
@@ -131,6 +141,7 @@ impl ModelPricing {
             primary,
             secondary,
             open_router: RwLock::new(HashMap::new()),
+            fallback: RwLock::new(fallback::Fallback::default()),
             discovers: false,
             generation: AtomicU64::new(0),
             resolved: Mutex::new(HashMap::new()),
@@ -151,7 +162,7 @@ impl ModelPricing {
 
     /// Supplement alias canonical name when a rule matches; otherwise `None`.
     pub fn canonical_name(&self, model: &str) -> Option<String> {
-        self.supplement.canonical_name(model)
+        self.fallback.read().unwrap().supplement(&self.supplement).canonical_name(model)
     }
 
     pub fn resolve(&self, model: &str) -> Option<ModelRates> {
@@ -182,6 +193,32 @@ impl ModelPricing {
     }
 
     fn resolve_uncached(&self, model: &str) -> Option<ModelRates> {
+        let fallback = self.fallback.read().unwrap();
+        PricingLookup {
+            supplement: fallback.supplement(&self.supplement),
+            primary: fallback.primary(&self.primary),
+            secondary: fallback.secondary(&self.secondary),
+            open_router: &self.open_router.read().unwrap(),
+        }.resolve(model)
+    }
+
+    fn catalog_changed(&self, apply: impl FnOnce()) {
+        let mut resolved = self.resolved.lock().unwrap();
+        apply();
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        resolved.clear();
+    }
+}
+
+struct PricingLookup<'a> {
+    supplement: &'a PricingSupplement,
+    primary: &'a HashMap<String, ModelRates>,
+    secondary: &'a HashMap<String, ModelRates>,
+    open_router: &'a HashMap<String, ModelRates>,
+}
+
+impl PricingLookup<'_> {
+    fn resolve(&self, model: &str) -> Option<ModelRates> {
         if let Some(canonical) = self.supplement.canonical_name(model) {
             if canonical != model {
                 if let Some(r) = self.lookup(&canonical) {
@@ -196,7 +233,7 @@ impl ModelPricing {
         if let Some(r) = self.supplement.pricing.get(name) {
             return Some(r.clone());
         }
-        if let Some(r) = self.open_router.read().unwrap().get(name) {
+        if let Some(r) = self.open_router.get(name) {
             return Some(self.with_supplement_fast_multiplier(name, r));
         }
         if let Some(r) = self.primary.get(name) {
@@ -207,7 +244,7 @@ impl ModelPricing {
             if let Some(r) = self.supplement.pricing.get(&normalized) {
                 return Some(r.clone());
             }
-            if let Some(r) = self.open_router.read().unwrap().get(&normalized) {
+            if let Some(r) = self.open_router.get(&normalized) {
                 return Some(self.with_supplement_fast_multiplier(name, r));
             }
             if let Some(r) = self.primary.get(&normalized) {
@@ -261,7 +298,7 @@ impl ModelPricing {
         if let Some(r) = self.supplement.pricing.get(base) {
             return Some((base.to_string(), r.clone()));
         }
-        if let Some(r) = self.open_router.read().unwrap().get(base) {
+        if let Some(r) = self.open_router.get(base) {
             return Some((base.to_string(), r.clone()));
         }
         self.primary
@@ -299,7 +336,7 @@ impl ModelPricing {
     fn fuzzy_primary(&self, model: &str) -> Option<&ModelRates> {
         let normalized = normalized_key(model);
         let mut best: Option<(&str, &ModelRates)> = None;
-        for (key, rates) in &self.primary {
+        for (key, rates) in self.primary {
             if key_matches(key, model, &normalized) {
                 best = match best {
                     Some((bk, _)) if key.len() > bk.len() || (key.len() == bk.len() && key.as_str() < bk) => {
@@ -350,7 +387,20 @@ fn load_supplement(json: &str) -> PricingSupplement {
         pricing: HashMap::new(),
         fast_multipliers: HashMap::new(),
         alias_rules: vec![],
+        updated_at: None,
+        retired_pricing_keys: Vec::new(),
+        retired_alias_patterns: None,
     });
+    build_supplement(file)
+}
+
+fn build_supplement(mut file: SupplementFile) -> PricingSupplement {
+    for key in file.retired_pricing_keys {
+        file.pricing.remove(&key);
+    }
+    if let Some(retired) = file.retired_alias_patterns {
+        file.alias_rules.retain(|rule| !retired.contains(&rule.pattern));
+    }
     let mut pricing = HashMap::new();
     for (model, entry) in file.pricing {
         let cache_read_is_explicit = entry.cache_read_per_million.is_some();
