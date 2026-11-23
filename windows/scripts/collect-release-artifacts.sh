@@ -65,7 +65,7 @@ Typical filenames (Tauri uses productName "quotabar" + version ${VERSION}):
   - Windows:   quotabar_${VERSION}_x64-setup.exe (NSIS installer)
   - Windows:   quotabar.exe + WebView2Loader.dll (same folder — required for GNU/MinGW portable exe)
   - Windows:   quotabar_${VERSION}_windows_amd64_onefile*.exe (optional true single-file; see build-gui-portable-onefile-windows-gnu.sh)
-  - CLI:       quotabar-cli (same .deb / installer as GUI when built with prepare-cli-sidecar.sh)
+  - CLI:       quotabar-cli (bundled with the GUI by the Tauri build)
   - CLI tarball: quotabar-cli_${VERSION}_linux_amd64.tar.gz, quotabar-cli_${VERSION}_windows_amd64.zip (scripts/build-cli-tarball.sh / build-cli-zip-windows-gnu.sh) for INSTALL_MODE=cli
   - Portable GUI: quotabar_${VERSION}_linux_<arch>.tar.gz, quotabar_${VERSION}_windows_<arch>.zip, quotabar_${VERSION}_darwin_<arch>.tar.gz (see scripts/build-gui-portable-*.sh / .ps1)
 EOF

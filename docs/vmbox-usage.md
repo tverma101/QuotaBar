@@ -12,4 +12,10 @@ Each VM has a stable device ID. Only the newest whole receipt for a device parti
 
 When a VM goes offline, its last received totals remain visible with an outdated warning after five minutes. An invalid replacement retains the last valid receipt in the running app and reports a warning. Receipts contain no prompts, transcripts or authentication credentials.
 
+On Windows, deliver the receipt files to `%USERPROFILE%\.local\share\vmbox\usage`. QuotaBar reads
+them on demand when showing daily history, at most once every 30 seconds. Claude and Codex totals
+appear after a local authenticated refresh verifies exactly one matching account. The daily chart
+labels imported and last-known VM totals. The Windows import never changes quota balances or writes
+VM totals into the local history database or API cache.
+
 Use `vmbox usage` to inspect the shared Quota Bar balances and the most recent receipt timestamps. `vmbox usage-sync` pulls accounting from an already running VM without starting compute. Restart Quota Bar after installing this integration; existing app processes cannot load new code.

@@ -7,7 +7,7 @@
   "build": {
     "beforeDevCommand": "node scripts/tauri-before-dev.cjs",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "bun run bundle:plugins && bun run build && bash scripts/prepare-cli-sidecar.sh",
+    "beforeBuildCommand": "bun run bundle:plugins && bun run build && node scripts/prepare-cli-sidecar.cjs",
     "frontendDist": "../dist"
   },
   "app": {

@@ -23,3 +23,5 @@ pub mod log_usage_types;
 pub mod model_pricing;
 pub mod usage_daily;
 pub mod usage_history;
+pub mod usage_snapshot;
+pub mod vmbox_usage;

@@ -21,6 +21,8 @@ mod popover_platform;
 mod tray;
 #[cfg(target_os = "linux")]
 mod tray_linux;
+#[cfg(windows)]
+mod vmbox_history;
 #[cfg(target_os = "macos")]
 mod webkit_config;
 
@@ -868,10 +870,8 @@ fn run_and_emit_probe(
 
     match result {
         Ok(output) => {
-            let has_error = output.lines.iter().any(|line| {
-                matches!(line, plugin_engine::runtime::MetricLine::Badge { label, .. } if label == "Error")
-            });
-            if has_error {
+            if quotabar_core::limits_export::probe_error_message(&output).is_some() {
+                local_http_api::record_probe_failure(&plugin_id);
                 log::warn!("probe {} completed with error", plugin_id);
             } else {
                 log::info!(
@@ -902,6 +902,7 @@ fn run_and_emit_probe(
             );
         }
         Err(_) => {
+            local_http_api::record_probe_failure(&plugin_id);
             log::error!("probe {} panicked", plugin_id);
             let output = plugin_engine::runtime::probe_fault_output(
                 &plugin,
@@ -1151,21 +1152,31 @@ fn clear_usage_history(state: tauri::State<'_, Mutex<AppState>>) -> Result<(), S
 }
 
 #[tauri::command]
-fn list_usage_daily(
+async fn list_usage_daily(
     state: tauri::State<'_, Mutex<AppState>>,
     limit: Option<u32>,
     instance_id: Option<String>,
 ) -> Result<Vec<quotabar_core::usage_daily::UsageDailyRow>, String> {
-    let dir = {
+    let (dir, providers) = {
         let locked = state.lock().map_err(|e| e.to_string())?;
-        locked.app_data_dir.clone()
+        let providers = locked.plugins.iter()
+            .filter(|p| matches!(p.manifest.id.as_str(), "antigravity" | "opencode" | "zai" | "claude" | "codex"))
+            .map(|p| (p.manifest.id.clone(), p.manifest.name.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        (locked.app_data_dir.clone(), providers)
     };
-    quotabar_core::usage_daily::list_recent(
-        &dir,
-        limit.unwrap_or(120),
-        instance_id.as_deref(),
-    )
-    .map_err(|e| e.to_string())
+    let limit = limit.unwrap_or(120);
+    tauri::async_runtime::spawn_blocking(move || {
+        let rows = quotabar_core::usage_daily::list_recent(&dir, limit, instance_id.as_deref())
+            .map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        let rows = vmbox_history::merge(rows, providers, &dir, instance_id.as_deref(), limit);
+        #[cfg(not(windows))]
+        let _ = providers;
+        Ok(rows)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn resolve_cursor_usage_stats_target(

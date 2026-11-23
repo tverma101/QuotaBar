@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use quotabar_core::plugin_engine::manifest::LoadedPlugin;
 use quotabar_core::plugin_engine::runtime::{self, MetricLine, PluginOutput};
+use quotabar_core::provider_accounts::ProviderAccountContext;
 
 /// Same as the dashboard: `QUOTABAR_PROBE_TIMEOUT_SEC` or **120** seconds.
 pub fn probe_timeout_secs() -> u64 {
@@ -62,6 +63,21 @@ pub fn run_probe_with_timeout(
     version: &str,
     interrupt: Option<&Arc<AtomicBool>>,
 ) -> PluginOutput {
+    run_account_probe_with_timeout(plugin, app_data, version, interrupt, None).output
+}
+
+pub struct ProbeAttempt {
+    pub output: PluginOutput,
+    pub timed_out: bool,
+}
+
+pub fn run_account_probe_with_timeout(
+    plugin: &LoadedPlugin,
+    app_data: &PathBuf,
+    version: &str,
+    interrupt: Option<&Arc<AtomicBool>>,
+    account: Option<ProviderAccountContext>,
+) -> ProbeAttempt {
     let plugin_for_err = plugin.clone();
     let plugin_id = plugin_for_err.manifest.id.clone();
     let timeout_sec = probe_timeout_secs();
@@ -72,7 +88,7 @@ pub fn run_probe_with_timeout(
     let version_thread = version.to_string();
     let (tx, rx) = mpsc::channel();
     let _join = thread::spawn(move || {
-        let out = runtime::run_probe(&plugin_thread, &app_data_thread, &version_thread);
+        let out = runtime::run_probe_with_account(&plugin_thread, &app_data_thread, &version_thread, account);
         let _ = tx.send(out);
     });
 
@@ -87,26 +103,32 @@ pub fn run_probe_with_timeout(
                 "quotabar-cli: probe timed out after {timeout_sec}s for provider `{plugin_id}` \
                  (set QUOTABAR_PROBE_TIMEOUT_SEC or e.g. `quotabar-cli list cursor`.)"
             );
-            return probe_error_output(
-                &plugin_for_err,
-                format!(
-                    "Probe timed out after {timeout_sec}s. The provider may be waiting on the network — \
-                     set QUOTABAR_PROBE_TIMEOUT_SEC or probe fewer providers."
+            return ProbeAttempt {
+                output: probe_error_output(
+                    &plugin_for_err,
+                    format!(
+                        "Probe timed out after {timeout_sec}s. The provider may be waiting on the network — \
+                         set QUOTABAR_PROBE_TIMEOUT_SEC or probe fewer providers."
+                    ),
                 ),
-            );
+                timed_out: true,
+            };
         }
 
         let remaining = deadline.saturating_duration_since(now);
         let wait = TICK.min(remaining);
 
         match rx.recv_timeout(wait) {
-            Ok(o) => return o,
+            Ok(output) => return ProbeAttempt { output, timed_out: false },
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
-                return probe_error_output(
-                    &plugin_for_err,
-                    "Probe thread ended without returning a result (panic?).".into(),
-                );
+                return ProbeAttempt {
+                    output: probe_error_output(
+                        &plugin_for_err,
+                        "Probe thread ended without returning a result (panic?).".into(),
+                    ),
+                    timed_out: false,
+                };
             }
         }
     }

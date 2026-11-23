@@ -53,6 +53,34 @@ pub fn initialize_plugins(
     (install_dir, plugins)
 }
 
+pub fn discover_plugin_dirs(
+    app_data_dir: &Path,
+    resource_dir: Option<&Path>,
+) -> std::collections::BTreeMap<String, PathBuf> {
+    fn index(root: &Path) -> std::collections::BTreeMap<String, PathBuf> {
+        std::fs::read_dir(root).into_iter().flatten().flatten().filter_map(|entry| {
+            let dir = entry.path();
+            let definition = std::fs::read(dir.join("plugin.json")).ok()?;
+            let manifest: manifest::PluginManifest = serde_json::from_slice(&definition).ok()?;
+            (!is_retired_bundled_plugin_id(&manifest.id)).then_some((manifest.id, dir))
+        }).collect()
+    }
+
+    if resource_dir.is_none() {
+        if let Some(dev_dir) = find_dev_plugins_dir() {
+            let plugins = index(&dev_dir);
+            if !plugins.is_empty() {
+                return plugins;
+            }
+        }
+    }
+    let mut plugins = index(&app_data_dir.join("plugins"));
+    if let Some(root) = resource_dir {
+        plugins.extend(index(&resolve_bundled_dir(root)));
+    }
+    plugins
+}
+
 fn load_active_plugins_from_dir(plugins_dir: &Path) -> Vec<LoadedPlugin> {
     manifest::load_plugins_from_dir(plugins_dir)
         .into_iter()
