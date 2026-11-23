@@ -217,6 +217,10 @@ When the language server is not running, the plugin falls back to Google's Cloud
 
 ### retrieveUserQuotaSummary
 
+The Antigravity and Antigravity CLI adapters keep the first usable value for each quota across
+the two Cloud Code hosts. When the service reports a valid, enabled Gemini 4 Argon weekly bucket,
+QuotaBar shows it separately from the shared Gemini meters.
+
 ```
 POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary
 Authorization: Bearer <access_token>
@@ -230,7 +234,7 @@ Base URLs tried in order:
 1. `https://daily-cloudcode-pa.googleapis.com`
 2. `https://cloudcode-pa.googleapis.com`
 
-The response has two quota groups. The plugin exposes four progress lines: `Session`, `Weekly`, `Session — Claude and GPT Models`, and `Weekly — Claude and GPT Models`. A bucket's `remainingFraction` is converted to percentage used; `resetTime` is retained for the reset display.
+The shared quota groups expose `Session`, `Weekly`, `Session — Claude and GPT Models`, and `Weekly — Claude and GPT Models`. A bucket's `remainingFraction` is converted to percentage used; `resetTime` is retained for the reset display.
 
 ### agy keychain fallback
 

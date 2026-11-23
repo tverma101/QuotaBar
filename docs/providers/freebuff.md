@@ -48,6 +48,9 @@ Freebuff's canonical API host for its session, model catalogue, and read-only ho
 
 ## Metrics
 
+On Windows, Active Sessions counts each occupied session once and lists its expiration in UTC.
+Unused Desktop purchases are not counted as active sessions.
+
 Current accounts show **Daily Hours** and **Hours Balance**, matching Freebuff's conversion of five
 Freebucks per hour. Daily Hours is today's replenishing allowance. Hours Balance is the separate
 wallet, including any remaining monthly bonus and earned or purchased funds. It excludes the daily

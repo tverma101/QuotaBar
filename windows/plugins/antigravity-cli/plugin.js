@@ -429,13 +429,15 @@
 
     var byBucketId = {}
     for (var gi = 0; gi < groups.length; gi += 1) {
-      var buckets = groups[gi] && groups[gi].buckets
+      var group = groups[gi]
+      if (!group || group.displayName === "Gemini 4 Argon") continue
+      var buckets = group.buckets
       if (!Array.isArray(buckets)) continue
       for (var bi = 0; bi < buckets.length; bi += 1) {
         var bucket = buckets[bi]
         if (!bucket || typeof bucket !== "object") continue
         var id = typeof bucket.bucketId === "string" ? bucket.bucketId : ""
-        if (!id || byBucketId[id]) continue
+        if (!id) continue
         var spec = null
         for (var si = 0; si < SUMMARY_BUCKETS.length; si += 1) {
           if (SUMMARY_BUCKETS[si].bucketId === id) {
@@ -446,6 +448,7 @@
         if (!spec) continue
         var remaining = bucket.remainingFraction
         if (typeof remaining !== "number" || !Number.isFinite(remaining)) continue
+        if (byBucketId[id] && byBucketId[id].remainingFraction <= remaining) continue
         byBucketId[id] = {
           label: spec.label,
           remainingFraction: remaining,
@@ -455,12 +458,52 @@
       }
     }
 
+    var argon = groups.filter(function (group) { return group && group.displayName === "Gemini 4 Argon" })
+    var weekly = []
+    if (argon.every(function (group) { return Array.isArray(group.buckets) })) {
+      argon.forEach(function (group) {
+        weekly = weekly.concat(group.buckets.filter(function (bucket) { return bucket && bucket.window === "weekly" }))
+      })
+    }
+    var argonBucket = weekly.length === 1 ? weekly[0] : null
+    var hasArgon = argonBucket && typeof argonBucket.bucketId === "string" && argonBucket.bucketId.trim() &&
+      !SUMMARY_BUCKETS.some(function (spec) { return spec.bucketId === argonBucket.bucketId }) &&
+      (argonBucket.disabled == null || argonBucket.disabled === false) &&
+      Number.isFinite(argonBucket.remainingFraction)
+
     var lines = []
     for (var i = 0; i < SUMMARY_BUCKETS.length; i += 1) {
+      if (i === 2 && hasArgon) {
+        lines.push(lineForBucket(ctx, "Argon Weekly", {
+          remainingFraction: argonBucket.remainingFraction,
+          resetTime: argonBucket.resetTime,
+          periodMs: QUOTA_WEEKLY_MS,
+        }))
+      }
       var entry = byBucketId[SUMMARY_BUCKETS[i].bucketId]
       if (entry) lines.push(lineForBucket(ctx, entry.label, entry))
     }
     return lines
+  }
+
+  function requestQuotaSummary(ctx, authState, authOpts) {
+    var urls = cloudCodeUrls(RETRIEVE_QUOTA_SUMMARY_PATH)
+    var byLabel = {}
+    for (var i = 0; i < urls.length; i += 1) {
+      var data = requestJson(ctx, urls[i], authState.token, {}, Object.assign({}, authOpts, {
+        optional: Object.keys(byLabel).length > 0,
+        continueOnHttpError: true,
+        userAgent: "antigravity/cli/1.5.0",
+      }))
+      var lines = parseQuotaSummary(ctx, data) || []
+      lines.forEach(function (line) {
+        if (!byLabel[line.label]) byLabel[line.label] = line
+      })
+      if (SUMMARY_BUCKETS.every(function (spec) { return byLabel[spec.label] })) break
+    }
+    var labels = SUMMARY_BUCKETS.map(function (spec) { return spec.label })
+    labels.splice(2, 0, "Argon Weekly")
+    return labels.map(function (label) { return byLabel[label] }).filter(Boolean)
   }
 
   function readPlan(loadCodeAssistData) {
@@ -738,23 +781,12 @@
       authFailureMessage: SESSION_EXPIRED_MESSAGE,
     }
 
-    var loadData = requestJsonAcrossBases(
-      ctx,
-      RETRIEVE_QUOTA_SUMMARY_PATH,
-      authState.token,
-      {},
-      Object.assign({}, authOpts, {
-        continueOnHttpError: true,
-        // Older client identities omitted Gemini buckets on the tested account.
-        userAgent: "antigravity/cli/1.5.0",
-      })
-    )
-    var summaryLines = parseQuotaSummary(ctx, loadData)
-    if (summaryLines && summaryLines.length > 0) {
+    var summaryLines = requestQuotaSummary(ctx, authState, authOpts)
+    if (summaryLines.length > 0) {
       return { plan: undefined, lines: summaryLines }
     }
 
-    loadData = requestJsonAcrossBases(
+    var loadData = requestJsonAcrossBases(
       ctx,
       LOAD_CODE_ASSIST_PATH,
       authState.token,

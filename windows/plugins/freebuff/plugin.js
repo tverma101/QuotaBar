@@ -219,13 +219,21 @@
     }
   }
 
+  function sessionExpiry(value) {
+    var raw = nonempty(value)
+    if (!raw || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/.test(raw)) {
+      throw ERR_INVALID_RESPONSE
+    }
+    var timestamp = Date.parse(raw)
+    if (!Number.isFinite(timestamp)) throw ERR_INVALID_RESPONSE
+    return timestamp
+  }
+
   function activeSessions(root) {
-    var sessions = {}
+    var sessions = Object.create(null)
     if (root.status === "active") {
-      var expiry = nonempty(root.expiresAt)
-      if (!expiry) throw ERR_INVALID_RESPONSE
       var id = nonempty(root.instanceId) || "single"
-      sessions[id] = { expiresAt: expiry }
+      sessions[id] = sessionExpiry(root.expiresAt)
     }
     if (root.desktopPurchases !== undefined && root.desktopPurchases !== null &&
         !Array.isArray(root.desktopPurchases)) {
@@ -234,18 +242,15 @@
     if (Array.isArray(root.desktopPurchases)) {
       for (var i = 0; i < root.desktopPurchases.length; i++) {
         var purchase = root.desktopPurchases[i]
-        if (!purchase || typeof purchase !== "object") continue
+        if (!purchase || typeof purchase !== "object" || Array.isArray(purchase)) throw ERR_INVALID_RESPONSE
         var holder = nonempty(purchase.holderInstanceId)
         if (!holder) continue
-        var pExpiry = nonempty(purchase.expiresAt)
-        if (!pExpiry) throw ERR_INVALID_RESPONSE
-        sessions[holder] = { expiresAt: pExpiry }
+        sessions[holder] = sessionExpiry(purchase.expiresAt)
       }
     }
-    var list = []
-    for (var key in sessions) list.push(sessions[key])
-    list.sort(function (a, b) { return a.expiresAt < b.expiresAt ? -1 : a.expiresAt > b.expiresAt ? 1 : 0 })
-    return list
+    return Object.keys(sessions)
+      .map(function (key) { return sessions[key] })
+      .sort(function (a, b) { return a - b })
   }
 
   function capitalize(value) {
@@ -351,7 +356,7 @@
     if (sessions.length > 0) {
       sessionsLine.statusDot = "green"
       sessionsLine.expiryTooltip = sessions
-        .map(function (s) { return s.expiresAt })
+        .map(function (expiry) { return new Date(expiry).toISOString() })
         .join("\n")
     }
     lines.push(ctx.line.text(sessionsLine))

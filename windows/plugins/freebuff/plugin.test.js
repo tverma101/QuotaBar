@@ -221,6 +221,40 @@ describe("freebuff plugin", () => {
     expect(line.expiryTooltip).toContain("2026-02-04")
   })
 
+  it("counts concurrent session holders once and orders expiries by instant", async () => {
+    const ctx = makeCtx()
+    setEnv(ctx, { CODEBUFF_API_KEY: "tok" })
+    mockRequest(ctx, () => okJson(sessionPayload({
+      status: "active",
+      instanceId: "same",
+      expiresAt: "2026-02-03T00:00:00Z",
+      desktopPurchases: [
+        { holderInstanceId: "same", expiresAt: "2026-02-05T00:00:00Z" },
+        { holderInstanceId: "__proto__", expiresAt: "2026-02-05T01:00:00+02:00" },
+        { holderInstanceId: "another", expiresAt: "2026-02-05T00:00:00Z" },
+        { holderInstanceId: null },
+      ],
+    })))
+
+    const result = (await loadPlugin()).probe(ctx)
+    const line = result.lines.find((line) => line.label === "Active Sessions")
+    expect(line.value).toBe("3")
+    expect(line.expiryTooltip.split("\n")).toEqual([
+      "2026-02-04T23:00:00.000Z", "2026-02-05T00:00:00.000Z", "2026-02-05T00:00:00.000Z",
+    ])
+  })
+
+  it("rejects an occupied purchase with a malformed expiration", async () => {
+    const ctx = makeCtx()
+    setEnv(ctx, { CODEBUFF_API_KEY: "tok" })
+    mockRequest(ctx, () => okJson(sessionPayload({
+      desktopPurchases: [{ holderInstanceId: "holder", expiresAt: "invalid" }],
+    })))
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Freebuff returned unreadable usage data. Try again later.")
+  })
+
   it("picks the most-used rate-limit pool", async () => {
     const ctx = makeCtx()
     setEnv(ctx, { CODEBUFF_API_KEY: "tok" })

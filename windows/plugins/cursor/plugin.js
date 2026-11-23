@@ -862,7 +862,9 @@
       (su && typeof su.pooledLimit === "number" && su.pooledLimit > 0)
     )
 
-    if (isTeamAccount && hasModelPools) {
+    const confirmedPercentOnlyTeam =
+      normalizedPlanName === "team" && !hasPlanUsageLimit && hasTotalUsagePercent
+    if (isTeamAccount && (hasModelPools || confirmedPercentOnlyTeam)) {
       // Modern Teams seats still report the old $20 allowance. Structured pool data wins;
       // never synthesize a total from stale dollars when Cursor omits totalPercentUsed.
       if (hasTotalUsagePercent) {
@@ -1244,6 +1246,30 @@
       return
     }
     appendEnterpriseOnDemandBucket(ctx, team && team.onDemand, cycle, lines)
+  }
+
+  function enrichOrgUsage(ctx, usage, accessToken, planName, result) {
+    var plan = planName.trim().toLowerCase()
+    var planIsOrg = plan === "enterprise" || plan === "team"
+    var spend = usage.spendLimitUsage
+    var teamShape = spend && (spend.limitType === "team" || readFiniteNumber(spend.pooledLimit) > 0)
+    if (!planIsOrg && !teamShape) return
+
+    var needsOnDemand = !result.lines.some(function (line) { return line.label === "On-demand" })
+    if (planIsOrg && !needsOnDemand) return
+    var summary = fetchUsageSummary(ctx, accessToken)
+    if (!summary) return
+
+    if (needsOnDemand) {
+      appendEnterpriseOnDemand(ctx, summary, enterpriseBillingCycle(ctx, summary, null), result.lines)
+    }
+    var membership = typeof summary.membershipType === "string"
+      ? summary.membershipType.trim().toLowerCase()
+      : ""
+    if ((membership === "enterprise" || membership === "team") &&
+        (!plan || plan === "pro" || plan === "pro plan")) {
+      result.plan = ctx.fmt.planLabel(membership) || result.plan
+    }
   }
 
   /** Combines /api/usage (included requests) + /api/usage-summary (percents / on-demand). */
@@ -1874,7 +1900,8 @@
     const planUsageLimitMissing = probeFlags.planUsageLimitMissing
     const hasTotalUsagePercent = probeFlags.hasTotalUsagePercent
     const hasModelPools = probeFlags.hasModelPools
-    const planUsageUnusable = !hasPlanUsage || (planUsageLimitMissing && !hasModelPools)
+    const confirmedPercentOnlyTeam = normalizedPlanName === "team" && hasTotalUsagePercent
+    const planUsageUnusable = !hasPlanUsage || (planUsageLimitMissing && !hasModelPools && !confirmedPercentOnlyTeam)
 
     // Enterprise and some Team request-based accounts can return no planUsage
     // or a planUsage object without limit from the Connect API.
@@ -1940,6 +1967,7 @@
       ctx.host.log.warn("team-inferred account missing planUsage.limit, attempting REST usage API fallback")
       return buildUnknownRequestBasedResult(ctx, accessToken, planName)
     }
+    enrichOrgUsage(ctx, usage, accessToken, planName, connectResult)
     return connectResult
   }
 
