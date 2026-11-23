@@ -2,15 +2,46 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Duration;
 
-use tauri::{AppHandle, Manager};
-use windows_sys::Win32::Foundation::HWND;
+use tauri::{AppHandle, Emitter, Manager};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GW_OWNER, GetAncestor, GetForegroundWindow, GetWindow,
+    GA_ROOT, GW_OWNER, GetAncestor, GetForegroundWindow, GetWindow, PBT_APMRESUMEAUTOMATIC,
+    WM_NCDESTROY, WM_POWERBROADCAST,
 };
 
 use crate::popover_platform;
 
 struct BlurWatcher(SyncSender<()>);
+
+fn watch_power_resume(window: HWND, app: AppHandle) {
+    let context = Box::into_raw(Box::new(app));
+    let id = watch_power_resume as *const () as usize;
+    if unsafe { SetWindowSubclass(window, Some(power_broadcast), id, context as usize) } == 0 {
+        unsafe { drop(Box::from_raw(context)) };
+        log::warn!("Cannot register Windows power-resume handler");
+    }
+}
+
+unsafe extern "system" fn power_broadcast(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    context: usize,
+) -> LRESULT {
+    let app = context as *mut AppHandle;
+    if message == WM_NCDESTROY {
+        unsafe { RemoveWindowSubclass(window, Some(power_broadcast), id) };
+        unsafe { drop(Box::from_raw(app)) };
+    } else if message == WM_POWERBROADCAST && wparam == PBT_APMRESUMEAUTOMATIC as usize {
+        if let Err(error) = unsafe { &*app }.emit("refresh:power-resume", ()) {
+            log::warn!("Cannot notify QuotaBar about Windows power resume: {error}");
+        }
+    }
+    unsafe { DefSubclassProc(window, message, wparam, lparam) }
+}
 
 /// Show the panel anchored to the tray when possible.
 pub fn show_panel(app_handle: &AppHandle) {
@@ -123,6 +154,7 @@ pub fn init(app_handle: &tauri::AppHandle) -> tauri::Result<()> {
         });
 
         if let Ok(hwnd) = window.hwnd() {
+            watch_power_resume(hwnd.0 as HWND, app_handle.clone());
             let (send, shown) = mpsc::sync_channel(1);
             if app_handle.manage(BlurWatcher(send)) {
                 spawn_blur_watcher(app_handle.clone(), hwnd.0 as usize, shown);

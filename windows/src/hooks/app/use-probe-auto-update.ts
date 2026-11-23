@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
+import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import {
   getEnabledPluginIds,
   type AutoUpdateIntervalMinutes,
@@ -79,7 +80,19 @@ export function useProbeAutoUpdate({
     schedule()
     window.addEventListener("focus", checkDeadlines)
     document.addEventListener("visibilitychange", checkDeadlines)
+    let cancelled = false
+    let unlistenResume: UnlistenFn | undefined
+    void listen("refresh:power-resume", () => {
+      if (!cancelled) checkDeadlines()
+    })
+      .then((unlisten) => {
+        if (cancelled) unlisten()
+        else unlistenResume = unlisten
+      })
+      .catch((error) => console.error("Failed to listen for Windows power resume:", error))
     return () => {
+      cancelled = true
+      unlistenResume?.()
       clearTimeout(timer)
       window.removeEventListener("focus", checkDeadlines)
       document.removeEventListener("visibilitychange", checkDeadlines)

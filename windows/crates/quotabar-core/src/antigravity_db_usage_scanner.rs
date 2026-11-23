@@ -260,7 +260,7 @@ fn aggregate(
             output,
             is_fast: false,
         };
-        let Some(cost) = pricing.estimated_cost_dollars(&event.model, &tokens) else {
+        let Some(cost) = pricing.estimated_cost_dollars_at(&event.model, &tokens, ts.with_timezone(&Utc)) else {
             continue;
         };
         let day = local_day_key_from_offset(&ts);

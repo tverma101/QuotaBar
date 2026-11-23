@@ -552,7 +552,7 @@ fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPrici
         let cost = if let Some(carried) = entry.cost_usd {
             carried
         } else if let Some(model) = entry.model.as_deref().filter(|m| !m.trim().is_empty()) {
-            match pricing.estimated_cost_dollars(model, &entry.tokens) {
+            match pricing.estimated_cost_dollars_at(model, &entry.tokens, entry.timestamp.with_timezone(&Utc)) {
                 Some(c) => c,
                 None => continue,
             }

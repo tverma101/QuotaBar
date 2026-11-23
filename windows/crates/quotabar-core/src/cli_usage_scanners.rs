@@ -397,7 +397,7 @@ fn aggregate_entries(
             .unwrap_or_else(|| entry.model.clone());
         let entry_cost = entry
             .carried_cost
-            .or_else(|| pricing.estimated_cost_dollars(&entry.model, &entry.tokens));
+            .or_else(|| pricing.estimated_cost_dollars_at(&entry.model, &entry.tokens, entry.timestamp));
 
         let day = by_day.entry(day_key).or_default();
         let cache_w = i64::from(entry.tokens.cache_write5m) + i64::from(entry.tokens.cache_write1h);

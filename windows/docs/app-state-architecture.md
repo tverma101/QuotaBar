@@ -11,7 +11,7 @@
 - `autoUpdateNextAt` is runtime scheduling state from `useProbe`.
 - `selectedPlugin` is computed by `useAppPluginViews`.
 
-Automatic probes check both the existing quota interval and local midnight. A midnight probe does not move the quota deadline. On focus or visibility changes, an overdue schedule runs at most one pass rather than replaying missed intervals. Disabled providers and providers already in flight are skipped.
+Automatic probes check both the existing quota interval and local midnight. A midnight probe does not move the quota deadline. On Windows power resume, focus, or visibility changes, an overdue schedule runs at most one pass rather than replaying missed intervals. Windows sends the wake signal through a native broadcast; it is not polled. Disabled providers and providers already in flight are skipped.
 
 The app runs at most four probes concurrently, even when several batches overlap. Requests for the same provider instance share one queued probe that uses the newest request and completes every waiting batch. Local account store changes are serialized across processes, including migration of legacy files.
 

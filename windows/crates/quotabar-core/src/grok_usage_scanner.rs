@@ -302,7 +302,7 @@ fn aggregate(
         }
         let cost = match entry.carried_cost {
             Some(c) => c,
-            None => match pricing.estimated_cost_dollars(&entry.model, &entry.tokens) {
+            None => match pricing.estimated_cost_dollars_at(&entry.model, &entry.tokens, entry.timestamp) {
                 Some(c) => c,
                 None => continue,
             },
