@@ -120,6 +120,31 @@ describe("codex plugin", () => {
     redeemRequestId: "test-request",
   }
 
+  it("does not request or consume an already expired reset credit", async () => {
+    const ctx = makeAccountCtx({ instanceId: "codex:work", credential: { accessToken: "work-token" } })
+    const plugin = await loadPlugin()
+    expect(plugin.claimResetCredit(ctx, { ...resetRequest, expiresAtIso: "2000-01-01T00:00:00Z" })).toBe("no_credit")
+    expect(ctx.host.http.request).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [" Account-A ", "account-a", "account-a"],
+    [undefined, "Account-A", "account-a"],
+    ["account-b", "account-a", undefined],
+  ])("exports only consistent Codex account identities (%s, %s)", async (accountId, claim, expected) => {
+    const ctx = makeCtx()
+    ctx.host.fs.writeText("~/.codex/auth.json", JSON.stringify({
+      tokens: {
+        access_token: "test-access-token",
+        account_id: accountId,
+        id_token: makeJwt({ "https://api.openai.com/auth": { chatgpt_account_id: claim } }),
+      },
+    }))
+    ctx.host.http.request.mockReturnValue({ status: 200, headers: {}, bodyText: "{}" })
+    const plugin = await loadPlugin()
+    expect(plugin.probe(ctx).verifiedHistoryIdentity).toBe(expected)
+  })
+
   it.each([null, { accessToken: "work-token" }])(
     "does not use default credentials to claim credits for a disconnected extra account (%j)",
     async (credential) => {

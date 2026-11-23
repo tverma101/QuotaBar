@@ -22,6 +22,7 @@
   // Live plan from GET /api/oauth/profile: once per access token, including failed lookups (#1262).
   let cachedLivePlan = null
   let cachedLivePlanTokenKey = null
+  let cachedHistoryIdentity = null
   // Hourly reset-grants check state (#1367).
   let resetGrantsLoginKey = null
   let resetGrantsCheckedAtMs = 0
@@ -168,6 +169,7 @@
     lastUsageFetchMs = 0
     cachedLivePlan = null
     cachedLivePlanTokenKey = null
+    cachedHistoryIdentity = null
   }
 
   function readEnvText(ctx, name) {
@@ -368,6 +370,7 @@
   function loadCredentials(ctx) {
     const injected = readInjectedCredential(ctx)
     if (injected) return injected
+    if (isExtraAccountInstance(ctx)) return null
 
     const envAccessToken = readEnvText(ctx, "CLAUDE_CODE_OAUTH_TOKEN")
     const stored = loadStoredCredentials(ctx, !!envAccessToken)
@@ -391,6 +394,12 @@
       fullData: stored ? stored.fullData : null,
       inferenceOnly: true,
     }
+  }
+
+  function isExtraAccountInstance(ctx) {
+    const account = ctx.account
+    return !!(account && account.instanceId && account.baseProviderId &&
+      account.instanceId !== account.baseProviderId)
   }
 
   function readInjectedCredential(ctx) {
@@ -676,6 +685,7 @@
     if (cachedLivePlanTokenKey === accessToken) return cachedLivePlan
     cachedLivePlanTokenKey = accessToken
     cachedLivePlan = null
+    cachedHistoryIdentity = null
     try {
       const resp = fetchProfile(ctx, accessToken)
       if (!resp || resp.status < 200 || resp.status >= 300) {
@@ -684,6 +694,15 @@
       }
       const profile = ctx.util.tryParseJson(resp.bodyText)
       cachedLivePlan = formatLivePlan(ctx, profile, oauth)
+      const account = profile && profile.account && profile.account.uuid
+      const organization = profile && profile.organization && profile.organization.uuid
+      if (typeof account === "string" && account.trim()) {
+        if (typeof organization === "string" && organization.trim()) {
+          cachedHistoryIdentity = account.trim().toLowerCase() + "|" + organization.trim().toLowerCase()
+        } else if (profile.organization == null) {
+          cachedHistoryIdentity = account.trim().toLowerCase()
+        }
+      }
     } catch (e) {
       ctx.host.log.warn("profile fetch failed: " + String(e))
     }
@@ -1148,10 +1167,11 @@
 
   function probe(ctx) {
     const homePath = getClaudeHomeOverride(ctx)
+    const extraAccount = isExtraAccountInstance(ctx)
     const creds = loadCredentials(ctx)
     if (!creds || !creds.oauth || !creds.oauth.accessToken || !creds.oauth.accessToken.trim()) {
       const lines = []
-      if (appendLocalSpendLines(lines, ctx, homePath, { requireUsage: true })) {
+      if (!extraAccount && appendLocalSpendLines(lines, ctx, homePath, { requireUsage: true })) {
         ctx.host.log.info("no OAuth credentials; showing local spend tiles")
         return { plan: null, lines: lines, warning: "Not logged in" }
       }
@@ -1364,7 +1384,7 @@
       }
     }
 
-    appendLocalSpendLines(lines, ctx, homePath)
+    if (!extraAccount) appendLocalSpendLines(lines, ctx, homePath)
 
     if (rateLimited) {
       const retryText = retryAfterSeconds !== null
@@ -1387,7 +1407,11 @@
       lines.push(ctx.line.badge({ label: "Status", text: "No usage data", color: "#a3a3a3" }))
     }
 
-    return { plan: plan, lines: lines, warning: warning }
+    const result = { plan: plan, lines: lines, warning: warning }
+    if (data && cachedLivePlanTokenKey === planToken && cachedHistoryIdentity) {
+      result.verifiedHistoryIdentity = cachedHistoryIdentity
+    }
+    return result
   }
 
   // _resetState is a testing hook — resets module-scope rate-limit state between tests.
@@ -1399,6 +1423,7 @@
     cachedUsageLoginKey = null
     cachedLivePlan = null
     cachedLivePlanTokenKey = null
+    cachedHistoryIdentity = null
     resetGrantsLoginKey = null
     resetGrantsCheckedAtMs = 0
     cachedResetGrantsBlock = null

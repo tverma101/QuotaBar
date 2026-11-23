@@ -95,7 +95,9 @@ The "Rate Limit Resets" row shows the on-demand reset-credit count, e.g. `2 avai
 
 You can also spend a reset credit right from that popover — the same claim the Codex CLI's "Usage limit resets" picker performs. Hover a credit in the timeline and a **Use** button appears; clicking it expands that credit into an inline confirmation ("Immediately reset your usage limits. This can't be undone.") with **Reset** / **Cancel**. Confirming claims that exact credit and immediately resets your 5-hour and weekly windows; the app then refreshes Codex so the meters and the remaining count reflect it before the success line ("Reset claimed. Enjoy!") appears.
 
-On Windows, an additional account's reset claim only uses that card's credentials. QuotaBar does not retry a rejected claim under another login.
+On Windows, an additional account's reset claim only uses that card's credentials. QuotaBar does
+not retry a rejected claim under another login or submit a claim for an expired credit. VM Box
+history matches using a verified ChatGPT account ID, not the card label.
 
 Safeguards, because a claim is irreversible:
 

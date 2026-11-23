@@ -91,6 +91,10 @@ usage objects do not count as assistant usage or block the scan; invalid token c
 The Windows scanner also counts advisor tokens without a known model under **Unattributed**;
 it does not estimate a cost for those tokens.
 
+On Windows, an additional account uses its own login and does not inherit the default Claude
+account's local spend. VM Box history matches an account using its verified Claude profile IDs,
+not its card label.
+
 Growing session files keep a small, bounded append cache so the next refresh reads their new bytes.
 Detected replacements, truncations, and rewrites are parsed again. Incomplete final lines are retried
 on the next append. Memory pressure releases the cached rows.

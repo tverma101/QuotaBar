@@ -26,6 +26,33 @@
     return base.replace(/[\\/]+$/, "") + "/" + leaf
   }
 
+  function normalizedAccountId(value) {
+    return typeof value === "string" && value.trim() ? value.trim().toLowerCase() : null
+  }
+
+  function tokenAccountId(ctx, token) {
+    if (typeof token !== "string") return null
+    const payload = ctx.jwt.decodePayload(token)
+    const claim = payload && payload["https://api.openai.com/auth"]
+    return normalizedAccountId(claim?.chatgpt_account_id ?? payload?.chatgpt_account_id)
+  }
+
+  function usageAccountId(ctx, tokens) {
+    return tokens.account_id || tokenAccountId(ctx, tokens.id_token) || tokenAccountId(ctx, tokens.access_token)
+  }
+
+  function verifiedHistoryIdentity(ctx, tokens, requestedAccountId, data) {
+    const observed = [
+      normalizedAccountId(requestedAccountId),
+      normalizedAccountId(tokens.account_id),
+      tokenAccountId(ctx, tokens.id_token),
+      tokenAccountId(ctx, tokens.access_token),
+      normalizedAccountId(data.account_id),
+    ].filter(Boolean)
+    const key = normalizedAccountId(requestedAccountId) || normalizedAccountId(data.account_id)
+    return key && observed.every((id) => id === key) ? key : null
+  }
+
   function readCodexHome(ctx) {
     if (!ctx.host.env || typeof ctx.host.env.get !== "function") {
       return null
@@ -421,7 +448,7 @@
     if (providerAuth && providerAuth.auth && providerAuth.auth.tokens && providerAuth.auth.tokens.access_token) {
       out.push({
         accessToken: providerAuth.auth.tokens.access_token,
-        accountId: providerAuth.auth.tokens.account_id || null,
+        accountId: usageAccountId(ctx, providerAuth.auth.tokens),
       })
     }
     if (isExtraAccountInstance(ctx)) return out
@@ -432,7 +459,7 @@
       if (auth && auth.tokens && auth.tokens.access_token) {
         out.push({
           accessToken: auth.tokens.access_token,
-          accountId: auth.tokens.account_id || null,
+          accountId: usageAccountId(ctx, auth.tokens),
         })
       }
     }
@@ -440,7 +467,7 @@
     if (keychainAuth && keychainAuth.auth && keychainAuth.auth.tokens && keychainAuth.auth.tokens.access_token) {
       out.push({
         accessToken: keychainAuth.auth.tokens.access_token,
-        accountId: keychainAuth.auth.tokens.account_id || null,
+        accountId: usageAccountId(ctx, keychainAuth.auth.tokens),
       })
     }
     return out
@@ -456,6 +483,7 @@
     if (!expiresAtIso || !redeemRequestId) return "failed"
     const expiryMs = Date.parse(expiresAtIso)
     if (!Number.isFinite(expiryMs)) return "failed"
+    if (expiryMs <= Date.now()) return "no_credit"
 
     const candidates = collectAuthCandidates(ctx)
     if (!candidates.length) {
@@ -488,6 +516,7 @@
       }
       const creditId = creditIdForExpiry(body, expiryMs)
       if (!creditId) return "no_credit"
+      if (expiryMs <= Date.now()) return "no_credit"
 
       let resp
       try {
@@ -1038,7 +1067,7 @@
     if (auth.tokens && auth.tokens.access_token) {
       const nowMs = Date.now()
       let accessToken = auth.tokens.access_token
-      let accountId = auth.tokens.account_id
+      let accountId = usageAccountId(ctx, auth.tokens)
       let proactiveRefreshAuthError = null
 
       if (needsRefresh(ctx, auth, nowMs)) {
@@ -1048,7 +1077,7 @@
         authState = reload.authState
         auth = authState.auth
         accessToken = auth.tokens.access_token
-        accountId = auth.tokens.account_id
+        accountId = usageAccountId(ctx, auth.tokens)
         let refreshed = null
         if (needsRefresh(ctx, auth, nowMs)) {
           try {
@@ -1089,7 +1118,7 @@
               authState = reload.authState
               auth = authState.auth
               accessToken = auth.tokens.access_token
-              accountId = auth.tokens.account_id
+              accountId = usageAccountId(ctx, auth.tokens)
               proactiveRefreshAuthError = null
               didReloadAuth = true
               ctx.host.log.info("usage returned 401, retrying with reloaded auth")
@@ -1283,7 +1312,10 @@
         lines.push(ctx.line.badge({ label: "Status", text: "No usage data", color: "#a3a3a3" }))
       }
 
-      return { plan: plan, lines: lines }
+      const result = { plan: plan, lines: lines }
+      const historyIdentity = verifiedHistoryIdentity(ctx, auth.tokens, accountId, data)
+      if (historyIdentity) result.verifiedHistoryIdentity = historyIdentity
+      return result
     }
 
     if (auth.OPENAI_API_KEY) {
