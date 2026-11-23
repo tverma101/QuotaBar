@@ -454,11 +454,13 @@ mod tests {
 
     #[test]
     fn unpriced_models_keep_their_tokens_without_inventing_a_cost() {
-        let mut value = turn("unknown-grok-fixture-model", 100.0, 0.0, 0.0, 0.0, None);
-        value["params"]["update"]["usage"]
-            .as_object_mut()
-            .unwrap()
-            .remove("costUsdTicks");
+        let value = serde_json::json!({
+            "timestamp": "2026-06-10T10:00:00.000Z",
+            "params": { "update": {
+                "sessionUpdate": "turn_completed",
+                "usage": { "modelUsage": { "unknown-grok-fixture-model": { "inputTokens": 100 } } }
+            } }
+        });
         let entries = parse_completed_turn(&value);
         let rows = aggregate(entries.into_iter(), default_pricing());
         assert_eq!(rows[0].total_tokens, 100);
