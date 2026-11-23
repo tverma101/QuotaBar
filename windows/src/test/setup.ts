@@ -23,7 +23,7 @@ vi.mock("@tauri-apps/plugin-notification", () => ({
   requestPermission: vi.fn(() => Promise.resolve("granted")),
 }))
 
-if (!window.matchMedia) {
+if (typeof window !== "undefined" && !window.matchMedia) {
   Object.defineProperty(window, "matchMedia", {
     writable: true,
     value: (query: string) => ({
