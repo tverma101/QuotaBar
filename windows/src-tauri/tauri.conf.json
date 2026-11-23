@@ -15,7 +15,7 @@
       {
         "label": "main",
         "title": "QuotaBar",
-        "width": 600,
+        "width": 320,
         "height": 800,
         "resizable": false,
         "decorations": false,

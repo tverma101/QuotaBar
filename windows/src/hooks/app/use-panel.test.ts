@@ -75,7 +75,7 @@ describe("usePanel", () => {
     )
 
     await waitFor(() => {
-      expect(listenMock).toHaveBeenCalledTimes(2)
+      expect(listenMock).toHaveBeenCalledTimes(3)
     })
 
     act(() => {

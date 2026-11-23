@@ -93,6 +93,7 @@ const LEGACY_TRAY_SHOW_PERCENTAGE_KEY = "trayShowPercentage";
 const GLOBAL_SHORTCUT_KEY = "globalShortcut";
 const START_ON_LOGIN_KEY = "startOnLogin";
 const START_HIDDEN_KEY = "startHidden";
+const HIDE_FROM_SCREEN_SHARE_KEY = "hideFromScreenShare";
 export const USAGE_ALERT_ENABLED_KEY = "usageAlertEnabled";
 export const USAGE_ALERT_THRESHOLD_KEY = "usageAlertThreshold";
 export const USAGE_ALERT_CUSTOM_THRESHOLD_KEY = "usageAlertCustomThreshold";
@@ -896,6 +897,15 @@ export async function loadStartHidden(): Promise<boolean> {
 
 export async function saveStartHidden(value: boolean): Promise<void> {
   await store.set(START_HIDDEN_KEY, value);
+  await store.save();
+}
+
+export async function loadHideFromScreenShare(): Promise<boolean> {
+  return (await store.get<unknown>(HIDE_FROM_SCREEN_SHARE_KEY)) === true;
+}
+
+export async function saveHideFromScreenShare(value: boolean): Promise<void> {
+  await store.set(HIDE_FROM_SCREEN_SHARE_KEY, value);
   await store.save();
 }
 

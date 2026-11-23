@@ -1,5 +1,6 @@
 import { renderHook } from "@testing-library/react"
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { USAGE_ALERT_GROUP_DELAY_MS } from "@/lib/usage-alert-group"
 import type { PluginOutput } from "@/lib/plugin-types"
 import { useAppPluginStore } from "@/stores/app-plugin-store"
 import { useAppPreferencesStore } from "@/stores/app-preferences-store"
@@ -42,7 +43,12 @@ function makeOutput(overrides: Partial<PluginOutput> = {}): PluginOutput {
 }
 
 describe("useUsageAlert", () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   beforeEach(() => {
+    vi.useFakeTimers()
     sendNotificationAsync.mockClear()
     useAppPreferencesStore.getState().resetState()
     useAppPluginStore.getState().resetState()
@@ -68,41 +74,54 @@ describe("useUsageAlert", () => {
     })
   })
 
-  it("sends low-remaining alert on primary progress line", () => {
+  it("groups the low-remaining and pace alerts of one refresh into one notification", () => {
     const { result } = renderHook(() => useUsageAlert())
     result.current.checkUsageAlert(makeOutput())
+    vi.advanceTimersByTime(USAGE_ALERT_GROUP_DELAY_MS)
 
+    expect(sendNotificationAsync).toHaveBeenCalledTimes(1)
     expect(sendNotificationAsync).toHaveBeenCalledWith(
       expect.objectContaining({
-        body: expect.stringContaining("Less than 20% remaining on Cursor (Total usage)"),
+        title: "2 Usage Alerts",
+        subtitle: "Cursor Total usage",
+        body: "Almost Out: Cursor Total usage\nWill Run Out: Cursor Total usage",
+        iconPath: "/icon.png",
       }),
     )
   })
 
-  it("sends pace-behind alert when projected to exceed limit before reset", () => {
+  it("does not repeat an alert until the metric recovers", () => {
     const { result } = renderHook(() => useUsageAlert())
     result.current.checkUsageAlert(makeOutput())
+    result.current.checkUsageAlert(makeOutput())
+    vi.advanceTimersByTime(USAGE_ALERT_GROUP_DELAY_MS)
+    result.current.checkUsageAlert(makeOutput())
+    vi.advanceTimersByTime(USAGE_ALERT_GROUP_DELAY_MS)
 
-    expect(sendNotificationAsync).toHaveBeenCalledWith(
-      expect.objectContaining({
-        body: expect.stringContaining("projected to run out before reset"),
-      }),
-    )
+    expect(sendNotificationAsync).toHaveBeenCalledTimes(1)
   })
 
   it("skips pace alerts when usagePaceAlertEnabled is false", () => {
     useAppPreferencesStore.getState().setUsagePaceAlertEnabled(false)
     const { result } = renderHook(() => useUsageAlert())
     result.current.checkUsageAlert(makeOutput())
+    vi.advanceTimersByTime(USAGE_ALERT_GROUP_DELAY_MS)
 
     expect(sendNotificationAsync).toHaveBeenCalledTimes(1)
-    expect(sendNotificationAsync.mock.calls[0][0].body).not.toContain("projected to run out")
+    expect(sendNotificationAsync.mock.calls[0][0]).toEqual(
+      expect.objectContaining({
+        title: "Almost Out",
+        subtitle: "Cursor Total usage",
+        body: "Under 20% usage remaining for this window.",
+      }),
+    )
   })
 
   it("does nothing when alerts are disabled", () => {
     useAppPreferencesStore.getState().setUsageAlertEnabled(false)
     const { result } = renderHook(() => useUsageAlert())
     result.current.checkUsageAlert(makeOutput())
+    vi.advanceTimersByTime(USAGE_ALERT_GROUP_DELAY_MS)
 
     expect(sendNotificationAsync).not.toHaveBeenCalled()
   })

@@ -1,16 +1,24 @@
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GW_OWNER, GetAncestor, GetForegroundWindow, GetWindow,
+    DispatchMessageW, EVENT_SYSTEM_FOREGROUND, GA_ROOT, GW_OWNER, GetAncestor, GetMessageW,
+    GetWindow, MSG, OBJID_WINDOW, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
-use crate::popover_platform;
+use crate::{popover_geometry, popover_platform};
 
-struct BlurWatcher(SyncSender<()>);
+/// The panel the foreground hook dismisses, set once at init.
+static BLUR_TARGET: OnceLock<(AppHandle, usize)> = OnceLock::new();
+/// When click-away last dismissed the panel. Clicking the tray icon moves the
+/// foreground to the taskbar first, so the tray press that follows must not reopen it.
+static LAST_BLUR_HIDE: Mutex<Option<Instant>> = Mutex::new(None);
+const TRAY_REOPEN_GUARD: Duration = Duration::from_millis(400);
 
 /// Show the panel anchored to the tray when possible.
 pub fn show_panel(app_handle: &AppHandle) {
@@ -21,11 +29,40 @@ pub fn show_panel(app_handle: &AppHandle) {
         }
         popover_platform::move_main_near_tray(app_handle);
         let _ = window.set_focus();
-        if let Some(watcher) = app_handle.try_state::<BlurWatcher>() {
-            // Coalesce repeated opens while the same window is already being watched.
-            let _ = watcher.0.try_send(());
+    }
+}
+
+/// Hide the panel and tell the frontend, which resets navigation and scroll the
+/// way closing the macOS panel does.
+pub fn hide_panel(app_handle: &AppHandle) {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        hide_window(&window);
+    }
+}
+
+fn hide_window(window: &WebviewWindow) {
+    if let Err(error) = window.hide() {
+        log::warn!("Cannot hide the QuotaBar window: {error}");
+        return;
+    }
+    let _ = window.emit("panel:did-hide", ());
+}
+
+/// Hide From Screen Share: exclude the panel from screen capture, recording and
+/// sharing (`WDA_EXCLUDEFROMCAPTURE`, Windows 10 2004+). The tray icon belongs to
+/// Explorer and cannot be excluded, so the frontend swaps its text for the
+/// wordmark separately.
+pub fn set_capture_excluded(app_handle: &AppHandle, excluded: bool) -> Result<(), String> {
+    let affinity = if excluded { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    for (label, window) in app_handle.webview_windows() {
+        let hwnd = window.hwnd().map_err(|e| e.to_string())?;
+        if unsafe { SetWindowDisplayAffinity(hwnd.0 as HWND, affinity) } == 0 {
+            let error = std::io::Error::last_os_error();
+            log::error!("SetWindowDisplayAffinity failed for {label}: {error}");
+            return Err(format!("Cannot change screen share protection: {error}"));
         }
     }
+    Ok(())
 }
 
 /// Toggle panel visibility (global shortcut). Positions near tray when opening.
@@ -33,7 +70,14 @@ pub fn toggle_panel(app_handle: &AppHandle) {
     if let Some(window) = app_handle.get_webview_window("main") {
         if window.is_visible().unwrap_or(false) {
             log::debug!("toggle_panel: hiding window");
-            let _ = window.hide();
+            hide_window(&window);
+        } else if LAST_BLUR_HIDE
+            .lock()
+            .ok()
+            .and_then(|last| *last)
+            .is_some_and(|at| at.elapsed() < TRAY_REOPEN_GUARD)
+        {
+            log::debug!("toggle_panel: panel was just dismissed by this click; keeping it closed");
         } else {
             log::debug!("toggle_panel: showing window");
             show_panel(app_handle);
@@ -46,51 +90,89 @@ pub fn toggle_panel(app_handle: &AppHandle) {
 /// blur, which is why `WindowEvent::Focused` can't be used for this), or an
 /// owned popup such as a tray menu or native dialog.
 unsafe fn foreground_is_panel(foreground: HWND, panel: HWND) -> bool {
-    if foreground == panel {
-        return true;
-    }
-    let fg_root = GetAncestor(foreground, GA_ROOT);
-    if !fg_root.is_null() && fg_root == GetAncestor(panel, GA_ROOT) {
-        return true;
-    }
-    // Owned popups (context menus, file dialogs) chain up to their owner.
-    let mut owner = foreground;
-    for _ in 0..8 {
-        owner = GetWindow(owner, GW_OWNER);
-        if owner.is_null() {
-            break;
-        }
-        if owner == panel {
+    unsafe {
+        if foreground == panel {
             return true;
         }
+        let fg_root = GetAncestor(foreground, GA_ROOT);
+        if !fg_root.is_null() && fg_root == GetAncestor(panel, GA_ROOT) {
+            return true;
+        }
+        // Owned popups (context menus, file dialogs) chain up to their owner.
+        let mut owner = foreground;
+        for _ in 0..8 {
+            owner = GetWindow(owner, GW_OWNER);
+            if owner.is_null() {
+                break;
+            }
+            if owner == panel {
+                return true;
+            }
+        }
+        false
     }
-    false
 }
 
 /// Popover semantics: dismiss when the user clicks away (mirrors the macOS
 /// panel's `window_did_resign_key` handler). `WindowEvent::Focused` is unusable
-/// here because focus moving into the WebView2 child reports a blur; poll the
-/// real foreground window instead.
-fn spawn_blur_watcher(app_handle: AppHandle, panel: usize, shown: Receiver<()>) {
-    thread::spawn(move || {
-        // Block while hidden. Provider refresh and the local API run independently.
-        while shown.recv().is_ok() {
-            loop {
-                thread::sleep(Duration::from_millis(250));
-                let Some(window) = app_handle.get_webview_window("main") else {
-                    return;
-                };
-                if !window.is_visible().unwrap_or(false) {
-                    break;
-                }
-                let foreground = unsafe { GetForegroundWindow() };
-                if !foreground.is_null()
-                    && !unsafe { foreground_is_panel(foreground, panel as HWND) }
-                {
-                    let _ = window.hide();
-                    break;
-                }
-            }
+/// here because focus moving into the WebView2 child reports a blur, so listen
+/// for real foreground changes. The WinEvent hook is event-driven: no polling,
+/// no CPU while idle. Our own process (panel, WebView2, menus, dialogs) is
+/// skipped, so only another app taking the foreground dismisses the panel.
+unsafe extern "system" fn on_foreground_changed(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    foreground: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if id_object != OBJID_WINDOW || foreground.is_null() {
+        return;
+    }
+    let Some((app_handle, panel)) = BLUR_TARGET.get() else {
+        return;
+    };
+    if unsafe { foreground_is_panel(foreground, *panel as HWND) } {
+        return;
+    }
+    let Some(window) = app_handle.get_webview_window("main") else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        if let Ok(mut last) = LAST_BLUR_HIDE.lock() {
+            *last = Some(Instant::now());
+        }
+        hide_window(&window);
+    }
+}
+
+fn spawn_blur_watcher(app_handle: AppHandle, panel: usize) {
+    if BLUR_TARGET.set((app_handle, panel)).is_err() {
+        return;
+    }
+    thread::spawn(|| unsafe {
+        let hook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            std::ptr::null_mut(),
+            Some(on_foreground_changed),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        if hook.is_null() {
+            log::error!(
+                "SetWinEventHook failed ({}); click-away will not dismiss the panel",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        // Out-of-context WinEvents are delivered through this thread's message queue.
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            DispatchMessageW(&msg);
         }
     });
 }
@@ -102,31 +184,26 @@ pub fn init(app_handle: &tauri::AppHandle) -> tauri::Result<()> {
         // this just pins the compact popover size and menu-bar behaviors:
         // click the tray icon to toggle, click away to dismiss.
         // Content-driven height: `resize_panel` resizes to whatever the webview
-        // reports, so the minimum only guards a degenerate near-zero state.
+        // reports, clamped by `popover_geometry` (320 pt wide like the macOS panel).
         let _ = window.set_min_size(Some(tauri::Size::Logical(tauri::LogicalSize {
-            width: 360.0,
-            height: 300.0,
+            width: popover_geometry::PANEL_WIDTH,
+            height: popover_geometry::MINIMUM_HEIGHT,
         })));
         let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize {
-            width: 400.0,
-            height: 640.0,
+            width: popover_geometry::PANEL_WIDTH,
+            height: popover_geometry::DEFAULT_HEIGHT,
         }));
 
         let handle = app_handle.clone();
         window.on_window_event(move |event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                if let Some(w) = handle.get_webview_window("main") {
-                    let _ = w.hide();
-                }
+                hide_panel(&handle);
             }
         });
 
         if let Ok(hwnd) = window.hwnd() {
-            let (send, shown) = mpsc::sync_channel(1);
-            if app_handle.manage(BlurWatcher(send)) {
-                spawn_blur_watcher(app_handle.clone(), hwnd.0 as usize, shown);
-            }
+            spawn_blur_watcher(app_handle.clone(), hwnd.0 as usize);
         }
     }
 

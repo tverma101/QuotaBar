@@ -25,6 +25,7 @@ import { Button } from "@/components/ui/button";
 import { ProviderIcon } from "@/components/provider-icon";
 import { GlobalShortcutSection } from "@/components/global-shortcut-section";
 import { LanguageRegionSection } from "@/components/settings/language-region-section";
+import { ScreenShareSection } from "@/components/settings/screen-share-section";
 import { getBarFillLayout } from "@/lib/tray-bars-icon";
 import { getTrayIconSizePx } from "@/lib/tray-icon-size";
 import {
@@ -1884,6 +1885,7 @@ export function SettingsPage({
           Start hidden
         </label>
       </section>
+      <ScreenShareSection />
       <InsightsSection />
       <LocalApiSection />
       <UsageHistorySection key={usageHistorySectionKey} />
