@@ -73,6 +73,7 @@ fn load_start_hidden(app: &tauri::AppHandle) -> bool {
 const MAX_CONCURRENT_PROBES: usize = 4;
 
 struct PendingProbe {
+    generation: u64,
     batch_ids: Vec<String>,
     plugin: plugin_engine::manifest::LoadedPlugin,
     account: provider_accounts::ProviderAccountContext,
@@ -80,7 +81,8 @@ struct PendingProbe {
 
 #[derive(Default)]
 struct ProbeCoord {
-    running: HashSet<String>,
+    generation: u64,
+    running: HashMap<String, u64>,
     queued: HashMap<String, PendingProbe>,
     ready: VecDeque<String>,
     batch_remaining: HashMap<String, usize>,
@@ -95,18 +97,21 @@ impl ProbeCoord {
         account: provider_accounts::ProviderAccountContext,
     ) {
         let id = account.instance_id.clone();
+        self.generation += 1;
         if let Some(work) = self.queued.get_mut(&id) {
+            work.generation = self.generation;
             work.batch_ids.push(batch_id);
             work.plugin = plugin;
             work.account = account;
             return;
         }
-        if !self.running.contains(&id) {
+        if !self.running.contains_key(&id) {
             self.ready.push_back(id.clone());
         }
         self.queued.insert(
             id,
             PendingProbe {
+                generation: self.generation,
                 batch_ids: vec![batch_id],
                 plugin,
                 account,
@@ -129,14 +134,23 @@ impl ProbeCoord {
             return None;
         };
         let work = self.queued.remove(&id).expect("ready probe is queued");
-        self.running.insert(id);
+        self.running.insert(id, work.generation);
         Some(work)
     }
 
-    fn finish_work(&mut self, id: String) {
+    fn is_current(&self, id: &str, generation: u64) -> bool {
+        self.running.get(id) == Some(&generation) && !self.queued.contains_key(id)
+    }
+
+    fn finish_work(&mut self, id: String, mut waiting_batches: Vec<String>) -> Vec<String> {
         self.running.remove(&id);
-        if self.queued.contains_key(&id) {
+        if let Some(next) = self.queued.get_mut(&id) {
+            waiting_batches.append(&mut next.batch_ids);
+            next.batch_ids = waiting_batches;
             self.ready.push_back(id);
+            Vec::new()
+        } else {
+            waiting_batches
         }
     }
 }
@@ -151,8 +165,8 @@ fn note_probe_finished(app_handle: &tauri::AppHandle, instance_id: String, batch
         let mut coord = probe_coord()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        coord.finish_work(instance_id);
-        batch_ids
+        coord
+            .finish_work(instance_id, batch_ids)
             .into_iter()
             .filter(|batch_id| {
                 let Some(remaining) = coord.batch_remaining.get_mut(batch_id) else {
@@ -759,9 +773,14 @@ async fn start_probe_batch(
                 };
                 let instance_id = work.account.instance_id.clone();
                 let batch_id = work.batch_ids.last().expect("probe work has a batch");
-                run_and_emit_probe(
-                    &handle, &data_dir, &version, batch_id, work.plugin, work.account,
-                );
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_and_emit_probe(
+                        &handle, &data_dir, &version, batch_id, work.generation, work.plugin, work.account,
+                    );
+                }));
+                if result.is_err() {
+                    log::error!("publishing probe {} panicked", instance_id);
+                }
                 note_probe_finished(&handle, instance_id, work.batch_ids);
             }
         });
@@ -778,6 +797,7 @@ fn run_and_emit_probe(
     data_dir: &PathBuf,
     version: &str,
     batch_id: &str,
+    generation: u64,
     plugin: plugin_engine::manifest::LoadedPlugin,
     account_context: provider_accounts::ProviderAccountContext,
 ) {
@@ -792,15 +812,33 @@ fn run_and_emit_probe(
         )
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let output = plugin_engine::runtime::run_probe_with_account(
-            &plugin,
-            data_dir,
-            version,
-            Some(account_context),
-        );
+        plugin_engine::runtime::run_probe_with_deferred_usage(&plugin, data_dir, version, account_context)
+    }));
+    let (output, payloads) = result.unwrap_or_else(|_| {
+        log::error!("probe {} panicked", plugin_id);
+        (
+            plugin_engine::runtime::probe_fault_output(
+                &plugin,
+                &plugin_id,
+                &probe_display_name,
+                "The probe crashed. Try again or update the app.".to_string(),
+            ),
+            Vec::new(),
+        )
+    });
+    let display_name = output.display_name.clone();
+    let scan_local_usage = {
+        let coord = probe_coord()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !coord.is_current(&plugin_id, generation) {
+            log::debug!("discarding superseded probe {}", plugin_id);
+            return;
+        }
         let has_error = output.lines.iter().any(|line| {
             matches!(line, plugin_engine::runtime::MetricLine::Badge { label, .. } if label == "Error")
         });
+        let persist = !has_error && persist_usage_history_enabled(handle);
         if has_error {
             log::warn!("probe {} completed with error", plugin_id);
         } else {
@@ -810,35 +848,42 @@ fn run_and_emit_probe(
                 output.lines.len()
             );
             local_http_api::cache_successful_output(&output);
-            if persist_usage_history_enabled(handle) {
+            if persist {
                 if let Err(e) = quotabar_core::usage_history::append_probe_snapshot(data_dir, &output) {
                     log::debug!("usage history append: {}", e);
                 }
-                quotabar_core::cli_usage_scanners::post_probe_local_usage_daily(
-                    data_dir,
-                    &plugin_id,
-                    &output.display_name,
-                );
+                for payload in payloads {
+                    if let Err(e) = quotabar_core::usage_daily::ingest_json(data_dir, &plugin_id, &payload) {
+                        log::warn!("[plugin:{}] usageDaily.ingest failed: {}", plugin_id, e);
+                    }
+                }
             }
         }
-        output
-    }));
-    let output = result.unwrap_or_else(|_| {
-        log::error!("probe {} panicked", plugin_id);
-        plugin_engine::runtime::probe_fault_output(
-            &plugin,
+        let _ = handle.emit(
+            "probe:result",
+            ProbeResult {
+                batch_id: batch_id.to_string(),
+                output,
+            },
+        );
+        persist
+    };
+    if scan_local_usage {
+        quotabar_core::cli_usage_scanners::post_probe_local_usage_daily(
+            data_dir,
             &plugin_id,
-            &probe_display_name,
-            "The probe crashed. Try again or update the app.".to_string(),
-        )
-    });
-    let _ = handle.emit(
-        "probe:result",
-        ProbeResult {
-            batch_id: batch_id.to_string(),
-            output,
-        },
-    );
+            &display_name,
+            |payload| {
+                let coord = probe_coord()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if coord.is_current(&plugin_id, generation) {
+                    quotabar_core::usage_daily::ingest_json(data_dir, &plugin_id, payload)?;
+                }
+                Ok(())
+            },
+        );
+    }
 }
 
 pub(crate) fn resolve_log_file_path(app_handle: &tauri::AppHandle) -> Result<String, String> {
@@ -1489,15 +1534,22 @@ mod tests {
         enqueue(&mut coord, "codex:work", "first");
         enqueue(&mut coord, "codex:work", "second");
         assert_eq!(coord.reserve_workers(), 1);
-        assert_eq!(coord.next_work().unwrap().batch_ids, ["first", "second"]);
+        let work = coord.next_work().unwrap();
+        assert_eq!(work.batch_ids, ["first", "second"]);
+        assert!(coord.is_current("codex:work", work.generation));
+        let superseded_generation = work.generation;
 
         enqueue(&mut coord, "codex:work", "follow-up");
         enqueue(&mut coord, "codex:work", "latest");
+        assert!(!coord.is_current("codex:work", work.generation));
         assert_eq!(coord.reserve_workers(), 0);
-        coord.finish_work("codex:work".to_owned());
+        assert!(coord.finish_work("codex:work".to_owned(), work.batch_ids).is_empty());
         let work = coord.next_work().unwrap();
-        assert_eq!(work.batch_ids, ["follow-up", "latest"]);
+        assert_eq!(&work.batch_ids[2..], ["follow-up", "latest"]);
+        assert_eq!(&work.batch_ids[..2], ["first", "second"]);
         assert_eq!(work.account.label, "latest");
+        assert!(coord.is_current("codex:work", work.generation));
+        assert!(!coord.is_current("codex:work", superseded_generation));
 
         for index in 0..8 {
             enqueue(&mut coord, &format!("codex:{index}"), "other batch");
@@ -1505,6 +1557,10 @@ mod tests {
         assert_eq!(coord.reserve_workers(), super::MAX_CONCURRENT_PROBES - 1);
         assert_eq!(coord.reserve_workers(), 0);
         assert_eq!(coord.active_workers, super::MAX_CONCURRENT_PROBES);
+        assert_eq!(
+            coord.finish_work("codex:work".to_owned(), work.batch_ids),
+            ["first", "second", "follow-up", "latest"]
+        );
     }
 
     #[test]

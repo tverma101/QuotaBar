@@ -15,6 +15,8 @@ Automatic probes check both the existing quota interval and local midnight. A mi
 
 The app runs at most four probes concurrently, even when several batches overlap. Requests for the same provider instance share one queued probe that uses the newest request and completes every waiting batch. Local account store changes are serialized across processes, including migration of legacy files.
 
+If a newer request supersedes a running probe, the older probe still completes its batch but does not publish results or write snapshots or daily usage. Plugin daily rows are held until the result is accepted. Native daily scans check again after scanning, before writing.
+
 ## Main data flow
 1. `App.tsx` composes hooks and owns cross-domain orchestration.
 2. Source stores are updated from bootstrap/settings/probe actions.

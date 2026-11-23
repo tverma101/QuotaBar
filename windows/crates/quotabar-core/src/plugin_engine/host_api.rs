@@ -14,13 +14,17 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::VecDeque;
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MIN_BLOCKING_TIMEOUT: Duration = Duration::from_millis(1);
+
+pub(crate) type DeferredUsage = Rc<RefCell<Vec<String>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProbeDeadline {
@@ -668,6 +672,7 @@ pub fn inject_host_api<'js>(
         app_data_dir,
         app_version,
         ProbeDeadline::none(),
+        None,
     )
 }
 
@@ -679,6 +684,7 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     app_data_dir: &PathBuf,
     app_version: &str,
     deadline: ProbeDeadline,
+    deferred_usage: Option<DeferredUsage>,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
     let probe_ctx = Object::new(ctx.clone())?;
@@ -726,7 +732,7 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     inject_sqlite(ctx, &host)?;
     inject_chromium_cookies(ctx, &host, instance_id)?;
     inject_ls(ctx, &host, base_plugin_id)?;
-    inject_usage_daily(ctx, &host, instance_id, app_data_dir)?;
+    inject_usage_daily(ctx, &host, instance_id, app_data_dir, deferred_usage)?;
     inject_cursor_logs(ctx, &host, base_plugin_id, deadline)?;
     inject_claude_logs(ctx, &host, deadline)?;
     inject_codex_logs(ctx, &host, deadline)?;
@@ -2194,6 +2200,7 @@ fn inject_usage_daily<'js>(
     host: &Object<'js>,
     instance_id: &str,
     app_data_dir: &PathBuf,
+    deferred_usage: Option<DeferredUsage>,
 ) -> rquickjs::Result<()> {
     let usage_daily_obj = Object::new(ctx.clone())?;
     let app_data = app_data_dir.clone();
@@ -2204,7 +2211,9 @@ fn inject_usage_daily<'js>(
         Function::new(
             ctx.clone(),
             move |_ctx_inner: Ctx<'_>, payload_json: String| -> rquickjs::Result<()> {
-                if let Err(e) = crate::usage_daily::ingest_json(&app_data, &iid, &payload_json) {
+                if let Some(usage) = &deferred_usage {
+                    usage.borrow_mut().push(payload_json);
+                } else if let Err(e) = crate::usage_daily::ingest_json(&app_data, &iid, &payload_json) {
                     log::warn!("[plugin:{}] usageDaily.ingest failed: {}", iid, e);
                 }
                 Ok(())
