@@ -2,21 +2,25 @@
 //! (`~/.gemini/antigravity*/conversations/*.db`).
 //! Discovered by FelixIsaac in openusage#1058/#1120.
 
-use crate::antigravity_proto::{self, GenerationEvent};
+use crate::antigravity_proto::{self, GenerationEvent, StepIdentity};
 use crate::log_usage_types::{
     DailyUsageRow, LogScanStatus, ModelDayUsage, TokenBreakdown, expand_tilde, host_query_response,
     local_day_key_from_offset, since_local_midnight, warn_unreadable_usage_file,
 };
 use crate::model_pricing::{ModelPricing, default_pricing};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use rusqlite::{Connection, OpenFlags, params};
 use same_file::Handle;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+use sha2::{Digest, Sha256};
+
+#[path = "antigravity_history_checkpoint.rs"]
+mod checkpoint;
 
 pub const MAXIMUM_BLOB_BYTES: i64 = 1_048_576;
 const BATCH_SIZE: i64 = 8;
@@ -66,10 +70,41 @@ impl DatabaseRevision {
         };
         Ok(Self { main, wal })
     }
+
+    fn digest(&self) -> Option<Vec<u8>> {
+        const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+        if self.main.bytes.saturating_add(self.wal.as_ref().map_or(0, |wal| wal.bytes))
+            > MAX_SOURCE_BYTES
+        {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        for revision in [&self.main].into_iter().chain(self.wal.iter()) {
+            let mut f = revision.identity.as_file();
+            f.rewind().ok()?;
+            hash.update(revision.bytes.to_le_bytes());
+            let mut reader = f.take(revision.bytes + 1);
+            let mut buf = [0; 8192];
+            let mut bytes = 0;
+            loop {
+                let n = reader.read(&mut buf).ok()?;
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buf[..n]);
+                bytes += n as u64;
+            }
+            if bytes != revision.bytes {
+                return None;
+            }
+        }
+        Some(hash.finalize().to_vec())
+    }
 }
 
 struct CachedFold {
     revision: DatabaseRevision,
+    zone: Option<String>,
     events: Arc<[GenerationEvent]>,
     bytes: usize,
 }
@@ -80,21 +115,21 @@ struct FoldCache {
 }
 
 impl FoldCache {
-    fn get(&mut self, revision: &DatabaseRevision) -> Option<Arc<[GenerationEvent]>> {
+    fn get(&mut self, revision: &DatabaseRevision, zone: Option<&str>) -> Option<Arc<[GenerationEvent]>> {
         let index = self
             .entries
             .iter()
-            .position(|entry| &entry.revision == revision)?;
+            .position(|entry| &entry.revision == revision && entry.zone.as_deref() == zone)?;
         let entry = self.entries.remove(index)?;
         let events = Arc::clone(&entry.events);
         self.entries.push_back(entry);
         Some(events)
     }
 
-    fn insert(&mut self, revision: DatabaseRevision, events: Arc<[GenerationEvent]>) {
+    fn insert(&mut self, revision: DatabaseRevision, zone: Option<String>, events: Arc<[GenerationEvent]>) {
         let bytes = std::mem::size_of_val(events.as_ref())
             .saturating_add(events.iter().map(|event| event.model.capacity()).sum());
-        if bytes > CACHE_BYTES || self.get(&revision).is_some() {
+        if bytes > CACHE_BYTES || self.get(&revision, zone.as_deref()).is_some() {
             return;
         }
         if let Some(index) = self
@@ -110,6 +145,7 @@ impl FoldCache {
         self.bytes += bytes;
         self.entries.push_back(CachedFold {
             revision,
+            zone,
             events,
             bytes,
         });
@@ -120,9 +156,17 @@ pub fn query_daily_since(
     since_compact: &str,
     home_path: Option<&str>,
 ) -> (LogScanStatus, Vec<DailyUsageRow>) {
+    query_daily(since_compact, home_path, None)
+}
+
+fn query_daily(
+    since_compact: &str,
+    home_path: Option<&str>,
+    checkpoint: Option<&Path>,
+) -> (LogScanStatus, Vec<DailyUsageRow>) {
     let since = parse_since(since_compact);
     let pricing = default_pricing();
-    let rows = scan(days_back_from_since(since), home_path, pricing).unwrap_or_default();
+    let rows = scan(days_back_from_since(since), home_path, pricing, checkpoint).unwrap_or_default();
     if rows.is_empty() {
         (LogScanStatus::NoData, vec![])
     } else {
@@ -130,11 +174,11 @@ pub fn query_daily_since(
     }
 }
 
-pub fn query_daily_host_json(opts_json: &str) -> String {
+pub fn query_daily_host_json(opts_json: &str, checkpoint: &Path) -> String {
     let v: serde_json::Value = serde_json::from_str(opts_json).unwrap_or(serde_json::json!({}));
     let since = v.get("since").and_then(|s| s.as_str()).unwrap_or("");
     let home_path = v.get("homePath").and_then(|s| s.as_str());
-    let (status, daily) = query_daily_since(since, home_path);
+    let (status, daily) = query_daily(since, home_path, Some(checkpoint));
     host_query_response(status, daily)
 }
 
@@ -186,6 +230,7 @@ fn scan(
     days_back: i32,
     home_path: Option<&str>,
     pricing: &ModelPricing,
+    checkpoint: Option<&Path>,
 ) -> Option<Vec<DailyUsageRow>> {
     let dirs = conversations_dirs(home_path);
     let mut paths = Vec::new();
@@ -201,8 +246,10 @@ fn scan(
     let since = since_local_midnight(days_back);
     let mut folds = Vec::new();
     let mut identities = HashSet::new();
+    let zone = iana_time_zone::get_timezone().ok();
+    let checkpoint = checkpoint.and_then(checkpoint::open);
     for path in &paths {
-        if let Some(events) = read_fold(path, &mut identities) {
+        if let Some(events) = read_fold(path, &mut identities, zone.as_deref(), checkpoint.as_ref()) {
             folds.push(events);
         }
     }
@@ -210,15 +257,39 @@ fn scan(
     if rows.is_empty() { None } else { Some(rows) }
 }
 
-fn read_fold(path: &Path, identities: &mut HashSet<Arc<Handle>>) -> Option<Arc<[GenerationEvent]>> {
+fn read_fold(
+    path: &Path,
+    identities: &mut HashSet<Arc<Handle>>,
+    zone: Option<&str>,
+    checkpoint: Option<&Connection>,
+) -> Option<Arc<[GenerationEvent]>> {
     let before = DatabaseRevision::read(path).ok();
     if let Some(revision) = &before {
         if identities.contains(&revision.main.identity) {
             return None;
         }
-        if let Some(events) = FOLDS.lock().ok().and_then(|mut cache| cache.get(revision)) {
+        if let Some(events) = FOLDS.lock().ok().and_then(|mut cache| cache.get(revision, zone)) {
             identities.insert(Arc::clone(&revision.main.identity));
             return Some(events);
+        }
+    }
+    let disk = (|| {
+        let conn = checkpoint?;
+        let zone = zone?;
+        let path_key = path.canonicalize().ok()?.into_os_string().into_string().ok()?;
+        Some((conn, zone, path_key, before.as_ref()?.digest()?))
+    })();
+    if let (Some((conn, zone, key, digest)), Some(revision)) = (&disk, &before) {
+        if let Some(events) = checkpoint::load(conn, key, zone, digest) {
+            if DatabaseRevision::read(path).ok().as_ref() == Some(revision) {
+                identities.insert(Arc::clone(&revision.main.identity));
+                let events = Arc::from(events);
+                if let (Ok(mut cache), Some(revision)) = (FOLDS.lock(), before) {
+                    cache.insert(revision, Some(zone.to_string()), Arc::clone(&events));
+                }
+                return Some(events);
+            }
+            return None;
         }
     }
     let (events, oversized, immutable) = match read_database(path) {
@@ -241,8 +312,13 @@ fn read_fold(path: &Path, identities: &mut HashSet<Arc<Handle>>) -> Option<Arc<[
         }
         identities.insert(Arc::clone(&before.main.identity));
         if !oversized && !immutable && before == after {
+            if let Some((conn, zone, key, digest)) = disk {
+                if after.digest().as_ref() == Some(&digest) {
+                    checkpoint::save(conn, &key, zone, &digest, &events);
+                }
+            }
             if let Ok(mut cache) = FOLDS.lock() {
-                cache.insert(before, Arc::clone(&events));
+                cache.insert(before, zone.map(str::to_owned), Arc::clone(&events));
             }
         }
     }
@@ -291,9 +367,81 @@ fn page_sql() -> String {
     )
 }
 
+struct StepIndex {
+    by_identity: HashMap<StepIdentity, Option<(NaiveDate, i64)>>,
+    legacy_by_index: HashMap<i64, i64>,
+}
+
+impl StepIndex {
+    fn read(conn: &Connection) -> Result<Option<Self>, rusqlite::Error> {
+        let has_steps = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('steps') WHERE name = 'metadata')
+                AND EXISTS(SELECT 1 FROM pragma_table_info('steps') WHERE name = 'idx' AND pk = 1)
+                AND (SELECT COUNT(*) FROM pragma_table_info('steps') WHERE pk > 0) = 1",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_steps {
+            return Ok(None);
+        }
+        let mut result = Self { by_identity: HashMap::new(), legacy_by_index: HashMap::new() };
+        let sql = format!(
+            "SELECT idx, metadata FROM steps
+             WHERE length(metadata) BETWEEN 1 AND {MAXIMUM_BLOB_BYTES} ORDER BY idx"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let mut estimated = 0;
+        while let Some(row) = rows.next()? {
+            let idx = row.get(0)?;
+            let blob = row.get_ref(1)?.as_blob().map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let Some((identity, timestamp)) = antigravity_proto::step_identity_timestamp(blob) else {
+                continue;
+            };
+            let Some(date) = DateTime::from_timestamp(timestamp, 0) else {
+                continue;
+            };
+            if identity.uuid.is_none() && identity.bot_id.is_none() {
+                estimated += 64;
+                result.legacy_by_index.insert(idx, timestamp);
+            } else {
+                let day = date.with_timezone(&Local).date_naive();
+                match result.by_identity.entry(identity) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        estimated += 256
+                            + slot.key().uuid.as_ref().map_or(0, String::capacity)
+                            + slot.key().bot_id.as_ref().map_or(0, String::capacity);
+                        slot.insert(Some((day, timestamp)));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if let Some((previous_day, previous_stamp)) = *slot.get() {
+                            slot.insert((day == previous_day).then_some((day, timestamp.min(previous_stamp))));
+                        }
+                    }
+                }
+            }
+            if estimated > CACHE_BYTES {
+                log::warn!("[antigravity] Step timestamp index exceeded its history memory budget");
+                return Ok(None);
+            }
+        }
+        Ok(Some(result))
+    }
+
+    fn timestamp(&self, idx: i64, blob: &[u8]) -> Option<i64> {
+        let identity = antigravity_proto::generation_identity(blob)?;
+        if identity.uuid.is_none() && identity.bot_id.is_none() {
+            self.legacy_by_index.get(&idx).copied()
+        } else {
+            self.by_identity.get(&identity).copied().flatten().map(|(_, stamp)| stamp)
+        }
+    }
+}
+
 fn read_database(path: &Path) -> Result<(Vec<GenerationEvent>, bool, bool), rusqlite::Error> {
     let (conn, immutable) = open_readonly(path)?;
     let tx = conn.unchecked_transaction()?;
+    let steps = StepIndex::read(&tx)?;
     let sql = page_sql();
     let mut stmt = tx.prepare(&sql)?;
     let mut last_index: i64 = -1;
@@ -321,7 +469,9 @@ fn read_database(path: &Path) -> Result<(Vec<GenerationEvent>, bool, bool), rusq
                 oversized = true;
                 continue;
             };
-            if let Some(event) = antigravity_proto::generation_event(&blob) {
+            if let Some(event) = antigravity_proto::generation_event_with_timestamp(&blob, || {
+                steps.as_ref()?.timestamp(idx, &blob)
+            }) {
                 events.push(event);
             }
         }
@@ -553,14 +703,14 @@ mod tests {
             )))]);
         };
         seed(&db, 40);
-        let original = read_fold(&db, &mut HashSet::new()).unwrap();
-        let unchanged = read_fold(&db, &mut HashSet::new()).unwrap();
+        let original = read_fold(&db, &mut HashSet::new(), None, None).unwrap();
+        let unchanged = read_fold(&db, &mut HashSet::new(), None, None).unwrap();
         assert!(Arc::ptr_eq(&original, &unchanged));
 
         let old = tmp.path().join("old.db");
         fs::rename(&db, old).unwrap();
         seed(&db, 20);
-        let replacement = read_fold(&db, &mut HashSet::new()).unwrap();
+        let replacement = read_fold(&db, &mut HashSet::new(), None, None).unwrap();
         assert_eq!(replacement[0].output_tokens, 20);
         assert!(!Arc::ptr_eq(&original, &replacement));
     }
@@ -573,7 +723,36 @@ mod tests {
         seed_db(&db, &[]);
         fs::hard_link(&db, &alias).unwrap();
         let mut identities = HashSet::new();
-        assert!(read_fold(&db, &mut identities).is_some());
-        assert!(read_fold(&alias, &mut identities).is_none());
+        assert!(read_fold(&db, &mut identities, None, None).is_some());
+        assert!(read_fold(&alias, &mut identities, None, None).is_none());
+    }
+
+    #[test]
+    fn joins_steps_by_identity_and_rejects_cross_day_duplicates() {
+        use antigravity_proto::{encode_bytes_field, encode_varint_field};
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("steps.db");
+        let generation = |id: &str| {
+            let mut blob = encode_generation_blob("gemini-3.6-flash", 10, 90, 40, 5, 0);
+            blob.extend(encode_bytes_field(4, id.as_bytes()));
+            blob
+        };
+        seed_db(&db, &[(1, Some(generation("match"))), (2, Some(generation("conflict"))),
+            (3, Some(generation("no-match")))]);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB)", []).unwrap();
+        let timestamp = Utc::now().timestamp() as u64;
+        for (idx, id, time) in [
+            (1, "other", timestamp), (11, "match", timestamp),
+            (12, "conflict", timestamp), (13, "conflict", timestamp - 172_800),
+        ] {
+            let mut metadata = encode_bytes_field(1, &encode_varint_field(1, time));
+            metadata.extend(encode_bytes_field(12, id.as_bytes()));
+            conn.execute("INSERT INTO steps VALUES (?1, ?2)", params![idx, metadata]).unwrap();
+        }
+        let (events, _, _) = read_database(&db).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].timestamp_seconds, timestamp as i64);
     }
 }

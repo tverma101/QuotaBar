@@ -99,12 +99,23 @@ pub fn run_probe_with_account(
     app_version: &str,
     account: Option<ProviderAccountContext>,
 ) -> PluginOutput {
+    run_probe_with_history(plugin, app_data_dir, app_version, account, false)
+}
+
+pub fn run_probe_with_history(
+    plugin: &LoadedPlugin,
+    app_data_dir: &PathBuf,
+    app_version: &str,
+    account: Option<ProviderAccountContext>,
+    refresh_history: bool,
+) -> PluginOutput {
     run_probe_with_account_timeout(
         plugin,
         app_data_dir,
         app_version,
         account,
         Duration::from_secs(PROBE_TIMEOUT_SECS),
+        refresh_history,
     )
 }
 
@@ -114,6 +125,7 @@ fn run_probe_with_account_timeout(
     app_version: &str,
     account: Option<ProviderAccountContext>,
     timeout: Duration,
+    refresh_history: bool,
 ) -> PluginOutput {
     let fallback = error_output(plugin, "runtime error".to_string());
     let timeout_message = format!("probe timed out after {}s", timeout.as_secs());
@@ -166,6 +178,12 @@ fn run_probe_with_account_timeout(
                 return error_output(plugin, timeout_message.clone());
             }
             return error_output(plugin, "host api injection failed".to_string());
+        }
+        if refresh_history
+            && base_plugin_id == "freebuff"
+            && ctx.eval::<(), _>("__openusage_ctx.app.refreshHistory = true; void 0").is_err()
+        {
+            return error_output(plugin, "history option initialization failed".to_string());
         }
         if host_api::patch_http_wrapper(&ctx).is_err() {
             if deadline.has_elapsed() {

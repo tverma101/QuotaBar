@@ -124,7 +124,7 @@ type UseSettingsBootstrapArgs = {
   setOnboardingComplete: (value: boolean) => void
   setLoadingForPlugins: (ids: string[]) => void
   setErrorForPlugins: (ids: string[], error: string) => void
-  startBatch: (pluginIds?: string[]) => Promise<string[] | undefined>
+  startBatch: (pluginIds?: string[], refreshHistory?: true) => Promise<string[] | undefined>
 }
 
 export function useSettingsBootstrap({
@@ -483,7 +483,7 @@ export function useSettingsBootstrap({
           const enabledIds = getEnabledPluginIds(settings)
           setLoadingForPlugins(enabledIds)
           try {
-            await startBatch(enabledIds)
+            await startBatch(enabledIds, true)
           } catch (error) {
             console.error("Failed to start probe batch:", error)
             if (isMounted) {

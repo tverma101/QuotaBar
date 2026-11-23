@@ -94,6 +94,11 @@ run from the history list does not erase its already measured consumption inside
 This mixed history is marked account-wide so another
 Mac cannot blindly add the hosted portion again.
 
+On Windows, app startup and manual refresh can also update hosted and older Desktop token
+totals. A five-minute cooldown limits those history requests. Interval refreshes use the last
+history snapshot for the same login and do not contact the hosted history endpoint. Windows
+shows measured token totals; the macOS model and price breakdown described below is separate.
+
 For older Desktop sessions, QuotaBar reads usage from assistant-message
 metrics and the separate `auto_run_decision_receipts.manager_json.usage` records in
 `~/.config/freebuff-desktop/projects/*/desktop-v2.db`, never conversation text. The mission manager's

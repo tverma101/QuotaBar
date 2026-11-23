@@ -42,7 +42,7 @@ describe("useProbeRefreshActions", () => {
     })
 
     expect(setLoadingForPlugins).toHaveBeenCalledWith(["codex"])
-    expect(startBatch).toHaveBeenCalledWith(["codex"])
+    expect(startBatch).toHaveBeenCalledWith(["codex"], true)
     expect(manualRefreshIdsRef.current.has("codex")).toBe(true)
   })
 
@@ -74,7 +74,7 @@ describe("useProbeRefreshActions", () => {
     })
 
     expect(setLoadingForPlugins).toHaveBeenCalledWith(["c"])
-    expect(startBatch).toHaveBeenCalledWith(["c"])
+    expect(startBatch).toHaveBeenCalledWith(["c"], true)
     nowSpy.mockRestore()
   })
 
