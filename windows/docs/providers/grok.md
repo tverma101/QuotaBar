@@ -26,7 +26,7 @@ grok login
 
 QuotaBar normally uses the local Grok CLI auth file. For an explicitly saved account, token rotation updates that account only; it does not modify the CLI login. If CLI refresh fails, run `grok login` again.
 
-The Weekly meter uses the reported billing window and is not shown for legacy monthly-only plans. Local spend counts completed coordinator turns, deduplicates replayed events, and skips separate subagent ledgers so child usage is not charged twice. If no price is known for a model, its tokens still count without inventing a cost.
+The Weekly meter uses the reported billing window and is not shown for legacy monthly-only plans. Local spend counts completed coordinator turns, deduplicates replayed events, and excludes subagent ledgers from the scan budget so child usage is not charged twice or counted in place of older coordinator logs. If no price is known for a model, its tokens still count without inventing a cost.
 
 ## Endpoint
 
