@@ -1,6 +1,6 @@
 use crate::plugin_engine::host_api;
 use crate::plugin_engine::manifest::LoadedPlugin;
-use crate::provider_accounts::ProviderAccountContext;
+use crate::provider_accounts::{self, ProviderAccountContext};
 use rquickjs::{Array, Context, Ctx, Error, Object, Promise, Runtime, Value};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -115,6 +115,24 @@ fn run_probe_with_account_timeout(
     account: Option<ProviderAccountContext>,
     timeout: Duration,
 ) -> PluginOutput {
+    let plugin_id = account
+        .as_ref()
+        .map(|account| account.instance_id.clone())
+        .unwrap_or_else(|| plugin.manifest.id.clone());
+    let identity_generation = if matches!(plugin.manifest.id.as_str(), "claude" | "codex") {
+        provider_accounts::begin_history_identity_probe(app_data_dir, &plugin_id).filter(|_| {
+            let Some(account) = &account else { return true };
+            let Some(path) = &account.store_path else { return true };
+            provider_accounts::load_store_path(path).is_ok_and(|store| {
+                let current = store.accounts.get(&plugin_id)
+                    .map(|entry| &entry.credential)
+                    .filter(|credential| !credential.is_empty());
+                current == account.credential.as_ref()
+            })
+        })
+    } else {
+        None
+    };
     let fallback = error_output(plugin, "runtime error".to_string());
     let timeout_message = format!("probe timed out after {}s", timeout.as_secs());
     let deadline_at = Instant::now()
@@ -133,10 +151,6 @@ fn run_probe_with_account_timeout(
         Err(_) => return fallback,
     };
 
-    let plugin_id = account
-        .as_ref()
-        .map(|account| account.instance_id.clone())
-        .unwrap_or_else(|| plugin.manifest.id.clone());
     let base_plugin_id = account
         .as_ref()
         .map(|account| account.base_provider_id.clone())
@@ -306,7 +320,16 @@ fn run_probe_with_account_timeout(
             .filter(|s| !s.is_empty());
 
         let lines = match parse_lines(&result) {
-            Ok(lines) if !lines.is_empty() => lines,
+            Ok(lines) if !lines.is_empty() => {
+                if let Some(generation) = identity_generation
+                    && let Ok(key) = result.get::<_, String>("verifiedHistoryIdentity")
+                {
+                    provider_accounts::finish_history_identity_probe(
+                        &app_data, &plugin_id, generation, &plugin.manifest.id, &key,
+                    );
+                }
+                lines
+            }
             Ok(_) => vec![error_line("no lines returned".to_string())],
             Err(msg) => vec![error_line(msg)],
         };
@@ -1036,6 +1059,42 @@ mod tests {
             Some(MetricLine::Badge { text, .. }) => text.clone(),
             other => panic!("expected error badge, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn history_identities_are_keyed_by_instance_not_display_label() {
+        let dir = temp_app_dir("history-identities");
+        for (family, instance, key) in [
+            ("claude", "claude:work", "Acct-1|Org-1"),
+            ("codex", "codex:work", "Account-A"),
+        ] {
+            let plugin = test_plugin_with_id(
+                family,
+                family,
+                &format!(r#"globalThis.__openusage_plugin = {{ probe: (ctx) => ({{
+                    lines: [ctx.line.text({{ label: "Status", value: "Ready" }})],
+                    verifiedHistoryIdentity: "{key}"
+                }}) }};"#),
+            );
+            run_probe_with_account(&plugin, &dir, "test", Some(account(instance, family, "Work", "test")));
+        }
+        assert_eq!(
+            provider_accounts::verified_history_identities(&dir).unwrap(),
+            [
+                ("claude:work".into(), "acct-1|org-1".into()),
+                ("codex:work".into(), "account-a".into()),
+            ].into()
+        );
+        let failed = test_plugin_with_id(
+            "claude",
+            "Claude",
+            r#"globalThis.__openusage_plugin = { probe: () => { throw "Not logged in"; } };"#,
+        );
+        run_probe_with_account(&failed, &dir, "test", Some(account("claude:work", "claude", "Work", "test")));
+        assert_eq!(
+            provider_accounts::verified_history_identities(&dir).unwrap(),
+            [("codex:work".into(), "account-a".into())].into()
+        );
     }
 
     fn account(

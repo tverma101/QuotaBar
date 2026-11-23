@@ -10,6 +10,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -253,8 +254,8 @@ fn file_mtime_before(mtime: &SystemTime, since: DateTime<Utc>) -> bool {
 }
 
 fn parse_file(path: &Path) -> Vec<ClaudeEntry> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
+    let mut reader = match fs::File::open(path) {
+        Ok(file) => BufReader::new(file),
         Err(_) => {
             warn_unreadable_usage_file(path);
             return vec![];
@@ -262,11 +263,20 @@ fn parse_file(path: &Path) -> Vec<ClaudeEntry> {
     };
     let marker = br#""usage""#;
     let mut entries = Vec::new();
-    for line in data.split(|&b| b == b'\n') {
-        if !line.windows(marker.len()).any(|w| w == marker) {
-            continue;
+    let mut line = Vec::new();
+    loop {
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => {
+                warn_unreadable_usage_file(path);
+                return vec![];
+            }
         }
-        entries.extend(parse_entries(line));
+        if line.windows(marker.len()).any(|w| w == marker) {
+            entries.extend(parse_entries(&line));
+        }
+        line.clear();
     }
     entries
 }
@@ -516,13 +526,7 @@ fn total_tokens(tokens: &TokenBreakdown) -> i32 {
 }
 
 fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPricing) -> Vec<DailyUsageRow> {
-    let mut tokens_by_day: BTreeMap<String, i32> = BTreeMap::new();
-    let mut cost_by_day: BTreeMap<String, f64> = BTreeMap::new();
-    let mut models_by_day: BTreeMap<String, BTreeMap<String, (i32, Option<f64>)>> = BTreeMap::new();
-    let mut input_by_day: BTreeMap<String, i32> = BTreeMap::new();
-    let mut output_by_day: BTreeMap<String, i32> = BTreeMap::new();
-    let mut cache_create_by_day: BTreeMap<String, i32> = BTreeMap::new();
-    let mut cache_read_by_day: BTreeMap<String, i32> = BTreeMap::new();
+    let mut by_day: BTreeMap<String, DailyUsageRow> = BTreeMap::new();
 
     for entry in entries {
         if entry.timestamp < since {
@@ -538,65 +542,46 @@ fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPrici
             model.and_then(|m| pricing.estimated_cost_dollars(m, &entry.tokens))
         });
 
-        let total = total_tokens(&entry.tokens);
-        let add_tokens = |days: &mut BTreeMap<String, i32>, count| {
-            let value = days.entry(day.clone()).or_default();
-            *value = value.saturating_add(count);
-        };
-        add_tokens(&mut tokens_by_day, total);
-        add_tokens(&mut input_by_day, entry.tokens.input);
-        add_tokens(&mut output_by_day, entry.tokens.output);
-        add_tokens(&mut cache_create_by_day, entry.tokens.cache_write5m.saturating_add(entry.tokens.cache_write1h));
-        add_tokens(&mut cache_read_by_day, entry.tokens.cache_read);
+        let row = by_day.entry(day).or_insert_with_key(|date| DailyUsageRow {
+            date: date.clone(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
+            total_cost: None,
+            cost_usd: None,
+            models: BTreeMap::new(),
+        });
+        let tokens = &entry.tokens;
+        let total = total_tokens(tokens);
+        row.input_tokens = row.input_tokens.saturating_add(tokens.input);
+        row.output_tokens = row.output_tokens.saturating_add(tokens.output);
+        row.cache_creation_tokens = row.cache_creation_tokens
+            .saturating_add(tokens.cache_write5m)
+            .saturating_add(tokens.cache_write1h);
+        row.cache_read_tokens = row.cache_read_tokens.saturating_add(tokens.cache_read);
+        row.total_tokens = row.total_tokens.saturating_add(total);
 
-        let slot = models_by_day.entry(day.clone()).or_default();
-        let (tokens, model_cost) = slot.entry(model.unwrap_or("Unattributed").to_string()).or_default();
-        *tokens = tokens.saturating_add(total);
+        let model = row.models.entry(model.unwrap_or("Unattributed").to_string()).or_insert(ModelDayUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
+            total_cost: None,
+        });
+        model.total_tokens = model.total_tokens.saturating_add(total);
+        model.output_tokens = model.total_tokens;
         if let Some(cost) = cost {
-            *cost_by_day.entry(day).or_default() += cost;
-            *model_cost = Some(model_cost.unwrap_or_default() + cost);
+            let daily_cost = row.total_cost.unwrap_or_default() + cost;
+            row.total_cost = Some(daily_cost);
+            row.cost_usd = Some(daily_cost);
+            model.total_cost = Some(model.total_cost.unwrap_or_default() + cost);
         }
     }
 
-    tokens_by_day
-        .keys()
-        .rev()
-        .cloned()
-        .map(|day| {
-            let total_cost = cost_by_day.get(&day).copied();
-            let models: BTreeMap<String, ModelDayUsage> = models_by_day
-                .get(&day)
-                .map(|m| {
-                    m.iter()
-                        .map(|(name, (tokens, cost))| {
-                            (
-                                name.clone(),
-                                ModelDayUsage {
-                                    input_tokens: 0,
-                                    output_tokens: *tokens,
-                                    cache_creation_tokens: 0,
-                                    cache_read_tokens: 0,
-                                    total_tokens: *tokens,
-                                    total_cost: *cost,
-                                },
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            DailyUsageRow {
-                date: day.clone(),
-                input_tokens: *input_by_day.get(&day).unwrap_or(&0),
-                output_tokens: *output_by_day.get(&day).unwrap_or(&0),
-                cache_creation_tokens: *cache_create_by_day.get(&day).unwrap_or(&0),
-                cache_read_tokens: *cache_read_by_day.get(&day).unwrap_or(&0),
-                total_tokens: *tokens_by_day.get(&day).unwrap_or(&0),
-                total_cost,
-                cost_usd: total_cost,
-                models,
-            }
-        })
-        .collect()
+    by_day.into_values().rev().collect()
 }
 
 #[cfg(test)]

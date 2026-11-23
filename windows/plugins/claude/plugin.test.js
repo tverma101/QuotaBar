@@ -630,12 +630,23 @@ describe("claude plugin", () => {
     const plugin = await loadPlugin()
     const result = plugin.probe(ctx)
     expect(result.plan).toBe("Max 20x")
+    expect(result.verifiedHistoryIdentity).toBe("acct-1|org-1")
     expect(usageRequestCount(ctx)).toBe(1)
     expect(profileRequestCount(ctx)).toBe(1)
 
-    plugin.probe(ctx)
+    expect(plugin.probe(ctx).verifiedHistoryIdentity).toBe("acct-1|org-1")
     expect(usageRequestCount(ctx)).toBe(1)
     expect(profileRequestCount(ctx)).toBe(1)
+  })
+
+  it("does not resolve a disconnected extra account from the default Claude login", async () => {
+    const ctx = makeCtx()
+    ctx.account = { instanceId: "claude:work", baseProviderId: "claude", label: "Work" }
+    ctx.host.fs.exists = () => true
+    ctx.host.fs.readText = () => JSON.stringify({ claudeAiOauth: { accessToken: "default-token" } })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Not logged in")
+    expect(ctx.host.http.request).not.toHaveBeenCalled()
   })
 
   it("keeps the stored Claude plan when the live profile lookup fails", async () => {
