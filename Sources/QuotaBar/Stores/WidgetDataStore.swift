@@ -42,6 +42,7 @@ final class WidgetDataStore {
     private let slowProviderRefreshThreshold: TimeInterval
     /// See `defaultProviderRefreshTimeout`. Injected so tests can drive the deadline in milliseconds.
     private let providerRefreshTimeout: TimeInterval
+    private let isOverSoftMemoryLimit: () -> Bool
     /// Quota-notification preferences (three independent triggers). Injected; `nil` disables
     /// notifications entirely (tests and previews that don't wire it).
     private let notificationSettings: (@MainActor () -> NotificationSettingsStore)?
@@ -317,6 +318,7 @@ final class WidgetDataStore {
         monotonicNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         slowProviderRefreshThreshold: TimeInterval = WidgetDataStore.defaultSlowProviderRefreshThreshold,
         providerRefreshTimeout: TimeInterval = WidgetDataStore.defaultProviderRefreshTimeout,
+        isOverSoftMemoryLimit: @escaping () -> Bool = { ProcessMemoryBudget.isOverSoftLimit },
         notificationSettings: (@MainActor () -> NotificationSettingsStore)? = nil,
         postNotification: (@MainActor (String, String, String, String) async -> Bool)? = nil,
         providerIdentityKeys: [String: String] = [:],
@@ -337,6 +339,7 @@ final class WidgetDataStore {
         self.monotonicNow = monotonicNow
         self.slowProviderRefreshThreshold = slowProviderRefreshThreshold
         self.providerRefreshTimeout = providerRefreshTimeout
+        self.isOverSoftMemoryLimit = isOverSoftMemoryLimit
         self.notificationSettings = notificationSettings
         self.postNotification = postNotification
             ?? { idPrefix, title, subtitle, body in
@@ -640,7 +643,7 @@ final class WidgetDataStore {
             // runs *after* a provider finishes, so a chunk that started under the limit can leave the
             // next one stacking on top of a much larger footprint. Dropping to one at a time here
             // caps the peak at a single provider's parse arrays instead of their sum.
-            if ProcessMemoryBudget.isOverSoftLimit {
+            if isOverSoftMemoryLimit() {
                 concurrency = 1
             }
             // Heavy local-log scans allocate their parse working set before the post-refresh unload.
@@ -1610,7 +1613,7 @@ final class WidgetDataStore {
         // place below the process budget and are released when that budget is crossed.
         if Self.isHeavyLocalLogProvider(providerID) {
             await PersistentJSONLScanCaches.unloadAfterHeavyProvider(providerID: providerID)
-        } else if ProcessMemoryBudget.isOverSoftLimit {
+        } else if isOverSoftMemoryLimit() {
             await PersistentJSONLScanCaches.unloadAfterHeavyProvider(providerID: providerID)
         }
         return .refreshed

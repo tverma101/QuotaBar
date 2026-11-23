@@ -46,8 +46,7 @@ require_contract(checkout && checkout.dig("with", "persist-credentials") == fals
 commands = steps.flat_map { |step| step.is_a?(Hash) ? step["run"].to_s.lines : [] }
                 .map(&:strip)
                 .reject { |line| line.empty? || line.start_with?("#") }
-require_contract(commands.any? { |line| line.match?(/^swift build(?:\s|$)/) }, "Swift package build")
-require_contract(commands.any? { |line| line.match?(/^bash script\/test_suites\.sh(?:\s|$)/) },
-                 "full test-suite driver (Swift, Python, and shell contracts)")
+require_contract(commands.include?("bash script/test_suites.sh --build"),
+                 "Swift package build and full test-suite driver")
 puts "QuotaBar CI routing and test-suite contracts passed"
 RUBY

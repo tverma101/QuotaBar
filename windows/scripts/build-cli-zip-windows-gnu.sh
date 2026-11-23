@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Portable **CLI** only (Windows .zip) from Linux: quotabar-cli.exe + resources/bundled_plugins.
+# For the full **GUI** portable zip (quotabar.exe + quotabar-cli + resources), use:
+#   scripts/build-gui-portable-zip-windows-gnu.sh  (after tauri build --target x86_64-pc-windows-gnu)
+# Same CLI layout as scripts/build-cli-windows.ps1 / install.ps1 INSTALL_MODE=cli.
+#
+# Prerequisites (Debian/Ubuntu example):
+#   sudo apt install -y mingw-w64 zip
+#   rustup target add x86_64-pc-windows-gnu
+#
+# Run from repo root:
+#   ./scripts/build-cli-zip-windows-gnu.sh
+#
+# Output: quotabar-cli_<version>_windows_amd64.zip (+ optional copies under releases/)
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+TARGET="x86_64-pc-windows-gnu"
+VERSION="$(node -p "require('./package.json').version")"
+
+if ! rustup target list --installed | grep -q "^${TARGET}\$"; then
+  echo "Missing Rust target ${TARGET}. Run: rustup target add ${TARGET}" >&2
+  exit 1
+fi
+
+if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+  echo "Missing MinGW linker (x86_64-w64-mingw32-gcc). On Debian/Ubuntu: sudo apt install -y mingw-w64" >&2
+  exit 1
+fi
+
+echo "==> Building quotabar-cli (release) for ${TARGET}"
+cargo build --release -p quotabar-cli --target "${TARGET}"
+
+EXE="${ROOT}/target/${TARGET}/release/quotabar-cli.exe"
+if [[ ! -f "$EXE" ]]; then
+  echo "Expected ${EXE} after cargo build" >&2
+  exit 1
+fi
+
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "${STAGE}/root/resources"
+cp -f "$EXE" "${STAGE}/root/quotabar-cli.exe"
+cp -a "${ROOT}/src-tauri/resources/bundled_plugins" "${STAGE}/root/resources/"
+
+OUT="${ROOT}/quotabar-cli_${VERSION}_windows_amd64.zip"
+rm -f "$OUT"
+(
+  cd "${STAGE}/root"
+  if command -v zip >/dev/null 2>&1; then
+    zip -qr "$OUT" .
+  else
+    echo "Need zip(1). On Debian/Ubuntu: sudo apt install -y zip" >&2
+    exit 1
+  fi
+)
+
+echo "==> Wrote $OUT"
+ls -lh "$OUT"
+
+REL="${ROOT}/releases"
+if [[ -d "$REL" ]]; then
+  cp -f "$OUT" "${REL}/quotabar-cli_${VERSION}_windows_amd64.zip"
+  cp -f "$OUT" "${REL}/quotabar-cli_windows_amd64.zip"
+  echo "==> Copied to releases/ (and legacy quotabar-cli_windows_amd64.zip)"
+fi

@@ -1,0 +1,119 @@
+import path from "path";
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+
+// @ts-expect-error process is a nodejs global
+const host = process.env.TAURI_DEV_HOST;
+
+// https://vite.dev/config/
+export default defineConfig(async () => ({
+  plugins: [react(), tailwindcss()],
+
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
+
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules/react-dom") || id.includes("node_modules/react/") || id.includes("node_modules/zustand")) {
+            return "vendor-react";
+          }
+          if (id.includes("node_modules/@dnd-kit")) {
+            return "vendor-dnd";
+          }
+          if (id.includes("node_modules/lucide-react")) {
+            return "vendor-icons";
+          }
+          if (id.includes("src/i18n/locales/") && !id.endsWith("/en.json")) {
+            return "i18n-locales";
+          }
+          if (
+            id.includes("src/pages/settings.tsx") ||
+            id.includes("src/pages/polls.tsx") ||
+            id.includes("src/components/onboarding-wizard.tsx") ||
+            id.includes("src/components/about-dialog.tsx") ||
+            id.includes("src/components/changelog-dialog.tsx")
+          ) {
+            return "views-secondary";
+          }
+          if (id.includes("src/components/app/modern-shell.tsx") || id.includes("src/components/modern/")) {
+            return "views-modern";
+          }
+        },
+      },
+    },
+  },
+
+  test: {
+    env: {
+      // `use-app-update` skips network checks in Vite dev unless this is set; keep tests exercising the hook.
+      VITE_UPDATER_IN_DEV: "true",
+    },
+    testTimeout: 15_000,
+    environment: "jsdom",
+    setupFiles: ["./src/test/setup.ts"],
+    include: ["src/**/*.test.{ts,tsx}", "plugins/**/*.test.js"],
+    exclude: ["**/node_modules/**", "**/src-tauri/target/**", "**/target/**"],
+    clearMocks: true,
+    mockReset: true,
+    restoreMocks: true,
+    coverage: {
+      provider: "v8",
+      include: ["src/**/*.{ts,tsx}", "plugins/**/*.js"],
+      exclude: [
+        "**/*.d.ts",
+        "**/*.css",
+        "public/**",
+        "scripts/**",
+        "src-tauri/**",
+        "src-tauri/resources/**",
+        "src-tauri/icons/**",
+        // Test-only helpers (not production code)
+        "plugins/test-helpers.js",
+        // Entry point bootstrap (side-effect heavy, hard to unit test)
+        "src/main.tsx",
+        // SSR guard branch untestable in jsdom
+        "src/hooks/use-dark-mode.ts",
+      ],
+      reporter: ["text", "html", "lcov"],
+      thresholds: {
+        perFile: false,
+        branches: 90,
+        lines: 90,
+        functions: 90,
+        statements: 90,
+      },
+    },
+  },
+
+  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
+  //
+  // 1. prevent Vite from obscuring rust errors
+  clearScreen: false,
+  // 2. tauri expects a fixed port, fail if that port is not available
+  server: {
+    port: 1420,
+    strictPort: true,
+    host: host || false,
+    hmr: host
+      ? {
+          protocol: "ws",
+          host,
+          port: 1421,
+        }
+      : undefined,
+    watch: {
+      // Ignore Rust build trees so Linux inotify limits are not exhausted (workspace `target/` is at repo root).
+      ignored: [
+        "**/src-tauri/**",
+        path.resolve(__dirname, "target"),
+        path.resolve(__dirname, "src-tauri/target"),
+      ],
+    },
+  },
+}));

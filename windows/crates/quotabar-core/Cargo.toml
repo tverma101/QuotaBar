@@ -1,0 +1,37 @@
+[package]
+name = "quotabar-core"
+version = "1.6.1"
+description = "Shared plugin engine for QuotaBar (GUI + CLI)"
+edition = "2024"
+
+[lib]
+name = "quotabar_core"
+path = "src/lib.rs"
+
+[dependencies]
+aes = "0.8.4"
+aes-gcm = "0.10.3"
+cbc = { version = "0.1.2", features = ["alloc"] }
+base64 = "0.22"
+log = "0.4"
+regex-lite = "0.1.9"
+reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json", "socks", "rustls", "system-proxy"] }
+rquickjs = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+chrono = "0.4"
+csv = "1.3"
+pbkdf2 = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
+dirs = "6"
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3.5"

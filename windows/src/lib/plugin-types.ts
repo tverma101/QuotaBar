@@ -1,0 +1,98 @@
+export type ProgressFormat =
+  | { kind: "percent" }
+  | { kind: "dollars" }
+  | { kind: "count"; suffix: string }
+
+export type BarChartPoint = {
+  label: string
+  value: number
+  valueLabel?: string
+}
+
+export type ModelSpendBreakdown = {
+  model: string
+  tokens: number
+  costUsd?: number
+  percent: number
+}
+
+export type ExpiryStatusDot = "normal" | "warning" | "critical"
+
+export type MetricLine =
+  | {
+      type: "text"
+      label: string
+      value: string
+      color?: string
+      subtitle?: string
+      modelBreakdown?: ModelSpendBreakdown[]
+      statusDot?: ExpiryStatusDot
+      expiryTooltip?: string
+      /** ISO-8601 expiry instants for Codex rate-limit reset credits (soonest first). */
+      resetCreditExpiries?: string[]
+    }
+  | {
+      type: "progress"
+      label: string
+      used: number
+      limit: number
+      format: ProgressFormat
+      resetsAt?: string
+      periodDurationMs?: number
+      color?: string
+      /** Claude Session: missingResetDate → show countdown at 0% when resetsAt is present. */
+      sessionStartSignal?: "missingResetDate" | "zeroUsage"
+    }
+  | { type: "badge"; label: string; text: string; color?: string; subtitle?: string }
+  | { type: "barChart"; label: string; points: BarChartPoint[]; note?: string; color?: string }
+
+export type ManifestLine = {
+  type: "text" | "progress" | "badge" | "barChart"
+  label: string
+  scope: "overview" | "detail"
+}
+
+export type PluginLink = {
+  label: string
+  url: string
+}
+
+export type PluginOutput = {
+  providerId: string
+  displayName: string
+  plan?: string
+  warning?: string
+  lines: MetricLine[]
+  iconUrl: string
+}
+
+export type PluginMeta = {
+  id: string
+  /** For account instances, the real plugin manifest id that provides plugin.js/icon/lines. */
+  baseProviderId?: string
+  /** User-visible account label for instances, e.g. Work or Personal. */
+  instanceLabel?: string
+  name: string
+  iconUrl: string
+  iconFilePath: string
+  brandColor?: string
+  lines: ManifestLine[]
+  links?: PluginLink[]
+  /** Ordered list of primary metric candidates. Frontend picks first available. */
+  primaryCandidates: string[]
+}
+
+export type PluginDisplayState = {
+  meta: PluginMeta
+  data: PluginOutput | null
+  loading: boolean
+  error: string | null
+  lastManualRefreshAt: number | null
+  lastUpdatedAt: number | null
+}
+
+export type ProbeTarget = {
+  instanceId: string
+  baseProviderId: string
+  label?: string
+}

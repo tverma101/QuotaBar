@@ -39,6 +39,10 @@ class CIWorkflowContractTests(unittest.TestCase):
         altered = self.substitute("run: bash script/test_suites.sh", "run: echo no tests")
         self.assertNotEqual(self.run_contract(altered).returncode, 0)
 
+    def test_rejects_missing_product_build(self):
+        altered = self.substitute("run: bash script/test_suites.sh --build", "run: bash script/test_suites.sh")
+        self.assertNotEqual(self.run_contract(altered).returncode, 0)
+
     def test_rejects_comment_only_pretend_suite(self):
         altered = self.substitute(
             "run: bash script/test_suites.sh", "run: |\n          # bash script/test_suites.sh\n          echo no tests"
