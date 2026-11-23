@@ -25,6 +25,7 @@ type ModernLayoutStore = ModernLayoutState & {
   ) => void
   setProviderOrder: (order: string[]) => void
   setMetricOrder: (pluginId: string, order: string[]) => void
+  setMetricPlacement: (pluginId: string, order: string[], onDemand: string[]) => void
   setMetricEnabled: (metricIdValue: string, enabled: boolean) => void
   setProviderMetricsEnabled: (pluginId: string, metricIds: string[], enabled: boolean) => void
   togglePin: (metricIdValue: string) => boolean
@@ -34,7 +35,31 @@ type ModernLayoutStore = ModernLayoutState & {
   syncDescriptors: (descriptors: MetricDescriptor[]) => void
   syncPinsFromTrayLines: (trayLines: Record<string, string[]> | undefined, descriptors: MetricDescriptor[]) => void
   clearPinNotice: () => void
-  persist: () => Promise<void>
+  clearLegacyPlacement: () => void
+  persist: () => void
+}
+
+let saveTimer: number | undefined
+let write = Promise.resolve()
+
+export function flushModernLayout(): Promise<void> {
+  if (saveTimer === undefined) return write
+  window.clearTimeout(saveTimer)
+  document.removeEventListener("visibilitychange", flushWhenHidden)
+  saveTimer = undefined
+  const {
+    placedMetricIds, providerOrder, metricOrderByProvider, pinnedMetricIds,
+    onDemandMetricIds, pinsCustomized, trayFocusProviderId, initialized,
+  } = useModernLayoutStore.getState()
+  write = write.then(() => saveModernLayout({
+    placedMetricIds, providerOrder, metricOrderByProvider, pinnedMetricIds,
+    onDemandMetricIds, pinsCustomized, trayFocusProviderId, initialized,
+  })).catch((e) => console.error("saveModernLayout:", e))
+  return write
+}
+
+function flushWhenHidden() {
+  if (document.hidden) void flushModernLayout()
 }
 
 function filterKnown(ids: string[], descriptors: MetricDescriptor[]): string[] {
@@ -77,7 +102,7 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
     }
 
     const next: ModernLayoutState = {
-      placedMetricIds: placed,
+      ...EMPTY_MODERN_LAYOUT,
       providerOrder: providerOrderFromPluginSettings(pluginSettings, descriptors),
       metricOrderByProvider: defaultMetricOrderByProvider(descriptors),
       pinnedMetricIds: pinned,
@@ -85,7 +110,7 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
       initialized: true,
     }
     set({ ...next, hydrated: true })
-    void saveModernLayout(next).catch((e) => console.error("saveModernLayout:", e))
+    get().persist()
   },
 
   setProviderOrder: (order) => {
@@ -96,6 +121,14 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
   setMetricOrder: (pluginId, order) => {
     set((s) => ({
       metricOrderByProvider: { ...s.metricOrderByProvider, [pluginId]: order },
+    }))
+    void get().persist()
+  },
+
+  setMetricPlacement: (pluginId, order, onDemand) => {
+    set((s) => ({
+      metricOrderByProvider: { ...s.metricOrderByProvider, [pluginId]: order },
+      onDemandMetricIds: [...s.onDemandMetricIds.filter((id) => parseMetricId(id)?.pluginId !== pluginId), ...onDemand],
     }))
     void get().persist()
   },
@@ -124,6 +157,7 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
   },
 
   setTrayFocusProvider: (pluginId) => {
+    if (get().trayFocusProviderId === pluginId) return
     set({ trayFocusProviderId: pluginId })
     void get().persist()
   },
@@ -176,6 +210,12 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
       metricOrderByProvider[pluginId] = merged
     }
 
+    const orderChanged = Object.keys(defaultOrder).some((id) => {
+      const previous = current.metricOrderByProvider[id]
+      const next = metricOrderByProvider[id]
+      return !previous || previous.length !== next.length || previous.some((metric, index) => metric !== next[index])
+    })
+    if (!orderChanged && pinned.length === current.pinnedMetricIds.length) return
     set({ pinnedMetricIds: pinned, metricOrderByProvider })
     void get().persist()
   },
@@ -187,7 +227,7 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
     // Pins and tray focus are user-chosen in Modern (and by applyTrayReadout).
     // Rebuilding from trayLines would drop customized pins and overwrite the
     // provider the tray-readout dialog just applied (fromTray[0] is map order).
-    if (current.pinnedMetricIds.length > 0) return
+    if (current.pinsCustomized || current.pinnedMetricIds.length > 0) return
 
     const fromTray = filterKnown(pinnedIdsFromTrayLines(trayLines), descriptors)
     if (fromTray.length === 0) return
@@ -210,7 +250,7 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
         s.trayFocusProviderId === parsed?.pluginId && pinned.length > 0
           ? (parseMetricId(pinned[0])?.pluginId ?? null)
           : s.trayFocusProviderId
-      set({ pinnedMetricIds: pinned, pinLimitNotice: null, trayFocusProviderId: nextFocus })
+      set({ pinnedMetricIds: pinned, pinsCustomized: true, pinLimitNotice: null, trayFocusProviderId: nextFocus })
       void get().persist()
       return true
     }
@@ -221,6 +261,7 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
     pinned.push(metricIdValue)
     set({
       pinnedMetricIds: pinned,
+      pinsCustomized: true,
       pinLimitNotice: null,
       trayFocusProviderId: parsed?.pluginId ?? s.trayFocusProviderId,
     })
@@ -230,23 +271,17 @@ export const useModernLayoutStore = create<ModernLayoutStore>((set, get) => ({
 
   clearPinNotice: () => set({ pinLimitNotice: null }),
 
-  persist: async () => {
-    const {
-      placedMetricIds,
-      providerOrder,
-      metricOrderByProvider,
-      pinnedMetricIds,
-      trayFocusProviderId,
-      initialized,
-    } = get()
-    await saveModernLayout({
-      placedMetricIds,
-      providerOrder,
-      metricOrderByProvider,
-      pinnedMetricIds,
-      trayFocusProviderId,
-      initialized,
-    })
+  clearLegacyPlacement: () => {
+    if (!get().placedMetricIds.length) return
+    set({ placedMetricIds: [] })
+    void get().persist()
+  },
+
+  persist: () => {
+    window.clearTimeout(saveTimer)
+    saveTimer = window.setTimeout(flushModernLayout, 150)
+    if (document.hidden) void flushModernLayout()
+    else document.addEventListener("visibilitychange", flushWhenHidden)
   },
 }))
 

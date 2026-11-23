@@ -72,8 +72,9 @@ export function usePanel({
     if (showAbout) return
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        invoke("hide_panel")
+      if (e.key === "Escape" && !e.defaultPrevented &&
+          !(e.target instanceof HTMLElement && e.target.closest("[role='menu'], [role='dialog']"))) {
+        invoke("hide_panel").catch(console.error)
       }
     }
 

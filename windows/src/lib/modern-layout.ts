@@ -11,6 +11,8 @@ export type ModernLayoutState = {
   providerOrder: string[]
   metricOrderByProvider: Record<string, string[]>
   pinnedMetricIds: string[]
+  onDemandMetricIds: string[]
+  pinsCustomized: boolean
   /** Which provider logo/readout to use for single-provider tray icon styles (Plugin, Pie, Logo). */
   trayFocusProviderId: string | null
   initialized: boolean
@@ -21,6 +23,8 @@ export const EMPTY_MODERN_LAYOUT: ModernLayoutState = {
   providerOrder: [],
   metricOrderByProvider: {},
   pinnedMetricIds: [],
+  onDemandMetricIds: [],
+  pinsCustomized: false,
   trayFocusProviderId: null,
   initialized: false,
 }
@@ -95,6 +99,8 @@ export function normalizeModernLayout(raw: unknown): ModernLayoutState {
     providerOrder: strArray(o.providerOrder),
     metricOrderByProvider: metricOrder,
     pinnedMetricIds: metricIdArray(o.pinnedMetricIds),
+    onDemandMetricIds: metricIdArray(o.onDemandMetricIds),
+    pinsCustomized: o.pinsCustomized === true,
     trayFocusProviderId:
       typeof o.trayFocusProviderId === "string" ? o.trayFocusProviderId : null,
     initialized: o.initialized === true,

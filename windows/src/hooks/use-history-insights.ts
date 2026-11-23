@@ -2,11 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { invoke, isTauri } from "@tauri-apps/api/core"
 import type { HistoryInsightsSummary } from "@/lib/usage-history-insights"
 
-export function useHistoryInsights(persistEnabled: boolean) {
+export function useHistoryInsights(persistEnabled: boolean, visibleOnly = false) {
   const [summary, setSummary] = useState<HistoryInsightsSummary | null>(null)
   const debounceRef = useRef<number | null>(null)
 
   const reload = useCallback(async () => {
+    if (visibleOnly && document.hidden) return
     if (!isTauri() || !persistEnabled) {
       setSummary(null)
       return
@@ -18,22 +19,26 @@ export function useHistoryInsights(persistEnabled: boolean) {
       console.error("get_usage_insights:", e)
       setSummary(null)
     }
-  }, [persistEnabled])
+  }, [persistEnabled, visibleOnly])
+
+  const cancelReload = useCallback(() => {
+    if (debounceRef.current === null) return
+    window.clearTimeout(debounceRef.current)
+    debounceRef.current = null
+  }, [])
 
   const scheduleReload = useCallback(() => {
-    if (debounceRef.current !== null) clearTimeout(debounceRef.current)
+    cancelReload()
     debounceRef.current = window.setTimeout(() => {
       debounceRef.current = null
       void reload()
     }, 32_000)
-  }, [reload])
+  }, [cancelReload, reload])
 
   useEffect(() => {
     void reload()
-    return () => {
-      if (debounceRef.current !== null) clearTimeout(debounceRef.current)
-    }
-  }, [reload])
+    return cancelReload
+  }, [cancelReload, reload])
 
-  return { summary, reload, scheduleReload }
+  return { summary, reload, scheduleReload, cancelReload }
 }

@@ -24,6 +24,10 @@ same iCloud account. Settings shows the five-minute write cadence and each Mac's
 time; it also reports unavailable iCloud, loading, write, and malformed-file states. See
 [iCloud Sync](icloud-sync.md) for what is included and which surfaces use the combined values.
 
+On Windows, **Sync Across Macs** is unavailable and usage history stays on the device.
+In the Modern panel, open **Options → Usage History** for saved totals and account history, or
+**Options → Customize** to choose which provider metrics are always visible or shown on demand.
+
 ## Appearance
 
 | Setting | Options | What it does |

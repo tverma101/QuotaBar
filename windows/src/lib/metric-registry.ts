@@ -34,6 +34,7 @@ export function buildMetricDescriptors(
   pluginsMeta: PluginMeta[],
   pluginSettings: PluginSettings | null,
   pluginStates?: Record<string, { data?: { lines?: MetricLine[] } | null } | undefined>,
+  includeDisabled = false,
 ): MetricDescriptor[] {
   if (!pluginSettings) return []
   const disabled = new Set(pluginSettings.disabled)
@@ -41,7 +42,7 @@ export function buildMetricDescriptors(
   const known = new Set<string>()
 
   for (const instanceId of pluginSettings.order) {
-    if (disabled.has(instanceId)) continue
+    if (!includeDisabled && disabled.has(instanceId)) continue
     const meta = getProviderInstanceMeta(instanceId, pluginSettings, pluginsMeta)
     if (!meta) continue
 
