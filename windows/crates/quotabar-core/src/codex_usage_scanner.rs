@@ -62,6 +62,13 @@ pub fn query_daily_host_json(opts_json: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(opts_json).unwrap_or(serde_json::json!({}));
     let since = v.get("since").and_then(|s| s.as_str()).unwrap_or("");
     let home_path = v.get("homePath").and_then(|s| s.as_str());
+    if v.get("isolatedHome").and_then(|flag| flag.as_bool()) == Some(true) {
+        let daily = home_path.filter(|path| !path.trim().is_empty()).and_then(|path| {
+            scan_homes(&[expand_tilde(path)], days_back_from_since(parse_since(since)), default_pricing())
+        }).unwrap_or_default();
+        let status = if daily.is_empty() { LogScanStatus::NoData } else { LogScanStatus::Ok };
+        return host_query_response(status, daily);
+    }
     let (status, daily) = query_daily_since(since, home_path);
     host_query_response(status, daily)
 }
@@ -88,8 +95,11 @@ fn days_back_from_since(since: DateTime<Utc>) -> i32 {
 }
 
 fn scan(days_back: i32, home_path: Option<&str>, pricing: &ModelPricing) -> Option<Vec<DailyUsageRow>> {
-    let homes = codex_homes(home_path);
-    let files = session_files(&homes);
+    scan_homes(&codex_homes(home_path), days_back, pricing)
+}
+
+fn scan_homes(homes: &[PathBuf], days_back: i32, pricing: &ModelPricing) -> Option<Vec<DailyUsageRow>> {
+    let files = session_files(homes);
     if files.is_empty() {
         return None;
     }

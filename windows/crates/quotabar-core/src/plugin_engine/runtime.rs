@@ -136,10 +136,12 @@ fn run_probe_with_account_timeout(
             let Some(account) = &account else { return true };
             let Some(path) = &account.store_path else { return true };
             provider_accounts::load_store_path(path).is_ok_and(|store| {
-                let current = store.accounts.get(&plugin_id)
+                let stored = store.accounts.get(&plugin_id);
+                let current = stored
                     .map(|entry| &entry.credential)
                     .filter(|credential| !credential.is_empty());
                 current == account.credential.as_ref()
+                    && stored.and_then(|entry| entry.codex_home.as_ref()) == account.codex_home.as_ref()
             })
         })
     } else {
@@ -1131,6 +1133,7 @@ mod tests {
                 session_key: None,
                 expires_at: None,
             }),
+            codex_home: None,
             store_path: None,
         }
     }

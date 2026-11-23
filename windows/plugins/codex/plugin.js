@@ -38,7 +38,8 @@
   }
 
   function usageAccountId(ctx, tokens) {
-    return tokens.account_id || tokenAccountId(ctx, tokens.id_token) || tokenAccountId(ctx, tokens.access_token)
+    return ctx.account?.codexHome?.accountId ||
+      tokens.account_id || tokenAccountId(ctx, tokens.id_token) || tokenAccountId(ctx, tokens.access_token)
   }
 
   function verifiedHistoryIdentity(ctx, tokens, requestedAccountId, data) {
@@ -54,6 +55,7 @@
   }
 
   function readCodexHome(ctx) {
+    if (ctx.account?.codexHome) return ctx.account.codexHome.path
     if (!ctx.host.env || typeof ctx.host.env.get !== "function") {
       return null
     }
@@ -129,6 +131,16 @@
 
   function hasAccessTokenAuth(auth) {
     return !!(auth && auth.tokens && auth.tokens.access_token)
+  }
+
+  function matchesRegisteredHome(ctx, auth) {
+    const expected = ctx.account?.codexHome?.accountId
+    if (!expected) return true
+    if (!hasAccessTokenAuth(auth)) return false
+    const tokens = auth.tokens
+    return typeof tokens.access_token === "string" && tokens.access_token.trim() &&
+      (normalizedAccountId(tokens.account_id) || tokenAccountId(ctx, tokens.id_token)) === expected &&
+      verifiedHistoryIdentity(ctx, tokens, expected, {}) === expected
   }
 
   function isAuthFallbackError(e) {
@@ -251,7 +263,7 @@
     }
 
     if (!reloaded) return { status: "unchanged", authState }
-    if (!hasAccessTokenAuth(reloaded.auth)) {
+    if (!hasAccessTokenAuth(reloaded.auth) || !matchesRegisteredHome(ctx, reloaded.auth)) {
       return { status: "error", error: ERR_TOKEN_CONFLICT }
     }
 
@@ -322,9 +334,14 @@
         return null
       }
 
-      auth.tokens.access_token = newAccessToken
-      if (body.refresh_token) auth.tokens.refresh_token = body.refresh_token
-      if (body.id_token) auth.tokens.id_token = body.id_token
+      const updated = {
+        ...auth.tokens,
+        access_token: newAccessToken,
+        refresh_token: body.refresh_token || auth.tokens.refresh_token,
+        id_token: body.id_token || auth.tokens.id_token,
+      }
+      if (!matchesRegisteredHome(ctx, { tokens: updated })) throw ERR_TOKEN_CONFLICT
+      auth.tokens = updated
       auth.last_refresh = new Date().toISOString()
 
       try {
@@ -443,6 +460,10 @@
   }
 
   function collectAuthCandidates(ctx) {
+    if (ctx.account?.codexHome) {
+      const state = loadRegisteredAuth(ctx)
+      return [{ accessToken: state.auth.tokens.access_token, accountId: ctx.account.codexHome.accountId }]
+    }
     const out = []
     const providerAuth = loadAuthFromProviderAccount(ctx)
     if (providerAuth && providerAuth.auth && providerAuth.auth.tokens && providerAuth.auth.tokens.access_token) {
@@ -485,7 +506,13 @@
     if (!Number.isFinite(expiryMs)) return "failed"
     if (expiryMs <= Date.now()) return "no_credit"
 
-    const candidates = collectAuthCandidates(ctx)
+    let candidates
+    try {
+      candidates = collectAuthCandidates(ctx)
+    } catch (e) {
+      ctx.host.log.error("reset claim: registered Codex home is unavailable: " + String(e))
+      return "failed"
+    }
     if (!candidates.length) {
       ctx.host.log.error("reset claim: no usable Codex credentials")
       return "failed"
@@ -746,6 +773,7 @@
     if (codexHome) {
       queryOpts.homePath = codexHome
     }
+    if (ctx.account?.codexHome) queryOpts.isolatedHome = true
 
     if (!ctx.host.codexLogs || typeof ctx.host.codexLogs.queryDaily !== "function") {
       return { status: "no_runner", data: null }
@@ -1254,7 +1282,9 @@
         }
       }
 
-      const tokenUsageResult = queryTokenUsage(ctx)
+      const tokenUsageResult = isExtraAccountInstance(ctx) && !ctx.account?.codexHome
+        ? { status: "no_data", data: null }
+        : queryTokenUsage(ctx)
       if (tokenUsageResult.status === "ok") {
         const tokenUsage = tokenUsageResult.data
         const now = new Date()
@@ -1346,7 +1376,18 @@
       account.instanceId !== account.baseProviderId)
   }
 
+  function loadRegisteredAuth(ctx) {
+    const authPath = joinPath(ctx.account.codexHome.path, AUTH_FILE)
+    const auth = ctx.host.fs.exists(authPath)
+      ? tryParseAuthJson(ctx, ctx.host.fs.readText(authPath).replace(/^\uFEFF/, ""))
+      : null
+    if (!auth || !hasAccessTokenAuth(auth)) throw ERR_ACCOUNT_NOT_LOGGED_IN
+    if (!matchesRegisteredHome(ctx, auth)) throw ERR_TOKEN_CONFLICT
+    return { auth, authPath, source: "file" }
+  }
+
   function probe(ctx) {
+    if (ctx.account?.codexHome) return probeWithAuthState(ctx, loadRegisteredAuth(ctx))
     const providerAuth = loadAuthFromProviderAccount(ctx)
     const extraAccount = isExtraAccountInstance(ctx)
     if (providerAuth) {

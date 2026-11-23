@@ -11,6 +11,7 @@ mod panel_windows;
 use quotabar_core::{plugin_engine, provider_accounts};
 #[cfg(target_os = "windows")]
 use panel_windows as panel;
+mod codex_registration;
 mod local_http_api;
 mod log_path;
 mod os_diagnostics;
@@ -543,10 +544,14 @@ fn save_provider_account(
         session_key: account.session_key,
         expires_at: account.expires_at,
     };
-    if credential.is_empty() {
-        if let Ok(Some(existing)) =
-            provider_accounts::get_account(&app_data_dir, account.instance_id.trim())
-        {
+    let existing = provider_accounts::get_account(&app_data_dir, account.instance_id.trim())
+        .map_err(|e| e.to_string())?;
+    let codex_home = existing.as_ref().and_then(|entry| entry.codex_home.clone());
+    if let Some(existing) = existing {
+        if !credential.is_empty() && codex_home.is_some() {
+            return Err("Manage this account's login in its Codex home.".into());
+        }
+        if credential.is_empty() {
             credential = existing.credential;
         }
     }
@@ -555,6 +560,7 @@ fn save_provider_account(
         base_provider_id: account.base_provider_id.trim().to_string(),
         label: account.label.trim().to_string(),
         credential,
+        codex_home,
     };
     if provider_account.instance_id.is_empty()
         || provider_account.base_provider_id.is_empty()
@@ -701,9 +707,11 @@ async fn start_probe_batch(
             .into_iter()
             .filter_map(|target| {
                 by_id.get(&target.base_provider_id).cloned().map(|plugin| {
-                    let credential = provider_accounts::get_account(&app_data_dir, &target.instance_id)
+                    let stored_account = provider_accounts::get_account(&app_data_dir, &target.instance_id)
                         .ok()
-                        .flatten()
+                        .flatten();
+                    let codex_home = stored_account.as_ref().and_then(|account| account.codex_home.clone());
+                    let credential = stored_account
                         .map(|account| account.credential)
                         .filter(|credential| !credential.is_empty());
                     let label = target
@@ -715,6 +723,7 @@ async fn start_probe_batch(
                         base_provider_id: target.base_provider_id,
                         label,
                         credential,
+                        codex_home,
                         store_path: Some(provider_accounts::store_path(&app_data_dir)),
                     };
                     (plugin, account_context)
@@ -1061,6 +1070,7 @@ fn codex_claim_reset_credit(
         base_provider_id,
         label,
         credential,
+        codex_home: account.and_then(|entry| entry.codex_home),
         store_path: Some(provider_accounts::store_path(&app_data_dir)),
     };
 
@@ -1463,6 +1473,9 @@ pub fn run() {
             open_devtools,
             start_probe_batch,
             codex_claim_reset_credit,
+            codex_registration::sign_in_to_codex,
+            codex_registration::cancel_codex_sign_in,
+            codex_registration::register_codex_home,
             list_provider_accounts,
             save_provider_account,
             delete_provider_account,
@@ -1683,6 +1696,7 @@ mod tests {
                 instance_id: "cursor:work".to_string(),
                 base_provider_id: "cursor".to_string(),
                 label: "Work".to_string(),
+                codex_home: None,
                 credential: ProviderCredential {
                     access_token: Some("work-token".to_string()),
                     ..Default::default()
