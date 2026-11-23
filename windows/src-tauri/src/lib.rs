@@ -83,6 +83,7 @@ struct PendingProbe {
     batch_id: String,
     plugin: plugin_engine::manifest::LoadedPlugin,
     account: provider_accounts::ProviderAccountContext,
+    opencode_go_batch: Option<Arc<plugin_engine::host_api::OpenCodeGoProbeBatch>>,
 }
 
 struct ProbeCoord {
@@ -712,6 +713,12 @@ async fn start_probe_batch(
         });
     }
 
+    let opencode_go_batch = selected_plugins
+        .iter()
+        .filter(|(_, account)| account.base_provider_id == "opencode-go")
+        .nth(1)
+        .is_some()
+        .then(|| Arc::new(plugin_engine::host_api::OpenCodeGoProbeBatch::default()));
     // Partition: run now vs coalesce into pending follow-up (#856).
     let (to_run, need_drain_worker) = {
         let mut coord = probe_coord()
@@ -724,19 +731,23 @@ async fn start_probe_batch(
         let mut deferred = Vec::new();
         for (plugin, account) in selected_plugins {
             let id = account.instance_id.clone();
+            let opencode_go_batch = if account.base_provider_id == "opencode-go" {
+                opencode_go_batch.clone()
+            } else {
+                None
+            };
+            let probe = PendingProbe {
+                batch_id: batch_id.clone(),
+                plugin,
+                account,
+                opencode_go_batch,
+            };
             if coord.in_flight.contains(&id) {
-                coord.pending.insert(
-                    id.clone(),
-                    PendingProbe {
-                        batch_id: batch_id.clone(),
-                        plugin,
-                        account,
-                    },
-                );
+                coord.pending.insert(id.clone(), probe);
                 deferred.push(id);
             } else {
                 coord.in_flight.insert(id);
-                to_run.push((plugin, account));
+                to_run.push(probe);
             }
         }
         if !deferred.is_empty() {
@@ -791,7 +802,6 @@ async fn start_probe_batch(
         let history_dir_spawn = history_dir.clone();
         let version = app_version.clone();
         let queue = Arc::clone(&probe_queue);
-        let queue_batch_id = batch_id.clone();
 
         tauri::async_runtime::spawn_blocking(move || {
             loop {
@@ -802,14 +812,8 @@ async fn start_probe_batch(
                     queue.pop_front()
                 };
 
-                let (plugin, account_context, bid) = match item {
-                    Some((plugin, account_context)) => {
-                        (plugin, account_context, queue_batch_id.clone())
-                    }
-                    None => match take_follow_up(None) {
-                        Some(pending) => (pending.plugin, pending.account, pending.batch_id),
-                        None => break,
-                    },
+                let Some(probe) = item.or_else(|| take_follow_up(None)) else {
+                    break;
                 };
 
                 run_and_emit_probe(
@@ -817,9 +821,7 @@ async fn start_probe_batch(
                     &data_dir,
                     &history_dir_spawn,
                     &version,
-                    &bid,
-                    plugin,
-                    account_context,
+                    probe,
                 );
             }
 
@@ -843,10 +845,14 @@ fn run_and_emit_probe(
     data_dir: &PathBuf,
     history_dir: &PathBuf,
     version: &str,
-    batch_id: &str,
-    plugin: plugin_engine::manifest::LoadedPlugin,
-    account_context: provider_accounts::ProviderAccountContext,
+    probe: PendingProbe,
 ) {
+    let PendingProbe {
+        batch_id,
+        plugin,
+        account: account_context,
+        opencode_go_batch,
+    } = probe;
     let plugin_id = account_context.instance_id.clone();
     let probe_display_name = if account_context.label.trim().is_empty() {
         plugin.manifest.name.clone()
@@ -858,11 +864,12 @@ fn run_and_emit_probe(
         )
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        plugin_engine::runtime::run_probe_with_account(
+        plugin_engine::runtime::run_probe_in_batch(
             &plugin,
             data_dir,
             version,
             Some(account_context),
+            opencode_go_batch,
         )
     }));
 
@@ -896,7 +903,7 @@ fn run_and_emit_probe(
             let _ = handle.emit(
                 "probe:result",
                 ProbeResult {
-                    batch_id: batch_id.to_string(),
+                    batch_id: batch_id.clone(),
                     output,
                 },
             );
@@ -912,14 +919,14 @@ fn run_and_emit_probe(
             let _ = handle.emit(
                 "probe:result",
                 ProbeResult {
-                    batch_id: batch_id.to_string(),
+                    batch_id: batch_id.clone(),
                     output,
                 },
             );
         }
     }
 
-    note_probe_finished(handle, batch_id);
+    note_probe_finished(handle, &batch_id);
 
     // Run coalesced follow-up for this id (nested call continues the chain).
     if let Some(pending) = take_follow_up(Some(&plugin_id)) {
@@ -928,9 +935,7 @@ fn run_and_emit_probe(
             data_dir,
             history_dir,
             version,
-            &pending.batch_id,
-            pending.plugin,
-            pending.account,
+            pending,
         );
     }
 }

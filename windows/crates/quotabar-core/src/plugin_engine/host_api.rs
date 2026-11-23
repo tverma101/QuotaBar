@@ -12,15 +12,52 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 #[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
 use std::collections::VecDeque;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MIN_BLOCKING_TIMEOUT: Duration = Duration::from_millis(1);
+
+type CachedGoResponse = Arc<Mutex<Option<Result<String, String>>>>;
+
+#[derive(Default)]
+pub struct OpenCodeGoProbeBatch {
+    responses: Mutex<HashMap<[u8; 32], CachedGoResponse>>,
+}
+
+pub(crate) struct ProbeNetwork {
+    pub deadline: ProbeDeadline,
+    pub opencode_go_batch: Option<Arc<OpenCodeGoProbeBatch>>,
+}
+
+impl OpenCodeGoProbeBatch {
+    fn response_slot(&self, req: &HttpReqParams) -> Option<CachedGoResponse> {
+        if req.url != "https://opencode.ai/zen/go/v1/usage"
+            || req.method.as_deref().unwrap_or("GET") != "GET"
+            || req.body_text.is_some()
+            || req.dangerously_ignore_tls.unwrap_or(false)
+            || req.http1_only.unwrap_or(false)
+        {
+            return None;
+        }
+        let key = req.headers.as_ref()?.get("Authorization")?.strip_prefix("Bearer ")?;
+        if key.is_empty() {
+            return None;
+        }
+        Some(self.responses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(Sha256::digest(key.as_bytes()).into())
+            .or_default()
+            .clone())
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProbeDeadline {
@@ -670,7 +707,7 @@ pub fn inject_host_api<'js>(
         account,
         app_data_dir,
         app_version,
-        ProbeDeadline::none(),
+        ProbeNetwork { deadline: ProbeDeadline::none(), opencode_go_batch: None },
     )
 }
 
@@ -681,8 +718,9 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     account: Option<&ProviderAccountContext>,
     app_data_dir: &PathBuf,
     app_version: &str,
-    deadline: ProbeDeadline,
+    network: ProbeNetwork,
 ) -> rquickjs::Result<()> {
+    let ProbeNetwork { deadline, opencode_go_batch } = network;
     let globals = ctx.globals();
     let probe_ctx = Object::new(ctx.clone())?;
 
@@ -723,7 +761,7 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     inject_cursor_paths(ctx, &host, base_plugin_id)?;
     inject_crypto(ctx, &host)?;
     inject_env(ctx, &host, base_plugin_id)?;
-    inject_http(ctx, &host, instance_id, deadline)?;
+    inject_http(ctx, &host, instance_id, deadline, opencode_go_batch)?;
     inject_credentials(ctx, &host, account)?;
     inject_keychain(ctx, &host, instance_id)?;
     inject_sqlite(ctx, &host)?;
@@ -1353,6 +1391,7 @@ fn inject_http<'js>(
     host: &Object<'js>,
     plugin_id: &str,
     deadline: ProbeDeadline,
+    opencode_go_batch: Option<Arc<OpenCodeGoProbeBatch>>,
 ) -> rquickjs::Result<()> {
     let http_obj = Object::new(ctx.clone())?;
     let pid = plugin_id.to_string();
@@ -1370,6 +1409,23 @@ fn inject_http<'js>(
                     return Err(probe_timeout_error(&ctx_inner));
                 }
 
+                let slot = opencode_go_batch.as_ref().and_then(|batch| batch.response_slot(&req));
+                let mut slot = slot.as_ref().map(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()));
+                if deadline.has_elapsed() {
+                    return Err(probe_timeout_error(&ctx_inner));
+                }
+                if let Some(response) = slot.as_deref().and_then(Option::as_ref) {
+                    return match response {
+                        Ok(body) => Ok(body.clone()),
+                        Err(message) => Err(Exception::throw_message(&ctx_inner, message)),
+                    };
+                }
+                let mut finish = |result: Result<String, String>| {
+                    if let Some(slot) = slot.as_deref_mut() {
+                        *slot = Some(result.clone());
+                    }
+                    result.map_err(|message| Exception::throw_message(&ctx_inner, &message))
+                };
                 let method_str = req.method.as_deref().unwrap_or("GET");
                 let redacted_url = redact_url(&req.url);
                 log::info!("[plugin:{}] HTTP {} {}", pid, method_str, redacted_url);
@@ -1395,24 +1451,22 @@ fn inject_http<'js>(
                 }
 
                 #[cfg(test)]
-                {
-                    let lock = HTTP_MOCK_STATE.get_or_init(|| Mutex::new(None));
-                    let mut guard = lock.lock().unwrap();
-                    if let Some(state) = guard.as_mut() {
+                if let Some(resp) = HTTP_MOCK_STATE.with_borrow_mut(|state| {
+                    state.as_mut().map(|state| {
                         state.requests.push(CapturedHttpRequest {
                             url: req.url.clone(),
                             method: method_str.to_string(),
                             headers: req.headers.clone().unwrap_or_default(),
                             body_text: req.body_text.clone(),
                         });
-                        let resp = state.responses.pop_front().unwrap_or(HttpRespParams {
+                        state.responses.pop_front().unwrap_or(HttpRespParams {
                             status: 200,
                             headers: std::collections::HashMap::new(),
                             body_text: "{}".to_string(),
-                        });
-                        return serde_json::to_string(&resp)
-                            .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()));
-                    }
+                        })
+                    })
+                }) {
+                    return finish(serde_json::to_string(&resp).map_err(|e| e.to_string()));
                 }
 
                 let timeout_ms = req.timeout_ms.unwrap_or(10_000);
@@ -1453,9 +1507,10 @@ fn inject_http<'js>(
                     builder = builder.body(body);
                 }
 
-                let response = builder
-                    .send()
-                    .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))?;
+                let response = match builder.send() {
+                    Ok(response) => response,
+                    Err(e) => return finish(Err(e.to_string())),
+                };
 
                 let status = response.status().as_u16();
                 let mut resp_headers = std::collections::HashMap::new();
@@ -1468,9 +1523,10 @@ fn inject_http<'js>(
                     })?;
                     resp_headers.insert(key.to_string(), header_value.to_string());
                 }
-                let body = response
-                    .text()
-                    .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))?;
+                let body = match response.text() {
+                    Ok(body) => body,
+                    Err(e) => return finish(Err(e.to_string())),
+                };
 
                 // Redact BEFORE truncation to ensure sensitive values are caught while intact
                 let redacted_body = redact_body(&body);
@@ -1500,8 +1556,7 @@ fn inject_http<'js>(
                     body_text: body,
                 };
 
-                serde_json::to_string(&resp)
-                    .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))
+                finish(serde_json::to_string(&resp).map_err(|e| e.to_string()))
             },
         )?,
     )?;
@@ -1918,7 +1973,9 @@ struct HttpMockState {
 }
 
 #[cfg(test)]
-static HTTP_MOCK_STATE: OnceLock<Mutex<Option<HttpMockState>>> = OnceLock::new();
+thread_local! {
+    static HTTP_MOCK_STATE: RefCell<Option<HttpMockState>> = const { RefCell::new(None) };
+}
 
 #[cfg(test)]
 pub(crate) fn install_http_mock(responses: Vec<(u16, &str)>) {
@@ -1933,16 +1990,12 @@ pub(crate) fn install_http_mock(responses: Vec<(u16, &str)>) {
             .collect(),
         requests: Vec::new(),
     };
-    let lock = HTTP_MOCK_STATE.get_or_init(|| Mutex::new(None));
-    *lock.lock().unwrap() = Some(state);
+    HTTP_MOCK_STATE.set(Some(state));
 }
 
 #[cfg(test)]
 pub(crate) fn take_http_mock_requests() -> Vec<CapturedHttpRequest> {
-    let lock = HTTP_MOCK_STATE.get_or_init(|| Mutex::new(None));
-    lock.lock()
-        .unwrap()
-        .take()
+    HTTP_MOCK_STATE.take()
         .map(|state| state.requests)
         .unwrap_or_default()
 }

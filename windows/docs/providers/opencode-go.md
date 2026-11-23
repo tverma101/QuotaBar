@@ -7,6 +7,7 @@
 - **Provider ID:** `opencode-go`
 - **Auth:** `~/.local/share/opencode/auth.json` (`opencode-go` entry `key`) or a Settings provider-account API key
 - **Account meters:** `GET https://opencode.ai/zen/go/v1/usage` (`Authorization: Bearer <key>`)
+- **Duplicate keys:** If local sign-in and one or more configured accounts use the same key, they share one meter request per refresh. Account labels stay intact, and local history is still counted only on the base card.
 - **Local fallback:** Assistant usage from every `opencode*.db` in `OPENCODE_DATA_DIR`, `XDG_DATA_HOME/opencode` or `~/.local/share/opencode` (in that order).
 
 ## Detection
