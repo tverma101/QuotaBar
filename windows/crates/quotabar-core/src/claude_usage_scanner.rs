@@ -260,7 +260,7 @@ fn parse_file(path: &Path) -> Vec<ClaudeEntry> {
             return vec![];
         }
     };
-    let marker = br#""usage":{"#;
+    let marker = br#""usage""#;
     let mut entries = Vec::new();
     for line in data.split(|&b| b == b'\n') {
         if !line.windows(marker.len()).any(|w| w == marker) {
@@ -276,6 +276,9 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
     let Ok(v) = serde_json::from_slice::<Value>(line) else {
         return vec![];
     };
+    if v.get("type").is_some_and(|kind| kind.as_str() != Some("assistant")) {
+        return vec![];
+    }
     let Some(timestamp_raw) = v.get("timestamp").and_then(|t| t.as_str()) else {
         return vec![];
     };
@@ -288,9 +291,6 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
     let Some(usage) = message.get("usage") else {
         return vec![];
     };
-    if has_unsupported_null_field(&v, message, usage) {
-        return vec![];
-    }
     let Some((tokens, has_speed)) = token_breakdown(usage) else {
         return vec![];
     };
@@ -314,7 +314,13 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
         .get("isSidechain")
         .and_then(|b| b.as_bool())
         .unwrap_or(false);
-    let cost_usd = v.get("costUSD").and_then(|c| c.as_f64());
+    let cost_usd = match v.get("costUSD").filter(|c| !c.is_null()) {
+        Some(value) => match value.as_f64().filter(|cost| (0.0..=1e12).contains(cost)) {
+            Some(cost) => Some(cost),
+            None => return vec![],
+        },
+        None => None,
+    };
 
     let parent = ClaudeEntry {
         timestamp,
@@ -337,13 +343,12 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
         if iteration.get("type").and_then(|t| t.as_str()) != Some("advisor_message") {
             continue;
         }
-        let Some(advisor_model) = iteration
+        let advisor_model = iteration
             .get("model")
             .and_then(|m| m.as_str())
+            .map(str::trim)
             .filter(|m| !m.is_empty())
-        else {
-            continue;
-        };
+            .map(str::to_string);
         let Some((advisor_tokens, advisor_has_speed)) = token_breakdown(iteration) else {
             continue;
         };
@@ -357,7 +362,7 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
             is_sidechain,
             has_speed: advisor_has_speed,
             cost_usd: None,
-            model: Some(advisor_model.to_string()),
+            model: advisor_model,
         });
         advisor_index += 1;
     }
@@ -365,30 +370,21 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
 }
 
 fn token_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
-    let input_v = usage.get("input_tokens")?;
-    let output_v = usage.get("output_tokens")?;
-    if input_v.as_i64().is_none() && input_v.as_f64().is_none() {
-        return None;
-    }
-    if output_v.as_i64().is_none() && output_v.as_f64().is_none() {
-        return None;
-    }
-    let input = crate::log_usage_types::bounded_token_json(Some(input_v));
-    let output = crate::log_usage_types::bounded_token_json(Some(output_v));
-    let speed = usage.get("speed").and_then(|s| s.as_str());
-    if let Some(s) = speed {
-        if s != "fast" && s != "standard" {
-            return None;
-        }
-    }
-    let (cache_write5m, cache_write1h) = if let Some(cache_creation) = usage.get("cache_creation") {
+    let input = nonnegative_token_count(usage.get("input_tokens")?)?;
+    let output = nonnegative_token_count(usage.get("output_tokens")?)?;
+    let speed = match usage.get("speed").filter(|s| !s.is_null()) {
+        Some(value) => Some(value.as_str().filter(|s| matches!(*s, "fast" | "standard"))?),
+        None => None,
+    };
+    let (cache_write5m, cache_write1h) = if let Some(cache_creation) = usage.get("cache_creation").filter(|c| !c.is_null()) {
+        let cache_creation = cache_creation.as_object()?;
         (
-            crate::log_usage_types::bounded_token_json(cache_creation.get("ephemeral_5m_input_tokens")),
-            crate::log_usage_types::bounded_token_json(cache_creation.get("ephemeral_1h_input_tokens")),
+            optional_token_count(cache_creation.get("ephemeral_5m_input_tokens"))?,
+            optional_token_count(cache_creation.get("ephemeral_1h_input_tokens"))?,
         )
     } else {
         (
-            crate::log_usage_types::bounded_token_json(usage.get("cache_creation_input_tokens")),
+            optional_token_count(usage.get("cache_creation_input_tokens"))?,
             0,
         )
     };
@@ -397,7 +393,7 @@ fn token_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
             input,
             cache_write5m,
             cache_write1h,
-            cache_read: crate::log_usage_types::bounded_token_json(usage.get("cache_read_input_tokens")),
+            cache_read: optional_token_count(usage.get("cache_read_input_tokens"))?,
             output,
             is_fast: speed == Some("fast"),
         },
@@ -405,27 +401,34 @@ fn token_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
     ))
 }
 
+fn nonnegative_token_count(value: &Value) -> Option<i32> {
+    let count = value.as_f64()?;
+    if !(0.0..=1e15).contains(&count) || count.fract() != 0.0 {
+        return None;
+    }
+    Some(count as i32)
+}
+
+fn optional_token_count(value: Option<&Value>) -> Option<i32> {
+    match value.filter(|v| !v.is_null()) {
+        Some(value) => nonnegative_token_count(value),
+        None => Some(0),
+    }
+}
+
 fn is_valid_entry(object: &Value, message: &Value) -> bool {
-    if let Some(version) = object.get("version").and_then(|v| v.as_str()) {
-        if !is_semver_prefix(version) {
+    if let Some(version) = object.get("version") {
+        if !version.as_str().is_some_and(is_semver_prefix) {
             return false;
         }
     }
-    for key in ["sessionId", "requestId"] {
-        if let Some(text) = object.get(key).and_then(|v| v.as_str()) {
-            if text.is_empty() {
-                return false;
-            }
+    for value in [object.get("sessionId"), object.get("requestId"), message.get("id")].into_iter().flatten() {
+        if !value.as_str().is_some_and(|text| !text.is_empty()) {
+            return false;
         }
     }
-    for key in ["id", "model"] {
-        if let Some(text) = message.get(key).and_then(|v| v.as_str()) {
-            if text.is_empty() {
-                return false;
-            }
-        }
-    }
-    true
+    !object.get("isSidechain").is_some_and(|v| !v.is_boolean())
+        && !message.get("model").is_some_and(|v| !v.as_str().is_some_and(|s| !s.trim().is_empty()))
 }
 
 fn is_semver_prefix(value: &str) -> bool {
@@ -437,27 +440,6 @@ fn is_semver_prefix(value: &str) -> bool {
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_digit())
-}
-
-fn has_unsupported_null_field(object: &Value, message: &Value, usage: &Value) -> bool {
-    const OBJECT_FIELDS: &[&str] = &[
-        "cwd",
-        "costUSD",
-        "version",
-        "sessionId",
-        "requestId",
-        "isApiErrorMessage",
-    ];
-    const MESSAGE_FIELDS: &[&str] = &["id", "model"];
-    const USAGE_FIELDS: &[&str] = &[
-        "speed",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-    ];
-    let is_null = |container: &Value, field: &str| matches!(container.get(field), Some(Value::Null));
-    OBJECT_FIELDS.iter().any(|f| is_null(object, f))
-        || MESSAGE_FIELDS.iter().any(|f| is_null(message, f))
-        || USAGE_FIELDS.iter().any(|f| is_null(usage, f))
 }
 
 pub fn parse_iso_timestamp(raw: &str) -> Option<DateTime<Utc>> {
@@ -519,19 +501,24 @@ fn should_replace(candidate: &ClaudeEntry, existing: &ClaudeEntry) -> bool {
     if candidate.is_sidechain != existing.is_sidechain {
         return existing.is_sidechain;
     }
-    let ct = candidate.tokens.total_tokens();
-    let et = existing.tokens.total_tokens();
+    let ct = total_tokens(&candidate.tokens);
+    let et = total_tokens(&existing.tokens);
     if ct != et {
         return ct > et;
     }
     candidate.has_speed && !existing.has_speed
 }
 
+fn total_tokens(tokens: &TokenBreakdown) -> i32 {
+    [tokens.input, tokens.cache_write5m, tokens.cache_write1h, tokens.cache_read, tokens.output]
+        .into_iter()
+        .fold(0, i32::saturating_add)
+}
+
 fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPricing) -> Vec<DailyUsageRow> {
     let mut tokens_by_day: BTreeMap<String, i32> = BTreeMap::new();
     let mut cost_by_day: BTreeMap<String, f64> = BTreeMap::new();
-    let mut priced_days: HashSet<String> = HashSet::new();
-    let mut models_by_day: BTreeMap<String, BTreeMap<String, (i32, f64)>> = BTreeMap::new();
+    let mut models_by_day: BTreeMap<String, BTreeMap<String, (i32, Option<f64>)>> = BTreeMap::new();
     let mut input_by_day: BTreeMap<String, i32> = BTreeMap::new();
     let mut output_by_day: BTreeMap<String, i32> = BTreeMap::new();
     let mut cache_create_by_day: BTreeMap<String, i32> = BTreeMap::new();
@@ -542,38 +529,33 @@ fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPrici
             continue;
         }
         let day = local_day_key_from_offset(&entry.timestamp);
-        let model_name = entry
+        let model = entry
             .model
             .as_deref()
             .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .unwrap_or("unattributed");
+            .filter(|m| !m.is_empty());
+        let cost = entry.cost_usd.or_else(|| {
+            model.and_then(|m| pricing.estimated_cost_dollars(m, &entry.tokens))
+        });
 
-        let cost = if let Some(carried) = entry.cost_usd {
-            carried
-        } else if let Some(model) = entry.model.as_deref().filter(|m| !m.trim().is_empty()) {
-            match pricing.estimated_cost_dollars(model, &entry.tokens) {
-                Some(c) => c,
-                None => continue,
-            }
-        } else {
-            continue;
+        let total = total_tokens(&entry.tokens);
+        let add_tokens = |days: &mut BTreeMap<String, i32>, count| {
+            let value = days.entry(day.clone()).or_default();
+            *value = value.saturating_add(count);
         };
-
-        let total = entry.tokens.total_tokens();
-        *tokens_by_day.entry(day.clone()).or_default() += total;
-        *cost_by_day.entry(day.clone()).or_default() += cost;
-        priced_days.insert(day.clone());
-        *input_by_day.entry(day.clone()).or_default() += entry.tokens.input;
-        *output_by_day.entry(day.clone()).or_default() += entry.tokens.output;
-        *cache_create_by_day.entry(day.clone()).or_default() +=
-            entry.tokens.cache_write5m + entry.tokens.cache_write1h;
-        *cache_read_by_day.entry(day.clone()).or_default() += entry.tokens.cache_read;
+        add_tokens(&mut tokens_by_day, total);
+        add_tokens(&mut input_by_day, entry.tokens.input);
+        add_tokens(&mut output_by_day, entry.tokens.output);
+        add_tokens(&mut cache_create_by_day, entry.tokens.cache_write5m.saturating_add(entry.tokens.cache_write1h));
+        add_tokens(&mut cache_read_by_day, entry.tokens.cache_read);
 
         let slot = models_by_day.entry(day.clone()).or_default();
-        let e = slot.entry(model_name.to_string()).or_insert((0, 0.0));
-        e.0 += total;
-        e.1 += cost;
+        let (tokens, model_cost) = slot.entry(model.unwrap_or("Unattributed").to_string()).or_default();
+        *tokens = tokens.saturating_add(total);
+        if let Some(cost) = cost {
+            *cost_by_day.entry(day).or_default() += cost;
+            *model_cost = Some(model_cost.unwrap_or_default() + cost);
+        }
     }
 
     tokens_by_day
@@ -581,11 +563,7 @@ fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPrici
         .rev()
         .cloned()
         .map(|day| {
-            let total_cost = if priced_days.contains(&day) {
-                cost_by_day.get(&day).copied()
-            } else {
-                None
-            };
+            let total_cost = cost_by_day.get(&day).copied();
             let models: BTreeMap<String, ModelDayUsage> = models_by_day
                 .get(&day)
                 .map(|m| {
@@ -599,7 +577,7 @@ fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPrici
                                     cache_creation_tokens: 0,
                                     cache_read_tokens: 0,
                                     total_tokens: *tokens,
-                                    total_cost: Some(*cost),
+                                    total_cost: *cost,
                                 },
                             )
                         })
@@ -660,17 +638,39 @@ mod tests {
     }
 
     #[test]
-    fn nested_iteration_null_model_does_not_drop_parent() {
+    fn nested_iteration_null_model_counts_unattributed_tokens_without_cost() {
         let line = br#"{"timestamp":"2026-07-12T10:00:00.000Z","message":{"id":"m1","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":50,"iterations":[{"type":"advisor_message","model":null,"input_tokens":10,"output_tokens":5}]}},"requestId":"r1","version":"1.0.0"}"#;
         let entries = parse_entries(line);
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].tokens.input, 100);
         assert_eq!(entries[0].model.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(entries[1].model, None);
+        let rows = aggregate(&entries, entries[0].timestamp, default_pricing());
+        assert_eq!(rows[0].total_tokens, 165);
+        assert_eq!(rows[0].models["Unattributed"].total_tokens, 15);
+        assert_eq!(rows[0].models["Unattributed"].total_cost, None);
     }
 
     #[test]
     fn top_level_null_model_is_still_rejected() {
         let line = br#"{"timestamp":"2026-07-12T10:00:00.000Z","message":{"id":"m1","model":null,"usage":{"input_tokens":100,"output_tokens":50}},"requestId":"r1","version":"1.0.0"}"#;
         assert!(parse_entries(line).is_empty());
+    }
+
+    #[test]
+    fn folds_nullable_assistant_rows_without_counting_tool_results_or_invalid_counts() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        let usage = r#"{"type":"assistant","timestamp":"2026-02-20T12:00:00Z","costUSD":null,"message":{"usage" : {"input_tokens":10,"output_tokens":2,"cache_creation":null,"cache_creation_input_tokens":3,"cache_read_input_tokens":null,"speed":null}}}"#;
+        let tool_result = r#"{"type":"user","timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":999,"output_tokens":999}}}"#;
+        let invalid = r#"{"type":"assistant","timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":-1,"output_tokens":2}}}"#;
+        fs::write(&log, [usage, tool_result, invalid].join("\n")).unwrap();
+
+        let entries = parse_file(&log);
+        assert_eq!(entries.len(), 1);
+        let rows = aggregate(&entries, entries[0].timestamp, default_pricing());
+        assert_eq!(rows[0].total_tokens, 15);
+        assert_eq!(rows[0].cache_creation_tokens, 3);
+        assert_eq!(rows[0].total_cost, None);
     }
 }
