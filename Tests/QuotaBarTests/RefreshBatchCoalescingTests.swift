@@ -265,13 +265,19 @@ final class RefreshBatchCoalescingTests: XCTestCase {
             sample: WidgetData(title: "Weekly", icon: provider.icon, kind: .percent, used: 0, limit: 100)
         )
         let runtime = SuspendableRuntime(provider: provider, descriptors: [descriptor], gate: gate)
-        let store = makeStore(runtime: runtime)
+        var batchStarts = 0
+        let store = makeStore(runtime: runtime, isOverSoftMemoryLimit: {
+            batchStarts += 1
+            return false
+        })
 
         // A non-forced batch in flight, then a forced caller. The forced one must run its own pass.
         async let background: Void = store.refreshAll(force: false)
-        await Task.yield()
+        await runtime.waitForEntries(1)
         async let forced: Void = store.refreshAll(force: true)
 
+        // The batch's memory check runs after the coalescing decision, before provider work.
+        await waitUntil({ batchStarts == 2 }, timeout: .seconds(5), "forced batch started")
         gate.openGate()
         _ = await (background, forced)
 
@@ -283,7 +289,10 @@ final class RefreshBatchCoalescingTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeStore(runtime: some ProviderRuntime) -> WidgetDataStore {
+    private func makeStore(
+        runtime: some ProviderRuntime,
+        isOverSoftMemoryLimit: @escaping () -> Bool = { ProcessMemoryBudget.isOverSoftLimit }
+    ) -> WidgetDataStore {
         let suiteName = "OpenUsageTests.BatchCoalescing.\(UUID().uuidString)"
         let suite = UserDefaults(suiteName: suiteName)!
         suite.removePersistentDomain(forName: suiteName)
@@ -294,7 +303,8 @@ final class RefreshBatchCoalescingTests: XCTestCase {
             ),
             providers: [runtime],
             cache: ProviderSnapshotCache(userDefaults: suite, storageKey: "snapshots", ttl: 600),
-            defaults: suite
+            defaults: suite,
+            isOverSoftMemoryLimit: isOverSoftMemoryLimit
         )
     }
 
