@@ -115,6 +115,40 @@ describe("codex plugin", () => {
     expect(usedDefaultFileToken(ctx)).toBe(true)
   })
 
+  const resetRequest = {
+    expiresAtIso: "2030-01-01T00:00:00Z",
+    redeemRequestId: "test-request",
+  }
+
+  it.each([null, { accessToken: "work-token" }])(
+    "does not use default credentials to claim credits for a disconnected extra account (%j)",
+    async (credential) => {
+      const ctx = makeAccountCtx({ instanceId: "codex:work", credential })
+      const plugin = await loadPlugin()
+      expect(plugin.claimResetCredit(ctx, resetRequest)).toBe("failed")
+      expect(usedDefaultFileToken(ctx)).toBe(false)
+      expect(ctx.host.keychain.readGenericPassword).not.toHaveBeenCalled()
+      expect(ctx.host.http.request.mock.calls.every(([opts]) => opts.method === "GET")).toBe(true)
+    }
+  )
+
+  it("never retries a consume request with a token that did not list the credit", async () => {
+    const ctx = makeAccountCtx({ instanceId: "codex", credential: { accessToken: "selected-token" } })
+    ctx.host.http.request.mockImplementation((opts) => {
+      if (opts.method === "GET" && opts.headers.Authorization === "Bearer selected-token") {
+        return {
+          status: 200,
+          bodyText: JSON.stringify({ credits: [{ id: "credit", expires_at: resetRequest.expiresAtIso }] }),
+        }
+      }
+      return { status: 403, bodyText: "" }
+    })
+    const plugin = await loadPlugin()
+    expect(plugin.claimResetCredit(ctx, resetRequest)).toBe("failed")
+    const requests = ctx.host.http.request.mock.calls.map(([opts]) => [opts.method, opts.headers.Authorization])
+    expect(requests).toEqual([["GET", "Bearer selected-token"], ["POST", "Bearer selected-token"]])
+  })
+
   it("throws when auth missing", async () => {
     const ctx = makeCtx()
     const plugin = await loadPlugin()

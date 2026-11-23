@@ -88,6 +88,8 @@ totals. A changed file list, file revision, pricing list, day window, time zone,
 rebuilds the fold. Incomplete reads keep the previous history and show a history warning.
 Optional null fields in current Claude logs are treated as absent. Attachment and tool-result
 usage objects do not count as assistant usage or block the scan; invalid token counts still do.
+The Windows scanner also counts advisor tokens without a known model under **Unattributed**;
+it does not estimate a cost for those tokens.
 
 Growing session files keep a small, bounded append cache so the next refresh reads their new bytes.
 Detected replacements, truncations, and rewrites are parsed again. Incomplete final lines are retried

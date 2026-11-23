@@ -424,6 +424,8 @@
         accountId: providerAuth.auth.tokens.account_id || null,
       })
     }
+    if (isExtraAccountInstance(ctx)) return out
+
     const fileAuth = loadFileAuthCandidates(ctx)
     for (let i = 0; i < fileAuth.candidates.length; i++) {
       const auth = fileAuth.candidates[i].auth
@@ -461,8 +463,6 @@
       return "failed"
     }
 
-    let creditId = null
-    let preferred = candidates
     let lastFailure = "no credential candidate authenticated"
     for (let i = 0; i < candidates.length; i++) {
       const creds = candidates[i]
@@ -486,21 +486,9 @@
         ctx.host.log.error("reset claim: credit list body invalid")
         return "failed"
       }
-      creditId = creditIdForExpiry(body, expiryMs)
+      const creditId = creditIdForExpiry(body, expiryMs)
       if (!creditId) return "no_credit"
-      preferred = [creds].concat(candidates.filter(function (c) {
-        return c.accessToken !== creds.accessToken || c.accountId !== creds.accountId
-      }))
-      break
-    }
-    if (!creditId) {
-      ctx.host.log.error("reset claim: " + lastFailure)
-      return "failed"
-    }
 
-    let lastRejection = null
-    for (let j = 0; j < preferred.length; j++) {
-      const creds = preferred[j]
       let resp
       try {
         resp = consumeResetCredit(ctx, creds.accessToken, creds.accountId, creditId, redeemRequestId)
@@ -508,17 +496,13 @@
         ctx.host.log.error("reset claim: consume request failed: " + String(e))
         return "failed"
       }
-      if (resp.status === 401 || resp.status === 403) {
-        lastRejection = resp.status
-        continue
-      }
       const outcome = outcomeFromConsume(resp.status, resp.bodyText)
       if (outcome === "failed") {
         ctx.host.log.error("reset claim: consume failed (" + resp.status + ")")
       }
       return outcome
     }
-    ctx.host.log.error("reset claim: consume rejected for every credential (last: " + (lastRejection || "none") + ")")
+    ctx.host.log.error("reset claim: " + lastFailure)
     return "failed"
   }
 
