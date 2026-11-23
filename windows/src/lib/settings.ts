@@ -93,6 +93,7 @@ const LEGACY_TRAY_SHOW_PERCENTAGE_KEY = "trayShowPercentage";
 const GLOBAL_SHORTCUT_KEY = "globalShortcut";
 const START_ON_LOGIN_KEY = "startOnLogin";
 const START_HIDDEN_KEY = "startHidden";
+const HIDE_FROM_SCREEN_SHARE_KEY = "hideFromScreenShare";
 export const USAGE_ALERT_ENABLED_KEY = "usageAlertEnabled";
 export const USAGE_ALERT_THRESHOLD_KEY = "usageAlertThreshold";
 export const USAGE_ALERT_CUSTOM_THRESHOLD_KEY = "usageAlertCustomThreshold";
@@ -899,6 +900,15 @@ export async function saveStartHidden(value: boolean): Promise<void> {
   await store.save();
 }
 
+export async function loadHideFromScreenShare(): Promise<boolean> {
+  return (await store.get<unknown>(HIDE_FROM_SCREEN_SHARE_KEY)) === true;
+}
+
+export async function saveHideFromScreenShare(value: boolean): Promise<void> {
+  await store.set(HIDE_FROM_SCREEN_SHARE_KEY, value);
+  await store.save();
+}
+
 export function isUsageAlertThreshold(value: unknown): value is UsageAlertThreshold {
   return value === "custom" || (typeof value === "number" && [10, 20, 30].includes(value));
 }
@@ -1290,6 +1300,7 @@ export async function resetAllUserPreferences(): Promise<void> {
   await store.set(MODERN_DENSITY_KEY, DEFAULT_MODERN_DENSITY);
   await store.set(MODERN_LAYOUT_KEY, EMPTY_MODERN_LAYOUT);
   await store.set(PERSIST_USAGE_HISTORY_KEY, false);
+  await store.set(HIDE_FROM_SCREEN_SHARE_KEY, false);
   await store.set(USAGE_HISTORY_RETENTION_DAYS_KEY, DEFAULT_USAGE_HISTORY_RETENTION_DAYS);
   await store.set(PRODUCT_POLLS_ENABLED_KEY, DEFAULT_PRODUCT_POLLS_ENABLED);
   await store.save();

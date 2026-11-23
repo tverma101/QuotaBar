@@ -1,9 +1,14 @@
-import { useCallback, useRef } from "react"
+import { useCallback, useEffect, useRef } from "react"
 import { convertFileSrc } from "@tauri-apps/api/core"
 import type { PluginOutput } from "@/lib/plugin-types"
 import { calculatePaceStatus, stableResetKeyMs } from "@/lib/pace-status"
 import { sendNotificationAsync } from "@/lib/notification"
 import { resolvePrimaryProgressLine } from "@/lib/primary-progress-line"
+import {
+  createUsageAlertBatcher,
+  type GroupedUsageAlert,
+  type UsageAlertEvent,
+} from "@/lib/usage-alert-group"
 import { useAppPluginStore } from "@/stores/app-plugin-store"
 import { useAppPreferencesStore } from "@/stores/app-preferences-store"
 
@@ -22,17 +27,20 @@ export function useUsageAlert() {
   const lowRemainingNotifiedRef = useRef<Record<string, boolean>>({})
   const paceNotifiedRef = useRef<Record<string, boolean>>({})
 
-  const sendAlert = useCallback(
-    (providerId: string, _displayName: string, body: string) => {
-      const meta = pluginsMeta.find((plugin) => plugin.id === providerId)
-      const iconFilePath = meta?.iconFilePath
+  const deliver = useCallback(
+    (alert: GroupedUsageAlert) => {
+      const iconFilePath =
+        alert.providerIds.length === 1
+          ? pluginsMeta.find((plugin) => plugin.id === alert.providerIds[0])?.iconFilePath
+          : undefined
 
       void sendNotificationAsync({
-        title: "Usage Alert",
-        body,
+        title: alert.title,
+        subtitle: alert.subtitle,
+        body: alert.body,
         sound: usageAlertSound,
         ...(iconFilePath
-          ? { attachments: [{ id: "icon", url: convertFileSrc(iconFilePath) }] }
+          ? { iconPath: iconFilePath, attachments: [{ id: "icon", url: convertFileSrc(iconFilePath) }] }
           : {}),
       }).catch((error) => {
         console.error("Failed to send usage alert notification:", error)
@@ -40,6 +48,18 @@ export function useUsageAlert() {
     },
     [pluginsMeta, usageAlertSound],
   )
+
+  const deliverRef = useRef(deliver)
+  deliverRef.current = deliver
+  const batcherRef = useRef<ReturnType<typeof createUsageAlertBatcher> | null>(null)
+  if (batcherRef.current == null) {
+    batcherRef.current = createUsageAlertBatcher((alert) => deliverRef.current(alert))
+  }
+  useEffect(() => () => batcherRef.current?.flush(), [])
+
+  const sendAlert = useCallback((event: UsageAlertEvent) => {
+    batcherRef.current?.add(event)
+  }, [])
 
   const checkUsageAlert = useCallback(
     (output: PluginOutput) => {
@@ -76,11 +96,14 @@ export function useUsageAlert() {
             lowRemainingNotifiedRef.current[instanceId] = false
           } else if (!lowRemainingNotifiedRef.current[instanceId]) {
             lowRemainingNotifiedRef.current[instanceId] = true
-            sendAlert(
-              instanceId,
-              displayName,
-              `Less than ${effectiveThreshold}% remaining on ${displayName} (${lineLabel})`,
-            )
+            sendAlert({
+              key: `${instanceId}:${lineLabel}:lowRemaining`,
+              kind: "lowRemaining",
+              providerId: instanceId,
+              providerName: displayName,
+              metricLabel: lineLabel,
+              body: `Under ${effectiveThreshold}% usage remaining for this window.`,
+            })
           }
         }
 
@@ -106,11 +129,14 @@ export function useUsageAlert() {
               paceNotifiedRef.current[paceKey] = false
             } else if (!paceNotifiedRef.current[paceKey]) {
               paceNotifiedRef.current[paceKey] = true
-              sendAlert(
-                instanceId,
-                displayName,
-                `${displayName} (${lineLabel}) — projected to run out before reset`,
-              )
+              sendAlert({
+                key: paceKey,
+                kind: "pace",
+                providerId: instanceId,
+                providerName: displayName,
+                metricLabel: lineLabel,
+                body: "Projected to finish before the limit resets.",
+              })
             }
           }
         }

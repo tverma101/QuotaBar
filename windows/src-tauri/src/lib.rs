@@ -18,6 +18,10 @@ mod support_bundle;
 mod usage_alert_sound;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod popover_platform;
+#[cfg(target_os = "windows")]
+mod notification_windows;
+#[cfg(any(target_os = "windows", test))]
+mod popover_geometry;
 mod tray;
 #[cfg(target_os = "linux")]
 mod tray_linux;
@@ -324,14 +328,7 @@ fn hide_panel(app_handle: tauri::AppHandle) {
         }
     }
     #[cfg(target_os = "windows")]
-    {
-        use tauri::Manager;
-        if let Some(window) = app_handle.get_webview_window("main") {
-            window
-                .hide()
-                .unwrap_or_else(|e| log::warn!("Failed to hide window: {}", e));
-        }
-    }
+    panel_windows::hide_panel(&app_handle);
 }
 
 #[tauri::command]
@@ -342,35 +339,71 @@ fn quit_app(app_handle: tauri::AppHandle) {
 /// Resize the popover window to the content height the frontend measured, then re-anchor
 /// it to the tray so its bottom edge stays flush above the taskbar (macOS-style sizing).
 #[tauri::command]
-fn resize_panel(app_handle: tauri::AppHandle, height: f64) {
+fn resize_panel(app_handle: tauri::AppHandle, height: f64) -> Option<f64> {
     use tauri::Manager;
 
     let Some(window) = app_handle.get_webview_window("main") else {
-        return;
+        return None;
     };
 
     if !height.is_finite() {
-        return;
+        return None;
     }
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let max = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .map(|m| (f64::from(m.work_area().size.height) / scale * 0.76).floor())
-        .unwrap_or(720.0);
-    let size = tauri::LogicalSize::new(400.0, height.round().clamp(300.0, max.max(300.0)));
-    if window.inner_size().ok() == Some(size.to_physical::<u32>(scale)) {
-        return;
-    }
-    if let Err(error) = window.set_size(size) {
-        log::warn!("Cannot size the QuotaBar window: {error}");
-        return;
-    }
-
     #[cfg(target_os = "windows")]
-    if window.is_visible().unwrap_or(false) {
-        popover_platform::move_main_near_tray(&app_handle);
+    {
+        popover_platform::place_windows_panel(&app_handle, &window, Some(height))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let max = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .map(|m| (f64::from(m.work_area().size.height) / scale * 0.76).floor())
+            .unwrap_or(720.0);
+        let size = tauri::LogicalSize::new(400.0, height.round().clamp(300.0, max.max(300.0)));
+        if window.inner_size().ok() != Some(size.to_physical::<u32>(scale)) {
+            if let Err(error) = window.set_size(size) {
+                log::warn!("Cannot size the QuotaBar window: {error}");
+            }
+        }
+        Some(max.max(300.0))
+    }
+}
+
+/// Hide From Screen Share (Windows): exclude QuotaBar's windows from capture.
+#[tauri::command]
+#[allow(unused_variables)]
+fn set_hide_from_screen_share(app_handle: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    return panel_windows::set_capture_excluded(&app_handle, enabled);
+    #[cfg(not(target_os = "windows"))]
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+const HIDE_FROM_SCREEN_SHARE_STORE_KEY: &str = "hideFromScreenShare";
+
+/// Apply the persisted Hide From Screen Share setting before the panel is first shown.
+#[cfg(target_os = "windows")]
+fn apply_stored_screen_share_protection(app: &tauri::AppHandle) {
+    use tauri_plugin_store::StoreExt;
+
+    let enabled = match app.store("settings.json") {
+        Ok(store) => matches!(
+            store.get(HIDE_FROM_SCREEN_SHARE_STORE_KEY),
+            Some(serde_json::Value::Bool(true))
+        ),
+        Err(error) => {
+            log::warn!("hideFromScreenShare: settings store unavailable ({error})");
+            false
+        }
+    };
+    if enabled {
+        if let Err(error) = panel_windows::set_capture_excluded(app, true) {
+            log::error!("hideFromScreenShare: {error}");
+        }
     }
 }
 
@@ -1372,7 +1405,15 @@ fn list_plugins(state: tauri::State<'_, Mutex<AppState>>) -> Vec<PluginMeta> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Must be the first plugin: a second launch hands off to the running instance
+    // (per-user named mutex + IPC) and exits before anything else starts.
+    #[cfg(target_os = "windows")]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        log::info!("second instance launched; activating the running QuotaBar");
+        panel::show_panel(app);
+    }));
+    let builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -1432,7 +1473,10 @@ pub fn run() {
             get_os_diagnostics,
             update_tray_usage_summary,
             set_tray_restart_label,
-            update_global_shortcut
+            update_global_shortcut,
+            set_hide_from_screen_share,
+            #[cfg(target_os = "windows")]
+            notification_windows::post_usage_notification
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -1491,6 +1535,8 @@ pub fn run() {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             {
                 panel::init(app.handle())?;
+                #[cfg(target_os = "windows")]
+                apply_stored_screen_share_protection(app.handle());
                 if should_show_main_window_on_launch(load_start_hidden(app.handle())) {
                     panel::show_panel(app.handle());
                 } else {

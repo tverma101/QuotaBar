@@ -41,6 +41,7 @@ import {
   loadResetTimerDisplayMode,
   loadShowAccountIdentity,
   loadStartHidden,
+  loadHideFromScreenShare,
   loadStartOnLogin,
   loadTimeFormatMode,
   loadUsageAlertCustomThreshold,
@@ -70,6 +71,7 @@ import {
   saveResetTimerDisplayMode,
   saveShowAccountIdentity,
   saveStartHidden,
+  saveHideFromScreenShare,
   saveStartOnLogin,
   saveTimeFormatMode,
   saveThemeMode,
@@ -959,8 +961,11 @@ describe("settings", () => {
       await saveProductPollsInstallId("install-keep")
       await saveProductPollsAnswered({ "poll-1": "opt-a" })
       await saveStartHidden(true)
+      await saveHideFromScreenShare(true)
 
       await resetAllUserPreferences()
+
+      await expect(loadHideFromScreenShare()).resolves.toBe(false)
 
       await expect(loadThemeMode()).resolves.toBe(DEFAULT_THEME_MODE)
       await expect(loadStartHidden()).resolves.toBe(DEFAULT_START_HIDDEN)
