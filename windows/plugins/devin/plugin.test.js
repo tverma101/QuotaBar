@@ -432,6 +432,25 @@ describe("devin plugin", () => {
     expect(result.lines.find((line) => line.label === "Weekly quota")?.used).toBe(100)
   })
 
+  it.each([false, true])("preserves an exhausted weekly window with a stale reset (hideDailyQuota=%s)", async (hideDailyQuota) => {
+    const ctx = makeCtx()
+    ctx.host.fs.writeText(CREDENTIALS_PATH, makeCredentialsToml())
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify(makeQuotaResponse({
+        planInfo: { hideDailyQuota },
+        dailyQuotaRemainingPercent: 75,
+        weeklyQuotaRemainingPercent: undefined,
+        weeklyQuotaResetAtUnix: "1",
+      })),
+    })
+
+    const plugin = await loadPlugin()
+    const weekly = plugin.probe(ctx).lines.find((line) => line.label === "Weekly quota")
+    expect(weekly?.used).toBe(100)
+    expect(weekly).not.toHaveProperty("resetsAt")
+  })
+
   it("throws quota unavailable when weekly remaining is present but unparsable", async () => {
     const ctx = makeCtx()
     ctx.host.fs.writeText(CREDENTIALS_PATH, makeCredentialsToml())
