@@ -1300,6 +1300,7 @@ export async function resetAllUserPreferences(): Promise<void> {
   await store.set(MODERN_DENSITY_KEY, DEFAULT_MODERN_DENSITY);
   await store.set(MODERN_LAYOUT_KEY, EMPTY_MODERN_LAYOUT);
   await store.set(PERSIST_USAGE_HISTORY_KEY, false);
+  await store.set(HIDE_FROM_SCREEN_SHARE_KEY, false);
   await store.set(USAGE_HISTORY_RETENTION_DAYS_KEY, DEFAULT_USAGE_HISTORY_RETENTION_DAYS);
   await store.set(PRODUCT_POLLS_ENABLED_KEY, DEFAULT_PRODUCT_POLLS_ENABLED);
   await store.save();

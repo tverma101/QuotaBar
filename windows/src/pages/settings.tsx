@@ -777,6 +777,11 @@ function ResetAllSettingsSection({ onResetComplete }: { onResetComplete: () => v
         } catch (e) {
           console.error("update global shortcut after reset:", e);
         }
+        try {
+          await invoke("set_hide_from_screen_share", { enabled: false });
+        } catch (e) {
+          console.error("clear Hide From Screen Share after reset:", e);
+        }
       }
       await hydrateModernLayoutStore();
       if (isTauri() && !DEFAULT_START_ON_LOGIN) {
