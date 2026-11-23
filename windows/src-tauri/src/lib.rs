@@ -1160,7 +1160,10 @@ async fn list_usage_daily(
     let (dir, providers) = {
         let locked = state.lock().map_err(|e| e.to_string())?;
         let providers = locked.plugins.iter()
-            .filter(|p| matches!(p.manifest.id.as_str(), "antigravity" | "opencode" | "zai" | "claude" | "codex"))
+            .filter(|p| matches!(
+                p.manifest.id.as_str(),
+                "antigravity" | "opencode" | "opencode-go" | "zai" | "claude" | "codex"
+            ))
             .map(|p| (p.manifest.id.clone(), p.manifest.name.clone()))
             .collect::<std::collections::BTreeMap<_, _>>();
         (locked.app_data_dir.clone(), providers)
