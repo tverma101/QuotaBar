@@ -53,6 +53,7 @@ For any provider below:
 4. **Save** — the row probes independently.
 
 Pasted credentials **override** env vars and local files for **that instance only**.
+If multiple accounts refresh in the app at the same time, their rotated credentials are saved independently.
 
 ---
 
