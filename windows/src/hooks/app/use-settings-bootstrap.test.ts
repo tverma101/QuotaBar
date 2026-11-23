@@ -307,7 +307,7 @@ describe("useSettingsBootstrap", () => {
         expect.any(Array)
       )
       expect(savePluginSettingsMock).toHaveBeenCalledWith({ order: ["devin"], disabled: [] })
-      expect(args.startBatch).toHaveBeenCalledWith(["devin"])
+      expect(args.startBatch).toHaveBeenCalledWith(["devin"], true)
     })
   })
 
@@ -429,7 +429,7 @@ describe("useSettingsBootstrap", () => {
 
     await waitFor(() => {
       expect(getEnabledPluginIdsMock).toHaveBeenCalledWith(merged)
-      expect(args.startBatch).toHaveBeenCalledWith(["cursor", "cursor:work"])
+      expect(args.startBatch).toHaveBeenCalledWith(["cursor", "cursor:work"], true)
     })
   })
 })

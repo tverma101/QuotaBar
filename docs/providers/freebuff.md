@@ -48,6 +48,9 @@ Freebuff's canonical API host for its session, model catalogue, and read-only ho
 
 ## Metrics
 
+On Windows, Active Sessions counts each occupied session once and lists its expiration in UTC.
+Unused Desktop purchases are not counted as active sessions.
+
 Current accounts show **Daily Hours** and **Hours Balance**, matching Freebuff's conversion of five
 Freebucks per hour. Daily Hours is today's replenishing allowance. Hours Balance is the separate
 wallet, including any remaining monthly bonus and earned or purchased funds. It excludes the daily
@@ -90,6 +93,11 @@ and chat timestamp have not changed, so a late receipt can repair the subtotal. 
 run from the history list does not erase its already measured consumption inside the saved window.
 This mixed history is marked account-wide so another
 Mac cannot blindly add the hosted portion again.
+
+On Windows, app startup and manual refresh can also update hosted and older Desktop token
+totals. A five-minute cooldown limits those history requests. Interval refreshes use the last
+history snapshot for the same login and do not contact the hosted history endpoint. Windows
+shows measured token totals; the macOS model and price breakdown described below is separate.
 
 For older Desktop sessions, QuotaBar reads usage from assistant-message
 metrics and the separate `auto_run_decision_receipts.manager_json.usage` records in

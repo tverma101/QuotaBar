@@ -493,6 +493,7 @@ describe("antigravity plugin", () => {
         { label: "Gemini 3 Pro (High)", modelOrAlias: { model: "M7" }, quotaInfo: { remainingFraction: 0.5, resetTime: "2026-02-08T09:10:56Z" } },
         { label: "", modelOrAlias: { model: "M99" }, quotaInfo: { remainingFraction: 0.8, resetTime: "2026-02-08T09:10:56Z" } },
         { modelOrAlias: { model: "M100" }, quotaInfo: { remainingFraction: 0.9, resetTime: "2026-02-08T09:10:56Z" } },
+        { label: "Gemini Pro (Legacy Alias)", modelOrAlias: { model: "MODEL_PLACEHOLDER_M421" }, quotaInfo: { remainingFraction: 0.1 } },
       ],
     })
     setupLsMock(ctx, discovery, response)
@@ -670,6 +671,37 @@ describe("antigravity plugin", () => {
     expect(result.lines.map((line) => line.color)).toEqual(["#4285F4", "#4285F4", "#4285F4", "#4285F4"])
     expect(result.lines[0].resetsAt).toBe("2026-07-10T04:55:18Z")
     expect(result.lines[1].periodDurationMs).toBe(7 * 24 * 60 * 60 * 1000)
+  })
+
+  it("merges complementary Cloud Code quotas, keeping the first host's most depleted duplicate", async () => {
+    const ctx = makeCtx()
+    const futureExpiry = Math.floor(Date.now() / 1000) + 3600
+    setupSqliteMock(ctx, makeOAuthSentinelB64(ctx, { accessToken: "ya29.summary-token", expirySeconds: futureExpiry }))
+    ctx.host.ls.discover.mockReturnValue(null)
+    ctx.host.http.request.mockImplementation(({ url }) => ({
+      status: 200,
+      bodyText: JSON.stringify(url.includes("daily-cloudcode") ? { groups: [
+        { buckets: [
+          { bucketId: "gemini-5h", remainingFraction: 0.8 },
+          { bucketId: "gemini-5h", remainingFraction: 0.6 },
+        ] },
+      ] } : { response: { groups: [
+        { buckets: [
+          { bucketId: "gemini-5h", remainingFraction: 0.3 },
+          { bucketId: "gemini-weekly", remainingFraction: 0.9 },
+        ] },
+        { displayName: "Gemini 4 Argon", buckets: [
+          { bucketId: "argon-5h", window: "5h", remainingFraction: 0.1 },
+          { bucketId: "argon-week", window: "weekly", remainingFraction: 0.75 },
+        ] },
+      ] } } ),
+    }))
+
+    const result = (await loadPlugin()).probe(ctx)
+    expect(result.lines.map(({ label, used }) => [label, used])).toEqual([
+      ["Session", 40], ["Weekly", 10], ["Argon Weekly", 25],
+    ])
+    expect(ctx.host.http.request).toHaveBeenCalledTimes(2)
   })
 
   it("falls back from the daily quota-summary host to the standard Cloud Code host", async () => {

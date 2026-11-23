@@ -217,6 +217,10 @@ When the language server is not running, the plugin falls back to Google's Cloud
 
 ### retrieveUserQuotaSummary
 
+The Antigravity and Antigravity CLI adapters keep the first usable value for each quota across
+the two Cloud Code hosts. When the service reports a valid, enabled Gemini 4 Argon weekly bucket,
+QuotaBar shows it separately from the shared Gemini meters.
+
 ```
 POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary
 Authorization: Bearer <access_token>
@@ -230,7 +234,7 @@ Base URLs tried in order:
 1. `https://daily-cloudcode-pa.googleapis.com`
 2. `https://cloudcode-pa.googleapis.com`
 
-The response has two quota groups. The plugin exposes four progress lines: `Session`, `Weekly`, `Session — Claude and GPT Models`, and `Weekly — Claude and GPT Models`. A bucket's `remainingFraction` is converted to percentage used; `resetTime` is retained for the reset display.
+The shared quota groups expose `Session`, `Weekly`, `Session — Claude and GPT Models`, and `Weekly — Claude and GPT Models`. A bucket's `remainingFraction` is converted to percentage used; `resetTime` is retained for the reset display.
 
 ### agy keychain fallback
 
@@ -256,6 +260,17 @@ The response has two quota groups. The plugin exposes four progress lines: `Sess
 ```
 
 Returns 401/403 if the token is invalid or expired — triggers reactive refresh.
+
+## Local Usage History
+
+Antigravity and Antigravity CLI read local conversation databases under
+`~/.gemini/antigravity*/conversations` for token estimates. This is device-local usage, not
+history attributed to a signed-in account. A database linked from multiple locations counts
+once. QuotaBar reuses bounded in-memory snapshots while the database and write-ahead log
+have the same file identities and revisions. Small unchanged databases can also reuse an
+app-local checkpoint after restart, verified against the source contents. For generations
+without their own timestamp, QuotaBar matches conversation step identifiers and does not
+use a match that points to more than one local day.
 
 ## Plugin Strategy
 

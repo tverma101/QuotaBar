@@ -730,7 +730,7 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     inject_cursor_logs(ctx, &host, base_plugin_id, deadline)?;
     inject_claude_logs(ctx, &host, deadline)?;
     inject_codex_logs(ctx, &host, deadline)?;
-    inject_antigravity_logs(ctx, &host, deadline)?;
+    inject_antigravity_logs(ctx, &host, deadline, plugin_data_dir.join("antigravity-history-v1.db"))?;
     inject_grok_logs(ctx, &host, deadline)?;
     inject_cursor_usage_export(ctx, &host, account, deadline)?;
     inject_fireworks(ctx, &host, base_plugin_id)?;
@@ -1223,12 +1223,16 @@ fn inject_crypto<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()
     Ok(())
 }
 
-fn inject_env<'js>(ctx: &Ctx<'js>, host: &Object<'js>, _plugin_id: &str) -> rquickjs::Result<()> {
+fn inject_env<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquickjs::Result<()> {
     let env_obj = Object::new(ctx.clone())?;
+    let freebuff = plugin_id == "freebuff";
     env_obj.set(
         "get",
         Function::new(ctx.clone(), move |name: String| -> Option<String> {
-            if !WHITELISTED_ENV_VARS.contains(&name.as_str()) {
+            if !WHITELISTED_ENV_VARS.contains(&name.as_str())
+                && !(freebuff && matches!(name.as_str(),
+                    "APPDATA" | "CODEBUFF_API_KEY" | "FREEBUFF_CONFIG_DIR" | "NEXT_PUBLIC_CB_ENVIRONMENT"))
+            {
                 return None;
             }
 
@@ -2304,7 +2308,7 @@ fn inject_codex_logs<'js>(ctx: &Ctx<'js>, host: &Object<'js>, deadline: ProbeDea
     Ok(())
 }
 
-fn inject_antigravity_logs<'js>(ctx: &Ctx<'js>, host: &Object<'js>, deadline: ProbeDeadline) -> rquickjs::Result<()> {
+fn inject_antigravity_logs<'js>(ctx: &Ctx<'js>, host: &Object<'js>, deadline: ProbeDeadline, checkpoint: PathBuf) -> rquickjs::Result<()> {
     let obj = Object::new(ctx.clone())?;
     obj.set(
         "_queryRaw",
@@ -2314,7 +2318,7 @@ fn inject_antigravity_logs<'js>(ctx: &Ctx<'js>, host: &Object<'js>, deadline: Pr
                     serde_json::json!({ "status": "no_data", "data": { "daily": [] } }).to_string(),
                 );
             }
-            Ok(crate::antigravity_db_usage_scanner::query_daily_host_json(&opts_json))
+            Ok(crate::antigravity_db_usage_scanner::query_daily_host_json(&opts_json, &checkpoint))
         })?,
     )?;
     host.set("antigravityLogs", obj)?;

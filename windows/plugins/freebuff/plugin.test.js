@@ -56,6 +56,66 @@ describe("freebuff plugin", () => {
     vi.restoreAllMocks()
   })
 
+  it("refreshes history only when requested, deduplicates receipts, and scopes last-good history by login", async () => {
+    const ctx = makeCtx()
+    setEnv(ctx, { HOME: "/home/user", CODEBUFF_API_KEY: "synthetic-login-a" })
+    ctx.nowIso = "2026-02-02T12:00:00.000Z"
+    const db = "/home/user/.config/freebuff-desktop/projects/sample/desktop-v2.db"
+    ctx.host.fs.writeText(db, "")
+    const row = (id, inputTokens) => ({
+      id,
+      stamp: Date.parse("2026-02-02T10:00:00.000Z"),
+      inputTokens,
+      outputTokens: 1,
+    })
+    ctx.host.sqlite.query.mockImplementation((_path, sql) => sql.includes("sqlite_schema") ? "[]" :
+      JSON.stringify([row("cloud:visited", 50), row("cloud:missing", 6), row("thread:1", 3)]))
+    const request = vi.fn(({ url, headers }) => {
+      if (url === SESSION_URL) return okJson(sessionPayload())
+      expect(headers["x-freebuff-device-chats"]).toBe("1")
+      const finish = "2026-02-02T11:00:00.000Z"
+      if (url.includes("/chats?")) return okJson({ items: [{ id: "chat", updatedAt: finish }], nextCursor: null })
+      if (url.includes("/chats/chat/runs")) return okJson({ items: ["visited", "missing"].map((id) =>
+        ({ id, status: "completed", finishedAt: finish })), nextCursor: null })
+      if (url.includes("/runs/visited/events")) return okJson({ items: [
+        { kind: "metrics", payload: { usage: { inputTokens: 4, outputTokens: 5 } } },
+        { kind: "metrics", payload: { usage: { inputTokens: 7, outputTokens: 5 } } },
+        { kind: "metrics", payload: {} },
+      ], nextCursor: null, endCursor: "after-last" })
+      if (url.includes("/runs/missing/events")) return okJson({ items: [], nextCursor: null })
+      throw new Error("Unexpected URL")
+    })
+    mockRequest(ctx, request)
+    const plugin = await loadPlugin()
+    const totals = (result) => result.lines.find((line) => line.label === "Last 30 Days")?.value
+    expect(totals(plugin.probe(ctx))).toBeUndefined()
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(ctx.host.sqlite.query).not.toHaveBeenCalled()
+
+    ctx.app.refreshHistory = true
+    const result = plugin.probe(ctx)
+    expect(totals(result)).toBe("23 tokens")
+    expect(result.warning).toMatch(/history is incomplete/i)
+    const historyCalls = () => request.mock.calls.filter(([req]) => req.url !== SESSION_URL).length
+    expect(historyCalls()).toBe(4)
+    expect(totals(plugin.probe(ctx))).toBe("23 tokens")
+    expect(historyCalls()).toBe(4)
+
+    ctx.app.refreshHistory = false
+    ctx.nowIso = "2026-02-02T12:10:00.000Z"
+    expect(totals(plugin.probe(ctx))).toBe("23 tokens")
+    expect(historyCalls()).toBe(4)
+
+    request.mockImplementation(({ url }) => url === SESSION_URL ? okJson(sessionPayload()) : { status: 503 })
+    ctx.app.refreshHistory = true
+    expect(totals(plugin.probe(ctx))).toBe("23 tokens")
+    expect(historyCalls()).toBe(5)
+
+    ctx.app.refreshHistory = false
+    setEnv(ctx, { HOME: "/home/user", CODEBUFF_API_KEY: "synthetic-login-b" })
+    expect(totals(plugin.probe(ctx))).toBeUndefined()
+  })
+
   it("throws when no credentials exist", async () => {
     const ctx = makeCtx()
     setEnv(ctx, { HOME: "/home/user" })
@@ -219,6 +279,40 @@ describe("freebuff plugin", () => {
     const line = out.lines.find((l) => l.label === "Active Sessions")
     expect(line.value).toBe("2")
     expect(line.expiryTooltip).toContain("2026-02-04")
+  })
+
+  it("counts concurrent session holders once and orders expiries by instant", async () => {
+    const ctx = makeCtx()
+    setEnv(ctx, { CODEBUFF_API_KEY: "tok" })
+    mockRequest(ctx, () => okJson(sessionPayload({
+      status: "active",
+      instanceId: "same",
+      expiresAt: "2026-02-03T00:00:00Z",
+      desktopPurchases: [
+        { holderInstanceId: "same", expiresAt: "2026-02-05T00:00:00Z" },
+        { holderInstanceId: "__proto__", expiresAt: "2026-02-05T01:00:00+02:00" },
+        { holderInstanceId: "another", expiresAt: "2026-02-05T00:00:00Z" },
+        { holderInstanceId: null },
+      ],
+    })))
+
+    const result = (await loadPlugin()).probe(ctx)
+    const line = result.lines.find((line) => line.label === "Active Sessions")
+    expect(line.value).toBe("3")
+    expect(line.expiryTooltip.split("\n")).toEqual([
+      "2026-02-04T23:00:00.000Z", "2026-02-05T00:00:00.000Z", "2026-02-05T00:00:00.000Z",
+    ])
+  })
+
+  it("rejects an occupied purchase with a malformed expiration", async () => {
+    const ctx = makeCtx()
+    setEnv(ctx, { CODEBUFF_API_KEY: "tok" })
+    mockRequest(ctx, () => okJson(sessionPayload({
+      desktopPurchases: [{ holderInstanceId: "holder", expiresAt: "invalid" }],
+    })))
+
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Freebuff returned unreadable usage data. Try again later.")
   })
 
   it("picks the most-used rate-limit pool", async () => {

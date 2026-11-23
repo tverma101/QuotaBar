@@ -98,7 +98,7 @@ export function useProbeEvents({ onResult, onBatchComplete, getProbeTargets }: U
     }
   }, [onBatchComplete, onResult])
 
-  const startBatch = useCallback(async (pluginIds?: string[]) => {
+  const startBatch = useCallback(async (pluginIds?: string[], refreshHistory?: true) => {
     // Wait for listeners to be ready before starting the batch
     if (listenersReadyRef.current) {
       await listenersReadyRef.current
@@ -117,7 +117,9 @@ export function useProbeEvents({ onResult, onBatchComplete, getProbeTargets }: U
         ? { batchId, pluginIds }
         : { batchId }
     try {
-      const result = await invoke<ProbeBatchStarted>("start_probe_batch", args)
+      const result = await invoke<ProbeBatchStarted>("start_probe_batch", refreshHistory
+        ? { ...args, refreshHistory }
+        : args)
       batchPluginIdsRef.current.set(batchId, result.pluginIds)
       return result.pluginIds
     } catch (error) {

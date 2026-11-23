@@ -20,6 +20,7 @@
       "primaryOrder": 2,
       "period": "weekly"
     },
+    { "type": "progress", "label": "Argon Weekly", "scope": "detail", "period": "weekly" },
     {
       "type": "progress",
       "label": "Session — Claude and GPT Models",

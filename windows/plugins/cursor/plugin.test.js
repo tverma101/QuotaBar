@@ -2695,6 +2695,59 @@ describe("cursor plugin", () => {
     )
   })
 
+  it("preserves live org meters and fills missing on-demand spend from the same session", async () => {
+    const ctx = makeCtx()
+    const token = makeJwt({ exp: 9999999999, sub: "user_123" })
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: token }]))
+    ctx.host.http.request.mockImplementation(({ url, headers }) => {
+      if (url.includes("GetCurrentPeriodUsage")) {
+        return { status: 200, bodyText: JSON.stringify({
+          planUsage: { totalPercentUsed: 20, autoPercentUsed: 10, apiPercentUsed: 30 },
+          spendLimitUsage: { limitType: "team" },
+        }) }
+      }
+      if (url.includes("GetPlanInfo")) {
+        return { status: 200, bodyText: JSON.stringify({ planInfo: { planName: "Pro" } }) }
+      }
+      if (url.endsWith("/api/usage-summary")) {
+        expect(headers.Authorization).toBe("Bearer " + token)
+        return { status: 200, bodyText: JSON.stringify({
+          membershipType: "enterprise",
+          individualUsage: { plan: { totalPercentUsed: 99 }, onDemand: { used: 250, limit: 1000 } },
+          teamUsage: { onDemand: { used: 500, limit: 5000 } },
+        }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const result = (await loadPlugin()).probe(ctx)
+    expect(ctx.host.http.request.mock.calls.filter(([request]) => request.url.endsWith("/api/usage-summary"))).toHaveLength(1)
+    expect(result.plan).toBe("Enterprise")
+    expect(result.lines.find((line) => line.label === "Total usage")).toMatchObject({ used: 20, limit: 100 })
+    expect(result.lines.find((line) => line.label === "On-demand")).toMatchObject({ used: 2.5, limit: 10 })
+  })
+
+  it("shows a percent-only team allowance without requiring a dollar limit", async () => {
+    const ctx = makeCtx()
+    ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: makeJwt({ exp: 9999999999, sub: "user_123" }) }]))
+    ctx.host.http.request.mockImplementation(({ url }) => {
+      if (url.includes("GetCurrentPeriodUsage")) {
+        return { status: 200, bodyText: JSON.stringify({
+          planUsage: { totalPercentUsed: 35 }, spendLimitUsage: { limitType: "team" },
+        }) }
+      }
+      if (url.includes("GetPlanInfo")) {
+        return { status: 200, bodyText: JSON.stringify({ planInfo: { planName: "Team" } }) }
+      }
+      return { status: 200, bodyText: "{}" }
+    })
+
+    const result = (await loadPlugin()).probe(ctx)
+    expect(result.lines.find((line) => line.label === "Total usage")).toMatchObject({
+      used: 35, limit: 100, format: { kind: "percent" },
+    })
+  })
+
   it("prefers structured team model pools over legacy $20 allowance (#1337)", async () => {
     const ctx = makeCtx()
     ctx.host.sqlite.query.mockReturnValue(JSON.stringify([{ value: "token" }]))
