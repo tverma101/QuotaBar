@@ -7,9 +7,16 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 const STORE_FILE: &str = "provider_accounts.json";
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_store() -> io::Result<MutexGuard<'static, ()>> {
+    STORE_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("provider accounts store lock poisoned"))
+}
 
 #[derive(Default)]
 struct HistoryIdentity {
@@ -161,6 +168,11 @@ pub fn load_store(app_data_dir: &Path) -> io::Result<ProviderAccountsStore> {
 }
 
 pub fn load_store_path(path: &Path) -> io::Result<ProviderAccountsStore> {
+    let _guard = lock_store()?;
+    load_store_unlocked(path)
+}
+
+fn load_store_unlocked(path: &Path) -> io::Result<ProviderAccountsStore> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(ProviderAccountsStore::default()),
@@ -172,7 +184,7 @@ pub fn load_store_path(path: &Path) -> io::Result<ProviderAccountsStore> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid provider accounts path"))?;
     let (store, migrated_from_legacy) = decode_store_text(&text, app_data_dir)?;
     if migrated_from_legacy {
-        save_store_path(path, &store)?;
+        save_store_unlocked(path, &store)?;
     }
     Ok(store)
 }
@@ -217,6 +229,11 @@ pub fn save_store(app_data_dir: &Path, store: &ProviderAccountsStore) -> io::Res
 }
 
 pub fn save_store_path(path: &Path, store: &ProviderAccountsStore) -> io::Result<()> {
+    let _guard = lock_store()?;
+    save_store_unlocked(path, store)
+}
+
+fn save_store_unlocked(path: &Path, store: &ProviderAccountsStore) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -253,18 +270,22 @@ pub fn upsert_account(app_data_dir: &Path, mut account: ProviderAccount) -> io::
     account.credential.refresh_token = account.credential.refresh_token.and_then(normalize_secret);
     account.credential.session_key = account.credential.session_key.and_then(normalize_secret);
 
-    let mut store = load_store(app_data_dir)?;
+    let path = store_path(app_data_dir);
+    let _guard = lock_store()?;
+    let mut store = load_store_unlocked(&path)?;
     let instance_id = account.instance_id.clone();
     store.accounts.insert(account.instance_id.clone(), account);
-    save_store(app_data_dir, &store)?;
+    save_store_unlocked(&path, &store)?;
     forget_history_identity(app_data_dir, &instance_id);
     Ok(())
 }
 
 pub fn delete_account(app_data_dir: &Path, instance_id: &str) -> io::Result<()> {
-    let mut store = load_store(app_data_dir)?;
+    let path = store_path(app_data_dir);
+    let _guard = lock_store()?;
+    let mut store = load_store_unlocked(&path)?;
     store.accounts.remove(instance_id);
-    save_store(app_data_dir, &store)?;
+    save_store_unlocked(&path, &store)?;
     forget_history_identity(app_data_dir, instance_id);
     Ok(())
 }
@@ -274,13 +295,14 @@ pub fn update_credential_at_path(
     instance_id: &str,
     update: ProviderCredential,
 ) -> io::Result<Option<ProviderCredential>> {
-    let mut store = load_store_path(store_path)?;
+    let _guard = lock_store()?;
+    let mut store = load_store_unlocked(store_path)?;
     let Some(account) = store.accounts.get_mut(instance_id) else {
         return Ok(None);
     };
     account.credential.merge_update(update);
     let credential = account.credential.clone();
-    save_store_path(store_path, &store)?;
+    save_store_unlocked(store_path, &store)?;
     Ok(Some(credential))
 }
 
@@ -359,6 +381,55 @@ mod tests {
         let on_disk = fs::read_to_string(store_path(&dir)).expect("encrypted store");
         assert!(!on_disk.contains("\"old\""));
         assert!(!on_disk.contains("\"new\""));
+        let _ = fs::remove_dir_all(dir);
+        provider_accounts_crypto::set_test_master_key(None);
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_credential_rotations_preserve_both_accounts() {
+        provider_accounts_crypto::set_test_master_key(Some([7_u8; 32]));
+        let dir = temp_dir("concurrent-rotations");
+        let ids = ["grok:work", "grok:personal"];
+        for id in ids {
+            upsert_account(
+                &dir,
+                ProviderAccount {
+                    instance_id: id.into(),
+                    base_provider_id: "grok".into(),
+                    label: id.into(),
+                    credential: ProviderCredential::default(),
+                },
+            )
+            .unwrap();
+        }
+        let path = store_path(&dir);
+        let start = std::sync::Barrier::new(ids.len());
+        std::thread::scope(|scope| {
+            for id in ids {
+                let (path, start) = (&path, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    update_credential_at_path(
+                        path,
+                        id,
+                        ProviderCredential {
+                            refresh_token: Some(format!("rotated-{id}")),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                });
+            }
+        });
+        let store = load_store(&dir).unwrap();
+        for id in ids {
+            assert_eq!(
+                store.accounts[id].credential.refresh_token,
+                Some(format!("rotated-{id}"))
+            );
+        }
         let _ = fs::remove_dir_all(dir);
         provider_accounts_crypto::set_test_master_key(None);
     }
