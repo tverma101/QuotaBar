@@ -26,6 +26,7 @@ import { ProviderIcon } from "@/components/provider-icon";
 import { GlobalShortcutSection } from "@/components/global-shortcut-section";
 import { LanguageRegionSection } from "@/components/settings/language-region-section";
 import { ScreenShareSection } from "@/components/settings/screen-share-section";
+import { CodexEnrollment } from "@/components/settings/codex-enrollment";
 import { getBarFillLayout } from "@/lib/tray-bars-icon";
 import { getTrayIconSizePx } from "@/lib/tray-icon-size";
 import {
@@ -105,6 +106,7 @@ const PREVIEW_BAR_TRACK_PX = 20;
 
 export type ProviderAccountCredentialInput = {
   label?: string;
+  registeredInstanceId?: string;
   accessToken: string;
   refreshToken: string;
   sessionKey: string;
@@ -2235,6 +2237,21 @@ export function SettingsPage({
                   accountFormSlot={
                     accountForm && accountFormAnchorPluginId(accountForm) === plugin.id ? (
                       <div className="pt-2 mt-2 border-t border-border">
+                        {isTauri() && accountForm.mode === "add" && accountForm.baseProviderId === "codex" ? (
+                          <CodexEnrollment
+                            label={accountForm.label}
+                            onRegistered={({ instanceId, label }) => {
+                              onAddProviderAccount("codex", {
+                                label,
+                                registeredInstanceId: instanceId,
+                                accessToken: "",
+                                refreshToken: "",
+                                sessionKey: "",
+                              });
+                              setAccountForm(null);
+                            }}
+                          />
+                        ) : null}
                         <ProviderAccountForm
                           form={accountForm}
                           onChange={setAccountForm}

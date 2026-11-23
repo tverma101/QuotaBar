@@ -18,6 +18,34 @@ describe("codex plugin", () => {
     vi.resetModules()
   })
 
+  it("uses only the registered home and stops if its login changes", async () => {
+    const ctx = makeCtx()
+    ctx.account = { instanceId: "codex:work", codexHome: { path: "C:/Work,Codex", accountId: "work" } }
+    const authPath = "C:/Work,Codex/auth.json"
+    const writeAuth = (accountId) => ctx.host.fs.writeText(authPath, JSON.stringify({
+      tokens: { access_token: "home-token", account_id: accountId },
+      last_refresh: new Date().toISOString(),
+    }))
+    writeAuth("work")
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      headers: { "x-codex-primary-used-percent": "12" },
+      bodyText: "{}",
+    })
+    const plugin = await loadPlugin()
+    expect(plugin.probe(ctx).verifiedHistoryIdentity).toBe("work")
+    expect(ctx.host.http.request.mock.calls[0][0].headers.Authorization).toBe("Bearer home-token")
+    expect(ctx.host.codexLogs.queryDaily).toHaveBeenCalledWith(expect.objectContaining({
+      homePath: "C:/Work,Codex",
+      isolatedHome: true,
+    }))
+    writeAuth("another-account")
+    ctx.host.http.request.mockClear()
+    expect(() => plugin.probe(ctx)).toThrow(/Token conflict/)
+    expect(ctx.host.http.request).not.toHaveBeenCalled()
+    expect(ctx.host.keychain.readGenericPassword).not.toHaveBeenCalled()
+  })
+
   const expectStaleFileAuthFallsBackToKeychain = async (refreshResponse) => {
     const ctx = makeCtx()
     ctx.host.fs.writeText("~/.codex/auth.json", JSON.stringify({

@@ -99,6 +99,12 @@ On Windows, an additional account's reset claim only uses that card's credential
 not retry a rejected claim under another login or submit a claim for an expired credit. VM Box
 history matches using a verified ChatGPT account ID, not the card label.
 
+To add another Codex account on Windows, open the Codex provider's account form and choose
+**Sign In to Codex** or **Use Existing Codex Home**. Browser sign-in needs the official Codex
+executable available on PATH. Codex writes its own login to a separate home; QuotaBar connects the
+home only after it identifies the signed-in account. Removing the card does not delete the home
+or its history.
+
 Safeguards, because a claim is irreversible:
 
 - Claiming is always a deliberate two-click flow behind the hover popover — nothing is ever claimed automatically.
