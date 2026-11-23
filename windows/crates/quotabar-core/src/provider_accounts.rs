@@ -6,8 +6,88 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 const STORE_FILE: &str = "provider_accounts.json";
+
+#[derive(Default)]
+struct HistoryIdentity {
+    generation: u64,
+    key: Option<String>,
+}
+
+type HistoryIdentities = BTreeMap<PathBuf, BTreeMap<String, HistoryIdentity>>;
+static HISTORY_IDENTITIES: LazyLock<Mutex<HistoryIdentities>> = LazyLock::new(Mutex::default);
+static HISTORY_IDENTITY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Read this process's latest verified Claude and Codex identities for an application data directory.
+/// Keys are Windows provider instance IDs; values use the macOS VM Box receipt identity format.
+/// Missing, failed, in-flight, or replaced logins have no entry. No names or credentials are exported.
+pub fn verified_history_identities(app_data_dir: &Path) -> io::Result<BTreeMap<String, String>> {
+    let identities = HISTORY_IDENTITIES
+        .lock()
+        .map_err(|_| io::Error::other("verified history identities unavailable"))?;
+    Ok(identities
+        .get(app_data_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|(instance, identity)| {
+            identity.key.as_ref().map(|key| (instance.clone(), key.clone()))
+        })
+        .collect())
+}
+
+pub(crate) fn begin_history_identity_probe(app_data_dir: &Path, instance_id: &str) -> Option<u64> {
+    let mut identities = HISTORY_IDENTITIES.lock().ok()?;
+    let generation = HISTORY_IDENTITY_GENERATION.fetch_add(1, Ordering::Relaxed);
+    identities.entry(app_data_dir.to_path_buf()).or_default().insert(
+        instance_id.to_string(),
+        HistoryIdentity { generation, key: None },
+    );
+    Some(generation)
+}
+
+pub(crate) fn finish_history_identity_probe(
+    app_data_dir: &Path,
+    instance_id: &str,
+    generation: u64,
+    family: &str,
+    key: &str,
+) {
+    let key = key.trim();
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 128
+            && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    };
+    let valid = match family {
+        "claude" => match key.split_once('|') {
+            Some((account, org)) => valid_part(account) && valid_part(org),
+            None => valid_part(key),
+        },
+        "codex" => valid_part(key),
+        _ => false,
+    };
+    if !valid {
+        return;
+    }
+    if let Ok(mut identities) = HISTORY_IDENTITIES.lock()
+        && let Some(identity) = identities.get_mut(app_data_dir)
+            .and_then(|entries| entries.get_mut(instance_id))
+        && identity.generation == generation
+    {
+        identity.key = Some(key.to_ascii_lowercase());
+    }
+}
+
+fn forget_history_identity(app_data_dir: &Path, instance_id: &str) {
+    if let Ok(mut identities) = HISTORY_IDENTITIES.lock()
+        && let Some(entries) = identities.get_mut(app_data_dir)
+    {
+        entries.remove(instance_id);
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -174,14 +254,19 @@ pub fn upsert_account(app_data_dir: &Path, mut account: ProviderAccount) -> io::
     account.credential.session_key = account.credential.session_key.and_then(normalize_secret);
 
     let mut store = load_store(app_data_dir)?;
+    let instance_id = account.instance_id.clone();
     store.accounts.insert(account.instance_id.clone(), account);
-    save_store(app_data_dir, &store)
+    save_store(app_data_dir, &store)?;
+    forget_history_identity(app_data_dir, &instance_id);
+    Ok(())
 }
 
 pub fn delete_account(app_data_dir: &Path, instance_id: &str) -> io::Result<()> {
     let mut store = load_store(app_data_dir)?;
     store.accounts.remove(instance_id);
-    save_store(app_data_dir, &store)
+    save_store(app_data_dir, &store)?;
+    forget_history_identity(app_data_dir, instance_id);
+    Ok(())
 }
 
 pub fn update_credential_at_path(

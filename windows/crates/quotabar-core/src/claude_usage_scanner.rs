@@ -10,6 +10,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -83,15 +84,14 @@ fn days_back_from_since(since: DateTime<Utc>) -> i32 {
 }
 
 fn scan(days_back: i32, home_path: Option<&str>, pricing: &ModelPricing) -> Option<Vec<DailyUsageRow>> {
-    let roots = claude_roots(home_path);
-    if roots.is_empty() {
-        return None;
-    }
-    let files = usage_files(&roots);
+    scan_roots(&claude_roots(home_path), since_local_midnight(days_back), pricing)
+}
+
+fn scan_roots(roots: &[PathBuf], since: DateTime<Utc>, pricing: &ModelPricing) -> Option<Vec<DailyUsageRow>> {
+    let files = usage_files(roots);
     if files.is_empty() {
         return None;
     }
-    let since = since_local_midnight(days_back);
     let mut entries = Vec::new();
     if let Ok(mut guard) = FILE_CACHE.lock() {
         let cache = guard.get_or_insert_with(HashMap::new);
@@ -126,24 +126,36 @@ fn scan(days_back: i32, home_path: Option<&str>, pricing: &ModelPricing) -> Opti
 }
 
 fn claude_roots(home_path: Option<&str>) -> Vec<PathBuf> {
+    let configured = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    let configured = home_path.filter(|s| !s.trim().is_empty()).or(configured.as_deref());
+    let home = dirs::home_dir();
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok().filter(|s| !s.is_empty());
+    #[cfg(windows)]
+    let desktop = windows_desktop_roots(dirs::config_dir().as_deref(), dirs::data_local_dir().as_deref());
+    #[cfg(not(windows))]
+    let desktop: Vec<_> = home.iter().map(|home| home.join("Library/Application Support/Claude")).collect();
+    claude_roots_for(configured, home.as_deref(), xdg.as_deref(), &desktop)
+}
+
+fn claude_roots_for(
+    configured: Option<&str>,
+    home: Option<&Path>,
+    xdg: Option<&str>,
+    desktop: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
 
-    fn push_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<String>, url: PathBuf) {
+    fn push_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, url: PathBuf) {
         if url.join("projects").is_dir() {
-            let key = url.to_string_lossy().to_string();
+            let key = fs::canonicalize(&url).unwrap_or_else(|_| url.clone());
             if seen.insert(key) {
                 roots.push(url);
             }
         }
     }
 
-    let env_or_arg = home_path
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok());
-
-    if let Some(raw) = env_or_arg.filter(|s| !s.trim().is_empty()) {
+    if let Some(raw) = configured.filter(|s| !s.trim().is_empty()) {
         for part in raw.split(',') {
             let part = part.trim();
             if part.is_empty() {
@@ -157,33 +169,39 @@ fn claude_roots(home_path: Option<&str>) -> Vec<PathBuf> {
             }
             push_root(&mut roots, &mut seen, url);
         }
+        if roots.is_empty() {
+            log::debug!("configured Claude roots contain no projects directories");
+        }
+    } else if let Some(home) = home {
+        let xdg = xdg.map(expand_tilde).unwrap_or_else(|| home.join(".config"));
+        push_root(&mut roots, &mut seen, xdg.join("claude"));
+        push_root(&mut roots, &mut seen, home.join(".claude"));
     }
-
-    if roots.is_empty() {
-        if let Some(home) = dirs::home_dir() {
-            let xdg = std::env::var("XDG_CONFIG_HOME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|s| expand_tilde(&s))
-                .unwrap_or_else(|| home.join(".config"));
-            push_root(&mut roots, &mut seen, xdg.join("claude"));
-            push_root(&mut roots, &mut seen, home.join(".claude"));
-            for sandbox in cowork_claude_dirs(&home) {
-                push_root(&mut roots, &mut seen, sandbox);
-            }
+    for dir in desktop {
+        for sandbox in cowork_claude_dirs(&dir.join("local-agent-mode-sessions")) {
+            push_root(&mut roots, &mut seen, sandbox);
         }
     }
 
     roots
 }
 
-fn cowork_claude_dirs(home: &Path) -> Vec<PathBuf> {
-    let base = home.join("Library/Application Support/Claude/local-agent-mode-sessions");
-    if !base.is_dir() {
-        return vec![];
+#[cfg(any(windows, test))]
+fn windows_desktop_roots(roaming: Option<&Path>, local: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(local) = local {
+        roots.push(local.join("Claude-Data/claude_pzs8sxrjxfjjc"));
+        roots.push(local.join("Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude"));
     }
+    if let Some(roaming) = roaming {
+        roots.push(roaming.join("Claude"));
+    }
+    roots
+}
+
+fn cowork_claude_dirs(base: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    let Ok(groups) = fs::read_dir(&base) else {
+    let Ok(groups) = fs::read_dir(base) else {
         return vec![];
     };
     for group in groups.flatten() {
@@ -191,19 +209,15 @@ fn cowork_claude_dirs(home: &Path) -> Vec<PathBuf> {
             continue;
         };
         for sub in subs.flatten() {
-            let mut sessions: Vec<PathBuf> = fs::read_dir(sub.path())
-                .ok()
-                .map(|rd| rd.flatten().map(|e| e.path()).collect())
-                .unwrap_or_default();
-            for holder in sessions.clone() {
-                if holder.file_name().is_some_and(|n| n == "agent") {
-                    if let Ok(agent_children) = fs::read_dir(&holder) {
-                        sessions.extend(agent_children.flatten().map(|e| e.path()));
-                    }
+            let Ok(sessions) = fs::read_dir(sub.path()) else {
+                continue;
+            };
+            for session in sessions.flatten() {
+                let path = session.path();
+                if session.file_name() == "agent" && let Ok(children) = fs::read_dir(&path) {
+                    dirs.extend(children.flatten().map(|entry| entry.path().join(".claude")));
                 }
-            }
-            for session in sessions {
-                dirs.push(session.join(".claude"));
+                dirs.push(path.join(".claude"));
             }
         }
     }
@@ -253,20 +267,29 @@ fn file_mtime_before(mtime: &SystemTime, since: DateTime<Utc>) -> bool {
 }
 
 fn parse_file(path: &Path) -> Vec<ClaudeEntry> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
+    let mut reader = match fs::File::open(path) {
+        Ok(file) => BufReader::new(file),
         Err(_) => {
             warn_unreadable_usage_file(path);
             return vec![];
         }
     };
-    let marker = br#""usage":{"#;
+    let marker = br#""usage""#;
     let mut entries = Vec::new();
-    for line in data.split(|&b| b == b'\n') {
-        if !line.windows(marker.len()).any(|w| w == marker) {
-            continue;
+    let mut line = Vec::new();
+    loop {
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => {
+                warn_unreadable_usage_file(path);
+                return vec![];
+            }
         }
-        entries.extend(parse_entries(line));
+        if line.windows(marker.len()).any(|w| w == marker) {
+            entries.extend(parse_entries(&line));
+        }
+        line.clear();
     }
     entries
 }
@@ -276,6 +299,9 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
     let Ok(v) = serde_json::from_slice::<Value>(line) else {
         return vec![];
     };
+    if v.get("type").is_some_and(|kind| kind.as_str() != Some("assistant")) {
+        return vec![];
+    }
     let Some(timestamp_raw) = v.get("timestamp").and_then(|t| t.as_str()) else {
         return vec![];
     };
@@ -288,9 +314,6 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
     let Some(usage) = message.get("usage") else {
         return vec![];
     };
-    if has_unsupported_null_field(&v, message, usage) {
-        return vec![];
-    }
     let Some((tokens, has_speed)) = token_breakdown(usage) else {
         return vec![];
     };
@@ -314,7 +337,13 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
         .get("isSidechain")
         .and_then(|b| b.as_bool())
         .unwrap_or(false);
-    let cost_usd = v.get("costUSD").and_then(|c| c.as_f64());
+    let cost_usd = match v.get("costUSD").filter(|c| !c.is_null()) {
+        Some(value) => match value.as_f64().filter(|cost| (0.0..=1e12).contains(cost)) {
+            Some(cost) => Some(cost),
+            None => return vec![],
+        },
+        None => None,
+    };
 
     let parent = ClaudeEntry {
         timestamp,
@@ -337,13 +366,12 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
         if iteration.get("type").and_then(|t| t.as_str()) != Some("advisor_message") {
             continue;
         }
-        let Some(advisor_model) = iteration
+        let advisor_model = iteration
             .get("model")
             .and_then(|m| m.as_str())
+            .map(str::trim)
             .filter(|m| !m.is_empty())
-        else {
-            continue;
-        };
+            .map(str::to_string);
         let Some((advisor_tokens, advisor_has_speed)) = token_breakdown(iteration) else {
             continue;
         };
@@ -357,7 +385,7 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
             is_sidechain,
             has_speed: advisor_has_speed,
             cost_usd: None,
-            model: Some(advisor_model.to_string()),
+            model: advisor_model,
         });
         advisor_index += 1;
     }
@@ -365,30 +393,21 @@ fn parse_entries(line: &[u8]) -> Vec<ClaudeEntry> {
 }
 
 fn token_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
-    let input_v = usage.get("input_tokens")?;
-    let output_v = usage.get("output_tokens")?;
-    if input_v.as_i64().is_none() && input_v.as_f64().is_none() {
-        return None;
-    }
-    if output_v.as_i64().is_none() && output_v.as_f64().is_none() {
-        return None;
-    }
-    let input = crate::log_usage_types::bounded_token_json(Some(input_v));
-    let output = crate::log_usage_types::bounded_token_json(Some(output_v));
-    let speed = usage.get("speed").and_then(|s| s.as_str());
-    if let Some(s) = speed {
-        if s != "fast" && s != "standard" {
-            return None;
-        }
-    }
-    let (cache_write5m, cache_write1h) = if let Some(cache_creation) = usage.get("cache_creation") {
+    let input = nonnegative_token_count(usage.get("input_tokens")?)?;
+    let output = nonnegative_token_count(usage.get("output_tokens")?)?;
+    let speed = match usage.get("speed").filter(|s| !s.is_null()) {
+        Some(value) => Some(value.as_str().filter(|s| matches!(*s, "fast" | "standard"))?),
+        None => None,
+    };
+    let (cache_write5m, cache_write1h) = if let Some(cache_creation) = usage.get("cache_creation").filter(|c| !c.is_null()) {
+        let cache_creation = cache_creation.as_object()?;
         (
-            crate::log_usage_types::bounded_token_json(cache_creation.get("ephemeral_5m_input_tokens")),
-            crate::log_usage_types::bounded_token_json(cache_creation.get("ephemeral_1h_input_tokens")),
+            optional_token_count(cache_creation.get("ephemeral_5m_input_tokens"))?,
+            optional_token_count(cache_creation.get("ephemeral_1h_input_tokens"))?,
         )
     } else {
         (
-            crate::log_usage_types::bounded_token_json(usage.get("cache_creation_input_tokens")),
+            optional_token_count(usage.get("cache_creation_input_tokens"))?,
             0,
         )
     };
@@ -397,7 +416,7 @@ fn token_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
             input,
             cache_write5m,
             cache_write1h,
-            cache_read: crate::log_usage_types::bounded_token_json(usage.get("cache_read_input_tokens")),
+            cache_read: optional_token_count(usage.get("cache_read_input_tokens"))?,
             output,
             is_fast: speed == Some("fast"),
         },
@@ -405,27 +424,34 @@ fn token_breakdown(usage: &Value) -> Option<(TokenBreakdown, bool)> {
     ))
 }
 
+fn nonnegative_token_count(value: &Value) -> Option<i32> {
+    let count = value.as_f64()?;
+    if !(0.0..=1e15).contains(&count) || count.fract() != 0.0 {
+        return None;
+    }
+    Some(count as i32)
+}
+
+fn optional_token_count(value: Option<&Value>) -> Option<i32> {
+    match value.filter(|v| !v.is_null()) {
+        Some(value) => nonnegative_token_count(value),
+        None => Some(0),
+    }
+}
+
 fn is_valid_entry(object: &Value, message: &Value) -> bool {
-    if let Some(version) = object.get("version").and_then(|v| v.as_str()) {
-        if !is_semver_prefix(version) {
+    if let Some(version) = object.get("version") {
+        if !version.as_str().is_some_and(is_semver_prefix) {
             return false;
         }
     }
-    for key in ["sessionId", "requestId"] {
-        if let Some(text) = object.get(key).and_then(|v| v.as_str()) {
-            if text.is_empty() {
-                return false;
-            }
+    for value in [object.get("sessionId"), object.get("requestId"), message.get("id")].into_iter().flatten() {
+        if !value.as_str().is_some_and(|text| !text.is_empty()) {
+            return false;
         }
     }
-    for key in ["id", "model"] {
-        if let Some(text) = message.get(key).and_then(|v| v.as_str()) {
-            if text.is_empty() {
-                return false;
-            }
-        }
-    }
-    true
+    !object.get("isSidechain").is_some_and(|v| !v.is_boolean())
+        && !message.get("model").is_some_and(|v| !v.as_str().is_some_and(|s| !s.trim().is_empty()))
 }
 
 fn is_semver_prefix(value: &str) -> bool {
@@ -437,27 +463,6 @@ fn is_semver_prefix(value: &str) -> bool {
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_digit())
-}
-
-fn has_unsupported_null_field(object: &Value, message: &Value, usage: &Value) -> bool {
-    const OBJECT_FIELDS: &[&str] = &[
-        "cwd",
-        "costUSD",
-        "version",
-        "sessionId",
-        "requestId",
-        "isApiErrorMessage",
-    ];
-    const MESSAGE_FIELDS: &[&str] = &["id", "model"];
-    const USAGE_FIELDS: &[&str] = &[
-        "speed",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-    ];
-    let is_null = |container: &Value, field: &str| matches!(container.get(field), Some(Value::Null));
-    OBJECT_FIELDS.iter().any(|f| is_null(object, f))
-        || MESSAGE_FIELDS.iter().any(|f| is_null(message, f))
-        || USAGE_FIELDS.iter().any(|f| is_null(usage, f))
 }
 
 pub fn parse_iso_timestamp(raw: &str) -> Option<DateTime<Utc>> {
@@ -519,106 +524,77 @@ fn should_replace(candidate: &ClaudeEntry, existing: &ClaudeEntry) -> bool {
     if candidate.is_sidechain != existing.is_sidechain {
         return existing.is_sidechain;
     }
-    let ct = candidate.tokens.total_tokens();
-    let et = existing.tokens.total_tokens();
+    let ct = total_tokens(&candidate.tokens);
+    let et = total_tokens(&existing.tokens);
     if ct != et {
         return ct > et;
     }
     candidate.has_speed && !existing.has_speed
 }
 
+fn total_tokens(tokens: &TokenBreakdown) -> i32 {
+    [tokens.input, tokens.cache_write5m, tokens.cache_write1h, tokens.cache_read, tokens.output]
+        .into_iter()
+        .fold(0, i32::saturating_add)
+}
+
 fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPricing) -> Vec<DailyUsageRow> {
-    let mut tokens_by_day: BTreeMap<String, i32> = BTreeMap::new();
-    let mut cost_by_day: BTreeMap<String, f64> = BTreeMap::new();
-    let mut priced_days: HashSet<String> = HashSet::new();
-    let mut models_by_day: BTreeMap<String, BTreeMap<String, (i32, f64)>> = BTreeMap::new();
-    let mut input_by_day: BTreeMap<String, i32> = BTreeMap::new();
-    let mut output_by_day: BTreeMap<String, i32> = BTreeMap::new();
-    let mut cache_create_by_day: BTreeMap<String, i32> = BTreeMap::new();
-    let mut cache_read_by_day: BTreeMap<String, i32> = BTreeMap::new();
+    let mut by_day: BTreeMap<String, DailyUsageRow> = BTreeMap::new();
 
     for entry in entries {
         if entry.timestamp < since {
             continue;
         }
         let day = local_day_key_from_offset(&entry.timestamp);
-        let model_name = entry
+        let model = entry
             .model
             .as_deref()
             .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .unwrap_or("unattributed");
+            .filter(|m| !m.is_empty());
+        let cost = entry.cost_usd.or_else(|| {
+            model.and_then(|m| pricing.estimated_cost_dollars(m, &entry.tokens))
+        });
 
-        let cost = if let Some(carried) = entry.cost_usd {
-            carried
-        } else if let Some(model) = entry.model.as_deref().filter(|m| !m.trim().is_empty()) {
-            match pricing.estimated_cost_dollars(model, &entry.tokens) {
-                Some(c) => c,
-                None => continue,
-            }
-        } else {
-            continue;
-        };
+        let row = by_day.entry(day).or_insert_with_key(|date| DailyUsageRow {
+            date: date.clone(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
+            total_cost: None,
+            cost_usd: None,
+            models: BTreeMap::new(),
+        });
+        let tokens = &entry.tokens;
+        let total = total_tokens(tokens);
+        row.input_tokens = row.input_tokens.saturating_add(tokens.input);
+        row.output_tokens = row.output_tokens.saturating_add(tokens.output);
+        row.cache_creation_tokens = row.cache_creation_tokens
+            .saturating_add(tokens.cache_write5m)
+            .saturating_add(tokens.cache_write1h);
+        row.cache_read_tokens = row.cache_read_tokens.saturating_add(tokens.cache_read);
+        row.total_tokens = row.total_tokens.saturating_add(total);
 
-        let total = entry.tokens.total_tokens();
-        *tokens_by_day.entry(day.clone()).or_default() += total;
-        *cost_by_day.entry(day.clone()).or_default() += cost;
-        priced_days.insert(day.clone());
-        *input_by_day.entry(day.clone()).or_default() += entry.tokens.input;
-        *output_by_day.entry(day.clone()).or_default() += entry.tokens.output;
-        *cache_create_by_day.entry(day.clone()).or_default() +=
-            entry.tokens.cache_write5m + entry.tokens.cache_write1h;
-        *cache_read_by_day.entry(day.clone()).or_default() += entry.tokens.cache_read;
-
-        let slot = models_by_day.entry(day.clone()).or_default();
-        let e = slot.entry(model_name.to_string()).or_insert((0, 0.0));
-        e.0 += total;
-        e.1 += cost;
+        let model = row.models.entry(model.unwrap_or("Unattributed").to_string()).or_insert(ModelDayUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
+            total_cost: None,
+        });
+        model.total_tokens = model.total_tokens.saturating_add(total);
+        model.output_tokens = model.total_tokens;
+        if let Some(cost) = cost {
+            let daily_cost = row.total_cost.unwrap_or_default() + cost;
+            row.total_cost = Some(daily_cost);
+            row.cost_usd = Some(daily_cost);
+            model.total_cost = Some(model.total_cost.unwrap_or_default() + cost);
+        }
     }
 
-    tokens_by_day
-        .keys()
-        .rev()
-        .cloned()
-        .map(|day| {
-            let total_cost = if priced_days.contains(&day) {
-                cost_by_day.get(&day).copied()
-            } else {
-                None
-            };
-            let models: BTreeMap<String, ModelDayUsage> = models_by_day
-                .get(&day)
-                .map(|m| {
-                    m.iter()
-                        .map(|(name, (tokens, cost))| {
-                            (
-                                name.clone(),
-                                ModelDayUsage {
-                                    input_tokens: 0,
-                                    output_tokens: *tokens,
-                                    cache_creation_tokens: 0,
-                                    cache_read_tokens: 0,
-                                    total_tokens: *tokens,
-                                    total_cost: Some(*cost),
-                                },
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            DailyUsageRow {
-                date: day.clone(),
-                input_tokens: *input_by_day.get(&day).unwrap_or(&0),
-                output_tokens: *output_by_day.get(&day).unwrap_or(&0),
-                cache_creation_tokens: *cache_create_by_day.get(&day).unwrap_or(&0),
-                cache_read_tokens: *cache_read_by_day.get(&day).unwrap_or(&0),
-                total_tokens: *tokens_by_day.get(&day).unwrap_or(&0),
-                total_cost,
-                cost_usd: total_cost,
-                models,
-            }
-        })
-        .collect()
+    by_day.into_values().rev().collect()
 }
 
 #[cfg(test)]
@@ -626,6 +602,55 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn windows_cowork_and_multi_home_logs_fold_into_one_readout() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("user");
+        let roaming = tmp.path().join("roaming");
+        let local = tmp.path().join("local");
+        let desktop = windows_desktop_roots(Some(&roaming), Some(&local));
+        let cli = [tmp.path().join("code-one"), tmp.path().join("code-two")];
+        let make_log = |root: &Path, id: &str, input: i32| {
+            let projects = root.join("projects/test");
+            fs::create_dir_all(&projects).unwrap();
+            let line = serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-07-12T12:00:00Z",
+                "requestId": id,
+                "costUSD": 0.0,
+                "message": {
+                    "id": id,
+                    "model": "claude-sonnet-4-20250514",
+                    "usage": { "input_tokens": input, "output_tokens": 1 }
+                }
+            });
+            fs::write(projects.join("session.jsonl"), line.to_string()).unwrap();
+        };
+        make_log(&cli[0], "first", 10);
+        make_log(&cli[1], "shared", 20);
+        make_log(&home.join(".claude"), "default", 1000);
+        for (index, base) in desktop.iter().enumerate() {
+            let group = base.join("local-agent-mode-sessions/account/org");
+            make_log(&group.join("local_session/.claude"), "shared", 20);
+            make_log(&group.join("agent/local_session/.claude"), &format!("desktop-{index}"), 5);
+        }
+        let configured = format!("{}, {}", cli[0].display(), cli[1].join("projects").display());
+        let roots = claude_roots_for(Some(&configured), Some(&home), None, &desktop);
+        assert_eq!(roots.len(), 8);
+        let since = parse_since("2026-07-11");
+        let rows = scan_roots(&roots, since, default_pricing()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input_tokens, 45);
+        assert_eq!(rows[0].output_tokens, 5);
+        assert_eq!(rows[0].total_tokens, 50);
+        assert_eq!(rows[0].total_cost, Some(0.0));
+        assert_eq!(rows[0].models["claude-sonnet-4-20250514"].total_tokens, 50);
+        let missing = tmp.path().join("missing");
+        let roots = claude_roots_for(missing.to_str(), Some(&home), None, &desktop);
+        assert_eq!(roots.len(), 6);
+        assert!(!roots.contains(&home.join(".claude")));
+    }
 
     #[test]
     fn parses_usage_line_and_aggregates() {
@@ -660,17 +685,39 @@ mod tests {
     }
 
     #[test]
-    fn nested_iteration_null_model_does_not_drop_parent() {
+    fn nested_iteration_null_model_counts_unattributed_tokens_without_cost() {
         let line = br#"{"timestamp":"2026-07-12T10:00:00.000Z","message":{"id":"m1","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":50,"iterations":[{"type":"advisor_message","model":null,"input_tokens":10,"output_tokens":5}]}},"requestId":"r1","version":"1.0.0"}"#;
         let entries = parse_entries(line);
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].tokens.input, 100);
         assert_eq!(entries[0].model.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(entries[1].model, None);
+        let rows = aggregate(&entries, entries[0].timestamp, default_pricing());
+        assert_eq!(rows[0].total_tokens, 165);
+        assert_eq!(rows[0].models["Unattributed"].total_tokens, 15);
+        assert_eq!(rows[0].models["Unattributed"].total_cost, None);
     }
 
     #[test]
     fn top_level_null_model_is_still_rejected() {
         let line = br#"{"timestamp":"2026-07-12T10:00:00.000Z","message":{"id":"m1","model":null,"usage":{"input_tokens":100,"output_tokens":50}},"requestId":"r1","version":"1.0.0"}"#;
         assert!(parse_entries(line).is_empty());
+    }
+
+    #[test]
+    fn folds_nullable_assistant_rows_without_counting_tool_results_or_invalid_counts() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("session.jsonl");
+        let usage = r#"{"type":"assistant","timestamp":"2026-02-20T12:00:00Z","costUSD":null,"message":{"usage" : {"input_tokens":10,"output_tokens":2,"cache_creation":null,"cache_creation_input_tokens":3,"cache_read_input_tokens":null,"speed":null}}}"#;
+        let tool_result = r#"{"type":"user","timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":999,"output_tokens":999}}}"#;
+        let invalid = r#"{"type":"assistant","timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":-1,"output_tokens":2}}}"#;
+        fs::write(&log, [usage, tool_result, invalid].join("\n")).unwrap();
+
+        let entries = parse_file(&log);
+        assert_eq!(entries.len(), 1);
+        let rows = aggregate(&entries, entries[0].timestamp, default_pricing());
+        assert_eq!(rows[0].total_tokens, 15);
+        assert_eq!(rows[0].cache_creation_tokens, 3);
+        assert_eq!(rows[0].total_cost, None);
     }
 }
