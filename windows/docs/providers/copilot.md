@@ -6,9 +6,11 @@ Tracks GitHub Copilot usage quotas for both paid and free tier users.
 
 The plugin looks for a GitHub token in this order:
 
-1. **OpenUsage Keychain** (`OpenUsage-copilot`) — Token previously cached by the plugin
-2. **GitHub CLI Keychain** (`gh:github.com`) — Token from `gh auth login`
-3. **State File** (`auth.json`) — Fallback file-based storage
+1. **Selected account** — An explicitly saved credential is used on its own.
+2. **Copilot editor** — `apps.json` or `hosts.json` in `%LOCALAPPDATA%\github-copilot` or `~/.config/github-copilot`.
+3. **GitHub CLI config** — `hosts.yml` in `GH_CONFIG_DIR`, or the standard Windows or home config directory.
+4. **Credential store** — QuotaBar's legacy cache, followed by the GitHub CLI credential for the configured GitHub.com user.
+5. **State file** — Legacy fallback.
 
 ### Setup
 
@@ -24,7 +26,7 @@ gh auth login
 
 Choose "GitHub.com" and follow the prompts. The plugin will automatically read the token from the gh CLI keychain.
 
-Once authenticated via gh CLI, the plugin caches the token in the OpenUsage keychain for faster access on subsequent probes.
+GitHub Enterprise host entries are not used against GitHub.com. For organization-managed seats, QuotaBar can show a personal credits count and, if authorized, separate organization-wide credits and spend. Denied organization billing does not hide personal usage.
 
 ## API
 

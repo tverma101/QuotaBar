@@ -24,7 +24,9 @@ grok login
 
 2. Enable the Grok plugin in OpenUsage settings.
 
-OpenUsage reads the same local auth file that the Grok CLI uses. Access tokens are refreshed automatically before expiry when a `refresh_token` is present. If refresh fails, run `grok login` again.
+QuotaBar normally uses the local Grok CLI auth file. For an explicitly saved account, token rotation updates that account only; it does not modify the CLI login. If CLI refresh fails, run `grok login` again.
+
+The Weekly meter uses the reported billing window and is not shown for legacy monthly-only plans. Local spend counts completed coordinator turns, deduplicates replayed events, and skips separate subagent ledgers so child usage is not charged twice. If no price is known for a model, its tokens still count without inventing a cost.
 
 ## Endpoint
 

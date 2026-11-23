@@ -70,9 +70,11 @@
     return null;
   }
 
-  function loadTokenFromGhCli(ctx) {
+  function loadTokenFromGhCli(ctx, account) {
     try {
-      const raw = ctx.host.keychain.readGenericPassword(GH_KEYCHAIN_SERVICE);
+      const raw = account
+        ? ctx.host.keychain.readGenericPassword(GH_KEYCHAIN_SERVICE, account)
+        : ctx.host.keychain.readGenericPassword(GH_KEYCHAIN_SERVICE);
       if (raw) {
         let token = raw;
         if (
@@ -83,13 +85,69 @@
         }
         if (token) {
           ctx.host.log.info("token loaded from gh CLI keychain");
-          return { token: token, source: "gh-cli" };
+          return { token: token, source: "gh-cli", scoped: Boolean(account) };
         }
       }
     } catch (e) {
       ctx.host.log.info("gh CLI keychain read failed: " + String(e));
     }
     return null;
+  }
+
+  function loadEditorToken(ctx) {
+    const local = ctx.host.env.get("LOCALAPPDATA");
+    const roots = local ? [local + "/github-copilot"] : [];
+    roots.push("~/.config/github-copilot");
+    for (const root of roots) {
+      for (const file of ["apps.json", "hosts.json"]) {
+        const entries = readJson(ctx, root + "/" + file);
+        if (!entries || typeof entries !== "object") continue;
+        for (const [host, entry] of Object.entries(entries)) {
+          if (host !== "github.com" && !host.startsWith("github.com:")) continue;
+          const token = entry && entry.oauth_token;
+          if (typeof token === "string" && token.trim()) {
+            return { token: token.trim(), source: "editor" };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function readGhConfig(ctx) {
+    const override = ctx.host.env.get("GH_CONFIG_DIR");
+    const roaming = ctx.host.env.get("APPDATA");
+    const roots = override
+      ? [override]
+      : [roaming && roaming + "/GitHub CLI", "~/.config/gh"];
+    for (const root of roots) {
+      if (!root || !ctx.host.fs.exists(root + "/hosts.yml")) continue;
+      try {
+        const text = ctx.host.fs.readText(root + "/hosts.yml");
+        const config = {};
+        let inGitHub = false;
+        let indent = null;
+        for (const line of text.split(/\r?\n/)) {
+          if (!line.trim() || line.trimStart().startsWith("#")) continue;
+          const content = line.trim();
+          const depth = line.length - line.trimStart().length;
+          if (depth === 0) {
+            if (inGitHub) break;
+            inGitHub = content === "github.com:";
+          } else if (inGitHub) {
+            if (indent === null) indent = depth;
+            if (depth !== indent) continue;
+            const match = /^(user|oauth_token):\s*(\S+?)(?:\s+#.*)?$/.exec(content);
+            if (match) config[match[1]] = match[2].replace(/^(["'])(.*)\1$/, "$2");
+          }
+        }
+        return config;
+      } catch {
+        ctx.host.log.warn("could not read GitHub CLI hosts.yml");
+        return null;
+      }
+    }
+    return {};
   }
 
   function loadTokenFromStateFile(ctx) {
@@ -101,20 +159,22 @@
     return null;
   }
 
-  function loadToken(ctx) {
+  function* tokenSources(ctx) {
     const credential = ctx.util.readProviderCredential && ctx.util.readProviderCredential()
     if (credential && (credential.accessToken || credential.sessionKey)) {
       ctx.host.log.info("token loaded from provider account")
-      return {
+      yield {
         token: credential.accessToken || credential.sessionKey,
         source: "provider-account",
       }
+      return
     }
-    return (
-      loadTokenFromKeychain(ctx) ||
-      loadTokenFromGhCli(ctx) ||
-      loadTokenFromStateFile(ctx)
-    );
+    yield loadEditorToken(ctx);
+    const gh = readGhConfig(ctx);
+    if (gh && gh.oauth_token) yield { token: gh.oauth_token, source: "gh-config" };
+    yield loadTokenFromKeychain(ctx);
+    if (gh) yield loadTokenFromGhCli(ctx, gh.user);
+    yield loadTokenFromStateFile(ctx);
   }
 
   function fetchUsage(ctx, token) {
@@ -332,9 +392,11 @@
     if (snapshots && typeof snapshots === "object") {
       const premium = snapshots.premium_interactions;
       const creditsLine = snapshotLine(ctx, "Credits", premium, resetDate);
-      if (creditsLine) lines.push(creditsLine);
-      const extraLine = overageLine(ctx, premium);
-      if (extraLine) lines.push(extraLine);
+      if (creditsLine) {
+        lines.push(creditsLine);
+        const extraLine = overageLine(ctx, premium);
+        if (extraLine) lines.push(extraLine);
+      }
 
       const chatLine = snapshotLine(ctx, "Chat", snapshots.chat, resetDate);
       if (chatLine) lines.push(chatLine);
@@ -357,7 +419,11 @@
         const premium = snapshots && typeof snapshots === "object" ? snapshots.premium_interactions : null;
         const personal = personalCreditsLines(ctx, premium);
         const orgLines = token ? probeOrgBilling(ctx, token) : [];
-        return { lines: personal.concat(orgLines) };
+        const managed = personal.concat(orgLines);
+        if (!managed.length) {
+          managed.push(ctx.line.badge({ label: "Status", text: "No usage data", color: "#a3a3a3" }));
+        }
+        return { lines: managed };
       }
       throw "Copilot usage data is unavailable for this account.";
     }
@@ -366,44 +432,25 @@
   }
 
   function probe(ctx) {
-    const cred = loadToken(ctx);
-    if (!cred) {
-      throw "Not logged in. Run `gh auth login` first.";
-    }
-
-    let token = cred.token;
-    let source = cred.source;
-
+    let cred;
     let resp;
-    try {
-      resp = fetchUsage(ctx, token);
-    } catch (e) {
-      ctx.host.log.error("usage request exception: " + String(e));
-      throw "Usage request failed. Check your connection.";
+    const attempted = new Set();
+    for (const candidate of tokenSources(ctx)) {
+      if (!candidate || attempted.has(candidate.token)) continue;
+      cred = candidate;
+      attempted.add(cred.token);
+      try {
+        resp = fetchUsage(ctx, cred.token);
+      } catch (e) {
+        ctx.host.log.error("usage request exception: " + String(e));
+        throw "Usage request failed. Check your connection.";
+      }
+      if (resp.status !== 401 && resp.status !== 403) break;
+      if (cred.source === "keychain") clearCachedToken(ctx);
     }
-
+    if (!resp) throw "Not logged in. Run `gh auth login` first.";
     if (resp.status === 401 || resp.status === 403) {
-      if (source === "keychain") {
-        ctx.host.log.info("cached token invalid, trying fallback sources");
-        clearCachedToken(ctx);
-        const fallback = loadTokenFromGhCli(ctx);
-        if (fallback) {
-          try {
-            resp = fetchUsage(ctx, fallback.token);
-          } catch (e) {
-            ctx.host.log.error("fallback usage request exception: " + String(e));
-            throw "Usage request failed. Check your connection.";
-          }
-          if (resp.status >= 200 && resp.status < 300) {
-            saveToken(ctx, fallback.token);
-            token = fallback.token;
-            source = fallback.source;
-          }
-        }
-      }
-      if (resp.status === 401 || resp.status === 403) {
-        throw "Token invalid. Run `gh auth login` to re-authenticate.";
-      }
+      throw "Token invalid. Run `gh auth login` to re-authenticate.";
     }
 
     if (resp.status < 200 || resp.status >= 300) {
@@ -415,8 +462,8 @@
       );
     }
 
-    if (source === "gh-cli") {
-      saveToken(ctx, token);
+    if (cred.source === "gh-cli" && !cred.scoped) {
+      saveToken(ctx, cred.token);
     }
 
     const data = ctx.util.tryParseJson(resp.bodyText);
@@ -431,7 +478,7 @@
       plan = ctx.fmt.planLabel(data.copilot_plan);
     }
 
-    const mapped = mapUsage(ctx, data, token);
+    const mapped = mapUsage(ctx, data, cred.token);
     return { plan: plan, lines: mapped.lines };
   }
 

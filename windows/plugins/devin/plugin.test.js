@@ -503,6 +503,31 @@ describe("devin plugin", () => {
     expect(() => plugin.probe(ctx)).toThrow("Devin quota data unavailable. Try again later.")
   })
 
+  it("uses the actual Windows local-data path and drops stale optional resets", async () => {
+    const ctx = makeCtx()
+    ctx.host.env.get.mockImplementation(name => name === "LOCALAPPDATA" ? "C:/Redirected" : null)
+    ctx.host.fs.writeText("C:/Redirected/devin/credentials.toml", makeCredentialsToml())
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify(makeQuotaResponse({ dailyQuotaResetAtUnix: "1", weeklyQuotaResetAtUnix: "99999999999" })),
+    })
+    const plugin = await loadPlugin()
+    const { lines } = plugin.probe(ctx)
+    expect(lines.find(line => line.label === "Daily quota")).not.toHaveProperty("resetsAt")
+    expect(lines.find(line => line.label === "Weekly quota")).not.toHaveProperty("resetsAt")
+  })
+
+  it("does not replace a rejected selected account with the local editor account", async () => {
+    const ctx = makeCtx()
+    mockAppAuth(ctx)
+    ctx.util.providerApiKey = () => "selected-account"
+    ctx.host.http.request.mockReturnValue({ status: 401, bodyText: "" })
+    const plugin = await loadPlugin()
+    expect(() => plugin.probe(ctx)).toThrow("Run devin auth login")
+    expect(ctx.host.http.request).toHaveBeenCalledTimes(1)
+    expect(ctx.host.sqlite.query).not.toHaveBeenCalled()
+  })
+
   it("omits daily quota when Devin marks it hidden", async () => {
     const ctx = makeCtx()
     ctx.host.fs.writeText(CREDENTIALS_PATH, makeCredentialsToml())
