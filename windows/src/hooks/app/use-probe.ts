@@ -1,0 +1,101 @@
+import { useCallback, useRef } from "react"
+import { useProbeEvents } from "@/hooks/use-probe-events"
+import type { PluginOutput } from "@/lib/plugin-types"
+import {
+  getProbeTargets,
+  type AutoUpdateIntervalMinutes,
+  type PluginSettings,
+} from "@/lib/settings"
+import { useAppPluginStore } from "@/stores/app-plugin-store"
+import { useProbeAutoUpdate } from "@/hooks/app/use-probe-auto-update"
+import { useProbeRefreshActions } from "@/hooks/app/use-probe-refresh-actions"
+import { useProbeState } from "@/hooks/app/use-probe-state"
+
+type UseProbeArgs = {
+  pluginSettings: PluginSettings | null
+  autoUpdateInterval: AutoUpdateIntervalMinutes
+  onProbeResult?: (output: PluginOutput) => void
+}
+
+export function useProbe({
+  pluginSettings,
+  autoUpdateInterval,
+  onProbeResult,
+}: UseProbeArgs) {
+  const pluginSettingsRef = useRef(pluginSettings)
+  pluginSettingsRef.current = pluginSettings
+
+  const {
+    pluginStates,
+    pluginStatesRef,
+    manualRefreshIdsRef,
+    setLoadingForPlugins,
+    setErrorForPlugins,
+    finalizeStaleProbeLoading,
+    handleProbeResult,
+  } = useProbeState({ onProbeResult })
+
+  const handleBatchComplete = useCallback(
+    (pluginIds: string[] | null) => {
+      // Unknown (backend-initiated) batch: clear loading on everything still
+      // waiting, since the events that would have resolved it were dropped.
+      const ids =
+        pluginIds ??
+        Object.keys(pluginStatesRef.current).filter(
+          (id) => pluginStatesRef.current[id]?.loading
+        )
+      finalizeStaleProbeLoading(ids)
+    },
+    [finalizeStaleProbeLoading, pluginStatesRef]
+  )
+  const resolveProbeTargets = useCallback((pluginIds?: string[]) => {
+    const settings =
+      useAppPluginStore.getState().pluginSettings ?? pluginSettingsRef.current
+    return getProbeTargets(pluginIds, settings)
+  }, [])
+
+  const { startBatch } = useProbeEvents({
+    onResult: handleProbeResult,
+    onBatchComplete: handleBatchComplete,
+    getProbeTargets: resolveProbeTargets,
+  })
+
+  const isPluginLoading = useCallback(
+    (id: string) => Boolean(pluginStatesRef.current[id]?.loading),
+    [pluginStatesRef]
+  )
+
+  const {
+    autoUpdateNextAt,
+    setAutoUpdateNextAt,
+    resetAutoUpdateSchedule,
+  } = useProbeAutoUpdate({
+    pluginSettings,
+    autoUpdateInterval,
+    setLoadingForPlugins,
+    setErrorForPlugins,
+    isPluginLoading,
+    startBatch,
+  })
+
+  const { handleRetryPlugin, handleRefreshAll } = useProbeRefreshActions({
+    pluginSettings,
+    pluginStatesRef,
+    manualRefreshIdsRef,
+    resetAutoUpdateSchedule,
+    setLoadingForPlugins,
+    setErrorForPlugins,
+    startBatch,
+  })
+
+  return {
+    pluginStates,
+    setLoadingForPlugins,
+    setErrorForPlugins,
+    startBatch,
+    autoUpdateNextAt,
+    setAutoUpdateNextAt,
+    handleRetryPlugin,
+    handleRefreshAll,
+  }
+}

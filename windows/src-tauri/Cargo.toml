@@ -1,0 +1,72 @@
+[package]
+name = "quotabar"
+version = "1.6.1"
+description = "QuotaBar — cross-platform fork of OpenUsage, an open source AI subscription limit tracker"
+authors = ["tverma101 <nirasushi221@gmail.com>"]
+homepage = "https://github.com/tverma101/QuotaBar"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "quotabar_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+quotabar-core = { path = "../crates/quotabar-core" }
+tauri = { version = "2.11", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "socks", "rustls", "system-proxy"] }
+dirs = "6"
+log = "0.4"
+tauri-plugin-store = "2.4.3"
+tauri-plugin-notification = "2"
+uuid = { version = "1", features = ["v4"] }
+tauri-plugin-log = "2"
+tauri-plugin-clipboard-manager = "2.3.2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2.5.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tauri-plugin-positioner = { version = "2.3.1", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+gtk-sys = "0.18"
+libappindicator = "0.9"
+libappindicator-sys = "0.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+window-vibrancy = "0.5"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri-plugin-liquid-glass = "0.1.6"
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSKeyValueCoding", "NSProcessInfo", "NSString"] }
+objc2-app-kit = { version = "0.3", features = ["NSClipView", "NSColor", "NSEvent", "NSGraphics", "NSScreen", "NSScrollView", "NSView", "NSWindow"] }
+objc2-web-kit = { version = "0.3", features = ["WKPreferences", "WKWebView", "WKWebViewConfiguration"] }
+
+[features]
+default = ["custom-protocol"]
+# Embed frontendDist in release builds; `tauri dev` passes --no-default-features.
+custom-protocol = ["tauri/custom-protocol"]
+
+[dev-dependencies]
+serial_test = "3.5"
