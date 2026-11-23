@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { DatabaseSync } from "node:sqlite"
 import { expect, it } from "vitest"
 import { makeCtx } from "../test-helpers.js"
