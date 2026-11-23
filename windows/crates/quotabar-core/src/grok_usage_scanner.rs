@@ -82,14 +82,13 @@ fn scan(
     home_path: Option<&str>,
     pricing: &ModelPricing,
 ) -> Option<Vec<DailyUsageRow>> {
-    let files = session_files(&grok_home(home_path));
+    let since = since_local_midnight(days_back);
+    let files = session_files(&grok_home(home_path), since);
     if files.is_empty() {
         return None;
     }
-    let since = since_local_midnight(days_back);
     let entries = files
         .iter()
-        .filter(|file| !file_mtime_before(&file.mtime, since) && is_coordinator_session(&file.path))
         .flat_map(|file| parse_file(&file.path))
         .filter(|entry| entry.timestamp >= since);
     Some(aggregate(dedup(entries), pricing))
@@ -108,9 +107,10 @@ fn grok_home(home_path: Option<&str>) -> PathBuf {
         .join(".grok")
 }
 
-fn session_files(home: &Path) -> Vec<DiscoveredFile> {
+fn session_files(home: &Path, since: DateTime<Utc>) -> Vec<DiscoveredFile> {
     let mut files = Vec::new();
     collect_updates(&home.join("sessions"), &mut files);
+    files.retain(|file| !file_mtime_before(&file.mtime, since) && is_coordinator_session(&file.path));
     cap_log_files_by_mtime(&mut files, |f| f.mtime, |f| f.size);
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
@@ -466,6 +466,34 @@ mod tests {
         assert_eq!(rows[0].total_tokens, 100);
         assert_eq!(rows[0].total_cost, None);
         assert_eq!(rows[0].models["unknown-grok-fixture-model"].total_cost, None);
+    }
+
+    #[test]
+    fn subagent_ledgers_do_not_take_slots_from_older_coordinators() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let coordinator = sessions.join("coordinator");
+        fs::create_dir_all(&coordinator).unwrap();
+        let ledger = coordinator.join("updates.jsonl");
+        fs::File::create(&ledger)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+        fs::write(coordinator.join("summary.json"), r#"{"session_kind":"coordinator"}"#).unwrap();
+        for i in 0..crate::log_usage_types::LOG_SCAN_MAX_FILES {
+            let subagent = sessions.join(format!("subagent-{i}"));
+            fs::create_dir_all(&subagent).unwrap();
+            fs::write(subagent.join("updates.jsonl"), "").unwrap();
+            fs::write(
+                subagent.join("summary.json"),
+                r#"{"session_kind":"subagent"}"#,
+            )
+            .unwrap();
+        }
+
+        let files = session_files(tmp.path(), Utc::now() - chrono::Duration::hours(1));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, ledger);
     }
 
     #[test]
