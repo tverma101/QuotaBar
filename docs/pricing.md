@@ -13,6 +13,8 @@ Prices are layered from four sources; when the same model appears in more than o
 
 The app ships the supplement and LiteLLM and models.dev snapshots for offline use and first launch. OpenRouter is cache-only after its first successful fetch. Sources refresh about once an hour under `~/Library/Application Support/QuotaBar/pricing/`; LiteLLM, models.dev, and the supplement use ETag revalidation. OpenRouter requests all pages in batches of up to 1,000 models and replaces its cached list only after every page validates. A refresh never blocks a usage scan. If OpenRouter cannot refresh, QuotaBar keeps using its last complete cached catalogue; other sources fill models that have no matching OpenRouter entry.
 
+On Windows, offline estimates use the bundled Windows supplement, LiteLLM, then exact matches from the shared models.dev snapshot. Models.dev IDs with conflicting prices remain unpriced by that source. A model marked fast or free does not inherit the standard rate through a fuzzy match. The live catalog refresh and discovery described here are currently macOS-only.
+
 A model without a curated price or an exact OpenRouter rate queues a public catalogue revalidation,
 even when LiteLLM or models.dev currently supplies a fallback estimate. Repeated names are combined,
 with at most one discovery fetch every five minutes. After three completed checks without an exact

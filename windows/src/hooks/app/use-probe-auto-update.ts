@@ -14,6 +14,12 @@ type UseProbeAutoUpdateArgs = {
   startBatch: (pluginIds?: string[]) => Promise<string[] | undefined>
 }
 
+function nextLocalMidnight(now: number) {
+  const next = new Date(now)
+  next.setHours(24, 0, 0, 0)
+  return next.getTime()
+}
+
 export function useProbeAutoUpdate({
   pluginSettings,
   autoUpdateInterval,
@@ -38,25 +44,46 @@ export function useProbeAutoUpdate({
     }
 
     const intervalMs = autoUpdateInterval * 60_000
-    const scheduleNext = () => setAutoUpdateNextAt(Date.now() + intervalMs)
-    scheduleNext()
+    let nextQuota = Date.now() + intervalMs
+    let midnight = nextLocalMidnight(Date.now())
+    let timer: ReturnType<typeof setTimeout>
+    setAutoUpdateNextAt(nextQuota)
 
-    const interval = setInterval(() => {
-      const idleIds = enabledIds.filter((id) => !isPluginLoading(id))
-      if (idleIds.length === 0) {
-        scheduleNext()
-        return
+    const schedule = () => {
+      clearTimeout(timer)
+      timer = setTimeout(checkDeadlines, Math.max(0, Math.min(nextQuota, midnight) - Date.now()))
+    }
+
+    function checkDeadlines() {
+      const now = Date.now()
+      const quotaDue = now >= nextQuota
+      const midnightDue = now >= midnight
+      midnight = nextLocalMidnight(now)
+      if (quotaDue) {
+        nextQuota = now + intervalMs
+        setAutoUpdateNextAt(nextQuota)
       }
+      schedule()
+      if (!quotaDue && !midnightDue) return
+
+      const idleIds = enabledIds.filter((id) => !isPluginLoading(id))
+      if (idleIds.length === 0) return
 
       setLoadingForPlugins(idleIds)
       startBatch(idleIds).catch((error) => {
         console.error("Failed to start auto-update batch:", error)
         setErrorForPlugins(idleIds, "Failed to start probe")
       })
-      scheduleNext()
-    }, intervalMs)
+    }
 
-    return () => clearInterval(interval)
+    schedule()
+    window.addEventListener("focus", checkDeadlines)
+    document.addEventListener("visibilitychange", checkDeadlines)
+    return () => {
+      clearTimeout(timer)
+      window.removeEventListener("focus", checkDeadlines)
+      document.removeEventListener("visibilitychange", checkDeadlines)
+    }
   }, [
     autoUpdateInterval,
     autoUpdateResetToken,

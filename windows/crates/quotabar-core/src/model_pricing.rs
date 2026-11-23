@@ -1,17 +1,47 @@
-//! Bundled model pricing (supplement + LiteLLM compact snapshot).
+//! Bundled model pricing (supplement, LiteLLM and models.dev compact snapshots).
 //! Ports upstream OpenUsage v0.7.3+ aliases; v0.7.8/0.7.9 add Kimi K3, Opus 5, Grok 4.6,
 //! Daybreak Blue, and Cursor Router prose labels. Upstream #909 refreshes price lists hourly
-//! via gh-pages. This fork ships the bundled supplement (`updated_at` in JSON)
-//! and does not fetch over the network — optional follow-up if live refresh is needed.
+//! via gh-pages. This Windows engine currently does not fetch over the network.
 
 use crate::log_usage_types::TokenBreakdown;
 use regex_lite::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const SUPPLEMENT_JSON: &str = include_str!("../data/pricing_supplement.json");
 const LITELLM_JSON: &str = include_str!("../data/pricing_litellm_snapshot.json");
+const CURRENT_LITELLM_JSON: &str =
+    include_str!("../../../../Sources/QuotaBar/Resources/pricing_litellm_snapshot.json");
+const MODELS_DEV_JSON: &str =
+    include_str!("../../../../Sources/QuotaBar/Resources/pricing_models_dev_snapshot.json");
+const MAX_CACHED_MODELS: usize = 1024;
+const MAX_CACHED_MODEL_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Deserialize)]
+struct PromptRateTier {
+    threshold_prompt_tokens: i64,
+    #[serde(default)]
+    includes_threshold: bool,
+    input_per_million: Option<f64>,
+    output_per_million: Option<f64>,
+    cache_write_per_million: Option<f64>,
+    cache_read_per_million: Option<f64>,
+    cache_write_1h_per_million: Option<f64>,
+}
+
+impl PromptRateTier {
+    fn scaled(&self, factor: f64) -> Self {
+        Self {
+            input_per_million: self.input_per_million.map(|v| v * factor),
+            output_per_million: self.output_per_million.map(|v| v * factor),
+            cache_write_per_million: self.cache_write_per_million.map(|v| v * factor),
+            cache_read_per_million: self.cache_read_per_million.map(|v| v * factor),
+            cache_write_1h_per_million: self.cache_write_1h_per_million.map(|v| v * factor),
+            ..*self
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ModelRates {
@@ -19,6 +49,8 @@ pub struct ModelRates {
     pub output_per_million: f64,
     pub cache_write_per_million: f64,
     pub cache_read_per_million: f64,
+    cache_write_1h_per_million: Option<f64>,
+    prompt_rate_tiers: Vec<PromptRateTier>,
     pub input_above_200k: Option<f64>,
     pub output_above_200k: Option<f64>,
     pub cache_write_above_200k: Option<f64>,
@@ -37,6 +69,12 @@ impl ModelRates {
             output_per_million: self.output_per_million * factor,
             cache_write_per_million: self.cache_write_per_million * factor,
             cache_read_per_million: self.cache_read_per_million * factor,
+            cache_write_1h_per_million: self.cache_write_1h_per_million.map(|v| v * factor),
+            prompt_rate_tiers: self
+                .prompt_rate_tiers
+                .iter()
+                .map(|tier| tier.scaled(factor))
+                .collect(),
             input_above_200k: self.input_above_200k.map(|v| v * factor),
             output_above_200k: self.output_above_200k.map(|v| v * factor),
             cache_write_above_200k: self.cache_write_above_200k.map(|v| v * factor),
@@ -61,19 +99,57 @@ impl ModelRates {
     ) -> f64 {
         const CACHE_WRITE_1H_MULT: f64 = 2.0;
         let mult = if tokens.is_fast { self.fast_multiplier } else { 1.0 };
-        let prompt_tokens =
-            tokens.input + tokens.cache_write5m + tokens.cache_write1h + tokens.cache_read;
-        let use_long =
-            apply_long_context_rates && prompt_tokens > self.long_context_threshold_tokens;
-        let input_rate = selected_rate(self.input_per_million, self.input_above_200k, use_long);
-        let output_rate = selected_rate(self.output_per_million, self.output_above_200k, use_long);
-        let cache_write_rate =
-            selected_rate(self.cache_write_per_million, self.cache_write_above_200k, use_long);
-        let cache_read_rate =
-            selected_rate(self.cache_read_per_million, self.cache_read_above_200k, use_long);
-        let cache_write_1h_rate =
-            selected_rate(self.input_per_million, self.input_above_200k, use_long)
-                * CACHE_WRITE_1H_MULT;
+        let prompt_tokens = [
+            tokens.input,
+            tokens.cache_write5m,
+            tokens.cache_write1h,
+            tokens.cache_read,
+        ]
+        .into_iter()
+        .map(i64::from)
+        .sum::<i64>();
+        let use_long = apply_long_context_rates
+            && prompt_tokens > i64::from(self.long_context_threshold_tokens);
+        let tier = self
+            .prompt_rate_tiers
+            .iter()
+            .filter(|tier| {
+                apply_long_context_rates
+                    && (prompt_tokens > tier.threshold_prompt_tokens
+                        || (tier.includes_threshold && prompt_tokens == tier.threshold_prompt_tokens))
+            })
+            .max_by_key(|tier| tier.threshold_prompt_tokens);
+        let select = |base, long, prompt: Option<f64>| {
+            prompt.unwrap_or_else(|| selected_rate(base, long, use_long))
+        };
+        let input_rate = select(
+            self.input_per_million,
+            self.input_above_200k,
+            tier.and_then(|t| t.input_per_million),
+        );
+        let output_rate = select(
+            self.output_per_million,
+            self.output_above_200k,
+            tier.and_then(|t| t.output_per_million),
+        );
+        let cache_write_rate = select(
+            self.cache_write_per_million,
+            self.cache_write_above_200k,
+            tier.and_then(|t| t.cache_write_per_million),
+        );
+        let cache_read_rate = if self.cache_read_is_explicit {
+            select(
+                self.cache_read_per_million,
+                self.cache_read_above_200k,
+                tier.and_then(|t| t.cache_read_per_million),
+            )
+        } else {
+            input_rate
+        };
+        let cache_write_1h_rate = tier
+            .and_then(|t| t.cache_write_1h_per_million)
+            .or(self.cache_write_1h_per_million)
+            .unwrap_or(input_rate * CACHE_WRITE_1H_MULT);
 
         let cost = flat_cost(tokens.input, input_rate)
             + flat_cost(tokens.output, output_rate)
@@ -137,6 +213,8 @@ struct AliasRuleFile {
 #[derive(Deserialize)]
 struct CompactCatalog {
     models: HashMap<String, CompactModel>,
+    #[serde(default)]
+    retired: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +223,9 @@ struct CompactModel {
     o: f64,
     cw: f64,
     cr: f64,
+    cw1: Option<f64>,
+    #[serde(default)]
+    tiers: Vec<PromptRateTier>,
     #[serde(default)]
     ia: Option<f64>,
     #[serde(default)]
@@ -163,6 +244,8 @@ struct CompactModel {
 pub struct ModelPricing {
     supplement: PricingSupplement,
     primary: HashMap<String, ModelRates>,
+    secondary: HashMap<String, ModelRates>,
+    resolved: Mutex<HashMap<String, Option<ModelRates>>>,
 }
 
 static DEFAULT_PRICING: OnceLock<ModelPricing> = OnceLock::new();
@@ -174,8 +257,15 @@ pub fn default_pricing() -> &'static ModelPricing {
 impl ModelPricing {
     pub fn from_bundled() -> Self {
         let supplement = load_supplement(SUPPLEMENT_JSON);
-        let primary = load_compact_catalog(LITELLM_JSON);
-        Self { supplement, primary }
+        let mut primary = load_compact_catalog(LITELLM_JSON);
+        primary.extend(load_compact_catalog(CURRENT_LITELLM_JSON));
+        let secondary = load_compact_catalog(MODELS_DEV_JSON);
+        Self {
+            supplement,
+            primary,
+            secondary,
+            resolved: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn can_price(&self, model: &str) -> bool {
@@ -192,6 +282,29 @@ impl ModelPricing {
     }
 
     pub fn resolve(&self, model: &str) -> Option<ModelRates> {
+        if model.len() > MAX_CACHED_MODEL_BYTES {
+            return self.resolve_uncached(model);
+        }
+        if let Some(cached) = self
+            .resolved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(model)
+        {
+            return cached.clone();
+        }
+        let result = self.resolve_uncached(model);
+        let mut resolved = self
+            .resolved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if resolved.len() < MAX_CACHED_MODELS {
+            resolved.entry(model.to_owned()).or_insert_with(|| result.clone());
+        }
+        result
+    }
+
+    fn resolve_uncached(&self, model: &str) -> Option<ModelRates> {
         if let Some(canonical) = self.supplement.canonical_name(model) {
             if canonical != model {
                 if let Some(r) = self.lookup(&canonical) {
@@ -207,12 +320,38 @@ impl ModelPricing {
             return Some(r.clone());
         }
         if let Some(r) = self.primary.get(name) {
-            return Some(r.clone());
+            return Some(self.with_supplement_fast_multiplier(name, r));
+        }
+        let normalized = normalized_key(name);
+        if normalized != name {
+            if let Some(r) = self.supplement.pricing.get(&normalized) {
+                return Some(r.clone());
+            }
+            if let Some(r) = self.primary.get(&normalized) {
+                return Some(self.with_supplement_fast_multiplier(name, r));
+            }
         }
         if let Some(r) = self.fast_variant(name) {
             return Some(r);
         }
-        self.fuzzy_primary(name)
+        if !name.ends_with("-fast")
+            && !normalized.rsplit('/').next().unwrap_or_default().to_ascii_lowercase().ends_with("-free")
+        {
+            if let Some(r) = self.fuzzy_primary(name) {
+                return Some(self.with_supplement_fast_multiplier(name, r));
+            }
+        }
+        self.secondary.get(name).map(|r| self.with_supplement_fast_multiplier(name, r))
+    }
+
+    fn with_supplement_fast_multiplier(&self, name: &str, rates: &ModelRates) -> ModelRates {
+        let mut rates = rates.clone();
+        if rates.fast_multiplier == 1.0 && !name.ends_with("-fast") {
+            if let Some(multiplier) = self.supplement.fast_multiplier(name) {
+                rates.fast_multiplier = multiplier;
+            }
+        }
+        rates
     }
 
     fn fast_variant(&self, name: &str) -> Option<ModelRates> {
@@ -242,10 +381,36 @@ impl ModelPricing {
         self.primary
             .get(base)
             .map(|r| (base.to_string(), r.clone()))
-            .or_else(|| self.fuzzy_primary(base).map(|r| (base.to_string(), r)))
+            .or_else(|| self.dated_primary_entry(base))
+            .or_else(|| self.secondary.get(base).map(|r| (base.to_string(), r.clone())))
     }
 
-    fn fuzzy_primary(&self, model: &str) -> Option<ModelRates> {
+    fn dated_primary_entry(&self, base: &str) -> Option<(String, ModelRates)> {
+        let base = normalized_key(base);
+        self.primary
+            .iter()
+            .filter_map(|(key, rates)| {
+                let candidate = normalized_key(key);
+                let candidate = if base.contains('/') {
+                    &candidate
+                } else {
+                    candidate.rsplit('/').next().unwrap_or_default()
+                };
+                let suffix = candidate.strip_prefix(&base)?.strip_prefix('-')?;
+                let (date, tail) = suffix.split_at_checked(8)?;
+                (date.bytes().all(|b| b.is_ascii_digit())
+                    && (tail.is_empty() || tail.starts_with('-')))
+                    .then(|| (date.to_owned(), key, rates))
+            })
+            .max_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1.len().cmp(&b.1.len()))
+                    .then_with(|| b.1.cmp(a.1))
+            })
+            .map(|(_, key, rates)| (key.clone(), rates.clone()))
+    }
+
+    fn fuzzy_primary(&self, model: &str) -> Option<&ModelRates> {
         let normalized = normalized_key(model);
         let mut best: Option<(&str, &ModelRates)> = None;
         for (key, rates) in &self.primary {
@@ -259,7 +424,7 @@ impl ModelPricing {
                 };
             }
         }
-        best.map(|(_, r)| r.clone())
+        best.map(|(_, r)| r)
     }
 }
 
@@ -303,6 +468,7 @@ fn load_supplement(json: &str) -> PricingSupplement {
     let mut pricing = HashMap::new();
     for (model, entry) in file.pricing {
         let cache_read_is_explicit = entry.cache_read_per_million.is_some();
+        let fast_multiplier = file.fast_multipliers.get(&model).copied().unwrap_or(1.0);
         pricing.insert(
             model,
             ModelRates {
@@ -314,13 +480,15 @@ fn load_supplement(json: &str) -> PricingSupplement {
                 cache_read_per_million: entry
                     .cache_read_per_million
                     .unwrap_or(entry.input_per_million * 0.1),
+                cache_write_1h_per_million: None,
+                prompt_rate_tiers: Vec::new(),
                 input_above_200k: None,
                 output_above_200k: None,
                 cache_write_above_200k: None,
                 cache_read_above_200k: None,
                 cache_read_is_explicit,
                 long_context_threshold_tokens: 200_000,
-                fast_multiplier: 1.0,
+                fast_multiplier,
             },
         );
     }
@@ -366,9 +534,16 @@ fn compile_alias_pattern(pattern: &str) -> Option<(Regex, Option<String>)> {
 }
 
 fn load_compact_catalog(json: &str) -> HashMap<String, ModelRates> {
-    let file: CompactCatalog = serde_json::from_str(json).unwrap_or(CompactCatalog {
-        models: HashMap::new(),
-    });
+    let mut file: CompactCatalog = match serde_json::from_str(json) {
+        Ok(file) => file,
+        Err(err) => {
+            log::warn!("failed to parse bundled compact pricing: {err}");
+            return HashMap::new();
+        }
+    };
+    for key in file.retired {
+        file.models.remove(&key);
+    }
     file.models
         .into_iter()
         .map(|(key, m)| {
@@ -379,6 +554,8 @@ fn load_compact_catalog(json: &str) -> HashMap<String, ModelRates> {
                     output_per_million: m.o,
                     cache_write_per_million: m.cw,
                     cache_read_per_million: m.cr,
+                    cache_write_1h_per_million: m.cw1,
+                    prompt_rate_tiers: m.tiers,
                     input_above_200k: m.ia,
                     output_above_200k: m.oa,
                     cache_write_above_200k: m.cwa,
@@ -393,14 +570,35 @@ fn load_compact_catalog(json: &str) -> HashMap<String, ModelRates> {
 }
 
 fn normalized_key(model: &str) -> String {
-    model.to_ascii_lowercase()
+    model.replace(['.', '@', ' ', '_'], "-")
 }
 
 fn key_matches(candidate: &str, model: &str, normalized_model: &str) -> bool {
     let nc = normalized_key(candidate);
-    normalized_model.contains(&nc)
-        || normalized_key(model).contains(&nc)
-        || model.contains(candidate)
+    contains_key(model, candidate) || contains_key(candidate, model)
+        || contains_key(normalized_model, &nc) || contains_key(&nc, normalized_model)
+}
+
+fn contains_key(value: &str, key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    value.match_indices(key).any(|(start, _)| {
+        let bytes = value.as_bytes();
+        if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            return false;
+        }
+        let suffix = &bytes[start + key.len()..];
+        match suffix {
+            [separator, rest @ ..] if matches!(separator, b'-' | b'.')
+                && key.as_bytes().last().is_some_and(u8::is_ascii_digit) => {
+                let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+                digits == 0 || (digits == 8 && !rest.get(digits).is_some_and(u8::is_ascii_alphanumeric))
+            }
+            [first, ..] => !first.is_ascii_alphanumeric(),
+            [] => true,
+        }
+    })
 }
 
 fn matches_model_suffix(part: &str, base: &str) -> bool {
@@ -415,6 +613,93 @@ fn matches_model_suffix(part: &str, base: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pricing_memoizes_repeated_hits_and_misses_without_unbounded_growth() {
+        let pricing = ModelPricing::from_bundled();
+        assert!(pricing.can_price("claude-sonnet-4-20250514"));
+        assert!(!pricing.can_price("unlisted-catalog-fixture"));
+        for _ in 0..100 {
+            assert!(pricing.can_price("claude-sonnet-4-20250514"));
+            assert!(!pricing.can_price("unlisted-catalog-fixture"));
+        }
+        {
+            let mut cache = pricing.resolved.lock().unwrap();
+            assert_eq!(cache.len(), 2);
+            assert!(cache["unlisted-catalog-fixture"].is_none());
+            for number in 2..MAX_CACHED_MODELS {
+                cache.insert(format!("test-{number}"), None);
+            }
+        }
+        assert!(!pricing.can_price("unlisted-catalog-fixture-2"));
+        assert_eq!(pricing.resolved.lock().unwrap().len(), MAX_CACHED_MODELS);
+    }
+
+    #[test]
+    fn models_dev_is_an_exact_fallback_and_honors_conflict_tombstones() {
+        let mut pricing = ModelPricing::from_bundled();
+        pricing.primary = load_compact_catalog(r#"{"models":{
+            "priority-model":{"i":1,"o":2,"cw":1,"cr":1},
+            "vendor/priority-model-v2":{"i":2,"o":2,"cw":2,"cr":2}
+        }}"#);
+        pricing.secondary = load_compact_catalog(r#"{"models":{
+            "priority-model":{"i":3,"o":2,"cw":3,"cr":3},
+            "priority-model-v2":{"i":4,"o":2,"cw":4,"cr":4},
+            "secondary-only":{"i":5,"o":2,"cw":5,"cr":5},
+            "conflict":{"i":6,"o":2,"cw":6,"cr":6}
+        },"retired":["conflict"]}"#);
+
+        assert_eq!(pricing.resolve("priority-model").unwrap().input_per_million, 1.0);
+        assert_eq!(pricing.resolve("priority-model-v2").unwrap().input_per_million, 2.0);
+        assert_eq!(pricing.resolve("secondary-only").unwrap().input_per_million, 5.0);
+        assert!(!pricing.can_price("secondary-only-extra"));
+        assert!(!pricing.can_price("conflict"));
+        assert!(ModelPricing::from_bundled().can_price("@cf/aisingapore/gemma-sea-lion-v4-27b-it"));
+    }
+
+    #[test]
+    fn lite_llm_fuzzy_match_requires_boundaries_and_cannot_price_unverified_variants() {
+        let mut pricing = ModelPricing::from_bundled();
+        pricing.primary = load_compact_catalog(r#"{"models":{
+            "vendor/example-4":{"i":1,"o":2,"cw":1,"cr":1},
+            "space-bunny":{"i":3,"o":2,"cw":3,"cr":3}
+        }}"#);
+        pricing.secondary.clear();
+
+        assert!(pricing.can_price("vendor/example-4-20250514"));
+        assert!(pricing.can_price("space bunny"));
+        for unknown in ["vendor/example-4.5", "notexample-4", "example-4-fast", "example-4-free"] {
+            assert!(!pricing.can_price(unknown), "{unknown} was incorrectly priced");
+        }
+    }
+
+    #[test]
+    fn compact_prompt_tiers_apply_to_the_entire_request_including_cache_writes() {
+        let entries = load_compact_catalog(r#"{"models":{"example":{
+            "i":1,"o":2,"cw":3,"cr":4,"cw1":5,"tiers":[
+                {"threshold_prompt_tokens":100,"input_per_million":7},
+                {"threshold_prompt_tokens":200,"includes_threshold":true,
+                 "output_per_million":8,"cache_write_1h_per_million":9}
+            ]
+        }}}"#);
+        let rates = &entries["example"];
+        let mut tokens = TokenBreakdown {
+            input: 90,
+            output: 10,
+            cache_write5m: 0,
+            cache_write1h: 10,
+            cache_read: 0,
+            is_fast: false,
+        };
+        let check = |actual: f64, expected: f64| assert!((actual * 1_000_000.0 - expected).abs() < 1e-9);
+        check(rates.cost_dollars(&tokens), 160.0);
+        tokens.input = 91;
+        check(rates.cost_dollars(&tokens), 707.0);
+        tokens.input = 190;
+        check(rates.cost_dollars(&tokens), 360.0);
+        check(rates.cost_dollars_with_options(&tokens, false), 260.0);
+        check(rates.scaled(2.0).cost_dollars(&tokens), 720.0);
+    }
 
     #[test]
     fn bundled_pricing_resolves_claude_sonnet() {
@@ -519,6 +804,8 @@ mod tests {
             output_per_million: 2.0,
             cache_write_per_million: 1.0,
             cache_read_per_million: 0.1,
+            cache_write_1h_per_million: None,
+            prompt_rate_tiers: Vec::new(),
             input_above_200k: Some(10.0),
             output_above_200k: Some(20.0),
             cache_write_above_200k: Some(10.0),
