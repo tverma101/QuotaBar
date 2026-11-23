@@ -5,7 +5,7 @@ import { getCurrentWindow, PhysicalSize, currentMonitor } from "@tauri-apps/api/
 import type { ActiveView } from "@/components/side-nav"
 import type { DisplayPluginState } from "@/hooks/app/use-app-plugin-views"
 
-const PANEL_WIDTH = 600
+const PANEL_WIDTH = 320
 const MAX_HEIGHT_FALLBACK_PX = 560
 const MAX_HEIGHT_FRACTION_OF_MONITOR = 0.76
 
@@ -106,6 +106,18 @@ export function usePanel({
         return
       }
       unlisteners.push(u2)
+
+      // Closing the panel resets navigation and scroll, like the macOS panel.
+      const u3 = await listen("panel:did-hide", () => {
+        setShowAbout(false)
+        setActiveView("home")
+        scrollRef.current?.scrollTo({ top: 0 })
+      })
+      if (cancelled) {
+        u3()
+        return
+      }
+      unlisteners.push(u3)
     }
 
     void setup()
@@ -162,6 +174,35 @@ export function usePanel({
       const width = Math.ceil(PANEL_WIDTH * factor)
       const desiredHeightLogical = Math.max(1, container.scrollHeight)
 
+      if (platformRef.current === null) {
+        try {
+          platformRef.current = await invoke<string>("get_platform")
+        } catch {
+          platformRef.current = ""
+        }
+      }
+
+      if (platformRef.current === "windows") {
+        // Natural content height = fixed chrome (top bar + footer + padding) +
+        // the scroll region's full content height. The backend clamps it with the
+        // macOS panel rules, keeps the tray-side edge anchored and returns the
+        // tallest height the work area allows.
+        const scroll = scrollRef.current
+        const chrome = container.offsetHeight - (scroll ? scroll.offsetHeight : 0)
+        const contentHeight =
+          chrome + (scroll ? scroll.scrollHeight : container.scrollHeight) + 2
+        try {
+          const maxHeight = await invoke<number | null>("resize_panel", { height: contentHeight })
+          if (typeof maxHeight === "number" && maxPanelHeightPxRef.current !== maxHeight) {
+            maxPanelHeightPxRef.current = maxHeight
+            setMaxPanelHeightPx(maxHeight)
+          }
+        } catch (error) {
+          console.error(error)
+        }
+        return
+      }
+
       let maxHeightPhysical: number | null = null
       let maxHeightLogical: number | null = null
 
@@ -184,26 +225,6 @@ export function usePanel({
       if (maxPanelHeightPxRef.current !== maxHeightLogical) {
         maxPanelHeightPxRef.current = maxHeightLogical
         setMaxPanelHeightPx(maxHeightLogical)
-      }
-
-      if (platformRef.current === null) {
-        try {
-          platformRef.current = await invoke<string>("get_platform")
-        } catch {
-          platformRef.current = ""
-        }
-      }
-
-      if (platformRef.current === "windows") {
-        // Natural content height = fixed chrome (top bar + footer + padding) +
-        // the scroll region's full content height. The backend clamps and
-        // re-anchors the window to the tray.
-        const scroll = scrollRef.current
-        const chrome = container.offsetHeight - (scroll ? scroll.offsetHeight : 0)
-        const contentHeight =
-          chrome + (scroll ? scroll.scrollHeight : container.scrollHeight) + 2
-        invoke("resize_panel", { height: Math.max(contentHeight, 240) }).catch(console.error)
-        return
       }
 
       // macOS undecorated popover: keep syncing outer window to content height + fixed width.
