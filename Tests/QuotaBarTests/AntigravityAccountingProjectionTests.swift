@@ -138,7 +138,7 @@ final class AntigravityAccountingProjectionTests: XCTestCase {
               let index = environment["QUOTABAR_ANTIGRAVITY_LIVE_INDEX"].flatMap(Int.init) else {
             throw XCTSkip("explicit local-source validation only")
         }
-        let sqlite = SQLiteCLIAccessor(allowsReadWriteFallback: false)
+        let sqlite = NativeSQLiteAccessor(allowsReadWriteFallback: false)
         let size = try XCTUnwrap(try sqlite.queryValue(path: path,
             sql: "SELECT length(data) FROM gen_metadata WHERE idx = \(index)").flatMap(Int.init))
         let projection = try XCTUnwrap(AntigravityAccountingProjection.read(path: path, index: index, expectedBytes: size))

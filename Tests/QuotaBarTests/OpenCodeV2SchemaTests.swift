@@ -79,12 +79,12 @@ final class OpenCodeV2SchemaTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.trashItem(at: directory, resultingItemURL: nil) }
         let path = directory.appendingPathComponent("opencode.db").path
-        try SQLiteCLIAccessor().execute(path: path, sql: statements)
+        try NativeSQLiteAccessor().execute(path: path, sql: statements)
         return path
     }
 
     private func scanner(path: String) -> OpenCodeUsageScanner {
-        OpenCodeUsageScanner(sqlite: SQLiteCLIAccessor(), databasePaths: { [path] })
+        OpenCodeUsageScanner(sqlite: NativeSQLiteAccessor(), databasePaths: { [path] })
     }
 
     /// A scan with every gateway source switched off: these tests are about the database layer, so
@@ -126,7 +126,7 @@ final class OpenCodeV2SchemaTests: XCTestCase {
         let legacy = try makeDatabase(legacyTableSQL)
         let mixed = try makeDatabase(v2TableSQL + legacyTableSQL)
 
-        let accessor = SQLiteCLIAccessor()
+        let accessor = NativeSQLiteAccessor()
         XCTAssertEqual(try OpenCodeDatabaseSchemaProbe.detect(sqlite: accessor, path: v2), .v2)
         XCTAssertEqual(try OpenCodeDatabaseSchemaProbe.detect(sqlite: accessor, path: legacy), .legacy)
         XCTAssertEqual(try OpenCodeDatabaseSchemaProbe.detect(sqlite: accessor, path: mixed), .mixed)
@@ -249,7 +249,7 @@ final class OpenCodeV2SchemaTests: XCTestCase {
                 )
         )
 
-        let accessor = SQLiteCLIAccessor()
+        let accessor = NativeSQLiteAccessor()
         let v2Schema = try OpenCodeDatabaseSchemaProbe.detect(sqlite: accessor, path: v2)
         let legacySchema = try OpenCodeDatabaseSchemaProbe.detect(sqlite: accessor, path: legacy)
         let mixedSchema = try OpenCodeDatabaseSchemaProbe.detect(sqlite: accessor, path: mixed)
@@ -278,7 +278,7 @@ final class OpenCodeV2SchemaTests: XCTestCase {
         XCTAssertTrue(scanner(path: go).hasHostedUsage())
         XCTAssertTrue(scanner(path: zen).hasHostedUsage())
 
-        let accessor = SQLiteCLIAccessor()
+        let accessor = NativeSQLiteAccessor()
         let zenSchema = try OpenCodeDatabaseSchemaProbe.detect(sqlite: accessor, path: zen)
         let zenAnchor = try accessor.queryValue(path: zen, sql: OpenCodeDatabaseSQL.anchorSQL(schema: zenSchema))
         XCTAssertNil(zenAnchor, "a Zen-only database has no Go usage to anchor the monthly cycle")

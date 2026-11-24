@@ -1217,24 +1217,12 @@ actor CodexLogUsageScanner {
             if sourceDirs.isEmpty {
                 continue
             }
-            // `.jsonl.zst` archives are always discovered; when zstd itself is absent they are
-            // dropped (with one process-wide warning) so the fold degrades to today's behavior
-            // instead of failing the whole source as unreadable.
             for dir in sourceDirs.map({ $0.resolvingSymlinksInPath() }) where seenDirs.insert(dir.path).inserted {
                 guard !Task.isCancelled,
                       let discovered = JSONLScanning.jsonlFilesIfComplete(under: dir, includeCompressedJSONL: true)
                 else { return nil }
                 for file in discovered {
                     guard !Task.isCancelled else { return nil }
-                    if file.path.hasSuffix(".zst"), ZstdDecompressor.shared.zstdExecutable == nil {
-                        DiagnosticGate.logOnce(for: "codex.zstd-unavailable") {
-                            AppLog.warn(
-                                LogTag.plugin("codex"),
-                                "zstd is not installed (expected at /opt/homebrew/bin/zstd or /usr/local/bin/zstd); compressed rollout archives are skipped"
-                            )
-                        }
-                        continue
-                    }
                     let relative = String(file.path.dropFirst(dir.path.count))
                     guard seenRelative.insert(relative).inserted else { continue }
                     let fileURL = URL(fileURLWithPath: file.path)
@@ -1465,7 +1453,7 @@ actor CodexLogUsageScanner {
             for case let url as URL in enumerator {
                 guard !Task.isCancelled else { return nil }
                 let compressed = url.lastPathComponent.hasSuffix(".jsonl.zst")
-                guard url.pathExtension == "jsonl" || (ZstdDecompressor.shared.zstdExecutable != nil && compressed) else { continue }
+                guard url.pathExtension == "jsonl" || compressed else { continue }
                 guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]) else { return nil }
                 guard values.isRegularFile == true else { continue }
                 guard let identity = fileIdentity(at: url) else { return nil }
@@ -1514,10 +1502,7 @@ actor CodexLogUsageScanner {
         return parser.finish()
     }
 
-    /// Parse a finished `.jsonl.zst` rollout through the decompressor. The decompressor itself is
-    /// optional equipment — nil here means "zstd missing", which the discovery path already filtered
-    /// out, so this is reached only on machines with zstd. Results are memoized per process keyed on
-    /// the archive's revision; appends never happen to a finished rollout, so the memo is exact.
+    /// Finished archives are immutable. Cache parsed events by the full file revision.
     private final class CompressedRolloutCache: @unchecked Sendable {
         static let shared = CompressedRolloutCache()
         private struct Entry {
@@ -1560,7 +1545,7 @@ actor CodexLogUsageScanner {
             return cached.filter { $0.timestamp >= emitSince }
         }
         do {
-            guard let data = try ZstdDecompressor.shared.decompress(path: url.path) else { return nil }
+            let data = try ZstdDecompressor.shared.decompress(path: url.path)
             var parser = FileParser(emitSince: nil)
             for line in data.split(separator: UInt8(ascii: "\n")) {
                 autoreleasepool {

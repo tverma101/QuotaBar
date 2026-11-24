@@ -45,6 +45,12 @@ pub struct LoadedPlugin {
     pub icon_file_path: PathBuf,
 }
 
+impl PluginManifest {
+    pub(super) fn uses_native_devin(&self) -> bool {
+        self.id == "devin" && self.entry == "native:devin"
+    }
+}
+
 pub fn load_plugins_from_dir(plugins_dir: &std::path::Path) -> Vec<LoadedPlugin> {
     let mut plugins = Vec::new();
     let entries = match std::fs::read_dir(plugins_dir) {
@@ -97,17 +103,19 @@ fn load_single_plugin(
         return Err("plugin entry must be a relative path".into());
     }
 
-    let entry_path = plugin_dir.join(&manifest.entry);
     let canonical_plugin_dir = plugin_dir.canonicalize()?;
-    let canonical_entry_path = entry_path.canonicalize()?;
-    if !canonical_entry_path.starts_with(&canonical_plugin_dir) {
-        return Err("plugin entry must remain within plugin directory".into());
-    }
-    if !canonical_entry_path.is_file() {
-        return Err("plugin entry must be a file".into());
-    }
-
-    let entry_script = std::fs::read_to_string(&canonical_entry_path)?;
+    let entry_script = if manifest.uses_native_devin() {
+        String::new()
+    } else {
+        let canonical_entry_path = plugin_dir.join(&manifest.entry).canonicalize()?;
+        if !canonical_entry_path.starts_with(&canonical_plugin_dir) {
+            return Err("plugin entry must remain within plugin directory".into());
+        }
+        if !canonical_entry_path.is_file() {
+            return Err("plugin entry must be a file".into());
+        }
+        std::fs::read_to_string(canonical_entry_path)?
+    };
 
     let icon_file_path = plugin_dir.join(&manifest.icon).canonicalize()?;
     if !icon_file_path.starts_with(&canonical_plugin_dir) {

@@ -105,7 +105,7 @@ struct OpenCodeUsageScanner: Sendable {
     private let readFailureReporter: UsageLogReadFailureReporter
 
     init(
-        sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
+        sqlite: SQLiteAccessing = NativeSQLiteAccessor(),
         databasePaths: @escaping @Sendable () throws -> [String] = OpenCodeUsageScanner.defaultDatabasePaths,
         claudeRoots: @escaping @Sendable () -> [URL] = { [] },
         claudeCacheIdentity: @escaping @Sendable () -> String = { ClaudeLogUsageScanner.parseSourceIdentity() },

@@ -141,24 +141,6 @@ extension GrokUsageError: CategorizedError {
     }
 }
 
-extension DevinAuthError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .notLoggedIn: .notLoggedIn
-        case .credentialsUnreadable: .credentialAccess
-        }
-    }
-}
-
-extension DevinUsageError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .invalidResponse: .decoding
-        case .quotaUnavailable: .notAvailable
-        }
-    }
-}
-
 extension FreebuffAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {

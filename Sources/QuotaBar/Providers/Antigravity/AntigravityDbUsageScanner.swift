@@ -39,7 +39,7 @@ actor AntigravityDbUsageScanner {
     }
 
     init(
-        sqlite: SQLiteAccessing = SQLiteCLIAccessor(allowsReadWriteFallback: false),
+        sqlite: SQLiteAccessing = NativeSQLiteAccessor(allowsReadWriteFallback: false),
         conversationsDirectory: (@Sendable () -> String)? = nil,
         conversationsDirectories: (@Sendable () throws -> [String])? = nil,
         conversationDiscovery: (@Sendable () throws -> ConversationDirectoryDiscovery)? = nil,

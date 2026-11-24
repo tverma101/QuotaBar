@@ -70,7 +70,7 @@ final class ZCodeUsageScanner: @unchecked Sendable {
     private var cachedPricingToken: String?
 
     init(
-        sqlite: any SQLiteAccessing = SQLiteCLIAccessor(allowsReadWriteFallback: true),
+        sqlite: any SQLiteAccessing = NativeSQLiteAccessor(allowsReadWriteFallback: true),
         path: String = defaultSqlitePath,
         leveldbPath: String = defaultLevelDBPath
     ) {

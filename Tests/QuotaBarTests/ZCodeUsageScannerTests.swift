@@ -6,7 +6,7 @@ final class ZCodeUsageScannerTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quotabar-zcode-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let path = directory.appendingPathComponent("db.sqlite").path
-        try SQLiteCLIAccessor().execute(path: path, sql: """
+        try NativeSQLiteAccessor().execute(path: path, sql: """
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER,
                                       cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
                                       provider_id TEXT, started_at INTEGER);
@@ -34,7 +34,7 @@ final class ZCodeUsageScannerTests: XCTestCase {
     /// surface a history warning instead of silently reading low.
     func testInvalidTokenCountsAreExcludedAndReported() throws {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
-        try SQLiteCLIAccessor().execute(path: path, sql: """
+        try NativeSQLiteAccessor().execute(path: path, sql: """
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER, provider_id TEXT, started_at INTEGER);
             INSERT INTO model_usage VALUES (100, 20, 'account:zai-start-plan', 1000), (-1, 2, 'account:zai-start-plan', 1001);
             """)
@@ -92,7 +92,7 @@ final class ZCodeUsageScannerTests: XCTestCase {
 
     func testIncompatibleDatabaseThrows() throws {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
-        try SQLiteCLIAccessor().execute(path: path, sql: "CREATE TABLE other (id INTEGER);")
+        try NativeSQLiteAccessor().execute(path: path, sql: "CREATE TABLE other (id INTEGER);")
         XCTAssertThrowsError(try ZCodeUsageScanner(path: path).totalTokens())
     }
 
@@ -101,7 +101,7 @@ final class ZCodeUsageScannerTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let path = directory.appendingPathComponent("db.sqlite").path
         let nowMs = Int(Date().timeIntervalSince1970 * 1000)
-        try SQLiteCLIAccessor().execute(path: path, sql: """
+        try NativeSQLiteAccessor().execute(path: path, sql: """
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER, provider_id TEXT, started_at INTEGER);
             INSERT INTO model_usage VALUES (100, 20, 'account:zai-start-plan', \(nowMs));
             """)
@@ -117,7 +117,7 @@ final class ZCodeUsageScannerTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quotabar-zcode-coding-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let path = directory.appendingPathComponent("db.sqlite").path
-        try SQLiteCLIAccessor().execute(path: path, sql: """
+        try NativeSQLiteAccessor().execute(path: path, sql: """
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER, provider_id TEXT, started_at INTEGER);
             INSERT INTO model_usage VALUES (500, 100, 'account:zai-coding-plan', 2000);
             """)
@@ -133,7 +133,7 @@ final class ZCodeProviderIntegrationTests: XCTestCase {
     func testLocalUsageRemainsAvailableWithoutCodingPlanKey() async throws {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
         let nowMs = Int(Date().timeIntervalSince1970 * 1000)
-        try SQLiteCLIAccessor().execute(path: path, sql: """
+        try NativeSQLiteAccessor().execute(path: path, sql: """
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER, provider_id TEXT, started_at INTEGER);
             INSERT INTO model_usage VALUES (100, 20, 'account:zai-start-plan', \(nowMs));
             """)
@@ -180,7 +180,7 @@ final class ZCodeProviderIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: levelDir, withIntermediateDirectories: true)
         let sqlitePath = dbDir.appendingPathComponent("db.sqlite").path
-        try SQLiteCLIAccessor().execute(path: sqlitePath, sql: """
+        try NativeSQLiteAccessor().execute(path: sqlitePath, sql: """
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER,
                                       cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
                                       provider_id TEXT, model_id TEXT, started_at INTEGER);
@@ -210,7 +210,7 @@ final class ZCodeProviderIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: levelDir, withIntermediateDirectories: true)
 
         let sqlitePath = dbDir.appendingPathComponent("db.sqlite").path
-        try SQLiteCLIAccessor().execute(path: sqlitePath, sql: """
+        try NativeSQLiteAccessor().execute(path: sqlitePath, sql: """
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER, provider_id TEXT, started_at INTEGER);
             INSERT INTO model_usage VALUES (1000, 500, 'account:zai-start-plan', 1794160000000);
             """)
@@ -338,7 +338,7 @@ final class ZCodeProviderIntegrationTests: XCTestCase {
         let path = directory.appendingPathComponent("db.sqlite").path
         let now = Date()
         let nowMs = Int(now.timeIntervalSince1970 * 1000)
-        try SQLiteCLIAccessor().execute(path: path, sql: """
+        try NativeSQLiteAccessor().execute(path: path, sql: """
             CREATE TABLE model_usage (
                 id TEXT PRIMARY KEY,
                 input_tokens INTEGER,
@@ -485,7 +485,7 @@ func makeZCodeFixture(sqliteRow: String, entitlementPayload: String) throws -> (
     try FileManager.default.createDirectory(at: levelDir, withIntermediateDirectories: true)
 
     let sqlitePath = dbDir.appendingPathComponent("db.sqlite").path
-    try SQLiteCLIAccessor().execute(path: sqlitePath, sql: """
+    try NativeSQLiteAccessor().execute(path: sqlitePath, sql: """
         CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER, provider_id TEXT, started_at INTEGER);
         \(sqliteRow);
         """)

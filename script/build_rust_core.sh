@@ -9,6 +9,7 @@
 # The archive always lands at Rust/quotabar-core/target/release/libquotabar_core.a, the path the
 # Package.swift linker setting searches, regardless of per-target intermediate directories.
 set -euo pipefail
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 crate_dir="$repo_root/Rust/quotabar-core"

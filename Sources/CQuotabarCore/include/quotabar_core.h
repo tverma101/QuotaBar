@@ -166,6 +166,46 @@ uint8_t qb_pricing_compact_catalog_retired_present(const void *result);
 void qb_pricing_compact_catalog_destroy(void *result);
 
 
+
+// ---------------------------------------------------------------------------
+// Engine (Rust/quotabar-engine): the cross-platform backend behind a JSON protocol.
+// Requests are {"method": ..., "params": {...}}; replies are {"ok": ...} or {"error": "..."}.
+// See Rust/quotabar-engine/src/engine.rs for the methods.
+// ---------------------------------------------------------------------------
+
+typedef void (*QbLogCallback)(void *context, uint32_t level, const uint8_t *tag, size_t tag_len,
+                              const uint8_t *message, size_t message_len);
+/// Host services as JSON {"method": ..., "params": ...}: `secureRead` and `env`. Returns a malloc'ed
+/// (strdup), NUL-terminated JSON reply, or NULL when the host cannot answer.
+typedef char *(*QbHostCallCallback)(void *context, const uint8_t *request_json, size_t request_len);
+typedef void (*QbCallCompletion)(void *context, char *reply);
+
+typedef struct {
+    void *context;
+    QbLogCallback log;
+    QbHostCallCallback host_call;
+    /// 0 error, 1 warn, 2 info, 3 debug.
+    uint32_t log_level;
+} QbHostCallbacks;
+
+/// Install the host callbacks once at launch, before any engine call.
+void qb_engine_install_host(QbHostCallbacks callbacks);
+void qb_engine_set_log_level(uint32_t level);
+/// Run one request on the calling thread (blocks). Free the reply with qb_engine_string_free.
+char *qb_engine_call(const uint8_t *request, size_t request_len);
+/// Run one request on an engine thread; `completion` receives the reply (free it with
+/// qb_engine_string_free) on that thread.
+void qb_engine_call_async(const uint8_t *request, size_t request_len, void *context, QbCallCompletion completion);
+/// Cancel a request by its requestId. Returns 1 when it was in flight.
+uint8_t qb_engine_cancel(uint64_t request_id);
+void qb_engine_string_free(char *string);
+
+/// Streams decoded chunks on the calling thread. Return zero to stop reading.
+typedef uint8_t (*QbZstdChunk)(void *context, const uint8_t *bytes, size_t len);
+/// Returns NULL on success or an owned error to release with qb_engine_string_free.
+char *qb_zstd_read(const char *path, void *context, QbZstdChunk consume);
+
+
 #ifdef __cplusplus
 }
 #endif
