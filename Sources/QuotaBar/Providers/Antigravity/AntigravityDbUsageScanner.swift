@@ -82,15 +82,43 @@ actor AntigravityDbUsageScanner {
 
     /// Antigravity keeps separate local conversation stores for the app, IDE, CLI, and compatible
     /// clients. Discover every sibling root so installing a different Antigravity client does not
-    /// leave its local spend and trend rows empty.
+    /// leave its local spend and trend rows empty. T3 Code's private ACP instances keep their stores
+    /// outside `~/.gemini` entirely; those roots are discovered too, the way T3's own reader does.
     static let defaultConversationDiscovery: @Sendable () throws -> ConversationDirectoryDiscovery = {
-        let geminiRoot = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini", isDirectory: true)
+        try defaultConversationDiscovery(home: FileManager.default.homeDirectoryForCurrentUser)
+    }
+
+    static func defaultConversationDiscovery(home: URL) throws -> ConversationDirectoryDiscovery {
+        let fileManager = FileManager.default
+        let geminiRoot = home.appendingPathComponent(".gemini", isDirectory: true)
+        var directories: [String] = []
+        var failures: [String: String] = [:]
         do {
-            return try discoverConversationDirectories(in: geminiRoot)
+            let discovery = try discoverConversationDirectories(in: geminiRoot)
+            directories.append(contentsOf: discovery.directories)
+            failures.merge(discovery.failures) { _, new in new }
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return ConversationDirectoryDiscovery(directories: [], failures: [:])
+            // No ~/.gemini yet — the other roots may still hold conversations.
+        } catch {
+            // A broken ~/.gemini must not freeze readable sibling roots; record the failure so the
+            // scan keeps cached rows and surfaces the warning while the other roots still update.
+            failures[geminiRoot.path] = error.localizedDescription
         }
+        // T3 Code's reader also covers ~/.config/antigravity; match that root for parity.
+        let configConversations = home
+            .appendingPathComponent(".config/antigravity", isDirectory: true)
+            .appendingPathComponent("conversations", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: configConversations.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            directories.append(configConversations.path)
+        }
+        do {
+            directories.append(contentsOf: try AntigravityT3Support.conversationDirectories(home: home))
+        } catch {
+            failures[home.appendingPathComponent(AntigravityT3Support.profilesRootSubpath, isDirectory: true).path] =
+                error.localizedDescription
+        }
+        return ConversationDirectoryDiscovery(directories: directories.sorted(), failures: failures)
     }
 
     static func conversationDirectories(in geminiRoot: URL) throws -> [String] {
@@ -201,8 +229,9 @@ actor AntigravityDbUsageScanner {
             .union(discoveryFailures.keys)
         let cachedPathsUnderUnreadableDirectories = Set(scanCache.keys.filter { path in
             unreadableDirectories.contains { directory in
-                let prefix = directory.hasSuffix("/") ? directory : directory + "/"
-                return path.hasPrefix(prefix)
+                // Cached keys are built as `directory.trimmingTrailingSlashes + "/" + name`, so
+                // match against the same normalized form.
+                path.hasPrefix(directory.trimmingTrailingSlashes + "/")
             }
         })
         let retainedPaths = discoveryFailures.isEmpty
@@ -463,9 +492,11 @@ actor AntigravityDbUsageScanner {
 
         var merged = DailyUsageAccumulator.merged(databaseScans) ?? DailyUsageAccumulator().build()
         if hasUnknownIncompleteSource {
-            let observedDays = Set(merged.series.daily.map(\.date))
+            // The stale scans above already mark the days their source covered; a missing source
+            // with no retained state leaves only today unverifiable. Marking every observed day
+            // would brand fully measured days from healthy databases as partial for years.
             merged = merged.markingUnmeasuredUsage(
-                on: observedDays.union([DailyUsageAccumulator.dayKey(from: now)])
+                on: [DailyUsageAccumulator.dayKey(from: now)]
             )
         }
         return AntigravityDbUsageScanResult(scan: merged, hasReadFailures: !failingPaths.isEmpty)
@@ -1089,13 +1120,21 @@ actor AntigravityDbUsageScanner {
             previous: cached.stepTimestampIndex,
             maximumEstimatedMemoryBytes: maximumStepIndexBytes
         ) : nil
-        let priorStepDatesChanged = cached.stepTimestampIndex.map { previous in
-            guard let stepIndex else { return true }
-            return !stepIndex.preserves(previous)
-                || cached.undatedIdentities.contains {
-                    previous.timestamp(for: $0) == nil && stepIndex.timestamp(for: $0) != nil
-                }
-        } ?? false
+        let priorStepDatesChanged: Bool
+        if let previous = cached.stepTimestampIndex {
+            priorStepDatesChanged = stepIndex.map { fresh in
+                !fresh.preserves(previous)
+                    || cached.undatedIdentities.contains {
+                        previous.timestamp(for: $0) == nil && fresh.timestamp(for: $0) != nil
+                    }
+            } ?? true
+        } else {
+            // A persisted record drops the step index. When the rebuilt index can date a row the
+            // record still carries as undated, replay so the row lands on its real day.
+            priorStepDatesChanged = stepIndex.map { fresh in
+                cached.undatedIdentities.contains { fresh.timestamp(for: $0) != nil }
+            } ?? false
+        }
         if (cached.hasStepMetadata != nil && cached.hasStepMetadata != hasStepMetadata)
             || priorStepDatesChanged {
             cached.lastIndex = -1
@@ -1151,11 +1190,12 @@ actor AntigravityDbUsageScanner {
                         if observedAt >= since { cached.oversizedTimestamps.append(observedTimestamp) }
                         continue
                     }
-                    switch AntigravityProtoDecoder.decodeGenerationEvent(
+                    let decoding = AntigravityProtoDecoder.decodeGeneration(
                         from: blob,
                         stepMetadata: row.stepHex.flatMap(Self.bytes(fromHex:)),
                         matchedStepTimestamp: stepIndex?.timestamp(for: blob)
-                    ) {
+                    )
+                    switch decoding.result {
                     case .ignored:
                         continue
                     case .invalidTokenCount(let timestamp):
@@ -1170,7 +1210,7 @@ actor AntigravityDbUsageScanner {
                         }
                     case .undatedUsage:
                         if observedAt >= since { cached.undatedUsageTimestamps.append(observedTimestamp) }
-                        if let identity = AntigravityProtoDecoder.generationStepIdentity(from: blob) {
+                        if let identity = decoding.undatedStepIdentity {
                             cached.undatedIdentities.insert(identity)
                         }
                     case .event(let event):
@@ -1425,17 +1465,29 @@ actor AntigravityDbUsageScanner {
         accumulator.add(day: day, tokens: total.partialValue, cost: cost, model: event.model)
     }
 
-    static func bytes(fromHex hex: String) -> [UInt8]? {
-        guard hex.utf8.count.isMultiple(of: 2) else { return nil }
-        var bytes: [UInt8] = []
-        bytes.reserveCapacity(hex.utf8.count / 2)
+    private static let hexNibbles: [UInt8] = {
+        var table = [UInt8](repeating: 0xFF, count: 256)
+        for (offset, character) in "0123456789abcdef".utf8.enumerated() {
+            table[Int(character)] = UInt8(offset)
+        }
+        // SQLite's hex() renders uppercase, so both cases must decode to the same nibbles.
+        for (offset, character) in "ABCDEF".utf8.enumerated() {
+            table[Int(character)] = UInt8(offset + 10)
+        }
+        return table
+    }()
 
-        var index = hex.startIndex
-        while index < hex.endIndex {
-            let next = hex.index(index, offsetBy: 2)
-            guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
-            bytes.append(byte)
-            index = next
+    static func bytes(fromHex hex: String) -> [UInt8]? {
+        let utf8 = hex.utf8
+        guard utf8.count.isMultiple(of: 2) else { return nil }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(utf8.count / 2)
+        var iterator = utf8.makeIterator()
+        while let high = iterator.next(), let low = iterator.next() {
+            let highNibble = Self.hexNibbles[Int(high)]
+            let lowNibble = Self.hexNibbles[Int(low)]
+            guard highNibble != 0xFF, lowNibble != 0xFF else { return nil }
+            bytes.append(highNibble << 4 | lowNibble)
         }
         return bytes
     }

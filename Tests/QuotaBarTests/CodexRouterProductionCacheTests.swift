@@ -141,13 +141,79 @@ final class CodexRouterProductionCacheTests: XCTestCase {
         }
     }
 
-    func testHalfSpecifiedUsageStillRejectsIncompleteMeasurement() async throws {
+    /// A half-specified usage row (some token fields, not all) is damaged data: it is skipped and
+    /// counted rather than rejecting the whole measurement. The valid sibling row still reads and
+    /// the scan reports the damage so the card can caveat its totals.
+    func testHalfSpecifiedUsageIsSkippedAndCountedAsDamage() async throws {
         try await withLedger { ledger in
             let damaged = "{\"at\":\"\(TestLocalInstant.iso(2026, 10, 4, 10))\",\"model\":\"test-model\",\"provider\":\"openai\",\"status\":200,\"inputTokens\":100}\n"
             try (line(tokens: 100) + damaged).write(to: ledger, atomically: true, encoding: .utf8)
-            let result = await scan(ledger)
-            XCTAssertNil(result)
+            let scanner = CodexRouterUsageScanner(ledgerPaths: { [ledger.path] }, identityAliases: { [:] })
+            let result = await scanner.scanResult(
+                accountIdentityKey: nil, allowsUnscopedEvents: true,
+                daysBack: 30, now: now, pricing: pricing()
+            )
+            guard case .complete(let scan, let damagedLines) = result else {
+                return XCTFail("a damaged row must not turn a readable ledger into an incomplete scan")
+            }
+            XCTAssertEqual(scan?.series.daily.first?.totalTokens, 100)
+            XCTAssertEqual(damagedLines, 1)
         }
+    }
+
+    /// The save dedup: re-saving a record identical to the resident one must not rewrite the
+    /// file — every completed fold used to pay atomic writes even when nothing changed.
+    func testAggregateSaveIsSkippedForIdenticalRecord() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("router-save-dedup-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let ledger = directory.appendingPathComponent("usage-events.jsonl")
+        try Data("{}".utf8).write(to: ledger)
+
+        let checkpoint = CodexRouterAggregateIndex.FileCheckpoint(
+            path: ledger.path, device: 1, inode: 1, size: 2,
+            mtimeSec: 0, mtimeNsec: 0, ctimeSec: 0, ctimeNsec: 0,
+            offset: 2, partial: Data(), discardingOversizedLine: false, anchor: Data("a".utf8)
+        )
+        let key = CodexRouterAggregateIndex.Key(
+            account: "", allowsUnscopedEvents: true, days: 30, since: 0,
+            timeZoneIdentifier: "UTC", aliases: [], pricingToken: "test", sourcePaths: [ledger.path]
+        )
+        defer {
+            CodexRouterAggregateIndex.shared.removeForTesting(key: key)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        func record(damagedLines: Int?) -> CodexRouterAggregateIndex.Record {
+            CodexRouterAggregateIndex.Record(
+                schema: CodexRouterAggregateIndex.schema, key: key, files: [checkpoint],
+                result: nil, nextFutureEventAt: nil, latestIncludedEventAt: nil,
+                complete: true, pricingDependencies: nil, damagedLines: damagedLines
+            )
+        }
+
+        CodexRouterAggregateIndex.shared.save(record(damagedLines: nil))
+        let url = try XCTUnwrap(
+            CodexRouterAggregateIndex.recordURLsForTesting(path: ledger.path).first,
+            "the first save must persist the record"
+        )
+        let firstWrite = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
+        )
+        Thread.sleep(forTimeInterval: 1.1)
+
+        // Identical record → the resident copy matches, so no second write.
+        CodexRouterAggregateIndex.shared.save(record(damagedLines: nil))
+        let afterDedup = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
+        )
+        XCTAssertEqual(firstWrite, afterDedup, "an identical save must not rewrite the record")
+
+        // A genuinely changed record still persists.
+        CodexRouterAggregateIndex.shared.save(record(damagedLines: 1))
+        let afterChange = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
+        )
+        XCTAssertNotEqual(firstWrite, afterChange, "a changed record must still be written")
     }
 
     func testCancelledTransportStatusZeroDoesNotInvalidateOrInflateMeasuredHistory() async throws {

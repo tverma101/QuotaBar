@@ -180,9 +180,52 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         let daysBack = UsageHistoryWindow.lifetimeDays(through: now)
         _ = try await scanner.scan(now: now, daysBack: daysBack)
 
+        // The whole-history read is sliced into bounded time chunks so one marshaled
+        // `json_group_array` cannot outrun the sqlite3 subprocess's five-second cap.
         let lifetimeSinceMs = Int(JSONLScanning.sinceDate(daysBack: daysBack, now: now).timeIntervalSince1970 * 1000)
-        guard let sql = sqlite.lastDataSQL else { return XCTFail("expected a data query") }
-        XCTAssertTrue(sql.contains("time_created >= \(lifetimeSinceMs)"), sql)
+        XCTAssertGreaterThan(sqlite.dataSQLs.count, 1, "a ~10y window must not be one giant query")
+        guard let first = sqlite.dataSQLs.first else { return XCTFail("expected data queries") }
+        XCTAssertTrue(first.contains("time_created >= \(lifetimeSinceMs)"), first)
+        XCTAssertTrue(first.contains("time_created <"), "non-final chunks carry an upper bound")
+        XCTAssertFalse(sqlite.dataSQLs.last!.contains("time_created <"),
+                       "the final chunk stays open-ended so future rows still reach the parser")
+    }
+
+    func testChunkedLifetimeQueryFoldsEachRowOnce() async throws {
+        // Rows on both sides of a chunk boundary land exactly once — the stub answers each
+        // chunk with only its in-range rows, so a duplicated or dropped boundary row shows here.
+        let recent = openCodeRow("2026-07-12T10:00:00.000Z", "1.0", 500, "glm-5.2", "opencode-go")
+        let old = openCodeRow("2023-01-15T10:00:00.000Z", "2.0", 700, "glm-5.2", "opencode-go")
+        let sqlite = OpenCodeFakeSQLite(data: ["/oc/opencode.db": "[" + [recent, old].joined(separator: ",") + "]"])
+        let scanner = OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { ["/oc/opencode.db"] })
+        let daysBack = UsageHistoryWindow.lifetimeDays(through: now)
+
+        guard let scan = try await scanner.scan(now: now, daysBack: daysBack) else {
+            return XCTFail("expected a scan")
+        }
+        XCTAssertGreaterThan(sqlite.dataSQLs.count, 1)
+        let tokens = scan.logScan.series.daily.reduce(0) { $0 + $1.totalTokens }
+        XCTAssertEqual(tokens, 1200, "each row folds exactly once across chunk boundaries")
+        XCTAssertEqual(
+            Set(scan.logScan.series.daily.map(\.date)),
+            Set(["2026-07-12", "2023-01-15"])
+        )
+    }
+
+    func testNegativeCostSentinelRejectsWholeQuery() async {
+        // `dataSQL` emits `-1` for a malformed cost — the same fail-closed contract as a bad
+        // token count, so a corrupt row must not silently degrade to unpriced.
+        let db = "[[\(epochMs("2026-07-12T10:00:00.000Z")),-1,100,\"glm-5.2\",\"opencode-go\"]]"
+        let scanner = OpenCodeUsageScanner(
+            sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": db]),
+            databasePaths: { ["/oc/opencode.db"] }
+        )
+        do {
+            _ = try await scanner.scan(now: now)
+            XCTFail("a -1 cost sentinel must reject the query instead of dropping to unpriced")
+        } catch {
+            XCTAssertEqual(error as? OpenCodeUsageError, .databaseUnreadable)
+        }
     }
 
     func testAbsurdTokenCountIsClampedNotCrashing() async throws {
@@ -293,12 +336,43 @@ func openCodeRow(_ iso: String, _ cost: String, _ tokens: Int, _ model: String, 
     return "[\(epochMs),\(cost),\(tokens),\"\(model)\",\"\(provider)\"]"
 }
 
+/// Answer one bounded `dataSQL` chunk with only the in-range rows of a full-history payload, so
+/// multi-chunk windows can't double-count across the stubs below.
+enum OpenCodeDBRowsForChunk {
+    static func apply(payload: String, sql: String) -> String {
+        let lower = integerBound("time_created >=", in: sql)
+        let upper = integerBound("time_created <", in: sql)
+        guard lower != nil || upper != nil,
+              let decoded = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [Any]
+        else { return payload }
+        let filtered = decoded.filter { element in
+            guard let entry = element as? [Any],
+                  let ms = entry.first as? NSNumber
+            else { return true }
+            let value = ms.intValue
+            if let lower, value < lower { return false }
+            if let upper, value >= upper { return false }
+            return true
+        }
+        guard let reencoded = try? JSONSerialization.data(withJSONObject: filtered) else { return payload }
+        return String(decoding: reencoded, as: UTF8.self)
+    }
+
+    private static func integerBound(_ marker: String, in sql: String) -> Int? {
+        guard let range = sql.range(of: "\(marker) [0-9]+", options: .regularExpression) else {
+            return nil
+        }
+        return Int(sql[range].dropFirst(marker.count + 1))
+    }
+}
+
 /// Stub that returns crafted payloads per database path and classifies the query by SQL shape.
 /// Shared by the OpenCode scanner and provider tests.
 final class OpenCodeFakeSQLite: SQLiteAccessing, @unchecked Sendable {
     var data: [String: String]
     var failing: Set<String>
     var lastDataSQL: String?
+    var dataSQLs: [String] = []
 
     init(data: [String: String] = [:], failing: Set<String> = []) {
         self.data = data
@@ -309,7 +383,9 @@ final class OpenCodeFakeSQLite: SQLiteAccessing, @unchecked Sendable {
         if failing.contains(path) { throw SQLiteError.queryFailed("boom") }
         if sql.contains("json_group_array") {
             lastDataSQL = sql
-            return data[path] ?? "[]"
+            dataSQLs.append(sql)
+            guard let payload = data[path] else { return "[]" }
+            return OpenCodeDBRowsForChunk.apply(payload: payload, sql: sql)
         }
         if sql.contains("SELECT 1") {
             let payload = data[path]

@@ -68,11 +68,13 @@ struct PopoverFooter: View {
         Button {
             refreshNow()
         } label: {
+            // The label shows whole seconds below a minute, so the 1s tick is the cadence the
+            // content needs — slower would freeze the countdown mid-display. The per-second
+            // numeric transition was gratuitous, though: it ran a digit-roll animation every tick.
             VisibilityGatedPeriodicTimeline(every: 1) { now in
                 HStack(spacing: 5) {
                     Text(updateStatusText(now: now))
                         .monospacedDigit()
-                        .contentTransition(.numericText())
                     if isUpdating {
                         MotionAwareProgressView(controlSize: .mini)
                     }

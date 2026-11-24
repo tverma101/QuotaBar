@@ -22,6 +22,9 @@ struct ZCodeUsageResult: Sendable, Equatable {
     /// token columns). Surfaced as a historyWarning so a partial history explains itself instead
     /// of silently reading low.
     var damagedRows: Int = 0
+    /// The sqlite half of the scan threw (corrupt db, schema mismatch); the LevelDB entitlement
+    /// still surfaced. Recorded so the provider can warn rather than silently reading low.
+    var sqliteReadFailure: String? = nil
 
     var dailySeries: DailyUsageSeries? {
         logScan?.series
@@ -33,7 +36,8 @@ struct ZCodeUsageResult: Sendable, Equatable {
         logScan: LogUsageScan? = nil,
         dailySeries: DailyUsageSeries? = nil,
         weekendBuild: ZCodeAllowance? = nil,
-        damagedRows: Int = 0
+        damagedRows: Int = 0,
+        sqliteReadFailure: String? = nil
     ) {
         self.totalTokens = totalTokens
         self.planName = planName
@@ -50,6 +54,7 @@ struct ZCodeUsageResult: Sendable, Equatable {
         }
         self.weekendBuild = weekendBuild
         self.damagedRows = damagedRows
+        self.sqliteReadFailure = sqliteReadFailure
     }
 }
 
@@ -68,6 +73,9 @@ final class ZCodeUsageScanner: @unchecked Sendable {
     private var cachedSqliteStamp: (size: UInt64, mtime: TimeInterval)?
     private var cachedLevelDBStamp: (size: UInt64, mtime: TimeInterval)?
     private var cachedPricingToken: String?
+    /// Reference `now` of the scan that produced `cachedResult`; lets a scheduled promo invalidate
+    /// the cache exactly once when it goes live instead of on every call.
+    private var cachedScanDate: Date?
 
     init(
         sqlite: any SQLiteAccessing = NativeSQLiteAccessor(allowsReadWriteFallback: true),
@@ -98,7 +106,8 @@ final class ZCodeUsageScanner: @unchecked Sendable {
         // Stamps are optional per source: a missing sqlite file must not blind the LevelDB
         // entitlement scan (and vice versa), so the cache compares each source independently.
         let currentSqliteStamp = Self.sqliteStamp(at: expanded)
-        let currentLevelDBStamp = levelDBStamp()
+        let levelFiles = Self.levelDBFiles(at: leveldbPath)
+        let currentLevelDBStamp = Self.levelDBStamp(files: levelFiles)
         let currentPricingToken = pricing.aggregateCacheToken
 
         if let cached = lock.withLock({ () -> ZCodeUsageResult? in
@@ -111,7 +120,13 @@ final class ZCodeUsageScanner: @unchecked Sendable {
             }
             if let now, let allowance = cachedResult?.weekendBuild {
                 if let exp = allowance.expiresAt, exp <= now { return nil }
-                if let eff = allowance.effectiveAt, eff <= now, allowance.used == 0 { return nil }
+                // One-shot transition: invalidate only when the promo went live *after* the scan
+                // that produced this cache (effectiveAt between scan time and now). An
+                // already-active unused promo would otherwise rescan on every call forever.
+                if let eff = allowance.effectiveAt, eff <= now, allowance.used == 0,
+                   let scannedAt = cachedScanDate, eff > scannedAt {
+                    return nil
+                }
             }
             return cachedResult
         }) {
@@ -127,57 +142,67 @@ final class ZCodeUsageScanner: @unchecked Sendable {
         var planName: String? = nil
         var logScan: LogUsageScan? = nil
         var damagedRows = 0
+        var sqliteError: Error? = nil
 
         if currentSqliteStamp != nil {
-            // Valid-row total + damaged-row count instead of a blanket 'invalid' sentinel: one
-            // corrupt row in model_usage must not throw away the whole card's history. Damaged
-            // rows are excluded from the total and reported (damagedRows > 0 → historyWarning).
-            let sql = """
-                SELECT (SELECT CAST(COALESCE(SUM(CASE WHEN typeof(input_tokens) != 'integer'
-                        OR typeof(output_tokens) != 'integer' OR input_tokens < 0 OR output_tokens < 0
-                        THEN 0 ELSE CAST(input_tokens AS REAL) + CAST(output_tokens AS REAL) END), 0) AS TEXT)
-                    FROM model_usage) || '|' ||
-                    CAST((SELECT COUNT(*) FROM model_usage WHERE typeof(input_tokens) != 'integer'
-                        OR typeof(output_tokens) != 'integer' OR input_tokens < 0 OR output_tokens < 0) AS TEXT)
-                    || '|' || COALESCE((SELECT provider_id FROM model_usage WHERE provider_id LIKE 'account:zai%' ORDER BY started_at DESC LIMIT 1), '');
-                """
-            let raw = try sqlite.queryValue(path: path, sql: sql)
-            try Task.checkCancellation()
+            do {
+                // Valid-row total + damaged-row count instead of a blanket 'invalid' sentinel: one
+                // corrupt row in model_usage must not throw away the whole card's history. Damaged
+                // rows are excluded from the total and reported (damagedRows > 0 → historyWarning).
+                let sql = """
+                    SELECT (SELECT CAST(COALESCE(SUM(CASE WHEN typeof(input_tokens) != 'integer'
+                            OR typeof(output_tokens) != 'integer' OR input_tokens < 0 OR output_tokens < 0
+                            THEN 0 ELSE CAST(input_tokens AS REAL) + CAST(output_tokens AS REAL) END), 0) AS TEXT)
+                        FROM model_usage) || '|' ||
+                        CAST((SELECT COUNT(*) FROM model_usage WHERE typeof(input_tokens) != 'integer'
+                            OR typeof(output_tokens) != 'integer' OR input_tokens < 0 OR output_tokens < 0) AS TEXT)
+                        || '|' || COALESCE((SELECT provider_id FROM model_usage WHERE provider_id LIKE 'account:zai%' ORDER BY started_at DESC LIMIT 1), '');
+                    """
+                let raw = try sqlite.queryValue(path: path, sql: sql)
+                try Task.checkCancellation()
 
-            if let raw {
-                // parts[0] is the valid-row total, parts[1] the damaged-row count, and the
-                // provider_id tail is joined back in case it ever contains the '|' delimiter.
-                let parts = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-                guard parts.count >= 2 else { throw ZCodeUsageError.invalidUsage }
-                if let total = Double(parts[0]), total.isFinite, total >= 0 {
-                    totalTokens = total > 0 ? total : nil
-                } else if !parts[0].isEmpty {
-                    throw ZCodeUsageError.invalidUsage
-                }
-                damagedRows = Int(parts[1]) ?? 0
-                if parts.count > 2 {
-                    let providerID = parts[2...].joined(separator: "|")
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    if providerID.contains("start-plan") {
-                        planName = "Start Plan"
-                    } else if providerID.contains("coding-plan") {
-                        planName = "Coding Plan"
+                if let raw {
+                    // parts[0] is the valid-row total, parts[1] the damaged-row count, and the
+                    // provider_id tail is joined back in case it ever contains the '|' delimiter.
+                    let parts = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+                    guard parts.count >= 2 else { throw ZCodeUsageError.invalidUsage }
+                    if let total = Double(parts[0]), total.isFinite, total >= 0 {
+                        totalTokens = total > 0 ? total : nil
+                    } else if !parts[0].isEmpty {
+                        throw ZCodeUsageError.invalidUsage
+                    }
+                    damagedRows = Int(parts[1]) ?? 0
+                    if parts.count > 2 {
+                        let providerID = parts[2...].joined(separator: "|")
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        if providerID.contains("start-plan") {
+                            planName = "Start Plan"
+                        } else if providerID.contains("coding-plan") {
+                            planName = "Coding Plan"
+                        }
                     }
                 }
-            }
 
-            // Daily series for spend tiles (Today, Yesterday, Last 30 Days)
-            logScan = readDailySeries(pricing: pricing)
+                // Daily series for spend tiles (Today, Yesterday, Last 30 Days)
+                logScan = readDailySeries(pricing: pricing)
+            } catch {
+                // A dead sqlite source must not hide a valid LevelDB entitlement: record the
+                // failure for the provider to surface and keep scanning the other source.
+                if ProviderCancellation.isCancellation(error) { throw error }
+                sqliteError = error
+            }
         }
 
         // Read live entitlement from LevelDB (e.g. Weekend Build total token allowance)
-        let entitlement = scanLevelDBEntitlement(leveldbPath: leveldbPath, now: now)
+        let entitlement = scanLevelDBEntitlement(files: levelFiles, now: now)
         if planName == nil, let entitlementPlan = entitlement?.planName {
             planName = entitlementPlan
         }
 
         if totalTokens == nil && logScan == nil && entitlement == nil {
-            // Neither source yielded anything readable — no result to build (and nothing to cache).
+            // Neither source yielded anything readable — no result to build (and nothing to
+            // cache). A sqlite failure without an entitlement fallback still fails loudly.
+            if let sqliteError { throw sqliteError }
             return nil
         }
 
@@ -186,13 +211,15 @@ final class ZCodeUsageScanner: @unchecked Sendable {
             planName: planName,
             logScan: logScan,
             weekendBuild: entitlement?.weekendBuild,
-            damagedRows: damagedRows
+            damagedRows: damagedRows,
+            sqliteReadFailure: sqliteError?.localizedDescription
         )
         lock.withLock {
             cachedResult = result
             cachedSqliteStamp = currentSqliteStamp
             cachedLevelDBStamp = currentLevelDBStamp
             cachedPricingToken = currentPricingToken
+            cachedScanDate = now ?? Date()
         }
         return result
     }
@@ -209,7 +236,8 @@ final class ZCodeUsageScanner: @unchecked Sendable {
                    CAST(SUM(cache_read_input_tokens) AS TEXT) || '|' ||
                    CAST(SUM(cache_creation_input_tokens) AS TEXT)
             FROM model_usage
-            WHERE input_tokens >= 0 AND output_tokens >= 0
+            WHERE typeof(input_tokens) = 'integer' AND typeof(output_tokens) = 'integer'
+                AND input_tokens >= 0 AND output_tokens >= 0
             GROUP BY date(started_at / 1000, 'unixepoch', 'localtime'), model_id
             ORDER BY date(started_at / 1000, 'unixepoch', 'localtime') DESC;
             """
@@ -260,7 +288,8 @@ final class ZCodeUsageScanner: @unchecked Sendable {
         let fallbackSql = """
             SELECT date(started_at / 1000, 'unixepoch', 'localtime') || ':' || CAST(SUM(input_tokens + output_tokens) AS TEXT)
             FROM model_usage
-            WHERE input_tokens >= 0 AND output_tokens >= 0
+            WHERE typeof(input_tokens) = 'integer' AND typeof(output_tokens) = 'integer'
+                AND input_tokens >= 0 AND output_tokens >= 0
             GROUP BY date(started_at / 1000, 'unixepoch', 'localtime')
             ORDER BY date(started_at / 1000, 'unixepoch', 'localtime') DESC;
             """
@@ -285,6 +314,7 @@ final class ZCodeUsageScanner: @unchecked Sendable {
             cachedSqliteStamp = nil
             cachedLevelDBStamp = nil
             cachedPricingToken = nil
+            cachedScanDate = nil
         }
     }
 
@@ -292,25 +322,52 @@ final class ZCodeUsageScanner: @unchecked Sendable {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
               let size = attrs[.size] as? UInt64,
               let mdate = attrs[.modificationDate] as? Date else { return nil }
-        return (size, mdate.timeIntervalSinceReferenceDate)
+        var stamp = (size: size, mtime: mdate.timeIntervalSinceReferenceDate)
+        // WAL-mode writes land in the -wal sidecar and only merge at checkpoint time; include it
+        // so writes between checkpoints still invalidate the cache.
+        if let wal = try? FileManager.default.attributesOfItem(atPath: path + "-wal") {
+            stamp.size += wal[.size] as? UInt64 ?? 0
+            if let walDate = wal[.modificationDate] as? Date {
+                stamp.mtime = max(stamp.mtime, walDate.timeIntervalSinceReferenceDate)
+            }
+        }
+        return stamp
     }
 
-    private func levelDBStamp() -> (size: UInt64, mtime: TimeInterval)? {
-        let expanded = (leveldbPath as NSString).expandingTildeInPath
+    /// One listing entry of the LevelDB directory, fetched once per `usage()` call so the stamp
+    /// comparison and the entitlement scan share a single `contentsOfDirectory` pass.
+    private struct LevelDBFile {
+        let url: URL
+        let size: UInt64
+        let mtime: TimeInterval
+    }
+
+    private static func levelDBFiles(at path: String) -> [LevelDBFile]? {
+        let expanded = (path as NSString).expandingTildeInPath
         let url = URL(fileURLWithPath: expanded)
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: url,
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: .skipsHiddenFiles
         ) else { return nil }
+        return files.compactMap { file in
+            guard file.pathExtension == "log" || file.pathExtension == "ldb" else { return nil }
+            let vals = try? file.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            return LevelDBFile(
+                url: file,
+                size: UInt64(vals?.fileSize ?? 0),
+                mtime: vals?.contentModificationDate?.timeIntervalSinceReferenceDate ?? 0
+            )
+        }
+    }
+
+    private static func levelDBStamp(files: [LevelDBFile]?) -> (size: UInt64, mtime: TimeInterval)? {
+        guard let files else { return nil }
         var maxMtime: TimeInterval = 0
         var totalSize: UInt64 = 0
-        for file in files where file.pathExtension == "log" || file.pathExtension == "ldb" {
-            let vals = try? file.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-            let mtime = vals?.contentModificationDate?.timeIntervalSinceReferenceDate ?? 0
-            let sz = UInt64(vals?.fileSize ?? 0)
-            if mtime > maxMtime { maxMtime = mtime }
-            totalSize += sz
+        for file in files {
+            if file.mtime > maxMtime { maxMtime = file.mtime }
+            totalSize += file.size
         }
         return totalSize > 0 ? (totalSize, maxMtime) : nil
     }
@@ -319,28 +376,19 @@ final class ZCodeUsageScanner: @unchecked Sendable {
     /// (`…:subscription-v2:account:zai-start-plan:…`, future coding/pro plan keys included). The
     /// scanner must not hardcode one plan's key or a new promotional plan silently stops showing.
     static let entitlementKeyPrefix = "zcode:usage-entitlement:subscription-v2:account:"
-    static let entitlementJSONMarker = "{\"cachedAt\""
+    /// Marker inside the JSON body; `cachedAt` is not guaranteed to be the first key, so the scan
+    /// locates it and walks `{` candidates back to the snapshot's opening brace.
+    static let entitlementJSONMarker = "\"cachedAt\""
+    /// The record's JSON body lands within this many bytes of the entitlement key.
+    static let entitlementValueSearchWindow = 512
     /// Cap on bytes scanned per JSON body — the entitlement snapshot is a few KB.
     static let maxEntitlementJSONBytes = 25_000
 
     private func scanLevelDBEntitlement(
-        leveldbPath: String,
+        files: [LevelDBFile]?,
         now: Date? = nil
     ) -> (planName: String?, weekendBuild: ZCodeAllowance?)? {
-        let expanded = (leveldbPath as NSString).expandingTildeInPath
-        let url = URL(fileURLWithPath: expanded)
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: url,
-            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
-            options: .skipsHiddenFiles
-        ) else { return nil }
-
-        let levelFiles = files.filter { $0.pathExtension == "log" || $0.pathExtension == "ldb" }
-        let sorted = levelFiles.sorted {
-            let d1 = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let d2 = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return d1 > d2
-        }
+        guard let files else { return nil }
 
         let keyPrefix = Data(Self.entitlementKeyPrefix.utf8)
         let jsonMarker = Data(Self.entitlementJSONMarker.utf8)
@@ -351,27 +399,33 @@ final class ZCodeUsageScanner: @unchecked Sendable {
         var bestSnapshot: [String: Any]?
         var bestCachedAt: Double = -1
         autoreleasepool {
-            for file in sorted {
-                guard let data = try? Data(contentsOf: file) else { continue }
+            for file in files {
+                guard let data = try? Data(contentsOf: file.url) else { continue }
                 var searchStart = data.startIndex
                 while searchStart < data.endIndex,
                       let keyRange = data.range(of: keyPrefix, in: searchStart..<data.endIndex) {
                     let scanFrom = keyRange.upperBound
-                    guard let markerRange = data.range(of: jsonMarker, in: scanFrom..<data.endIndex),
-                          markerRange.lowerBound - scanFrom < 512 else {
+                    let windowEnd = min(scanFrom + Self.entitlementValueSearchWindow, data.endIndex)
+                    guard let markerRange = data.range(of: jsonMarker, in: scanFrom..<windowEnd) else {
                         searchStart = keyRange.upperBound
                         continue
                     }
-                    if let snapshot = Self.parseEntitlementSnapshot(data, from: markerRange.lowerBound) {
-                        let cachedAt = snapshot.cachedAt
-                        if cachedAt > bestCachedAt {
-                            bestCachedAt = cachedAt
-                            bestSnapshot = snapshot.root
+                    // Walk '{' candidates back from the marker toward the key; the first one that
+                    // parses into a JSON body carrying `cachedAt` is the snapshot root.
+                    var pos = markerRange.lowerBound
+                    while pos > scanFrom {
+                        pos -= 1
+                        guard data[pos] == 0x7B else { continue }
+                        if let snapshot = Self.parseEntitlementSnapshot(data, from: pos),
+                           snapshot.root["cachedAt"] != nil {
+                            if snapshot.cachedAt > bestCachedAt {
+                                bestCachedAt = snapshot.cachedAt
+                                bestSnapshot = snapshot.root
+                            }
+                            break
                         }
-                        searchStart = markerRange.upperBound
-                    } else {
-                        searchStart = markerRange.upperBound
                     }
+                    searchStart = markerRange.upperBound
                 }
             }
         }
@@ -428,7 +482,7 @@ final class ZCodeUsageScanner: @unchecked Sendable {
 
         var planName: String? = nil
         if let quota = snapshot["quota"] as? [String: Any], let level = quota["level"] as? String {
-            planName = level == "Start" ? "Start Plan" : (level == "Coding" ? "Coding Plan" : "\(level) Plan")
+            planName = level == "Start" ? "Start Plan" : (level == "Coding" ? "Coding Plan" : "\(level.capitalized) Plan")
         }
 
         struct PromoInfo {
@@ -447,7 +501,8 @@ final class ZCodeUsageScanner: @unchecked Sendable {
                 let billingCycle = detail["billingCycle"] as? String ?? ""
                 let rawName = detail["productName"] as? String ?? ""
                 let isOneTime = billingCycle == "one_time"
-                let isBuild = productID.contains("build") || productID.contains("wk") || rawName.localizedCaseInsensitiveContains("build")
+                let isBuild = productID.contains("build") || productID.hasSuffix("wk") || productID.contains("-wk")
+                    || rawName.localizedCaseInsensitiveContains("build")
                 guard isOneTime || isBuild else { continue }
 
                 var effDate = (detail["beginTime"] as? String).flatMap(OpenUsageISO8601.date)
@@ -478,11 +533,13 @@ final class ZCodeUsageScanner: @unchecked Sendable {
             for limit in limits {
                 let planId = limit["planId"] as? String ?? ""
                 let isOneTime = (limit["period"] as? String ?? "") == "one_time"
-                guard planId.contains("wk") || planId.contains("build") || isOneTime || promos[planId] != nil else { continue }
-                seenPlanIDs.insert(planId)
+                let isWeeklyPlan = planId.hasSuffix("wk") || planId.contains("-wk")
+                guard isWeeklyPlan || planId.contains("build") || isOneTime || promos[planId] != nil else { continue }
 
                 let unit = limit["unit"] as? Double ?? Double(limit["unit"] as? Int ?? 0)
+                // A dropped limit row (no positive cap) must not suppress the promo fallback below.
                 guard unit > 0 else { continue }
+                seenPlanIDs.insert(planId)
                 let usage = limit["usage"] as? Double ?? Double(limit["usage"] as? Int ?? 0)
                 let remaining = limit["remaining"] as? Double ?? Double(limit["remaining"] as? Int ?? 0)
                 var resetMs = limit["nextResetTime"] as? Double ?? (limit["nextResetTime"] as? Int).map(Double.init)
@@ -502,7 +559,13 @@ final class ZCodeUsageScanner: @unchecked Sendable {
             }
         }
 
-        for (prodID, promo) in promos where !seenPlanIDs.contains(prodID) {
+        // Dictionary order is unstable; sort so candidate selection picks the same promo every time.
+        let sortedPromos = promos.values.sorted { a, b in
+            let aEff = a.effectiveAt ?? .distantFuture
+            let bEff = b.effectiveAt ?? .distantFuture
+            return aEff == bEff ? a.productID < b.productID : aEff < bEff
+        }
+        for promo in sortedPromos where !seenPlanIDs.contains(promo.productID) {
             allowances.append(ZCodeAllowance(
                 label: promo.label, used: 0, limit: 500_000_000, remaining: 500_000_000,
                 resetsAt: nil, expiresAt: promo.expiresAt, effectiveAt: promo.effectiveAt

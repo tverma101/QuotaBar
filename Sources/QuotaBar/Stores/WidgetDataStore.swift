@@ -9,6 +9,28 @@ struct StalenessHint: Equatable {
     let tooltip: String
 }
 
+/// Everything a provider section header renders, computed once per snapshot publish instead of
+/// once per view body evaluation. Views read `WidgetDataStore.providerHeaderInfo`; the per-provider
+/// accessor methods (`plan(for:)`, `headerNotice(for:)`, `stalenessHint(for:)`, …) remain the
+/// source of truth the map is built from.
+struct ProviderHeaderInfo: Equatable {
+    /// `plan(for:)` — the provider's subscription label, if the latest snapshot carries one.
+    var plan: String?
+    /// `headerNotice(for:)` — the rendered triangle text: the hard refresh error if any, else the
+    /// last-good snapshot's soft warning.
+    var warningMessage: String?
+    /// `stalenessHint(for:)` sampled at rebuild time. Ages between rebuilds; views needing the live
+    /// value can still call `stalenessHint(for:)`.
+    var stalenessHint: StalenessHint?
+    /// `errorMessage(for:)` — the latest refresh failure, if any.
+    var errorMessage: String?
+    /// `errorCategory(for:)` — the error's telemetry/empty-state bucket.
+    var errorCategory: ErrorCategory?
+    /// Whether the provider was inside `refresh()` when the map was built. Kept current at the
+    /// `refreshingProviderIDs` mutation sites between rebuilds.
+    var isRefreshing: Bool
+}
+
 @MainActor
 @Observable
 final class WidgetDataStore {
@@ -120,6 +142,28 @@ final class WidgetDataStore {
     /// peer contribution can never echo back out and multiply on the next device.
     private(set) var localSnapshots: [String: ProviderSnapshot] = [:]
     var refreshingProviderIDs: Set<String> = []
+
+    /// Header state for every provider, rebuilt inside `rebuildRenderedSnapshots` so views read a
+    /// map instead of re-deriving plan / notice / staleness per render. Entries exist only for
+    /// providers that rendered a snapshot or are mid-refresh; `isRefreshing` is also patched at the
+    /// `refreshingProviderIDs` mutation sites between rebuilds.
+    var providerHeaderInfo: [String: ProviderHeaderInfo] = [:]
+    /// `data(for:)` resolved once per rebuild for every enabled ordered descriptor whose provider
+    /// has a rendered snapshot. `data(for:)` stays the resolver; views read this map instead of
+    /// re-resolving every row per render. A missing key means no snapshot backs the descriptor —
+    /// call `data(for:)` for the deterministic no-data value.
+    var widgetDataByDescriptorID: [String: WidgetData] = [:]
+    /// `TotalSpendAggregator.total` for every period, computed once per rebuild over the
+    /// spend-capable provider set (registry order) with dormant providers folded from retained
+    /// history. The Total Spend card reads this instead of folding per body evaluation.
+    var totalSpendByPeriod: [TotalSpendPeriod: TotalSpend] = [:]
+    /// `Self.stalenessThreshold` sampled once per rebuild: reading it hits IOPSCopyPowerSourcesInfo,
+    /// so per-call use multiplies an IOKit syscall by provider × render. Falls back to the live
+    /// computation when no rebuild has run yet.
+    @ObservationIgnored private var renderedStalenessThreshold: TimeInterval?
+    /// The local day the rendered snapshots were built under. Lets the periodic VM Box check
+    /// rebuild on day rollover even when the drop itself did not change.
+    @ObservationIgnored private var renderedDayKey: String?
     /// Running batches keyed by their complete execution policy, so a second caller asking for the same
     /// thing joins it instead of starting its own set of per-provider tasks. Manual action identity is
     /// part of the key: a new Refresh Now must not join work whose Keychain prompt budget it superseded.
@@ -285,6 +329,11 @@ final class WidgetDataStore {
         if let zai = providersByID["zai"] as? ZAIProvider {
             await zai.unloadLocalAccountingCachesForMemoryPressure()
         }
+        for provider in providersByID.values {
+            if let codex = provider as? CodexProvider {
+                await codex.unloadLocalAccountingCachesForMemoryPressure()
+            }
+        }
         // Unloading frees blocks into the malloc zone; relief is what returns the pages.
         ProcessMemoryBudget.releaseAllocatorFreePages()
     }
@@ -376,14 +425,15 @@ final class WidgetDataStore {
             }
         }
         self.localSnapshots = loaded
-        self.snapshots = loaded
+        self.snapshots = Self.removingExpiredZCodePromotions(from: loaded, through: retentionDate)
         if vmBoxHistory != nil {
+            _ = refreshVMBoxIfChanged(now: now())
             rebuildRenderedSnapshots()
             vmBoxHistoryTask = Task { [weak self] in
                 while !Task.isCancelled {
                     do { try await Task.sleep(for: .seconds(30)) } catch { return }
                     guard let self else { return }
-                    self.rebuildRenderedSnapshots()
+                    self.vmBoxPeriodicCheck()
                 }
             }
         }
@@ -631,6 +681,10 @@ final class WidgetDataStore {
                 preMarkedInFlight = []
             }
         }
+        // Snapshot-blob writes coalesce into one encode+flush at the end of the batch; each provider
+        // `cache.store` otherwise re-encodes the whole all-providers payload on the MainActor.
+        cache.beginDeferredWrites()
+        defer { cache.flushDeferredWrites() }
         let startingHistoryRevision = localHistoryRevision
         var concurrency = max(1, maxConcurrentProviders ?? providerIDs.count)
         var outcomes: [RefreshOutcome] = []
@@ -1320,6 +1374,7 @@ final class WidgetDataStore {
         // `refreshingProviderIDs` is a single slot that every provider card observes.
         if !refreshingProviderIDs.contains(providerID) {
             refreshingProviderIDs.insert(providerID)
+            providerHeaderInfo[providerID]?.isRefreshing = true
         }
         defer {
             runningProviderRefreshScopes[providerID]?[taskID] = nil
@@ -1327,6 +1382,7 @@ final class WidgetDataStore {
                 runningProviderRefreshScopes[providerID] = nil
                 if refreshingProviderIDs.contains(providerID) {
                     refreshingProviderIDs.remove(providerID)
+                    providerHeaderInfo[providerID]?.isRefreshing = false
                 }
             }
         }
@@ -1858,6 +1914,7 @@ final class WidgetDataStore {
     /// available to direct API reads, but disabled providers stop receiving peer contributions.
     func providerEnablementDidChange(changedProviderIDs: Set<String> = []) {
         invalidateMergedHistoryCache()
+        _ = refreshVMBoxIfChanged(now: now())
         rebuildRenderedSnapshots()
         let disabledProviderIDs = changedProviderIDs.filter { !isProviderEnabled($0) }
         let enabledProviderIDs = changedProviderIDs.filter { isProviderEnabled($0) }
@@ -1914,6 +1971,7 @@ final class WidgetDataStore {
         peerHistoryDocuments = UsageHistoryDocument.newestByDevice(documents)
             .filter { $0.deviceID != ownDeviceID }
         invalidateMergedHistoryCache()
+        _ = refreshVMBoxIfChanged(now: now())
         rebuildRenderedSnapshots()
     }
 
@@ -1921,6 +1979,7 @@ final class WidgetDataStore {
         guard !peerHistoryDocuments.isEmpty else { return }
         peerHistoryDocuments = []
         invalidateMergedHistoryCache()
+        _ = refreshVMBoxIfChanged(now: now())
         rebuildRenderedSnapshots()
     }
 
@@ -1986,18 +2045,51 @@ final class WidgetDataStore {
     /// The guard makes the whole family idempotent — one place, so every caller benefits and none can
     /// forget it. `ProviderSnapshot` is `Equatable`, so the comparison is cheap relative to the work this
     /// function has just done.
+    /// Reloads the VM Box accounting drop and retains the result the renderer uses. Returns whether
+    /// it changed, so the periodic check can skip the merge/render pass while the drop is untouched —
+    /// `rebuildRenderedSnapshots` itself no longer pays the directory scan on every provider publish.
+    @discardableResult
+    private func refreshVMBoxIfChanged(now: Date) -> Bool {
+        guard let vmBoxHistory else { return false }
+        let vmBox = vmBoxHistory.load(
+            identityKeys: providerIdentityKeys,
+            providerIDs: Set(registry.providers.map(\.id)),
+            now: now
+        )
+        guard vmBox != lastVMBoxHistory else { return false }
+        lastVMBoxHistory = vmBox
+        invalidateMergedHistoryCache()
+        return true
+    }
+
+    /// The periodic VM Box check. Rebuilds only when something the render depends on moved: the
+    /// drop's contents, the local day (spend/history windows re-window), or a lapsed ZCode promo row.
+    /// The common case — an untouched drop mid-day — costs one directory scan instead of a full
+    /// merge + render + dictionary compare.
+    private func vmBoxPeriodicCheck() {
+        let checkDate = now()
+        let vmBoxChanged = refreshVMBoxIfChanged(now: checkDate)
+        let dayRolled = renderedDayKey != nil
+            && renderedDayKey != DailyUsageAccumulator.dayKey(from: checkDate)
+        let promoExpired = snapshots != Self.removingExpiredZCodePromotions(
+            from: snapshots, through: checkDate
+        )
+        if vmBoxChanged || dayRolled || promoExpired {
+            rebuildRenderedSnapshots()
+        }
+    }
+
     private func rebuildRenderedSnapshots() {
         let renderDate = now()
-        let vmBox = vmBoxHistory?.load(identityKeys: providerIdentityKeys,
-            providerIDs: Set(registry.providers.map(\.id)), now: renderDate) ?? .init()
-        if vmBox != lastVMBoxHistory {
-            lastVMBoxHistory = vmBox
-            invalidateMergedHistoryCache()
-        }
+        let vmBox = lastVMBoxHistory
         let peerDocuments = UsageHistoryDocument.newestByDevice(peerHistoryDocuments + vmBox.documents)
         guard !peerDocuments.isEmpty else {
-            let rendered = applyingVMBoxWarnings(vmBox.warnings, to: applyingVMBoxZCodeTotal(vmBox.documents, to: localSnapshots))
+            let rendered = Self.removingExpiredZCodePromotions(
+                from: applyingVMBoxWarnings(vmBox.warnings, to: applyingVMBoxZCodeTotal(vmBox.documents, to: localSnapshots)),
+                through: renderDate
+            )
             if snapshots != rendered { snapshots = rendered }
+            rebuildDerivedViewState(now: renderDate)
             return
         }
         let renderDayKey = DailyUsageAccumulator.dayKey(from: renderDate)
@@ -2043,7 +2135,106 @@ final class WidgetDataStore {
         }
         rendered = applyingVMBoxZCodeTotal(vmBox.documents, to: rendered)
         rendered = applyingVMBoxWarnings(vmBox.warnings, to: rendered)
+        rendered = Self.removingExpiredZCodePromotions(from: rendered, through: renderDate)
         if snapshots != rendered { snapshots = rendered }
+        rebuildDerivedViewState(now: renderDate)
+    }
+
+    /// Rebuilds the published view-state maps (`providerHeaderInfo`, `widgetDataByDescriptorID`,
+    /// `totalSpendByPeriod`) from the freshly rendered `snapshots`. Runs once per rebuild so views
+    /// read memoized values instead of re-deriving them per render; each map is reassigned only when
+    /// it actually changed, matching the `snapshots` write policy above.
+    private func rebuildDerivedViewState(now renderDate: Date) {
+        renderedStalenessThreshold = Self.stalenessThreshold
+        renderedDayKey = DailyUsageAccumulator.dayKey(from: renderDate)
+
+        var headers: [String: ProviderHeaderInfo] = [:]
+        headers.reserveCapacity(snapshots.count)
+        for providerID in snapshots.keys {
+            headers[providerID] = headerInfo(for: providerID)
+        }
+        if providerHeaderInfo != headers { providerHeaderInfo = headers }
+
+        var resolved: [String: WidgetData] = [:]
+        for descriptor in orderedDescriptors()
+        where isProviderEnabled(descriptor.providerID) && snapshots[descriptor.providerID] != nil
+        {
+            resolved[descriptor.id] = data(for: descriptor)
+        }
+        if widgetDataByDescriptorID != resolved { widgetDataByDescriptorID = resolved }
+
+        let spendCapableIDs = Set(registry.descriptors.filter(\.isSpendTile).map(\.providerID))
+        let spendProviders = registry.providers.filter { spendCapableIDs.contains($0.id) }
+        let dormantHistories = dormantUsageHistories(for: spendProviders.map(\.id))
+        var totals: [TotalSpendPeriod: TotalSpend] = [:]
+        for period in TotalSpendPeriod.allCases {
+            totals[period] = TotalSpendAggregator.total(
+                for: period,
+                providers: spendProviders,
+                snapshots: snapshots,
+                dormantHistories: dormantHistories,
+                now: renderDate
+            )
+        }
+        if totalSpendByPeriod != totals { totalSpendByPeriod = totals }
+    }
+
+    /// Drops a cached Z.ai promotional row once its expiry has passed — or when an older build
+    /// saved only the display string and no machine-readable deadline — even when the live quota
+    /// request that would normally retire it cannot run (for example when quota is unavailable,
+    /// such as a Keychain-blocked meter pass). This is render-only — the stored snapshot keeps the
+    /// row — and keys on the provider plus the "Expires …" detail the producer writes for promo
+    /// deadlines, so ordinary reset countdowns and every other provider are unaffected.
+    static func removingExpiredZCodePromotions(
+        from values: [String: ProviderSnapshot], through date: Date
+    ) -> [String: ProviderSnapshot] {
+        guard var snapshot = values["zai"] else { return values }
+        let visible = snapshot.lines.filter { line in
+            guard case .progress(_, _, _, _, let expiry, _, _, let detail?) = line,
+                  detail.hasPrefix("Expires ") else { return true }
+            // Older builds saved only the display string. Wait for a fresh entitlement rather than showing it indefinitely.
+            return expiry.map { $0 > date } ?? false
+        }
+        guard visible.count != snapshot.lines.count else { return values }
+        snapshot.lines = visible
+        var result = values
+        result["zai"] = snapshot
+        return result
+    }
+
+    private func applyingVMBoxWarnings(_ warnings: [String: String], to values: [String: ProviderSnapshot]) -> [String: ProviderSnapshot] {
+        var result = values
+        for (id, warning) in warnings where isProviderEnabled(id) {
+            guard var snapshot = result[id] else { continue }
+            snapshot.historyWarning = [snapshot.historyWarning, warning].compactMap { $0 }.joined(separator: " · ")
+            result[id] = snapshot
+        }
+        return result
+    }
+
+    /// Older installations expose ZCode's cumulative Tokens tile rather than daily history.
+    /// Preserve that existing metric and its layout settings; newer daily-history catalogs use
+    /// the normal merger above. Neither path changes Z.ai Coding Plan quota meters.
+    private func applyingVMBoxZCodeTotal(_ documents: [UsageHistoryDocument], to values: [String: ProviderSnapshot]) -> [String: ProviderSnapshot] {
+        guard registry.historyDescriptorsByProvider["zai"] == nil,
+              registry.descriptors.contains(where: { $0.id == "zai.zcodeTokens" }),
+              isProviderEnabled("zai")
+        else { return values }
+        let remote = documents.compactMap { $0.providers["zai"] }.flatMap(\.series.daily)
+            .reduce(0.0) { $0 + Double($1.totalTokens) }
+        guard remote > 0, remote.isFinite else { return values }
+        var result = values
+        var snapshot = result["zai"] ?? ProviderSnapshot(providerID: "zai", displayName: "Z.ai", lines: [], refreshedAt: .distantPast)
+        var local = 0.0
+        for line in snapshot.lines {
+            if case let .values(label, numbers, _, _, _, _) = line, label == "ZCode Tokens" {
+                local += numbers.filter { $0.kind == .count }.reduce(0) { $0 + $1.number }
+            }
+        }
+        snapshot.lines.removeAll { $0.label == "ZCode Tokens" }
+        snapshot.lines.append(.values(label: "ZCode Tokens", values: [MetricValue(number: local + remote, kind: .count, label: "tokens")]))
+        result["zai"] = snapshot
+        return result
     }
 
     private func applyingVMBoxWarnings(_ warnings: [String: String], to values: [String: ProviderSnapshot]) -> [String: ProviderSnapshot] {
@@ -2122,6 +2313,20 @@ final class WidgetDataStore {
     /// real "Token expired" failure. When there's no error, the soft warning (if any) shows.
     func headerNotice(for providerID: String) -> String? {
         errorMessage(for: providerID) ?? warningMessage(for: providerID)
+    }
+
+    /// Live-computed `ProviderHeaderInfo` for providers the published `providerHeaderInfo` map does
+    /// not cover (no snapshot yet). Views should read the map first and fall back to this — the map
+    /// exists to keep these derivations off the per-render path.
+    func headerInfo(for providerID: String) -> ProviderHeaderInfo {
+        ProviderHeaderInfo(
+            plan: plan(for: providerID),
+            warningMessage: headerNotice(for: providerID),
+            stalenessHint: stalenessHint(for: providerID),
+            errorMessage: errorMessage(for: providerID),
+            errorCategory: errorCategory(for: providerID),
+            isRefreshing: refreshingProviderIDs.contains(providerID)
+        )
     }
 
     /// Local history may succeed beside a failed quota read. Any explicit provider error remains a
@@ -2322,7 +2527,8 @@ final class WidgetDataStore {
             stamps.append(snapshot.historyRefreshedAt ?? snapshot.refreshedAt)
         }
         let age = now().timeIntervalSince(stamps.min() ?? snapshot.refreshedAt)
-        guard age >= Self.stalenessThreshold, let duration = Formatters.compactDuration(age) else {
+        guard age >= (renderedStalenessThreshold ?? Self.stalenessThreshold),
+              let duration = Formatters.compactDuration(age) else {
             return nil
         }
         return StalenessHint(label: "Outdated", tooltip: "Last updated \(duration) ago")

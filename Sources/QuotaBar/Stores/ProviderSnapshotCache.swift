@@ -132,6 +132,53 @@ struct ProviderSnapshotCache {
     /// same reason as `memo`: the value-type cache shares it across copies and stays safe. See #697.
     private let sessionWrites = OSAllocatedUnfairLock<Set<String>>(initialState: [])
 
+    /// Deferred-write state for `beginDeferredWrites`/`flushDeferredWrites`. While a batch is open,
+    /// mutation methods keep updating the in-memory mirror under the per-call lock but skip the
+    /// whole-payload encode + `UserDefaults` write; `flushDeferredWrites` persists once. A foreign
+    /// process's write is still detected by the byte-compare in `loadPayload` — which overlays the
+    /// deferred providers' entries onto the newer blob instead of silently dropping either side,
+    /// so the cross-process fence (issued/stored orders) is preserved exactly.
+    private struct DeferredWriteState {
+        var depth = 0
+        var dirtyProviderIDs: Set<String> = []
+    }
+    private let deferWrites = OSAllocatedUnfairLock(initialState: DeferredWriteState())
+
+    /// Coalesce a multi-provider refresh batch into one blob write. Pair every call with
+    /// `flushDeferredWrites` (e.g. via `defer`); nesting is depth-counted so overlapping batches
+    /// share one final flush.
+    func beginDeferredWrites() {
+        deferWrites.withLock { $0.depth += 1 }
+    }
+
+    /// Persist the deferred mirror once. Runs under the same process+flock lock as a normal write,
+    /// and merges any foreign write that landed while the batch ran (see `loadPayload`).
+    func flushDeferredWrites() {
+        let flushNow = deferWrites.withLock { state -> Bool in
+            guard state.depth > 0 else { return false }
+            state.depth -= 1
+            return state.depth == 0 && !state.dirtyProviderIDs.isEmpty
+        }
+        guard flushNow else {
+            deferWrites.withLock { if $0.depth == 0 { $0.dirtyProviderIDs = [] } }
+            return
+        }
+        deferWrites.withLock { $0.dirtyProviderIDs = [] }
+        _ = withPersistentStoreLock {
+            // `loadPayload` merges deferred entries onto a foreign write before returning.
+            _ = save(loadPayload())
+        }
+    }
+
+    /// Record that a mutation method touched `providerID` inside a deferred batch, so a foreign
+    /// write can be overlaid and the flush knows there is work to persist.
+    private func markDeferredDirty(providerIDs: some Sequence<String>) {
+        let ids = Array(providerIDs)
+        deferWrites.withLock {
+            if $0.depth > 0 { $0.dirtyProviderIDs.formUnion(ids) }
+        }
+    }
+
     private let userDefaults: UserDefaults
     private let storageKey: String
     /// The process-shared refresh-order allocator. It lives in its own small key so that allocating
@@ -230,7 +277,10 @@ struct ProviderSnapshotCache {
                 payload.snapshots[providerID] = snapshot
                 changed = true
             }
-            if changed { save(payload) }
+            if changed {
+                markDeferredDirty(providerIDs: Array(payload.snapshots.keys))
+                save(payload)
+            }
         }
     }
 
@@ -291,6 +341,7 @@ struct ProviderSnapshotCache {
             guard compacted != history else { return }
             snapshot.usageHistory = compacted
             payload.snapshots[providerID] = snapshot
+            markDeferredDirty(providerIDs: [providerID])
             _ = save(payload)
         }
     }
@@ -416,6 +467,7 @@ struct ProviderSnapshotCache {
                         payload.producedByIdentityKeys[providerID] = producedByIdentityKey
                     }
                     payload.snapshots[providerID] = warningSnapshot
+                    markDeferredDirty(providerIDs: [providerID])
                     result = save(payload) ? .stored(warningSnapshot) : .unavailable
                 } else {
                     // A completed fold with no history is not authoritative. Preserve the previous
@@ -469,6 +521,7 @@ struct ProviderSnapshotCache {
                 if quotaAccepted { payload.storedQuotaOrders[providerID] = refreshOrder }
                 if historyAccepted { payload.storedHistoryOrders[providerID] = refreshOrder }
             }
+            markDeferredDirty(providerIDs: [providerID])
             result = save(payload) ? .stored(storedSnapshot) : .unavailable
         }
         guard locked else { return .unavailable }
@@ -649,6 +702,7 @@ struct ProviderSnapshotCache {
             payload.storedQuotaOrders[providerID] = order
             payload.storedHistoryOrders[providerID] = order
             accepted = true
+            markDeferredDirty(providerIDs: [providerID])
             didStore = save(payload)
         }
         guard stored, didStore, accepted else { return false }
@@ -683,6 +737,7 @@ struct ProviderSnapshotCache {
                 payload.storedRefreshOrders[providerID, default: 0], order
             )
             payload.storedQuotaOrders[providerID] = order
+            markDeferredDirty(providerIDs: [providerID])
             result = save(payload) ? .stored(cleared) : .unavailable
         }
         guard locked else { return .unavailable }
@@ -773,10 +828,37 @@ struct ProviderSnapshotCache {
         if currentBytes == knownBytes, let mirror = memo.withLock({ $0 }) { return mirror }
         // Decode the exact bytes observed above. Re-reading UserDefaults here could pair one writer's
         // blob with another writer's byte stamp and bless a stale mirror as current.
-        let loaded = decodeStoredPayload(currentBytes)
-        memo.withLock { $0 = loaded }
+        var loaded = decodeStoredPayload(currentBytes)
+        // Another process wrote while this one holds deferred (unflushed) mutations. Overlay our
+        // pending providers onto the foreign blob rather than dropping either side's entries — the
+        // same merge the deferred flush would have committed had no interleaving write landed.
+        let pending = deferWrites.withLock { $0.dirtyProviderIDs }
+        if !pending.isEmpty, let mirror = memo.withLock({ $0 }) {
+            for providerID in pending {
+                loaded.snapshots[providerID] = mirror.snapshots[providerID]
+                loaded.producedByIdentityKeys[providerID] = mirror.producedByIdentityKeys[providerID]
+                loaded.issuedRefreshOrders[providerID] = max(
+                    loaded.issuedRefreshOrders[providerID, default: 0],
+                    mirror.issuedRefreshOrders[providerID, default: 0]
+                )
+                loaded.storedRefreshOrders[providerID] = max(
+                    loaded.storedRefreshOrders[providerID, default: 0],
+                    mirror.storedRefreshOrders[providerID, default: 0]
+                )
+                loaded.storedQuotaOrders[providerID] = max(
+                    loaded.storedQuotaOrders[providerID, default: 0],
+                    mirror.storedQuotaOrders[providerID, default: 0]
+                )
+                loaded.storedHistoryOrders[providerID] = max(
+                    loaded.storedHistoryOrders[providerID, default: 0],
+                    mirror.storedHistoryOrders[providerID, default: 0]
+                )
+            }
+        }
+        let result = loaded
+        memo.withLock { $0 = result }
         persistedBytes.withLock { $0 = currentBytes }
-        return loaded
+        return result
     }
 
     private func decodeStoredPayload(_ data: Data?) -> Payload {
@@ -799,6 +881,11 @@ struct ProviderSnapshotCache {
 
     @discardableResult
     private func save(_ payload: Payload) -> Bool {
+        // Deferred batch: mirror the mutation now, encode + write once at flush.
+        if deferWrites.withLock({ $0.depth }) > 0 {
+            memo.withLock { $0 = payload }
+            return true
+        }
         do {
             let data = try encoder.encode(payload)
             metrics?.recordWrite()

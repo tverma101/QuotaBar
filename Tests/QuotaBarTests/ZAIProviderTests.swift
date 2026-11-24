@@ -582,6 +582,76 @@ final class ZAIProviderTests: XCTestCase {
         XCTAssertEqual(vals.first?.number, 1200)
     }
 
+    func testHistoryOnlyRefreshDoesNotCallQuotaAPI() async {
+        // Fold-only scopes (.panelAccounting / .localAccounting) recompute local ZCode history but
+        // must not touch the live Coding Plan quota API — that path can be Keychain-gated.
+        let http = RoutingHTTPClient { _ in
+            XCTFail("Accounting should not call the quota API")
+            return jsonResponse(quotaBothLimitsJSON)
+        }
+        let provider = ZAIProvider(
+            zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite", leveldbPath: "/nonexistent-quotabar-zcode-test/leveldb"),
+            authStore: makeAuthStore(key: "zai-test"),
+            usageClient: ZAIUsageClient(http: http)
+        )
+
+        let snapshot = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await provider.refresh()
+        }
+
+        XCTAssertTrue(http.requests.isEmpty)
+        XCTAssertNil(snapshot.line(label: "Session"))
+    }
+
+    func testExpiredCachedZCodePromotionIsRemovedWithoutDroppingLiveQuota() {
+        let instant = Date(timeIntervalSince1970: 1_800_000_000)
+        let later = instant.addingTimeInterval(7_200)
+        let zai = Provider(id: "zai", displayName: "Z.ai", icon: .providerMark("zai"))
+        let other = Provider(id: "other", displayName: "Other", icon: .providerMark("codex"))
+        func promo(_ label: String, resetsAt: Date, detail: String) -> MetricLine {
+            .progress(
+                label: label, used: 1, limit: 10,
+                format: .count(suffix: "tokens"),
+                resetsAt: resetsAt, detail: detail
+            )
+        }
+        let zaiSnapshot = ProviderSnapshot.make(
+            provider: zai,
+            plan: nil,
+            lines: [
+                promo("Global Build", resetsAt: instant, detail: "Expires soon"),
+                .progress(label: "Session", used: 5, limit: 100, format: .percent, resetsAt: instant),
+                promo("Weekend Build", resetsAt: later, detail: "Expires in 2h"),
+                // Rows saved by older builds carry only the display string — no machine-readable
+                // deadline — so they are hidden until a fresh entitlement republishes them.
+                .progress(label: "Legacy Build", used: 1, limit: 10, format: .count(suffix: "tokens"), detail: "Expires soon")
+            ],
+            refreshedAt: instant
+        )
+        let otherSnapshot = ProviderSnapshot.make(
+            provider: other,
+            plan: nil,
+            lines: [promo("Global Build", resetsAt: instant, detail: "Expires soon")],
+            refreshedAt: instant
+        )
+        let values = ["zai": zaiSnapshot, "other": otherSnapshot]
+
+        // One second before the expiry the dated promo still renders; the undated legacy row is
+        // already hidden.
+        let beforeExpiry = WidgetDataStore.removingExpiredZCodePromotions(
+            from: values, through: instant.addingTimeInterval(-1)
+        )
+        XCTAssertEqual(beforeExpiry["zai"]?.lines.map(\.label), ["Global Build", "Session", "Weekend Build"])
+
+        // Exactly at the expiry instant the promo row is gone; the ordinary Session meter that
+        // shares the same reset instant, the still-future Weekend Build, timestamps, and every
+        // other provider's identical row are untouched.
+        let filtered = WidgetDataStore.removingExpiredZCodePromotions(from: values, through: instant)
+        XCTAssertEqual(filtered["zai"]?.lines.map(\.label), ["Session", "Weekend Build"])
+        XCTAssertEqual(filtered["zai"]?.refreshedAt, instant)
+        XCTAssertEqual(filtered["other"], otherSnapshot)
+    }
+
     func testProviderIdentityAndLinks() {
         let provider = ZAIProvider()
         XCTAssertEqual(provider.provider.id, "zai")

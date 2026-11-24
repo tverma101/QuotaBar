@@ -10,9 +10,11 @@ extension LayoutStore {
     }
 
     var visiblePlaced: [PlacedWidget] {
-        placed.filter { widget in
-            guard let providerID = providerID(of: widget) else { return true }
-            return isProviderEnabled(providerID)
+        derived(\.visiblePlaced) {
+            placed.filter { widget in
+                guard let providerID = providerID(of: widget) else { return true }
+                return isProviderEnabled(providerID)
+            }
         }
     }
 
@@ -33,7 +35,7 @@ extension LayoutStore {
     /// must still count, and look-alike dollar rows from other providers (OpenRouter's API-spend
     /// "Today") must not.
     var spendCapableProviders: [Provider] {
-        spendCapableProviders(where: isProviderEnabled)
+        derived(\.spendCapableProviders) { spendCapableProviders(where: isProviderEnabled) }
     }
 
     /// Turned-off providers that still ship the local spend tiles, in the user's provider order.
@@ -45,7 +47,7 @@ extension LayoutStore {
     /// and cannot be trusted as "today", so the card re-windows their dated history instead; see
     /// `TotalSpendAggregator.slice(for:period:history:)`.
     var dormantSpendCapableProviders: [Provider] {
-        spendCapableProviders { !isProviderEnabled($0) }
+        derived(\.dormantSpendCapableProviders) { spendCapableProviders { !isProviderEnabled($0) } }
     }
 
     private func spendCapableProviders(
@@ -71,38 +73,42 @@ extension LayoutStore {
     /// provider's metrics kept in the provider's custom metric order. Drives the grouped dashboard list; providers with
     /// no visible metric are dropped so the dashboard only shows groups that have something to show.
     var displayGroups: [ProviderGroup] {
-        orderedProviders().compactMap { provider in
-            let widgetsByDescriptor = Dictionary(
-                visiblePlaced
-                    .filter { providerID(of: $0) == provider.id }
-                    .map { ($0.descriptorID, $0) },
-                uniquingKeysWith: { first, _ in first }
-            )
-            let widgets = metricOrder(for: provider.id).compactMap { widgetsByDescriptor[$0] }
-            guard !widgets.isEmpty else { return nil }
-            let alwaysShown = widgets.filter { !expandedMetricIDs.contains($0.descriptorID) }
-            let expanded = widgets.filter { expandedMetricIDs.contains($0.descriptorID) }
-            // A provider whose only enabled metrics are all marked expanded would otherwise render an
-            // empty card with a caret — promote them to always-shown so the card always has rows.
-            if alwaysShown.isEmpty {
-                return ProviderGroup(provider: provider, alwaysShownWidgets: expanded, expandedWidgets: [])
+        derived(\.displayGroups) {
+            orderedProviders().compactMap { provider in
+                let widgetsByDescriptor = Dictionary(
+                    visiblePlaced
+                        .filter { providerID(of: $0) == provider.id }
+                        .map { ($0.descriptorID, $0) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+                let widgets = metricOrder(for: provider.id).compactMap { widgetsByDescriptor[$0] }
+                guard !widgets.isEmpty else { return nil }
+                let alwaysShown = widgets.filter { !expandedMetricIDs.contains($0.descriptorID) }
+                let expanded = widgets.filter { expandedMetricIDs.contains($0.descriptorID) }
+                // A provider whose only enabled metrics are all marked expanded would otherwise render an
+                // empty card with a caret — promote them to always-shown so the card always has rows.
+                if alwaysShown.isEmpty {
+                    return ProviderGroup(provider: provider, alwaysShownWidgets: expanded, expandedWidgets: [])
+                }
+                return ProviderGroup(provider: provider, alwaysShownWidgets: alwaysShown, expandedWidgets: expanded)
             }
-            return ProviderGroup(provider: provider, alwaysShownWidgets: alwaysShown, expandedWidgets: expanded)
         }
     }
 
     /// Every enabled provider with *all* the metrics it supports, in its saved metric order. Enabled and
     /// disabled rows stay in-place; the switch only controls visibility.
     var customizeGroups: [ProviderMetrics] {
-        orderedProviders().compactMap { provider in
-            guard isProviderEnabled(provider.id) else { return nil }
-            let metrics = orderedSupportedMetrics(for: provider.id)
-            guard !metrics.isEmpty else { return nil }
-            return ProviderMetrics(
-                provider: provider,
-                alwaysShownMetrics: metrics.filter { !expandedMetricIDs.contains($0.id) },
-                expandedMetrics: metrics.filter { expandedMetricIDs.contains($0.id) }
-            )
+        derived(\.customizeGroups) {
+            orderedProviders().compactMap { provider in
+                guard isProviderEnabled(provider.id) else { return nil }
+                let metrics = orderedSupportedMetrics(for: provider.id)
+                guard !metrics.isEmpty else { return nil }
+                return ProviderMetrics(
+                    provider: provider,
+                    alwaysShownMetrics: metrics.filter { !expandedMetricIDs.contains($0.id) },
+                    expandedMetrics: metrics.filter { expandedMetricIDs.contains($0.id) }
+                )
+            }
         }
     }
 
@@ -111,12 +117,14 @@ extension LayoutStore {
     /// detail — unlike the enabled-provider reorder list exposed by `customizeGroups`, which filters them
     /// out. Each row carries the enablement flag and total metric count shown by the list.
     var customizeProviderRows: [ProviderRow] {
-        orderedProviders().map { provider in
-            ProviderRow(
-                provider: provider,
-                isEnabled: isProviderEnabled(provider.id),
-                metricCount: metricCount(for: provider.id)
-            )
+        derived(\.customizeProviderRows) {
+            orderedProviders().map { provider in
+                ProviderRow(
+                    provider: provider,
+                    isEnabled: isProviderEnabled(provider.id),
+                    metricCount: metricCount(for: provider.id)
+                )
+            }
         }
     }
 
@@ -162,15 +170,17 @@ extension LayoutStore {
     /// provider's metric order). A temporarily disabled provider is excluded from the rendered groups
     /// but keeps its pins. Drives the menu-bar strip.
     var pinnedGroups: [ProviderMetrics] {
-        orderedProviders().compactMap { provider in
-            guard isProviderEnabled(provider.id) else { return nil }
-            // Keep the strip order matching Customize: always-shown pins first, then expanded ones.
-            let metrics = orderedSupportedMetrics(for: provider.id).filter { pinnedMetricIDs.contains($0.id) }
-            return metrics.isEmpty ? nil : ProviderMetrics(
-                provider: provider,
-                alwaysShownMetrics: metrics.filter { !expandedMetricIDs.contains($0.id) },
-                expandedMetrics: metrics.filter { expandedMetricIDs.contains($0.id) }
-            )
+        derived(\.pinnedGroups) {
+            orderedProviders().compactMap { provider in
+                guard isProviderEnabled(provider.id) else { return nil }
+                // Keep the strip order matching Customize: always-shown pins first, then expanded ones.
+                let metrics = orderedSupportedMetrics(for: provider.id).filter { pinnedMetricIDs.contains($0.id) }
+                return metrics.isEmpty ? nil : ProviderMetrics(
+                    provider: provider,
+                    alwaysShownMetrics: metrics.filter { !expandedMetricIDs.contains($0.id) },
+                    expandedMetrics: metrics.filter { expandedMetricIDs.contains($0.id) }
+                )
+            }
         }
     }
 

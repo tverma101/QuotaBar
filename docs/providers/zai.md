@@ -8,7 +8,7 @@ Tracks [Z.ai](https://z.ai) (Zhipu AI) GLM Coding Plan usage quotas for coding s
 |---|---|
 | Session | 5-hour rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
 | Weekly | 7-day rolling window token usage (percentage); suppressed when the account has no Coding Plan, otherwise visible even if the response omits the limit |
-| Weekend Build | A promotional one-time token grant read from local ZCode (used / total); shows its expiry, and "Expired" once the grant ends; hidden when the account has none |
+| Weekend Build | A promotional one-time token grant read from local ZCode (used / total); shows its expiry and drops off the card once the grant ends; hidden when the account has none |
 | Web Searches | Monthly web-search / web-reader / Zread calls (used / limit); hidden when the plan carries no web-search allowance |
 | Today / Yesterday / Last 30 Days | Local ZCode usage history; sit below the caret |
 
@@ -46,16 +46,18 @@ export ZAI_API_KEY="YOUR_API_KEY"
 
 Promotional grants (like a one-time token bonus) are read from ZCode's local entitlement snapshot —
 no API key involved. The row shows how much of the grant is used and, when the grant has a recorded
-end date, how long it lasts; after that date it reads "Expired" until the next snapshot drops it.
+end date, how long it lasts; once that date passes the row is removed from display, even when the
+quota refresh that would normally retire it can't run at that moment.
 Grant data updates whenever ZCode refreshes its snapshot, so a fresh manual ZCode run feeds QuotaBar.
 
 ## ZCode History
 
 The Today / Yesterday / Last 30 Days tiles come from this Mac's `~/.zcode/cli/db/db.sqlite`. They
-count recorded input and output across models used in ZCode, including cached input once. This is
-local app usage, not the Coding Plan quota or a billing figure. They appear below the caret and are
-not pinned by default. A corrupt row in the sqlite history is skipped with a warning (and a note on
-the card) instead of hiding the rest of the history.
+count recorded input and output across models used in ZCode, including cached input once, and
+estimate cost at public API rates. This is local app usage, not the Coding Plan quota or a billing
+figure. A day with no recorded ZCode usage reads "No data" rather than a zero. They appear below
+the caret and are not pinned by default. A corrupt row in the sqlite history is skipped with a
+warning (and a note on the card) instead of hiding the rest of the history.
 
 ## Under the hood
 

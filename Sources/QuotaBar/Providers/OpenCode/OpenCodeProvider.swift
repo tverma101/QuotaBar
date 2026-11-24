@@ -793,28 +793,49 @@ final class OpenCodeProvider: ProviderRuntime {
         var accountAPIErrors: [(name: String, keyID: String, credentialID: String, error: OpenCodeUsageError)] = []
         var wasCancelled = false
         if !uniqueAPIKeys.isEmpty, !ProviderRefreshContext.scope.suppressesLiveQuota {
-            for entry in uniqueAPIKeys {
+            // One request per unique credential, all in flight together: each carries its own 15s
+            // timeout, so a serial loop made an N-key card wait N×15s on an unreachable account.
+            let usageClient = usageClient
+            let results = await withTaskGroup(
+                of: (credentialID: String, result: Result<OpenCodeGoAccountUsage, Error>).self
+            ) { group -> [String: Result<OpenCodeGoAccountUsage, Error>] in
+                for entry in uniqueAPIKeys {
+                    let credentialID = Self.credentialID(for: entry.key)
+                    group.addTask {
+                        do {
+                            return (credentialID, .success(try await usageClient.fetchUsage(key: entry.key)))
+                        } catch {
+                            return (credentialID, .failure(error))
+                        }
+                    }
+                }
+                var fetched: [String: Result<OpenCodeGoAccountUsage, Error>] = [:]
+                for await (credentialID, result) in group {
+                    fetched[credentialID] = result
+                }
+                return fetched
+            }
+            // Map answers back in credential order so meter ordering never depends on which
+            // request's response landed first.
+            fetchLoop: for entry in uniqueAPIKeys {
                 guard !Task.isCancelled else {
                     wasCancelled = true
                     break
                 }
-                do {
-                    let usage = try await usageClient.fetchUsage(key: entry.key)
-                    guard !Task.isCancelled else {
-                        wasCancelled = true
-                        break
-                    }
+                let credentialID = Self.credentialID(for: entry.key)
+                switch results[credentialID] {
+                case .success(let usage):
                     accountUsages.append((
                         entry.name,
                         entry.id,
-                        Self.credentialID(for: entry.key),
+                        credentialID,
                         usage
                     ))
-                    DiagnosticGate.clearFailure(accountAPIDiagnosticKey(for: Self.credentialID(for: entry.key)))
-                } catch {
+                    DiagnosticGate.clearFailure(accountAPIDiagnosticKey(for: credentialID))
+                case .failure(let error):
                     if ProviderCancellation.isCancellation(error) {
                         wasCancelled = true
-                        break
+                        break fetchLoop
                     }
                     let usageError = (error as? OpenCodeUsageError)
                         ?? .accountAPIUnavailable(detail: error.localizedDescription)
@@ -822,14 +843,16 @@ final class OpenCodeProvider: ProviderRuntime {
                         (
                             name: entry.name,
                             keyID: entry.id,
-                            credentialID: Self.credentialID(for: entry.key),
+                            credentialID: credentialID,
                             error: usageError
                         )
                     )
-                    let diagnosticKey = accountAPIDiagnosticKey(for: Self.credentialID(for: entry.key))
+                    let diagnosticKey = accountAPIDiagnosticKey(for: credentialID)
                     DiagnosticGate.logOnce(for: diagnosticKey) {
                         AppLog.warn(LogTag.plugin("opencode"), "account usage API unavailable (\(entry.name)): \(usageError.localizedDescription)")
                     }
+                case nil:
+                    wasCancelled = true
                 }
             }
         }

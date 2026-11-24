@@ -257,8 +257,9 @@ struct OpenCodeUsageScanner: Sendable {
 
     /// Scan the last `daysBack` days. Returns `nil` only when there is no OpenCode database at all (→ the
     /// provider shows "No data"); a present-but-empty database yields an empty scan (idle tiles collapse
-    /// to "No data" via `SpendTileMapper`). Throws `databaseUnreadable` when databases exist but none
-    /// could be read — an all-failed refresh has no data source and must not render as zero usage.
+    /// to "No data" via `SpendTileMapper`). Throws `databaseUnreadable` when the data directory or ANY
+    /// discovered database could not be read — a partial scan must not replace last-good history with a
+    /// smaller total.
     /// Escaping fold visits mutate OpenCode accumulators through this box.
     private final class GatewayFoldState: @unchecked Sendable {
         let scanSince: Date
@@ -548,23 +549,32 @@ struct OpenCodeUsageScanner: Sendable {
                         AppLog.info(.refresh, "opencode database \(path) uses the \(layout) layout")
                     }
                 }
-                guard let json = try JSONLAccountingWorkPacer.shared.perform({
-                    try sqlite.queryValue(
-                        path: path,
-                        sql: OpenCodeDatabaseSQL.dataSQL(cutoffMs: cutoffMs, schema: schema)
-                    )
-                }) else {
-                    failures[path] = "usage query returned no result"
+                // The whole-history read is chunked into bounded time ranges: one marshaled
+                // `json_group_array` for ~10 years of rows outruns the sqlite3 subprocess's 5s cap
+                // on a large store and fails closed on every fold.
+                let nowMs = Int(now.timeIntervalSince1970 * 1000)
+                var queryFailure: String?
+                for sql in OpenCodeDatabaseSQL.dataSQLChunks(cutoffMs: cutoffMs, nowMs: nowMs, schema: schema) {
+                    guard !Task.isCancelled else { return nil }
+                    guard let json = try JSONLAccountingWorkPacer.shared.perform({
+                        try sqlite.queryValue(path: path, sql: sql)
+                    }) else {
+                        queryFailure = "usage query returned no result"
+                        break
+                    }
+                    guard !Task.isCancelled else { return nil }
+                    guard let parsedRows = JSONLAccountingWorkPacer.shared.perform({
+                        Self.parseRows(json, maximumTimestampMs: maximumTimestampMs)
+                    }) else {
+                        queryFailure = "usage rows contain malformed accounting values"
+                        break
+                    }
+                    rows.append(contentsOf: parsedRows)
+                }
+                if let queryFailure {
+                    failures[path] = queryFailure
                     continue
                 }
-                guard !Task.isCancelled else { return nil }
-                guard let parsedRows = JSONLAccountingWorkPacer.shared.perform({
-                    Self.parseRows(json, maximumTimestampMs: maximumTimestampMs)
-                }) else {
-                    failures[path] = "usage rows contain malformed accounting values"
-                    continue
-                }
-                rows.append(contentsOf: parsedRows)
             } catch {
                 guard !Task.isCancelled else { return nil }
                 failures[path] = error.localizedDescription
@@ -1416,31 +1426,21 @@ struct OpenCodeUsageScanner: Sendable {
         partialDays: inout Set<String>,
         skippingDayModels: Set<String> = []
     ) {
+        let sinceDay = DailyUsageAccumulator.dayKey(from: since)
         JSONLAccountingWorkPacer.shared.forEach(rows) { row in
-            guard row.date >= since, row.tokens > 0 else { return }
+            // Aggregated rows are whole local-day buckets materialized at noon: a non-midnight
+            // `since` later than noon must still keep its boundary-day bucket.
+            guard row.tokens > 0,
+                  row.isAggregated
+                    ? DailyUsageAccumulator.dayKey(from: row.date) >= sinceDay
+                    : row.date >= since
+            else { return }
             let day = DailyUsageAccumulator.dayKey(from: row.date)
             guard !skippingDayModels.contains(Self.dayModelKey(day: day, model: row.model)) else { return }
             if row.isInProgress {
                 // Still-running Hermes session: its ledger is not final (Hermes writes it in
                 // delayed bursts), so the day's total is partial until the session ends.
                 partialDays.insert(day)
-            }
-            let cost: Double?
-            let providerID = row.burnsGoQuota ? Self.goProviderID : Self.zenProviderID
-            if let rate = effectiveRates[EffectiveRateKey(model: row.model, providerID: providerID)] {
-                // The gateway's own recorded average for this model — all of the row's tokens blend
-                // at it (the same proportion the provider's recorded dollars represent).
-                cost = rate * Double(row.tokens)
-            } else if let estimated = pricing.estimatedCostDollars(
-                model: row.model,
-                tokens: TokenBreakdown(
-                    input: row.input, cacheWrite5m: row.cacheWrite, cacheRead: row.cacheRead, output: row.output
-                ),
-                applyLongContextRates: !row.isAggregated
-            ) {
-                cost = estimated
-            } else {
-                cost = nil
             }
             let apiEstimate = pricing.estimatedCostDollars(
                 model: row.model,
@@ -1449,6 +1449,15 @@ struct OpenCodeUsageScanner: Sendable {
                 ),
                 applyLongContextRates: !row.isAggregated
             )
+            let cost: Double?
+            let providerID = row.burnsGoQuota ? Self.goProviderID : Self.zenProviderID
+            if let rate = effectiveRates[EffectiveRateKey(model: row.model, providerID: providerID)] {
+                // The gateway's own recorded average for this model — all of the row's tokens blend
+                // at it (the same proportion the provider's recorded dollars represent).
+                cost = rate * Double(row.tokens)
+            } else {
+                cost = apiEstimate
+            }
             let hasEstimatedRouterInput = row.routerInputWasEstimated == true
             let hasIncompleteRouterBreakdown = row.routerCostBreakdownIsComplete == false
             let hasIncompleteRouterAccounting = hasEstimatedRouterInput
@@ -1591,7 +1600,11 @@ struct OpenCodeUsageScanner: Sendable {
             else { return nil }
             let tokenCountSaturated = rawTokens > 1e15
             let tokens = Int(min(rawTokens, 1e15))
-            let cost = ProviderParse.number(entry[1]).flatMap { $0 >= 0 ? $0 : nil }
+            // `dataSQL` emits `-1` for malformed cost just like it does for malformed token counts;
+            // treat it the same way — a corrupt row invalidates the query instead of silently
+            // degrading to unpriced.
+            if let rawCost = ProviderParse.number(entry[1]), rawCost < 0 { return nil }
+            let cost = ProviderParse.number(entry[1])
             // Completed zero-token, zero-cost bookkeeping rows carry no usage and must not let a
             // skewed timestamp discard otherwise complete history. Keep cost-only rows meaningful.
             if tokens == 0, (cost ?? 0) == 0 { continue }
@@ -1634,6 +1647,12 @@ struct OpenCodeUsageScanner: Sendable {
     /// companion: in WAL mode a commit touches the companion without moving the main db, so any
     /// write — including a deleted oldest session — re-queries. Idle databases (the common
     /// panel-open case) then skip the scan entirely.
+    ///
+    /// A weaker key was considered — an "anchor floor" per path reused while the file only grew —
+    /// but file stats cannot distinguish an append from a delete that does not shrink the file
+    /// (SQLite frees pages in place, and a WAL-mode delete only grows `-wal`), nor from an insert
+    /// carrying an *earlier* `time_created`. Either leaves a stale floor with no recovery signal,
+    /// so correctness keeps the full-stamp key and pays the rescan on active databases.
     private static let goAnchorMemo = OSAllocatedUnfairLock<[String: Double]>(initialState: [:])
 
     private static func goAnchorMemoKey(path: String, schema: OpenCodeDatabaseSchema) -> String? {

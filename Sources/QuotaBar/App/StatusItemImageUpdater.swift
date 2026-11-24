@@ -132,9 +132,13 @@ final class StatusItemImageUpdater {
                     ?? MenuBarStripRenderer.fallbackIcon
             }
             let now = Date()
+            let dataStore = container.dataStore
+            let widgetData: (WidgetDescriptor) -> WidgetData = {
+                dataStore.widgetDataByDescriptorID[$0.id] ?? dataStore.data(for: $0)
+            }
             let snoozedIDs = container.snooze.snoozedProviderIDs(
                 groups: container.layout.pinnedGroups,
-                data: { container.dataStore.data(for: $0) },
+                data: widgetData,
                 now: now
             )
             let content = MenuBarContentBuilder.build(
@@ -142,7 +146,7 @@ final class StatusItemImageUpdater {
                 hiddenProviderIDs: container.layout.hiddenMenuBarProviderIDs,
                 snoozedProviderIDs: snoozedIDs,
                 now: now,
-                data: { container.dataStore.data(for: $0) }
+                data: widgetData
             )
             let tooltip = content.accessibilityText.isEmpty ? "QuotaBar" : content.accessibilityText
             updateTooltip?(tooltip)

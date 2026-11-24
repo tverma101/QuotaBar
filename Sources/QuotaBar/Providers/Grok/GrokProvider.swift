@@ -74,6 +74,19 @@ final class GrokProvider: ProviderRuntime {
     }
 
     func refresh() async -> ProviderSnapshot {
+        // Fold-only passes run the SuperGrok session-log scan and priced fold in the scan-worker
+        // child when available; the body below stays the in-process path for the fallback and for
+        // meter/full scopes.
+        if ProviderRefreshContext.scope.suppressesLiveQuota {
+            return await ScanWorkerClient.shared.foldOnlySnapshot(
+                provider: provider,
+                inProcessFallback: { await self.refreshInProcess() }
+            )
+        }
+        return await refreshInProcess()
+    }
+
+    private func refreshInProcess() async -> ProviderSnapshot {
         do {
             return try await loadAndProbe()
         } catch {

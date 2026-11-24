@@ -9,8 +9,17 @@ import Glibc
 
 /// A missing native source is complete empty data; an incomplete discovery or fold must preserve the
 /// last-good combined history instead of publishing whichever session files happened to succeed.
+///
+/// A damaged record (a torn write, a structurally invalid `token_count` payload) is not an incomplete
+/// fold: the record is skipped and counted, and the rest of the file still folds. Rollouts are
+/// append-only, so treating one damaged line as incomplete used to freeze the card's whole history
+/// forever with no repair path — the count lets the provider surface the caveat instead.
 enum CodexLogUsageScanResult: Sendable {
-    case complete(LogUsageScan?)
+    case complete(LogUsageScan?, damagedLines: Int)
+    /// A session file holds a timestamp beyond the freshness gate. The fold is deliberately deferred
+    /// (last-good history is preserved until the timestamp passes); distinguished from `.incomplete`
+    /// so the provider can say why history is paused rather than freezing silently.
+    case deferredByFutureTimestamp
     case incomplete
 }
 
@@ -214,6 +223,9 @@ actor CodexLogUsageScanner {
         var currentServiceTierIsValid: Bool
         var sawSessionMeta: Bool
         var replayGate: ChildReplayGate?
+        /// Damaged records seen so far in this file's parsed history. Rides the checkpoint so an
+        /// append-parse continues the count instead of forgetting earlier damage.
+        var damagedLines: Int = 0
     }
 
     struct IncrementalReadStatistics: Equatable, Sendable {
@@ -291,6 +303,10 @@ actor CodexLogUsageScanner {
         var attributeMtime: Date?
         var latestIncludedTimestamp: Date?
         var scan: LogUsageScan
+        /// Damaged records skipped when this file last parsed. `nil` for records written before
+        /// damage counting existed — treated as zero. Persisted so a cache-hit pass (which reads
+        /// no source bytes) can still surface the caveat.
+        var damagedLines: Int?
     }
 
     private struct PersistedInodeAggregates: Codable {
@@ -343,12 +359,38 @@ actor CodexLogUsageScanner {
         }
     }
 
+    /// Per-pass damaged-record counts keyed by file path. The scanner's parse permits can run two
+    /// files concurrently, so the box is lock-protected like `PerFileFoldBucket`.
+    private final class DamageLedger: @unchecked Sendable {
+        private let lock = NSLock()
+        private var byPath: [String: Int] = [:]
+
+        /// Records a file's cumulative damage. The max wins so a mid-pass re-invoked parse
+        /// (resident items unloaded, tail-cache hit returning the checkpoint's count) can never
+        /// double-count the same file's already-recorded damage.
+        func note(_ path: String, _ cumulativeCount: Int) {
+            lock.withLock {
+                if cumulativeCount > (byPath[path] ?? 0) { byPath[path] = cumulativeCount }
+            }
+        }
+
+        func count(for path: String) -> Int {
+            lock.withLock { byPath[path] ?? 0 }
+        }
+
+        var total: Int {
+            lock.withLock { byPath.values.reduce(0, +) }
+        }
+    }
+
     private var inodeAggregates: [InodeAggregateKey: InodeAggregateRecord] = [:]
     private var aggregatePricingToken: String?
     private var aggregateSince: Date?
     private var aggregateTimeZone: String?
     private var aggregateIdentity: String?
     private var didAttemptAggregateLoad = false
+    /// Encoded bytes of the last successful aggregate-index write, for the identical-payload skip.
+    private var lastPersistedAggregateData: Data?
 
     private static var persistsUsageAggregates: Bool {
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
@@ -384,9 +426,9 @@ actor CodexLogUsageScanner {
             pricing: pricing,
             peerHomes: peerHomesOverride
         ) {
-        case .complete(let scan):
+        case .complete(let scan, _):
             return scan
-        case .incomplete:
+        case .deferredByFutureTimestamp, .incomplete:
             return nil
         }
     }
@@ -441,6 +483,9 @@ actor CodexLogUsageScanner {
                 peerHomes: peerHomesOverride ?? peerHomes
             )
             let cacheKey = "codex-native|\(scopeKey)"
+            // A future-timestamp deferral is not cacheable and not a failure; remember it so the
+            // provider can still say why history is paused after the cache reports `.incomplete`.
+            let deferred = OSAllocatedUnfairLock(initialState: false)
             let outcome = await aggregateCache.scan(
                 key: cacheKey,
                 pricingStamp: LogUsagePricingStamp.of(pricing),
@@ -454,17 +499,20 @@ actor CodexLogUsageScanner {
                     pricing: pricing,
                     peerHomes: peerHomesOverride
                 ) {
-                case .complete(let scan):
-                    return .complete(scan, validUntil: nil)
+                case .complete(let scan, let damagedLines):
+                    return .complete(scan, validUntil: nil, damagedLines: damagedLines)
+                case .deferredByFutureTimestamp:
+                    deferred.withLock { $0 = true }
+                    return .incomplete
                 case .incomplete:
                     return .incomplete
                 }
             }
             switch outcome {
-            case .complete(let scan):
-                return .complete(scan)
+            case .complete(let scan, let damagedLines):
+                return .complete(scan, damagedLines: damagedLines)
             case .incomplete:
-                return .incomplete
+                return deferred.withLock { $0 } ? .deferredByFutureTimestamp : .incomplete
             }
         }
         return await scanResultUncached(
@@ -511,7 +559,7 @@ actor CodexLogUsageScanner {
                         at: url,
                         emitSince: context.cacheSince,
                         retentionDays: context.retentionDays
-                    )
+                    ).events
                 },
                 visit: { _ in }
             )
@@ -526,7 +574,7 @@ actor CodexLogUsageScanner {
                 return .incomplete
             }
             Self.clearScanFailures(identity: context.identity)
-            return Task.isCancelled ? .incomplete : .complete(nil)
+            return Task.isCancelled ? .incomplete : .complete(nil, damagedLines: 0)
         }
 
         let maximumTimestamp = JSONLScanning.maximumTimestamp(now: now)
@@ -535,7 +583,7 @@ actor CodexLogUsageScanner {
             identity: futureIdentity, file: file, maximumTimestamp: maximumTimestamp
         ) {
             Self.logFutureTimestamp(identity: futureIdentity)
-            return .incomplete
+            return .deferredByFutureTimestamp
         }
 
         let pricingToken = pricing.aggregateCacheToken
@@ -554,7 +602,7 @@ actor CodexLogUsageScanner {
         // paid a full re-fold of the whole session corpus. The narrower window is clipped at serve
         // time instead, from the same retained aggregates.
         let minDayKey = DailyUsageAccumulator.dayKey(from: requestedSince)
-        var unchanged: [LogUsageScan] = []
+        var unchanged: [(scan: LogUsageScan, damagedLines: Int)] = []
         var changed: [JSONLScanning.DiscoveredFile] = []
         var liveInodes: Set<InodeAggregateKey> = []
         var fileKeysByPath: [String: InodeAggregateKey] = [:]
@@ -595,9 +643,9 @@ actor CodexLogUsageScanner {
                         )
                     }
                     Self.logFutureTimestamp(identity: futureIdentity)
-                    return .incomplete
+                    return .deferredByFutureTimestamp
                 }
-                unchanged.append(cached.scan)
+                unchanged.append((cached.scan, cached.damagedLines ?? 0))
             } else {
                 changed.append(file)
             }
@@ -611,22 +659,28 @@ actor CodexLogUsageScanner {
             DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey(for: futureIdentity))
             Self.clearScanFailures(identity: context.identity)
             return .complete(
-                DailyUsageAccumulator.merged(unchanged, droppingDaysBefore: minDayKey)
-                    ?? DailyUsageAccumulator().build()
+                DailyUsageAccumulator.merged(unchanged.map(\.scan), droppingDaysBefore: minDayKey)
+                    ?? DailyUsageAccumulator().build(),
+                damagedLines: unchanged.reduce(0) { $0 + $1.damagedLines }
             )
         }
         AppLog.debug(LogTag.plugin("codex"), "aggregate split: unchanged=\(unchanged.count) changed=\(changed.count)")
 
         let bucket = PerFileFoldBucket()
+        let damage = DamageLedger()
         guard !Task.isCancelled else { return .incomplete }
         let ok = await scanner.foldItems(
             from: changed, since: context.cacheSince, cacheIdentity: context.identity,
             parseFile: { url in
-                Self.parseFileIncrementally(
+                let outcome = Self.parseFileIncrementally(
                     at: url,
                     emitSince: context.cacheSince,
                     retentionDays: context.retentionDays
                 )
+                if let events = outcome.events {
+                    damage.note(url.path, outcome.damagedLines)
+                }
+                return outcome.events
             },
             visit: { event in
                 guard Self.hasTokenUsage(event) else { return }
@@ -687,7 +741,8 @@ actor CodexLogUsageScanner {
                     mtime: file.mtime,
                     attributeMtime: file.attributeMtime,
                     latestIncludedTimestamp: bucket.latestTimestamps[file.path],
-                    scan: scan
+                    scan: scan,
+                    damagedLines: damage.count(for: file.path)
                 ),
                 scan: scan
             ))
@@ -713,7 +768,7 @@ actor CodexLogUsageScanner {
         }
         for item in refreshed {
             inodeAggregates[item.key] = item.record
-            unchanged.append(item.scan)
+            unchanged.append((item.scan, item.record.damagedLines ?? 0))
         }
         if !refreshed.isEmpty {
             persistInodeAggregates(
@@ -726,13 +781,14 @@ actor CodexLogUsageScanner {
         guard !Task.isCancelled else { return .incomplete }
         if !futurePaths.isEmpty {
             Self.logFutureTimestamp(identity: futureIdentity)
-            return .incomplete
+            return .deferredByFutureTimestamp
         }
         DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticKey(for: futureIdentity))
         Self.clearScanFailures(identity: context.identity)
         return .complete(
-            DailyUsageAccumulator.merged(unchanged, droppingDaysBefore: minDayKey)
-                ?? DailyUsageAccumulator().build()
+            DailyUsageAccumulator.merged(unchanged.map(\.scan), droppingDaysBefore: minDayKey)
+                ?? DailyUsageAccumulator().build(),
+            damagedLines: unchanged.reduce(0) { $0 + $1.damagedLines }
         )
     }
 
@@ -797,6 +853,7 @@ actor CodexLogUsageScanner {
         if contextChanged {
             inodeAggregates = [:]
             didAttemptAggregateLoad = false
+            lastPersistedAggregateData = nil
             aggregateIdentity = identity
             aggregatePricingToken = pricingToken
             aggregateSince = since
@@ -856,9 +913,13 @@ actor CodexLogUsageScanner {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .secondsSince1970
             let data = try encoder.encode(payload)
+            // An active session repays this whole-index write every fold pass; an unchanged payload
+            // (the changed file folded to identical aggregates, e.g. outside retention) is skipped.
+            if data == lastPersistedAggregateData { return }
             try data.write(to: url, options: .atomic)
+            lastPersistedAggregateData = data
         } catch {
-            AppLog.debug(LogTag.plugin("codex"), "usage aggregate index write failed")
+            AppLog.warn(LogTag.plugin("codex"), "usage aggregate index write failed: \(error.localizedDescription)")
         }
     }
 
@@ -906,7 +967,7 @@ actor CodexLogUsageScanner {
                     at: url,
                     emitSince: context.cacheSince,
                     retentionDays: context.retentionDays
-                )
+                ).events
             }
         ) ?? []
         return cached.filter { $0.timestamp >= context.requestedSince }
@@ -936,7 +997,7 @@ actor CodexLogUsageScanner {
                     at: url,
                     emitSince: context.cacheSince,
                     retentionDays: context.retentionDays
-                )
+                ).events
             },
             visit: { event in
                 guard event.timestamp >= context.requestedSince else { return }
@@ -988,7 +1049,7 @@ actor CodexLogUsageScanner {
             parseFile: { url in
                 if let projected = projection.read(at: url) { return projected }
                 return Self.parseFileIncrementally(at: url, emitSince: context.cacheSince,
-                    retentionDays: context.retentionDays)?.filter {
+                    retentionDays: context.retentionDays).events?.filter {
                     OpenCodeUsageScanner.isHostedGatewayModel($0.model)
                 }
             },
@@ -1208,7 +1269,15 @@ actor CodexLogUsageScanner {
                 } catch {
                     return nil
                 }
-                guard attributes[.type] as? FileAttributeType == .typeDirectory else { return nil }
+                guard attributes[.type] as? FileAttributeType == .typeDirectory else {
+                    // A stray *file* named sessions/archived_sessions is not usage data and never
+                    // heals; freezing the whole card over it would hide real history forever.
+                    // Skip the pseudo-source and keep enumerating the real one.
+                    DiagnosticGate.logOnce(for: "codex.discovery.non-directory.\(JSONLScanCachePaths.stableFingerprint(dir.path))") {
+                        AppLog.warn(LogTag.plugin("codex"), "\(dir.path) exists but is not a directory; skipping this session source")
+                    }
+                    continue
+                }
                 sourceDirs.append(dir)
             }
             // CodexRouter chatgpt-accounts homes often have auth + plugins but no session rollouts.
@@ -1498,7 +1567,7 @@ actor CodexLogUsageScanner {
                 parser.consume(line)
             }
         }
-        guard readSucceeded, !parser.hasMalformedUsage else { return nil }
+        guard readSucceeded else { return nil }
         return parser.finish()
     }
 
@@ -1509,6 +1578,7 @@ actor CodexLogUsageScanner {
             let revision: AppendOnlyFileRevision
             let mtimeKey: String
             let items: [Event]
+            let damagedLines: Int
         }
         private let lock = NSLock()
         private var entries: [String: Entry] = [:]
@@ -1517,15 +1587,20 @@ actor CodexLogUsageScanner {
             "\(revision.device)-\(revision.inode)-\(revision.size)-\(times.mtimeSeconds)-\(times.mtimeNanoseconds)-\(times.ctimeSeconds)-\(times.ctimeNanoseconds)"
         }
 
-        func load(path: String, revision: AppendOnlyFileRevision, times: AppendOnlyFileModificationTimes) -> [Event]? {
+        func load(
+            path: String, revision: AppendOnlyFileRevision, times: AppendOnlyFileModificationTimes
+        ) -> (items: [Event], damagedLines: Int)? {
             let keyValue = Self.key(revision: revision, times: times)
-            return lock.withLock { () -> [Event]? in
+            return lock.withLock { () -> (items: [Event], damagedLines: Int)? in
                 guard let entry = entries[path], entry.mtimeKey == keyValue else { return nil }
-                return entry.items
+                return (entry.items, entry.damagedLines)
             }
         }
 
-        func store(path: String, revision: AppendOnlyFileRevision, times: AppendOnlyFileModificationTimes, items: [Event]) {
+        func store(
+            path: String, revision: AppendOnlyFileRevision, times: AppendOnlyFileModificationTimes,
+            items: [Event], damagedLines: Int
+        ) {
             let keyValue = Self.key(revision: revision, times: times)
             lock.withLock {
                 if entries.count >= 512 {
@@ -1533,16 +1608,19 @@ actor CodexLogUsageScanner {
                     // cache trivially correct without an eviction policy.
                     entries.removeAll(keepingCapacity: true)
                 }
-                entries[path] = Entry(revision: revision, mtimeKey: keyValue, items: items)
+                entries[path] = Entry(revision: revision, mtimeKey: keyValue, items: items, damagedLines: damagedLines)
             }
         }
     }
 
-    nonisolated private static func parseCompressedRollout(at url: URL, emitSince: Date) -> [Event]? {
+    nonisolated private static func parseCompressedRollout(
+        at url: URL,
+        emitSince: Date
+    ) -> (events: [Event]?, damagedLines: Int) {
         let key = url.standardizedFileURL.path
-        guard let stamp = AppendOnlyFileProbe.stamp(at: url) else { return nil }
+        guard let stamp = AppendOnlyFileProbe.stamp(at: url) else { return (nil, 0) }
         if let cached = CompressedRolloutCache.shared.load(path: key, revision: stamp.revision, times: stamp.modificationTimes) {
-            return cached.filter { $0.timestamp >= emitSince }
+            return (cached.items.filter { $0.timestamp >= emitSince }, cached.damagedLines)
         }
         do {
             let data = try ZstdDecompressor.shared.decompress(path: url.path)
@@ -1552,25 +1630,31 @@ actor CodexLogUsageScanner {
                     parser.consume(line)
                 }
             }
-            guard !parser.hasMalformedUsage else { return nil }
+            // Damaged records are skipped and counted, exactly like plain rollouts.
             let items = parser.finish()
-            CompressedRolloutCache.shared.store(path: key, revision: stamp.revision, times: stamp.modificationTimes, items: items)
-            return items.filter { $0.timestamp >= emitSince }
+            CompressedRolloutCache.shared.store(
+                path: key, revision: stamp.revision, times: stamp.modificationTimes,
+                items: items, damagedLines: parser.damagedLineCount
+            )
+            return (items.filter { $0.timestamp >= emitSince }, parser.damagedLineCount)
         } catch is CancellationError {
-            return nil
+            return (nil, 0)
         } catch {
             // The read-failure reporter reports this as unreadable and the fold keeps last-good.
-            return nil
+            return (nil, 0)
         }
     }
 
     /// Read only bytes after the prior EOF when the file still proves to be an append of the same
     /// prefix. Otherwise perform the safe full streaming parse and replace the checkpoint.
+    ///
+    /// Damaged records are skipped and counted, never fatal: `events` is `nil` only when the file
+    /// could not be read at all, which keeps the scan incomplete.
     nonisolated private static func parseFileIncrementally(
         at url: URL,
         emitSince: Date,
         retentionDays: Int
-    ) -> [Event]? {
+    ) -> (events: [Event]?, damagedLines: Int) {
         // `.jsonl.zst` archives are finished rollouts — read-once, never appended. They bypass the
         // append-only checkpoint machinery entirely and go through the decompressor with a
         // process-local cache: re-folds in a long-lived process must not re-decompress the archive.
@@ -1593,7 +1677,7 @@ actor CodexLogUsageScanner {
             // itemsAvailable=false means a prior refresh unloaded Event arrays — fall through to a
             // full parse rather than treating the empty array as authoritative.
             if cached.itemsAvailable {
-                return cached.items.filter { $0.timestamp >= emitSince }
+                return (cached.items.filter { $0.timestamp >= emitSince }, cached.parserState.damagedLines)
             }
         }
 
@@ -1618,8 +1702,7 @@ actor CodexLogUsageScanner {
                     parser.consume(line)
                 }
             }
-            guard read.isComplete else { return nil }
-            guard !parser.hasMalformedUsage else { return nil }
+            guard read.isComplete else { return (nil, 0) }
 
             // A same-inode historical rewrite can race after the pre-read anchor check while we are
             // consuming the tail. Re-prove the exact old checkpoint prefix before accepting any parser
@@ -1633,12 +1716,10 @@ actor CodexLogUsageScanner {
                 )
             }
 
-            let finalConsumed = consumeCompleteFinalJSONIfPossible(&read) { line in
+            _ = consumeCompleteFinalJSONIfPossible(&read) { line in
                 parser.consume(line)
                 return true
             }
-            guard finalConsumed else { return nil }
-            guard !parser.hasMalformedUsage else { return nil }
 
             let newOffset = cached.offset + UInt64(read.statistics.bytesRead)
             if let after = AppendOnlyFileProbe.stamp(at: url),
@@ -1665,7 +1746,7 @@ actor CodexLogUsageScanner {
                     parseKind: .tail,
                     bytesRead: read.statistics.bytesRead
                 )
-                return merged
+                return (merged, parser.damagedLineCount)
             }
             // File identity changed while the handle was open. The bytes we read are not a checkpoint
             // we can safely continue from; fall through to one authoritative full parse.
@@ -1679,27 +1760,25 @@ actor CodexLogUsageScanner {
         emitSince: Date,
         retentionDays: Int,
         key: String
-    ) -> [Event]? {
+    ) -> (events: [Event]?, damagedLines: Int) {
         _ = retentionDays
         let before = AppendOnlyFileProbe.stamp(at: url)
 
-        // Fast path: the quotabar-core Rust parser. It runs with the same state machine as the
-        // Swift reference parser and declines the whole file when a line carries a timestamp this
+        // Fast path: the quotabar-core Rust parser. It runs the same state machine as the Swift
+        // reference parser and declines the whole file when a line carries a timestamp this
         // library cannot emulate — the Swift parser then re-parses from scratch, so results never
         // come from a mix of the two engines.
         if let attempt = attemptRustFullParse(at: url, emitSince: emitSince) {
             switch attempt {
             case .incomplete:
                 sharedTailCache.remove(key)
-                return nil
-            case .malformed:
-                sharedTailCache.remove(key)
-                return nil
+                return (nil, 0)
             case .parsed(let events, let checkpoint, let read):
-                return finishFullParse(
+                let finished = finishFullParse(
                     at: url, before: before, read: read, key: key,
                     checkpoint: checkpoint, events: events
                 )
+                return (finished, checkpoint.damagedLines)
             }
         }
         return fullParseAndCheckpointSwift(
@@ -1709,7 +1788,6 @@ actor CodexLogUsageScanner {
 
     private enum RustFullParseOutcome {
         case parsed(events: [Event], checkpoint: ParserCheckpoint, read: JSONLFileReader.ReadResult)
-        case malformed
         case incomplete
     }
 
@@ -1738,9 +1816,9 @@ actor CodexLogUsageScanner {
             }
         }
         guard !declined else { return nil }
-        guard !parser.hasMalformedUsage else { return .malformed }
         guard let events = parser.finish() else { return nil }
-        guard let checkpoint = rustCheckpoint(from: parser.checkpoint()) else { return nil }
+        guard var checkpoint = rustCheckpoint(from: parser.checkpoint()) else { return nil }
+        checkpoint.damagedLines = parser.damagedLineCount
         return .parsed(events: events, checkpoint: checkpoint, read: read)
     }
 
@@ -1825,36 +1903,31 @@ actor CodexLogUsageScanner {
         emitSince: Date,
         before: AppendOnlyFileStamp?,
         key: String
-    ) -> [Event]? {
+    ) -> (events: [Event]?, damagedLines: Int) {
         var parser = FileParser(emitSince: emitSince)
         var read = JSONLFileReader.readLines(
             at: url,
             chunkSize: 64 * 1024,
             deliverFinalPartial: false
         ) { line in
-            parser.consume(line)
+            autoreleasepool {
+                parser.consume(line)
+            }
         }
         guard read.isComplete else {
             sharedTailCache.remove(key)
-            return nil
+            return (nil, 0)
         }
-        let finalConsumed = consumeCompleteFinalJSONIfPossible(&read) { line in
+        _ = consumeCompleteFinalJSONIfPossible(&read) { line in
             parser.consume(line)
             return true
         }
-        guard finalConsumed else {
-            sharedTailCache.remove(key)
-            return nil
-        }
-        guard !parser.hasMalformedUsage else {
-            sharedTailCache.remove(key)
-            return nil
-        }
         let events = parser.finish()
-        return finishFullParse(
+        let finished = finishFullParse(
             at: url, before: before, read: read, key: key,
             checkpoint: parser.checkpoint(), events: events
         )
+        return (finished, parser.damagedLineCount)
     }
 
     /// JSONL permits a complete final record without a newline. Keep an invalid final fragment as
@@ -1878,12 +1951,12 @@ actor CodexLogUsageScanner {
 
     /// Internal wrapper so tests can compare the Rust engine against the Swift reference parser
     /// line by line (FFI parity coverage).
-    static func parseFileForTesting(_ data: Data, emitSince: Date? = nil) -> (events: [Event], malformed: Bool) {
+    static func parseFileForTesting(_ data: Data, emitSince: Date? = nil) -> (events: [Event], damagedLines: Int) {
         var parser = FileParser(emitSince: emitSince)
         for line in data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true) {
             parser.consume(line)
         }
-        return (parser.finish(), parser.hasMalformedUsage)
+        return (parser.finish(), parser.damagedLineCount)
     }
 
     private struct FileParser {
@@ -1902,7 +1975,11 @@ actor CodexLogUsageScanner {
         private var sawSessionMeta = false
         private var replayGate: ChildReplayGate?
         private let emitSince: Date?
-        var hasMalformedUsage = false
+        /// Records skipped because they are damaged (unparseable JSON, structurally invalid
+        /// payload). Skipping is safe for cumulative differencing — a skipped `token_count` record
+        /// simply folds the next valid record's delta across the gap — and a torn write in an
+        /// append-only rollout never heals, so aborting the file used to freeze history forever.
+        private(set) var damagedLineCount = 0
 
         init(emitSince: Date? = nil, checkpoint: ParserCheckpoint? = nil) {
             self.emitSince = emitSince
@@ -1914,6 +1991,7 @@ actor CodexLogUsageScanner {
                 self.currentServiceTierIsValid = checkpoint.currentServiceTierIsValid
                 self.sawSessionMeta = checkpoint.sawSessionMeta
                 self.replayGate = checkpoint.replayGate
+                self.damagedLineCount = checkpoint.damagedLines
             }
         }
 
@@ -1926,7 +2004,7 @@ actor CodexLogUsageScanner {
                 || line.range(of: tokenCountMarker) != nil
             else { return }
             guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
-                if line.range(of: tokenCountMarker) != nil { hasMalformedUsage = true }
+                if line.range(of: tokenCountMarker) != nil { damagedLineCount += 1 }
                 return
             }
 
@@ -1935,13 +2013,13 @@ actor CodexLogUsageScanner {
 
             if type == "turn_context" {
                 guard let payload else {
-                    hasMalformedUsage = true
+                    damagedLineCount += 1
                     currentModel = nil
                     return
                 }
                 let modelUpdate = CodexLogUsageScanner.modelNameUpdate(in: payload)
                 if case .invalid = modelUpdate {
-                    hasMalformedUsage = true
+                    damagedLineCount += 1
                     currentModel = nil
                     return
                 }
@@ -1973,7 +2051,7 @@ actor CodexLogUsageScanner {
                 return
             }
             guard type == "event_msg", let payload else {
-                if line.range(of: tokenCountMarker) != nil { hasMalformedUsage = true }
+                if line.range(of: tokenCountMarker) != nil { damagedLineCount += 1 }
                 return
             }
 
@@ -1986,13 +2064,13 @@ actor CodexLogUsageScanner {
                 return
             }
             guard payload["type"] as? String == "token_count" else {
-                if line.range(of: tokenCountMarker) != nil { hasMalformedUsage = true }
+                if line.range(of: tokenCountMarker) != nil { damagedLineCount += 1 }
                 return
             }
             guard let timestampRaw = (object["timestamp"] as? String)?.trimmingCharacters(in: .whitespaces),
                   let timestamp = OpenUsageISO8601.date(from: timestampRaw)
             else {
-                hasMalformedUsage = true
+                damagedLineCount += 1
                 return
             }
 
@@ -2005,18 +2083,18 @@ actor CodexLogUsageScanner {
             guard let rawInfo = payload["info"],
                   let info = rawInfo as? [String: Any]
             else {
-                hasMalformedUsage = true
+                damagedLineCount += 1
                 return
             }
             let totals: RawUsage?
             if let rawTotals = info["total_token_usage"], !(rawTotals is NSNull) {
                 guard let totalsObject = rawTotals as? [String: Any] else {
-                    hasMalformedUsage = true
+                    damagedLineCount += 1
                     return
                 }
                 let parsedTotals = RawUsage(json: totalsObject)
                 guard parsedTotals.isValid else {
-                    hasMalformedUsage = true
+                    damagedLineCount += 1
                     return
                 }
                 totals = parsedTotals
@@ -2029,12 +2107,12 @@ actor CodexLogUsageScanner {
                     previousTotals = totals
                 } else if let rawLast = info["last_token_usage"], !(rawLast is NSNull) {
                     guard let lastObject = rawLast as? [String: Any] else {
-                        hasMalformedUsage = true
+                        damagedLineCount += 1
                         return
                     }
                     let last = RawUsage(json: lastObject)
                     guard last.isValid else {
-                        hasMalformedUsage = true
+                        damagedLineCount += 1
                         return
                     }
                     previousTotals = previousTotals?.addingAsBaseline(last) ?? last.asBaseline()
@@ -2048,12 +2126,12 @@ actor CodexLogUsageScanner {
             let usage: RawUsage
             if let rawLast = info["last_token_usage"], !(rawLast is NSNull) {
                 guard let lastObject = rawLast as? [String: Any] else {
-                    hasMalformedUsage = true
+                    damagedLineCount += 1
                     return
                 }
                 let last = RawUsage(json: lastObject)
                 guard last.isValid else {
-                    hasMalformedUsage = true
+                    damagedLineCount += 1
                     return
                 }
                 usage = last
@@ -2063,11 +2141,11 @@ actor CodexLogUsageScanner {
             } else if let totals {
                 usage = totals.subtracting(previousTotals)
             } else {
-                hasMalformedUsage = true
+                damagedLineCount += 1
                 return
             }
             guard usage.isValid else {
-                hasMalformedUsage = true
+                damagedLineCount += 1
                 return
             }
             if let totals { previousTotals = totals }
@@ -2080,13 +2158,13 @@ actor CodexLogUsageScanner {
             case .value(let model):
                 parsedModel = model
             case .invalid:
-                hasMalformedUsage = true
+                damagedLineCount += 1
                 return
             case .absent:
                 switch CodexLogUsageScanner.modelNameUpdate(in: info) {
                 case .value(let model): parsedModel = model
                 case .invalid:
-                    hasMalformedUsage = true
+                    damagedLineCount += 1
                     return
                 case .absent: parsedModel = nil
                 }
@@ -2125,7 +2203,8 @@ actor CodexLogUsageScanner {
                 currentServiceTier: currentServiceTier,
                 currentServiceTierIsValid: currentServiceTierIsValid,
                 sawSessionMeta: sawSessionMeta,
-                replayGate: replayGate
+                replayGate: replayGate,
+                damagedLines: damagedLineCount
             )
         }
     }

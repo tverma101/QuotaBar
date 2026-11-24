@@ -71,7 +71,10 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         var data: [String: String]
         init(data: [String: String] = [:]) { self.data = data }
         func queryValue(path: String, sql: String) throws -> String? {
-            if sql.contains("json_group_array") { return data[path] ?? "[]" }
+            if sql.contains("json_group_array") {
+                guard let payload = data[path] else { return "[]" }
+                return OpenCodeDBRowsForChunk.apply(payload: payload, sql: sql)
+            }
             if sql.contains("SELECT 1") { return data[path] == nil ? nil : "1" }
             return nil
         }

@@ -25,6 +25,9 @@ private struct ScanWorkerSchemaError: LocalizedError {
 /// child pays them once instead of N times. Any anomaly (spawn failure, timeout, missing or
 /// undecodable member, or a member the child skipped) falls that member back to the in-process
 /// fold, so batching can only add speed, never change results.
+/// The child runs with `--return-only`: shared scan/parse caches are safe for it to write, but it
+/// never opens a snapshot transaction — the calling store owns the refresh order and publishes the
+/// returned snapshot itself, so the worker cannot supersede the refresh that launched it.
 @MainActor
 final class ScanWorkerClient {
     static let shared = ScanWorkerClient()
@@ -77,9 +80,6 @@ final class ScanWorkerClient {
         provider: Provider,
         inProcessFallback: @MainActor () async -> ProviderSnapshot
     ) async -> ProviderSnapshot {
-        guard let executableURL = workerExecutableURL, !Task.isCancelled else {
-            return await inProcessFallback()
-        }
         let scope = ProviderRefreshContext.scope
         let paced = ProviderRefreshContext.accountingCPUThrottleEnabled
         let scopeArgument: String
@@ -90,10 +90,14 @@ final class ScanWorkerClient {
             // Only fold-only scopes delegate; meter and full scopes keep their in-process paths.
             return await inProcessFallback()
         }
+        guard let executableURL = workerExecutableURL, !Task.isCancelled else {
+            return await inProcessFallback()
+        }
         let arguments = [
             "--scan-worker",
             "--providers", provider.id,
             "--scope", scopeArgument,
+            "--return-only",
         ] + (paced ? ["--paced"] : [])
         do {
             // The runner blocks its calling thread for the child's whole lifetime; keep that wait
@@ -197,6 +201,7 @@ final class ScanWorkerClient {
             "--scan-worker",
             "--providers", providerIDs.joined(separator: ","),
             "--scope", scopeArgument,
+            "--return-only",
         ] + pacedArgument
         do {
             let runResult = try await loadOffMainActor { [runner] in

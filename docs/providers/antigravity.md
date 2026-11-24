@@ -42,6 +42,7 @@ QuotaBar never asks for a token — it reads what Antigravity already has:
 
 - **Antigravity running** — QuotaBar talks to the app's local language server (the richest source, and where the plan name comes from). Provider detection also recognizes a discovered Antigravity or `agy` listener; it does not need a separate Cloud Code Keychain token while that local source is available.
 - **App closed** — it falls back to the OAuth token Antigravity / `agy` store in your macOS Keychain and queries Google's Cloud Code API. An expired token is refreshed automatically (QuotaBar never writes back to Antigravity's own keychain item). Its short-lived cache is reused only while the same Keychain login is present and readable.
+- **T3 Code's Antigravity instances** — when the Keychain token is missing or macOS blocks QuotaBar from reading it (a rebuilt app's signature no longer matches the item's permission list), QuotaBar falls back to the sign-in credentials T3 Code keeps for its private Antigravity instances. Those files are only ever read, never modified, and refresh without any Keychain approval.
 
 If macOS needs approval for that existing Gemini Keychain item, use the provider's **Refresh** action and choose **Always Allow**. Automatic refreshes stay silent and won't open a Keychain dialog.
 Opening Antigravity also lets QuotaBar use its local server without a new Keychain grant. Cached
@@ -61,8 +62,9 @@ is simply what Antigravity's stores hold. If you don't want these rows counted, 
 the meters keep their last-good values while it is off.
 
 QuotaBar reads generation token counts, including the fixed system prompt, from every
-`~/.gemini/antigravity*/conversations/*.db` store. This covers the app, IDE, CLI, and compatible
-clients with separate conversation roots. It estimates API-equivalent cost using the shared
+`~/.gemini/antigravity*/conversations/*.db` store, plus `~/.config/antigravity/conversations` and
+T3 Code's private Antigravity instances under `~/.t3/userdata/providers/antigravity/`. This covers
+the app, IDE, CLI, T3 Code, and compatible clients with separate conversation roots. It estimates API-equivalent cost using the shared
 [model pricing](../pricing.md). These are estimates, not subscription charges, and conversation
 content never leaves your Mac.
 
@@ -119,6 +121,7 @@ Malformed or oversized records remain partial until corrected or until they age 
 
 - **"Start Antigravity or run `agy`…"** — sign in to the Antigravity app (or run `agy`) so a usable token exists, then refresh.
 - **"Couldn't read Antigravity credentials…"** — unlock Keychain or sign in to Antigravity again. QuotaBar will not use its cached access token until the current login can be verified.
+- **"Antigravity needs permission to read its Keychain item"** — use the Antigravity card's **Refresh** action and approve the macOS Keychain prompt. Local history can still refresh without this permission.
 - **"Google denied access to Antigravity usage"** — Cloud Code returned 403. Check that the signed-in account and project have access; QuotaBar does not treat this as an expired token.
 - **"Antigravity did not provide a supported usage endpoint"** — the current account or Antigravity build does not expose a quota endpoint QuotaBar recognizes. Update Antigravity and refresh; if the message remains, that account may not expose usage through these endpoints.
 - **"Google rejected QuotaBar's Antigravity OAuth client configuration"** — Google returned `invalid_client` while exchanging the refresh token. This is an app-side client configuration issue, not an expired Antigravity sign-in; update QuotaBar and try again.
@@ -131,7 +134,7 @@ Malformed or oversized records remain partial until corrected or until they age 
 
 ## Under the hood
 
-Best source first: the local language server discovered by scanning for the `language_server` / `agy` process and reading its CSRF token and listening ports; then Google Cloud Code using the Keychain token, refreshed via Google OAuth when needed. QuotaBar binds its short-lived refreshed-token cache to a one-way fingerprint of the current Keychain refresh credential. Logout, account changes, legacy caches, and expired or malformed entries cannot reuse a previous account's access token. On each source QuotaBar asks the quota-summary endpoint first (`RetrieveUserQuotaSummary` on the language server, `v1internal:retrieveUserQuotaSummary` on Cloud Code) — the only endpoint that reports the merged pools and the weekly windows. Builds without it fall back to the legacy per-model endpoints (`GetUserStatus` / `GetCommandModelConfigs` locally, `fetchAvailableModels` / `retrieveUserQuota` remotely), whose per-model quotas are merged into the two pools by keeping each pool's worst remaining fraction; those endpoints only know the 5-hour windows. The plan name prefers Antigravity's own `userTier` over the inherited Windsurf plan field. Spend history comes from the generation-accounting protobuf records in each local conversation database.
+Best source first: the local language server discovered by scanning for the `language_server` / `agy` process and reading its CSRF token and listening ports; then Google Cloud Code using the Keychain token (or T3 Code's file-based instance credentials when the Keychain is unavailable), refreshed via Google OAuth when needed. Cloud Code requests identify as the Antigravity hub client so the separate Argon window and the paid tier are reported. QuotaBar binds its short-lived refreshed-token cache to a one-way fingerprint of the current refresh credential, whichever source it came from. Logout, account changes, legacy caches, and expired or malformed entries cannot reuse a previous account's access token. On each source QuotaBar asks the quota-summary endpoint first (`RetrieveUserQuotaSummary` on the language server, `v1internal:retrieveUserQuotaSummary` on Cloud Code) — the only endpoint that reports the merged pools and the weekly windows. Builds without it fall back to the legacy per-model endpoints (`GetUserStatus` / `GetCommandModelConfigs` locally, `fetchAvailableModels` / `retrieveUserQuota` remotely), whose per-model quotas are merged into the two pools by keeping each pool's worst remaining fraction; those endpoints only know the 5-hour windows. The plan name prefers Antigravity's own `userTier` over the inherited Windsurf plan field. Spend history comes from the generation-accounting protobuf records in each local conversation database.
 
 Thanks to [FelixIsaac](https://github.com/FelixIsaac) for identifying the conversation-database source and contributing the original SQLite/protobuf implementation in [issue #1120](https://github.com/robinebers/openusage/issues/1120) and [pull request #1058](https://github.com/robinebers/openusage/pull/1058).
 

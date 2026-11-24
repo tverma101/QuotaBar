@@ -241,7 +241,9 @@ final class AppContainer {
                     var failures = 0
                     for attempt in 0..<45 {
                         guard let dataStore else { return }
-                        let outcome = await withThrottledFullAccounting {
+                        // The claim only changes meters: probe the live quota APIs but do not pay
+                        // a full history fold on each of the up-to-45 post-claim refreshes.
+                        let outcome = await withThrottledPanelMeters {
                             await dataStore.refresh(providerID: codex.provider.id, force: true)
                         }
                         switch outcome {
@@ -745,8 +747,16 @@ final class AppContainer {
                         if accountingScope == .panelAccounting {
                             lastHistoryRefreshUptime = ProcessInfo.processInfo.systemUptime
                         }
+                        // Closed-panel accounting is background bookkeeping: pace the scan-worker
+                        // children (--paced caps each at a fraction of a core) and cap concurrency so
+                        // the periodic history sweep cannot stack one 100%-core child per provider.
+                        // Panel-open passes stay unpaced for responsiveness.
+                        let panelClosed = !panelOpen
+                        let throttleAccounting = accountingScope == .localAccounting || panelClosed
                         let maxConcurrentProviders = accountingScope == .panelAccounting
-                            ? (serializeAccountingProviders ? 1 : nil)
+                            ? (serializeAccountingProviders
+                                ? 1
+                                : (panelClosed ? 2 : nil))
                             : (overSoftMemoryLimit ? 1 : nil)
                         passRan = true
                         accountingTask = Task { @MainActor in
@@ -755,7 +765,7 @@ final class AppContainer {
                                     accountingScope == .localAccounting
                                 ) {
                                     await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(
-                                        accountingScope == .localAccounting
+                                        throttleAccounting
                                     ) {
                                         await dataStore.refreshAll(
                                             bypassSnapshotCache: bypassSnapshotCache,

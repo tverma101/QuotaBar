@@ -131,6 +131,38 @@ final class OpenCodeGatewayMergeRegressionTests: XCTestCase {
                      "v5 buckets did not carry router total-breakdown completeness and must rebuild from source")
     }
 
+    func testAggregatedBoundaryDayRowsSurviveNonMidnightSince() {
+        // Aggregated rows materialize at local noon. A `since` later than noon the same day
+        // must still keep the whole boundary-day bucket; only raw rows compare exact timestamps.
+        let noon = Calendar.current.startOfDay(for: Date()).addingTimeInterval(12 * 3_600)
+        let since = noon.addingTimeInterval(3 * 3_600)
+        func makeRow(aggregated: Bool) -> OpenCodeUsageScanner.ClaudeGatewayRow {
+            .init(date: noon, input: 10, output: 5, cacheWrite: 0, cacheRead: 0,
+                  model: "space-bunny-free", burnsGoQuota: false, isInProgress: false,
+                  isAggregated: aggregated)
+        }
+        var accumulator = DailyUsageAccumulator()
+        var quota: [(ms: Double, cost: Double)] = []
+        var estimated = false
+        var partial: Set<String> = []
+        OpenCodeUsageScanner.foldGatewayRows(
+            [makeRow(aggregated: true)], since: since, pricing: .empty, effectiveRates: [:],
+            accumulator: &accumulator, goWindowCosts: &quota,
+            includesEstimatedCost: &estimated, partialDays: &partial
+        )
+        XCTAssertEqual(accumulator.build().series.daily.reduce(0) { $0 + $1.totalTokens }, 15,
+                       "a day bucket must not be dropped because `since` sits past its noon")
+
+        accumulator = DailyUsageAccumulator()
+        OpenCodeUsageScanner.foldGatewayRows(
+            [makeRow(aggregated: false)], since: since, pricing: .empty, effectiveRates: [:],
+            accumulator: &accumulator, goWindowCosts: &quota,
+            includesEstimatedCost: &estimated, partialDays: &partial
+        )
+        XCTAssertEqual(accumulator.build().series.daily.reduce(0) { $0 + $1.totalTokens }, 0,
+                       "raw rows keep the exact-timestamp compare")
+    }
+
     func testRouterCoverageReplacesOverlapAndNativeFillsMissingDayAndModel() {
         let today = Calendar.current.startOfDay(for: Date()).addingTimeInterval(3_600)
         let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: today)!
