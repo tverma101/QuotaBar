@@ -24,27 +24,17 @@ struct AntigravityResponse: Equatable, Sendable {
 }
 
 enum AntigravityConversationReader {
-    /// Canonical store order across the CLI, the desktop app and the IDE; first store to emit a
-    /// response id owns it (a fork copy lives in exactly one other store).
+    /// Only the native Antigravity app's store carries production conversation history; CLI, IDE,
+    /// parity, and T3 stores are not this app's usage.
     static let storeSubpaths = [
-        ".gemini/antigravity",
-        ".gemini/antigravity-cli",
-        ".gemini/antigravity-ide"
+        ".gemini/antigravity"
     ]
 
-    /// Every conversation root: the canonical `~/.gemini` stores, the `~/.config/antigravity` parity
-    /// root, and T3 Code's private ACP instances — when T3 drives Antigravity, the recent usage is
-    /// written there, not under `~/.gemini`.
+    /// The native conversation roots, resolved through the scanner's strict directory discovery
+    /// (symlink-out roots are refused there rather than followed).
     static func conversationRoots(home: URL) -> [URL] {
-        var roots = storeSubpaths.map {
-            home.appendingPathComponent($0).appendingPathComponent("conversations", isDirectory: true)
-        }
-        roots.append(home
-            .appendingPathComponent(".config/antigravity", isDirectory: true)
-            .appendingPathComponent("conversations", isDirectory: true))
-        roots.append(contentsOf: (try? AntigravityT3Support.conversationDirectories(home: home))?
-            .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? [])
-        return roots
+        (try? AntigravityDbUsageScanner.discoverAllConversationDirectories(home: home))?
+            .directories.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? []
     }
 
     /// Every conversation database under the local stores, in path order (stable for dedup),
@@ -56,12 +46,16 @@ enum AntigravityConversationReader {
         for conversations in conversationRoots(home: home) {
             guard let entries = try? FileManager.default.contentsOfDirectory(
                 at: conversations,
-                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             ) else { continue }
             for entry in entries {
                 let name = entry.lastPathComponent.lowercased()
                 guard name.hasSuffix(".db") else { continue }
+                // A symlinked leaf could reach outside the native store; never follow it.
+                if (try? entry.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true {
+                    continue
+                }
                 guard isConversationDatabaseName(name: entry.lastPathComponent) else { continue }
                 if skipStale(entry, sinceMs: sinceMs) { continue }
                 found.append(entry)

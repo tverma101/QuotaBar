@@ -58,7 +58,10 @@ enum AntigravityHistoryCheckpoint {
     private enum FileState { case valid, missing, invalid }
 
     static var defaultURL: URL {
-        JSONLScanCachePaths.defaultDirectory.appendingPathComponent("antigravity-history.plist")
+        // Give the native manifest and its per-source records a separate directory.
+        JSONLScanCachePaths.defaultDirectory
+            .appendingPathComponent("antigravity-native", isDirectory: true)
+            .appendingPathComponent("history.plist")
     }
 
     private static let lock = NSLock()

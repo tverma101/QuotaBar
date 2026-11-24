@@ -10,7 +10,10 @@ import Foundation
 /// the same way (its table fingerprint against the live prefix digest) so reuse never skips the
 /// correctness check — it only skips the per-page table scan.
 enum AntigravityAggregatePersistence {
-    static let schema = 1
+    // v2: the oversized-row projection reads in 512-byte chunks, so records produced under the old
+    // 4 KiB chunk reader's read-budget refusals are suspect. Keep schema-1 records that never hit a
+    // refused oversized row; the rest rescan for real instead of replaying a truncated history.
+    static let schema = 2
     /// Refuse to cache pathological histories that would dominate the log-scan-cache directory.
     static let maximumRecordBytes = 64 * 1_024 * 1_024
     private static let mutationLock = NSLock()
@@ -38,6 +41,7 @@ enum AntigravityAggregatePersistence {
             guard let data = try? Data(contentsOf: fileURL(path: path)),
                   let record = try? decoder.decode(Record.self, from: data),
                   record.schema == schema
+                      || (record.schema == 1 && record.cache.oversizedTimestamps.isEmpty)
             else { return nil }
             return record
         }

@@ -122,7 +122,7 @@ struct AntigravityUsageClient: Sendable {
         path: String,
         token: String,
         userAgent: String,
-        body: [String: String],
+        body: [String: any Sendable],
         bases: [String] = AntigravityUsageClient.cloudCodeURLs
     ) async throws -> CloudCodeOutcome {
         switch try await cloudCodeResponses(path: path, token: token, userAgent: userAgent, body: body, collectSummaries: false, bases: bases) {
@@ -140,15 +140,15 @@ struct AntigravityUsageClient: Sendable {
     /// even if another host refused it — a refusal on a canary host says nothing about the quota
     /// pool a complete body can prove. Failed hosts still withhold the freshness stamp when no
     /// answer was complete.
-    func cloudCodeSummaries(token: String) async throws -> CloudCodeBatchOutcome {
-        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: Self.clientUserAgent, body: [:], collectSummaries: true, bases: Self.cloudCodeURLs)
+    func cloudCodeSummaries(token: String, project: String? = nil) async throws -> CloudCodeBatchOutcome {
+        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: Self.clientUserAgent, body: project.map { ["project": $0] } ?? [:], collectSummaries: true, bases: Self.cloudCodeURLs)
     }
 
     private func cloudCodeResponses(
         path: String,
         token: String,
         userAgent: String,
-        body: [String: String],
+        body: [String: any Sendable],
         collectSummaries: Bool,
         bases: [String] = AntigravityUsageClient.cloudCodeURLs
     ) async throws -> CloudCodeBatchOutcome {

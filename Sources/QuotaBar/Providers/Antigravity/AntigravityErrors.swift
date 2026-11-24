@@ -29,11 +29,11 @@ enum AntigravityError: Error, LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .notSignedIn:
-            return "Start Antigravity or run `agy` and try again."
+            return "Sign in to Antigravity once, then refresh QuotaBar. The app can stay closed after sign-in."
         case .credentialStoreUnreadable:
             return "Couldn't read Antigravity credentials from Keychain. Unlock Keychain or sign in to Antigravity again."
         case .credentialPermissionRequired:
-            return "Antigravity needs permission to read its Keychain item. Use Refresh Now to be asked once, then grant it."
+            return "Allow QuotaBar to read Antigravity's saved sign-in. Click Refresh on this card, then choose Always Allow if macOS asks."
         case .invalidCredentialData:
             return "Antigravity credentials are invalid. Open Antigravity or run `agy` to sign in again."
         case .oauthClientConfigurationInvalid:

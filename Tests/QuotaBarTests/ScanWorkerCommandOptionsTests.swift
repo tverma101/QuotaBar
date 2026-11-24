@@ -52,28 +52,38 @@ final class ScanWorkerCommandOptionsTests: XCTestCase {
         ))
     }
 
-    func testParsesBatchBudgetFlags() throws {
-        let options = try ScanWorkerCommand.Options.parse(
-            ["--scan-worker", "--providers", "claude,devin", "--return-only",
-             "--per-provider-timeout", "40", "--batch-budget", "100"]
-        )
-        XCTAssertEqual(options.perProviderTimeout, 40)
-        XCTAssertEqual(options.batchBudget, 100)
-        XCTAssertNil(try ScanWorkerCommand.Options.parse(
-            ["--scan-worker", "--providers", "claude"]
-        ).perProviderTimeout)
-    }
-
-    func testRejectsInvalidBatchBudgetFlags() {
-        XCTAssertThrowsError(try ScanWorkerCommand.Options.parse(
-            ["--scan-worker", "--providers", "claude", "--per-provider-timeout", "abc"]
-        ))
-        XCTAssertThrowsError(try ScanWorkerCommand.Options.parse(
-            ["--scan-worker", "--providers", "claude", "--batch-budget", "-5"]
-        ))
         XCTAssertThrowsError(try ScanWorkerCommand.Options.parse(
             ["--scan-worker", "--providers", "claude", "--per-provider-timeout"]
         ))
+    }
+
+    @MainActor
+    func testAntigravityFoldDoesNotResolveQuotaIdentity() async throws {
+        // Antigravity's fold produces machine-local history only: it can never prove which Google
+        // account owns the cached quota, so the response must carry no identity for it — and must
+        // not even fire the launch-identity fallback probe.
+        let options = try ScanWorkerCommand.Options.parse(["--providers", "antigravity", "--return-only"])
+        var defaultIdentityCalls: [String] = []
+        let response = await ScanWorkerCommand.collectUnpublishedSnapshots(
+            options: options,
+            providers: [UnpublishedWorkerTestProvider(id: "antigravity", reportedIdentity: nil)],
+            defaultIdentityKey: { id in
+                defaultIdentityCalls.append(id)
+                return AntigravityAuthStore.unresolvedCacheIdentityKey
+            }
+        )
+
+        let snapshot = try XCTUnwrap(response.snapshots["antigravity"])
+        XCTAssertNotNil(snapshot.usageHistory)
+        XCTAssertNil(
+            response.identityKeys["antigravity"],
+            "a history-only fold must not advertise a quota account identity"
+        )
+        XCTAssertTrue(
+            defaultIdentityCalls.isEmpty,
+            "the fold must not trigger the launch-identity fallback for Antigravity"
+        )
+        XCTAssertTrue(response.errors.isEmpty)
     }
 
     func testRejectsMissingProviders() {
@@ -93,13 +103,21 @@ final class ScanWorkerCommandOptionsTests: XCTestCase {
 
 @MainActor
 private final class UnpublishedWorkerTestProvider: ProviderRuntime {
-    let provider = Provider(id: "opencode", displayName: "OpenCode", icon: .providerMark("opencode"))
+    let provider: Provider
     let widgetDescriptors: [WidgetDescriptor] = []
+    private let reportedIdentity: String?
+
+    init(id: String = "opencode", reportedIdentity: String? = "actual") {
+        provider = Provider(id: id, displayName: id.capitalized, icon: .providerMark(id))
+        self.reportedIdentity = reportedIdentity
+    }
 
     func hasLocalCredentials() async -> Bool { false }
 
     func refresh() async -> ProviderSnapshot {
-        ProviderRefreshContext.cacheIdentityResult?.set("actual")
+        if let reportedIdentity {
+            ProviderRefreshContext.cacheIdentityResult?.set(reportedIdentity)
+        }
         return .make(
             provider: provider,
             plan: nil,

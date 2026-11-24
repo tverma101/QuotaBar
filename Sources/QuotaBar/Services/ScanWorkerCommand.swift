@@ -127,7 +127,13 @@ public enum ScanWorkerCommand {
                 // child was asked to fold so a narrow batch pays only its own credential reads.
                 var providerIdentityKeys = assembly.providerIdentityKeys
                 for providerID in options.providerIDs {
-                    providerIdentityKeys[providerID] = await assembly.providerIdentityKey(for: providerID)
+                    // Antigravity history is machine-local; a fold cannot resolve the quota
+                    // account. Stamp the unresolved sentinel rather than probing Keychain: the
+                    // store treats a missing key as "no fence", so nil would leave a stale stamped
+                    // entry unfenced while the sentinel keeps the read-side protection.
+                    providerIdentityKeys[providerID] = providerID == "antigravity"
+                        ? AntigravityAuthStore.unresolvedCacheIdentityKey
+                        : await assembly.providerIdentityKey(for: providerID)
                 }
                 let dataStore = WidgetDataStore(
                     registry: assembly.registry,
@@ -172,12 +178,21 @@ public enum ScanWorkerCommand {
                 response = Response(
                     schema: schemaName,
                     snapshots: options.providerIDs.reduce(into: [:]) { partial, id in
-                        if let snapshot = dataStore.snapshots[id] { partial[id] = snapshot }
+                        guard let snapshot = dataStore.snapshots[id] else { return }
+                        // The standalone fold is explicitly history-only: even a snapshot stamped
+                        // with the matching unresolved sentinel may carry quota a prior live
+                        // request measured, so the response redacts it without touching disk.
+                        partial[id] = id == "antigravity"
+                            ? WidgetDataStore.snapshotByClearingQuotaState(snapshot)
+                            : snapshot
                     },
                     errors: options.providerIDs.reduce(into: [:]) { partial, id in
                         if let error = dataStore.providerErrors[id] { partial[id] = error }
                     },
                     identityKeys: options.providerIDs.reduce(into: [:]) { partial, id in
+                        // Antigravity's fold can never prove which Google account owns the cached
+                        // quota, so the worker must not advertise one in either mode.
+                        guard id != "antigravity" else { return }
                         if let key = providerIdentityKeys[id] { partial[id] = key }
                     }
                 )
@@ -232,10 +247,14 @@ public enum ScanWorkerCommand {
             guard let result else { return }
             if let snapshot = result.snapshot {
                 response.snapshots[result.providerID] = snapshot
-                response.identityKeys[result.providerID] = await {
-                    if let key = result.identityKey { return key }
-                    return await defaultIdentityKey(result.providerID)
-                }()
+                // Antigravity history is machine-local; a fold cannot resolve the quota account.
+                if result.providerID != "antigravity" {
+                    if let key = result.identityKey {
+                        response.identityKeys[result.providerID] = key
+                    } else {
+                        response.identityKeys[result.providerID] = await defaultIdentityKey(result.providerID)
+                    }
+                }
             } else {
                 response.errors[result.providerID] = "Accounting refresh timed out"
             }

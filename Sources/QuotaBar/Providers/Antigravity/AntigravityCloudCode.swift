@@ -13,7 +13,9 @@ extension AntigravityProvider {
     }
 
     /// Called from `probe()` in AntigravityProvider.swift.
-    func probeCloudCode() async throws -> StrategyResult {
+    /// `allowFileCredentials` gates the T3 file-credential branch: the native source reads only the
+    /// app's own saved sign-in, so production never looks at another client's credential files.
+    func probeCloudCode(allowFileCredentials: Bool) async throws -> StrategyResult {
         let authStore = self.authStore
         let keychainToken: AntigravityKeychainToken?
         var keychainError: Error?
@@ -33,11 +35,13 @@ extension AntigravityProvider {
 
         // Keychain absent or blocked: T3 Code's private Antigravity instances keep file-based OAuth
         // credentials that refresh without a Keychain grant, so a per-build cdhash change cannot
-        // strand quota while T3 Code is signed in.
-        let fileCredentials = await loadOffMainActor { authStore.loadFileCredentials() }
-        try Task.checkCancellation()
-        if !fileCredentials.isEmpty {
-            return try await probeCloudCode(fileCredentials: fileCredentials)
+        // strand quota while T3 Code is signed in. Only the legacy fixture path may consult them.
+        if allowFileCredentials {
+            let fileCredentials = await loadOffMainActor { authStore.loadFileCredentials() }
+            try Task.checkCancellation()
+            if !fileCredentials.isEmpty {
+                return try await probeCloudCode(fileCredentials: fileCredentials)
+            }
         }
 
         // Proven logout invalidates the derived cache. A Keychain read failure deliberately leaves
@@ -101,14 +105,22 @@ extension AntigravityProvider {
             switch try await usageClient.refreshGoogleToken(refreshToken) {
             case .refreshed(let accessToken, let expiresIn):
                 try Task.checkCancellation()
-                let cached = try await loadOffMainActor {
-                    try authStore.cacheToken(
-                        accessToken,
-                        expiresIn: expiresIn,
-                        matching: keychainToken
-                    )
+                do {
+                    let sourceStillMatches = try await loadOffMainActor {
+                        try authStore.cacheToken(
+                            accessToken,
+                            expiresIn: expiresIn,
+                            matching: keychainToken
+                        )
+                    }
+                    guard sourceStillMatches else { throw AntigravityError.authExpired }
+                } catch AntigravityError.credentialPermissionRequired
+                    where quotaSource == .nativeApp && ProviderRefreshContext.isManual {
+                    // A one-time Keychain grant authorizes this refresh, but not a second silent
+                    // read or durable caching. The provider-held token is still used; nothing is
+                    // written to the derived cache on a silent refusal.
+                    AppLog.debug(LogTag.auth("antigravity"), "using renewed Antigravity sign-in for this refresh only")
                 }
-                guard cached else { throw AntigravityError.authExpired }
                 try Task.checkCancellation()
                 switch try await fetchCloudCode(token: accessToken) {
                 case .success(let result): return result
@@ -267,6 +279,9 @@ extension AntigravityProvider {
     }
 
     private func fetchCloudCode(token: String) async throws -> CloudCodeProbe {
+        // The native source uses only the summary endpoint: the saved sign-in's project scope is
+        // resolved through loadCodeAssist, and no synthesized per-model quota is ever fabricated.
+        if quotaSource == .nativeApp { return try await fetchNativeSavedQuota(token: token) }
         // Authoritative first: the quota summary (merged pools + weekly windows). A parsed summary —
         // even one with zero usable buckets — is the answer and must never fall into the legacy chain
         // below, which fabricates "fully used" from missing quota info. A 404 falls through; if every
@@ -374,13 +389,51 @@ extension AntigravityProvider {
         }
     }
 
+    /// The saved-sign-in path: resolve the app's project once, then ask the summary endpoint for
+    /// that project — retrying projectless only on a definitive refusal. No legacy per-model
+    /// endpoint ever fills in for a missing summary.
+    private func fetchNativeSavedQuota(token: String) async throws -> CloudCodeProbe {
+        let account = try await loadCodeAssist(token: token)
+        let project: String?
+        if case .response(_, let value) = account { project = value } else { project = nil }
+        var outcome = try await usageClient.cloudCodeSummaries(token: token, project: project)
+        if project != nil {
+            switch outcome {
+            case .authFailed, .forbidden, .notFound:
+                outcome = try await usageClient.cloudCodeSummaries(token: token)
+            default: break
+            }
+        }
+        switch outcome {
+        case .authFailed: return .authFailed
+        case .forbidden: return .forbidden
+        case .notFound: return .notFound
+        case .unavailable: return .unavailable
+        case .ok(let bodies, let allHostsAnswered):
+            guard let summary = AntigravityUsageMapper.parseQuotaSummariesResult(
+                bodies,
+                allHostsAnswered: allHostsAnswered
+            ) else { return .unavailable }
+            guard !summary.lines.isEmpty else { return .notFound }
+            return .success(StrategyResult(
+                plan: account.plan,
+                lines: summary.lines,
+                replacesPriorQuotaProgress: summary.isComplete,
+                warning: summary.isComplete
+                    ? nil
+                    : "Some Antigravity quota limits could not be read. Missing limits may retain older values."
+            ))
+        }
+    }
+
     private func loadCodeAssist(token: String) async throws -> CodeAssistLookup {
         // Plan and project lookups prefer production; daily has the active counters for quota reads.
+        // The nested metadata identifies this client as the Antigravity IDE to the Cloud Code API.
         switch try await usageClient.cloudCode(
             path: AntigravityUsageClient.loadCodeAssistPath,
             token: token,
             userAgent: AntigravityUsageClient.clientUserAgent,
-            body: [:],
+            body: ["metadata": ["ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"]],
             bases: AntigravityUsageClient.planProjectURLs
         ) {
         case .authFailed:

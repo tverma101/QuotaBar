@@ -266,6 +266,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let inner = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2099-01-01T00:00:00Z"}}"#
         let wrapped = "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
         return AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: NoProcessRunner()),
@@ -371,6 +372,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
             .init(directories: [], failures: ["/private/antigravity/conversations": "permission denied"])
         })
         let provider = AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrappedCredentials), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: NoProcessRunner()),
@@ -441,6 +443,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
     @MainActor
     private func makeLSProvider(routing: RoutingHTTPClient) -> AntigravityProvider {
         AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: FakeLSProcessRunner()),

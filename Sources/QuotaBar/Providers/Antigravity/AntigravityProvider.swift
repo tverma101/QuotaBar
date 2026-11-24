@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Tracks pool quota for Antigravity (Google's Codeium/Windsurf-derived AI IDE). Quotas are
@@ -18,6 +19,16 @@ import Foundation
 final class AntigravityProvider: ProviderRuntime {
     let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
 
+    /// Which quota transport this provider may use. Production is `nativeApp` — quota comes only
+    /// from the running Antigravity app's own `language_server` process. `legacyTestFixture`
+    /// exists so the retained transport tests can still exercise the Cloud Code/T3 paths; no
+    /// production caller selects it.
+    enum QuotaSource {
+        case nativeApp
+        case legacyTestFixture
+    }
+
+    let quotaSource: QuotaSource
     let authStore: AntigravityAuthStore
     let usageClient: AntigravityUsageClient
     let discovery: LanguageServerDiscovery
@@ -42,9 +53,26 @@ final class AntigravityProvider: ProviderRuntime {
         portFlag: nil
     )
 
+    /// Discovery pinned to the native Antigravity app's shipped executable. No markers: the exact
+    /// bundle path is the only identity we accept — a T3/agy/IDE language server copy elsewhere on
+    /// disk must never be mistaken for the app.
+    private var nativeServerOptions: LanguageServerDiscovery.Options {
+        let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.antigravity")
+            ?? URL(fileURLWithPath: "/Applications/Antigravity.app")
+        return .init(
+            processName: "language_server",
+            markers: [],
+            csrfFlag: "--csrf_token",
+            portFlag: "--extension_server_port",
+            requiredExecutablePath: bundle
+                .appendingPathComponent("Contents/Resources/bin/language_server").path
+        )
+    }
+
     private static let usageSourceNote = "From your Antigravity conversations"
 
     init(
+        quotaSource: QuotaSource = .nativeApp,
         authStore: AntigravityAuthStore = AntigravityAuthStore(),
         usageClient: AntigravityUsageClient = AntigravityUsageClient(),
         discovery: LanguageServerDiscovery = LanguageServerDiscovery(),
@@ -52,6 +80,7 @@ final class AntigravityProvider: ProviderRuntime {
         now: @escaping @Sendable () -> Date = Date.init,
         pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
     ) {
+        self.quotaSource = quotaSource
         self.authStore = authStore
         self.usageClient = usageClient
         self.discovery = discovery
@@ -63,18 +92,23 @@ final class AntigravityProvider: ProviderRuntime {
     var widgetDescriptors: [WidgetDescriptor] {
         [
             .percent(id: AntigravityMetric.geminiID, provider: provider, title: AntigravityMetric.sessionLabel, sessionStartSignal: .zeroUsage)
-                .exportingLimit("geminiSession", unit: "percent"),
+                .exportingLimit("geminiSession", unit: "percent")
+                .showingFractionalPercentAtEdges(),
             .percent(id: AntigravityMetric.geminiWeeklyID, provider: provider, title: AntigravityMetric.weeklyLabel)
-                .exportingLimit("geminiWeekly", unit: "percent"),
+                .exportingLimit("geminiWeekly", unit: "percent")
+                .showingFractionalPercentAtEdges(),
             .percent(id: AntigravityMetric.argonWeeklyID, provider: provider, title: AntigravityMetric.argonWeeklyLabel)
                 .exportingLimit("argonWeekly", unit: "percent")
-                .hidingWhenEmpty(),
+                .hidingWhenEmpty()
+                .showingFractionalPercentAtEdges(),
             .percent(id: AntigravityMetric.claudeID, provider: provider, title: AntigravityMetric.claudeLabel, sessionStartSignal: .zeroUsage)
                 .exportingLimit("nonGeminiSession", unit: "percent")
-                .hidingWhenEmpty(),
+                .hidingWhenEmpty()
+                .showingFractionalPercentAtEdges(),
             .percent(id: AntigravityMetric.claudeWeeklyID, provider: provider, title: AntigravityMetric.claudeWeeklyLabel)
                 .exportingLimit("nonGeminiWeekly", unit: "percent")
-                .hidingWhenEmpty(),
+                .hidingWhenEmpty()
+                .showingFractionalPercentAtEdges(),
             .usageTrend(provider: provider)
                 .exportingHistory(
                     scope: .machineLocal,
@@ -85,6 +119,18 @@ final class AntigravityProvider: ProviderRuntime {
     }
 
     func hasLocalCredentials() async -> Bool {
+        // Native quota comes from the running app's own language server, or from the app's saved
+        // macOS sign-in while it stays closed — never from T3, agy, or another client's credentials.
+        // Both checks are silent: process table + non-interactive Keychain read only.
+        if quotaSource == .nativeApp {
+            let discovery = self.discovery
+            let options = nativeServerOptions
+            if await loadOffMainActor({ discovery.discover(options) != nil }) { return true }
+            let authStore = self.authStore
+            return await loadOffMainActor {
+                authStore.cacheIdentityKeyForLaunch() != AntigravityAuthStore.unresolvedCacheIdentityKey
+            }
+        }
         // A running local server is an independent quota source. Discovery only inspects the local
         // process table and its listening sockets; it never calls Google during first-run seeding.
         let discovery = self.discovery
@@ -196,7 +242,14 @@ final class AntigravityProvider: ProviderRuntime {
                 return cancelledRefreshSnapshot(provider: provider)
             } catch {
                 guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-                var snapshot = ProviderSnapshot.error(provider: provider, error: error)
+                // A proven sign-out clears the prior menu-bar quota for the native source; an ACL
+                // denial or outage keeps the same-process held values with the explicit error.
+                var snapshot = ProviderSnapshot.error(
+                    provider: provider,
+                    error: error,
+                    clearsPriorMenuBarQuotaState: quotaSource == .nativeApp
+                        && (error as? AntigravityError) == .notSignedIn ? true : nil
+                )
                 let history = await historyTask?.value
                 guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
                 if let history {
@@ -288,6 +341,23 @@ final class AntigravityProvider: ProviderRuntime {
 
     private func probe() async throws -> StrategyResult {
         try Task.checkCancellation()
+        if quotaSource == .nativeApp {
+            // Native quota has exactly two sources: the running app's own language server, then the
+            // app's saved macOS sign-in. A discovered server that answers — even with a warning or
+            // an empty summary — is authoritative; dropping it for a credential read would risk an
+            // unwanted Keychain prompt. Only transport-level no-result falls through.
+            let discovery = self.discovery
+            let options = nativeServerOptions
+            if let server = await loadOffMainActor({ discovery.discover(options) }),
+               let result = try await probeLS(discovered: server) {
+                AppLog.debug(LogTag.plugin("antigravity"), "quota source: native Antigravity app")
+                return result
+            }
+            try Task.checkCancellation()
+            let result = try await probeCloudCode(allowFileCredentials: false)
+            AppLog.debug(LogTag.plugin("antigravity"), "quota source: Antigravity saved sign-in")
+            return result
+        }
         let discovery = self.discovery
         let processSnapshot = await loadOffMainActor { discovery.processSnapshot() }
         try Task.checkCancellation()
@@ -306,7 +376,7 @@ final class AntigravityProvider: ProviderRuntime {
             }
         }
         try Task.checkCancellation()
-        return try await probeCloudCode()
+        return try await probeCloudCode(allowFileCredentials: true)
     }
 
     // MARK: - Language server
@@ -319,7 +389,10 @@ final class AntigravityProvider: ProviderRuntime {
         guard let discovered = await loadOffMainActor({
             discovery.discover(options, processSnapshot: processSnapshot)
         }) else { return nil }
+        return try await probeLS(discovered: discovered)
+    }
 
+    private func probeLS(discovered: LanguageServerDiscovery.Result) async throws -> StrategyResult? {
         // HTTPS first (the LS serves a self-signed cert), then HTTP, then the HTTP-only extension port.
         var endpoints: [(scheme: String, port: Int)] = []
         for port in discovered.ports {

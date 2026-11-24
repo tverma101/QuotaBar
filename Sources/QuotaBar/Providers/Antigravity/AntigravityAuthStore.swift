@@ -29,7 +29,9 @@ struct AntigravityAuthStore: Sendable {
     static let unresolvedCacheIdentityKey = "antigravity-unresolved"
     /// Our own cache of refreshed access tokens, so a Google OAuth refresh happens ~once per token
     /// lifetime instead of every refresh cycle. We never write back to Antigravity's keychain item.
-    static let cachePath = "~/Library/Application Support/QuotaBar/antigravity/auth.json"
+    // Native-source builds keep their derived-token cache under a native name; the old T3-era file
+    // stays on disk unreferenced so it can never be mistaken for this app's credential.
+    static let cachePath = "~/Library/Application Support/QuotaBar/antigravity/native-auth.json"
     private static let cacheReadFailureKey = "auth.antigravity.cache.read"
     private static let cacheDecodeFailureKey = "auth.antigravity.cache.decode"
     private static let cacheWriteFailureKey = "auth.antigravity.cache.write"
@@ -48,7 +50,9 @@ struct AntigravityAuthStore: Sendable {
         keychain: KeychainAccessing = SecurityKeychainAccessor(),
         files: TextFileAccessing = LocalTextFileAccessor(),
         now: @escaping @Sendable () -> Date = Date.init,
-        fileCredentialPaths: @escaping @Sendable () -> [URL] = { AntigravityT3Support.credentialFiles() }
+        // Production reads no file credentials — T3's credentials belong to T3, not this app.
+        // Tests that exercise the legacy loader inject their own paths explicitly.
+        fileCredentialPaths: @escaping @Sendable () -> [URL] = { [] }
     ) {
         self.keychain = keychain
         self.files = files

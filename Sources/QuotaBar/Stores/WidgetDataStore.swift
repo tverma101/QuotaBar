@@ -1440,7 +1440,13 @@ final class WidgetDataStore {
             AppLog.debug(.refresh, "superseded cross-process provider request (\(providerID))")
             return .skipped
         }
-        if let identityKey = cacheIdentityResult.value {
+        // Antigravity's history is machine-local, so a fold-scope result can never prove which
+        // Google account owns the cached quota. Ignore any identity it reports — including a key
+        // forwarded by an older or misbehaving scan worker — and let only a live-quota scope move
+        // the account stamp.
+        if let identityKey = cacheIdentityResult.value,
+           providerID != "antigravity" || !scope.suppressesLiveQuota
+        {
             let lastIdentityOrder = providerIdentityResolutionOrders[providerID, default: 0]
             let currentIdentityKey = providerIdentityKeys[providerID]
             if requestOrder < lastIdentityOrder, currentIdentityKey != identityKey {
@@ -2583,6 +2589,7 @@ final class WidgetDataStore {
             result.sessionStartSignal = descriptor.sample.sessionStartSignal
             // Same reason: a timer segment is a descriptor opt-in, and `.progress` rebuilds the row.
             result.trayStyle = descriptor.sample.trayStyle
+            result.showsFractionalPercentAtEdges = descriptor.sample.showsFractionalPercentAtEdges
             result.boundedDetail = detail
             return result
         case .text:

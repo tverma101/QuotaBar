@@ -130,6 +130,7 @@ final class AntigravityQuotaSummaryMergeTests: XCTestCase {
         }
         let token = #"{"token":{"access_token":"test","expiry":"2099-01-01T00:00:00Z"}}"#
         let provider = AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain("go-keyring-base64:" + Data(token.utf8).base64EncodedString()), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
             discovery: LanguageServerDiscovery(processRunner: MergeNoProcessRunner()),
@@ -157,6 +158,7 @@ final class AntigravityQuotaSummaryMergeTests: XCTestCase {
         }
         let token = #"{"token":{"access_token":"test","expiry":"2099-01-01T00:00:00Z"}}"#
         let provider = AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain("go-keyring-base64:" + Data(token.utf8).base64EncodedString()), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: http, http: http),
             discovery: LanguageServerDiscovery(processRunner: MergeNoProcessRunner()),

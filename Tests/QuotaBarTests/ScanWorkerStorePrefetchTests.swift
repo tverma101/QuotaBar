@@ -67,7 +67,10 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
     }
 
     private func makeStore(
-        runtimeIDs: [String]
+        runtimeIDs: [String],
+        identityKeys: [String: String] = [:],
+        seededSnapshot: ProviderSnapshot? = nil,
+        seededIdentityKey: String? = nil
     ) -> (WidgetDataStore, [String: RecordingRuntime], ProviderSnapshotCache) {
         let suiteName = "OpenUsageTests.Prefetch.\(UUID().uuidString)"
         let suite = UserDefaults(suiteName: suiteName)!
@@ -76,6 +79,9 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
             (id, RecordingRuntime(id: id, planMarker: "in-process-\(id)"))
         })
         let cache = ProviderSnapshotCache(userDefaults: suite, storageKey: "snapshots", ttl: 600)
+        if let seededSnapshot {
+            cache.store(seededSnapshot, producedByIdentityKey: seededIdentityKey)
+        }
         let store = WidgetDataStore(
             registry: WidgetRegistry(
                 providers: runtimes.values.map(\.provider),
@@ -84,7 +90,8 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
             providers: Array(runtimes.values),
             cache: cache,
             defaults: suite,
-            isProviderEnabled: { _ in true }
+            isProviderEnabled: { _ in true },
+            providerIdentityKeys: identityKeys
         )
         return (store, runtimes, cache)
     }
@@ -173,6 +180,69 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
         XCTAssertNotNil(store.localSnapshots["a"])
         XCTAssertEqual(store.localSnapshots["a"]?.refreshedAt, cachedSnapshot.refreshedAt)
         XCTAssertEqual(store.localSnapshots["b"]?.plan, "child-b")
+    }
+
+    /// A delegated Antigravity fold produces machine-local history only — it can never prove which
+    /// Google account owns the cached quota. Even when an older or misbehaving child reports an
+    /// identity for it, the fold must not re-stamp or clear the live quota: the persisted entry,
+    /// its account stamp, and the in-memory card keep the original meters and pick up only the new
+    /// history.
+    func testAntigravityPrefetchedHistoryCannotReplaceLiveQuotaIdentity() async throws {
+        let originalQuotaStamp = Date(timeIntervalSince1970: 1_800_000_000)
+        var seeded = ProviderSnapshot(
+            providerID: "antigravity",
+            displayName: "Antigravity",
+            plan: "Pro",
+            lines: [.progress(label: "Session", used: 30, limit: 100, format: .percent)],
+            refreshedAt: originalQuotaStamp
+        )
+        seeded.quotaRefreshedAt = originalQuotaStamp
+        let (store, runtimes, cache) = makeStore(
+            runtimeIDs: ["antigravity"],
+            identityKeys: ["antigravity": "google-acct-A"],
+            seededSnapshot: seeded,
+            seededIdentityKey: "google-acct-A"
+        )
+        let childSnapshot = ProviderSnapshot.make(
+            provider: runtimes["antigravity"]!.provider,
+            plan: nil,
+            lines: [],
+            refreshedAt: Date(),
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-14", totalTokens: 42, costUSD: 0.42)
+            ]))
+        )
+        let runner = attachRunner(store, outcome: .success(stdout: try encodeResponse(
+            ["antigravity": childSnapshot],
+            identityKeys: ["antigravity": AntigravityAuthStore.unresolvedCacheIdentityKey]
+        )))
+
+        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await store.refreshAll(force: true)
+        }
+
+        XCTAssertEqual(runner.spawnCount, 1)
+        XCTAssertEqual(runtimes["antigravity"]?.refreshCount, 0)
+        // The unresolved identity the child reported must not replace the live account stamp...
+        XCTAssertEqual(cache.producedByIdentityKey(providerID: "antigravity"), "google-acct-A")
+        // ...nor the persisted quota under it.
+        let persisted = cache.loadSnapshots(providerIDs: ["antigravity"])["antigravity"]
+        XCTAssertEqual(persisted?.plan, "Pro")
+        XCTAssertEqual(
+            persisted?.line(label: "Session"),
+            .progress(label: "Session", used: 30, limit: 100, format: .percent)
+        )
+        XCTAssertEqual(persisted?.quotaRefreshedAt, originalQuotaStamp)
+        XCTAssertEqual(persisted?.usageHistory?.series.daily.first?.totalTokens, 42)
+        // The visible snapshot is the merge of the same two halves: original meters, fresh history.
+        let current = store.localSnapshots["antigravity"]
+        XCTAssertEqual(current?.plan, "Pro")
+        XCTAssertEqual(
+            current?.line(label: "Session"),
+            .progress(label: "Session", used: 30, limit: 100, format: .percent)
+        )
+        XCTAssertEqual(current?.quotaRefreshedAt, originalQuotaStamp)
+        XCTAssertEqual(current?.usageHistory?.series.daily.first?.totalTokens, 42)
     }
 
     func testChildDroppingAMemberFallsBackToInProcessFold() async throws {

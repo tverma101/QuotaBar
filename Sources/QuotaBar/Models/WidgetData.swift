@@ -17,6 +17,9 @@ struct WidgetData: Hashable {
     let kind: MetricKind
     var currencyCode: String? = nil
     var currencyFractionDigits: Int? = nil
+    /// Descriptor opt-in: within half a point of either percent edge, print two decimals instead of
+    /// rounding to 0%/100%, so tiny-but-real usage (or leftovers) is never invisible.
+    var showsFractionalPercentAtEdges = false
     let used: Double
     var limit: Double?         // nil => unbounded (number tile); cleared when a .values line resolves
     var countSuffix: String?   // e.g. "credits", "requests"
@@ -265,12 +268,28 @@ struct WidgetData: Hashable {
         roundedAtDisplayPrecision(displayedValue)
     }
 
+    private func isFractionalPercentEdge(_ value: Double) -> Bool {
+        showsFractionalPercentAtEdges && kind == .percent
+            && ((value > 0 && value < 0.5) || (value >= 99.5 && value < 100))
+    }
+
+    /// The edge reading itself: an exact 0 or 100 still prints whole so "Not started" / spent stay
+    /// endpoints, while just-off-edge values keep their two decimals.
+    private func fractionalPercentEdgeText(_ value: Double) -> String? {
+        guard isFractionalPercentEdge(value) else { return nil }
+        if value < 0.01 { return "<0.01%" }
+        if value > 99.99 { return ">99.99%" }
+        return String(format: "%.2f%%", locale: Locale(identifier: "en_US_POSIX"), value)
+    }
+
     /// Rounds a value to the precision this kind shows in the headline — whole percent, one-decimal
     /// count, or cents — so the meter geometry and the spent check never disagree with the printed
-    /// number. (A value that reads "0%" must register as zero, not a hairline sliver.)
+    /// number. (A value that reads "0%" must register as zero, not a hairline sliver.) Opted-in
+    /// fractional percent edges are the exception: they print two decimals, so the raw value passes
+    /// through and keeps the meter/spent verdict off the endpoint it only approaches.
     private func roundedAtDisplayPrecision(_ value: Double) -> Double {
         switch kind {
-        case .percent: return value.rounded()
+        case .percent: return isFractionalPercentEdge(value) ? value : value.rounded()
         case .count: return (value * 10).rounded() / 10
         case .dollars:
             let scale = pow(10, Double(currencyFractionDigits ?? 2))
@@ -310,6 +329,9 @@ struct WidgetData: Hashable {
                 // ends so a provider sample can never print "-5%" or "105%" beside the icon. The
                 // sanitizer also covers an untrusted sample: `Int(_:)` on a large or NaN value traps,
                 // and this runs on every menu-bar repaint.
+                if let edge = fractionalPercentEdgeText(displayedValue / limit * 100) {
+                    return edge
+                }
                 let percent = ProviderParse.intFromClampedDouble(
                     (displayedValue / limit * 100).rounded(),
                     lower: 0,
@@ -575,7 +597,8 @@ struct WidgetData: Hashable {
     /// Bounded/fallback formatting, delegated to the shared formatter so the popover and tray always
     /// agree. Unbounded `.values` rows format their values directly (`unboundedDetail`).
     private func format(_ value: Double) -> String {
-        MetricFormatter.number(value, kind: kind, style: .full, currencyCode: currencyCode)
+        fractionalPercentEdgeText(value)
+            ?? MetricFormatter.number(value, kind: kind, style: .full, currencyCode: currencyCode)
     }
 }
 

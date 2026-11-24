@@ -96,7 +96,9 @@ final class AntigravityT3CredentialTests: XCTestCase {
         XCTAssertEqual(AntigravityT3Support.credentialFiles(home: home), [])
     }
 
-    func testScannerDefaultDiscoveryIncludesGeminiConfigAndT3Roots() throws {
+    /// Production history is the native store only: config parity roots and T3 profiles are valid
+    /// fixtures for their own tests but are never discovered for this app's usage.
+    func testScannerDefaultDiscoveryIncludesOnlyTheNativeRoot() throws {
         let home = try makeHome()
         let geminiConversations = home
             .appendingPathComponent(".gemini/antigravity/conversations", isDirectory: true)
@@ -104,15 +106,11 @@ final class AntigravityT3CredentialTests: XCTestCase {
         let configConversations = home
             .appendingPathComponent(".config/antigravity/conversations", isDirectory: true)
         try FileManager.default.createDirectory(at: configConversations, withIntermediateDirectories: true)
-        let profile = try makeProfile(home: home, key: "aaa")
+        _ = try makeProfile(home: home, key: "aaa")
 
         let discovery = try AntigravityDbUsageScanner.discoverAllConversationDirectories(home: home)
         XCTAssertTrue(discovery.failures.isEmpty)
-        XCTAssertEqual(discovery.directories, [
-            geminiConversations.path,
-            configConversations.path,
-            profile.appendingPathComponent("conversations").path
-        ].sorted())
+        XCTAssertEqual(discovery.directories, [geminiConversations.resolvingSymlinksInPath().path])
     }
 
     func testCredentialFilesOrderMostRecentlyActiveFirst() throws {
@@ -214,6 +212,7 @@ final class AntigravityT3CredentialTests: XCTestCase {
         http: RoutingHTTPClient
     ) -> AntigravityProvider {
         AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(
                 keychain: keychain, files: files, fileCredentialPaths: credentialPaths
             ),

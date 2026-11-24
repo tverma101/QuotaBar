@@ -43,6 +43,10 @@ struct ProviderSnapshotCache {
         /// can overlap without fencing the other domain's still-running result.
         var storedQuotaOrders: [String: UInt64]
         var storedHistoryOrders: [String: UInt64]
+        /// Written `true` by native-source builds. A blob recorded before the native switch (or by
+        /// a build without the marker) still holds T3/agy-sourced Antigravity rows, so decoding it
+        /// drops that provider's snapshot and stamp rather than rendering foreign-source data.
+        var antigravityUsesNativeSources = true
 
         private enum CodingKeys: String, CodingKey {
             case snapshots
@@ -51,6 +55,7 @@ struct ProviderSnapshotCache {
             case storedRefreshOrders
             case storedQuotaOrders
             case storedHistoryOrders
+            case antigravityUsesNativeSources
         }
 
         init(
@@ -92,6 +97,13 @@ struct ProviderSnapshotCache {
                 [String: UInt64].self,
                 forKey: .storedHistoryOrders
             ) ?? [:]
+            // Pre-native-source payloads carried T3/agy-derived Antigravity rows; drop that provider's
+            // snapshot and identity stamp before any read or merge sees them. Other providers are
+            // untouched — only Antigravity's source changed.
+            if try values.decodeIfPresent(Bool.self, forKey: .antigravityUsesNativeSources) != true {
+                snapshots.removeValue(forKey: "antigravity")
+                producedByIdentityKeys.removeValue(forKey: "antigravity")
+            }
         }
     }
 
@@ -405,9 +417,18 @@ struct ProviderSnapshotCache {
         }
         AppLog.debug(.cache, "write \(snapshot.providerID)")
         var result: StoreResult = .unavailable
+        var hideQuotaInResult = false
         let locked = withPersistentStoreLock {
             var payload = loadPayload()
             let providerID = snapshot.providerID
+            // Antigravity folds are history-only and machine-local: they must never rewrite the
+            // quota stamp, even when this process resolved a different (or no) launch identity.
+            // Keeping the persisted stamp also pins the merge to the identityMatches path, so a
+            // fold cannot trip the account-switch quota clear.
+            let preservesQuotaIdentity = providerID == "antigravity" && scope?.suppressesLiveQuota == true
+            let existingIdentityKey = payload.producedByIdentityKeys[providerID]
+            let storedIdentityKey = preservesQuotaIdentity ? existingIdentityKey : producedByIdentityKey
+            hideQuotaInResult = preservesQuotaIdentity && existingIdentityKey != producedByIdentityKey
             // A refresh order is normally allocated before the provider work starts, so this write can
             // be fenced against a newer result. When that allocation failed (the shared lock could
             // not be taken) the snapshot must still be persisted: refusing it silently dropped the
@@ -464,7 +485,7 @@ struct ProviderSnapshotCache {
                         warningSnapshot.quotaRefreshedAt = .distantPast
                         warningSnapshot.historyRefreshedAt = .distantPast
                         warningSnapshot.refreshedAt = .distantPast
-                        payload.producedByIdentityKeys[providerID] = producedByIdentityKey
+                        payload.producedByIdentityKeys[providerID] = storedIdentityKey
                     }
                     payload.snapshots[providerID] = warningSnapshot
                     markDeferredDirty(providerIDs: [providerID])
@@ -478,7 +499,7 @@ struct ProviderSnapshotCache {
             }
 
             var storedSnapshot = snapshot
-            let identityMatches = payload.producedByIdentityKeys[providerID] == producedByIdentityKey
+            let identityMatches = existingIdentityKey == storedIdentityKey
             if let scope, identityMatches {
                 storedSnapshot = Self.merge(
                     snapshot,
@@ -508,7 +529,7 @@ struct ProviderSnapshotCache {
             payload.snapshots[providerID] = storedSnapshot
             // Stamp (or clear) the producing account alongside the entry. A nil identity must clear
             // any prior stamp rather than falsely bless an unattributable snapshot at next launch.
-            payload.producedByIdentityKeys[providerID] = producedByIdentityKey
+            payload.producedByIdentityKeys[providerID] = storedIdentityKey
             if let refreshOrder {
                 payload.issuedRefreshOrders[providerID] = max(
                     payload.issuedRefreshOrders[providerID, default: 0],
@@ -529,7 +550,27 @@ struct ProviderSnapshotCache {
         if case .stored = result {
             sessionWrites.withLock { _ = $0.insert(snapshot.providerID) }
         }
-        return result
+        // The persisted payload keeps the stamped quota intact — the merge above never touched it.
+        // Only this caller's view is masked: an Antigravity fold cannot verify that the cached
+        // meters belong to the identity this process would stamp, so it is handed local history
+        // alone until a live quota response re-attributes or clears the meters for real.
+        guard hideQuotaInResult else { return result }
+        func historyOnly(_ snapshot: ProviderSnapshot?) -> ProviderSnapshot? {
+            guard let snapshot else { return nil }
+            var result = Self.clearingQuotaState(snapshot)
+            result.quotaRefreshedAt = .distantPast
+            return result
+        }
+        switch result {
+        case .stored(let snapshot):
+            return .stored(historyOnly(snapshot))
+        case .unchanged(let snapshot):
+            return .unchanged(historyOnly(snapshot))
+        case .superseded(let snapshot):
+            return .superseded(historyOnly(snapshot))
+        case .unavailable:
+            return .unavailable
+        }
     }
 
     private static func merge(
