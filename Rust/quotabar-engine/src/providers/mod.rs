@@ -46,9 +46,11 @@ pub fn cancelled_snapshot(info: &ProviderInfo, ctx: &RefreshContext) -> Provider
 pub fn all() -> Vec<Arc<dyn ProviderRuntime>> {
     vec![
         Arc::new(copilot::CopilotProvider::live()),
+        Arc::new(cursor::CursorProvider::live()),
         Arc::new(devin::DevinProvider::live()),
         Arc::new(grok::GrokProvider::live()),
         Arc::new(hermes::HermesProvider::live()),
         Arc::new(openrouter::OpenRouterProvider::live()),
+        Arc::new(zai::ZAIProvider::live()),
     ]
 }
