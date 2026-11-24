@@ -1792,7 +1792,7 @@ actor CodexLogUsageScanner {
                     at: url, before: before, read: read, key: key,
                     checkpoint: checkpoint, events: events
                 )
-                return (finished, checkpoint.damagedLines)
+                return (finished.events, finished.damagedLines)
             }
         }
         return fullParseAndCheckpointSwift(
@@ -1941,7 +1941,7 @@ actor CodexLogUsageScanner {
             at: url, before: before, read: read, key: key,
             checkpoint: parser.checkpoint(), events: events
         )
-        return (finished, parser.damagedLineCount)
+        return (finished.events, finished.damagedLines)
     }
 
     /// JSONL permits a complete final record without a newline. Keep an invalid final fragment as

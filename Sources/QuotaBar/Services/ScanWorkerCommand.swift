@@ -235,7 +235,7 @@ public enum ScanWorkerCommand {
     static func collectUnpublishedSnapshots(
         options: Options,
         providers: [ProviderRuntime],
-        defaultIdentityKey: (String) async -> String?
+        defaultIdentityKey: @escaping (String) async -> String?
     ) async -> Response {
         let runner = UnpublishedFoldRunner(
             options: options,

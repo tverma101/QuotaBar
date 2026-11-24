@@ -2226,29 +2226,6 @@ final class WidgetDataStore {
         return result
     }
 
-    /// Drops a cached Z.ai promotional row once its expiry has passed — or when an older build
-    /// saved only the display string and no machine-readable deadline — even when the live quota
-    /// request that would normally retire it cannot run (for example when quota is unavailable,
-    /// such as a Keychain-blocked meter pass). This is render-only — the stored snapshot keeps the
-    /// row — and keys on the provider plus the "Expires …" detail the producer writes for promo
-    /// deadlines, so ordinary reset countdowns and every other provider are unaffected.
-    static func removingExpiredZCodePromotions(
-        from values: [String: ProviderSnapshot], through date: Date
-    ) -> [String: ProviderSnapshot] {
-        guard var snapshot = values["zai"] else { return values }
-        let visible = snapshot.lines.filter { line in
-            guard case .progress(_, _, _, _, let expiry, _, _, let detail?) = line,
-                  detail.hasPrefix("Expires ") else { return true }
-            // Older builds saved only the display string. Wait for a fresh entitlement rather than showing it indefinitely.
-            return expiry.map { $0 > date } ?? false
-        }
-        guard visible.count != snapshot.lines.count else { return values }
-        snapshot.lines = visible
-        var result = values
-        result["zai"] = snapshot
-        return result
-    }
-
     private func applyingVMBoxWarnings(_ warnings: [String: String], to values: [String: ProviderSnapshot]) -> [String: ProviderSnapshot] {
         var result = values
         for (id, warning) in warnings where isProviderEnabled(id) {
