@@ -14,7 +14,8 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
     /// catalogue change that cannot touch the fold's numbers no longer costs a full ledger read.
     /// Also bump this when hardcoded Codex pricing rules change; catalogue dependencies cover rates,
     /// identities and dated resolution, rather than every implementation detail of the cost formula.
-    static let schema = 15
+    /// v17: cached-input selection now checks explicit lanes before falling back to input.
+    static let schema = 17
     static let maxResidentRecords = 32
 
     struct Key: Codable, Equatable, Sendable {
@@ -74,7 +75,10 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
     }
 
     enum Lookup {
-        case hit(result: LogUsageScan?, damagedLines: Int)
+        /// `nextFutureEventAt` rides along so callers gating a second persisted aggregate can keep
+        /// the earliest-eligibility bound the record carried — otherwise a fold seeded through a
+        /// warm index loses its "stop serving when this future event arrives" deadline.
+        case hit(result: LogUsageScan?, damagedLines: Int, nextFutureEventAt: Date?)
         case append(Record)
         case rebuild
     }
@@ -174,7 +178,8 @@ final class CodexRouterAggregateIndex: @unchecked Sendable {
             record.key.pricingToken = key.pricingToken
             save(record)
         }
-        return .hit(result: record.result, damagedLines: record.damagedLines ?? 0)
+        return .hit(result: record.result, damagedLines: record.damagedLines ?? 0,
+                    nextFutureEventAt: record.nextFutureEventAt)
     }
 
     /// Persists a fold record. A save that would write bytes identical to the resident record is

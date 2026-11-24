@@ -44,13 +44,10 @@ enum SpendTileMapper {
         }
         let unexplainedIncompleteDays = Set(usage.daily.compactMap { entry -> String? in
             guard let day = dayKey(fromUsageDate: entry.date) else { return nil }
-            if entry.hasUnexplainedIncompleteCost == true
-                || (!entry.costIsComplete && entry.hasUnexplainedIncompleteCost == nil
-                    && unknownModelsByDay[day]?.isEmpty != false && !partialDays.contains(day))
-            {
-                return day
-            }
-            return nil
+            return entry.hasUnexplainedCostGap(
+                hasUnknownModels: unknownModelsByDay[day]?.isEmpty == false,
+                isPartial: partialDays.contains(day)
+            ) ? day : nil
         })
 
         if let entry = usage.daily.first(where: { dayKey(fromUsageDate: $0.date) == today }), hasUsage(entry) {
@@ -128,14 +125,7 @@ enum SpendTileMapper {
         // Keep the priced subtotal when incompleteness is explained by named unknown models. Other
         // incomplete accounting (for example, a provider-reported token mismatch) remains hidden until
         // its source can produce a trustworthy subtotal and a matching warning.
-        let hasUnexplainedIncompleteCost = windowed.contains { entry in
-            guard !entry.costIsComplete,
-                  let day = dayKey(fromUsageDate: entry.date)
-            else { return false }
-            return entry.hasUnexplainedIncompleteCost == true
-                || (entry.hasUnexplainedIncompleteCost == nil && unknownModelsByDay[day]?.isEmpty != false
-                    && !partialDays.contains(day))
-        }
+        let hasUnexplainedIncompleteCost = !windowKeys.isDisjoint(with: unexplainedIncompleteDays)
         let costSamples = windowed.compactMap { entry -> Double? in
             guard let day = dayKey(fromUsageDate: entry.date) else { return nil }
             return displayableCost(entry, day: day, unknownModelsByDay: unknownModelsByDay,
@@ -322,11 +312,10 @@ enum SpendTileMapper {
         partialDays: Set<String>
     ) -> Double? {
         guard let cost = entry.costUSD, cost.isFinite, cost >= 0 else { return nil }
-        guard entry.costIsComplete
-            || entry.hasUnexplainedIncompleteCost == false
-            || partialDays.contains(day)
-            || (entry.hasUnexplainedIncompleteCost != true && unknownModelsByDay[day]?.isEmpty == false)
-        else { return nil }
+        guard !entry.hasUnexplainedCostGap(
+            hasUnknownModels: unknownModelsByDay[day]?.isEmpty == false,
+            isPartial: partialDays.contains(day)
+        ) else { return nil }
         return cost
     }
 
@@ -381,7 +370,9 @@ enum SpendTileMapper {
         return values
     }
 
-    private static let namedModelCap = 5
+    /// The popover names only the leading models; everything past the cap folds into Other's
+    /// expandable contributors — a wall of tail rows is the same noise as a stack of slivers.
+    private static let namedModelCap = 3
 
     /// Tracks the casings seen for one case-folded name and elects the one that carried the most
     /// tokens (ties prefer the all-lowercase spelling, then alphabetical) — so `GLM-5.2` and `glm-5.2`
@@ -519,7 +510,7 @@ enum SpendTileMapper {
             let list = variants
                 .map { key, value in
                     ModelUsageVariant(model: value.vote.best ?? key, totalTokens: value.tokens,
-                                      costUSD: value.costUSD.map(SpendTileMapper.roundToCents),
+                                      costUSD: value.costUSD,
                                       costIsComplete: value.costIsComplete ? nil : false,
                                       tokenCountSaturated: value.tokenCountSaturated ? true : nil)
                 }
@@ -527,7 +518,7 @@ enum SpendTileMapper {
             // One variant carrying the row's own name is no breakdown — nil keeps the tooltip on plain figures.
             let isTrivial = list.count == 1 && list[0].model.lowercased() == model.lowercased()
             return ModelUsageEntry(model: model, totalTokens: tokens,
-                                   costUSD: costUSD.map(SpendTileMapper.roundToCents),
+                                   costUSD: costUSD,
                                    variants: isTrivial ? nil : list,
                                    costIsComplete: costIsComplete ? nil : false,
                                    tokenCountSaturated: tokenCountSaturated ? true : nil)
@@ -568,8 +559,17 @@ enum SpendTileMapper {
             }
         }
 
+        guard !byModel.isEmpty else { return nil }
+        let modeledTokens = byModel.values.reduce(0) { ProviderParse.addingSaturating($0, $1.tokens) }
+        if totalTokens > modeledTokens {
+            let name = ModelUsageEntry.unattributedModelName
+            byModel[name.lowercased(), default: ModelAccumulator()].add(
+                ModelUsageEntry(model: name, totalTokens: totalTokens - modeledTokens, costUSD: nil),
+                spelledAs: name
+            )
+        }
         let sorted = byModel.map { key, accumulator in accumulator.entry(model: accumulator.displayName ?? key) }
-            .sorted(by: modelSortPrecedes)
+            .sorted(by: ModelUsageEntry.ranksBefore)
         let folded = foldModelList(sorted)
         guard !folded.isEmpty else { return nil }
         return ModelUsageBreakdown(
@@ -601,72 +601,27 @@ enum SpendTileMapper {
         return trimmed.isEmpty ? ModelUsageEntry.unattributedModelName : trimmed
     }
 
-    private static func modelSortPrecedes(_ lhs: ModelUsageEntry, _ rhs: ModelUsageEntry) -> Bool {
-        let lhsCost = lhs.costUSD ?? 0
-        let rhsCost = rhs.costUSD ?? 0
-        if lhsCost != rhsCost { return lhsCost > rhsCost }
-        if lhs.totalTokens != rhs.totalTokens { return lhs.totalTokens > rhs.totalTokens }
-        return lhs.model.localizedStandardCompare(rhs.model) == .orderedAscending
-    }
-
-    /// Models below this share of the period fold into Other — a stack of sub-5% slivers is noise,
-    /// and the Other row lists its leading contributors.
-    private static let minVisibleShare = 0.05
-
+    /// The entries arrive spend-ranked (priced dollars first, then unpriced by tokens), so the
+    /// first `namedModelCap` are the rows worth a full row each. Past the cap, priced slivers and
+    /// low-volume unpriced models fold into Other's expandable contributors. An unpriced model
+    /// escapes the fold only when its token volume is genuinely material — a tenth of the
+    /// leader's tokens and ten million outright — so heavy custom models stay visible without
+    /// stretching the popover into a wall of tail rows.
     private static func foldModelList(_ entries: [ModelUsageEntry]) -> [ModelUsageEntry] {
-        // The threshold uses the same basis as the panel's percent labels (cost shares only when
-        // every model is priced, token shares otherwise — see `ModelUsageDetail.share`). A model is
-        // only minor enough to fold when it is a sliver on BOTH bases: its display share and its
-        // raw token share. The token floor is what keeps a cheap-but-heavy model visible — tokens
-        // are the measured quantity and cost is the imputed one, so a model holding half the
-        // period's tokens must never disappear behind "Other" just because its cost share is small
-        // (the bug that hid 488M glm tokens under a 3% Other row).
-        let allCostsComplete = entries.allSatisfy { $0.costUSD != nil && !$0.hasIncompleteCost }
-        let largestCost = entries.compactMap(\.costUSD).max() ?? 0
-        // Normalize by the largest entry before summing so a finite set of prices cannot overflow
-        // the denominator and make every model appear to have a zero share.
-        let normalizedCostTotal = largestCost > 0 && largestCost.isFinite
-            ? entries.reduce(0.0) { $0 + (($1.costUSD ?? 0) / largestCost) }
-            : 0
-        let canUseCostShares = allCostsComplete && normalizedCostTotal.isFinite && normalizedCostTotal > 0
-        let tokenTotal = entries.reduce(0) { ProviderParse.addingSaturating($0, $1.totalTokens) }
-        func share(_ entry: ModelUsageEntry) -> Double {
-            if canUseCostShares {
-                return ((entry.costUSD ?? 0) / largestCost) / normalizedCostTotal
-            }
-            guard tokenTotal > 0 else { return 0 }
-            return Double(entry.totalTokens) / Double(tokenTotal)
-        }
-        func tokenShareLeader(_ entry: ModelUsageEntry) -> Bool {
-            guard tokenTotal > 0 else { return false }
-            return Double(entry.totalTokens) / Double(tokenTotal) >= minVisibleShare
-        }
-
         var visible: [ModelUsageEntry] = []
         var other = ModelAccumulator()
-        var namedCount = 0
+        let unpricedTokenFloor = max((entries.first?.totalTokens ?? 0) / 10, 10_000_000)
 
         for entry in entries {
             // Tokens the logs couldn't tie to a model (Grok) read as noise under their own
             // "Unattributed" row — the panel is an insight, not an accounting ledger, so they just
             // count into Other however large they are.
             let isUnattributed = entry.model.caseInsensitiveCompare(ModelUsageEntry.unattributedModelName) == .orderedSame
-            if isUnattributed {
+            let unpricedHeavyweight = entry.costUSD == nil && entry.totalTokens >= unpricedTokenFloor
+            if isUnattributed || (visible.count >= namedModelCap && !unpricedHeavyweight) {
                 other.fold(entry)
-            } else if share(entry) < minVisibleShare && !tokenShareLeader(entry) {
-                other.fold(entry)
-            } else if entry.costUSD == nil {
-                visible.append(entry)
-                namedCount += 1
-            } else if tokenShareLeader(entry) {
-                // A substantial token consumer stays named regardless of cost share, without
-                // spending a paid-model slot — its usage must stay identifiable.
-                visible.append(entry)
-            } else if namedCount < namedModelCap {
-                visible.append(entry)
-                namedCount += 1
             } else {
-                other.fold(entry)
+                visible.append(entry)
             }
         }
 
@@ -675,7 +630,7 @@ enum SpendTileMapper {
             // that model's tokens and cost twice: once on Other, again as its only contributor.
             visible.append(contentsOf: other.entry(model: ModelUsageEntry.otherModelName).presentedRows())
         }
-        return visible
+        return visible.sorted(by: ModelUsageEntry.ranksBefore)
     }
 
     private static func addingFiniteCost(_ current: Double?, _ addition: Double) -> Double? {
@@ -684,9 +639,4 @@ enum SpendTileMapper {
         return total.isFinite ? total : nil
     }
 
-    private static func roundToCents(_ value: Double) -> Double {
-        let scaled = value * 100
-        guard value.isFinite, scaled.isFinite else { return value }
-        return scaled.rounded() / 100
-    }
 }

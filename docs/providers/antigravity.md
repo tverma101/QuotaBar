@@ -62,11 +62,12 @@ is simply what Antigravity's stores hold. If you don't want these rows counted, 
 the meters keep their last-good values while it is off.
 
 QuotaBar reads generation token counts, including the fixed system prompt, from every
-`~/.gemini/antigravity*/conversations/*.db` store, plus `~/.config/antigravity/conversations` and
-T3 Code's private Antigravity instances under `~/.t3/userdata/providers/antigravity/`. This covers
-the app, IDE, CLI, T3 Code, and compatible clients with separate conversation roots. It estimates API-equivalent cost using the shared
-[model pricing](../pricing.md). These are estimates, not subscription charges, and conversation
-content never leaves your Mac.
+`~/.gemini/antigravity*/conversations/*.db` store. This covers the app, IDE, CLI, and compatible
+clients with separate conversation roots. Local spend also reads Antigravity's alternative
+`~/.config/antigravity/conversations` store and T3 Code's private Antigravity ACP conversation stores.
+The spend scan does not read credentials from these stores. QuotaBar estimates API-equivalent cost
+using the shared [model pricing](../pricing.md). These are estimates, not subscription charges, and
+conversation content never leaves your Mac.
 
 Older stores include generation dates directly. Newer stores keep dates in conversation steps.
 QuotaBar matches their UUIDs and bot IDs even when row numbers differ. Repeated matches are usable

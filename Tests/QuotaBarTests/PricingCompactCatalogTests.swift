@@ -80,6 +80,24 @@ final class PricingCompactCatalogTests: XCTestCase {
         XCTAssertThrowsError(try PricingCatalogCodecs.catalogFromCompact(json))
     }
 
+    func testTierOnlyCacheReadRemainsCompatibleWithLegacyCompactReaders() throws {
+        let rates = ModelRates(
+            inputPerMillion: 1, outputPerMillion: 2, cacheWritePerMillion: 1, cacheReadPerMillion: 1,
+            promptRateTiers: [PromptRateTier(thresholdPromptTokens: 1_000, cacheReadPerMillion: 0.25)],
+            cacheReadIsExplicit: false
+        )
+        let compact = try PricingCatalogCodecs.compactData(from: PricingCatalog(entries: ["model": rates]))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: compact) as? [String: Any])
+        let models = try XCTUnwrap(json["models"] as? [String: [String: Any]])
+        let model = try XCTUnwrap(models["model"])
+        XCTAssertNil(model["cre"], "legacy readers must still see an explicit tier")
+        XCTAssertEqual(model["crb"] as? Bool, false)
+        let swiftRates = try XCTUnwrap(PricingCatalogCodecs.catalogFromCompact(compact).entries["model"])
+        let rustRates = try XCTUnwrap(CompactCatalogRustParser.parse(compact)?.entries["model"])
+        XCTAssertEqual(swiftRates, rates)
+        XCTAssertEqual(rustRates, rates)
+    }
+
     func testEmptyRetiredArrayIsPresentAsAuthoritative() throws {
         let json = Data(#"""
         {"models":{"cheap":{"i":0.1,"o":0.2,"cw":0.1,"cr":0.01}},"retired":[]}

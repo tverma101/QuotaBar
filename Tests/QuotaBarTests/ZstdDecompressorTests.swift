@@ -135,12 +135,12 @@ final class ZstdDecompressorTests: XCTestCase {
 
         switch result {
         case .complete(let scan, let damagedLines):
+            XCTAssertEqual(damagedLines, 0)
             XCTAssertEqual(
                 scan?.series.daily.reduce(0) { $0 + $1.totalTokens },
                 450,
                 "\(String(describing: scan))"
             )
-            XCTAssertEqual(damagedLines, 0)
         case .deferredByFutureTimestamp, .incomplete:
             XCTFail("the fold must complete when zstd is available")
         }

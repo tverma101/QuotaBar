@@ -184,6 +184,9 @@ final class WidgetDataStore {
         let scope: ProviderRefreshContext.Scope
         let manualActionID: UInt64?
         let maxConcurrentProviders: Int?
+        /// A deferred-request resume covers only its own providers; it must not join a wider pass
+        /// (a joiner would fold providers nobody asked for) nor let a wider caller join it.
+        let onlyProviderIDs: Set<String>?
     }
 
     /// Quota requests and local history folds are independent work. A failure in one must not
@@ -334,8 +337,8 @@ final class WidgetDataStore {
                 await codex.unloadLocalAccountingCachesForMemoryPressure()
             }
         }
-        // Unloading frees blocks into the malloc zone; relief is what returns the pages.
-        ProcessMemoryBudget.releaseAllocatorFreePages()
+        // Callers relieve the malloc zone at the end of the chain so one free-list walk covers
+        // every unload in the cycle.
     }
 
     /// Releases Freebuff's derived accounting caches on every refresh cycle, below the memory budget.
@@ -350,8 +353,6 @@ final class WidgetDataStore {
         if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
             await freebuff.unloadLocalAccountingCachesForMemoryPressure()
         }
-        // Unloading frees blocks into the malloc zone; relief is what returns the pages.
-        ProcessMemoryBudget.releaseAllocatorFreePages()
     }
 
     init(
@@ -517,7 +518,8 @@ final class WidgetDataStore {
         force: Bool = false,
         bypassSnapshotCache: Bool = false,
         bypassFailureBackoff: Bool = false,
-        maxConcurrentProviders: Int? = nil
+        maxConcurrentProviders: Int? = nil,
+        onlyProviderIDs: Set<String>? = nil
     ) async {
         let scope = ProviderRefreshContext.scope
         let batchKey = RefreshBatchKey(
@@ -526,7 +528,8 @@ final class WidgetDataStore {
             bypassFailureBackoff: bypassFailureBackoff,
             scope: scope,
             manualActionID: ProviderRefreshContext.manualActionID,
-            maxConcurrentProviders: maxConcurrentProviders.map { max(1, $0) }
+            maxConcurrentProviders: maxConcurrentProviders.map { max(1, $0) },
+            onlyProviderIDs: onlyProviderIDs
         )
         if let active = activeBatches[batchKey] {
             AppLog.debug(.refresh, "batch join (force=\(force), bypassCache=\(bypassSnapshotCache) already in flight)")
@@ -543,7 +546,8 @@ final class WidgetDataStore {
                 force: force,
                 bypassSnapshotCache: bypassSnapshotCache,
                 bypassFailureBackoff: bypassFailureBackoff,
-                maxConcurrentProviders: maxConcurrentProviders
+                maxConcurrentProviders: maxConcurrentProviders,
+                onlyProviderIDs: onlyProviderIDs
             )
         }
         activeBatches[batchKey] = task
@@ -582,7 +586,8 @@ final class WidgetDataStore {
         force: Bool,
         bypassSnapshotCache: Bool,
         bypassFailureBackoff: Bool,
-        maxConcurrentProviders: Int?
+        maxConcurrentProviders: Int?,
+        onlyProviderIDs: Set<String>? = nil
     ) async {
         // `Task {}` from MainActor context inherits the isolation (a task-group child can't capture
         // the non-Sendable store), so fire one task per provider in bounded groups, then await them all.
@@ -605,6 +610,9 @@ final class WidgetDataStore {
                 registry.historyDescriptorsByProvider[$0] != nil
                     && providersByID[$0]?.panelMetersRefreshIncludesHistory != true
             }
+        }
+        if let onlyProviderIDs {
+            providerIDs = providerIDs.filter { onlyProviderIDs.contains($0) }
         }
         if providerIDs.isEmpty {
             AppLog.info(.refresh, "batch skip (0 providers for scope=\(Self.batchScopeLabel(ProviderRefreshContext.scope)), force=\(force))")
@@ -678,6 +686,10 @@ final class WidgetDataStore {
                 // against its own marker. The window is covered by these markers; members mark
                 // themselves for the (instant) consuming phase as usual.
                 for id in preMarkedInFlight { refreshingProviderIDs.remove(id) }
+                // Resume anything that deferred behind the fold child the instant the window closes,
+                // instead of waiting for a consumption-phase unregister (which a mid-loop cancellation
+                // could skip entirely for some providers).
+                for id in preMarkedInFlight { emitReadyDeferredRefreshes(for: id) }
                 preMarkedInFlight = []
             }
         }
@@ -1067,8 +1079,14 @@ final class WidgetDataStore {
     private func emitReadyDeferredRefreshes(for providerID: String) {
         guard let requests = deferredRefreshRequests[providerID], !requests.isEmpty else { return }
         let activeScopes = Array(runningProviderRefreshScopes[providerID, default: [:]].values)
+        // Mirror the admission gate exactly: a resumed non-forced pass runs iff the provider is not
+        // marked in flight, or its meter scope may overlap the running scopes. The batched fold child
+        // pre-marks providers while `runningProviderRefreshScopes` stays empty; emitting on "no running
+        // scopes" alone re-latched passes the gate instantly re-deferred — a millisecond spin that
+        // lasted the whole fold (up to minutes) and burned CPU on all-deferred batches.
         let ready = requests.filter { request in
-            activeScopes.isEmpty || Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
+            !refreshingProviderIDs.contains(providerID)
+                || Self.mayOverlapMeterRefresh(request.scope, with: activeScopes)
         }
         guard !ready.isEmpty else { return }
         deferredRefreshRequests[providerID] = requests.subtracting(ready)
@@ -2177,6 +2195,29 @@ final class WidgetDataStore {
             )
         }
         if totalSpendByPeriod != totals { totalSpendByPeriod = totals }
+    }
+
+    /// Drops a cached Z.ai promotional row once its expiry has passed — or when an older build
+    /// saved only the display string and no machine-readable deadline — even when the live quota
+    /// request that would normally retire it cannot run (for example when quota is unavailable,
+    /// such as a Keychain-blocked meter pass). This is render-only — the stored snapshot keeps the
+    /// row — and keys on the provider plus the "Expires …" detail the producer writes for promo
+    /// deadlines, so ordinary reset countdowns and every other provider are unaffected.
+    static func removingExpiredZCodePromotions(
+        from values: [String: ProviderSnapshot], through date: Date
+    ) -> [String: ProviderSnapshot] {
+        guard var snapshot = values["zai"] else { return values }
+        let visible = snapshot.lines.filter { line in
+            guard case .progress(_, _, _, _, let expiry, _, _, let detail?) = line,
+                  detail.hasPrefix("Expires ") else { return true }
+            // Older builds saved only the display string. Wait for a fresh entitlement rather than showing it indefinitely.
+            return expiry.map { $0 > date } ?? false
+        }
+        guard visible.count != snapshot.lines.count else { return values }
+        snapshot.lines = visible
+        var result = values
+        result["zai"] = snapshot
+        return result
     }
 
     /// Drops a cached Z.ai promotional row once its expiry has passed — or when an older build

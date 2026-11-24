@@ -6,10 +6,11 @@ struct FreebuffUsageReceipt: Codable, Equatable, Sendable {
     var timestampMs: Double
     var metricsJSON: String
     var model: String?
+    var runStatus: String? = nil
 
     var scannerRow: [String: Any] {
         ["id": id, "timestamp": String(timestampMs), "metrics": metricsJSON,
-         "selectedModel": model ?? ""]
+         "selectedModel": model ?? "", "runStatus": runStatus ?? ""]
     }
 }
 
@@ -47,6 +48,9 @@ extension FreebuffDesktopUsageScanner {
             guard account(96 + day.utf8.count) else { return false }
         }
         for day in scan.partialDays {
+            guard account(64 + day.utf8.count) else { return false }
+        }
+        for day in scan.unexplainedPartialDays {
             guard account(64 + day.utf8.count) else { return false }
         }
         for day in scan.usage.apiEstimateIncompleteDays ?? [] {

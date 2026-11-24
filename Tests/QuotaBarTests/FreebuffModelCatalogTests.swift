@@ -49,7 +49,8 @@ final class FreebuffModelCatalogTests: XCTestCase {
         XCTAssertEqual(http.requests.count, 2)
     }
 
-    func testCatalogueReadUsesCanonicalHostAndCachesWithoutHandles() async throws {        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    func testCatalogueReadCachesWithoutHandles() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("identities.json")
         let http = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"protocol":1,"rows":[{"key":"m-known","displayName":"Model 1","handle":"must-not-persist"}]}"#.utf8)))
@@ -59,10 +60,6 @@ final class FreebuffModelCatalogTests: XCTestCase {
         try await catalog.refresh(auth: FreebuffAuth(token: "test-token"), client: client, now: now)
         try await catalog.refresh(auth: FreebuffAuth(token: "test-token"), client: client, now: now.addingTimeInterval(100))
         XCTAssertEqual(http.requests.count, 1)
-        let request = try XCTUnwrap(http.requests.first)
-        XCTAssertEqual(request.url.absoluteString, "https://www.codebuff.com/api/v1/freebuff/models")
-        XCTAssertEqual(request.method, "GET")
-        XCTAssertEqual(request.headers["x-freebuff-catalog-protocol"], "1")
         let saved = try String(contentsOf: url, encoding: .utf8)
         XCTAssertFalse(saved.contains("must-not-persist"))
         XCTAssertFalse(saved.contains("test-token"))

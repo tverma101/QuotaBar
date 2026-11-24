@@ -18,7 +18,7 @@ import Foundation
 public enum ScanWorkerCommand {
     static let schemaName = "quotabar.scan-worker.v1"
 
-    struct Options: Equatable {
+    struct Options: Equatable, Sendable {
         struct InvalidArguments: LocalizedError {
             var errorDescription: String? {
                 "Usage: QuotaBar --scan-worker --providers <id[,id...]> [--scope local-accounting|panel-accounting] [--paced] [--return-only] [--per-provider-timeout <s>] [--batch-budget <s>]"
@@ -103,7 +103,11 @@ public enum ScanWorkerCommand {
             let assembly = try await HeadlessProviderAssembly.assemble(
                 defaults: defaults,
                 settingsDomainName: defaultsDomain,
-                forceEnabledFamilies: requestedFamilies
+                forceEnabledFamilies: requestedFamilies,
+                // This one-shot child folds only the requested cards: their identity probes
+                // resolve now, and any other provider's credential read stays deferred instead
+                // of being paid by every spawn.
+                identityKeyProviderIDs: Set(options.providerIDs)
             )
             let knownIDs = Set(assembly.registry.providers.map(\.id))
             for providerID in options.providerIDs where !knownIDs.contains(providerID) {
@@ -115,10 +119,16 @@ public enum ScanWorkerCommand {
                 response = await Self.collectUnpublishedSnapshots(
                     options: options,
                     providers: assembly.providers,
-                    defaultIdentityKeys: assembly.providerIdentityKeys
+                    defaultIdentityKey: { await assembly.providerIdentityKey(for: $0) }
                 )
             } else {
                 let cache = ProviderSnapshotCache(userDefaults: defaults, allowsPersistedFreshness: true)
+                // Assembly deferred every per-provider identity probe: resolve only the cards this
+                // child was asked to fold so a narrow batch pays only its own credential reads.
+                var providerIdentityKeys = assembly.providerIdentityKeys
+                for providerID in options.providerIDs {
+                    providerIdentityKeys[providerID] = await assembly.providerIdentityKey(for: providerID)
+                }
                 let dataStore = WidgetDataStore(
                     registry: assembly.registry,
                     providers: assembly.providers,
@@ -127,31 +137,35 @@ public enum ScanWorkerCommand {
                     isProviderEnabled: { id in
                         requestedFamilies.contains(ProviderAccountID.family(of: id))
                     },
-                    providerIdentityKeys: assembly.providerIdentityKeys
+                    providerIdentityKeys: providerIdentityKeys
                 )
                 // Fold-only scope: local corpora recompute, no live quota APIs. Closed-panel background
                 // passes run paced (7.5% of one core); panel-open accounting runs unpaced to make its
-                // provider deadline, mirroring the scheduler's pacing choice in the app.
+                // provider deadline, mirroring the scheduler's pacing choice in the app. The model
+                // catalog is likewise the app's job — a one-shot child would discard any feed
+                // refresh it fetched, so it only reads what is already on disk.
                 await ProviderRefreshContext.$scope.withValue(options.scope) {
                     await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(options.paced) {
-                        let (light, heavy) = Self.partitionByWeight(options.providerIDs)
-                        await withTaskGroup(of: Void.self) { group in
-                            for providerID in light {
-                                group.addTask {
-                                    _ = await dataStore.refresh(
-                                        providerID: providerID,
-                                        force: true,
-                                        bypassSnapshotCache: true
-                                    )
+                        await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(true) {
+                            let (light, heavy) = Self.partitionByWeight(options.providerIDs)
+                            await withTaskGroup(of: Void.self) { group in
+                                for providerID in light {
+                                    group.addTask {
+                                        _ = await dataStore.refresh(
+                                            providerID: providerID,
+                                            force: true,
+                                            bypassSnapshotCache: true
+                                        )
+                                    }
                                 }
                             }
-                        }
-                        for providerID in heavy {
-                            _ = await dataStore.refresh(
-                                providerID: providerID,
-                                force: true,
-                                bypassSnapshotCache: true
-                            )
+                            for providerID in heavy {
+                                _ = await dataStore.refresh(
+                                    providerID: providerID,
+                                    force: true,
+                                    bypassSnapshotCache: true
+                                )
+                            }
                         }
                     }
                 }
@@ -164,7 +178,7 @@ public enum ScanWorkerCommand {
                         if let error = dataStore.providerErrors[id] { partial[id] = error }
                     },
                     identityKeys: options.providerIDs.reduce(into: [:]) { partial, id in
-                        if let key = assembly.providerIdentityKeys[id] { partial[id] = key }
+                        if let key = providerIdentityKeys[id] { partial[id] = key }
                     }
                 )
             }
@@ -192,17 +206,36 @@ public enum ScanWorkerCommand {
         providers: [ProviderRuntime],
         defaultIdentityKeys: [String: String]
     ) async -> Response {
+        await collectUnpublishedSnapshots(
+            options: options,
+            providers: providers,
+            defaultIdentityKey: { defaultIdentityKeys[$0] }
+        )
+    }
+
+    /// `defaultIdentityKey` resolves a provider's launch identity on demand: the fold usually
+    /// reports its own observed identity first, so the credential probe behind the default is
+    /// paid only when a provider finished without reporting one.
+    @MainActor
+    static func collectUnpublishedSnapshots(
+        options: Options,
+        providers: [ProviderRuntime],
+        defaultIdentityKey: (String) async -> String?
+    ) async -> Response {
         let runner = UnpublishedFoldRunner(
             options: options,
             providers: providers,
-            defaultIdentityKeys: defaultIdentityKeys
+            defaultIdentityKey: defaultIdentityKey
         )
         var response = Response(schema: schemaName, snapshots: [:], errors: [:], identityKeys: [:])
-        func record(_ result: UnpublishedFoldRunner.Outcome?) {
+        func record(_ result: UnpublishedFoldRunner.Outcome?) async {
             guard let result else { return }
             if let snapshot = result.snapshot {
                 response.snapshots[result.providerID] = snapshot
-                response.identityKeys[result.providerID] = result.identityKey
+                response.identityKeys[result.providerID] = await {
+                    if let key = result.identityKey { return key }
+                    return await defaultIdentityKey(result.providerID)
+                }()
             } else {
                 response.errors[result.providerID] = "Accounting refresh timed out"
             }
@@ -219,9 +252,10 @@ public enum ScanWorkerCommand {
             for await result in group { results.append(result) }
             return results
         }
-        lightResults.forEach(record)
+        for result in lightResults { await record(result) }
         for id in heavy {
-            record(await runner.fold(id))
+            guard !Task.isCancelled else { break }
+            await record(await runner.fold(id))
         }
         return response
     }
@@ -248,13 +282,17 @@ private final class UnpublishedFoldRunner {
 
     private let options: ScanWorkerCommand.Options
     private let byID: [String: ProviderRuntime]
-    private let defaultIdentityKeys: [String: String]
+    private let defaultIdentityKey: (String) async -> String?
     private let batchStart = Date()
 
-    init(options: ScanWorkerCommand.Options, providers: [ProviderRuntime], defaultIdentityKeys: [String: String]) {
+    init(
+        options: ScanWorkerCommand.Options,
+        providers: [ProviderRuntime],
+        defaultIdentityKey: @escaping (String) async -> String?
+    ) {
         self.options = options
         self.byID = Dictionary(uniqueKeysWithValues: providers.map { ($0.provider.id, $0) })
-        self.defaultIdentityKeys = defaultIdentityKeys
+        self.defaultIdentityKey = defaultIdentityKey
     }
 
     func fold(_ id: String) async -> Outcome? {
@@ -276,11 +314,15 @@ private final class UnpublishedFoldRunner {
                 // finishes while the caller still waits.
                 await ProviderRefreshContext.$accountingCPUInteractiveBudgetEnabled.withValue(options.paced) {
                     await ProviderRefreshContext.$cacheIdentityResult.withValue(identity) {
-                        await ProviderRefreshDeadline.snapshot(from: provider, timeout: timeout)
+                        // A one-shot child discards whatever feed it refreshes; the app owns catalog
+                        // freshness, so the fold reads only what is already on disk.
+                        await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(true) {
+                            await ProviderRefreshDeadline.snapshot(from: provider, timeout: timeout)
+                        }
                     }
                 }
             }
         }
-        return Outcome(providerID: id, snapshot: snapshot, identityKey: identity.value ?? defaultIdentityKeys[id])
+        return Outcome(providerID: id, snapshot: snapshot, identityKey: identity.value)
     }
 }

@@ -273,7 +273,7 @@ struct WidgetRowView: View {
         }
         .onTapGesture {
             guard !currentSessions.isEmpty else { return }
-            modelHover.toggleForTap()
+            modelHover.presentForTap()
         }
         .motionAwareHoverPopover(
             isPresented: Binding(
@@ -340,7 +340,9 @@ struct WidgetRowView: View {
     /// and an optional secondary line ("on-device estimate") beneath it.
     private var unboundedRow: some View {
         unboundedRowContent
-            .onChange(of: data.modelBreakdown) { _, _ in modelHover.dismiss() }
+            .onChange(of: data.modelBreakdown) { _, _ in
+                if !modelHover.isPinned { modelHover.dismiss() }
+            }
             // A refresh can replace the reset credits (count and expiries) while the popover is open;
             // drop it so it never lingers over a stale timeline — except while the claim flow has the
             // popover pinned: the claim's own forced refresh is what changes the credits, and dismissing
@@ -436,25 +438,26 @@ struct WidgetRowView: View {
                     modelHover.inlineHover(false)
                 }
             }
-            // Tap toggles the same popover, with no dwell: hovering a small value is fiddly, and the
-            // 400 ms reveal outwaits a quick click. Only rows that actually have a popover respond —
-            // a tap on a plain row is a no-op, exactly like hovering it.
+            // Tap opens the same popover, with no dwell: hovering a small value is fiddly, and the
+            // 400 ms reveal outwaits a quick click. A tap only opens — closing belongs to hover-out
+            // and panel close, so a second tap can't tear the surface down. Only rows that actually
+            // have a popover respond — a tap on a plain row is a no-op, exactly like hovering it.
             .onTapGesture {
                 guard hasHoverPopover else { return }
-                modelHover.toggleForTap()
+                modelHover.presentForTap()
             }
             .motionAwareHoverPopover(
                 isPresented: Binding(
                     get: { hasHoverPopover && modelHover.isPresented },
-                    // A click-outside dismiss removes the detail view without an `.ended` hover event,
-                    // so a plain assignment would strand `overDetail == true` and block future hides.
+                    // A close that skips the `.ended` hover event (popover teardown, refresh, panel
+                    // close) removes the detail view, so a plain assignment would strand
+                    // `overDetail == true` and block future hides.
                     set: { if !$0 { modelHover.dismiss() } }
                 ),
                 reduceAnimations: reduceAnimations
             ) {
                 if let breakdown = data.modelBreakdown {
-                    ModelUsageDetail(title: data.title, breakdown: breakdown,
-                                     loadOnTap: data.revealsBreakdownOnTap) { inside in
+                    ModelUsageDetail(title: data.title, breakdown: breakdown) { inside in
                         modelHover.detailHover(inside)
                     }
                 } else if data.showsResetExpiries {

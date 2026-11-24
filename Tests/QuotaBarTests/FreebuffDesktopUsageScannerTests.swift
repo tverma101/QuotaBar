@@ -69,7 +69,12 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
                                cacheWritePerMillion: 2, cacheReadPerMillion: 0.2,
                                inputAbove200kPerMillion: 20, outputAbove200kPerMillion: 100,
                                cacheReadIsExplicit: true, longContextThresholdTokens: 1)
-        let pricing = ModelPricing(supplement: PricingSupplement(), primary: PricingCatalog(),
+        let supplement = PricingSupplement(
+            pricing: ["model-1": ModelRates(inputPerMillion: 200, outputPerMillion: 1_000,
+                                          cacheWritePerMillion: 200, cacheReadPerMillion: 20)],
+            aliasRules: [.init(pattern: try NSRegularExpression(pattern: "^vendor/model-1$"), canonical: "model-1")]
+        )
+        let pricing = ModelPricing(supplement: supplement, primary: PricingCatalog(),
                                    secondary: PricingCatalog(), openRouter: PricingCatalog(entries: [
                                     "vendor/model-1": rates, "vendor/recorded-model": rates
                                    ]))
@@ -147,7 +152,7 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
                        "the route prices the row but the catalog name still titles it")
     }
 
-    func testDeepSeekPeakWindowPricesBaseAndRemovedFastCollapse() async throws {
+    func testDeepSeekStandardRateAssumptionUsesThePeakWindow() async throws {
         let formatter = ISO8601DateFormatter()
         let peakTimestamp = try XCTUnwrap(formatter.date(from: "2026-10-26T02:00:00Z"))
         let scanNow = peakTimestamp.addingTimeInterval(3_600)
@@ -213,14 +218,16 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         let day = DailyUsageAccumulator.dayKey(from: peakTimestamp)
         let models = try XCTUnwrap(scan?.usage.modelUsage?.daily.first?.models)
         let model = try XCTUnwrap(models.first { $0.model == "DeepSeek V4.1 Flash" })
-        let fastModel = try XCTUnwrap(model.variants?.first { $0.model == "DeepSeek V4.1 Flash" })
+        let assumed = try XCTUnwrap(models.first { $0.model == "DeepSeek V4.1 Flash (Standard Rate Assumed)" })
 
-        XCTAssertEqual(models.count, 1, "the removed Fast mode shares the base model's row")
+        XCTAssertEqual(models.count, 2, "the assumed-standard Fast label keeps its own row")
         XCTAssertEqual(scan?.usage.series.daily.first?.totalTokens, 300)
-        // The retired Fast-tier alias must stay shadowed: both turns price at their route's
-        // peak-window rates — 2 × (20*0.3 + 80*0.006 + 50*1.2)/1M — never at 0.6/2.4.
+        // Both rows price at the standard route's peak-window rate — (20*0.3 + 80*0.006 + 50*1.2)/1M
+        // each — never at 0.6/2.4; the assumption reuses the base route's UTC window.
         XCTAssertEqual(try XCTUnwrap(scan?.usage.apiEstimateByDay?[day]), 0.000_132_96, accuracy: 0.000_000_001)
-        XCTAssertEqual(try XCTUnwrap(fastModel.costUSD), 0.000_066_48, accuracy: 0.000_000_001)
+        XCTAssertEqual(try XCTUnwrap(model.costUSD), 0.000_066_48, accuracy: 0.000_000_001)
+        XCTAssertEqual(assumed.totalTokens, 150)
+        XCTAssertEqual(try XCTUnwrap(assumed.costUSD), 0.000_066_48, accuracy: 0.000_000_001)
     }
 
     func testUnchangedHistoryIsNotDecodedAgain() async throws {

@@ -12,7 +12,7 @@ struct PopoverFooter: View {
     @ViewBuilder
     var body: some View {
         Group {
-            if screen == .customize {
+            if screen == .customize || screen == .generationSpeed {
                 EmptyView()
             } else {
                 HStack(alignment: .center, spacing: 8) {

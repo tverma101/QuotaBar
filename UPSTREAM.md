@@ -1,7 +1,7 @@
 # Upstream provenance
 
-Status: **owned fork.** This resolves the question left open by issue #41 in `tverma101/Tools`,
-where this tree was vendored and tracked with no commits and no recorded provenance.
+Status: **owned fork.** The tree was vendored from an internal workspace where it had been
+tracked with no commits and no recorded provenance.
 
 ## Upstream
 
@@ -13,7 +13,7 @@ where this tree was vendored and tracked with no commits and no recorded provena
 
 ## Imported revision
 
-The subtree arrived in `tverma101/Tools` with its history squashed to nothing — 544 tracked files,
+The subtree arrived with its history squashed to nothing — 544 tracked files,
 zero commits — so the original revision could not be recovered from local Git history.
 
 It is now pinned by this repository's own history instead:

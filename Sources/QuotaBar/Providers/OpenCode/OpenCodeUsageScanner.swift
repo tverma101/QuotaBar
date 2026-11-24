@@ -339,12 +339,7 @@ struct OpenCodeUsageScanner: Sendable {
                     pricing: pricing
                 )
                 nativeCoverage.insert(key)
-                return OpenCodeUsageScanner.shouldFoldNativeCodexRow(
-                    row,
-                    accountIdentityKey: accountIdentityKey,
-                    completeRouterCoverage: routerCoverage,
-                    pricing: pricing
-                )
+                return !routerCoverage.contains(key)
             }
             OpenCodeUsageScanner.foldGatewayRows(
                 rowsToFold,
@@ -663,10 +658,13 @@ struct OpenCodeUsageScanner: Sendable {
         JSONLAccountingWorkPacer.shared.forEach(rows) { row in
             let date = Date(timeIntervalSince1970: row.ms / 1000)
             guard date >= scanSince else { return }
+            let day = DailyUsageAccumulator.dayKey(from: date)
+            accumulator.recordApiEstimate(day: day, cost: nil, tokens: row.tokens)
             accumulator.add(
-                day: DailyUsageAccumulator.dayKey(from: date),
+                day: day,
                 tokens: row.tokens, cost: row.cost, model: row.model,
-                tokenCountSaturated: row.tokenCountSaturated
+                tokenCountSaturated: row.tokenCountSaturated,
+                reportedCost: row.cost
             )
         }
 

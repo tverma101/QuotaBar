@@ -22,10 +22,12 @@ QuotaBar uses an API key for Coding Plan quotas. Weekend Build and the local usa
 data on this Mac independently and do not need a key.
 QuotaBar reads it from the first place it finds one, in this order:
 
-1. `~/.config/openusage/zai.json` — `{"apiKey":"…"}` (the file Settings writes to)
+1. `~/.config/quotabar/zai.json` — `{"apiKey":"…"}` (the file Settings writes to)
 2. `~/.config/zai/key.json`
 3. The `ZAI_API_KEY` environment variable
 4. The `GLM_API_KEY` environment variable (the legacy Zhipu name, still accepted)
+
+Keys saved by older builds at `~/.config/openusage/zai.json` keep working.
 
 You can also add and rotate the key from **Settings → API Keys** without touching a file. Either
 way, nothing leaves your Mac except the same API calls Z.ai's own subscription UI makes.

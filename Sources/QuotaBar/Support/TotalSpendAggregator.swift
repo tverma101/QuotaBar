@@ -279,31 +279,34 @@ enum TotalSpendAggregator {
         var amount = 0.0
         var hasValidDollarAmount = false
         var dollarsOverflowed = false
-        var tokens = 0.0
+        var tokens = 0
         var tokenCountSaturated = false
         var estimated = false
         var hasIncompleteCost = false
+        var hasUnexplainedCost = false
 
         for entry in history.series.daily {
             guard let day = dayKey(fromUsageDate: entry.date, calendar: calendar), days.contains(day)
             else { continue }
             if entry.tokenCountSaturated { tokenCountSaturated = true }
             if entry.totalTokens > 0 {
-                let next = tokens + Double(entry.totalTokens)
-                if next.isFinite { tokens = next } else { tokenCountSaturated = true }
+                if tokens > Int.max - entry.totalTokens {
+                    tokenCountSaturated = true
+                }
+                tokens = ProviderParse.addingSaturating(tokens, entry.totalTokens)
             }
-            // A day whose cost is incomplete but unexplained (and not a running local session) has no
-            // trustworthy subtotal; keep its tokens and mark the period's dollars incomplete.
-            let dayCostIsTrustworthy = entry.costIsComplete
-                || entry.hasUnexplainedIncompleteCost == false
-                || history.partialDays?.contains(day) == true
-                || history.unknownModelsByDay[day]?.isEmpty == false
-            guard let cost = entry.costUSD, cost.isFinite, cost >= 0 else {
-                if entry.totalTokens > 0 { hasIncompleteCost = true }
+            // A day whose cost is incomplete but unexplained has no trustworthy subtotal; keep its
+            // tokens and mark the period's dollars incomplete.
+            if entry.hasUnexplainedCostGap(
+                hasUnknownModels: history.unknownModelsByDay[day]?.isEmpty == false,
+                isPartial: history.partialDays?.contains(day) == true
+            ) {
+                hasUnexplainedCost = true
+                hasIncompleteCost = true
                 continue
             }
-            guard dayCostIsTrustworthy else {
-                hasIncompleteCost = true
+            guard let cost = entry.costUSD, cost.isFinite, cost >= 0 else {
+                if entry.totalTokens > 0 { hasIncompleteCost = true }
                 continue
             }
             guard !dollarsOverflowed else { continue }
@@ -322,13 +325,18 @@ enum TotalSpendAggregator {
         // A partial (still-running) day inside the window makes the period's figures lower bounds.
         let windowIsPartial = days.contains { history.partialDays?.contains($0) == true }
         if windowIsPartial { hasIncompleteCost = true }
+        if hasUnexplainedCost {
+            amount = 0
+            hasValidDollarAmount = false
+            estimated = false
+        }
         guard hasValidDollarAmount || tokens > 0 || tokenCountSaturated else { return nil }
 
         return TotalSpendSlice(
             provider: provider,
             amountUSD: amount,
             hasDollarAmount: hasValidDollarAmount,
-            tokenCount: tokens,
+            tokenCount: Double(tokens),
             tokenCountSaturated: tokenCountSaturated,
             estimated: estimated,
             isPartial: windowIsPartial,

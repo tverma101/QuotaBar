@@ -38,9 +38,16 @@ enum TokenRefreshOutcome: Sendable {
 /// Google Cloud Code endpoints, and the Google OAuth token refresh.
 struct AntigravityUsageClient: Sendable {
     static let lsService = "exa.language_server_pb.LanguageServerService"
+    // Daily has the active counters for the quota pools; production can return untouched Gemini
+    // windows, so the summary tries daily first and falls back to production.
     static let cloudCodeURLs = [
         "https://daily-cloudcode-pa.googleapis.com",
         "https://cloudcode-pa.googleapis.com"
+    ]
+    /// Plan and project lookups prefer production; daily has the active counters for quota reads.
+    static let planProjectURLs = [
+        "https://cloudcode-pa.googleapis.com",
+        "https://daily-cloudcode-pa.googleapis.com"
     ]
     static let fetchModelsPath = "/v1internal:fetchAvailableModels"
     static let loadCodeAssistPath = "/v1internal:loadCodeAssist"
@@ -111,8 +118,14 @@ struct AntigravityUsageClient: Sendable {
     /// authentication; a 403 is a permission denial and must not trigger OAuth refresh. Both
     /// short-circuit because the same request would fail on the other base. Other non-2xx / transport
     /// errors fall through to the next base and finally `.unavailable`.
-    func cloudCode(path: String, token: String, userAgent: String, body: [String: String]) async throws -> CloudCodeOutcome {
-        switch try await cloudCodeResponses(path: path, token: token, userAgent: userAgent, body: body, collectSummaries: false) {
+    func cloudCode(
+        path: String,
+        token: String,
+        userAgent: String,
+        body: [String: String],
+        bases: [String] = AntigravityUsageClient.cloudCodeURLs
+    ) async throws -> CloudCodeOutcome {
+        switch try await cloudCodeResponses(path: path, token: token, userAgent: userAgent, body: body, collectSummaries: false, bases: bases) {
         case .ok(let bodies, _): return .ok(bodies[0])
         case .authFailed: return .authFailed
         case .forbidden: return .forbidden
@@ -123,18 +136,29 @@ struct AntigravityUsageClient: Sendable {
 
     /// A host can omit an entire quota pool. Consult the other host only when the first usable body
     /// cannot supply all shared meters; a failed supplemental host never discards measured limits.
+    /// A host that answered with a complete summary ends the read with `allHostsAnswered: true`
+    /// even if another host refused it — a refusal on a canary host says nothing about the quota
+    /// pool a complete body can prove. Failed hosts still withhold the freshness stamp when no
+    /// answer was complete.
     func cloudCodeSummaries(token: String) async throws -> CloudCodeBatchOutcome {
-        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: Self.clientUserAgent, body: [:], collectSummaries: true)
+        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: Self.clientUserAgent, body: [:], collectSummaries: true, bases: Self.cloudCodeURLs)
     }
 
     private func cloudCodeResponses(
-        path: String, token: String, userAgent: String, body: [String: String], collectSummaries: Bool
+        path: String,
+        token: String,
+        userAgent: String,
+        body: [String: String],
+        collectSummaries: Bool,
+        bases: [String] = AntigravityUsageClient.cloudCodeURLs
     ) async throws -> CloudCodeBatchOutcome {
         let payload = (try? JSONSerialization.data(withJSONObject: body)) ?? Data("{}".utf8)
         var sawNotFound = false
         var sawOtherFailure = false
+        var sawAuthFailure = false
+        var sawForbidden = false
         var bodies: [Data] = []
-        for (index, base) in Self.cloudCodeURLs.enumerated() {
+        for (index, base) in bases.enumerated() {
             try Task.checkCancellation()
             guard let url = URL(string: base + path) else { continue }
             let request = HTTPRequest(
@@ -163,6 +187,13 @@ struct AntigravityUsageClient: Sendable {
             try Task.checkCancellation()
             if response.statusCode == 401 || response.statusCode == 403 {
                 if !bodies.isEmpty { return .ok(bodies, allHostsAnswered: false) }
+                if collectSummaries {
+                    // A refusal on one host may not hold on the other (daily is a canary host that
+                    // can 401 a token production accepts), so the summary consults both before
+                    // classifying. Legacy paths short-circuit — the same token fails there too.
+                    if response.statusCode == 401 { sawAuthFailure = true } else { sawForbidden = true }
+                    continue
+                }
                 return response.statusCode == 401 ? .authFailed : .forbidden
             }
             if (200..<300).contains(response.statusCode) {
@@ -179,8 +210,10 @@ struct AntigravityUsageClient: Sendable {
             }
         }
         if !bodies.isEmpty {
-            return .ok(bodies, allHostsAnswered: !sawNotFound && !sawOtherFailure)
+            return .ok(bodies, allHostsAnswered: !sawNotFound && !sawOtherFailure && !sawAuthFailure && !sawForbidden)
         }
+        if sawAuthFailure { return .authFailed }
+        if sawForbidden { return .forbidden }
         return sawNotFound && !sawOtherFailure ? .notFound : .unavailable
     }
 

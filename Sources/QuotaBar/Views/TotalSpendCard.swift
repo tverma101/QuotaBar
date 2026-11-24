@@ -19,6 +19,9 @@ struct TotalSpendCard: View {
     /// The selected metric (Cost / Cost/MTok / Tokens) survives the same way.
     @AppStorage(TotalSpendSetting.metricKey) private var metricRawValue = TotalSpendMetric.cost.rawValue
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
+    /// Plain-box memo like `ReorderFrameStore`: caches the aggregate on exactly the inputs it reads,
+    /// so a `snapshots` republish that changed no spend data skips re-windowing every daily history.
+    @State private var aggregationCache = TotalSpendAggregationCache()
 
     private var period: TotalSpendPeriod {
         TotalSpendPeriod(rawValue: periodRawValue) ?? .today
@@ -44,9 +47,9 @@ struct TotalSpendCard: View {
     }
 
     private var total: TotalSpend {
-        // The store precomputes one total per period at snapshot publish; the live aggregator call is
-        // the fallback before the first publish.
-        dataStore.totalSpendByPeriod[period] ?? TotalSpendAggregator.total(
+        // The store precomputes one total per period at snapshot publish; the cache is the
+        // fallback before the first publish.
+        dataStore.totalSpendByPeriod[period] ?? aggregationCache.total(
             for: period,
             providers: providers,
             snapshots: dataStore.snapshots,
@@ -239,6 +242,75 @@ struct TotalSpendCard: View {
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 18)
+    }
+}
+
+/// One TotalSpendCard's memoized `TotalSpendAggregator.total`. `dataStore.snapshots` republishes on
+/// every refresh pass — including quota-only passes that carry the same spend tiles forward — but the
+/// aggregate is a pure function of a narrow input set: the period, the ordered providers, each
+/// provider's spend line for that period (enabled) or retained daily history (dormant), and the local
+/// day the histories re-window against. A republish that changed none of those hits the cache.
+final class TotalSpendAggregationCache {
+    private var key: Key?
+    private var value: TotalSpend?
+
+    func total(
+        for period: TotalSpendPeriod,
+        providers: [Provider],
+        snapshots: [String: ProviderSnapshot],
+        dormantHistories: [String: ProviderUsageHistory],
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> TotalSpend {
+        // `now` doubles as the key's day component and the aggregator's window anchor, so the two
+        // can't disagree across a midnight boundary.
+        let key = Key(
+            period: period,
+            day: DailyUsageAccumulator.dayKey(from: now, calendar: calendar),
+            calendarID: calendar.identifier,
+            timeZoneID: calendar.timeZone.identifier,
+            inputs: providers.map { provider in
+                Input(
+                    provider: provider,
+                    line: dormantHistories[provider.id] == nil
+                        ? snapshots[provider.id]?.line(label: period.lineLabel)
+                        : nil,
+                    history: dormantHistories[provider.id]
+                )
+            }
+        )
+        if key == self.key, let value { return value }
+        let value = TotalSpendAggregator.total(
+            for: period,
+            providers: providers,
+            snapshots: snapshots,
+            dormantHistories: dormantHistories,
+            now: now,
+            calendar: calendar
+        )
+        self.key = key
+        self.value = value
+        return value
+    }
+
+    private struct Key: Equatable {
+        let period: TotalSpendPeriod
+        /// The local day the period windows against — the same inputs on a different day are
+        /// different inputs (dormant histories and the 30-day window move with the calendar).
+        let day: String
+        /// Same inputs under a different calendar/timezone produce different buckets, so the key
+        /// must carry the zone identity — matching `UsageHistoryWindow.DayKeysCacheKey`.
+        let calendarID: Calendar.Identifier
+        let timeZoneID: String
+        let inputs: [Input]
+    }
+
+    /// The one thing the aggregator reads from each provider: its period spend line when enabled,
+    /// or its retained daily history when dormant — never the whole snapshot.
+    private struct Input: Equatable {
+        let provider: Provider
+        let line: MetricLine?
+        let history: ProviderUsageHistory?
     }
 }
 

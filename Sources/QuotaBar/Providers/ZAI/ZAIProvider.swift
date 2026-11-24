@@ -101,6 +101,14 @@ final class ZAIProvider: ProviderRuntime {
             quota = await refreshQuota()
         }
         guard quota.errorCategory != .cancelled, !Task.isCancelled else { return quota }
+
+        // Menu-bar and panel-meter passes only need the live quota meters. Skip the local ZCode
+        // sqlite/LevelDB scan; the data store merges prior spend tiles, Weekend Build, and usage
+        // history onto this snapshot (the same scope split Grok and Devin apply).
+        if ProviderRefreshContext.scope.skipsLocalAccounting {
+            return quota
+        }
+
         do {
             let currentNow = now()
             let modelPricing = await pricing()
@@ -210,13 +218,6 @@ final class ZAIProvider: ProviderRuntime {
                 }
                 let damaged = "Skipped \(usage.damagedRows) invalid ZCode usage row\(usage.damagedRows == 1 ? "" : "s"); recent totals may be slightly low."
                 result.historyWarning = [result.historyWarning, damaged].compactMap { $0 }.joined(separator: " · ")
-            }
-            if usage.damagedRows > 0 {
-                // Corrupt rows were excluded from the history rather than blanking it — say so.
-                DiagnosticGate.logOnce(for: "zcode.damaged-usage-rows") {
-                    AppLog.warn(LogTag.auth("zai"), "ZCode history had \(usage.damagedRows) invalid rows; totals exclude them")
-                }
-                result.historyWarning = "Skipped \(usage.damagedRows) invalid ZCode usage row\(usage.damagedRows == 1 ? "" : "s"); recent totals may be slightly low."
             }
             return result
         } catch {

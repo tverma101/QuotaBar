@@ -1133,7 +1133,7 @@ final class CodexProviderTests: XCTestCase {
         XCTAssertTrue(httpClient.requests.isEmpty, "localAccounting scope must not re-read live quota APIs")
     }
 
-    func testLocalAccountingReusesPriorNativeScanWhenAvailable() async throws {
+    func testLocalAccountingSeesNativeUsageAppendedAfterFullRefresh() async throws {
         let now = TestLocalInstant.date(2026, 2, 20, 12)
         let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data("{}".utf8)))
         let home = try CodexLogFixture.makeHome(files: [
@@ -1180,17 +1180,23 @@ final class CodexProviderTests: XCTestCase {
                        [MetricValue(number: 0.25, kind: .dollars, estimated: true),
                         MetricValue(number: 150, kind: .count, label: "tokens")])
 
-        // Remove the home directory so that any re-scanning of native sessions would find nothing.
-        try? FileManager.default.removeItem(at: home)
+        // A ledger wake must not reuse a stale native fold after the session has changed.
+        let rollout = home.appendingPathComponent("sessions/rollout-1.jsonl")
+        let append = "\n" + CodexLogFixture.tokenCount(
+            timestamp: TestLocalInstant.iso(2026, 2, 20, 10, 2),
+            last: CodexLogFixture.usage(input: 200, output: 100)
+        )
+        let handle = try FileHandle(forWritingTo: rollout)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(append.utf8))
+        try handle.close()
 
-        // Second pass in .localAccounting scope reuses cached native scan.
         let second = await ProviderRefreshContext.$scope.withValue(.localAccounting) {
             await provider.refresh()
         }
         XCTAssertEqual(values(second.lines, "Today"),
-                       [MetricValue(number: 0.25, kind: .dollars, estimated: true),
-                        MetricValue(number: 150, kind: .count, label: "tokens")],
-                       "localAccounting must reuse prior native scan without re-walking disk")
+                       [MetricValue(number: 0.75, kind: .dollars, estimated: true),
+                        MetricValue(number: 450, kind: .count, label: "tokens")])
     }
 
     func testIncompletePiDiscoveryDoesNotPublishCodexOnlyHistory() async throws {

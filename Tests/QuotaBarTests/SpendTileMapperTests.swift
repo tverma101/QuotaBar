@@ -267,7 +267,7 @@ final class SpendTileMapperTests: XCTestCase {
         XCTAssertNil(breakdown.models.first { $0.model == "Other" })
     }
 
-    func testModelBreakdownSortsFoldsOtherAndKeepsUnpricedNamed() throws {
+    func testModelBreakdownKeepsTopThreeAndFoldsRestIntoOther() throws {
         let lines = mappedLines(
             [DailyUsageEntry(date: "2026-06-26", totalTokens: 3_700, costUSD: 49)],
             models: [DailyModelUsageEntry(date: "2026-06-26", models: [
@@ -282,26 +282,26 @@ final class SpendTileMapperTests: XCTestCase {
             ])]
         )
 
-        // The unpriced "mystery" puts the whole list on token shares (the basis the panel's percent
-        // labels use), so "alpha" — top spend but only 100 of 3,700 tokens (~3%), a sliver on both
-        // bases — is the only model small enough to fold. One model is not a group, so it keeps its
-        // name instead of becoming Other plus a second line with the same tokens and cost. "eta"
-        // clears the cap's slot count but holds 19% of measured tokens, so the token floor keeps it
-        // named anyway (the cap only ever folds slivers). The sort still ranks by cost first.
+        // The three spend leaders stay named; the rest — priced slivers and the unpriced model
+        // alike — fold into Other's expandable contributors. Other's folded $21 outspends every
+        // named row here, so it ranks first like any other entry.
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
         XCTAssertEqual(
             breakdown.models.map(\.model),
-            ["aardvark", "beta", "delta", "epsilon", "zeta", "eta", "mystery", "alpha"]
+            ["Other", "alpha", "aardvark", "beta"]
         )
         let alpha = try XCTUnwrap(breakdown.models.first { $0.model == "alpha" })
         XCTAssertEqual(alpha.totalTokens, 100)
         XCTAssertEqual(alpha.costUSD, 10)
         XCTAssertNil(alpha.variants, "a lone small model is not listed again under itself")
-        XCTAssertNil(breakdown.models.first { $0.model == "Other" })
-        XCTAssertNil(breakdown.models.first { $0.model == "mystery" }?.costUSD)
+        let other = try XCTUnwrap(breakdown.models.first { $0.model == "Other" })
+        XCTAssertEqual(other.totalTokens, 3_100)
+        XCTAssertEqual(other.costUSD, 21)
+        XCTAssertTrue(other.hasIncompleteCost, "the folded unpriced model marks Other's dollars partial")
+        XCTAssertEqual(other.variants?.map(\.model), ["delta", "epsilon", "zeta", "eta", "mystery"])
     }
 
-    func testModelBreakdownFoldsModelsMinorOnBothSharesIntoOther() throws {
+    func testModelBreakdownLeavesThreeOrFewerModelsNamed() throws {
         let lines = mappedLines(
             [DailyUsageEntry(date: "2026-06-26", totalTokens: 1_000, costUSD: 100)],
             models: [DailyModelUsageEntry(date: "2026-06-26", models: [
@@ -311,15 +311,14 @@ final class SpendTileMapperTests: XCTestCase {
             ])]
         )
 
-        // All priced → cost shares: 90% / 6% / 4%. "tiny" is under the 5% cost floor — but it holds
-        // 10% of the measured tokens, so the token floor keeps it named; nothing folds.
+        // Three models fit inside the named cap, so nothing folds.
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
         XCTAssertEqual(breakdown.models.map(\.model), ["big", "mid", "tiny"])
-        XCTAssertNil(breakdown.models.first { $0.model == "Other" }, "no slivers, no Other row")
+        XCTAssertNil(breakdown.models.first { $0.model == "Other" }, "no tail, no Other row")
     }
 
-    /// The reported bug: a model holding half the measured tokens vanished into Other because its
-    /// imputed-cost share was 2.9% and the old escape hatch required cost exactly zero.
+    /// A model heavy on measured tokens but third by spend keeps its named row — the fold only
+    /// reaches models ranked past the named cap.
     func testModelBreakdownKeepsCheapHeavyModelNamedDespiteSmallCostShare() throws {
         let models = [
             ModelUsageEntry(model: "grok-4.6", totalTokens: 410_300_000, costUSD: 553.04),
@@ -334,9 +333,8 @@ final class SpendTileMapperTests: XCTestCase {
             models: [DailyModelUsageEntry(date: "2026-06-26", models: models)]
         )
 
-        // Cost shares: 91% / 6% / 3% — glm's 3% cost share is under the fold floor, but its
-        // 50.8% token share is the largest measured usage in the period. It stays named; only the
-        // two genuine slivers fold.
+        // Cost shares: 91% / 6% / 3% — glm's spend is third, so it stays named; only the two
+        // genuine slivers fold.
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
         XCTAssertEqual(
             breakdown.models.map(\.model),
@@ -350,7 +348,9 @@ final class SpendTileMapperTests: XCTestCase {
         XCTAssertEqual(other.variants?.map(\.model), ["straggler-a", "straggler-b"])
     }
 
-    func testModelBreakdownKeepsHighTokenZeroCostModelNamed() throws {
+    /// Huge unpriced or zero-cost token volume past the named cap folds into Other instead of
+    /// claiming a row — its tokens stay readable as Other's leading contributor.
+    func testModelBreakdownFoldsHighTokenTailModelsIntoOther() throws {
         let models = [
             ModelUsageEntry(model: "muse-spark-1.3-contributor", totalTokens: 243_900_000, costUSD: 1.14),
             ModelUsageEntry(model: "mimo-v2.5", totalTokens: 13_700_000, costUSD: 0.18),
@@ -367,15 +367,20 @@ final class SpendTileMapperTests: XCTestCase {
         )
 
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
-        let freeModel = try XCTUnwrap(breakdown.models.first { $0.model == "space-bunny-free" })
-        XCTAssertEqual(freeModel.totalTokens, 10_500_000_000)
-        XCTAssertEqual(freeModel.costUSD, 0)
-        let tiny = try XCTUnwrap(breakdown.models.first { $0.model == "tiny-paid-model" })
-        XCTAssertEqual(tiny.totalTokens, 1_000)
-        XCTAssertEqual(tiny.costUSD, 0.01)
-        XCTAssertNil(tiny.variants)
-        XCTAssertNil(breakdown.models.first { $0.model == "Other" },
-                     "the only sliver stays named so its cost is not printed twice")
+        XCTAssertEqual(
+            breakdown.models.map(\.model),
+            ["muse-spark-1.3-contributor", "Other", "mimo-v2.5", "deepseek-v4.1-flash"]
+        )
+        let other = try XCTUnwrap(breakdown.models.first { $0.model == "Other" })
+        XCTAssertEqual(other.totalTokens, 10_500_021_000)
+        XCTAssertEqual(other.costUSD ?? 0, 0.21, accuracy: 0.0001)
+        XCTAssertEqual(
+            other.variants?.map(\.model),
+            ["another-paid-model", "last-paid-model", "tiny-paid-model", "space-bunny-free"]
+        )
+        let freeContributor = try XCTUnwrap(other.variants?.first { $0.model == "space-bunny-free" })
+        XCTAssertEqual(freeContributor.totalTokens, 10_500_000_000)
+        XCTAssertEqual(freeContributor.costUSD, 0)
     }
 
     /// The Codex Today hover showed gpt-6-luna under Other with the same $0.05 and 1.5M tokens.
@@ -445,7 +450,7 @@ final class SpendTileMapperTests: XCTestCase {
             [DailyUsageEntry(date: "2026-06-26", totalTokens: 1_000, costUSD: 6)],
             models: [DailyModelUsageEntry(date: "2026-06-26", models: [
                 ModelUsageEntry(model: "grok-build", totalTokens: 600, costUSD: 6),
-                // 40% of tokens — well above the 5% floor, still folds.
+                // Unattributed always folds, whatever its token share.
                 ModelUsageEntry(model: ModelUsageEntry.unattributedModelName, totalTokens: 400, costUSD: nil)
             ])]
         )
@@ -536,7 +541,9 @@ final class SpendTileMapperTests: XCTestCase {
         XCTAssertTrue(variant.hasIncompleteCost)
     }
 
-    func testCostShareFoldingNormalizesBeforeSummingHugeFiniteModels() throws {
+    /// The folded tail's accumulated cost can exceed a named model's by magnitudes; Other keeps a
+    /// finite partial subtotal and still ranks by those known dollars.
+    func testOtherFoldRetainsHugeFiniteCostsWithoutOverflowingRow() throws {
         let models = (0..<21).map { index in
             ModelUsageEntry(
                 model: index == 0 ? "dominant" : "minor-\(index)",
@@ -556,8 +563,36 @@ final class SpendTileMapperTests: XCTestCase {
         )
 
         let breakdown = try XCTUnwrap(modelBreakdown(lines, "Today"))
-        XCTAssertEqual(breakdown.models.map(\.model), ["dominant", "Other"])
-        XCTAssertEqual(breakdown.models.first?.costUSD, 1e308)
+        XCTAssertEqual(breakdown.models.map(\.model), ["Other", "dominant", "minor-1", "minor-2"])
+        let other = try XCTUnwrap(breakdown.models.first)
+        XCTAssertTrue(other.costUSD ?? 0 > 1e308, "the folded tail outspends the named leader")
+        XCTAssertTrue(other.hasIncompleteCost, "the clipped accumulation is marked partial")
+        XCTAssertEqual(breakdown.models.last?.costUSD, 1e307)
+    }
+
+    func testBreakdownKeepsTokensFromDaysWithoutModelDetailAndSubCentPrices() throws {
+        let lines = mappedLines(
+            [
+                DailyUsageEntry(date: "2026-06-26", totalTokens: 10, costUSD: 0.001),
+                DailyUsageEntry(date: "2026-06-25", totalTokens: 90, costUSD: nil)
+            ],
+            models: [DailyModelUsageEntry(date: "2026-06-26", models: [
+                ModelUsageEntry(model: "priced", totalTokens: 10, costUSD: 0.001)
+            ])]
+        )
+        let breakdown = try XCTUnwrap(modelBreakdown(lines, "Last 30 Days"))
+        XCTAssertEqual(breakdown.models.map(\.model), ["priced", "Other"])
+        XCTAssertEqual(breakdown.models.map(\.totalTokens), [10, 90])
+        XCTAssertEqual(breakdown.models.first?.costUSD, 0.001)
+        XCTAssertNil(breakdown.models.last?.costUSD)
+    }
+
+    func testOtherExpansionKeepsUnreconciledLegacySubtotal() {
+        let other = ModelUsageEntry(model: "Other", totalTokens: 300, costUSD: 12, variants: [
+            .init(model: "priced", totalTokens: 100, costUSD: 12),
+            .init(model: "unpriced", totalTokens: 100, costUSD: nil)
+        ])
+        XCTAssertEqual(other.presentedRows(), [other])
     }
 
     // MARK: - Helpers

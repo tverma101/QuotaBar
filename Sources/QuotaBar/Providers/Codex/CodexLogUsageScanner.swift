@@ -433,7 +433,7 @@ actor CodexLogUsageScanner {
         }
     }
 
-    private static func aggregateScopeKey(homes: [URL], peerHomes: [URL]) -> String {
+    private static func aggregateScopeKey(homes: [URL], peerHomes: [URL], sharedAttribution: SharedAttribution?) -> String {
         let homesKey = homes
             .map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
             .sorted()
@@ -442,7 +442,11 @@ actor CodexLogUsageScanner {
             .map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
             .sorted()
             .joined(separator: ",")
-        return "homes=\(homesKey)|peers=\(peersKey)"
+        // Attribution changes which files enter the fold, and timezone changes how events bucket
+        // into days — both belong to the aggregate's identity, not just its source fingerprints.
+        let attributionKey = sharedAttribution
+            .map { "\($0.home)|\($0.identity)|\($0.keepsUnattributed)" } ?? "-"
+        return "homes=\(homesKey)|peers=\(peersKey)|shared=\(attributionKey)|tz=\(TimeZone.current.identifier)"
     }
 
     /// Completeness-aware scan used by providers that merge Codex logs with other sources.
@@ -480,7 +484,8 @@ actor CodexLogUsageScanner {
             ]
             let scopeKey = Self.aggregateScopeKey(
                 homes: homes,
-                peerHomes: peerHomesOverride ?? peerHomes
+                peerHomes: peerHomesOverride ?? peerHomes,
+                sharedAttribution: sharedAttribution
             )
             let cacheKey = "codex-native|\(scopeKey)"
             // A future-timestamp deferral is not cacheable and not a failure; remember it so the
@@ -503,7 +508,7 @@ actor CodexLogUsageScanner {
                     return .complete(scan, validUntil: nil, damagedLines: damagedLines)
                 case .deferredByFutureTimestamp:
                     deferred.withLock { $0 = true }
-                    return .incomplete
+                    return .deferredByFutureTimestamp
                 case .incomplete:
                     return .incomplete
                 }
@@ -511,6 +516,8 @@ actor CodexLogUsageScanner {
             switch outcome {
             case .complete(let scan, let damagedLines):
                 return .complete(scan, damagedLines: damagedLines)
+            case .deferredByFutureTimestamp:
+                return .deferredByFutureTimestamp
             case .incomplete:
                 return deferred.withLock { $0 } ? .deferredByFutureTimestamp : .incomplete
             }
@@ -677,7 +684,7 @@ actor CodexLogUsageScanner {
                     emitSince: context.cacheSince,
                     retentionDays: context.retentionDays
                 )
-                if let events = outcome.events {
+                if outcome.events != nil {
                     damage.note(url.path, outcome.damagedLines)
                 }
                 return outcome.events
@@ -1022,7 +1029,8 @@ actor CodexLogUsageScanner {
         guard let discovered = Self.sessionFilesIfComplete(
             homes: homes,
             peerHomes: peerHomes,
-            homeDirectory: homeDirectory
+            homeDirectory: homeDirectory,
+            gatewayAppendWitnessesSince: context.cacheSince
         ) else { return false }
         let files = rolloutNameDeduper?.retainingFirstOccurrence(of: discovered) ?? discovered
         let futureIdentity = "codex.gateway.\(context.identity)"
@@ -1061,7 +1069,8 @@ actor CodexLogUsageScanner {
                 visit(event)
             },
             fileStarted: { bucket.begin($0) },
-            fileCompleted: { path, _ in bucket.finish(path) }
+            fileCompleted: { path, _ in bucket.finish(path) },
+            toleratesGatewayAppends: true
         )
         guard complete else { return false }
         // Index once instead of scanning the whole file list per future-timestamp entry.
@@ -1212,7 +1221,8 @@ actor CodexLogUsageScanner {
         peerHomes: [URL] = [],
         homeDirectory: @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
         peerInodeDiscovery: (@Sendable (URL) -> Set<FileIdentity>?)? = nil,
-        sharedAttribution: SharedAttribution? = nil
+        sharedAttribution: SharedAttribution? = nil,
+        gatewayAppendWitnessesSince: Date? = nil
     ) -> [JSONLScanning.DiscoveredFile]? {
         guard !Task.isCancelled else { return nil }
         let defaultCodexPath = homeDirectory()
@@ -1288,7 +1298,11 @@ actor CodexLogUsageScanner {
             }
             for dir in sourceDirs.map({ $0.resolvingSymlinksInPath() }) where seenDirs.insert(dir.path).inserted {
                 guard !Task.isCancelled,
-                      let discovered = JSONLScanning.jsonlFilesIfComplete(under: dir, includeCompressedJSONL: true)
+                      let discovered = JSONLScanning.jsonlFilesIfComplete(
+                        under: dir,
+                        includeCompressedJSONL: true,
+                        gatewayAppendWitnessesSince: gatewayAppendWitnessesSince
+                      )
                 else { return nil }
                 for file in discovered {
                     guard !Task.isCancelled else { return nil }
@@ -1831,7 +1845,7 @@ actor CodexLogUsageScanner {
         key: String,
         checkpoint: ParserCheckpoint,
         events: [Event]
-    ) -> [Event] {
+    ) -> (events: [Event], damagedLines: Int) {
         let offset = UInt64(read.statistics.bytesRead)
 
         if let before,
@@ -1860,7 +1874,7 @@ actor CodexLogUsageScanner {
         } else {
             sharedTailCache.remove(key)
         }
-        return events
+        return (events, checkpoint.damagedLines)
     }
 
     /// Rust checkpoint → Swift tail-cache checkpoint. Nil on any unreadable string.
@@ -2499,19 +2513,15 @@ actor CodexLogUsageScanner {
             effectiveRates.cacheReadAbove200kPerMillion = longContext.cacheRead
             effectiveRates.longContextThresholdTokens = 272_000
         }
-        if codexModelHasNoCacheDiscount(model) {
-            effectiveRates.cacheReadPerMillion = effectiveRates.inputPerMillion
-            effectiveRates.cacheReadAbove200kPerMillion = effectiveRates.inputAbove200kPerMillion
-        } else if !rates.cacheReadIsExplicit {
-            effectiveRates.cacheReadPerMillion = effectiveRates.inputPerMillion
-            effectiveRates.cacheReadAbove200kPerMillion = effectiveRates.inputAbove200kPerMillion
-        }
         effectiveRates.fastMultiplier = fastMultiplier
 
-        let nonCached = max(0, event.input - event.cached)
+        // No-discount models bill the whole prompt as input regardless of lane; every other model
+        // uses its explicit selected or hardcoded long-context cache-read rate.
+        let cached = codexModelHasNoCacheDiscount(model) ? 0 : event.cached
+        let nonCached = max(0, event.input - cached)
         return effectiveRates.costDollars(for: TokenBreakdown(
             input: nonCached,
-            cacheRead: event.cached,
+            cacheRead: cached,
             output: event.output,
             isFast: fastTier
         ))

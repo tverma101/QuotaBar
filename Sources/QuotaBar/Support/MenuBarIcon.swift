@@ -13,7 +13,7 @@ enum MenuBarIcon {
     static let image: NSImage? = render()
 
     private static func render() -> NSImage? {
-        guard let mark = ProviderMarks.mark(for: "openusage") else { return nil }
+        guard let mark = ProviderMarks.mark(for: "quotabar") else { return nil }
         let renderer = ImageRenderer(
             // Smaller inset than the provider default so the brand gauge keeps its prior menu-bar size
             // (its art already carries ~8% margin inside the source viewBox).

@@ -33,6 +33,10 @@ dollar figures are estimates. Devin-native `swe-*` models have no public rate, s
 real token counts without a dollar figure. These totals sit under the Devin caret and are not
 pinned by default.
 
+Devin's quota API returns meters and balances, not per-call dollar amounts, so Devin costs appear
+only in **API Estimates**. The local log slug `gemini-4-neon-xhigh` maps to the exact public route
+`google/gemini-4-neon` for that estimate; this is not a Devin-reported charge.
+
 ## Where credentials come from
 
 Checked in this order — whichever works first wins:

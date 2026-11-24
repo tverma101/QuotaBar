@@ -479,6 +479,34 @@ final class TotalSpendAggregatorTests: XCTestCase {
         )
     }
 
+    func testDormantStructuralGapCannotBeExplainedByUnknownModelOrActiveSession() throws {
+        let now = TestLocalInstant.date(2026, 10, 27, 12)
+        var history = history(days: [("2026-10-27", 100, 12), ("2026-10-26", 200, 8)])
+        history.series.daily[0].costIsComplete = false
+        history.series.daily[0].hasUnexplainedIncompleteCost = true
+        history.unknownModelsByDay = ["2026-10-27": ["unknown-model"]]
+        history.partialDays = ["2026-10-27"]
+
+        for (period, tokens) in [(TotalSpendPeriod.today, 100.0), (.last30, 300.0)] {
+            let slice = try XCTUnwrap(TotalSpendAggregator.slice(for: claude, period: period, history: history, now: now))
+            XCTAssertFalse(slice.hasDollarAmount)
+            XCTAssertTrue(slice.hasIncompleteCost)
+            XCTAssertEqual(slice.tokenCount, tokens)
+        }
+        let yesterday = try XCTUnwrap(TotalSpendAggregator.slice(for: claude, period: .yesterday, history: history, now: now))
+        XCTAssertEqual(yesterday.amountUSD, 8)
+        XCTAssertTrue(yesterday.hasDollarAmount)
+    }
+
+    func testDormantPeriodPreservesTokenSaturationAcrossDays() throws {
+        let now = TestLocalInstant.date(2026, 10, 27, 12)
+        let history = history(days: [("2026-10-27", Int.max - 1, 12), ("2026-10-26", 10, 8)])
+        let slice = try XCTUnwrap(TotalSpendAggregator.slice(for: claude, period: .last30, history: history, now: now))
+        XCTAssertTrue(slice.tokenCountSaturated)
+        XCTAssertEqual(slice.tokenCount, Double(Int.max))
+        XCTAssertEqual(slice.amountUSD, 20)
+    }
+
     private func history(days: [(String, Int, Double?)]) -> ProviderUsageHistory {
         ProviderUsageHistory(series: DailyUsageSeries(daily: days.map { date, tokens, cost in
             DailyUsageEntry(date: date, totalTokens: tokens, costUSD: cost, costIsComplete: cost != nil)

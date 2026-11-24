@@ -58,7 +58,7 @@ final class ModelUsageHoverTests: XCTestCase {
         }
     }
 
-    func testStoreCarriesRevealOnTapFlagIntoWidgetData() {
+    func testStoreResolvesBreakdownForEverySpendPeriod() {
         let provider = Provider(id: "codex", displayName: "Codex", icon: .providerMark("codex"))
         let tiles = WidgetDescriptor.spendTiles(provider: provider)
         let last30 = tiles.first { $0.id == "codex.last30" }!
@@ -66,7 +66,7 @@ final class ModelUsageHoverTests: XCTestCase {
         let store = WidgetDataStore(
             registry: WidgetRegistry(providers: [provider], descriptors: tiles),
             providers: [],
-            defaults: makeDefaults("reveal-on-tap")
+            defaults: makeDefaults("breakdown-periods")
         )
         store.snapshots[provider.id] = ProviderSnapshot(
             providerID: provider.id,
@@ -88,9 +88,8 @@ final class ModelUsageHoverTests: XCTestCase {
             )]
         )
 
-        XCTAssertTrue(store.data(for: last30).revealsBreakdownOnTap)
-        XCTAssertFalse(store.data(for: today).revealsBreakdownOnTap)
         XCTAssertTrue(store.data(for: last30).hasModelBreakdown)
+        XCTAssertTrue(store.data(for: today).hasModelBreakdown)
     }
 
     func testWholePercentsAlwaysSumToOneHundred() {
@@ -122,13 +121,35 @@ final class ModelUsageHoverTests: XCTestCase {
         XCTAssertEqual(ModelUsageDetail.shares(for: models), [0.75, 0.25])
     }
 
-    func testSharesUseTokensForEveryModelWhenOneIsUnpriced() {
+    func testFreebuffScreenshotSharesUseKnownSpendEvenWithOlderUnpricedUsage() {
         let models = [
-            ModelUsageEntry(model: "alpha", totalTokens: 25, costUSD: 9),
-            ModelUsageEntry(model: "beta", totalTokens: 75, costUSD: nil)
+            ModelUsageEntry(model: "DeepSeek V4.1 Flash", totalTokens: 22_000_000_000, costUSD: 168.45),
+            ModelUsageEntry(model: "Older Freebuff Usage", totalTokens: 2_100_000_000, costUSD: nil),
+            ModelUsageEntry(model: "Other", totalTokens: 136_300_000, costUSD: 7.76, costIsComplete: false)
         ]
 
+        let shares = ModelUsageDetail.shares(for: models)
+        XCTAssertEqual(ModelUsageDetail.wholePercents(shares), [96, 0, 4])
+        XCTAssertEqual(models.sorted(by: ModelUsageEntry.ranksBefore).map(\.model),
+                       ["DeepSeek V4.1 Flash", "Other", "Older Freebuff Usage"])
+        XCTAssertEqual(models.reduce(0) { $0 + $1.totalTokens }, 24_236_300_000)
+    }
+
+    func testWithoutPositiveSpendSharesUseMeasuredTokens() {
+        let models = [
+            ModelUsageEntry(model: "free", totalTokens: 25, costUSD: 0),
+            ModelUsageEntry(model: "unpriced", totalTokens: 75, costUSD: nil)
+        ]
         XCTAssertEqual(ModelUsageDetail.shares(for: models), [0.25, 0.75])
+    }
+
+    func testSpendSharesStillWorkWhenTokenTotalSaturates() {
+        let models = [
+            ModelUsageEntry(model: "alpha", totalTokens: .max, costUSD: 1e308, tokenCountSaturated: true),
+            ModelUsageEntry(model: "beta", totalTokens: 1, costUSD: 1e308)
+        ]
+        XCTAssertTrue(ModelUsageDetail.sharesAreReliable(for: models, aggregateTokenCountSaturated: true))
+        XCTAssertEqual(ModelUsageDetail.shares(for: models, aggregateTokenCountSaturated: true), [0.5, 0.5])
     }
 
     func testSharesAreZeroWhenThereIsNoCostOrTokenTotal() {
@@ -183,10 +204,9 @@ final class ModelUsageHoverTests: XCTestCase {
         let other = ModelUsageEntry(model: "Other", totalTokens: 772, costUSD: 7, variants: variants,
                                     costIsComplete: false)
         let contributors = ModelUsageDetail.otherContributors(for: other)
-        XCTAssertEqual(contributors.map(\.model), names)
-        XCTAssertEqual(contributors.map(\.totalTokens), variants.map(\.totalTokens))
-        XCTAssertNil(contributors[1].costUSD)
-        XCTAssertTrue(contributors[1].hasIncompleteCost)
+        XCTAssertEqual(contributors, variants.filter { $0.costUSD != nil } + [variants[1]])
+        XCTAssertNil(contributors.last?.costUSD)
+        XCTAssertTrue(contributors.last?.hasIncompleteCost == true)
     }
 
     func testOtherContributorDetailsRenderInABoundedNativePopover() throws {
@@ -251,42 +271,68 @@ final class ModelUsageHoverTests: XCTestCase {
         let state = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
         XCTAssertFalse(state.isPresented)
 
-        state.toggleForTap()
+        state.presentForTap()
         XCTAssertTrue(state.isPresented, "a tap presents on the spot — a deliberate tap must not outwait the 400 ms dwell")
         XCTAssertTrue(state.overInline, "tap-present lights the value highlight like a hover-present does")
     }
 
-    func testHoverPopoverStateTapClosesWhenAlreadyPresented() {
+    func testHoverPopoverStateSecondTapKeepsItPresented() {
         let state = HoverPopoverState(revealDelay: .milliseconds(1), hideGrace: .milliseconds(1))
-        state.toggleForTap()
+        state.presentForTap()
         XCTAssertTrue(state.isPresented)
 
-        state.toggleForTap()
-        XCTAssertFalse(state.isPresented, "a second tap closes it — unlike hover-out, with no grace period")
-        XCTAssertFalse(state.overInline, "dismissal clears the value highlight")
+        state.presentForTap()
+        XCTAssertTrue(state.isPresented, "a tap only opens — the popover must not vanish under the tap meant to keep it")
+        XCTAssertTrue(state.overInline, "the value highlight stays lit while the popover is up")
     }
 
     func testHoverPopoverStateTapBeatsPendingHoverDwell() {
         let state = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
         // The cursor is already hovering, so a reveal is scheduled; the user taps out of impatience.
         state.inlineHover(true)
-        state.toggleForTap()
+        state.presentForTap()
 
         XCTAssertTrue(state.isPresented, "tapping during the dwell opens now instead of dismissing")
     }
 
+    func testHoverPopoverStatePresentingSupersedesOtherPopovers() {
+        let first = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        let second = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        first.presentForTap()
+        XCTAssertTrue(first.isPresented)
+
+        second.presentForTap()
+        XCTAssertTrue(second.isPresented)
+        XCTAssertFalse(first.isPresented, "one hover surface at a time — the new popover supersedes the open one")
+    }
+
+    func testHoverPopoverStatePinnedPopoverSurvivesSupersede() {
+        let pinned = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        let other = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        pinned.presentForTap()
+        pinned.setPinned(true)
+        other.presentForTap()
+        XCTAssertTrue(other.isPresented)
+        XCTAssertTrue(pinned.isPresented, "a pinned confirm/claim popover is not torn down by another row")
+
+        pinned.setPinned(false)
+        let third = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
+        third.presentForTap()
+        XCTAssertFalse(pinned.isPresented, "once unpinned the popover supersedes normally again")
+    }
+
     func testHoverPopoverStateTapRightAfterDismissalDoesNotReopen() async {
         let state = HoverPopoverState(revealDelay: .seconds(60), hideGrace: .milliseconds(1))
-        state.toggleForTap()
-        // The transient popover's outside-click close ran first; this tap is that same click
-        // passing through to the anchor view, not a fresh open request.
+        state.presentForTap()
+        // A programmatic close (data refresh, panel teardown) can precede a tap by moments; the
+        // tap is that close's tail, not a fresh open request.
         state.dismiss()
 
-        state.toggleForTap()
-        XCTAssertFalse(state.isPresented, "the pass-through click of a tap-close must not re-open the popover")
+        state.presentForTap()
+        XCTAssertFalse(state.isPresented, "the pass-through click of a close must not re-open the popover")
 
         try? await Task.sleep(for: .milliseconds(300))
-        state.toggleForTap()
+        state.presentForTap()
         XCTAssertTrue(state.isPresented, "the just-dismissed guard is a momentary race window, not a lockout")
     }
 

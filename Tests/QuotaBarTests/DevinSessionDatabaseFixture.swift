@@ -8,7 +8,7 @@ import SQLite3
 /// prefix checks run against the same plan they get in production.
 enum DevinSessionDatabaseFixture {
     struct Row {
-        var sessionID: String
+        var sessionID: String = "fixture-session"
         var createdAt: Int64
         var message: [String: Any]
 

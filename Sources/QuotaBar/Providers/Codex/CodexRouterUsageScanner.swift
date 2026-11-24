@@ -91,7 +91,7 @@ actor CodexRouterUsageScanner {
 
     private enum AggregateCacheLookup {
         case miss
-        case hit(LogUsageScan?)
+        case hit(LogUsageScan?, damagedLines: Int, nextFutureEventAt: Date?)
     }
 
     private struct ScanPreflight {
@@ -349,11 +349,7 @@ actor CodexRouterUsageScanner {
                     )
                     switch full.result {
                     case .complete(let scan, let damagedLines):
-                        return .complete(
-                            scan,
-                            validUntil: full.nextFutureEventAt,
-                            damagedLines: damagedLines
-                        )
+                        return .complete(scan, validUntil: full.nextFutureEventAt, damagedLines: damagedLines)
                     case .incomplete:
                         return .incomplete
                     }
@@ -361,7 +357,7 @@ actor CodexRouterUsageScanner {
                 switch outcome {
                 case .complete(let scan, let damagedLines):
                     return .complete(scan, damagedLines: damagedLines)
-                case .incomplete:
+                case .deferredByFutureTimestamp, .incomplete:
                     return .incomplete
                 }
             }
@@ -381,7 +377,9 @@ actor CodexRouterUsageScanner {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty?
             .lowercased() ?? "-"
-        return "\(identity)|allows-unscoped=\(allowsUnscopedEvents)"
+        // Timezone is part of the identity: day buckets are calendar-bound, so traveling must
+        // not serve an aggregate folded under a different zone.
+        return "\(identity)|allows-unscoped=\(allowsUnscopedEvents)|tz=\(TimeZone.current.identifier)"
     }
 
     /// The un-gated scan body: the incremental tail/parse machinery plus per-account folding.
@@ -402,8 +400,10 @@ actor CodexRouterUsageScanner {
     ) async -> RouterFoldOutcome {
         let days = max(1, daysBack)
         let calendar = Calendar.current
-        let today = calendar.startOfDay(for: now)
-        let since = calendar.date(byAdding: .day, value: -(days - 1), to: today) ?? today
+        // `daysBack` counts days strictly before today (UsageHistoryWindow.previousDays), so the
+        // window starts `days` calendar days back — matching JSONLScanning.sinceDate and the
+        // persisted-aggregate window filter. An off-by-one here silently shrinks the fold by a day.
+        let since = JSONLScanning.sinceDate(daysBack: days, now: now)
         if readFile == nil, !usesInjectedScanner {
             // One unpaced pass seeds the on-disk aggregate inside the 120s provider deadline.
             // Later taps hit that aggregate and do not read the ledger. Leaving the 7.5% pacer on
@@ -469,7 +469,8 @@ actor CodexRouterUsageScanner {
                 if aggregateCache.sources == sourceRevisions,
                    !futureEventBecameEligible,
                    !clockMovedBeforeIncludedEvent {
-                    cacheLookup = .hit(aggregateCache.result)
+                    cacheLookup = .hit(aggregateCache.result, damagedLines: aggregateCache.damagedLines,
+                                       nextFutureEventAt: aggregateCache.nextFutureEventAt)
                 } else if !futureEventBecameEligible, !clockMovedBeforeIncludedEvent,
                           let skipCounts = Self.appendOnlySkipCounts(
                             previous: aggregateCache,
@@ -496,7 +497,7 @@ actor CodexRouterUsageScanner {
             )
         }
         guard preflight.discoveryComplete else { return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil) }
-        if case .hit(let cachedResult) = preflight.cacheLookup {
+        if case let .hit(cachedResult, damagedLines, nextFutureEventAt) = preflight.cacheLookup {
             // A cache hit skips the event fold, but it still re-discovers the ledgers, stats every
             // source and samples each append anchor. That metadata work must share the same CPU
             // allowance as the preflight that produced the hit: unpaced, it made a repeated
@@ -508,10 +509,7 @@ actor CodexRouterUsageScanner {
             guard !Task.isCancelled, sourceStayedStable else {
                 return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil)
             }
-            return RouterFoldOutcome(
-                result: .complete(cachedResult, damagedLines: aggregateCache?.damagedLines ?? 0),
-                nextFutureEventAt: nil
-            )
+            return RouterFoldOutcome(result: .complete(cachedResult, damagedLines: damagedLines), nextFutureEventAt: nextFutureEventAt)
         }
         let sourceFiles = preflight.sourceFiles
         let sourceRevisions = preflight.sourceRevisions
@@ -773,6 +771,7 @@ actor CodexRouterUsageScanner {
         }
 
         let totalDamagedLines = (incrementalBase?.damagedLines ?? 0) + fold.damagedLines
+        let nextFutureEventAt = [incrementalBase?.nextFutureEventAt, fold.nextFutureEventAt].compactMap { $0 }.min()
         let result = JSONLAccountingWorkPacer.shared.perform { () -> LogUsageScan? in
             let deltaResult: LogUsageScan?
             if fold.sawRows {
@@ -789,9 +788,6 @@ actor CodexRouterUsageScanner {
         if let aggregateKey, let sourceRevisions {
             let sourceStayedStable = JSONLAccountingWorkPacer.shared.perform { () -> Bool in
                 guard sourcesAndAliasesStillMatch(preflight) else { return false }
-                let nextFutureEventAt = [incrementalBase?.nextFutureEventAt, fold.nextFutureEventAt]
-                    .compactMap { $0 }
-                    .min()
                 let latestIncludedEventAt = [incrementalBase?.latestIncludedEventAt, fold.latestIncludedEventAt]
                     .compactMap { $0 }
                     .max()
@@ -810,10 +806,8 @@ actor CodexRouterUsageScanner {
                 return RouterFoldOutcome(result: .incomplete, nextFutureEventAt: nil)
             }
         }
-        return RouterFoldOutcome(
-            result: .complete(result, damagedLines: totalDamagedLines),
-            nextFutureEventAt: fold.nextFutureEventAt
-        )
+        return RouterFoldOutcome(result: .complete(result, damagedLines: totalDamagedLines),
+                                 nextFutureEventAt: nextFutureEventAt)
     }
 
     /// Escaping fold visits cannot capture `inout` accumulators; this tiny box owns them.
@@ -1859,11 +1853,12 @@ actor CodexRouterUsageScanner {
         )
         let prior: CodexRouterAggregateIndex.Record?
         switch lookup {
-        case let .hit(cached, damagedLines):
+        case let .hit(cached, damagedLines, nextFutureEventAt):
             guard !Task.isCancelled,
                   identityAliasesStillMatch(aliasSnapshot, hasLedgerSources: !discovery.files.isEmpty)
             else { return incomplete("cached-identity-changed") }
-            return RouterFoldOutcome(result: .complete(cached, damagedLines: damagedLines), nextFutureEventAt: nil)
+            return RouterFoldOutcome(result: .complete(cached, damagedLines: damagedLines),
+                                     nextFutureEventAt: nextFutureEventAt)
         case .append(let record):
             prior = record
         case .rebuild:

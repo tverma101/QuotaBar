@@ -9,6 +9,7 @@ actor FreebuffDesktopUsageScanner {
     struct Scan: Sendable {
         var usage: LogUsageScan
         var partialDays: Set<String>
+        var unexplainedPartialDays: Set<String>
     }
 
     struct Revision: Codable, Equatable {
@@ -69,6 +70,9 @@ actor FreebuffDesktopUsageScanner {
         /// Whether the model came from the receipt rather than the thread's saved selection.
         var fromReceipt: Bool
         var partial: Bool
+        /// True when a hosted run's terminal state (failed/cancelled) or an imported hosted row
+        /// explains the missing receipt; nil for rows that predate run-status provenance.
+        var hasExplainedHostedGap: Bool?
     }
 
     /// The counts of one receipt. `invalid` keeps "the field was there but was not a number" apart
@@ -287,8 +291,14 @@ actor FreebuffDesktopUsageScanner {
         }
         var accumulator = DailyUsageAccumulator()
         var partialDays: Set<String> = []
+        var unexplainedPartialDays: Set<String> = []
         var seen: Set<String> = []
         var nextFutureTimestamp: Date?
+        func recordCoverage(of turn: DerivedTurn, on day: String) {
+            guard turn.partial else { return }
+            partialDays.insert(day)
+            if turn.hasExplainedHostedGap != true { unexplainedPartialDays.insert(day) }
+        }
         for databaseTurns in turnsByDatabase {
             for turn in databaseTurns {
                 try Task.checkCancellation()
@@ -299,10 +309,8 @@ actor FreebuffDesktopUsageScanner {
                     continue
                 }
                 let day = DailyUsageAccumulator.dayKey(from: date, calendar: calendar)
-                guard let usage = turn.usage else {
-                    if turn.partial { partialDays.insert(day) }
-                    continue
-                }
+                recordCoverage(of: turn, on: day)
+                guard let usage = turn.usage else { continue }
                 // A hosted placeholder must not hide a measured older Desktop copy.
                 seen.insert(turn.id)
                 guard case .counts(let inputCount, let outputCount, let cachedCount,
@@ -322,7 +330,7 @@ actor FreebuffDesktopUsageScanner {
                 let reasoning = try Self.optional(reasoningCount)
                 guard cached <= input, reasoning <= output else { throw FreebuffUsageError.localHistoryUnreadable }
                 let saved = turn.savedModel
-                let identity = saved.map { modelIdentity.resolve($0, pricing: pricing) }
+                let identity = saved.map { modelIdentity.resolve($0, pricing: pricing, fromReceipt: turn.fromReceipt) }
                 let route = identity?.route
                 let displayName = identity?.displayName
                 let legacyWithoutIdentity = displayName == nil && !turn.fromReceipt
@@ -333,21 +341,25 @@ actor FreebuffDesktopUsageScanner {
                     ?? ModelUsageEntry.unattributedModelName
                 // A turn aggregates multiple requests, so do not apply single-request context tiers.
                 // Cached input is already in input; reasoning is already in output.
-                let cost = route.flatMap { pricing.resolve(model: $0) }?.costDollars(
+                let rates = route.flatMap {
+                    FreebuffFlashComparison.rates(for: $0, at: date)
+                        ?? pricing.openRouter.entries[$0] ?? pricing.supplement.pricing[$0]
+                }
+                let cost = rates?.costDollars(
                     for: TokenBreakdown(input: input - cached, cacheRead: cached, output: output),
                     at: date,
                     applyLongContextRates: false
                 )
                 accumulator.add(day: day, tokens: total, cost: cost, model: model,
                                 canonical: identity?.group, costIsComplete: cost != nil)
-                if let cost {
+                accumulator.recordApiEstimate(day: day, cost: cost, tokens: total)
+                if cost != nil {
                     accumulator.markEstimatedCost(day: day)
-                    accumulator.addApiEstimate(day: day, cost: cost)
                 } else if legacyWithoutIdentity {
                     // A retired/missing label on older local records is an explained history gap,
                     // not an actionable pricing failure. Preserve tokens and the lower-bound cost.
                     accumulator.addNamedUnpricedModel(day: day, model: model)
-                } else if displayName == nil {
+                } else if displayName == nil || identity?.hasUnknownRoute == true {
                     // A raw receipt slug nothing names and unattributed streams stay unknown: the app
                     // genuinely cannot tell what served them, so the warning stays honest.
                     accumulator.addUnknownModel(day: day, model: model)
@@ -356,7 +368,6 @@ actor FreebuffDesktopUsageScanner {
                     // not an unknown model. Tokens count; no warning triangle.
                     accumulator.addNamedUnpricedModel(day: day, model: model)
                 }
-                if turn.partial { partialDays.insert(day) }
             }
         }
         if unreadableRows > 0 {
@@ -375,7 +386,8 @@ actor FreebuffDesktopUsageScanner {
                 }
             }
         }
-        let result = Scan(usage: accumulator.build(), partialDays: partialDays)
+        let result = Scan(usage: accumulator.build(), partialDays: partialDays,
+                          unexplainedPartialDays: unexplainedPartialDays)
         if snapshotStable, Self.fitsCachedScanBudget(result) {
             cachedScan = CachedScan(
                 databases: databaseSnapshots,
@@ -703,13 +715,16 @@ actor FreebuffDesktopUsageScanner {
         let usage = metrics["usage"] as? [String: Any]
         let recordedModel = (usage?["model"] as? String)?.nilIfEmpty
         let savedModel = recordedModel ?? text(row["selectedModel"]).nilIfEmpty
+        let runStatus = text(row["runStatus"])
         var derived = DerivedTurn(
             id: id,
             timestampMs: stamp,
             usage: nil,
             savedModel: savedModel,
             fromReceipt: recordedModel != nil,
-            partial: usage == nil || metrics["usageIncomplete"] as? Bool == true
+            partial: usage == nil || metrics["usageIncomplete"] as? Bool == true,
+            hasExplainedHostedGap: runStatus.isEmpty
+                ? nil : (runStatus == "failed" || runStatus == "cancelled" || id.hasPrefix("cloud:import-"))
         )
         if let usage {
             derived.usage = .counts(

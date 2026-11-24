@@ -203,7 +203,7 @@ struct SettingsScreen: View {
                         container.codexAutoReset.restart()
                     }
             }
-            Text("When enabled, use an available Codex reset 1 minute before expiry, on each connected account. Requires QuotaBar to be running and the Mac awake.")
+            Text("When enabled, use an available Codex reset 5 minutes before expiry, on each connected account. Requires QuotaBar to be running and the Mac awake.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
@@ -467,7 +467,7 @@ struct SettingsScreen: View {
         }
     }
 
-    /// A full-width glass button row, matching the "Check for Updates…" idiom.
+    /// A full-width glass button row, matching the wide settings-action idiom.
     /// Glass on macOS 26+, bordered fallback on macOS 15.
     private func logButton(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {

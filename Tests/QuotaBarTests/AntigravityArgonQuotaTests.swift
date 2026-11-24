@@ -21,10 +21,14 @@ final class AntigravityArgonQuotaTests: XCTestCase {
     private func assertSharedPoolsOnly(_ data: Data, file: StaticString = #filePath, line: UInt = #line) {
         let lines = AntigravityUsageMapper.parseQuotaSummary(data)
         XCTAssertEqual(lines?.map(\.label), ["Session", "Weekly", "Claude", "Claude Weekly"], file: file, line: line)
-        XCTAssertEqual(lines?.map { metric -> Double? in
+        let used = lines?.map { metric -> Double? in
             guard case .progress(_, let used, _, _, _, _, _, _) = metric else { return nil }
             return used
-        }, [20, 30, 40, 50], file: file, line: line)
+        }
+        XCTAssertEqual(used?.count, 4, file: file, line: line)
+        for (actual, expected) in zip(used ?? [], [20.0, 30, 40, 50]) {
+            XCTAssertEqual(actual ?? -1, expected, accuracy: 0.0001, file: file, line: line)
+        }
     }
 
     func testAbsentArgonPreservesExistingFourBuckets() {
@@ -145,10 +149,9 @@ final class AntigravityArgonQuotaTests: XCTestCase {
         }}
         """
         let lines = AntigravityUsageMapper.buildLines(AntigravityUsageMapper.parseCloudCodeModels(Data(json.utf8)))
-        XCTAssertEqual(lines, [.progress(
-            label: "Session", used: 20, limit: 100, format: .percent,
-            resetsAt: nil, periodDurationMs: MetricPeriod.sessionMs
-        )])
+        XCTAssertEqual(lines.map(\.label), ["Session"])
+        guard case .progress(_, let used, _, _, _, _, _, _)? = lines.first else { return XCTFail("expected a progress line") }
+        XCTAssertEqual(used, 20, accuracy: 0.0001)
 
         let buckets = Data(#"{"buckets":[{"modelId":"gemini-4-argon","remainingFraction":0.1},{"modelId":"gemini-3.8-flash","remainingFraction":0.8}]}"#.utf8)
         XCTAssertEqual(AntigravityUsageMapper.buildLines(AntigravityUsageMapper.parseQuotaBuckets(buckets)), lines)

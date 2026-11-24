@@ -24,7 +24,7 @@ enum CodexAutoResetStatus: Equatable {
         case .unverified: "This account's identity could not be verified. Sign in and reload accounts."
         case .checking: "Checking this account's available credits."
         case .monitoring: "Monitoring this account. No reset is currently scheduled."
-        case .scheduled: "Next attempt, one minute before expiry:"
+        case .scheduled: "Next attempt, five minutes before expiry:"
         case .due: "An expiring reset is due for an automatic attempt."
         case .attention(let message): message
         case .windowPassed:

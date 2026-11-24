@@ -106,7 +106,7 @@ final class AntigravityT3CredentialTests: XCTestCase {
         try FileManager.default.createDirectory(at: configConversations, withIntermediateDirectories: true)
         let profile = try makeProfile(home: home, key: "aaa")
 
-        let discovery = try AntigravityDbUsageScanner.defaultConversationDiscovery(home: home)
+        let discovery = try AntigravityDbUsageScanner.discoverAllConversationDirectories(home: home)
         XCTAssertTrue(discovery.failures.isEmpty)
         XCTAssertEqual(discovery.directories, [
             geminiConversations.path,

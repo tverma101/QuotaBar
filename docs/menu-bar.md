@@ -8,22 +8,28 @@ Right-click (or control-click) the QuotaBar menu bar icon for a quick menu with 
 
 ## Usage History
 
-Hovering a spend value shows its model breakdown. Tapping the value toggles the same breakdown
+Hovering a spend value shows its model breakdown. Tapping the value opens the same breakdown
 without the hover wait, and the value's touch area reaches a little past the text so the tap lands
-easily. Several small models stay together as **Other**,
+easily. The top three models keep their own rows and the rest stay together as **Other**,
 which lists each one's name, measured tokens, and cost or **Unpriced** once. A single small model,
 or the one model that accounts for Other's whole price, keeps its own row, so the same tokens and
 cost are not shown twice. Missing older model labels remain explicit usage categories rather than
 being counted as additional named models. When Other has more contributors than fit, the list
-scrolls inside the popover.
+scrolls inside the popover. The breakdown stays put while you tap around the panel; it closes once
+the pointer leaves it, another breakdown takes its place, or the panel itself closes.
 
-The dashboard footer's **Options** menu → **Usage History** opens a read-only report built from the same local usage data the spend tiles show, so the two can never disagree:
+The dashboard footer's **Options** menu → **Usage History** opens a read-only report built from the same local usage data as the spend tiles. Its **Cost Source** selector changes dollars only; measured token totals and dashboard, menu-bar, and CLI spend remain unchanged.
 
-- **Lifetime** — recorded tokens and plan-priced cost from the retained history window (up to 10 years), dated by its earliest day ("Since Mar 2026"). Claude, Codex, and Grok fold up to ten years of local logs; sources with shorter scan or retention windows contribute only the history they preserve. When those dollars were imputed from token counts (subscription logs carry no per-message cost, so they are priced at public API rates), the headline carries an **Est.** mark.
-- **At Public API Rates (Est.)** — what all that recorded usage would have cost at each model's public API rates. A what-if comparison, never a recorded amount. QuotaBar hides the figure when any retained day includes an unpriced model, even after that model's name ages out of the 30-day detail. It is marked **Partial** while an active local session can still add usage. It is also hidden when it would display the same figure as the Lifetime total — subscription logs with no per-message cost make the two coincide, and one number stated twice adds nothing.
-- **Today / 7 Days / 30 Days** summary cards: tokens always, plan-priced cost (a dash where nothing could be priced yet), and **Est.** when any included dollars were imputed from tokens.
+- **Reported Only** (default) sums dollar amounts recorded by providers. Missing costs remain blank, and known partial coverage is marked rather than filled with estimates.
+- **API Estimates** compares measured tokens with published API rates; it is not a bill. Only priced usage contributes, so totals are lower bounds when some usage has no public rate. Model rows may remain dollar-free when the estimate cannot be safely carried to individual models.
+- **Lifetime** — the selected cost source across retained history (up to 10 years), dated by its earliest day ("Since Mar 2026"). Claude, Codex, and Grok fold up to ten years of local logs; sources with shorter scan or retention windows contribute only the history they preserve.
+- **Today / 7 Days / 30 Days** summary cards: tokens always, plus the selected cost source or a dash when no amount is available.
 - A **daily token trend** across the 30-day window, with one bar for every calendar day including idle days.
-- One section per enabled provider with **per-model rows** for the window: tokens plus cost (or a dash for models no catalogue prices yet — those backfill automatically once discovery finds a rate; see [Pricing](pricing.md)). Provider totals show **Est.** when their dollars include token-based estimates.
+- One section per enabled provider with **per-model rows** for the window: tokens plus cost where its provenance is available (or a dash); see [Pricing](pricing.md).
+
+## Generation Speed
+
+Open **Options → Generation Speed** in the dashboard footer to see [average output speed by provider and model](dashboard.md#generation-speed) for ZCode and Antigravity.
 
 ## Starring
 

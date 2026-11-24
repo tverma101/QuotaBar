@@ -85,18 +85,17 @@ actor AntigravityDbUsageScanner {
     /// leave its local spend and trend rows empty. T3 Code's private ACP instances keep their stores
     /// outside `~/.gemini` entirely; those roots are discovered too, the way T3's own reader does.
     static let defaultConversationDiscovery: @Sendable () throws -> ConversationDirectoryDiscovery = {
-        try defaultConversationDiscovery(home: FileManager.default.homeDirectoryForCurrentUser)
+        try discoverAllConversationDirectories(home: FileManager.default.homeDirectoryForCurrentUser)
     }
 
-    static func defaultConversationDiscovery(home: URL) throws -> ConversationDirectoryDiscovery {
-        let fileManager = FileManager.default
+    static func discoverAllConversationDirectories(home: URL) throws -> ConversationDirectoryDiscovery {
         let geminiRoot = home.appendingPathComponent(".gemini", isDirectory: true)
-        var directories: [String] = []
+        var directories = Set<String>()
         var failures: [String: String] = [:]
         do {
-            let discovery = try discoverConversationDirectories(in: geminiRoot)
-            directories.append(contentsOf: discovery.directories)
-            failures.merge(discovery.failures) { _, new in new }
+            let base = try discoverConversationDirectories(in: geminiRoot)
+            directories.formUnion(base.directories)
+            failures.merge(base.failures) { _, new in new }
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             // No ~/.gemini yet — the other roots may still hold conversations.
         } catch {
@@ -104,21 +103,21 @@ actor AntigravityDbUsageScanner {
             // scan keeps cached rows and surfaces the warning while the other roots still update.
             failures[geminiRoot.path] = error.localizedDescription
         }
-        // T3 Code's reader also covers ~/.config/antigravity; match that root for parity.
-        let configConversations = home
-            .appendingPathComponent(".config/antigravity", isDirectory: true)
-            .appendingPathComponent("conversations", isDirectory: true)
-        var isDirectory: ObjCBool = false
-        if fileManager.fileExists(atPath: configConversations.path, isDirectory: &isDirectory), isDirectory.boolValue {
-            directories.append(configConversations.path)
+        let config = home.appendingPathComponent(".config/antigravity/conversations", isDirectory: true)
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: config.path)
+            if attributes[.type] as? FileAttributeType == .typeDirectory { directories.insert(config.path) }
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+        } catch {
+            failures[config.path] = error.localizedDescription
         }
         do {
-            directories.append(contentsOf: try AntigravityT3Support.conversationDirectories(home: home))
+            directories.formUnion(try AntigravityT3Support.conversationDirectories(home: home))
         } catch {
-            failures[home.appendingPathComponent(AntigravityT3Support.profilesRootSubpath, isDirectory: true).path] =
-                error.localizedDescription
+            failures[home.appendingPathComponent(AntigravityT3Support.profilesRootSubpath).path] = error.localizedDescription
         }
-        return ConversationDirectoryDiscovery(directories: directories.sorted(), failures: failures)
+        let canonical = Set(directories.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
+        return ConversationDirectoryDiscovery(directories: canonical.sorted(), failures: failures)
     }
 
     static func conversationDirectories(in geminiRoot: URL) throws -> [String] {

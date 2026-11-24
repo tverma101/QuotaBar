@@ -146,7 +146,7 @@ private struct MenuBarPrivacyLabel: View {
         HStack(spacing: 5) {
             // The same mark and inset as `MenuBarIcon` (the art carries its own margin), sized to the
             // strip's glyph box so the swap keeps the provider-glyph scale.
-            if let mark = ProviderMarks.mark(for: "openusage") {
+            if let mark = ProviderMarks.mark(for: "quotabar") {
                 ProviderIconShape(mark: mark, inset: 0.08)
                     .fill(Color.black)
                     .frame(width: 16, height: 16)

@@ -129,6 +129,10 @@ canonical home separately, sharing the per-home cache with its account card. Thi
 and multi-config setups from omitting or re-reading the same terminal session during a cold refresh
 without changing the usage sources or ownership filtering.
 
+An active Claude or Codex log can grow while QuotaBar reads it. Ordinary appends no longer
+block the OpenCode history refresh; the next pass picks up any turns that arrived too late.
+A detected rewrite, replacement, or truncation still keeps the last complete history.
+
 Imputed dollars (items 2, 4, 5) are calibrated to the provider's OWN recorded cost per token: when the
 local logs carry billed rows for a model, its fold is priced at the average rate those rows actually
 recorded, not the catalog sticker rate. That matters because the gateway bills DeepSeek cache hits at a

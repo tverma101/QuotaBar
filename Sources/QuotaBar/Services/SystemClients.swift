@@ -250,6 +250,79 @@ struct NativeSQLiteAccessor: SQLiteAccessing {
     }
 }
 
+struct SQLiteCLIAccessor: SQLiteAccessing {
+    var processRunner: ProcessRunning
+    var allowsReadWriteFallback: Bool
+    var queryTimeout: TimeInterval
+
+    init(
+        processRunner: ProcessRunning = SystemProcessRunner(),
+        allowsReadWriteFallback: Bool = true,
+        queryTimeout: TimeInterval = 5
+    ) {
+        self.processRunner = processRunner
+        self.allowsReadWriteFallback = allowsReadWriteFallback
+        self.queryTimeout = queryTimeout
+    }
+
+    func queryValue(path: String, sql: String) throws -> String? {
+        // A normal sqlite3 open can create a missing database. Credential probes must be read-only and
+        // side-effect free, so absence returns nil before a process is launched.
+        guard try databaseExists(path) else { return nil }
+        var result = try run(path: path, sql: sql, readOnly: true, timeout: queryTimeout)
+        if !result.succeeded, allowsReadWriteFallback {
+            // A WAL-mode database under an active writer can refuse a readonly open with
+            // SQLITE_CANTOPEN (14) — the shared-memory lock it needs is held. Retry read-write: the
+            // query is a SELECT (no side effects), and the existence guard above already prevents
+            // creating a missing database.
+            result = try run(path: path, sql: sql, readOnly: false, timeout: queryTimeout)
+        }
+        guard result.succeeded else {
+            throw SQLiteError.queryFailed(result.stderr)
+        }
+        let trimmed = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func execute(path: String, sql: String) throws {
+        // SQL can contain credential values (for example Cursor's rotated access token). Keep it
+        // off the process argument list, where other local processes can inspect it with `ps`.
+        let result = try run(path: path, sql: sql, sendSQLOnStandardInput: true)
+        guard result.succeeded else {
+            throw SQLiteError.queryFailed(result.stderr)
+        }
+    }
+
+    private func run(
+        path: String,
+        sql: String,
+        readOnly: Bool = false,
+        sendSQLOnStandardInput: Bool = false,
+        timeout: TimeInterval = 5
+    ) throws -> ProcessResult {
+        var arguments = ["-batch", "-noheader"]
+        if readOnly { arguments.append("-readonly") }
+        arguments += [
+            "-cmd", ".timeout 1000",
+            expandHome(path)
+        ]
+        if !sendSQLOnStandardInput { arguments.append(sql) }
+        return try processRunner.run(
+            executable: "/usr/bin/sqlite3",
+            arguments: arguments,
+            environment: [:],
+            standardInput: sendSQLOnStandardInput ? Data(sql.utf8) : nil,
+            timeout: timeout
+        )
+    }
+
+    private func databaseExists(_ path: String) throws -> Bool {
+        var isDirectory: ObjCBool = false
+        let expanded = expandHome(path)
+        return FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory) && !isDirectory.boolValue
+    }
+}
+
 enum SQLiteError: Error, LocalizedError, Equatable {
     case queryFailed(String)
 

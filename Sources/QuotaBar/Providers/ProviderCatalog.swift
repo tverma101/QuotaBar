@@ -330,12 +330,18 @@ enum ProviderCatalog {
             preloadedAccountInventory: openCodeGoAccountInventory,
             accountInventoryDiscoveryDeferred: openCodeAccountInventoryDeferred
         )
+        #if QUOTABAR_LOCAL_FREEBUFF
+        let freebuffUsageClient = FreebuffLocalSessionTransport.client()
+        #else
+        let freebuffUsageClient = FreebuffUsageClient()
+        #endif
         providers += [
             CursorProvider(),
             AntigravityProvider(),
             CopilotProvider(defaults: defaults),
             DevinProvider(),
-            FreebuffProvider(authStore: FreebuffAuthStore(environment: openUsageEnvironment)),
+            FreebuffProvider(authStore: FreebuffAuthStore(environment: openUsageEnvironment),
+                             usageClient: freebuffUsageClient, defaults: defaults),
             GrokProvider(),
             HermesProvider(),
             openCode,

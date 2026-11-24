@@ -113,6 +113,19 @@ final class PopoverScreenTests: XCTestCase {
         XCTAssertEqual(store.screenSlideID, slideID)
     }
 
+    func testGenerationSpeedRouteResetsWithoutStartingSlide() {
+        let store = makeStore("CloseGenerationSpeed")
+        store.screen = MenuHostSafeNavigation.toggledScreen(current: .dashboard, requested: .generationSpeed)
+        XCTAssertEqual(store.screen, .generationSpeed)
+        XCTAssertFalse(store.isEditing)
+        let slideID = store.screenSlideID
+
+        store.resetForPopoverClose()
+
+        XCTAssertEqual(store.screen, .dashboard)
+        XCTAssertEqual(store.screenSlideID, slideID)
+    }
+
     func testNormalScreenAssignToDashboardDoesBumpSlideID() {
         let store = makeStore("UserBackHome")
         store.screen = .customize

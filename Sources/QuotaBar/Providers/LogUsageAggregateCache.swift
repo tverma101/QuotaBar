@@ -34,64 +34,10 @@ struct LogUsageSourceFingerprint: Codable, Sendable, Equatable {
     }
 }
 
-/// Identity of the pricing snapshot an aggregate was computed with. Aggregates store dollar
-/// costs, so any rate change must invalidate them — including edits that change no key sets. The
-/// stamp hashes every rate, tier and qualifier in both catalogs and the supplement, so a price
-/// change is always detected here.
-///
-/// The payload is hashed on every call: rates must be checked field for field, and a fold's
-/// hot path can afford microseconds of hashing against hundreds of milliseconds of I/O. Callers
-/// that need a stable value memoize it themselves.
+/// All priced folds use the same rate identity, including OpenRouter and rate overrides.
 enum LogUsagePricingStamp {
     static func of(_ pricing: ModelPricing) -> String {
-        computeStamp(pricing)
-    }
-
-    private static func computeStamp(_ pricing: ModelPricing) -> String {
-        var payload = ""
-        payload += "updatedAt=\(pricing.supplement.updatedAt ?? "-")\n"
-        for (key, rates) in pricing.supplement.pricing.sorted(by: { $0.key < $1.key }) {
-            payload += "suppl|\(key)|\(ratesPayload(rates))\n"
-        }
-        payload += "fast=\(pricing.supplement.fastMultipliers.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ","))\n"
-        payload += "normFast=\(pricing.supplement.normalizedFastMultipliers.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ","))\n"
-        payload += "aliases=\(pricing.supplement.aliasRules.map { "\($0.pattern.pattern)>\($0.canonical)" }.joined(separator: "|"))\n"
-        payload += "cursorAliases=\(pricing.supplement.cursorAliasRules.map { "\($0.pattern.pattern)>\($0.canonical)" }.joined(separator: "|"))\n"
-        payload += "retiredPricing=\(pricing.supplement.retiredPricingKeys.sorted().joined(separator: ","))\n"
-        payload += "retiredAliasPatterns=\(pricing.supplement.retiredAliasPatterns.sorted().joined(separator: ","))\n"
-        payload += "retiredAliasPatternsAuthoritative=\(pricing.supplement.retiredAliasPatternsAreAuthoritative ? 1 : 0)\n"
-        payload += catalogPayload("primary", pricing.primary)
-        payload += catalogPayload("secondary", pricing.secondary)
-        return LogUsageSourceFingerprint.sha256(payload)
-    }
-
-    private static func catalogPayload(_ name: String, _ catalog: PricingCatalog) -> String {
-        var section = "catalog=\(name) retired=\(catalog.retiredKeys.sorted().joined(separator: ",")) retiredAuthoritative=\(catalog.retiredKeysAreAuthoritative ? 1 : 0) retrievedAt=\(catalog.retrievedAt ?? "-")\n"
-        for (key, rates) in catalog.entries.sorted(by: { $0.key < $1.key }) {
-            section += "\(name)|\(key)|\(ratesPayload(rates))\n"
-        }
-        return section
-    }
-
-    private static func ratesPayload(_ rates: ModelRates) -> String {
-        var payload = "i=\(rates.inputPerMillion),o=\(rates.outputPerMillion),cw=\(rates.cacheWritePerMillion),cr=\(rates.cacheReadPerMillion)"
-        payload += ",cw1h=\(rates.cacheWrite1hPerMillion.map { String($0) } ?? "-")"
-        payload += ",cri=\(rates.cacheReadIsExplicit ? 1 : 0)"
-        payload += ",lct=\(rates.longContextThresholdTokens)"
-        payload += ",fast=\(rates.fastMultiplier)"
-        for tier in rates.promptRateTiers {
-            payload += ",tier{threshold=\(tier.thresholdPromptTokens),incl=\(tier.includesThreshold ? 1 : 0),i=\(tier.inputPerMillion.map { String($0) } ?? "-"),o=\(tier.outputPerMillion.map { String($0) } ?? "-"),cw=\(tier.cacheWritePerMillion.map { String($0) } ?? "-"),cr=\(tier.cacheReadPerMillion.map { String($0) } ?? "-"),cw1h=\(tier.cacheWrite1hPerMillion.map { String($0) } ?? "-")}"
-        }
-        if let lanes = rates.utcPriceOverrides {
-            for lane in lanes {
-                payload += ",utc{days=\((lane.utcDays ?? []).sorted().joined(separator: ".")),start=\(lane.utcStartMinute.map { String($0) } ?? "-"),end=\(lane.utcEndMinute.map { String($0) } ?? "-"),i=\(lane.inputPerMillion.map { String($0) } ?? "-"),o=\(lane.outputPerMillion.map { String($0) } ?? "-"),cw=\(lane.cacheWritePerMillion.map { String($0) } ?? "-"),cr=\(lane.cacheReadPerMillion.map { String($0) } ?? "-"),cw1h=\(lane.cacheWrite1hPerMillion.map { String($0) } ?? "-")}"
-            }
-        }
-        payload += ",i200k=\(rates.inputAbove200kPerMillion.map { String($0) } ?? "-")"
-        payload += ",o200k=\(rates.outputAbove200kPerMillion.map { String($0) } ?? "-")"
-        payload += ",cw200k=\(rates.cacheWriteAbove200kPerMillion.map { String($0) } ?? "-")"
-        payload += ",cr200k=\(rates.cacheReadAbove200kPerMillion.map { String($0) } ?? "-")"
-        return payload
+        pricing.aggregateCacheToken
     }
 }
 
@@ -131,19 +77,23 @@ enum LogUsageAggregatePaths {
 /// aggregate so a cache hit reports the same caveat as the fold that produced it.
 enum AggregateComputeResult: Sendable {
     case complete(LogUsageScan?, validUntil: Date?, damagedLines: Int = 0)
+    case deferredByFutureTimestamp
     case incomplete
 }
 
 /// What callers should do with the fold result.
 enum AggregateCacheOutcome: Sendable {
     case complete(LogUsageScan?, damagedLines: Int = 0)
+    case deferredByFutureTimestamp
     case incomplete
 }
 
 actor LogUsageAggregateCache {
     static let shared = LogUsageAggregateCache(directory: LogUsageAggregatePaths.defaultDirectory)
 
-    private static let schemaVersion = 2
+    /// v3: the Codex router/proxy folds moved to the shared `sinceDate` window convention — entries
+    /// folded under the old `startOfDay - (days-1)` convention are one day short and must recompute.
+    private static let schemaVersion = 3
     /// Reuse bound. Retention windows are ≥ 35 days while request windows are ≤ ~33, so anything
     /// reused within this horizon still covers the full requested window. Beyond it, recompute.
     static let maxReuseAge: TimeInterval = 36 * 3600
@@ -194,6 +144,9 @@ actor LogUsageAggregateCache {
            entry.daysBack == days,
            entry.fingerprints == fingerprints,
            entry.validUntil.map({ now < $0 }) ?? true,
+           // A clock moved backward past the compute instant makes the entry untrustworthy in
+           // the same way the inner index's latestIncludedEventAt check does — rebuild.
+           now >= entry.computedAt,
            now.timeIntervalSince(entry.computedAt) <= Self.maxReuseAge
         {
             return .complete(
@@ -202,6 +155,8 @@ actor LogUsageAggregateCache {
             )
         }
         switch await compute() {
+        case .deferredByFutureTimestamp:
+            return .deferredByFutureTimestamp
         case .incomplete:
             return .incomplete
         case .complete(let fresh, let validUntil, let damagedLines):
@@ -266,8 +221,25 @@ actor LogUsageAggregateCache {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let data = try PropertyListEncoder().encode(entry)
             try data.write(to: fileURL(for: entry.key), options: .atomic)
+            pruneStaleFiles()
         } catch {
             AppLog.warn(.cache, "could not persist usage aggregate: \(error.localizedDescription)")
+        }
+    }
+
+    /// Drops aggregate files older than the reuse horizon — schema bumps and scope-key changes
+    /// orphan entries that no key will ever match again, so they must not accumulate forever.
+    private func pruneStaleFiles() {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }
+        let cutoff = Date().addingTimeInterval(-Self.maxReuseAge)
+        for url in files where url.lastPathComponent.hasPrefix("aggregate-") {
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            if let modified, modified < cutoff {
+                try? FileManager.default.removeItem(at: url)
+            }
         }
     }
 

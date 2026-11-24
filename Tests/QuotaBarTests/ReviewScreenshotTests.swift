@@ -76,6 +76,7 @@ final class ReviewScreenshotTests: XCTestCase {
     }
 }
 
+@MainActor
 extension ReviewScreenshotTests {
     func testAccountNameBlurRendersForReview() throws {
         func card(_ suite: String, blurred: Bool) throws -> NSImage {
@@ -101,6 +102,36 @@ extension ReviewScreenshotTests {
 
         if let dir = ProcessInfo.processInfo.environment["QUOTABAR_REVIEW_IMAGE_DIR"] {
             for (name, image) in [("account-blur-on.png", blurred), ("account-blur-off.png", plain)] {
+                let png = try XCTUnwrap(ShareCardRenderer.pngData(from: image))
+                try png.write(to: URL(fileURLWithPath: dir).appendingPathComponent(name))
+            }
+        }
+    }
+
+    func testGenerationSpeedCardsRenderForReview() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "quotabar.review.\(UUID().uuidString)"))
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let now = Date(timeIntervalSince1970: 1_795_262_400)
+        var report = GenerationSpeedReport(now: now, calendar: calendar)
+        for _ in 0..<2 {
+            report.add(.init(finishedAt: now, seconds: 2, outputTokens: 60, model: "glm-flash"), source: .zcode)
+        }
+        for _ in 0..<4 {
+            report.add(.init(finishedAt: now, seconds: 5, outputTokens: 250, model: "glm-standard"), source: .zcode)
+        }
+        for _ in 0..<6 {
+            report.add(.init(finishedAt: now, seconds: 5, outputTokens: 200, model: "gemini-pro"), source: .antigravity)
+        }
+
+        let cards = GenerationSpeedResults(report: report, window: .today)
+            .frame(width: 292).padding(14).background(Theme.traySurface)
+            .defaultAppStorage(defaults)
+        for (name, scheme) in [("generation-speed-light.png", ColorScheme.light),
+                               ("generation-speed-dark.png", ColorScheme.dark)] {
+            let image = try XCTUnwrap(ImageRenderer(content: cards.environment(\.colorScheme, scheme)).nsImage)
+            XCTAssertGreaterThan(image.size.height, 100)
+            if let dir = ProcessInfo.processInfo.environment["QUOTABAR_REVIEW_IMAGE_DIR"] {
                 let png = try XCTUnwrap(ShareCardRenderer.pngData(from: image))
                 try png.write(to: URL(fileURLWithPath: dir).appendingPathComponent(name))
             }
