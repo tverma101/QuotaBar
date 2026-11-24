@@ -12,11 +12,13 @@ pub mod codex;
 pub mod copilot;
 pub mod cursor;
 pub mod devin;
+pub mod error_text;
 pub mod grok;
 pub mod hermes;
 pub mod muse;
 pub mod openrouter;
 pub mod pi;
+pub mod private_file;
 pub mod zai;
 
 pub trait ProviderRuntime: Send + Sync {

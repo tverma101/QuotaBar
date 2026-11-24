@@ -8,7 +8,7 @@ use crate::host::{self, auth_tag};
 use crate::qlog;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,13 +106,7 @@ impl ApiKeySpec {
         };
         let encoded = serde_json::to_string(&json!({ "apiKey": trimmed }))
             .map_err(|_| self.save_failed_error.to_string())?;
-        if let Some(parent) = primary.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                qlog!(Error, auth_tag(self.provider_id), "create API key directory failed: {err}");
-                return Err(self.save_failed_error.to_string());
-            }
-        }
-        write_atomic(primary, encoded.as_bytes()).map_err(|err| {
+        super::private_file::write_private_file(primary, encoded.as_bytes()).map_err(|err| {
             qlog!(Error, auth_tag(self.provider_id), "save API key failed: {err}");
             self.save_failed_error.to_string()
         })
@@ -186,21 +180,6 @@ pub fn key_from_config_text(text: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    use std::io::Write;
-    tmp.write_all(bytes)?;
-    tmp.flush()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600));
-    }
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
 }
 
 /// Dispatch `credentialAction` RPC for user API-key providers (`openrouter`, later `zai`).

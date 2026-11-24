@@ -75,7 +75,7 @@ pub fn key_metrics(data: &Map<String, Value>) -> (Option<String>, Vec<MetricLine
         }
     }
 
-    let plan = data.get("is_free_tier").and_then(Value::as_bool).map(|free| {
+    let plan = foundation_bool(data.get("is_free_tier")).map(|free| {
         if free { "Free tier" } else { "Pay as you go" }.to_string()
     });
     (plan, lines)
@@ -86,4 +86,18 @@ fn append_spend(value: Option<&Value>, label: &str, lines: &mut Vec<MetricLine>)
         return;
     };
     lines.push(MetricLine::values(label, vec![MetricValue::new(amount.max(0.0), MetricKind::Dollars)]));
+}
+
+/// Swift's `value as? Bool` on a `JSONSerialization` value: a real boolean, or a number that is
+/// exactly 0 or 1 (an `NSNumber` bridges to `Bool` only for those two values).
+fn foundation_bool(value: Option<&Value>) -> Option<bool> {
+    match value? {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => match n.as_f64() {
+            Some(v) if v == 0.0 => Some(false),
+            Some(v) if v == 1.0 => Some(true),
+            _ => None,
+        },
+        _ => None,
+    }
 }

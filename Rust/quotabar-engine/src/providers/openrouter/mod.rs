@@ -19,7 +19,7 @@ pub const ID: &str = "openrouter";
 pub const CREDITS_URL: &str = "https://openrouter.ai/api/v1/credits";
 pub const KEY_URL: &str = "https://openrouter.ai/api/v1/key";
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 enum EndpointResult {
     Success(Map<String, Value>),
