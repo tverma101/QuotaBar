@@ -503,6 +503,52 @@ final class IncrementalJSONLScannerTests: XCTestCase {
         XCTAssertEqual(residentAfterRelaunch, 0)
     }
 
+    /// `foldItems` decodes persisted records lazily, just ahead of each visit. A record that
+    /// fails to decode reparses from source *in visit order*: the corrupted file still
+    /// contributes its items and only that file reparses.
+    func testFoldItemsReparsesCorruptPersistedRecordInVisitOrder() async throws {
+        let base = try makeDirectory("FoldHydrationReparse")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let now = Date()
+        let first = try makeFile(named: "a.jsonl", contents: "1", in: base, mtime: now)
+        let second = try makeFile(named: "b.jsonl", contents: "2", in: base, mtime: now)
+        let persistence = makePersistence(in: base)
+        let counter = ParseCounter()
+        let scanner = IncrementalJSONLScanner<Int>(
+            retainResidentItems: false,
+            persistence: persistence
+        )
+
+        let seeded = await scanner.items(
+            from: [first, second], since: .distantPast, cacheIdentity: "home", parse: counter.parse
+        )
+        XCTAssertEqual(seeded, [1, 2])
+        await scanner.flushPendingWrites()
+
+        let recordURLValue = await scanner.cacheRecordURLForTesting(
+            identity: "home", filePath: second.path
+        )
+        let recordURL = try XCTUnwrap(recordURLValue)
+        try Data("corrupt".utf8).write(to: recordURL)
+
+        let relaunchedCounter = ParseCounter()
+        let relaunched = IncrementalJSONLScanner<Int>(
+            retainResidentItems: false,
+            persistence: persistence
+        )
+        let visited = IntVisitCollector()
+        let complete = await relaunched.foldItems(
+            from: [first, second],
+            since: .distantPast,
+            cacheIdentity: "home",
+            parseFile: relaunchedCounter.parseFile,
+            visit: { visited.record($0) }
+        )
+        XCTAssertTrue(complete)
+        XCTAssertEqual(visited.items, [1, 2])
+        XCTAssertEqual(relaunchedCounter.count, 1, "only the corrupt record reparses")
+    }
+
     private func makeDirectory(_ suffix: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OpenUsageScanner\(suffix)-\(UUID().uuidString)", isDirectory: true)
@@ -663,6 +709,20 @@ private final class FirstVisitSignal: @unchecked Sendable {
             waiter = block
             lock.unlock()
         }
+    }
+}
+
+/// Collects visited integers from a `foldItems` visit closure.
+private final class IntVisitCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var collected: [Int] = []
+
+    func record(_ item: Int) {
+        lock.withLock { collected.append(item) }
+    }
+
+    var items: [Int] {
+        lock.withLock { collected }
     }
 }
 

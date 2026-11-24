@@ -41,6 +41,28 @@ Swift reference implementation, and the two are tested against each other.
   wrote); the Rust parser (`Sources/QuotaBar/Support/CompactCatalogRustParser.swift`) is called
   only when Foundation cannot handle an input at all. `catalogFromCompact` throws if both fail.
 
+## The engine (`quotabar-engine`)
+
+`Rust/quotabar-engine/` is the cross-platform backend the Swift app (and the Windows port) is moving
+onto. It is linked into the same static library and called over a small JSON request/reply bridge
+(`Sources/QuotaBar/Engine/RustEngine.swift`). Today it serves:
+
+- **Devin** — the whole live refresh (credentials, API, mapping) runs in the engine; Swift adds the
+  local transcript history on top.
+- **Local SQLite reads** for every provider that reads another app's database (OpenCode, Freebuff,
+  Antigravity, ZCode, Cursor, Hermes, Claude Desktop, the Codex proxy). Reads run in-process instead of launching `/usr/bin/sqlite3`
+  per query, open read-only, and stop at a per-query time limit: five seconds by default, thirty for
+  the large OpenCode and Freebuff stores.
+- **Compressed Codex archives** (`.jsonl.zst`), decoded in-process with output and time limits.
+
+The engine asks the app for things only the app can do — Keychain reads and writes, environment
+values — through host callbacks, so a Keychain read still uses the app's signed identity and its
+existing "Always Allow" grants, and is cancelled with the refresh that asked for it.
+
+Not yet moved: the remaining providers' live refreshes and the Claude/Codex/Grok local-history
+scanners still run in Swift (their per-line parsers already use the Rust core above), and the
+scan-worker child process still hosts the heavy history folds.
+
 ## The fallback contract
 
 The bridge can return nil, and production then runs the Swift path, **never a different answer**:
@@ -53,6 +75,10 @@ The bridge can return nil, and production then runs the Swift path, **never a di
 For Codex the scope is **one whole file, not one line**: the engine is stateful across the file's
 lines (running model, fast-tier flags, the child-session replay gate), so a line it cannot emulate
 makes the entire file re-parse with the Swift engine. Mixing engines within a file is never done.
+Lines the parser skips as damaged are counted (`damaged_line_count`, exposed as
+`qb_codex_parser_damaged_count` / `Handle.damagedLineCount`) exactly like the Swift parser's
+`damagedLineCount` — a torn write skips the record and rides the checkpoint, it does not reject
+the file.
 
 Everything else — invalid JSON, non-object JSON, malformed tokens, advisor iterations, SemVer
 rules, leap-second calendar math — is implemented identically in both paths and pinned by the

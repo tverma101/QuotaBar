@@ -217,12 +217,21 @@ protocol SQLiteAccessing: Sendable {
 
 struct NativeSQLiteAccessor: SQLiteAccessing {
     var allowsReadWriteFallback = true
+    /// Wall-clock budget for each query. The five-second default suits credential probes and small
+    /// stores; scanners over large usage databases (OpenCode's multi-hundred-MB `opencode*.db`,
+    /// Freebuff's GB-scale project stores) pass a wider budget so cold-cache reads don't fail.
+    var queryTimeout: TimeInterval = 5
 
     func queryValue(path: String, sql: String) throws -> String? {
         do {
             return try RustEngine.callSync([
                 "method": "sqliteQuery",
-                "params": ["path": expandHome(path), "sql": sql, "allowWalRetry": allowsReadWriteFallback],
+                "params": [
+                    "path": expandHome(path),
+                    "sql": sql,
+                    "allowWalRetry": allowsReadWriteFallback,
+                    "timeoutSeconds": queryTimeout,
+                ],
             ], as: String?.self)
         } catch {
             throw SQLiteError.queryFailed(error.localizedDescription)

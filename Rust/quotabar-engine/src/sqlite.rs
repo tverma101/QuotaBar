@@ -41,6 +41,7 @@ pub fn open_read_only(path: &Path) -> Result<Option<Connection>, SqliteError> {
 }
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn open_for_query(path: &Path, allow_wal_retry: bool, deadline: Instant) -> Result<Option<Connection>, SqliteError> {
     match path.metadata() {
@@ -79,7 +80,21 @@ fn bound_query(conn: &Connection, deadline: Instant) -> rusqlite::Result<()> {
 /// The SQLite shell's plain list output. Some legacy scanner queries consume multiple rows
 /// separated by newlines, with pipes between columns and empty strings for SQL NULLs.
 pub fn query_text(path: &Path, sql: &str, allow_wal_retry: bool) -> Result<Option<String>, SqliteError> {
-    let Some(conn) = open_for_query(path, allow_wal_retry, Instant::now() + QUERY_TIMEOUT)? else { return Ok(None) };
+    query_text_within(path, sql, allow_wal_retry, QUERY_TIMEOUT)
+}
+
+/// [`query_text`] with a caller-chosen wall-clock budget. The five-second default suits credential
+/// probes and small stores; usage scanners over multi-hundred-MB databases (OpenCode, Freebuff)
+/// pass a wider budget because their whole-history queries legitimately outrun five seconds on a
+/// cold page cache. The budget is clamped to `[0.1s, MAX_QUERY_TIMEOUT]`.
+pub fn query_text_within(
+    path: &Path,
+    sql: &str,
+    allow_wal_retry: bool,
+    timeout: Duration,
+) -> Result<Option<String>, SqliteError> {
+    let timeout = timeout.clamp(Duration::from_millis(100), MAX_QUERY_TIMEOUT);
+    let Some(conn) = open_for_query(path, allow_wal_retry, Instant::now() + timeout)? else { return Ok(None) };
     let mut statement = conn.prepare(sql)?;
     if !statement.readonly() {
         return Err(SqliteError::Unreadable("Expected a read-only SQLite query.".into()));
@@ -222,6 +237,23 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         Connection::open(&path).unwrap().execute("INSERT INTO ItemTable VALUES ('x', 'y')", []).unwrap();
         assert_ne!(before, source_signature(&path));
+    }
+
+    #[test]
+    fn a_caller_budget_bounds_long_queries_and_is_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.sqlite");
+        Connection::open(&path).unwrap().execute_batch("CREATE TABLE t (v INTEGER);").unwrap();
+        // A zero budget clamps to the floor instead of failing every query outright.
+        assert_eq!(
+            query_text_within(&path, "SELECT 42", false, Duration::ZERO).unwrap().as_deref(),
+            Some("42")
+        );
+        // A runaway query stops at its budget rather than running unbounded.
+        let started = Instant::now();
+        let runaway = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT count(*) FROM n";
+        assert!(query_text_within(&path, runaway, false, Duration::from_millis(300)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5), "budget ignored: {:?}", started.elapsed());
     }
 
     #[test]

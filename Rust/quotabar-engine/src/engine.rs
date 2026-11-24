@@ -129,7 +129,16 @@ impl Engine {
             )),
             "sqliteQuery" => {
                 let p: SqliteParams = from_params(params)?;
-                crate::sqlite::query_text(&p.path, &p.sql, p.allow_wal_retry)
+                let result = match p.timeout_seconds.filter(|seconds| seconds.is_finite() && *seconds > 0.0) {
+                    Some(seconds) => crate::sqlite::query_text_within(
+                        &p.path,
+                        &p.sql,
+                        p.allow_wal_retry,
+                        std::time::Duration::from_secs_f64(seconds.min(3600.0)),
+                    ),
+                    None => crate::sqlite::query_text(&p.path, &p.sql, p.allow_wal_retry),
+                };
+                result
                     .map(|value| json!(value))
                     .map_err(|error| error.to_string())
             }
@@ -199,6 +208,9 @@ struct SqliteParams {
     sql: String,
     #[serde(default)]
     allow_wal_retry: bool,
+    /// Per-query wall-clock budget in seconds; the engine default (5s) when absent.
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
 }
 
 #[derive(Deserialize)]

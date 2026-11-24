@@ -87,8 +87,8 @@ typedef struct {
 
 void *qb_codex_parser_create(uint8_t has_emit_since, double emit_since_seconds);
 uint32_t qb_codex_parser_feed_line(void *parser, const uint8_t *line, size_t line_len);
-/// Nonzero when Swift's `hasMalformedUsage` semantics apply to at least one line.
-uint32_t qb_codex_parser_malformed(const void *parser);
+/// Number of lines the parser skipped as damaged (Swift's `damagedLineCount` accounting).
+uint64_t qb_codex_parser_damaged_count(const void *parser);
 /// Move out the events emitted so far. Call once at the end of a file.
 void *qb_codex_parser_take_events(void *parser);
 uint32_t qb_codex_take_events_count(const void *result);

@@ -682,7 +682,7 @@ fn build_result(outcome: LineOutcome) -> *mut ClaudeParseResult {
 /// ABI version of this library. Bump when the entry layout changes.
 #[no_mangle]
 pub extern "C" fn qb_core_version() -> u32 {
-    3
+    4
 }
 
 /// Parse one Claude usage line.

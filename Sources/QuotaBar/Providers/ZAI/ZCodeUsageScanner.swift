@@ -1,6 +1,6 @@
 import Foundation
 
-struct ZCodeAllowance: Sendable, Equatable {
+struct ZCodeAllowance: Sendable, Equatable, Codable {
     var label: String
     var used: Double
     var limit: Double
@@ -13,7 +13,7 @@ struct ZCodeAllowance: Sendable, Equatable {
     var effectiveAt: Date? = nil
 }
 
-struct ZCodeUsageResult: Sendable, Equatable {
+struct ZCodeUsageResult: Sendable, Equatable, Codable {
     var totalTokens: Double?
     var planName: String?
     var logScan: LogUsageScan?
@@ -118,19 +118,34 @@ final class ZCodeUsageScanner: @unchecked Sendable {
                   cachedPricingToken == currentPricingToken else {
                 return nil
             }
-            if let now, let allowance = cachedResult?.weekendBuild {
-                if let exp = allowance.expiresAt, exp <= now { return nil }
-                // One-shot transition: invalidate only when the promo went live *after* the scan
-                // that produced this cache (effectiveAt between scan time and now). An
-                // already-active unused promo would otherwise rescan on every call forever.
-                if let eff = allowance.effectiveAt, eff <= now, allowance.used == 0,
-                   let scannedAt = cachedScanDate, eff > scannedAt {
-                    return nil
-                }
+            if let now, !Self.promoStillValid(cachedResult?.weekendBuild, scannedAt: cachedScanDate, now: now) {
+                return nil
             }
             return cachedResult
         }) {
             return cached
+        }
+
+        // A fresh scan-worker child has no in-memory cache; the persisted record lets it answer
+        // an unchanged fold without spawning sqlite3 or touching the LevelDB again.
+        if let persisted = ZCodeUsageCachePersistence.read(),
+           persisted.sqlitePath == path,
+           persisted.leveldbPath == leveldbPath,
+           persisted.sqliteSize == currentSqliteStamp?.size,
+           persisted.sqliteMtime == currentSqliteStamp?.mtime,
+           persisted.leveldbSize == currentLevelDBStamp?.size,
+           persisted.leveldbMtime == currentLevelDBStamp?.mtime,
+           persisted.pricingToken == currentPricingToken,
+           Self.promoStillValid(persisted.result.weekendBuild, scannedAt: persisted.scannedAt,
+                                now: now ?? Date()) {
+            lock.withLock {
+                cachedResult = persisted.result
+                cachedSqliteStamp = currentSqliteStamp
+                cachedLevelDBStamp = currentLevelDBStamp
+                cachedPricingToken = currentPricingToken
+                cachedScanDate = persisted.scannedAt
+            }
+            return persisted.result
         }
 
         try Task.checkCancellation()
@@ -214,14 +229,40 @@ final class ZCodeUsageScanner: @unchecked Sendable {
             damagedRows: damagedRows,
             sqliteReadFailure: sqliteError?.localizedDescription
         )
+        let scannedAt = now ?? Date()
         lock.withLock {
             cachedResult = result
             cachedSqliteStamp = currentSqliteStamp
             cachedLevelDBStamp = currentLevelDBStamp
             cachedPricingToken = currentPricingToken
-            cachedScanDate = now ?? Date()
+            cachedScanDate = scannedAt
         }
+        ZCodeUsageCachePersistence.write(ZCodeUsageCachePersistence.Record(
+            schema: ZCodeUsageCachePersistence.schema,
+            sqlitePath: path,
+            leveldbPath: leveldbPath,
+            sqliteSize: currentSqliteStamp?.size,
+            sqliteMtime: currentSqliteStamp?.mtime,
+            leveldbSize: currentLevelDBStamp?.size,
+            leveldbMtime: currentLevelDBStamp?.mtime,
+            pricingToken: currentPricingToken,
+            scannedAt: scannedAt,
+            result: result
+        ))
         return result
+    }
+
+    /// The promo rules the cache must re-apply on every hit: an expired bucket invalidates, and a
+    /// promo that went live *after* the scan invalidates exactly once (an already-active unused
+    /// promo would otherwise rescan on every call forever).
+    private static func promoStillValid(_ allowance: ZCodeAllowance?, scannedAt: Date?, now: Date) -> Bool {
+        guard let allowance else { return true }
+        if let exp = allowance.expiresAt, exp <= now { return false }
+        if let eff = allowance.effectiveAt, eff <= now, allowance.used == 0,
+           let scannedAt, eff > scannedAt {
+            return false
+        }
+        return true
     }
 
     /// The per-day model usage series read from the local sqlite history, for spend tiles and the

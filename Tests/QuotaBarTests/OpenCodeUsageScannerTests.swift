@@ -53,6 +53,39 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         }
     }
 
+    /// A WAL-churn stamp change that left usage rows alone must skip the chunked re-read: the
+    /// stored fingerprint proves the chunks still describe the live store, and only a real
+    /// content change pays the full read again.
+    func testUnchangedContentFingerprintSkipsTheChunkedRead() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        OpenCodeDatabaseRowsCache.directoryOverride = directory
+        defer { OpenCodeDatabaseRowsCache.directoryOverride = nil }
+
+        let dbPath = directory.appendingPathComponent("opencode.db").path
+        try Data().write(to: URL(fileURLWithPath: dbPath))
+        let sqlite = OpenCodeFakeSQLite(data: [dbPath: db1])
+        sqlite.fingerprintResponses[dbPath] = "m:3:42:900"
+        let scanner = OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { [dbPath] })
+
+        _ = try await scanner.scan(now: now)
+        let chunkReads = sqlite.dataSQLs.count
+        XCTAssertGreaterThan(chunkReads, 0, "first scan reads the chunked projection")
+
+        // Churn the file so its stamp moves without changing the stored fingerprint.
+        try Data("wal churn".utf8).write(to: URL(fileURLWithPath: dbPath))
+        _ = try await scanner.scan(now: now)
+        XCTAssertEqual(sqlite.dataSQLs.count, chunkReads,
+                       "a proven fingerprint serves the persisted chunks, no re-read")
+
+        sqlite.fingerprintResponses[dbPath] = "m:4:55:1200"
+        try Data("real change".utf8).write(to: URL(fileURLWithPath: dbPath))
+        _ = try await scanner.scan(now: now)
+        XCTAssertGreaterThan(sqlite.dataSQLs.count, chunkReads,
+                             "a changed fingerprint falls back to the chunked read")
+    }
+
     func testMissingDatabaseReturnsNil() async throws {
         let scanner = OpenCodeUsageScanner(sqlite: OpenCodeFakeSQLite(), databasePaths: { [] })
         let scan = try await scanner.scan(now: now)
@@ -139,6 +172,17 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         }
     }
 
+    func testDefaultScannerWidensTheSQLiteStatementBudget() {
+        // OpenCode databases carry hundreds of MB of message JSON; the whole-history data chunks
+        // and the anchor MIN() scan legitimately outrun the accessor's five-second credential-
+        // probe cap, so the production default must construct a wider-budget accessor.
+        let scanner = OpenCodeUsageScanner()
+        XCTAssertEqual(
+            (scanner.sqlite as? NativeSQLiteAccessor)?.queryTimeout,
+            OpenCodeUsageScanner.sqliteQueryTimeout
+        )
+    }
+
     func testHasHostedUsageProbe() {
         let db = "[" + openCodeRow("2026-07-12T10:00:00.000Z", "1.0", 500, "gpt-5.5", "opencode") + "]"
         let withUsage = OpenCodeUsageScanner(
@@ -181,7 +225,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         _ = try await scanner.scan(now: now, daysBack: daysBack)
 
         // The whole-history read is sliced into bounded time chunks so one marshaled
-        // `json_group_array` cannot outrun the sqlite3 subprocess's five-second cap.
+        // `json_group_array` cannot outrun the sqlite3 subprocess's per-statement cap.
         let lifetimeSinceMs = Int(JSONLScanning.sinceDate(daysBack: daysBack, now: now).timeIntervalSince1970 * 1000)
         XCTAssertGreaterThan(sqlite.dataSQLs.count, 1, "a ~10y window must not be one giant query")
         guard let first = sqlite.dataSQLs.first else { return XCTFail("expected data queries") }
@@ -371,6 +415,7 @@ enum OpenCodeDBRowsForChunk {
 final class OpenCodeFakeSQLite: SQLiteAccessing, @unchecked Sendable {
     var data: [String: String]
     var failing: Set<String>
+    var fingerprintResponses: [String: String] = [:]
     var lastDataSQL: String?
     var dataSQLs: [String] = []
 
@@ -381,6 +426,7 @@ final class OpenCodeFakeSQLite: SQLiteAccessing, @unchecked Sendable {
 
     func queryValue(path: String, sql: String) throws -> String? {
         if failing.contains(path) { throw SQLiteError.queryFailed("boom") }
+        if sql.contains("SUM(rowid)") { return fingerprintResponses[path] }
         if sql.contains("json_group_array") {
             lastDataSQL = sql
             dataSQLs.append(sql)

@@ -21,13 +21,21 @@ public enum ScanWorkerCommand {
     struct Options: Equatable {
         struct InvalidArguments: LocalizedError {
             var errorDescription: String? {
-                "Usage: QuotaBar --scan-worker --providers <id[,id...]> [--scope local-accounting|panel-accounting] [--paced] [--return-only]"
+                "Usage: QuotaBar --scan-worker --providers <id[,id...]> [--scope local-accounting|panel-accounting] [--paced] [--return-only] [--per-provider-timeout <s>] [--batch-budget <s>]"
             }
         }
         var providerIDs: [String] = []
         var scope: ProviderRefreshContext.Scope = .panelAccounting
         var paced = false
         var returnOnly = false
+        /// Cap on one provider's fold inside a multi-provider batch. Below the child process's own
+        /// wall timeout so one slow fold returns an error entry instead of the parent killing the
+        /// child and losing every sibling's completed snapshot.
+        var perProviderTimeout: TimeInterval?
+        /// Total wall budget for a batch fold. When the loop runs out, unattempted providers are
+        /// simply absent from the response — the caller then folds them in-process instead of
+        /// reporting a failure for work that never ran.
+        var batchBudget: TimeInterval?
 
         static func parse(_ arguments: [String]) throws -> Options {
             var options = Options()
@@ -41,6 +49,18 @@ public enum ScanWorkerCommand {
                     options.paced = true
                 case "--return-only":
                     options.returnOnly = true
+                case "--per-provider-timeout":
+                    index += 1
+                    guard index < arguments.count,
+                          let seconds = TimeInterval(arguments[index]), seconds > 0
+                    else { throw InvalidArguments() }
+                    options.perProviderTimeout = seconds
+                case "--batch-budget":
+                    index += 1
+                    guard index < arguments.count,
+                          let seconds = TimeInterval(arguments[index]), seconds > 0
+                    else { throw InvalidArguments() }
+                    options.batchBudget = seconds
                 case "--providers":
                     index += 1
                     guard index < arguments.count else { throw InvalidArguments() }
@@ -172,47 +192,36 @@ public enum ScanWorkerCommand {
         providers: [ProviderRuntime],
         defaultIdentityKeys: [String: String]
     ) async -> Response {
-        let byID = Dictionary(uniqueKeysWithValues: providers.map { ($0.provider.id, $0) })
+        let runner = UnpublishedFoldRunner(
+            options: options,
+            providers: providers,
+            defaultIdentityKeys: defaultIdentityKeys
+        )
         var response = Response(schema: schemaName, snapshots: [:], errors: [:], identityKeys: [:])
-        @MainActor
-        func fold(_ id: String) async -> (String, ProviderSnapshot?, String?)? {
-            guard let provider = byID[id], !Task.isCancelled else { return nil }
-            let identity = ProviderCacheIdentityResult()
-            let snapshot = await ProviderRefreshContext.$scope.withValue(options.scope) {
-                await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(options.paced) {
-                    await ProviderRefreshContext.$cacheIdentityResult.withValue(identity) {
-                        await ProviderRefreshDeadline.snapshot(
-                            from: provider, timeout: WidgetDataStore.defaultProviderRefreshTimeout
-                        )
-                    }
-                }
-            }
-            return (id, snapshot, identity.value ?? defaultIdentityKeys[id])
-        }
-        func record(_ result: (String, ProviderSnapshot?, String?)?) {
-            guard let (id, snapshot, identityKey) = result else { return }
-            if let snapshot {
-                response.snapshots[id] = snapshot
-                response.identityKeys[id] = identityKey
+        func record(_ result: UnpublishedFoldRunner.Outcome?) {
+            guard let result else { return }
+            if let snapshot = result.snapshot {
+                response.snapshots[result.providerID] = snapshot
+                response.identityKeys[result.providerID] = result.identityKey
             } else {
-                response.errors[id] = "Accounting refresh timed out"
+                response.errors[result.providerID] = "Accounting refresh timed out"
             }
         }
         // Light providers fold concurrently — MainActor interleaving overlaps their network/SQLite
         // waits; heavy local-corpora providers run one at a time so their parse working sets never
         // stack in the child's memory, mirroring the app's heavy-provider serialization.
         let (light, heavy) = partitionByWeight(options.providerIDs)
-        let lightResults = await withTaskGroup(of: (String, ProviderSnapshot?, String?)?.self) { group in
+        let lightResults = await withTaskGroup(of: UnpublishedFoldRunner.Outcome?.self) { group in
             for id in light {
-                group.addTask { @MainActor in await fold(id) }
+                group.addTask { await runner.fold(id) }
             }
-            var results: [(String, ProviderSnapshot?, String?)?] = []
+            var results: [UnpublishedFoldRunner.Outcome?] = []
             for await result in group { results.append(result) }
             return results
         }
         lightResults.forEach(record)
         for id in heavy {
-            record(await fold(id))
+            record(await runner.fold(id))
         }
         return response
     }
@@ -224,5 +233,54 @@ public enum ScanWorkerCommand {
                 || WidgetDataStore.heavyLocalLogProviders.contains(providerID)
         }
         return (providerIDs.filter { !isHeavy($0) }, providerIDs.filter { isHeavy($0) })
+    }
+}
+
+/// Folds one requested provider at a time for `collectUnpublishedSnapshots`. Main-actor isolated so
+/// the light providers' concurrent folds can share the (non-Sendable) provider runtimes safely.
+@MainActor
+private final class UnpublishedFoldRunner {
+    struct Outcome: Sendable {
+        var providerID: String
+        var snapshot: ProviderSnapshot?
+        var identityKey: String?
+    }
+
+    private let options: ScanWorkerCommand.Options
+    private let byID: [String: ProviderRuntime]
+    private let defaultIdentityKeys: [String: String]
+    private let batchStart = Date()
+
+    init(options: ScanWorkerCommand.Options, providers: [ProviderRuntime], defaultIdentityKeys: [String: String]) {
+        self.options = options
+        self.byID = Dictionary(uniqueKeysWithValues: providers.map { ($0.provider.id, $0) })
+        self.defaultIdentityKeys = defaultIdentityKeys
+    }
+
+    func fold(_ id: String) async -> Outcome? {
+        guard let provider = byID[id], !Task.isCancelled else { return nil }
+        // The parent kills a batch child at its process timeout. A provider not yet started when
+        // the budget is spent is omitted entirely, so the caller refreshes it on its own rather
+        // than surfacing an error for a fold that never ran.
+        let remaining = options.batchBudget.map { $0 - Date().timeIntervalSince(batchStart) }
+        if let remaining, remaining < 5 { return nil }
+        let timeout = min(
+            options.perProviderTimeout ?? WidgetDataStore.defaultProviderRefreshTimeout,
+            remaining ?? .greatestFiniteMagnitude
+        )
+        let identity = ProviderCacheIdentityResult()
+        let snapshot = await ProviderRefreshContext.$scope.withValue(options.scope) {
+            await ProviderRefreshContext.$accountingCPUThrottleEnabled.withValue(options.paced) {
+                // The parent blocks on this short-lived child; the background 7.5% pace would only
+                // stretch the same CPU seconds ~3x. Use the interactive allowance so the fold
+                // finishes while the caller still waits.
+                await ProviderRefreshContext.$accountingCPUInteractiveBudgetEnabled.withValue(options.paced) {
+                    await ProviderRefreshContext.$cacheIdentityResult.withValue(identity) {
+                        await ProviderRefreshDeadline.snapshot(from: provider, timeout: timeout)
+                    }
+                }
+            }
+        }
+        return Outcome(providerID: id, snapshot: snapshot, identityKey: identity.value ?? defaultIdentityKeys[id])
     }
 }

@@ -74,6 +74,14 @@ struct OpenCodeUsageScanner: Sendable {
     static let goProviderID = "opencode-go"
     private static let zenProviderID = "opencode"
 
+    /// Per-statement wall-clock budget for this scanner's SQLite queries. OpenCode databases
+    /// routinely hold hundreds of MB of message JSON — the whole-history data chunks and the
+    /// anchor's full-table `MIN()` legitimately outrun the accessor's five-second default on a cold
+    /// or contended machine, and every timeout fails the whole scan. Thirty seconds leaves an order
+    /// of magnitude of headroom over the measured worst case (~2.5s on a 650MB store) while the
+    /// 120s provider-refresh deadline still bounds the sqlite stage as a whole.
+    static let sqliteQueryTimeout: TimeInterval = 30
+
     var sqlite: SQLiteAccessing
     var databasePaths: @Sendable () throws -> [String]
     /// Roots whose `projects/**/*.jsonl` hold Claude Code sessions routed through the OpenCode
@@ -105,7 +113,7 @@ struct OpenCodeUsageScanner: Sendable {
     private let readFailureReporter: UsageLogReadFailureReporter
 
     init(
-        sqlite: SQLiteAccessing = NativeSQLiteAccessor(),
+        sqlite: SQLiteAccessing = NativeSQLiteAccessor(queryTimeout: OpenCodeUsageScanner.sqliteQueryTimeout),
         databasePaths: @escaping @Sendable () throws -> [String] = OpenCodeUsageScanner.defaultDatabasePaths,
         claudeRoots: @escaping @Sendable () -> [URL] = { [] },
         claudeCacheIdentity: @escaping @Sendable () -> String = { ClaudeLogUsageScanner.parseSourceIdentity() },
@@ -531,7 +539,7 @@ struct OpenCodeUsageScanner: Sendable {
         var failures: [String: String] = [:]
 
         for path in paths {
-            // sqlite3 is a synchronous subprocess (bounded to five seconds). A disable cannot stop the
+            // sqlite3 is a synchronous subprocess (bounded per statement). A disable cannot stop the
             // query already running, but this prevents later database/anchor queries from starting.
             guard !Task.isCancelled else { return nil }
             checked.insert(path)
@@ -550,26 +558,45 @@ struct OpenCodeUsageScanner: Sendable {
                     }
                 }
                 // The whole-history read is chunked into bounded time ranges: one marshaled
-                // `json_group_array` for ~10 years of rows outruns the sqlite3 subprocess's 5s cap
-                // on a large store and fails closed on every fold.
+                // `json_group_array` for ~10 years of rows outruns the sqlite3 subprocess's
+                // per-statement cap on a large store and fails closed on every fold.
                 let nowMs = Int(now.timeIntervalSince1970 * 1000)
                 var queryFailure: String?
-                for sql in OpenCodeDatabaseSQL.dataSQLChunks(cutoffMs: cutoffMs, nowMs: nowMs, schema: schema) {
-                    guard !Task.isCancelled else { return nil }
-                    guard let json = try JSONLAccountingWorkPacer.shared.perform({
-                        try sqlite.queryValue(path: path, sql: sql)
-                    }) else {
-                        queryFailure = "usage query returned no result"
-                        break
+                let stamp = OpenCodeDatabaseSchemaProbe.revisionStamp(path: path)
+                // Persisted chunks first: an exact stamp match costs zero sqlite calls, and a
+                // stamp that only moved on WAL churn re-verifies by one aggregate fingerprint.
+                // Stored rows are a safe superset — their older cutoff keeps rows the live
+                // `date >= scanSince` filter then drops — so window drift needs no re-read.
+                if let cached = cachedRows(path: path, schema: schema, stamp: stamp,
+                                           maximumTimestampMs: maximumTimestampMs) {
+                    rows.append(contentsOf: cached)
+                } else {
+                    var chunks: [String] = []
+                    for sql in OpenCodeDatabaseSQL.dataSQLChunks(cutoffMs: cutoffMs, nowMs: nowMs, schema: schema) {
+                        guard !Task.isCancelled else { return nil }
+                        guard let json = try JSONLAccountingWorkPacer.shared.perform({
+                            try sqlite.queryValue(path: path, sql: sql)
+                        }) else {
+                            queryFailure = "usage query returned no result"
+                            break
+                        }
+                        chunks.append(json)
                     }
-                    guard !Task.isCancelled else { return nil }
-                    guard let parsedRows = JSONLAccountingWorkPacer.shared.perform({
-                        Self.parseRows(json, maximumTimestampMs: maximumTimestampMs)
-                    }) else {
-                        queryFailure = "usage rows contain malformed accounting values"
-                        break
+                    if queryFailure == nil {
+                        for json in chunks {
+                            guard !Task.isCancelled else { return nil }
+                            guard let parsedRows = JSONLAccountingWorkPacer.shared.perform({
+                                Self.parseRows(json, maximumTimestampMs: maximumTimestampMs)
+                            }) else {
+                                queryFailure = "usage rows contain malformed accounting values"
+                                break
+                            }
+                            rows.append(contentsOf: parsedRows)
+                        }
+                        if queryFailure == nil {
+                            persistChunks(chunks, path: path, stamp: stamp, schema: schema)
+                        }
                     }
-                    rows.append(contentsOf: parsedRows)
                 }
                 if let queryFailure {
                     failures[path] = queryFailure
@@ -1569,6 +1596,62 @@ struct OpenCodeUsageScanner: Sendable {
     }
 
     // MARK: - Parsing
+
+    /// Serve a database's persisted chunk JSON when it still describes the live store: an exact
+    /// revision-stamp match is a free hit, and a stamp that moved on WAL churn alone re-verifies
+    /// by one aggregate fingerprint query. `nil` is unproven — the caller takes the live read
+    /// path exactly as before, so a stale record can never leak into the fold.
+    private func cachedRows(path: String, schema: OpenCodeDatabaseSchema, stamp: String?,
+                            maximumTimestampMs: Double) -> [Row]? {
+        guard let stamp,
+              let record = OpenCodeDatabaseRowsCache.readAnyRevision(path: path)
+        else { return nil }
+        let proven = record.revisionStamp == stamp
+            || (record.contentFingerprint.map { fingerprint in
+                Self.isWellFormedFingerprint(fingerprint)
+                    && ((try? sqlite.queryValue(path: path, sql: OpenCodeDatabaseSQL.fingerprintSQL(schema: schema))) == fingerprint)
+            } ?? false)
+        guard proven else { return nil }
+        var out: [Row] = []
+        for json in record.chunks {
+            guard let parsed = JSONLAccountingWorkPacer.shared.perform({
+                Self.parseRows(json, maximumTimestampMs: maximumTimestampMs)
+            }) else { return nil }
+            out.append(contentsOf: parsed)
+        }
+        return out
+    }
+
+    /// Persist the just-read chunks keyed by the pre-read stamp, only when the file stayed
+    /// stable across the whole read — the same consistent-snapshot contract the anchor memo
+    /// relies on. The fingerprint query runs once per real read and lets later WAL churn
+    /// resolve without the chunked re-read.
+    private func persistChunks(_ chunks: [String], path: String, stamp: String?,
+                             schema: OpenCodeDatabaseSchema) {
+        guard let stamp,
+              OpenCodeDatabaseSchemaProbe.revisionStamp(path: path) == stamp else { return }
+        let fingerprint = (try? sqlite.queryValue(
+            path: path, sql: OpenCodeDatabaseSQL.fingerprintSQL(schema: schema)
+        )).flatMap { Self.isWellFormedFingerprint($0) ? $0 : nil }
+        OpenCodeDatabaseRowsCache.write(
+            OpenCodeDatabaseRowsCache.Record(
+                schema: OpenCodeDatabaseRowsCache.schema,
+                revisionStamp: stamp,
+                chunks: chunks,
+                contentFingerprint: fingerprint
+            ),
+            path: path
+        )
+    }
+
+    /// `v2:N:N:N|m:N:N:N` segments — anything else (a stubbed accessor's canned value, an empty
+    /// result) is unproven so test fakes and odd stores cannot false-positive into stale reuse.
+    private static func isWellFormedFingerprint(_ value: String) -> Bool {
+        value.range(
+            of: #"^([a-z0-9]+:\d+:\d+:\d+\|)*[a-z0-9]+:\d+:\d+:\d+$"#,
+            options: .regularExpression
+        ) != nil
+    }
 
     private struct Row {
         var ms: Double

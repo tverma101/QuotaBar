@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import os
 
 /// A missing Pi source is a complete empty result, but a failed directory walk is not. Callers that
 /// merge Pi with another history source must keep the prior combined history on `.incomplete`.
@@ -114,6 +115,9 @@ actor PiUsageScanner {
             return .incomplete
         }
         let bucket = FutureTimestampFoldBucket<Entry>()
+        // Dedup during the fold (first occurrence wins, same as `Self.dedup` afterwards): the
+        // second full-size entries array a post-fold dedup would build never materializes.
+        let dedupIDs = OSAllocatedUnfairLock<Set<String>>(initialState: [])
         let complete = await scanner.foldItems(
             from: files,
             since: since,
@@ -122,6 +126,10 @@ actor PiUsageScanner {
             visit: { entry in
                 guard entry.cardID == cardID else { return }
                 guard entry.reportedTotalTokens > 0 || (entry.carriedCost ?? 0) > 0 else { return }
+                if let id = entry.id,
+                   !dedupIDs.withLock({ $0.insert(id).inserted }) {
+                    return
+                }
                 bucket.append(entry, timestamp: entry.timestamp, maximumTimestamp: maximumTimestamp)
             },
             fileStarted: { bucket.begin($0) },
@@ -140,9 +148,8 @@ actor PiUsageScanner {
             return .incomplete
         }
         DiagnosticGate.clearFailure(futureDiagnosticKey)
-        let deduped = Self.dedup(bucket.items)
         guard !Task.isCancelled else { return .incomplete }
-        let result = Self.aggregate(entries: deduped, cardID: cardID, since: since, pricing: pricing)
+        let result = Self.aggregate(entries: bucket.items, cardID: cardID, since: since, pricing: pricing)
         guard !Task.isCancelled else { return .incomplete }
         return .complete(result)
     }

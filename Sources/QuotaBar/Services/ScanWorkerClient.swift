@@ -38,6 +38,8 @@ final class ScanWorkerClient {
     /// the cap surfaces per-member timeout errors (matching the single-provider timeout contract)
     /// instead of re-folding everything in-process on the app's heap.
     nonisolated private static let batchFoldTimeout: TimeInterval = 300
+    /// Time the batch child keeps back from `batchFoldTimeout` to encode and report finished folds.
+    nonisolated private static let batchReportingReserve: TimeInterval = 20
 
     private let runner: any ProcessRunning
     /// Slightly below the provider refresh deadline so the client can still report a timeout
@@ -202,6 +204,12 @@ final class ScanWorkerClient {
             "--providers", providerIDs.joined(separator: ","),
             "--scope", scopeArgument,
             "--return-only",
+            // One slow fold (Antigravity's history scan, a GB-scale Devin or Freebuff store) must
+            // not let the parent's process timeout erase every sibling's finished result: each
+            // member gets the single-provider timeout, and the child stops starting members early
+            // enough to still report the finished ones. Unstarted members refresh on their own.
+            "--per-provider-timeout", String(Int(timeout)),
+            "--batch-budget", String(Int(Self.batchFoldTimeout - Self.batchReportingReserve)),
         ] + pacedArgument
         do {
             let runResult = try await loadOffMainActor { [runner] in

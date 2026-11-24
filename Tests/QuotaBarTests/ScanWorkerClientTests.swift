@@ -15,6 +15,8 @@ private final class CannedScanWorkerRunner: ProcessRunning, @unchecked Sendable 
     private(set) var lastEnvironment: [String: String] = [:]
     private(set) var lastExecutable: String = ""
     private(set) var spawnCount = 0
+    private(set) var allArguments: [[String]] = []
+    private let lock = NSLock()
     let outcome: Outcome
 
     init(outcome: Outcome) {
@@ -27,10 +29,13 @@ private final class CannedScanWorkerRunner: ProcessRunning, @unchecked Sendable 
         environment: [String: String],
         timeout: TimeInterval
     ) throws -> ProcessResult {
+        lock.lock()
         spawnCount += 1
         lastExecutable = executable
         lastArguments = arguments
         lastEnvironment = environment
+        allArguments.append(arguments)
+        lock.unlock()
         switch outcome {
         case .success(let stdout):
             return ProcessResult(exitCode: 0, stdout: stdout, stderr: "")
@@ -199,99 +204,6 @@ final class ScanWorkerClientTests: XCTestCase {
         XCTAssertEqual(fallbackRunCount, 1)
         XCTAssertEqual(result.providerID, provider.id)
     }
-
-    /// A batch fold must spawn one child for the whole list and serve each provider's
-    /// `foldOnlySnapshot` out of the stash — no per-provider respawn.
-    func testBatchFoldServesStashedResultsWithoutRespawn() async throws {
-        let other = Provider(id: "grok", displayName: "Grok", icon: .providerMark("grok"))
-        let snapshotA = ProviderSnapshot.make(
-            provider: provider, plan: nil, lines: [], refreshedAt: TestLocalInstant.date(2026, 11, 10, 12)
-        )
-        let snapshotB = ProviderSnapshot.make(
-            provider: other, plan: nil, lines: [], refreshedAt: TestLocalInstant.date(2026, 11, 10, 12)
-        )
-        let payload = try encodeResponse(ScanWorkerCommand.Response(
-            schema: ScanWorkerCommand.schemaName,
-            snapshots: [provider.id: snapshotA, other.id: snapshotB],
-            errors: [:],
-            identityKeys: [provider.id: "identity-1"]
-        ))
-        let runner = CannedScanWorkerRunner(outcome: .success(stdout: payload))
-        let client = makeClient(runner: runner)
-
-        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
-            await client.batchFold(providerIDs: [provider.id, other.id])
-            XCTAssertEqual(runner.spawnCount, 1)
-            XCTAssertTrue(runner.lastArguments.contains("--return-only"))
-            XCTAssertEqual(
-                runner.lastArguments.firstIndex(of: "--providers").map { runner.lastArguments[$0 + 1] },
-                "codex,grok"
-            )
-
-            let first = await client.foldOnlySnapshot(provider: provider, inProcessFallback: { await self.fallback() })
-            let second = await client.foldOnlySnapshot(provider: other, inProcessFallback: { await self.fallback() })
-            XCTAssertEqual(first.providerID, provider.id)
-            XCTAssertEqual(second.providerID, other.id)
-            XCTAssertNil(first.errorCategory)
-        }
-
-        XCTAssertEqual(runner.spawnCount, 1, "consumed stash entries must not respawn the child")
-        XCTAssertEqual(fallbackRunCount, 0)
-    }
-
-    /// A provider absent from the batch (or a stale batch entry) keeps the per-provider child path.
-    func testBatchFoldMissFallsBackToIndividualSpawn() async throws {
-        let other = Provider(id: "grok", displayName: "Grok", icon: .providerMark("grok"))
-        let payload = try encodeResponse(ScanWorkerCommand.Response(
-            schema: ScanWorkerCommand.schemaName,
-            snapshots: [provider.id: ProviderSnapshot.make(
-                provider: provider, plan: nil, lines: [], refreshedAt: TestLocalInstant.date(2026, 11, 10, 12)
-            )],
-            errors: [:],
-            identityKeys: [:]
-        ))
-        let runner = CannedScanWorkerRunner(outcome: .success(stdout: payload))
-        let client = makeClient(runner: runner)
-
-        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
-            await client.batchFold(providerIDs: [provider.id, other.id])
-            _ = await client.foldOnlySnapshot(provider: other, inProcessFallback: { await self.fallback() })
-        }
-
-        // `other` had no batch result: the fallback closure ran, no second child was spawned for it
-        // (a missing snapshot entry is a benign child outcome, not a spawn failure).
-        XCTAssertEqual(fallbackRunCount, 1)
-        XCTAssertEqual(runner.spawnCount, 1)
-    }
-
-    /// A failed batch leaves the stash empty and each provider falls back to its own child.
-    func testFailedBatchLeavesPerProviderPathIntact() async throws {
-        let snapshot = ProviderSnapshot.make(
-            provider: provider, plan: nil, lines: [], refreshedAt: TestLocalInstant.date(2026, 11, 10, 12)
-        )
-        let payload = try encodeResponse(ScanWorkerCommand.Response(
-            schema: ScanWorkerCommand.schemaName,
-            snapshots: [provider.id: snapshot],
-            errors: [:],
-            identityKeys: [:]
-        ))
-        let runner = CannedScanWorkerRunner(outcome: .exit(exitCode: 3, stderr: "child crashed"))
-        let client = makeClient(runner: runner)
-
-        // Batch fails, then the individual spawn succeeds on a fresh runner result.
-        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
-            await client.batchFold(providerIDs: [provider.id, "grok"])
-            XCTAssertEqual(runner.spawnCount, 1)
-            let result = await client.foldOnlySnapshot(provider: provider, inProcessFallback: { await self.fallback() })
-            // The runner still reports the canned failure for the individual spawn too — that is
-            // the error-snapshot path, not the in-process fallback.
-            XCTAssertEqual(errorMessage(in: result), "child crashed")
-        }
-
-        XCTAssertEqual(runner.spawnCount, 2, "a failed batch must not suppress the per-provider child")
-        XCTAssertEqual(fallbackRunCount, 0)
-        _ = payload
-    }
 }
 
 @MainActor
@@ -360,6 +272,28 @@ final class ScanWorkerBatchTests: XCTestCase {
 
         XCTAssertTrue(runner.lastArguments.contains("--paced"))
         XCTAssertTrue(runner.lastArguments.contains("local-accounting"))
+    }
+
+    /// One slow member must not let the parent's process timeout erase its siblings' results: the
+    /// child gets a per-member cap and a batch budget inside the parent's process timeout.
+    func testBatchFoldBoundsEachMemberInsideTheProcessTimeout() async throws {
+        let payload = try encode(ScanWorkerCommand.Response(
+            schema: ScanWorkerCommand.schemaName, snapshots: [:], errors: [:], identityKeys: [:]
+        ))
+        let runner = CannedScanWorkerRunner(outcome: .success(stdout: payload))
+        let client = makeClient(runner: runner)
+
+        _ = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await client.fetchFoldSnapshots(providers: [codex.id: codex, claude.id: claude], paced: false)
+        }
+
+        func value(after flag: String) -> Double? {
+            runner.lastArguments.firstIndex(of: flag).flatMap { Double(runner.lastArguments[$0 + 1]) }
+        }
+        XCTAssertEqual(value(after: "--per-provider-timeout"), 110)
+        let budget = try XCTUnwrap(value(after: "--batch-budget"))
+        XCTAssertLessThan(budget, 300, "the child must report before the parent kills it")
+        XCTAssertGreaterThanOrEqual(budget, 110, "a budget below one member's cap starves the batch")
     }
 
     func testBatchMemberErrorBecomesErrorSnapshotWithoutFallback() async throws {

@@ -854,6 +854,39 @@ actor AntigravityDbUsageScanner {
         }
 
         var cachedContentFingerprint: ContentFingerprint?
+        var mergedProbe: AntigravityChangeProbe.Result?
+
+        // A changed database can rewrite an old row and append a new one in the same transaction.
+        // Verify the full cached generation prefix before retaining it, then read any appended rows.
+        // Databases that already proved the steps schema run one merged statement covering the
+        // schema probe, the step table digests, and the generation digests; any merged failure
+        // degrades to the sequential queries below with identical semantics.
+        if let existing = cached, existing.fingerprint != fingerprint,
+           existing.hasStepMetadata == true, sqliteSupportsSHA3Aggregate != false {
+            do {
+                mergedProbe = try AntigravityChangeProbe.query(
+                    path: path,
+                    sqlite: sqlite,
+                    throughGenerationIndex: existing.lastIndex,
+                    throughStepIndex: existing.stepTimestampIndex?.lastIndex ?? -1
+                )
+                if mergedProbe != nil { sqliteSupportsSHA3Aggregate = true }
+            } catch {
+                if Task.isCancelled || Self.isRetryableSQLiteFailure(error.localizedDescription) {
+                    throw error
+                }
+                if Self.isSHA3Unavailable(error) { sqliteSupportsSHA3Aggregate = false }
+                mergedProbe = nil
+                let diagnosticKey = "provider.antigravity.change-probe.\(JSONLScanCachePaths.stableFingerprint(path))"
+                DiagnosticGate.logOnce(for: diagnosticKey) {
+                    AppLog.warn(
+                        LogTag.plugin("antigravity"),
+                        "merged Antigravity change probe failed in \(path); falling back to sequential verification: \(error.localizedDescription)"
+                    )
+                }
+            }
+        }
+
         var contentFingerprintUnavailable = sqliteSupportsSHA3Aggregate == false
         var prefixVerifiedBeforeRead = false
 
@@ -864,17 +897,25 @@ actor AntigravityDbUsageScanner {
         if let existing = cached, existing.fingerprint != fingerprint {
             guard !Task.isCancelled else { return nil }
             if !contentFingerprintUnavailable {
-                do {
-                    cachedContentFingerprint = try Self.contentFingerprint(
-                        path: path,
-                        through: existing.lastIndex,
-                        sqlite: sqlite,
-                        includeStepMetadata: existing.hasStepMetadata == true
+                if let mergedProbe {
+                    cachedContentFingerprint = ContentFingerprint(
+                        maximumIndex: mergedProbe.generationMaximumIndex,
+                        prefixFingerprint: mergedProbe.generationPrefixFingerprint,
+                        tableFingerprint: mergedProbe.generationTableFingerprint
                     )
-                    if cachedContentFingerprint != nil { sqliteSupportsSHA3Aggregate = true }
-                } catch {
-                    contentFingerprintUnavailable = Self.isSHA3Unavailable(error)
-                    if contentFingerprintUnavailable { sqliteSupportsSHA3Aggregate = false }
+                } else {
+                    do {
+                        cachedContentFingerprint = try Self.contentFingerprint(
+                            path: path,
+                            through: existing.lastIndex,
+                            sqlite: sqlite,
+                            includeStepMetadata: existing.hasStepMetadata == true
+                        )
+                        if cachedContentFingerprint != nil { sqliteSupportsSHA3Aggregate = true }
+                    } catch {
+                        contentFingerprintUnavailable = Self.isSHA3Unavailable(error)
+                        if contentFingerprintUnavailable { sqliteSupportsSHA3Aggregate = false }
+                    }
                 }
             }
             guard !Task.isCancelled else { return nil }
@@ -916,6 +957,11 @@ actor AntigravityDbUsageScanner {
                 since: since,
                 observedAt: observedAt,
                 maximumStepIndexBytes: availableStepIndexBytes,
+                precomputedStepMetadataProbe: mergedProbe?.hasStepMetadata,
+                precomputedStepDigest: mergedProbe.map {
+                    (prefix: $0.stepPrefixFingerprint, table: $0.stepTableFingerprint,
+                     maximumIndex: $0.stepMaximumIndex)
+                },
                 into: &refreshed
             )
         } catch AntigravityStepTimestampIndex.LoadError.memoryLimitExceeded {
@@ -1085,6 +1131,8 @@ actor AntigravityDbUsageScanner {
         since: Date,
         observedAt: Date,
         maximumStepIndexBytes: Int,
+        precomputedStepMetadataProbe: Bool? = nil,
+        precomputedStepDigest: (prefix: String, table: String, maximumIndex: Int)? = nil,
         into cached: inout CachedDatabase
     ) throws {
         // Modern Antigravity stores put generation times in the matching steps.metadata row instead
@@ -1094,31 +1142,38 @@ actor AntigravityDbUsageScanner {
         // query, so idle refreshes still pay no schema-probe cost.
         let hasStepMetadata: Bool
         let stepMetadataDiagnosticKey = "provider.antigravity.step-metadata-probe.\(JSONLScanCachePaths.stableFingerprint(path))"
-        do {
-            hasStepMetadata = try sqlite.queryValue(path: path, sql: Self.stepMetadataProbeSQL) == "1"
+        if let precomputedStepMetadataProbe {
+            // The merged change probe already ran the same schema check in its single subprocess.
+            hasStepMetadata = precomputedStepMetadataProbe
             DiagnosticGate.clearFailure(stepMetadataDiagnosticKey)
-        } catch {
-            if Self.isRetryableSQLiteFailure(error.localizedDescription) {
-                throw SQLiteError.queryFailed(error.localizedDescription)
+        } else {
+            do {
+                hasStepMetadata = try sqlite.queryValue(path: path, sql: Self.stepMetadataProbeSQL) == "1"
+                DiagnosticGate.clearFailure(stepMetadataDiagnosticKey)
+            } catch {
+                if Self.isRetryableSQLiteFailure(error.localizedDescription) {
+                    throw SQLiteError.queryFailed(error.localizedDescription)
+                }
+                guard Self.isUnsupportedStepMetadataProbe(error.localizedDescription) else {
+                    throw SQLiteError.queryFailed(error.localizedDescription)
+                }
+                // Older or restricted SQLite CLIs may reject table-valued PRAGMA. The generation rows
+                // remain readable without the correlated timestamp; their history is surfaced as partial.
+                DiagnosticGate.logOnce(for: stepMetadataDiagnosticKey) {
+                    AppLog.warn(
+                        LogTag.plugin("antigravity"),
+                        "could not inspect Antigravity step metadata in \(path); reading generation rows without it: \(error.localizedDescription)"
+                    )
+                }
+                hasStepMetadata = false
             }
-            guard Self.isUnsupportedStepMetadataProbe(error.localizedDescription) else {
-                throw SQLiteError.queryFailed(error.localizedDescription)
-            }
-            // Older or restricted SQLite CLIs may reject table-valued PRAGMA. The generation rows
-            // remain readable without the correlated timestamp; their history is surfaced as partial.
-            DiagnosticGate.logOnce(for: stepMetadataDiagnosticKey) {
-                AppLog.warn(
-                    LogTag.plugin("antigravity"),
-                    "could not inspect Antigravity step metadata in \(path); reading generation rows without it: \(error.localizedDescription)"
-                )
-            }
-            hasStepMetadata = false
         }
         let stepIndex = hasStepMetadata ? try AntigravityStepTimestampIndex.load(
             path: path,
             sqlite: sqlite,
             previous: cached.stepTimestampIndex,
-            maximumEstimatedMemoryBytes: maximumStepIndexBytes
+            maximumEstimatedMemoryBytes: maximumStepIndexBytes,
+            precomputedDigest: precomputedStepDigest
         ) : nil
         let priorStepDatesChanged: Bool
         if let previous = cached.stepTimestampIndex {
@@ -1578,9 +1633,8 @@ actor AntigravityDbUsageScanner {
     }
 
     /// The unit of derived state per conversation database: source stamps plus parsed events plus
-    /// the priced daily aggregate. Codable mirrors the whole value to the disk record except the
-    /// step timestamp index, which is process-resident and rebuilt from SQLite only when a scan
-    /// needs to resolve undated rows.
+    /// the priced daily aggregate plus the step timestamp index. Codable mirrors the whole value to
+    /// the disk record so a cold scan worker verifies (rather than re-pages) the step table.
     struct CachedDatabase {
         var fingerprint: DatabaseFingerprint
         var windowStart: Date
@@ -1634,7 +1688,7 @@ extension AntigravityDbUsageScanner.CachedDatabase: Codable {
         case fingerprint, windowStart, lastIndex, rowCount, tableFingerprint, contentFingerprint
         case events, hasProjectedRows, oversizedTimestamps, invalidTokenTimestamps
         case malformedUsageTimestamps, undatedUsageTimestamps, undatedIdentities, hasStepMetadata
-        case aggregate
+        case stepTimestampIndex, aggregate
     }
 
     init(from decoder: Decoder) throws {
@@ -1655,10 +1709,12 @@ extension AntigravityDbUsageScanner.CachedDatabase: Codable {
             Set<AntigravityProtoDecoder.StepIdentity>.self, forKey: .undatedIdentities
         ) ?? []
         hasStepMetadata = try container.decodeIfPresent(Bool.self, forKey: .hasStepMetadata)
+        // Older records predate index persistence; a missing index simply takes the rebuild path
+        // once, then re-persists with it on the next changed scan.
+        stepTimestampIndex = try container.decodeIfPresent(
+            AntigravityStepTimestampIndex.self, forKey: .stepTimestampIndex
+        )
         aggregate = try container.decodeIfPresent(AntigravityDbUsageScanner.CachedAggregate.self, forKey: .aggregate)
-        // The step timestamp index is deliberately not persisted: it is a bounded memory-budget
-        // structure that a scan rebuilds from SQLite the first time it resolves undated rows.
-        stepTimestampIndex = nil
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1677,6 +1733,7 @@ extension AntigravityDbUsageScanner.CachedDatabase: Codable {
         try container.encode(undatedUsageTimestamps, forKey: .undatedUsageTimestamps)
         try container.encode(undatedIdentities, forKey: .undatedIdentities)
         try container.encodeIfPresent(hasStepMetadata, forKey: .hasStepMetadata)
+        try container.encodeIfPresent(stepTimestampIndex, forKey: .stepTimestampIndex)
         try container.encodeIfPresent(aggregate, forKey: .aggregate)
     }
 }

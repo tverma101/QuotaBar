@@ -2237,41 +2237,6 @@ final class WidgetDataStore {
         return result
     }
 
-    private func applyingVMBoxWarnings(_ warnings: [String: String], to values: [String: ProviderSnapshot]) -> [String: ProviderSnapshot] {
-        var result = values
-        for (id, warning) in warnings where isProviderEnabled(id) {
-            guard var snapshot = result[id] else { continue }
-            snapshot.historyWarning = [snapshot.historyWarning, warning].compactMap { $0 }.joined(separator: " · ")
-            result[id] = snapshot
-        }
-        return result
-    }
-
-    /// Older installations expose ZCode's cumulative Tokens tile rather than daily history.
-    /// Preserve that existing metric and its layout settings; newer daily-history catalogs use
-    /// the normal merger above. Neither path changes Z.ai Coding Plan quota meters.
-    private func applyingVMBoxZCodeTotal(_ documents: [UsageHistoryDocument], to values: [String: ProviderSnapshot]) -> [String: ProviderSnapshot] {
-        guard registry.historyDescriptorsByProvider["zai"] == nil,
-              registry.descriptors.contains(where: { $0.id == "zai.zcodeTokens" }),
-              isProviderEnabled("zai")
-        else { return values }
-        let remote = documents.compactMap { $0.providers["zai"] }.flatMap(\.series.daily)
-            .reduce(0.0) { $0 + Double($1.totalTokens) }
-        guard remote > 0, remote.isFinite else { return values }
-        var result = values
-        var snapshot = result["zai"] ?? ProviderSnapshot(providerID: "zai", displayName: "Z.ai", lines: [], refreshedAt: .distantPast)
-        var local = 0.0
-        for line in snapshot.lines {
-            if case let .values(label, numbers, _, _, _, _) = line, label == "ZCode Tokens" {
-                local += numbers.filter { $0.kind == .count }.reduce(0) { $0 + $1.number }
-            }
-        }
-        snapshot.lines.removeAll { $0.label == "ZCode Tokens" }
-        snapshot.lines.append(.values(label: "ZCode Tokens", values: [MetricValue(number: local + remote, kind: .count, label: "tokens")]))
-        result["zai"] = snapshot
-        return result
-    }
-
     private func invalidateMergedHistoryCache() {
         mergedHistoryCache = nil
         mergedHistoryCacheDayKey = nil

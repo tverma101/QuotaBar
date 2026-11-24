@@ -73,10 +73,16 @@ final class ZstdDecompressorTests: XCTestCase {
         XCTAssertEqual(decompressed, payload)
     }
 
-    func testAbsenceOfZstdIsNotAnError() {
-        let decompressor = ZstdDecompressor(searchPaths: ["/nonexistent-probe-zstd-\(UUID().uuidString)"])
-        XCTAssertNil(decompressor.zstdExecutable)
-        XCTAssertNil(try decompressor.decompress(path: "/nonexistent.jsonl.zst"))
+    func testMissingArchiveFailsLoudly() {
+        // The Rust reader is in-process, so there is no "zstd not installed" state any more; an
+        // archive that vanished between discovery and read is a decompression failure.
+        let path = "/nonexistent-\(UUID().uuidString).jsonl.zst"
+        XCTAssertThrowsError(try ZstdDecompressor().decompress(path: path)) { error in
+            guard case .decompressionFailed(let failedPath, _) = error as? ZstdDecompressor.ZstdError else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(failedPath, path)
+        }
     }
 
     func testOutputBeyondTheCapTerminatesTheChild() throws {
@@ -128,13 +134,14 @@ final class ZstdDecompressorTests: XCTestCase {
         let result = await scanner.scanResult(daysBack: 3650, now: Date().addingTimeInterval(-3600), pricing: TestPricing.bundled)
 
         switch result {
-        case .complete(let scan):
+        case .complete(let scan, let damagedLines):
             XCTAssertEqual(
                 scan?.series.daily.reduce(0) { $0 + $1.totalTokens },
                 450,
                 "\(String(describing: scan))"
             )
-        case .incomplete:
+            XCTAssertEqual(damagedLines, 0)
+        case .deferredByFutureTimestamp, .incomplete:
             XCTFail("the fold must complete when zstd is available")
         }
     }

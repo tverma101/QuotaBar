@@ -223,13 +223,12 @@ final class CodexProvider: ProviderRuntime {
     }
 
     /// Memory-pressure hook, mirroring Antigravity/Freebuff/ZAI: the retained per-scan
-    /// `LogUsageScan`s (native sessions, FCC proxy, pi) and the router fold's aggregate are all
+    /// `LogUsageScan`s (native sessions, FCC proxy) and the router fold's aggregate are all
     /// recomputable — the fold re-derives them from the durable caches on the next pass.
     func unloadLocalAccountingCachesForMemoryPressure() async {
         lastNativeScan = nil
         lastNativeScanDamagedLines = 0
         lastProxyScan = nil
-        lastPiScan = nil
         await routerUsageScanner.unloadLocalAccountingCachesForMemoryPressure()
     }
 

@@ -117,9 +117,9 @@ enum OpenCodeDatabaseSchemaProbe {
 /// `[time_created, cost, tokens, model, provider]` entries.
 enum OpenCodeDatabaseSQL {
     /// One statement's worth of history. The whole-history query marshals ~10 years of rows, each
-    /// carrying ~15 `json_extract`s, into a single string — that blows the sqlite3 subprocess's 5s
-    /// cap on a large store and the scan would fail closed on every refresh. Slicing the window
-    /// into bounded ranges keeps each subprocess call small enough to finish.
+    /// carrying ~15 `json_extract`s, into a single string — that outruns the sqlite3 subprocess's
+    /// per-statement cap on a large store and the scan would fail closed on every refresh. Slicing
+    /// the window into bounded ranges keeps each subprocess call small enough to finish.
     private static let dataChunkSpanMs = 366 * 86_400_000
 
     /// The data query as serial time-bounded chunks: each covers `[lower, lower+span)` except the
@@ -176,6 +176,30 @@ enum OpenCodeDatabaseSQL {
         \(branches)
         );
         """
+    }
+
+    /// One aggregate per source the data query reads: assistant `session_message` rows carry their
+    /// payload+timestamp bytes for v2, and the whole `message` table for the legacy layout — the
+    /// role filter lives inside `data` there, and an over-sensitive fingerprint only costs a
+    /// needless re-read, never stale rows. A matching fingerprint across a stamp change proves WAL
+    /// churn, so the persisted row chunks still describe the live projection.
+    static func fingerprintSQL(schema: OpenCodeDatabaseSchema) -> String {
+        var parts: [String] = []
+        if schema.effective.readsV2 {
+            parts.append("""
+            (SELECT 'v2:' || COUNT(*) || ':' || COALESCE(SUM(rowid),0) || ':' ||
+                    COALESCE(SUM(LENGTH(data)+LENGTH(time_created)),0)
+             FROM session_message WHERE type='assistant')
+            """)
+        }
+        if schema.effective.readsLegacy {
+            parts.append("""
+            (SELECT 'm:' || COUNT(*) || ':' || COALESCE(SUM(rowid),0) || ':' ||
+                    COALESCE(SUM(LENGTH(data)+LENGTH(time_created)),0)
+             FROM message)
+            """)
+        }
+        return "SELECT \(parts.joined(separator: " || '|' || \n"))"
     }
 
     /// A cheap "does this database hold any hosted usage" probe.

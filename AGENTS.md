@@ -15,8 +15,8 @@ AGENTS.md is the source of truth for agent instructions in this repository. CLAU
 
 ## Releases
 
-There is no release automation. `main` is the development line; releases are built and installed by
-hand with `./script/build_and_run.sh build`.
+There is no release automation. `main` is the development line; release bundles
+are staged by hand with `./script/build_and_run.sh build` (no install or launch).
 
 ### Guardrails (do not break)
 - **Never increase the version number on your own initiative — ask for explicit approval first.**
@@ -81,7 +81,23 @@ than a crash; `rm -rf .build/out/Intermediates.noindex/XCBuildData .build/.lock`
 
 ## Running / Testing Changes
 
-- There is no hot reload. The app is a long-lived menu-bar process, so **every code change requires a full rebuild and restart of the running app** to take effect — kill the running instance, rebuild, and relaunch before testing.
+- Before handing off a repository change, build QuotaBar end to end, replace
+  the signed app in `/Applications/QuotaBar.app`, relaunch it, and verify the
+  live process. A successful compile, test run, staged bundle, or `verify`
+  preview does not replace the running app. There is no hot reload.
+- Use `./script/build_and_run.sh install` from the checkout that contains the
+  changes to be installed. Match the installed bundle ID, version, and signing
+  identity. Honor any local `AGENTS.local.md` build instructions; don't silently
+  replace a customized install with a public build or build from a checkout
+  that doesn't contain the changes being handed off.
+- Check the executable paths and arguments of running QuotaBar processes before
+  and after installing. Quit confirmed `dist/` previews, including previews
+  from other checkouts; don't stop unrelated processes. The installer stages
+  and signs the replacement before stopping the installed app. Verify exactly
+  one QuotaBar app is running from `/Applications/QuotaBar.app`, not `dist/`.
+  Exclude `--scan-worker` child processes from the app instance count.
+- Use `./script/build_and_run.sh verify` only for an explicitly requested
+  preview. Don't leave a preview and the installed app running together.
 
 ## Pull Requests
 
