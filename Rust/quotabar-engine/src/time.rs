@@ -5,6 +5,9 @@
 /// `Date` as seconds since this instant by default, so caches shared with the Swift app use it.
 pub const REFERENCE_DATE_UNIX: f64 = 978_307_200.0;
 
+/// Swift `Date.distantPast.timeIntervalSince1970`.
+pub const DISTANT_PAST: f64 = -62_135_769_600.0;
+
 /// Proleptic Gregorian days since 1970-01-01 (Howard Hinnant's civil-date transform).
 pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = year - i64::from(month <= 2);

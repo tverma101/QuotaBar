@@ -49,6 +49,15 @@ pub(super) fn dispatch(engine: &Engine, method: &str, params: Value) -> Result<V
             let p: CredentialActionParams = from_params(params)?;
             crate::providers::api_key::dispatch(&p.provider_id, &p.action, p.key.as_deref())
         }
+        "cacheIdentityKey" => {
+            let p: ProviderIdParams = from_params(params)?;
+            match p.provider_id.as_str() {
+                "cursor" => Ok(Value::String(
+                    crate::providers::cursor::auth::CursorAuthStore::live().cache_identity_key_for_launch(),
+                )),
+                other => Err(format!("provider does not support cacheIdentityKey: {other}")),
+            }
+        }
         "refresh" => {
             let p: RefreshParams = from_params(params)?;
             let mut ctx = RefreshContext::new(p.scope.unwrap_or(Scope::Full));
@@ -198,6 +207,12 @@ struct PricingResolveParams {
     timestamp: Option<f64>,
     apply_long_context_rates: Option<bool>,
     skip_model_catalog_refresh: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderIdParams {
+    provider_id: String,
 }
 
 #[derive(Deserialize)]

@@ -10,12 +10,14 @@ pub mod auth_retry;
 pub mod claude;
 pub mod codex;
 pub mod copilot;
+pub mod cursor;
 pub mod devin;
 pub mod grok;
 pub mod hermes;
 pub mod muse;
 pub mod openrouter;
 pub mod pi;
+pub mod zai;
 
 pub trait ProviderRuntime: Send + Sync {
     fn info(&self) -> &ProviderInfo;

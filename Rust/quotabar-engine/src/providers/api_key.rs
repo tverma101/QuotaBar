@@ -207,6 +207,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub fn dispatch(provider_id: &str, action: &str, key: Option<&str>) -> Result<Value, String> {
     let spec = match provider_id {
         "openrouter" => super::openrouter::auth::live_spec(),
+        "zai" => super::zai::auth::live_spec(),
         other => return Err(format!("provider does not support credentialAction: {other}")),
     };
     match action {
