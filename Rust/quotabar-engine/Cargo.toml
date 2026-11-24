@@ -16,7 +16,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 # Native, in-process SQLite. Replaces the `/usr/bin/sqlite3` subprocess per query the Swift backend
 # spawned (each with its own 5-30 s timeout); `bundled` pins one SQLite build on every platform.
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
+tempfile = "3"
 # Local calendar math (day keys follow the user's time zone exactly like Swift's Calendar.current).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Fast newline / marker search in JSONL scanners.
@@ -44,6 +45,3 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 [features]
 # Exposes `http::mock` to downstream crates' tests (the Windows app, the C ABI).
 test-support = []
-
-[dev-dependencies]
-tempfile = "3"

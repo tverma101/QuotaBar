@@ -216,7 +216,7 @@ impl PricingSupplement {
             .into_iter()
             .map(|(model, e)| {
                 let tiers = e.prompt_rate_tiers.unwrap_or_default();
-                let explicit = e.cache_read_per_million.is_some() || tiers.iter().any(|t| t.cache_read_per_million.is_some());
+                let explicit = e.cache_read_per_million.is_some();
                 let mut rates = ModelRates::new(
                     e.input_per_million,
                     e.output_per_million,

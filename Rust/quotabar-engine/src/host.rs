@@ -143,6 +143,24 @@ pub enum SecureWriteOutcome {
     Failed { message: String },
 }
 
+/// A request to remove a secret from the platform credential store.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SecureDeleteRequest {
+    pub service: String,
+    #[serde(default, skip_serializing_if = "SecureAccount::is_any")]
+    pub account: SecureAccount,
+    pub provider: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum SecureDeleteOutcome {
+    Deleted,
+    NotFound,
+    Failed { message: String },
+}
+
 pub trait Host: Send + Sync {
     fn log(&self, level: LogLevel, tag: &str, message: &str);
     /// The most verbose level the host will keep; lets callers skip building messages.
@@ -151,6 +169,10 @@ pub trait Host: Send + Sync {
     fn secure_write(&self, request: &SecureWriteRequest) -> SecureWriteOutcome {
         let _ = request;
         SecureWriteOutcome::Failed { message: "this host has no credential store".into() }
+    }
+    fn secure_delete(&self, request: &SecureDeleteRequest) -> SecureDeleteOutcome {
+        let _ = request;
+        SecureDeleteOutcome::Failed { message: "this host has no credential store".into() }
     }
     /// Whether an item exists, from its attributes only (never reads the secret or prompts).
     /// `None` when the store cannot tell.
@@ -214,6 +236,10 @@ pub fn secure_read(request: &SecureReadRequest) -> SecureReadOutcome {
 
 pub fn secure_write(request: &SecureWriteRequest) -> SecureWriteOutcome {
     host().secure_write(request)
+}
+
+pub fn secure_delete(request: &SecureDeleteRequest) -> SecureDeleteOutcome {
+    host().secure_delete(request)
 }
 
 pub fn secure_exists(service: &str) -> Option<bool> {
@@ -309,5 +335,13 @@ mod tests {
         assert_eq!(outcome, SecureReadOutcome::Found { value: "x".into() });
         let outcome: SecureReadOutcome = serde_json::from_str(r#"{"status":"deferred"}"#).unwrap();
         assert_eq!(outcome, SecureReadOutcome::Deferred);
+        let delete = SecureDeleteRequest {
+            service: "s".into(),
+            account: SecureAccount::Named("acct".into()),
+            provider: "openrouter".into(),
+        };
+        assert_eq!(serde_json::to_value(&delete).unwrap()["account"], serde_json::json!({"kind": "named", "name": "acct"}));
+        let deleted: SecureDeleteOutcome = serde_json::from_str(r#"{"status":"deleted"}"#).unwrap();
+        assert_eq!(deleted, SecureDeleteOutcome::Deleted);
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import Synchronization
 
 /// Supplies platform services to Rust on its worker threads.
@@ -43,6 +44,8 @@ enum RustEngineHost {
                 return try encode(read(envelope.params, keychain: keychain))
             case "secureWrite":
                 return try encode(write(envelope.params, keychain: keychain))
+            case "secureDelete":
+                return try encode(delete(envelope.params))
             case "secureExists":
                 guard let service = envelope.params.service else { return nil }
                 return try encode(keychain.genericPasswordExists(service: service))
@@ -114,6 +117,25 @@ enum RustEngineHost {
             return Response(status: "written")
         } catch {
             return Response(status: "failed", message: "Keychain write failed.")
+        }
+    }
+
+    private static func delete(_ params: Parameters) -> Response {
+        guard let service = params.service else {
+            return Response(status: "failed", message: "Keychain service is missing.")
+        }
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ]
+        if let account = params.account?.resolved {
+            query[kSecAttrAccount as String] = account
+        }
+        let status = SecItemDelete(query as CFDictionary)
+        switch status {
+        case errSecSuccess: return Response(status: "deleted")
+        case errSecItemNotFound: return Response(status: "notFound")
+        default: return Response(status: "failed", message: "Keychain delete failed.")
         }
     }
 

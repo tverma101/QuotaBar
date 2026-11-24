@@ -65,7 +65,7 @@ fn model_and_other_rows_keep_known_subtotals_and_mark_them_partial() {
 }
 
 #[test]
-fn model_breakdown_sorts_folds_other_and_keeps_unpriced_named() {
+fn model_breakdown_keeps_top_three_and_folds_rest_into_other() {
     let lines = one_day(
         3_700,
         Some(49.0),
@@ -80,38 +80,36 @@ fn model_breakdown_sorts_folds_other_and_keeps_unpriced_named() {
             model("mystery", 900, None),
         ],
     );
-    // The unpriced "mystery" puts the whole list on token shares, so "alpha" — top spend but ~3% of
-    // tokens — is the only model small enough to fold; one model is not a group, so it keeps its name.
-    // "eta" clears the cap's slot count but holds 19% of tokens, so the token floor keeps it named.
+    // The three spend leaders stay named; the rest — priced slivers and the unpriced model alike —
+    // fold into Other's expandable contributors. Other's folded $21 outspends every named row here.
     let breakdown = model_breakdown(&lines, "Today").expect("breakdown");
-    assert_eq!(
-        model_names(&breakdown),
-        vec!["aardvark", "beta", "delta", "epsilon", "zeta", "eta", "mystery", "alpha"]
-    );
+    assert_eq!(model_names(&breakdown), vec!["Other", "alpha", "aardvark", "beta"]);
     let alpha = find(&breakdown, "alpha").expect("alpha");
     assert_eq!(alpha.total_tokens, 100);
     assert_eq!(alpha.cost_usd, Some(10.0));
     assert!(alpha.variants.is_none(), "a lone small model is not listed again under itself");
-    assert!(find(&breakdown, "Other").is_none());
-    assert_eq!(find(&breakdown, "mystery").and_then(|m| m.cost_usd), None);
+    let other = find(&breakdown, "Other").expect("other");
+    assert_eq!(other.total_tokens, 3_100);
+    assert_eq!(other.cost_usd, Some(21.0));
+    assert!(other.has_incomplete_cost(), "the folded unpriced model marks Other's dollars partial");
+    let names: Vec<&str> = other.variants.iter().flatten().map(|v| v.model.as_str()).collect();
+    assert_eq!(names, vec!["delta", "epsilon", "zeta", "eta", "mystery"]);
 }
 
 #[test]
-fn model_breakdown_folds_models_minor_on_both_shares_into_other() {
+fn model_breakdown_leaves_three_or_fewer_models_named() {
     let lines = one_day(
         1_000,
         Some(100.0),
         vec![model("big", 700, Some(90.0)), model("mid", 200, Some(6.0)), model("tiny", 100, Some(4.0))],
     );
-    // All priced -> cost shares 90% / 6% / 4%. "tiny" is under the 5% cost floor, but holds 10% of the
-    // measured tokens, so the token floor keeps it named; nothing folds.
     let breakdown = model_breakdown(&lines, "Today").expect("breakdown");
     assert_eq!(model_names(&breakdown), vec!["big", "mid", "tiny"]);
-    assert!(find(&breakdown, "Other").is_none(), "no slivers, no Other row");
+    assert!(find(&breakdown, "Other").is_none(), "no tail, no Other row");
 }
 
-/// The reported bug: a model holding half the measured tokens vanished into Other because its
-/// imputed-cost share was 2.9%.
+/// A model heavy on measured tokens but third by spend keeps its named row — the fold only reaches
+/// models ranked past the named cap.
 #[test]
 fn model_breakdown_keeps_cheap_heavy_model_named_despite_small_cost_share() {
     let models = vec![
@@ -129,13 +127,15 @@ fn model_breakdown_keeps_cheap_heavy_model_named_despite_small_cost_share() {
     assert_eq!(find(&breakdown, "glm-5.3-flash").map(|m| m.total_tokens), Some(488_000_000));
     let other = find(&breakdown, "Other").expect("other");
     assert_eq!(other.total_tokens, 8_000_000);
-    assert_eq!(other.cost_usd, Some(0.80));
+    assert!((other.cost_usd.unwrap() - 0.80).abs() < 1e-9);
     let names: Vec<&str> = other.variants.iter().flatten().map(|v| v.model.as_str()).collect();
     assert_eq!(names, vec!["straggler-a", "straggler-b"]);
 }
 
+/// Huge unpriced or zero-cost token volume past the named cap folds into Other instead of claiming a
+/// row — its tokens stay readable as Other's leading contributor.
 #[test]
-fn model_breakdown_keeps_high_token_zero_cost_model_named() {
+fn model_breakdown_folds_high_token_tail_models_into_other() {
     let models = vec![
         model("muse-spark-1.3-contributor", 243_900_000, Some(1.14)),
         model("mimo-v2.5", 13_700_000, Some(0.18)),
@@ -149,14 +149,15 @@ fn model_breakdown_keeps_high_token_zero_cost_model_named() {
     let lines = one_day(total, Some(1.69), models);
 
     let breakdown = model_breakdown(&lines, "Today").expect("breakdown");
-    let free = find(&breakdown, "space-bunny-free").expect("free");
+    assert_eq!(model_names(&breakdown), vec!["muse-spark-1.3-contributor", "Other", "mimo-v2.5", "deepseek-v4.1-flash"]);
+    let other = find(&breakdown, "Other").expect("other");
+    assert_eq!(other.total_tokens, 10_500_021_000);
+    assert!((other.cost_usd.unwrap_or(0.0) - 0.21).abs() < 0.0001);
+    let names: Vec<&str> = other.variants.iter().flatten().map(|v| v.model.as_str()).collect();
+    assert_eq!(names, vec!["another-paid-model", "last-paid-model", "tiny-paid-model", "space-bunny-free"]);
+    let free = other.variants.iter().flatten().find(|v| v.model == "space-bunny-free").expect("free");
     assert_eq!(free.total_tokens, 10_500_000_000);
     assert_eq!(free.cost_usd, Some(0.0));
-    let tiny = find(&breakdown, "tiny-paid-model").expect("tiny");
-    assert_eq!(tiny.total_tokens, 1_000);
-    assert_eq!(tiny.cost_usd, Some(0.01));
-    assert!(tiny.variants.is_none());
-    assert!(find(&breakdown, "Other").is_none(), "the only sliver stays named so its cost is not printed twice");
 }
 
 /// The Codex Today hover showed gpt-6-luna under Other with the same $0.05 and 1.5M tokens.
@@ -301,8 +302,10 @@ fn model_and_variant_cost_overflow_retains_marked_known_subtotal() {
     assert!(thinking.has_incomplete_cost());
 }
 
+/// The folded tail's accumulated cost can exceed a named model's by magnitudes; Other keeps a finite
+/// partial subtotal and still ranks by those known dollars.
 #[test]
-fn cost_share_folding_normalizes_before_summing_huge_finite_models() {
+fn other_fold_retains_huge_finite_costs_without_overflowing_row() {
     let models: Vec<ModelUsageEntry> = (0..21)
         .map(|index| {
             let name = if index == 0 { "dominant".to_string() } else { format!("minor-{index}") };
@@ -320,6 +323,34 @@ fn cost_share_folding_normalizes_before_summing_huge_finite_models() {
         None,
     );
     let breakdown = model_breakdown(&lines, "Today").expect("breakdown");
-    assert_eq!(model_names(&breakdown), vec!["dominant", "Other"]);
-    assert_eq!(breakdown.models.first().and_then(|m| m.cost_usd), Some(1e308));
+    assert_eq!(model_names(&breakdown), vec!["Other", "dominant", "minor-1", "minor-2"]);
+    let other = breakdown.models.first().expect("other");
+    assert!(other.cost_usd.unwrap_or(0.0) > 1e308);
+    assert!(other.has_incomplete_cost());
+    assert_eq!(breakdown.models.last().and_then(|m| m.cost_usd), Some(1e307));
+}
+
+#[test]
+fn breakdown_keeps_tokens_from_days_without_model_detail_and_sub_cent_prices() {
+    let lines = mapped_lines(
+        vec![entry("2026-06-26", 10, Some(0.001)), entry("2026-06-25", 90, None)],
+        vec![model_day("2026-06-26", vec![model("priced", 10, Some(0.001))])],
+        BTreeMap::new(),
+        None,
+    );
+    let breakdown = model_breakdown(&lines, "Last 30 Days").expect("breakdown");
+    assert_eq!(model_names(&breakdown), vec!["priced", "Other"]);
+    let tokens_list: Vec<i64> = breakdown.models.iter().map(|m| m.total_tokens).collect();
+    assert_eq!(tokens_list, vec![10, 90]);
+    assert_eq!(breakdown.models[0].cost_usd, Some(0.001));
+    assert_eq!(breakdown.models[1].cost_usd, None);
+}
+
+#[test]
+fn other_expansion_keeps_unreconciled_legacy_subtotal() {
+    let other = ModelUsageEntry {
+        variants: Some(vec![variant("priced", 100, Some(12.0)), variant("unpriced", 100, None)]),
+        ..model("Other", 300, Some(12.0))
+    };
+    assert_eq!(other.presented_rows(), vec![other]);
 }

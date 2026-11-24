@@ -57,19 +57,24 @@ enum RustEngine {
 
     /// Refresh one provider in the engine. Engine failures become a visible error snapshot and an
     /// error log line, never a silent empty card.
-    static func refresh(provider: Provider) async -> ProviderSnapshot {
+    static func refresh(provider: Provider, config: [String: Any]? = nil) async -> ProviderSnapshot {
         prepare()
         let requestID = requestCounter.next()
         let keychain = RustEngineHost.Refresh()
         RustEngineHost.register(keychain, for: requestID)
         defer { RustEngineHost.unregister(requestID) }
-        let params: [String: Any] = [
+        var params: [String: Any] = [
             "providerId": provider.id,
             "scope": ProviderRefreshContext.scope.engineName,
             "isManual": ProviderRefreshContext.isManual,
             "skipModelCatalogRefresh": ProviderRefreshContext.skipModelCatalogRefresh,
+            "paced": ProviderRefreshContext.accountingCPUThrottleEnabled,
+            "includeIdentity": true,
             "requestId": requestID
         ]
+        if let config {
+            params["config"] = config
+        }
         let reply = await withTaskCancellationHandler {
             await call(["method": "refresh", "params": params])
         } onCancel: {
@@ -80,7 +85,11 @@ enum RustEngine {
         switch reply {
         case .success(let data):
             do {
-                return try decoder.decode(OkReply<ProviderSnapshot>.self, from: data).ok
+                let decoded = try decoder.decode(OkReply<RefreshOutcome>.self, from: data).ok
+                if let identityKey = decoded.identityKey {
+                    ProviderRefreshContext.cacheIdentityResult?.set(identityKey)
+                }
+                return decoded.snapshot
             } catch {
                 AppLog.error(LogTag.plugin(provider.id), "engine snapshot could not be decoded: \(error)")
                 return ProviderSnapshot.error(
@@ -100,9 +109,11 @@ enum RustEngine {
     }
 
     /// The engine's silent local-only setup probe.
-    static func hasLocalCredentials(providerID: String) async -> Bool {
+    static func hasLocalCredentials(providerID: String, config: [String: Any]? = nil) async -> Bool {
         prepare()
-        switch await call(["method": "hasLocalCredentials", "params": ["providerId": providerID]]) {
+        var params: [String: Any] = ["providerId": providerID]
+        if let config { params["config"] = config }
+        switch await call(["method": "hasLocalCredentials", "params": params]) {
         case .success(let data):
             do {
                 return try decoder.decode(OkReply<Bool>.self, from: data).ok
@@ -114,6 +125,139 @@ enum RustEngine {
             AppLog.error(LogTag.plugin(providerID), "engine credential probe failed: \(error.localizedDescription)")
             return false
         }
+    }
+
+    struct BatchItem {
+        let providerID: String
+        var config: [String: Any]? = nil
+        var defaultIdentityKey: String? = nil
+
+        func encoded() -> [String: Any] {
+            var dict: [String: Any] = ["providerId": providerID]
+            if let config { dict["config"] = config }
+            if let defaultIdentityKey { dict["defaultIdentityKey"] = defaultIdentityKey }
+            return dict
+        }
+    }
+
+    struct BatchResponse: Decodable {
+        let snapshots: [String: ProviderSnapshot]
+        let errors: [String: String]
+        let identityKeys: [String: String]
+    }
+
+    /// Run a batched local/panel refresh inside the Rust engine (replaces the out-of-process scan worker).
+    static func refreshBatch(
+        items: [BatchItem],
+        scope: ProviderRefreshContext.Scope = .panelAccounting,
+        isManual: Bool = false,
+        skipModelCatalogRefresh: Bool = true,
+        perProviderTimeoutSeconds: TimeInterval? = nil,
+        batchBudgetSeconds: TimeInterval? = nil,
+        paced: Bool = false
+    ) async throws -> BatchResponse {
+        prepare()
+        let requestID = requestCounter.next()
+        let keychain = RustEngineHost.Refresh()
+        RustEngineHost.register(keychain, for: requestID)
+        defer { RustEngineHost.unregister(requestID) }
+        var params: [String: Any] = [
+            "items": items.map { $0.encoded() },
+            "scope": scope.engineName,
+            "isManual": isManual,
+            "skipModelCatalogRefresh": skipModelCatalogRefresh,
+            "paced": paced,
+            "requestId": requestID,
+        ]
+        if let perProviderTimeoutSeconds {
+            params["perProviderTimeoutSeconds"] = perProviderTimeoutSeconds
+        }
+        if let batchBudgetSeconds {
+            params["batchBudgetSeconds"] = batchBudgetSeconds
+        }
+        let reply = await withTaskCancellationHandler {
+            await call(["method": "refreshBatch", "params": params])
+        } onCancel: {
+            keychain.cancel()
+            _ = qb_engine_cancel(requestID)
+        }
+        let data = try reply.get()
+        return try decoder.decode(OkReply<BatchResponse>.self, from: data).ok
+    }
+
+    static func unloadCaches() async {
+        prepare()
+        if case .failure(let error) = await call(["method": "unloadCaches", "params": [:]]) {
+            AppLog.warn(LogTag.refresh, "engine unloadCaches failed: \(error.localizedDescription)")
+        }
+    }
+
+    static func pricingStatus() async throws -> [String: Any] {
+        prepare()
+        let data = try await call(["method": "pricingStatus", "params": [:]]).get()
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ok = root["ok"] as? [String: Any] else {
+            throw EngineError.failed("pricingStatus reply could not be decoded")
+        }
+        return ok
+    }
+
+    static func pricingRefresh(background: Bool = false) async throws -> [String: Any] {
+        prepare()
+        let data = try await call(["method": "pricingRefresh", "params": ["background": background]]).get()
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ok = root["ok"] as? [String: Any] else {
+            throw EngineError.failed("pricingRefresh reply could not be decoded")
+        }
+        return ok
+    }
+
+    static func pricingClearCaches() async {
+        prepare()
+        _ = await call(["method": "pricingClearCaches", "params": [:]])
+    }
+
+    static func pricingResolve(
+        model: String,
+        isCursor: Bool = false,
+        tokens: TokenBreakdown? = nil,
+        timestamp: Date? = nil,
+        applyLongContextRates: Bool = true
+    ) async throws -> PricingResolveReply {
+        prepare()
+        var params: [String: Any] = [
+            "model": model,
+            "isCursor": isCursor,
+            "applyLongContextRates": applyLongContextRates,
+        ]
+        if let tokens {
+            params["tokens"] = [
+                "input": tokens.input,
+                "cacheWrite5m": tokens.cacheWrite5m,
+                "cacheWrite1h": tokens.cacheWrite1h,
+                "cacheRead": tokens.cacheRead,
+                "output": tokens.output,
+                "isFast": tokens.isFast,
+            ]
+        }
+        if let timestamp {
+            params["timestamp"] = timestamp.timeIntervalSince1970
+        }
+        let data = try await call(["method": "pricingResolve", "params": params]).get()
+        return try decoder.decode(OkReply<PricingResolveReply>.self, from: data).ok
+    }
+
+    struct PricingResolveReply: Decodable {
+        let canonicalName: String?
+        let cursorCanonicalName: String?
+        let hasExactOpenRouterRate: Bool
+        let cacheToken: String
+        let costUsd: Double?
+    }
+
+    private struct RefreshOutcome: Decodable {
+        let snapshot: ProviderSnapshot
+        let identityKey: String?
     }
 
     // MARK: - Transport

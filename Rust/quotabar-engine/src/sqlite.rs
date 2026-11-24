@@ -9,6 +9,7 @@
 
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 use std::fmt::Write;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,7 @@ fn open_for_query(path: &Path, allow_wal_retry: bool, deadline: Instant) -> Resu
         let conn = Connection::open_with_flags(path, access | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         bound_query(&conn, deadline)?;
         conn.pragma_update(None, "query_only", true)?;
+        crate::sqlite_sha3::register(&conn)?;
         // Touch the schema now so WAL open failures surface inside the retry boundary.
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
         Ok(conn)
@@ -204,6 +206,117 @@ fn sibling_paths(path: &Path) -> [PathBuf; 3] {
     [path.to_path_buf(), with_suffix("-wal"), with_suffix("-journal")]
 }
 
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_owned();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// Recover a sidecarless WAL-mode SQLite database by cloning it into a private temp directory,
+/// switching the clone alone to `journal_mode=DELETE`, and opening the clone read-only. Never
+/// touches the source file or its directory, so SQLite never leaves `-wal`/`-shm` sidecars behind.
+pub fn with_recovered_sidecarless_database<T>(
+    path: &Path,
+    op: impl FnOnce(&Connection) -> Result<T, SqliteError>,
+) -> Result<T, SqliteError> {
+    if with_suffix(path, "-wal").exists()
+        || with_suffix(path, "-shm").exists()
+        || with_suffix(path, "-journal").exists()
+    {
+        return Err(SqliteError::Unreadable("Database already has journal sidecars.".into()));
+    }
+    let mut source = open_pinned_regular_file(path)?;
+    let mut header = [0u8; 20];
+    source.read_exact(&mut header).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+    if &header[..16] != b"SQLite format 3\0" || header[18] != 2 || header[19] != 2 {
+        return Err(SqliteError::Unreadable("Database is not a sidecarless WAL SQLite file.".into()));
+    }
+    let dir = tempfile::tempdir().map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+    }
+    let snapshot = dir.path().join("snapshot.db");
+    clone_or_copy_pinned(&mut source, &snapshot)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+    }
+    {
+        let rw = Connection::open_with_flags(
+            &snapshot,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        bound_query(&rw, Instant::now() + QUERY_TIMEOUT)?;
+        rw.execute_batch("PRAGMA journal_mode=DELETE;")?;
+    }
+    let ro = open_for_query(&snapshot, false, Instant::now() + QUERY_TIMEOUT)?
+        .ok_or_else(|| SqliteError::Unreadable("Recovered snapshot missing.".into()))?;
+    op(&ro)
+}
+
+fn open_pinned_regular_file(path: &Path) -> Result<std::fs::File, SqliteError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW + O_NONBLOCK | O_CLOEXEC on macOS/Unix (macOS flags: 0x0100 | 0x0004 | 0x1000000).
+        #[cfg(target_os = "macos")]
+        const FLAGS: i32 = 0x0100 | 0x0004 | 0x1000000;
+        #[cfg(not(target_os = "macos"))]
+        const FLAGS: i32 = 0x20000 | 0x0800 | 0x80000; // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC on Linux
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FLAGS)
+            .open(path)
+            .map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+        let meta = file.metadata().map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+        if !meta.is_file() {
+            return Err(SqliteError::Unreadable("Source database is not a regular file.".into()));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let sym = std::fs::symlink_metadata(path).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+        if !sym.file_type().is_file() {
+            return Err(SqliteError::Unreadable("Source database is not a regular file.".into()));
+        }
+        std::fs::File::open(path).map_err(|e| SqliteError::Unreadable(e.to_string()))
+    }
+}
+
+fn clone_or_copy_pinned(source: &mut std::fs::File, dst: &Path) -> Result<(), SqliteError> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn fclonefileat(
+                srcfd: std::os::raw::c_int,
+                dst_dirfd: std::os::raw::c_int,
+                dst: *const std::os::raw::c_char,
+                flags: u32,
+            ) -> std::os::raw::c_int;
+        }
+        const AT_FDCWD: std::os::raw::c_int = -2;
+        if let Ok(c_dst) = CString::new(dst.as_os_str().as_bytes()) {
+            let rc = unsafe { fclonefileat(source.as_raw_fd(), AT_FDCWD, c_dst.as_ptr(), 0) };
+            if rc == 0 {
+                return Ok(());
+            }
+        }
+    }
+    source.seek(SeekFrom::Start(0)).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+    let mut out = std::fs::File::create(dst).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+    std::io::copy(source, &mut out).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +381,33 @@ mod tests {
              INSERT INTO usage VALUES ('in the WAL');",
         ).unwrap();
         assert_eq!(query_text(&path, "SELECT name FROM usage", false).unwrap().as_deref(), Some("in the WAL"));
+    }
+
+    #[test]
+    fn recovers_sidecarless_wal_database_without_touching_source_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidecarless.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE items (name TEXT);
+                 INSERT INTO items VALUES ('ok');
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        }
+        // Simulate an unlinked -wal/-shm pair on a WAL-mode database.
+        let _ = std::fs::remove_file(with_suffix(&path, "-wal"));
+        let _ = std::fs::remove_file(with_suffix(&path, "-shm"));
+        assert!(!with_suffix(&path, "-wal").exists());
+
+        let count: i64 = with_recovered_sidecarless_database(&path, |conn| {
+            Ok(conn.query_row("SELECT count(*) FROM items", [], |r| r.get(0))?)
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(!with_suffix(&path, "-wal").exists(), "recovery must never create sidecars");
+        assert!(!with_suffix(&path, "-shm").exists(), "recovery must never create sidecars");
     }
 }

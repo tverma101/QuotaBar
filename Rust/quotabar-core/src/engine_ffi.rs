@@ -8,7 +8,8 @@
 //! it with `free`.
 
 use quotabar_engine::host::{
-    self, Host, LogLevel, SecureReadOutcome, SecureReadRequest, SecureWriteOutcome, SecureWriteRequest,
+    self, Host, LogLevel, SecureDeleteOutcome, SecureDeleteRequest, SecureReadOutcome, SecureReadRequest,
+    SecureWriteOutcome, SecureWriteRequest,
 };
 use quotabar_engine::Engine;
 use std::ffi::{c_char, c_void, CString};
@@ -103,6 +104,17 @@ impl Host for FfiHost {
             Some(reply) => serde_json::from_value(reply)
                 .unwrap_or_else(|_| SecureWriteOutcome::Failed { message: "host reply could not be decoded".into() }),
             None => SecureWriteOutcome::Failed { message: "host has no credential store".into() },
+        }
+    }
+
+    fn secure_delete(&self, request: &SecureDeleteRequest) -> SecureDeleteOutcome {
+        let Ok(params) = serde_json::to_value(request) else {
+            return SecureDeleteOutcome::Failed { message: "request encoding failed".into() };
+        };
+        match self.call("secureDelete", params) {
+            Some(reply) => serde_json::from_value(reply)
+                .unwrap_or_else(|_| SecureDeleteOutcome::Failed { message: "host reply could not be decoded".into() }),
+            None => SecureDeleteOutcome::Failed { message: "host has no credential store".into() },
         }
     }
 

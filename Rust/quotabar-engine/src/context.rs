@@ -2,8 +2,9 @@
 
 use crate::model::Timestamp;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Which domains a refresh pass covers (Swift `ProviderRefreshContext.Scope`).
@@ -84,8 +85,14 @@ pub struct RefreshContext {
     pub cancel: CancelToken,
     /// Skip network pricing-catalog refreshes (the host already refreshed recently).
     pub skip_model_catalog_refresh: bool,
+    /// Background folds run paced to bound CPU/IO impact.
+    pub paced: bool,
     /// The host's id for this refresh; forwarded with host callbacks (Keychain prompt budgets).
     pub request_id: Option<u64>,
+    /// Optional per-call provider configuration (multi-account paths, preferences, overrides).
+    pub config: Option<Value>,
+    /// Observed account/cache identity produced by the provider during this refresh.
+    pub observed_identity_key: Arc<Mutex<Option<String>>>,
 }
 
 impl RefreshContext {
@@ -96,12 +103,23 @@ impl RefreshContext {
             now: now_timestamp(),
             cancel: CancelToken::new(),
             skip_model_catalog_refresh: false,
+            paced: false,
             request_id: None,
+            config: None,
+            observed_identity_key: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    pub fn set_observed_identity_key(&self, key: impl Into<String>) {
+        *self.observed_identity_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(key.into());
+    }
+
+    pub fn observed_identity_key(&self) -> Option<String> {
+        self.observed_identity_key.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 

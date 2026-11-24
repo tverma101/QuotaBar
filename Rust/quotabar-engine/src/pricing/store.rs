@@ -190,6 +190,41 @@ impl PricingStore {
         self.lock().pricing.clear_caches();
     }
 
+    /// Snapshot of current store state and model counts for the `pricingStatus` RPC.
+    pub fn status(self: &Arc<Self>) -> Value {
+        let mut state = self.lock();
+        self.load_if_needed(&mut state);
+        let p = &state.pricing;
+        let sources: serde_json::Map<String, Value> = SourceId::ALL
+            .into_iter()
+            .map(|id| {
+                let entry = state.source_states.get(&id).cloned().unwrap_or_default();
+                (
+                    id.raw().to_string(),
+                    json!({
+                        "etag": entry.etag,
+                        "fetchedAt": entry.fetched_at,
+                        "failedAt": entry.failed_at,
+                        "cached": self.cache_file(id).exists(),
+                    }),
+                )
+            })
+            .collect();
+        json!({
+            "loaded": state.loaded,
+            "refreshRunning": state.refresh_running,
+            "discoveryRunning": state.discovery.running,
+            "aggregateCacheToken": p.aggregate_cache_token(),
+            "counts": {
+                "supplement": p.supplement.pricing.len(),
+                "openRouter": p.open_router.entries.len(),
+                "primary": p.primary.entries.len(),
+                "secondary": p.secondary.entries.len(),
+            },
+            "sources": sources,
+        })
+    }
+
     fn load_if_needed(&self, state: &mut StoreState) {
         if state.loaded {
             return;

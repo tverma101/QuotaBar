@@ -59,10 +59,14 @@ impl ModelUsageEntry {
         let echo_indexes: Vec<usize> = (0..variants.len())
             .filter(|&i| variants[i].cost_usd.is_some_and(|part| part > 0.0 && (part - cost).abs() < 0.005))
             .collect();
+        let contributor_tokens = variants.iter().try_fold(0i64, |acc, v| acc.checked_add(v.total_tokens));
         let [echo_index] = echo_indexes[..] else { return vec![collapsed.clone()] };
+        if contributor_tokens != Some(collapsed.total_tokens) || collapsed.token_count_saturated == Some(true) {
+            return vec![collapsed.clone()];
+        }
         let rest: Vec<ModelUsageVariant> =
             variants.iter().enumerate().filter(|(i, _)| *i != echo_index).map(|(_, v)| v.clone()).collect();
-        if !rest.iter().all(|v| v.cost_usd.unwrap_or(0.0) <= 0.004) {
+        if !rest.iter().all(|v| v.cost_usd.unwrap_or(0.0) == 0.0) {
             return vec![collapsed.clone()];
         }
         let mut rows = vec![row_for(&variants[echo_index])];

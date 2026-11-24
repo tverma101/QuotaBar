@@ -220,15 +220,11 @@ impl ModelRates {
             self.cache_write_above_200k_per_million,
             tier.and_then(|t| t.cache_write_per_million),
         );
-        let cache_read_rate = if self.cache_read_is_explicit {
-            select(
-                timed.and_then(|t| t.cache_read_per_million).unwrap_or(self.cache_read_per_million),
-                self.cache_read_above_200k_per_million,
-                tier.and_then(|t| t.cache_read_per_million),
-            )
-        } else {
-            input_rate
-        };
+        let cache_read_rate = tier
+            .and_then(|t| t.cache_read_per_million)
+            .or_else(|| if use_long { self.cache_read_above_200k_per_million } else { None })
+            .or_else(|| timed.and_then(|t| t.cache_read_per_million))
+            .unwrap_or(if self.cache_read_is_explicit { self.cache_read_per_million } else { input_rate });
         let cache_write_1h_rate = tier
             .and_then(|t| t.cache_write_1h_per_million)
             .or_else(|| timed.and_then(|t| t.cache_write_1h_per_million))

@@ -16,7 +16,15 @@ pub trait ProviderRuntime: Send + Sync {
     /// the credential sources and usability filters `refresh` starts with.
     fn has_local_credentials(&self) -> bool;
 
+    /// Configuration-aware variant of `has_local_credentials` (e.g. account-scoped paths).
+    fn has_local_credentials_with_config(&self, _config: Option<&serde_json::Value>) -> bool {
+        self.has_local_credentials()
+    }
+
     fn refresh(&self, ctx: &RefreshContext) -> ProviderSnapshot;
+
+    /// Release any recomputable in-memory provider caches when the OS reports memory pressure.
+    fn unload_caches(&self) {}
 }
 
 /// Swift `cancelledRefreshSnapshot(provider:)`.

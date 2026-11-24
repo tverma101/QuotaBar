@@ -135,7 +135,7 @@ fn models_dev_uses_explicit_prompt_tier_cache_read_rate_without_base_cache_rate(
     let catalog = catalog_from_models_dev(source).unwrap();
     let rates = &catalog.entries["tiered"];
 
-    assert!(rates.cache_read_is_explicit);
+    assert!(!rates.cache_read_is_explicit);
     assert_close(
         cost(rates, &TokenBreakdown { input: 1_000, cache_read: 2_000, ..Default::default() }),
         0.004,
@@ -145,21 +145,44 @@ fn models_dev_uses_explicit_prompt_tier_cache_read_rate_without_base_cache_rate(
 }
 
 #[test]
-fn litellm_tier_only_cache_read_rate_is_explicit_and_survives_compaction() {
+fn litellm_tier_only_cache_read_rate_survives_compaction_without_base_discount() {
     let source = br#"{"tiered":{"input_cost_per_token":0.000001,"output_cost_per_token":0.000002,"cache_read_input_token_cost_above_272k_tokens":0.0000002}}"#;
 
     let catalog = catalog_from_litellm(source).unwrap();
-    assert!(catalog.entries["tiered"].cache_read_is_explicit);
+    assert!(!catalog.entries["tiered"].cache_read_is_explicit);
 
     let restored = round_trip(&catalog);
     let restored = &restored.entries["tiered"];
-    assert!(restored.cache_read_is_explicit);
+    assert!(!restored.cache_read_is_explicit);
     assert_close(
         cost(restored, &TokenBreakdown { cache_read: 272_001, ..Default::default() }),
         272_001.0 * 0.2 / 1_000_000.0,
         0.000_001,
         "tier-only cache read",
     );
+}
+
+#[test]
+fn tier_cache_read_does_not_turn_fallback_into_an_incorrect_base_rate() {
+    let source = br#"
+    {"data":[{"id":"vendor/model","pricing":{
+      "prompt":"0.000001","completion":"0.000002","overrides":[
+        {"min_prompt_tokens":1000,"prompt":"0.000003"},
+        {"min_prompt_tokens":2000,"prompt":"0.000004","input_cache_read":"0"},
+        {"utc_days":["monday"],"prompt":"0.000005"},
+        {"utc_days":["tuesday"],"prompt":"0.000005","input_cache_read":"0.0000005"}
+      ]}}],"total_count":1,"links":{"next":null}}
+    "#;
+    let catalog = catalog_from_open_router(source).unwrap();
+    let restored = round_trip(&catalog);
+    let rates = &restored.entries["vendor/model"];
+    let monday = epoch("2026-10-26T12:00:00Z");
+    let tuesday = epoch("2026-10-27T12:00:00Z");
+    assert!(!rates.cache_read_is_explicit);
+    assert_close(cost(rates, &TokenBreakdown { cache_read: 1000, ..Default::default() }), 0.003, 1e-12, "1k tier fallback");
+    assert_close(cost(rates, &TokenBreakdown { cache_read: 2000, ..Default::default() }), 0.0, 1e-12, "2k tier explicit 0");
+    assert_close(rates.cost_dollars(&TokenBreakdown { cache_read: 100, ..Default::default() }, Some(monday), true), 0.0005, 1e-12, "monday timed fallback");
+    assert_close(rates.cost_dollars(&TokenBreakdown { cache_read: 100, ..Default::default() }, Some(tuesday), true), 0.00005, 1e-12, "tuesday timed explicit");
 }
 
 #[test]

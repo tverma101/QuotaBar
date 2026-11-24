@@ -143,9 +143,7 @@ pub fn catalog_from_open_router(data: &[u8]) -> Result<PricingCatalog, CodecErro
             cache_read.unwrap_or(input),
         );
         rates.cache_write_1h_per_million = open_router_rate(pricing.get("input_cache_write_1h"));
-        rates.cache_read_is_explicit = cache_read.is_some()
-            || tiers.iter().any(|t| t.cache_read_per_million.is_some())
-            || utc.iter().any(|t| t.cache_read_per_million.is_some());
+        rates.cache_read_is_explicit = cache_read.is_some();
         rates.prompt_rate_tiers = tiers;
         rates.utc_price_overrides = (!utc.is_empty()).then_some(utc);
         routes.insert(key.to_string(), rates);
@@ -309,7 +307,7 @@ pub fn catalog_from_litellm(data: &[u8]) -> Result<PricingCatalog, CodecError> {
             per_million_from_per_token(entry.get("cache_creation_input_token_cost")).unwrap_or(input),
             cache_read.unwrap_or(input),
         );
-        rates.cache_read_is_explicit = cache_read.is_some() || tiers.iter().any(|t| t.cache_read_per_million.is_some());
+        rates.cache_read_is_explicit = cache_read.is_some();
         rates.prompt_rate_tiers = tiers;
         rates.input_above_200k_per_million = per_million_from_per_token(entry.get("input_cost_per_token_above_200k_tokens"));
         rates.output_above_200k_per_million = per_million_from_per_token(entry.get("output_cost_per_token_above_200k_tokens"));
@@ -366,7 +364,7 @@ pub fn catalog_from_models_dev(data: &[u8]) -> Result<PricingCatalog, CodecError
             tiers.sort_by_key(|t| t.threshold_prompt_tokens);
             let cache_read = valid_per_million(cost.get("cache_read"));
             let mut rates = ModelRates::new(input, output, valid_per_million(cost.get("cache_write")).unwrap_or(input), cache_read.unwrap_or(input));
-            rates.cache_read_is_explicit = cache_read.is_some() || tiers.iter().any(|t| t.cache_read_per_million.is_some());
+            rates.cache_read_is_explicit = cache_read.is_some();
             rates.prompt_rate_tiers = tiers;
             candidates.entry(model_id.clone()).or_default().push(rates);
         }
@@ -436,6 +434,8 @@ struct CompactModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cre: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    crb: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     fast: Option<f64>,
 }
 
@@ -453,7 +453,7 @@ pub fn catalog_from_compact(data: &[u8]) -> Result<PricingCatalog, String> {
             rates.output_above_200k_per_million = m.oa;
             rates.cache_write_above_200k_per_million = m.cwa;
             rates.cache_read_above_200k_per_million = m.cra;
-            rates.cache_read_is_explicit = m.cre.unwrap_or(true);
+            rates.cache_read_is_explicit = m.crb.or(m.cre).unwrap_or(true);
             rates.fast_multiplier = m.fast.unwrap_or(1.0);
             (key, rates)
         })
@@ -467,6 +467,9 @@ pub fn compact_data(catalog: &PricingCatalog) -> Vec<u8> {
         .entries
         .iter()
         .map(|(key, r)| {
+            let has_cache_read_override = r.cache_read_above_200k_per_million.is_some()
+                || r.prompt_rate_tiers.iter().any(|t| t.cache_read_per_million.is_some())
+                || r.utc_price_overrides.as_ref().is_some_and(|o| o.iter().any(|u| u.cache_read_per_million.is_some()));
             let model = CompactModel {
                 i: r.input_per_million,
                 o: r.output_per_million,
@@ -479,7 +482,8 @@ pub fn compact_data(catalog: &PricingCatalog) -> Vec<u8> {
                 oa: r.output_above_200k_per_million,
                 cwa: r.cache_write_above_200k_per_million,
                 cra: r.cache_read_above_200k_per_million,
-                cre: (!r.cache_read_is_explicit).then_some(false),
+                cre: (!r.cache_read_is_explicit && !has_cache_read_override).then_some(false),
+                crb: (!r.cache_read_is_explicit && has_cache_read_override).then_some(false),
                 fast: (r.fast_multiplier != 1.0).then_some(r.fast_multiplier),
             };
             (key.clone(), model)

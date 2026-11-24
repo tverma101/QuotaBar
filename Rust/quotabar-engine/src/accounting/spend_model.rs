@@ -8,20 +8,7 @@ use crate::model::{ModelUsageBreakdown, ModelUsageEntry, ModelUsageSeries, Model
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-const NAMED_MODEL_CAP: usize = 5;
-
-/// Models below this share of the period fold into Other — a stack of sub-5% slivers is noise, and the
-/// Other row lists its leading contributors.
-const MIN_VISIBLE_SHARE: f64 = 0.05;
-
-/// Snap a dollar amount to whole cents once, for display.
-pub(super) fn round_to_cents(value: f64) -> f64 {
-    let scaled = value * 100.0;
-    if !value.is_finite() || !scaled.is_finite() {
-        return value;
-    }
-    scaled.round() / 100.0
-}
+const NAMED_MODEL_CAP: usize = 3;
 
 /// Tracks the casings seen for one case-folded name and elects the one that carried the most tokens
 /// (ties prefer the all-lowercase spelling, then alphabetical) — so `GLM-5.2` and `glm-5.2` collapse
@@ -216,7 +203,7 @@ impl ModelAccumulator {
             .map(|(key, value)| ModelUsageVariant {
                 model: value.vote.best().unwrap_or(key).to_string(),
                 total_tokens: value.tokens,
-                cost_usd: value.cost_usd.map(round_to_cents),
+                cost_usd: value.cost_usd,
                 cost_is_complete: (!value.cost_is_complete).then_some(false),
                 token_count_saturated: value.token_count_saturated.then_some(true),
             })
@@ -227,7 +214,7 @@ impl ModelAccumulator {
         ModelUsageEntry {
             model: model.to_string(),
             total_tokens: self.tokens,
-            cost_usd: self.cost_usd.map(round_to_cents),
+            cost_usd: self.cost_usd,
             variants: if is_trivial { None } else { Some(list) },
             cost_is_complete: (!self.cost_is_complete).then_some(false),
             token_count_saturated: self.token_count_saturated.then_some(true),
@@ -235,9 +222,10 @@ impl ModelAccumulator {
     }
 }
 
-/// Cost desc (nil as $0), then tokens desc, then name.
+/// Cost desc (priced before unpriced at equal dollars), then tokens desc, then name.
 fn order_by(lhs: (Option<f64>, i64, &str), rhs: (Option<f64>, i64, &str)) -> Ordering {
     cost_desc(lhs.0.unwrap_or(0.0), rhs.0.unwrap_or(0.0))
+        .then_with(|| rhs.0.is_some().cmp(&lhs.0.is_some()))
         .then_with(|| rhs.1.cmp(&lhs.1))
         .then_with(|| localized_standard_compare(lhs.2, rhs.2))
 }
@@ -287,6 +275,23 @@ pub(super) fn model_breakdown(usage: Option<&ModelUsageSeries>, request: &Breakd
         }
     }
 
+    if by_model.is_empty() {
+        return None;
+    }
+    let modeled_tokens = by_model.values().fold(0i64, |acc, v| adding_saturating(acc, v.tokens));
+    if request.total_tokens > modeled_tokens {
+        let name = ModelUsageEntry::UNATTRIBUTED;
+        let entry = ModelUsageEntry {
+            model: name.to_string(),
+            total_tokens: request.total_tokens - modeled_tokens,
+            cost_usd: None,
+            variants: None,
+            cost_is_complete: None,
+            token_count_saturated: None,
+        };
+        by_model.entry(name.to_lowercase()).or_insert_with(ModelAccumulator::new).add(&entry, name);
+    }
+
     let mut sorted: Vec<ModelUsageEntry> =
         by_model.iter().map(|(key, accumulator)| accumulator.entry(accumulator.display_name().unwrap_or(key))).collect();
     sorted.sort_by(model_order);
@@ -322,56 +327,17 @@ fn normalized_model_name(raw: &str) -> String {
 }
 
 fn fold_model_list(entries: &[ModelUsageEntry]) -> Vec<ModelUsageEntry> {
-    // The threshold uses the same basis as the panel's percent labels (cost shares only when every
-    // model is priced, token shares otherwise). A model is only minor enough to fold when it is a
-    // sliver on BOTH bases: its display share and its raw token share. The token floor keeps a
-    // cheap-but-heavy model visible — tokens are the measured quantity and cost is the imputed one.
-    let all_costs_complete = entries.iter().all(|e| e.cost_usd.is_some() && !e.has_incomplete_cost());
-    let largest_cost = entries.iter().filter_map(|e| e.cost_usd).fold(None, |m: Option<f64>, c| Some(m.map_or(c, |m| m.max(c)))).unwrap_or(0.0);
-    // Normalize by the largest entry before summing so a finite set of prices cannot overflow the
-    // denominator and make every model appear to have a zero share.
-    let normalized_cost_total = if largest_cost > 0.0 && largest_cost.is_finite() {
-        entries.iter().fold(0.0, |acc, e| acc + e.cost_usd.unwrap_or(0.0) / largest_cost)
-    } else {
-        0.0
-    };
-    let can_use_cost_shares = all_costs_complete && normalized_cost_total.is_finite() && normalized_cost_total > 0.0;
-    let token_total = entries.iter().fold(0i64, |acc, e| adding_saturating(acc, e.total_tokens));
-    let share = |entry: &ModelUsageEntry| -> f64 {
-        if can_use_cost_shares {
-            return (entry.cost_usd.unwrap_or(0.0) / largest_cost) / normalized_cost_total;
-        }
-        if token_total <= 0 {
-            return 0.0;
-        }
-        entry.total_tokens as f64 / token_total as f64
-    };
-    let token_share_leader = |entry: &ModelUsageEntry| -> bool {
-        token_total > 0 && entry.total_tokens as f64 / token_total as f64 >= MIN_VISIBLE_SHARE
-    };
-
     let mut visible: Vec<ModelUsageEntry> = Vec::new();
     let mut other = ModelAccumulator::new();
-    let mut named_count = 0;
+    let unpriced_token_floor = (entries.first().map_or(0, |e| e.total_tokens) / 10).max(10_000_000);
 
     for entry in entries {
-        // Tokens the logs couldn't tie to a model (Grok) read as noise under their own "Unattributed"
-        // row — they count into Other however large they are.
         let is_unattributed = entry.model.to_lowercase() == ModelUsageEntry::UNATTRIBUTED.to_lowercase();
-        if is_unattributed || (share(entry) < MIN_VISIBLE_SHARE && !token_share_leader(entry)) {
+        let unpriced_heavyweight = entry.cost_usd.is_none() && entry.total_tokens >= unpriced_token_floor;
+        if is_unattributed || (visible.len() >= NAMED_MODEL_CAP && !unpriced_heavyweight) {
             other.fold(entry);
-        } else if entry.cost_usd.is_none() {
-            visible.push(entry.clone());
-            named_count += 1;
-        } else if token_share_leader(entry) {
-            // A substantial token consumer stays named regardless of cost share, without spending a
-            // paid-model slot — its usage must stay identifiable.
-            visible.push(entry.clone());
-        } else if named_count < NAMED_MODEL_CAP {
-            visible.push(entry.clone());
-            named_count += 1;
         } else {
-            other.fold(entry);
+            visible.push(entry.clone());
         }
     }
 
@@ -380,5 +346,6 @@ fn fold_model_list(entries: &[ModelUsageEntry]) -> Vec<ModelUsageEntry> {
         // model's tokens and cost twice.
         visible.extend(other.entry(ModelUsageEntry::OTHER).presented_rows());
     }
+    visible.sort_by(model_order);
     visible
 }

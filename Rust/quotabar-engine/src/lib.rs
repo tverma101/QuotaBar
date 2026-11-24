@@ -18,6 +18,7 @@ pub mod providers;
 pub mod redact;
 pub mod scan;
 pub mod sqlite;
+pub mod sqlite_sha3;
 pub mod time;
 
 pub use engine::Engine;
