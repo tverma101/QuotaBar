@@ -5,9 +5,17 @@ use crate::context::RefreshContext;
 use crate::model::{ErrorCategory, ProviderInfo, ProviderSnapshot};
 use std::sync::Arc;
 
+pub mod api_key;
+pub mod auth_retry;
 pub mod claude;
 pub mod codex;
+pub mod copilot;
 pub mod devin;
+pub mod grok;
+pub mod hermes;
+pub mod muse;
+pub mod openrouter;
+pub mod pi;
 
 pub trait ProviderRuntime: Send + Sync {
     fn info(&self) -> &ProviderInfo;
@@ -34,5 +42,11 @@ pub fn cancelled_snapshot(info: &ProviderInfo, ctx: &RefreshContext) -> Provider
 
 /// Every provider the engine implements, in no particular order (the host owns display order).
 pub fn all() -> Vec<Arc<dyn ProviderRuntime>> {
-    vec![Arc::new(devin::DevinProvider::live())]
+    vec![
+        Arc::new(copilot::CopilotProvider::live()),
+        Arc::new(devin::DevinProvider::live()),
+        Arc::new(grok::GrokProvider::live()),
+        Arc::new(hermes::HermesProvider::live()),
+        Arc::new(openrouter::OpenRouterProvider::live()),
+    ]
 }

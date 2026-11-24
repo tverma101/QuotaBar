@@ -40,6 +40,16 @@ impl Request {
         }
     }
 
+    pub fn post_form(url: impl Into<String>, body: impl Into<String>) -> Self {
+        Request {
+            method: "POST",
+            url: url.into(),
+            headers: vec![("Content-Type".into(), "application/x-www-form-urlencoded".into())],
+            body: Some(body.into().into_bytes()),
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
     pub fn header(mut self, name: &str, value: impl Into<String>) -> Self {
         self.headers.push((name.to_string(), value.into()));
         self
@@ -49,6 +59,20 @@ impl Request {
         self.timeout = timeout;
         self
     }
+}
+
+/// Percent-encode unreserved bytes according to RFC 3986 (matches Swift `urlFormEncoded`).
+pub fn url_form_encode(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }
 
 #[derive(Clone, Debug, Default)]
@@ -252,6 +276,29 @@ pub mod mock {
                 return Err(HttpError::Transport("no scripted response".into()));
             }
             responses.remove(0)
+        }
+    }
+
+    pub struct FnClient {
+        handler: Box<dyn Fn(&Request) -> Result<Response, HttpError> + Send + Sync>,
+        pub requests: Mutex<Vec<Request>>,
+    }
+
+    impl FnClient {
+        pub fn new(
+            handler: impl Fn(&Request) -> Result<Response, HttpError> + Send + Sync + 'static,
+        ) -> Self {
+            FnClient { handler: Box::new(handler), requests: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl HttpClient for FnClient {
+        fn send(&self, request: &Request, cancel: &CancelToken) -> Result<Response, HttpError> {
+            if cancel.is_cancelled() {
+                return Err(HttpError::Cancelled);
+            }
+            self.requests.lock().unwrap().push(request.clone());
+            (self.handler)(request)
         }
     }
 }

@@ -44,7 +44,7 @@ final class RustEngineBridgeTests: XCTestCase {
     }
 
     @MainActor
-    func testDevinRefreshRoundTripsThroughTheEngine() async throws {
+    func testBatch3AProvidersRoundTripThroughTheEngine() async throws {
         let home = FileManager.default.temporaryDirectory
             .appendingPathComponent("QuotaBarTests.RustEngine.\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
@@ -54,9 +54,41 @@ final class RustEngineBridgeTests: XCTestCase {
             try? FileManager.default.removeItem(at: home)
         }
 
-        let provider = DevinProvider()
-        let detected = await provider.hasLocalCredentials()
-        let snapshot = await provider.refresh()
+        let devin = DevinProvider()
+        let hermes = HermesProvider()
+        let grok = GrokProvider()
+        let copilot = CopilotProvider()
+        let openRouter = OpenRouterProvider()
+
+        let devinDetected = await devin.hasLocalCredentials()
+        let devinSnapshot = await devin.refresh()
+        let hermesDetected = await hermes.hasLocalCredentials()
+        let hermesSnapshot = await hermes.refresh()
+        let grokDetected = await grok.hasLocalCredentials()
+        let grokSnapshot = await grok.refresh()
+        let copilotDetected = await copilot.hasLocalCredentials()
+        let openRouterInitialStatus = openRouter.apiKeyStatus
+        var savedStatus: APIKeyStatus?
+        var revealedKey: String?
+        var emptySaveThrew = false
+        var clearedStatus: APIKeyStatus?
+        var keyActionError: Error?
+        do {
+            try openRouter.saveAPIKey("sk-or-bridge-test")
+            savedStatus = openRouter.apiKeyStatus
+            revealedKey = openRouter.currentAPIKey()
+            do {
+                try openRouter.saveAPIKey("   ")
+            } catch {
+                emptySaveThrew = true
+            }
+            try openRouter.deleteAPIKey()
+            clearedStatus = openRouter.apiKeyStatus
+        } catch {
+            keyActionError = error
+        }
+        let openRouterDetected = await openRouter.hasLocalCredentials()
+        let openRouterSnapshot = await openRouter.refresh()
 
         // Restore the real home for anything else in this process that uses the engine.
         _ = await RustEngine.call(["method": "configure", "params": [
@@ -65,14 +97,38 @@ final class RustEngineBridgeTests: XCTestCase {
                 .appendingPathComponent("QuotaBar").path
         ]])
 
-        XCTAssertFalse(detected, "an empty home has no Devin credentials")
-        XCTAssertEqual(snapshot.providerID, "devin")
-        XCTAssertEqual(snapshot.errorCategory, .notLoggedIn)
-        guard case .badge(let label, let text, _, _) = snapshot.lines.first else {
-            return XCTFail("expected an error badge, got \(snapshot.lines)")
+        if let keyActionError {
+            XCTFail("unexpected OpenRouter API key error: \(keyActionError)")
+        }
+        XCTAssertFalse(devinDetected, "an empty home has no Devin credentials")
+        XCTAssertEqual(devinSnapshot.providerID, "devin")
+        XCTAssertEqual(devinSnapshot.errorCategory, .notLoggedIn)
+        guard case .badge(let label, let text, _, _) = devinSnapshot.lines.first else {
+            return XCTFail("expected an error badge, got \(devinSnapshot.lines)")
         }
         XCTAssertEqual(label, MetricLine.errorBadgeLabel)
         XCTAssertEqual(text, "Run devin auth login or sign in to Devin and try again.")
+
+        XCTAssertFalse(hermesDetected, "an empty home has no Hermes database")
+        XCTAssertEqual(hermesSnapshot.providerID, "hermes")
+        XCTAssertEqual(hermesSnapshot.errorCategory, .notLoggedIn)
+
+        XCTAssertFalse(grokDetected, "an empty home has no Grok auth")
+        XCTAssertEqual(grokSnapshot.providerID, "grok")
+        XCTAssertEqual(grokSnapshot.errorCategory, .notLoggedIn)
+
+        _ = copilotDetected
+        _ = copilot
+
+        XCTAssertTrue(openRouterInitialStatus == .notSet || openRouterInitialStatus == .fromEnvironment)
+        XCTAssertEqual(savedStatus, openRouterInitialStatus == .fromEnvironment ? .overrideActive : .saved)
+        XCTAssertEqual(revealedKey, "sk-or-bridge-test")
+        XCTAssertTrue(emptySaveThrew)
+        XCTAssertEqual(clearedStatus, openRouterInitialStatus)
+        if openRouterInitialStatus == .notSet {
+            XCTAssertFalse(openRouterDetected)
+            XCTAssertEqual(openRouterSnapshot.errorCategory, .notLoggedIn)
+        }
     }
 
     func testUnknownMethodsFailLoudly() async {

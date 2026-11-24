@@ -338,7 +338,7 @@ enum ProviderCatalog {
         providers += [
             CursorProvider(),
             AntigravityProvider(),
-            CopilotProvider(defaults: defaults),
+            CopilotProvider(),
             DevinProvider(),
             FreebuffProvider(authStore: FreebuffAuthStore(environment: openUsageEnvironment),
                              usageClient: freebuffUsageClient, defaults: defaults),

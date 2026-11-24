@@ -222,7 +222,30 @@ pub fn set_host(host: Arc<dyn Host>) {
     *host_slot().write().unwrap_or_else(|e| e.into_inner()) = host;
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_HOST: std::cell::RefCell<Option<Arc<dyn Host>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Temporarily override `host()` on the current thread for unit tests.
+#[cfg(test)]
+pub fn with_test_host<R>(host: Arc<dyn Host>, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<Arc<dyn Host>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_HOST.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = TEST_HOST.with(|slot| slot.borrow_mut().replace(host));
+    let _reset = Reset(prev);
+    f()
+}
+
 pub fn host() -> Arc<dyn Host> {
+    #[cfg(test)]
+    if let Some(h) = TEST_HOST.with(|slot| slot.borrow().clone()) {
+        return h;
+    }
     host_slot().read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 

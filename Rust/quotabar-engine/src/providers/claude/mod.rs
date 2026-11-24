@@ -19,7 +19,7 @@ mod logs;
 mod owned;
 mod ownership;
 mod roots;
-mod util;
+pub mod util;
 
 pub use aggregate::aggregate;
 pub use dedup::{dedup, should_replace, ClaudeEntryDeduplication};

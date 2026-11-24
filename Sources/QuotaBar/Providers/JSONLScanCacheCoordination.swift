@@ -286,8 +286,6 @@ enum PersistentJSONLScanCaches {
         await ClaudeLogUsageScanner.flushPersistentCacheWrites()
         await CodexLogUsageScanner.flushPersistentCacheWrites()
         await CodexRouterUsageScanner.flushPersistentCacheWrites()
-        await DevinTranscriptUsageScanner.flushPersistentCacheWrites()
-        await GrokLogUsageScanner.flushPersistentCacheWrites()
         await MuseUsageScanner.flushPersistentCacheWrites()
         await PiUsageScanner.flushPersistentCacheWrites()
     }

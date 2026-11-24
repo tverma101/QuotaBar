@@ -16,7 +16,7 @@ import XCTest
 final class CredentialPermissionMappingTests: XCTestCase {
     /// Every provider that reads its credential from the Keychain must be able to distinguish "no
     /// credential" from "macOS won't release the credential".
-    private static let keychainBackedProviders: [String] = ["Codex", "Copilot", "Cursor"]
+    private static let keychainBackedProviders: [String] = ["Codex", "Cursor"]
 
     override func setUp() {
         super.setUp()
@@ -34,10 +34,9 @@ final class CredentialPermissionMappingTests: XCTestCase {
     /// `ErrorCategory` documents as expected noise, so misfiling it there also blinded telemetry to a
     /// genuine configuration problem.
     func testRefusalIsCategorisedAsCredentialAccessNotNotLoggedIn() throws {
-        XCTAssertEqual(Self.keychainBackedProviders.count, 3, "keep in sync with the list under test")
+        XCTAssertEqual(Self.keychainBackedProviders.count, 2, "keep in sync with the list under test")
 
         XCTAssertEqual(CodexAuthError.credentialPermissionRequired.errorCategory, .credentialAccess)
-        XCTAssertEqual(CopilotAuthError.credentialPermissionRequired.errorCategory, .credentialAccess)
         XCTAssertEqual(CursorAuthError.credentialPermissionRequired.errorCategory, .credentialAccess)
 
         // And the distinction is real, not cosmetic.
@@ -50,7 +49,6 @@ final class CredentialPermissionMappingTests: XCTestCase {
     func testRefusalCopyNamesTheActionThatActuallyWorks() throws {
         for description in [
             CodexAuthError.credentialPermissionRequired.errorDescription,
-            CopilotAuthError.credentialPermissionRequired.errorDescription,
             CursorAuthError.credentialPermissionRequired.errorDescription,
         ] {
             let text = try XCTUnwrap(description, "every case needs copy")
@@ -70,7 +68,6 @@ final class CredentialPermissionMappingTests: XCTestCase {
     func testEveryCaseHasUserFacingCopy() throws {
         let all: [LocalizedError] = [
             CodexAuthError.credentialPermissionRequired,
-            CopilotAuthError.credentialPermissionRequired,
             CursorAuthError.credentialPermissionRequired,
         ]
         for error in all {
@@ -91,13 +88,6 @@ final class CredentialPermissionMappingTests: XCTestCase {
         }
     }
 
-    func testCopilotKeychainRefusalThrowsInsteadOfReturningNil() throws {
-        let store = CopilotAuthStore(files: FakeFiles(), keychain: RefusingKeychain())
-        XCTAssertThrowsError(try store.loadToken()) { error in
-            XCTAssertEqual(error as? CopilotAuthError, .credentialPermissionRequired)
-        }
-    }
-
     /// The mirror case for the Cursor triad: with no database credential, the Keychain *is* the only
     /// source, so a refusal is the real answer and must still surface as the permission error rather
     /// than as "not logged in".
@@ -112,15 +102,12 @@ final class CredentialPermissionMappingTests: XCTestCase {
     func testUnreadableKeychainDoesNotHideKeychainOnlyProvidersDuringSeeding() async {
         let unreadableKeychain = UnreadableKeychain()
         let codex = CodexProvider(authStore: CodexAuthStore(files: FakeFiles(), keychain: unreadableKeychain))
-        let copilot = CopilotProvider(authStore: CopilotAuthStore(files: FakeFiles(), keychain: unreadableKeychain))
         let cursor = CursorProvider(authStore: CursorAuthStore(sqlite: MissingSQLite(), keychain: unreadableKeychain))
 
         let codexDetected = await codex.hasLocalCredentials()
-        let copilotDetected = await copilot.hasLocalCredentials()
         let cursorDetected = await cursor.hasLocalCredentials()
 
         XCTAssertTrue(codexDetected)
-        XCTAssertTrue(copilotDetected)
         XCTAssertTrue(cursorDetected)
     }
 
@@ -128,31 +115,7 @@ final class CredentialPermissionMappingTests: XCTestCase {
     /// be `nil`, never a permission error. Otherwise every unconfigured provider would claim macOS is
     /// withholding a credential that does not exist.
     func testGenuineMissStillReturnsNil() throws {
-        XCTAssertNil(try CopilotAuthStore(files: FakeFiles(), keychain: FakeKeychain()).loadToken())
         XCTAssertNil(try CodexAuthStore(files: FakeFiles(), keychain: FakeKeychain()).loadKeychainAuth())
-    }
-
-    /// Copilot reads the gh item twice — account-scoped, then service-only. Those are different items
-    /// with different ACLs, so a refusal on one must not be retried as the other, which is how a second
-    /// dialog for the same item used to be raised on a manual refresh.
-    func testCopilotDoesNotRetryTheOtherLookupAfterARefusal() throws {
-        let keychain = RefusingKeychain()
-        let store = CopilotAuthStore(files: FakeFiles(), keychain: keychain)
-
-        XCTAssertThrowsError(try store.loadToken()) { error in
-            XCTAssertEqual(error as? CopilotAuthError, .credentialPermissionRequired)
-        }
-        XCTAssertEqual(keychain.reads, 1, "must not re-raise the same refusal through the fallback lookup")
-    }
-
-    /// A refusal on the account-scoped item must not mask a readable service-only item: they are
-    /// different Keychain items with independent ACLs.
-    func testCopilotServiceOnlyItemStaysReadableWhenTheAccountScopedOneRefuses() throws {
-        let store = CopilotAuthStore(
-            files: FakeFiles(),
-            keychain: RefusingKeychain(refusesAccountScoped: true, refusesServiceOnly: false)
-        )
-        XCTAssertEqual(try store.loadToken()?.value, CopilotAuthStore.ghKeychainService)
     }
 
     // MARK: - Fakes
@@ -184,11 +147,11 @@ final class CredentialPermissionMappingTests: XCTestCase {
         }
 
         /// The value the service-only lookup resolves with, so a passing assertion is meaningful.
-        private var serviceOnlyValue: String { CopilotAuthStore.ghKeychainService }
+        private var serviceOnlyValue: String { "gh:github.com" }
 
         func readGenericPassword(service: String, account: String, allowInteraction: Bool) throws -> String? {
             // A service-only lookup is the one made without an account.
-            if account == CopilotAuthStore.ghKeychainService { return serviceOnlyValue }
+            if account == serviceOnlyValue { return serviceOnlyValue }
             return try read(nil, allowInteraction: refusesAccountScoped ? false : true)
         }
 

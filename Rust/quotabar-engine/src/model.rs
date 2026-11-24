@@ -109,6 +109,16 @@ impl MetricValue {
             is_lower_bound: None,
         }
     }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn with_estimated(mut self, estimated: bool) -> Self {
+        self.estimated = estimated;
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -204,6 +214,12 @@ impl MetricLine {
         MetricLine::badge("Status", "No usage data", Some("#A3A3A3"))
     }
 
+    pub fn append_no_data_if_needed(lines: &mut Vec<MetricLine>) {
+        if lines.is_empty() {
+            lines.push(MetricLine::no_usage_data());
+        }
+    }
+
     pub fn values(label: &str, values: Vec<MetricValue>) -> Self {
         MetricLine::Values {
             label: label.to_string(),
@@ -238,6 +254,13 @@ impl MetricLine {
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedUsageCost {
+    pub dollars: f64,
+    pub covered_tokens: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", from = "DailyUsageEntryWire")]
 pub struct DailyUsageEntry {
     pub date: String,
@@ -248,6 +271,8 @@ pub struct DailyUsageEntry {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub has_unexplained_incomplete_cost: Option<bool>,
     pub token_count_saturated: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reported_cost: Option<ReportedUsageCost>,
 }
 
 /// Decode shape of [`DailyUsageEntry`] with the Swift decoder's legacy defaults: a persisted day
@@ -266,6 +291,8 @@ struct DailyUsageEntryWire {
     has_unexplained_incomplete_cost: Option<bool>,
     #[serde(default)]
     token_count_saturated: Option<bool>,
+    #[serde(default)]
+    reported_cost: Option<ReportedUsageCost>,
 }
 
 impl From<DailyUsageEntryWire> for DailyUsageEntry {
@@ -277,6 +304,7 @@ impl From<DailyUsageEntryWire> for DailyUsageEntry {
             total_tokens: wire.total_tokens,
             cost_usd: wire.cost_usd,
             has_unexplained_incomplete_cost: wire.has_unexplained_incomplete_cost,
+            reported_cost: wire.reported_cost,
         }
     }
 }
@@ -586,6 +614,7 @@ mod tests {
             cost_is_complete: true,
             has_unexplained_incomplete_cost: None,
             token_count_saturated: false,
+            reported_cost: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["costUSD"], 1.0);

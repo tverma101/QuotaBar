@@ -260,6 +260,52 @@ enum RustEngine {
         let identityKey: String?
     }
 
+    static func apiKeyStatus(providerID: String) -> APIKeyStatus {
+        prepare()
+        struct Reply: Decodable { let status: APIKeyStatus }
+        do {
+            return try callSync(
+                ["method": "credentialAction", "params": ["providerId": providerID, "action": "status"]],
+                as: Reply.self
+            ).status
+        } catch {
+            AppLog.error(LogTag.auth(providerID), "credentialAction status failed: \(error.localizedDescription)")
+            return .notSet
+        }
+    }
+
+    static func currentAPIKey(providerID: String) -> String? {
+        prepare()
+        struct Reply: Decodable { let key: String? }
+        do {
+            return try callSync(
+                ["method": "credentialAction", "params": ["providerId": providerID, "action": "current"]],
+                as: Reply.self
+            ).key
+        } catch {
+            AppLog.error(LogTag.auth(providerID), "credentialAction current failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    static func saveAPIKey(_ key: String, providerID: String) throws {
+        prepare()
+        struct Reply: Decodable { let status: APIKeyStatus }
+        _ = try callSync(
+            ["method": "credentialAction", "params": ["providerId": providerID, "action": "save", "key": key]],
+            as: Reply.self
+        )
+    }
+
+    static func deleteAPIKey(providerID: String) throws {
+        prepare()
+        struct Reply: Decodable { let status: APIKeyStatus }
+        _ = try callSync(
+            ["method": "credentialAction", "params": ["providerId": providerID, "action": "delete"]],
+            as: Reply.self
+        )
+    }
+
     // MARK: - Transport
 
     private struct OkReply<Value: Decodable>: Decodable {

@@ -1,5 +1,7 @@
 import Foundation
 
+/// OpenRouter credits, balance, and key-limit tiles. All credential loading, API calls, and mapping
+/// live in the Rust engine (`Rust/quotabar-engine/src/providers/openrouter`).
 @MainActor
 final class OpenRouterProvider: ProviderRuntime {
     let provider = Provider(
@@ -11,20 +13,6 @@ final class OpenRouterProvider: ProviderRuntime {
             ProviderLink(label: "Credits", url: "https://openrouter.ai/settings/credits")
         ]
     )
-
-    let authStore: OpenRouterAuthStore
-    let usageClient: OpenRouterUsageClient
-    let now: @Sendable () -> Date
-
-    init(
-        authStore: OpenRouterAuthStore = OpenRouterAuthStore(),
-        usageClient: OpenRouterUsageClient = OpenRouterUsageClient(),
-        now: @escaping @Sendable () -> Date = Date.init
-    ) {
-        self.authStore = authStore
-        self.usageClient = usageClient
-        self.now = now
-    }
 
     var widgetDescriptors: [WidgetDescriptor] {
         [
@@ -50,104 +38,17 @@ final class OpenRouterProvider: ProviderRuntime {
     }
 
     func hasLocalCredentials() async -> Bool {
-        // Same source as `refresh()`: a stored or environment-exported API key. A present but
-        // unreadable config still counts so refresh can surface its repair message.
-        await loadOffMainActor { [authStore] in authStore.hasKeyOrUnreadableConfig() }
+        await RustEngine.hasLocalCredentials(providerID: provider.id)
     }
 
     func refresh() async -> ProviderSnapshot {
-        let auth: OpenRouterAuth?
-        do {
-            auth = try await loadOffMainActor { [authStore] in try authStore.loadAPIKeyForRefresh() }
-        } catch {
-            return ProviderSnapshot.error(provider: provider, error: error)
-        }
-        guard let auth else {
-            return ProviderSnapshot.error(provider: provider, error: OpenRouterAuthError.missingKey)
-        }
-
-        // Both endpoints are fetched independently and mapped from whatever succeeds. `/credits` carries
-        // the balance and `/key` the tier + period spend; OpenRouter gates some endpoints to specific key
-        // types, so one returning 403 must not blank out the data the other returned.
-        let credits: EndpointResult
-        do {
-            credits = try await load { try await usageClient.fetchCredits(apiKey: auth.apiKey) }
-        } catch {
-            return ProviderSnapshot.error(provider: provider, error: error)
-        }
-        let key: EndpointResult
-        do {
-            key = try await load { try await usageClient.fetchKey(apiKey: auth.apiKey) }
-        } catch {
-            return ProviderSnapshot.error(provider: provider, error: error)
-        }
-
-        var lines: [MetricLine] = []
-        var plan: String?
-        if case .success(let data) = credits {
-            lines += OpenRouterUsageMapper.creditsLines(from: data)
-        }
-        if case .success(let data) = key {
-            let mapped = OpenRouterUsageMapper.keyMetrics(from: data)
-            plan = mapped.plan
-            lines += mapped.lines
-        }
-
-        if !lines.isEmpty {
-            return ProviderSnapshot.make(provider: provider, plan: plan, lines: lines, refreshedAt: now())
-        }
-
-        // Nothing usable came back. Only call the key invalid when BOTH endpoints rejected it
-        // (401/403) — OpenRouter gates some endpoints to specific key types, so a single 403 (e.g.
-        // `/credits` forbidden) while `/key` succeeded means the key is valid but gated, not invalid.
-        if credits.isAuthFailure && key.isAuthFailure {
-            return ProviderSnapshot.error(provider: provider, error: OpenRouterAuthError.invalidKey)
-        }
-        let error = credits.failureError ?? key.failureError ?? OpenRouterUsageError.invalidResponse
-        return ProviderSnapshot.error(provider: provider, error: error)
-    }
-
-    /// Run one endpoint call and classify the outcome: a parsed data object on 2xx, an auth failure on
-    /// 401/403, or a typed failure for any other non-2xx, transport error, or unparsable body.
-    private func load(_ call: () async throws -> HTTPResponse) async throws -> EndpointResult {
-        try Task.checkCancellation()
-        do {
-            let response = try await call()
-            try Task.checkCancellation()
-            if response.statusCode == 401 || response.statusCode == 403 { return .authFailure }
-            guard (200..<300).contains(response.statusCode) else {
-                return .failed(.requestFailed(response.statusCode))
-            }
-            guard let data = OpenRouterUsageMapper.dataObject(response.body) else {
-                return .failed(.invalidResponse)
-            }
-            return .success(data)
-        } catch {
-            try ProviderCancellation.rethrowIfCancellation(error)
-            return .failed(.connectionFailed)
-        }
+        await RustEngine.refresh(provider: provider)
     }
 }
 
 extension OpenRouterProvider: APIKeyManaging {
-    var apiKeyStatus: APIKeyStatus { authStore.keyStatus() }
-    func currentAPIKey() -> String? { authStore.currentAPIKey() }
-    func saveAPIKey(_ key: String) throws { try authStore.saveAPIKey(key) }
-    func deleteAPIKey() throws { try authStore.deleteAPIKey() }
-}
-
-private enum EndpointResult {
-    case success([String: Any])
-    case authFailure
-    case failed(OpenRouterUsageError)
-
-    var isAuthFailure: Bool {
-        if case .authFailure = self { return true }
-        return false
-    }
-
-    var failureError: OpenRouterUsageError? {
-        if case .failed(let error) = self { return error }
-        return nil
-    }
+    var apiKeyStatus: APIKeyStatus { RustEngine.apiKeyStatus(providerID: provider.id) }
+    func currentAPIKey() -> String? { RustEngine.currentAPIKey(providerID: provider.id) }
+    func saveAPIKey(_ key: String) throws { try RustEngine.saveAPIKey(key, providerID: provider.id) }
+    func deleteAPIKey() throws { try RustEngine.deleteAPIKey(providerID: provider.id) }
 }

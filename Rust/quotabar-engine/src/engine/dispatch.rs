@@ -45,6 +45,10 @@ pub(super) fn dispatch(engine: &Engine, method: &str, params: Value) -> Result<V
             let provider = engine.provider(&p.provider_id).ok_or_else(|| unknown(&p.provider_id))?;
             Ok(Value::Bool(provider.has_local_credentials_with_config(p.config.as_ref())))
         }
+        "credentialAction" => {
+            let p: CredentialActionParams = from_params(params)?;
+            crate::providers::api_key::dispatch(&p.provider_id, &p.action, p.key.as_deref())
+        }
         "refresh" => {
             let p: RefreshParams = from_params(params)?;
             let mut ctx = RefreshContext::new(p.scope.unwrap_or(Scope::Full));
@@ -194,6 +198,15 @@ struct PricingResolveParams {
     timestamp: Option<f64>,
     apply_long_context_rates: Option<bool>,
     skip_model_catalog_refresh: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialActionParams {
+    provider_id: String,
+    action: String,
+    #[serde(default)]
+    key: Option<String>,
 }
 
 #[derive(Deserialize)]

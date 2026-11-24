@@ -216,6 +216,7 @@ impl DailyUsageAccumulator {
                         None
                     },
                     token_count_saturated: self.token_count_saturated_days.contains(day),
+                    reported_cost: None,
                 }
             })
             .collect();

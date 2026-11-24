@@ -1,11 +1,17 @@
 //! Ported from `Tests/QuotaBarTests/DevinProviderTests.swift` (main + fix/devin-weekly-quota), using
 //! real temporary files and SQLite databases instead of fakes.
 
+use super::client::{INVALID_RESPONSE_KEY, TRANSPORT_FAILURE_KEY};
 use super::*;
 use crate::context::{RefreshContext, Scope};
-use crate::http::mock::MockClient;
+use crate::host::diagnostic_gate;
+use crate::http::{mock::MockClient, HttpError};
+use crate::model::{MetricKind, MetricLine, ProviderSnapshot};
+use crate::parse;
 use crate::test_support::{captured_logs, install_capture_host};
-use std::path::Path;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const NOW: f64 = 1_773_000_000.0;
 

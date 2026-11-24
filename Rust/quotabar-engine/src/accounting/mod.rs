@@ -53,6 +53,7 @@ impl DailyUsageEntry {
             cost_is_complete: true,
             has_unexplained_incomplete_cost: None,
             token_count_saturated: total_tokens == i64::MAX,
+            reported_cost: None,
         }
     }
 }
