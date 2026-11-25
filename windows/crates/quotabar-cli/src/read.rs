@@ -88,6 +88,7 @@ pub fn run(provider: Option<&str>, force: bool, diagnose: bool) -> Result<i32> {
             base_provider_id: base_id.to_string(),
             label: label.unwrap_or_default().to_string(),
             credential,
+            codex_home: saved_account.and_then(|account| account.codex_home.clone()),
             store_path: Some(provider_accounts::store_path(&paths.app_data)),
         };
         let attempt = super::batch_probe::run_account_probe_with_timeout(
