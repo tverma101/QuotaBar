@@ -13,6 +13,8 @@ export type ModernLayoutState = {
   pinnedMetricIds: string[]
   /** Which provider logo/readout to use for single-provider tray icon styles (Plugin, Pie, Logo). */
   trayFocusProviderId: string | null
+  /** Customize overrides of the default Always Visible / On Demand split (true = On Demand). */
+  onDemandOverrides: Record<string, boolean>
   initialized: boolean
 }
 
@@ -22,6 +24,7 @@ export const EMPTY_MODERN_LAYOUT: ModernLayoutState = {
   metricOrderByProvider: {},
   pinnedMetricIds: [],
   trayFocusProviderId: null,
+  onDemandOverrides: {},
   initialized: false,
 }
 
@@ -90,6 +93,12 @@ export function normalizeModernLayout(raw: unknown): ModernLayoutState {
       metricOrder[k] = metricIdArray(v)
     }
   }
+  const onDemandOverrides: Record<string, boolean> = {}
+  if (o.onDemandOverrides && typeof o.onDemandOverrides === "object") {
+    for (const [k, v] of Object.entries(o.onDemandOverrides as Record<string, unknown>)) {
+      if (typeof v === "boolean") onDemandOverrides[migrateStoredMetricId(k)] = v
+    }
+  }
   return {
     placedMetricIds: metricIdArray(o.placedMetricIds),
     providerOrder: strArray(o.providerOrder),
@@ -97,6 +106,7 @@ export function normalizeModernLayout(raw: unknown): ModernLayoutState {
     pinnedMetricIds: metricIdArray(o.pinnedMetricIds),
     trayFocusProviderId:
       typeof o.trayFocusProviderId === "string" ? o.trayFocusProviderId : null,
+    onDemandOverrides,
     initialized: o.initialized === true,
   }
 }

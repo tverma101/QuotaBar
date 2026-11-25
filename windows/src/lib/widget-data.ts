@@ -34,6 +34,10 @@ export type WidgetData = {
   /** Plugin instance id for claim actions (e.g. codex). */
   pluginId?: string
   color?: string
+  /** Progress lines only: the unit the headline is formatted in. */
+  format?: "percent" | "dollars" | "count"
+  /** Progress lines only: formatted limit for the trailing "… limit" copy. */
+  limitText?: string
 }
 
 export function placeholderWidgetData(args: {
@@ -75,6 +79,12 @@ function progressPrimaryText(
     return `${formatMoney(shownAmount, { sourceCurrency: "USD" })}${leftSuffix}`
   }
   return `${formatCountNumber(shownAmount)} ${line.format.suffix}${leftSuffix}`
+}
+
+function formatLimitText(line: Extract<MetricLine, { type: "progress" }>): string {
+  if (line.format.kind === "percent") return `${Math.round(line.limit)}%`
+  if (line.format.kind === "dollars") return formatMoney(line.limit, { sourceCurrency: "USD" })
+  return `${formatCountNumber(line.limit)} ${line.format.suffix}`
 }
 
 export function resolveWidgetData(args: {
@@ -165,6 +175,8 @@ export function resolveWidgetData(args: {
       paceDetail,
       isLimitReached: limit > 0 && used >= limit,
       color: line.color,
+      format: line.format.kind,
+      limitText: formatLimitText(line),
     }
   }
 

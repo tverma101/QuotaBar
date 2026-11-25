@@ -1495,7 +1495,9 @@ export function SettingsPage({
   return (
     <div
       className={cn(
-        tabbed
+        isModern
+          ? "space-y-[10px] pb-1"
+          : tabbed
           ? "space-y-2 pb-2 [&_section]:rounded-xl [&_section]:border [&_section]:border-border/50 [&_section]:bg-card/30 [&_section]:px-3 [&_section]:py-2.5 [&_h3]:text-sm [&_h3]:font-semibold [&_section>p.text-sm]:text-xs [&_section>p.text-sm]:text-muted-foreground [&_section>p.text-sm]:mb-2"
           : "py-3 space-y-4",
       )}
@@ -1508,7 +1510,34 @@ export function SettingsPage({
           {devMockSaveNotice}
         </div>
       ) : null}
-      {tabbed ? (
+      {isModern ? (
+        <nav
+          className="sticky top-0 z-10 -mx-[14px] -mt-[14px] bg-background px-[14px] pb-[8px] pt-[10px]"
+          aria-label="Settings sections"
+        >
+          <div className="flex rounded-full bg-segment p-[3px]">
+            {modernTabs.map((tab) => {
+              const selected = modernTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  aria-pressed={selected}
+                  className={cn(
+                    "min-w-0 flex-auto truncate rounded-full px-[5px] py-[4px] text-[11.5px] tracking-[-0.01em] transition-colors",
+                    selected
+                      ? "bg-segment-selected font-semibold text-foreground shadow-[0_1px_3px_rgba(0,0,0,0.18)]"
+                      : "font-medium text-muted-foreground hover:text-foreground",
+                  )}
+                  onClick={() => setModernTab(tab.id)}
+                >
+                  {tab.label}
+                </button>
+              );
+            })}
+          </div>
+        </nav>
+      ) : tabbed ? (
         <nav
           className="flex flex-wrap gap-1 sticky top-0 z-10 -mx-1 px-1 py-1 bg-background/95 border-b border-border/40"
           aria-label="Settings sections"
