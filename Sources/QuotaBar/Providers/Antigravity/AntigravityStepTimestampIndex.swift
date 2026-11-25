@@ -24,7 +24,7 @@ struct AntigravityStepTimestampIndex: Codable, Equatable, Sendable {
         timeZoneIdentifier = Calendar.current.timeZone.identifier
     }
 
-    /// The derivation record stores the index so a cold scan worker verifies (prefix digest) instead
+    /// The derivation record stores the index so a cold process verifies (prefix digest) instead
     /// of re-paging every `steps` row. A fingerprint mismatch simply rebuilds the index from the
     /// table — persistence changes cost, not correctness. Required fields decode strictly so a
     /// truncated record rejects the whole index instead of silently trusting partial identities.

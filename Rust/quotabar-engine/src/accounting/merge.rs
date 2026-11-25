@@ -19,7 +19,10 @@ pub fn default_model_identity(model: &str) -> String {
 /// spellings remain untouched.
 pub fn codex_cross_source_model_identity(model: &str, pricing: &ModelPricing) -> String {
     let normalized = model.to_lowercase();
-    let canonical = pricing.canonical_name(model).map(|c| c.to_lowercase()).unwrap_or(normalized);
+    let canonical = pricing
+        .canonical_name(model)
+        .map(|c| c.to_lowercase())
+        .unwrap_or(normalized);
     if canonical.starts_with("gpt-") && canonical.ends_with("-fast") {
         return canonical[..canonical.len() - "-fast".len()].to_string();
     }
@@ -65,10 +68,14 @@ fn replay_day_flags(accumulator: &mut DailyUsageAccumulator, entry: &DailyUsageE
         accumulator.incomplete_cost_days.insert(entry.date.clone());
     }
     if entry.has_unexplained_incomplete_cost == Some(true) {
-        accumulator.structural_incomplete_cost_days.insert(entry.date.clone());
+        accumulator
+            .structural_incomplete_cost_days
+            .insert(entry.date.clone());
     }
     if entry.token_count_saturated {
-        accumulator.token_count_saturated_days.insert(entry.date.clone());
+        accumulator
+            .token_count_saturated_days
+            .insert(entry.date.clone());
     }
 }
 
@@ -86,7 +93,10 @@ impl DailyUsageAccumulator {
     ///
     /// `dropping_days_before` clips the merged result to a narrower requested window without
     /// re-folding. Day keys are zero-padded `yyyy-MM-dd`, so lexicographic order is chronological.
-    pub fn merged(scans: &[Option<LogUsageScan>], dropping_days_before: Option<&str>) -> Option<LogUsageScan> {
+    pub fn merged(
+        scans: &[Option<LogUsageScan>],
+        dropping_days_before: Option<&str>,
+    ) -> Option<LogUsageScan> {
         let present: Vec<&LogUsageScan> = scans.iter().flatten().collect();
         if present.is_empty() {
             return None;
@@ -103,7 +113,12 @@ impl DailyUsageAccumulator {
     /// counting their tokens; the unknown-model flags merge separately.
     fn merge(&mut self, scan: &LogUsageScan, min_day: Option<&str>) {
         let keep = |day: &str| min_day.is_none_or(|min| day >= min);
-        for day in scan.unmeasured_usage_days.iter().flatten().filter(|d| keep(d)) {
+        for day in scan
+            .unmeasured_usage_days
+            .iter()
+            .flatten()
+            .filter(|d| keep(d))
+        {
             self.unmeasured_usage_days.insert(day.clone());
         }
         for (day, models) in scan.unknown_models_by_day.iter().filter(|(d, _)| keep(d)) {
@@ -111,7 +126,12 @@ impl DailyUsageAccumulator {
                 self.add_unknown_model(day, model);
             }
         }
-        for day in scan.model_usage.iter().flat_map(|m| m.daily.iter()).filter(|d| keep(&d.date)) {
+        for day in scan
+            .model_usage
+            .iter()
+            .flat_map(|m| m.daily.iter())
+            .filter(|d| keep(&d.date))
+        {
             for model in &day.models {
                 replay_model(self, &day.date, model);
             }
@@ -119,10 +139,18 @@ impl DailyUsageAccumulator {
         for day in scan.series.daily.iter().filter(|d| keep(&d.date)) {
             replay_day_flags(self, day);
         }
-        for day in incomplete_estimate_days(scan).into_iter().filter(|d| keep(d)) {
+        for day in incomplete_estimate_days(scan)
+            .into_iter()
+            .filter(|d| keep(d))
+        {
             self.api_estimate_incomplete_days.insert(day);
         }
-        for (day, estimate) in scan.api_estimate_by_day.iter().flatten().filter(|(d, _)| keep(d)) {
+        for (day, estimate) in scan
+            .api_estimate_by_day
+            .iter()
+            .flatten()
+            .filter(|(d, _)| keep(d))
+        {
             self.add_api_estimate(day, *estimate);
         }
     }
@@ -145,7 +173,11 @@ impl DailyUsageAccumulator {
             .and_then(|p| p.model_usage.as_ref())
             .into_iter()
             .flat_map(|usage| usage.daily.iter())
-            .filter(|day| day.models.iter().any(|m| m.total_tokens > 0 || m.cost_usd.unwrap_or(0.0) > 0.0))
+            .filter(|day| {
+                day.models
+                    .iter()
+                    .any(|m| m.total_tokens > 0 || m.cost_usd.unwrap_or(0.0) > 0.0)
+            })
             .map(|day| day.date.clone())
             .collect();
 
@@ -175,7 +207,7 @@ impl DailyUsageAccumulator {
     /// safely split into model-level pieces here.
     pub fn merged_preferring_primary_by_model(
         primary: Option<&LogUsageScan>,
-        filling_gaps_from: &[Option<LogUsageScan>],
+        filling_gaps_from: &[Option<&LogUsageScan>],
         model_identity: &dyn Fn(&str) -> String,
     ) -> (Option<LogUsageScan>, bool) {
         let mut accumulator = DailyUsageAccumulator::new();
@@ -195,7 +227,13 @@ impl DailyUsageAccumulator {
                     accumulator.add_unknown_model(day, model);
                 }
             }
-            let added_days = absorb_rows(&mut accumulator, &mut seen_models, primary, false, model_identity);
+            let added_days = absorb_rows(
+                &mut accumulator,
+                &mut seen_models,
+                primary,
+                false,
+                model_identity,
+            );
             covered_days.extend(added_days.iter().cloned());
             saw_any = !added_days.is_empty();
             saw_any = saw_any || !primary.unknown_models_by_day.is_empty();
@@ -213,14 +251,23 @@ impl DailyUsageAccumulator {
             let mut added_unknown_days: BTreeSet<String> = BTreeSet::new();
             for (day, models) in &supplement.unknown_models_by_day {
                 for model in models {
-                    let known = accumulator.unknown_models_by_day.get(day).is_some_and(|set| set.contains(model));
+                    let known = accumulator
+                        .unknown_models_by_day
+                        .get(day)
+                        .is_some_and(|set| set.contains(model));
                     if !known {
                         accumulator.add_unknown_model(day, model);
                         added_unknown_days.insert(day.clone());
                     }
                 }
             }
-            let added_days = absorb_rows(&mut accumulator, &mut seen_models, supplement, true, model_identity);
+            let added_days = absorb_rows(
+                &mut accumulator,
+                &mut seen_models,
+                supplement,
+                true,
+                model_identity,
+            );
             let incomplete_days = incomplete_estimate_days(supplement);
             if added_days.is_empty() && added_unknown_days.is_empty() {
                 continue;
@@ -235,7 +282,11 @@ impl DailyUsageAccumulator {
                     if incomplete_days.contains(day) {
                         accumulator.api_estimate_incomplete_days.insert(day.clone());
                     }
-                    if let Some(estimate) = supplement.api_estimate_by_day.as_ref().and_then(|e| e.get(day)) {
+                    if let Some(estimate) = supplement
+                        .api_estimate_by_day
+                        .as_ref()
+                        .and_then(|e| e.get(day))
+                    {
                         accumulator.add_api_estimate(day, *estimate);
                     }
                 }
@@ -256,7 +307,11 @@ impl DailyUsageAccumulator {
 
 /// `absorb` of `mergedPreferringPrimary`: replay everything in `scan` except `days_to_skip`; true when
 /// anything was absorbed.
-fn absorb_skipping(accumulator: &mut DailyUsageAccumulator, scan: &LogUsageScan, days_to_skip: &BTreeSet<String>) -> bool {
+fn absorb_skipping(
+    accumulator: &mut DailyUsageAccumulator,
+    scan: &LogUsageScan,
+    days_to_skip: &BTreeSet<String>,
+) -> bool {
     let mut absorbed = false;
     for (day, models) in &scan.unknown_models_by_day {
         if days_to_skip.contains(day) {
@@ -276,13 +331,26 @@ fn absorb_skipping(accumulator: &mut DailyUsageAccumulator, scan: &LogUsageScan,
             absorbed = true;
         }
     }
-    for day in scan.series.daily.iter().filter(|d| !days_to_skip.contains(&d.date)) {
+    for day in scan
+        .series
+        .daily
+        .iter()
+        .filter(|d| !days_to_skip.contains(&d.date))
+    {
         replay_day_flags(accumulator, day);
     }
-    for day in incomplete_estimate_days(scan).into_iter().filter(|d| !days_to_skip.contains(d)) {
+    for day in incomplete_estimate_days(scan)
+        .into_iter()
+        .filter(|d| !days_to_skip.contains(d))
+    {
         accumulator.api_estimate_incomplete_days.insert(day);
     }
-    for (day, estimate) in scan.api_estimate_by_day.iter().flatten().filter(|(d, _)| !days_to_skip.contains(*d)) {
+    for (day, estimate) in scan
+        .api_estimate_by_day
+        .iter()
+        .flatten()
+        .filter(|(d, _)| !days_to_skip.contains(*d))
+    {
         accumulator.add_api_estimate(day, *estimate);
         absorbed = true;
     }

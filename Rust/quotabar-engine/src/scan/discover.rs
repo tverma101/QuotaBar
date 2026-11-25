@@ -42,8 +42,14 @@ fn platform_revision(meta: &Metadata) -> Revision {
     use std::os::unix::fs::MetadataExt;
     Revision {
         size: meta.len(),
-        mtime_ns: meta.mtime().saturating_mul(1_000_000_000).saturating_add(meta.mtime_nsec()),
-        ctime_ns: meta.ctime().saturating_mul(1_000_000_000).saturating_add(meta.ctime_nsec()),
+        mtime_ns: meta
+            .mtime()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(meta.mtime_nsec()),
+        ctime_ns: meta
+            .ctime()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(meta.ctime_nsec()),
         dev: meta.dev(),
         ino: meta.ino(),
     }
@@ -113,7 +119,10 @@ pub fn discover(root: &Path, extensions: Extensions) -> io::Result<Vec<Discovere
         Err(e) => return Err(e),
     };
     if !std::fs::metadata(&root)?.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "log root is not a directory"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "log root is not a directory",
+        ));
     }
     let mut files = Vec::new();
     let mut stack = vec![root];
@@ -158,20 +167,36 @@ mod tests {
     #[test]
     fn missing_root_is_empty_and_files_are_sorted_and_filtered() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(discover(&dir.path().join("absent"), Extensions::Jsonl).unwrap().is_empty());
+        assert!(discover(&dir.path().join("absent"), Extensions::Jsonl)
+            .unwrap()
+            .is_empty());
         std::fs::create_dir_all(dir.path().join("b/c")).unwrap();
-        for name in ["b/c/2.jsonl", "a.jsonl", "b/1.jsonl", "b/skip.json", "b/old.jsonl.zst"] {
+        for name in [
+            "b/c/2.jsonl",
+            "a.jsonl",
+            "b/1.jsonl",
+            "b/skip.json",
+            "b/old.jsonl.zst",
+        ] {
             std::fs::write(dir.path().join(name), b"{}\n").unwrap();
         }
         let names = |ext| {
             discover(dir.path(), ext)
                 .unwrap()
                 .iter()
-                .map(|f| f.path.strip_prefix(std::fs::canonicalize(dir.path()).unwrap()).unwrap().to_owned())
+                .map(|f| {
+                    f.path
+                        .strip_prefix(std::fs::canonicalize(dir.path()).unwrap())
+                        .unwrap()
+                        .to_owned()
+                })
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(Extensions::Jsonl), ["a.jsonl", "b/1.jsonl", "b/c/2.jsonl"]);
+        assert_eq!(
+            names(Extensions::Jsonl),
+            ["a.jsonl", "b/1.jsonl", "b/c/2.jsonl"]
+        );
         assert_eq!(
             names(Extensions::JsonlAndZstd),
             ["a.jsonl", "b/1.jsonl", "b/c/2.jsonl", "b/old.jsonl.zst"]
@@ -193,9 +218,17 @@ mod tests {
         let file = dir.path().join("x.jsonl");
         std::fs::write(&file, b"a\n").unwrap();
         let first = Revision::read(&file).unwrap();
-        std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
         use std::io::Write;
-        std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(b"b\n").unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(b"b\n")
+            .unwrap();
         let second = Revision::read(&file).unwrap();
         assert!(first.same_file(&second));
         assert_eq!(second.size, 4);

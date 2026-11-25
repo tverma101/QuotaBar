@@ -69,7 +69,13 @@ pub fn day_key_in(timestamp: Timestamp, zone: DayZone) -> String {
 fn has_iso_day_shape(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 10
-        && bytes.iter().enumerate().all(|(i, b)| if i == 4 || i == 7 { *b == b'-' } else { b.is_ascii_digit() })
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
 }
 
 /// The leading `yyyy-MM-dd` of a timestamp-shaped string, if it starts with one.
@@ -90,18 +96,25 @@ fn compact_day_key(value: &str) -> Option<String> {
     Some(format!("{}-{}-{}", &value[..4], &value[4..6], &value[6..]))
 }
 
-const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const MONTHS: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
 
 /// The fallback `MMM dd, yyyy` shape ("Jun 21, 2026"), read as a calendar date.
 fn parse_month_day_year(value: &str) -> Option<String> {
     let (month_text, rest) = value.split_once(char::is_whitespace)?;
-    let month = MONTHS.iter().position(|m| m.eq_ignore_ascii_case(month_text))? as u32 + 1;
+    let month = MONTHS
+        .iter()
+        .position(|m| m.eq_ignore_ascii_case(month_text))? as u32
+        + 1;
     let (day_text, year_text) = rest.trim_start().split_once(',')?;
     let (day_text, year_text) = (day_text.trim(), year_text.trim());
     if day_text.is_empty() || day_text.len() > 2 || year_text.len() != 4 {
         return None;
     }
-    if !day_text.bytes().all(|b| b.is_ascii_digit()) || !year_text.bytes().all(|b| b.is_ascii_digit()) {
+    if !day_text.bytes().all(|b| b.is_ascii_digit())
+        || !year_text.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     let date = NaiveDate::from_ymd_opt(year_text.parse().ok()?, month, day_text.parse().ok()?)?;
@@ -121,7 +134,9 @@ pub fn day_key_from_usage_date(raw: &str, zone: DayZone) -> Option<String> {
     if let Some(timestamp) = parse_iso8601(value) {
         return Some(zone.day_key(timestamp));
     }
-    iso_day_prefix(value).or_else(|| compact_day_key(value)).or_else(|| parse_month_day_year(value))
+    iso_day_prefix(value)
+        .or_else(|| compact_day_key(value))
+        .or_else(|| parse_month_day_year(value))
 }
 
 /// The calendar window shared by local scanners, combined iCloud history and the usage trend.
@@ -138,7 +153,9 @@ impl UsageHistoryWindow {
     /// The Usage History lifetime window: ten calendar years back from today, inclusive. Calendar year
     /// arithmetic keeps the cutoff on the same month/day, clamping a leap day.
     pub fn lifetime_days(now: Timestamp, zone: DayZone) -> usize {
-        let Some(today) = zone.local_date(now) else { return 1 };
+        let Some(today) = zone.local_date(now) else {
+            return 1;
+        };
         let first = today.checked_sub_months(Months::new(120)).unwrap_or(today);
         let span = days_from_civil(today.year().into(), today.month(), today.day())
             - days_from_civil(first.year().into(), first.month(), first.day());
@@ -156,7 +173,9 @@ impl UsageHistoryWindow {
     }
 
     fn day_keys_count(now: Timestamp, count: usize, zone: DayZone) -> BTreeSet<String> {
-        let Some(today) = zone.local_date(now) else { return BTreeSet::new() };
+        let Some(today) = zone.local_date(now) else {
+            return BTreeSet::new();
+        };
         (0..count as u64)
             .filter_map(|offset| today.checked_sub_days(Days::new(offset)))
             .map(format_day)

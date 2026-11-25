@@ -1,6 +1,6 @@
 use super::batch::{self, BatchParams};
 use super::Engine;
-use crate::context::{RefreshContext, Scope};
+use crate::context::{now_timestamp, CancelToken, RefreshContext, Scope};
 use crate::paths::{self, Paths};
 use crate::pricing::TokenBreakdown;
 use serde::Deserialize;
@@ -11,7 +11,10 @@ pub(super) fn dispatch(engine: &Engine, method: &str, params: Value) -> Result<V
     match method {
         "configure" => {
             let p: ConfigureParams = from_params(params)?;
-            paths::configure(Paths { home: PathBuf::from(p.home), app_data: PathBuf::from(p.app_data) });
+            paths::configure(Paths {
+                home: PathBuf::from(p.home),
+                app_data: PathBuf::from(p.app_data),
+            });
             Ok(Value::Null)
         }
         "providers" => Ok(Value::Array(
@@ -23,7 +26,10 @@ pub(super) fn dispatch(engine: &Engine, method: &str, params: Value) -> Result<V
         )),
         "sqliteQuery" => {
             let p: SqliteParams = from_params(params)?;
-            let result = match p.timeout_seconds.filter(|seconds| seconds.is_finite() && *seconds > 0.0) {
+            let result = match p
+                .timeout_seconds
+                .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            {
                 Some(seconds) => crate::sqlite::query_text_within(
                     &p.path,
                     &p.sql,
@@ -32,7 +38,9 @@ pub(super) fn dispatch(engine: &Engine, method: &str, params: Value) -> Result<V
                 ),
                 None => crate::sqlite::query_text(&p.path, &p.sql, p.allow_wal_retry),
             };
-            result.map(|value| json!(value)).map_err(|error| error.to_string())
+            result
+                .map(|value| json!(value))
+                .map_err(|error| error.to_string())
         }
         "sqliteExecute" => {
             let p: SqliteParams = from_params(params)?;
@@ -42,8 +50,12 @@ pub(super) fn dispatch(engine: &Engine, method: &str, params: Value) -> Result<V
         }
         "hasLocalCredentials" => {
             let p: HasCredsParams = from_params(params)?;
-            let provider = engine.provider(&p.provider_id).ok_or_else(|| unknown(&p.provider_id))?;
-            Ok(Value::Bool(provider.has_local_credentials_with_config(p.config.as_ref())))
+            let provider = engine
+                .provider(&p.provider_id)
+                .ok_or_else(|| unknown(&p.provider_id))?;
+            Ok(Value::Bool(
+                provider.has_local_credentials_with_config(p.config.as_ref()),
+            ))
         }
         "credentialAction" => {
             let p: CredentialActionParams = from_params(params)?;
@@ -53,9 +65,12 @@ pub(super) fn dispatch(engine: &Engine, method: &str, params: Value) -> Result<V
             let p: ProviderIdParams = from_params(params)?;
             match p.provider_id.as_str() {
                 "cursor" => Ok(Value::String(
-                    crate::providers::cursor::auth::CursorAuthStore::live().cache_identity_key_for_launch(),
+                    crate::providers::cursor::auth::CursorAuthStore::live()
+                        .cache_identity_key_for_launch(),
                 )),
-                other => Err(format!("provider does not support cacheIdentityKey: {other}")),
+                other => Err(format!(
+                    "provider does not support cacheIdentityKey: {other}"
+                )),
             }
         }
         "refresh" => {
@@ -82,6 +97,48 @@ pub(super) fn dispatch(engine: &Engine, method: &str, params: Value) -> Result<V
             let response = batch::run(engine, p);
             serde_json::to_value(response).map_err(|e| e.to_string())
         }
+        "codexResetCredits" => {
+            let p: ResetCreditsParams = from_params(params)?;
+            let mut ctx = RefreshContext::new(Scope::Full);
+            ctx.is_manual = p.is_manual.unwrap_or(false);
+            ctx.now = p.now.unwrap_or_else(now_timestamp);
+            ctx.request_id = p.request_id;
+            let mut cancel = CancelToken::new();
+            engine.register_token(p.request_id, &mut cancel);
+            ctx.cancel = cancel;
+            let config = crate::providers::codex::reset_claim::ClaimConfig::from_value(
+                &p.provider_id,
+                p.config.as_ref(),
+            );
+            let reply = crate::providers::codex::reset_claim::available_credits(&config, &ctx);
+            engine.finish_token(p.request_id);
+            serde_json::to_value(reply).map_err(|e| e.to_string())
+        }
+        "codexResetClaim" => {
+            let p: ResetClaimParams = from_params(params)?;
+            let mut ctx = RefreshContext::new(Scope::Full);
+            ctx.is_manual = p.is_manual.unwrap_or(false);
+            ctx.now = p.now.unwrap_or_else(now_timestamp);
+            ctx.request_id = p.request_id;
+            let mut cancel = CancelToken::new();
+            engine.register_token(p.request_id, &mut cancel);
+            ctx.cancel = cancel;
+            let config = crate::providers::codex::reset_claim::ClaimConfig::from_value(
+                &p.provider_id,
+                p.config.as_ref(),
+            );
+            let request = crate::providers::codex::reset_claim::ClaimRequest {
+                expiry: p.expiry,
+                redeem_request_id: p.redeem_request_id,
+                credit_id: p.credit_id,
+                owner_identity: p.owner_identity,
+                is_retry: p.is_retry.unwrap_or(false),
+                automatic: p.automatic.unwrap_or(false),
+            };
+            let reply = crate::providers::codex::reset_claim::claim(&config, &request, &ctx);
+            engine.finish_token(p.request_id);
+            serde_json::to_value(reply).map_err(|e| e.to_string())
+        }
         "unloadCaches" => {
             if let Some(pricing) = crate::pricing::shared_if_initialized() {
                 pricing.clear_caches();
@@ -89,6 +146,14 @@ pub(super) fn dispatch(engine: &Engine, method: &str, params: Value) -> Result<V
             for provider in engine.providers() {
                 provider.unload_caches();
             }
+            Ok(Value::Null)
+        }
+        "unloadProviderCaches" => {
+            let p: ProviderIdParams = from_params(params)?;
+            let provider = engine
+                .provider(&p.provider_id)
+                .ok_or_else(|| unknown(&p.provider_id))?;
+            provider.unload_caches();
             Ok(Value::Null)
         }
         "pricingStatus" => Ok(crate::pricing::shared().status()),
@@ -108,7 +173,8 @@ pub(super) fn dispatch(engine: &Engine, method: &str, params: Value) -> Result<V
         }
         "pricingResolve" => {
             let p: PricingResolveParams = from_params(params)?;
-            let pricing = crate::pricing::shared().current(p.skip_model_catalog_refresh.unwrap_or(true));
+            let pricing =
+                crate::pricing::shared().current(p.skip_model_catalog_refresh.unwrap_or(true));
             let apply_long = p.apply_long_context_rates.unwrap_or(true);
             let rates = pricing.resolve(&p.model);
             let cost_usd = p.tokens.as_ref().and_then(|t| {
@@ -143,7 +209,9 @@ fn from_params<T: for<'de> Deserialize<'de>>(params: Value) -> Result<T, String>
     serde_json::from_value(params).map_err(|e| format!("invalid params: {e}"))
 }
 
-fn from_params_or_default<T: Default + for<'de> Deserialize<'de>>(params: Value) -> Result<T, String> {
+fn from_params_or_default<T: Default + for<'de> Deserialize<'de>>(
+    params: Value,
+) -> Result<T, String> {
     if params.is_null() {
         Ok(T::default())
     } else {
@@ -176,6 +244,44 @@ struct SqliteParams {
     /// Per-query wall-clock budget in seconds; the engine default (5s) when absent.
     #[serde(default)]
     timeout_seconds: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetCreditsParams {
+    provider_id: String,
+    #[serde(default)]
+    config: Option<Value>,
+    #[serde(default)]
+    is_manual: Option<bool>,
+    #[serde(default)]
+    request_id: Option<u64>,
+    #[serde(default)]
+    now: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetClaimParams {
+    provider_id: String,
+    #[serde(default)]
+    config: Option<Value>,
+    expiry: f64,
+    redeem_request_id: String,
+    #[serde(default)]
+    credit_id: Option<String>,
+    #[serde(default)]
+    owner_identity: Option<String>,
+    #[serde(default)]
+    is_retry: Option<bool>,
+    #[serde(default)]
+    automatic: Option<bool>,
+    #[serde(default)]
+    is_manual: Option<bool>,
+    #[serde(default)]
+    request_id: Option<u64>,
+    #[serde(default)]
+    now: Option<f64>,
 }
 
 #[derive(Deserialize)]

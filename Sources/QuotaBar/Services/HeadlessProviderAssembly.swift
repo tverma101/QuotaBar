@@ -1,13 +1,13 @@
 import Foundation
 
-/// Shared headless assembly for the one-shot CLI (`UsageReader`) and the scan-worker child
-/// (`ScanWorkerCommand`): settings migration, shell-environment capture, account discovery,
+/// Shared headless assembly for the one-shot CLI (`UsageReader`): settings migration,
+/// shell-environment capture, account discovery,
 /// provider construction, and cache-identity keys. Both entry points must resolve the same
 /// credential sources in the same order, so the sequence lives in exactly one place — a second
 /// copy here would let the child classify accounts differently from the app and CLI.
 ///
 /// `forceEnabledFamilies` forces provider families on top of saved enablement while the catalog
-/// is built: the CLI names one provider family, and the scan worker names the families of the
+/// is built: the CLI names one provider family or the fold set it is about to refresh.
 /// exact cards its parent asked it to fold. Extra cards built by a forced family are never
 /// refreshed unless requested.
 @MainActor
@@ -22,7 +22,7 @@ struct HeadlessProviderAssembly {
     let providerIdentityKeys: [String: String]
     /// Identity-key probes assembly skipped because the caller named the cards it would refresh.
     /// Each loader runs exactly one provider's credential read (Cursor's sqlite3 queries,
-    /// Antigravity's Keychain query) on first access — the deferred cost a one-shot scan worker
+    /// Antigravity's Keychain query) on first access — the deferred cost a one-shot headless read
     /// avoids for providers its parent never asked it to fold.
     private let deferredIdentityKeyLoaders: [String: @Sendable () async -> String]
 
@@ -41,7 +41,7 @@ struct HeadlessProviderAssembly {
         forceEnabledFamilies: Set<String>,
         identityKeyProviderIDs: Set<String>? = nil
     ) async throws -> HeadlessProviderAssembly {
-        // The CLI and the scan worker share the app's provider settings, so migrate them before a
+        // The CLI shares the app's provider settings, so migrate them before a
         // store interprets the enabled/disabled lists. If migration stops partway through, fail
         // closed before discovery can read optional providers' local credentials under the legacy
         // "everything on" rule.
@@ -59,7 +59,7 @@ struct HeadlessProviderAssembly {
         // triggers the capture itself, so identity would read one home while the providers'
         // off-main reads (which do trigger it) fetch usage from another.
         //
-        // With a snapshot present, skip the eager warm in the one-shot scan worker: identity keys
+        // With a snapshot present, skip the eager warm in the one-shot CLI: identity keys
         // resolve from the snapshot (frozen for the session), and off-main readers trigger the
         // one-time capture on demand if a non-identity key is actually needed — so the spawn is
         // paid only when a fold path truly reads one, not by every short-lived child. Freebuff's
@@ -135,14 +135,14 @@ struct HeadlessProviderAssembly {
         // when something actually asks. `nil` keeps the CLI's catalog-wide read.
         if identityKeyProviderIDs == nil {
             providerIdentityKeys["cursor"] = await loadOffMainActor {
-                CursorAuthStore().cacheIdentityKeyForLaunch()
+                CursorProvider.cacheIdentityKeyForLaunch()
             }
             providerIdentityKeys["antigravity"] = await loadOffMainActor {
                 AntigravityAuthStore().cacheIdentityKeyForLaunch()
             }
         } else {
             deferredIdentityKeyLoaders["cursor"] = {
-                await loadOffMainActor { CursorAuthStore().cacheIdentityKeyForLaunch() }
+                await loadOffMainActor { CursorProvider.cacheIdentityKeyForLaunch() }
             }
             deferredIdentityKeyLoaders["antigravity"] = {
                 await loadOffMainActor { AntigravityAuthStore().cacheIdentityKeyForLaunch() }

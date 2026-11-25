@@ -95,7 +95,6 @@ than a crash; `rm -rf .build/out/Intermediates.noindex/XCBuildData .build/.lock`
   from other checkouts; don't stop unrelated processes. The installer stages
   and signs the replacement before stopping the installed app. Verify exactly
   one QuotaBar app is running from `/Applications/QuotaBar.app`, not `dist/`.
-  Exclude `--scan-worker` child processes from the app instance count.
 - Use `./script/build_and_run.sh verify` only for an explicitly requested
   preview. Don't leave a preview and the installed app running together.
 

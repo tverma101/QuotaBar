@@ -2,8 +2,8 @@
 
 use crate::accounting::{adding_saturating, append_usage_trend_in, DayZone};
 use crate::model::{
-    DailyUsageSeries, MetricKind, MetricLine, MetricValue, ModelUsageBreakdown, ModelUsageEntry, ModelUsageVariant,
-    ProviderUsageHistory, Timestamp,
+    DailyUsageSeries, MetricKind, MetricLine, MetricValue, ModelUsageBreakdown, ModelUsageEntry,
+    ModelUsageVariant, ProviderUsageHistory, Timestamp,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,7 +18,11 @@ pub enum HermesPeriod {
 }
 
 impl HermesPeriod {
-    pub const ALL: [HermesPeriod; 3] = [HermesPeriod::Today, HermesPeriod::ThisWeek, HermesPeriod::ThisMonth];
+    pub const ALL: [HermesPeriod; 3] = [
+        HermesPeriod::Today,
+        HermesPeriod::ThisWeek,
+        HermesPeriod::ThisMonth,
+    ];
 
     pub fn display_name(self) -> &'static str {
         match self {
@@ -41,7 +45,10 @@ pub struct HermesTokenCounts {
 impl HermesTokenCounts {
     pub fn total(self) -> i64 {
         adding_saturating(
-            adding_saturating(adding_saturating(self.input, self.output), adding_saturating(self.cache_read, self.cache_write)),
+            adding_saturating(
+                adding_saturating(self.input, self.output),
+                adding_saturating(self.cache_read, self.cache_write),
+            ),
             self.reasoning,
         )
     }
@@ -75,10 +82,18 @@ pub struct HermesUsageScan {
 pub fn lines(scan: &HermesUsageScan, now: Timestamp, zone: DayZone) -> Vec<MetricLine> {
     let mut out = Vec::new();
     for period in HermesPeriod::ALL {
-        let Some(usage) = scan.periods.iter().find(|p| p.period == period && has_usage(p)) else {
+        let Some(usage) = scan
+            .periods
+            .iter()
+            .find(|p| p.period == period && has_usage(p))
+        else {
             continue;
         };
-        let models = scan.model_usage_by_period.get(&period).map(Vec::as_slice).unwrap_or(&[]);
+        let models = scan
+            .model_usage_by_period
+            .get(&period)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         out.push(MetricLine::Values {
             label: period.display_name().to_string(),
             values: period_values(usage),
@@ -89,15 +104,28 @@ pub fn lines(scan: &HermesUsageScan, now: Timestamp, zone: DayZone) -> Vec<Metri
         });
     }
     if !scan.daily.daily.is_empty() {
-        append_usage_trend_in(&scan.daily, &mut out, now, SOURCE_NOTE, &scan.partial_days, None, zone);
+        append_usage_trend_in(
+            &scan.daily,
+            &mut out,
+            now,
+            SOURCE_NOTE,
+            &scan.partial_days,
+            None,
+            zone,
+        );
     }
     MetricLine::append_no_data_if_needed(&mut out);
     out
 }
 
 pub fn usage_history(scan: &HermesUsageScan) -> ProviderUsageHistory {
-    let incomplete_days: BTreeSet<String> =
-        scan.daily.daily.iter().filter(|d| d.total_tokens > 0).map(|d| d.date.clone()).collect();
+    let incomplete_days: BTreeSet<String> = scan
+        .daily
+        .daily
+        .iter()
+        .filter(|d| d.total_tokens > 0)
+        .map(|d| d.date.clone())
+        .collect();
     ProviderUsageHistory {
         series: scan.daily.clone(),
         model_usage: None,
@@ -129,7 +157,11 @@ fn period_values(usage: &HermesPeriodUsage) -> Vec<MetricValue> {
     values
 }
 
-pub fn breakdown(models: &[HermesModelUsage], total_tokens: i64, total_cost_usd: Option<f64>) -> Option<ModelUsageBreakdown> {
+pub fn breakdown(
+    models: &[HermesModelUsage],
+    total_tokens: i64,
+    total_cost_usd: Option<f64>,
+) -> Option<ModelUsageBreakdown> {
     if models.is_empty() {
         return None;
     }
@@ -179,7 +211,9 @@ pub fn breakdown(models: &[HermesModelUsage], total_tokens: i64, total_cost_usd:
                 cost_is_complete: model.is_partial.then_some(false),
                 token_count_saturated: None,
             });
-            other_has_partial = other_has_partial || model.is_partial || (model.cost_usd.is_none() && model.tokens > 0);
+            other_has_partial = other_has_partial
+                || model.is_partial
+                || (model.cost_usd.is_none() && model.tokens > 0);
         } else {
             named.push(entry);
         }

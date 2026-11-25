@@ -54,7 +54,10 @@ struct PromoInfo {
 
 /// Scan every `.log`/`.ldb` file in `files`, pick the entitlement snapshot with the highest
 /// `cachedAt`, and select the active/scheduled promotional allowance relative to `now`.
-pub fn scan_leveldb_entitlement(files: &[LevelDBFile], now: Option<f64>) -> Option<ZCodeEntitlementSnapshot> {
+pub fn scan_leveldb_entitlement(
+    files: &[LevelDBFile],
+    now: Option<f64>,
+) -> Option<ZCodeEntitlementSnapshot> {
     let mut sorted: Vec<&LevelDBFile> = files.iter().collect();
     sorted.sort_by(|a, b| b.modified_ns.cmp(&a.modified_ns));
 
@@ -62,7 +65,9 @@ pub fn scan_leveldb_entitlement(files: &[LevelDBFile], now: Option<f64>) -> Opti
     let mut best_cached_at: f64 = -1.0;
 
     for file in sorted {
-        let Ok(bytes) = std::fs::read(&file.path) else { continue };
+        let Ok(bytes) = std::fs::read(&file.path) else {
+            continue;
+        };
         let mut search_from = 0usize;
         while search_from < bytes.len() {
             let Some(rel) = find_subslice(&bytes[search_from..], ENTITLEMENT_KEY_PREFIX) else {
@@ -70,7 +75,9 @@ pub fn scan_leveldb_entitlement(files: &[LevelDBFile], now: Option<f64>) -> Opti
             };
             let scan_from = search_from + rel + ENTITLEMENT_KEY_PREFIX.len();
             let window_end = (scan_from + ENTITLEMENT_VALUE_SEARCH_WINDOW).min(bytes.len());
-            let Some(marker_rel) = find_subslice(&bytes[scan_from..window_end], ENTITLEMENT_JSON_MARKER) else {
+            let Some(marker_rel) =
+                find_subslice(&bytes[scan_from..window_end], ENTITLEMENT_JSON_MARKER)
+            else {
                 search_from = scan_from;
                 continue;
             };
@@ -97,7 +104,10 @@ pub fn scan_leveldb_entitlement(files: &[LevelDBFile], now: Option<f64>) -> Opti
     entitlement_from_root(&snapshot, now)
 }
 
-fn parse_entitlement_snapshot(bytes: &[u8], brace_start: usize) -> Option<(Map<String, Value>, f64)> {
+fn parse_entitlement_snapshot(
+    bytes: &[u8],
+    brace_start: usize,
+) -> Option<(Map<String, Value>, f64)> {
     let mut depth = 0usize;
     let mut json_end = brace_start;
     let limit = bytes.len().min(brace_start + MAX_ENTITLEMENT_JSON_BYTES);
@@ -115,14 +125,19 @@ fn parse_entitlement_snapshot(bytes: &[u8], brace_start: usize) -> Option<(Map<S
     if depth != 0 || json_end <= brace_start {
         return None;
     }
-    let Value::Object(root) = serde_json::from_slice::<Value>(&bytes[brace_start..json_end]).ok()? else {
+    let Value::Object(root) =
+        serde_json::from_slice::<Value>(&bytes[brace_start..json_end]).ok()?
+    else {
         return None;
     };
     let cached_at = parse::number(root.get("cachedAt"))?;
     Some((root, cached_at))
 }
 
-fn entitlement_from_root(root: &Map<String, Value>, now: Option<f64>) -> Option<ZCodeEntitlementSnapshot> {
+fn entitlement_from_root(
+    root: &Map<String, Value>,
+    now: Option<f64>,
+) -> Option<ZCodeEntitlementSnapshot> {
     let snapshot = root.get("snapshot")?.as_object()?;
     let plan_name = snapshot
         .get("quota")
@@ -141,16 +156,27 @@ fn entitlement_from_root(root: &Map<String, Value>, now: Option<f64>) -> Option<
         .and_then(Value::as_array)
     {
         for raw in details {
-            let Some(detail) = raw.as_object() else { continue };
+            let Some(detail) = raw.as_object() else {
+                continue;
+            };
             let Some(product_id) = detail.get("productId").and_then(Value::as_str) else {
                 continue;
             };
-            let expire = detail.get("expireTime").and_then(Value::as_str).and_then(parse_iso8601);
+            let expire = detail
+                .get("expireTime")
+                .and_then(Value::as_str)
+                .and_then(parse_iso8601);
             if let Some(exp) = expire {
                 expiry_by_product_id.insert(product_id.to_string(), exp);
             }
-            let billing_cycle = detail.get("billingCycle").and_then(Value::as_str).unwrap_or("");
-            let raw_name = detail.get("productName").and_then(Value::as_str).unwrap_or("");
+            let billing_cycle = detail
+                .get("billingCycle")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let raw_name = detail
+                .get("productName")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let is_one_time = billing_cycle == "one_time";
             let is_build = product_id.contains("build")
                 || product_id.ends_with("wk")
@@ -165,7 +191,11 @@ fn entitlement_from_root(root: &Map<String, Value>, now: Option<f64>) -> Option<
                 .and_then(parse_iso8601);
             if let Some(entitlements) = detail.get("entitlements").and_then(Value::as_array) {
                 for ent in entitlements.iter().filter_map(Value::as_object) {
-                    if let Some(d) = ent.get("effectiveTime").and_then(Value::as_str).and_then(parse_iso8601) {
+                    if let Some(d) = ent
+                        .get("effectiveTime")
+                        .and_then(Value::as_str)
+                        .and_then(parse_iso8601)
+                    {
                         effective_at = Some(d);
                         break;
                     }
@@ -194,11 +224,17 @@ fn entitlement_from_root(root: &Map<String, Value>, now: Option<f64>) -> Option<
         .and_then(Value::as_array)
     {
         for raw in limits {
-            let Some(limit) = raw.as_object() else { continue };
+            let Some(limit) = raw.as_object() else {
+                continue;
+            };
             let plan_id = limit.get("planId").and_then(Value::as_str).unwrap_or("");
             let is_one_time = limit.get("period").and_then(Value::as_str) == Some("one_time");
             let is_weekly_plan = plan_id.ends_with("wk") || plan_id.contains("-wk");
-            if !(is_weekly_plan || plan_id.contains("build") || is_one_time || promos.contains_key(plan_id)) {
+            if !(is_weekly_plan
+                || plan_id.contains("build")
+                || is_one_time
+                || promos.contains_key(plan_id))
+            {
                 continue;
             }
             let unit = parse::number(limit.get("unit")).unwrap_or(0.0);
@@ -222,7 +258,9 @@ fn entitlement_from_root(root: &Map<String, Value>, now: Option<f64>) -> Option<
                 reset_ms = None;
             }
             allowances.push(ZCodeAllowance {
-                label: promo.map(|p| p.label.clone()).unwrap_or_else(|| "Weekend Build".to_string()),
+                label: promo
+                    .map(|p| p.label.clone())
+                    .unwrap_or_else(|| "Weekend Build".to_string()),
                 used,
                 limit: unit,
                 remaining,
@@ -237,7 +275,9 @@ fn entitlement_from_root(root: &Map<String, Value>, now: Option<f64>) -> Option<
     sorted_promos.sort_by(|a, b| {
         let a_eff = a.effective_at.unwrap_or(f64::INFINITY);
         let b_eff = b.effective_at.unwrap_or(f64::INFINITY);
-        a_eff.total_cmp(&b_eff).then_with(|| a.product_id.cmp(&b.product_id))
+        a_eff
+            .total_cmp(&b_eff)
+            .then_with(|| a.product_id.cmp(&b.product_id))
     });
     for promo in sorted_promos {
         if !seen_plan_ids.contains(&promo.product_id) {
@@ -260,14 +300,16 @@ fn entitlement_from_root(root: &Map<String, Value>, now: Option<f64>) -> Option<
             _ => true,
         })
         .collect();
-    let active_with_remaining = candidates
-        .iter()
-        .copied()
-        .find(|a| a.effective_at.is_none_or(|e| now.is_some_and(|n| e <= n) || now.is_none()) && a.remaining > 0.0);
-    let active_drained = candidates
-        .iter()
-        .copied()
-        .find(|a| a.effective_at.is_none_or(|e| now.is_some_and(|n| e <= n) || now.is_none()) && a.remaining == 0.0);
+    let active_with_remaining = candidates.iter().copied().find(|a| {
+        a.effective_at
+            .is_none_or(|e| now.is_some_and(|n| e <= n) || now.is_none())
+            && a.remaining > 0.0
+    });
+    let active_drained = candidates.iter().copied().find(|a| {
+        a.effective_at
+            .is_none_or(|e| now.is_some_and(|n| e <= n) || now.is_none())
+            && a.remaining == 0.0
+    });
     let scheduled = candidates
         .iter()
         .copied()
@@ -275,7 +317,13 @@ fn entitlement_from_root(root: &Map<String, Value>, now: Option<f64>) -> Option<
     let selected = active_with_remaining
         .or(active_drained)
         .or(scheduled)
-        .or_else(|| if now.is_none() { allowances.first() } else { None })
+        .or_else(|| {
+            if now.is_none() {
+                allowances.first()
+            } else {
+                None
+            }
+        })
         .cloned();
 
     Some(ZCodeEntitlementSnapshot {
@@ -334,7 +382,9 @@ fn capitalize_words(s: &str) -> String {
 }
 
 fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
-    haystack.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
 }
 
 fn plausible_reset_date(milliseconds: f64, now: Option<f64>) -> Option<f64> {

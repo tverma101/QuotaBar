@@ -35,7 +35,10 @@ impl ClaudeEntryDeduplication {
             self.entries.push(entry);
             return;
         };
-        let key = ExactKey { message_id: message_id.clone(), request_id: entry.request_id.clone() };
+        let key = ExactKey {
+            message_id: message_id.clone(),
+            request_id: entry.request_id.clone(),
+        };
         let collision = self.exact_index.get(&key).copied().or_else(|| {
             self.message_index
                 .get(&message_id)?
@@ -47,7 +50,10 @@ impl ClaudeEntryDeduplication {
             if should_replace(&entry, &self.entries[index]) {
                 let old = &self.entries[index];
                 if let Some(old_id) = &old.message_id {
-                    self.exact_index.remove(&ExactKey { message_id: old_id.clone(), request_id: old.request_id.clone() });
+                    self.exact_index.remove(&ExactKey {
+                        message_id: old_id.clone(),
+                        request_id: old.request_id.clone(),
+                    });
                 }
                 self.entries[index] = entry;
                 self.exact_index.insert(key, index);
@@ -57,7 +63,10 @@ impl ClaudeEntryDeduplication {
         let index = self.entries.len();
         self.entries.push(entry);
         self.exact_index.insert(key, index);
-        self.message_index.entry(message_id).or_default().push(index);
+        self.message_index
+            .entry(message_id)
+            .or_default()
+            .push(index);
     }
 }
 
@@ -75,7 +84,10 @@ pub fn should_replace(candidate: &ClaudeEntry, existing: &ClaudeEntry) -> bool {
     if candidate.is_sidechain != existing.is_sidechain {
         return existing.is_sidechain;
     }
-    let (candidate_total, existing_total) = (candidate.tokens.total_tokens(), existing.tokens.total_tokens());
+    let (candidate_total, existing_total) = (
+        candidate.tokens.total_tokens(),
+        existing.tokens.total_tokens(),
+    );
     if candidate_total != existing_total {
         return candidate_total > existing_total;
     }

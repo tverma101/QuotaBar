@@ -26,7 +26,11 @@ pub struct RowOptions<'a> {
 
 impl Default for RowOptions<'_> {
     fn default() -> Self {
-        RowOptions { canonical: None, cost_is_complete: true, token_count_saturated: false }
+        RowOptions {
+            canonical: None,
+            cost_is_complete: true,
+            token_count_saturated: false,
+        }
     }
 }
 
@@ -74,39 +78,103 @@ impl DailyUsageAccumulator {
     /// `cost` is `None` for a row no pricing source can price. Those rows count their tokens and leave
     /// their own model cost blank; priced models on the same day retain their subtotal with an
     /// incomplete-cost marker.
-    pub fn add_with(&mut self, day: &str, tokens: i64, cost: Option<f64>, model: &str, options: RowOptions<'_>) {
-        let prior_tokens = self.tokens_by_day.get(day).copied().unwrap_or(0);
-        if tokens > 0 && prior_tokens > i64::MAX - tokens {
+    pub fn add_with(
+        &mut self,
+        day: &str,
+        tokens: i64,
+        cost: Option<f64>,
+        model: &str,
+        options: RowOptions<'_>,
+    ) {
+        let prior_tokens = match self.tokens_by_day.get_mut(day) {
+            Some(total) => {
+                let prior = *total;
+                *total = adding_saturating(prior, tokens);
+                prior
+            }
+            None => {
+                self.tokens_by_day.insert(day.to_string(), tokens);
+                0
+            }
+        };
+        let saturated =
+            (tokens > 0 && prior_tokens > i64::MAX - tokens) || options.token_count_saturated;
+        if saturated && !self.token_count_saturated_days.contains(day) {
             self.token_count_saturated_days.insert(day.to_string());
         }
-        if options.token_count_saturated {
-            self.token_count_saturated_days.insert(day.to_string());
-        }
-        self.tokens_by_day.insert(day.to_string(), adding_saturating(prior_tokens, tokens));
         if let Some(cost) = cost {
             if self.overflowed_cost_days.contains(day) {
-                self.incomplete_cost_days.insert(day.to_string());
-            } else if let Some(total) = adding_finite_cost(self.cost_by_day.get(day).copied(), cost) {
-                self.cost_by_day.insert(day.to_string(), total);
+                if !self.incomplete_cost_days.contains(day) {
+                    self.incomplete_cost_days.insert(day.to_string());
+                }
+            } else if let Some(total) = adding_finite_cost(self.cost_by_day.get(day).copied(), cost)
+            {
+                match self.cost_by_day.get_mut(day) {
+                    Some(existing) => *existing = total,
+                    None => {
+                        self.cost_by_day.insert(day.to_string(), total);
+                    }
+                }
             } else {
                 self.overflowed_cost_days.insert(day.to_string());
-                self.incomplete_cost_days.insert(day.to_string());
+                if !self.incomplete_cost_days.contains(day) {
+                    self.incomplete_cost_days.insert(day.to_string());
+                }
             }
         } else if tokens > 0 {
-            self.incomplete_cost_days.insert(day.to_string());
-            self.incomplete_model_costs_by_day.entry(day.to_string()).or_default().insert(model.to_string());
+            if !self.incomplete_cost_days.contains(day) {
+                self.incomplete_cost_days.insert(day.to_string());
+            }
+            let incomplete = self
+                .incomplete_model_costs_by_day
+                .entry(day.to_string())
+                .or_default();
+            if !incomplete.contains(model) {
+                incomplete.insert(model.to_string());
+            }
         }
         if !options.cost_is_complete {
-            self.incomplete_cost_days.insert(day.to_string());
-            self.incomplete_model_costs_by_day.entry(day.to_string()).or_default().insert(model.to_string());
+            if !self.incomplete_cost_days.contains(day) {
+                self.incomplete_cost_days.insert(day.to_string());
+            }
+            let incomplete = self
+                .incomplete_model_costs_by_day
+                .entry(day.to_string())
+                .or_default();
+            if !incomplete.contains(model) {
+                incomplete.insert(model.to_string());
+            }
         }
         let identity = options.canonical.unwrap_or(model);
-        self.models_by_day
-            .entry(day.to_string())
-            .or_default()
-            .entry(identity.to_string())
-            .or_default()
-            .add(tokens, cost, model, options.cost_is_complete, options.token_count_saturated);
+        let models = match self.models_by_day.get_mut(day) {
+            Some(models) => models,
+            None => {
+                self.models_by_day.insert(day.to_string(), BTreeMap::new());
+                self.models_by_day
+                    .get_mut(day)
+                    .expect("day was just inserted")
+            }
+        };
+        match models.get_mut(identity) {
+            Some(accumulator) => accumulator.add(
+                tokens,
+                cost,
+                model,
+                options.cost_is_complete,
+                options.token_count_saturated,
+            ),
+            None => {
+                let mut accumulator = ModelAccumulator::default();
+                accumulator.add(
+                    tokens,
+                    cost,
+                    model,
+                    options.cost_is_complete,
+                    options.token_count_saturated,
+                );
+                models.insert(identity.to_string(), accumulator);
+            }
+        }
     }
 
     /// Keep a known component subtotal available internally while preventing it from being presented
@@ -122,7 +190,11 @@ impl DailyUsageAccumulator {
     /// unpresentable (an active session while sibling models on the same day are complete).
     pub fn mark_model_cost_incomplete(&mut self, day: &str, model: &str, canonical: Option<&str>) {
         let identity = canonical.unwrap_or(model);
-        if let Some(accumulator) = self.models_by_day.get_mut(day).and_then(|models| models.get_mut(identity)) {
+        if let Some(accumulator) = self
+            .models_by_day
+            .get_mut(day)
+            .and_then(|models| models.get_mut(identity))
+        {
             accumulator.mark_cost_incomplete(model);
         }
     }
@@ -169,7 +241,10 @@ impl DailyUsageAccumulator {
     /// Note a model that couldn't be priced but still carried tokens — surfaced as the tile's warning
     /// triangle. Its cost is excluded, while known priced usage remains in the displayed subtotal.
     pub fn add_unknown_model(&mut self, day: &str, model: &str) {
-        self.unknown_models_by_day.entry(day.to_string()).or_default().insert(model.to_string());
+        self.unknown_models_by_day
+            .entry(day.to_string())
+            .or_default()
+            .insert(model.to_string());
         self.incomplete_cost_days.insert(day.to_string());
         self.api_estimate_incomplete_days.insert(day.to_string());
     }
@@ -178,7 +253,10 @@ impl DailyUsageAccumulator {
     /// [`add_unknown_model`](Self::add_unknown_model) this is an *explained* cost gap: the day's known
     /// priced subtotal stays displayed with a lower-bound marker and no unknown-model warning fires.
     pub fn add_named_unpriced_model(&mut self, day: &str, model: &str) {
-        self.named_unpriced_models_by_day.entry(day.to_string()).or_default().insert(model.to_string());
+        self.named_unpriced_models_by_day
+            .entry(day.to_string())
+            .or_default()
+            .insert(model.to_string());
         self.incomplete_cost_days.insert(day.to_string());
         self.api_estimate_incomplete_days.insert(day.to_string());
     }
@@ -199,10 +277,16 @@ impl DailyUsageAccumulator {
                 let has_unnamed_incomplete_model = self
                     .incomplete_model_costs_by_day
                     .get(day)
-                    .is_some_and(|models| models.iter().any(|m| !unknown.contains(m) && !named.contains(m)));
-                let has_structural_gap = self.structural_incomplete_cost_days.contains(day) || has_unnamed_incomplete_model;
-                let has_known_cost_gap =
-                    self.overflowed_cost_days.contains(day) || !unknown.is_empty() || !named.is_empty();
+                    .is_some_and(|models| {
+                        models
+                            .iter()
+                            .any(|m| !unknown.contains(m) && !named.contains(m))
+                    });
+                let has_structural_gap = self.structural_incomplete_cost_days.contains(day)
+                    || has_unnamed_incomplete_model;
+                let has_known_cost_gap = self.overflowed_cost_days.contains(day)
+                    || !unknown.is_empty()
+                    || !named.is_empty();
                 DailyUsageEntry {
                     date: day.clone(),
                     total_tokens: tokens,
@@ -226,8 +310,10 @@ impl DailyUsageAccumulator {
                 .iter()
                 .rev()
                 .map(|(day, models)| {
-                    let mut entries: Vec<ModelUsageEntry> =
-                        models.iter().map(|(model, accumulator)| accumulator.entry(model)).collect();
+                    let mut entries: Vec<ModelUsageEntry> = models
+                        .iter()
+                        .map(|(model, accumulator)| accumulator.entry(model))
+                        .collect();
                     // Deterministic order: cost desc with nil as $0, then tokens desc, then name — the
                     // same total order the spend-tile breakdown uses, so scans and history agree.
                     entries.sort_by(|l, r| {
@@ -235,7 +321,10 @@ impl DailyUsageAccumulator {
                             .then_with(|| r.total_tokens.cmp(&l.total_tokens))
                             .then_with(|| localized_standard_compare(&l.model, &r.model))
                     });
-                    DailyModelUsageEntry { date: day.clone(), models: entries }
+                    DailyModelUsageEntry {
+                        date: day.clone(),
+                        models: entries,
+                    }
                 })
                 .collect(),
         };
@@ -243,10 +332,13 @@ impl DailyUsageAccumulator {
             series: DailyUsageSeries { daily: days },
             model_usage: Some(model_usage),
             unknown_models_by_day: self.unknown_models_by_day.clone(),
-            api_estimate_by_day: (!self.api_estimate_by_day.is_empty()).then(|| self.api_estimate_by_day.clone()),
+            api_estimate_by_day: (!self.api_estimate_by_day.is_empty())
+                .then(|| self.api_estimate_by_day.clone()),
             api_estimate_incomplete_days: Some(self.api_estimate_incomplete_days.clone()),
-            estimated_cost_days: (!self.estimated_cost_days.is_empty()).then(|| self.estimated_cost_days.clone()),
-            unmeasured_usage_days: (!self.unmeasured_usage_days.is_empty()).then(|| self.unmeasured_usage_days.clone()),
+            estimated_cost_days: (!self.estimated_cost_days.is_empty())
+                .then(|| self.estimated_cost_days.clone()),
+            unmeasured_usage_days: (!self.unmeasured_usage_days.is_empty())
+                .then(|| self.unmeasured_usage_days.clone()),
         }
     }
 }
@@ -263,12 +355,24 @@ struct Totals {
 
 impl Default for Totals {
     fn default() -> Self {
-        Totals { tokens: 0, token_count_saturated: false, cost_usd: None, cost_is_complete: true, cost_overflowed: false }
+        Totals {
+            tokens: 0,
+            token_count_saturated: false,
+            cost_usd: None,
+            cost_is_complete: true,
+            cost_overflowed: false,
+        }
     }
 }
 
 impl Totals {
-    fn absorb(&mut self, tokens: i64, cost: Option<f64>, cost_is_complete: bool, source_saturated: bool) {
+    fn absorb(
+        &mut self,
+        tokens: i64,
+        cost: Option<f64>,
+        cost_is_complete: bool,
+        source_saturated: bool,
+    ) {
         if tokens > 0 && self.tokens > i64::MAX - tokens {
             self.token_count_saturated = true;
         }
@@ -309,13 +413,40 @@ pub(super) struct ModelAccumulator {
 }
 
 impl ModelAccumulator {
-    fn add(&mut self, tokens: i64, cost: Option<f64>, spelling: &str, cost_is_complete: bool, source_saturated: bool) {
-        self.totals.absorb(tokens, cost, cost_is_complete, source_saturated);
-        let existing = self
-            .spellings
-            .entry(spelling.to_lowercase())
-            .or_insert_with(|| Spelling { totals: Totals::default(), spelling: spelling.to_string() });
-        existing.totals.absorb(tokens, cost, cost_is_complete, source_saturated);
+    fn add(
+        &mut self,
+        tokens: i64,
+        cost: Option<f64>,
+        spelling: &str,
+        cost_is_complete: bool,
+        source_saturated: bool,
+    ) {
+        self.totals
+            .absorb(tokens, cost, cost_is_complete, source_saturated);
+        // Most scans see the same spelling row after row. Try the exact key first so the common
+        // path does not allocate a lowercase copy just to look up an existing entry.
+        if let Some(existing) = self.spellings.get_mut(spelling) {
+            existing
+                .totals
+                .absorb(tokens, cost, cost_is_complete, source_saturated);
+            return;
+        }
+        let folded = spelling.to_lowercase();
+        if let Some(existing) = self.spellings.get_mut(&folded) {
+            existing
+                .totals
+                .absorb(tokens, cost, cost_is_complete, source_saturated);
+            return;
+        }
+        let mut totals = Totals::default();
+        totals.absorb(tokens, cost, cost_is_complete, source_saturated);
+        self.spellings.insert(
+            folded,
+            Spelling {
+                totals,
+                spelling: spelling.to_string(),
+            },
+        );
     }
 
     fn mark_cost_incomplete(&mut self, spelling: &str) {
@@ -340,12 +471,17 @@ impl ModelAccumulator {
         // Stable sort over the case-folded key order: ties are deterministic.
         variants.sort_by_key(|v| std::cmp::Reverse(v.total_tokens));
         // A single spelling that is just the row's own name is no breakdown.
-        let is_trivial = variants.len() == 1 && variants[0].model.to_lowercase() == model.to_lowercase();
+        let is_trivial =
+            variants.len() == 1 && variants[0].model.to_lowercase() == model.to_lowercase();
         ModelUsageEntry {
             model: model.to_string(),
             total_tokens: self.totals.tokens,
             cost_usd: self.totals.cost_usd,
-            variants: if is_trivial || variants.is_empty() { None } else { Some(variants) },
+            variants: if is_trivial || variants.is_empty() {
+                None
+            } else {
+                Some(variants)
+            },
             cost_is_complete: (!self.totals.cost_is_complete).then_some(false),
             token_count_saturated: self.totals.token_count_saturated.then_some(true),
         }

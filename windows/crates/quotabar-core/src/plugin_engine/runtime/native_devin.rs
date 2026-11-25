@@ -29,22 +29,33 @@ fn run_with_provider(
     provider: &DevinProvider,
 ) -> PluginOutput {
     let provider_id = account.map_or(plugin.manifest.id.as_str(), |account| &account.instance_id);
-    let display_name = account.map_or(plugin.manifest.name.as_str(), |account| &account.label);
+    let display_name = account
+        .filter(|account| !account.label.trim().is_empty())
+        .map(|account| format!("{} ({})", plugin.manifest.name, account.label.trim()))
+        .unwrap_or_else(|| plugin.manifest.name.clone());
     let api_key = account
         .and_then(|account| account.credential.as_ref())
-        .and_then(|credential| credential.access_token.as_deref());
+        .and_then(|credential| credential.access_token.as_deref())
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    let api_key = if provider_id == plugin.manifest.id {
+        api_key
+    } else {
+        // An unconfigured secondary card must not display the default account's quota.
+        Some(api_key.unwrap_or_default())
+    };
     let deadline = Instant::now() + timeout;
     let snapshot = provider.refresh_with_api_key(
-        &RefreshContext::new(Scope::Full),
+        &RefreshContext::new(Scope::PanelMeters),
         api_key,
         Some(deadline),
     );
     if Instant::now() >= deadline {
         return probe_fault_output(
-            plugin, provider_id, display_name, format!("probe timed out after {}s", timeout.as_secs()),
+            plugin, provider_id, &display_name, format!("probe timed out after {}s", timeout.as_secs()),
         );
     }
-    into_output(plugin, provider_id, display_name, snapshot)
+    into_output(plugin, provider_id, &display_name, snapshot)
 }
 
 fn into_output(
@@ -131,11 +142,121 @@ impl Host for DesktopLogHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_engine::manifest::load_plugins_from_dir;
+    use crate::provider_accounts::ProviderCredential;
+    use quotabar_engine::context::{now_timestamp, CancelToken};
+    use quotabar_engine::http::{HttpClient, HttpError, Request, Response};
     use quotabar_engine::model::MetricValue;
+    use quotabar_engine::providers::devin::{
+        transcripts::DevinTranscriptUsageScanner, DevinAuthStore, NOT_LOGGED_IN,
+    };
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    const USER_STATUS_FIXTURE: &str = r#"{"userStatus":{"planStatus":{"planInfo":{"planName":"Max","billingStrategy":"BILLING_STRATEGY_QUOTA"},"weeklyQuotaRemainingPercent":40,"overageBalanceMicros":"964220000"}}}"#;
+
+    struct FakeHttp {
+        requests: Mutex<Vec<Request>>,
+    }
+
+    impl HttpClient for FakeHttp {
+        fn send(&self, request: &Request, _cancel: &CancelToken) -> Result<Response, HttpError> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(Response { status: 200, headers: Vec::new(), body: USER_STATUS_FIXTURE.as_bytes().to_vec() })
+        }
+    }
+
+    fn bundled_devin_plugin() -> LoadedPlugin {
+        let plugins_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        load_plugins_from_dir(&plugins_dir)
+            .into_iter()
+            .find(|plugin| plugin.manifest.id == "devin")
+            .expect("bundled devin plugin")
+    }
+
+    /// A provider whose only credentials are explicit overrides. The transcript scanner is real so a
+    /// Full-scope regression would append local metric lines the converter cannot represent.
+    fn fixture_provider(http: Arc<dyn HttpClient>, dir: &Path) -> DevinProvider {
+        let transcripts = dir.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let ts = quotabar_engine::time::format_iso8601(now_timestamp());
+        let transcript = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "agent": { "model_name": "SWE-2 Max" },
+            "steps": [
+                { "source": "user", "timestamp": ts },
+                { "source": "agent", "timestamp": ts, "model_name": "swe-2-max",
+                  "metrics": { "prompt_tokens": 15836, "completion_tokens": 1813, "cached_tokens": 11776 } }
+            ]
+        });
+        std::fs::write(transcripts.join("exported.json"), serde_json::to_vec(&transcript).unwrap()).unwrap();
+        DevinProvider::new(DevinAuthStore::new(vec![], vec![]), http).with_local_scanner(
+            DevinTranscriptUsageScanner::new(transcripts, None, Some(dir.join("cache"))),
+        )
+    }
 
     #[test]
     fn formats_the_balance_as_a_windows_text_tile() {
         let line = EngineLine::values("Extra usage balance", vec![MetricValue::new(964.22, MetricKind::Dollars)]);
         assert!(matches!(convert_line(line), Some(MetricLine::Text { value, .. }) if value == "$964.22"));
+    }
+
+    #[test]
+    fn matches_the_script_probe_contract_for_instance_accounts() {
+        let plugin = bundled_devin_plugin();
+        assert!(plugin.manifest.uses_native_devin());
+        assert!(plugin.entry_script.is_empty());
+
+        let http = Arc::new(FakeHttp { requests: Mutex::new(Vec::new()) });
+        let dir = tempfile::tempdir().unwrap();
+        let provider = fixture_provider(http.clone(), dir.path());
+        let account = ProviderAccountContext {
+            instance_id: "devin:work".into(),
+            base_provider_id: "devin".into(),
+            label: " Work ".into(),
+            credential: Some(ProviderCredential {
+                access_token: Some("fake-key".into()),
+                ..ProviderCredential::default()
+            }),
+            store_path: None,
+        };
+
+        let output = run_with_provider(&plugin, Some(&account), Duration::from_secs(30), &provider);
+        assert_eq!(output.provider_id, "devin:work");
+        assert_eq!(output.display_name, "Devin (Work)");
+        assert_eq!(output.plan.as_deref(), Some("Max"));
+        let weekly = output.lines.iter().find_map(|line| match line {
+            MetricLine::Progress { label, used, limit, .. } if label == "Weekly quota" => Some((*used, *limit)),
+            _ => None,
+        });
+        assert_eq!(weekly, Some((60.0, 100.0)));
+        let balance = output.lines.iter().find_map(|line| match line {
+            MetricLine::Text { label, value, .. } if label == "Extra usage balance" => Some(value.as_str()),
+            _ => None,
+        });
+        assert_eq!(balance, Some("$964.22"));
+        {
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let sent: serde_json::Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
+            assert_eq!(sent["metadata"]["apiKey"], "fake-key");
+        }
+
+        // A secondary instance without a credential must not read the machine's Devin login.
+        let blank = ProviderAccountContext {
+            instance_id: "devin:blank".into(),
+            base_provider_id: "devin".into(),
+            label: String::new(),
+            credential: None,
+            store_path: None,
+        };
+        let output = run_with_provider(&plugin, Some(&blank), Duration::from_secs(30), &provider);
+        assert_eq!(output.provider_id, "devin:blank");
+        assert_eq!(output.display_name, "Devin");
+        assert!(matches!(
+            output.lines.as_slice(),
+            [MetricLine::Badge { text, .. }] if text == NOT_LOGGED_IN
+        ));
+        assert_eq!(http.requests.lock().unwrap().len(), 1);
     }
 }

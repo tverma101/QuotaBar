@@ -49,7 +49,10 @@ pub struct OpenRouterProvider {
 impl OpenRouterProvider {
     pub fn live() -> Self {
         OpenRouterProvider {
-            info: ProviderInfo { id: ID.into(), display_name: "OpenRouter".into() },
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "OpenRouter".into(),
+            },
             spec: None,
             http: http::shared(),
         }
@@ -57,7 +60,10 @@ impl OpenRouterProvider {
 
     pub fn new(spec: ApiKeySpec, http: Arc<dyn HttpClient>) -> Self {
         OpenRouterProvider {
-            info: ProviderInfo { id: ID.into(), display_name: "OpenRouter".into() },
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "OpenRouter".into(),
+            },
             spec: Some(spec),
             http,
         }
@@ -67,7 +73,12 @@ impl OpenRouterProvider {
         self.spec.clone().unwrap_or_else(auth::live_spec)
     }
 
-    fn load_endpoint(&self, url: &str, api_key: &str, ctx: &RefreshContext) -> Result<EndpointResult, ()> {
+    fn load_endpoint(
+        &self,
+        url: &str,
+        api_key: &str,
+        ctx: &RefreshContext,
+    ) -> Result<EndpointResult, ()> {
         if ctx.is_cancelled() {
             return Err(());
         }
@@ -120,7 +131,9 @@ impl ProviderRuntime for OpenRouterProvider {
         let spec = self.effective_spec();
         let api_key = match auth::load_for_refresh(&spec) {
             Ok(key) => key,
-            Err((msg, category)) => return ProviderSnapshot::error(&self.info, msg, category, ctx.now),
+            Err((msg, category)) => {
+                return ProviderSnapshot::error(&self.info, msg, category, ctx.now)
+            }
         };
 
         let Ok(credits) = self.load_endpoint(CREDITS_URL, &api_key, ctx) else {
@@ -145,15 +158,22 @@ impl ProviderRuntime for OpenRouterProvider {
             return ProviderSnapshot::new(&self.info, plan, lines, ctx.now);
         }
         if credits.is_auth_failure() && key_res.is_auth_failure() {
-            return ProviderSnapshot::error(&self.info, auth::INVALID_KEY_ERROR, ErrorCategory::AuthInvalid, ctx.now);
+            return ProviderSnapshot::error(
+                &self.info,
+                auth::INVALID_KEY_ERROR,
+                ErrorCategory::AuthInvalid,
+                ctx.now,
+            );
         }
         let (msg, category) = credits
             .failure()
             .or_else(|| key_res.failure())
-            .unwrap_or_else(|| (
-                "OpenRouter usage data unavailable. Try again later.".into(),
-                ErrorCategory::Decoding,
-            ));
+            .unwrap_or_else(|| {
+                (
+                    "OpenRouter usage data unavailable. Try again later.".into(),
+                    ErrorCategory::Decoding,
+                )
+            });
         ProviderSnapshot::error(&self.info, &msg, category, ctx.now)
     }
 }

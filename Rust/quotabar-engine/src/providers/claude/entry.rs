@@ -32,7 +32,13 @@ impl Record for ClaudeEntry {
     fn encode(&self, w: &mut Writer) {
         w.f64(self.timestamp);
         let t = &self.tokens;
-        for value in [t.input, t.cache_write_5m, t.cache_write_1h, t.cache_read, t.output] {
+        for value in [
+            t.input,
+            t.cache_write_5m,
+            t.cache_write_1h,
+            t.cache_read,
+            t.output,
+        ] {
             w.i64(value);
         }
         w.bool(t.is_fast);

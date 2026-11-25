@@ -172,14 +172,7 @@ final class AntigravityProvider: ProviderRuntime {
 
     func refresh() async -> ProviderSnapshot {
         // Fold-only passes run the conversation-database scan (SQLite reads, protobuf decode, and
-        // the priced fold) in the scan-worker child when available; the body below stays the
-        // in-process path for the fallback and for meter/full scopes.
-        if ProviderRefreshContext.scope.suppressesLiveQuota {
-            return await ScanWorkerClient.shared.foldOnlySnapshot(
-                provider: provider,
-                inProcessFallback: { await self.refreshInProcess() }
-            )
-        }
+        // the priced fold) in-process in this reference implementation. Production uses the Rust engine.
         return await refreshInProcess()
     }
 

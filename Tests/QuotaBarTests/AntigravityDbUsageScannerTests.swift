@@ -2309,7 +2309,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         )
     }
 
-    /// A cold process (the scan worker) reloads the persisted step index and verifies it by digest
+    /// A cold process (a cold process) reloads the persisted step index and verifies it by digest
     /// instead of re-paging every step row.
     func testPersistedStepIndexReloadVerifiesWithoutStepTableReads() async throws {
         let fixture = try makeDatabaseDirectory()

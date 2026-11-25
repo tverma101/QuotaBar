@@ -39,7 +39,8 @@ pub struct ApiKeySpec {
 impl ApiKeySpec {
     /// Effective key (`config > env`) without distinguishing unreadable files (used by `currentAPIKey()`).
     pub fn load_key(&self) -> Option<String> {
-        self.key_from_config_file().or_else(|| self.key_from_environment())
+        self.key_from_config_file()
+            .or_else(|| self.key_from_environment())
     }
 
     /// Key resolution for refresh: keeps scanning later paths/env when an earlier file is unreadable,
@@ -107,7 +108,11 @@ impl ApiKeySpec {
         let encoded = serde_json::to_string(&json!({ "apiKey": trimmed }))
             .map_err(|_| self.save_failed_error.to_string())?;
         super::private_file::write_private_file(primary, encoded.as_bytes()).map_err(|err| {
-            qlog!(Error, auth_tag(self.provider_id), "save API key failed: {err}");
+            qlog!(
+                Error,
+                auth_tag(self.provider_id),
+                "save API key failed: {err}"
+            );
             self.save_failed_error.to_string()
         })
     }
@@ -120,7 +125,11 @@ impl ApiKeySpec {
             }
             if let Err(err) = std::fs::remove_file(path) {
                 if err.kind() != std::io::ErrorKind::NotFound {
-                    qlog!(Error, auth_tag(self.provider_id), "delete API key failed: {err}");
+                    qlog!(
+                        Error,
+                        auth_tag(self.provider_id),
+                        "delete API key failed: {err}"
+                    );
                     return Err(self.delete_failed_error.to_string());
                 }
             }
@@ -145,7 +154,9 @@ impl ApiKeySpec {
             if !path.exists() {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(path) else { continue };
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
             if let Some(key) = key_from_config_text(&text) {
                 return Some(key);
             }
@@ -187,7 +198,11 @@ pub fn dispatch(provider_id: &str, action: &str, key: Option<&str>) -> Result<Va
     let spec = match provider_id {
         "openrouter" => super::openrouter::auth::live_spec(),
         "zai" => super::zai::auth::live_spec(),
-        other => return Err(format!("provider does not support credentialAction: {other}")),
+        other => {
+            return Err(format!(
+                "provider does not support credentialAction: {other}"
+            ))
+        }
     };
     match action {
         "status" => Ok(json!({ "status": spec.key_status() })),
@@ -210,10 +225,22 @@ mod tests {
 
     #[test]
     fn parses_json_and_plain_text_keys() {
-        assert_eq!(key_from_config_text(r#"{"apiKey":" sk-1 "}"#).as_deref(), Some("sk-1"));
-        assert_eq!(key_from_config_text(r#"{"api_key":"sk-2"}"#).as_deref(), Some("sk-2"));
-        assert_eq!(key_from_config_text(r#"{"key":"sk-3"}"#).as_deref(), Some("sk-3"));
-        assert_eq!(key_from_config_text("  sk-plain\n").as_deref(), Some("sk-plain"));
+        assert_eq!(
+            key_from_config_text(r#"{"apiKey":" sk-1 "}"#).as_deref(),
+            Some("sk-1")
+        );
+        assert_eq!(
+            key_from_config_text(r#"{"api_key":"sk-2"}"#).as_deref(),
+            Some("sk-2")
+        );
+        assert_eq!(
+            key_from_config_text(r#"{"key":"sk-3"}"#).as_deref(),
+            Some("sk-3")
+        );
+        assert_eq!(
+            key_from_config_text("  sk-plain\n").as_deref(),
+            Some("sk-plain")
+        );
         assert_eq!(key_from_config_text("   "), None);
         assert_eq!(key_from_config_text("{broken"), None);
     }
@@ -235,7 +262,10 @@ mod tests {
         assert!(spec.save_key("   ").is_err());
 
         spec.save_key("  sk-or-new  ").unwrap();
-        assert_eq!(std::fs::read_to_string(&primary).unwrap(), r#"{"apiKey":"sk-or-new"}"#);
+        assert_eq!(
+            std::fs::read_to_string(&primary).unwrap(),
+            r#"{"apiKey":"sk-or-new"}"#
+        );
         assert_eq!(spec.key_status(), ApiKeyStatus::Saved);
         assert_eq!(spec.load_key().as_deref(), Some("sk-or-new"));
 

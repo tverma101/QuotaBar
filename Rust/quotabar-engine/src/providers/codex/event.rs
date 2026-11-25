@@ -35,7 +35,13 @@ impl Record for Event {
         w.f64(self.timestamp);
         w.str(&self.model);
         w.opt_str(self.pricing_model.as_deref());
-        for value in [self.input, self.cached, self.output, self.reasoning, self.total] {
+        for value in [
+            self.input,
+            self.cached,
+            self.output,
+            self.reasoning,
+            self.total,
+        ] {
             w.i64(value);
         }
         w.bool(self.has_complete_cost_breakdown);

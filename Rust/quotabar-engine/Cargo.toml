@@ -29,6 +29,12 @@ regex-lite = "0.1.9"
 fancy-regex = "0.19"
 # Content fingerprints for persisted caches.
 sha2 = "0.10"
+# Claude Desktop's Electron Safe Storage cache: base64 + AES-128-CBC with a PBKDF2-SHA1 key.
+base64 = "0.22"
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = "0.12"
+sha1 = "0.10"
 # Codex compresses finished sessions to `.jsonl.zst`. A pure-Rust decoder replaces the Swift
 # backend's `zstd` subprocess (which needed a Homebrew install and silently skipped archives without
 # it) and works the same on Windows.

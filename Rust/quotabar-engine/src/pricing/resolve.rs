@@ -24,13 +24,26 @@ pub type RecheckHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone)]
 enum MemoEntry {
-    Rates { rates: Arc<ModelRates>, needs_recheck: bool, reported: bool },
-    Unresolved { reported: bool },
+    Rates {
+        rates: Arc<ModelRates>,
+        needs_recheck: bool,
+        reported: bool,
+    },
+    Unresolved {
+        reported: bool,
+    },
 }
 
 impl MemoEntry {
     fn wants_report(&self) -> bool {
-        matches!(self, MemoEntry::Rates { needs_recheck: true, reported: false, .. } | MemoEntry::Unresolved { reported: false })
+        matches!(
+            self,
+            MemoEntry::Rates {
+                needs_recheck: true,
+                reported: false,
+                ..
+            } | MemoEntry::Unresolved { reported: false }
+        )
     }
 }
 
@@ -50,7 +63,13 @@ pub struct ModelPricing {
 
 impl Default for ModelPricing {
     fn default() -> Self {
-        ModelPricing::new(PricingSupplement::default(), PricingCatalog::default(), PricingCatalog::default(), PricingCatalog::default(), None)
+        ModelPricing::new(
+            PricingSupplement::default(),
+            PricingCatalog::default(),
+            PricingCatalog::default(),
+            PricingCatalog::default(),
+            None,
+        )
     }
 }
 
@@ -93,13 +112,25 @@ impl ModelPricing {
         matches!(self.memoized_entry(model), MemoEntry::Rates { .. })
     }
 
-    pub fn estimated_cost_dollars(&self, model: &str, tokens: &TokenBreakdown, timestamp: Option<f64>, apply_long_context_rates: bool) -> Option<f64> {
-        self.resolve(model).map(|r| r.cost_dollars(tokens, timestamp, apply_long_context_rates))
+    pub fn estimated_cost_dollars(
+        &self,
+        model: &str,
+        tokens: &TokenBreakdown,
+        timestamp: Option<f64>,
+        apply_long_context_rates: bool,
+    ) -> Option<f64> {
+        self.resolve(model)
+            .map(|r| r.cost_dollars(tokens, timestamp, apply_long_context_rates))
     }
 
     /// Cursor's usage CSV: scoped aliases may select Cursor-specific rates (`cursor-<canonical>`);
     /// every other model goes through the shared lookup.
-    pub fn estimated_cursor_cost_dollars(&self, model: &str, tokens: &TokenBreakdown, apply_long_context_rates: bool) -> Option<f64> {
+    pub fn estimated_cursor_cost_dollars(
+        &self,
+        model: &str,
+        tokens: &TokenBreakdown,
+        apply_long_context_rates: bool,
+    ) -> Option<f64> {
         let rates = match self.cursor_canonical_name(model) {
             Some(canonical) => self
                 .lookup(&format!("cursor-{canonical}"))
@@ -137,11 +168,15 @@ impl ModelPricing {
     }
 
     pub fn canonical_name(&self, model: &str) -> Option<String> {
-        memoized(&self.canonical_memo, model, || self.supplement.canonical_name(model))
+        memoized(&self.canonical_memo, model, || {
+            self.supplement.canonical_name(model)
+        })
     }
 
     pub fn cursor_canonical_name(&self, model: &str) -> Option<String> {
-        memoized(&self.cursor_canonical_memo, model, || self.supplement.cursor_canonical_name(model))
+        memoized(&self.cursor_canonical_memo, model, || {
+            self.supplement.cursor_canonical_name(model)
+        })
     }
 
     /// Whether OpenRouter itself has an exact rate (never a fallback estimate).
@@ -162,7 +197,9 @@ impl ModelPricing {
         let pricing = &self.supplement.pricing;
         pricing.contains_key(model)
             || pricing.contains_key(normalized_key(model).as_ref())
-            || self.canonical_name(model).is_some_and(|c| pricing.contains_key(&c))
+            || self
+                .canonical_name(model)
+                .is_some_and(|c| pricing.contains_key(&c))
     }
 
     /// A stable fingerprint of every rate and rule; equal catalogues give equal tokens across launches
@@ -190,7 +227,9 @@ impl ModelPricing {
                 hasher.update(format!("alias:{}:{}\n", rule.pattern, rule.canonical).as_bytes());
             }
             for rule in &self.supplement.cursor_alias_rules {
-                hasher.update(format!("cursor-alias:{}:{}\n", rule.pattern, rule.canonical).as_bytes());
+                hasher.update(
+                    format!("cursor-alias:{}:{}\n", rule.pattern, rule.canonical).as_bytes(),
+                );
             }
             let mut retired: Vec<&String> = self.supplement.retired_pricing_keys.iter().collect();
             retired.sort();
@@ -202,15 +241,26 @@ impl ModelPricing {
             for (key, multiplier) in fast {
                 hasher.update(format!("fast:{key}:{multiplier:?}\n").as_bytes());
             }
-            hasher.finalize().iter().take(16).map(|b| format!("{b:02x}")).collect()
+            hasher
+                .finalize()
+                .iter()
+                .take(16)
+                .map(|b| format!("{b:02x}"))
+                .collect()
         })
     }
 
     /// Release memoized lookups and the lazy fuzzy indexes.
     pub fn clear_caches(&self) {
         self.memo.write().unwrap_or_else(|e| e.into_inner()).clear();
-        self.canonical_memo.write().unwrap_or_else(|e| e.into_inner()).clear();
-        self.cursor_canonical_memo.write().unwrap_or_else(|e| e.into_inner()).clear();
+        self.canonical_memo
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.cursor_canonical_memo
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.primary.clear_fuzzy_index();
         self.secondary.clear_fuzzy_index();
         self.open_router.clear_fuzzy_index();
@@ -219,19 +269,30 @@ impl ModelPricing {
     // MARK: resolution
 
     fn memoized_entry(&self, model: &str) -> MemoEntry {
-        if let Some(entry) = self.memo.read().unwrap_or_else(|e| e.into_inner()).get(model) {
+        if let Some(entry) = self
+            .memo
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model)
+        {
             return entry.clone();
         }
         let candidate = match self.resolve_uncached(model) {
             Some(rates) => MemoEntry::Rates {
                 rates: Arc::new(rates),
-                needs_recheck: !self.has_exact_open_router_rate(model) && !self.has_curated_supplement_rate(model),
+                needs_recheck: !self.has_exact_open_router_rate(model)
+                    && !self.has_curated_supplement_rate(model),
                 reported: false,
             },
             None => MemoEntry::Unresolved { reported: false },
         };
         // Concurrent scans may resolve the same name at once; the first memoized result wins.
-        self.memo.write().unwrap_or_else(|e| e.into_inner()).entry(model.to_string()).or_insert(candidate).clone()
+        self.memo
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(model.to_string())
+            .or_insert(candidate)
+            .clone()
     }
 
     /// Flip the entry to reported under the lock, then call the hook outside it, so a name is handed
@@ -241,7 +302,12 @@ impl ModelPricing {
         let report = {
             let mut memo = self.memo.write().unwrap_or_else(|e| e.into_inner());
             match memo.get_mut(model) {
-                Some(MemoEntry::Rates { needs_recheck: true, reported, .. }) | Some(MemoEntry::Unresolved { reported })
+                Some(MemoEntry::Rates {
+                    needs_recheck: true,
+                    reported,
+                    ..
+                })
+                | Some(MemoEntry::Unresolved { reported })
                     if !*reported =>
                 {
                     *reported = true;
@@ -257,7 +323,9 @@ impl ModelPricing {
 
     fn resolve_uncached(&self, model: &str) -> Option<ModelRates> {
         match self.canonical_name(model) {
-            Some(canonical) if canonical != model => self.lookup(&canonical).or_else(|| self.lookup(model)),
+            Some(canonical) if canonical != model => {
+                self.lookup(&canonical).or_else(|| self.lookup(model))
+            }
             _ => self.lookup(model),
         }
     }
@@ -296,7 +364,9 @@ impl ModelPricing {
         if let Some((_, rates)) = self.primary.find_fuzzy(name) {
             return Some(self.with_supplement_fast_multiplier(name, rates));
         }
-        self.secondary.find_exact(name).map(|(_, rates)| self.with_supplement_fast_multiplier(name, rates))
+        self.secondary
+            .find_exact(name)
+            .map(|(_, rates)| self.with_supplement_fast_multiplier(name, rates))
     }
 
     /// Feeds can drop their own fast multiplier (LiteLLM removed Anthropic's in October 2026); fall
@@ -306,7 +376,10 @@ impl ModelPricing {
             return rates.clone();
         }
         match self.supplement.fast_multiplier(name) {
-            Some(multiplier) => ModelRates { fast_multiplier: multiplier, ..rates.clone() },
+            Some(multiplier) => ModelRates {
+                fast_multiplier: multiplier,
+                ..rates.clone()
+            },
             None => rates.clone(),
         }
     }
@@ -317,7 +390,9 @@ impl ModelPricing {
         let multiplier = if rates.fast_multiplier != 1.0 {
             rates.fast_multiplier
         } else {
-            self.supplement.fast_multiplier(&key).or_else(|| self.supplement.fast_multiplier(base))?
+            self.supplement
+                .fast_multiplier(&key)
+                .or_else(|| self.supplement.fast_multiplier(base))?
         };
         Some(rates.scaled(multiplier))
     }
@@ -326,11 +401,18 @@ impl ModelPricing {
         if let Some(entry) = self.supplement.pricing.get(base) {
             return Some((base.to_string(), entry));
         }
-        if let Some((key, rates)) = self.open_router.find_exact(base).or_else(|| self.primary.find_exact(base)) {
+        if let Some((key, rates)) = self
+            .open_router
+            .find_exact(base)
+            .or_else(|| self.primary.find_exact(base))
+        {
             return Some((key.to_string(), rates));
         }
-        self.dated_primary_entry(base)
-            .or_else(|| self.secondary.find_exact(base).map(|(k, r)| (k.to_string(), r)))
+        self.dated_primary_entry(base).or_else(|| {
+            self.secondary
+                .find_exact(base)
+                .map(|(k, r)| (k.to_string(), r))
+        })
     }
 
     /// Dated-slug compatibility for fast variants (`gpt-9` -> `gpt-9-20260101`) without letting a
@@ -338,15 +420,28 @@ impl ModelPricing {
     fn dated_primary_entry(&self, base: &str) -> Option<(String, &ModelRates)> {
         let normalized_base = normalized_key(base);
         let has_prefix = normalized_base.contains('/');
-        let comparable_base = if has_prefix { normalized_base.as_ref() } else { last_segment(&normalized_base) };
+        let comparable_base = if has_prefix {
+            normalized_base.as_ref()
+        } else {
+            last_segment(&normalized_base)
+        };
         let dated_prefix = format!("{comparable_base}-");
         let mut best: Option<([u8; 8], &str, &ModelRates)> = None; // (date, key, rates)
         for (key, rates) in &self.primary.entries {
             let normalized = normalized_key(key);
-            let comparable = if has_prefix { normalized.as_ref() } else { last_segment(&normalized) };
-            let Some(suffix) = comparable.strip_prefix(dated_prefix.as_str()) else { continue };
+            let comparable = if has_prefix {
+                normalized.as_ref()
+            } else {
+                last_segment(&normalized)
+            };
+            let Some(suffix) = comparable.strip_prefix(dated_prefix.as_str()) else {
+                continue;
+            };
             let bytes = suffix.as_bytes();
-            if bytes.len() < 8 || !bytes[..8].iter().all(u8::is_ascii_digit) || !(bytes.len() == 8 || bytes[8] == b'-') {
+            if bytes.len() < 8
+                || !bytes[..8].iter().all(u8::is_ascii_digit)
+                || !(bytes.len() == 8 || bytes[8] == b'-')
+            {
                 continue;
             }
             let mut date = [0u8; 8];
@@ -358,7 +453,11 @@ impl ModelPricing {
                         date > best_date
                     } else {
                         let (a, b) = (key.chars().count(), best_key.chars().count());
-                        if a == b { key.as_str() < best_key } else { a > b }
+                        if a == b {
+                            key.as_str() < best_key
+                        } else {
+                            a > b
+                        }
                     }
                 }
             };
@@ -372,7 +471,11 @@ impl ModelPricing {
 
 /// Swift `split(separator: "/").last ?? value` (empty components omitted).
 fn last_segment(value: &str) -> &str {
-    value.split('/').filter(|s| !s.is_empty()).last().unwrap_or(value)
+    value
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or(value)
 }
 
 fn has_free_suffix(name: &str) -> bool {
@@ -380,11 +483,17 @@ fn has_free_suffix(name: &str) -> bool {
     last_segment(&normalized).ends_with("-free")
 }
 
-fn memoized(memo: &RwLock<HashMap<String, Option<String>>>, key: &str, compute: impl FnOnce() -> Option<String>) -> Option<String> {
+fn memoized(
+    memo: &RwLock<HashMap<String, Option<String>>>,
+    key: &str,
+    compute: impl FnOnce() -> Option<String>,
+) -> Option<String> {
     if let Some(hit) = memo.read().unwrap_or_else(|e| e.into_inner()).get(key) {
         return hit.clone();
     }
     let value = compute();
-    memo.write().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), value.clone());
+    memo.write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_string(), value.clone());
     value
 }

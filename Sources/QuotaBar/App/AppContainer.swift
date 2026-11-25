@@ -226,9 +226,9 @@ final class AppContainer {
         })
         let codexClaimServices = Dictionary(uniqueKeysWithValues: codexProviders.map { codex in
             (codex.provider.id, CodexResetClaimService(
-                authStore: codex.authStore.scoped(to: codexIdentityByProviderID[codex.provider.id]),
-                usageClient: codex.usageClient,
-                allowsKeychainFallback: codex.allowsKeychainFallback,
+                providerID: codex.provider.id,
+                engineConfig: codex.rawConfig,
+                verifiedAccountIdentity: codexIdentityByProviderID[codex.provider.id],
                 refreshAfterClaim: { [weak dataStore] in
                     // The bound must outlast the provider's slowest refresh: usage fetch (10s timeout)
                     // + token refresh (15s) + usage retry (10s) + reset-credit fetch (10s) ≈ 45s. The
@@ -798,18 +798,17 @@ final class AppContainer {
                                     (scope, $0.providerIDs, $0.bypassSnapshotCache, $0.bypassFailureBackoff)
                                 }
                             }
-                        // Closed-panel accounting is background bookkeeping: pace the scan-worker
+                        // Closed-panel accounting is background bookkeeping: pace the engine batch
                         // children (--paced caps each at a fraction of a core) and cap concurrency so
                         // the periodic history sweep cannot stack one 100%-core child per provider.
                         // Panel-open passes stay unpaced for responsiveness.
                         let panelClosed = !panelOpen
                         passRan = true
                         accountingTask = Task { @MainActor in
-                            if scheduledScope == .panelAccounting {
-                                // Fold workers use disk catalogs and may exit before a fetch can finish.
-                                // The long-lived app owns due revalidation for subsequent folds.
-                                _ = await ModelPricingStore.shared.current()
-                            }
+                            // Rust provider runtimes own pricing in-process, including due catalog
+                            // revalidation. Warming the legacy Swift oracle store here would decode a
+                            // second copy of every catalog and keep it resident without serving a
+                            // production provider.
                             if let scheduledScope {
                                 await ProviderRefreshContext.$scope.withValue(scheduledScope) {
                                     await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(
@@ -883,7 +882,10 @@ final class AppContainer {
                 // Codex session tail remains warm between cycles under its own row cap; memory pressure
                 // releases both, while the durable indexes remain available for the next scan.
                 let keepRouterIndexWarm = transparency.popoverShown
-                if accountingTask == nil {
+                if Self.shouldRunRefreshCycleMaintenance(
+                    passRan: passRan,
+                    accountingTaskInFlight: accountingTask != nil
+                ) {
                     await PersistentJSONLScanCaches.unloadAfterRefreshCycle(
                         keepRouterItemsResident: keepRouterIndexWarm
                     )
@@ -1044,6 +1046,16 @@ final class AppContainer {
             URLCache.shared.removeAllCachedResponses()
             ProcessMemoryBudget.releaseAllocatorFreePages()
         }
+    }
+
+    /// Post-pass cache maintenance is worthwhile only after a pass allocated or fetched something.
+    /// Running it on a no-work wake repeatedly evicts Freebuff's derived cache, clears URLCache, and
+    /// walks the allocator free list without any new memory to reclaim.
+    nonisolated static func shouldRunRefreshCycleMaintenance(
+        passRan: Bool,
+        accountingTaskInFlight: Bool
+    ) -> Bool {
+        passRan && !accountingTaskInFlight
     }
 
     nonisolated static func hasPriorityRefreshPass(

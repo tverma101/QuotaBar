@@ -13,7 +13,10 @@ use crate::paths;
 use crate::pricing::TokenBreakdown;
 use crate::qlog;
 use crate::scan::discover::{DiscoveredFile, Revision};
-use crate::scan::{first_future_dated, IncrementalScanner, LineError, LineParser, Reader, Record, ScanError, ScanStore, Writer};
+use crate::scan::{
+    first_future_dated, IncrementalScanner, LineError, LineParser, Reader, Record, ScanError,
+    ScanStore, Writer,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -68,7 +71,12 @@ impl LineParser for MuseLineParser {
         memchr::memmem::find(line, br#""goal_usage_attribution""#).is_some()
     }
 
-    fn parse(&self, _state: &mut (), line: &[u8], out: &mut Vec<Self::Item>) -> Result<(), LineError> {
+    fn parse(
+        &self,
+        _state: &mut (),
+        line: &[u8],
+        out: &mut Vec<Self::Item>,
+    ) -> Result<(), LineError> {
         if line.iter().all(u8::is_ascii_whitespace) {
             return Ok(());
         }
@@ -114,10 +122,14 @@ pub fn parse_line(line: &[u8]) -> Result<Option<MuseEntry>, LineError> {
         return Ok(None);
     }
 
-    let input = strict_count(quantity.get("input_tokens"), true).ok_or(LineError("invalid input_tokens"))?;
-    let output = strict_count(quantity.get("output_tokens"), true).ok_or(LineError("invalid output_tokens"))?;
-    let cached = strict_count(quantity.get("cached_tokens"), false).ok_or(LineError("invalid cached_tokens"))?;
-    let reasoning = strict_count(quantity.get("reasoning_tokens"), false).ok_or(LineError("invalid reasoning_tokens"))?;
+    let input = strict_count(quantity.get("input_tokens"), true)
+        .ok_or(LineError("invalid input_tokens"))?;
+    let output = strict_count(quantity.get("output_tokens"), true)
+        .ok_or(LineError("invalid output_tokens"))?;
+    let cached = strict_count(quantity.get("cached_tokens"), false)
+        .ok_or(LineError("invalid cached_tokens"))?;
+    let reasoning = strict_count(quantity.get("reasoning_tokens"), false)
+        .ok_or(LineError("invalid reasoning_tokens"))?;
     if cached > input {
         return Err(LineError("cached_tokens exceeds input_tokens"));
     }
@@ -194,14 +206,19 @@ pub fn discover_session_files(roots: &[PathBuf]) -> std::io::Result<Vec<Discover
             Err(e) => return Err(e),
         };
         if !std::fs::metadata(&canon)?.is_dir() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "muse root is not a directory"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "muse root is not a directory",
+            ));
         }
         let mut stack = vec![canon];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir)? {
                 let entry = entry?;
                 let name = entry.file_name();
-                let Some(name_str) = name.to_str() else { continue };
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
                 let kind = entry.file_type()?;
                 if kind.is_dir() {
                     if name_str == "approval-review" || name_str == "process-owners" {
@@ -231,7 +248,10 @@ impl MuseUsageScanner {
         Self::new(vec![sessions_directory(&paths::home())], None)
     }
 
-    pub fn new(roots: Vec<PathBuf>, incremental: Option<Arc<IncrementalScanner<MuseLineParser>>>) -> Self {
+    pub fn new(
+        roots: Vec<PathBuf>,
+        incremental: Option<Arc<IncrementalScanner<MuseLineParser>>>,
+    ) -> Self {
         MuseUsageScanner { roots, incremental }
     }
 
@@ -248,14 +268,22 @@ impl MuseUsageScanner {
         let files = match discover_session_files(&self.roots) {
             Ok(files) => files,
             Err(err) => {
-                qlog!(Warn, host::plugin_tag("muse"), "muse session directory unreadable: {err}");
+                qlog!(
+                    Warn,
+                    host::plugin_tag("muse"),
+                    "muse session directory unreadable: {err}"
+                );
                 return None;
             }
         };
         let identity = if self.roots.is_empty() {
             "no-muse-root".to_string()
         } else {
-            let mut sorted: Vec<String> = self.roots.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            let mut sorted: Vec<String> = self
+                .roots
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
             sorted.sort();
             sorted.join("\n")
         };
@@ -264,7 +292,11 @@ impl MuseUsageScanner {
             Ok(s) => s,
             Err(ScanError::Cancelled) => return None,
             Err(err) => {
-                qlog!(Warn, host::plugin_tag("muse"), "muse session scan incomplete: {err}");
+                qlog!(
+                    Warn,
+                    host::plugin_tag("muse"),
+                    "muse session scan incomplete: {err}"
+                );
                 return None;
             }
         };
@@ -304,7 +336,11 @@ impl MuseUsageScanner {
                 is_sidechain: false,
                 has_speed: false,
                 cost_usd: None,
-                model: Some(e.model.clone().unwrap_or_else(|| Arc::from("muse-spark-1.2-contributor"))),
+                model: Some(
+                    e.model
+                        .clone()
+                        .unwrap_or_else(|| Arc::from("muse-spark-1.2-contributor")),
+                ),
             })
             .collect()
     }
@@ -316,13 +352,20 @@ impl MuseUsageScanner {
         let partition = format!("muse:{}", super::claude::util::stable_fingerprint(identity));
         let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         reg.entry(partition.clone())
-            .or_insert_with(|| Arc::new(IncrementalScanner::new(MuseLineParser, partition, Some(ScanStore::shared()))))
+            .or_insert_with(|| {
+                Arc::new(IncrementalScanner::new(
+                    MuseLineParser,
+                    partition,
+                    Some(ScanStore::shared()),
+                ))
+            })
             .clone()
     }
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<IncrementalScanner<MuseLineParser>>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<IncrementalScanner<MuseLineParser>>>>> = OnceLock::new();
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<IncrementalScanner<MuseLineParser>>>>> =
+        OnceLock::new();
     REGISTRY.get_or_init(Default::default)
 }
 

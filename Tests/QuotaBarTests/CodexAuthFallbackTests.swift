@@ -95,7 +95,7 @@ final class CodexAuthFallbackTests: XCTestCase {
                 return HTTPResponse(statusCode: 200, headers: [:], body: Data("{}".utf8))
             }
         }
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-router-home"]),
                 files: files,

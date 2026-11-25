@@ -11,8 +11,8 @@ use crate::providers::claude::util::{expand_home, since_date, stable_fingerprint
 use crate::qlog;
 use crate::scan::discover::{DiscoveredFile, Revision};
 use crate::scan::{
-    fingerprint, first_future_dated, FileItems, IncrementalScanner, LineError, LineParser, Reader, Record, ScanError,
-    ScanStore, Writer,
+    fingerprint, first_future_dated, FileItems, IncrementalScanner, LineError, LineParser, Reader,
+    Record, ScanError, ScanStore, Writer,
 };
 use crate::time;
 use serde_json::Value;
@@ -74,7 +74,12 @@ impl LineParser for GrokLineParser {
         memchr::memmem::find(line, b"turn_completed").is_some()
     }
 
-    fn parse(&self, _state: &mut (), line: &[u8], out: &mut Vec<Self::Item>) -> Result<(), LineError> {
+    fn parse(
+        &self,
+        _state: &mut (),
+        line: &[u8],
+        out: &mut Vec<Self::Item>,
+    ) -> Result<(), LineError> {
         if let Some(entries) = parse_line(line) {
             out.extend(entries);
         }
@@ -104,7 +109,9 @@ pub fn parse_line(line: &[u8]) -> Option<Vec<GrokEntry>> {
         return None;
     }
 
-    let raw_meta = params.and_then(|p| p.get("_meta")).or_else(|| obj.get("_meta"));
+    let raw_meta = params
+        .and_then(|p| p.get("_meta"))
+        .or_else(|| obj.get("_meta"));
     let metadata = match raw_meta {
         None | Some(Value::Null) => None,
         Some(Value::Object(m)) => Some(m),
@@ -114,7 +121,11 @@ pub fn parse_line(line: &[u8]) -> Option<Vec<GrokEntry>> {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => {
             let trimmed = s.trim();
-            if trimmed.is_empty() { None } else { Some(Arc::from(trimmed)) }
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(Arc::from(trimmed))
+            }
         }
         Some(_) => return None,
     };
@@ -140,7 +151,13 @@ pub fn parse_line(line: &[u8]) -> Option<Vec<GrokEntry>> {
             return None;
         }
         let ticks = match values.get("costUsdTicks") {
-            None | Some(Value::Null) => if model_usage.len() == 1 { top_ticks } else { None },
+            None | Some(Value::Null) => {
+                if model_usage.len() == 1 {
+                    top_ticks
+                } else {
+                    None
+                }
+            }
             Some(raw) => Some(valid_ticks(raw)?),
         };
         let carried_cost = ticks.map(|t| t / 10_000_000_000.0);
@@ -162,11 +179,15 @@ pub fn parse_line(line: &[u8]) -> Option<Vec<GrokEntry>> {
     Some(out)
 }
 
-fn extract_timestamp(meta: Option<&serde_json::Map<String, Value>>, obj: &serde_json::Map<String, Value>) -> Option<f64> {
+fn extract_timestamp(
+    meta: Option<&serde_json::Map<String, Value>>,
+    obj: &serde_json::Map<String, Value>,
+) -> Option<f64> {
     if let Some(m) = meta {
         if let Some(raw_ms) = m.get("agentTimestampMs") {
             if !raw_ms.is_null() {
-                let ms = crate::parse::number(Some(raw_ms)).filter(|v| v.is_finite() && *v > 0.0)?;
+                let ms =
+                    crate::parse::number(Some(raw_ms)).filter(|v| v.is_finite() && *v > 0.0)?;
                 return Some(ms / 1000.0);
             }
         }
@@ -225,7 +246,12 @@ pub fn aggregate(entries: &[GrokEntry], since: f64, pricing: &ModelPricing) -> L
         }
         let day = day_key(entry.timestamp);
         let tokens = entry.tokens.total_tokens();
-        let estimate = pricing.estimated_cost_dollars(&entry.model, &entry.tokens, Some(entry.timestamp), true);
+        let estimate = pricing.estimated_cost_dollars(
+            &entry.model,
+            &entry.tokens,
+            Some(entry.timestamp),
+            true,
+        );
         let cost = entry.carried_cost.or(estimate);
         accumulator.record_api_estimate(&day, estimate, tokens);
         if cost.is_none() && tokens > 0 {
@@ -259,7 +285,10 @@ pub fn aggregate(entries: &[GrokEntry], since: f64, pricing: &ModelPricing) -> L
     for day_entry in &mut scan.series.daily {
         if let Some(&(dollars, covered_tokens, overflowed)) = reported_by_day.get(&day_entry.date) {
             if !overflowed && covered_tokens >= 0 {
-                day_entry.reported_cost = Some(ReportedUsageCost { dollars, covered_tokens });
+                day_entry.reported_cost = Some(ReportedUsageCost {
+                    dollars,
+                    covered_tokens,
+                });
             }
         }
     }
@@ -297,7 +326,10 @@ impl GrokLogUsageScanner {
     }
 
     pub fn unload_caches(&self) {
-        self.summary_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.summary_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     fn grok_home(&self) -> PathBuf {
@@ -308,7 +340,10 @@ impl GrokLogUsageScanner {
                 return expand_home(&base, trimmed);
             }
         }
-        self.home_override.clone().unwrap_or_else(paths::home).join(".grok")
+        self.home_override
+            .clone()
+            .unwrap_or_else(paths::home)
+            .join(".grok")
     }
 
     pub fn scan(
@@ -343,7 +378,11 @@ impl GrokLogUsageScanner {
             Ok(s) => s,
             Err(ScanError::Cancelled) => return None,
             Err(err) => {
-                qlog!(Warn, host::plugin_tag(ID), "grok session scan incomplete: {err}");
+                qlog!(
+                    Warn,
+                    host::plugin_tag(ID),
+                    "grok session scan incomplete: {err}"
+                );
                 return None;
             }
         };
@@ -368,7 +407,10 @@ impl GrokLogUsageScanner {
             Err(e) => return Err(e),
         };
         if !std::fs::metadata(&canon)?.is_dir() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "grok sessions root is not a directory"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "grok sessions root is not a directory",
+            ));
         }
         let mut files = Vec::new();
         let mut stack = vec![canon];
@@ -382,7 +424,10 @@ impl GrokLogUsageScanner {
                     let updates_path = entry.path();
                     if self.include_session_for_updates(&updates_path)? {
                         let revision = Revision::read(&updates_path)?;
-                        files.push(DiscoveredFile { path: updates_path, revision });
+                        files.push(DiscoveredFile {
+                            path: updates_path,
+                            revision,
+                        });
                     }
                 }
             }
@@ -413,11 +458,18 @@ impl GrokLogUsageScanner {
         let obj: serde_json::Map<String, Value> = serde_json::from_str::<Value>(&text)
             .ok()
             .and_then(|v| v.as_object().cloned())
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed summary.json"))?;
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed summary.json")
+            })?;
         let include = match obj.get("session_kind") {
             None | Some(Value::Null) => true,
             Some(Value::String(kind)) => !kind.trim().to_ascii_lowercase().starts_with("subagent"),
-            Some(_) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid session_kind")),
+            Some(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid session_kind",
+                ))
+            }
         };
         let mut cache = self.summary_cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= SUMMARY_CACHE_CAP {
@@ -434,13 +486,20 @@ impl GrokLogUsageScanner {
         let partition = format!("grok:{}", stable_fingerprint(identity));
         let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         reg.entry(partition.clone())
-            .or_insert_with(|| Arc::new(IncrementalScanner::new(GrokLineParser, partition, Some(ScanStore::shared()))))
+            .or_insert_with(|| {
+                Arc::new(IncrementalScanner::new(
+                    GrokLineParser,
+                    partition,
+                    Some(ScanStore::shared()),
+                ))
+            })
             .clone()
     }
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<IncrementalScanner<GrokLineParser>>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<IncrementalScanner<GrokLineParser>>>>> = OnceLock::new();
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<IncrementalScanner<GrokLineParser>>>>> =
+        OnceLock::new();
     REGISTRY.get_or_init(Default::default)
 }
 

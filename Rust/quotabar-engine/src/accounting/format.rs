@@ -10,7 +10,11 @@ const COMPACT_TIERS: [(usize, &str); 4] = [(3, "K"), (6, "M"), (9, "B"), (12, "T
 fn scaled_round(abs: f64, shift: usize) -> (String, u8) {
     let text = format!("{abs}");
     let (int_part, frac_part) = text.split_once('.').unwrap_or((text.as_str(), ""));
-    let mut digits: Vec<u8> = int_part.bytes().chain(frac_part.bytes()).map(|b| b - b'0').collect();
+    let mut digits: Vec<u8> = int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .map(|b| b - b'0')
+        .collect();
     let point = int_part.len() as isize - shift as isize;
     let pad = (-point).max(0) as usize;
     digits.splice(0..0, std::iter::repeat_n(0u8, pad));
@@ -23,7 +27,9 @@ fn scaled_round(abs: f64, shift: usize) -> (String, u8) {
         None => false,
         Some(&d) if d > 5 => true,
         Some(&d) if d < 5 => false,
-        Some(_) => rest[1..].iter().any(|&x| x != 0) || digits.last().is_some_and(|last| last % 2 == 1),
+        Some(_) => {
+            rest[1..].iter().any(|&x| x != 0) || digits.last().is_some_and(|last| last % 2 == 1)
+        }
     };
     if round_up {
         let mut i = digits.len();
@@ -44,7 +50,14 @@ fn scaled_round(abs: f64, shift: usize) -> (String, u8) {
     let tenths = digits.pop().unwrap_or(0);
     let int_digits: String = digits.iter().map(|d| (b'0' + d) as char).collect();
     let int_digits = int_digits.trim_start_matches('0').to_string();
-    (if int_digits.is_empty() { "0".to_string() } else { int_digits }, tenths)
+    (
+        if int_digits.is_empty() {
+            "0".to_string()
+        } else {
+            int_digits
+        },
+        tenths,
+    )
 }
 
 fn group(int_digits: &str, min_digits: usize) -> String {
@@ -63,7 +76,11 @@ fn group(int_digits: &str, min_digits: usize) -> String {
 
 fn assemble(int_digits: &str, tenths: u8, min_group: usize) -> String {
     let int = group(int_digits, min_group);
-    if tenths == 0 { int } else { format!("{int}.{tenths}") }
+    if tenths == 0 {
+        int
+    } else {
+        format!("{int}.{tenths}")
+    }
 }
 
 /// The popover-row spelling of a token count (`500`, `12.9K`, `222M`, `1.5B`).
@@ -77,7 +94,10 @@ pub fn format_count_row(value: f64) -> String {
         let (int, tenths) = scaled_round(abs, 0);
         return format!("{sign}{}", assemble(&int, tenths, 4));
     }
-    let mut tier = COMPACT_TIERS.iter().rposition(|(shift, _)| abs >= 10f64.powi(*shift as i32)).unwrap_or(0);
+    let mut tier = COMPACT_TIERS
+        .iter()
+        .rposition(|(shift, _)| abs >= 10f64.powi(*shift as i32))
+        .unwrap_or(0);
     loop {
         let (shift, suffix) = COMPACT_TIERS[tier];
         let (int, tenths) = scaled_round(abs, shift);

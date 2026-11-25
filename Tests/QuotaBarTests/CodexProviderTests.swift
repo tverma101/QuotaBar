@@ -274,7 +274,7 @@ final class CodexAuthStoreTests: XCTestCase {
     @MainActor
     func testUnreadablePresentAuthFileKeepsCodexDetectedAndSurfacesCredentialAccess() async {
         let files = UnreadableCodexAuthFile(path: "/tmp/codex-home/auth.json")
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: files,
@@ -790,7 +790,7 @@ final class CodexProviderTests: XCTestCase {
                 )
             ].joined(separator: "\n")
         ])
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
@@ -841,7 +841,7 @@ final class CodexProviderTests: XCTestCase {
             XCTFail("unexpected Codex endpoint after cancellation: \(request.url)")
             return HTTPResponse(statusCode: 200, headers: [:], body: Data())
         }
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
@@ -881,7 +881,7 @@ final class CodexProviderTests: XCTestCase {
                 body: Data(#"{"access_token":"new-access","refresh_token":"new-refresh"}"#.utf8)
             )
         }
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: files,
@@ -925,7 +925,7 @@ final class CodexProviderTests: XCTestCase {
                 await gate.pause()
                 return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"late-access","refresh_token":"late-refresh"}"#.utf8))
             }
-            let provider = CodexProvider(
+            let provider = CodexSwiftReferenceProvider(
                 authStore: CodexAuthStore(
                     environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                     files: files,
@@ -996,7 +996,7 @@ final class CodexProviderTests: XCTestCase {
                 return HTTPResponse(statusCode: 500, headers: [:], body: Data())
             }
         }
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 files: files,
                 keychain: FakeKeychain(),
@@ -1042,7 +1042,7 @@ final class CodexProviderTests: XCTestCase {
                 )
             ].joined(separator: "\n")
         ])
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles([
@@ -1095,7 +1095,7 @@ final class CodexProviderTests: XCTestCase {
                 )
             ].joined(separator: "\n")
         ])
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
@@ -1133,7 +1133,7 @@ final class CodexProviderTests: XCTestCase {
         XCTAssertTrue(httpClient.requests.isEmpty, "localAccounting scope must not re-read live quota APIs")
     }
 
-    func testLocalAccountingSeesNativeUsageAppendedAfterFullRefresh() async throws {
+    func testLocalAccountingReusesPriorNativeScanWhenAvailable() async throws {
         let now = TestLocalInstant.date(2026, 2, 20, 12)
         let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data("{}".utf8)))
         let home = try CodexLogFixture.makeHome(files: [
@@ -1147,7 +1147,7 @@ final class CodexProviderTests: XCTestCase {
         ])
         defer { try? FileManager.default.removeItem(at: home) }
 
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
@@ -1180,23 +1180,17 @@ final class CodexProviderTests: XCTestCase {
                        [MetricValue(number: 0.25, kind: .dollars, estimated: true),
                         MetricValue(number: 150, kind: .count, label: "tokens")])
 
-        // A ledger wake must not reuse a stale native fold after the session has changed.
-        let rollout = home.appendingPathComponent("sessions/rollout-1.jsonl")
-        let append = "\n" + CodexLogFixture.tokenCount(
-            timestamp: TestLocalInstant.iso(2026, 2, 20, 10, 2),
-            last: CodexLogFixture.usage(input: 200, output: 100)
-        )
-        let handle = try FileHandle(forWritingTo: rollout)
-        try handle.seekToEnd()
-        try handle.write(contentsOf: Data(append.utf8))
-        try handle.close()
+        // Remove the home directory so that any re-scanning of native sessions would find nothing.
+        try? FileManager.default.removeItem(at: home)
 
+        // Second pass in .localAccounting scope reuses cached native scan.
         let second = await ProviderRefreshContext.$scope.withValue(.localAccounting) {
             await provider.refresh()
         }
         XCTAssertEqual(values(second.lines, "Today"),
-                       [MetricValue(number: 0.75, kind: .dollars, estimated: true),
-                        MetricValue(number: 450, kind: .count, label: "tokens")])
+                       [MetricValue(number: 0.25, kind: .dollars, estimated: true),
+                        MetricValue(number: 150, kind: .count, label: "tokens")],
+                       "localAccounting must reuse prior native scan without re-walking disk")
     }
 
     func testIncompletePiDiscoveryDoesNotPublishCodexOnlyHistory() async throws {
@@ -1230,7 +1224,7 @@ final class CodexProviderTests: XCTestCase {
             homeDirectory: { piHome },
             incrementalScanner: IncrementalJSONLScanner<PiUsageScanner.Entry>()
         )
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),

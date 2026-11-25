@@ -355,6 +355,10 @@ protocol ProviderRuntime: AnyObject {
     /// must never change provider enablement. Mirror the credential sources `refresh()` reads and run
     /// blocking loads via `loadOffMainActor`.
     func hasLocalCredentials() async -> Bool
+
+    /// Per-provider engine configuration for batched Rust refreshes (account cards, discovery
+    /// overrides). Providers without configuration return `nil`.
+    var engineConfig: EngineProviderConfig? { get }
 }
 
 /// Request-scoped identity output for providers that can switch accounts while the app is running.
@@ -378,6 +382,7 @@ final class ProviderCacheIdentityResult: @unchecked Sendable {
 
 extension ProviderRuntime {
     var panelMetersRefreshIncludesHistory: Bool { false }
+    var engineConfig: EngineProviderConfig? { nil }
 }
 
 /// Run a blocking, `Sendable` credential load off the MainActor.

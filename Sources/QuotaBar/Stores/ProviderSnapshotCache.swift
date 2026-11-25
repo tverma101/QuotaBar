@@ -358,7 +358,11 @@ struct ProviderSnapshotCache {
         }
     }
 
-    func snapshot(providerID: String, freshnessInterval: TimeInterval? = nil) -> ProviderSnapshot? {
+    func snapshot(
+        providerID: String,
+        freshnessInterval: TimeInterval? = nil,
+        includeMeterFreshness: Bool = true
+    ) -> ProviderSnapshot? {
         let snapshot = loadPayload().snapshots[providerID]
         guard let snapshot else { return nil }
         // Freshness has two requirements, and disk age alone is not enough: the snapshot must have been
@@ -383,9 +387,17 @@ struct ProviderSnapshotCache {
         } else {
             historyStamp = snapshot.refreshedAt
         }
-        let freshnessStamp = freshnessInterval == nil
-            ? min(snapshot.refreshedAt, min(meterStamp, historyStamp))
-            : meterStamp
+        let freshnessStamp: Date
+        if freshnessInterval != nil {
+            freshnessStamp = meterStamp
+        } else if includeMeterFreshness {
+            freshnessStamp = min(snapshot.refreshedAt, min(meterStamp, historyStamp))
+        } else {
+            // Fold-only passes do not refresh quota. Their freshness question is only whether the
+            // history domain is current; otherwise recovered meter stamps older than the accounting
+            // TTL retrigger the accounting phase forever while the panel is open.
+            freshnessStamp = min(snapshot.refreshedAt, historyStamp)
+        }
         let age = now().timeIntervalSince(freshnessStamp)
         let trusted = allowsPersistedFreshness || writtenThisSession
         let effectiveTTL = freshnessInterval ?? ttl

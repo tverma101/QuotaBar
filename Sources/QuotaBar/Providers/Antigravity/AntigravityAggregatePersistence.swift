@@ -3,7 +3,7 @@ import Foundation
 
 /// Disk mirror of one Antigravity conversation database's derived scan state — parsed generation
 /// events, the priced daily aggregate, and the step timestamp index — validated against the
-/// database's file stamps before use. A fresh process (the scan-worker child, or this app after a
+/// database's file stamps before use. A fresh process (a cold process, or this app after a
 /// memory-pressure unload) reloads the record instead of re-reading SQLite and re-decoding
 /// protobufs. Records carry the raw events so a changed database can verify its prefix and fold
 /// only appended rows, exactly like the in-memory cache path; the persisted step index is verified
@@ -67,7 +67,7 @@ enum AntigravityAggregatePersistence {
                 }
                 let directory = url.deletingLastPathComponent()
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                // The kernel lock orders app/scan-worker writers on the same file, mirroring the
+                // The kernel lock orders process writers on the same file, mirroring the
                 // other log-scan-cache records; the write itself is atomic so readers never see a
                 // half-written record.
                 let descriptor = Darwin.open(

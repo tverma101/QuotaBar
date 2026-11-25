@@ -77,12 +77,19 @@ impl UtcPriceRateOverride {
     }
 
     pub fn matches(&self, weekday: &str, previous_weekday: &str, minute_of_day: i64) -> bool {
-        let day_in = |day: &str| self.utc_days.as_ref().map_or(true, |days| days.iter().any(|d| d == day));
+        let day_in = |day: &str| {
+            self.utc_days
+                .as_ref()
+                .map_or(true, |days| days.iter().any(|d| d == day))
+        };
         let current = day_in(weekday);
         match (self.utc_start_minute, self.utc_end_minute) {
-            (Some(start), Some(end)) if start < end => current && minute_of_day >= start && minute_of_day < end,
+            (Some(start), Some(end)) if start < end => {
+                current && minute_of_day >= start && minute_of_day < end
+            }
             (Some(start), Some(end)) if start > end => {
-                (current && minute_of_day >= start) || (day_in(previous_weekday) && minute_of_day < end)
+                (current && minute_of_day >= start)
+                    || (day_in(previous_weekday) && minute_of_day < end)
             }
             (Some(_), Some(_)) => false,
             (Some(start), None) => current && minute_of_day >= start,
@@ -124,13 +131,29 @@ pub struct ModelRates {
     pub prompt_rate_tiers: Vec<PromptRateTier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utc_price_overrides: Option<Vec<UtcPriceRateOverride>>,
-    #[serde(default, rename = "inputAbove200kPerMillion", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "inputAbove200kPerMillion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub input_above_200k_per_million: Option<f64>,
-    #[serde(default, rename = "outputAbove200kPerMillion", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "outputAbove200kPerMillion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub output_above_200k_per_million: Option<f64>,
-    #[serde(default, rename = "cacheWriteAbove200kPerMillion", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "cacheWriteAbove200kPerMillion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cache_write_above_200k_per_million: Option<f64>,
-    #[serde(default, rename = "cacheReadAbove200kPerMillion", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "cacheReadAbove200kPerMillion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cache_read_above_200k_per_million: Option<f64>,
     /// Whether the source published the cache-read rate. When not, cache reads bill at the selected
     /// input rate rather than an invented discount.
@@ -183,8 +206,15 @@ impl ModelRates {
             cache_write_per_million: self.cache_write_per_million * factor,
             cache_read_per_million: self.cache_read_per_million * factor,
             cache_write_1h_per_million: scale(self.cache_write_1h_per_million),
-            prompt_rate_tiers: self.prompt_rate_tiers.iter().map(|t| t.scaled(factor)).collect(),
-            utc_price_overrides: self.utc_price_overrides.as_ref().map(|o| o.iter().map(|t| t.scaled(factor)).collect()),
+            prompt_rate_tiers: self
+                .prompt_rate_tiers
+                .iter()
+                .map(|t| t.scaled(factor))
+                .collect(),
+            utc_price_overrides: self
+                .utc_price_overrides
+                .as_ref()
+                .map(|o| o.iter().map(|t| t.scaled(factor)).collect()),
             input_above_200k_per_million: scale(self.input_above_200k_per_million),
             output_above_200k_per_million: scale(self.output_above_200k_per_million),
             cache_write_above_200k_per_million: scale(self.cache_write_above_200k_per_million),
@@ -198,33 +228,66 @@ impl ModelRates {
     /// Dollar cost of one request: request-wide long-context tier, prompt-length tier, UTC timed lane
     /// (when `timestamp` is given) and fast multiplier. Aggregated sources that lose request
     /// boundaries pass `apply_long_context_rates = false`.
-    pub fn cost_dollars(&self, tokens: &TokenBreakdown, timestamp: Option<f64>, apply_long_context_rates: bool) -> f64 {
-        let multiplier = if tokens.is_fast { self.fast_multiplier } else { 1.0 };
+    pub fn cost_dollars(
+        &self,
+        tokens: &TokenBreakdown,
+        timestamp: Option<f64>,
+        apply_long_context_rates: bool,
+    ) -> f64 {
+        let multiplier = if tokens.is_fast {
+            self.fast_multiplier
+        } else {
+            1.0
+        };
         let prompt = tokens.prompt_tokens();
         let use_long = apply_long_context_rates && prompt > self.long_context_threshold_tokens;
-        let tier = if apply_long_context_rates { self.selected_prompt_tier(prompt) } else { None };
+        let tier = if apply_long_context_rates {
+            self.selected_prompt_tier(prompt)
+        } else {
+            None
+        };
         let timed = timestamp.and_then(|ts| self.utc_price_override(ts));
 
         let select = |base: f64, long: Option<f64>, tier_rate: Option<f64>| -> f64 {
             tier_rate.unwrap_or(if use_long { long.unwrap_or(base) } else { base })
         };
-        let base_input = timed.and_then(|t| t.input_per_million).unwrap_or(self.input_per_million);
-        let input_rate = select(base_input, self.input_above_200k_per_million, tier.and_then(|t| t.input_per_million));
+        let base_input = timed
+            .and_then(|t| t.input_per_million)
+            .unwrap_or(self.input_per_million);
+        let input_rate = select(
+            base_input,
+            self.input_above_200k_per_million,
+            tier.and_then(|t| t.input_per_million),
+        );
         let output_rate = select(
-            timed.and_then(|t| t.output_per_million).unwrap_or(self.output_per_million),
+            timed
+                .and_then(|t| t.output_per_million)
+                .unwrap_or(self.output_per_million),
             self.output_above_200k_per_million,
             tier.and_then(|t| t.output_per_million),
         );
         let cache_write_rate = select(
-            timed.and_then(|t| t.cache_write_per_million).unwrap_or(self.cache_write_per_million),
+            timed
+                .and_then(|t| t.cache_write_per_million)
+                .unwrap_or(self.cache_write_per_million),
             self.cache_write_above_200k_per_million,
             tier.and_then(|t| t.cache_write_per_million),
         );
         let cache_read_rate = tier
             .and_then(|t| t.cache_read_per_million)
-            .or_else(|| if use_long { self.cache_read_above_200k_per_million } else { None })
+            .or_else(|| {
+                if use_long {
+                    self.cache_read_above_200k_per_million
+                } else {
+                    None
+                }
+            })
             .or_else(|| timed.and_then(|t| t.cache_read_per_million))
-            .unwrap_or(if self.cache_read_is_explicit { self.cache_read_per_million } else { input_rate });
+            .unwrap_or(if self.cache_read_is_explicit {
+                self.cache_read_per_million
+            } else {
+                input_rate
+            });
         let cache_write_1h_rate = tier
             .and_then(|t| t.cache_write_1h_per_million)
             .or_else(|| timed.and_then(|t| t.cache_write_1h_per_million))
@@ -249,7 +312,11 @@ impl ModelRates {
             } else {
                 prompt > tier.threshold_prompt_tokens
             };
-            if crosses && best.map_or(true, |b| b.threshold_prompt_tokens < tier.threshold_prompt_tokens) {
+            if crosses
+                && best.map_or(true, |b| {
+                    b.threshold_prompt_tokens < tier.threshold_prompt_tokens
+                })
+            {
                 best = Some(tier);
             }
         }
@@ -257,7 +324,10 @@ impl ModelRates {
     }
 
     fn utc_price_override(&self, timestamp: f64) -> Option<&UtcPriceRateOverride> {
-        let overrides = self.utc_price_overrides.as_ref().filter(|o| !o.is_empty())?;
+        let overrides = self
+            .utc_price_overrides
+            .as_ref()
+            .filter(|o| !o.is_empty())?;
         if !timestamp.is_finite() {
             return None;
         }
@@ -267,12 +337,22 @@ impl ModelRates {
         // 1970-01-01 was a Thursday (index 4 counting from Sunday).
         let index = (days + 4).rem_euclid(7) as usize;
         let previous = (index + 6) % 7;
-        overrides.iter().find(|o| o.matches(UTC_WEEKDAYS[index], UTC_WEEKDAYS[previous], minute_of_day))
+        overrides
+            .iter()
+            .find(|o| o.matches(UTC_WEEKDAYS[index], UTC_WEEKDAYS[previous], minute_of_day))
     }
 }
 
 const CACHE_WRITE_1H_INPUT_MULTIPLIER: f64 = 2.0;
-const UTC_WEEKDAYS: [&str; 7] = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+const UTC_WEEKDAYS: [&str; 7] = [
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+];
 
 fn cost(tokens: i64, rate_per_million: f64) -> f64 {
     tokens as f64 * rate_per_million / 1_000_000.0
@@ -315,14 +395,24 @@ mod tests {
     use super::*;
 
     fn tokens(input: i64, output: i64) -> TokenBreakdown {
-        TokenBreakdown { input, output, ..Default::default() }
+        TokenBreakdown {
+            input,
+            output,
+            ..Default::default()
+        }
     }
 
     #[test]
     fn flat_cost_and_fast_multiplier() {
         let mut rates = ModelRates::new(3.0, 15.0, 3.75, 0.3);
         rates.fast_multiplier = 6.0;
-        let t = TokenBreakdown { input: 1_000_000, output: 100_000, cache_read: 2_000_000, cache_write_5m: 10, ..Default::default() };
+        let t = TokenBreakdown {
+            input: 1_000_000,
+            output: 100_000,
+            cache_read: 2_000_000,
+            cache_write_5m: 10,
+            ..Default::default()
+        };
         let expected = 3.0 + 1.5 + 0.6 + 10.0 * 3.75 / 1e6;
         assert!((rates.cost_dollars(&t, None, true) - expected).abs() < 1e-12);
         let fast = TokenBreakdown { is_fast: true, ..t };
@@ -336,16 +426,38 @@ mod tests {
         rates.output_above_200k_per_million = Some(22.5);
         // Exactly 200k stays standard; above it the whole request bills long-context.
         assert_eq!(rates.cost_dollars(&tokens(200_000, 0), None, true), 0.6);
-        assert_eq!(rates.cost_dollars(&tokens(200_001, 1_000_000), None, true), 200_001.0 * 6.0 / 1e6 + 22.5);
-        assert_eq!(rates.cost_dollars(&tokens(200_001, 0), None, false), 200_001.0 * 3.0 / 1e6);
+        assert_eq!(
+            rates.cost_dollars(&tokens(200_001, 1_000_000), None, true),
+            200_001.0 * 6.0 / 1e6 + 22.5
+        );
+        assert_eq!(
+            rates.cost_dollars(&tokens(200_001, 0), None, false),
+            200_001.0 * 3.0 / 1e6
+        );
 
         rates.prompt_rate_tiers = vec![
-            PromptRateTier { threshold_prompt_tokens: 100_000, includes_threshold: true, input_per_million: Some(4.0), ..tier0() },
-            PromptRateTier { threshold_prompt_tokens: 300_000, includes_threshold: false, input_per_million: Some(8.0), ..tier0() },
+            PromptRateTier {
+                threshold_prompt_tokens: 100_000,
+                includes_threshold: true,
+                input_per_million: Some(4.0),
+                ..tier0()
+            },
+            PromptRateTier {
+                threshold_prompt_tokens: 300_000,
+                includes_threshold: false,
+                input_per_million: Some(8.0),
+                ..tier0()
+            },
         ];
         assert_eq!(rates.cost_dollars(&tokens(100_000, 0), None, true), 0.4);
-        assert_eq!(rates.cost_dollars(&tokens(300_000, 0), None, true), 300_000.0 * 4.0 / 1e6);
-        assert_eq!(rates.cost_dollars(&tokens(300_001, 0), None, true), 300_001.0 * 8.0 / 1e6);
+        assert_eq!(
+            rates.cost_dollars(&tokens(300_000, 0), None, true),
+            300_000.0 * 4.0 / 1e6
+        );
+        assert_eq!(
+            rates.cost_dollars(&tokens(300_001, 0), None, true),
+            300_001.0 * 8.0 / 1e6
+        );
     }
 
     fn tier0() -> PromptRateTier {
@@ -365,7 +477,11 @@ mod tests {
         let mut rates = ModelRates::new(2.0, 8.0, 2.0, 2.0);
         rates.cache_read_is_explicit = false;
         rates.cache_read_per_million = 0.2;
-        let t = TokenBreakdown { cache_read: 1_000_000, cache_write_1h: 1_000_000, ..Default::default() };
+        let t = TokenBreakdown {
+            cache_read: 1_000_000,
+            cache_write_1h: 1_000_000,
+            ..Default::default()
+        };
         assert_eq!(rates.cost_dollars(&t, None, true), 2.0 + 4.0);
     }
 
@@ -384,15 +500,29 @@ mod tests {
         }]);
         // 2026-11-23 is a Monday. 23:00 Monday matches; 01:00 Tuesday matches via previous day.
         let monday_2300 = 1_795_474_800.0 - 3600.0 * 0.0; // 2026-11-23T23:00:00Z
-        assert_eq!(rates.cost_dollars(&tokens(1_000_000, 0), Some(monday_2300), true), 0.5);
-        assert_eq!(rates.cost_dollars(&tokens(1_000_000, 0), Some(monday_2300 + 7200.0), true), 0.5);
-        assert_eq!(rates.cost_dollars(&tokens(1_000_000, 0), Some(monday_2300 - 7200.0), true), 1.0);
+        assert_eq!(
+            rates.cost_dollars(&tokens(1_000_000, 0), Some(monday_2300), true),
+            0.5
+        );
+        assert_eq!(
+            rates.cost_dollars(&tokens(1_000_000, 0), Some(monday_2300 + 7200.0), true),
+            0.5
+        );
+        assert_eq!(
+            rates.cost_dollars(&tokens(1_000_000, 0), Some(monday_2300 - 7200.0), true),
+            1.0
+        );
         assert_eq!(rates.cost_dollars(&tokens(1_000_000, 0), None, true), 1.0);
     }
 
     #[test]
     fn saturating_prompt_tokens() {
-        let t = TokenBreakdown { input: i64::MAX, cache_read: 5, output: 1, ..Default::default() };
+        let t = TokenBreakdown {
+            input: i64::MAX,
+            cache_read: 5,
+            output: 1,
+            ..Default::default()
+        };
         assert_eq!(t.prompt_tokens(), i64::MAX);
         assert_eq!(t.total_tokens(), i64::MAX);
     }

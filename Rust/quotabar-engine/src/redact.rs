@@ -21,18 +21,72 @@ pub fn redact_value(value: &str) -> String {
 }
 
 const URL_SENSITIVE_PARAMS: &[&str] = &[
-    "key", "api_key", "apikey", "token", "access_token", "secret", "password", "auth", "authorization",
-    "bearer", "credential", "user", "user_id", "userid", "account_id", "accountid", "profilearn",
-    "profile_arn", "email", "login", "cookie", "sid", "sapisid",
+    "key",
+    "api_key",
+    "apikey",
+    "token",
+    "access_token",
+    "secret",
+    "password",
+    "auth",
+    "authorization",
+    "bearer",
+    "credential",
+    "user",
+    "user_id",
+    "userid",
+    "account_id",
+    "accountid",
+    "profilearn",
+    "profile_arn",
+    "email",
+    "login",
+    "cookie",
+    "sid",
+    "sapisid",
 ];
 
 const JSON_SENSITIVE_KEYS: &[&str] = &[
-    "name", "password", "token", "access_token", "refresh_token", "secret", "api_key", "apiKey",
-    "authorization", "bearer", "credential", "session_token", "sessionToken", "auth_token", "authToken",
-    "id_token", "idToken", "accessToken", "refreshToken", "user_id", "userId", "account_id", "accountId",
-    "team_id", "teamId", "org_id", "orgId", "account_display_name", "accountDisplayName", "payment_id",
-    "paymentId", "profile_arn", "profileArn", "email", "login", "username", "rpc_token", "simpleToken",
-    "analytics_tracking_id", "uuid",
+    "name",
+    "password",
+    "token",
+    "access_token",
+    "refresh_token",
+    "secret",
+    "api_key",
+    "apiKey",
+    "authorization",
+    "bearer",
+    "credential",
+    "session_token",
+    "sessionToken",
+    "auth_token",
+    "authToken",
+    "id_token",
+    "idToken",
+    "accessToken",
+    "refreshToken",
+    "user_id",
+    "userId",
+    "account_id",
+    "accountId",
+    "team_id",
+    "teamId",
+    "org_id",
+    "orgId",
+    "account_display_name",
+    "accountDisplayName",
+    "payment_id",
+    "paymentId",
+    "profile_arn",
+    "profileArn",
+    "email",
+    "login",
+    "username",
+    "rpc_token",
+    "simpleToken",
+    "analytics_tracking_id",
+    "uuid",
 ];
 
 struct Patterns {
@@ -75,7 +129,8 @@ fn patterns() -> &'static Patterns {
 }
 
 fn mask_whole(re: &Regex, input: &str) -> String {
-    re.replace_all(input, |c: &Captures| redact_value(&c[0])).into_owned()
+    re.replace_all(input, |c: &Captures| redact_value(&c[0]))
+        .into_owned()
 }
 
 /// Redact sensitive query parameters and `/accounts/<id>` path segments in a URL.
@@ -83,9 +138,13 @@ pub fn redact_url(url: &str) -> String {
     let p = patterns();
     let url = p
         .account_path
-        .replace_all(url, |c: &Captures| format!("{}{}", &c["prefix"], redact_value(&c["value"])))
+        .replace_all(url, |c: &Captures| {
+            format!("{}{}", &c["prefix"], redact_value(&c["value"]))
+        })
         .into_owned();
-    let Some(query_start) = url.find('?') else { return url };
+    let Some(query_start) = url.find('?') else {
+        return url;
+    };
     let (base, query) = url.split_at(query_start + 1);
     let params: Vec<String> = query
         .split('&')
@@ -110,17 +169,23 @@ pub fn redact_body(body: &str) -> String {
     let p = patterns();
     let mut result = p
         .cookie_pair
-        .replace_all(body, |c: &Captures| format!("{}={}", &c[1], redact_value(&c[2])))
+        .replace_all(body, |c: &Captures| {
+            format!("{}={}", &c[1], redact_value(&c[2]))
+        })
         .into_owned();
     result = mask_whole(&p.jwt_body, &result);
     result = p
         .api_key_quoted
-        .replace_all(&result, |c: &Captures| redact_value(c[0].trim_matches(|ch| ch == '"' || ch == '\'')))
+        .replace_all(&result, |c: &Captures| {
+            redact_value(c[0].trim_matches(|ch| ch == '"' || ch == '\''))
+        })
         .into_owned();
     result = mask_whole(&p.devin_session, &result);
     for (key, re) in &p.json_keys {
         result = re
-            .replace_all(&result, |c: &Captures| format!("\"{key}\": \"{}\"", redact_value(&c[1])))
+            .replace_all(&result, |c: &Captures| {
+                format!("\"{key}\": \"{}\"", redact_value(&c[1]))
+            })
             .into_owned();
     }
     result = mask_whole(&p.email, &result);
@@ -133,7 +198,11 @@ pub fn body_preview(body: &str, limit: usize) -> String {
     if redacted.len() <= limit {
         return redacted;
     }
-    let cut: String = redacted.char_indices().take_while(|(i, _)| *i < limit).map(|(_, c)| c).collect();
+    let cut: String = redacted
+        .char_indices()
+        .take_while(|(i, _)| *i < limit)
+        .map(|(_, c)| c)
+        .collect();
     format!("{cut}... ({} bytes total)", body.len())
 }
 
@@ -142,7 +211,9 @@ pub fn redact_log_message(message: &str) -> String {
     let p = patterns();
     let mut result = p
         .cookie_pair
-        .replace_all(message, |c: &Captures| format!("{}={}", &c[1], redact_value(&c[2])))
+        .replace_all(message, |c: &Captures| {
+            format!("{}={}", &c[1], redact_value(&c[2]))
+        })
         .into_owned();
     result = mask_whole(&p.email, &result);
     result = mask_whole(&p.jwt_message, &result);
@@ -150,7 +221,9 @@ pub fn redact_log_message(message: &str) -> String {
     result = mask_whole(&p.devin_session, &result);
     result = p
         .account_eq
-        .replace_all(&result, |c: &Captures| format!("{}{}", &c[1], redact_value(&c[2])))
+        .replace_all(&result, |c: &Captures| {
+            format!("{}{}", &c[1], redact_value(&c[2]))
+        })
         .into_owned();
     p.path.replace_all(&result, "[PATH]").into_owned()
 }
@@ -175,7 +248,8 @@ mod tests {
 
     #[test]
     fn redacts_body_keys_and_paths_before_truncating() {
-        let body = r#"{"apiKey": "sk-ws-01-abcdefghijklmnopqrstuvwxyz", "path": "/Users/someone/x"}"#;
+        let body =
+            r#"{"apiKey": "sk-ws-01-abcdefghijklmnopqrstuvwxyz", "path": "/Users/someone/x"}"#;
         let out = body_preview(body, 500);
         assert!(!out.contains("abcdefghijklmnopqrstuvwxyz"), "{out}");
         assert!(out.contains("[PATH]"), "{out}");
@@ -183,7 +257,8 @@ mod tests {
 
     #[test]
     fn redacts_messages() {
-        let out = redact_log_message("token eyJabc.def.ghi for a@b.co at /Users/me/file account=12345");
+        let out =
+            redact_log_message("token eyJabc.def.ghi for a@b.co at /Users/me/file account=12345");
         assert!(!out.contains("eyJabc.def.ghi"));
         assert!(!out.contains("/Users/me"));
         assert!(out.contains("account=[REDACTED]"));

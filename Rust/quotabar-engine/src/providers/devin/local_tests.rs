@@ -57,15 +57,36 @@ fn session_reader_verified_incremental_delete_update_and_damage() {
     create_sessions_db(
         &db,
         &[
-            ("s1", "a", assistant_msg(Some("req-a"), ts, "swe-2-max", json!({"input_tokens": 10, "output_tokens": 1}))),
-            ("s1", "a", assistant_msg(Some("req-b"), ts, "swe-2-max", json!({"input_tokens": 20, "output_tokens": 2}))),
+            (
+                "s1",
+                "a",
+                assistant_msg(
+                    Some("req-a"),
+                    ts,
+                    "swe-2-max",
+                    json!({"input_tokens": 10, "output_tokens": 1}),
+                ),
+            ),
+            (
+                "s1",
+                "a",
+                assistant_msg(
+                    Some("req-b"),
+                    ts,
+                    "swe-2-max",
+                    json!({"input_tokens": 20, "output_tokens": 2}),
+                ),
+            ),
         ],
     );
 
     let mut r1 = DevinSessionUsageReader::new(Some(cache.clone()));
     let entries = r1.entries(&db).unwrap();
     assert_eq!(r1.last_fold_kind, Some(FoldKind::Full));
-    assert_eq!(entries.iter().map(|e| e.tokens.total_tokens()).sum::<i64>(), 33);
+    assert_eq!(
+        entries.iter().map(|e| e.tokens.total_tokens()).sum::<i64>(),
+        33
+    );
 
     // Warm reader verifies from disk without refolding
     let mut r2 = DevinSessionUsageReader::new(Some(cache.clone()));
@@ -80,8 +101,21 @@ fn session_reader_verified_incremental_delete_update_and_damage() {
         append_rows(
             &conn,
             &[
-                ("s1", "a", assistant_msg(Some("req-a"), ts, "swe-2-max", json!({"input_tokens": 99, "output_tokens": 9}))),
-                ("s1", "a", assistant_msg(Some("req-c"), ts, "swe-2-max", json!({"output_tokens": 5}))),
+                (
+                    "s1",
+                    "a",
+                    assistant_msg(
+                        Some("req-a"),
+                        ts,
+                        "swe-2-max",
+                        json!({"input_tokens": 99, "output_tokens": 9}),
+                    ),
+                ),
+                (
+                    "s1",
+                    "a",
+                    assistant_msg(Some("req-c"), ts, "swe-2-max", json!({"output_tokens": 5})),
+                ),
             ],
         );
     }
@@ -93,8 +127,18 @@ fn session_reader_verified_incremental_delete_update_and_damage() {
     // In-place update moving request_id forces Full fold and promotes runner-up
     {
         let conn = Connection::open(&db).unwrap();
-        let moved = serde_json::to_string(&assistant_msg(Some("req-moved"), ts, "swe-2-max", json!({"input_tokens": 99, "output_tokens": 9}))).unwrap();
-        conn.execute("UPDATE message_nodes SET chat_message = ?1 WHERE row_id = 3", params![moved]).unwrap();
+        let moved = serde_json::to_string(&assistant_msg(
+            Some("req-moved"),
+            ts,
+            "swe-2-max",
+            json!({"input_tokens": 99, "output_tokens": 9}),
+        ))
+        .unwrap();
+        conn.execute(
+            "UPDATE message_nodes SET chat_message = ?1 WHERE row_id = 3",
+            params![moved],
+        )
+        .unwrap();
     }
     let mut r4 = DevinSessionUsageReader::new(Some(cache.clone()));
     let e4 = r4.entries(&db).unwrap();
@@ -106,7 +150,16 @@ fn session_reader_verified_incremental_delete_update_and_damage() {
         let conn = Connection::open(&db).unwrap();
         append_rows(
             &conn,
-            &[("s1", "a", assistant_msg(Some("req-bad"), ts, "swe-2-max", json!({"input_tokens": "bad"})))],
+            &[(
+                "s1",
+                "a",
+                assistant_msg(
+                    Some("req-bad"),
+                    ts,
+                    "swe-2-max",
+                    json!({"input_tokens": "bad"}),
+                ),
+            )],
         );
     }
     let mut r5 = DevinSessionUsageReader::new(Some(cache));
@@ -140,7 +193,10 @@ fn transcript_parser_and_neon_routing_and_db_precedence() {
 
     // gemini-4-neon-xhigh uses exact OpenRouter route google/gemini-4-neon
     let mut openrouter_entries = std::collections::HashMap::new();
-    openrouter_entries.insert("google/gemini-4-neon".to_string(), ModelRates::new(3.0, 15.0, 3.0, 0.15));
+    openrouter_entries.insert(
+        "google/gemini-4-neon".to_string(),
+        ModelRates::new(3.0, 15.0, 3.0, 0.15),
+    );
     let pricing = ModelPricing::new(
         PricingSupplement::default(),
         PricingCatalog::default(),
@@ -152,7 +208,12 @@ fn transcript_parser_and_neon_routing_and_db_precedence() {
     let neon = DevinSessionEntry {
         timestamp: now,
         model: "gemini-4-neon-xhigh".into(),
-        tokens: TokenBreakdown { input: 1_000_000, cache_read: 1_000_000, output: 1_000_000, ..Default::default() },
+        tokens: TokenBreakdown {
+            input: 1_000_000,
+            cache_read: 1_000_000,
+            output: 1_000_000,
+            ..Default::default()
+        },
     };
     let scan = aggregate(&[neon], 0.0, &pricing);
     let day = &scan.series.daily[0];
@@ -166,9 +227,68 @@ fn transcript_parser_and_neon_routing_and_db_precedence() {
     let tr = dir.path().join("transcripts");
     std::fs::create_dir_all(&tr).unwrap();
     std::fs::write(tr.join("exported.json"), &t_json).unwrap();
-    create_sessions_db(&db, &[("s1", "a", assistant_msg(Some("r1"), ts, "swe-2-max", json!({"input_tokens": 10, "output_tokens": 5})))]);
+    create_sessions_db(
+        &db,
+        &[(
+            "s1",
+            "a",
+            assistant_msg(
+                Some("r1"),
+                ts,
+                "swe-2-max",
+                json!({"input_tokens": 10, "output_tokens": 5}),
+            ),
+        )],
+    );
     let scanner = DevinTranscriptUsageScanner::new(tr, Some(db), Some(dir.path().join("c")));
     let now_june = time::parse_iso8601("2026-06-18T12:00:00Z").unwrap();
-    let res = scanner.scan(30, now_june, &|| Arc::new(ModelPricing::default()), &CancelToken::new()).unwrap();
+    let res = scanner
+        .scan(
+            30,
+            now_june,
+            &|| Arc::new(ModelPricing::default()),
+            &CancelToken::new(),
+        )
+        .unwrap();
     assert_eq!(res.series.daily[0].total_tokens, 15);
+}
+
+#[test]
+fn unchanged_transcripts_reuse_shared_cached_rows_across_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    let tr = dir.path().join("transcripts");
+    std::fs::create_dir_all(&tr).unwrap();
+    let transcript = tr.join("session.json");
+    std::fs::write(
+        &transcript,
+        serde_json::to_vec(&json!({
+            "schema_version": "ATIF-v1.7",
+            "agent": { "model_name": "swe-2-max" },
+            "steps": [{
+                "source": "agent",
+                "timestamp": "2026-06-10T10:00:00.000Z",
+                "metrics": { "prompt_tokens": 10, "completion_tokens": 5, "cached_tokens": 0 }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let missing_db = dir.path().join("missing.db");
+    let scanner = DevinTranscriptUsageScanner::new(tr, Some(missing_db), None);
+    let now = time::parse_iso8601("2026-06-18T12:00:00Z").unwrap();
+    let cancel = CancelToken::new();
+    let pricing = || Arc::new(ModelPricing::default());
+
+    assert!(scanner.scan(30, now, &pricing, &cancel).is_some());
+    let first = scanner
+        .cached_rows_shared_for_test(&transcript)
+        .expect("first scan populates the transcript cache");
+    assert!(scanner.scan(30, now, &pricing, &cancel).is_some());
+    let second = scanner
+        .cached_rows_shared_for_test(&transcript)
+        .expect("second scan keeps the transcript cache");
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "unchanged transcript rows must be shared rather than deep-copied"
+    );
 }

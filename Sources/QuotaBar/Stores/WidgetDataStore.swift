@@ -43,8 +43,8 @@ final class WidgetDataStore {
     /// `ProviderEnablementStore` without owning it; defaults to "all enabled" for tests and previews.
     private let isProviderEnabled: @MainActor (String) -> Bool
     /// Overridable for tests: the batched fold delegation point for accounting passes. Production
-    /// always uses `ScanWorkerClient.shared`.
-    var scanWorker: ScanWorkerClient
+    /// always uses `EngineFoldBatchClient.shared`.
+    var foldBatch: EngineFoldBatchClient
     /// The user's widget order (already enablement-filtered) that drives the menu-bar value. Injected
     /// so the store reads `LayoutStore.visiblePlaced` without owning it; defaults to registry order.
     private let orderedDescriptors: @MainActor () -> [WidgetDescriptor]
@@ -323,20 +323,10 @@ final class WidgetDataStore {
     }
 
     func unloadProviderCachesForMemoryPressure() async {
-        if let antigravity = providersByID["antigravity"] as? AntigravityProvider {
-            await antigravity.unloadLocalAccountingCachesForMemoryPressure()
-        }
-        if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
-            await freebuff.unloadLocalAccountingCachesForMemoryPressure()
-        }
-        if let zai = providersByID["zai"] as? ZAIProvider {
-            await zai.unloadLocalAccountingCachesForMemoryPressure()
-        }
-        for provider in providersByID.values {
-            if let codex = provider as? CodexProvider {
-                await codex.unloadLocalAccountingCachesForMemoryPressure()
-            }
-        }
+        // Providers served by the Rust engine keep their recomputable local-accounting caches there.
+        // Unload them as one engine pass so account-scoped Claude/Codex cards share the same pressure
+        // response without depending on which Swift wrapper the catalog constructed.
+        await RustEngine.unloadCaches()
         // Callers relieve the malloc zone at the end of the chain so one free-list walk covers
         // every unload in the cycle.
     }
@@ -350,9 +340,7 @@ final class WidgetDataStore {
     /// pages while the cheap-to-rebuild provider caches (Antigravity's ~8 MB index and friends) stay
     /// warm under the soft budget.
     func unloadFreebuffAccountingCacheForMemoryPressure() async {
-        if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
-            await freebuff.unloadLocalAccountingCachesForMemoryPressure()
-        }
+        await RustEngine.unloadCaches(providerID: "freebuff")
     }
 
     init(
@@ -373,7 +361,7 @@ final class WidgetDataStore {
         postNotification: (@MainActor (String, String, String, String) async -> Bool)? = nil,
         providerIdentityKeys: [String: String] = [:],
         vmBoxHistoryDirectory: URL? = nil,
-        scanWorker: ScanWorkerClient? = nil
+        foldBatch: EngineFoldBatchClient? = nil
     ) {
         precondition(slowProviderRefreshThreshold >= 0)
         precondition(providerRefreshTimeout > 0)
@@ -397,7 +385,7 @@ final class WidgetDataStore {
             }
         self.providerIdentityKeys = providerIdentityKeys
         self.vmBoxHistory = vmBoxHistoryDirectory.map(VMBoxUsageHistory.init(directory:))
-        self.scanWorker = scanWorker ?? .shared
+        self.foldBatch = foldBatch ?? .shared
         self.meterStyle = defaults.enumValue(forKey: Self.meterStyleKey, default: .remaining)
         self.resetDisplayMode = defaults.enumValue(forKey: Self.resetDisplayModeKey, default: .relative)
         self.alwaysShowPacing = defaults.bool(forKey: Self.alwaysShowPacingKey)
@@ -629,10 +617,10 @@ final class WidgetDataStore {
         }
         let start = monotonicNow()
         AppLog.info(.refresh, "batch start (\(providerIDs.count) providers, force=\(force), scope=\(Self.batchScopeLabel(ProviderRefreshContext.scope)))")
-        // One batched scan-worker child folds the whole provider set: the per-process fixed costs
-        // (account discovery, login shell, Keychain metadata queries, Swift-runtime startup) are
-        // paid once per pass instead of once per provider. Providers the child can't cover fall
-        // back to the in-process fold inside performRefresh, exactly as if delegation never ran.
+        // One engine batch folds the whole provider set, so shared pricing/cache state and batch
+        // scheduling are paid once per pass instead of once per provider. Providers the batch
+        // can't cover fall back to their ordinary Rust-backed runtime inside performRefresh,
+        // exactly as if batching never ran.
         //
         // Members whose snapshot cache is TTL-fresh are left out of the child entirely — they hit
         // the cache inside performRefresh as usual, so a panel-open pass within the window pays
@@ -650,7 +638,11 @@ final class WidgetDataStore {
             var staleIDs = foldProviders.keys.filter { id in
                 force || bypassSnapshotCache
                     || cache.hasStaleAccountStamp(providerID: id, currentIdentityKey: providerIdentityKeys[id])
-                    || cache.snapshot(providerID: id, freshnessInterval: nil) == nil
+                    || cache.snapshot(
+                        providerID: id,
+                        freshnessInterval: nil,
+                        includeMeterFreshness: !ProviderRefreshContext.scope.suppressesLiveQuota
+                    ) == nil
             }
             staleIDs.sort()
             if !staleIDs.isEmpty {
@@ -671,15 +663,19 @@ final class WidgetDataStore {
                 for id in preMarkedInFlight where !refreshingProviderIDs.contains(id) {
                     refreshingProviderIDs.insert(id)
                 }
-                let fetched = await self.scanWorker.fetchFoldSnapshots(
+                let engineConfigs = staleIDs.reduce(into: [String: EngineProviderConfig]()) { partial, id in
+                    if let config = providersByID[id]?.engineConfig { partial[id] = config }
+                }
+                let fetched = await self.foldBatch.fetchFoldSnapshots(
                     providers: staleProviders,
+                    engineConfigs: engineConfigs,
                     paced: ProviderRefreshContext.accountingCPUThrottleEnabled
                 )
                 prefetchedFoldSnapshots = fetched.snapshots
                 prefetchedFoldIdentityKeys = fetched.identityKeys
                 AppLog.info(
                     .refresh,
-                    "batched scan worker folded \(fetched.snapshots.count)/\(staleIDs.count) stale providers (of \(foldProviders.count) enabled)"
+                    "engine batch folded \(fetched.snapshots.count)/\(staleIDs.count) stale providers (of \(foldProviders.count) enabled)"
                 )
                 // Clear before members run: performRefresh reads `refreshingProviderIDs` as its
                 // in-flight gate, so leaving our placeholder set would make every member defer
@@ -1251,7 +1247,11 @@ final class WidgetDataStore {
             ? RefreshSetting.quotaCacheInterval
             : nil
         if !force, !bypassSnapshotCache, !staleAccountStamp,
-           let cachedSnapshot = cache.snapshot(providerID: providerID, freshnessInterval: freshnessInterval) {
+           let cachedSnapshot = cache.snapshot(
+            providerID: providerID,
+            freshnessInterval: freshnessInterval,
+            includeMeterFreshness: !ProviderRefreshContext.scope.suppressesLiveQuota
+        ) {
             var cached = cachedSnapshot
             if let history = cached.usageHistory {
                 let compacted = history.retainingHistory(through: now())
@@ -1406,7 +1406,7 @@ final class WidgetDataStore {
         }
         // App and CLI share persisted snapshots but have independent in-process request generations.
         // The cache order fences a slower result if a newer refresh starts in the other process.
-        // A prefetched fold allocated its order before the scan-worker child started, so the fence
+        // A prefetched fold allocated its order before the engine batch started, so the fence
         // can still reject it in favor of a newer commit; only in-process passes allocate here.
         let cacheRefreshOrder = prefetchedRefreshOrder ?? cache.beginRefreshOrder(providerID: providerID)
         let start = monotonicNow()
@@ -1415,7 +1415,7 @@ final class WidgetDataStore {
         let cacheIdentityResult = ProviderCacheIdentityResult()
         var fetchedSnapshot: ProviderSnapshot? = nil
         if let prefetchedFoldSnapshot {
-            // Batched scan-worker fold already produced this provider's snapshot; treat it as the
+            // Batched engine batch fold already produced this provider's snapshot; treat it as the
             // runtime result (including its identity key, reported through the batch response).
             if let prefetchedFoldIdentityKey { cacheIdentityResult.set(prefetchedFoldIdentityKey) }
             fetchedSnapshot = prefetchedFoldSnapshot
@@ -1442,7 +1442,7 @@ final class WidgetDataStore {
         }
         // Antigravity's history is machine-local, so a fold-scope result can never prove which
         // Google account owns the cached quota. Ignore any identity it reports — including a key
-        // forwarded by an older or misbehaving scan worker — and let only a live-quota scope move
+        // forwarded by an older or misbehaving engine batch — and let only a live-quota scope move
         // the account stamp.
         if let identityKey = cacheIdentityResult.value,
            providerID != "antigravity" || !scope.suppressesLiveQuota
@@ -1801,7 +1801,7 @@ final class WidgetDataStore {
     }
 
     /// Provider IDs / families whose refresh parses large on-disk JSONL corpora. Internal so the
-    /// scan-worker child can serialize them the same way the app serializes its own heavy providers.
+    /// engine batch can serialize them the same way the app serializes its own heavy providers.
     nonisolated static let heavyLocalLogProviders: Set<String> = [
         // Large on-disk corpora whose folds allocate real parse working sets: JSONL logs,
         // protobuf-over-SQLite receipt stores, multi-thousand-row usage CSVs.

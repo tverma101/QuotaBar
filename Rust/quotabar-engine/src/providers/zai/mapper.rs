@@ -11,8 +11,9 @@ use serde_json::{Map, Value};
 pub const MAXIMUM_RESET_HORIZON_SECS: f64 = 2.0 * 365.0 * 24.0 * 3600.0;
 pub const MONTHLY_PERIOD_MS: i64 = 30 * DAY_MS;
 
-pub const INVALID_RESPONSE_ERROR: &str = "Z.ai returned an unexpected response.";
-pub const NO_CODING_PLAN_ERROR: &str = "This account doesn't have an active GLM Coding Plan.";
+pub const INVALID_RESPONSE_ERROR: &str = super::super::error_text::INVALID_RESPONSE;
+pub const NO_CODING_PLAN_ERROR: &str =
+    "No active GLM Coding Plan. Subscribe at z.ai/subscribe to see usage.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapperError {
@@ -62,7 +63,11 @@ pub fn plan_name(subscription_body: &[u8]) -> Option<String> {
     (!raw.is_empty()).then(|| raw.to_string())
 }
 
-pub fn map(quota_body: &[u8], subscription_body: Option<&[u8]>, now: f64) -> Result<MappedUsage, MapperError> {
+pub fn map(
+    quota_body: &[u8],
+    subscription_body: Option<&[u8]>,
+    now: f64,
+) -> Result<MappedUsage, MapperError> {
     let lines = map_quota(quota_body, now)?;
     let plan = subscription_body.and_then(plan_name);
     Ok(MappedUsage { plan, lines })
@@ -175,15 +180,30 @@ fn classify_token_window(entry: &Map<String, Value>) -> WindowOutcome {
 
 fn damaged_window_entry(entry: &Map<String, Value>, reason: &str) -> WindowOutcome {
     diagnostic_gate::log_once("zai.quota.damaged-window-entry", || {
-        qlog!(Warn, auth_tag(ID), "skipped unreadable quota window entry ({reason}): {:?}", entry);
+        qlog!(
+            Warn,
+            auth_tag(ID),
+            "skipped unreadable quota window entry ({reason}): {:?}",
+            entry
+        );
     });
     WindowOutcome::Damaged
 }
 
-fn percent_line(entry: &Map<String, Value>, label: &str, period_ms: i64, now: f64) -> Option<MetricLine> {
+fn percent_line(
+    entry: &Map<String, Value>,
+    label: &str,
+    period_ms: i64,
+    now: f64,
+) -> Option<MetricLine> {
     let Some(raw_pct) = parse::number(entry.get("percentage")) else {
         diagnostic_gate::log_once("zai.quota.damaged-percentage-entry", || {
-            qlog!(Warn, auth_tag(ID), "skipped {label} quota entry with unreadable percentage: {:?}", entry);
+            qlog!(
+                Warn,
+                auth_tag(ID),
+                "skipped {label} quota entry with unreadable percentage: {:?}",
+                entry
+            );
         });
         return None;
     };
@@ -226,7 +246,12 @@ fn web_search_line(entry: &Map<String, Value>, now: f64) -> WebSearchOutcome {
 
 fn damaged_time_limit(entry: &Map<String, Value>) -> WebSearchOutcome {
     diagnostic_gate::log_once("zai.quota.damaged-time-limit", || {
-        qlog!(Warn, auth_tag(ID), "skipped unreadable TIME_LIMIT entry: {:?}", entry);
+        qlog!(
+            Warn,
+            auth_tag(ID),
+            "skipped unreadable TIME_LIMIT entry: {:?}",
+            entry
+        );
     });
     WebSearchOutcome::Damaged
 }
@@ -241,7 +266,10 @@ pub(super) fn reset_date(value: Option<&Value>, now: f64) -> Option<f64> {
     }
 }
 
-fn find_limit<'a>(limits: &[&'a Map<String, Value>], target: &str) -> Option<&'a Map<String, Value>> {
+fn find_limit<'a>(
+    limits: &[&'a Map<String, Value>],
+    target: &str,
+) -> Option<&'a Map<String, Value>> {
     limits.iter().copied().find(|entry| {
         entry.get("type").and_then(Value::as_str) == Some(target)
             || entry.get("name").and_then(Value::as_str) == Some(target)

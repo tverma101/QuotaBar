@@ -65,7 +65,13 @@ impl PricingCatalog {
         retired_keys: HashSet<String>,
         retired_keys_are_authoritative: bool,
     ) -> PricingCatalog {
-        PricingCatalog { entries, retrieved_at, retired_keys, retired_keys_are_authoritative, fuzzy: RwLock::new(None) }
+        PricingCatalog {
+            entries,
+            retrieved_at,
+            retired_keys,
+            retired_keys_are_authoritative,
+            fuzzy: RwLock::new(None),
+        }
     }
 
     pub fn from_entries(entries: HashMap<String, ModelRates>) -> PricingCatalog {
@@ -73,7 +79,9 @@ impl PricingCatalog {
     }
 
     pub fn find_exact(&self, model: &str) -> Option<(&str, &ModelRates)> {
-        self.entries.get_key_value(model).map(|(k, v)| (k.as_str(), v))
+        self.entries
+            .get_key_value(model)
+            .map(|(k, v)| (k.as_str(), v))
     }
 
     /// Fuzzy lookup over every entry: the longest matching key wins, then the lexicographically
@@ -99,7 +107,9 @@ impl PricingCatalog {
             };
         }
         let key = &best?.key;
-        self.entries.get_key_value(key.as_str()).map(|(k, v)| (k.as_str(), v))
+        self.entries
+            .get_key_value(key.as_str())
+            .map(|(k, v)| (k.as_str(), v))
     }
 
     pub fn clear_fuzzy_index(&self) {
@@ -107,7 +117,12 @@ impl PricingCatalog {
     }
 
     fn fuzzy_index(&self) -> Arc<Vec<FuzzyEntry>> {
-        if let Some(index) = self.fuzzy.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(index) = self
+            .fuzzy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             return index.clone();
         }
         let mut slot = self.fuzzy.write().unwrap_or_else(|e| e.into_inner());
@@ -115,7 +130,10 @@ impl PricingCatalog {
             Arc::new(
                 self.entries
                     .keys()
-                    .map(|key| FuzzyEntry { key: key.clone(), normalized: normalized_key(key).into_owned() })
+                    .map(|key| FuzzyEntry {
+                        key: key.clone(),
+                        normalized: normalized_key(key).into_owned(),
+                    })
                     .collect(),
             )
         })
@@ -127,7 +145,11 @@ impl PricingCatalog {
     pub fn merging(&self, other: &PricingCatalog) -> PricingCatalog {
         let mut merged = self.entries.clone();
         merged.extend(other.entries.iter().map(|(k, v)| (k.clone(), v.clone())));
-        let mut retired: HashSet<String> = self.retired_keys.union(&other.retired_keys).cloned().collect();
+        let mut retired: HashSet<String> = self
+            .retired_keys
+            .union(&other.retired_keys)
+            .cloned()
+            .collect();
         if other.retired_keys_are_authoritative {
             for key in other.entries.keys() {
                 if !other.retired_keys.contains(key) {
@@ -140,7 +162,10 @@ impl PricingCatalog {
         }
         PricingCatalog::new(
             merged,
-            other.retrieved_at.clone().or_else(|| self.retrieved_at.clone()),
+            other
+                .retrieved_at
+                .clone()
+                .or_else(|| self.retrieved_at.clone()),
             retired,
             self.retired_keys_are_authoritative || other.retired_keys_are_authoritative,
         )
@@ -155,10 +180,24 @@ fn is_better_key(candidate: &str, current: &str) -> bool {
 
 /// `.`, `@`, `_` and spaces become `-` (`grok-4.3` -> `grok-4-3`, `space bunny` -> `space-bunny`).
 pub fn normalized_key(value: &str) -> Cow<'_, str> {
-    if !value.bytes().any(|b| matches!(b, b'.' | b'@' | b' ' | b'_')) {
+    if !value
+        .bytes()
+        .any(|b| matches!(b, b'.' | b'@' | b' ' | b'_'))
+    {
         return Cow::Borrowed(value);
     }
-    Cow::Owned(value.chars().map(|c| if matches!(c, '.' | '@' | ' ' | '_') { '-' } else { c }).collect())
+    Cow::Owned(
+        value
+            .chars()
+            .map(|c| {
+                if matches!(c, '.' | '@' | ' ' | '_') {
+                    '-'
+                } else {
+                    c
+                }
+            })
+            .collect(),
+    )
 }
 
 /// `key` occurs in `value` at a non-alphanumeric boundary, and the suffix does not continue a
@@ -212,15 +251,30 @@ mod tests {
     use super::*;
 
     fn catalog(keys: &[&str]) -> PricingCatalog {
-        PricingCatalog::from_entries(keys.iter().map(|k| (k.to_string(), ModelRates::new(1.0, 1.0, 1.0, 1.0))).collect())
+        PricingCatalog::from_entries(
+            keys.iter()
+                .map(|k| (k.to_string(), ModelRates::new(1.0, 1.0, 1.0, 1.0)))
+                .collect(),
+        )
     }
 
     #[test]
     fn fuzzy_respects_version_and_date_boundaries() {
-        let c = catalog(&["claude-sonnet-4-20250514", "claude-sonnet-4-5", "grok-4-3", "gpt-5"]);
-        assert_eq!(c.find_fuzzy("claude-sonnet-4").unwrap().0, "claude-sonnet-4-20250514");
+        let c = catalog(&[
+            "claude-sonnet-4-20250514",
+            "claude-sonnet-4-5",
+            "grok-4-3",
+            "gpt-5",
+        ]);
+        assert_eq!(
+            c.find_fuzzy("claude-sonnet-4").unwrap().0,
+            "claude-sonnet-4-20250514"
+        );
         assert_eq!(c.find_fuzzy("xai/grok-4.3").unwrap().0, "grok-4-3");
-        assert!(c.find_fuzzy("gpt-5-1").is_none(), "numeric continuation must not match");
+        assert!(
+            c.find_fuzzy("gpt-5-1").is_none(),
+            "numeric continuation must not match"
+        );
         assert_eq!(c.find_fuzzy("openai/gpt-5").unwrap().0, "gpt-5");
         assert!(c.find_fuzzy("gpt-55").is_none());
     }

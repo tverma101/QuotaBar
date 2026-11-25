@@ -7,8 +7,8 @@ use super::day::{day_key_from_usage_date, format_day, DayZone, UsageHistoryWindo
 use super::spend_model::{model_breakdown, BreakdownRequest};
 use super::{adding_saturating, format_count_row};
 use crate::model::{
-    DailyUsageEntry, DailyUsageSeries, MetricChartPoint, MetricKind, MetricLine, MetricValue, ModelUsageBreakdown,
-    ModelUsageSeries, Timestamp,
+    DailyUsageEntry, DailyUsageSeries, MetricChartPoint, MetricKind, MetricLine, MetricValue,
+    ModelUsageBreakdown, ModelUsageSeries, Timestamp,
 };
 use chrono::{Datelike, Days};
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,7 +47,12 @@ impl Default for TokenUsageOptions {
 }
 
 /// [`append_token_usage_in`] in the user's local time zone.
-pub fn append_token_usage(usage: &DailyUsageSeries, lines: &mut Vec<MetricLine>, now: Timestamp, options: &TokenUsageOptions) {
+pub fn append_token_usage(
+    usage: &DailyUsageSeries,
+    lines: &mut Vec<MetricLine>,
+    now: Timestamp,
+    options: &TokenUsageOptions,
+) {
     append_token_usage_in(usage, lines, now, options, DayZone::Local);
 }
 
@@ -68,14 +73,20 @@ pub fn append_token_usage_in(
     let has_unknown = |day: &str| unknown.get(day).is_some_and(|set| !set.is_empty());
 
     let today = zone.day_key(now);
-    let yesterday = zone.local_date(now).and_then(|d| d.checked_sub_days(Days::new(1))).map(format_day);
+    let yesterday = zone
+        .local_date(now)
+        .and_then(|d| d.checked_sub_days(Days::new(1)))
+        .map(format_day);
     let estimated_cost = |day: Option<&str>| match &options.estimated_cost_days {
         None => options.estimated,
         Some(days) => day.is_some_and(|d| days.contains(d)),
     };
     // Normalize each row's date once; every lookup below reads the same keys.
-    let keyed: Vec<(Option<String>, &DailyUsageEntry)> =
-        usage.daily.iter().map(|e| (day_key_from_usage_date(&e.date, zone), e)).collect();
+    let keyed: Vec<(Option<String>, &DailyUsageEntry)> = usage
+        .daily
+        .iter()
+        .map(|e| (day_key_from_usage_date(&e.date, zone), e))
+        .collect();
 
     let unexplained_incomplete_days: BTreeSet<String> = keyed
         .iter()
@@ -97,27 +108,47 @@ pub fn append_token_usage_in(
         let days = BTreeSet::from([day.to_string()]);
         MetricLine::Values {
             label: label.to_string(),
-            values: spend_values(entry.total_tokens, cost, estimated_cost(Some(day)), partial, lower_bound, entry.token_count_saturated),
+            values: spend_values(
+                entry.total_tokens,
+                cost,
+                estimated_cost(Some(day)),
+                partial,
+                lower_bound,
+                entry.token_count_saturated,
+            ),
             color_hex: None,
             expiries_at: Vec::new(),
-            unknown_models: unknown.get(day).map(|s| s.iter().cloned().collect()).unwrap_or_default(),
-            model_breakdown: breakdown(options, zone, &BreakdownInput {
-                days: &days,
-                total_tokens: entry.total_tokens,
-                saturated: entry.token_count_saturated,
-                cost,
-                unexplained: &unexplained_incomplete_days,
-            }),
+            unknown_models: unknown
+                .get(day)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default(),
+            model_breakdown: breakdown(
+                options,
+                zone,
+                &BreakdownInput {
+                    days: &days,
+                    total_tokens: entry.total_tokens,
+                    saturated: entry.token_count_saturated,
+                    cost,
+                    unexplained: &unexplained_incomplete_days,
+                },
+            ),
         }
     };
 
-    if let Some((_, entry)) = keyed.iter().find(|(key, _)| key.as_deref() == Some(today.as_str())) {
+    if let Some((_, entry)) = keyed
+        .iter()
+        .find(|(key, _)| key.as_deref() == Some(today.as_str()))
+    {
         if has_usage(entry) {
             lines.push(day_line("Today", entry, &today));
         }
     }
     if let Some(yesterday) = &yesterday {
-        if let Some((_, entry)) = keyed.iter().find(|(key, _)| key.as_deref() == Some(yesterday.as_str())) {
+        if let Some((_, entry)) = keyed
+            .iter()
+            .find(|(key, _)| key.as_deref() == Some(yesterday.as_str()))
+        {
             if has_usage(entry) {
                 lines.push(day_line("Yesterday", entry, yesterday));
             }
@@ -130,7 +161,11 @@ pub fn append_token_usage_in(
     let window_keys = UsageHistoryWindow::day_keys(now, zone);
     let windowed: Vec<(&str, &DailyUsageEntry)> = keyed
         .iter()
-        .filter_map(|(key, entry)| key.as_deref().filter(|k| window_keys.contains(*k)).map(|k| (k, *entry)))
+        .filter_map(|(key, entry)| {
+            key.as_deref()
+                .filter(|k| window_keys.contains(*k))
+                .map(|k| (k, *entry))
+        })
         .collect();
 
     let mut total_tokens = 0i64;
@@ -142,18 +177,25 @@ pub fn append_token_usage_in(
         }
         total_tokens = adding_saturating(total_tokens, entry.total_tokens);
     }
-    let all_unknown: BTreeSet<&String> =
-        unknown.iter().filter(|(day, _)| window_keys.contains(*day)).flat_map(|(_, models)| models.iter()).collect();
+    let all_unknown: BTreeSet<&String> = unknown
+        .iter()
+        .filter(|(day, _)| window_keys.contains(*day))
+        .flat_map(|(_, models)| models.iter())
+        .collect();
     // Keep the priced subtotal when incompleteness is explained by named unknown models. Other
     // incomplete accounting (for example, a provider-reported token mismatch) remains hidden until its
     // source can produce a trustworthy subtotal and a matching warning.
     let has_unexplained_incomplete_cost = windowed.iter().any(|(day, entry)| {
         !entry.cost_is_complete
             && (entry.has_unexplained_incomplete_cost == Some(true)
-                || (entry.has_unexplained_incomplete_cost.is_none() && !has_unknown(day) && !partial_days.contains(*day)))
+                || (entry.has_unexplained_incomplete_cost.is_none()
+                    && !has_unknown(day)
+                    && !partial_days.contains(*day)))
     });
-    let cost_samples: Vec<f64> =
-        windowed.iter().filter_map(|(day, entry)| displayable_cost(entry, day, unknown, partial_days)).collect();
+    let cost_samples: Vec<f64> = windowed
+        .iter()
+        .filter_map(|(day, entry)| displayable_cost(entry, day, unknown, partial_days))
+        .collect();
     let mut finite_cost_total = 0.0f64;
     let mut finite_cost_total_overflowed = false;
     for sample in &cost_samples {
@@ -164,7 +206,8 @@ pub fn append_token_usage_in(
         }
         finite_cost_total = next;
     }
-    let total_cost = (!has_unexplained_incomplete_cost && !cost_samples.is_empty()).then_some(finite_cost_total);
+    let total_cost =
+        (!has_unexplained_incomplete_cost && !cost_samples.is_empty()).then_some(finite_cost_total);
     if total_tokens > 0 || total_cost.unwrap_or(0.0) > 0.0 {
         // The 30-day total is incomplete whenever ANY day in the window is partial — a running session
         // keeps growing, so the sum is real but not final.
@@ -172,13 +215,15 @@ pub fn append_token_usage_in(
         let cost_is_lower_bound = finite_cost_total_overflowed
             || window_partial
             || windowed.iter().any(|(day, entry)| {
-                !entry.cost_is_complete && (entry.has_unexplained_incomplete_cost == Some(false) || has_unknown(day))
+                !entry.cost_is_complete
+                    && (entry.has_unexplained_incomplete_cost == Some(false) || has_unknown(day))
             });
         let window_estimated = match &options.estimated_cost_days {
             Some(days) => windowed.iter().any(|(day, _)| days.contains(*day)),
             None => options.estimated,
         };
-        let window_days: BTreeSet<String> = windowed.iter().map(|(day, _)| day.to_string()).collect();
+        let window_days: BTreeSet<String> =
+            windowed.iter().map(|(day, _)| day.to_string()).collect();
         lines.push(MetricLine::Values {
             label: "Last 30 Days".to_string(),
             values: spend_values(
@@ -192,13 +237,17 @@ pub fn append_token_usage_in(
             color_hex: None,
             expiries_at: Vec::new(),
             unknown_models: all_unknown.into_iter().cloned().collect(),
-            model_breakdown: breakdown(options, zone, &BreakdownInput {
-                days: &window_days,
-                total_tokens,
-                saturated: total_tokens_saturated,
-                cost: total_cost,
-                unexplained: &unexplained_incomplete_days,
-            }),
+            model_breakdown: breakdown(
+                options,
+                zone,
+                &BreakdownInput {
+                    days: &window_days,
+                    total_tokens,
+                    saturated: total_tokens_saturated,
+                    cost: total_cost,
+                    unexplained: &unexplained_incomplete_days,
+                },
+            ),
         });
     }
     // The All-At-API-Rates figure is intentionally NOT a dashboard row; the plan-versus-API comparison
@@ -213,7 +262,11 @@ struct BreakdownInput<'a> {
     unexplained: &'a BTreeSet<String>,
 }
 
-fn breakdown(options: &TokenUsageOptions, zone: DayZone, input: &BreakdownInput<'_>) -> Option<ModelUsageBreakdown> {
+fn breakdown(
+    options: &TokenUsageOptions,
+    zone: DayZone,
+    input: &BreakdownInput<'_>,
+) -> Option<ModelUsageBreakdown> {
     model_breakdown(
         options.model_usage.as_ref(),
         &BreakdownRequest {
@@ -243,7 +296,15 @@ pub fn append_usage_trend(
     partial_days: &BTreeSet<String>,
     partial_note: Option<&str>,
 ) {
-    append_usage_trend_in(usage, lines, now, note, partial_days, partial_note, DayZone::Local);
+    append_usage_trend_in(
+        usage,
+        lines,
+        now,
+        note,
+        partial_days,
+        partial_note,
+        DayZone::Local,
+    );
 }
 
 /// Append the Usage Trend chart line: one bar per calendar day over the window, value = tokens used
@@ -267,16 +328,28 @@ pub fn append_usage_trend_in(
         // Some providers have an explicit partial-day cause such as an active session or a skipped
         // oversized source record; retain the established Hermes copy by default.
         trend_note.push_str(" · ");
-        trend_note.push_str(partial_note.unwrap_or("days with an active Hermes session are partial until it ends"));
+        trend_note.push_str(
+            partial_note.unwrap_or("days with an active Hermes session are partial until it ends"),
+        );
     }
-    lines.push(MetricLine::Chart { label: "Usage Trend".to_string(), points, note: Some(trend_note) });
+    lines.push(MetricLine::Chart {
+        label: "Usage Trend".to_string(),
+        points,
+        note: Some(trend_note),
+    });
 }
 
-const MONTH_ABBREVIATIONS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTH_ABBREVIATIONS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 /// The compact month/day axis label, e.g. "Jun 21" (en-US).
 pub fn month_day_label(date: chrono::NaiveDate) -> String {
-    format!("{} {}", MONTH_ABBREVIATIONS[date.month0() as usize], date.day())
+    format!(
+        "{} {}",
+        MONTH_ABBREVIATIONS[date.month0() as usize],
+        date.day()
+    )
 }
 
 /// Per-day token points across the queried window (today + the previous 29 days), oldest first.
@@ -288,7 +361,10 @@ fn trend_points(usage: &DailyUsageSeries, now: Timestamp, zone: DayZone) -> Vec<
     let mut tokens_by_day: BTreeMap<String, i64> = BTreeMap::new();
     let mut saturated_days: BTreeSet<String> = BTreeSet::new();
     for day in &usage.daily {
-        let Some(key) = (day.total_tokens >= 0).then(|| day_key_from_usage_date(&day.date, zone)).flatten() else {
+        let Some(key) = (day.total_tokens >= 0)
+            .then(|| day_key_from_usage_date(&day.date, zone))
+            .flatten()
+        else {
             continue;
         };
         let previous = tokens_by_day.get(&key).copied().unwrap_or(0);
@@ -304,7 +380,9 @@ fn trend_points(usage: &DailyUsageSeries, now: Timestamp, zone: DayZone) -> Vec<
         return Vec::new();
     }
 
-    let Some(today) = zone.local_date(now) else { return Vec::new() };
+    let Some(today) = zone.local_date(now) else {
+        return Vec::new();
+    };
     (0..UsageHistoryWindow::TOTAL_DAYS as u64)
         .rev()
         .filter_map(|offset| today.checked_sub_days(Days::new(offset)))
@@ -316,7 +394,10 @@ fn trend_points(usage: &DailyUsageSeries, now: Timestamp, zone: DayZone) -> Vec<
             MetricChartPoint {
                 value: tokens as f64,
                 label: month_day_label(date),
-                value_label: Some(format!("{}{text} tokens", if lower_bound { "≥" } else { "" })),
+                value_label: Some(format!(
+                    "{}{text} tokens",
+                    if lower_bound { "≥" } else { "" }
+                )),
             }
         })
         .collect()
@@ -337,11 +418,16 @@ fn displayable_cost(
         .then_some(cost)
 }
 
-fn has_known_partial_cost(entry: &DailyUsageEntry, day: &str, unknown: &BTreeMap<String, BTreeSet<String>>) -> bool {
+fn has_known_partial_cost(
+    entry: &DailyUsageEntry,
+    day: &str,
+    unknown: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
     if entry.cost_is_complete || entry.has_unexplained_incomplete_cost == Some(true) {
         return false;
     }
-    entry.has_unexplained_incomplete_cost == Some(false) || unknown.get(day).is_some_and(|set| !set.is_empty())
+    entry.has_unexplained_incomplete_cost == Some(false)
+        || unknown.get(day).is_some_and(|set| !set.is_empty())
 }
 
 /// One period's spend as raw values: the estimated dollars followed by the measured token count,

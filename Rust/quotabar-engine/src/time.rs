@@ -46,7 +46,11 @@ fn digits(bytes: &[u8]) -> Option<i64> {
     if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    Some(bytes.iter().fold(0i64, |acc, b| acc * 10 + i64::from(b - b'0')))
+    Some(
+        bytes
+            .iter()
+            .fold(0i64, |acc, b| acc * 10 + i64::from(b - b'0')),
+    )
 }
 
 /// Parse the ISO-8601 shapes provider logs and APIs emit: `2026-05-01T10:00:00Z`, fractional seconds
@@ -112,7 +116,8 @@ pub fn parse_iso8601(raw: &str) -> Option<f64> {
             sign * (hh * 3600 + mm * 60)
         }
     };
-    let whole = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second - offset_seconds;
+    let whole = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
+        - offset_seconds;
     Some(whole as f64 + millis as f64 / 1_000.0)
 }
 
@@ -152,7 +157,10 @@ mod tests {
     fn parses_common_shapes() {
         let base = 1_777_629_600.0; // 2026-05-01T10:00:00Z
         assert_eq!(parse_iso8601("2026-05-01T10:00:00Z"), Some(base));
-        assert_eq!(parse_iso8601("2026-05-01T10:00:00.1239Z"), Some(base + 0.123));
+        assert_eq!(
+            parse_iso8601("2026-05-01T10:00:00.1239Z"),
+            Some(base + 0.123)
+        );
         assert_eq!(parse_iso8601("2026-05-01 10:00:00"), Some(base));
         assert_eq!(parse_iso8601("2026-05-01 10:00:00 UTC"), Some(base));
         assert_eq!(parse_iso8601("2026-05-01T12:30:00+02:30"), Some(base));

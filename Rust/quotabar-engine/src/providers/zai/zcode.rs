@@ -1,6 +1,8 @@
 //! Local ZCode SQLite + LevelDB scanner and disk cache (`ZCodeUsageScanner.swift`, `ZCodeUsageCachePersistence.swift`).
 
-use super::zcode_leveldb::{scan_leveldb_entitlement, LevelDBFile, ZCodeAllowance, ZCodeEntitlementSnapshot};
+use super::zcode_leveldb::{
+    scan_leveldb_entitlement, LevelDBFile, ZCodeAllowance, ZCodeEntitlementSnapshot,
+};
 use crate::accounting::{DailyUsageAccumulator, LogUsageScan, RowOptions};
 use crate::model::{DailyUsageEntry, DailyUsageSeries};
 use crate::paths;
@@ -145,7 +147,11 @@ impl ZCodeUsageScanner {
                     && persisted.sqlite_stamp == sqlite_stamp
                     && persisted.leveldb_stamp == leveldb_stamp
                     && persisted.pricing_token == pricing_token
-                    && promo_still_valid(persisted.result.weekend_build.as_ref(), Some(persisted.scanned_at), effective_now)
+                    && promo_still_valid(
+                        persisted.result.weekend_build.as_ref(),
+                        Some(persisted.scanned_at),
+                        effective_now,
+                    )
                 {
                     let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
                     guard.sqlite_part = Some(SqlitePart {
@@ -177,7 +183,10 @@ impl ZCodeUsageScanner {
             .clone()
             .or_else(|| entitlement.as_ref().and_then(|e| e.plan_name.clone()));
 
-        if sqlite_part.total_tokens.is_none() && sqlite_part.log_scan.is_none() && entitlement.is_none() {
+        if sqlite_part.total_tokens.is_none()
+            && sqlite_part.log_scan.is_none()
+            && entitlement.is_none()
+        {
             if let Some(err) = sqlite_part.sqlite_error {
                 return Err(SqliteError::Unreadable(err));
             }
@@ -194,7 +203,10 @@ impl ZCodeUsageScanner {
         };
 
         let scanned_at = now.unwrap_or_else(current_unix_secs);
-        self.cache.lock().unwrap_or_else(|e| e.into_inner()).scanned_at = Some(scanned_at);
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .scanned_at = Some(scanned_at);
         if sqlite_part.sqlite_error.is_none() {
             self.write_disk_cache(&DiskCacheRecord {
                 schema: CACHE_SCHEMA,
@@ -215,7 +227,9 @@ impl ZCodeUsageScanner {
         {
             let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = &guard.sqlite_part {
-                if guard.sqlite_stamp == stamp && guard.sqlite_pricing_token.as_deref() == Some(pricing_token) {
+                if guard.sqlite_stamp == stamp
+                    && guard.sqlite_pricing_token.as_deref() == Some(pricing_token)
+                {
                     return cached.clone();
                 }
             }
@@ -293,7 +307,13 @@ impl ZCodeUsageScanner {
         {
             let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if guard.has_cached_entitlement && guard.leveldb_stamp == stamp {
-                let valid = match (now, guard.entitlement.as_ref().and_then(|e| e.weekend_build.as_ref())) {
+                let valid = match (
+                    now,
+                    guard
+                        .entitlement
+                        .as_ref()
+                        .and_then(|e| e.weekend_build.as_ref()),
+                ) {
                     (Some(n), Some(promo)) => promo_still_valid(Some(promo), guard.scanned_at, n),
                     _ => true,
                 };
@@ -329,22 +349,30 @@ impl ZCodeUsageScanner {
     }
 
     fn write_disk_cache(&self, record: &DiskCacheRecord) {
-        let Ok(bytes) = serde_json::to_vec(record) else { return };
+        let Ok(bytes) = serde_json::to_vec(record) else {
+            return;
+        };
         if bytes.len() <= MAX_CACHE_BYTES {
             let _ = paths::write_atomic(&self.cache_path(), &bytes);
         }
     }
 }
 
-fn promo_still_valid(allowance: Option<&ZCodeAllowance>, scanned_at: Option<f64>, now: f64) -> bool {
-    let Some(allowance) = allowance else { return true };
+fn promo_still_valid(
+    allowance: Option<&ZCodeAllowance>,
+    scanned_at: Option<f64>,
+    now: f64,
+) -> bool {
+    let Some(allowance) = allowance else {
+        return true;
+    };
     if allowance.expires_at.is_some_and(|exp| exp <= now) {
         return false;
     }
-        let is_active_unused = allowance.effective_at.is_some_and(|e| e <= now)
-            && allowance.used == 0.0
-            && scanned_at.is_some_and(|s| allowance.effective_at.is_some_and(|e| e > s));
-        !is_active_unused
+    let is_active_unused = allowance.effective_at.is_some_and(|e| e <= now)
+        && allowance.used == 0.0
+        && scanned_at.is_some_and(|s| allowance.effective_at.is_some_and(|e| e > s));
+    !is_active_unused
 }
 
 fn read_daily_series(sqlite_path: &Path, pricing: &ModelPricing) -> Option<LogUsageScan> {
@@ -384,7 +412,9 @@ fn read_daily_series(sqlite_path: &Path, pricing: &ModelPricing) -> Option<LogUs
             if row_tokens <= 0 {
                 continue;
             }
-            let uncached_input = input.saturating_sub(cache_read).saturating_sub(cache_creation);
+            let uncached_input = input
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_creation);
             let tokens = TokenBreakdown {
                 input: uncached_input,
                 cache_write_5m: cache_creation,
@@ -394,13 +424,19 @@ fn read_daily_series(sqlite_path: &Path, pricing: &ModelPricing) -> Option<LogUs
                 is_fast: false,
             };
             let cost = pricing.estimated_cost_dollars(model, &tokens, None, true);
-            let canonical = pricing.canonical_name(model).unwrap_or_else(|| model.to_string());
+            let canonical = pricing
+                .canonical_name(model)
+                .unwrap_or_else(|| model.to_string());
             acc.add_with(
                 day,
                 row_tokens,
                 cost,
                 model,
-                RowOptions { canonical: Some(&canonical), cost_is_complete: true, token_count_saturated: false },
+                RowOptions {
+                    canonical: Some(&canonical),
+                    cost_is_complete: true,
+                    token_count_saturated: false,
+                },
             );
             if cost.is_some() {
                 acc.mark_estimated_cost(day);
@@ -424,8 +460,12 @@ fn read_daily_series(sqlite_path: &Path, pricing: &ModelPricing) -> Option<LogUs
     if let Ok(Some(raw)) = crate::sqlite::query_text(sqlite_path, fallback_sql, true) {
         let mut entries = Vec::new();
         for line in raw.lines() {
-            let Some((day, tok_str)) = line.split_once(':') else { continue };
-            let Ok(tokens) = tok_str.parse::<i64>() else { continue };
+            let Some((day, tok_str)) = line.split_once(':') else {
+                continue;
+            };
+            let Ok(tokens) = tok_str.parse::<i64>() else {
+                continue;
+            };
             if tokens > 0 {
                 entries.push(DailyUsageEntry {
                     date: day.to_string(),
@@ -471,11 +511,18 @@ fn load_leveldb_files(dir: &Path) -> Option<Vec<LevelDBFile>> {
     let mut files = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !matches!(path.extension().and_then(|s| s.to_str()), Some("log" | "ldb")) {
+        if !matches!(
+            path.extension().and_then(|s| s.to_str()),
+            Some("log" | "ldb")
+        ) {
             continue;
         }
         if let Ok(rev) = Revision::read(&path) {
-            files.push(LevelDBFile { path, modified_ns: rev.mtime_ns, size: rev.size });
+            files.push(LevelDBFile {
+                path,
+                modified_ns: rev.mtime_ns,
+                size: rev.size,
+            });
         }
     }
     Some(files)
@@ -491,7 +538,10 @@ fn leveldb_stamp(files: Option<&[LevelDBFile]>) -> Option<SourceStamp> {
             max_mtime = f.modified_ns;
         }
     }
-    (total_size > 0).then_some(SourceStamp { size: total_size, mtime_ns: max_mtime })
+    (total_size > 0).then_some(SourceStamp {
+        size: total_size,
+        mtime_ns: max_mtime,
+    })
 }
 
 fn current_unix_secs() -> f64 {

@@ -115,11 +115,17 @@ impl RefreshContext {
     }
 
     pub fn set_observed_identity_key(&self, key: impl Into<String>) {
-        *self.observed_identity_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(key.into());
+        *self
+            .observed_identity_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(key.into());
     }
 
     pub fn observed_identity_key(&self) -> Option<String> {
-        self.observed_identity_key.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.observed_identity_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 

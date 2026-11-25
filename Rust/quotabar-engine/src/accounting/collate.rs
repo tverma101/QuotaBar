@@ -41,7 +41,11 @@ fn chunks(s: &str) -> Vec<Chunk<'_>> {
         match in_digits {
             Some(prev) if prev == digit => {}
             Some(prev) => {
-                out.push(if prev { Chunk::Digits(&s[start..i]) } else { Chunk::Text(&s[start..i]) });
+                out.push(if prev {
+                    Chunk::Digits(&s[start..i])
+                } else {
+                    Chunk::Text(&s[start..i])
+                });
                 start = i;
                 in_digits = Some(digit);
             }
@@ -49,7 +53,11 @@ fn chunks(s: &str) -> Vec<Chunk<'_>> {
         }
     }
     if let Some(prev) = in_digits {
-        out.push(if prev { Chunk::Digits(&s[start..]) } else { Chunk::Text(&s[start..]) });
+        out.push(if prev {
+            Chunk::Digits(&s[start..])
+        } else {
+            Chunk::Text(&s[start..])
+        });
     }
     out
 }
@@ -89,13 +97,29 @@ mod tests {
 
     #[test]
     fn orders_naturally_and_ignores_case_first() {
-        assert_eq!(localized_standard_compare("gpt-5.5", "gpt-5.10"), Ordering::Less);
-        assert_eq!(localized_standard_compare("gpt-5", "gpt-5-codex"), Ordering::Less);
-        assert_eq!(localized_standard_compare("Beta", "alpha"), Ordering::Greater);
+        assert_eq!(
+            localized_standard_compare("gpt-5.5", "gpt-5.10"),
+            Ordering::Less
+        );
+        assert_eq!(
+            localized_standard_compare("gpt-5", "gpt-5-codex"),
+            Ordering::Less
+        );
+        assert_eq!(
+            localized_standard_compare("Beta", "alpha"),
+            Ordering::Greater
+        );
         assert_eq!(localized_standard_compare("alpha", "Beta"), Ordering::Less);
-        assert_eq!(localized_standard_compare("A", "a"), Ordering::Less, "literal tie-break");
+        assert_eq!(
+            localized_standard_compare("A", "a"),
+            Ordering::Less,
+            "literal tie-break"
+        );
         assert_eq!(localized_standard_compare("a", "a"), Ordering::Equal);
-        assert_eq!(localized_standard_compare("model-2", "model-10"), Ordering::Less);
+        assert_eq!(
+            localized_standard_compare("model-2", "model-10"),
+            Ordering::Less
+        );
         assert_eq!(localized_standard_compare("1x", "ax"), Ordering::Less);
     }
 }

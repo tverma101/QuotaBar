@@ -43,14 +43,26 @@ impl Serialize for ProgressFormat {
         // Mirrors Swift: a currency format is written as kind "dollars" plus a code so older readers
         // of the shared snapshot cache still decode it.
         let wire = match self {
-            ProgressFormat::Percent => ProgressFormatWire { kind: "percent".into(), suffix: None, code: None },
-            ProgressFormat::Dollars => ProgressFormatWire { kind: "dollars".into(), suffix: None, code: None },
-            ProgressFormat::Currency(code) => {
-                ProgressFormatWire { kind: "dollars".into(), suffix: None, code: Some(code.clone()) }
-            }
-            ProgressFormat::Count(suffix) => {
-                ProgressFormatWire { kind: "count".into(), suffix: Some(suffix.clone()), code: None }
-            }
+            ProgressFormat::Percent => ProgressFormatWire {
+                kind: "percent".into(),
+                suffix: None,
+                code: None,
+            },
+            ProgressFormat::Dollars => ProgressFormatWire {
+                kind: "dollars".into(),
+                suffix: None,
+                code: None,
+            },
+            ProgressFormat::Currency(code) => ProgressFormatWire {
+                kind: "dollars".into(),
+                suffix: None,
+                code: Some(code.clone()),
+            },
+            ProgressFormat::Count(suffix) => ProgressFormatWire {
+                kind: "count".into(),
+                suffix: Some(suffix.clone()),
+                code: None,
+            },
         };
         wire.serialize(serializer)
     }
@@ -73,7 +85,10 @@ impl<'de> Deserialize<'de> for ProgressFormat {
                 .suffix
                 .map(ProgressFormat::Count)
                 .ok_or_else(|| D::Error::missing_field("suffix")),
-            other => Err(D::Error::unknown_variant(other, &["percent", "dollars", "currency", "count"])),
+            other => Err(D::Error::unknown_variant(
+                other,
+                &["percent", "dollars", "currency", "count"],
+            )),
         }
     }
 }
@@ -135,7 +150,11 @@ fn is_false_or_empty<T>(v: &[T]) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
 pub enum MetricLine {
     Text {
         label: String,
@@ -231,7 +250,12 @@ impl MetricLine {
         }
     }
 
-    pub fn percent_progress(label: &str, used: f64, resets_at: Option<Timestamp>, period_ms: Option<i64>) -> Self {
+    pub fn percent_progress(
+        label: &str,
+        used: f64,
+        resets_at: Option<Timestamp>,
+        period_ms: Option<i64>,
+    ) -> Self {
         MetricLine::Progress {
             label: label.to_string(),
             used: finite(used),
@@ -298,7 +322,9 @@ struct DailyUsageEntryWire {
 impl From<DailyUsageEntryWire> for DailyUsageEntry {
     fn from(wire: DailyUsageEntryWire) -> Self {
         DailyUsageEntry {
-            token_count_saturated: wire.token_count_saturated.unwrap_or(wire.total_tokens == i64::MAX),
+            token_count_saturated: wire
+                .token_count_saturated
+                .unwrap_or(wire.total_tokens == i64::MAX),
             cost_is_complete: wire.cost_is_complete.unwrap_or(false),
             date: wire.date,
             total_tokens: wire.total_tokens,
@@ -380,7 +406,11 @@ pub struct ModelUsageBreakdown {
     pub total_tokens: i64,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub token_count_saturated: Option<bool>,
-    #[serde(rename = "totalCostUSD", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "totalCostUSD",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub total_cost_usd: Option<f64>,
     pub models: Vec<ModelUsageEntry>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -499,7 +529,12 @@ pub struct ProviderInfo {
 impl ProviderSnapshot {
     /// Swift `ProviderSnapshot.init`: a provider-produced snapshot assumes its meters are live; the
     /// history stamp exists only when this refresh computed history.
-    pub fn new(info: &ProviderInfo, plan: Option<String>, lines: Vec<MetricLine>, refreshed_at: Timestamp) -> Self {
+    pub fn new(
+        info: &ProviderInfo,
+        plan: Option<String>,
+        lines: Vec<MetricLine>,
+        refreshed_at: Timestamp,
+    ) -> Self {
         ProviderSnapshot {
             provider_id: info.id.clone(),
             display_name: info.display_name.clone(),
@@ -527,11 +562,20 @@ impl ProviderSnapshot {
     }
 
     /// Swift `ProviderSnapshot.error(provider:message:category:)`.
-    pub fn error(info: &ProviderInfo, message: &str, category: ErrorCategory, now: Timestamp) -> Self {
+    pub fn error(
+        info: &ProviderInfo,
+        message: &str,
+        category: ErrorCategory,
+        now: Timestamp,
+    ) -> Self {
         let mut snapshot = ProviderSnapshot::new(
             info,
             None,
-            vec![MetricLine::badge(MetricLine::ERROR_BADGE_LABEL, message, Some("#EF4444"))],
+            vec![MetricLine::badge(
+                MetricLine::ERROR_BADGE_LABEL,
+                message,
+                Some("#EF4444"),
+            )],
             now,
         );
         snapshot.error_category = Some(category);
@@ -585,21 +629,30 @@ mod tests {
                 "format": {"kind": "percent"}, "resetsAt": 1_800_000_000.0, "periodDurationMs": 604_800_000
             })
         );
-        let values = MetricLine::values("Extra usage balance", vec![MetricValue::new(3.5, MetricKind::Dollars)]);
+        let values = MetricLine::values(
+            "Extra usage balance",
+            vec![MetricValue::new(3.5, MetricKind::Dollars)],
+        );
         assert_eq!(
             serde_json::to_value(&values).unwrap(),
             serde_json::json!({"type": "values", "label": "Extra usage balance",
                 "values": [{"number": 3.5, "kind": "dollars", "estimated": false}]})
         );
         let currency = serde_json::to_value(ProgressFormat::Currency("EUR".into())).unwrap();
-        assert_eq!(currency, serde_json::json!({"kind": "dollars", "code": "EUR"}));
+        assert_eq!(
+            currency,
+            serde_json::json!({"kind": "dollars", "code": "EUR"})
+        );
         let round: ProgressFormat = serde_json::from_value(currency).unwrap();
         assert_eq!(round, ProgressFormat::Currency("EUR".into()));
     }
 
     #[test]
     fn snapshot_uses_swift_key_spellings() {
-        let info = ProviderInfo { id: "devin".into(), display_name: "Devin".into() };
+        let info = ProviderInfo {
+            id: "devin".into(),
+            display_name: "Devin".into(),
+        };
         let snap = ProviderSnapshot::error(&info, "boom", ErrorCategory::Http5xx, 10.0);
         let json = serde_json::to_value(&snap).unwrap();
         assert_eq!(json["providerID"], "devin");

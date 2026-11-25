@@ -1,7 +1,8 @@
 //! Maps Cursor's `/api/usage-summary` + `/api/usage` enterprise/team fallback responses (`CursorUsageSummaryMapper.swift`).
 
 use super::mapper::{
-    clamped_billing_duration_ms, plan_label, CursorMappedUsage, CursorMapperError, BILLING_PERIOD_MS,
+    clamped_billing_duration_ms, plan_label, CursorMappedUsage, CursorMapperError,
+    BILLING_PERIOD_MS,
 };
 use crate::model::{MetricLine, ProgressFormat};
 use crate::parse;
@@ -24,7 +25,14 @@ pub fn map(
     let mut has_total = false;
 
     if let Some(line) = requests_line(request_usage, &cycle) {
-        if let MetricLine::Progress { used, limit, resets_at, period_duration_ms, .. } = &line {
+        if let MetricLine::Progress {
+            used,
+            limit,
+            resets_at,
+            period_duration_ms,
+            ..
+        } = &line
+        {
             lines.push(MetricLine::Progress {
                 label: "Total usage".to_string(),
                 used: *used,
@@ -44,7 +52,9 @@ pub fn map(
         let ind = summary.get("individualUsage").and_then(Value::as_object);
         let team = summary.get("teamUsage").and_then(Value::as_object);
         let ind_plan = ind.and_then(|i| i.get("plan")).and_then(Value::as_object);
-        let team_pooled = team.and_then(|t| t.get("pooled")).and_then(Value::as_object);
+        let team_pooled = team
+            .and_then(|t| t.get("pooled"))
+            .and_then(Value::as_object);
 
         if !has_total {
             if let Some((used, limit, is_dollars)) = pooled_or_plan_total(ind_plan, team_pooled) {
@@ -52,7 +62,11 @@ pub fn map(
                     label: "Total usage".to_string(),
                     used,
                     limit,
-                    format: if is_dollars { ProgressFormat::Dollars } else { ProgressFormat::Percent },
+                    format: if is_dollars {
+                        ProgressFormat::Dollars
+                    } else {
+                        ProgressFormat::Percent
+                    },
                     resets_at: cycle.0,
                     period_duration_ms: Some(cycle.1),
                     color_hex: None,
@@ -90,7 +104,9 @@ pub fn map(
     }
 
     if lines.is_empty() {
-        return Err(CursorMapperError::RequestBasedUnavailable(unavailable_message.to_string()));
+        return Err(CursorMapperError::RequestBasedUnavailable(
+            unavailable_message.to_string(),
+        ));
     }
 
     Ok(CursorMappedUsage { plan, lines })
@@ -154,8 +170,9 @@ fn pooled_or_plan_total(
         if pooled.get("enabled").and_then(Value::as_bool) != Some(false) {
             if let Some(limit_cents) = parse::number(pooled.get("limit")).filter(|&l| l > 0.0) {
                 let remaining = parse::number(pooled.get("remaining"));
-                let used_cents = parse::number(pooled.get("used"))
-                    .unwrap_or_else(|| remaining.map(|r| (limit_cents - r).max(0.0)).unwrap_or(0.0));
+                let used_cents = parse::number(pooled.get("used")).unwrap_or_else(|| {
+                    remaining.map(|r| (limit_cents - r).max(0.0)).unwrap_or(0.0)
+                });
                 return Some((used_cents / 100.0, limit_cents / 100.0, true));
             }
         }
@@ -174,7 +191,10 @@ fn pooled_or_plan_total(
     None
 }
 
-fn requests_line(request_usage: Option<&Map<String, Value>>, cycle: &(Option<f64>, i64)) -> Option<MetricLine> {
+fn requests_line(
+    request_usage: Option<&Map<String, Value>>,
+    cycle: &(Option<f64>, i64),
+) -> Option<MetricLine> {
     let usage = request_usage?;
     let gpt4 = usage.get("gpt-4")?.as_object()?;
     let limit = parse::number(gpt4.get("maxRequestUsage")).filter(|&l| l > 0.0)?;
@@ -194,7 +214,10 @@ fn requests_line(request_usage: Option<&Map<String, Value>>, cycle: &(Option<f64
     })
 }
 
-fn billing_cycle(summary: Option<&Map<String, Value>>, request_usage: Option<&Map<String, Value>>) -> (Option<f64>, i64) {
+fn billing_cycle(
+    summary: Option<&Map<String, Value>>,
+    request_usage: Option<&Map<String, Value>>,
+) -> (Option<f64>, i64) {
     let start = summary
         .and_then(|s| s.get("billingCycleStart"))
         .and_then(Value::as_str)

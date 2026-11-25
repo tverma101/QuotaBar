@@ -38,7 +38,12 @@ pub trait LineParser: Send + Sync + 'static {
     const LAYOUT: u32;
     /// Cheap byte-level prefilter; rejected lines never reach `parse`.
     fn wants(&self, line: &[u8]) -> bool;
-    fn parse(&self, state: &mut Self::State, line: &[u8], out: &mut Vec<Self::Item>) -> Result<(), LineError>;
+    fn parse(
+        &self,
+        state: &mut Self::State,
+        line: &[u8],
+        out: &mut Vec<Self::Item>,
+    ) -> Result<(), LineError>;
     /// When a row counts toward usage, its timestamp (seconds since 1970) for the future-timestamp
     /// guard; `None` for rows that do not contribute.
     fn contributing_timestamp(&self, _item: &Self::Item) -> Option<f64> {
@@ -53,26 +58,42 @@ pub const FUTURE_TOLERANCE_SECONDS: f64 = 5.0 * 60.0;
 #[derive(Debug)]
 pub enum ScanError {
     Cancelled,
-    Read { path: PathBuf, error: io::Error },
-    Malformed { path: PathBuf, reason: &'static str },
+    Read {
+        path: PathBuf,
+        error: io::Error,
+    },
+    Malformed {
+        path: PathBuf,
+        reason: &'static str,
+    },
     /// The file was replaced or truncated while it was read.
-    Changed { path: PathBuf },
+    Changed {
+        path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for ScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ScanError::Cancelled => f.write_str("cancelled"),
-            ScanError::Read { path, error } => write!(f, "could not read {}: {error}", file_label(path)),
-            ScanError::Malformed { path, reason } => write!(f, "malformed record in {}: {reason}", file_label(path)),
-            ScanError::Changed { path } => write!(f, "{} changed while it was read", file_label(path)),
+            ScanError::Read { path, error } => {
+                write!(f, "could not read {}: {error}", file_label(path))
+            }
+            ScanError::Malformed { path, reason } => {
+                write!(f, "malformed record in {}: {reason}", file_label(path))
+            }
+            ScanError::Changed { path } => {
+                write!(f, "{} changed while it was read", file_label(path))
+            }
         }
     }
 }
 
 /// Log-safe file label: the file name only, never the user's directory layout.
 pub fn file_label(path: &Path) -> String {
-    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "<log>".into())
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<log>".into())
 }
 
 /// One file's rows in a scan result: committed rows then the provisional trailing-line rows.
@@ -101,7 +122,8 @@ impl<T> FileItems<T> {
 
     /// The row is dated beyond the tolerance past `now`.
     pub fn is_future_dated(&self, now: f64) -> bool {
-        self.latest_timestamp.is_some_and(|t| t > now + FUTURE_TOLERANCE_SECONDS)
+        self.latest_timestamp
+            .is_some_and(|t| t > now + FUTURE_TOLERANCE_SECONDS)
     }
 }
 
@@ -174,7 +196,11 @@ impl<P: LineParser> IncrementalScanner<P> {
             parser,
             partition: partition.into(),
             store,
-            state: Mutex::new(Partition { loaded: false, files: HashMap::new(), last_stats: ScanStats::default() }),
+            state: Mutex::new(Partition {
+                loaded: false,
+                files: HashMap::new(),
+                last_stats: ScanStats::default(),
+            }),
         }
     }
 
@@ -183,7 +209,10 @@ impl<P: LineParser> IncrementalScanner<P> {
     }
 
     pub fn last_stats(&self) -> ScanStats {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).last_stats
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_stats
     }
 
     /// Parse what changed among `files` and return every in-window file's rows, in input order.
@@ -224,7 +253,14 @@ impl<P: LineParser> IncrementalScanner<P> {
                     stats.reused += 1;
                     cached
                 }
-                (Plan::Parse(_), Some(Parsed { cached, appended, bytes_read })) => {
+                (
+                    Plan::Parse(_),
+                    Some(Parsed {
+                        cached,
+                        appended,
+                        bytes_read,
+                    }),
+                ) => {
                     if appended {
                         stats.appended += 1;
                     } else {
@@ -237,7 +273,9 @@ impl<P: LineParser> IncrementalScanner<P> {
                     partition.files.insert(file.path.clone(), cached.clone());
                     cached
                 }
-                (Plan::Parse(_), None) => unreachable!("every planned parse produced a result or failed the scan"),
+                (Plan::Parse(_), None) => {
+                    unreachable!("every planned parse produced a result or failed the scan")
+                }
             };
             results.push(FileItems {
                 path: file.path.clone(),
@@ -247,13 +285,22 @@ impl<P: LineParser> IncrementalScanner<P> {
                 latest_timestamp: max_opt(entry.latest_committed, entry.latest_fragment),
             });
         }
-        let keep: std::collections::HashSet<&Path> = in_window.iter().map(|f| f.path.as_path()).collect();
-        let removed: Vec<PathBuf> = partition.files.keys().filter(|p| !keep.contains(p.as_path())).cloned().collect();
+        let keep: std::collections::HashSet<&Path> =
+            in_window.iter().map(|f| f.path.as_path()).collect();
+        let removed: Vec<PathBuf> = partition
+            .files
+            .keys()
+            .filter(|p| !keep.contains(p.as_path()))
+            .cloned()
+            .collect();
         for path in &removed {
             partition.files.remove(path);
         }
         if let Some(store) = self.store {
-            let removed: Vec<String> = removed.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            let removed: Vec<String> = removed
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
             store.commit(&self.partition, P::LAYOUT, &changed, &removed);
         }
         partition.last_stats = stats;
@@ -266,14 +313,23 @@ impl<P: LineParser> IncrementalScanner<P> {
         plans: &[Plan<P>],
         cancel: &CancelToken,
     ) -> Result<Vec<Option<Parsed<P>>>, ScanError> {
-        let jobs: Vec<usize> = plans.iter().enumerate().filter(|(_, p)| matches!(p, Plan::Parse(_))).map(|(i, _)| i).collect();
+        let jobs: Vec<usize> = plans
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p, Plan::Parse(_)))
+            .map(|(i, _)| i)
+            .collect();
         let mut results: Vec<Option<Parsed<P>>> = (0..files.len()).map(|_| None).collect();
         if jobs.is_empty() {
             return Ok(results);
         }
-        let workers = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4).min(jobs.len());
+        let workers = std::thread::available_parallelism()
+            .map_or(2, |n| n.get())
+            .clamp(1, 4)
+            .min(jobs.len());
         let next = AtomicUsize::new(0);
-        let slots: Mutex<Vec<(usize, Result<Parsed<P>, ScanError>)>> = Mutex::new(Vec::with_capacity(jobs.len()));
+        let slots: Mutex<Vec<(usize, Result<Parsed<P>, ScanError>)>> =
+            Mutex::new(Vec::with_capacity(jobs.len()));
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| loop {
@@ -285,7 +341,10 @@ impl<P: LineParser> IncrementalScanner<P> {
                     };
                     let outcome = self.parse_file(files[index], base, cancel);
                     let failed = outcome.is_err();
-                    slots.lock().unwrap_or_else(|e| e.into_inner()).push((index, outcome));
+                    slots
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((index, outcome));
                     if failed {
                         // Stop the other workers early; the scan fails as a whole.
                         next.store(jobs.len(), Ordering::Relaxed);
@@ -299,7 +358,11 @@ impl<P: LineParser> IncrementalScanner<P> {
         for (index, outcome) in outcomes {
             results[index] = Some(outcome?);
         }
-        if results.iter().zip(plans).any(|(r, p)| matches!(p, Plan::Parse(_)) && r.is_none()) {
+        if results
+            .iter()
+            .zip(plans)
+            .any(|(r, p)| matches!(p, Plan::Parse(_)) && r.is_none())
+        {
             // A worker stopped early after another failed; the failure was returned above, so this is
             // only reachable through cancellation.
             return Err(ScanError::Cancelled);
@@ -307,9 +370,17 @@ impl<P: LineParser> IncrementalScanner<P> {
         Ok(results)
     }
 
-    fn parse_file(&self, file: &DiscoveredFile, base: Option<&Cached<P>>, cancel: &CancelToken) -> Result<Parsed<P>, ScanError> {
+    fn parse_file(
+        &self,
+        file: &DiscoveredFile,
+        base: Option<&Cached<P>>,
+        cancel: &CancelToken,
+    ) -> Result<Parsed<P>, ScanError> {
         cancel.check().map_err(|_| ScanError::Cancelled)?;
-        let read_err = |error| ScanError::Read { path: file.path.clone(), error };
+        let read_err = |error| ScanError::Read {
+            path: file.path.clone(),
+            error,
+        };
         if file.is_zstd() {
             return self.parse_zstd(file, cancel);
         }
@@ -334,7 +405,10 @@ impl<P: LineParser> IncrementalScanner<P> {
             match self.parser.parse(&mut state, line, &mut items) {
                 Ok(()) => true,
                 Err(LineError(reason)) => {
-                    failure = Some(ScanError::Malformed { path: file.path.clone(), reason });
+                    failure = Some(ScanError::Malformed {
+                        path: file.path.clone(),
+                        reason,
+                    });
                     false
                 }
             }
@@ -348,18 +422,32 @@ impl<P: LineParser> IncrementalScanner<P> {
         let mut fragment = Vec::new();
         if !summary.fragment.is_empty() && self.parser.wants(&summary.fragment) {
             let mut scratch = state.clone();
-            if self.parser.parse(&mut scratch, &summary.fragment, &mut fragment).is_err() {
+            if self
+                .parser
+                .parse(&mut scratch, &summary.fragment, &mut fragment)
+                .is_err()
+            {
                 fragment.clear();
-                qlog!(Debug, "scan", "{}: trailing line is incomplete; it is re-read on the next scan", file_label(&file.path));
+                qlog!(
+                    Debug,
+                    "scan",
+                    "{}: trailing line is incomplete; it is re-read on the next scan",
+                    file_label(&file.path)
+                );
             }
         }
         // Only append-only growth may follow the read: the bytes we parsed must still be the file's.
         let after = Revision::read(&file.path).map_err(read_err)?;
         if !after.same_file(&file.revision) || after.size < file.revision.size {
-            return Err(ScanError::Changed { path: file.path.clone() });
+            return Err(ScanError::Changed {
+                path: file.path.clone(),
+            });
         }
         let anchor = reader::prefix_anchor(&file.path, summary.committed_end).map_err(read_err)?;
-        let latest_committed = max_opt(resume.and_then(|b| b.latest_committed), self.latest_of(&items));
+        let latest_committed = max_opt(
+            resume.and_then(|b| b.latest_committed),
+            self.latest_of(&items),
+        );
         let latest_fragment = self.latest_of(&fragment);
         let items = match resume {
             Some(base) if !items.is_empty() => {
@@ -391,14 +479,20 @@ impl<P: LineParser> IncrementalScanner<P> {
     /// The cached prefix still describes the file: same inode, grown (never shrunk or same-size
     /// rewritten), and the sampled signature of the parsed bytes is unchanged.
     fn can_append(&self, file: &DiscoveredFile, base: &Cached<P>) -> bool {
-        let Some(anchor) = base.anchor else { return false };
+        let Some(anchor) = base.anchor else {
+            return false;
+        };
         base.revision.same_file(&file.revision)
             && file.revision.size > base.revision.size
             && base.committed_end <= file.revision.size
             && reader::prefix_anchor(&file.path, base.committed_end).is_ok_and(|now| now == anchor)
     }
 
-    fn parse_zstd(&self, file: &DiscoveredFile, cancel: &CancelToken) -> Result<Parsed<P>, ScanError> {
+    fn parse_zstd(
+        &self,
+        file: &DiscoveredFile,
+        cancel: &CancelToken,
+    ) -> Result<Parsed<P>, ScanError> {
         let mut state = P::State::default();
         let mut items = Vec::new();
         let mut failure = None;
@@ -413,12 +507,18 @@ impl<P: LineParser> IncrementalScanner<P> {
             match self.parser.parse(&mut state, line, &mut items) {
                 Ok(()) => true,
                 Err(LineError(reason)) => {
-                    failure = Some(ScanError::Malformed { path: file.path.clone(), reason });
+                    failure = Some(ScanError::Malformed {
+                        path: file.path.clone(),
+                        reason,
+                    });
                     false
                 }
             }
         })
-        .map_err(|error| ScanError::Read { path: file.path.clone(), error })?;
+        .map_err(|error| ScanError::Read {
+            path: file.path.clone(),
+            error,
+        })?;
         if let Some(failure) = failure {
             return Err(failure);
         }
@@ -453,7 +553,9 @@ impl<P: LineParser> IncrementalScanner<P> {
     }
 
     fn load_from_store(&self) -> HashMap<PathBuf, Cached<P>> {
-        let Some(store) = self.store else { return HashMap::new() };
+        let Some(store) = self.store else {
+            return HashMap::new();
+        };
         let rows = store.load_partition(&self.partition, P::LAYOUT);
         let mut files = HashMap::with_capacity(rows.len());
         let mut corrupt = 0usize;
@@ -481,7 +583,12 @@ impl<P: LineParser> IncrementalScanner<P> {
             }
         }
         if corrupt > 0 {
-            qlog!(Warn, "scan-cache", "{}: {corrupt} cached file record(s) were unreadable and will be re-parsed", self.partition);
+            qlog!(
+                Warn,
+                "scan-cache",
+                "{}: {corrupt} cached file record(s) were unreadable and will be re-parsed",
+                self.partition
+            );
         }
         files
     }
@@ -489,7 +596,10 @@ impl<P: LineParser> IncrementalScanner<P> {
 
 impl<P: LineParser> IncrementalScanner<P> {
     fn latest_of(&self, items: &[P::Item]) -> Option<f64> {
-        items.iter().filter_map(|i| self.parser.contributing_timestamp(i)).reduce(f64::max)
+        items
+            .iter()
+            .filter_map(|i| self.parser.contributing_timestamp(i))
+            .reduce(f64::max)
     }
 }
 

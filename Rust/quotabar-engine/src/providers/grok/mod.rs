@@ -47,7 +47,10 @@ pub struct GrokProvider {
 impl GrokProvider {
     pub fn live() -> Self {
         GrokProvider {
-            info: ProviderInfo { id: ID.into(), display_name: "Grok".into() },
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "Grok".into(),
+            },
             auth: None,
             http: http::shared(),
             logs: None,
@@ -57,7 +60,10 @@ impl GrokProvider {
 
     pub fn new(auth: GrokAuthStore, http: Arc<dyn HttpClient>, logs: GrokLogUsageScanner) -> Self {
         GrokProvider {
-            info: ProviderInfo { id: ID.into(), display_name: "Grok".into() },
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "Grok".into(),
+            },
             auth: Some(auth),
             http,
             logs: Some(logs),
@@ -84,9 +90,16 @@ impl GrokProvider {
             Ok(r) => r,
             Err(HttpError::Cancelled) => return Err(GrokProviderError::Cancelled),
             Err(_) => {
-                diagnostic_gate::log_once(&refresh_failure_key(store, &original, "transport"), || {
-                    qlog!(Warn, auth_tag(ID), "token refresh request failed (transport)");
-                });
+                diagnostic_gate::log_once(
+                    &refresh_failure_key(store, &original, "transport"),
+                    || {
+                        qlog!(
+                            Warn,
+                            auth_tag(ID),
+                            "token refresh request failed (transport)"
+                        );
+                    },
+                );
                 return Err(GrokProviderError::Usage(GrokUsageError::ConnectionFailed));
             }
         };
@@ -95,35 +108,62 @@ impl GrokProvider {
         }
         if !resp.is_success() {
             let status = resp.status;
-            diagnostic_gate::log_once(&refresh_failure_key(store, &original, &format!("http.{status}")), || {
-                qlog!(Warn, auth_tag(ID), "token refresh failed (HTTP {status})");
-            });
+            diagnostic_gate::log_once(
+                &refresh_failure_key(store, &original, &format!("http.{status}")),
+                || {
+                    qlog!(Warn, auth_tag(ID), "token refresh failed (HTTP {status})");
+                },
+            );
             if status == 400 || status == 401 {
                 return Ok(None);
             }
-            return Err(GrokProviderError::Usage(GrokUsageError::RequestFailed(status)));
+            return Err(GrokProviderError::Usage(GrokUsageError::RequestFailed(
+                status,
+            )));
         }
         let Some(decoded) = client::decode_refresh_response(&resp) else {
-            diagnostic_gate::log_once(&refresh_failure_key(store, &original, "invalid-response"), || {
-                qlog!(Warn, auth_tag(ID), "token refresh returned an undecodable or empty access token");
-            });
+            diagnostic_gate::log_once(
+                &refresh_failure_key(store, &original, "invalid-response"),
+                || {
+                    qlog!(
+                        Warn,
+                        auth_tag(ID),
+                        "token refresh returned an undecodable or empty access token"
+                    );
+                },
+            );
             return Ok(None);
         };
         let access_token = decoded.access_token.trim().to_string();
         if access_token.is_empty() {
-            diagnostic_gate::log_once(&refresh_failure_key(store, &original, "invalid-response"), || {
-                qlog!(Warn, auth_tag(ID), "token refresh returned an undecodable or empty access token");
-            });
+            diagnostic_gate::log_once(
+                &refresh_failure_key(store, &original, "invalid-response"),
+                || {
+                    qlog!(
+                        Warn,
+                        auth_tag(ID),
+                        "token refresh returned an undecodable or empty access token"
+                    );
+                },
+            );
             return Ok(None);
         }
 
         diagnostic_gate::clear_prefix(&refresh_diag_prefix(&original.entry_key));
         state.token = access_token.clone();
         state.entry.key = Some(access_token.clone());
-        if let Some(new_rt) = decoded.refresh_token.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        if let Some(new_rt) = decoded
+            .refresh_token
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
             state.entry.refresh_token = Some(new_rt);
         }
-        if let Some(new_id) = decoded.id_token.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        if let Some(new_id) = decoded
+            .id_token
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
             state.entry.id_token = Some(new_id);
         }
         let expires_at = decoded
@@ -136,13 +176,20 @@ impl GrokProvider {
 
         match store.save_replacing(state, &original) {
             Ok(()) => diagnostic_gate::clear_prefix(&refresh_diag_prefix(&original.entry_key)),
-            Err(err @ (GrokAuthError::AuthConflict | GrokAuthError::CredentialsUnreadable | GrokAuthError::InvalidAuth)) => {
+            Err(
+                err @ (GrokAuthError::AuthConflict
+                | GrokAuthError::CredentialsUnreadable
+                | GrokAuthError::InvalidAuth),
+            ) => {
                 return Err(GrokProviderError::Auth(err));
             }
             Err(_) => {
-                diagnostic_gate::log_once(&refresh_failure_key(store, &original, "persist"), || {
-                    qlog!(Error, auth_tag(ID), "failed to persist rotated credentials; using the refreshed token for this session only");
-                });
+                diagnostic_gate::log_once(
+                    &refresh_failure_key(store, &original, "persist"),
+                    || {
+                        qlog!(Error, auth_tag(ID), "failed to persist rotated credentials; using the refreshed token for this session only");
+                    },
+                );
             }
         }
         if ctx.is_cancelled() {
@@ -151,7 +198,12 @@ impl GrokProvider {
         Ok(Some(access_token))
     }
 
-    fn fetch_plan_name(&self, access_token: &str, account: &str, ctx: &RefreshContext) -> Result<Option<String>, ()> {
+    fn fetch_plan_name(
+        &self,
+        access_token: &str,
+        account: &str,
+        ctx: &RefreshContext,
+    ) -> Result<Option<String>, ()> {
         if ctx.is_cancelled() {
             return Err(());
         }
@@ -177,14 +229,22 @@ impl GrokProvider {
             Ok(resp) => {
                 let code = resp.status;
                 diagnostic_gate::log_once(PLAN_FAILURE_DIAGNOSTIC_KEY, || {
-                    qlog!(Warn, plugin_tag(ID), "plan label request failed (HTTP {code})");
+                    qlog!(
+                        Warn,
+                        plugin_tag(ID),
+                        "plan label request failed (HTTP {code})"
+                    );
                 });
                 Ok(self.cached_plan_for(account))
             }
             Err(HttpError::Cancelled) => Err(()),
             Err(err) => {
                 diagnostic_gate::log_once(PLAN_FAILURE_DIAGNOSTIC_KEY, || {
-                    qlog!(Warn, plugin_tag(ID), "plan label request failed (transport): {err}");
+                    qlog!(
+                        Warn,
+                        plugin_tag(ID),
+                        "plan label request failed (transport): {err}"
+                    );
                 });
                 Ok(self.cached_plan_for(account))
             }
@@ -200,7 +260,12 @@ impl GrokProvider {
             .and_then(|c| c.plan.clone())
     }
 
-    fn probe(&self, store: &GrokAuthStore, state: &mut GrokAuthState, ctx: &RefreshContext) -> Result<ProviderSnapshot, GrokProviderError> {
+    fn probe(
+        &self,
+        store: &GrokAuthStore,
+        state: &mut GrokAuthState,
+        ctx: &RefreshContext,
+    ) -> Result<ProviderSnapshot, GrokProviderError> {
         if ctx.is_cancelled() {
             return Err(GrokProviderError::Cancelled);
         }
@@ -235,14 +300,20 @@ impl GrokProvider {
                 RetryOutcome::ConnectionFailed | RetryOutcome::RetriedConnectionFailed => {
                     return Err(GrokProviderError::Usage(GrokUsageError::ConnectionFailed));
                 }
-                RetryOutcome::AuthExpired => return Err(GrokProviderError::Auth(GrokAuthError::Expired)),
+                RetryOutcome::AuthExpired => {
+                    return Err(GrokProviderError::Auth(GrokAuthError::Expired))
+                }
                 RetryOutcome::RefreshError(e) => return Err(e),
             };
             if !resp.is_success() {
-                return Err(GrokProviderError::Usage(GrokUsageError::RequestFailed(resp.status)));
+                return Err(GrokProviderError::Usage(GrokUsageError::RequestFailed(
+                    resp.status,
+                )));
             }
             lines = mapper::map_credits_config(&resp.body).map_err(GrokProviderError::Usage)?;
-            plan = self.fetch_plan_name(&state.token, &state.entry_key, ctx).map_err(|()| GrokProviderError::Cancelled)?;
+            plan = self
+                .fetch_plan_name(&state.token, &state.entry_key, ctx)
+                .map_err(|()| GrokProviderError::Cancelled)?;
         }
 
         if ctx.scope.skips_local_accounting() {
@@ -253,7 +324,11 @@ impl GrokProvider {
         Ok(ProviderSnapshot::new(&self.info, plan, lines, ctx.now).with_usage_history(history))
     }
 
-    fn append_local_usage(&self, lines: &mut Vec<MetricLine>, ctx: &RefreshContext) -> Option<ProviderUsageHistory> {
+    fn append_local_usage(
+        &self,
+        lines: &mut Vec<MetricLine>,
+        ctx: &RefreshContext,
+    ) -> Option<ProviderUsageHistory> {
         let days_back = UsageHistoryWindow::lifetime_days(ctx.now, DayZone::Local);
         let skip = ctx.skip_model_catalog_refresh;
         let pricing_fn = || pricing::shared().current(skip);
@@ -276,7 +351,14 @@ impl GrokProvider {
             estimated_cost_days: scan.estimated_cost_days.clone(),
         };
         append_token_usage(&scan.series, lines, ctx.now, &opts);
-        append_usage_trend(&scan.series, lines, ctx.now, LOCAL_SOURCE_NOTE, &Default::default(), None);
+        append_usage_trend(
+            &scan.series,
+            lines,
+            ctx.now,
+            LOCAL_SOURCE_NOTE,
+            &Default::default(),
+            None,
+        );
         Some(ProviderUsageHistory {
             series: scan.series,
             model_usage: scan.model_usage,
@@ -298,8 +380,12 @@ enum GrokProviderError {
 impl GrokProviderError {
     fn into_snapshot(self, info: &ProviderInfo, ctx: &RefreshContext) -> ProviderSnapshot {
         match self {
-            GrokProviderError::Auth(e) => ProviderSnapshot::error(info, e.message(), e.category(), ctx.now),
-            GrokProviderError::Usage(e) => ProviderSnapshot::error(info, &e.message(), e.category(), ctx.now),
+            GrokProviderError::Auth(e) => {
+                ProviderSnapshot::error(info, e.message(), e.category(), ctx.now)
+            }
+            GrokProviderError::Usage(e) => {
+                ProviderSnapshot::error(info, &e.message(), e.category(), ctx.now)
+            }
             GrokProviderError::Cancelled => cancelled_snapshot(info, ctx),
         }
     }
@@ -323,7 +409,8 @@ impl ProviderRuntime for GrokProvider {
             let mut lines = Vec::new();
             let history = self.append_local_usage(&mut lines, ctx);
             MetricLine::append_no_data_if_needed(&mut lines);
-            return ProviderSnapshot::new(&self.info, None, lines, ctx.now).with_usage_history(history);
+            return ProviderSnapshot::new(&self.info, None, lines, ctx.now)
+                .with_usage_history(history);
         }
 
         let store = self.effective_auth();
@@ -391,5 +478,9 @@ fn refresh_diag_prefix(entry_key: &str) -> String {
 
 fn refresh_failure_key(store: &GrokAuthStore, state: &GrokAuthState, kind: &str) -> String {
     let rt = store.refresh_token(&state.entry).unwrap_or_default();
-    format!("{}{}.{kind}", refresh_diag_prefix(&state.entry_key), stable_fingerprint(&rt))
+    format!(
+        "{}{}.{kind}",
+        refresh_diag_prefix(&state.entry_key),
+        stable_fingerprint(&rt)
+    )
 }

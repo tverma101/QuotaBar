@@ -25,12 +25,18 @@ pub enum CopilotUsageError {
 impl CopilotUsageError {
     pub fn message(self) -> String {
         match self {
-            CopilotUsageError::InvalidResponse => "Copilot usage response invalid. Try again later.".into(),
-            CopilotUsageError::ConnectionFailed => "Couldn't reach GitHub. Check your connection.".into(),
+            CopilotUsageError::InvalidResponse => {
+                "Copilot usage response invalid. Try again later.".into()
+            }
+            CopilotUsageError::ConnectionFailed => {
+                "Couldn't reach GitHub. Check your connection.".into()
+            }
             CopilotUsageError::RequestFailed(status) => {
                 format!("Copilot usage request failed (HTTP {status}). Try again later.")
             }
-            CopilotUsageError::QuotaUnavailable => "Copilot usage data is unavailable for this account.".into(),
+            CopilotUsageError::QuotaUnavailable => {
+                "Copilot usage data is unavailable for this account.".into()
+            }
         }
     }
 
@@ -51,7 +57,9 @@ pub fn map_user_response(body: &[u8]) -> Result<MappedUsage, CopilotUsageError> 
     map_user_object(&root)
 }
 
-pub fn map_user_object(body: &serde_json::Map<String, Value>) -> Result<MappedUsage, CopilotUsageError> {
+pub fn map_user_object(
+    body: &serde_json::Map<String, Value>,
+) -> Result<MappedUsage, CopilotUsageError> {
     let plan = plan_label(body.get("copilot_plan"));
     let resets_at = parse_reset_date(body.get("quota_reset_date"))
         .or_else(|| parse_reset_date(body.get("limited_user_reset_date")));
@@ -69,7 +77,11 @@ pub fn map_user_object(body: &serde_json::Map<String, Value>) -> Result<MappedUs
     if let Some(chat) = snapshot_line("Chat", snapshots.and_then(|s| s.get("chat")), resets_at) {
         lines.push(chat);
     }
-    if let Some(comp) = snapshot_line("Completions", snapshots.and_then(|s| s.get("completions")), resets_at) {
+    if let Some(comp) = snapshot_line(
+        "Completions",
+        snapshots.and_then(|s| s.get("completions")),
+        resets_at,
+    ) {
         lines.push(comp);
     }
 
@@ -125,15 +137,25 @@ pub fn org_usage_lines(body: &[u8]) -> Option<Vec<MetricLine>> {
     }
     let credits: f64 = credit_items
         .iter()
-        .map(|i| parse::number(i.get("grossQuantity")).unwrap_or(0.0).max(0.0))
+        .map(|i| {
+            parse::number(i.get("grossQuantity"))
+                .unwrap_or(0.0)
+                .max(0.0)
+        })
         .sum();
     let spend: f64 = credit_items
         .iter()
         .map(|i| parse::number(i.get("netAmount")).unwrap_or(0.0).max(0.0))
         .sum();
     Some(vec![
-        MetricLine::values("Org Credits", vec![MetricValue::new(credits, MetricKind::Count).with_label("credits")]),
-        MetricLine::values("Org Spend", vec![MetricValue::new(spend, MetricKind::Dollars)]),
+        MetricLine::values(
+            "Org Credits",
+            vec![MetricValue::new(credits, MetricKind::Count).with_label("credits")],
+        ),
+        MetricLine::values(
+            "Org Spend",
+            vec![MetricValue::new(spend, MetricKind::Dollars)],
+        ),
     ])
 }
 
@@ -149,27 +171,40 @@ fn is_credit_unit(val: Option<&Value>) -> bool {
     })
 }
 
-fn snapshot_line(label: &str, raw: Option<&Value>, resets_at: Option<Timestamp>) -> Option<MetricLine> {
+fn snapshot_line(
+    label: &str,
+    raw: Option<&Value>,
+    resets_at: Option<Timestamp>,
+) -> Option<MetricLine> {
     let snapshot = raw?.as_object()?;
     let entitlement = parse::number(snapshot.get("entitlement"));
     let remaining = parse::number(snapshot.get("remaining"));
 
-    if parse::bool(snapshot.get("unlimited")) == Some(true) || entitlement == Some(-1.0) || remaining == Some(-1.0) {
+    if parse::bool(snapshot.get("unlimited")) == Some(true)
+        || entitlement == Some(-1.0)
+        || remaining == Some(-1.0)
+    {
         return None;
     }
     if entitlement == Some(0.0) {
         return None;
     }
 
-    let used_percent = if let Some(percent_remaining) = parse::number(snapshot.get("percent_remaining")) {
-        clamp_percent(100.0 - percent_remaining)
-    } else if let (Some(ent), Some(rem)) = (entitlement.filter(|e| *e > 0.0), remaining) {
-        clamp_percent(100.0 - (rem / ent) * 100.0)
-    } else {
-        return None;
-    };
+    let used_percent =
+        if let Some(percent_remaining) = parse::number(snapshot.get("percent_remaining")) {
+            clamp_percent(100.0 - percent_remaining)
+        } else if let (Some(ent), Some(rem)) = (entitlement.filter(|e| *e > 0.0), remaining) {
+            clamp_percent(100.0 - (rem / ent) * 100.0)
+        } else {
+            return None;
+        };
 
-    Some(MetricLine::percent_progress(label, used_percent, resets_at, Some(PERIOD_MS)))
+    Some(MetricLine::percent_progress(
+        label,
+        used_percent,
+        resets_at,
+        Some(PERIOD_MS),
+    ))
 }
 
 fn personal_credits_lines(raw: Option<&Value>) -> Vec<MetricLine> {
@@ -179,7 +214,10 @@ fn personal_credits_lines(raw: Option<&Value>) -> Vec<MetricLine> {
     let Some(used) = parse::number(snapshot.get("credits_used")).filter(|v| *v > 0.0) else {
         return Vec::new();
     };
-    vec![MetricLine::values("Credits", vec![MetricValue::new(used, MetricKind::Count)])]
+    vec![MetricLine::values(
+        "Credits",
+        vec![MetricValue::new(used, MetricKind::Count)],
+    )]
 }
 
 fn overage_line(raw: Option<&Value>) -> Option<MetricLine> {
@@ -187,8 +225,13 @@ fn overage_line(raw: Option<&Value>) -> Option<MetricLine> {
     if parse::bool(snapshot.get("overage_permitted")) != Some(true) {
         return None;
     }
-    let overage = parse::number(snapshot.get("overage_count")).unwrap_or(0.0).max(0.0);
-    Some(MetricLine::values("Extra Usage", vec![MetricValue::new(overage, MetricKind::Count)]))
+    let overage = parse::number(snapshot.get("overage_count"))
+        .unwrap_or(0.0)
+        .max(0.0);
+    Some(MetricLine::values(
+        "Extra Usage",
+        vec![MetricValue::new(overage, MetricKind::Count)],
+    ))
 }
 
 fn limited_line(
@@ -200,7 +243,12 @@ fn limited_line(
     let total = parse::number(total).filter(|t| *t > 0.0)?;
     let remaining = parse::number(remaining)?;
     let used = (total - remaining).max(0.0);
-    Some(MetricLine::percent_progress(label, clamp_percent((used / total) * 100.0), resets_at, Some(PERIOD_MS)))
+    Some(MetricLine::percent_progress(
+        label,
+        clamp_percent((used / total) * 100.0),
+        resets_at,
+        Some(PERIOD_MS),
+    ))
 }
 
 fn plan_label(value: Option<&Value>) -> Option<String> {

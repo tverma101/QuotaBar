@@ -71,7 +71,7 @@ enum ProviderRefreshDeadline {
                     // Cancel the deadline the moment the snapshot lands, so a fast refresh doesn't leave
                     // a timer sleeping per provider until it expires.
                     deadline.cancel()
-                    // Between-fold relief: sequential provider folds — the scan-worker child runs
+                    // Between-fold relief: sequential provider folds — the engine batch runs
                     // providers back to back through this same chokepoint — have no store-level
                     // unload pass between them, so one provider's freed parse churn would stack
                     // onto the next provider's fold. The app's own post-refresh hook repeats this

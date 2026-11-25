@@ -44,7 +44,22 @@ pub fn open_read_only(path: &Path) -> Result<Option<Connection>, SqliteError> {
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn open_for_query(path: &Path, allow_wal_retry: bool, deadline: Instant) -> Result<Option<Connection>, SqliteError> {
+/// [`open_read_only`] with a caller-chosen budget for the connection's whole query sequence. The
+/// five-second default suits probes and small stores; a scanner that deliberately chunks a large
+/// full-history fold can spend longer in total while keeping every individual statement bounded.
+pub fn open_read_only_within(
+    path: &Path,
+    timeout: Duration,
+) -> Result<Option<Connection>, SqliteError> {
+    let timeout = timeout.clamp(Duration::from_millis(100), MAX_QUERY_TIMEOUT);
+    open_for_query(path, false, Instant::now() + timeout)
+}
+
+fn open_for_query(
+    path: &Path,
+    allow_wal_retry: bool,
+    deadline: Instant,
+) -> Result<Option<Connection>, SqliteError> {
     match path.metadata() {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -67,21 +82,29 @@ fn open_for_query(path: &Path, allow_wal_retry: bool, deadline: Instant) -> Resu
         {
             // The read/write handle can initialize WAL shared memory. There is no CREATE flag and
             // query_only prevents writes through this handle.
-            open(OpenFlags::SQLITE_OPEN_READ_WRITE).map(Some).map_err(Into::into)
+            open(OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map(Some)
+                .map_err(Into::into)
         }
         result => result.map(Some).map_err(Into::into),
     }
 }
 
 fn bound_query(conn: &Connection, deadline: Instant) -> rusqlite::Result<()> {
-    conn.busy_timeout(Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())))?;
+    conn.busy_timeout(
+        Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())),
+    )?;
     conn.progress_handler(1000, Some(move || Instant::now() >= deadline));
     Ok(())
 }
 
 /// The SQLite shell's plain list output. Some legacy scanner queries consume multiple rows
 /// separated by newlines, with pipes between columns and empty strings for SQL NULLs.
-pub fn query_text(path: &Path, sql: &str, allow_wal_retry: bool) -> Result<Option<String>, SqliteError> {
+pub fn query_text(
+    path: &Path,
+    sql: &str,
+    allow_wal_retry: bool,
+) -> Result<Option<String>, SqliteError> {
     query_text_within(path, sql, allow_wal_retry, QUERY_TIMEOUT)
 }
 
@@ -96,10 +119,14 @@ pub fn query_text_within(
     timeout: Duration,
 ) -> Result<Option<String>, SqliteError> {
     let timeout = timeout.clamp(Duration::from_millis(100), MAX_QUERY_TIMEOUT);
-    let Some(conn) = open_for_query(path, allow_wal_retry, Instant::now() + timeout)? else { return Ok(None) };
+    let Some(conn) = open_for_query(path, allow_wal_retry, Instant::now() + timeout)? else {
+        return Ok(None);
+    };
     let mut statement = conn.prepare(sql)?;
     if !statement.readonly() {
-        return Err(SqliteError::Unreadable("Expected a read-only SQLite query.".into()));
+        return Err(SqliteError::Unreadable(
+            "Expected a read-only SQLite query.".into(),
+        ));
     }
     let columns = statement.column_count();
     let mut rows = statement.query([])?;
@@ -112,9 +139,15 @@ pub fn query_text_within(
             use rusqlite::types::ValueRef;
             match row.get_ref(index)? {
                 ValueRef::Null => {}
-                ValueRef::Text(value) | ValueRef::Blob(value) => output.push_str(&String::from_utf8_lossy(value)),
-                ValueRef::Integer(value) => { let _ = write!(output, "{value}"); }
-                ValueRef::Real(value) => { let _ = write!(output, "{value}"); }
+                ValueRef::Text(value) | ValueRef::Blob(value) => {
+                    output.push_str(&String::from_utf8_lossy(value))
+                }
+                ValueRef::Integer(value) => {
+                    let _ = write!(output, "{value}");
+                }
+                ValueRef::Real(value) => {
+                    let _ = write!(output, "{value}");
+                }
             }
         }
         output.push('\n');
@@ -123,24 +156,60 @@ pub fn query_text_within(
     Ok((!trimmed.is_empty()).then(|| trimmed.to_owned()))
 }
 
+/// Visit each result row without materializing the query as one text blob. Usage scanners use
+/// this for their wide history queries: it avoids SQLite's `json_group_array` encoding and the
+/// second JSON decode that would otherwise allocate a `Value` tree for every row.
+pub(crate) fn for_each_row_within<F>(
+    path: &Path,
+    sql: &str,
+    allow_wal_retry: bool,
+    timeout: Duration,
+    mut visit: F,
+) -> Result<(), SqliteError>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> Result<(), String>,
+{
+    let timeout = timeout.clamp(Duration::from_millis(100), MAX_QUERY_TIMEOUT);
+    let Some(conn) = open_for_query(path, allow_wal_retry, Instant::now() + timeout)? else {
+        return Ok(());
+    };
+    let mut statement = conn.prepare(sql)?;
+    if !statement.readonly() {
+        return Err(SqliteError::Unreadable(
+            "Expected a read-only SQLite query.".into(),
+        ));
+    }
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        visit(row).map_err(SqliteError::Unreadable)?;
+    }
+    Ok(())
+}
+
 /// Run an intentional write, such as persisting Cursor's rotated token. SQL stays inside the
 /// process, and errors avoid returning SQL text that could contain a credential.
 pub fn execute(path: &Path, sql: &str) -> Result<(), SqliteError> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     (|| {
         let conn = Connection::open_with_flags(path, flags)?;
         bound_query(&conn, Instant::now() + QUERY_TIMEOUT)?;
         conn.execute_batch(sql)
     })()
-    .map_err(|error| SqliteError::Unreadable(match error.sqlite_error_code() {
-        Some(code) => format!("SQLite write failed ({code:?})."),
-        None => "SQLite write failed.".into(),
-    }))
+    .map_err(|error| {
+        SqliteError::Unreadable(match error.sqlite_error_code() {
+            Some(code) => format!("SQLite write failed ({code:?})."),
+            None => "SQLite write failed.".into(),
+        })
+    })
 }
 
 /// First column of the first row as text. `Ok(None)` when the database or the row is absent.
 pub fn query_value(path: &Path, sql: &str) -> Result<Option<String>, SqliteError> {
-    let Some(conn) = open_read_only(path)? else { return Ok(None) };
+    let Some(conn) = open_read_only(path)? else {
+        return Ok(None);
+    };
     let mut statement = conn.prepare(sql)?;
     let mut rows = statement.query([])?;
     match rows.next()? {
@@ -151,7 +220,10 @@ pub fn query_value(path: &Path, sql: &str) -> Result<Option<String>, SqliteError
 
 /// Like [`query_value`], but a missing table is an absent source rather than an error (an app that
 /// was installed but never signed in has an empty database).
-pub fn query_value_tolerating_missing_table(path: &Path, sql: &str) -> Result<Option<String>, SqliteError> {
+pub fn query_value_tolerating_missing_table(
+    path: &Path,
+    sql: &str,
+) -> Result<Option<String>, SqliteError> {
     match query_value(path, sql) {
         Err(SqliteError::Unreadable(message)) if message.contains("no such table") => Ok(None),
         other => other,
@@ -185,7 +257,10 @@ pub fn file_stamp(path: &Path) -> Option<FileStamp> {
             Err(e) => -(e.duration().as_nanos() as i128),
         })
         .unwrap_or(0);
-    Some(FileStamp { len: meta.len(), mtime_ns })
+    Some(FileStamp {
+        len: meta.len(),
+        mtime_ns,
+    })
 }
 
 /// The revision of a SQLite database: the stamps of the main file, its write-ahead log and its
@@ -203,7 +278,11 @@ fn sibling_paths(path: &Path) -> [PathBuf; 3] {
         os.push(suffix);
         PathBuf::from(os)
     };
-    [path.to_path_buf(), with_suffix("-wal"), with_suffix("-journal")]
+    [
+        path.to_path_buf(),
+        with_suffix("-wal"),
+        with_suffix("-journal"),
+    ]
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -223,13 +302,19 @@ pub fn with_recovered_sidecarless_database<T>(
         || with_suffix(path, "-shm").exists()
         || with_suffix(path, "-journal").exists()
     {
-        return Err(SqliteError::Unreadable("Database already has journal sidecars.".into()));
+        return Err(SqliteError::Unreadable(
+            "Database already has journal sidecars.".into(),
+        ));
     }
     let mut source = open_pinned_regular_file(path)?;
     let mut header = [0u8; 20];
-    source.read_exact(&mut header).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+    source
+        .read_exact(&mut header)
+        .map_err(|e| SqliteError::Unreadable(e.to_string()))?;
     if &header[..16] != b"SQLite format 3\0" || header[18] != 2 || header[19] != 2 {
-        return Err(SqliteError::Unreadable("Database is not a sidecarless WAL SQLite file.".into()));
+        return Err(SqliteError::Unreadable(
+            "Database is not a sidecarless WAL SQLite file.".into(),
+        ));
     }
     let dir = tempfile::tempdir().map_err(|e| SqliteError::Unreadable(e.to_string()))?;
     #[cfg(unix)]
@@ -273,17 +358,24 @@ fn open_pinned_regular_file(path: &Path) -> Result<std::fs::File, SqliteError> {
             .custom_flags(FLAGS)
             .open(path)
             .map_err(|e| SqliteError::Unreadable(e.to_string()))?;
-        let meta = file.metadata().map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| SqliteError::Unreadable(e.to_string()))?;
         if !meta.is_file() {
-            return Err(SqliteError::Unreadable("Source database is not a regular file.".into()));
+            return Err(SqliteError::Unreadable(
+                "Source database is not a regular file.".into(),
+            ));
         }
         Ok(file)
     }
     #[cfg(not(unix))]
     {
-        let sym = std::fs::symlink_metadata(path).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+        let sym =
+            std::fs::symlink_metadata(path).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
         if !sym.file_type().is_file() {
-            return Err(SqliteError::Unreadable("Source database is not a regular file.".into()));
+            return Err(SqliteError::Unreadable(
+                "Source database is not a regular file.".into(),
+            ));
         }
         std::fs::File::open(path).map_err(|e| SqliteError::Unreadable(e.to_string()))
     }
@@ -311,7 +403,9 @@ fn clone_or_copy_pinned(source: &mut std::fs::File, dst: &Path) -> Result<(), Sq
             }
         }
     }
-    source.seek(SeekFrom::Start(0)).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| SqliteError::Unreadable(e.to_string()))?;
     let mut out = std::fs::File::create(dst).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
     std::io::copy(source, &mut out).map_err(|e| SqliteError::Unreadable(e.to_string()))?;
     Ok(())
@@ -326,7 +420,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.db");
         assert!(query_value(&path, "SELECT 1").unwrap().is_none());
-        assert_eq!(source_signature(&path), SourceSignature(vec![None, None, None]));
+        assert_eq!(
+            source_signature(&path),
+            SourceSignature(vec![None, None, None])
+        );
     }
 
     #[test]
@@ -344,11 +441,22 @@ mod tests {
         let before = source_signature(&path);
         let value = query_value(&path, "SELECT value FROM ItemTable WHERE key = 'k'").unwrap();
         assert_eq!(value.as_deref(), Some("{\"apiKey\":\"abc\"}"));
-        assert!(query_value(&path, "SELECT value FROM ItemTable WHERE key = 'nope'").unwrap().is_none());
+        assert!(
+            query_value(&path, "SELECT value FROM ItemTable WHERE key = 'nope'")
+                .unwrap()
+                .is_none()
+        );
         assert!(query_value(&path, "SELECT value FROM Missing").is_err());
-        assert!(query_value_tolerating_missing_table(&path, "SELECT value FROM Missing").unwrap().is_none());
+        assert!(
+            query_value_tolerating_missing_table(&path, "SELECT value FROM Missing")
+                .unwrap()
+                .is_none()
+        );
         std::thread::sleep(Duration::from_millis(5));
-        Connection::open(&path).unwrap().execute("INSERT INTO ItemTable VALUES ('x', 'y')", []).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute("INSERT INTO ItemTable VALUES ('x', 'y')", [])
+            .unwrap();
         assert_ne!(before, source_signature(&path));
     }
 
@@ -356,17 +464,26 @@ mod tests {
     fn a_caller_budget_bounds_long_queries_and_is_clamped() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.sqlite");
-        Connection::open(&path).unwrap().execute_batch("CREATE TABLE t (v INTEGER);").unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (v INTEGER);")
+            .unwrap();
         // A zero budget clamps to the floor instead of failing every query outright.
         assert_eq!(
-            query_text_within(&path, "SELECT 42", false, Duration::ZERO).unwrap().as_deref(),
+            query_text_within(&path, "SELECT 42", false, Duration::ZERO)
+                .unwrap()
+                .as_deref(),
             Some("42")
         );
         // A runaway query stops at its budget rather than running unbounded.
         let started = Instant::now();
         let runaway = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT count(*) FROM n";
         assert!(query_text_within(&path, runaway, false, Duration::from_millis(300)).is_err());
-        assert!(started.elapsed() < Duration::from_secs(5), "budget ignored: {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "budget ignored: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -374,13 +491,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("database with spaces.sqlite");
         let writer = Connection::open(&path).unwrap();
-        writer.execute_batch(
-            "PRAGMA journal_mode = WAL;
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
              PRAGMA wal_autocheckpoint = 0;
              CREATE TABLE usage (name TEXT);
              INSERT INTO usage VALUES ('in the WAL');",
-        ).unwrap();
-        assert_eq!(query_text(&path, "SELECT name FROM usage", false).unwrap().as_deref(), Some("in the WAL"));
+            )
+            .unwrap();
+        assert_eq!(
+            query_text(&path, "SELECT name FROM usage", false)
+                .unwrap()
+                .as_deref(),
+            Some("in the WAL")
+        );
     }
 
     #[test]
@@ -407,7 +531,13 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count, 1);
-        assert!(!with_suffix(&path, "-wal").exists(), "recovery must never create sidecars");
-        assert!(!with_suffix(&path, "-shm").exists(), "recovery must never create sidecars");
+        assert!(
+            !with_suffix(&path, "-wal").exists(),
+            "recovery must never create sidecars"
+        );
+        assert!(
+            !with_suffix(&path, "-shm").exists(),
+            "recovery must never create sidecars"
+        );
     }
 }

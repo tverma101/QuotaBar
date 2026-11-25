@@ -81,7 +81,11 @@ impl Record for RolloutState {
 
     fn decode(r: &mut Reader<'_>) -> Option<Self> {
         Some(RolloutState {
-            previous_totals: if r.bool()? { Some(RawUsage::decode(r)?) } else { None },
+            previous_totals: if r.bool()? {
+                Some(RawUsage::decode(r)?)
+            } else {
+                None
+            },
             current_model: r.opt_str()?,
             current_tier_is_fast: r.bool()?,
             current_service_tier: r.opt_str()?,

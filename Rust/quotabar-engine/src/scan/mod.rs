@@ -16,8 +16,8 @@ pub mod store;
 pub use codec::{Reader, Record, Writer};
 pub use discover::{discover, discover_all, DiscoveredFile, Extensions, Revision};
 pub use incremental::{
-    file_label, first_future_dated, FileItems, IncrementalScanner, LineError, LineParser, ScanError, ScanStats,
-    FUTURE_TOLERANCE_SECONDS,
+    file_label, first_future_dated, FileItems, IncrementalScanner, LineError, LineParser,
+    ScanError, ScanStats, FUTURE_TOLERANCE_SECONDS,
 };
 pub use store::ScanStore;
 

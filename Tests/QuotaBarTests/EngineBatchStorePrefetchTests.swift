@@ -1,54 +1,57 @@
 import XCTest
 @testable import QuotaBar
 
-/// Records spawn requests and replays a canned child response, so the store's batched fold path
-/// is exercised without touching the real app bundle.
-private final class CannedBatchRunner: ProcessRunning, @unchecked Sendable {
+/// Records engine batch requests and replays a canned response, so the store's batched fold path
+/// is exercised without touching the real provider corpora.
+@MainActor
+private final class RecordingEngineBatch: @unchecked Sendable {
     enum Outcome {
-        case success(stdout: String)
-        case exit(exitCode: Int32, stderr: String)
+        case success(RustEngine.BatchResponse)
+        case failure(String)
     }
 
-    private(set) var lastArguments: [String] = []
-    private(set) var lastEnvironment: [String: String] = [:]
-    private(set) var spawnCount = 0
+    private(set) var callCount = 0
+    private(set) var providerIDs: [String] = []
+    private(set) var configsByProviderID: [[String: [String: Any]]] = []
+    private(set) var scopes: [ProviderRefreshContext.Scope] = []
+    private(set) var pacedValues: [Bool] = []
     private let outcome: Outcome
 
     init(outcome: Outcome) {
         self.outcome = outcome
     }
 
-    func run(
-        executable: String,
-        arguments: [String],
-        environment: [String: String],
-        timeout: TimeInterval
-    ) throws -> ProcessResult {
-        spawnCount += 1
-        lastArguments = arguments
-        lastEnvironment = environment
+    func execute(
+        items: [RustEngine.BatchItem],
+        scope: ProviderRefreshContext.Scope,
+        paced: Bool
+    ) async throws -> RustEngine.BatchResponse {
+        callCount += 1
+        providerIDs = items.map(\.providerID)
+        configsByProviderID.append(
+            Dictionary(uniqueKeysWithValues: items.compactMap { item in
+                item.config.map { (item.providerID, $0) }
+            })
+        )
+        scopes.append(scope)
+        pacedValues.append(paced)
         switch outcome {
-        case .success(let stdout):
-            return ProcessResult(exitCode: 0, stdout: stdout, stderr: "")
-        case .exit(let exitCode, let stderr):
-            return ProcessResult(exitCode: exitCode, stdout: "", stderr: stderr)
+        case .success(let response): return response
+        case .failure(let message): throw EngineFoldBatchError(message: message)
         }
-    }
-
-    var providersArgument: String {
-        lastArguments.firstIndex(of: "--providers").map { lastArguments[$0 + 1] } ?? ""
     }
 }
 
 @MainActor
-final class ScanWorkerStorePrefetchTests: XCTestCase {
+final class EngineBatchStorePrefetchTests: XCTestCase {
     private final class RecordingRuntime: ProviderRuntime {
         let provider: Provider
         let widgetDescriptors: [WidgetDescriptor]
         private(set) var refreshCount = 0
         let planMarker: String
+        let engineConfig: EngineProviderConfig?
 
-        init(id: String, planMarker: String) {
+        init(id: String, planMarker: String, engineConfig: EngineProviderConfig? = nil) {
             let provider = Provider(id: id, displayName: id.uppercased(), icon: .providerMark("codex"))
             self.provider = provider
             self.widgetDescriptors = [
@@ -56,6 +59,7 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
                     .exportingHistory(scope: .machineLocal, estimatedCost: true, sourceNote: "test"),
             ]
             self.planMarker = planMarker
+            self.engineConfig = engineConfig
         }
 
         func refresh() async -> ProviderSnapshot {
@@ -70,13 +74,14 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
         runtimeIDs: [String],
         identityKeys: [String: String] = [:],
         seededSnapshot: ProviderSnapshot? = nil,
-        seededIdentityKey: String? = nil
+        seededIdentityKey: String? = nil,
+        engineConfigs: [String: EngineProviderConfig] = [:]
     ) -> (WidgetDataStore, [String: RecordingRuntime], ProviderSnapshotCache) {
         let suiteName = "OpenUsageTests.Prefetch.\(UUID().uuidString)"
         let suite = UserDefaults(suiteName: suiteName)!
         suite.removePersistentDomain(forName: suiteName)
         let runtimes = Dictionary(uniqueKeysWithValues: runtimeIDs.map { id in
-            (id, RecordingRuntime(id: id, planMarker: "in-process-\(id)"))
+            (id, RecordingRuntime(id: id, planMarker: "in-process-\(id)", engineConfig: engineConfigs[id]))
         })
         let cache = ProviderSnapshotCache(userDefaults: suite, storageKey: "snapshots", ttl: 600)
         if let seededSnapshot {
@@ -96,61 +101,50 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
         return (store, runtimes, cache)
     }
 
-    private func attachRunner(_ store: WidgetDataStore, outcome: CannedBatchRunner.Outcome) -> CannedBatchRunner {
-        let runner = CannedBatchRunner(outcome: outcome)
-        store.scanWorker = ScanWorkerClient(
-            runner: runner,
-            timeout: 110,
-            executableURLOverride: URL(fileURLWithPath: "/tmp/fake.app/Contents/MacOS/QuotaBar")
-        )
-        return runner
+    private func attachBatch(
+        _ store: WidgetDataStore,
+        outcome: RecordingEngineBatch.Outcome
+    ) -> RecordingEngineBatch {
+        let recorder = RecordingEngineBatch(outcome: outcome)
+        store.foldBatch = EngineFoldBatchClient(batchExecutor: recorder.execute)
+        return recorder
     }
 
     private func snapshot(for provider: Provider, plan: String, refreshedAt: Date = Date()) -> ProviderSnapshot {
         ProviderSnapshot.make(provider: provider, plan: plan, lines: [], refreshedAt: refreshedAt)
     }
 
-    private func encodeResponse(
+    private func response(
         _ snapshots: [String: ProviderSnapshot],
         errors: [String: String] = [:],
         identityKeys: [String: String] = [:]
-    ) throws -> String {
-        let response = ScanWorkerCommand.Response(
-            schema: ScanWorkerCommand.schemaName,
-            snapshots: snapshots,
-            errors: errors,
-            identityKeys: identityKeys
-        )
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        return String(data: try encoder.encode(response), encoding: .utf8)!
+    ) -> RustEngine.BatchResponse {
+        RustEngine.BatchResponse(snapshots: snapshots, errors: errors, identityKeys: identityKeys)
     }
 
-    func testStaleProvidersFoldInSingleChildWithoutTouchingRuntimes() async throws {
+    func testStaleProvidersFoldInSingleEngineBatchWithoutTouchingRuntimes() async throws {
         let (store, runtimes, _) = makeStore(runtimeIDs: ["a", "b"])
-        let runner = attachRunner(store, outcome: .success(stdout: try encodeResponse([
-            "a": snapshot(for: runtimes["a"]!.provider, plan: "child-a"),
-            "b": snapshot(for: runtimes["b"]!.provider, plan: "child-b"),
+        let recorder = attachBatch(store, outcome: .success(response([
+            "a": snapshot(for: runtimes["a"]!.provider, plan: "batch-a"),
+            "b": snapshot(for: runtimes["b"]!.provider, plan: "batch-b"),
         ], identityKeys: ["a": "identity-a", "b": "identity-b"])))
 
         await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
             await store.refreshAll(force: true)
         }
 
-        XCTAssertEqual(runner.spawnCount, 1, "one child folds the whole batch")
-        XCTAssertEqual(runner.providersArgument, "a,b")
-        XCTAssertEqual(runner.lastEnvironment["QUOTABAR_IN_SCAN_WORKER"], "1")
-        XCTAssertEqual(runtimes["a"]?.refreshCount, 0, "child-covered members must not fold in-process")
+        XCTAssertEqual(recorder.callCount, 1, "one engine batch folds the whole provider set")
+        XCTAssertEqual(recorder.providerIDs, ["a", "b"])
+        XCTAssertEqual(recorder.scopes, [.panelAccounting])
+        XCTAssertEqual(runtimes["a"]?.refreshCount, 0, "batch-covered members must not fold through their runtimes")
         XCTAssertEqual(runtimes["b"]?.refreshCount, 0)
-        XCTAssertEqual(store.localSnapshots["a"]?.plan, "child-a")
-        XCTAssertEqual(store.localSnapshots["b"]?.plan, "child-b")
+        XCTAssertEqual(store.localSnapshots["a"]?.plan, "batch-a")
+        XCTAssertEqual(store.localSnapshots["b"]?.plan, "batch-b")
     }
 
-    func testFreshMemberIsExcludedFromChildAndKeepsCachedValue() async throws {
+    func testFreshMemberIsExcludedFromEngineBatchAndKeepsCachedValue() async throws {
         let (store, runtimes, cache) = makeStore(runtimeIDs: ["a", "b"])
         var cachedSnapshot = snapshot(for: runtimes["a"]!.provider, plan: "cached-a")
-        // A history-bearing entry so the fold-phase "first fold" exception doesn't force a re-fold:
-        // a historyless snapshot must re-fold even when fresh (see WidgetDataStore's fold-phase rule).
         cachedSnapshot.usageHistory = ProviderUsageHistory(
             series: DailyUsageSeries(daily: [
                 DailyUsageEntry(date: "2026-11-16", totalTokens: 42, costUSD: 0.5),
@@ -163,30 +157,26 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
                 scope: .machineLocal, estimatedCost: true, sourceNote: "test"
             )
         )
-        let runner = attachRunner(store, outcome: .success(stdout: try encodeResponse([
-            "b": snapshot(for: runtimes["b"]!.provider, plan: "child-b"),
+        let recorder = attachBatch(store, outcome: .success(response([
+            "b": snapshot(for: runtimes["b"]!.provider, plan: "batch-b"),
         ])))
 
         await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
             await store.refreshAll()
         }
-        XCTAssertEqual(runner.spawnCount, 1)
-        XCTAssertEqual(runner.providersArgument, "b", "the TTL-fresh member is not handed to the child")
+        XCTAssertEqual(recorder.callCount, 1)
+        XCTAssertEqual(recorder.providerIDs, ["b"], "the TTL-fresh member is not handed to the batch")
         XCTAssertEqual(runtimes["a"]?.refreshCount, 0)
         XCTAssertEqual(runtimes["b"]?.refreshCount, 0)
-        // The history-only fold-scope cache strips the plan (it cannot vouch for quota meters),
-        // so "cached-a" is planless by design; the important part is the member was not re-folded,
-        // not re-delegated, and its cached entry published.
         XCTAssertNotNil(store.localSnapshots["a"])
         XCTAssertEqual(store.localSnapshots["a"]?.refreshedAt, cachedSnapshot.refreshedAt)
-        XCTAssertEqual(store.localSnapshots["b"]?.plan, "child-b")
+        XCTAssertEqual(store.localSnapshots["b"]?.plan, "batch-b")
     }
 
     /// A delegated Antigravity fold produces machine-local history only — it can never prove which
-    /// Google account owns the cached quota. Even when an older or misbehaving child reports an
-    /// identity for it, the fold must not re-stamp or clear the live quota: the persisted entry,
-    /// its account stamp, and the in-memory card keep the original meters and pick up only the new
-    /// history.
+    /// Google account owns the cached quota. Even when a response reports an unresolved identity,
+    /// the fold must not re-stamp or clear the live quota: the persisted entry, its account stamp,
+    /// and the in-memory card keep the original meters and pick up only the new history.
     func testAntigravityPrefetchedHistoryCannotReplaceLiveQuotaIdentity() async throws {
         let originalQuotaStamp = Date(timeIntervalSince1970: 1_800_000_000)
         var seeded = ProviderSnapshot(
@@ -203,7 +193,7 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
             seededSnapshot: seeded,
             seededIdentityKey: "google-acct-A"
         )
-        let childSnapshot = ProviderSnapshot.make(
+        let batchSnapshot = ProviderSnapshot.make(
             provider: runtimes["antigravity"]!.provider,
             plan: nil,
             lines: [],
@@ -212,8 +202,8 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
                 DailyUsageEntry(date: "2026-10-14", totalTokens: 42, costUSD: 0.42)
             ]))
         )
-        let runner = attachRunner(store, outcome: .success(stdout: try encodeResponse(
-            ["antigravity": childSnapshot],
+        let recorder = attachBatch(store, outcome: .success(response(
+            ["antigravity": batchSnapshot],
             identityKeys: ["antigravity": AntigravityAuthStore.unresolvedCacheIdentityKey]
         )))
 
@@ -221,11 +211,9 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
             await store.refreshAll(force: true)
         }
 
-        XCTAssertEqual(runner.spawnCount, 1)
+        XCTAssertEqual(recorder.callCount, 1)
         XCTAssertEqual(runtimes["antigravity"]?.refreshCount, 0)
-        // The unresolved identity the child reported must not replace the live account stamp...
         XCTAssertEqual(cache.producedByIdentityKey(providerID: "antigravity"), "google-acct-A")
-        // ...nor the persisted quota under it.
         let persisted = cache.loadSnapshots(providerIDs: ["antigravity"])["antigravity"]
         XCTAssertEqual(persisted?.plan, "Pro")
         XCTAssertEqual(
@@ -234,7 +222,6 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
         )
         XCTAssertEqual(persisted?.quotaRefreshedAt, originalQuotaStamp)
         XCTAssertEqual(persisted?.usageHistory?.series.daily.first?.totalTokens, 42)
-        // The visible snapshot is the merge of the same two halves: original meters, fresh history.
         let current = store.localSnapshots["antigravity"]
         XCTAssertEqual(current?.plan, "Pro")
         XCTAssertEqual(
@@ -245,34 +232,67 @@ final class ScanWorkerStorePrefetchTests: XCTestCase {
         XCTAssertEqual(current?.usageHistory?.series.daily.first?.totalTokens, 42)
     }
 
-    func testChildDroppingAMemberFallsBackToInProcessFold() async throws {
-        let (store, runtimes, _) = makeStore(runtimeIDs: ["a", "b"])
-        // Child answers only for a; b reports nothing — b must fold in-process.
-        let runner = attachRunner(store, outcome: .success(stdout: try encodeResponse([
-            "a": snapshot(for: runtimes["a"]!.provider, plan: "child-a"),
+    func testAccountScopedEngineConfigsAreIncludedInBatchItems() async throws {
+        let configA = EngineProviderConfig([
+            "cardID": "claude@acct-a",
+            "expectedIdentityKey": "user-a|org-a",
+            "organizationUUID": "org-a",
+        ])
+        let configB = EngineProviderConfig([
+            "cardID": "claude@acct-b",
+            "expectedIdentityKey": "user-b|org-b",
+            "organizationUUID": "org-b",
+        ])
+        let (store, runtimes, _) = makeStore(
+            runtimeIDs: ["claude@acct-a", "claude@acct-b"],
+            engineConfigs: ["claude@acct-a": configA, "claude@acct-b": configB]
+        )
+        let recorder = attachBatch(store, outcome: .success(response([
+            "claude@acct-a": snapshot(for: runtimes["claude@acct-a"]!.provider, plan: "batch-a"),
+            "claude@acct-b": snapshot(for: runtimes["claude@acct-b"]!.provider, plan: "batch-b"),
         ])))
 
         await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
             await store.refreshAll(force: true)
         }
 
-        XCTAssertEqual(runner.spawnCount, 1)
-        XCTAssertEqual(runtimes["a"]?.refreshCount, 0)
-        XCTAssertEqual(runtimes["b"]?.refreshCount, 1, "absent member falls back to the in-process fold")
-        XCTAssertEqual(store.localSnapshots["a"]?.plan, "child-a")
-        XCTAssertEqual(store.localSnapshots["b"]?.plan, "in-process-b")
+        XCTAssertEqual(recorder.callCount, 1)
+        let configs = try XCTUnwrap(recorder.configsByProviderID.first)
+        XCTAssertEqual(configs["claude@acct-a"]?["cardID"] as? String, "claude@acct-a")
+        XCTAssertEqual(configs["claude@acct-a"]?["expectedIdentityKey"] as? String, "user-a|org-a")
+        XCTAssertEqual(configs["claude@acct-b"]?["cardID"] as? String, "claude@acct-b")
+        XCTAssertEqual(configs["claude@acct-b"]?["organizationUUID"] as? String, "org-b")
+        XCTAssertEqual(runtimes["claude@acct-a"]?.refreshCount, 0)
+        XCTAssertEqual(runtimes["claude@acct-b"]?.refreshCount, 0)
     }
 
-    func testChildSpawnFailureFallsBackToInProcessFold() async {
+    func testBatchDroppingAMemberFallsBackToProviderRuntime() async throws {
         let (store, runtimes, _) = makeStore(runtimeIDs: ["a", "b"])
-        let runner = attachRunner(store, outcome: .exit(exitCode: 4, stderr: "quotabar: boom"))
+        let recorder = attachBatch(store, outcome: .success(response([
+            "a": snapshot(for: runtimes["a"]!.provider, plan: "batch-a"),
+        ])))
 
         await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
             await store.refreshAll(force: true)
         }
 
-        XCTAssertEqual(runner.spawnCount, 1)
+        XCTAssertEqual(recorder.callCount, 1)
+        XCTAssertEqual(runtimes["a"]?.refreshCount, 0)
+        XCTAssertEqual(runtimes["b"]?.refreshCount, 1, "absent member falls back to its provider runtime")
+        XCTAssertEqual(store.localSnapshots["a"]?.plan, "batch-a")
+        XCTAssertEqual(store.localSnapshots["b"]?.plan, "in-process-b")
+    }
+
+    func testEngineBatchFailureFallsBackToProviderRuntimes() async {
+        let (store, runtimes, _) = makeStore(runtimeIDs: ["a", "b"])
+        let recorder = attachBatch(store, outcome: .failure("engine exploded"))
+
+        await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+            await store.refreshAll(force: true)
+        }
+
+        XCTAssertEqual(recorder.callCount, 1)
         XCTAssertEqual(runtimes["a"]?.refreshCount, 1)
-        XCTAssertEqual(runtimes["b"]?.refreshCount, 1, "spawn failure folds every member in-process")
+        XCTAssertEqual(runtimes["b"]?.refreshCount, 1, "batch failure folds every member through its runtime")
     }
 }

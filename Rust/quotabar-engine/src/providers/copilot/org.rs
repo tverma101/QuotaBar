@@ -41,11 +41,17 @@ pub struct FileOrgStateStore {
 
 impl FileOrgStateStore {
     pub fn live() -> Self {
-        FileOrgStateStore { cache: Mutex::new(None), fixed_path: None }
+        FileOrgStateStore {
+            cache: Mutex::new(None),
+            fixed_path: None,
+        }
     }
 
     pub fn at(path: PathBuf) -> Self {
-        FileOrgStateStore { cache: Mutex::new(None), fixed_path: Some(path) }
+        FileOrgStateStore {
+            cache: Mutex::new(None),
+            fixed_path: Some(path),
+        }
     }
 
     fn path(&self) -> PathBuf {
@@ -148,29 +154,43 @@ pub fn org_billing_lines(
             }
             Err(OrgSummaryError::Cancelled) => return Err(()),
             Err(OrgSummaryError::RateLimit) => {
-                qlog!(Info, plugin_tag(ID), "org billing rate limited; pausing org discovery");
+                qlog!(
+                    Info,
+                    plugin_tag(ID),
+                    "org billing rate limited; pausing org discovery"
+                );
                 return Ok(Vec::new());
             }
             Err(OrgSummaryError::Transient(desc)) => {
-                diagnostic_gate::log_once(&format!("{}transient", org_diag_prefix(&cached_org)), || {
-                    qlog!(Warn, plugin_tag(ID), "org billing lookup failed for the remembered org: {desc}");
-                });
+                diagnostic_gate::log_once(
+                    &format!("{}transient", org_diag_prefix(&cached_org)),
+                    || {
+                        qlog!(
+                            Warn,
+                            plugin_tag(ID),
+                            "org billing lookup failed for the remembered org: {desc}"
+                        );
+                    },
+                );
                 return Ok(Vec::new());
             }
         }
     }
 
-    let OrgsFetchResult { response, partial_status, partial_rate_limited } =
-        match client::fetch_user_orgs(http, token, &ctx.cancel) {
-            Ok(res) => res,
-            Err(HttpError::Cancelled) => return Err(()),
-            Err(err) => {
-                diagnostic_gate::log_once(&format!("{ORG_LIST_DIAG_PREFIX}fetch"), || {
-                    qlog!(Warn, plugin_tag(ID), "org list fetch failed: {err}");
-                });
-                return Ok(Vec::new());
-            }
-        };
+    let OrgsFetchResult {
+        response,
+        partial_status,
+        partial_rate_limited,
+    } = match client::fetch_user_orgs(http, token, &ctx.cancel) {
+        Ok(res) => res,
+        Err(HttpError::Cancelled) => return Err(()),
+        Err(err) => {
+            diagnostic_gate::log_once(&format!("{ORG_LIST_DIAG_PREFIX}fetch"), || {
+                qlog!(Warn, plugin_tag(ID), "org list fetch failed: {err}");
+            });
+            return Ok(Vec::new());
+        }
+    };
     if ctx.is_cancelled() {
         return Err(());
     }
@@ -178,22 +198,53 @@ pub fn org_billing_lines(
         if let Ok(code) = partial.parse::<u16>() {
             let rl = partial_rate_limited || client::is_rate_limit_response(&response);
             if rl {
-                record_rate_limit(store, &mut state, response.header("retry-after"), response.header("x-ratelimit-reset"), ctx.now);
-                qlog!(Info, plugin_tag(ID), "org list rate limited; pausing org discovery");
+                record_rate_limit(
+                    store,
+                    &mut state,
+                    response.header("retry-after"),
+                    response.header("x-ratelimit-reset"),
+                    ctx.now,
+                );
+                qlog!(
+                    Info,
+                    plugin_tag(ID),
+                    "org list rate limited; pausing org discovery"
+                );
                 return Ok(Vec::new());
             }
             diagnostic_gate::log_once(&format!("{ORG_LIST_DIAG_PREFIX}partial.{code}"), || {
-                qlog!(Warn, plugin_tag(ID), "org list pagination stopped at HTTP {code}; using completed pages");
+                qlog!(
+                    Warn,
+                    plugin_tag(ID),
+                    "org list pagination stopped at HTTP {code}; using completed pages"
+                );
             });
         } else {
-            diagnostic_gate::log_once(&format!("{ORG_LIST_DIAG_PREFIX}partial.{}", fingerprint_str(partial)), || {
-                qlog!(Warn, plugin_tag(ID), "org list pagination stopped after {partial}; using completed pages");
-            });
+            diagnostic_gate::log_once(
+                &format!("{ORG_LIST_DIAG_PREFIX}partial.{}", fingerprint_str(partial)),
+                || {
+                    qlog!(
+                        Warn,
+                        plugin_tag(ID),
+                        "org list pagination stopped after {partial}; using completed pages"
+                    );
+                },
+            );
         }
     }
     if client::is_rate_limit_response(&response) {
-        record_rate_limit(store, &mut state, response.header("retry-after"), response.header("x-ratelimit-reset"), ctx.now);
-        qlog!(Info, plugin_tag(ID), "org list rate limited; pausing org discovery");
+        record_rate_limit(
+            store,
+            &mut state,
+            response.header("retry-after"),
+            response.header("x-ratelimit-reset"),
+            ctx.now,
+        );
+        qlog!(
+            Info,
+            plugin_tag(ID),
+            "org list rate limited; pausing org discovery"
+        );
         return Ok(Vec::new());
     }
     if response.status != 200 {
@@ -203,7 +254,11 @@ pub fn org_billing_lines(
         }
         let code = response.status;
         diagnostic_gate::log_once(&format!("{ORG_LIST_DIAG_PREFIX}http.{code}"), || {
-            qlog!(Info, plugin_tag(ID), "org list HTTP {code}; skipping org billing lookup");
+            qlog!(
+                Info,
+                plugin_tag(ID),
+                "org list HTTP {code}; skipping org billing lookup"
+            );
         });
         return Ok(Vec::new());
     }
@@ -233,13 +288,21 @@ pub fn org_billing_lines(
             }
             Err(OrgSummaryError::Cancelled) => return Err(()),
             Err(OrgSummaryError::RateLimit) => {
-                qlog!(Info, plugin_tag(ID), "org billing rate limited; pausing org discovery");
+                qlog!(
+                    Info,
+                    plugin_tag(ID),
+                    "org billing rate limited; pausing org discovery"
+                );
                 return Ok(Vec::new());
             }
             Err(OrgSummaryError::Transient(desc)) => {
                 saw_transient_failure = true;
                 diagnostic_gate::log_once(&format!("{}transient", org_diag_prefix(&org)), || {
-                    qlog!(Warn, plugin_tag(ID), "org billing summary failed for one org; trying the next: {desc}");
+                    qlog!(
+                        Warn,
+                        plugin_tag(ID),
+                        "org billing summary failed for one org; trying the next: {desc}"
+                    );
                 });
             }
         }
@@ -273,7 +336,13 @@ fn fetch_org_lines(
     if client::is_rate_limit_response(&resp) {
         let retry_after = resp.header("retry-after").map(ToString::to_string);
         let rate_limit_reset = resp.header("x-ratelimit-reset").map(ToString::to_string);
-        record_rate_limit(store, state, retry_after.as_deref(), rate_limit_reset.as_deref(), ctx.now);
+        record_rate_limit(
+            store,
+            state,
+            retry_after.as_deref(),
+            rate_limit_reset.as_deref(),
+            ctx.now,
+        );
         if resp.status == 200 {
             if let Some(lines) = org_usage_lines(&resp.body) {
                 return Ok(Some(lines));
@@ -282,7 +351,12 @@ fn fetch_org_lines(
         return Err(OrgSummaryError::RateLimit);
     }
     if resp.status != 200 {
-        qlog!(Debug, plugin_tag(ID), "org billing summary for one org: HTTP {}", resp.status);
+        qlog!(
+            Debug,
+            plugin_tag(ID),
+            "org billing summary for one org: HTTP {}",
+            resp.status
+        );
         if resp.status >= 500 {
             return Err(OrgSummaryError::Transient(format!("HTTP {}", resp.status)));
         }
@@ -333,10 +407,17 @@ fn record_rate_limit(
 }
 
 fn org_diag_prefix(org: &str) -> String {
-    format!("copilot.org-billing.{}.", fingerprint_str(&org.to_ascii_lowercase()))
+    format!(
+        "copilot.org-billing.{}.",
+        fingerprint_str(&org.to_ascii_lowercase())
+    )
 }
 
 fn fingerprint_str(s: &str) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(s.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }

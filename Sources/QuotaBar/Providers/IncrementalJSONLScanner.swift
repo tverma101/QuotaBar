@@ -238,14 +238,6 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
     /// after the panel closes or memory pressure fires. The durable parse cache remains authoritative.
     private var residentItemsSuspended = false
     private var unloadedResidentPaths: [String: Set<String>] = [:]
-    /// True inside the short-lived `--scan-worker` child (the environment contract it shares with
-    /// `ScanWorkerClient`). A one-shot fold gains nothing from keeping decoded items resident — the
-    /// next scan is another process — so retention is treated as suspended there: every scanner
-    /// stays on the metadata-only/hydrate-and-drop path, and e.g. the router's ~128k-item warm
-    /// index never materializes in a process that drops it at exit anyway.
-    private static var ephemeralFoldProcess: Bool {
-        ProcessInfo.processInfo.environment["QUOTABAR_IN_SCAN_WORKER"] != nil
-    }
     private let parsePermitPool: JSONLParsePermitPool
     private let readFailureReporter: UsageLogReadFailureReporter
     private let persistence: JSONLScanCachePersistence?
@@ -273,9 +265,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         self.readFailureReporter = UsageLogReadFailureReporter(logTag: logTag, warning: readFailureWarning)
         self.persistence = persistence
         self.logTag = logTag
-        // A one-shot scan worker exits after its fold; pruning stale cache identities on every
-        // provider init would repeat launch-time maintenance the app already owns.
-        if let persistence, ProcessInfo.processInfo.environment["QUOTABAR_IN_SCAN_WORKER"] == nil {
+        if let persistence {
             let cutoff = Date().addingTimeInterval(-JSONLScanCachePaths.staleIdentityRetention)
             Task.detached(priority: .utility) {
                 await JSONLScanCacheWriter.shared.pruneStaleIdentities(
@@ -308,7 +298,7 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
     }
 
     private var retainsResidentItemsNow: Bool {
-        retainResidentItems && !residentItemsSuspended && !Self.ephemeralFoldProcess
+        retainResidentItems && !residentItemsSuspended
     }
 
     /// Compatibility overload for parsers that already own a `Data`-based test surface. Production

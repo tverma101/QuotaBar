@@ -61,7 +61,10 @@ impl Engine {
 
     pub(crate) fn finish_token(&self, request_id: Option<u64>) {
         if let Some(request_id) = request_id {
-            self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).remove(&request_id);
+            self.in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id);
         }
     }
 
@@ -77,7 +80,10 @@ impl Engine {
 
     pub(crate) fn clear_batch_children(&self, batch_id: Option<u64>) {
         if let Some(batch_id) = batch_id {
-            self.batch_children.lock().unwrap_or_else(|e| e.into_inner()).remove(&batch_id);
+            self.batch_children
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&batch_id);
         }
     }
 
@@ -113,8 +119,14 @@ impl Engine {
     }
 
     /// Refresh one provider. `request_id` registers the call so [`Engine::cancel`] can stop it.
-    pub fn refresh(&self, id: &str, ctx: RefreshContext, request_id: Option<u64>) -> Option<ProviderSnapshot> {
-        self.refresh_with_identity(id, ctx, request_id).map(|(snapshot, _)| snapshot)
+    pub fn refresh(
+        &self,
+        id: &str,
+        ctx: RefreshContext,
+        request_id: Option<u64>,
+    ) -> Option<ProviderSnapshot> {
+        self.refresh_with_identity(id, ctx, request_id)
+            .map(|(snapshot, _)| snapshot)
     }
 
     /// Cancel an in-flight (or not yet started) refresh or batch. Returns whether it was in flight.
@@ -134,7 +146,12 @@ impl Engine {
                 }
             }
         };
-        if let Some(children) = self.batch_children.lock().unwrap_or_else(|e| e.into_inner()).get(&request_id) {
+        if let Some(children) = self
+            .batch_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&request_id)
+        {
             for child in children {
                 child.cancel();
             }
@@ -191,7 +208,12 @@ mod tests {
     }
 
     fn engine() -> Arc<Engine> {
-        Arc::new(Engine::new(vec![Arc::new(Slow { info: ProviderInfo { id: "slow".into(), display_name: "Slow".into() } })]))
+        Arc::new(Engine::new(vec![Arc::new(Slow {
+            info: ProviderInfo {
+                id: "slow".into(),
+                display_name: "Slow".into(),
+            },
+        })]))
     }
 
     #[test]
@@ -199,14 +221,21 @@ mod tests {
         let engine = engine();
         let reply: Value = serde_json::from_str(&engine.call(r#"{"method":"providers"}"#)).unwrap();
         assert_eq!(reply["ok"][0]["id"], "slow");
-        let reply: Value =
-            serde_json::from_str(&engine.call(r#"{"method":"hasLocalCredentials","params":{"providerId":"slow"}}"#)).unwrap();
+        let reply: Value = serde_json::from_str(
+            &engine.call(r#"{"method":"hasLocalCredentials","params":{"providerId":"slow"}}"#),
+        )
+        .unwrap();
         assert_eq!(reply["ok"], true);
-        let reply: Value =
-            serde_json::from_str(&engine.call(r#"{"method":"refresh","params":{"providerId":"nope"}}"#)).unwrap();
+        let reply: Value = serde_json::from_str(
+            &engine.call(r#"{"method":"refresh","params":{"providerId":"nope"}}"#),
+        )
+        .unwrap();
         assert_eq!(reply["error"], "unknown provider: nope");
         let reply: Value = serde_json::from_str(&engine.call("not json")).unwrap();
-        assert!(reply["error"].as_str().unwrap().starts_with("malformed request"));
+        assert!(reply["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("malformed request"));
     }
 
     #[test]
@@ -215,7 +244,9 @@ mod tests {
         let worker = {
             let engine = engine.clone();
             std::thread::spawn(move || {
-                engine.call(r#"{"method":"refresh","params":{"providerId":"slow","requestId":7,"now":5}}"#)
+                engine.call(
+                    r#"{"method":"refresh","params":{"providerId":"slow","requestId":7,"now":5}}"#,
+                )
             })
         };
         std::thread::sleep(std::time::Duration::from_millis(30));

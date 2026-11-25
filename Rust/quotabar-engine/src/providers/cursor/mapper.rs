@@ -19,7 +19,8 @@ pub const BILLING_PERIOD_MS: i64 = 30 * DAY_MS;
 const MAXIMUM_BILLING_EPOCH_MS: f64 = 4_102_444_800_000.0;
 const MAXIMUM_BILLING_PERIOD_MS: f64 = 366.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 pub const CURSOR_EXPORT_SOURCE_NOTE: &str = "From your Cursor usage export";
-pub const UNKNOWN_USAGE_UNAVAILABLE: &str = "Cursor request-based usage data unavailable. Try again later.";
+pub const UNKNOWN_USAGE_UNAVAILABLE: &str =
+    "Cursor request-based usage data unavailable. Try again later.";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CursorMappedUsage {
@@ -38,7 +39,9 @@ impl CursorMapperError {
     pub fn message(&self) -> &str {
         match self {
             CursorMapperError::NoActiveSubscription => "No active Cursor subscription.",
-            CursorMapperError::TotalUsageLimitMissing => "Total usage limit missing from API response.",
+            CursorMapperError::TotalUsageLimitMissing => {
+                "Total usage limit missing from API response."
+            }
             CursorMapperError::RequestBasedUnavailable(msg) => msg.as_str(),
         }
     }
@@ -66,7 +69,9 @@ impl CursorPlanUsageFacts {
             spend_limit_type: spend_limit
                 .and_then(|s| parse::trimmed_string(s.get("limitType")))
                 .map(|s| s.to_ascii_lowercase()),
-            pooled_limit: spend_limit.and_then(|s| parse::number(s.get("pooledLimit"))).unwrap_or(0.0),
+            pooled_limit: spend_limit
+                .and_then(|s| parse::number(s.get("pooledLimit")))
+                .unwrap_or(0.0),
         }
     }
 
@@ -80,11 +85,17 @@ impl CursorPlanUsageFacts {
 }
 
 pub fn is_org_membership(raw: Option<&str>) -> bool {
-    matches!(raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("enterprise" | "team"))
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("enterprise" | "team")
+    )
 }
 
 pub fn preferred_membership(local: Option<&str>, summary: Option<&str>) -> Option<String> {
-    let norm = |v: Option<&str>| v.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+    let norm = |v: Option<&str>| {
+        v.map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+    };
     let local_m = norm(local);
     let summary_m = norm(summary);
     if is_org_membership(local_m.as_deref()) {
@@ -96,26 +107,47 @@ pub fn preferred_membership(local: Option<&str>, summary: Option<&str>) -> Optio
     local_m.or(summary_m)
 }
 
-pub fn routing_plan_name(plan_info_name: Option<&str>, membership_type: Option<&str>) -> Option<String> {
-    let membership = membership_type.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+pub fn routing_plan_name(
+    plan_info_name: Option<&str>,
+    membership_type: Option<&str>,
+) -> Option<String> {
+    let membership = membership_type
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
     if is_org_membership(membership.as_deref()) {
         return membership;
     }
-    plan_info_name.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    plan_info_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
-pub fn resolved_plan_name(plan_info_name: Option<&str>, membership_type: Option<&str>) -> Option<String> {
-    let membership = membership_type.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
-    let plan_info = plan_info_name.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+pub fn resolved_plan_name(
+    plan_info_name: Option<&str>,
+    membership_type: Option<&str>,
+) -> Option<String> {
+    let membership = membership_type
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let plan_info = plan_info_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     if is_org_membership(membership.as_deref())
-        && plan_info.as_deref().is_none_or(|p| matches!(p.to_ascii_lowercase().as_str(), "pro" | "pro plan"))
+        && plan_info
+            .as_deref()
+            .is_none_or(|p| matches!(p.to_ascii_lowercase().as_str(), "pro" | "pro plan"))
     {
         return membership;
     }
     plan_info.or(membership)
 }
 
-pub fn resolved_plan_label(plan_info_name: Option<&str>, membership_type: Option<&str>) -> Option<String> {
+pub fn resolved_plan_label(
+    plan_info_name: Option<&str>,
+    membership_type: Option<&str>,
+) -> Option<String> {
     plan_label(resolved_plan_name(plan_info_name, membership_type).as_deref())
 }
 
@@ -128,17 +160,30 @@ pub fn should_use_request_based_fallback(
     if !facts.is_enabled {
         return (false, "");
     }
-    let norm = plan_name.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let norm = plan_name
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
     if facts.plan_usage_unusable() && facts.total_percent_used.is_none() && norm == "enterprise" {
         return (true, "Enterprise usage data unavailable. Try again later.");
     }
     if facts.plan_usage_unusable() && facts.total_percent_used.is_none() && norm == "team" {
-        return (true, "Team request-based usage data unavailable. Try again later.");
+        return (
+            true,
+            "Team request-based usage data unavailable. Try again later.",
+        );
     }
-    if facts.plan_usage_unusable() && facts.total_percent_used.is_none() && norm.is_empty() && plan_info_unavailable {
+    if facts.plan_usage_unusable()
+        && facts.total_percent_used.is_none()
+        && norm.is_empty()
+        && plan_info_unavailable
+    {
         return (true, UNKNOWN_USAGE_UNAVAILABLE);
     }
-    if facts.is_team_by_shape() && facts.has_plan_usage && facts.limit.is_none() && facts.total_percent_used.is_none() {
+    if facts.is_team_by_shape()
+        && facts.has_plan_usage
+        && facts.limit.is_none()
+        && facts.total_percent_used.is_none()
+    {
         return (true, UNKNOWN_USAGE_UNAVAILABLE);
     }
     (false, "")
@@ -161,43 +206,70 @@ pub fn map_usage(
         return Err(CursorMapperError::TotalUsageLimitMissing);
     }
 
-    let normalized_plan = plan_name.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let normalized_plan = plan_name
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
     let remaining_cents = parse::number(plan_usage.get("remaining")).unwrap_or(0.0);
     let plan_used_cents = parse::number(plan_usage.get("totalSpend"))
         .unwrap_or_else(|| (facts.limit.unwrap_or(0.0) - remaining_cents).max(0.0));
-    let computed_pct = facts.limit.filter(|&l| l > 0.0).map(|l| plan_used_cents / l * 100.0).unwrap_or(0.0);
+    let computed_pct = facts
+        .limit
+        .filter(|&l| l > 0.0)
+        .map(|l| plan_used_cents / l * 100.0)
+        .unwrap_or(0.0);
     let total_usage_pct = facts.total_percent_used.unwrap_or(computed_pct);
 
     let (resets_at, period_ms) = billing_cycle(usage);
     let mut lines = Vec::new();
     append_credits(credit_grants, stripe_balance_cents, &mut lines);
 
-    let progress = |label: &str, used: f64, limit: f64, format: ProgressFormat| MetricLine::Progress {
-        label: label.to_string(),
-        used,
-        limit,
-        format,
-        resets_at,
-        period_duration_ms: Some(period_ms),
-        color_hex: None,
-        detail: None,
-    };
+    let progress =
+        |label: &str, used: f64, limit: f64, format: ProgressFormat| MetricLine::Progress {
+            label: label.to_string(),
+            used,
+            limit,
+            format,
+            resets_at,
+            period_duration_ms: Some(period_ms),
+            color_hex: None,
+            detail: None,
+        };
 
     if normalized_plan == "team" || facts.is_team_by_shape() {
         if let Some(limit_cents) = facts.limit.filter(|&l| l > 0.0) {
-            lines.push(progress("Total usage", plan_used_cents / 100.0, limit_cents / 100.0, ProgressFormat::Dollars));
+            lines.push(progress(
+                "Total usage",
+                plan_used_cents / 100.0,
+                limit_cents / 100.0,
+                ProgressFormat::Dollars,
+            ));
         } else if let Some(pct) = facts.total_percent_used {
             lines.push(progress("Total usage", pct, 100.0, ProgressFormat::Percent));
         }
     } else {
-        lines.push(progress("Total usage", total_usage_pct, 100.0, ProgressFormat::Percent));
+        lines.push(progress(
+            "Total usage",
+            total_usage_pct,
+            100.0,
+            ProgressFormat::Percent,
+        ));
     }
 
     if let Some(auto_pct) = parse::number(plan_usage.get("autoPercentUsed")) {
-        lines.push(progress("Cursor Models", auto_pct, 100.0, ProgressFormat::Percent));
+        lines.push(progress(
+            "Cursor Models",
+            auto_pct,
+            100.0,
+            ProgressFormat::Percent,
+        ));
     }
     if let Some(api_pct) = parse::number(plan_usage.get("apiPercentUsed")) {
-        lines.push(progress("Other Models", api_pct, 100.0, ProgressFormat::Percent));
+        lines.push(progress(
+            "Other Models",
+            api_pct,
+            100.0,
+            ProgressFormat::Percent,
+        ));
     }
 
     if let Some(spend_limit) = usage.get("spendLimitUsage").and_then(Value::as_object) {
@@ -209,13 +281,24 @@ pub fn map_usage(
             .unwrap_or(0.0);
         let spent = on_demand_spend_cents(spend_limit, limit, remaining);
         if limit > 0.0 {
-            lines.push(progress("On-demand", spent / 100.0, limit / 100.0, ProgressFormat::Dollars));
+            lines.push(progress(
+                "On-demand",
+                spent / 100.0,
+                limit / 100.0,
+                ProgressFormat::Dollars,
+            ));
         } else if spent > 0.0 {
-            lines.push(MetricLine::values("On-demand", vec![MetricValue::new(spent / 100.0, MetricKind::Dollars)]));
+            lines.push(MetricLine::values(
+                "On-demand",
+                vec![MetricValue::new(spent / 100.0, MetricKind::Dollars)],
+            ));
         }
     }
 
-    Ok(CursorMappedUsage { plan: plan_label(plan_name), lines })
+    Ok(CursorMappedUsage {
+        plan: plan_label(plan_name),
+        lines,
+    })
 }
 
 fn on_demand_spend_cents(obj: &Map<String, Value>, limit: f64, remaining: f64) -> f64 {
@@ -239,14 +322,18 @@ fn on_demand_spend_cents(obj: &Map<String, Value>, limit: f64, remaining: f64) -
 }
 
 pub fn map_grok_bot_usage(body: &Map<String, Value>) -> Option<MetricLine> {
-    if body.get("usesPooledEnterpriseAllowance").and_then(Value::as_bool) == Some(true)
+    if body
+        .get("usesPooledEnterpriseAllowance")
+        .and_then(Value::as_bool)
+        == Some(true)
         || body.get("includedLimitZero").and_then(Value::as_bool) == Some(true)
         || body.get("hasNonZeroIncludedLimit").and_then(Value::as_bool) == Some(false)
     {
         return None;
     }
     let raw_pct = parse::number(body.get("usagePercent")).filter(|&v| v >= 0.0)?;
-    let resets_at = parse::trimmed_string(body.get("nextResetTimestampUtc")).and_then(|s| parse_iso8601(&s));
+    let resets_at =
+        parse::trimmed_string(body.get("nextResetTimestampUtc")).and_then(|s| parse_iso8601(&s));
     Some(MetricLine::Progress {
         label: "Grok Bot usage".to_string(),
         used: clamp_percent(raw_pct),
@@ -274,15 +361,37 @@ pub fn stripe_balance_cents(body: &Map<String, Value>) -> f64 {
     }
 }
 
-fn append_credits(credit_grants: Option<&Map<String, Value>>, stripe_balance_cents: f64, lines: &mut Vec<MetricLine>) {
-    let has_grants = credit_grants.and_then(|g| g.get("hasCreditGrants")).and_then(Value::as_bool) == Some(true);
-    let grant_total = if has_grants { credit_grants.and_then(|g| parse::number(g.get("totalCents"))).unwrap_or(0.0) } else { 0.0 };
-    let grant_used = if has_grants { credit_grants.and_then(|g| parse::number(g.get("usedCents"))).unwrap_or(0.0) } else { 0.0 };
+fn append_credits(
+    credit_grants: Option<&Map<String, Value>>,
+    stripe_balance_cents: f64,
+    lines: &mut Vec<MetricLine>,
+) {
+    let has_grants = credit_grants
+        .and_then(|g| g.get("hasCreditGrants"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let grant_total = if has_grants {
+        credit_grants
+            .and_then(|g| parse::number(g.get("totalCents")))
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let grant_used = if has_grants {
+        credit_grants
+            .and_then(|g| parse::number(g.get("usedCents")))
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
     let valid_grant = has_grants && grant_total > 0.0;
     let combined = (if valid_grant { grant_total } else { 0.0 }) + stripe_balance_cents;
     let remaining = (combined - if valid_grant { grant_used } else { 0.0 }).max(0.0);
     if combined > 0.0 {
-        lines.push(MetricLine::values("Credits", vec![MetricValue::new(remaining / 100.0, MetricKind::Dollars)]));
+        lines.push(MetricLine::values(
+            "Credits",
+            vec![MetricValue::new(remaining / 100.0, MetricKind::Dollars)],
+        ));
     }
 }
 
@@ -300,16 +409,46 @@ pub fn append_spend_lines(
         let total = row.tokens.total_tokens();
         let family = family_name(&row.model, pricing);
         if row.cost_is_opaque_grok_bot {
-            acc.add_with(&day, total, None, &row.model, RowOptions { canonical: Some(&family), cost_is_complete: false, token_count_saturated: false });
+            acc.add_with(
+                &day,
+                total,
+                None,
+                &row.model,
+                RowOptions {
+                    canonical: Some(&family),
+                    cost_is_complete: false,
+                    token_count_saturated: false,
+                },
+            );
             acc.add_named_unpriced_model(&day, &row.model);
             acc.record_api_estimate(&day, None, total);
         } else if let Some(cost) = row.imputed_cost_dollars {
-            acc.add_with(&day, total, Some(cost), &row.model, RowOptions { canonical: Some(&family), cost_is_complete: true, token_count_saturated: false });
+            acc.add_with(
+                &day,
+                total,
+                Some(cost),
+                &row.model,
+                RowOptions {
+                    canonical: Some(&family),
+                    cost_is_complete: true,
+                    token_count_saturated: false,
+                },
+            );
             acc.mark_estimated_cost(&day);
             let api_est = pricing.estimated_cost_dollars(&row.model, &row.tokens, None, false);
             acc.record_api_estimate(&day, api_est, total);
         } else {
-            acc.add_with(&day, total, None, &row.model, RowOptions { canonical: Some(&family), cost_is_complete: false, token_count_saturated: false });
+            acc.add_with(
+                &day,
+                total,
+                None,
+                &row.model,
+                RowOptions {
+                    canonical: Some(&family),
+                    cost_is_complete: false,
+                    token_count_saturated: false,
+                },
+            );
             if total > 0 {
                 acc.add_unknown_model(&day, &row.model);
             }
@@ -319,8 +458,16 @@ pub fn append_spend_lines(
         if let Some(rep) = row.reported_cost_dollars {
             let entry = reported_by_day.entry(day).or_insert((0.0, 0, false));
             let sum = entry.0 + rep;
-            if !sum.is_finite() { entry.2 = true; } else { entry.0 = sum; }
-            if let Some(cov) = entry.1.checked_add(total) { entry.1 = cov; } else { entry.2 = true; }
+            if !sum.is_finite() {
+                entry.2 = true;
+            } else {
+                entry.0 = sum;
+            }
+            if let Some(cov) = entry.1.checked_add(total) {
+                entry.1 = cov;
+            } else {
+                entry.2 = true;
+            }
         }
     }
 
@@ -328,7 +475,10 @@ pub fn append_spend_lines(
     for entry in &mut scan.series.daily {
         if let Some(&(dollars, covered_tokens, overflowed)) = reported_by_day.get(&entry.date) {
             if !overflowed && covered_tokens >= 0 {
-                entry.reported_cost = Some(ReportedUsageCost { dollars, covered_tokens });
+                entry.reported_cost = Some(ReportedUsageCost {
+                    dollars,
+                    covered_tokens,
+                });
             }
         }
     }
@@ -343,7 +493,14 @@ pub fn append_spend_lines(
         estimated_cost_days: scan.estimated_cost_days.clone(),
     };
     append_token_usage(&scan.series, lines, now, &opts);
-    append_usage_trend(&scan.series, lines, now, CURSOR_EXPORT_SOURCE_NOTE, &BTreeSet::new(), None);
+    append_usage_trend(
+        &scan.series,
+        lines,
+        now,
+        CURSOR_EXPORT_SOURCE_NOTE,
+        &BTreeSet::new(),
+        None,
+    );
 
     ProviderUsageHistory {
         series: scan.series,
@@ -382,14 +539,19 @@ pub fn clamped_billing_duration_ms(duration_ms: f64, max_ms: f64) -> i64 {
 fn billing_cycle(usage: &Map<String, Value>) -> (Option<f64>, i64) {
     let cycle_start = parse::number(usage.get("billingCycleStart"));
     let cycle_end = parse::number(usage.get("billingCycleEnd"));
-    let resets_at = cycle_end.filter(|&e| e > 0.0 && e <= MAXIMUM_BILLING_EPOCH_MS).map(|e| e / 1000.0);
+    let resets_at = cycle_end
+        .filter(|&e| e > 0.0 && e <= MAXIMUM_BILLING_EPOCH_MS)
+        .map(|e| e / 1000.0);
     let (Some(s), Some(e)) = (cycle_start, cycle_end) else {
         return (resets_at, BILLING_PERIOD_MS);
     };
     if s < 0.0 || e <= s {
         return (resets_at, BILLING_PERIOD_MS);
     }
-    (resets_at, clamped_billing_duration_ms(e - s, MAXIMUM_BILLING_PERIOD_MS))
+    (
+        resets_at,
+        clamped_billing_duration_ms(e - s, MAXIMUM_BILLING_PERIOD_MS),
+    )
 }
 
 pub fn plan_label(raw: Option<&str>) -> Option<String> {
@@ -403,7 +565,10 @@ pub fn plan_label(raw: Option<&str>) -> Option<String> {
             .map(|word| {
                 let mut chars = word.chars();
                 match chars.next() {
-                    Some(first) => first.to_uppercase().chain(chars.flat_map(char::to_lowercase)).collect::<String>(),
+                    Some(first) => first
+                        .to_uppercase()
+                        .chain(chars.flat_map(char::to_lowercase))
+                        .collect::<String>(),
                     None => String::new(),
                 }
             })

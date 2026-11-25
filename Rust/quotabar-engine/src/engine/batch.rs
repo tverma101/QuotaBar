@@ -76,7 +76,9 @@ pub(super) fn run(engine: &Engine, params: BatchParams) -> BatchResponse {
         .per_provider_timeout_seconds
         .filter(|s| s.is_finite() && *s > 0.0)
         .unwrap_or(DEFAULT_PROVIDER_TIMEOUT_SECS);
-    let batch_budget = params.batch_budget_seconds.filter(|s| s.is_finite() && *s > 0.0);
+    let batch_budget = params
+        .batch_budget_seconds
+        .filter(|s| s.is_finite() && *s > 0.0);
     let batch_start = Instant::now();
 
     let mut light = Vec::new();
@@ -117,7 +119,10 @@ pub(super) fn run(engine: &Engine, params: BatchParams) -> BatchResponse {
     } else {
         std::thread::scope(|s| {
             let handles: Vec<_> = light.iter().map(|item| s.spawn(|| run_one(item))).collect();
-            handles.into_iter().map(|h| h.join().ok().flatten()).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().ok().flatten())
+                .collect()
         })
     };
     for outcome in light_outcomes.into_iter().flatten() {
@@ -171,6 +176,9 @@ fn run_item(
     ctx.paced = paced;
     ctx.now = now;
     ctx.config = item.config.clone();
+    // Host credential reads need the batch's registered request id to recover the caller's manual
+    // interaction context. Without it the Swift host deliberately treats the read as background-only.
+    ctx.request_id = batch_request_id;
     let child_cancel = ctx.cancel.clone();
     engine.register_batch_child(batch_request_id, &child_cancel);
 
@@ -236,15 +244,23 @@ fn run_item(
 fn record(response: &mut BatchResponse, outcome: Outcome, scope: Scope) {
     let family = provider_family(&outcome.provider_id);
     if let Some(snapshot) = outcome.snapshot {
-        response.snapshots.insert(outcome.provider_id.clone(), snapshot);
+        response
+            .snapshots
+            .insert(outcome.provider_id.clone(), snapshot);
         // Antigravity local history is machine-local; a fold must never publish a quota identity.
         if !(scope.suppresses_live_quota() && family == "antigravity") {
-            if let Some(key) = outcome.observed_identity_key.or(outcome.default_identity_key) {
+            if let Some(key) = outcome
+                .observed_identity_key
+                .or(outcome.default_identity_key)
+            {
                 response.identity_keys.insert(outcome.provider_id, key);
             }
         }
     } else {
-        response.errors.insert(outcome.provider_id, "Accounting refresh timed out".to_string());
+        response.errors.insert(
+            outcome.provider_id,
+            "Accounting refresh timed out".to_string(),
+        );
     }
 }
 
@@ -253,7 +269,9 @@ fn provider_family(provider_id: &str) -> &str {
 }
 
 fn resolve_provider(engine: &Engine, provider_id: &str) -> Option<Arc<dyn ProviderRuntime>> {
-    engine.provider(provider_id).or_else(|| engine.provider(provider_family(provider_id)))
+    engine
+        .provider(provider_id)
+        .or_else(|| engine.provider(provider_family(provider_id)))
 }
 
 fn is_heavy_provider(provider_id: &str, scope: Scope) -> bool {
@@ -281,7 +299,10 @@ mod tests {
     impl TestProvider {
         fn simple(id: &str, delay_ms: u64, identity: Option<&'static str>) -> Self {
             TestProvider {
-                info: ProviderInfo { id: id.into(), display_name: id.into() },
+                info: ProviderInfo {
+                    id: id.into(),
+                    display_name: id.into(),
+                },
                 delay: Duration::from_millis(delay_ms),
                 identity,
                 active_heavy: None,
@@ -328,16 +349,26 @@ mod tests {
         let max_seen = Arc::new(AtomicUsize::new(0));
         let engine = Engine::new(vec![
             Arc::new(TestProvider::simple("devin", 10, Some("devin-id"))),
-            Arc::new(TestProvider::simple("antigravity", 10, Some("leaked-ag-id"))),
+            Arc::new(TestProvider::simple(
+                "antigravity",
+                10,
+                Some("leaked-ag-id"),
+            )),
             Arc::new(TestProvider {
-                info: ProviderInfo { id: "claude".into(), display_name: "Claude".into() },
+                info: ProviderInfo {
+                    id: "claude".into(),
+                    display_name: "Claude".into(),
+                },
                 delay: Duration::from_millis(25),
                 identity: Some("claude-id"),
                 active_heavy: Some(active.clone()),
                 max_heavy: Some(max_seen.clone()),
             }),
             Arc::new(TestProvider {
-                info: ProviderInfo { id: "codex".into(), display_name: "Codex".into() },
+                info: ProviderInfo {
+                    id: "codex".into(),
+                    display_name: "Codex".into(),
+                },
                 delay: Duration::from_millis(25),
                 identity: None,
                 active_heavy: Some(active),
@@ -368,6 +399,49 @@ mod tests {
     }
 
     #[test]
+    fn batch_child_context_carries_the_registered_request_id() {
+        struct RequestIDProvider {
+            info: ProviderInfo,
+            seen: Arc<std::sync::Mutex<Option<u64>>>,
+        }
+        impl ProviderRuntime for RequestIDProvider {
+            fn info(&self) -> &ProviderInfo {
+                &self.info
+            }
+            fn has_local_credentials(&self) -> bool {
+                true
+            }
+            fn refresh(&self, ctx: &RefreshContext) -> ProviderSnapshot {
+                *self.seen.lock().unwrap() = ctx.request_id;
+                ProviderSnapshot::new(&self.info, None, vec![], ctx.now)
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let engine = Engine::new(vec![Arc::new(RequestIDProvider {
+            info: ProviderInfo {
+                id: "devin".into(),
+                display_name: "Devin".into(),
+            },
+            seen: seen.clone(),
+        })]);
+        let reply: Value = serde_json::from_str(
+            &engine.call(
+                &serde_json::json!({
+                    "method": "refreshBatch",
+                    "params": {
+                        "requestId": 42,
+                        "items": [{ "providerId": "devin" }]
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert!(reply["ok"]["snapshots"]["devin"].is_object());
+        assert_eq!(*seen.lock().unwrap(), Some(42));
+    }
+
+    #[test]
     fn timeout_records_error_and_budget_omits_unstarted_providers() {
         let engine = Engine::new(vec![
             Arc::new(TestProvider::simple("claude", 2_000, None)),
@@ -387,7 +461,10 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(reply["ok"]["errors"]["claude"], "Accounting refresh timed out");
+        assert_eq!(
+            reply["ok"]["errors"]["claude"],
+            "Accounting refresh timed out"
+        );
         assert!(reply["ok"]["snapshots"]["codex"].is_object());
 
         let engine2 = Engine::new(vec![Arc::new(TestProvider::simple("devin", 10, None))]);

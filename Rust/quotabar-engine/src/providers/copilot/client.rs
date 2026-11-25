@@ -12,7 +12,11 @@ pub const USER_ORGS_URL: &str = "https://api.github.com/user/orgs?per_page=100";
 const USAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const ORG_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub fn fetch_usage(http: &dyn HttpClient, token: &str, cancel: &CancelToken) -> Result<Response, HttpError> {
+pub fn fetch_usage(
+    http: &dyn HttpClient,
+    token: &str,
+    cancel: &CancelToken,
+) -> Result<Response, HttpError> {
     let req = Request::get(USAGE_URL)
         .header("Authorization", format!("token {token}"))
         .header("Accept", "application/json")
@@ -65,7 +69,11 @@ pub struct OrgsFetchResult {
     pub partial_rate_limited: bool,
 }
 
-pub fn fetch_user_orgs(http: &dyn HttpClient, token: &str, cancel: &CancelToken) -> Result<OrgsFetchResult, HttpError> {
+pub fn fetch_user_orgs(
+    http: &dyn HttpClient,
+    token: &str,
+    cancel: &CancelToken,
+) -> Result<OrgsFetchResult, HttpError> {
     let mut next_url = Some(USER_ORGS_URL.to_string());
     let mut visited = HashSet::new();
     let mut orgs: Vec<Value> = Vec::new();
@@ -74,7 +82,9 @@ pub fn fetch_user_orgs(http: &dyn HttpClient, token: &str, cancel: &CancelToken)
     for _ in 0..100 {
         let Some(url) = next_url.take() else { break };
         if !visited.insert(url.clone()) {
-            return Err(HttpError::Transport("repeated GitHub pagination URL".into()));
+            return Err(HttpError::Transport(
+                "repeated GitHub pagination URL".into(),
+            ));
         }
         if cancel.is_cancelled() {
             return Err(HttpError::Cancelled);
@@ -166,7 +176,11 @@ pub fn is_rate_limit_response(resp: &Response) -> bool {
 fn contains_secondary_rate_limit_message(body: &[u8]) -> bool {
     let msg = serde_json::from_slice::<Value>(body)
         .ok()
-        .and_then(|v| v.get("message").and_then(Value::as_str).map(ToString::to_string))
+        .and_then(|v| {
+            v.get("message")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
         .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
     let lower = msg.to_ascii_lowercase();
     lower.contains("secondary rate limit")
@@ -179,7 +193,9 @@ pub fn next_link_url(link_header: Option<&str>) -> Option<String> {
     let header = link_header?;
     for part in header.split(',') {
         let mut segments = part.split(';');
-        let Some(url_seg) = segments.next() else { continue };
+        let Some(url_seg) = segments.next() else {
+            continue;
+        };
         let is_next = segments.any(|seg| {
             let trimmed = seg.trim();
             trimmed == r#"rel="next""# || trimmed == "rel='next'" || trimmed == "rel=next"

@@ -95,35 +95,53 @@ pub(super) fn sorted_entries(winners: &HashMap<String, StoredWinner>) -> Vec<Dev
 }
 
 fn stable_fingerprint(s: &str) -> String {
-    Sha256::digest(s.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn cache_file_path(db_path: &Path, dir_override: Option<&Path>) -> PathBuf {
-    let base = dir_override.map(PathBuf::from).unwrap_or_else(|| paths::cache_dir("devin-session-usage"));
+    let base = dir_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths::cache_dir("devin-session-usage"));
     let fp = stable_fingerprint(&db_path.to_string_lossy());
     base.join(format!("{fp}.json"))
 }
 
-pub(super) fn read_cache_record(db_path: &Path, dir_override: Option<&Path>) -> Option<CacheRecord> {
+pub(super) fn read_cache_record(
+    db_path: &Path,
+    dir_override: Option<&Path>,
+) -> Option<CacheRecord> {
     let path = cache_file_path(db_path, dir_override);
     let data = std::fs::read(&path).ok()?;
     let rec: CacheRecord = serde_json::from_slice(&data).ok()?;
     (rec.schema == CACHE_SCHEMA).then_some(rec)
 }
 
-pub(super) fn write_cache_record(record: &CacheRecord, db_path: &Path, dir_override: Option<&Path>) {
+pub(super) fn write_cache_record(
+    record: &CacheRecord,
+    db_path: &Path,
+    dir_override: Option<&Path>,
+) {
     let url = cache_file_path(db_path, dir_override);
     let fp = stable_fingerprint(&db_path.to_string_lossy());
-    let Ok(bytes) = serde_json::to_vec(record) else { return };
+    let Ok(bytes) = serde_json::to_vec(record) else {
+        return;
+    };
     if bytes.len() > MAX_RECORD_BYTES {
-        diagnostic_gate::log_once(&format!("provider.devin.session-usage-record-oversized.{fp}"), || {
-            qlog!(
-                Warn,
-                plugin_tag("devin"),
-                "devin session usage record for {fp} is {} MB; not persisting it",
-                bytes.len() / 1_048_576
-            );
-        });
+        diagnostic_gate::log_once(
+            &format!("provider.devin.session-usage-record-oversized.{fp}"),
+            || {
+                qlog!(
+                    Warn,
+                    plugin_tag("devin"),
+                    "devin session usage record for {fp} is {} MB; not persisting it",
+                    bytes.len() / 1_048_576
+                );
+            },
+        );
         return;
     }
     let Some(dir) = url.parent() else { return };
@@ -131,7 +149,12 @@ pub(super) fn write_cache_record(record: &CacheRecord, db_path: &Path, dir_overr
         return;
     }
     let lock_path = dir.join(".devin-session-usage.lock");
-    let Ok(lock_file) = OpenOptions::new().create(true).read(true).write(true).open(&lock_path) else {
+    let Ok(lock_file) = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    else {
         return;
     };
     #[cfg(unix)]
@@ -140,7 +163,12 @@ pub(super) fn write_cache_record(record: &CacheRecord, db_path: &Path, dir_overr
         use std::io::Write;
         if tmp.write_all(&bytes).is_ok() && tmp.flush().is_ok() {
             if let Err(err) = tmp.persist(&url) {
-                qlog!(Warn, plugin_tag("devin"), "devin session usage cache write failed for {fp}: {}", err.error);
+                qlog!(
+                    Warn,
+                    plugin_tag("devin"),
+                    "devin session usage cache write failed for {fp}: {}",
+                    err.error
+                );
             }
         }
     }

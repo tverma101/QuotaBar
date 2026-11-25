@@ -4,7 +4,8 @@
 use super::adding_saturating;
 use super::day::{DayZone, UsageHistoryWindow};
 use crate::model::{
-    DailyModelUsageEntry, DailyUsageSeries, ModelUsageEntry, ModelUsageSeries, ProviderUsageHistory, Timestamp,
+    DailyModelUsageEntry, DailyUsageSeries, ModelUsageEntry, ModelUsageSeries,
+    ProviderUsageHistory, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,7 +41,10 @@ pub struct LogUsageScan {
 
 impl LogUsageScan {
     /// Swift `LogUsageScan.init`: the incomplete-estimate days default to the unknown-model days.
-    pub fn new(series: DailyUsageSeries, unknown_models_by_day: BTreeMap<String, BTreeSet<String>>) -> Self {
+    pub fn new(
+        series: DailyUsageSeries,
+        unknown_models_by_day: BTreeMap<String, BTreeSet<String>>,
+    ) -> Self {
         let incomplete = unknown_models_by_day.keys().cloned().collect();
         LogUsageScan {
             series,
@@ -56,17 +60,25 @@ impl LogUsageScan {
     /// Trim an unchanged cached aggregate as its rolling lifetime window advances. This avoids
     /// repricing every retained event at midnight; the per-database cache can discard whole days.
     pub fn dropping_days(&self, before: &str) -> LogUsageScan {
-        let keep_set = |set: &BTreeSet<String>| set.iter().filter(|d| d.as_str() >= before).cloned().collect();
+        let keep_set = |set: &BTreeSet<String>| {
+            set.iter()
+                .filter(|d| d.as_str() >= before)
+                .cloned()
+                .collect()
+        };
         let mut trimmed = self.clone();
         trimmed.series.daily.retain(|d| d.date.as_str() >= before);
         if let Some(models) = trimmed.model_usage.as_mut() {
             models.daily.retain(|d| d.date.as_str() >= before);
         }
-        trimmed.unknown_models_by_day.retain(|day, _| day.as_str() >= before);
+        trimmed
+            .unknown_models_by_day
+            .retain(|day, _| day.as_str() >= before);
         if let Some(estimates) = trimmed.api_estimate_by_day.as_mut() {
             estimates.retain(|day, _| day.as_str() >= before);
         }
-        trimmed.api_estimate_incomplete_days = self.api_estimate_incomplete_days.as_ref().map(keep_set);
+        trimmed.api_estimate_incomplete_days =
+            self.api_estimate_incomplete_days.as_ref().map(keep_set);
         trimmed.estimated_cost_days = self.estimated_cost_days.as_ref().map(keep_set);
         trimmed.unmeasured_usage_days = self.unmeasured_usage_days.as_ref().map(keep_set);
         trimmed
@@ -77,7 +89,9 @@ impl LogUsageScan {
             return self.clone();
         }
         let mut marked = self.clone();
-        let existing = marked.unmeasured_usage_days.get_or_insert_with(BTreeSet::new);
+        let existing = marked
+            .unmeasured_usage_days
+            .get_or_insert_with(BTreeSet::new);
         existing.extend(days.iter().cloned());
         marked
     }
@@ -88,10 +102,18 @@ impl ProviderUsageHistory {
     /// rows' costs incomplete, legacy incomplete days get their cause classified, and the
     /// incomplete-estimate days default to the unknown-model days. Idempotent.
     pub fn normalizing(mut self) -> Self {
-        self.model_usage = self.model_usage.take().map(|m| marking_named_unknown_costs_incomplete(m, &self.unknown_models_by_day));
-        classify_legacy_incomplete_days(&mut self.series, self.model_usage.as_ref(), &self.unknown_models_by_day);
+        self.model_usage = self
+            .model_usage
+            .take()
+            .map(|m| marking_named_unknown_costs_incomplete(m, &self.unknown_models_by_day));
+        classify_legacy_incomplete_days(
+            &mut self.series,
+            self.model_usage.as_ref(),
+            &self.unknown_models_by_day,
+        );
         if self.api_estimate_incomplete_days.is_none() {
-            self.api_estimate_incomplete_days = Some(self.unknown_models_by_day.keys().cloned().collect());
+            self.api_estimate_incomplete_days =
+                Some(self.unknown_models_by_day.keys().cloned().collect());
         }
         self
     }
@@ -113,20 +135,41 @@ impl ProviderUsageHistory {
         let model_days: Vec<DailyModelUsageEntry> = self
             .model_usage
             .as_ref()
-            .map(|m| m.daily.iter().filter(|d| detail_day_keys.contains(&d.date)).cloned().collect())
+            .map(|m| {
+                m.daily
+                    .iter()
+                    .filter(|d| detail_day_keys.contains(&d.date))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
-        let api_estimates: Option<BTreeMap<String, f64>> = self.api_estimate_by_day.as_ref().map(|estimates| {
-            estimates.iter().filter(|(day, _)| lifetime_day_keys.contains(*day)).map(|(d, v)| (d.clone(), *v)).collect()
-        });
+        let api_estimates: Option<BTreeMap<String, f64>> =
+            self.api_estimate_by_day.as_ref().map(|estimates| {
+                estimates
+                    .iter()
+                    .filter(|(day, _)| lifetime_day_keys.contains(*day))
+                    .map(|(d, v)| (d.clone(), *v))
+                    .collect()
+            });
         let incomplete_estimate_days: BTreeSet<String> = self
             .api_estimate_incomplete_days
             .clone()
             .unwrap_or_else(|| self.unknown_models_by_day.keys().cloned().collect());
-        let keep_lifetime =
-            |set: &BTreeSet<String>| -> BTreeSet<String> { set.iter().filter(|d| lifetime_day_keys.contains(*d)).cloned().collect() };
+        let keep_lifetime = |set: &BTreeSet<String>| -> BTreeSet<String> {
+            set.iter()
+                .filter(|d| lifetime_day_keys.contains(*d))
+                .cloned()
+                .collect()
+        };
         ProviderUsageHistory {
             series: DailyUsageSeries {
-                daily: self.series.daily.iter().filter(|d| lifetime_day_keys.contains(&d.date)).cloned().collect(),
+                daily: self
+                    .series
+                    .daily
+                    .iter()
+                    .filter(|d| lifetime_day_keys.contains(&d.date))
+                    .cloned()
+                    .collect(),
             },
             model_usage: (!model_days.is_empty()).then_some(ModelUsageSeries { daily: model_days }),
             unknown_models_by_day: self
@@ -169,10 +212,10 @@ fn marking_named_unknown_costs_incomplete(
                             }
                         }
                     }
-                    let variant_named = model
-                        .variants
-                        .as_ref()
-                        .is_some_and(|vs| vs.iter().any(|v| unknown_names.contains(&v.model.to_lowercase())));
+                    let variant_named = model.variants.as_ref().is_some_and(|vs| {
+                        vs.iter()
+                            .any(|v| unknown_names.contains(&v.model.to_lowercase()))
+                    });
                     if unknown_names.contains(&model.model.to_lowercase()) || variant_named {
                         model.cost_is_complete = Some(false);
                     }
@@ -193,14 +236,21 @@ fn classify_legacy_incomplete_days(
 ) {
     let mut models_by_day: BTreeMap<&str, Vec<&ModelUsageEntry>> = BTreeMap::new();
     for model_day in model_usage.map(|m| m.daily.as_slice()).unwrap_or_default() {
-        models_by_day.entry(model_day.date.as_str()).or_default().extend(model_day.models.iter());
+        models_by_day
+            .entry(model_day.date.as_str())
+            .or_default()
+            .extend(model_day.models.iter());
     }
     for day in &mut series.daily {
         if day.cost_is_complete || day.has_unexplained_incomplete_cost.is_some() {
             continue;
         }
-        let unknown_names = unknown_models_by_day.get(&day.date).filter(|names| !names.is_empty());
-        let model_rows = models_by_day.get(day.date.as_str()).filter(|rows| !rows.is_empty());
+        let unknown_names = unknown_models_by_day
+            .get(&day.date)
+            .filter(|names| !names.is_empty());
+        let model_rows = models_by_day
+            .get(day.date.as_str())
+            .filter(|rows| !rows.is_empty());
         let (Some(unknown_names), Some(model_rows)) = (unknown_names, model_rows) else {
             day.has_unexplained_incomplete_cost = Some(true);
             continue;
@@ -213,21 +263,35 @@ fn classify_legacy_incomplete_days(
                 model_tokens_saturated = true;
             }
             model_tokens = adding_saturating(model_tokens, model.total_tokens);
-            model_tokens_saturated = model_tokens_saturated || model.token_count_saturated == Some(true);
+            model_tokens_saturated =
+                model_tokens_saturated || model.token_count_saturated == Some(true);
         }
-        let normalized_unknown: BTreeSet<String> = unknown_names.iter().map(|n| n.to_lowercase()).collect();
+        let normalized_unknown: BTreeSet<String> =
+            unknown_names.iter().map(|n| n.to_lowercase()).collect();
         let represented: BTreeSet<String> = model_rows
             .iter()
             .flat_map(|model| {
-                std::iter::once(model.model.to_lowercase())
-                    .chain(model.variants.iter().flatten().map(|v| v.model.to_lowercase()))
+                std::iter::once(model.model.to_lowercase()).chain(
+                    model
+                        .variants
+                        .iter()
+                        .flatten()
+                        .map(|v| v.model.to_lowercase()),
+                )
             })
             .collect();
-        let incomplete: Vec<&&ModelUsageEntry> = model_rows.iter().filter(|m| m.has_incomplete_cost()).collect();
+        let incomplete: Vec<&&ModelUsageEntry> = model_rows
+            .iter()
+            .filter(|m| m.has_incomplete_cost())
+            .collect();
         let all_incomplete_named = !incomplete.is_empty()
             && incomplete.iter().all(|model| {
                 normalized_unknown.contains(&model.model.to_lowercase())
-                    || model.variants.iter().flatten().any(|v| normalized_unknown.contains(&v.model.to_lowercase()))
+                    || model
+                        .variants
+                        .iter()
+                        .flatten()
+                        .any(|v| normalized_unknown.contains(&v.model.to_lowercase()))
             });
         let names_represented = normalized_unknown.is_subset(&represented);
         day.has_unexplained_incomplete_cost = Some(

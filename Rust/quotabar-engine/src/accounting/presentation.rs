@@ -13,7 +13,9 @@ impl ModelUsageEntry {
     fn restates_cost(&self, other: Option<f64>) -> bool {
         match (self.cost_usd, other) {
             (None, None) => true,
-            (Some(row), Some(part)) => row.is_finite() && part.is_finite() && (row - part).abs() < 0.005,
+            (Some(row), Some(part)) => {
+                row.is_finite() && part.is_finite() && (row - part).abs() < 0.005
+            }
             _ => false,
         }
     }
@@ -22,10 +24,17 @@ impl ModelUsageEntry {
     /// show the same tokens and cost. A lone named model becomes its own row. A lone unattributed
     /// bucket stays Other, without a second line that repeats it.
     pub fn collapsing_restated_other(&self) -> ModelUsageEntry {
-        let Some(only) = self.variants.as_deref().filter(|v| v.len() == 1).map(|v| &v[0]) else {
+        let Some(only) = self
+            .variants
+            .as_deref()
+            .filter(|v| v.len() == 1)
+            .map(|v| &v[0])
+        else {
             return self.clone();
         };
-        if !is_named(&self.model, Self::OTHER) || only.total_tokens != self.total_tokens || !self.restates_cost(only.cost_usd)
+        if !is_named(&self.model, Self::OTHER)
+            || only.total_tokens != self.total_tokens
+            || !self.restates_cost(only.cost_usd)
         {
             return self.clone();
         }
@@ -57,15 +66,29 @@ impl ModelUsageEntry {
         }
 
         let echo_indexes: Vec<usize> = (0..variants.len())
-            .filter(|&i| variants[i].cost_usd.is_some_and(|part| part > 0.0 && (part - cost).abs() < 0.005))
+            .filter(|&i| {
+                variants[i]
+                    .cost_usd
+                    .is_some_and(|part| part > 0.0 && (part - cost).abs() < 0.005)
+            })
             .collect();
-        let contributor_tokens = variants.iter().try_fold(0i64, |acc, v| acc.checked_add(v.total_tokens));
-        let [echo_index] = echo_indexes[..] else { return vec![collapsed.clone()] };
-        if contributor_tokens != Some(collapsed.total_tokens) || collapsed.token_count_saturated == Some(true) {
+        let contributor_tokens = variants
+            .iter()
+            .try_fold(0i64, |acc, v| acc.checked_add(v.total_tokens));
+        let [echo_index] = echo_indexes[..] else {
+            return vec![collapsed.clone()];
+        };
+        if contributor_tokens != Some(collapsed.total_tokens)
+            || collapsed.token_count_saturated == Some(true)
+        {
             return vec![collapsed.clone()];
         }
-        let rest: Vec<ModelUsageVariant> =
-            variants.iter().enumerate().filter(|(i, _)| *i != echo_index).map(|(_, v)| v.clone()).collect();
+        let rest: Vec<ModelUsageVariant> = variants
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != echo_index)
+            .map(|(_, v)| v.clone())
+            .collect();
         if !rest.iter().all(|v| v.cost_usd.unwrap_or(0.0) == 0.0) {
             return vec![collapsed.clone()];
         }
@@ -77,7 +100,9 @@ impl ModelUsageEntry {
     /// A single raw slug that repeats this row's own tokens and cost is not a breakdown.
     pub fn dropping_restated_variant(&self) -> ModelUsageEntry {
         match self.variants.as_deref() {
-            Some([only]) if only.total_tokens == self.total_tokens && self.restates_cost(only.cost_usd) => {
+            Some([only])
+                if only.total_tokens == self.total_tokens && self.restates_cost(only.cost_usd) =>
+            {
                 let mut row = self.clone();
                 row.variants = None;
                 row
@@ -108,7 +133,9 @@ fn rows_for_remaining(variants: &[ModelUsageVariant]) -> Vec<ModelUsageEntry> {
         }],
         [only] => vec![row_for(only)],
         _ => {
-            let tokens = variants.iter().fold(0, |acc, v| adding_saturating(acc, v.total_tokens));
+            let tokens = variants
+                .iter()
+                .fold(0, |acc, v| adding_saturating(acc, v.total_tokens));
             let mut cost: Option<f64> = None;
             let mut incomplete = false;
             let mut saturated = false;

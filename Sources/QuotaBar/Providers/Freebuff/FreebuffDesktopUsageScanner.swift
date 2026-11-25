@@ -237,7 +237,7 @@ actor FreebuffDesktopUsageScanner {
                 turnsByDatabase.append(cached.rows)
                 unreadableRows += cached.unreadableRows
             } else if let diskRecord = FreebuffDesktopTurnPersistence.read(path: path, revision: before) {
-                // Disk-warm start: a fresh process (scan-worker child, or after a memory-pressure
+                // Disk-warm start: a fresh process (cold process, or after a memory-pressure
                 // unload) reloads derived turns without another SQLite read. The record's revision
                 // was validated against `before`, so the rows match this pass's snapshot exactly.
                 let derived = DerivedTurns(turns: diskRecord.rows, unreadable: diskRecord.unreadableRows)

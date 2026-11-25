@@ -1,6 +1,8 @@
 //! Hermes Agent local SQLite database scanner (`~/.hermes/state.db` or `$HERMES_HOME/state.db`).
 
-use super::mapper::{HermesModelUsage, HermesPeriod, HermesPeriodUsage, HermesTokenCounts, HermesUsageScan};
+use super::mapper::{
+    HermesModelUsage, HermesPeriod, HermesPeriodUsage, HermesTokenCounts, HermesUsageScan,
+};
 use crate::accounting::{DayZone, UsageHistoryWindow};
 use crate::context::CancelToken;
 use crate::host;
@@ -36,11 +38,19 @@ pub struct HermesUsageScanner {
 
 impl HermesUsageScanner {
     pub fn live() -> Self {
-        HermesUsageScanner { fixed_path: None, zone: DayZone::Local, cache: Mutex::new(None) }
+        HermesUsageScanner {
+            fixed_path: None,
+            zone: DayZone::Local,
+            cache: Mutex::new(None),
+        }
     }
 
     pub fn at(path: PathBuf, zone: DayZone) -> Self {
-        HermesUsageScanner { fixed_path: Some(path), zone, cache: Mutex::new(None) }
+        HermesUsageScanner {
+            fixed_path: Some(path),
+            zone,
+            cache: Mutex::new(None),
+        }
     }
 
     pub fn unload_caches(&self) {
@@ -48,10 +58,16 @@ impl HermesUsageScanner {
     }
 
     pub fn effective_path(&self) -> PathBuf {
-        self.fixed_path.clone().unwrap_or_else(default_state_db_path)
+        self.fixed_path
+            .clone()
+            .unwrap_or_else(default_state_db_path)
     }
 
-    pub fn scan(&self, now: Timestamp, cancel: &CancelToken) -> Result<Option<HermesUsageScan>, HermesScanError> {
+    pub fn scan(
+        &self,
+        now: Timestamp,
+        cancel: &CancelToken,
+    ) -> Result<Option<HermesUsageScan>, HermesScanError> {
         if cancel.is_cancelled() {
             return Err(HermesScanError::Cancelled);
         }
@@ -86,10 +102,14 @@ impl HermesUsageScanner {
             if cancel.is_cancelled() {
                 return Err(HermesScanError::Cancelled);
             }
-            let sum_json = query(&path, &period_sql(start, Some(max_ts)))?
-                .ok_or_else(|| HermesScanError::DatabaseUnreadable("period query returned no result".into()))?;
-            let parsed_period = parse_period(&sum_json)
-                .ok_or_else(|| HermesScanError::DatabaseUnreadable("period query returned malformed accounting data".into()))?;
+            let sum_json = query(&path, &period_sql(start, Some(max_ts)))?.ok_or_else(|| {
+                HermesScanError::DatabaseUnreadable("period query returned no result".into())
+            })?;
+            let parsed_period = parse_period(&sum_json).ok_or_else(|| {
+                HermesScanError::DatabaseUnreadable(
+                    "period query returned malformed accounting data".into(),
+                )
+            })?;
             periods.push(HermesPeriodUsage {
                 period,
                 counts: parsed_period.counts,
@@ -101,26 +121,45 @@ impl HermesUsageScanner {
                 return Err(HermesScanError::Cancelled);
             }
             let models_json = query(&path, &models_sql(start, has_model_table, Some(max_ts)))?
-                .ok_or_else(|| HermesScanError::DatabaseUnreadable("model query returned no result".into()))?;
-            let parsed_models = parse_models(&models_json)
-                .ok_or_else(|| HermesScanError::DatabaseUnreadable("model query returned malformed accounting data".into()))?;
+                .ok_or_else(|| {
+                    HermesScanError::DatabaseUnreadable("model query returned no result".into())
+                })?;
+            let parsed_models = parse_models(&models_json).ok_or_else(|| {
+                HermesScanError::DatabaseUnreadable(
+                    "model query returned malformed accounting data".into(),
+                )
+            })?;
             model_usage_by_period.insert(period, parsed_models);
         }
 
         let lifetime_days = UsageHistoryWindow::lifetime_days(now, self.zone);
-        let today_date = self.zone.local_date(now).unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
-        let cutoff_date = today_date.checked_sub_days(Days::new((lifetime_days.saturating_sub(1)) as u64)).unwrap_or(today_date);
+        let today_date = self
+            .zone
+            .local_date(now)
+            .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        let cutoff_date = today_date
+            .checked_sub_days(Days::new((lifetime_days.saturating_sub(1)) as u64))
+            .unwrap_or(today_date);
         let cutoff = start_of_day(cutoff_date, self.zone);
 
         if cancel.is_cancelled() {
             return Err(HermesScanError::Cancelled);
         }
-        let daily_json = query(&path, &daily_sql(cutoff, Some(max_ts)))?
-            .ok_or_else(|| HermesScanError::DatabaseUnreadable("daily query returned no result".into()))?;
-        let (series, partial_days) = parse_daily(&daily_json)
-            .ok_or_else(|| HermesScanError::DatabaseUnreadable("daily query returned malformed accounting data".into()))?;
+        let daily_json = query(&path, &daily_sql(cutoff, Some(max_ts)))?.ok_or_else(|| {
+            HermesScanError::DatabaseUnreadable("daily query returned no result".into())
+        })?;
+        let (series, partial_days) = parse_daily(&daily_json).ok_or_else(|| {
+            HermesScanError::DatabaseUnreadable(
+                "daily query returned malformed accounting data".into(),
+            )
+        })?;
 
-        let result = HermesUsageScan { periods, daily: series, model_usage_by_period, partial_days };
+        let result = HermesUsageScan {
+            periods,
+            daily: series,
+            model_usage_by_period,
+            partial_days,
+        };
         if let Some(valid_until) = next_midnight(today_date, self.zone) {
             *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(CachedScan {
                 path,
@@ -150,13 +189,18 @@ pub fn default_state_db_path() -> PathBuf {
 }
 
 fn query(path: &Path, sql: &str) -> Result<Option<String>, HermesScanError> {
-    sqlite::query_text(path, sql, true).map_err(|err| HermesScanError::DatabaseUnreadable(err.to_string()))
+    sqlite::query_text(path, sql, true)
+        .map_err(|err| HermesScanError::DatabaseUnreadable(err.to_string()))
 }
 
 fn period_starts(now: Timestamp, zone: DayZone) -> [(HermesPeriod, Timestamp); 3] {
-    let today = zone.local_date(now).unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+    let today = zone
+        .local_date(now)
+        .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
     let days_since_monday = today.weekday().num_days_from_monday() as u64;
-    let week_date = today.checked_sub_days(Days::new(days_since_monday)).unwrap_or(today);
+    let week_date = today
+        .checked_sub_days(Days::new(days_since_monday))
+        .unwrap_or(today);
     let month_date = today.with_day(1).unwrap_or(today);
     [
         (HermesPeriod::Today, start_of_day(today, zone)),
@@ -167,19 +211,25 @@ fn period_starts(now: Timestamp, zone: DayZone) -> [(HermesPeriod, Timestamp); 3
 
 fn start_of_day(date: NaiveDate, zone: DayZone) -> Timestamp {
     for hour in 0..4 {
-        let Some(naive) = date.and_hms_opt(hour, 0, 0) else { continue };
+        let Some(naive) = date.and_hms_opt(hour, 0, 0) else {
+            continue;
+        };
         let resolved = match zone {
             DayZone::Local => match Local.from_local_datetime(&naive) {
                 LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => Some(t.timestamp() as f64),
                 LocalResult::None => None,
             },
-            DayZone::Fixed(offset) => offset.from_local_datetime(&naive).single().map(|t| t.timestamp() as f64),
+            DayZone::Fixed(offset) => offset
+                .from_local_datetime(&naive)
+                .single()
+                .map(|t| t.timestamp() as f64),
         };
         if let Some(ts) = resolved {
             return ts;
         }
     }
-    Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()).timestamp() as f64
+    Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
+        .timestamp() as f64
 }
 
 fn next_midnight(today: NaiveDate, zone: DayZone) -> Option<Timestamp> {
@@ -209,9 +259,17 @@ pub fn period_sql(start: Timestamp, max_timestamp: Option<Timestamp>) -> String 
 pub fn models_sql(start: Timestamp, detailed: bool, max_timestamp: Option<Timestamp>) -> String {
     let model_expr = if detailed { "smu.model" } else { "model" };
     let tok = token_sum_expr(detailed.then_some("smu"));
-    let cost_expr = if detailed { "smu.estimated_cost_usd" } else { "estimated_cost_usd" };
+    let cost_expr = if detailed {
+        "smu.estimated_cost_usd"
+    } else {
+        "estimated_cost_usd"
+    };
     let comp = cost_completeness_expr(&tok, cost_expr);
-    let invalid = invalid_rows_expr(detailed.then_some("smu"), detailed.then_some("s"), max_timestamp);
+    let invalid = invalid_rows_expr(
+        detailed.then_some("smu"),
+        detailed.then_some("s"),
+        max_timestamp,
+    );
     let active = if detailed {
         "CASE WHEN SUM(CASE WHEN s.ended_at IS NULL THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END"
     } else {
@@ -255,9 +313,19 @@ fn cost_completeness_expr(tok_expr: &str, cost_expr: &str) -> String {
     format!("CASE WHEN SUM(CASE WHEN {tok_expr} > 0 AND ({cost_expr} IS NULL OR {cost_expr} <= 0) THEN 1 ELSE 0 END) = 0 THEN 1 ELSE 0 END")
 }
 
-fn invalid_rows_expr(alias: Option<&str>, session_alias: Option<&str>, max_ts: Option<Timestamp>) -> String {
+fn invalid_rows_expr(
+    alias: Option<&str>,
+    session_alias: Option<&str>,
+    max_ts: Option<Timestamp>,
+) -> String {
     let p = alias.map_or_else(String::new, |a| format!("{a}."));
-    let mut names = vec!["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"];
+    let mut names = vec![
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+    ];
     if alias.is_none() {
         names.push("api_call_count");
     }
@@ -274,10 +342,19 @@ fn invalid_rows_expr(alias: Option<&str>, session_alias: Option<&str>, max_ts: O
         let sp = session_alias.map_or_else(String::new, |a| format!("{a}."));
         let ts = format!("{sp}started_at");
         let calls = format!("{sp}api_call_count");
-        let has_usage = format!("({} > 0 OR COALESCE({calls},0) > 0 OR COALESCE({cost},0) > 0)", token_sum_expr(alias));
-        parts.push(format!("({has_usage} AND (typeof({ts}) NOT IN ('integer','real') OR {ts} > {}))", literal(max)));
+        let has_usage = format!(
+            "({} > 0 OR COALESCE({calls},0) > 0 OR COALESCE({cost},0) > 0)",
+            token_sum_expr(alias)
+        );
+        parts.push(format!(
+            "({has_usage} AND (typeof({ts}) NOT IN ('integer','real') OR {ts} > {}))",
+            literal(max)
+        ));
     }
-    format!("CASE WHEN SUM(CASE WHEN {} THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END", parts.join(" OR "))
+    format!(
+        "CASE WHEN SUM(CASE WHEN {} THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END",
+        parts.join(" OR ")
+    )
 }
 
 fn non_opencode_billing_predicate(session_alias: Option<&str>) -> String {
@@ -312,7 +389,13 @@ fn parse_period(json_text: &str) -> Option<ParsedPeriod> {
     }
     let active = strict_tok(&arr[9]).filter(|v| *v <= 1)?;
     Some(ParsedPeriod {
-        counts: HermesTokenCounts { input, output, cache_read, cache_write, reasoning },
+        counts: HermesTokenCounts {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning,
+        },
         cost_usd: (cost_complete && cost_val > 0.0).then_some(cost_val),
         api_call_count,
         is_partial: active == 1,

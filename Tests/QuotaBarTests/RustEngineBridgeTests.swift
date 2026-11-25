@@ -131,6 +131,98 @@ final class RustEngineBridgeTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testRefreshBatchRoundTripsThroughTheEngine() async throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("QuotaBarTests.RustBatch.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        RustEngine.prepare()
+        _ = await RustEngine.call(["method": "configure", "params": ["home": home.path, "appData": home.path]])
+        func restore() async {
+            try? FileManager.default.removeItem(at: home)
+            _ = await RustEngine.call(["method": "configure", "params": [
+                "home": FileManager.default.homeDirectoryForCurrentUser.path,
+                "appData": FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("QuotaBar").path
+            ]])
+        }
+
+        let response: RustEngine.BatchResponse
+        do {
+            response = try await RustEngine.refreshBatch(
+                items: [RustEngine.BatchItem(providerID: "devin")],
+                scope: .panelAccounting,
+                perProviderTimeoutSeconds: 30,
+                batchBudgetSeconds: 60
+            )
+        } catch {
+            await restore()
+            throw error
+        }
+        await restore()
+        let snapshot = try XCTUnwrap(response.snapshots["devin"])
+        XCTAssertEqual(snapshot.providerID, "devin")
+        // A fold-only batch deliberately does not read live credentials or call the provider API;
+        // an empty home yields a usable, empty local snapshot rather than a login error.
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertTrue(response.errors.isEmpty)
+    }
+
+    @MainActor
+    func testCodexResetClaimServiceUsesTheEngineForItsCredentiallessPath() async throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("QuotaBarTests.ResetClaim.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        RustEngine.prepare()
+        _ = await RustEngine.call(["method": "configure", "params": ["home": home.path, "appData": home.path]])
+        func restore() async {
+            try? FileManager.default.removeItem(at: home)
+            _ = await RustEngine.call(["method": "configure", "params": [
+                "home": FileManager.default.homeDirectoryForCurrentUser.path,
+                "appData": FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("QuotaBar").path
+            ]])
+        }
+
+        var refreshes = 0
+        let service = CodexResetClaimService(
+            providerID: "codex",
+            engineConfig: [
+                "candidateAuthHomes": [home.path],
+                "allowsKeychainFallback": false
+            ],
+            refreshAfterClaim: { refreshes += 1 }
+        )
+        let credits = await service.availableCredits()
+        let outcome = await service.claim(
+            creditExpiringAt: Date(timeIntervalSince1970: 1_800_000_000),
+            redeemRequestID: "bridge-test"
+        )
+        await restore()
+
+        XCTAssertNil(credits, "a credentialless account has no live credit list")
+        XCTAssertEqual(outcome, .failed)
+        XCTAssertEqual(refreshes, 0, "a failed claim must not refresh the dashboard")
+    }
+
+    func testNativeSQLiteAccessorUsesTheInProcessEngine() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("QuotaBarTests.NativeSQLite.\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let sqlite = NativeSQLiteAccessor()
+        try sqlite.execute(
+            path: path,
+            sql: "CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('hello');"
+        )
+        XCTAssertEqual(try sqlite.queryValue(path: path, sql: "SELECT value FROM sample;"), "hello")
+        XCTAssertNil(
+            try sqlite.queryValue(path: path + ".missing", sql: "SELECT 1;"),
+            "a missing database is an absent source, and the native path must not create it"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path + ".missing"))
+    }
+
     func testUnknownMethodsFailLoudly() async {
         RustEngine.prepare()
         let reply = await RustEngine.call(["method": "definitely-not-a-method"])

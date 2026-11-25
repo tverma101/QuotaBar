@@ -138,7 +138,7 @@ final class AntigravityAggregatePersistenceTests: XCTestCase {
         XCTAssertNil(AntigravityAggregatePersistence.read(path: fixture.path))
     }
 
-    /// A fresh scanner — the scan-worker child, or this app after a memory-pressure unload —
+    /// A fresh scanner — a cold process, or this app after a memory-pressure unload —
     /// must rebuild its view from the disk record without re-reading the conversation database.
     func testFreshScannerServesDiskRecordWithoutSQLiteQueries() async throws {
         let fixture = try makeDatabaseDirectory()

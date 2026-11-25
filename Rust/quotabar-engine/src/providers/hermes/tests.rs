@@ -1,6 +1,6 @@
 use super::mapper::{
-    breakdown, lines, usage_history, HermesModelUsage, HermesPeriod, HermesPeriodUsage, HermesTokenCounts,
-    HermesUsageScan,
+    breakdown, lines, usage_history, HermesModelUsage, HermesPeriod, HermesPeriodUsage,
+    HermesTokenCounts, HermesUsageScan,
 };
 use super::scanner::{state_db_path_for, HermesUsageScanner};
 use super::*;
@@ -49,13 +49,18 @@ fn create_hermes_db(path: &Path, sql: &str) {
 #[test]
 fn hermes_paths_respects_hermes_home_override_and_tilde() {
     let home = PathBuf::from("/Users/test");
-    assert_eq!(state_db_path_for(&home, &|_| None), home.join(".hermes/state.db"));
     assert_eq!(
-        state_db_path_for(&home, &|k| (k == "HERMES_HOME").then(|| "/custom/hermes".into())),
+        state_db_path_for(&home, &|_| None),
+        home.join(".hermes/state.db")
+    );
+    assert_eq!(
+        state_db_path_for(&home, &|k| (k == "HERMES_HOME")
+            .then(|| "/custom/hermes".into())),
         PathBuf::from("/custom/hermes/state.db")
     );
     assert_eq!(
-        state_db_path_for(&home, &|k| (k == "HERMES_HOME").then(|| "~/hermes-data".into())),
+        state_db_path_for(&home, &|k| (k == "HERMES_HOME")
+            .then(|| "~/hermes-data".into())),
         home.join("hermes-data/state.db")
     );
     assert_eq!(
@@ -86,12 +91,19 @@ fn real_db_periods_daily_opencode_exclusion_and_missing_table_fallback() {
     );
     let scanner = HermesUsageScanner::at(db.clone(), DayZone::Local);
     let scan = scanner.scan(now, &CancelToken::new()).unwrap().unwrap();
-    let today = scan.periods.iter().find(|p| p.period == HermesPeriod::Today).unwrap();
+    let today = scan
+        .periods
+        .iter()
+        .find(|p| p.period == HermesPeriod::Today)
+        .unwrap();
     assert_eq!(today.counts.total(), 9250);
     assert!((today.cost_usd.unwrap() - 0.42).abs() < 1e-4);
     assert_eq!(today.api_call_count, 12);
     let models = &scan.model_usage_by_period[&HermesPeriod::Today];
-    assert_eq!(models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(), ["kimi/kimi-k2.7", "deepseek/deepseek-v4-flash"]);
+    assert_eq!(
+        models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(),
+        ["kimi/kimi-k2.7", "deepseek/deepseek-v4-flash"]
+    );
     let mut daily_toks: Vec<i64> = scan.daily.daily.iter().map(|d| d.total_tokens).collect();
     daily_toks.sort();
     assert_eq!(daily_toks, [9250, 9900]);
@@ -105,8 +117,14 @@ fn real_db_periods_daily_opencode_exclusion_and_missing_table_fallback() {
         ts = now - 60.0,
     )).unwrap();
     drop(conn);
-    let s2 = HermesUsageScanner::at(db2.clone(), DayZone::Local).scan(now, &CancelToken::new()).unwrap().unwrap();
-    assert_eq!(s2.model_usage_by_period[&HermesPeriod::Today][0].tokens, 1200);
+    let s2 = HermesUsageScanner::at(db2.clone(), DayZone::Local)
+        .scan(now, &CancelToken::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        s2.model_usage_by_period[&HermesPeriod::Today][0].tokens,
+        1200
+    );
 
     // Future dated session fails scan cleanly
     let conn = Connection::open(&db2).unwrap();
@@ -115,7 +133,9 @@ fn real_db_periods_daily_opencode_exclusion_and_missing_table_fallback() {
         fut = now + 400.0
     )).unwrap();
     drop(conn);
-    assert!(HermesUsageScanner::at(db2, DayZone::Local).scan(now, &CancelToken::new()).is_err());
+    assert!(HermesUsageScanner::at(db2, DayZone::Local)
+        .scan(now, &CancelToken::new())
+        .is_err());
 }
 
 #[test]
@@ -148,19 +168,89 @@ fn default_zero_cost_active_session_and_mapper_breakdown_fold_rules() {
 
     // Mapper top-3 + material unpriced model rule
     let models = vec![
-        HermesModelUsage { model: "leader".into(), tokens: 100_000_000, cost_usd: Some(10.0), is_partial: false },
-        HermesModelUsage { model: "b".into(), tokens: 50_000_000, cost_usd: Some(5.0), is_partial: false },
-        HermesModelUsage { model: "c".into(), tokens: 30_000_000, cost_usd: Some(3.0), is_partial: false },
-        HermesModelUsage { model: "d".into(), tokens: 20_000_000, cost_usd: Some(2.0), is_partial: false },
-        HermesModelUsage { model: "swe-2-max".into(), tokens: 15_000_000, cost_usd: None, is_partial: false },
-        HermesModelUsage { model: "e".into(), tokens: 10_000_000, cost_usd: Some(1.0), is_partial: false },
-        HermesModelUsage { model: "compactor".into(), tokens: 1_500_000, cost_usd: None, is_partial: false },
+        HermesModelUsage {
+            model: "leader".into(),
+            tokens: 100_000_000,
+            cost_usd: Some(10.0),
+            is_partial: false,
+        },
+        HermesModelUsage {
+            model: "b".into(),
+            tokens: 50_000_000,
+            cost_usd: Some(5.0),
+            is_partial: false,
+        },
+        HermesModelUsage {
+            model: "c".into(),
+            tokens: 30_000_000,
+            cost_usd: Some(3.0),
+            is_partial: false,
+        },
+        HermesModelUsage {
+            model: "d".into(),
+            tokens: 20_000_000,
+            cost_usd: Some(2.0),
+            is_partial: false,
+        },
+        HermesModelUsage {
+            model: "swe-2-max".into(),
+            tokens: 15_000_000,
+            cost_usd: None,
+            is_partial: false,
+        },
+        HermesModelUsage {
+            model: "e".into(),
+            tokens: 10_000_000,
+            cost_usd: Some(1.0),
+            is_partial: false,
+        },
+        HermesModelUsage {
+            model: "compactor".into(),
+            tokens: 1_500_000,
+            cost_usd: None,
+            is_partial: false,
+        },
     ];
     let bd = breakdown(&models, 216_500_000, Some(21.0)).unwrap();
-    assert_eq!(bd.models.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(), ["leader", "b", "c", "swe-2-max", ModelUsageEntry::OTHER]);
+    assert_eq!(
+        bd.models
+            .iter()
+            .map(|m| m.model.as_str())
+            .collect::<Vec<_>>(),
+        ["leader", "b", "c", "swe-2-max", ModelUsageEntry::OTHER]
+    );
     assert!(bd.models.last().unwrap().has_incomplete_cost());
 
-    let missing_snap = HermesProvider::with_scanner(HermesUsageScanner::at(dir.path().join("absent.db"), DayZone::Local)).refresh(&ctx);
-    assert_eq!(missing_snap.error_category, Some(ErrorCategory::NotLoggedIn));
-    let _ = (lines, usage_history, HermesTokenCounts::default(), HermesPeriodUsage { period: HermesPeriod::Today, counts: HermesTokenCounts::default(), cost_usd: None, api_call_count: 0, is_partial: false }, DailyUsageSeries { daily: vec![DailyUsageEntry::new("2026-07-01", 10, None)] }, BTreeMap::<HermesPeriod, Vec<HermesModelUsage>>::new(), BTreeSet::<String>::new(), HermesUsageScan { periods: vec![], daily: DailyUsageSeries { daily: vec![] }, model_usage_by_period: BTreeMap::new(), partial_days: BTreeSet::new() });
+    let missing_snap = HermesProvider::with_scanner(HermesUsageScanner::at(
+        dir.path().join("absent.db"),
+        DayZone::Local,
+    ))
+    .refresh(&ctx);
+    assert_eq!(
+        missing_snap.error_category,
+        Some(ErrorCategory::NotLoggedIn)
+    );
+    let _ = (
+        lines,
+        usage_history,
+        HermesTokenCounts::default(),
+        HermesPeriodUsage {
+            period: HermesPeriod::Today,
+            counts: HermesTokenCounts::default(),
+            cost_usd: None,
+            api_call_count: 0,
+            is_partial: false,
+        },
+        DailyUsageSeries {
+            daily: vec![DailyUsageEntry::new("2026-07-01", 10, None)],
+        },
+        BTreeMap::<HermesPeriod, Vec<HermesModelUsage>>::new(),
+        BTreeSet::<String>::new(),
+        HermesUsageScan {
+            periods: vec![],
+            daily: DailyUsageSeries { daily: vec![] },
+            model_usage_by_period: BTreeMap::new(),
+            partial_days: BTreeSet::new(),
+        },
+    );
 }

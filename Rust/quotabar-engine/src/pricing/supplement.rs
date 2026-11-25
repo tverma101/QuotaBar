@@ -5,8 +5,8 @@
 
 use super::catalog::normalized_key;
 use super::rates::{ModelRates, PromptRateTier};
-use crate::time;
 use crate::qlog;
+use crate::time;
 use fancy_regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -24,13 +24,22 @@ pub struct AliasRule {
 impl AliasRule {
     pub fn new(pattern: &str, canonical: &str) -> Result<AliasRule, String> {
         let regex = Regex::new(pattern).map_err(|e| e.to_string())?;
-        Ok(AliasRule { pattern: pattern.to_string(), regex: Arc::new(regex), canonical: canonical.to_string() })
+        Ok(AliasRule {
+            pattern: pattern.to_string(),
+            regex: Arc::new(regex),
+            canonical: canonical.to_string(),
+        })
     }
 
     fn matches(&self, model: &str) -> bool {
         // A pathological pattern can exceed the backtracking limit; treat that as "no match" but say so.
         self.regex.is_match(model).unwrap_or_else(|error| {
-            qlog!(Warn, "pricing", "alias pattern '{}' failed on a model name: {error}", self.pattern);
+            qlog!(
+                Warn,
+                "pricing",
+                "alias pattern '{}' failed on a model name: {error}",
+                self.pattern
+            );
             false
         })
     }
@@ -73,14 +82,18 @@ impl PricingSupplement {
             let specificity = base.chars().count();
             let replace = match normalized.get(&key) {
                 None => true,
-                Some((_, existing, raw)) => specificity > *existing || (specificity == *existing && base < raw),
+                Some((_, existing, raw)) => {
+                    specificity > *existing || (specificity == *existing && base < raw)
+                }
             };
             if replace {
                 normalized.insert(key, (*multiplier, specificity, base.clone()));
             }
         }
-        let mut normalized_fast_multipliers: Vec<(String, f64)> =
-            normalized.into_iter().map(|(k, (m, _, _))| (k, m)).collect();
+        let mut normalized_fast_multipliers: Vec<(String, f64)> = normalized
+            .into_iter()
+            .map(|(k, (m, _, _))| (k, m))
+            .collect();
         normalized_fast_multipliers.sort_by(|a, b| a.0.cmp(&b.0));
         PricingSupplement {
             pricing,
@@ -96,11 +109,17 @@ impl PricingSupplement {
     }
 
     pub fn canonical_name(&self, model: &str) -> Option<String> {
-        self.alias_rules.iter().find(|r| r.matches(model)).map(|r| r.canonical.clone())
+        self.alias_rules
+            .iter()
+            .find(|r| r.matches(model))
+            .map(|r| r.canonical.clone())
     }
 
     pub fn cursor_canonical_name(&self, model: &str) -> Option<String> {
-        self.cursor_alias_rules.iter().find(|r| r.matches(model)).map(|r| r.canonical.clone())
+        self.cursor_alias_rules
+            .iter()
+            .find(|r| r.matches(model))
+            .map(|r| r.canonical.clone())
     }
 
     /// Fast multiplier for a resolved base model: exact key, then ccusage's normalized-suffix match so
@@ -136,8 +155,11 @@ impl PricingSupplement {
     pub fn merging(&self, other: &PricingSupplement) -> PricingSupplement {
         let mut pricing = self.pricing.clone();
         pricing.extend(other.pricing.iter().map(|(k, v)| (k.clone(), v.clone())));
-        let mut retired_keys: HashSet<String> =
-            self.retired_pricing_keys.union(&other.retired_pricing_keys).cloned().collect();
+        let mut retired_keys: HashSet<String> = self
+            .retired_pricing_keys
+            .union(&other.retired_pricing_keys)
+            .cloned()
+            .collect();
         for key in other.pricing.keys() {
             if !other.retired_pricing_keys.contains(key) {
                 retired_keys.remove(key);
@@ -150,8 +172,11 @@ impl PricingSupplement {
         multipliers.extend(other.fast_multipliers.iter().map(|(k, v)| (k.clone(), *v)));
         let mut rules = union_rules(&other.alias_rules, &self.alias_rules);
         let cursor_rules = union_rules(&other.cursor_alias_rules, &self.cursor_alias_rules);
-        let mut retired_patterns: HashSet<String> =
-            self.retired_alias_patterns.union(&other.retired_alias_patterns).cloned().collect();
+        let mut retired_patterns: HashSet<String> = self
+            .retired_alias_patterns
+            .union(&other.retired_alias_patterns)
+            .cloned()
+            .collect();
         if other.retired_alias_patterns_are_authoritative {
             for rule in &other.alias_rules {
                 if !other.retired_alias_patterns.contains(&rule.pattern) {
@@ -175,18 +200,29 @@ impl PricingSupplement {
             cursor_rules,
             retired_keys,
             retired_patterns,
-            self.retired_alias_patterns_are_authoritative || other.retired_alias_patterns_are_authoritative,
+            self.retired_alias_patterns_are_authoritative
+                || other.retired_alias_patterns_are_authoritative,
             updated_at,
         )
     }
 
     /// Keep an authority snapshot's explicit removals when an older or independently refreshed overlay
     /// still carries those entries.
-    pub fn preserving_retirements(&self, authority: &PricingSupplement, preserve_alias_patterns: bool) -> PricingSupplement {
-        let retired_keys: HashSet<String> =
-            self.retired_pricing_keys.union(&authority.retired_pricing_keys).cloned().collect();
+    pub fn preserving_retirements(
+        &self,
+        authority: &PricingSupplement,
+        preserve_alias_patterns: bool,
+    ) -> PricingSupplement {
+        let retired_keys: HashSet<String> = self
+            .retired_pricing_keys
+            .union(&authority.retired_pricing_keys)
+            .cloned()
+            .collect();
         let retired_patterns: HashSet<String> = if preserve_alias_patterns {
-            self.retired_alias_patterns.union(&authority.retired_alias_patterns).cloned().collect()
+            self.retired_alias_patterns
+                .union(&authority.retired_alias_patterns)
+                .cloned()
+                .collect()
         } else {
             self.retired_alias_patterns.clone()
         };
@@ -197,11 +233,16 @@ impl PricingSupplement {
         PricingSupplement::new(
             pricing,
             self.fast_multipliers.clone(),
-            self.alias_rules.iter().filter(|r| !retired_patterns.contains(&r.pattern)).cloned().collect(),
+            self.alias_rules
+                .iter()
+                .filter(|r| !retired_patterns.contains(&r.pattern))
+                .cloned()
+                .collect(),
             self.cursor_alias_rules.clone(),
             retired_keys,
             retired_patterns,
-            self.retired_alias_patterns_are_authoritative || authority.retired_alias_patterns_are_authoritative,
+            self.retired_alias_patterns_are_authoritative
+                || authority.retired_alias_patterns_are_authoritative,
             self.updated_at.clone(),
         )
     }
@@ -209,7 +250,8 @@ impl PricingSupplement {
     /// Decode the supplement JSON (bundled or feed). Malformed JSON is an error; an individually
     /// invalid alias pattern is skipped and logged.
     pub fn decode(data: &[u8]) -> Result<PricingSupplement, String> {
-        let file: SupplementFile = serde_json::from_slice(data).map_err(|e| format!("supplement JSON: {e}"))?;
+        let file: SupplementFile =
+            serde_json::from_slice(data).map_err(|e| format!("supplement JSON: {e}"))?;
         let fast = file.fast_multipliers.unwrap_or_default();
         let pricing = file
             .pricing
@@ -249,8 +291,14 @@ impl PricingSupplement {
             fast,
             compile(file.alias_rules, ""),
             compile(file.cursor_alias_rules.unwrap_or_default(), "Cursor "),
-            file.retired_pricing_keys.unwrap_or_default().into_iter().collect(),
-            file.retired_alias_patterns.unwrap_or_default().into_iter().collect(),
+            file.retired_pricing_keys
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            file.retired_alias_patterns
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             authoritative,
             file.updated_at,
         ))
@@ -259,7 +307,15 @@ impl PricingSupplement {
 
 fn union_rules(first: &[AliasRule], then: &[AliasRule]) -> Vec<AliasRule> {
     let seen: HashSet<&str> = first.iter().map(|r| r.pattern.as_str()).collect();
-    first.iter().cloned().chain(then.iter().filter(|r| !seen.contains(r.pattern.as_str())).cloned()).collect()
+    first
+        .iter()
+        .cloned()
+        .chain(
+            then.iter()
+                .filter(|r| !seen.contains(r.pattern.as_str()))
+                .cloned(),
+        )
+        .collect()
 }
 
 /// `base` occurs in `part` (last occurrence) with nothing after it, or followed by `-`.

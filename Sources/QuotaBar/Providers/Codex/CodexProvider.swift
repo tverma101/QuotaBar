@@ -1,7 +1,10 @@
 import Foundation
 
+/// Test-only oracle for the Swift Codex refresh path, kept so the Swift unit tests can compare the
+/// Rust engine's behavior against the implementation it replaced. Production constructs the
+/// Rust-backed `CodexProvider` wrapper instead.
 @MainActor
-final class CodexProvider: ProviderRuntime {
+final class CodexSwiftReferenceProvider: ProviderRuntime {
     static func makeProvider(id: String = "codex", displayName: String = "Codex") -> Provider {
         Provider(
             id: id,
@@ -23,6 +26,7 @@ final class CodexProvider: ProviderRuntime {
     let piUsageScanner: PiUsageScanner
     let expectedIdentityKey: String?
     private var lastResolvedAccountIdentityKey: String?
+    private var lastNativeScan: LogUsageScan?
     private var lastProxyScan: LogUsageScan?
     /// Source revision the cached proxy fold was built from. Ledger wakes reuse that fold only while
     /// the FCC databases (and their WAL sidecars) are byte-for-byte unchanged.
@@ -36,7 +40,7 @@ final class CodexProvider: ProviderRuntime {
     let pricing: @Sendable () async -> ModelPricing
 
     init(
-        provider: Provider = CodexProvider.makeProvider(),
+        provider: Provider = CodexSwiftReferenceProvider.makeProvider(),
         authStore: CodexAuthStore = CodexAuthStore(),
         usageClient: CodexUsageClient = CodexUsageClient(),
         logUsageScanner: CodexLogUsageScanner = CodexLogUsageScanner(),
@@ -142,10 +146,7 @@ final class CodexProvider: ProviderRuntime {
         // phase 1 fetched the meters seconds ago. The data store's merge recovers the quota
         // meters from the prior snapshot and carries their freshness stamp.
         if ProviderRefreshContext.scope.suppressesLiveQuota {
-            return await ScanWorkerClient.shared.foldOnlySnapshot(
-                provider: provider,
-                inProcessFallback: { await self.foldOnlySnapshotInProcess() }
-            )
+            return await foldOnlySnapshotInProcess()
         }
 
         let fileCandidates: [CodexAuthState]
@@ -227,8 +228,7 @@ final class CodexProvider: ProviderRuntime {
         await routerUsageScanner.unloadLocalAccountingCachesForMemoryPressure()
     }
 
-    /// The in-process fold-only body, kept verbatim as the scan worker's fallback (and the child's
-    /// own path): the router ledger and native sessions fold without re-reading live quota APIs.
+    /// The in-process fold-only body, used directly now that production folds run in the Rust engine: the router ledger and native sessions fold without re-reading live quota APIs.
     private func foldOnlySnapshotInProcess() async -> ProviderSnapshot {
         var lines: [MetricLine] = []
         let accountIdentityKey = expectedIdentityKey ?? lastResolvedAccountIdentityKey
@@ -431,7 +431,9 @@ final class CodexProvider: ProviderRuntime {
 
         let nativeScan: LogUsageScan?
         var nativeDamagedLines = 0
-        do {
+        if isLocalAccountingWake, let cached = lastNativeScan {
+            nativeScan = cached
+        } else {
             let nativeResult = await logUsageScanner.scanResult(
                 daysBack: UsageHistoryWindow.lifetimeDays(through: now),
                 now: now,
@@ -442,6 +444,7 @@ final class CodexProvider: ProviderRuntime {
             switch nativeResult {
             case .complete(let scan, let damagedLines):
                 nativeScan = scan
+                lastNativeScan = scan
                 nativeDamagedLines = damagedLines
                 DiagnosticGate.clearFailure(nativeIncompleteDiagnosticKey)
             case .deferredByFutureTimestamp:
