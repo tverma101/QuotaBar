@@ -2,6 +2,8 @@
 //! Maps probe/cache progress lines into a stable JSON envelope for CLI + local HTTP.
 
 use crate::plugin_engine::runtime::{MetricLine, PluginOutput, ProgressFormat};
+use crate::usage_snapshot::CachedPluginSnapshot;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -11,6 +13,8 @@ pub const LIMITS_SCHEMA: &str = "quotabar.limits.v1";
 #[serde(rename_all = "camelCase")]
 pub struct LimitsDocument {
     pub schema: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
     pub providers: BTreeMap<String, ProviderLimits>,
     pub errors: Vec<LimitsError>,
 }
@@ -24,6 +28,8 @@ pub struct ProviderLimits {
     pub resources: BTreeMap<String, ResourceLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fetched_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale: Option<bool>,
 }
@@ -153,8 +159,56 @@ pub fn provider_limits_from_lines(
         plan: plan.map(str::to_string),
         resources,
         fetched_at: fetched_at.map(str::to_string),
+        expires_at: None,
         stale,
     }
+}
+
+pub fn limits_from_snapshots<'a>(
+    snapshots: impl IntoIterator<Item = &'a CachedPluginSnapshot>,
+    errors: Vec<LimitsError>,
+    now: DateTime<Utc>,
+) -> LimitsDocument {
+    let providers = snapshots
+        .into_iter()
+        .map(|snapshot| {
+            let mut provider = provider_limits_from_lines(
+                &snapshot.display_name,
+                snapshot.plan.as_deref(),
+                &snapshot.lines,
+                Some(&snapshot.fetched_at),
+                Some(snapshot.is_stale(now)),
+            );
+            provider.expires_at = snapshot.expires_at()
+                .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+            (snapshot.provider_id.clone(), provider)
+        })
+        .collect();
+    LimitsDocument {
+        schema: LIMITS_SCHEMA.to_string(),
+        generated_at: Some(now.to_rfc3339()),
+        providers,
+        errors,
+    }
+}
+
+pub fn probe_error_message(output: &PluginOutput) -> Option<&str> {
+    output.lines.iter().find_map(|line| match line {
+        MetricLine::Badge { label, text, .. } if label == "Error" => Some(text.as_str()),
+        MetricLine::Text { label, value, .. } if label == "Error" => Some(value.as_str()),
+        _ => None,
+    })
+}
+
+/// A warning-only probe cannot replace a previously measured quota snapshot.
+pub fn probe_limits_error(output: &PluginOutput) -> Option<&str> {
+    probe_error_message(output).or_else(|| {
+        if output.lines.iter().any(|line| matches!(line, MetricLine::Progress { .. })) {
+            None
+        } else {
+            output.warning.as_deref()
+        }
+    })
 }
 
 pub fn limits_from_plugin_outputs(outputs: &[PluginOutput]) -> LimitsDocument {
@@ -184,6 +238,7 @@ pub fn limits_from_plugin_outputs(outputs: &[PluginOutput]) -> LimitsDocument {
     }
     LimitsDocument {
         schema: LIMITS_SCHEMA.to_string(),
+        generated_at: None,
         providers,
         errors,
     }
@@ -192,6 +247,7 @@ pub fn limits_from_plugin_outputs(outputs: &[PluginOutput]) -> LimitsDocument {
 pub fn empty_limits_document() -> LimitsDocument {
     LimitsDocument {
         schema: LIMITS_SCHEMA.to_string(),
+        generated_at: None,
         providers: BTreeMap::new(),
         errors: Vec::new(),
     }
@@ -206,6 +262,30 @@ mod tests {
         assert_eq!(resource_slug("Session"), "session");
         assert_eq!(resource_slug("Total usage"), "total-usage");
         assert_eq!(resource_slug("  "), "resource");
+    }
+
+    #[test]
+    fn warning_only_probe_is_a_limits_error() {
+        let mut output = PluginOutput {
+            provider_id: "claude".into(),
+            display_name: "Claude".into(),
+            plan: None,
+            warning: Some("Updates blocked by Anthropic rate limit".into()),
+            lines: vec![],
+            icon_url: String::new(),
+        };
+        assert_eq!(probe_limits_error(&output), output.warning.as_deref());
+        output.lines.push(MetricLine::Progress {
+            label: "Session".into(),
+            used: 10.0,
+            limit: 100.0,
+            format: ProgressFormat::Percent,
+            resets_at: None,
+            period_duration_ms: None,
+            color: None,
+            session_start_signal: None,
+        });
+        assert_eq!(probe_limits_error(&output), None);
     }
 
     #[test]

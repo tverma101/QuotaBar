@@ -12,7 +12,7 @@ echo "==> Linux bundles (deb, rpm, appimage)"
 bun run tauri build --bundles deb,rpm,appimage
 
 echo "==> Windows (GNU cross-target: quotabar.exe + NSIS setup)"
-bun run tauri build --target x86_64-pc-windows-gnu
+bun run tauri build --bundles nsis --target x86_64-pc-windows-gnu -- --locked
 
 echo ""
 echo "Outputs (workspace target/ at repo root; productName quotabar + version):"
@@ -21,7 +21,7 @@ echo "  rpm:       target/release/bundle/rpm/quotabar-*.rpm"
 echo "  appimage:  target/release/bundle/appimage/quotabar_*_amd64.AppImage"
 echo "  win exe:   target/x86_64-pc-windows-gnu/release/quotabar.exe"
 echo "  win dll:   target/x86_64-pc-windows-gnu/release/WebView2Loader.dll  (keep next to quotabar.exe for portable GNU builds)"
-echo "  win setup: target/x86_64-pc-windows-gnu/release/bundle/nsis/quotabar_*_x64-setup.exe"
+echo "  win setup: target/x86_64-pc-windows-gnu/release/bundle/nsis/QuotaBar_*_x64-setup.exe"
 echo ""
 echo "Portable archives (optional, after this script or a normal tauri build):"
 echo "  Linux GUI .tar.gz:     ./scripts/build-gui-portable-linux-tarball.sh"

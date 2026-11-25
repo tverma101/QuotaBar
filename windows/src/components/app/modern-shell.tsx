@@ -1,46 +1,37 @@
-import { useEffect, useMemo, useState } from "react"
-import { useTranslation } from "react-i18next"
+import { useCallback, useMemo, useRef, useState } from "react"
+import { invoke, isTauri } from "@tauri-apps/api/core"
 import { useShallow } from "zustand/react/shallow"
 import { LiquidGlassFilter } from "@/components/liquid-glass-filter"
-import { OnboardingWizard } from "@/components/onboarding-wizard"
-import { PanelFooter } from "@/components/panel-footer"
-import { CustomizeView } from "@/components/modern/customize-view"
+import { CustomizeProviderDetail, CustomizeProviderList, type CustomizeMetric } from "@/components/modern/customize-view"
+import { NavBar } from "@/components/modern/mac-ui"
+import { ModernFooter } from "@/components/modern/modern-footer"
 import { TotalSpendCard } from "@/components/modern/total-spend-card"
-import {
-  WidgetGroupedList,
-  buildProviderWidgetGroups,
-} from "@/components/modern/widget-grouped-list"
-import { UsageInsightsBanner } from "@/components/usage-insights-banner"
+import { UsageHistoryView } from "@/components/modern/usage-history-view"
+import { WelcomeHint } from "@/components/modern/welcome-hint"
+import { WidgetGroupedList } from "@/components/modern/widget-grouped-list"
 import { AppContent, type AppContentActionProps } from "@/components/app/app-content"
-import { Button } from "@/components/ui/button"
 import type { DisplayPluginState } from "@/hooks/app/use-app-plugin-views"
 import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
 import { useAppVersion } from "@/hooks/app/use-app-version"
-import { useWeeklyRollup } from "@/hooks/use-weekly-rollup"
-import { useHistoryInsights } from "@/hooks/use-history-insights"
-import { usePersistUsageHistory } from "@/hooks/use-persist-usage-history"
+import { useModernDashboard } from "@/hooks/app/use-modern-dashboard"
+import { useModernPanel } from "@/hooks/app/use-modern-panel"
 import { useNowTicker } from "@/hooks/use-now-ticker"
-import { buildMetricDescriptors, findMetricLine } from "@/lib/metric-registry"
-import { parseMetricId } from "@/lib/metric-id"
-import {
-  pinnedIdsFromTrayLines,
-  placedIdsFromPluginSettings,
-  providerOrderFromPluginSettings,
-  migrateModernPlacedToTrayLines,
-} from "@/lib/modern-layout"
-import { savePluginSettings } from "@/lib/settings"
-import { resolveWidgetData } from "@/lib/widget-data"
-import { buildUsageInsights } from "@/lib/usage-insights"
-import { getProviderInstanceMeta } from "@/lib/settings"
+import { metricId } from "@/lib/metric-id"
+import { isMetricOnDemand } from "@/lib/metric-display"
+import { getProviderInstanceMeta, type UILayout } from "@/lib/settings"
 import { cn } from "@/lib/utils"
-import { useAppPluginStore } from "@/stores/app-plugin-store"
 import { useAppPreferencesStore } from "@/stores/app-preferences-store"
 import { useAppUiStore } from "@/stores/app-ui-store"
 import { useModernLayoutStore } from "@/stores/modern-layout-store"
-import type { UILayout } from "@/lib/settings"
-import { useMotionPointer } from "@/hooks/app/use-motion-pointer"
 
-type ModernScreen = "dashboard" | "customize" | "settings"
+type ModernScreen =
+  | { id: "dashboard" }
+  | { id: "customize" }
+  | { id: "provider"; pluginId: string }
+  | { id: "settings" }
+  | { id: "history" }
+
+const DASHBOARD: ModernScreen = { id: "dashboard" }
 
 type ModernShellProps = {
   onRefreshAll: () => void
@@ -49,9 +40,7 @@ type ModernShellProps = {
   autoUpdateNextAt: number | null
   appContentProps: AppContentActionProps
   showOnboardingWizard: boolean
-  onOnboardingComplete: (layout: UILayout) => void
-  onOnboardingSkip: () => void
-  preferWeeklyLimit: boolean
+  onOnboardingComplete: (layout: UILayout, openSettings?: boolean) => void
 }
 
 export function ModernShell({
@@ -62,324 +51,228 @@ export function ModernShell({
   appContentProps,
   showOnboardingWizard,
   onOnboardingComplete,
-  onOnboardingSkip,
-  preferWeeklyLimit,
 }: ModernShellProps) {
-  const { t } = useTranslation()
-  const [screen, setScreen] = useState<ModernScreen>("dashboard")
+  const [stack, setStack] = useState<ModernScreen[]>(() =>
+    useAppUiStore.getState().activeView === "settings" ? [{ id: "settings" }] : [],
+  )
+  const screen = stack[stack.length - 1] ?? DASHBOARD
   const appVersion = useAppVersion()
+  const panelRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
 
-  const { themeMode, displayMode, resetTimerDisplayMode, modernDensity, displayCurrency, exchangeRatesRevision, showTotalSpend, reduceAnimations } =
-    useAppPreferencesStore(
+  const { themeMode, modernDensity, showTotalSpend } = useAppPreferencesStore(
     useShallow((s) => ({
       themeMode: s.themeMode,
-      displayMode: s.displayMode,
-      resetTimerDisplayMode: s.resetTimerDisplayMode,
       modernDensity: s.modernDensity,
-      displayCurrency: s.displayCurrency,
-      exchangeRatesRevision: s.exchangeRatesRevision,
       showTotalSpend: s.showTotalSpend,
-      reduceAnimations: s.reduceAnimations,
     })),
   )
-
-  const { showAbout, setShowAbout } = useAppUiStore(
-    useShallow((s) => ({
-      showAbout: s.showAbout,
-      setShowAbout: s.setShowAbout,
-    })),
+  const { showAbout, setShowAbout, setActiveView } = useAppUiStore(
+    useShallow((s) => ({ showAbout: s.showAbout, setShowAbout: s.setShowAbout, setActiveView: s.setActiveView })),
   )
-
-  const { pluginsMeta, pluginSettings } = useAppPluginStore(
-    useShallow((s) => ({
-      pluginsMeta: s.pluginsMeta,
-      pluginSettings: s.pluginSettings,
-    })),
-  )
-
-  const layout = useModernLayoutStore(
+  const layoutActions = useModernLayoutStore(
     useShallow((s) => ({
       metricOrderByProvider: s.metricOrderByProvider,
-      pinnedMetricIds: s.pinnedMetricIds,
-      hydrated: s.hydrated,
-      ensureInitialized: s.ensureInitialized,
-      setMetricOrder: s.setMetricOrder,
+      onDemandOverrides: s.onDemandOverrides,
       setTrayFocusProvider: s.setTrayFocusProvider,
-      syncDescriptors: s.syncDescriptors,
-      syncPinsFromTrayLines: s.syncPinsFromTrayLines,
+      setProviderArrangement: s.setProviderArrangement,
+      resetProviderLayout: s.resetProviderLayout,
     })),
   )
 
   const compact = modernDensity === "compact"
   const nowMs = useNowTicker()
-  const persistEnabled = usePersistUsageHistory()
-  const { dailyRows, rollup, rollup30, scheduleReload: scheduleRollupReload } = useWeeklyRollup(persistEnabled)
-  const { summary: historyInsights, scheduleReload: scheduleHistoryInsightsReload } =
-    useHistoryInsights(persistEnabled)
+  const dashboard = useModernDashboard(displayPlugins, nowMs)
+  const { pluginSettings, pluginsMeta, descriptors, placedMetricIds } = dashboard
 
-  const probeStamp = displayPlugins.map((p) => p.lastUpdatedAt ?? 0).join(",")
-  useEffect(() => {
-    scheduleRollupReload()
-    scheduleHistoryInsightsReload()
-  }, [probeStamp, scheduleRollupReload, scheduleHistoryInsightsReload])
+  const push = useCallback((next: ModernScreen) => setStack((s) => [...s, next]), [])
+  const back = useCallback(() => {
+    const next = stack.slice(0, -1)
+    if (!next.some((x) => x.id === "settings")) setActiveView("home")
+    setStack(next)
+  }, [stack, setActiveView])
+  const home = useCallback(() => {
+    setActiveView("home")
+    setStack([])
+  }, [setActiveView])
+  const openSettings = useCallback(() => {
+    setActiveView("settings")
+    setStack((s) => (s[s.length - 1]?.id === "settings" ? s : [...s, { id: "settings" }]))
+  }, [setActiveView])
 
-  const setActiveView = useAppUiStore((s) => s.setActiveView)
+  useModernPanel({
+    panelRef,
+    contentRef,
+    screenKey: screen.id === "provider" ? `provider:${screen.pluginId}` : screen.id,
+    canGoBack: stack.length > 0,
+    showAbout,
+    onBack: back,
+    onHome: home,
+    onOpenSettings: openSettings,
+    onShowAbout: setShowAbout,
+  })
 
-  useEffect(() => {
-    if (!pluginSettings || !layout.hydrated) return
-    const pluginStates = Object.fromEntries(
-      displayPlugins.map((p) => [p.meta.id, { data: p.data }]),
-    )
-    const descriptors = buildMetricDescriptors(pluginsMeta, pluginSettings, pluginStates)
-    const state = useModernLayoutStore.getState()
-
-    let settings = pluginSettings
-    if (state.initialized && state.placedMetricIds.length > 0) {
-      const migrated = migrateModernPlacedToTrayLines(pluginSettings, state.placedMetricIds)
-      if (migrated !== pluginSettings) {
-        settings = migrated
-        useAppPluginStore.getState().setPluginSettings(migrated)
-        void savePluginSettings(migrated).catch((e) => console.error("migrateModernPlacedToTrayLines:", e))
-      }
-    }
-
-    if (!state.initialized) {
-      state.ensureInitialized(
-        descriptors,
-        settings,
-        pinnedIdsFromTrayLines(settings.trayLines),
-      )
-      return
-    }
-    state.syncDescriptors(descriptors)
-    state.syncPinsFromTrayLines(settings.trayLines, descriptors)
-  }, [pluginSettings, pluginsMeta, layout.hydrated, displayPlugins])
-
-  const pluginStatesForDescriptors = useMemo(
+  const customizeProviders = useMemo(
     () =>
-      Object.fromEntries(displayPlugins.map((p) => [p.meta.id, { data: p.data }])),
-    [displayPlugins],
-  )
-
-  const descriptors = useMemo(
-    () => buildMetricDescriptors(pluginsMeta, pluginSettings, pluginStatesForDescriptors),
-    [pluginsMeta, pluginSettings, pluginStatesForDescriptors],
-  )
-
-  const placedMetricIds = useMemo(
-    () => (pluginSettings ? placedIdsFromPluginSettings(pluginSettings, descriptors) : []),
-    [pluginSettings, descriptors],
-  )
-
-  const providerOrder = useMemo(
-    () => (pluginSettings ? providerOrderFromPluginSettings(pluginSettings, descriptors) : []),
-    [pluginSettings, descriptors],
-  )
-
-  const widgetDataById = useMemo(() => {
-    const map = new Map<string, import("@/lib/widget-data").WidgetData>()
-    if (!pluginSettings) return map
-    for (const d of descriptors) {
-      const state = displayPlugins.find((p) => p.meta.id === d.pluginId)
-      const line = findMetricLine(state?.data?.lines, d.lineLabel)
-      const data = resolveWidgetData({
-        metricId: d.id,
-        displayName: d.displayName,
-        line,
-        displayMode,
-        resetTimerDisplayMode,
-        nowMs,
-      })
-      if (data) {
-        data.pluginId = d.pluginId
-        map.set(d.id, data)
-      }
-    }
-    return map
-  }, [descriptors, displayPlugins, displayMode, resetTimerDisplayMode, nowMs, pluginSettings, displayCurrency, exchangeRatesRevision])
-
-  const groups = useMemo(
-    () =>
-      buildProviderWidgetGroups({
-        placedMetricIds,
-        providerOrder,
-        metricOrderByProvider: layout.metricOrderByProvider,
-        widgetDataById,
-        getMeta: (id) => getProviderInstanceMeta(id, pluginSettings, pluginsMeta) ?? undefined,
+      settingsPlugins.map((p) => {
+        const meta = getProviderInstanceMeta(p.id, pluginSettings, pluginsMeta)
+        const live = descriptors.filter((d) => d.pluginId === p.id).length
+        return { id: p.id, name: p.name, iconUrl: meta?.iconUrl, enabled: p.enabled, metricCount: live || meta?.lines.length || 0 }
       }),
-    [
-      placedMetricIds,
-      providerOrder,
-      layout.metricOrderByProvider,
-      widgetDataById,
-      pluginSettings,
-      pluginsMeta,
-    ],
+    [settingsPlugins, pluginSettings, pluginsMeta, descriptors],
   )
 
-  const spendProviders = useMemo(
-    () =>
-      displayPlugins.map((p) => ({
-        id: p.meta.id,
-        displayName: p.meta.name,
-        brandColor: p.meta.brandColor,
-      })),
-    [displayPlugins],
+  const providerMetrics = useCallback(
+    (pluginId: string): CustomizeMetric[] => {
+      const meta = getProviderInstanceMeta(pluginId, pluginSettings, pluginsMeta)
+      const live = descriptors.filter((d) => d.pluginId === pluginId).map((d) => ({ id: d.id, lineLabel: d.lineLabel }))
+      const items = live.length > 0 ? live : (meta?.lines ?? []).map((l) => ({ id: metricId(pluginId, l.label), lineLabel: l.label }))
+      const rank = new Map((layoutActions.metricOrderByProvider[pluginId] ?? []).map((id, i) => [id, i]))
+      items.sort((a, b) => (rank.get(a.id) ?? 999) - (rank.get(b.id) ?? 999))
+      const enabled = !pluginSettings?.disabled.includes(pluginId)
+      const raw = pluginSettings?.trayLines?.[pluginId]
+      const placed = enabled
+        ? new Set(placedMetricIds)
+        : new Set(raw == null || raw.length === 0 ? items.map((i) => i.id) : raw.map((l) => metricId(pluginId, l)))
+      const base = meta?.baseProviderId ?? pluginId
+      return items.map((item) => ({
+        ...item,
+        placed: placed.has(item.id),
+        onDemand: isMetricOnDemand(item.id, base, item.lineLabel, layoutActions.onDemandOverrides),
+      }))
+    },
+    [descriptors, pluginSettings, pluginsMeta, placedMetricIds, layoutActions.metricOrderByProvider, layoutActions.onDemandOverrides],
   )
 
-  const spendOutputs = useMemo(() => {
-    const map = new Map<string, import("@/lib/plugin-types").PluginOutput | null>()
-    for (const p of displayPlugins) {
-      map.set(p.meta.id, p.data)
-    }
-    return map
-  }, [displayPlugins])
+  const refreshing = displayPlugins.some((p) => p.loading)
+  const enabledNames = displayPlugins.map((p) => p.meta.name)
 
-  const insights = useMemo(
-    () =>
-      buildUsageInsights({
-        plugins: displayPlugins,
-        pluginSettings,
-        preferWeeklyLimit,
-        nowMs,
-      }),
-    [displayPlugins, pluginSettings, preferWeeklyLimit, nowMs],
-  )
-  const panelMotionRef = useMotionPointer(!reduceAnimations)
-
-  return (
-    <div
-      className="app-popover-shell w-full bg-transparent"
-      data-density={modernDensity}
-    >
-      <LiquidGlassFilter active={themeMode === "glass"} />
-      <div
-        ref={panelMotionRef}
-        className="app-panel-surface relative w-full overflow-hidden rounded-[18px] select-none flex flex-col min-h-[320px]"
-        data-ui-layout="modern"
-      >
-        <nav
-          className="flex gap-1 px-3 pt-2 pb-1 border-b border-border/50"
-          aria-label="Modern navigation"
-        >
-          {(
-            [
-              ["dashboard", t("modern.dashboard")],
-              ["customize", t("modern.customize")],
-              ["settings", t("modern.settings")],
-            ] as const
-          ).map(([id, label]) => (
-            <Button
-              key={id}
-              type="button"
-              size="sm"
-              variant={screen === id ? "default" : "ghost"}
-              className={cn("relative flex-1 motion-tab")}
-              data-active={screen === id}
-              onClick={() => {
-                if (id === "settings") setActiveView("settings")
-                else setActiveView("home")
-                setScreen(id)
-              }}
-            >
-              {label}
-            </Button>
-          ))}
-        </nav>
-
-        <div className="relative flex min-h-0 flex-1 flex-col px-3 pt-2 pb-1.5">
+  let title = ""
+  let onReset: (() => void) | undefined
+  let content: React.ReactNode = null
+  switch (screen.id) {
+    case "dashboard":
+      content = (
+        <div className={cn("flex flex-col motion-stagger", compact ? "gap-[8px]" : "gap-[14px]")}>
           {showOnboardingWizard ? (
-            <OnboardingWizard
-              onComplete={onOnboardingComplete}
-              onSkip={onOnboardingSkip}
+            <WelcomeHint
+              enabledNames={enabledNames}
+              onOpenCustomize={() => {
+                onOnboardingComplete("modern", false)
+                push({ id: "customize" })
+              }}
+              onDismiss={() => onOnboardingComplete("modern", false)}
             />
           ) : null}
-
-          <div
-            data-panel-scroll
-            className={cn(
-              "min-h-0 flex-1 overflow-y-auto scrollbar-none",
-              compact ? "text-sm" : "text-base",
-            )}
-          >
-            {screen === "dashboard" ? (
-              <div key="dashboard" className="motion-view space-y-2 pb-2 motion-stagger">
-                <UsageInsightsBanner
-                  insights={insights}
-                  historyTightest={historyInsights?.tightest}
-                  rollup={rollup}
-                  rollup30={rollup30}
-                  dailyRows={dailyRows}
-                  persistEnabled={persistEnabled}
-                  nowMs={nowMs}
-                  onSelectProvider={setActiveView}
-                />
-                {showTotalSpend ? (
-                  <TotalSpendCard
-                    providers={spendProviders}
-                    outputs={spendOutputs}
-                    compact={compact}
-                  />
-                ) : null}
-                <WidgetGroupedList
-                  groups={groups}
-                  compact={compact}
-                  onRefreshPlugin={(pluginId) => {
-                    appContentProps.onRetryPlugin(pluginId)
-                  }}
-                  onFocusProvider={layout.setTrayFocusProvider}
-                />
-              </div>
-            ) : null}
-
-            {screen === "customize" ? (
-              <div key="customize" className="motion-view">
-              <CustomizeView
-                descriptors={descriptors}
-                providerOrder={providerOrder}
-                metricOrderByProvider={layout.metricOrderByProvider}
-                placedMetricIds={placedMetricIds}
-                onTogglePlaced={(metricId, enabled) => {
-                  const labels = descriptors
-                    .filter((d) => d.pluginId === parseMetricId(metricId)?.pluginId)
-                    .map((d) => d.lineLabel)
-                  appContentProps.onDashboardMetricToggle(metricId, enabled, labels)
-                }}
-                onSetProviderMetricsEnabled={(pluginId, metricIds, enabled) => {
-                  const labels = metricIds
-                    .map((id) => parseMetricId(id)?.lineLabel)
-                    .filter((l): l is string => Boolean(l))
-                  appContentProps.onProviderDashboardMetrics(pluginId, labels, enabled)
-                }}
-                onProviderReorder={appContentProps.onReorder}
-                onMetricReorder={layout.setMetricOrder}
-                compact={compact}
-              />
-              </div>
-            ) : null}
-
-            {screen === "settings" ? (
-              <div key="settings" className="motion-view">
-              <AppContent
-                {...appContentProps}
-                displayPlugins={displayPlugins}
-                settingsPlugins={settingsPlugins}
-                selectedPlugin={null}
-                viewOverride="settings"
-              />
-              </div>
-            ) : null}
-          </div>
-
-          <PanelFooter
-            version={appVersion}
-            autoUpdateNextAt={autoUpdateNextAt}
-            onRefreshAll={onRefreshAll}
-            showAbout={showAbout}
-            onShowAbout={() => setShowAbout(true)}
-            onCloseAbout={() => setShowAbout(false)}
+          {showTotalSpend ? (
+            <TotalSpendCard providers={dashboard.spendProviders} outputs={dashboard.spendOutputs} compact={compact} />
+          ) : null}
+          <WidgetGroupedList
+            groups={dashboard.groups}
+            compact={compact}
+            displayMode={dashboard.displayMode}
+            nowMs={nowMs}
+            onRefreshPlugin={appContentProps.onRetryPlugin}
+            onFocusProvider={layoutActions.setTrayFocusProvider}
+            onOpenCustomize={() => push({ id: "customize" })}
           />
         </div>
+      )
+      break
+    case "customize":
+      title = "Customize"
+      content = (
+        <CustomizeProviderList
+          providers={customizeProviders}
+          compact={compact}
+          onToggleProvider={appContentProps.onToggle}
+          onReorder={appContentProps.onReorder}
+          onOpenProvider={(pluginId) => push({ id: "provider", pluginId })}
+          onOpenSettings={openSettings}
+        />
+      )
+      break
+    case "provider": {
+      const { pluginId } = screen
+      const metrics = providerMetrics(pluginId)
+      title = customizeProviders.find((p) => p.id === pluginId)?.name ?? "Provider"
+      onReset = () => layoutActions.resetProviderLayout(pluginId)
+      content = (
+        <CustomizeProviderDetail
+          metrics={metrics}
+          compact={compact}
+          onTogglePlaced={(id, placed) =>
+            appContentProps.onDashboardMetricToggle(id, placed, metrics.map((m) => m.lineLabel))
+          }
+          onArrange={(order, onDemandIds) => {
+            const onDemand = new Set(onDemandIds)
+            layoutActions.setProviderArrangement(
+              pluginId,
+              order,
+              Object.fromEntries(metrics.map((m) => [m.id, onDemand.has(m.id)])),
+            )
+          }}
+        />
+      )
+      break
+    }
+    case "settings":
+      title = "Settings"
+      content = (
+        <div className="mac-settings">
+          <AppContent
+            {...appContentProps}
+            displayPlugins={displayPlugins}
+            settingsPlugins={settingsPlugins}
+            selectedPlugin={null}
+            viewOverride="settings"
+          />
+        </div>
+      )
+      break
+    case "history":
+      title = "Usage History"
+      content = (
+        <UsageHistoryView nowMs={nowMs} onOpenSettings={openSettings} />
+      )
+      break
+  }
+
+  return (
+    <div className="app-popover-shell w-full bg-transparent" data-density={modernDensity}>
+      <LiquidGlassFilter active={themeMode === "glass"} />
+      <div
+        ref={panelRef}
+        className="app-panel-surface relative flex w-full select-none flex-col overflow-hidden rounded-[13px]"
+        data-ui-layout="modern"
+        data-density={modernDensity}
+      >
+        {screen.id !== "dashboard" ? <NavBar title={title} onBack={back} onReset={onReset} /> : null}
+        <div data-panel-scroll className="min-h-0 flex-1 overflow-y-auto scrollbar-none">
+          <div
+            ref={contentRef}
+            key={screen.id === "provider" ? `provider:${screen.pluginId}` : screen.id}
+            className={cn("motion-view px-[14px] pb-[14px]", compact ? "pt-[10px]" : "pt-[14px]")}
+          >
+            {content}
+          </div>
+        </div>
+        <ModernFooter
+          version={appVersion}
+          autoUpdateNextAt={autoUpdateNextAt}
+          refreshing={refreshing}
+          onRefreshAll={onRefreshAll}
+          showAbout={showAbout}
+          onShowAbout={() => setShowAbout(true)}
+          onCloseAbout={() => setShowAbout(false)}
+          showOptions={screen.id === "dashboard"}
+          onOpenCustomize={() => push({ id: "customize" })}
+          onOpenHistory={() => push({ id: "history" })}
+          onOpenSettings={openSettings}
+          onQuit={() => {
+            if (isTauri()) invoke("quit_app").catch(console.error)
+          }}
+        />
       </div>
     </div>
   )

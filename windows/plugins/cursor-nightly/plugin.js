@@ -389,7 +389,7 @@ globalThis.__OPENUSAGE_PLUGIN_REGISTRATION_ID__ = "cursor-nightly";
         ctx.line.progress({
           label: "Other Models",
           used: 7,
-          limit: 50,
+          limit: 100,
           format: { kind: "percent" },
         }),
         ctx.line.progress({
@@ -401,7 +401,7 @@ globalThis.__OPENUSAGE_PLUGIN_REGISTRATION_ID__ = "cursor-nightly";
         ctx.line.progress({
           label: "On-demand",
           used: 1,
-          limit: 10,
+          limit: 100,
           format: { kind: "percent" },
         }),
       ],
@@ -1695,9 +1695,11 @@ globalThis.__OPENUSAGE_PLUGIN_REGISTRATION_ID__ = "cursor-nightly";
   }
 
   var lastProbeAccessToken = null
+  var lastProbeWasDevMock = false
 
   function probeImpl(ctx) {
     lastProbeAccessToken = null
+    lastProbeWasDevMock = false
     const authState = loadAuthState(ctx)
     let accessToken = authState.accessToken
     const refreshTokenValue = authState.refreshToken
@@ -1707,6 +1709,7 @@ globalThis.__OPENUSAGE_PLUGIN_REGISTRATION_ID__ = "cursor-nightly";
       authSource === "provider-account" &&
       isQuotabarDevMockCredential(accessToken, refreshTokenValue)
     ) {
+      lastProbeWasDevMock = true
       return buildQuotabarDevMockProbeOutput(ctx)
     }
 
@@ -1974,6 +1977,7 @@ globalThis.__OPENUSAGE_PLUGIN_REGISTRATION_ID__ = "cursor-nightly";
 
   function probe(ctx) {
     var result = probeImpl(ctx)
+    if (lastProbeWasDevMock) return result
     result = attachGrokBotUsage(ctx, result, lastProbeAccessToken)
     result = attachCursorTranscriptActivity(ctx, result)
     result = attachCursorBillingDaily(ctx, result)

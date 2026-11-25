@@ -89,4 +89,40 @@ describe("openrouter plugin", () => {
     expect(result.plan).toBe("Free tier");
     expect(result.lines.find((l) => l.label === "Today")).toBeTruthy();
   });
+
+  it("omits unmeasured balances and caps but preserves reported zeroes", async () => {
+    const ctx = makePluginTestContext();
+    mockEnvKey(ctx, "sk-or-test");
+    ctx.host.http.request.mockImplementation(({ url }) => ({
+      status: 200,
+      bodyText: JSON.stringify({ data: url.endsWith("/credits")
+        ? { total_usage: 4.5 }
+        : { usage_daily: 0, limit: 20 } }),
+    }));
+    const plugin = await loadPlugin();
+    expect(plugin.probe(ctx).lines.map((line) => line.label)).toEqual(["Today"]);
+    expect(ctx.host.log.warn).toHaveBeenCalledWith(expect.stringContaining("remaining amount"));
+  });
+
+  it("uses the saved key, then config, then environment", async () => {
+    const ctx = makePluginTestContext();
+    const path = "~/.config/openusage/openrouter.json";
+    mockEnvKey(ctx, "environment-key");
+    ctx.host.fs.writeText(path, JSON.stringify({ apiKey: "config-key" }));
+    ctx.util.providerApiKey = vi.fn().mockReturnValueOnce("saved-key");
+    ctx.host.http.request.mockReturnValue({
+      status: 200,
+      bodyText: JSON.stringify({ data: { usage_daily: 0 } }),
+    });
+    const plugin = await loadPlugin();
+    plugin.probe(ctx);
+    plugin.probe(ctx);
+    ctx.host.fs.writeText(path, "");
+    plugin.probe(ctx);
+    expect(ctx.host.http.request.mock.calls.map(([req]) => req.headers.Authorization)).toEqual([
+      "Bearer saved-key", "Bearer saved-key",
+      "Bearer config-key", "Bearer config-key",
+      "Bearer environment-key", "Bearer environment-key",
+    ]);
+  });
 });

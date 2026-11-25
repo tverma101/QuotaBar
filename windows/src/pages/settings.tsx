@@ -26,6 +26,8 @@ import { ProviderIcon } from "@/components/provider-icon";
 import { GlobalShortcutSection } from "@/components/global-shortcut-section";
 import { LanguageRegionSection } from "@/components/settings/language-region-section";
 import { ScreenShareSection } from "@/components/settings/screen-share-section";
+import { CodexEnrollment, type RegisteredCodexAccount } from "@/components/settings/codex-enrollment";
+import { CodexAutoResetSetting } from "@/components/settings/codex-auto-reset-setting";
 import { getBarFillLayout } from "@/lib/tray-bars-icon";
 import { getTrayIconSizePx } from "@/lib/tray-icon-size";
 import {
@@ -105,6 +107,7 @@ const PREVIEW_BAR_TRACK_PX = 20;
 
 export type ProviderAccountCredentialInput = {
   label?: string;
+  registeredInstanceId?: string;
   accessToken: string;
   refreshToken: string;
   sessionKey: string;
@@ -673,7 +676,7 @@ function ProviderAccountForm({
   );
 }
 
-function InsightsSection() {
+function DisplayOptionsSection() {
   const showTrayInsight = useAppPreferencesStore((state) => state.showTrayInsight);
   const setShowTrayInsight = useAppPreferencesStore((state) => state.setShowTrayInsight);
   const showTotalSpend = useAppPreferencesStore((state) => state.showTotalSpend);
@@ -703,10 +706,7 @@ function InsightsSection() {
 
   return (
     <section>
-      <h3 className="text-lg font-semibold mb-0">Insights</h3>
-      <p className="text-sm text-muted-foreground mb-2">
-        Live insights on Dashboard; optional tray line and history-backed tightest quotas when snapshots are saved.
-      </p>
+      <h3 className="text-lg font-semibold mb-2">Display Options</h3>
       <label className="flex items-center gap-2 text-sm select-none text-foreground">
         <Checkbox
           checked={showTrayInsight}
@@ -781,6 +781,11 @@ function ResetAllSettingsSection({ onResetComplete }: { onResetComplete: () => v
           await invoke("set_hide_from_screen_share", { enabled: false });
         } catch (e) {
           console.error("clear Hide From Screen Share after reset:", e);
+        }
+        try {
+          await invoke("set_codex_auto_reset_enabled", { value: false });
+        } catch (e) {
+          console.error("clear Codex automatic resets after reset:", e);
         }
       }
       await hydrateModernLayoutStore();
@@ -1492,10 +1497,22 @@ export function SettingsPage({
     setAccountForm(null);
   };
 
+  function addRegisteredCodexAccount({ instanceId, label }: RegisteredCodexAccount) {
+    onAddProviderAccount("codex", {
+      label,
+      registeredInstanceId: instanceId,
+      accessToken: "",
+      refreshToken: "",
+      sessionKey: "",
+    });
+  }
+
   return (
     <div
       className={cn(
-        tabbed
+        isModern
+          ? "space-y-[10px] pb-1"
+          : tabbed
           ? "space-y-2 pb-2 [&_section]:rounded-xl [&_section]:border [&_section]:border-border/50 [&_section]:bg-card/30 [&_section]:px-3 [&_section]:py-2.5 [&_h3]:text-sm [&_h3]:font-semibold [&_section>p.text-sm]:text-xs [&_section>p.text-sm]:text-muted-foreground [&_section>p.text-sm]:mb-2"
           : "py-3 space-y-4",
       )}
@@ -1508,7 +1525,34 @@ export function SettingsPage({
           {devMockSaveNotice}
         </div>
       ) : null}
-      {tabbed ? (
+      {isModern ? (
+        <nav
+          className="sticky top-0 z-10 -mx-[14px] -mt-[14px] bg-background px-[14px] pb-[8px] pt-[10px]"
+          aria-label="Settings sections"
+        >
+          <div className="flex rounded-full bg-segment p-[3px]">
+            {modernTabs.map((tab) => {
+              const selected = modernTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  aria-pressed={selected}
+                  className={cn(
+                    "min-w-0 flex-auto truncate rounded-full px-[5px] py-[4px] text-[11.5px] tracking-[-0.01em] transition-colors",
+                    selected
+                      ? "bg-segment-selected font-semibold text-foreground shadow-[0_1px_3px_rgba(0,0,0,0.18)]"
+                      : "font-medium text-muted-foreground hover:text-foreground",
+                  )}
+                  onClick={() => setModernTab(tab.id)}
+                >
+                  {tab.label}
+                </button>
+              );
+            })}
+          </div>
+        </nav>
+      ) : tabbed ? (
         <nav
           className="flex flex-wrap gap-1 sticky top-0 z-10 -mx-1 px-1 py-1 bg-background/95 border-b border-border/40"
           aria-label="Settings sections"
@@ -1530,6 +1574,12 @@ export function SettingsPage({
       ) : null}
       {showModernSection("general") ? (
       <>
+      {isTauri() && plugins.some((plugin) => plugin.id === "codex") ? (
+        <div className={cn("space-y-1", modernDensity === "compact" && "space-y-0.5")}>
+          <h4 className="px-2 text-xs font-semibold text-muted-foreground">Codex Accounts</h4>
+          <CodexEnrollment label="" onRegistered={addRegisteredCodexAccount} presentation="settings" />
+        </div>
+      ) : null}
       <LanguageRegionSection
         appLocale={appLocale}
         displayCurrency={displayCurrency}
@@ -1629,6 +1679,7 @@ export function SettingsPage({
           </div>
         </div>
       </section>
+      {isTauri() ? <CodexAutoResetSetting /> : null}
       <section>
         <h3 className="text-lg font-semibold mb-0">{t("settings.timeFormat.title")}</h3>
         <p className="text-sm text-muted-foreground mb-2">
@@ -1891,7 +1942,7 @@ export function SettingsPage({
         </label>
       </section>
       <ScreenShareSection />
-      <InsightsSection />
+      <DisplayOptionsSection />
       <LocalApiSection />
       <UsageHistorySection key={usageHistorySectionKey} />
       <section>
@@ -2235,6 +2286,15 @@ export function SettingsPage({
                   accountFormSlot={
                     accountForm && accountFormAnchorPluginId(accountForm) === plugin.id ? (
                       <div className="pt-2 mt-2 border-t border-border">
+                        {isTauri() && accountForm.mode === "add" && accountForm.baseProviderId === "codex" ? (
+                          <CodexEnrollment
+                            label={accountForm.label}
+                            onRegistered={(account) => {
+                              addRegisteredCodexAccount(account);
+                              setAccountForm(null);
+                            }}
+                          />
+                        ) : null}
                         <ProviderAccountForm
                           form={accountForm}
                           onChange={setAccountForm}

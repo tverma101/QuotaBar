@@ -82,18 +82,16 @@ fn scan(
     home_path: Option<&str>,
     pricing: &ModelPricing,
 ) -> Option<Vec<DailyUsageRow>> {
-    let files = session_files(&grok_home(home_path));
+    let since = since_local_midnight(days_back);
+    let files = session_files(&grok_home(home_path), since);
     if files.is_empty() {
         return None;
     }
-    let since = since_local_midnight(days_back);
-    let mut entries = Vec::new();
-    for file in &files {
-        if !file_mtime_before(&file.mtime, since) {
-            entries.extend(parse_file(&file.path));
-        }
-    }
-    Some(aggregate(&dedup(entries), since, pricing))
+    let entries = files
+        .iter()
+        .flat_map(|file| parse_file(&file.path))
+        .filter(|entry| entry.timestamp >= since);
+    Some(aggregate(dedup(entries), pricing))
 }
 
 fn grok_home(home_path: Option<&str>) -> PathBuf {
@@ -109,9 +107,10 @@ fn grok_home(home_path: Option<&str>) -> PathBuf {
         .join(".grok")
 }
 
-fn session_files(home: &Path) -> Vec<DiscoveredFile> {
+fn session_files(home: &Path, since: DateTime<Utc>) -> Vec<DiscoveredFile> {
     let mut files = Vec::new();
     collect_updates(&home.join("sessions"), &mut files);
+    files.retain(|file| !file_mtime_before(&file.mtime, since) && is_coordinator_session(&file.path));
     cap_log_files_by_mtime(&mut files, |f| f.mtime, |f| f.size);
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
@@ -120,13 +119,13 @@ fn session_files(home: &Path) -> Vec<DiscoveredFile> {
 fn collect_updates(dir: &Path, out: &mut Vec<DiscoveredFile>) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for entry in rd.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_updates(&path, out);
-        } else if path.file_name().and_then(|n| n.to_str()) == Some("updates.jsonl") {
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            collect_updates(&entry.path(), out);
+        } else if kind.is_file() && entry.file_name() == "updates.jsonl" {
             if let Ok(meta) = entry.metadata() {
                 out.push(DiscoveredFile {
-                    path,
+                    path: entry.path(),
                     size: meta.len(),
                     mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                 });
@@ -135,8 +134,29 @@ fn collect_updates(dir: &Path, out: &mut Vec<DiscoveredFile>) {
     }
 }
 
-/// Child sessions can contain usage absent from their coordinator. Include every
-/// `updates.jsonl`; event-id+model dedup drops replayed turns, not session kind.
+fn is_coordinator_session(updates: &Path) -> bool {
+    let summary = updates.with_file_name("summary.json");
+    let body = match fs::read_to_string(&summary) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => {
+            warn_unreadable_usage_file(&summary);
+            return false;
+        }
+    };
+    if let Ok(Value::Object(summary_fields)) = serde_json::from_str::<Value>(&body) {
+        match summary_fields.get("session_kind") {
+            None => return true,
+            Some(Value::String(kind)) => {
+                return !kind.trim().to_ascii_lowercase().starts_with("subagent");
+            }
+            _ => {}
+        }
+    }
+    warn_unreadable_usage_file(&summary);
+    false
+}
+
 fn file_mtime_before(mtime: &SystemTime, since: DateTime<Utc>) -> bool {
     let Ok(duration) = mtime.duration_since(SystemTime::UNIX_EPOCH) else {
         return false;
@@ -147,25 +167,25 @@ fn file_mtime_before(mtime: &SystemTime, since: DateTime<Utc>) -> bool {
     file_dt < since
 }
 
-fn parse_file(path: &Path) -> Vec<Entry> {
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
+fn parse_file(path: &Path) -> impl Iterator<Item = Entry> {
+    let reader = match fs::File::open(path) {
+        Ok(file) => Some(BufReader::new(file)),
         Err(_) => {
             warn_unreadable_usage_file(path);
-            return vec![];
+            None
         }
     };
-    let mut entries = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { continue };
-        if !line.contains("turn_completed") {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            entries.extend(parse_completed_turn(&v));
-        }
-    }
-    entries
+    reader
+        .into_iter()
+        .flat_map(|reader| reader.split(b'\n').map_while(Result::ok))
+        .filter_map(|line| {
+            let text = std::str::from_utf8(&line).ok()?;
+            if !text.contains("turn_completed") {
+                return None;
+            }
+            serde_json::from_str::<Value>(text).ok()
+        })
+        .flat_map(|value| parse_completed_turn(&value))
 }
 
 fn parse_completed_turn(object: &Value) -> Vec<Entry> {
@@ -269,50 +289,40 @@ fn timestamp_in(object: &Value, params: Option<&Value>) -> Option<DateTime<Utc>>
     }
 }
 
-fn dedup(entries: Vec<Entry>) -> Vec<Entry> {
+fn dedup(entries: impl Iterator<Item = Entry>) -> impl Iterator<Item = Entry> {
     let mut seen = HashSet::new();
-    entries
-        .into_iter()
-        .filter(|e| match &e.event_id {
-            Some(id) => seen.insert(format!("{id}\0{}", e.model)),
-            None => true,
-        })
-        .collect()
+    entries.filter(move |e| match &e.event_id {
+        Some(id) => seen.insert(format!("{id}\0{}", e.model)),
+        None => true,
+    })
 }
 
 struct DayAcc {
     tokens: i32,
-    cost: f64,
+    cost: Option<f64>,
     input: i32,
     output: i32,
     cache_create: i32,
     cache_read: i32,
-    models: BTreeMap<String, (i32, f64)>,
+    models: BTreeMap<String, (i32, Option<f64>)>,
 }
 
 fn aggregate(
-    entries: &[Entry],
-    since: DateTime<Utc>,
+    entries: impl Iterator<Item = Entry>,
     pricing: &ModelPricing,
 ) -> Vec<DailyUsageRow> {
     let mut days: BTreeMap<String, DayAcc> = BTreeMap::new();
     for entry in entries {
-        if entry.timestamp < since {
-            continue;
-        }
-        let cost = match entry.carried_cost {
-            Some(c) => c,
-            None => match pricing.estimated_cost_dollars(&entry.model, &entry.tokens) {
-                Some(c) => c,
-                None => continue,
-            },
-        };
+        let cost = entry
+            .carried_cost
+            .or_else(|| pricing.estimated_cost_dollars_at(&entry.model, &entry.tokens, entry.timestamp));
+
         let total = entry.tokens.total_tokens();
         let acc = days
             .entry(local_day_key_from_offset(&entry.timestamp))
             .or_insert(DayAcc {
                 tokens: 0,
-                cost: 0.0,
+                cost: None,
                 input: 0,
                 output: 0,
                 cache_create: 0,
@@ -320,14 +330,16 @@ fn aggregate(
                 models: BTreeMap::new(),
             });
         acc.tokens = acc.tokens.saturating_add(total);
-        acc.cost += cost;
         acc.input = acc.input.saturating_add(entry.tokens.input);
         acc.output = acc.output.saturating_add(entry.tokens.output);
         acc.cache_create = acc.cache_create.saturating_add(entry.tokens.cache_write5m);
         acc.cache_read = acc.cache_read.saturating_add(entry.tokens.cache_read);
-        let m = acc.models.entry(entry.model.clone()).or_insert((0, 0.0));
+        let m = acc.models.entry(entry.model).or_insert((0, None));
         m.0 = m.0.saturating_add(total);
-        m.1 += cost;
+        if let Some(cost) = cost {
+            *acc.cost.get_or_insert(0.0) += cost;
+            *m.1.get_or_insert(0.0) += cost;
+        }
     }
     days.into_iter()
         .rev()
@@ -338,8 +350,8 @@ fn aggregate(
             cache_creation_tokens: acc.cache_create,
             cache_read_tokens: acc.cache_read,
             total_tokens: acc.tokens,
-            total_cost: Some(acc.cost),
-            cost_usd: Some(acc.cost),
+            total_cost: acc.cost,
+            cost_usd: acc.cost,
             models: acc
                 .models
                 .into_iter()
@@ -352,7 +364,7 @@ fn aggregate(
                             cache_creation_tokens: 0,
                             cache_read_tokens: 0,
                             total_tokens: tokens,
-                            total_cost: Some(cost),
+                            total_cost: cost,
                         },
                     )
                 })
@@ -426,9 +438,8 @@ mod tests {
                 parse_completed_turn(&a)
                     .into_iter()
                     .chain(parse_completed_turn(&a))
-                    .collect()
             )
-            .len(),
+            .count(),
             1
         );
         assert_eq!(
@@ -436,15 +447,58 @@ mod tests {
                 parse_completed_turn(&a)
                     .into_iter()
                     .chain(parse_completed_turn(&b))
-                    .collect()
             )
-            .len(),
+            .count(),
             2
         );
     }
 
     #[test]
-    fn includes_subagent_and_forked_ledgers() {
+    fn unpriced_models_keep_their_tokens_without_inventing_a_cost() {
+        let value = serde_json::json!({
+            "timestamp": "2026-06-10T10:00:00.000Z",
+            "params": { "update": {
+                "sessionUpdate": "turn_completed",
+                "usage": { "modelUsage": { "unknown-grok-fixture-model": { "inputTokens": 100 } } }
+            } }
+        });
+        let entries = parse_completed_turn(&value);
+        let rows = aggregate(entries.into_iter(), default_pricing());
+        assert_eq!(rows[0].total_tokens, 100);
+        assert_eq!(rows[0].total_cost, None);
+        assert_eq!(rows[0].models["unknown-grok-fixture-model"].total_cost, None);
+    }
+
+    #[test]
+    fn subagent_ledgers_do_not_take_slots_from_older_coordinators() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let coordinator = sessions.join("coordinator");
+        fs::create_dir_all(&coordinator).unwrap();
+        let ledger = coordinator.join("updates.jsonl");
+        fs::File::create(&ledger)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+        fs::write(coordinator.join("summary.json"), r#"{"session_kind":"coordinator"}"#).unwrap();
+        for i in 0..crate::log_usage_types::LOG_SCAN_MAX_FILES {
+            let subagent = sessions.join(format!("subagent-{i}"));
+            fs::create_dir_all(&subagent).unwrap();
+            fs::write(subagent.join("updates.jsonl"), "").unwrap();
+            fs::write(
+                subagent.join("summary.json"),
+                r#"{"session_kind":"subagent"}"#,
+            )
+            .unwrap();
+        }
+
+        let files = session_files(tmp.path(), Utc::now() - chrono::Duration::hours(1));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, ledger);
+    }
+
+    #[test]
+    fn counts_coordinator_and_legacy_ledgers_without_subagent_duplicates() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sessions = tmp.path().join("sessions");
         let ts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -467,8 +521,8 @@ mod tests {
         }
         let rows = scan(1, Some(&tmp.path().to_string_lossy()), default_pricing()).unwrap();
         assert_eq!(
-            rows[0].total_tokens, 500,
-            "coord + sub + fork + legacy + unreadable summary"
+            rows[0].total_tokens, 200,
+            "coordinator and legacy only"
         );
     }
 }

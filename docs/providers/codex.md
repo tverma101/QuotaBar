@@ -99,10 +99,21 @@ On Windows, an additional account's reset claim only uses that card's credential
 not retry a rejected claim under another login or submit a claim for an expired credit. VM Box
 history matches using a verified ChatGPT account ID, not the card label.
 
+To add another Codex account on Windows, open **Codex Accounts** in General Settings and choose
+**Sign In to Codex** or **Use Existing Codex Home**. Browser sign-in needs the official Codex
+executable available on PATH. Codex writes its own login to a separate home; QuotaBar connects the
+home only after it identifies the signed-in account. Removing the card does not delete the home
+or its history.
+
+**Auto-Use Expiring Codex Resets** is off by default. When enabled in Settings, QuotaBar checks
+verified Codex accounts and may use a matching credit in the final minute before expiry.
+QuotaBar must be running and the computer awake. Attempts are tracked for each ChatGPT account
+and credit so a retry can reuse its original request ID without spending a different credit.
+
 Safeguards, because a claim is irreversible:
 
-- Claiming is always a deliberate two-click flow behind the hover popover — nothing is ever claimed automatically.
-- Each claim targets one explicit credit (re-matched against a fresh credit list at claim time) and carries an idempotency key, so a retry after a network error can never spend a second credit.
+- Claiming from the popover is a deliberate two-click flow. Automatic claims require explicitly opting in.
+- The first claim attempt matches one explicit credit against a fresh list. A retry reuses the account, credit, and request ID, even if a lost response means the credit no longer appears in the list.
 - If the credit was meanwhile used elsewhere (CLI or web) the popover says it's no longer available and refreshes; if your usage doesn't need a reset, Codex refuses without spending the credit and the popover says so. After a claim resets usage, the remaining Use buttons disable ("nothing to reset") until the popover is reopened.
 - Reset tries usable auth files first and reads Keychain only when no file credential is available or the API rejects the file credentials. It uses the same one-prompt Keychain permission as **Refresh Now** and follows the card's Keychain fallback setting.
 - If no usable credential can be read, the popover reports a credential access problem; choose **Always Allow** in the Keychain prompt or check the Codex auth file, then try again.

@@ -48,6 +48,7 @@ import {
   loadUsageAlertEnabled,
   loadUsageAlertSound,
   loadUsageAlertThreshold,
+  loadUILayout,
   migrateLegacyTraySettings,
   migrateWindsurfToDevin,
   loadThemeMode,
@@ -114,6 +115,11 @@ describe("settings", () => {
 
   it("loads defaults when no settings stored", async () => {
     await expect(loadPluginSettings()).resolves.toEqual(DEFAULT_PLUGIN_SETTINGS)
+  })
+
+  it.each(["classic", "modern"])("honors a saved %s layout", async (layout) => {
+    storeState.set("uiLayout", layout)
+    await expect(loadUILayout()).resolves.toBe(layout)
   })
 
   it("sanitizes stored settings", async () => {

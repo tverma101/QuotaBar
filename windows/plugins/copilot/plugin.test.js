@@ -216,7 +216,7 @@ describe("copilot plugin", () => {
     );
   });
 
-  it("returns empty lines for token-based billing seats", async () => {
+  it("reports no data without an error for token-based billing seats", async () => {
     const ctx = makePluginTestContext();
     setKeychainToken(ctx, "tok");
     ctx.host.http.request.mockReturnValue({
@@ -232,7 +232,7 @@ describe("copilot plugin", () => {
     const plugin = await loadPlugin();
     const result = plugin.probe(ctx);
     expect(result.plan).toBe("Business");
-    expect(result.lines).toHaveLength(0);
+    expect(result.lines).toEqual([expect.objectContaining({ type: "badge", text: "No usage data" })]);
   });
 
   it("shows personal credits on org-managed seats", async () => {
@@ -259,6 +259,73 @@ describe("copilot plugin", () => {
       type: "text",
       value: "42",
     });
+  });
+
+  it("keeps personal credits and tries the next org when billing is denied", async () => {
+    const ctx = makePluginTestContext();
+    setKeychainToken(ctx, "tok");
+    ctx.host.http.request.mockImplementation(({ url }) => {
+      if (url.endsWith("/copilot_internal/user")) return {
+        status: 200,
+        bodyText: JSON.stringify({
+          copilot_plan: "business", token_based_billing: true,
+          quota_snapshots: { premium_interactions: { entitlement: 0, overage_permitted: true, credits_used: 42 } },
+        }),
+      };
+      if (url.includes("/user/orgs?")) return {
+        status: 200, bodyText: JSON.stringify([{ login: "denied" }, { login: "allowed" }]),
+      };
+      if (url.includes("/orgs/denied/")) return { status: 403, bodyText: "" };
+      return { status: 200, bodyText: JSON.stringify({ usageItems: [
+        { product: "copilot", unitType: "ai-credits", grossQuantity: 60, netAmount: 4 },
+        { product: "copilot", unitType: "seat", grossQuantity: 20, netAmount: 200 },
+      ] }) };
+    });
+    const plugin = await loadPlugin();
+    expect(plugin.probe(ctx).lines.map(({ label, value }) => [label, value])).toEqual([
+      ["Credits", "42"], ["Org Credits", "60 credits"], ["Org Spend", "$4.00"],
+    ]);
+  });
+
+  it("falls back from the Windows editor to the github.com entry in GH_CONFIG_DIR", async () => {
+    const ctx = makePluginTestContext();
+    ctx.host.env.get.mockImplementation(name => ({
+      LOCALAPPDATA: "C:/local", GH_CONFIG_DIR: "C:/gh", APPDATA: "C:/roaming",
+    })[name]);
+    ctx.host.fs.writeText("C:/local/github-copilot/apps.json", JSON.stringify({
+      "github.com:editor": { oauth_token: "editor" },
+    }));
+    ctx.host.fs.writeText("C:/gh/hosts.yml",
+      "enterprise.test:\r\n    oauth_token: enterprise\r\ngithub.com:\r\n    users:\r\n        other:\r\n            oauth_token: wrong\r\n    user: active\r\n    oauth_token: gh-active\r\n");
+    ctx.host.http.request.mockReturnValueOnce({ status: 401, bodyText: "" })
+      .mockReturnValue({ status: 200, bodyText: JSON.stringify(makeUsageResponse()) });
+    const plugin = await loadPlugin();
+    expect(plugin.probe(ctx).plan).toBe("Pro");
+    expect(ctx.host.http.request.mock.calls.map(([req]) => req.headers.Authorization))
+      .toEqual(["token editor", "token gh-active"]);
+  });
+
+  it("tries another editor file before GitHub CLI when the first editor token is rejected", async () => {
+    const ctx = makePluginTestContext();
+    ctx.host.env.get.mockImplementation(name => ({
+      LOCALAPPDATA: "C:/local", GH_CONFIG_DIR: "C:/gh",
+    })[name]);
+    ctx.host.fs.writeText("C:/local/github-copilot/apps.json", JSON.stringify({
+      "github.com:editor": { oauth_token: "editor-stale" },
+    }));
+    ctx.host.fs.writeText("~/.config/github-copilot/hosts.json", JSON.stringify({
+      "github.com": { oauth_token: "editor-active" },
+    }));
+    ctx.host.fs.writeText("C:/gh/hosts.yml", "github.com:\n    oauth_token: gh-active\n");
+    ctx.host.http.request.mockImplementation(({ headers }) =>
+      headers.Authorization === "token editor-active"
+        ? { status: 200, bodyText: JSON.stringify(makeUsageResponse()) }
+        : { status: 401, bodyText: "" }
+    );
+    const plugin = await loadPlugin();
+    expect(plugin.probe(ctx).plan).toBe("Pro");
+    expect(ctx.host.http.request.mock.calls.map(([req]) => req.headers.Authorization))
+      .toEqual(["token editor-stale", "token editor-active"]);
   });
 
   it("returns plan label from copilot_plan", async () => {

@@ -143,14 +143,26 @@ pub fn list_recent(
     limit: u32,
     instance_id: Option<&str>,
 ) -> rusqlite::Result<Vec<UsageDailyRow>> {
+    list_rows(app_data_dir, i64::from(limit.clamp(1, 500)), instance_id)
+}
+
+/// Read retained daily totals for the dedicated History screen.
+pub fn list_all(app_data_dir: &Path) -> rusqlite::Result<Vec<UsageDailyRow>> {
+    // SQLite treats a negative LIMIT as unbounded.
+    list_rows(app_data_dir, -1, None)
+}
+
+fn list_rows(
+    app_data_dir: &Path,
+    limit: i64,
+    instance_id: Option<&str>,
+) -> rusqlite::Result<Vec<UsageDailyRow>> {
     let path = usage_history_db_path(app_data_dir);
     if !path.exists() {
         return Ok(vec![]);
     }
     let conn = Connection::open(&path)?;
     init_schema(&conn)?;
-    let lim = i64::from(limit).max(1).min(500);
-
     let mut out = Vec::new();
     if let Some(id) = instance_id {
         let mut stmt = conn.prepare_cached(
@@ -159,7 +171,7 @@ pub fn list_recent(
              FROM usage_daily WHERE instance_id = ?1
              ORDER BY day_key DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![id, lim], map_daily_row)?;
+        let rows = stmt.query_map(params![id, limit], map_daily_row)?;
         for row in rows {
             out.push(row?);
         }
@@ -169,7 +181,7 @@ pub fn list_recent(
                     output_tokens, cost_usd, source, ingested_at_ms
              FROM usage_daily ORDER BY day_key DESC, instance_id ASC LIMIT ?1",
         )?;
-        let rows = stmt.query_map([lim], map_daily_row)?;
+        let rows = stmt.query_map([limit], map_daily_row)?;
         for row in rows {
             out.push(row?);
         }
@@ -218,6 +230,22 @@ mod tests {
         ingest_json(dir.path(), "claude", payload).unwrap();
         let rows = list_recent(dir.path(), 10, None).unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn dedicated_history_includes_rows_beyond_recent_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = Connection::open(usage_history_db_path(dir.path())).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 501)
+             INSERT INTO usage_daily (instance_id, day_key, display_name, ingested_at_ms)
+             SELECT 'fixture-' || i, '2026-05-01', 'Fixture', 0 FROM n;",
+        )
+        .unwrap();
+
+        assert_eq!(list_recent(dir.path(), 501, None).unwrap().len(), 500);
+        assert_eq!(list_all(dir.path()).unwrap().len(), 501);
     }
 
     #[test]

@@ -1,0 +1,174 @@
+/*
+ * Modern layout Settings, styled like the macOS panel: borderless grouped cards,
+ * segmented pickers, switch toggles and compact popup selects.
+ * Scoped to `.mac-settings`, which only the Modern shell renders, so Classic
+ * keeps its own look. Unlayered on purpose so these win over Tailwind utilities.
+ */
+
+.mac-settings section {
+  border: 0;
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 12px 14px;
+  box-shadow: none;
+}
+
+.mac-settings section section {
+  background: transparent;
+  padding: 0;
+}
+
+.mac-settings section h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+
+.mac-settings section h4 {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.mac-settings section > p.text-sm,
+.mac-settings section > div > p.text-xs {
+  margin-top: 2px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--muted-foreground);
+}
+
+/* Nested bordered boxes (language, currency, accounts) become plain groups. */
+.mac-settings section .rounded-xl.border {
+  border: 0;
+  border-radius: 9px;
+  background: var(--segment);
+  box-shadow: none;
+}
+
+/* Segmented pickers. */
+.mac-settings div:has(> [role="radiogroup"].flex) {
+  background: transparent;
+  padding: 0;
+}
+
+.mac-settings [role="radiogroup"].flex {
+  gap: 0;
+  padding: 3px;
+  border-radius: 9px;
+  background: var(--segment);
+}
+
+.mac-settings [role="radiogroup"].flex > [role="radio"] {
+  height: auto;
+  min-height: 26px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.mac-settings [role="radiogroup"].flex > [role="radio"]:hover {
+  color: var(--foreground);
+}
+
+.mac-settings [role="radiogroup"].flex > [role="radio"][aria-checked="true"] {
+  /* Previews inside a selected option were drawn for an accent fill; keep them readable. */
+  --primary-foreground: var(--foreground);
+  background: var(--segment-selected);
+  color: var(--foreground);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.18);
+}
+
+.mac-settings [role="radiogroup"].flex > [role="radio"] span.text-xs {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+}
+
+/* Layout chooser cards. */
+.mac-settings [role="radiogroup"].grid > [role="radio"] {
+  border-color: transparent;
+  border-radius: 10px;
+  background: var(--segment);
+}
+
+.mac-settings [role="radiogroup"].grid > [role="radio"][aria-checked="true"] {
+  border-color: var(--switch-on);
+  box-shadow: 0 0 0 1px var(--switch-on);
+}
+
+/* Checkbox rows read like macOS toggle rows: label left, switch right. */
+.mac-settings label:has(> [data-slot="checkbox"]) {
+  flex-direction: row-reverse;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.mac-settings [data-slot="checkbox"] {
+  width: 36px;
+  height: 20px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--switch-off);
+  box-shadow: none;
+  transition: background-color 0.15s ease;
+}
+
+.mac-settings [data-slot="checkbox"]::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--switch-knob);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+  transition:
+    left 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.mac-settings [data-slot="checkbox"][data-checked] {
+  background: var(--switch-on);
+}
+
+.mac-settings [data-slot="checkbox"][data-checked]::before {
+  left: 14px;
+  background: var(--switch-knob-on);
+}
+
+.mac-settings [data-slot="checkbox-indicator"] {
+  display: none;
+}
+
+/* Popup selects and text fields. */
+.mac-settings select,
+.mac-settings input[type="text"],
+.mac-settings input[type="number"],
+.mac-settings input:not([type]) {
+  border: 0;
+  border-radius: 7px;
+  background-color: var(--control);
+  box-shadow: none;
+  font-size: 13px;
+}
+
+.mac-settings select:hover {
+  background-color: var(--control-hover);
+}
+
+.mac-settings select {
+  min-height: 30px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}

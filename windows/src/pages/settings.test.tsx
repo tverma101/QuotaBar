@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const tauriMocks = vi.hoisted(() => ({
-  invoke: vi.fn(() => Promise.resolve()),
+  invoke: vi.fn<(command: string, args?: unknown) => Promise<unknown>>(() => Promise.resolve()),
   isTauri: vi.fn(() => false),
 }))
 
@@ -171,6 +171,24 @@ beforeEach(() => {
 })
 
 describe("SettingsPage", () => {
+  it("connects a Codex account directly from General Settings", async () => {
+    tauriMocks.isTauri.mockReturnValue(true)
+    tauriMocks.invoke.mockImplementation((command) => Promise.resolve(
+      command === "sign_in_to_codex" ? { instanceId: "codex:registered", label: "Account" } : undefined,
+    ))
+    const onAddProviderAccount = vi.fn()
+    renderSettings({
+      ...defaultProps, presentation: "modern", onAddProviderAccount,
+      plugins: [{ id: "codex", baseProviderId: "codex", name: "Codex", enabled: true, primaryCandidates: [], trayReadoutLabels: [], trayLines: [] }],
+    })
+    expect(screen.getByRole("heading", { name: "Codex Accounts" })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole("button", { name: "Sign In to Codex…" }))
+    await waitFor(() => expect(onAddProviderAccount).toHaveBeenCalledWith("codex", {
+      label: "Account", registeredInstanceId: "codex:registered",
+      accessToken: "", refreshToken: "", sessionKey: "",
+    }))
+  })
+
   it("toggles plugins", async () => {
     const onToggle = vi.fn()
     renderSettings({

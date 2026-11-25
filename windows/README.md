@@ -1,12 +1,12 @@
 # QuotaBar for Windows
 
-QuotaBar shows AI coding subscription limits, reset times, credits, and spend in the Windows notification area. See [GitHub Releases](https://github.com/tverma101/QuotaBar/releases) for the Windows 11 x64 setup executable.
+QuotaBar for Windows is the Windows half of the cross-platform QuotaBar desktop app. It shows AI coding subscription limits, reset times, credits, and spend in the Windows notification area, complementing the native macOS menu-bar app in the repository root. See [GitHub Releases](https://github.com/tverma101/QuotaBar/releases) for the Windows 11 x64 setup executable.
 
 ## Install and Set Up
 
 1. Run the `-setup.exe` and open **QuotaBar** from Start. The installer uses the current user's profile and installs WebView2 if it is missing.
 2. Click the gauge in the taskbar notification area to reopen the dashboard. You may find it under the hidden icons arrow. Right-click the icon for Settings, About, Restart, and Quit.
-3. Open **Options → Settings → Providers** to change which providers are tracked. Claude, Codex, Cursor, and Freebuff start enabled. Sign in through the relevant provider tool if a card needs credentials.
+3. Open **Options → Customize** in Modern or **Options → Settings → Providers** in Classic to change which providers are tracked. Claude, Codex, Cursor, and Freebuff start enabled. Sign in through the relevant provider tool if a card needs credentials.
 4. Set **Start on Login** or **Start Hidden** under **Advanced**. Usage normally refreshes every 15 minutes, including when the panel is closed.
 
 To update, open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and run the newer installer under the same Windows account. Your selected dashboard layout and provider settings carry over.
@@ -33,4 +33,4 @@ bun run tauri:build --bundles nsis -- --locked
 
 The `-setup.exe` is under `target/release/bundle/nsis/`. For a public build, follow the [release instructions](../docs/releasing.md).
 
-The desktop port uses Tauri and a local QuickJS provider runtime. See [provenance](PROVENANCE.md) for attribution and upstream synchronization details.
+The desktop port uses Tauri, a React interface, a Rust backend/core, and a local QuickJS provider runtime. See [provenance](PROVENANCE.md) for attribution and upstream synchronization details.
