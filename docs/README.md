@@ -1,6 +1,6 @@
 # QuotaBar Documentation
 
-What the app does and how it behaves. These pages describe **behavior, not visuals**, and they are updated together with any change to that behavior — if the app and a page here disagree, that's a bug.
+What the app does and how it behaves on macOS and Windows. These pages describe **behavior, not visuals**, and they are updated together with any change to that behavior — if the app and a page here disagree, that's a bug. Most behavior pages were written around the macOS menu-bar app; platform-specific Windows installation, tray behavior, and architecture are documented in [QuotaBar for Windows](../windows/README.md).
 
 ## The app
 
