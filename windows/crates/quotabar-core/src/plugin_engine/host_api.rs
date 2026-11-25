@@ -1359,7 +1359,7 @@ fn inject_credentials<'js>(
     account: Option<&ProviderAccountContext>,
 ) -> rquickjs::Result<()> {
     let credentials_obj = Object::new(ctx.clone())?;
-    let credential = std::rc::Rc::new(std::cell::RefCell::new(
+    let credential = Rc::new(RefCell::new(
         account.and_then(|account| account.credential.clone()),
     ));
     let current = credential.clone();

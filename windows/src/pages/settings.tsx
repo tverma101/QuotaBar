@@ -676,7 +676,7 @@ function ProviderAccountForm({
   );
 }
 
-function InsightsSection() {
+function DisplayOptionsSection() {
   const showTrayInsight = useAppPreferencesStore((state) => state.showTrayInsight);
   const setShowTrayInsight = useAppPreferencesStore((state) => state.setShowTrayInsight);
   const showTotalSpend = useAppPreferencesStore((state) => state.showTotalSpend);
@@ -706,10 +706,7 @@ function InsightsSection() {
 
   return (
     <section>
-      <h3 className="text-lg font-semibold mb-0">Insights</h3>
-      <p className="text-sm text-muted-foreground mb-2">
-        Live insights on Dashboard; optional tray line and history-backed tightest quotas when snapshots are saved.
-      </p>
+      <h3 className="text-lg font-semibold mb-2">Display Options</h3>
       <label className="flex items-center gap-2 text-sm select-none text-foreground">
         <Checkbox
           checked={showTrayInsight}
@@ -1945,7 +1942,7 @@ export function SettingsPage({
         </label>
       </section>
       <ScreenShareSection />
-      <InsightsSection />
+      <DisplayOptionsSection />
       <LocalApiSection />
       <UsageHistorySection key={usageHistorySectionKey} />
       <section>
