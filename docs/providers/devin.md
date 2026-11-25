@@ -1,6 +1,6 @@
 # Devin
 
-Tracks your Devin quota using the login from the Devin CLI or the Devin app.
+Tracks your Devin quota using the login from the Devin CLI or the Devin app, plus the token usage the Devin CLI records in its local session database.
 
 ## What it tracks
 
@@ -9,8 +9,34 @@ Tracks your Devin quota using the login from the Devin CLI or the Devin app.
 | Weekly | Weekly quota used (falls back to the daily figure when Devin reports no weekly quota) |
 | Daily | Daily quota used (hidden by default when Devin does not return a daily quota; an explicit Customize opt-in keeps the empty state visible) |
 | Extra Balance | Overage/extra-usage balance in dollars |
+| Usage Trend | Token usage per day for the last 30 days, from local CLI sessions |
+| Today / Yesterday / Last 30 Days | Tokens used that day or across the last 30 days, from local CLI sessions; below the caret |
 
 When Devin reports your plan name, QuotaBar shows it beside the provider name.
+
+## Token usage comes from local sessions
+
+Devin's quota API reports percentages, not tokens. Token usage is read from the Devin CLI's local
+session database (`~/.local/share/devin/cli/sessions.db`), which records every model call — so
+ordinary `devin` sessions count without any export flag. The CLI writes a fresh row as a response
+streams; QuotaBar counts each call once.
+
+When the database is missing or holds no metered calls, QuotaBar falls back to the ATIF transcript
+exports in `~/.local/share/devin/cli/transcripts` — only sessions launched with `devin --export`
+(or run through Devin Desktop) leave one there. The two sources are never added together. When
+neither source has usage, the tiles honestly read "No data" rather than inventing totals, and the
+numbers are not a billing statement.
+
+Tokens are counted per model call. Reasoning levels for SWE-2, SWE-2 Flash, and SWE-2.1 appear under
+one row per model. SWE-2.1 Ultrafast has its own row and rates. These totals sit under the Devin caret.
+
+QuotaBar estimates local Desktop and CLI extra-usage costs from the self-serve rate in effect when
+each call ran, including the documented free and discounted windows. A call with an unpublished
+rate for one of its token buckets still counts toward token totals. The quota API provides meters
+and balances. It does not provide a per-call bill. [Devin model pricing](https://docs.devin.ai/desktop/models)
+
+The Gemini 4 Neon estimate uses the exact public route `google/gemini-4-neon` for both local
+reasoning variants.
 
 ## Where credentials come from
 
