@@ -7,7 +7,8 @@ set -euo pipefail
 #     rebuilds (macOS keys those to the signing identity + bundle id, not the install location);
 #   - uses its own bundle id (com.tverma101.quotabar.dev), so it never touches the real installed
 #     app's settings or keychain. To run against the real app's data instead, set BUNDLE_ID to
-#     com.tverma101.quotabar below;
+#     com.tverma101.quotabar; builds with that explicit production ID don't add a -dev version suffix.
+# The install mode defaults to the stable production bundle id (com.tverma101.quotabar).
 #
 # Usage: script/build_and_run.sh [run|build|install|logs|verify]
 # Env:   CODESIGN_IDENTITY  override signing identity (exact name or hash)
@@ -16,7 +17,8 @@ set -euo pipefail
 #        BUILD_JOBS         SwiftPM worker count (default: 2, to limit peak compiler memory)
 #        LOCAL_APP_VERSION  preserve an existing installed version for a local non-release build
 #        RELEASE            "1" requires a v-prefixed tag at HEAD and builds universal arm64 + x86_64
-#                           with the production app identity; install preserves the destination identity
+#                           with the production app identity
+#        QUOTABAR_LOCAL_FREEBUFF  "1" enables the private session reader for local install only
 #        ICLOUD_PROVISIONING_PROFILE  optional override for the development provisioning profile;
 #                         otherwise the newest matching installed profile is selected automatically
 
@@ -32,7 +34,12 @@ APP_DISPLAY="QuotaBar"                  # user-facing app name
 # designated requirement, which embeds the bundle id, and UserDefaults are per-domain, so a different id
 # means a fresh settings store and every previously-granted Keychain item needing consent again.
 RELEASE="${RELEASE:-0}"
-if [ "$RELEASE" = "1" ]; then
+LOCAL_FREEBUFF="${QUOTABAR_LOCAL_FREEBUFF:-0}"
+if [ "$LOCAL_FREEBUFF" = "1" ] && { [ "$MODE" != "install" ] || [ "$RELEASE" != "0" ]; }; then
+  echo "QUOTABAR_LOCAL_FREEBUFF=1 requires a local install (RELEASE=0)" >&2
+  exit 2
+fi
+if [ "$RELEASE" = "1" ] || [ "$MODE" = "install" ]; then
   DEFAULT_BUNDLE_ID="com.tverma101.quotabar"
 else
   DEFAULT_BUNDLE_ID="com.tverma101.quotabar.dev"
@@ -53,10 +60,17 @@ if [ "$RELEASE" = "1" ]; then
 else
   APP_VERSION="${LOCAL_APP_VERSION:-0.7.0}"
   APP_BUILD="$APP_VERSION"
-  DISPLAY_VERSION="${LOCAL_APP_VERSION:-$APP_VERSION-dev}"
+  if [ "$BUNDLE_ID" = "com.tverma101.quotabar" ]; then
+    DISPLAY_VERSION="$APP_VERSION"
+  else
+    DISPLAY_VERSION="${LOCAL_APP_VERSION:-$APP_VERSION-dev}"
+  fi
 fi
 
 DIST_DIR="$ROOT_DIR/dist"
+if [ "$LOCAL_FREEBUFF" = "1" ]; then
+  DIST_DIR="$DIST_DIR/local"
+fi
 APP_BUNDLE="$DIST_DIR/$APP_DISPLAY.app"
 STAGING_APP_BUNDLE="$DIST_DIR/.$APP_DISPLAY.staging.$$"
 DIST_BACKUP_BUNDLE="$DIST_DIR/.$APP_DISPLAY.backup.$$"
@@ -82,6 +96,10 @@ INSTALL_BACKUP_MOVED=0
 INSTALL_COMMITTED=0
 
 if [ "$MODE" = "install" ]; then
+  if [ "$BUNDLE_ID" != "com.tverma101.quotabar" ]; then
+    echo "install requires the production bundle identity; use verify for a development build" >&2
+    exit 1
+  fi
   if [ ! -d /Applications ] || [ ! -w /Applications ]; then
     echo "cannot install: /Applications is not writable by the current user" >&2
     exit 1
@@ -182,6 +200,14 @@ if { [ -z "$CODESIGN_IDENTITY" ] || [ "$CODESIGN_IDENTITY" = "-" ]; } && [ "${AL
   exit 1
 fi
 
+swift_build() {
+  if [ "$LOCAL_FREEBUFF" = "1" ]; then
+    swift build -Xswiftc -DQUOTABAR_LOCAL_FREEBUFF "$@"
+  else
+    swift build "$@"
+  fi
+}
+
 BUILD_JOBS="${BUILD_JOBS:-2}"
 if [ "$RELEASE" = "1" ]; then
   echo "==> Rust core (universal arm64 + x86_64)"
@@ -206,8 +232,8 @@ if [ "$RELEASE" = "1" ]; then
   RESOURCE_BUILD_DIR="$ARM64_BUILD_DIR"
 else
   echo "==> swift build ($CONFIG, $BUILD_JOBS jobs, index store disabled)"
-  swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store
-  BUILD_DIR="$(swift build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store --show-bin-path)"
+  swift_build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store
+  BUILD_DIR="$(swift_build -c "$CONFIG" -j "$BUILD_JOBS" --disable-index-store --show-bin-path)"
   BUILD_BINARY="$BUILD_DIR/$TARGET_NAME"
   BUILD_CLI_BINARY="$BUILD_DIR/quotabar-cli"
   RESOURCE_BUILD_DIR="$BUILD_DIR"
@@ -234,6 +260,7 @@ fi
 echo "==> staging $STAGING_APP_BUNDLE"
 trash_if_present "$STAGING_APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_HELPERS" "$APP_RESOURCES"
+cp "$ROOT_DIR/THIRD_PARTY_NOTICES.txt" "$APP_RESOURCES/"
 if [ "$RELEASE" = "1" ]; then
   trash_if_present "$PACKAGE_SCRATCH_DIR"
   mkdir -p "$PACKAGE_SCRATCH_DIR"

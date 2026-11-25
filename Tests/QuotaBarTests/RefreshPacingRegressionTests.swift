@@ -122,6 +122,21 @@ final class RefreshPacingRegressionTests: XCTestCase {
         )
     }
 
+    func testIdleWakeDoesNotRunRefreshCycleMaintenance() {
+        XCTAssertFalse(AppContainer.shouldRunRefreshCycleMaintenance(
+            passRan: false,
+            accountingTaskInFlight: false
+        ))
+        XCTAssertTrue(AppContainer.shouldRunRefreshCycleMaintenance(
+            passRan: true,
+            accountingTaskInFlight: false
+        ))
+        XCTAssertFalse(AppContainer.shouldRunRefreshCycleMaintenance(
+            passRan: true,
+            accountingTaskInFlight: true
+        ))
+    }
+
     func testLedgerAccountingWorkIsPriorityDuringTriggerCooldown() {
         XCTAssertTrue(AppContainer.hasPriorityRefreshPass(
             quotaRefreshDue: false,

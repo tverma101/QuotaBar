@@ -74,7 +74,9 @@ enum AntigravityAccountingProjection {
             try Task.checkCancellation()
             guard offset >= 0, offset < byteCount else { throw ProjectionError.invalid }
             if offset < pageStart || offset >= pageStart + page.count {
-                let count = min(4_096, byteCount - offset)
+                // Sparse wire fields touch scattered offsets; small chunks load less ignored
+                // payload when advancing to the next tag.
+                let count = min(512, byteCount - offset)
                 guard bytesRead <= maximumReadBytes - count else { throw ProjectionError.invalid }
                 pageStart = offset
                 page = try read(offset..<(offset + count))

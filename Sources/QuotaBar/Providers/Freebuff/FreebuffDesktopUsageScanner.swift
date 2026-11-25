@@ -9,6 +9,7 @@ actor FreebuffDesktopUsageScanner {
     struct Scan: Sendable {
         var usage: LogUsageScan
         var partialDays: Set<String>
+        var unexplainedPartialDays: Set<String>
     }
 
     struct Revision: Codable, Equatable {
@@ -27,6 +28,7 @@ actor FreebuffDesktopUsageScanner {
         var revision: [Revision]
         var rows: [DerivedTurn]
         var unreadableRows: Int
+        var contentFingerprint: String?
     }
 
     private struct CachedScan {
@@ -68,6 +70,9 @@ actor FreebuffDesktopUsageScanner {
         /// Whether the model came from the receipt rather than the thread's saved selection.
         var fromReceipt: Bool
         var partial: Bool
+        /// True when a hosted run's terminal state (failed/cancelled) or an imported hosted row
+        /// explains the missing receipt; nil for rows that predate run-status provenance.
+        var hasExplainedHostedGap: Bool?
     }
 
     /// The counts of one receipt. `invalid` keeps "the field was there but was not a number" apart
@@ -126,7 +131,9 @@ actor FreebuffDesktopUsageScanner {
     private var cachedSessionChats: [String: SessionChatInfo] = [:]
 
     init(
-        sqlite: any SQLiteAccessing = SQLiteCLIAccessor(),
+        // A project database can reach gigabytes of turn history (the MathNotes store is ~1.1 GB);
+        // the five-second default cap made its periodic reads fail loud every refresh.
+        sqlite: any SQLiteAccessing = NativeSQLiteAccessor(queryTimeout: 30),
         databasePaths: @escaping @Sendable () throws -> [String] = FreebuffDesktopUsageScanner.defaultDatabasePaths,
         sessionEndsPath: @escaping @Sendable () -> String? = FreebuffDesktopUsageScanner.defaultSessionEndsPath,
         parseMetrics: @escaping @Sendable (String) -> [String: Any]? = { ProviderParse.jsonObject(Data($0.utf8)) },
@@ -230,13 +237,19 @@ actor FreebuffDesktopUsageScanner {
                 turnsByDatabase.append(cached.rows)
                 unreadableRows += cached.unreadableRows
             } else if let diskRecord = FreebuffDesktopTurnPersistence.read(path: path, revision: before) {
-                // Disk-warm start: a fresh process (scan-worker child, or after a memory-pressure
+                // Disk-warm start: a fresh process (cold process, or after a memory-pressure
                 // unload) reloads derived turns without another SQLite read. The record's revision
                 // was validated against `before`, so the rows match this pass's snapshot exactly.
                 let derived = DerivedTurns(turns: diskRecord.rows, unreadable: diskRecord.unreadableRows)
-                store(path: path, revision: before, derived: derived)
+                store(path: path, revision: before, derived: derived, contentFingerprint: diskRecord.contentFingerprint)
                 turnsByDatabase.append(diskRecord.rows)
                 unreadableRows += diskRecord.unreadableRows
+            } else if let proven = provenUnchangedRows(path: path, before: before) {
+                // WAL churn (checkpoint, metadata write) invalidates the stamp revision while
+                // leaving usage rows alone; one cheap aggregate query proves it and the stored
+                // derived rows describe the live projection exactly — no full re-read.
+                turnsByDatabase.append(proven.rows)
+                unreadableRows += proven.unreadableRows
             } else {
                 try Task.checkCancellation()
                 // Saved selection is used only when a receipt lacks its serving model. Mission
@@ -255,13 +268,19 @@ actor FreebuffDesktopUsageScanner {
                 // One query is a consistent SQLite snapshot. If another turn commits while it is
                 // running, keep that result for this pass and re-read the changed DB on the next.
                 if try revisions([path]) == before {
-                    store(path: path, revision: before, derived: derived)
+                    // Capture the fingerprint from the same proven-stable snapshot so later WAL
+                    // churn can skip the re-read entirely. A fingerprint failure only loses the
+                    // optimization — the derived rows still persist either way.
+                    let fingerprint = FreebuffDesktopUsageSQL.contentFingerprint(sqlite: sqlite, path: path)
+                        .flatMap { Self.isWellFormedFingerprint($0) ? $0 : nil }
+                    store(path: path, revision: before, derived: derived, contentFingerprint: fingerprint)
                     FreebuffDesktopTurnPersistence.write(
                         FreebuffDesktopTurnPersistence.Record(
                             schema: FreebuffDesktopTurnPersistence.schema,
                             revision: before,
                             rows: derived.turns,
-                            unreadableRows: derived.unreadable
+                            unreadableRows: derived.unreadable,
+                            contentFingerprint: fingerprint
                         ),
                         path: path
                     )
@@ -272,8 +291,14 @@ actor FreebuffDesktopUsageScanner {
         }
         var accumulator = DailyUsageAccumulator()
         var partialDays: Set<String> = []
+        var unexplainedPartialDays: Set<String> = []
         var seen: Set<String> = []
         var nextFutureTimestamp: Date?
+        func recordCoverage(of turn: DerivedTurn, on day: String) {
+            guard turn.partial else { return }
+            partialDays.insert(day)
+            if turn.hasExplainedHostedGap != true { unexplainedPartialDays.insert(day) }
+        }
         for databaseTurns in turnsByDatabase {
             for turn in databaseTurns {
                 try Task.checkCancellation()
@@ -284,10 +309,8 @@ actor FreebuffDesktopUsageScanner {
                     continue
                 }
                 let day = DailyUsageAccumulator.dayKey(from: date, calendar: calendar)
-                guard let usage = turn.usage else {
-                    if turn.partial { partialDays.insert(day) }
-                    continue
-                }
+                recordCoverage(of: turn, on: day)
+                guard let usage = turn.usage else { continue }
                 // A hosted placeholder must not hide a measured older Desktop copy.
                 seen.insert(turn.id)
                 guard case .counts(let inputCount, let outputCount, let cachedCount,
@@ -307,7 +330,7 @@ actor FreebuffDesktopUsageScanner {
                 let reasoning = try Self.optional(reasoningCount)
                 guard cached <= input, reasoning <= output else { throw FreebuffUsageError.localHistoryUnreadable }
                 let saved = turn.savedModel
-                let identity = saved.map { modelIdentity.resolve($0, pricing: pricing) }
+                let identity = saved.map { modelIdentity.resolve($0, pricing: pricing, fromReceipt: turn.fromReceipt) }
                 let route = identity?.route
                 let displayName = identity?.displayName
                 let legacyWithoutIdentity = displayName == nil && !turn.fromReceipt
@@ -318,21 +341,25 @@ actor FreebuffDesktopUsageScanner {
                     ?? ModelUsageEntry.unattributedModelName
                 // A turn aggregates multiple requests, so do not apply single-request context tiers.
                 // Cached input is already in input; reasoning is already in output.
-                let cost = route.flatMap { pricing.resolve(model: $0) }?.costDollars(
+                let rates = route.flatMap {
+                    FreebuffFlashComparison.rates(for: $0, at: date)
+                        ?? pricing.openRouter.entries[$0] ?? pricing.supplement.pricing[$0]
+                }
+                let cost = rates?.costDollars(
                     for: TokenBreakdown(input: input - cached, cacheRead: cached, output: output),
                     at: date,
                     applyLongContextRates: false
                 )
                 accumulator.add(day: day, tokens: total, cost: cost, model: model,
                                 canonical: identity?.group, costIsComplete: cost != nil)
-                if let cost {
+                accumulator.recordApiEstimate(day: day, cost: cost, tokens: total)
+                if cost != nil {
                     accumulator.markEstimatedCost(day: day)
-                    accumulator.addApiEstimate(day: day, cost: cost)
                 } else if legacyWithoutIdentity {
                     // A retired/missing label on older local records is an explained history gap,
                     // not an actionable pricing failure. Preserve tokens and the lower-bound cost.
                     accumulator.addNamedUnpricedModel(day: day, model: model)
-                } else if displayName == nil {
+                } else if displayName == nil || identity?.hasUnknownRoute == true {
                     // A raw receipt slug nothing names and unattributed streams stay unknown: the app
                     // genuinely cannot tell what served them, so the warning stays honest.
                     accumulator.addUnknownModel(day: day, model: model)
@@ -341,7 +368,6 @@ actor FreebuffDesktopUsageScanner {
                     // not an unknown model. Tokens count; no warning triangle.
                     accumulator.addNamedUnpricedModel(day: day, model: model)
                 }
-                if turn.partial { partialDays.insert(day) }
             }
         }
         if unreadableRows > 0 {
@@ -360,7 +386,8 @@ actor FreebuffDesktopUsageScanner {
                 }
             }
         }
-        let result = Scan(usage: accumulator.build(), partialDays: partialDays)
+        let result = Scan(usage: accumulator.build(), partialDays: partialDays,
+                          unexplainedPartialDays: unexplainedPartialDays)
         if snapshotStable, Self.fitsCachedScanBudget(result) {
             cachedScan = CachedScan(
                 databases: databaseSnapshots,
@@ -572,8 +599,49 @@ actor FreebuffDesktopUsageScanner {
         }
     }
 
+    /// Serve a stale-revision database's stored rows when a cheap content fingerprint proves the
+    /// projected rows did not change — WAL churn, checkpoints and metadata writes all move the
+    /// stamp without touching usage content. `nil` means unproven (no stored fingerprint, a
+    /// query failure, or a real change) and the caller takes the full-read path exactly as before.
+    private func provenUnchangedRows(
+        path: String,
+        before: [Revision]
+    ) -> (rows: [DerivedTurn], unreadableRows: Int)? {
+        let memory = databases[path]
+        let record = memory == nil ? FreebuffDesktopTurnPersistence.readAnyRevision(path: path) : nil
+        guard let fingerprint = (memory?.contentFingerprint ?? record?.contentFingerprint),
+              Self.isWellFormedFingerprint(fingerprint),
+              FreebuffDesktopUsageSQL.contentFingerprint(sqlite: sqlite, path: path) == fingerprint
+        else { return nil }
+        let rows = memory.map { ($0.rows, $0.unreadableRows) } ?? record.map { ($0.rows, $0.unreadableRows) }
+        guard let rows else { return nil }
+        // Rebind the live revision so the next pass is a free in-memory hit again.
+        store(
+            path: path,
+            revision: before,
+            derived: DerivedTurns(turns: rows.0, unreadable: rows.1),
+            contentFingerprint: fingerprint
+        )
+        return rows
+    }
+
+    /// The fingerprint is two `count:rowidSum:byteSum` aggregates joined by `|`; anything else —
+    /// a stubbed accessor's canned value, an empty result — is treated as unproven so test fakes
+    /// and odd stores can never false-positive into stale reuse.
+    private static func isWellFormedFingerprint(_ value: String) -> Bool {
+        value.range(
+            of: #"^\d+:\d+:\d+\|\d+:\d+:\d+$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
     /// Keep a database's derived turns while evicting whole older databases to stay under the cap.
-    private func store(path: String, revision: [Revision], derived: DerivedTurns) {
+    private func store(
+        path: String,
+        revision: [Revision],
+        derived: DerivedTurns,
+        contentFingerprint: String? = nil
+    ) {
         if let existing = databases.removeValue(forKey: path) { retainedTurns -= existing.rows.count }
         databaseOrder.removeAll { $0 == path }
         guard derived.turns.count <= maximumRetainedTurns else { return }
@@ -583,7 +651,12 @@ actor FreebuffDesktopUsageScanner {
             if let dropped = databases.removeValue(forKey: oldest) { retainedTurns -= dropped.rows.count }
         }
         databaseOrder.append(path)
-        databases[path] = CachedDatabase(revision: revision, rows: derived.turns, unreadableRows: derived.unreadable)
+        databases[path] = CachedDatabase(
+            revision: revision,
+            rows: derived.turns,
+            unreadableRows: derived.unreadable,
+            contentFingerprint: contentFingerprint
+        )
         retainedTurns += derived.turns.count
     }
 
@@ -642,13 +715,16 @@ actor FreebuffDesktopUsageScanner {
         let usage = metrics["usage"] as? [String: Any]
         let recordedModel = (usage?["model"] as? String)?.nilIfEmpty
         let savedModel = recordedModel ?? text(row["selectedModel"]).nilIfEmpty
+        let runStatus = text(row["runStatus"])
         var derived = DerivedTurn(
             id: id,
             timestampMs: stamp,
             usage: nil,
             savedModel: savedModel,
             fromReceipt: recordedModel != nil,
-            partial: usage == nil || metrics["usageIncomplete"] as? Bool == true
+            partial: usage == nil || metrics["usageIncomplete"] as? Bool == true,
+            hasExplainedHostedGap: runStatus.isEmpty
+                ? nil : (runStatus == "failed" || runStatus == "cancelled" || id.hasPrefix("cloud:import-"))
         )
         if let usage {
             derived.usage = .counts(

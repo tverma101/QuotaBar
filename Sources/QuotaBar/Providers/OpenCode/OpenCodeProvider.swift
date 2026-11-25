@@ -106,8 +106,6 @@ struct OpenCodeGoAccountInventory: Sendable, Equatable {
 /// history, never subscription caps. See `OpenCodeUsageScanner` and `OpenCodeGoUsageClient`.
 @MainActor
 final class OpenCodeProvider: ProviderRuntime {
-    private static let authFileInventoryReadDiagnosticKey = "opencode.account-inventory.auth-file-read"
-    private static let savedKeysInventoryReadDiagnosticKey = "opencode.account-inventory.saved-keys-read"
 
     let provider = Provider(
         id: "opencode",
@@ -305,18 +303,18 @@ final class OpenCodeProvider: ProviderRuntime {
         }
         let (fileResult, savedResult) = await (fileRead, savedRead)
         if let error = fileResult.1 {
-            DiagnosticGate.logOnce(for: authFileInventoryReadDiagnosticKey) {
+            DiagnosticGate.logOnce(for: OpenCodeGoKeyDiagnostics.authFileInventoryRead) {
                 AppLog.warn(LogTag.plugin("opencode"), "Go account descriptor discovery could not read auth.json: \(error)")
             }
         } else {
-            DiagnosticGate.clearFailure(authFileInventoryReadDiagnosticKey)
+            DiagnosticGate.clearFailure(OpenCodeGoKeyDiagnostics.authFileInventoryRead)
         }
         if let error = savedResult.1 {
-            DiagnosticGate.logOnce(for: savedKeysInventoryReadDiagnosticKey) {
+            DiagnosticGate.logOnce(for: OpenCodeGoKeyDiagnostics.savedKeysInventoryRead) {
                 AppLog.warn(LogTag.plugin("opencode"), "Go account descriptor discovery could not read saved keys: \(error)")
             }
         } else {
-            DiagnosticGate.clearFailure(savedKeysInventoryReadDiagnosticKey)
+            DiagnosticGate.clearFailure(OpenCodeGoKeyDiagnostics.savedKeysInventoryRead)
         }
         let apiKeys = fileResult.0.map {
             (name: $0.name, key: $0.key, id: $0.name, source: OpenCodeGoKeySource.authFile)
@@ -337,7 +335,7 @@ final class OpenCodeProvider: ProviderRuntime {
         await discoverAccountInventory(authStore: authStore, goKeyStore: goKeyStore).identities
     }
 
-    private static func distinctAccountIdentities(
+    static func distinctAccountIdentities(
         apiKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)]
     ) -> [OpenCodeGoAccountIdentity] {
         var seenCredentials = Set<String>()
@@ -453,15 +451,8 @@ final class OpenCodeProvider: ProviderRuntime {
     func refresh() async -> ProviderSnapshot {
         guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
         // Fold-only passes run the multi-corpus scan (Claude/Codex session logs, the router ledger,
-        // Hermes, and Muse — 15-20s of JSONSerialization churn on a real corpus) in the scan-worker
-        // child when available; the body below stays the in-process path for the fallback and for
-        // meter/full scopes.
-        if ProviderRefreshContext.scope.suppressesLiveQuota {
-            return await ScanWorkerClient.shared.foldOnlySnapshot(
-                provider: provider,
-                inProcessFallback: { await self.refreshInProcess() }
-            )
-        }
+        // Hermes, and Muse — 15-20s of JSONSerialization churn on a real corpus) in-process in this
+        // reference implementation. Production uses the Rust engine instead.
         return await refreshInProcess()
     }
 
@@ -753,7 +744,7 @@ final class OpenCodeProvider: ProviderRuntime {
     }
 
     private static func credentialID(for key: String) -> String {
-        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+        OpenCodeGoKeyIdentity.credentialID(for: key)
     }
 
     private func accountAPIDiagnosticKey(for credentialID: String) -> String {
@@ -793,28 +784,49 @@ final class OpenCodeProvider: ProviderRuntime {
         var accountAPIErrors: [(name: String, keyID: String, credentialID: String, error: OpenCodeUsageError)] = []
         var wasCancelled = false
         if !uniqueAPIKeys.isEmpty, !ProviderRefreshContext.scope.suppressesLiveQuota {
-            for entry in uniqueAPIKeys {
+            // One request per unique credential, all in flight together: each carries its own 15s
+            // timeout, so a serial loop made an N-key card wait N×15s on an unreachable account.
+            let usageClient = usageClient
+            let results = await withTaskGroup(
+                of: (credentialID: String, result: Result<OpenCodeGoAccountUsage, Error>).self
+            ) { group -> [String: Result<OpenCodeGoAccountUsage, Error>] in
+                for entry in uniqueAPIKeys {
+                    let credentialID = Self.credentialID(for: entry.key)
+                    group.addTask {
+                        do {
+                            return (credentialID, .success(try await usageClient.fetchUsage(key: entry.key)))
+                        } catch {
+                            return (credentialID, .failure(error))
+                        }
+                    }
+                }
+                var fetched: [String: Result<OpenCodeGoAccountUsage, Error>] = [:]
+                for await (credentialID, result) in group {
+                    fetched[credentialID] = result
+                }
+                return fetched
+            }
+            // Map answers back in credential order so meter ordering never depends on which
+            // request's response landed first.
+            fetchLoop: for entry in uniqueAPIKeys {
                 guard !Task.isCancelled else {
                     wasCancelled = true
                     break
                 }
-                do {
-                    let usage = try await usageClient.fetchUsage(key: entry.key)
-                    guard !Task.isCancelled else {
-                        wasCancelled = true
-                        break
-                    }
+                let credentialID = Self.credentialID(for: entry.key)
+                switch results[credentialID] {
+                case .success(let usage):
                     accountUsages.append((
                         entry.name,
                         entry.id,
-                        Self.credentialID(for: entry.key),
+                        credentialID,
                         usage
                     ))
-                    DiagnosticGate.clearFailure(accountAPIDiagnosticKey(for: Self.credentialID(for: entry.key)))
-                } catch {
+                    DiagnosticGate.clearFailure(accountAPIDiagnosticKey(for: credentialID))
+                case .failure(let error):
                     if ProviderCancellation.isCancellation(error) {
                         wasCancelled = true
-                        break
+                        break fetchLoop
                     }
                     let usageError = (error as? OpenCodeUsageError)
                         ?? .accountAPIUnavailable(detail: error.localizedDescription)
@@ -822,14 +834,16 @@ final class OpenCodeProvider: ProviderRuntime {
                         (
                             name: entry.name,
                             keyID: entry.id,
-                            credentialID: Self.credentialID(for: entry.key),
+                            credentialID: credentialID,
                             error: usageError
                         )
                     )
-                    let diagnosticKey = accountAPIDiagnosticKey(for: Self.credentialID(for: entry.key))
+                    let diagnosticKey = accountAPIDiagnosticKey(for: credentialID)
                     DiagnosticGate.logOnce(for: diagnosticKey) {
                         AppLog.warn(LogTag.plugin("opencode"), "account usage API unavailable (\(entry.name)): \(usageError.localizedDescription)")
                     }
+                case nil:
+                    wasCancelled = true
                 }
             }
         }
@@ -914,104 +928,39 @@ final class OpenCodeProvider: ProviderRuntime {
     }
 }
 
-// MARK: - GoKeyManaging (settings: multiple keys + active-key swap)
+// MARK: - GoKeyManaging (test-oracle compatibility shim)
+//
+// Production uses `OpenCodeGoKeyManager` through `RustOpenCodeProvider`; the oracle keeps the same
+// protocol surface so the historical provider tests exercise the exact settings workflow.
 
 extension OpenCodeProvider: GoKeyManaging {
-    /// Every key the card can use, in fetch order. The settings section renders this list and
-    /// drives `selectGoKey` — the same merge `refresh()` performs, in one readable helper.
-    private func allGoKeys() async throws -> [(name: String, key: String, id: String, source: OpenCodeGoKeySource)] {
-        async let fileKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)] =
-            loadOffMainActor { [authStore] in
-                try authStore.apiKeys().map {
-                    (name: $0.name, key: $0.key, id: $0.name, source: .authFile)
-                }
-            }
-        async let storedKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)] =
-            loadOffMainActor { [goKeyStore] in
-                try goKeyStore.loadKeys().map {
-                    (name: $0.label, key: $0.key, id: $0.id.uuidString, source: .appSaved)
-                }
-            }
-        let (fileValues, storedValues) = try await (fileKeys, storedKeys)
-        return fileValues + storedValues
+    private var keyManager: OpenCodeGoKeyManager {
+        OpenCodeGoKeyManager(
+            authStore: authStore,
+            goKeyStore: goKeyStore,
+            activeKeyID: activeKeyID,
+            onGoKeysChanged: onGoKeysChanged
+        )
     }
 
     func goKeyEntries() async -> [OpenCodeGoKeyEntry] {
-        async let fileRead: ([(name: String, key: String)], String?) = loadOffMainActor { [authStore] in
-            do { return (try authStore.apiKeys(), nil) }
-            catch { return ([], error.localizedDescription) }
-        }
-        async let savedRead: ([OpenCodeGoKey], String?) = loadOffMainActor { [goKeyStore] in
-            do { return (try goKeyStore.loadKeys(), nil) }
-            catch { return ([], error.localizedDescription) }
-        }
-        let (fileResult, savedResult) = await (fileRead, savedRead)
-        if let error = fileResult.1 {
-            DiagnosticGate.logOnce(for: Self.authFileInventoryReadDiagnosticKey) {
-                AppLog.warn(LogTag.plugin("opencode"), "Go keys unreadable from auth.json: \(error)")
-            }
-        } else {
-            DiagnosticGate.clearFailure(Self.authFileInventoryReadDiagnosticKey)
-        }
-        if let error = savedResult.1 {
-            DiagnosticGate.logOnce(for: Self.savedKeysInventoryReadDiagnosticKey) {
-                AppLog.warn(LogTag.plugin("opencode"), "Go saved keys unreadable: \(error)")
-            }
-        } else {
-            DiagnosticGate.clearFailure(Self.savedKeysInventoryReadDiagnosticKey)
-        }
-        guard fileResult.1 == nil, savedResult.1 == nil else {
-            return []
-        }
-        let keys = fileResult.0.map {
-            (name: $0.name, key: $0.key, id: $0.name, source: OpenCodeGoKeySource.authFile)
-        } + savedResult.0.map {
-            (name: $0.label, key: $0.key, id: $0.id.uuidString, source: OpenCodeGoKeySource.appSaved)
-        }
-        let selection = activeKeyID()
-        return keys.map { entry in
-            OpenCodeGoKeyEntry(
-                id: entry.id,
-                label: entry.name,
-                maskedKey: Self.mask(entry.key),
-                accountID: Self.credentialID(for: entry.key),
-                source: entry.source,
-                isActive: entry.id == selection
-            )
-        }
+        await keyManager.goKeyEntries()
     }
 
     @discardableResult
     func saveGoKey(label: String, key: String) async throws -> OpenCodeGoKey {
-        let saved = try await loadOffMainActor { [goKeyStore, label, key] in
-            try goKeyStore.addKey(label: label, key: key)
-        }
-        onGoKeysChanged()
-        return saved
+        try await keyManager.saveGoKey(label: label, key: key)
     }
 
     func removeGoKey(id: UUID) async throws {
-        try await loadOffMainActor { [goKeyStore, id] in
-            try goKeyStore.removeKey(id: id)
-        }
-        // Dropping the pinned key must not leave a stale selection behind — refresh would fall
-        // back to "all accounts", but the settings list should reflect reality immediately.
-        if OpenCodeGoKeyStore.activeSelection() == id.uuidString {
-            OpenCodeGoKeyStore.setActiveSelection(nil)
-        }
-        onGoKeysChanged()
+        try await keyManager.removeGoKey(id: id)
     }
 
     func selectGoKey(id: String) {
-        OpenCodeGoKeyStore.setActiveSelection(id)
+        keyManager.selectGoKey(id: id)
     }
 
     func activeGoKeyID() -> String? {
-        activeKeyID()
-    }
-
-    private static func mask(_ key: String) -> String {
-        guard key.count > 8 else { return "••••••••" }
-        return String(key.prefix(4)) + "…" + String(key.suffix(4))
+        keyManager.activeGoKeyID()
     }
 }

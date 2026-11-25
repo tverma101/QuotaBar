@@ -286,7 +286,6 @@ enum PersistentJSONLScanCaches {
         await ClaudeLogUsageScanner.flushPersistentCacheWrites()
         await CodexLogUsageScanner.flushPersistentCacheWrites()
         await CodexRouterUsageScanner.flushPersistentCacheWrites()
-        await GrokLogUsageScanner.flushPersistentCacheWrites()
         await MuseUsageScanner.flushPersistentCacheWrites()
         await PiUsageScanner.flushPersistentCacheWrites()
     }
@@ -301,7 +300,12 @@ enum PersistentJSONLScanCaches {
     /// release both caches.
     static func unloadAfterRefreshCycle(keepRouterItemsResident: Bool = false) async {
         await flushPendingWrites()
-        if ProcessMemoryBudget.isOverSoftLimit {
+        // The parsed Router index and session tails are expensive caches in the same class as the
+        // provider databases — a flat soft-limit unload every pass forced each ledger append to
+        // re-decode them. They ride the same hysteresis ceiling so a hover near the soft limit
+        // keeps them resident instead of thrashing.
+        if ProcessMemoryBudget.isOverSoftUnloadCeiling {
+            ProcessMemoryBudget.noteSoftLimitUnload()
             CodexLogUsageScanner.unloadSharedTailCacheItems()
             ClaudeSessionAppendCache.shared.unloadRetainedItems()
             CodexRouterUsageScanner.unloadSharedTailCacheItems()
@@ -312,9 +316,8 @@ enum PersistentJSONLScanCaches {
             CodexRouterUsageScanner.unloadSharedTailCacheItems()
             await CodexRouterUsageScanner.unloadSharedParsedItems()
         }
-        // The cycle's folds grew the malloc zone for their transient parse arrays; hand the freed
-        // pages back so the settled idle footprint tracks the live caches, not the cycle's peak.
-        ProcessMemoryBudget.releaseAllocatorFreePages()
+        // The cycle's folds grew the malloc zone for their transient parse arrays; callers hand the
+        // freed pages back at the end of the chain so one free-list walk covers every unload.
         if let summary = ProcessMemoryBudget.footprintSummary() {
             let checkpoints = ProcessMemoryBudget.checkpointReliefSummary
                 .map { ", checkpoints \($0)" } ?? ""
@@ -323,15 +326,17 @@ enum PersistentJSONLScanCaches {
     }
 
     /// Call after a heavy local-log provider (Codex / Claude / OpenCode / …) finishes: unload session
-    /// caches only when the process crosses its soft memory budget. These append caches are capped,
+    /// caches only when the process crosses its unload ceiling. These append caches are capped,
     /// and keeping them warm avoids reparsing unchanged session history between provider cards.
+    @concurrent
     static func unloadAfterHeavyProvider(providerID: String) async {
-        if ProcessMemoryBudget.isOverSoftLimit {
+        if ProcessMemoryBudget.isOverSoftUnloadCeiling {
             await flushPendingWrites()
+            ProcessMemoryBudget.noteSoftLimitUnload()
             CodexLogUsageScanner.unloadSharedTailCacheItems()
             ClaudeSessionAppendCache.shared.unloadRetainedItems()
-            // Soft limit is the one place routine paths may drop the router tail: RSS is already over
-            // budget. Prefer this over waiting for a kernel memory-pressure event.
+            // The ceiling is the one place routine paths may drop the router tail: RSS is already over
+            // the re-armed budget. Prefer this over waiting for a kernel memory-pressure event.
             CodexRouterUsageScanner.unloadSharedTailCacheItems()
             await CodexRouterUsageScanner.unloadSharedParsedItems()
             if let summary = ProcessMemoryBudget.footprintSummary() {
@@ -347,6 +352,7 @@ enum PersistentJSONLScanCaches {
     }
 
     /// Memory-pressure / hard-limit path: flush and unload even mid-cycle (including the router tail).
+    @concurrent
     static func unloadForMemoryPressure() async {
         await flushPendingWrites()
         CodexLogUsageScanner.unloadSharedTailCacheItems()

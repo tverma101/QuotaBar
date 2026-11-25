@@ -1,83 +1,159 @@
 # Rust core
 
-QuotaBar is a Swift app; the UI and the provider logic stay in Swift. A small set of
-CPU-heavy primitives are implemented in Rust as a static library (`quotabar-core`) and called
-from Swift over a C ABI. This document describes the split, the fallback contract, and how to
-build and extend it.
+QuotaBar is a SwiftUI menu-bar app with a Rust backend. The Swift layer owns the AppKit bridge,
+SwiftUI views, and the observable stores that drive them. Every provider refresh — authentication,
+HTTP clients, local scanners, accounting, pricing, and mapping — runs in Rust and reaches the app
+over a C ABI. A few platform workflows remain in Swift (launch-time account discovery, the
+Keychain/environment host shim, and telemetry); they are listed below.
 
-## Why a Rust core
+## The two crates
 
-The menu-bar app is already native code, so this is not about a slow interpreter. The goal is to
-do the hot accounting work — today, the per-line parsers behind the Claude and Codex local-history
-folds — without Foundation's overhead per line: JSONSerialization dictionary materialization,
-`Data` copies, and per-call formatting. Measured on a 20,000-line synthetic corpus: the Rust path
-uses roughly **10x less CPU** for the Claude parse (**~4.6x** for the Codex rollout parser) — run
-it yourself with the benchmarks below.
+- `Rust/quotabar-core/` — the macOS static library (`staticlib` + `rlib`). It exposes the C ABI in
+  `Sources/CQuotabarCore/include/quotabar_core.h` and depends on `quotabar-engine`. It also keeps the
+  line parsers and compact pricing-catalog codec that Swift still calls directly.
+- `Rust/quotabar-engine/` — the cross-platform backend (`rlib`). It is linked into the macOS archive
+  through `quotabar-core` and is a normal dependency of the Windows app. It contains provider
+  runtimes, the in-process SQLite reader, the incremental JSONL scanner, pricing, and the accounting
+  fold.
 
-QuotaBar shares none of this behavior change: the Rust parser is a line-for-line port of the
-Swift reference implementation, and the two are tested against each other.
+`Sources/CQuotabarCore/` is a clang target whose header declares the ABI; the `.c` shim is a link
+probe. `Sources/QuotaBar/Engine/RustEngine.swift` is the Swift client, and
+`Sources/QuotaBar/Engine/RustEngineHost.swift` supplies platform services the engine cannot own:
+Keychain reads/writes, environment values, and log forwarding.
 
-## Layout
+## The boundary
 
-- `Rust/quotabar-core/` — the crate (edition 2021, `staticlib` + `rlib`). Only dependency:
-  `serde_json`, the vetted parser used rather than a hand-rolled one; it is the minimum needed to
-  deserialize usage lines and nothing else. New crate dependencies need the usual justification
-  from AGENTS.md.
-- `Sources/CQuotabarCore/` — a clang target whose header (`include/quotabar_core.h`) declares the
-  C ABI the Swift code imports. The `.c` shim is a link probe.
-- `Sources/QuotaBar/Support/ClaudeUsageLineRustParser.swift` — the Claude bridge. Maps the FFI
-  result onto `ClaudeLogUsageScanner.Entry`, or returns nil.
-- `Sources/QuotaBar/Support/CodexRolloutRustParser.swift` — the Codex bridge. Stateful across one
-  file's lines; `consume(_:)` returns false when the file must be re-parsed with Swift.
-- `Sources/QuotaBar/Providers/Claude/ClaudeLogUsageScanner.swift` — `parseEntries` tries the Rust
-  bridge first and falls back to the untouched Swift reference (`parseEntriesSwift`) when the
-  bridge declines.
-- `Sources/QuotaBar/Providers/Codex/CodexLogUsageScanner.swift` — `fullParseAndCheckpoint` tries
-  the Rust engine (`attemptRustFullParse`) and falls back to `fullParseAndCheckpointSwift` when
-  any line declines. Incremental (tail) parsing stays in Swift; the checkpoint crosses the FFI
-  one-way so the in-memory append cache can round-trip through either engine.
-- `Rust/quotabar-core/src/pricing.rs` — the compact pricing-catalog codec (`catalogFromCompact`),
-  **Swift-primary**: Swift's Foundation decoder runs first (byte-exact with the snapshots it
-  wrote); the Rust parser (`Sources/QuotaBar/Support/CompactCatalogRustParser.swift`) is called
-  only when Foundation cannot handle an input at all. `catalogFromCompact` throws if both fail.
+Requests and replies are JSON:
 
-## The fallback contract
+```json
+{"method":"refresh","params":{"providerId":"cursor","scope":"full","requestId":42}}
+{"ok":{"providerID":"cursor","displayName":"Cursor","lines":[...],"refreshedAt":...}}
+```
 
-The bridge can return nil, and production then runs the Swift path, **never a different answer**:
+Asynchronous calls run on an engine-owned thread (`qb_engine_call_async`), so a slow network or disk
+read never blocks Swift concurrency. Cancelling the Swift task cancels the engine request by ID. A
+few synchronous calls remain — credential status and in-process SQLite — and return immediately or
+run on a scanner's background actor; none performs network I/O. The reply's snapshot JSON is
+byte-compatible with the Swift `ProviderSnapshot` / `MetricLine` `Codable` shape, so the UI decodes
+it with the same models it already renders.
 
-- a timestamp that is a string but is not one of the canonical UTC shapes this module accepts
-  (the Foundation-backed normalization path in `OpenUsageISO8601` handles those),
+The host callbacks let the engine read Keychain items through the app's signed identity (keeping
+"Always Allow" grants and the manual-refresh interaction budget intact) and ask for environment
+values captured from the login shell. Claude Desktop refreshes can reuse the Safe Storage grant
+already read during account discovery. A provider never shells out to `security`, `sqlite3`, or `zstd`.
+
+## What runs in Rust
+
+Engine-backed providers — credentials, API calls, mapping, and their local history:
+
+- Antigravity, Claude, Codex, Copilot, Cursor, Devin, Freebuff, Grok, Hermes, OpenCode, OpenRouter,
+  and Z.ai. `ProviderCatalog` constructs these thin Swift wrappers; their former Swift
+  implementations remain only as test oracles.
+- Codex folds native rollout logs, FCC's SQLite proxy ledger, CodexRouter's JSONL ledger, and pi
+  usage in the engine, including account fingerprints, pool aliases, status filtering, cross-source
+  model identity, and the per-day merge. The account-scoped merge prefers Router metering and keeps
+  native logs/proxy rows as gap fillers; the default card keeps logs → FCC → Router ordering.
+- Codex reset-credit reads and claims (credential candidate selection and Keychain fallback, the
+  credit-list GET, the idempotent consume POST, expiry matching, replay, and outcome parsing) run in
+  `providers/codex/reset_claim.rs` behind cancellable `codexResetCredits` / `codexResetClaim`
+  methods. Swift keeps only the popover's orchestration and the state it renders.
+- OpenCode's gateway history folds from the engine's OpenCode, Codex Router, Claude, and Muse scan
+  sources through the batch path; the Swift scanner survives as a test oracle.
+- Muse and pi local scanners are engine modules: pi folds into the Claude and Codex histories, and
+  Muse folds into OpenCode's gateway history. Neither has a standalone provider wrapper.
+
+Shared engine infrastructure:
+
+- In-process SQLite (read-only, query time limits, WAL recovery) replacing the per-query
+  `/usr/bin/sqlite3` subprocess.
+- In-process zstd decoding for compressed Codex archives.
+- Model pricing catalogs, resolution, and spend imputation.
+- Accounting folds, spend tiles, day buckets, and presentation rows.
+- The engine's `refreshBatch` is the production local/accounting fold path; the old Swift child-process
+  design is retired. If a batch member is missing or the batch itself fails, the store falls back to
+  that provider's ordinary Rust-backed runtime refresh.
+
+Still Swift: launch-time account and identity discovery (`ProviderAccountAssembly`,
+Cursor/Antigravity identity caching, OpenCode account inventory), the Keychain/environment host
+callbacks in `RustEngineHost`, the popover orchestration around Codex reset credits, and telemetry.
+Those are platform workflows around the engine, not provider refreshes: no provider refresh or
+provider-API write executes in Swift, and the Swift reference providers are test-only oracles.
+
+## The parser fallback contract
+
+The Claude and Codex line parsers are also exposed as direct C functions for the retained Swift
+reference scanners. Their bridge may return nil, and the oracle then runs its Swift reference path,
+**never a different answer**:
+
+- a timestamp that is a string but is not one of the canonical UTC shapes this module accepts,
 - a line with more than 64 entries (parent + advisor iterations, Claude only),
 - any internal failure (a panic is caught at the FFI boundary and reported as "fall back").
 
 For Codex the scope is **one whole file, not one line**: the engine is stateful across the file's
-lines (running model, fast-tier flags, the child-session replay gate), so a line it cannot emulate
-makes the entire file re-parse with the Swift engine. Mixing engines within a file is never done.
+lines, so a line it cannot emulate makes the entire file re-parse with the Swift engine. Lines the
+parser skips as damaged are counted exactly like the Swift parser's `damagedLineCount`.
 
 Everything else — invalid JSON, non-object JSON, malformed tokens, advisor iterations, SemVer
-rules, leap-second calendar math — is implemented identically in both paths and pinned by the
-parity suites in `Tests/QuotaBarTests/ClaudeUsageLineRustParserTests.swift` and
-`Tests/QuotaBarTests/CodexRolloutRustParserTests.swift` (run the full suite, not just the filter,
-when touching either side).
-
-The C ABI returns a heap-allocated opaque result; Swift copies the strings out and calls
-`qb_claude_result_destroy`. A null result is the "fall back to Swift" signal, not an error.
+rules, leap-second calendar math — is implemented identically in both paths and pinned by the parity
+suites in `Tests/QuotaBarTests/ClaudeUsageLineRustParserTests.swift` and
+`Tests/QuotaBarTests/CodexRolloutRustParserTests.swift`.
 
 ## Building
 
-`script/build_rust_core.sh` builds the crate with `--locked` and copies `libquotabar_core.a` to
-`Rust/quotabar-core/target/release/` (the path Package.swift searches). It is called
-automatically by `script/build_and_run.sh`, `script/test_suites.sh`, and CI. A plain
-`swift build` or `swift test` requires the archive to exist first — run the script once after
-cloning, or via the two entry points above.
+`script/build_rust_core.sh` builds `quotabar-core` (and therefore `quotabar-engine`) with `--locked`
+and copies `libquotabar_core.a` to `Rust/quotabar-core/target/release/`. It is called automatically
+by `script/build_and_run.sh`, `script/test_suites.sh`, and CI. A plain `swift build` or `swift test`
+requires the archive to exist first.
 
-`QUOTABAR_RUST_UNIVERSAL=1 script/build_rust_core.sh` builds arm64 + x86_64 and lipo-combines
-them (used by `RELEASE=1` release builds); missing Rust targets are installed via `rustup target add`.
+`QUOTABAR_RUST_UNIVERSAL=1` builds arm64 + x86_64 and lipo-combines them. `QUOTABAR_RUST_TARGET`
+builds a specific triple for cross-compilation checks.
 
-Rust sources are formatted with rustfmt conventions; `cargo test --release` in the crate runs
-its unit tests (shared with nothing — the crate must not depend on Swift).
+The macOS target uses the system TLS stack (Security.framework) and links Security,
+SystemConfiguration, CoreFoundation, and iconv, as declared in `Package.swift`.
+
+## Testing
+
+```sh
+cargo test --release --manifest-path Rust/quotabar-engine/Cargo.toml
+cargo test --release --manifest-path Rust/quotabar-core/Cargo.toml
+swift test --filter RustEngineBridgeTests
+```
+
+The Rust suites cover provider behavior and the engine's parsers/scanners. The Swift bridge suite
+pins the JSON contract and the C ABI round trip. Where a Swift reference implementation is kept as
+an oracle (for example `ClaudeSwiftReferenceProvider`, `CodexSwiftReferenceProvider`, or the retained
+Antigravity/Freebuff/OpenCode scanner tests), production still constructs only the engine-backed
+providers in `ProviderCatalog`, so there is never a second live path. Do not update an oracle to
+"fix" a production bug — change the engine and its Rust test instead.
 
 ## Measuring
+
+```sh
+script/measure_backend_efficiency.sh
+```
+
+prints the refresh hot path, end to end:
+
+- `BENCH batch_all_providers` — all providers through `refreshBatch`, cold and warm, with total
+  allocations and allocated bytes from a counting allocator. The `localAccounting` line is the
+  fold-only accounting pass.
+- `BENCH opencode_scan` — a synthetic 100k-row OpenCode SQLite database, cold (cache cleared) and
+  warm, so the parsed-row cache's effect is visible.
+- `BENCH opencode_cache_retention` — measures bytes retained by that parsed-row cache with
+  100,000 synthetic rows. It clears the cache after checking that cold and warm totals agree.
+- `BENCH devin_warm_session_reads` — repeated reads of a synthetic 30,000-row Devin database,
+  comparing the previous row-copy cost with the shared cache.
+- `BENCH c_abi_large_reply` — an 8 MiB SQLite reply through the C ABI, plus the extra copy the old
+  boundary paid.
+- `SWIFT_BENCH fold_refresh` — the same fold batch through the Swift bridge on the signed-in
+  profile's own local history: wall time per refresh, snapshot decode and request encode time,
+  main-actor ticks during the call (the engine runs off the main thread), and per-provider wall
+  times.
+
+`QUOTABAR_BENCH_ROWS` and `QUOTABAR_BENCH_ITERATIONS` tune the synthetic OpenCode scan. Run the
+all-provider measurement in an isolated profile without provider environment overrides. The Swift
+measurement reads local history from the current profile and may read credentials to match saved
+receipts. A cold pricing cache may start a public catalogue request.
 
 ```sh
 QUOTABAR_CLAUDE_PARSE_BENCH=1 swift test --filter testClaudeParseBenchmarkRustVsSwift
@@ -87,18 +163,28 @@ QUOTABAR_CODEX_PARSE_BENCH=1 swift test --filter testCodexParseBenchmarkRustVsSw
 print `CLAUDE_PARSE_BENCH` / `CODEX_PARSE_BENCH` with Rust vs Swift CPU/wall for the synthetic
 corpora in those tests.
 
+### Refresh cost
+
+Provider refresh runs on engine-owned threads, never the Swift/UI thread; the bridge only encodes
+one request and decodes the resulting snapshot JSON. Pricing is likewise engine-owned in production;
+the Swift pricing implementation remains only a test oracle, so folds no longer decode a duplicate
+Swift catalog set. Scanners keep revision-keyed caches so an
+unchanged local source is not reparsed on every pass: OpenCode caches parsed rows by source
+signature, and Antigravity caches decoded conversation folds for the whole database set (its byte
+budget, not a small database-count cap, bounds memory). Devin's cached session rows and transcript
+rows are shared across refreshes. Transcripts are aggregated file by file, so a warm refresh avoids
+copying the local corpus. Devin's first full session-database fold is
+split into row-id chunks so no statement hits SQLite's per-query interrupt; the one-time build gets
+a longer connection budget, persists its winner map, and every later pass verifies the record. Cache
+entries are dropped on memory-pressure `unloadCaches` and on account changes where the scanner
+exposes that hook.
+
 ## Extending it
 
-Move a primitive only when it is (a) on a measured hot path, (b) safely expressible behind a
-small C ABI, and (c) covered by a parity test against its Swift oracle. Candidates next in line:
-the per-line parse in other JSONL providers (Grok, pi, Muse), and the pricing fold. Keep the
-C ABI additive — bump `qb_core_version` when the entry layout changes — and keep every new
-FFI function returning a null result on any failure so Swift can always fall back loudly.
-
-Note the two FFI directions in use: parsers (Claude, Codex) are **Rust-primary** — the bridge
-runs first and Swift re-parses on decline; the compact-catalog codec is **Swift-primary** —
-Foundation runs first because exact-half decimal rounding differs between Apple's `strtod`
-(toward zero, as used by the snapshot writer) and `serde_json` (half-to-even), so the bundled
-snapshots are only byte-exact through Foundation. Rust is invoked only for inputs Foundation
-rejects, `retired` presence (not non-emptiness) is preserved across the FFI as the authoritative
-flag, and both paths are pinned by `Tests/QuotaBarTests/PricingCompactCatalogTests.swift`.
+A provider moves when its auth store, HTTP client, mapper, and local scanners can be expressed in
+the engine and covered by tests. Keep the JSON ABI additive: new methods do not change the C layout.
+A failure inside the engine becomes a typed error snapshot, never a silent empty card. When a
+provider's Swift implementation is kept as a reference oracle, `ProviderCatalog` must construct the
+engine-backed runtime so production never has a second live path. Host-granted network capabilities
+stay explicit in provider configuration: Freebuff fails closed unless the host enables its read-only
+session meter, and hosted detail remains disabled in the macOS public and private-local builds.

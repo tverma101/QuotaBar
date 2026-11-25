@@ -71,7 +71,10 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         var data: [String: String]
         init(data: [String: String] = [:]) { self.data = data }
         func queryValue(path: String, sql: String) throws -> String? {
-            if sql.contains("json_group_array") { return data[path] ?? "[]" }
+            if sql.contains("json_group_array") {
+                guard let payload = data[path] else { return "[]" }
+                return OpenCodeDBRowsForChunk.apply(payload: payload, sql: sql)
+            }
             if sql.contains("SELECT 1") { return data[path] == nil ? nil : "1" }
             return nil
         }
@@ -84,10 +87,10 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // catalogs), marking the series estimated.
         let claudeHome = try fixtureClaudeHome(files: [
             // Real Claude Code layout: sessions live in per-project subdirectories of `projects/`.
-            ".claude/projects/-Users-tejas-Gaming/session.jsonl":
+            ".claude/projects/-Users-fixture-user-ProjectA/session.jsonl":
                 line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000) + "\n" +
                 line(TestLocalInstant.iso(2026, 7, 12, 10), "claude-sonnet-4-5", input: 999, output: 999) + "\n",
-            ".claude/projects/-Users-tejas-Experiments/other.jsonl":
+            ".claude/projects/-Users-fixture-user-ProjectB/other.jsonl":
                 line(TestLocalInstant.iso(2026, 7, 12, 9), "anthropic/opencode_go/deepseek-v4-flash", input: 300, output: 100) + "\n"
         ])
         let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
@@ -125,7 +128,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // deepseek-v4-flash tokens ($0.50/M effective); the folded Claude gateway session (9200
         // tokens) must price at that recorded rate, not the catalog's $0.14/M input rate.
         let claudeHome = try fixtureClaudeHome(files: [
-            ".claude/projects/-Users-tejas-Gaming/session.jsonl":
+            ".claude/projects/-Users-fixture-user-ProjectA/session.jsonl":
                 line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000) + "\n",
         ])
         let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
@@ -153,7 +156,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
 
     func testSaturatedDatabaseCountsDoNotCalibrateGatewayRates() async throws {
         let claudeHome = try fixtureClaudeHome(files: [
-            ".claude/projects/-Users-tejas-Gaming/session.jsonl":
+            ".claude/projects/-Users-fixture-user-ProjectA/session.jsonl":
                 line(TestLocalInstant.iso(2026, 7, 12, 11),
                      "anthropic/opencode_go/deepseek-v4-flash", input: 1000, output: 200, cacheRead: 8000) + "\n",
         ])
@@ -179,7 +182,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // A free-tier model the gateway recorded at $0 must fold at $0 — the fold follows the
         // provider's own accounting (calibrated), not the catalog's paid rates.
         let claudeHome = try fixtureClaudeHome(files: [
-            ".claude/projects/-Users-tejas-Gaming/session.jsonl":
+            ".claude/projects/-Users-fixture-user-ProjectA/session.jsonl":
                 line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode/deepseek-v4-flash-free", input: 400) + "\n",
         ])
         let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
@@ -210,7 +213,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // $0.60 output / $0.03 cache read per 1M, opencode.ai/docs/go verified 2026-10-06) —
         // unlike genuinely-free models, whose recorded $0 is the truth (see the deepseek test).
         let claudeHome = try fixtureClaudeHome(files: [
-            ".claude/projects/-Users-tejas-Gaming/session.jsonl":
+            ".claude/projects/-Users-fixture-user-ProjectA/session.jsonl":
                 line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/space-bunny-free", input: 1000, output: 200, cacheRead: 8000) + "\n",
         ])
         let ms = epochMs(TestLocalInstant.iso(2026, 7, 12, 11))
@@ -240,7 +243,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // sessions (anthropic/opencode_go/…) count against the caps; Zen pay-as-you-go sessions
         // (anthropic/opencode/…) bill separately and must not inflate the local spend.
         let claudeHome = try fixtureClaudeHome(files: [
-            ".claude/projects/-Users-tejas-Gaming/session.jsonl":
+            ".claude/projects/-Users-fixture-user-ProjectA/session.jsonl":
                 line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/deepseek-v4-flash", input: 100_000, output: 20_000, cacheRead: 800_000) + "\n" +
                 line(TestLocalInstant.iso(2026, 7, 12, 10), "anthropic/opencode/gpt-5.5", input: 300, output: 100) + "\n",
         ])
@@ -266,7 +269,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // history screen shows volume) but no cost is claimed, and it lands in the unknown-model
         // warning for the reveal affordance.
         let claudeHome = try fixtureClaudeHome(files: [
-            ".claude/projects/-Users-tejas-Gaming/session.jsonl":
+            ".claude/projects/-Users-fixture-user-ProjectA/session.jsonl":
                 line(TestLocalInstant.iso(2026, 7, 12, 11), "anthropic/opencode_go/not-a-real-model-xyz", input: 1000, output: 200) + "\n"
         ])
         let scanner = OpenCodeUsageScanner(
@@ -301,8 +304,8 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         // Claude Code stores sessions at projects/<project>/<session>.jsonl. A flat read of the
         // projects/ directory alone finds nothing — this regression locks the recursive walk.
         let claudeHome = try fixtureClaudeHome(files: [
-            ".claude/projects/-Users-tejas-Gaming/65b28018-9dd4-4a01-be86-0fa1971fce5d.jsonl": "x\n",
-            ".claude/projects/-Users-tejas-Experiments/28272f85-c16c-4c52-b385-9f17ef2dbf43.jsonl": "x\n",
+            ".claude/projects/-Users-fixture-user-ProjectA/65b28018-9dd4-4a01-be86-0fa1971fce5d.jsonl": "x\n",
+            ".claude/projects/-Users-fixture-user-ProjectB/28272f85-c16c-4c52-b385-9f17ef2dbf43.jsonl": "x\n",
             ".claude/projects/ignored.txt": "x\n"
         ])
         let files = OpenCodeUsageScanner.claudeUsageFiles(under: claudeHome.appendingPathComponent(".claude"))

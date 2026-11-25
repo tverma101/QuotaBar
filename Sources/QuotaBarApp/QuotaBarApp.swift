@@ -18,13 +18,6 @@ enum QuotaBarMain {
             )
             exit(status)
         }
-        if arguments.contains("--scan-worker") {
-            let status = await ScanWorkerCommand.run(
-                arguments: arguments,
-                defaultsDomain: Bundle.main.bundleIdentifier ?? "com.tverma101.quotabar"
-            )
-            exit(status)
-        }
         OpenUsageApp.main()
     }
 }

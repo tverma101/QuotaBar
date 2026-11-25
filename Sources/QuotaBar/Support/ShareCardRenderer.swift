@@ -90,11 +90,12 @@ enum ShareCardRenderer {
         // Same predicate the dashboard uses, via the same `showsRow` rule.
         let data = { (widget: PlacedWidget) -> WidgetData? in
             guard let descriptor = layout.descriptor(for: widget) else { return nil }
-            return dataStore.data(for: descriptor)
+            return dataStore.widgetDataByDescriptorID[descriptor.id] ?? dataStore.data(for: descriptor)
         }
         let kept = group.visibleRows {
             guard let descriptor = layout.descriptor(for: $0) else { return false }
-            let widgetData = dataStore.data(for: descriptor)
+            let widgetData = dataStore.widgetDataByDescriptorID[descriptor.id]
+                ?? dataStore.data(for: descriptor)
             return ProviderSectionVisibility.shouldRenderMetricRow(
                 providerID: descriptor.providerID,
                 descriptorID: descriptor.id,

@@ -6,9 +6,13 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
     private final class SQLite: SQLiteAccessing, @unchecked Sendable {
         var rows: [[String: Any]] = []
         var rowsByPath: [String: [[String: Any]]] = [:]
+        var fingerprintResponses: [String: String] = [:]
         var calls = 0
         func queryValue(path: String, sql: String) throws -> String? {
             calls += 1
+            if sql.contains("SUM(m.rowid)") {
+                return fingerprintResponses[path]
+            }
             XCTAssertTrue(sql.contains("m.role = 'assistant'"))
             XCTAssertFalse(sql.contains("parts_json"), "never read transcript content for accounting")
             return String(decoding: try JSONSerialization.data(withJSONObject: rowsByPath[path] ?? rows), as: UTF8.self)
@@ -39,7 +43,7 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         XCTAssertEqual(result?.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
         let again = try await scanner.scan(now: now)
         XCTAssertEqual(again?.usage.series.daily.first?.totalTokens, 300)
-        XCTAssertEqual(sqlite.calls, 1, "unchanged DB/WAL revisions avoid another sqlite subprocess")
+        XCTAssertEqual(sqlite.calls, 2, "unchanged DB/WAL revisions avoid another sqlite subprocess")
     }
 
     func testInconsistentReceiptFailsInsteadOfPublishingPlausibleTotals() async throws {
@@ -65,7 +69,12 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
                                cacheWritePerMillion: 2, cacheReadPerMillion: 0.2,
                                inputAbove200kPerMillion: 20, outputAbove200kPerMillion: 100,
                                cacheReadIsExplicit: true, longContextThresholdTokens: 1)
-        let pricing = ModelPricing(supplement: PricingSupplement(), primary: PricingCatalog(),
+        let supplement = PricingSupplement(
+            pricing: ["model-1": ModelRates(inputPerMillion: 200, outputPerMillion: 1_000,
+                                          cacheWritePerMillion: 200, cacheReadPerMillion: 20)],
+            aliasRules: [.init(pattern: try NSRegularExpression(pattern: "^vendor/model-1$"), canonical: "model-1")]
+        )
+        let pricing = ModelPricing(supplement: supplement, primary: PricingCatalog(),
                                    secondary: PricingCatalog(), openRouter: PricingCatalog(entries: [
                                     "vendor/model-1": rates, "vendor/recorded-model": rates
                                    ]))
@@ -143,7 +152,7 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
                        "the route prices the row but the catalog name still titles it")
     }
 
-    func testDeepSeekPeakWindowPricesBaseAndRemovedFastCollapse() async throws {
+    func testDeepSeekStandardRateAssumptionUsesThePeakWindow() async throws {
         let formatter = ISO8601DateFormatter()
         let peakTimestamp = try XCTUnwrap(formatter.date(from: "2026-10-26T02:00:00Z"))
         let scanNow = peakTimestamp.addingTimeInterval(3_600)
@@ -209,14 +218,16 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         let day = DailyUsageAccumulator.dayKey(from: peakTimestamp)
         let models = try XCTUnwrap(scan?.usage.modelUsage?.daily.first?.models)
         let model = try XCTUnwrap(models.first { $0.model == "DeepSeek V4.1 Flash" })
-        let fastModel = try XCTUnwrap(model.variants?.first { $0.model == "DeepSeek V4.1 Flash" })
+        let assumed = try XCTUnwrap(models.first { $0.model == "DeepSeek V4.1 Flash (Standard Rate Assumed)" })
 
-        XCTAssertEqual(models.count, 1, "the removed Fast mode shares the base model's row")
+        XCTAssertEqual(models.count, 2, "the assumed-standard Fast label keeps its own row")
         XCTAssertEqual(scan?.usage.series.daily.first?.totalTokens, 300)
-        // The retired Fast-tier alias must stay shadowed: both turns price at their route's
-        // peak-window rates — 2 × (20*0.3 + 80*0.006 + 50*1.2)/1M — never at 0.6/2.4.
+        // Both rows price at the standard route's peak-window rate — (20*0.3 + 80*0.006 + 50*1.2)/1M
+        // each — never at 0.6/2.4; the assumption reuses the base route's UTC window.
         XCTAssertEqual(try XCTUnwrap(scan?.usage.apiEstimateByDay?[day]), 0.000_132_96, accuracy: 0.000_000_001)
-        XCTAssertEqual(try XCTUnwrap(fastModel.costUSD), 0.000_066_48, accuracy: 0.000_000_001)
+        XCTAssertEqual(try XCTUnwrap(model.costUSD), 0.000_066_48, accuracy: 0.000_000_001)
+        XCTAssertEqual(assumed.totalTokens, 150)
+        XCTAssertEqual(try XCTUnwrap(assumed.costUSD), 0.000_066_48, accuracy: 0.000_000_001)
     }
 
     func testUnchangedHistoryIsNotDecodedAgain() async throws {
@@ -268,13 +279,13 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         )
 
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 3)
+        XCTAssertEqual(sqlite.calls, 6)
 
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 3, "the completed daily fold survives eviction of raw turn rows")
+        XCTAssertEqual(sqlite.calls, 6, "the completed daily fold survives eviction of raw turn rows")
 
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 3, "unchanged project revisions reuse the aggregate without SQLite")
+        XCTAssertEqual(sqlite.calls, 6, "unchanged project revisions reuse the aggregate without SQLite")
     }
 
     func testProjectDatabaseListIsResolvedOncePerInterval() async throws {
@@ -308,17 +319,46 @@ final class FreebuffDesktopUsageScannerTests: XCTestCase {
         sqlite.rowsByPath = [first.path: [try row("turn:1")], second.path: [try row("turn:2")]]
         let scanner = FreebuffDesktopUsageScanner(sqlite: sqlite, databasePaths: { [first.path, second.path] })
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 2)
+        XCTAssertEqual(sqlite.calls, 4)
         _ = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 2)
+        XCTAssertEqual(sqlite.calls, 4)
         sqlite.rowsByPath[first.path] = [["id": "turn:1",
                                         "timestamp": String(now.addingTimeInterval(-60).timeIntervalSince1970 * 1000),
                                         "metrics": #"{"usage":{"inputTokens":200,"outputTokens":50,"totalTokens":250}}"#]]
         try Data("newly committed rows".utf8).write(to: URL(fileURLWithPath: first.path + "-wal"))
         let result = try await scanner.scan(now: now)
-        XCTAssertEqual(sqlite.calls, 3, "a single active project must not reread every other database")
+        XCTAssertEqual(sqlite.calls, 6, "a single active project must not reread every other database")
         XCTAssertEqual(result?.usage.series.daily.first?.totalTokens, 400,
                        "an updated cumulative turn replaces its earlier value instead of adding it again")
+    }
+
+    /// WAL churn (a checkpoint or metadata write) bumps the stamp revision without touching usage
+    /// rows. The stored content fingerprint proves it: the next scan pays one aggregate probe
+    /// instead of the full row read, and only a real usage change falls back to the full read.
+    func testUnchangedUsageFingerprintSkipsTheRowReadOnWALChurn() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = directory.appendingPathComponent("first.db")
+        try Data().write(to: first)
+        let sqlite = SQLite()
+        sqlite.rowsByPath = [first.path: [try row("turn:1")]]
+        sqlite.fingerprintResponses = [first.path: "3:42:900|0:0:0"]
+        let scanner = FreebuffDesktopUsageScanner(sqlite: sqlite, databasePaths: { [first.path] })
+
+        _ = try await scanner.scan(now: now)
+        XCTAssertEqual(sqlite.calls, 2, "first scan: row read plus fingerprint capture")
+
+        // Churn the WAL while usage rows stay identical.
+        try Data("checkpoint".utf8).write(to: URL(fileURLWithPath: first.path + "-wal"))
+        _ = try await scanner.scan(now: now)
+        XCTAssertEqual(sqlite.calls, 3, "unchanged usage rows re-verify by fingerprint, not re-read")
+
+        // A real usage change must still cost the full read.
+        sqlite.fingerprintResponses[first.path] = "4:55:1200|0:0:0"
+        try Data("more churn".utf8).write(to: URL(fileURLWithPath: first.path + "-wal"))
+        _ = try await scanner.scan(now: now)
+        XCTAssertEqual(sqlite.calls, 6, "a changed fingerprint falls back to the full read")
     }
 
     private final class SessionChatsSQLite: SQLiteAccessing, @unchecked Sendable {

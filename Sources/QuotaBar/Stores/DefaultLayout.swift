@@ -23,7 +23,8 @@ enum DefaultLayout {
         "copilot.premium", "copilot.extra", "copilot.orgCredits", "copilot.orgSpend",
         "copilot.chat", "copilot.completions",
 
-        "devin.daily", "devin.weekly", "devin.extra",
+        "devin.daily", "devin.weekly", "devin.extra", "devin.trend",
+        "devin.today", "devin.yesterday", "devin.last30",
 
         "freebuff.session", "freebuff.daily", "freebuff.weekly", "freebuff.fiveDay",
         "freebuff.monthly", "freebuff.premiumSessions", "freebuff.freePremiumSessions", "freebuff.freebucksDaily",
@@ -118,7 +119,9 @@ enum DefaultLayout {
         // caret. Org billing is role-dependent; Chat/Completions carry real counts on free only.
         // These optional rows hide when the response has no corresponding data.
         "copilot.orgCredits", "copilot.orgSpend", "copilot.chat", "copilot.completions",
-        "devin.extra",
+        // Devin: Daily/Weekly quota and the Usage Trend stay above the fold;
+        // Extra Balance and the spend tiles (local session usage) sit below the caret.
+        "devin.extra", "devin.today", "devin.yesterday", "devin.last30",
         "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",
         // Hermes: the period token rows (Today / This Week / This Month) are the card's core and stay
         // above the fold; the Usage Trend chart sits below the caret.

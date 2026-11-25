@@ -43,6 +43,10 @@ struct ProviderSnapshotCache {
         /// can overlap without fencing the other domain's still-running result.
         var storedQuotaOrders: [String: UInt64]
         var storedHistoryOrders: [String: UInt64]
+        /// Written `true` by native-source builds. A blob recorded before the native switch (or by
+        /// a build without the marker) still holds T3/agy-sourced Antigravity rows, so decoding it
+        /// drops that provider's snapshot and stamp rather than rendering foreign-source data.
+        var antigravityUsesNativeSources = true
 
         private enum CodingKeys: String, CodingKey {
             case snapshots
@@ -51,6 +55,7 @@ struct ProviderSnapshotCache {
             case storedRefreshOrders
             case storedQuotaOrders
             case storedHistoryOrders
+            case antigravityUsesNativeSources
         }
 
         init(
@@ -92,6 +97,13 @@ struct ProviderSnapshotCache {
                 [String: UInt64].self,
                 forKey: .storedHistoryOrders
             ) ?? [:]
+            // Pre-native-source payloads carried T3/agy-derived Antigravity rows; drop that provider's
+            // snapshot and identity stamp before any read or merge sees them. Other providers are
+            // untouched — only Antigravity's source changed.
+            if try values.decodeIfPresent(Bool.self, forKey: .antigravityUsesNativeSources) != true {
+                snapshots.removeValue(forKey: "antigravity")
+                producedByIdentityKeys.removeValue(forKey: "antigravity")
+            }
         }
     }
 
@@ -131,6 +143,53 @@ struct ProviderSnapshotCache {
     /// but never counts as fresh, forcing one refresh on the first post-launch pass. Lock-backed for the
     /// same reason as `memo`: the value-type cache shares it across copies and stays safe. See #697.
     private let sessionWrites = OSAllocatedUnfairLock<Set<String>>(initialState: [])
+
+    /// Deferred-write state for `beginDeferredWrites`/`flushDeferredWrites`. While a batch is open,
+    /// mutation methods keep updating the in-memory mirror under the per-call lock but skip the
+    /// whole-payload encode + `UserDefaults` write; `flushDeferredWrites` persists once. A foreign
+    /// process's write is still detected by the byte-compare in `loadPayload` — which overlays the
+    /// deferred providers' entries onto the newer blob instead of silently dropping either side,
+    /// so the cross-process fence (issued/stored orders) is preserved exactly.
+    private struct DeferredWriteState {
+        var depth = 0
+        var dirtyProviderIDs: Set<String> = []
+    }
+    private let deferWrites = OSAllocatedUnfairLock(initialState: DeferredWriteState())
+
+    /// Coalesce a multi-provider refresh batch into one blob write. Pair every call with
+    /// `flushDeferredWrites` (e.g. via `defer`); nesting is depth-counted so overlapping batches
+    /// share one final flush.
+    func beginDeferredWrites() {
+        deferWrites.withLock { $0.depth += 1 }
+    }
+
+    /// Persist the deferred mirror once. Runs under the same process+flock lock as a normal write,
+    /// and merges any foreign write that landed while the batch ran (see `loadPayload`).
+    func flushDeferredWrites() {
+        let flushNow = deferWrites.withLock { state -> Bool in
+            guard state.depth > 0 else { return false }
+            state.depth -= 1
+            return state.depth == 0 && !state.dirtyProviderIDs.isEmpty
+        }
+        guard flushNow else {
+            deferWrites.withLock { if $0.depth == 0 { $0.dirtyProviderIDs = [] } }
+            return
+        }
+        deferWrites.withLock { $0.dirtyProviderIDs = [] }
+        _ = withPersistentStoreLock {
+            // `loadPayload` merges deferred entries onto a foreign write before returning.
+            _ = save(loadPayload())
+        }
+    }
+
+    /// Record that a mutation method touched `providerID` inside a deferred batch, so a foreign
+    /// write can be overlaid and the flush knows there is work to persist.
+    private func markDeferredDirty(providerIDs: some Sequence<String>) {
+        let ids = Array(providerIDs)
+        deferWrites.withLock {
+            if $0.depth > 0 { $0.dirtyProviderIDs.formUnion(ids) }
+        }
+    }
 
     private let userDefaults: UserDefaults
     private let storageKey: String
@@ -230,7 +289,10 @@ struct ProviderSnapshotCache {
                 payload.snapshots[providerID] = snapshot
                 changed = true
             }
-            if changed { save(payload) }
+            if changed {
+                markDeferredDirty(providerIDs: Array(payload.snapshots.keys))
+                save(payload)
+            }
         }
     }
 
@@ -291,11 +353,16 @@ struct ProviderSnapshotCache {
             guard compacted != history else { return }
             snapshot.usageHistory = compacted
             payload.snapshots[providerID] = snapshot
+            markDeferredDirty(providerIDs: [providerID])
             _ = save(payload)
         }
     }
 
-    func snapshot(providerID: String, freshnessInterval: TimeInterval? = nil) -> ProviderSnapshot? {
+    func snapshot(
+        providerID: String,
+        freshnessInterval: TimeInterval? = nil,
+        includeMeterFreshness: Bool = true
+    ) -> ProviderSnapshot? {
         let snapshot = loadPayload().snapshots[providerID]
         guard let snapshot else { return nil }
         // Freshness has two requirements, and disk age alone is not enough: the snapshot must have been
@@ -320,9 +387,17 @@ struct ProviderSnapshotCache {
         } else {
             historyStamp = snapshot.refreshedAt
         }
-        let freshnessStamp = freshnessInterval == nil
-            ? min(snapshot.refreshedAt, min(meterStamp, historyStamp))
-            : meterStamp
+        let freshnessStamp: Date
+        if freshnessInterval != nil {
+            freshnessStamp = meterStamp
+        } else if includeMeterFreshness {
+            freshnessStamp = min(snapshot.refreshedAt, min(meterStamp, historyStamp))
+        } else {
+            // Fold-only passes do not refresh quota. Their freshness question is only whether the
+            // history domain is current; otherwise recovered meter stamps older than the accounting
+            // TTL retrigger the accounting phase forever while the panel is open.
+            freshnessStamp = min(snapshot.refreshedAt, historyStamp)
+        }
         let age = now().timeIntervalSince(freshnessStamp)
         let trusted = allowsPersistedFreshness || writtenThisSession
         let effectiveTTL = freshnessInterval ?? ttl
@@ -354,9 +429,18 @@ struct ProviderSnapshotCache {
         }
         AppLog.debug(.cache, "write \(snapshot.providerID)")
         var result: StoreResult = .unavailable
+        var hideQuotaInResult = false
         let locked = withPersistentStoreLock {
             var payload = loadPayload()
             let providerID = snapshot.providerID
+            // Antigravity folds are history-only and machine-local: they must never rewrite the
+            // quota stamp, even when this process resolved a different (or no) launch identity.
+            // Keeping the persisted stamp also pins the merge to the identityMatches path, so a
+            // fold cannot trip the account-switch quota clear.
+            let preservesQuotaIdentity = providerID == "antigravity" && scope?.suppressesLiveQuota == true
+            let existingIdentityKey = payload.producedByIdentityKeys[providerID]
+            let storedIdentityKey = preservesQuotaIdentity ? existingIdentityKey : producedByIdentityKey
+            hideQuotaInResult = preservesQuotaIdentity && existingIdentityKey != producedByIdentityKey
             // A refresh order is normally allocated before the provider work starts, so this write can
             // be fenced against a newer result. When that allocation failed (the shared lock could
             // not be taken) the snapshot must still be persisted: refusing it silently dropped the
@@ -413,9 +497,10 @@ struct ProviderSnapshotCache {
                         warningSnapshot.quotaRefreshedAt = .distantPast
                         warningSnapshot.historyRefreshedAt = .distantPast
                         warningSnapshot.refreshedAt = .distantPast
-                        payload.producedByIdentityKeys[providerID] = producedByIdentityKey
+                        payload.producedByIdentityKeys[providerID] = storedIdentityKey
                     }
                     payload.snapshots[providerID] = warningSnapshot
+                    markDeferredDirty(providerIDs: [providerID])
                     result = save(payload) ? .stored(warningSnapshot) : .unavailable
                 } else {
                     // A completed fold with no history is not authoritative. Preserve the previous
@@ -426,7 +511,7 @@ struct ProviderSnapshotCache {
             }
 
             var storedSnapshot = snapshot
-            let identityMatches = payload.producedByIdentityKeys[providerID] == producedByIdentityKey
+            let identityMatches = existingIdentityKey == storedIdentityKey
             if let scope, identityMatches {
                 storedSnapshot = Self.merge(
                     snapshot,
@@ -456,7 +541,7 @@ struct ProviderSnapshotCache {
             payload.snapshots[providerID] = storedSnapshot
             // Stamp (or clear) the producing account alongside the entry. A nil identity must clear
             // any prior stamp rather than falsely bless an unattributable snapshot at next launch.
-            payload.producedByIdentityKeys[providerID] = producedByIdentityKey
+            payload.producedByIdentityKeys[providerID] = storedIdentityKey
             if let refreshOrder {
                 payload.issuedRefreshOrders[providerID] = max(
                     payload.issuedRefreshOrders[providerID, default: 0],
@@ -469,6 +554,7 @@ struct ProviderSnapshotCache {
                 if quotaAccepted { payload.storedQuotaOrders[providerID] = refreshOrder }
                 if historyAccepted { payload.storedHistoryOrders[providerID] = refreshOrder }
             }
+            markDeferredDirty(providerIDs: [providerID])
             result = save(payload) ? .stored(storedSnapshot) : .unavailable
         }
         guard locked else { return .unavailable }
@@ -476,7 +562,27 @@ struct ProviderSnapshotCache {
         if case .stored = result {
             sessionWrites.withLock { _ = $0.insert(snapshot.providerID) }
         }
-        return result
+        // The persisted payload keeps the stamped quota intact — the merge above never touched it.
+        // Only this caller's view is masked: an Antigravity fold cannot verify that the cached
+        // meters belong to the identity this process would stamp, so it is handed local history
+        // alone until a live quota response re-attributes or clears the meters for real.
+        guard hideQuotaInResult else { return result }
+        func historyOnly(_ snapshot: ProviderSnapshot?) -> ProviderSnapshot? {
+            guard let snapshot else { return nil }
+            var result = Self.clearingQuotaState(snapshot)
+            result.quotaRefreshedAt = .distantPast
+            return result
+        }
+        switch result {
+        case .stored(let snapshot):
+            return .stored(historyOnly(snapshot))
+        case .unchanged(let snapshot):
+            return .unchanged(historyOnly(snapshot))
+        case .superseded(let snapshot):
+            return .superseded(historyOnly(snapshot))
+        case .unavailable:
+            return .unavailable
+        }
     }
 
     private static func merge(
@@ -649,6 +755,7 @@ struct ProviderSnapshotCache {
             payload.storedQuotaOrders[providerID] = order
             payload.storedHistoryOrders[providerID] = order
             accepted = true
+            markDeferredDirty(providerIDs: [providerID])
             didStore = save(payload)
         }
         guard stored, didStore, accepted else { return false }
@@ -683,6 +790,7 @@ struct ProviderSnapshotCache {
                 payload.storedRefreshOrders[providerID, default: 0], order
             )
             payload.storedQuotaOrders[providerID] = order
+            markDeferredDirty(providerIDs: [providerID])
             result = save(payload) ? .stored(cleared) : .unavailable
         }
         guard locked else { return .unavailable }
@@ -773,10 +881,37 @@ struct ProviderSnapshotCache {
         if currentBytes == knownBytes, let mirror = memo.withLock({ $0 }) { return mirror }
         // Decode the exact bytes observed above. Re-reading UserDefaults here could pair one writer's
         // blob with another writer's byte stamp and bless a stale mirror as current.
-        let loaded = decodeStoredPayload(currentBytes)
-        memo.withLock { $0 = loaded }
+        var loaded = decodeStoredPayload(currentBytes)
+        // Another process wrote while this one holds deferred (unflushed) mutations. Overlay our
+        // pending providers onto the foreign blob rather than dropping either side's entries — the
+        // same merge the deferred flush would have committed had no interleaving write landed.
+        let pending = deferWrites.withLock { $0.dirtyProviderIDs }
+        if !pending.isEmpty, let mirror = memo.withLock({ $0 }) {
+            for providerID in pending {
+                loaded.snapshots[providerID] = mirror.snapshots[providerID]
+                loaded.producedByIdentityKeys[providerID] = mirror.producedByIdentityKeys[providerID]
+                loaded.issuedRefreshOrders[providerID] = max(
+                    loaded.issuedRefreshOrders[providerID, default: 0],
+                    mirror.issuedRefreshOrders[providerID, default: 0]
+                )
+                loaded.storedRefreshOrders[providerID] = max(
+                    loaded.storedRefreshOrders[providerID, default: 0],
+                    mirror.storedRefreshOrders[providerID, default: 0]
+                )
+                loaded.storedQuotaOrders[providerID] = max(
+                    loaded.storedQuotaOrders[providerID, default: 0],
+                    mirror.storedQuotaOrders[providerID, default: 0]
+                )
+                loaded.storedHistoryOrders[providerID] = max(
+                    loaded.storedHistoryOrders[providerID, default: 0],
+                    mirror.storedHistoryOrders[providerID, default: 0]
+                )
+            }
+        }
+        let result = loaded
+        memo.withLock { $0 = result }
         persistedBytes.withLock { $0 = currentBytes }
-        return loaded
+        return result
     }
 
     private func decodeStoredPayload(_ data: Data?) -> Payload {
@@ -799,6 +934,11 @@ struct ProviderSnapshotCache {
 
     @discardableResult
     private func save(_ payload: Payload) -> Bool {
+        // Deferred batch: mirror the mutation now, encode + write once at flush.
+        if deferWrites.withLock({ $0.depth }) > 0 {
+            memo.withLock { $0 = payload }
+            return true
+        }
         do {
             let data = try encoder.encode(payload)
             metrics?.recordWrite()

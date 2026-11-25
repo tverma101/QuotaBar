@@ -24,7 +24,7 @@ actor CodexProxyUsageScanner {
     private let optionalDefaultDatabasePath: String?
 
     init(
-        sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
+        sqlite: SQLiteAccessing = NativeSQLiteAccessor(),
         environment: EnvironmentReading = QuotaBarEnvironmentReader(),
         homeDirectory: @escaping @Sendable () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
         databasePaths: (@Sendable () -> [String])? = nil
@@ -78,7 +78,9 @@ actor CodexProxyUsageScanner {
         let days = max(1, daysBack)
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
-        let since = calendar.date(byAdding: .day, value: -(days - 1), to: today) ?? today
+        // `daysBack` counts days strictly before today (UsageHistoryWindow.previousDays); see
+        // CodexRouterUsageScanner for the convention shared with the persisted-aggregate filter.
+        let since = JSONLScanning.sinceDate(daysBack: days, now: now)
         let sinceDay = DailyUsageAccumulator.dayKey(from: since, calendar: calendar)
         let throughDay = DailyUsageAccumulator.dayKey(from: today, calendar: calendar)
 

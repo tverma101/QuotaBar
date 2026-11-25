@@ -20,6 +20,10 @@ struct OpenCodeGoKeyStore: Sendable {
     /// UserDefaults key for the active selection.
     static let selectionKey = "opencode.activeGoKeyID"
 
+    /// Serializes add/remove's load-modify-write: two concurrent mutations used to let the
+    /// slower writer's stale load drop the other's key.
+    private static let mutationLock = NSLock()
+
     var files: TextFileAccessing
     var filePath: @Sendable () -> String
 
@@ -56,27 +60,31 @@ struct OpenCodeGoKeyStore: Sendable {
     /// is trimmed and must be non-empty. Returns the stored entry (its UUID is the selection id).
     @discardableResult
     func addKey(label: String, key: String) throws -> OpenCodeGoKey {
-        var keys = try loadKeys()
-        let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedKey.isEmpty else {
-            throw OpenCodeUsageError.credentialsUnreadable(detail: "refusing to save an empty key")
+        try Self.mutationLock.withLock {
+            var keys = try loadKeys()
+            let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedKey.isEmpty else {
+                throw OpenCodeUsageError.credentialsUnreadable(detail: "refusing to save an empty key")
+            }
+            let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            let entry = OpenCodeGoKey(
+                id: UUID(),
+                label: trimmedLabel.isEmpty ? "Account \(keys.count + 1)" : trimmedLabel,
+                key: trimmedKey
+            )
+            keys.append(entry)
+            try save(keys)
+            return entry
         }
-        let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        let entry = OpenCodeGoKey(
-            id: UUID(),
-            label: trimmedLabel.isEmpty ? "Account \(keys.count + 1)" : trimmedLabel,
-            key: trimmedKey
-        )
-        keys.append(entry)
-        try save(keys)
-        return entry
     }
 
     /// Remove a saved key and persist the list. A missing key is a no-op.
     func removeKey(id: UUID) throws {
-        var keys = try loadKeys()
-        keys.removeAll { $0.id == id }
-        try save(keys)
+        try Self.mutationLock.withLock {
+            var keys = try loadKeys()
+            keys.removeAll { $0.id == id }
+            try save(keys)
+        }
     }
 
     private func save(_ keys: [OpenCodeGoKey]) throws {

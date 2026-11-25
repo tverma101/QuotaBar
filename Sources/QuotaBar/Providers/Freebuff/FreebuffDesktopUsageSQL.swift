@@ -35,13 +35,10 @@ enum FreebuffDesktopUsageSQL {
           CAST(r.created_at AS TEXT), ''
         ) AS timestamp,
         json_object(
-          'usage', json(json_set(
-            json_extract(r.manager_json, '$.usage'),
-            '$.model', json_extract(r.manager_json, '$.model')
-          )),
+          'usage', json_extract(r.manager_json, '$.usage'),
           'usageIncomplete', COALESCE(json_extract(r.manager_json, '$.usageIncomplete'), 0)
         ) || '' AS metrics,
-        \(selectedModel) AS selectedModel
+        COALESCE(NULLIF(json_extract(r.manager_json, '$.model'), ''), \(selectedModel)) AS selectedModel
       FROM auto_run_decision_receipts r JOIN threads t ON t.id = r.thread_id
       WHERE t.harness_id = 'codebuff'
         AND json_extract(r.manager_json, '$.harnessId') = 'codebuff'
@@ -83,6 +80,29 @@ enum FreebuffDesktopUsageSQL {
                 } else { throw error }
             }
         }
+    }
+
+    /// One aggregate per source the projections consume — assistant messages carry their joined
+    /// thread's model fields, and the receipts table is summed wholesale. Any WAL churn that left
+    /// usage rows alone produces the same fingerprint; a changed fingerprint re-reads in full.
+    static let contentFingerprintQuery = """
+    SELECT
+      (SELECT COUNT(*) || ':' || COALESCE(SUM(m.rowid),0) || ':' ||
+              COALESCE(SUM(LENGTH(m.request_id)+LENGTH(m.metrics_json)+LENGTH(m.ts)+
+                             LENGTH(COALESCE(t.model,''))+LENGTH(COALESCE(t.world_snapshot,''))),0)
+       FROM messages m JOIN threads t ON t.id = m.thread_id
+       WHERE t.harness_id = 'codebuff' AND m.role = 'assistant')
+      || '|' ||
+      (SELECT COUNT(*) || ':' || COALESCE(SUM(r.rowid),0) || ':' ||
+              COALESCE(SUM(LENGTH(r.manager_json)),0)
+       FROM auto_run_decision_receipts r)
+    """
+
+    /// Cheap proof that the projected rows did not change across a stamp-level revision bump.
+    /// `nil` means unproven — an old schema (missing receipts table or `world_snapshot`) or any
+    /// query failure — and the caller falls back to the full read, identical to today's path.
+    static func contentFingerprint(sqlite: any SQLiteAccessing, path: String) -> String? {
+        try? sqlite.queryValue(path: path, sql: contentFingerprintQuery)
     }
 
     static func activeSessionChatsQuery(instanceIDs: [String], threadIDs: [String]) -> String {

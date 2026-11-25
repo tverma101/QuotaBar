@@ -83,16 +83,15 @@ final class PricingMemoryOptimizationTests: XCTestCase {
         XCTAssertEqual(pricing.supplement.canonicalName(for: "DeepSeek Fast"), "deepseek-v4.1-flash-1017")
         XCTAssertEqual(pricing.supplement.canonicalName(for: "DeepSeek"), "deepseek-v4.1-flash-1017")
 
-        // The catalogue's real display names. Freebuff removed the Flash Fast mode: the key that
-        // used to name it now serves the base Flash model (hosted receipts carry only the plain
-        // slug), so it must price as the base model, never at the retired Fast-tier rates.
+        // The catalogue's real display names. A Fast label cannot prove the serving route in the
+        // discovery map; the resolver decides whether the row assumes the standard Flash rate.
         let entries = [
             "m-096e75164d": FreebuffModelCatalog.Entry(key: "m-096e75164d", displayName: "DeepSeek V4.1 Flash Fast"),
             "m-8db1ccbba6": FreebuffModelCatalog.Entry(key: "m-8db1ccbba6", displayName: "DeepSeek V4.1 Flash"),
             "m-61c26317cc": FreebuffModelCatalog.Entry(key: "m-61c26317cc", displayName: "DeepSeek V4.1 Flash Slow")
         ]
         let routes = FreebuffModelCatalog.pricingRoutes(entries: entries, pricing: pricing)
-        XCTAssertEqual(routes["m-096e75164d"], "deepseek-v4.1-flash")
+        XCTAssertNil(routes["m-096e75164d"], "a Fast catalogue label cannot prove the serving route")
         XCTAssertEqual(routes["m-8db1ccbba6"], "deepseek-v4.1-flash")
         XCTAssertNil(routes["m-61c26317cc"], "Slow mode variant should remain unpriced")
     }

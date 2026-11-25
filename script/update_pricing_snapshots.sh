@@ -14,9 +14,8 @@
 #
 # The compact format must stay in sync with PricingCatalogCodecs.swift (compact codec + the
 # defaulting rules of the LiteLLM/models.dev parsers): per-million rates and cache write defaults to
-# the input rate. If a source omits cache read, runtime estimates use the selected input rate and
-# `cre:false` records that provenance. Context tiers use the same PromptRateTier coding keys as the
-# supplement. A cache-read lane published only in a context tier still marks the entry as explicit.
+# the input rate. Cache-read provenance uses legacy cre (any lane) and a base-only crb override.
+# Context tiers use the same PromptRateTier coding keys as the supplement.
 # After regenerating, `swift test` exercises the snapshots via the pricing resolution tests.
 set -euo pipefail
 
@@ -40,7 +39,7 @@ import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, "script")
-from pricing_snapshot_codec import cache_read_is_explicit
+from pricing_snapshot_codec import cache_read_provenance
 
 tmpdir, resources = sys.argv[1], sys.argv[2]
 retrieved_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -65,11 +64,13 @@ def previous_retired_keys(snapshot_path):
     except (OSError, KeyError, ValueError):
         return set()
 
-def compact_model(input_pm, output_pm, cache_write_pm, cache_read_pm, cache_read_explicit,
+def compact_model(input_pm, output_pm, cache_write_pm, cache_read_pm, base_cache_read,
                   ia=None, oa=None, cwa=None, cra=None, fast=None, tiers=None):
     model = {"i": input_pm, "o": output_pm, "cw": cache_write_pm, "cr": cache_read_pm}
-    if not cache_read_explicit:
-        model["cre"] = False
+    has_cache_read_override = cra is not None or any(
+        tier.get("cache_read_per_million") is not None for tier in (tiers or [])
+    )
+    model.update(cache_read_provenance(base_cache_read, has_cache_read_override))
     for key, value in (("ia", ia), ("oa", oa), ("cwa", cwa), ("cra", cra), ("fast", fast)):
         if value is not None:
             model[key] = value
@@ -146,7 +147,7 @@ for key, entry in litellm.items():
         i * 1e6, o * 1e6,
         (cw if cw is not None else i) * 1e6,
         (cr if cr is not None else i) * 1e6,
-        cache_read_is_explicit(cr, tiers),
+        cr,
         ia=(lambda v: v * 1e6 if v is not None else None)(number(entry.get("input_cost_per_token_above_200k_tokens"))),
         oa=(lambda v: v * 1e6 if v is not None else None)(number(entry.get("output_cost_per_token_above_200k_tokens"))),
         cwa=(lambda v: v * 1e6 if v is not None else None)(number(entry.get("cache_creation_input_token_cost_above_200k_tokens"))),
@@ -183,7 +184,7 @@ for provider_name in sorted(models_dev):
             i, o,
             cw if cw is not None else i,
             cr if cr is not None else i,
-            cache_read_is_explicit(cr, tiers),
+            cr,
             tiers=tiers,
         ))
 models = {

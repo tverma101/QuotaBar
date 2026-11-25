@@ -80,15 +80,19 @@ final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
     private var maximumIndexQueryCount = 0
     private(set) var contentFingerprintSQLs: [String] = []
     private var stepMetadataQueryCount = 0
+    private(set) var mergedProbeQueryCount = 0
     let failingPaths: Set<String>
+    private var lateFailingPaths: Set<String> = []
     let failingStepMetadataProbePaths: Set<String>
     let failingStepMetadataOpenPaths: Set<String>
     let transientStepMetadataProbePaths: Set<String>
     let transientStepMetadataTimeoutPaths: Set<String>
     let transientBatchTimeoutPaths: Set<String>
     let unindexedStepMetadataPaths: Set<String>
+    let transientMergedProbePaths: Set<String>
     private var triggeredTransientStepMetadataFailures: Set<String> = []
     private var triggeredTransientBatchTimeouts: Set<String> = []
+    private var triggeredTransientMergedProbePaths: Set<String> = []
     let cancellingPath: String?
     let cancellingSQLContaining: String?
     let throwingCancellationSQLContaining: String?
@@ -105,6 +109,7 @@ final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
         transientStepMetadataTimeoutPaths: Set<String> = [],
         transientBatchTimeoutPaths: Set<String> = [],
         unindexedStepMetadataPaths: Set<String> = [],
+        transientMergedProbePaths: Set<String> = [],
         cancellingPath: String? = nil,
         cancellingSQLContaining: String? = nil,
         throwingCancellationSQLContaining: String? = nil,
@@ -120,6 +125,7 @@ final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
         self.transientStepMetadataTimeoutPaths = transientStepMetadataTimeoutPaths
         self.transientBatchTimeoutPaths = transientBatchTimeoutPaths
         self.unindexedStepMetadataPaths = unindexedStepMetadataPaths
+        self.transientMergedProbePaths = transientMergedProbePaths
         self.cancellingPath = cancellingPath
         self.cancellingSQLContaining = cancellingSQLContaining
         self.throwingCancellationSQLContaining = throwingCancellationSQLContaining
@@ -133,8 +139,76 @@ final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
         defer { lock.unlock() }
 
         queryCounts[path, default: 0] += 1
-        if failingPaths.contains(path) {
+        if failingPaths.contains(path) || lateFailingPaths.contains(path) {
             throw SQLiteError.queryFailed("database locked")
+        }
+        // The merged change probe packs the schema probe plus both table digests into one JSON
+        // object; emulate the sequential branches' answers with identical signature schemes.
+        if sql.contains("antigravity_change_probe") {
+            mergedProbeQueryCount += 1
+            if unsupportedSHA3 { throw SQLiteError.queryFailed("no such function: sha3") }
+            if transientMergedProbePaths.contains(path),
+               triggeredTransientMergedProbePaths.insert(path).inserted {
+                throw SQLiteError.queryFailed("database is locked")
+            }
+            if transientStepMetadataProbePaths.contains(path),
+               triggeredTransientStepMetadataFailures.insert(path).inserted {
+                throw SQLiteError.queryFailed("database is locked")
+            }
+            if transientStepMetadataTimeoutPaths.contains(path),
+               triggeredTransientStepMetadataFailures.insert(path).inserted {
+                throw SQLiteError.queryFailed("/usr/bin/sqlite3 timed out after 5s.")
+            }
+            if failingStepMetadataProbePaths.contains(path) {
+                throw SQLiteError.queryFailed("no such table: pragma_table_info")
+            }
+            if failingStepMetadataOpenPaths.contains(path) {
+                throw SQLiteError.queryFailed("unable to open database file")
+            }
+            if transientBatchTimeoutPaths.contains(path),
+               triggeredTransientBatchTimeouts.insert(path).inserted {
+                throw ProcessRunnerError.timedOut(executable: "/usr/bin/sqlite3", timeout: 5)
+            }
+            if path == cancellingPath || cancellingSQLContaining.map(sql.contains) == true {
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+            if throwingCancellationSQLContaining.map(sql.contains) == true {
+                withUnsafeCurrentTask { $0?.cancel() }
+                throw CancellationError()
+            }
+            let probe = unindexedStepMetadataPaths.contains(path)
+                ? 0
+                : (rowsByPath[path, default: []].contains { $0.stepMetadata != nil } ? 1 : 0)
+            let steps = rowsByPath[path, default: []]
+                .filter { $0.stepMetadata != nil }.sorted { $0.index < $1.index }
+            let stepThrough = Int(sql[sql.range(of: "step_idx <= ")!.upperBound...]
+                .split(whereSeparator: \.isWhitespace).first!)!
+            let genThrough = Int(sql[sql.range(of: "gen_idx <= ")!.upperBound...]
+                .split(whereSeparator: \.isWhitespace).first!)!
+            func stepSignature(_ rows: [AntigravityFixtureRow]) -> String {
+                rows.map { "\($0.index):" + $0.stepMetadata!.map { String(format: "%02x", $0) }.joined() }
+                    .joined(separator: ";")
+            }
+            let generations = rowsByPath[path, default: []].sorted { $0.index < $1.index }
+            func generationSignature(_ rows: [AntigravityFixtureRow]) -> String {
+                rows.map { row in
+                    let byteCount = row.blob?.count ?? 0
+                    let digest = byteCount <= AntigravityDbUsageScanner.maximumBlobBytes
+                        ? row.blob?.map { String(format: "%02x", $0) }.joined() ?? ""
+                        : "oversized"
+                    return "\(row.index):\(byteCount):\(digest);"
+                }.joined()
+            }
+            let payload: [String: Any] = [
+                "probe": probe,
+                "step_prefix": stepSignature(steps.filter { $0.index <= stepThrough }),
+                "step_table": stepSignature(steps),
+                "step_max": steps.last?.index ?? -1,
+                "gen_max": generations.last?.index ?? -1,
+                "gen_prefix": generationSignature(generations.filter { $0.index <= genThrough }),
+                "gen_table": generationSignature(generations)
+            ]
+            return String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)
         }
         if sql.contains("pragma_table_info('steps')") {
             if transientStepMetadataProbePaths.contains(path),
@@ -227,9 +301,12 @@ final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
             let range = sql.range(of: marker)!
             let cursor = Int(sql[range.upperBound...].split(whereSeparator: \.isWhitespace).first!)!
             stepTimestampCursors.append(cursor)
+            let pageLimit = sql.range(of: "LIMIT ").map {
+                Int(sql[$0.upperBound...].split(whereSeparator: \.isWhitespace).first ?? "") ?? 128
+            } ?? 128
             let rows: [[String: Any]] = rowsByPath[path, default: []]
                 .filter { $0.index > cursor && $0.stepMetadata != nil }
-                .sorted { $0.index < $1.index }.prefix(128)
+                .sorted { $0.index < $1.index }.prefix(pageLimit)
                 .map { row in ["index": row.index, "hex": row.stepMetadata!.map { String(format: "%02x", $0) }.joined()] }
             return String(decoding: try JSONSerialization.data(withJSONObject: rows), as: UTF8.self)
         }
@@ -285,6 +362,11 @@ final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
         lock.withLock { rowsByPath[path, default: []].append(row) }
     }
 
+    /// Start failing a path after an earlier healthy scan seeded its cache.
+    func fail(_ path: String) {
+        lock.withLock { _ = lateFailingPaths.insert(path) }
+    }
+
     func replaceRows(_ rows: [AntigravityFixtureRow], at path: String) {
         lock.withLock { rowsByPath[path] = rows }
     }
@@ -315,6 +397,10 @@ final class AntigravityFakeSQLite: SQLiteAccessing, @unchecked Sendable {
 
     var stepMetadataQueries: Int {
         lock.withLock { stepMetadataQueryCount }
+    }
+
+    var mergedProbeQueries: Int {
+        lock.withLock { mergedProbeQueryCount }
     }
 
     func execute(path: String, sql: String) throws {}
@@ -687,7 +773,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         XCTAssertEqual(process.terminationStatus, 0, String(decoding: data, as: UTF8.self))
-        let index = try AntigravityStepTimestampIndex.load(path: fixture.paths[0], sqlite: SQLiteCLIAccessor())
+        let index = try AntigravityStepTimestampIndex.load(path: fixture.paths[0], sqlite: NativeSQLiteAccessor())
         let generation = antigravityGenerationBlob(model: "gemini-3.6-flash", input: 10, output: 2, timestamp: nil)
         XCTAssertEqual(index.timestamp(for: generation), Int64(timestamp))
     }
@@ -1844,7 +1930,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         process.waitUntilExit()
         XCTAssertEqual(process.terminationStatus, 0, String(decoding: processData, as: UTF8.self))
 
-        let accessor = SQLiteCLIAccessor()
+        let accessor = NativeSQLiteAccessor()
         let firstPayload = try XCTUnwrap(accessor.queryValue(
             path: fixture.paths[0],
             sql: AntigravityDbUsageScanner.dataSQL(after: -1)
@@ -1884,7 +1970,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         process.waitUntilExit()
         XCTAssertEqual(process.terminationStatus, 0, String(decoding: processData, as: UTF8.self))
 
-        let accessor = SQLiteCLIAccessor()
+        let accessor = NativeSQLiteAccessor()
         let firstPayload = try XCTUnwrap(accessor.queryValue(
             path: fixture.paths[0],
             sql: AntigravityDbUsageScanner.dataSQL(after: -1, includeStepMetadata: true)
@@ -1910,7 +1996,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
 
     func testStepMetadataProbeRequiresASingleColumnIndexedKey() throws {
         let fixture = try makeDatabaseDirectory(fileNames: ["indexed.db", "unindexed.db", "composite.db"])
-        let accessor = SQLiteCLIAccessor()
+        let accessor = NativeSQLiteAccessor()
         try accessor.execute(path: fixture.paths[0], sql: "CREATE TABLE steps(idx INTEGER PRIMARY KEY, metadata BLOB)")
         try accessor.execute(path: fixture.paths[1], sql: "CREATE TABLE steps(idx INTEGER, metadata BLOB)")
         try accessor.execute(
@@ -1962,6 +2048,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         let credentials = #"{"token":{"access_token":"ya29.test","refresh_token":"1//test","expiry":"2099-01-01T00:00:00Z"}}"#
         let wrappedCredentials = "go-keyring-base64:" + Data(credentials.utf8).base64EncodedString()
         let provider = AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrappedCredentials), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
@@ -2019,6 +2106,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         let credentials = #"{"token":{"access_token":"ya29.test","refresh_token":"1//test","expiry":"2099-01-01T00:00:00Z"}}"#
         let wrappedCredentials = "go-keyring-base64:" + Data(credentials.utf8).base64EncodedString()
         let provider = AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrappedCredentials), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
@@ -2055,6 +2143,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         let credentials = #"{"token":{"access_token":"ya29.test","refresh_token":"1//test","expiry":"2099-01-01T00:00:00Z"}}"#
         let wrappedCredentials = "go-keyring-base64:" + Data(credentials.utf8).base64EncodedString()
         let provider = AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrappedCredentials), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
@@ -2084,6 +2173,7 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         let credentials = #"{"token":{"access_token":"ya29.test","refresh_token":"1//test","expiry":"2099-01-01T00:00:00Z"}}"#
         let wrappedCredentials = "go-keyring-base64:" + Data(credentials.utf8).base64EncodedString()
         let provider = AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrappedCredentials), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: EmptyProcessRunner()),
@@ -2118,5 +2208,228 @@ final class AntigravityDbUsageScannerTests: XCTestCase {
         XCTAssertEqual(quotaLabels(merged), ["Session"], "An omitted pool must not retain its previous quota value")
         XCTAssertEqual(merged.plan, "Pro", "Quota replacement must preserve independently fetched plan state")
         XCTAssertNil(merged.clearsPriorMenuBarQuotaState)
+    }
+
+    func testPersistedCacheReloadReplaysNewlyDatedUndatedGenerations() async throws {
+        let fixture = try makeDatabaseDirectory()
+        let timestamp = UInt64(now.timeIntervalSince1970) - 3_600
+        let blob = antigravityGenerationBlob(model: "gemini-3.6-flash", input: 10, output: 2, timestamp: nil)
+        let sqlite = AntigravityFakeSQLite(rowsByPath: [fixture.paths[0]: [
+            .init(index: 0, blob: blob),
+            .init(index: 10, blob: nil, stepMetadata:
+                antigravityStepMetadata(timestamp: timestamp, stepUUID: "other", botID: "other"))
+        ]])
+        let first = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+            projectOversized: { _, _, _ in nil })
+        _ = await first.scan(now: now, pricing: pricing)
+
+        // A fresh process reloads the derivation record, including its persisted step timestamp
+        // index. An appended step that finally dates the recorded undated generation must still
+        // replay the generation rows — the index verifies incrementally, it does not go stale.
+        sqlite.append(.init(index: 11, blob: nil,
+            stepMetadata: antigravityStepMetadata(timestamp: timestamp)), to: fixture.paths[0])
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(2)],
+            ofItemAtPath: fixture.paths[0]
+        )
+        let reloaded = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+            projectOversized: { _, _, _ in nil })
+        let recovered = await reloaded.scan(now: now, pricing: pricing)
+
+        XCTAssertEqual(recovered?.series.daily.first?.totalTokens, 12)
+        XCTAssertEqual(sqlite.queriedCursors, [-1, -1],
+                       "the reloaded record must replay generations once the rebuilt step index dates them")
+    }
+
+    func testUnreadableDatabaseMarksOnlyItsCoveredDaysAndToday() async throws {
+        let fixture = try makeDatabaseDirectory(fileNames: ["a.db", "b.db"])
+        let coveredDay = now.addingTimeInterval(-3 * 86_400)
+        let liveDay = now.addingTimeInterval(-86_400)
+        let sqlite = AntigravityFakeSQLite(rowsByPath: [
+            fixture.paths[0]: [.init(index: 0, blob: antigravityGenerationBlob(
+                model: "gemini-3.6-flash", input: 10, output: 5,
+                timestamp: UInt64(coveredDay.timeIntervalSince1970)
+            ))],
+            fixture.paths[1]: [.init(index: 0, blob: antigravityGenerationBlob(
+                model: "gemini-3.6-flash", input: 20, output: 10,
+                timestamp: UInt64(liveDay.timeIntervalSince1970)
+            ))]
+        ])
+        let scanner = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path }
+        )
+        let initial = await scanner.scan(now: now, pricing: pricing)
+        XCTAssertNil(initial?.unmeasuredUsageDays)
+
+        sqlite.fail(fixture.paths[0])
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(2)],
+            ofItemAtPath: fixture.paths[0]
+        )
+        let degradedResult = await scanner.scan(now: now, pricing: pricing)
+        let degraded = try XCTUnwrap(degradedResult)
+
+        // The dead database keeps its last-good day and today marked; the day the healthy sibling
+        // alone covers stays fully measured instead of being branded partial forever.
+        XCTAssertEqual(
+            degraded.unmeasuredUsageDays,
+            [DailyUsageAccumulator.dayKey(from: coveredDay), DailyUsageAccumulator.dayKey(from: now)]
+        )
+    }
+
+    /// The merged change probe covers the schema probe, the step-table digests, and the generation
+    /// digests in one subprocess; a changed step-backed store then only needs the generation tail.
+    func testMergedChangeProbeVerifiesStepBackedDatabaseWithoutSequentialQueries() async throws {
+        let fixture = try makeDatabaseDirectory()
+        let timestamp = UInt64(now.timeIntervalSince1970) - 3_600
+        let sqlite = AntigravityFakeSQLite(rowsByPath: [fixture.paths[0]: [
+            .init(index: 0, blob: antigravityGenerationBlob(
+                model: "gemini-3.6-flash", input: 10, output: 5, timestamp: nil
+            )),
+            .init(index: 10, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: timestamp))
+        ]])
+        let scanner = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+            projectOversized: { _, _, _ in nil }
+        )
+        _ = await scanner.scan(now: now, pricing: pricing)
+        let queriesBefore = sqlite.queriedPaths[fixture.paths[0]] ?? 0
+
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: fixture.paths[0])
+        let updated = await scanner.scan(now: now, pricing: pricing)
+
+        XCTAssertEqual(try XCTUnwrap(updated).series.daily.first?.totalTokens, 15)
+        XCTAssertEqual(sqlite.mergedProbeQueries, 1, "the changed step-backed store must take the merged probe")
+        XCTAssertEqual(
+            (sqlite.queriedPaths[fixture.paths[0]] ?? 0) - queriesBefore,
+            2,
+            "one merged probe plus one generation tail page; the verified step index reads no table pages"
+        )
+    }
+
+    /// A cold process (a cold process) reloads the persisted step index and verifies it by digest
+    /// instead of re-paging every step row.
+    func testPersistedStepIndexReloadVerifiesWithoutStepTableReads() async throws {
+        let fixture = try makeDatabaseDirectory()
+        let timestamp = UInt64(now.timeIntervalSince1970) - 3_600
+        let sqlite = AntigravityFakeSQLite(rowsByPath: [fixture.paths[0]: [
+            .init(index: 0, blob: antigravityGenerationBlob(
+                model: "gemini-3.6-flash", input: 10, output: 5, timestamp: nil
+            )),
+            .init(index: 10, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: timestamp))
+        ]])
+        let first = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+            projectOversized: { _, _, _ in nil }
+        )
+        _ = await first.scan(now: now, pricing: pricing)
+        let stepQueriesAfterFirst = sqlite.queriedStepTimestampCursors.count
+
+        let record = AntigravityAggregatePersistence.read(path: fixture.paths[0])
+        XCTAssertNotNil(record?.cache.stepTimestampIndex, "the derivation record must carry the step index")
+
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: fixture.paths[0])
+        let reloaded = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+            projectOversized: { _, _, _ in nil }
+        )
+        let updated = await reloaded.scan(now: now, pricing: pricing)
+
+        XCTAssertEqual(try XCTUnwrap(updated).series.daily.first?.totalTokens, 15)
+        XCTAssertEqual(sqlite.mergedProbeQueries, 1)
+        XCTAssertEqual(
+            sqlite.queriedStepTimestampCursors.count,
+            stepQueriesAfterFirst,
+            "the persisted step index must verify by digest, not re-page the steps table"
+        )
+    }
+
+    /// A changed step-backed store where the merged probe's transient lock must retry the whole
+    /// database read once, like the sequential probe does today.
+    func testMergedChangeProbeRetriesTransientLockOnce() async throws {
+        let fixture = try makeDatabaseDirectory()
+        let timestamp = UInt64(now.timeIntervalSince1970) - 3_600
+        let sqlite = AntigravityFakeSQLite(
+            rowsByPath: [fixture.paths[0]: [
+                .init(index: 0, blob: antigravityGenerationBlob(
+                    model: "gemini-3.6-flash", input: 10, output: 5, timestamp: nil
+                )),
+                .init(index: 10, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: timestamp))
+            ]],
+            transientMergedProbePaths: [fixture.paths[0]]
+        )
+        let scanner = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+            projectOversized: { _, _, _ in nil }
+        )
+        _ = await scanner.scan(now: now, pricing: pricing)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: fixture.paths[0])
+
+        let updated = await scanner.scan(now: now, pricing: pricing)
+
+        XCTAssertEqual(try XCTUnwrap(updated).series.daily.first?.totalTokens, 15)
+        XCTAssertEqual(sqlite.mergedProbeQueries, 2, "a locked merged probe retries like the sequential path")
+    }
+
+    /// SQLite CLI builds without SHA3 must attempt the merged probe once, remember the missing
+    /// extension, and complete the changed scan through the sequential fallback.
+    func testMergedChangeProbeDegradesToSequentialQueriesWhenSHA3Unavailable() async throws {
+        let fixture = try makeDatabaseDirectory()
+        let timestamp = UInt64(now.timeIntervalSince1970) - 3_600
+        let rows = [
+            AntigravityFixtureRow(
+                index: 0,
+                blob: antigravityGenerationBlob(
+                    model: "gemini-3.6-flash", input: 10, output: 5, timestamp: nil
+                )
+            ),
+            AntigravityFixtureRow(index: 10, blob: nil, stepMetadata: antigravityStepMetadata(timestamp: timestamp))
+        ]
+        let sqlite = AntigravityFakeSQLite(rowsByPath: [fixture.paths[0]: rows])
+        let first = AntigravityDbUsageScanner(
+            sqlite: sqlite, conversationsDirectory: { fixture.url.path },
+            projectOversized: { _, _, _ in nil }
+        )
+        _ = await first.scan(now: now, pricing: pricing)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: fixture.paths[0])
+
+        // A different process (or an older sqlite3 install) that lacks SHA3 still folds correctly.
+        let sqlite2 = AntigravityFakeSQLite(rowsByPath: [fixture.paths[0]: rows], unsupportedSHA3: true)
+        let second = AntigravityDbUsageScanner(
+            sqlite: sqlite2, conversationsDirectory: { fixture.url.path },
+            projectOversized: { _, _, _ in nil }
+        )
+        let updated = await second.scan(now: now, pricing: pricing)
+
+        XCTAssertEqual(try XCTUnwrap(updated).series.daily.first?.totalTokens, 15)
+        XCTAssertEqual(sqlite2.mergedProbeQueries, 1, "merged is attempted once before the capability flag sticks")
+        XCTAssertFalse(sqlite2.queriedStepTimestampCursors.isEmpty,
+                       "the sequential fallback rebuilds the step index by paging rows")
+    }
+
+    /// The derivation record stores the index verbatim: identities, ambiguity marks, and the
+    /// digest-verification state must all survive encode/decode.
+    func testStepTimestampIndexCodableRoundTripPreservesIdentitiesAndDigestState() throws {
+        var index = AntigravityStepTimestampIndex()
+        let timestamp = UInt64(TestLocalInstant.date(2026, 10, 20, 12).timeIntervalSince1970)
+        try index.insert(
+            antigravityStepMetadata(timestamp: timestamp),
+            maximumEstimatedMemoryBytes: 64 * 1024 * 1024
+        )
+        try index.insert(
+            antigravityStepMetadata(timestamp: timestamp + 86_400),
+            maximumEstimatedMemoryBytes: 64 * 1024 * 1024
+        )
+        let encoded = try JSONEncoder().encode(index)
+        let decoded = try JSONDecoder().decode(AntigravityStepTimestampIndex.self, from: encoded)
+
+        XCTAssertEqual(decoded, index)
+        let generation = antigravityGenerationBlob(
+            model: "gemini-3.6-flash", input: 10, output: 2, timestamp: nil
+        )
+        XCTAssertNil(decoded.timestamp(for: generation), "cross-day ambiguity must survive the round trip")
+        XCTAssertEqual(decoded.timeZoneIdentifier, Calendar.current.timeZone.identifier)
     }
 }

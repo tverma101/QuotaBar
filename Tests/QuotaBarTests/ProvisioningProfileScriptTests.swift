@@ -3,21 +3,21 @@ import XCTest
 
 final class ProvisioningProfileScriptTests: XCTestCase {
     func testProfileMatcherAcceptsBareAndMatchingTeamPrefixedUbiquityIdentifiers() throws {
-        XCTAssertTrue(try matches(containerID: "iCloud.com.robinebers.openusage.dev"))
-        XCTAssertTrue(try matches(containerID: "TEAM123.iCloud.com.robinebers.openusage.dev"))
+        XCTAssertTrue(try matches(containerID: "iCloud.com.tverma101.quotabar.dev"))
+        XCTAssertTrue(try matches(containerID: "TEAM123.iCloud.com.tverma101.quotabar.dev"))
     }
 
     func testProfileMatcherRejectsWrongTeamBundleAndContainerIdentifiers() throws {
-        XCTAssertFalse(try matches(containerID: "OTHERTEAM.iCloud.com.robinebers.openusage.dev"))
+        XCTAssertFalse(try matches(containerID: "OTHERTEAM.iCloud.com.tverma101.quotabar.dev"))
         XCTAssertFalse(try matches(
-            applicationID: "TEAM123.com.robinebers.some-other-app",
-            containerID: "TEAM123.iCloud.com.robinebers.openusage.dev"
+            applicationID: "TEAM123.com.tverma101.some-other-app",
+            containerID: "TEAM123.iCloud.com.tverma101.quotabar.dev"
         ))
-        XCTAssertFalse(try matches(containerID: "TEAM123.iCloud.com.robinebers.openusage"))
+        XCTAssertFalse(try matches(containerID: "TEAM123.iCloud.com.tverma101.quotabar"))
     }
 
     private func matches(
-        applicationID: String = "TEAM123.com.robinebers.openusage.dev",
+        applicationID: String = "TEAM123.com.tverma101.quotabar.dev",
         containerID: String
     ) throws -> Bool {
         let script = URL(fileURLWithPath: #filePath)
@@ -35,8 +35,8 @@ final class ProvisioningProfileScriptTests: XCTestCase {
             script.path,
             applicationID,
             containerID,
-            "com.robinebers.openusage.dev",
-            "iCloud.com.robinebers.openusage.dev"
+            "com.tverma101.quotabar.dev",
+            "iCloud.com.tverma101.quotabar.dev"
         ]
         try process.run()
         process.waitUntilExit()

@@ -1,21 +1,26 @@
 import Foundation
 
-/// Display identity is separate from the rate used for each receipt. Modes can share a model row
-/// while keeping their own measured tokens and public-rate estimates in its variants — except the
-/// removed Flash Fast mode, which collapses onto its base model entirely (`presentedName`).
+/// Receipt provenance determines whether a Fast-tier name and price can be used. Modes can share
+/// a model row while keeping their own measured tokens and public-rate estimates in its variants.
 struct FreebuffModelIdentity {
     static let olderUsageName = "Older Freebuff Usage"
     struct Resolved {
         var route: String?
         var displayName: String?
         var group: String?
+        /// The raw text looks Fast but nothing identifies it — report unknown, not named-unpriced.
+        var hasUnknownRoute: Bool = false
     }
 
     private let entries: [String: FreebuffModelCatalog.Entry]
     private let routes: [String: String]
     private let legacyEntries: [String: FreebuffModelCatalog.Entry]
     private let routeNames: [String: String]
-    private var memo: [String: Resolved] = [:]
+    private struct LookupKey: Hashable {
+        let model: String
+        let fromReceipt: Bool
+    }
+    private var memo: [LookupKey: Resolved] = [:]
 
     init(entries: [String: FreebuffModelCatalog.Entry], pricing: ModelPricing) {
         self.entries = entries
@@ -30,36 +35,78 @@ struct FreebuffModelIdentity {
             return pairs.first?.1
         }
         routeNames = Dictionary(grouping: routes.keys, by: { routes[$0]! }).compactMapValues { keys in
-            let names = Set(keys.compactMap { entries[$0]?.displayName }.map(Self.presentedName))
+            let names = Set(keys.compactMap { entries[$0]?.displayName })
             // Multiple opaque keys with the same display name still name one model. Distinct
             // catalogue names on one price route do not prove an identity.
             return names.count == 1 ? names.first : nil
         }
     }
 
-    mutating func resolve(_ model: String, pricing: ModelPricing) -> Resolved {
-        if let cached = memo[model] { return cached }
-        // Use the provider's published migration contract, never guess an opaque key from its name.
+    mutating func resolve(_ model: String, pricing: ModelPricing, fromReceipt: Bool = false) -> Resolved {
+        let key = LookupKey(model: model, fromReceipt: fromReceipt)
+        if let cached = memo[key] { return cached }
+        // A display label, opaque key, or saved selection cannot prove a serving tier.
         let entry = entries[model] ?? legacyEntries[Self.legacyDigest(model)]
-        let route: String?
-        if pricing.openRouter.entries[model] != nil || pricing.supplement.pricing[model] != nil {
-            route = model
+        let exact = exactRoute(for: model, pricing: pricing)
+        let resolved: Resolved
+        if let base = (exact == nil || !fromReceipt
+                       ? entry.flatMap({ FreebuffModelCatalog.fastBaseName($0.displayName) }) : nil)
+            ?? FreebuffModelCatalog.fastBaseName(model) {
+            let name: String
+            let route: String?
+            if fromReceipt, let exact, FreebuffModelCatalog.fastBaseName(model) != nil {
+                name = Self.isDeepSeekFlashFastRoute(model)
+                    ? "DeepSeek V4.1 Flash Fast (Recorded Route)" : "\(model) (Recorded Route)"
+                route = exact
+            } else if Self.isDeepSeekFlashFastRoute(model) || Self.isDeepSeekFlashBaseName(base) {
+                route = FreebuffFlashComparison.route
+                name = "DeepSeek V4.1 Flash (Standard Rate Assumed)"
+            } else {
+                let modelName = Self.isDeepSeekFlashFastRoute(model) ? "DeepSeek V4.1 Flash" : base
+                name = "\(modelName) (Route Unverified)"
+                route = nil
+            }
+            resolved = Resolved(route: route, displayName: name, group: name,
+                                hasUnknownRoute: entry == nil && exact == nil
+                                    && !Self.isDeepSeekFlashFastRoute(model)
+                                    && !Self.isDeepSeekFlashBaseName(base))
         } else {
-            route = entry.flatMap { routes[$0.key] }
+            let route = exact ?? entry.flatMap { entry in
+                if routes[entry.key] != nil { return routes[entry.key] }
+                switch Self.groupName(entry.displayName).lowercased() {
+                case "deepseek v4.1 flash": return FreebuffFlashComparison.route
+                default: return nil
+                }
+            }
+            let entryName = entry?.displayName
+            let displayName = entryName.flatMap { FreebuffModelCatalog.fastBaseName($0) == nil ? $0 : nil }
+                ?? route.flatMap { routeNames[$0] }
+            resolved = Resolved(route: route, displayName: displayName, group: displayName.map(Self.groupName))
         }
-        let displayName = (entry?.displayName ?? route.flatMap { routeNames[$0] }).map(Self.presentedName)
-        let resolved = Resolved(route: route, displayName: displayName,
-                                group: displayName.map(Self.groupName))
-        if memo.count < 4_096 { memo[model] = resolved }
+        if memo.count < 4_096 { memo[key] = resolved }
         return resolved
     }
 
-    /// The catalogue name a model row presents. Freebuff removed its Flash Fast serving mode, so a
-    /// name that still claims it is stale — the key serves the base Flash model (hosted receipts
-    /// carry only the plain slug). Present that base name; the removed mode must not reappear as a
-    /// model identity or a spelling variant anywhere. Slow remains a real mode and keeps its label.
-    static func presentedName(_ name: String) -> String {
-        FreebuffModelCatalog.removedModeBaseName(name) ?? name
+    private static let curatedFastRoute = "deepseek-v4.1-flash-fast"
+
+    private static func isDeepSeekFlashFastRoute(_ name: String) -> Bool {
+        name == curatedFastRoute || name == "deepseek/\(curatedFastRoute)"
+    }
+
+    /// The one family whose Fast label QuotaBar treats as the standard tier by owner decision.
+    private static func isDeepSeekFlashBaseName(_ name: String) -> Bool {
+        switch name.lowercased() {
+        case "deepseek v4.1 flash", "deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash": true
+        default: false
+        }
+    }
+
+    private func exactRoute(for model: String, pricing: ModelPricing) -> String? {
+        if pricing.openRouter.entries[model] != nil || pricing.supplement.pricing[model] != nil { return model }
+        if Self.isDeepSeekFlashFastRoute(model), pricing.supplement.pricing[Self.curatedFastRoute] != nil {
+            return Self.curatedFastRoute
+        }
+        return FreebuffFlashComparison.matchesRoute(model) ? model : nil
     }
 
     /// Matches `freebuffLegacyModelDigest` in Freebuff's common/types/freebuff-model-catalog.ts:

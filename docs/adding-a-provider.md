@@ -5,21 +5,21 @@ pieces below make sense.
 
 ## What a provider is
 
-A provider is a small Swift module under `Sources/QuotaBar/Providers/<Name>/` that conforms to
-`ProviderRuntime`. It has three parts:
+A provider implements `ProviderRuntime` under `Rust/quotabar-engine/src/providers/`. It has three parts:
 
 - an **auth store** that reads credentials already on the user's machine (config files, keychain),
 - a **usage client** that calls the provider's API,
 - a **mapper** that turns the response into the app's metric vocabulary.
 
-QuotaBar never asks the user to paste a token — if the provider's own CLI or app has already logged in,
-QuotaBar reads those existing credentials.
+QuotaBar normally reads the companion CLI or app's existing login. API-key-only providers use the
+settings workflow described below.
 
-Besides `refresh()`, every provider implements `hasLocalCredentials()` — a local-only check of whether
+Besides `refresh`, every Rust provider implements `has_local_credentials`, a local-only check of whether
 its setup credentials exist, without contacting the provider. Customize uses this probe to mark
 matching setups on the Mac. The probe must stay silent and mirror the credential sources `refresh()`
 reads. Its result is a hint only: optional providers stay off until the user selects them in Customize.
-Run blocking loads via `loadOffMainActor`. See [Which Providers Are On](provider-enablement.md).
+The Swift wrapper calls `RustEngine`, which runs blocking work away from the UI thread. See
+[Which Providers Are On](provider-enablement.md).
 
 ## The metric contract
 
@@ -43,25 +43,23 @@ of the number, not by the provider:
   use `.progress`, `.values`, `.badge`, or `.chart` for every descriptor-backed row.
 
 Set the snapshot's `plan` when the provider exposes a plan name. On failure, return
-`ProviderSnapshot.error(provider:error:)` with a typed provider error when possible, so telemetry can group
-the failure by a stable, non-private reason such as "not logged in" or "network". Use the message-only
-factory only when there is no typed error, and never return stale or empty data silently.
+`ProviderSnapshot::error` with a user-facing message and an `ErrorCategory`. Telemetry uses the
+category to group failures. Report incomplete scans and honor cancellation.
 
 ## Steps
 
 1. **Check first.** Look at open issues and `docs/providers/` to see if the provider is already requested
    or in progress.
-2. **Create the module.** Add `Sources/QuotaBar/Providers/<Name>/` with the auth store, usage client, and
-   mapper, conforming to `ProviderRuntime` — both `refresh()` and `hasLocalCredentials()` (the compiler
-   enforces the latter; there is no default). The probe must stay local-only and reuse the same auth-store
-   loaders and credential-usability filters that `refresh()` starts with — don't write a second
-   credential-reading path. Reuse the shared helpers in `Support/` (`ProviderParse` for
-   JSON/number/percent parsing, `QuotaBarISO8601` for timestamps) instead of copying them.
-3. **Declare its widgets.** Expose the provider's metrics as `WidgetDescriptor`s using the factories in
+2. **Create the Rust module.** Reuse the shared HTTP, parsing, accounting, and host services. Use the
+   same credential loaders for setup probes and refreshes. Honor the refresh scope so a history
+   scan can run independently of live quota requests.
+3. **Declare its widgets.** Add a Swift wrapper under `Sources/QuotaBar/Providers/<Name>/` that calls
+   `RustEngine.refresh` and `RustEngine.hasLocalCredentials`. Declare metrics with the factories in
    `WidgetDescriptor+Factories.swift` (`percent`, `boundedDollars`, `spend`, `tokenSpend`, `combined`, `values`, `badge`, and so on).
-4. **Register it.** Add the provider to the list in `AppContainer`.
-5. **Test it.** Add focused tests under `Tests/QuotaBarTests/`, including a mapper test that feeds a
-   sample API response and checks the resulting metric lines.
+4. **Register it.** Add the runtime to the Rust provider registry in `src/providers/mod.rs` and the
+   Swift wrapper to `ProviderCatalog`. Confirm widget defaults with the project owner.
+5. **Test it.** Put mapper, credential, and scanner fixtures in the Rust engine tests. Use Swift
+   tests to verify widget and bridge behavior.
 6. **Document it.** Add a page under `docs/providers/` covering what it tracks, where its credentials come
    from, the endpoints it calls, and what its error states mean.
 7. **Run it.** Build and launch with `./script/build_and_run.sh` and confirm the provider shows up.
@@ -74,7 +72,9 @@ factory only when there is no typed error, and never return stale or empty data 
 
 ## Keychain credential reads
 
-- Use `readGenericPasswordForRefresh` (or its current-user variant) on every refresh path. Keep the flagless `readGenericPassword` overloads out of refresh code; they cannot reliably suppress Keychain UI.
+- Use the engine's `SecureReadRequest::for_refresh` for refreshes and `SecureReadRequest::silent` for
+  setup probes. The Swift host uses the request ID to recover the explicit Refresh action's
+  interaction budget.
 - Pass the provider's known account name so reads and prompt suppression stay scoped to the exact item. Codex profiles, for example, have separate account names derived from their `CODEX_HOME` paths.
 - Keep credential probes local and silent. Do not enable interaction from `hasLocalCredentials()`.
 - Only explicit Refresh actions run inside `withManualRefresh`. `loadOffMainActor` carries that context through its detached task, including the shared one-dialog budget. Background, panel-open, and startup passes stay silent.

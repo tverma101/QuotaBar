@@ -8,7 +8,7 @@
 //! "input_per_million"?: …, "output_per_million"?: …, "cache_write_per_million"?: …,
 //! "cache_read_per_million"?: …, "cache_write_1h_per_million"?: …}],
 //! "ia"?: 1.0, "oa"?: 1.0, "cwa"?: 1.0, "cra"?: 1.0,
-//! "cre"?: true, "fast"?: 1.0}} , "retired"?: ["…"]}`
+//! "cre"?: true, "crb"?: false, "fast"?: 1.0}} , "retired"?: ["…"]}`
 //!
 //! The Rust entry point returns an opaque handle; Swift reassembles `ModelRates` through the C ABI.
 //! This is the *fallback*: Swift's `catalogFromCompact` runs Foundation's `JSONDecoder` first
@@ -107,12 +107,16 @@ fn intern_entry(
     let cw_200k = opt_f64(model, "cwa")?;
     let cr_200k = opt_f64(model, "cra")?;
 
-    let cache_read_is_explicit = match model.get("cre") {
+    let legacy_cache_read_is_explicit = match model.get("cre") {
         None => 1,
         Some(v) => match v.as_bool() {
             Some(b) => u8::from(b),
             None => return None, // Foundation throws on a wrong-typed cre
         },
+    };
+    let cache_read_is_explicit = match model.get("crb") {
+        None | Some(Value::Null) => legacy_cache_read_is_explicit,
+        Some(v) => u8::from(v.as_bool()?),
     };
     let fast_multiplier = match model.get("fast") {
         None => 1.0,

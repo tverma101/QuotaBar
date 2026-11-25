@@ -21,7 +21,8 @@ struct SnoozeSettingsSection: View {
                 let status = snooze.statusText(
                     for: providerID,
                     pinnedMetrics: pinned,
-                    data: { container.dataStore.data(for: $0) }
+                    data: { container.dataStore.widgetDataByDescriptorID[$0.id]
+                        ?? container.dataStore.data(for: $0) }
                 )
                 HStack(spacing: 8) {
                     if let mark = ProviderMarks.mark(for: provider.icon.providerID) {

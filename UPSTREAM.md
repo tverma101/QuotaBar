@@ -65,6 +65,15 @@ Local changes that matter when syncing shared code:
    undated records never become today's usage on launch. OpenCode reads both SQLite message layouts
    and deduplicates migrated IDs. Reasoning-only Router records keep their measured lower bound
    without blocking independent OpenCode history. Completed Router prefixes remain usable through ordinary appends during the wider fold; rewrites and replacements still invalidate them. Preserve these format-compatibility fixes.
+5. **Rust backend (`Rust/quotabar-engine`).** Upstream is Swift-only. QuotaBar's macOS provider
+   backends live in a cross-platform Rust engine linked through `quotabar-core` (see
+   `docs/rust-core.md`): Antigravity, Claude, Codex, Copilot, Cursor, Devin, Freebuff, Grok, Hermes,
+   OpenCode, OpenRouter, and Z.ai refresh there, alongside local history folds, in-process SQLite
+   reads (replacing `/usr/bin/sqlite3`), and `.jsonl.zst` decoding. The Windows port runs Devin's
+   live quota on the same engine while its other providers stay on plugins. When syncing an upstream
+   provider fix, check whether that provider now lives in the engine. The SQLite read-only open and
+   source-signature techniques are adapted from rsusage (MIT, © 2026 Coobyk,
+   https://github.com/coobyk/rsusage); keep that attribution in `Rust/quotabar-engine/src/sqlite.rs`.
 
 ## Selective sync — 2026-10-21
 
@@ -104,3 +113,11 @@ Adapted upstream `214ba770`: the screenshot action appears while the pointer is 
 
 Adapted upstream `8a883219` to carry Claude Extra Usage's billing currency and minor-unit scale through
 the dashboard and local limits API. Existing USD output and the fork's uncapped-row behavior are retained.
+
+## Devin weekly-quota exhausted-window adaptation
+
+Adapted upstream `6a28acec`: a missing weekly percentage paired with a valid future weekly
+reset is treated as an exhausted window (100% used), because proto3 JSON omits zero values.
+The hidden-daily fallback in the Rust Devin mapper applies only when
+both the percentage and a usable reset are absent, and present-but-unreadable percentages
+fail as invalid responses.

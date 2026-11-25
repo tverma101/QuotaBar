@@ -378,8 +378,10 @@ actor JSONLScanCacheWriter {
             }
             return data
         }
-        let manifest = try JSONLAccountingWorkPacer.shared.perform {
-            try PropertyListDecoder().decode(JSONLScanCacheManifest.self, from: manifestData)
+        let manifest = try autoreleasepool {
+            try JSONLAccountingWorkPacer.shared.perform {
+                try PropertyListDecoder().decode(JSONLScanCacheManifest.self, from: manifestData)
+            }
         }
         var files: [String: JSONLScanCachedFile<Item>] = [:]
         var invalidRecords: [String: JSONLScanCacheFileMetadata] = [:]
@@ -450,8 +452,10 @@ actor JSONLScanCacheWriter {
             }
             return manifestData
         }
-        return try JSONLAccountingWorkPacer.shared.perform {
-            try PropertyListDecoder().decode(JSONLScanCacheManifest.self, from: manifestData)
+        return try autoreleasepool {
+            try JSONLAccountingWorkPacer.shared.perform {
+                try PropertyListDecoder().decode(JSONLScanCacheManifest.self, from: manifestData)
+            }
         }
     }
 
@@ -475,8 +479,10 @@ actor JSONLScanCacheWriter {
             try? Data(contentsOf: url, options: .mappedIfSafe)
         }
         guard let data,
-              let record = JSONLAccountingWorkPacer.shared.perform({
-                  try? PropertyListDecoder().decode(JSONLScanCacheRecord<Item>.self, from: data)
+              let record = autoreleasepool(invoking: {
+                  JSONLAccountingWorkPacer.shared.perform {
+                      try? PropertyListDecoder().decode(JSONLScanCacheRecord<Item>.self, from: data)
+                  }
               }),
               record.path == path,
               record.size == metadata.size,
@@ -517,32 +523,36 @@ actor JSONLScanCacheWriter {
             at: JSONLScanCachePaths.lockURL(persistence: persistence, identity: identity)
         ) {
             for (path, metadata) in requested {
-                let url = JSONLScanCachePaths.recordURL(
-                    persistence: persistence,
-                    identity: identity,
-                    fileName: metadata.recordFileName
-                )
-                guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
-                    invalid[path] = metadata
-                    continue
+                // Decode debris (mapped data + plist object graph) drains per record rather
+                // than piling up across a whole batch inside one lock pass.
+                autoreleasepool {
+                    let url = JSONLScanCachePaths.recordURL(
+                        persistence: persistence,
+                        identity: identity,
+                        fileName: metadata.recordFileName
+                    )
+                    guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+                        invalid[path] = metadata
+                        return
+                    }
+                    guard let record = JSONLAccountingWorkPacer.shared.perform({
+                        try? recordDecoder.decode(JSONLScanCacheRecord<Item>.self, from: data)
+                    }),
+                    record.path == path,
+                    record.size == metadata.size,
+                    record.mtime == metadata.mtime,
+                    record.attributeMtime == metadata.attributeMtime
+                    else {
+                        invalid[path] = metadata
+                        return
+                    }
+                    files[path] = JSONLScanCachedFile(
+                        size: record.size,
+                        mtime: record.mtime,
+                        attributeMtime: record.attributeMtime,
+                        items: record.items
+                    )
                 }
-                guard let record = JSONLAccountingWorkPacer.shared.perform({
-                    try? recordDecoder.decode(JSONLScanCacheRecord<Item>.self, from: data)
-                }),
-                record.path == path,
-                record.size == metadata.size,
-                record.mtime == metadata.mtime,
-                record.attributeMtime == metadata.attributeMtime
-                else {
-                    invalid[path] = metadata
-                    continue
-                }
-                files[path] = JSONLScanCachedFile(
-                    size: record.size,
-                    mtime: record.mtime,
-                    attributeMtime: record.attributeMtime,
-                    items: record.items
-                )
             }
         }
         return (files, invalid)
@@ -595,8 +605,10 @@ actor JSONLScanCacheWriter {
     }
 
     private static func readManifest(at url: URL) -> JSONLScanCacheManifest? {
-        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
-        return try? PropertyListDecoder().decode(JSONLScanCacheManifest.self, from: data)
+        autoreleasepool {
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+            return try? PropertyListDecoder().decode(JSONLScanCacheManifest.self, from: data)
+        }
     }
 
     private static func sameSourceRevision(

@@ -116,8 +116,9 @@ enum CodexRolloutRustParser {
             return state
         }
 
-        var hasMalformedUsage: Bool {
-            qb_codex_parser_malformed(parser) != 0
+        /// Lines the engine skipped as damaged (mirrors `FileParser.damagedLineCount`).
+        var damagedLineCount: Int {
+            Int(qb_codex_parser_damaged_count(parser))
         }
 
         /// Move out the events emitted so far. Valid to call once, after the last line.

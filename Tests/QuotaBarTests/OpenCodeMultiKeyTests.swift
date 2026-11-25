@@ -23,15 +23,32 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         )
     }
 
-    /// Returns canned responses in order — one per request — so a two-key refresh sees two answers.
+    /// Returns canned responses — one per credential — so a two-key refresh sees two answers.
+    /// Account fetches run concurrently, so multi-response fixtures pass `credentialOrder` (the
+    /// keys in `apiKeys` order) and responses are keyed to the request's Bearer token rather
+    /// than to whichever request happened to arrive first.
     private final class SequenceHTTPClient: HTTPClient, @unchecked Sendable {
-        var responses: [HTTPResponse]
+        private let lock = NSLock()
+        private var responses: [HTTPResponse]
+        private let credentialOrder: [String]
         var requests: [HTTPRequest] = []
-        init(_ responses: [HTTPResponse]) { self.responses = responses }
+        init(_ responses: [HTTPResponse], credentialOrder: [String] = []) {
+            self.responses = responses
+            self.credentialOrder = credentialOrder
+        }
         func send(_ request: HTTPRequest) async throws -> HTTPResponse {
-            requests.append(request)
-            if responses.count == 1 { return responses[0] }
-            return responses.isEmpty ? HTTPResponse(statusCode: 500, headers: [:], body: Data()) : responses.removeFirst()
+            lock.withLock {
+                requests.append(request)
+                if responses.count == 1 { return responses[0] }
+                if !credentialOrder.isEmpty,
+                   let index = request.headers["Authorization"]
+                       .flatMap({ $0.hasPrefix("Bearer ") ? String($0.dropFirst(7)) : nil })
+                       .flatMap({ credentialOrder.firstIndex(of: $0) }),
+                   index < responses.count {
+                    return responses[index]
+                }
+                return responses.isEmpty ? HTTPResponse(statusCode: 500, headers: [:], body: Data()) : responses.removeFirst()
+            }
         }
     }
 
@@ -44,7 +61,10 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         }
         func queryValue(path: String, sql: String) throws -> String? {
             if failingPaths.contains(path) { throw CocoaError(.fileReadNoPermission) }
-            if sql.contains("json_group_array") { return data[path] ?? "[]" }
+            if sql.contains("json_group_array") {
+                guard let payload = data[path] else { return "[]" }
+                return OpenCodeDBRowsForChunk.apply(payload: payload, sql: sql)
+            }
             if sql.contains("SELECT 1") { return data[path] == nil ? nil : "1" }
             return nil
         }
@@ -386,7 +406,7 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         let http = SequenceHTTPClient([
             HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79)),
             HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 55, weekly: 60, monthly: 90))
-        ])
+        ], credentialOrder: ["sk-go", "sk-work"])
         let work = OpenCodeGoKey(id: UUID(), label: "Work", key: "sk-work")
         let snapshot = await provider(authJSON: authJSON, http: http, storedKeys: [work]).refresh()
         XCTAssertEqual(snapshot.line(label: "Session (opencode-go)")?.label, "Session (opencode-go)")
@@ -407,7 +427,7 @@ final class OpenCodeMultiKeyTests: XCTestCase {
             http: SequenceHTTPClient([
                 HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79)),
                 HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 55, weekly: 60, monthly: 90))
-            ]),
+            ], credentialOrder: ["sk-go", "sk-work"]),
             storedKeys: [work]
         )
         let registry = WidgetRegistry.from([runtime])
@@ -454,7 +474,7 @@ final class OpenCodeMultiKeyTests: XCTestCase {
             http: SequenceHTTPClient([
                 HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79)),
                 HTTPResponse(statusCode: 503, headers: [:], body: Data())
-            ]),
+            ], credentialOrder: ["sk-go", "sk-work"]),
             storedKeys: [work]
         )
         let registry = WidgetRegistry.from([runtime])
@@ -492,7 +512,11 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         let responses = [7, 17, 27, 37].map { value in
             HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: value, weekly: value + 1, monthly: value + 2))
         }
-        let runtime = provider(authJSON: authJSON, http: SequenceHTTPClient(responses), storedKeys: accounts)
+        let runtime = provider(
+            authJSON: authJSON,
+            http: SequenceHTTPClient(responses, credentialOrder: ["sk-go", "sk-work-a", "sk-work-b", "sk-work-c"]),
+            storedKeys: accounts
+        )
         let registry = WidgetRegistry.from([runtime])
 
         let snapshot = await runtime.refresh()
@@ -721,7 +745,7 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         let http = SequenceHTTPClient([
             HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79)),
             HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79))
-        ])
+        ], credentialOrder: ["sk-go", "sk-work"])
         let work = OpenCodeGoKey(id: UUID(), label: "Work", key: "sk-work")
         let snapshot = await provider(authJSON: authJSON, http: http, storedKeys: [work]).refresh()
 
@@ -761,11 +785,11 @@ final class OpenCodeMultiKeyTests: XCTestCase {
 
     func testSelectionPinsCardToThatAccountOnly() async {
         // Two distinct credentials; the selection swaps the card to one of them.
+        let work = OpenCodeGoKey(id: UUID(), label: "Work", key: "sk-work")
         let http = SequenceHTTPClient([
             HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79)),
             HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 55, weekly: 60, monthly: 90))
-        ])
-        let work = OpenCodeGoKey(id: UUID(), label: "Work", key: "sk-work")
+        ], credentialOrder: ["sk-go", "sk-work"])
         let snapshot = await provider(
             authJSON: authJSON,
             http: http,
@@ -788,7 +812,7 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         let http = SequenceHTTPClient([
             HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79)),
             HTTPResponse(statusCode: 503, headers: [:], body: Data())
-        ])
+        ], credentialOrder: ["sk-go", "sk-work"])
         let work = OpenCodeGoKey(id: UUID(), label: "Work", key: "sk-work")
 
         let snapshot = await provider(
@@ -808,12 +832,30 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         XCTAssertNotNil(snapshot.warning)
     }
 
+    func testSelectionByStoredKeyUUIDPinsThatAccount() async {
+        let work = OpenCodeGoKey(id: UUID(), label: "Work", key: "sk-work")
+        let http = SequenceHTTPClient([
+            HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79)),
+            HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 55, weekly: 60, monthly: 90))
+        ], credentialOrder: ["sk-go", "sk-work"])
+        let snapshot = await provider(
+            authJSON: authJSON, http: http, storedKeys: [work], activeKeyID: { work.id.uuidString }
+        ).refresh()
+        XCTAssertEqual(snapshot.line(label: "Session (Work)")?.label, "Session (Work)")
+        XCTAssertNil(snapshot.line(label: "Session (opencode-go)"))
+        XCTAssertNil(snapshot.line(label: "Session"))
+        guard case let .progress(_, used, _, _, _, _, _, _)? = snapshot.line(label: "Session (Work)") else {
+            return XCTFail("expected the stored-key account's Session meter")
+        }
+        XCTAssertEqual(used, 55)
+    }
+
     func testStaleSelectionFallsBackToAllAccounts() async {
         // A selection that matches no fetched key must not hide anything: all accounts render.
         let http = SequenceHTTPClient([
             HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 7, weekly: 26, monthly: 79)),
             HTTPResponse(statusCode: 200, headers: [:], body: Self.payload(rolling: 55, weekly: 60, monthly: 90))
-        ])
+        ], credentialOrder: ["sk-go", "sk-work"])
         let work = OpenCodeGoKey(id: UUID(), label: "Work", key: "sk-work")
         let snapshot = await provider(
             authJSON: authJSON,

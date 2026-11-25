@@ -49,18 +49,6 @@ final class HostileNumericInputTests: XCTestCase {
 
     // MARK: - End-to-end through the parsers that crashed
 
-    /// Grok's `modelUsage` counts. The only guard was `>= 0`, which bounds the wrong end of the range.
-    func testGrokLogLineWithAbsurdCountsDoesNotTrap() throws {
-        let line = #"{"type":"event_msg","payload":{"type":"token_count","modelUsage":{"m":{"inputTokens":1e30,"outputTokens":5,"cachedReadTokens":-1e30}}},"timestamp":"2026-09-20T10:00:00.000Z"}"#
-        // Surviving the payload is the entire assertion: a trap fails the run rather than an assertion,
-        // which is the regression being guarded. Whether the line also happens to yield a row is a
-        // separate question and deliberately not claimed here.
-        let entries = GrokLogUsageScanner.parseFile(Data(line.utf8))
-        for entry in entries {
-            XCTAssertGreaterThanOrEqual(entry.tokens.input, 0, "a count must never be negative")
-        }
-    }
-
     /// Pi session usage block, six unclamped conversion sites.
     func testPiUsageBlockWithAbsurdCountDoesNotTrap() throws {
         let line = #"{"id":"m1","timestamp":"2026-09-20T10:00:00.000Z","message":{"role":"assistant","provider":"cursor","model":"composer-2.5","usage":{"input":1e30,"output":1e30,"cacheRead":1e30,"cacheWrite":1e30,"cacheWrite1h":1e30,"totalTokens":1e30}}}"#

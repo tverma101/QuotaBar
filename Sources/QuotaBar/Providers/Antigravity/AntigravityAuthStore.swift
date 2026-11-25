@@ -11,13 +11,27 @@ struct AntigravityKeychainToken: Sendable, Equatable {
     var expiry: Date?
 }
 
+/// T3 Code's private Antigravity instances keep a self-contained OAuth credential on disk
+/// (`acp_token.json`: refresh token plus the instance's own client pair). Reading it needs no
+/// Keychain grant, so a per-build cdhash change cannot lock QuotaBar out of quota the way the
+/// Keychain ACL does. QuotaBar only ever reads the file; T3 Code owns writing it.
+struct AntigravityFileCredential: Sendable, Equatable {
+    var refreshToken: String
+    var clientID: String
+    var clientSecret: String
+    var projectID: String?
+    var sourcePath: String
+}
+
 struct AntigravityAuthStore: Sendable {
     static let keychainService = "gemini"
     static let keychainAccount = "antigravity"
     static let unresolvedCacheIdentityKey = "antigravity-unresolved"
     /// Our own cache of refreshed access tokens, so a Google OAuth refresh happens ~once per token
     /// lifetime instead of every refresh cycle. We never write back to Antigravity's keychain item.
-    static let cachePath = "~/Library/Application Support/QuotaBar/antigravity/auth.json"
+    // Native-source builds keep their derived-token cache under a native name; the old T3-era file
+    // stays on disk unreferenced so it can never be mistaken for this app's credential.
+    static let cachePath = "~/Library/Application Support/QuotaBar/antigravity/native-auth.json"
     private static let cacheReadFailureKey = "auth.antigravity.cache.read"
     private static let cacheDecodeFailureKey = "auth.antigravity.cache.decode"
     private static let cacheWriteFailureKey = "auth.antigravity.cache.write"
@@ -28,15 +42,22 @@ struct AntigravityAuthStore: Sendable {
     var keychain: KeychainAccessing
     var files: TextFileAccessing
     var now: @Sendable () -> Date
+    /// Where T3 Code's private Antigravity instances keep their file-based OAuth credentials.
+    /// Injected so tests can point at a fixture tree; the default discovers the real profiles.
+    var fileCredentialPaths: @Sendable () -> [URL]
 
     init(
         keychain: KeychainAccessing = SecurityKeychainAccessor(),
         files: TextFileAccessing = LocalTextFileAccessor(),
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        // Production reads no file credentials — T3's credentials belong to T3, not this app.
+        // Tests that exercise the legacy loader inject their own paths explicitly.
+        fileCredentialPaths: @escaping @Sendable () -> [URL] = { [] }
     ) {
         self.keychain = keychain
         self.files = files
         self.now = now
+        self.fileCredentialPaths = fileCredentialPaths
     }
 
     /// Blocking keychain read — call off the main actor.
@@ -72,10 +93,48 @@ struct AntigravityAuthStore: Sendable {
     /// Stable, non-secret account stamp for quota snapshots. Refresh credentials remain stable across
     /// access-token rotation; access-token-only records still get a conservative account fence.
     static func cacheIdentityKey(for token: AntigravityKeychainToken) -> String? {
-        guard let fingerprint = credentialFingerprint(for: token.refreshToken)
-                ?? credentialFingerprint(for: token.accessToken) else { return nil }
+        cacheIdentityKey(forRefreshToken: token.refreshToken)
+            ?? cacheIdentityKey(forRefreshToken: token.accessToken)
+    }
+
+    /// Same account stamp for a file-based refresh credential (T3 Code's private instances).
+    static func cacheIdentityKey(forRefreshToken refreshToken: String?) -> String? {
+        guard let fingerprint = credentialFingerprint(for: refreshToken) else { return nil }
         let digest = fingerprint.map { String(format: "%02x", $0) }.joined()
         return "antigravity-\(digest)"
+    }
+
+    // MARK: - T3 Code file credentials
+
+    /// Every usable T3 Code Antigravity credential, most recently active instance first. Silent and
+    /// local-only: a missing or malformed file is that instance's absence, never an error here — the
+    /// provider reports the outcome when no source can authenticate.
+    func loadFileCredentials() -> [AntigravityFileCredential] {
+        fileCredentialPaths().compactMap { loadFileCredential(atPath: $0.path) }
+    }
+
+    /// One `acp_token.json`. The refresh token is only ever sent to Google's OAuth endpoint: a file
+    /// naming any other `token_uri` is refused at this boundary rather than trusted.
+    func loadFileCredential(atPath path: String) -> AntigravityFileCredential? {
+        guard let text = try? files.readTextIfPresent(path) else { return nil }
+        guard let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else {
+            DiagnosticGate.logOnce(for: "auth.antigravity.file.\(JSONLScanCachePaths.stableFingerprint(path))") {
+                AppLog.warn(LogTag.auth("antigravity"), "T3 Code Antigravity credential is not readable JSON; skipping it")
+            }
+            return nil
+        }
+        guard let refresh = Self.firstString(object, ["refresh_token", "refreshToken"]),
+              let clientID = Self.firstString(object, ["client_id", "clientId"]),
+              let clientSecret = Self.firstString(object, ["client_secret", "clientSecret"]),
+              (object["token_uri"] as? String) == AntigravityUsageClient.googleOAuthURL
+        else { return nil }
+        return AntigravityFileCredential(
+            refreshToken: refresh,
+            clientID: clientID,
+            clientSecret: clientSecret,
+            projectID: Self.firstString(object, ["project_id", "projectId"]),
+            sourcePath: path
+        )
     }
 
     /// Resolve the launch identity without ever presenting a Keychain prompt. If Antigravity's ACL
@@ -114,7 +173,17 @@ struct AntigravityAuthStore: Sendable {
     }
 
     func loadCachedToken(matching source: AntigravityKeychainToken) -> String? {
-        guard let expectedFingerprint = Self.credentialFingerprint(for: source.refreshToken) else {
+        guard let refreshToken = source.refreshToken else {
+            discardCachedToken()
+            return nil
+        }
+        return loadCachedToken(matchingRefreshToken: refreshToken)
+    }
+
+    /// The derived cache is bound to the refresh credential that produced it, whether that
+    /// credential came from the Keychain or from a T3 Code instance's file.
+    func loadCachedToken(matchingRefreshToken refreshToken: String) -> String? {
+        guard let expectedFingerprint = Self.credentialFingerprint(for: refreshToken) else {
             discardCachedToken()
             return nil
         }
@@ -160,19 +229,34 @@ struct AntigravityAuthStore: Sendable {
         expiresIn: Double,
         matching source: AntigravityKeychainToken
     ) throws -> Bool {
-        guard let credentialFingerprint = Self.credentialFingerprint(for: source.refreshToken),
+        try cacheToken(accessToken, expiresIn: expiresIn, matchingRefreshToken: source.refreshToken) {
+            // OAuth runs off-thread and can outlive a logout/account switch. Re-read the Keychain
+            // source in the same synchronous operation immediately before writing the derived cache.
+            try ProviderRefreshContext.withCredentialSourceRevalidation {
+                try self.loadKeychainToken()
+            }?.refreshToken
+        }
+    }
+
+    /// Cache a refreshed access token bound to a refresh credential, revalidating that the credential
+    /// is still the live one before writing. `revalidate` returns the current refresh token for the
+    /// source (Keychain or a T3 Code file); a mismatch discards the derived token instead of caching
+    /// it against a login that changed mid-OAuth.
+    @discardableResult
+    func cacheToken(
+        _ accessToken: String,
+        expiresIn: Double,
+        matchingRefreshToken refreshToken: String?,
+        revalidate: () throws -> String?
+    ) throws -> Bool {
+        guard let credentialFingerprint = Self.credentialFingerprint(for: refreshToken),
               accessToken.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty != nil else {
             return false
         }
 
-        // OAuth runs off-thread and can outlive a logout/account switch. Re-read the source in the
-        // same synchronous operation immediately before writing the derived token cache.
-        let live = try ProviderRefreshContext.withCredentialSourceRevalidation {
-            try loadKeychainToken()
-        }
-        guard let live,
-              Self.credentialFingerprint(for: live.refreshToken) == credentialFingerprint else {
-            AppLog.warn(LogTag.auth("antigravity"), "discarding refreshed token because the Keychain login changed during OAuth")
+        let liveRefreshToken = try revalidate()
+        guard Self.credentialFingerprint(for: liveRefreshToken) == credentialFingerprint else {
+            AppLog.warn(LogTag.auth("antigravity"), "discarding refreshed token because the Antigravity login changed during OAuth")
             return false
         }
         let expiresAtMs = (now().timeIntervalSince1970 + expiresIn) * 1000

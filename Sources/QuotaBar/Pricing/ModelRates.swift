@@ -120,8 +120,10 @@ struct ModelRates: Sendable, Equatable, Codable {
     var cacheWriteAbove200kPerMillion: Double?
     var cacheReadAbove200kPerMillion: Double?
 
-    /// Whether the pricing source explicitly published the cache-read rate. When it did not, spend
-    /// uses the selected input rate for cache reads rather than inventing a discount.
+    /// Whether the pricing source explicitly published the **base** cache-read price. A cache-read
+    /// rate that exists only inside a prompt tier or a timed lane does not count — those lanes are
+    /// checked separately when they match. When no base price was published, spend uses the selected
+    /// input rate for cache reads rather than inventing a discount.
     var cacheReadIsExplicit: Bool = true
 
     /// Prompt-token threshold above which the optional long-context rates apply.
@@ -237,12 +239,10 @@ extension ModelRates {
                                           longContext: cacheWriteAbove200kPerMillion,
                                           promptTier: selectedPromptTier?.cacheWritePerMillion,
                                           useLongContextRates: useLongContextRates)
-        let cacheReadRate = cacheReadIsExplicit
-            ? selectedRate(base: timedRates?.cacheReadPerMillion ?? cacheReadPerMillion,
-                           longContext: cacheReadAbove200kPerMillion,
-                           promptTier: selectedPromptTier?.cacheReadPerMillion,
-                           useLongContextRates: useLongContextRates)
-            : inputRate
+        let cacheReadRate = selectedPromptTier?.cacheReadPerMillion
+            ?? (useLongContextRates ? cacheReadAbove200kPerMillion : nil)
+            ?? timedRates?.cacheReadPerMillion
+            ?? (cacheReadIsExplicit ? cacheReadPerMillion : inputRate)
         let cacheWrite1hRate = selectedPromptTier?.cacheWrite1hPerMillion
             ?? timedRates?.cacheWrite1hPerMillion
             ?? cacheWrite1hPerMillion

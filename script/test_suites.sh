@@ -24,6 +24,9 @@ if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
+printf '\n==> Rust engine tests (jobs=%s)\n' "$jobs"
+cargo test --release --locked --manifest-path Rust/quotabar-engine/Cargo.toml -j "$jobs"
+
 if [[ ${1:-} == --build ]]; then
     printf '\n==> Swift package build (jobs=%s)\n' "$jobs"
     swift build -j "$jobs" --disable-index-store

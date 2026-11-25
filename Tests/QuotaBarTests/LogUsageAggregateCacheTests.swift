@@ -47,8 +47,8 @@ final class LogUsageAggregateCacheTests: XCTestCase {
         compute: @Sendable () async -> AggregateComputeResult
     ) async -> LogUsageScan? {
         switch await cache.scan(key: key, pricingStamp: pricingStamp, daysBack: daysBack, fingerprints: fingerprints, now: now, compute: compute) {
-        case .complete(let scan): return scan
-        case .incomplete: return nil
+        case .complete(let scan, _): return scan
+        case .deferredByFutureTimestamp, .incomplete: return nil
         }
     }
 
@@ -71,6 +71,35 @@ final class LogUsageAggregateCacheTests: XCTestCase {
         )
         XCTAssertEqual(counter.count, 1, "unchanged sources must reuse the persisted aggregate")
         XCTAssertEqual(second?.series.daily.first?.totalTokens, 100)
+    }
+
+    /// A persisted aggregate carrying `validUntil` (e.g. a future-dated event's eligibility time)
+    /// must stop serving once `now` reaches it — otherwise the newly eligible event never lands.
+    func testPersistedAggregateStopsReusingOnceValidUntilPasses() async {
+        let cache = makeCache()
+        let fingerprints = ["ledger": LogUsageSourceFingerprint.of([file("/l.jsonl", size: 10, mtime: now)])]
+        let counter = Counter()
+        let result = scan([("2026-04-29", 100)])
+        let validUntil = now.addingTimeInterval(3_600)
+        let compute: @Sendable () async -> AggregateComputeResult = {
+            counter.count += 1
+            return .complete(result, validUntil: validUntil)
+        }
+
+        _ = await completeScan(cache: cache,
+            key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints, now: now,
+            compute: compute)
+        XCTAssertEqual(counter.count, 1)
+
+        _ = await completeScan(cache: cache,
+            key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints,
+            now: now.addingTimeInterval(1_800), compute: compute)
+        XCTAssertEqual(counter.count, 1, "inside the validity window the entry must be reused")
+
+        _ = await completeScan(cache: cache,
+            key: "k", pricingStamp: "p1", daysBack: 30, fingerprints: fingerprints,
+            now: validUntil.addingTimeInterval(1), compute: compute)
+        XCTAssertEqual(counter.count, 2, "past validUntil the entry must recompute")
     }
 
     func testAppendTruncateAndRotateEachRecompute() async {
@@ -194,6 +223,33 @@ final class LogUsageAggregateScannerIntegrationTests: XCTestCase {
         ]
         let data = try! JSONSerialization.data(withJSONObject: object)
         return String(decoding: data, as: UTF8.self)
+    }
+
+    func testRouterRepricesUnchangedLedgerWhenOnlyOpenRouterRatesChange() async throws {
+        let ledger = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quotabar-router-pricing-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: ledger) }
+        try (routerLine(at: "2026-04-29T08:00:00.000Z", tokens: 100) + "\n")
+            .write(to: ledger, atomically: true, encoding: .utf8)
+        let scanner = CodexRouterUsageScanner(
+            ledgerPaths: { [ledger.path] }, identityAliases: { [:] }, persistentAggregateCache: makeCache()
+        )
+        func pricing(_ input: Double, retrievedAt: String) -> ModelPricing {
+            ModelPricing(supplement: PricingSupplement(), primary: PricingCatalog(), secondary: PricingCatalog(),
+                         openRouter: PricingCatalog(entries: ["gpt-5.6-terra": ModelRates(
+                            inputPerMillion: input, outputPerMillion: 1,
+                            cacheWritePerMillion: input, cacheReadPerMillion: input
+                         )], retrievedAt: retrievedAt))
+        }
+        let first = await scanner.scan(accountIdentityKey: nil, allowsUnscopedEvents: true,
+                                       daysBack: 30, now: now, pricing: pricing(1, retrievedAt: "2026-04-29"))
+        let repriced = await scanner.scan(accountIdentityKey: nil, allowsUnscopedEvents: true,
+                                          daysBack: 30, now: now, pricing: pricing(3, retrievedAt: "2026-04-30"))
+        XCTAssertEqual(try XCTUnwrap(first?.series.daily.first?.costUSD), 0.0001, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(repriced?.series.daily.first?.costUSD), 0.0003, accuracy: 1e-12)
+        XCTAssertEqual(repriced?.series.daily.first?.totalTokens, 100)
+        XCTAssertEqual(LogUsagePricingStamp.of(pricing(3, retrievedAt: "2026-04-30")),
+                       LogUsagePricingStamp.of(pricing(3, retrievedAt: "2026-05-01")))
     }
 
     func testRouterLedgerWarmScanDoesNotReparseAndAppendTruncateRecompute() async throws {

@@ -18,6 +18,9 @@ struct LanguageServerDiscovery: Sendable {
         var csrfFlag: String
         /// Optional flag carrying an HTTP fallback port (e.g. `--extension_server_port`).
         var portFlag: String?
+        /// Optional absolute executable path the candidate's argv0 must resolve to. Set it to pin
+        /// discovery to one installed app; unset keeps the marker-rank matching above.
+        var requiredExecutablePath: String? = nil
     }
 
     struct Result: Sendable {
@@ -126,6 +129,13 @@ struct LanguageServerDiscovery: Sendable {
                   commandMatchesProcess(command: command, processNameLower: processNameLower),
                   let rank = markerRank(command: command, markersLower: markersLower)
             else { continue }
+            if let path = options.requiredExecutablePath {
+                guard argv0(command: command) == path
+                    || command == path
+                    || command.hasPrefix(path + " ")
+                    || command.hasPrefix(path + "\t")
+                else { continue }
+            }
             ranked.append((rank, pid, command))
         }
 

@@ -1,8 +1,8 @@
 """Small serialization rules shared by the pricing snapshot generator and its tests."""
 
 
-def cache_read_is_explicit(base_cache_read, tiers):
-    """Preserve a published cache-read lane even when it exists only in a prompt tier."""
-    return base_cache_read is not None or any(
-        tier.get("cache_read_per_million") is not None for tier in (tiers or [])
-    )
+def cache_read_provenance(base_cache_read, has_override):
+    """Keep tier-only cache prices usable by older compact-cache readers."""
+    if base_cache_read is not None:
+        return {}
+    return {"crb": False} if has_override else {"cre": False}

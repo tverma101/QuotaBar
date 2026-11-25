@@ -5,9 +5,9 @@ import XCTest
 
 /// FFI parity tests for the quotabar-core Rust Codex rollout line parser (stage 2). The Swift
 /// reference parser (`CodexLogUsageScanner.FileParser`) is the oracle: whenever Rust consumes a
-/// line it must produce the identical event stream and malformed flag. The test corpus exercises
-/// cumulative-total deltas, last-token-usage baselines, the child-session replay gate, tier flags,
-/// and the auto-review pricing slug.
+/// line it must produce the identical event stream and damaged-line count. The test corpus
+/// exercises cumulative-total deltas, last-token-usage baselines, the child-session replay gate,
+/// tier flags, and the auto-review pricing slug.
 final class CodexRolloutRustParserTests: XCTestCase {
     private typealias Event = CodexLogUsageScanner.Event
 
@@ -19,9 +19,9 @@ final class CodexRolloutRustParserTests: XCTestCase {
         base + offset
     }
 
-    private func feedRust(_ data: Data, emitSince: Date?) -> (events: [Event], malformed: Bool, declined: Bool) {
+    private func feedRust(_ data: Data, emitSince: Date?) -> (events: [Event], damagedLines: Int, declined: Bool) {
         guard let parser = CodexRolloutRustParser.Handle(emitSince: emitSince) else {
-            return ([], false, true)
+            return ([], 0, true)
         }
         var declined = false
         for line in data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true) {
@@ -31,9 +31,9 @@ final class CodexRolloutRustParserTests: XCTestCase {
             if !parser.consume(Data(bytes)[...]) { declined = true }
         }
         guard !declined, let events = parser.finish() else {
-            return ([], parser.hasMalformedUsage, true)
+            return ([], parser.damagedLineCount, true)
         }
-        return (events, parser.hasMalformedUsage, false)
+        return (events, parser.damagedLineCount, false)
     }
 
     private func assertParity(
@@ -47,7 +47,7 @@ final class CodexRolloutRustParserTests: XCTestCase {
         let oracle = CodexLogUsageScanner.parseFileForTesting(data, emitSince: emitSince)
         let rust = feedRust(data, emitSince: emitSince)
         XCTAssertFalse(rust.declined, "Rust parser declined input it should handle", file: fileID, line: lineID)
-        XCTAssertEqual(rust.malformed, oracle.malformed, "malformed flag mismatch for:\n\(raw)", file: fileID, line: lineID)
+        XCTAssertEqual(rust.damagedLines, oracle.damagedLines, "damaged-line count mismatch for:\n\(raw)", file: fileID, line: lineID)
         XCTAssertEqual(rust.events, oracle.events, "events mismatch for:\n\(raw)", file: fileID, line: lineID)
     }
 
@@ -126,11 +126,11 @@ final class CodexRolloutRustParserTests: XCTestCase {
     }
 
     func testRateLimitOnlyTokenCountPingIsNoOp() {
-        // `info: null` with the token_count marker present is a rate-limit ping, not accounting
-        // (ported fix from 8e62c5d7); it must not mark the source malformed.
-        assertParity([
-            #"{"type":"event_msg","timestamp":"\#(iso(0))","payload":{"type":"token_count","info":null}}"#,
-        ])
+        // `info: null` with the token_count marker present is a rate-limit ping (ported fix from
+        // 8e62c5d7): it emits no event and is not damage, in either engine.
+        let ping = #"{"type":"event_msg","timestamp":"\#(iso(0))","payload":{"type":"token_count","info":null}}"#
+        assertParity([ping])
+        XCTAssertEqual(feedRust(Data(ping.utf8), emitSince: nil).damagedLines, 0)
     }
 
     func testMalformedTokenCountVariants() {

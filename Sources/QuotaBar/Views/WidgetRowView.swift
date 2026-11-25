@@ -159,7 +159,7 @@ struct WidgetRowView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-                .hoverTooltip(state.tooltip)
+                .hoverTooltip { state.tooltip }
         case .healthy where data.alwaysShowPacing:
             // "Always show pacing" surfaces the projection on the otherwise-silent on-track row: the
             // same quiet secondary note as the amber case, but the cushion ("~33% left at reset")
@@ -199,7 +199,7 @@ struct WidgetRowView: View {
             }
         }
         .foregroundStyle(.secondary)
-        .hoverTooltip(state.tooltip)
+        .hoverTooltip { state.tooltip }
         .accessibilityLabel(accessibility)
 
         if let action {
@@ -273,7 +273,7 @@ struct WidgetRowView: View {
         }
         .onTapGesture {
             guard !currentSessions.isEmpty else { return }
-            modelHover.toggleForTap()
+            modelHover.presentForTap()
         }
         .motionAwareHoverPopover(
             isPresented: Binding(
@@ -308,7 +308,7 @@ struct WidgetRowView: View {
             // panel's clearStrayFocus covers open/close, but not an in-card tap that leaves the
             // button first responder.
             .focusEffectDisabled()
-            .hoverTooltip(data.meterStyleTooltip)
+            .hoverTooltip { data.meterStyleTooltip }
         } else {
             Text(data.headline)
                 .foregroundStyle(.primary)
@@ -328,10 +328,10 @@ struct WidgetRowView: View {
                 }
                 .buttonStyle(.plain)
                 .focusEffectDisabled()
-                .hoverTooltip(data.resetTooltip())
+                .hoverTooltip { data.resetTooltip() }
             } else {
                 Text(text).foregroundStyle(.secondary)
-                    .hoverTooltip(data.resetTooltip())
+                    .hoverTooltip { data.resetTooltip() }
             }
         }
     }
@@ -340,7 +340,9 @@ struct WidgetRowView: View {
     /// and an optional secondary line ("on-device estimate") beneath it.
     private var unboundedRow: some View {
         unboundedRowContent
-            .onChange(of: data.modelBreakdown) { _, _ in modelHover.dismiss() }
+            .onChange(of: data.modelBreakdown) { _, _ in
+                if !modelHover.isPinned { modelHover.dismiss() }
+            }
             // A refresh can replace the reset credits (count and expiries) while the popover is open;
             // drop it so it never lingers over a stale timeline — except while the claim flow has the
             // popover pinned: the claim's own forced refresh is what changes the credits, and dismissing
@@ -393,7 +395,7 @@ struct WidgetRowView: View {
                         // fighting over the same hover reads as two competing surfaces, and the panel's
                         // per-model tooltips carry the exact figures instead. The resets row likewise
                         // drops its tooltip — the timeline popover replaces it.
-                        .hoverTooltip(hasHoverPopover ? nil : data.unboundedValueTooltip)
+                        .hoverTooltip { hasHoverPopover ? nil : data.unboundedValueTooltip }
                 }
                 if let subtitle = data.unboundedSubtitle {
                     // Secondary, not tertiary: the subtitle is informational ("on-device estimate"),
@@ -436,25 +438,26 @@ struct WidgetRowView: View {
                     modelHover.inlineHover(false)
                 }
             }
-            // Tap toggles the same popover, with no dwell: hovering a small value is fiddly, and the
-            // 400 ms reveal outwaits a quick click. Only rows that actually have a popover respond —
-            // a tap on a plain row is a no-op, exactly like hovering it.
+            // Tap opens the same popover, with no dwell: hovering a small value is fiddly, and the
+            // 400 ms reveal outwaits a quick click. A tap only opens — closing belongs to hover-out
+            // and panel close, so a second tap can't tear the surface down. Only rows that actually
+            // have a popover respond — a tap on a plain row is a no-op, exactly like hovering it.
             .onTapGesture {
                 guard hasHoverPopover else { return }
-                modelHover.toggleForTap()
+                modelHover.presentForTap()
             }
             .motionAwareHoverPopover(
                 isPresented: Binding(
                     get: { hasHoverPopover && modelHover.isPresented },
-                    // A click-outside dismiss removes the detail view without an `.ended` hover event,
-                    // so a plain assignment would strand `overDetail == true` and block future hides.
+                    // A close that skips the `.ended` hover event (popover teardown, refresh, panel
+                    // close) removes the detail view, so a plain assignment would strand
+                    // `overDetail == true` and block future hides.
                     set: { if !$0 { modelHover.dismiss() } }
                 ),
                 reduceAnimations: reduceAnimations
             ) {
                 if let breakdown = data.modelBreakdown {
-                    ModelUsageDetail(title: data.title, breakdown: breakdown,
-                                     loadOnTap: data.revealsBreakdownOnTap) { inside in
+                    ModelUsageDetail(title: data.title, breakdown: breakdown) { inside in
                         modelHover.detailHover(inside)
                     }
                 } else if data.showsResetExpiries {
@@ -524,7 +527,7 @@ struct WidgetRowView: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: density.supportingPointSize - 1))
                 .foregroundStyle(severityColor(.warning))
-                .hoverTooltip(data.unknownModelTooltip)
+                .hoverTooltip { data.unknownModelTooltip }
                 .accessibilityLabel("This period used a model with unknown pricing")
         }
     }
@@ -566,7 +569,7 @@ struct WidgetRowView: View {
         .frame(height: density.meterHeight)
         .animation(Motion.spring, value: data.fraction)
         .accessibilityHidden(true)
-        .hoverTooltip(state.tooltip)
+        .hoverTooltip { state.tooltip }
     }
 
     private static let paceTickWidth: CGFloat = 2

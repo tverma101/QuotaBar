@@ -13,6 +13,14 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         return used
     }
 
+    private func assertUsed(_ lines: [MetricLine]?, _ expected: [Double], file: StaticString = #filePath, line: UInt = #line) {
+        let actual = lines?.map { used($0) } ?? []
+        XCTAssertEqual(actual.count, expected.count, file: file, line: line)
+        for (actualValue, expectedValue) in zip(actual, expected) {
+            XCTAssertEqual(actualValue ?? -1, expectedValue, accuracy: 0.0001, file: file, line: line)
+        }
+    }
+
     private func resetsAt(_ line: MetricLine?) -> Date? {
         guard case .progress(_, _, _, _, let resetsAt, _, _, _)? = line else { return nil }
         return resetsAt
@@ -46,7 +54,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
 
         guard let lines = bare else { return XCTFail("full summary did not parse") }
         XCTAssertEqual(lines.map(\.label), ["Session", "Weekly", "Claude", "Claude Weekly"])
-        XCTAssertEqual(lines.map { used($0) }, [25, 10, 60, 0])
+        assertUsed(lines, [25, 10, 60, 0])
         XCTAssertEqual(resetsAt(lines[0]), OpenUsageISO8601.date(from: "2026-07-02T16:00:00Z"))
         XCTAssertEqual(resetsAt(lines[2]), OpenUsageISO8601.date(from: "2026-07-02T15:30:00Z"))
         XCTAssertEqual(lines.map { periodMs($0) }, [
@@ -164,12 +172,12 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let duplicateValues = #"{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8},{"bucketId":"gemini-5h","remainingFraction":0.2}]}]}"#
         let parsed = try XCTUnwrap(AntigravityUsageMapper.parseQuotaSummaryResult(Data(duplicateValues.utf8)))
         XCTAssertEqual(parsed.lines.map(\.label), ["Session"])
-        XCTAssertEqual(used(parsed.lines.first), 80)
+        XCTAssertEqual(used(parsed.lines.first) ?? -1, 80, accuracy: 0.0001)
         XCTAssertFalse(parsed.isComplete)
 
         let duplicateMissingValue = #"{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.8},{"bucketId":"gemini-5h"}]}]}"#
         let incomplete = try XCTUnwrap(AntigravityUsageMapper.parseQuotaSummaryResult(Data(duplicateMissingValue.utf8)))
-        XCTAssertEqual(used(incomplete.lines.first), 20)
+        XCTAssertEqual(used(incomplete.lines.first) ?? -1, 20, accuracy: 0.0001)
         XCTAssertFalse(incomplete.isComplete)
     }
 
@@ -258,6 +266,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let inner = #"{"token":{"access_token":"ya29.kc","refresh_token":"1//r","expiry":"2099-01-01T00:00:00Z"}}"#
         let wrapped = "go-keyring-base64:" + Data(inner.utf8).base64EncodedString()
         return AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrapped), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: NoProcessRunner()),
@@ -284,7 +293,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.plan, "Pro")
         XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Weekly", "Claude", "Claude Weekly"])
-        XCTAssertEqual(snapshot.lines.map { used($0) }, [25, 10, 60, 0])
+        assertUsed(snapshot.lines, [25, 10, 60, 0])
         XCTAssertFalse(routing.requests.contains { $0.url.path.contains("fetchAvailableModels") },
                        "a parsed summary must not touch the legacy model endpoints")
     }
@@ -363,6 +372,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
             .init(directories: [], failures: ["/private/antigravity/conversations": "permission denied"])
         })
         let provider = AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain(wrappedCredentials), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: NoProcessRunner()),
@@ -433,6 +443,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
     @MainActor
     private func makeLSProvider(routing: RoutingHTTPClient) -> AntigravityProvider {
         AntigravityProvider(
+            quotaSource: .legacyTestFixture,
             authStore: AntigravityAuthStore(keychain: FakeKeychain(nil), files: FakeFiles()),
             usageClient: AntigravityUsageClient(lsHTTP: routing, http: routing),
             discovery: LanguageServerDiscovery(processRunner: FakeLSProcessRunner()),
@@ -465,7 +476,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
         let snapshot = await provider.refresh()
         // Summary values win — not the single 1%-used line the legacy GetUserStatus configs would pool to.
         XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Weekly", "Claude", "Claude Weekly"])
-        XCTAssertEqual(snapshot.lines.map { used($0) }, [25, 10, 60, 0])
+        assertUsed(snapshot.lines, [25, 10, 60, 0])
         XCTAssertEqual(snapshot.plan, "Pro")
         XCTAssertFalse(routing.requests.contains { $0.url.path.hasSuffix("/GetCommandModelConfigs") })
     }
@@ -514,7 +525,7 @@ final class AntigravityQuotaSummaryTests: XCTestCase {
 
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.lines.map(\.label), ["Session", "Claude"])
-        XCTAssertEqual(snapshot.lines.map { used($0) }, [50, 20])
+        assertUsed(snapshot.lines, [50, 20])
         XCTAssertEqual(snapshot.plan, "Pro")
     }
 }
