@@ -308,21 +308,40 @@ actor CodexLogUsageScanner {
     }
 
     private final class PerFileFoldBucket: @unchecked Sendable {
-        var fold = AggregateFoldState()
+        /// Carries the scan window and the resolved pricing table across files, so each file's
+        /// fold only pays for its own entries.
+        var context: CodexRustFold.FoldContext
         var scans: [String: LogUsageScan] = [:]
         var latestTimestamps: [String: Date] = [:]
         var futureTimestamps: [String: Date] = [:]
         private var currentPath: String?
+        private var currentEvents: [Event] = []
         private var currentLatestTimestamp: Date?
+
+        init(context: CodexRustFold.FoldContext) {
+            self.context = context
+        }
 
         func begin(_ path: String) {
             currentPath = path
-            fold = AggregateFoldState()
+            currentEvents = []
             currentLatestTimestamp = nil
         }
 
+        func record(_ event: Event) {
+            currentEvents.append(event)
+        }
+
         func finish(_ path: String) {
-            scans[path] = fold.accumulator.build()
+            // One Rust fold per file, mirroring the per-inode aggregate this bucket feeds. The
+            // Swift accumulator remains the oracle and the fallback for this file.
+            scans[path] = CodexRustFold.fold(events: currentEvents, context: &context)
+                ?? CodexLogUsageScanner.aggregate(
+                    events: currentEvents,
+                    since: context.since,
+                    pricing: context.pricing
+                )
+            currentEvents = []
             if let currentLatestTimestamp {
                 latestTimestamps[path] = currentLatestTimestamp
             }
@@ -617,7 +636,13 @@ actor CodexLogUsageScanner {
         }
         AppLog.debug(LogTag.plugin("codex"), "aggregate split: unchanged=\(unchanged.count) changed=\(changed.count)")
 
-        let bucket = PerFileFoldBucket()
+        let bucket = PerFileFoldBucket(
+            context: CodexRustFold.FoldContext(
+                since: context.cacheSince,
+                pricing: pricing,
+                now: now
+            )
+        )
         guard !Task.isCancelled else { return .incomplete }
         let ok = await scanner.foldItems(
             from: changed, since: context.cacheSince, cacheIdentity: context.identity,
@@ -635,13 +660,7 @@ actor CodexLogUsageScanner {
                     return
                 }
                 bucket.noteIncludedTimestamp(event.timestamp)
-                Self.accumulate(
-                    event: event,
-                    since: context.cacheSince,
-                    pricing: pricing,
-                    seen: &bucket.fold.seen,
-                    accumulator: &bucket.fold.accumulator
-                )
+                bucket.record(event)
             },
             fileStarted: { path in
                 bucket.begin(path)
@@ -2281,12 +2300,7 @@ actor CodexLogUsageScanner {
 
     // MARK: - Aggregation
 
-    /// Escaping fold visits cannot capture `inout` Sets/accumulators; this tiny box owns them.
-    private final class AggregateFoldState: @unchecked Sendable {
-        var seen: Set<EventKey> = []
-        var accumulator = DailyUsageAccumulator()
-    }
-
+    /// Identity for the event-level dedupe in the Swift reference fold.
     private struct EventKey: Hashable {
         var timestamp: Date
         var model: String

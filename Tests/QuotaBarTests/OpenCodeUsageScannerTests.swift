@@ -25,7 +25,9 @@ final class OpenCodeUsageScannerTests: XCTestCase {
             "/oc/opencode.db": db1,
             "/oc/opencode-next.db": db2
         ])
-        return OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] })
+        return OpenCodeUsageScanner(sqlite: sqlite,
+                databaseEngine: .sqliteCLI,
+                databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] })
     }
 
     func testCombinedHostedSeriesKeepsTokensWhenReportedCostIsMissing() async throws {
@@ -43,6 +45,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
     func testMalformedNativeRowFailsClosedInsteadOfPublishingASmallerTotal() async {
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": "[\"malformed-row\"]"]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] }
         )
         do {
@@ -54,7 +57,9 @@ final class OpenCodeUsageScannerTests: XCTestCase {
     }
 
     func testMissingDatabaseReturnsNil() async throws {
-        let scanner = OpenCodeUsageScanner(sqlite: OpenCodeFakeSQLite(), databasePaths: { [] })
+        let scanner = OpenCodeUsageScanner(sqlite: OpenCodeFakeSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] })
         let scan = try await scanner.scan(now: now)
         XCTAssertNil(scan)
     }
@@ -62,6 +67,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
     func testEmptyDatabaseYieldsEmptyScanNotNil() async throws {
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": "[]"]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] }
         )
         guard let scan = try await scanner.scan(now: now) else { return XCTFail("expected a scan") }
@@ -71,6 +77,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
     func testOneFailingDatabaseRejectsPartialHistory() async {
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode-next.db": db2], failing: ["/oc/opencode.db"]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] }
         )
         do {
@@ -84,6 +91,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
     func testAllDatabasesFailingThrowsInsteadOfEmptyScan() async {
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(failing: ["/oc/opencode.db", "/oc/opencode-next.db"]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] }
         )
         do {
@@ -97,6 +105,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
     func testUnreadableDataDirectoryThrowsInsteadOfNil() async {
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(),
+            databaseEngine: .sqliteCLI,
             databasePaths: { throw CocoaError(.fileReadNoPermission) }
         )
         do {
@@ -112,6 +121,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
             .appendingPathComponent("missing-router-ledger-\(UUID().uuidString).jsonl").path
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": db1]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             routerLedgerPaths: { [missingLedger] }
         )
@@ -128,6 +138,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
             .appendingPathComponent("missing-hermes-db-\(UUID().uuidString).db").path
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": db1]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             hermesStateDBPath: { missingDatabase }
         )
@@ -143,12 +154,14 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         let db = "[" + openCodeRow("2026-07-12T10:00:00.000Z", "1.0", 500, "gpt-5.5", "opencode") + "]"
         let withUsage = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] }
         )
         XCTAssertTrue(withUsage.hasHostedUsage())
 
         let empty = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": "[]"]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] }
         )
         XCTAssertFalse(empty.hasHostedUsage())
@@ -157,6 +170,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
     func testHasHostedUsageProbeTreatsUnreadableDatabaseAsFootprint() {
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode-next.db": "[]"], failing: ["/oc/opencode.db"]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db", "/oc/opencode-next.db"] }
         )
 
@@ -166,7 +180,9 @@ final class OpenCodeUsageScannerTests: XCTestCase {
     func testSQLCutoffMatchesCalendarTileWindow() async throws {
         let now = d("2026-07-12T18:00:00.000Z")
         let sqlite = OpenCodeFakeSQLite(data: ["/oc/opencode.db": "[]"])
-        let scanner = OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { ["/oc/opencode.db"] })
+        let scanner = OpenCodeUsageScanner(sqlite: sqlite,
+                databaseEngine: .sqliteCLI,
+                databasePaths: { ["/oc/opencode.db"] })
         _ = try await scanner.scan(now: now)
 
         let tileSinceMs = Int(JSONLScanning.sinceDate(daysBack: UsageHistoryWindow.previousDays, now: now).timeIntervalSince1970 * 1000)
@@ -176,7 +192,9 @@ final class OpenCodeUsageScannerTests: XCTestCase {
 
     func testSQLCanLoadTheLifetimeHistoryWindow() async throws {
         let sqlite = OpenCodeFakeSQLite(data: ["/oc/opencode.db": "[]"])
-        let scanner = OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { ["/oc/opencode.db"] })
+        let scanner = OpenCodeUsageScanner(sqlite: sqlite,
+                databaseEngine: .sqliteCLI,
+                databasePaths: { ["/oc/opencode.db"] })
         let daysBack = UsageHistoryWindow.lifetimeDays(through: now)
         _ = try await scanner.scan(now: now, daysBack: daysBack)
 
@@ -189,6 +207,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         let db = "[[\(epochMs("2026-07-12T10:00:00.000Z")),1.0,1e19,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] }
         )
         guard let scan = try await scanner.scan(now: now) else { return XCTFail("expected a scan") }
@@ -204,6 +223,7 @@ final class OpenCodeUsageScannerTests: XCTestCase {
         ].joined(separator: ",") + "]"
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] }
         )
 

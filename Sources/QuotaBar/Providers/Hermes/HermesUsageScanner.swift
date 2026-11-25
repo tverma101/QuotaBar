@@ -71,15 +71,20 @@ struct HermesUsageScanner: Sendable {
     var sqlite: SQLiteAccessing
     var databasePaths: @Sendable () throws -> [String]
     var calendar: Calendar
+    /// Production folds through the Rust backend; `.swift` keeps the original SQLite-CLI reference
+    /// available for parity tests and for the logged fallback when the backend declines a refresh.
+    var engine: HermesScanEngine
 
     init(
         sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
         databasePaths: @escaping @Sendable () throws -> [String] = HermesUsageScanner.defaultDatabasePaths,
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        engine: HermesScanEngine = .rust
     ) {
         self.sqlite = sqlite
         self.databasePaths = databasePaths
         self.calendar = calendar
+        self.engine = engine
     }
 
     /// `[]` when Hermes' state database doesn't exist (the normal "Hermes not used on this machine"
@@ -103,6 +108,18 @@ struct HermesUsageScanner: Sendable {
             throw HermesUsageError.databaseUnreadable(detail: error.localizedDescription)
         }
         guard let path = paths.first else { return nil }
+
+        if engine == .rust {
+            do {
+                return try HermesRustScan.scan(path: path, now: now, calendar: calendar)
+            } catch let error as HermesRustScan.BridgeUnavailable {
+                AppLog.warn(LogTag.plugin("hermes"), "Rust scan declined; using the Swift reference scan: \(error)")
+            } catch let error as HermesUsageError {
+                throw error
+            } catch {
+                AppLog.warn(LogTag.plugin("hermes"), "Rust scan failed; using the Swift reference scan: \(error)")
+            }
+        }
 
         let starts = periodStarts(now: now)
         var periods: [HermesPeriodUsage] = []
@@ -159,10 +176,7 @@ struct HermesUsageScanner: Sendable {
 
         // Keep the history screen on the same calendar-year boundary as the other local scanners.
         // A fixed number of days would drift around leap years and this helper requires its `through` date.
-        let today = calendar.startOfDay(for: now)
-        let dailyCutoff = calendar.date(byAdding: .year, value: -10, to: today)
-            ?? calendar.date(byAdding: .day, value: -3_650, to: today)
-            ?? calendar.startOfDay(for: now)
+        let dailyCutoff = Self.dailyCutoff(now: now, calendar: calendar)
         let parsedDaily: ParsedDaily
         guard !Task.isCancelled else { return nil }
         if let dailyJSON = try JSONLAccountingWorkPacer.shared.perform({
@@ -191,6 +205,15 @@ struct HermesUsageScanner: Sendable {
     // MARK: - Period boundaries (local calendar)
 
     private func periodStarts(now: Date) -> [(period: HermesPeriod, start: Date)] {
+        Self.periodStarts(now: now, calendar: calendar)
+    }
+
+    /// Local-calendar period boundaries shared by the Rust bridge and the Swift reference scan.
+    /// Array order is fixed (`today`, `thisWeek`, `thisMonth`) because the bridge indexes it.
+    static func periodStarts(
+        now: Date,
+        calendar: Calendar
+    ) -> [(period: HermesPeriod, start: Date)] {
         let today = calendar.startOfDay(for: now)
         let weekday = calendar.component(.weekday, from: today) // 1=Sun ... 7=Sat
         let daysSinceMonday = (weekday + 5) % 7                 // Mon→0, Sun→6
@@ -203,6 +226,14 @@ struct HermesUsageScanner: Sendable {
             (.thisWeek, weekStart),
             (.thisMonth, monthStart)
         ]
+    }
+
+    /// Ten-year history cutoff, kept on the same calendar-year boundary as the other local scanners.
+    static func dailyCutoff(now: Date, calendar: Calendar) -> Date {
+        let today = calendar.startOfDay(for: now)
+        return calendar.date(byAdding: .year, value: -10, to: today)
+            ?? calendar.date(byAdding: .day, value: -3_650, to: today)
+            ?? today
     }
 
     // MARK: - Parsing

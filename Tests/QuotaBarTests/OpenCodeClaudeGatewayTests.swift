@@ -94,6 +94,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         let db = "[[\(ms),2.0,500,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
@@ -132,6 +133,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         let db = "[[\(ms),0.005,10000,\"deepseek-v4-flash\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
@@ -163,6 +165,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         let db = "[[\(ms),2.0,2000000000000000,\"deepseek-v4-flash\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
@@ -186,6 +189,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         let db = "[[\(ms),0.0,5000,\"deepseek-v4-flash-free\",\"opencode\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
@@ -217,6 +221,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         let db = "[[\(ms),0.0,5000,\"space-bunny-free\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
@@ -248,6 +253,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         let db = "[[\(ms),1.0,1000,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
@@ -271,6 +277,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         ])
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": "[]"]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [claudeHome.appendingPathComponent(".claude")] }
         )
@@ -286,6 +293,7 @@ final class OpenCodeClaudeGatewayTests: XCTestCase {
         let db = "[[\(ms),2.0,500,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             claudeRoots: { [] }
         )

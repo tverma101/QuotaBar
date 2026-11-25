@@ -101,7 +101,15 @@ shows measured token totals; the macOS model and price breakdown described below
 
 For older Desktop sessions, QuotaBar reads usage from assistant-message
 metrics and the separate `auto_run_decision_receipts.manager_json.usage` records in
-`~/.config/freebuff-desktop/projects/*/desktop-v2.db`, never conversation text. The mission manager's
+`~/.config/freebuff-desktop/projects/*/desktop-v2.db`, never conversation text. The two SQLite
+statements (the usage projection and the active-session title lookup) run through the in-process
+Rust query engine with the CLI path's five-second bound per statement; each statement is one paced
+slice, including the legacy-schema retry. The healthy path spawns no
+`/usr/bin/sqlite3`. The explicit CLI engine remains the parity oracle, and an internal backend
+failure falls back to it for that one statement only — the next statement tries the in-process
+engine again, so one bad response cannot disable the fast path for the session. That fallback does
+spawn `/usr/bin/sqlite3`. A SQL error from the database is rethrown unchanged rather than retried on
+the other engine. The mission manager's
 recorded model and start time are used for its estimate. `outcome_json.usage` is excluded because it
 repeats the completed assistant response; older databases without the manager-receipt table still
 provide assistant-message history. Unchanged database and WAL files reuse the previous read and

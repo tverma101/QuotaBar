@@ -8,21 +8,23 @@ build and extend it.
 ## Why a Rust core
 
 The menu-bar app is already native code, so this is not about a slow interpreter. The goal is to
-do the hot accounting work — today, the per-line parsers behind the Claude and Codex local-history
-folds — without Foundation's overhead per line: JSONSerialization dictionary materialization,
-`Data` copies, and per-call formatting. Measured on a 20,000-line synthetic corpus: the Rust path
-uses roughly **10x less CPU** for the Claude parse (**~4.6x** for the Codex rollout parser) — run
-it yourself with the benchmarks below.
+do the hot accounting work — the per-line parsers behind the Claude and Codex local-history folds
+and the per-entry dedupe/pricing/aggregation tails themselves — without Foundation's overhead per
+line: JSONSerialization dictionary materialization, `Data` copies, and per-call formatting.
+Measured on a 20,000-line synthetic corpus: the Rust path uses roughly **10x less CPU** for the
+Claude parse (**~4.6x** for the Codex rollout parser) — run it yourself with the benchmarks below.
+The folds add **2.2× (Claude)** and **6.1× (Codex)** on a 150,000-entry history; see
+[Rust backend port](rust-backend.md).
 
 QuotaBar shares none of this behavior change: the Rust parser is a line-for-line port of the
 Swift reference implementation, and the two are tested against each other.
 
 ## Layout
 
-- `Rust/quotabar-core/` — the crate (edition 2021, `staticlib` + `rlib`). Only dependency:
-  `serde_json`, the vetted parser used rather than a hand-rolled one; it is the minimum needed to
-  deserialize usage lines and nothing else. New crate dependencies need the usual justification
-  from AGENTS.md.
+- `Rust/quotabar-core/` — the crate (edition 2021, `staticlib` + `rlib`). Dependencies: `serde` /
+  `serde_json` (the vetted parser, with `float_roundtrip` enabled so decimal rates parse to the
+  same bit pattern Swift holds) and bundled `rusqlite` for in-process local database reads. New
+  crate dependencies need the usual justification from AGENTS.md.
 - `Sources/CQuotabarCore/` — a clang target whose header (`include/quotabar_core.h`) declares the
   C ABI the Swift code imports. The `.c` shim is a link probe.
 - `Sources/QuotaBar/Support/ClaudeUsageLineRustParser.swift` — the Claude bridge. Maps the FFI
@@ -40,6 +42,21 @@ Swift reference implementation, and the two are tested against each other.
   **Swift-primary**: Swift's Foundation decoder runs first (byte-exact with the snapshots it
   wrote); the Rust parser (`Sources/QuotaBar/Support/CompactCatalogRustParser.swift`) is called
   only when Foundation cannot handle an input at all. `catalogFromCompact` throws if both fail.
+- `Rust/quotabar-core/src/backend/` — the provider backend envelope (`qb_backend_call`, plus
+  `qb_backend_call_with_payload` for fixed-stride entry records): UTF-8 JSON request in,
+  `{ok, result}` / `{ok, error}` JSON out. `Sources/QuotaBar/Support/RustBackend.swift` is the
+  generic Swift client. Operations today: `hermes.scan` (`Providers/Hermes/HermesRustScan.swift`),
+  `opencode.scan` / `opencode.query` / `opencode.probe`
+  (`Providers/OpenCode/OpenCodeRustScan.swift`), the provider-neutral `sqlite.query`
+  (`backend/sqlite.rs`; `Providers/Antigravity/AntigravityRustScan.swift`,
+  `Providers/Freebuff/FreebuffDesktopRustScan.swift`), `claude.fold`
+  (`Providers/Claude/ClaudeRustFold.swift`), `codex.fold`
+  (`Providers/Codex/CodexRustFold.swift`), and the pricing snapshot operations `pricing.load` /
+  `pricing.release` / `pricing.clear` / `pricing.resolve` (`Pricing/ModelPricing.swift`).
+  `backend/accounting/` is the shared rate and daily accumulator core both folds use;
+  `backend/pricing/` is the catalogue resolver (exact, normalized, fuzzy, fast variants, dated
+  bases) that lets the folds take model names. See [Rust backend port](rust-backend.md) for the
+  inventory and measured results.
 
 ## The fallback contract
 
@@ -82,6 +99,7 @@ its unit tests (shared with nothing — the crate must not depend on Swift).
 ```sh
 QUOTABAR_CLAUDE_PARSE_BENCH=1 swift test --filter testClaudeParseBenchmarkRustVsSwift
 QUOTABAR_CODEX_PARSE_BENCH=1 swift test --filter testCodexParseBenchmarkRustVsSwift
+QUOTABAR_RUST_FOLD_BENCH=1 swift test --filter RustFoldBenchmarkTests
 ```
 
 print `CLAUDE_PARSE_BENCH` / `CODEX_PARSE_BENCH` with Rust vs Swift CPU/wall for the synthetic
@@ -91,9 +109,21 @@ corpora in those tests.
 
 Move a primitive only when it is (a) on a measured hot path, (b) safely expressible behind a
 small C ABI, and (c) covered by a parity test against its Swift oracle. Candidates next in line:
-the per-line parse in other JSONL providers (Grok, pi, Muse), and the pricing fold. Keep the
-C ABI additive — bump `qb_core_version` when the entry layout changes — and keep every new
-FFI function returning a null result on any failure so Swift can always fall back loudly.
+the remaining SQLite/JSONL provider scans (ZCode, Grok, pi, Muse) and the local limits
+serializer. Antigravity's SQLite reads already run through the in-process query boundary; its
+decode and fold stay Swift. Provider backends go through the `backend/` JSON envelope instead
+of one function per operation; see [Rust backend port](rust-backend.md) for what has moved and the
+measured results.
+
+Pricing catalogue resolution moved; pricing *alias rules* stay Swift on purpose. They are ICU
+(`NSRegularExpression`) patterns from a network-refreshed feed, and the current feed uses a
+lookahead (`(?=-)`) the Rust `regex` crate cannot express. Swift evaluates each rule once per
+distinct slug and sends the canonical name with the fold. Any future engine swap needs the same
+kind of parity proof before it can take over.
+
+Keep the C ABI additive — bump `qb_core_version` (and `qb_backend_abi_version` when the envelope
+changes) — and keep every new FFI function returning a null result on any failure so Swift can
+always fall back loudly.
 
 Note the two FFI directions in use: parsers (Claude, Codex) are **Rust-primary** — the bridge
 runs first and Swift re-parses on decline; the compact-catalog codec is **Swift-primary** —

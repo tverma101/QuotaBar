@@ -48,7 +48,9 @@ final class OpenCodeProviderTests: XCTestCase {
     func testHasLocalCredentialsViaGoAuthKey() async {
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
         let has = await provider.hasLocalCredentials()
@@ -62,7 +64,9 @@ final class OpenCodeProviderTests: XCTestCase {
         ])
         let provider = OpenCodeProvider(
             authStore: authStore(files: files),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             goKeyStore: OpenCodeGoKeyStore(files: files, filePath: { "/oc/go-keys.json" }),
             activeKeyID: { nil }
         )
@@ -86,6 +90,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
@@ -99,6 +104,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": "[]"]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
@@ -118,6 +124,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: client,
@@ -144,7 +151,9 @@ final class OpenCodeProviderTests: XCTestCase {
         let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles()),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             now: { now },
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
@@ -159,7 +168,9 @@ final class OpenCodeProviderTests: XCTestCase {
         let (client, _) = usageClient(statusCode: 401)
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             usageClient: client,
             now: { now },
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
@@ -183,6 +194,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: client,
@@ -213,6 +225,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: client,
@@ -240,6 +253,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: client,
@@ -266,6 +280,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: client,
@@ -289,7 +304,9 @@ final class OpenCodeProviderTests: XCTestCase {
         let (client, _) = usageClient()
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             usageClient: client,
             now: { now },
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
@@ -314,7 +331,9 @@ final class OpenCodeProviderTests: XCTestCase {
         }
         let provider = OpenCodeProvider(
             authStore: authStore(files: files),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             usageClient: OpenCodeGoUsageClient(http: http),
             goKeyStore: OpenCodeGoKeyStore(files: files, filePath: { "/oc/go-keys.json" }),
             activeKeyID: { nil }
@@ -335,6 +354,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: client,
@@ -382,6 +402,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: client,
@@ -408,6 +429,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(failing: ["/oc/opencode.db"]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: client,
@@ -425,7 +447,9 @@ final class OpenCodeProviderTests: XCTestCase {
         let now = d(TestLocalInstant.iso(2026, 7, 12, 12, 0, 0))
         let provider = OpenCodeProvider(
             authStore: authStore(files: UnreadableFiles(present: ["/oc/auth.json"])),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             now: { now },
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
@@ -438,7 +462,9 @@ final class OpenCodeProviderTests: XCTestCase {
         // can show the actionable error rather than staying invisible.
         let provider = OpenCodeProvider(
             authStore: authStore(files: UnreadableFiles(present: ["/oc/auth.json"])),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
         let has = await provider.hasLocalCredentials()
@@ -449,7 +475,9 @@ final class OpenCodeProviderTests: XCTestCase {
         // An app-saved Go-key file is a provider footprint even when its permissions prevent reading it.
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles()),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             usageClient: usageClient().client,
             goKeyStore: OpenCodeGoKeyStore(
                 files: UnreadableFiles(present: ["/oc/go-keys.json"]),
@@ -473,6 +501,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             now: { now },
@@ -494,6 +523,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db], anchor: "1700000000000"),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             now: { now },
@@ -514,7 +544,9 @@ final class OpenCodeProviderTests: XCTestCase {
         let (client, _) = usageClient()
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             usageClient: client,
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
@@ -541,6 +573,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db], anchor: "1700000000000"),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: client,
@@ -569,6 +602,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(failing: ["/oc/opencode.db"]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: client,
@@ -596,6 +630,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": db], anchor: "1700000000000"),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             now: { now },
@@ -636,7 +671,9 @@ final class OpenCodeProviderTests: XCTestCase {
     func testPanelMetersNotLoggedInWithoutKeysOrData() async {
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles()),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
         let snapshot = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
@@ -649,7 +686,9 @@ final class OpenCodeProviderTests: XCTestCase {
     func testFullRefreshWithoutGoKeyOrDataClearsPreviousQuotaState() async {
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles()),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )
 
@@ -664,6 +703,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { throw OpenCodeUsageError.databaseUnreadable }
             ),
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
@@ -691,6 +731,7 @@ final class OpenCodeProviderTests: XCTestCase {
             authStore: authStore(files: FakeFiles()),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { throw OpenCodeUsageError.databaseUnreadable }
             ),
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
@@ -710,7 +751,9 @@ final class OpenCodeProviderTests: XCTestCase {
         let (client, http) = usageClient()
         let provider = OpenCodeProvider(
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             usageClient: client,
             goKeyStore: goKeyStoreStub(), activeKeyID: { nil }
         )

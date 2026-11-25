@@ -49,6 +49,41 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
             """)
     }
 
+    /// Fails the test if any query reaches the subprocess accessor. The scanner is handed the real
+    /// `/usr/bin/sqlite3` accessor in production; here it is a tripwire for the zero-spawn contract.
+    private final class CountingSQLiteAccessor: SQLiteAccessing, @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        private var sql: [String] = []
+
+        var calls: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return count
+        }
+
+        var recordedSQL: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return sql
+        }
+
+        func queryValue(path: String, sql: String) throws -> String? {
+            lock.lock()
+            count += 1
+            self.sql.append(sql)
+            lock.unlock()
+            return nil
+        }
+
+        func execute(path: String, sql: String) throws {
+            lock.lock()
+            count += 1
+            self.sql.append(sql)
+            lock.unlock()
+        }
+    }
+
     override func tearDownWithError() throws {
         if let hermesDB {
             try? FileManager.default.removeItem(at: URL(fileURLWithPath: hermesDB).deletingLastPathComponent())
@@ -131,6 +166,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         let hermesPath: String = self.hermesDB
         let scanner = OpenCodeUsageScanner(
             sqlite: SQLiteCLIAccessor(),
+            databaseEngine: .sqliteCLI,
             databasePaths: { [dbPath] },
             hermesStateDBPath: { hermesPath }
         )
@@ -149,6 +185,44 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         XCTAssertTrue(values.contains(where: \.estimated), "imputed dollars must carry the ⓘ marker")
     }
 
+    func testRefreshSpawnsNoSQLiteSubprocess() async throws {
+        try sqlite(hermesDB, """
+            INSERT INTO sessions (id, model, started_at, billing_provider, billing_base_url, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, ended_at) VALUES
+              ('go-session', 'deepseek-v4-flash', \(now.timeIntervalSince1970 - 3600), 'opencode-go', 'https://opencode.ai/zen/go/v1', 1000, 200, 8000, 0, 0, \(now.timeIntervalSince1970 - 1800));
+            """)
+        let ms = Int(now.timeIntervalSince1970 * 1000)
+        try sqlite(opencodeDB, """
+            INSERT INTO message (time_created, data) VALUES
+              (\(ms), '{"role":"assistant","providerID":"opencode-go","cost":2.0,"tokens":{"total":500},"modelID":"glm-5.2"}');
+            """)
+
+        let spy = CountingSQLiteAccessor()
+        let opencodePath: String = self.opencodeDB
+        let hermesPath: String = self.hermesDB
+        let scanner = OpenCodeUsageScanner(
+            sqlite: spy,
+            databaseEngine: .rust,
+            databasePaths: { [opencodePath] },
+            hermesStateDBPath: { hermesPath }
+        )
+        #if DEBUG
+        let scansBefore = OpenCodeRustScan.completedSchemaReadsForTesting
+        #endif
+        let scan = try await scanner.scan(now: now, pricing: TestPricing.bundled)
+        #if DEBUG
+        XCTAssertGreaterThan(
+            OpenCodeRustScan.completedSchemaReadsForTesting, scansBefore,
+            "the refresh never reached opencode.schema"
+        )
+        #endif
+        XCTAssertNotNil(scan)
+        XCTAssertTrue(scanner.hasHostedUsage())
+        XCTAssertEqual(
+            spy.calls, 0,
+            "an OpenCode refresh must not touch /usr/bin/sqlite3: \(spy.recordedSQL)"
+        )
+    }
+
     func testInProgressHermesSessionMarksDayAndTilesPartial() async throws {
         // Hermes finalizes a running session's ledger in delayed bursts, so an in-progress session
         // (ended_at NULL) means the day's fold is real but NOT final — the scan must mark the day
@@ -164,6 +238,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         let opencodePath: String = self.opencodeDB
         let scanner = OpenCodeUsageScanner(
             sqlite: SQLiteCLIAccessor(),
+            databaseEngine: .sqliteCLI,
             databasePaths: { [opencodePath] },
             hermesStateDBPath: { hermesPath }
         )
@@ -238,6 +313,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         }
         let scanner = OpenCodeUsageScanner(
             sqlite: stub,
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             hermesStateDBPath: { "/hermes/state.db" },
             readFailureWarning: warning
@@ -261,6 +337,7 @@ final class OpenCodeHermesGatewayTests: XCTestCase {
         let dbPath: String = self.opencodeDB
         let scanner = OpenCodeUsageScanner(
             sqlite: SQLiteCLIAccessor(),
+            databaseEngine: .sqliteCLI,
             databasePaths: { [dbPath] },
             hermesStateDBPath: { nil }
         )

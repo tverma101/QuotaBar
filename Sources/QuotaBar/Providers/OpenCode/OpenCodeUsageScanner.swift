@@ -75,6 +75,9 @@ struct OpenCodeUsageScanner: Sendable {
     private static let zenProviderID = "opencode"
 
     var sqlite: SQLiteAccessing
+    /// Which engine reads the local databases. Production pins `.rust`; `.sqliteCLI` is the
+    /// parity oracle, the fallback, and what test doubles use.
+    var databaseEngine: OpenCodeDatabaseEngine
     var databasePaths: @Sendable () throws -> [String]
     /// Roots whose `projects/**/*.jsonl` hold Claude Code sessions routed through the OpenCode
     /// gateway (`anthropic/opencode_go/…` / `anthropic/opencode/…` models). Those sessions burn the
@@ -106,6 +109,7 @@ struct OpenCodeUsageScanner: Sendable {
 
     init(
         sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
+        databaseEngine: OpenCodeDatabaseEngine = .rust,
         databasePaths: @escaping @Sendable () throws -> [String] = OpenCodeUsageScanner.defaultDatabasePaths,
         claudeRoots: @escaping @Sendable () -> [URL] = { [] },
         claudeCacheIdentity: @escaping @Sendable () -> String = { ClaudeLogUsageScanner.parseSourceIdentity() },
@@ -116,6 +120,7 @@ struct OpenCodeUsageScanner: Sendable {
         readFailureWarning: UsageLogReadFailureReporter.Warning? = nil
     ) {
         self.sqlite = sqlite
+        self.databaseEngine = databaseEngine
         self.databasePaths = databasePaths
         self.claudeRoots = claudeRoots
         self.claudeCacheIdentity = claudeCacheIdentity
@@ -127,6 +132,11 @@ struct OpenCodeUsageScanner: Sendable {
             logTag: LogTag.plugin("opencode"),
             warning: readFailureWarning
         )
+    }
+
+    /// One owner for engine selection, pacing, and Rust→CLI fallback.
+    private var databaseAccess: OpenCodeDatabaseAccess {
+        OpenCodeDatabaseAccess(engine: databaseEngine, sqlite: sqlite)
     }
 
     static let defaultDatabasePaths: @Sendable () throws -> [String] = {
@@ -529,82 +539,13 @@ struct OpenCodeUsageScanner: Sendable {
         var checked: Set<String> = []
         var failures: [String: String] = [:]
 
-        for path in paths {
-            // sqlite3 is a synchronous subprocess (bounded to five seconds). A disable cannot stop the
-            // query already running, but this prevents later database/anchor queries from starting.
-            guard !Task.isCancelled else { return nil }
-            checked.insert(path)
-            let schema: OpenCodeDatabaseSchema
-            do {
-                // Which message tables this database holds (OpenCode 1's `message`, OpenCode 2's
-                // `session_message`, or both while the v1→v2 migration runs). The probe is one
-                // `sqlite_master` lookup, memoized per database revision.
-                schema = try JSONLAccountingWorkPacer.shared.perform({
-                    try OpenCodeDatabaseSchemaProbe.detect(sqlite: sqlite, path: path)
-                })
-                if schema.readsV2 {
-                    let layout = schema == .v2 ? "session_message" : "session_message + message"
-                    DiagnosticGate.logOnce(for: "opencode.sqlite.schema.\(JSONLScanCachePaths.stableFingerprint(path))") {
-                        AppLog.info(.refresh, "opencode database \(path) uses the \(layout) layout")
-                    }
-                }
-                guard let json = try JSONLAccountingWorkPacer.shared.perform({
-                    try sqlite.queryValue(
-                        path: path,
-                        sql: OpenCodeDatabaseSQL.dataSQL(cutoffMs: cutoffMs, schema: schema)
-                    )
-                }) else {
-                    failures[path] = "usage query returned no result"
-                    continue
-                }
-                guard !Task.isCancelled else { return nil }
-                guard let parsedRows = JSONLAccountingWorkPacer.shared.perform({
-                    Self.parseRows(json, maximumTimestampMs: maximumTimestampMs)
-                }) else {
-                    failures[path] = "usage rows contain malformed accounting values"
-                    continue
-                }
-                rows.append(contentsOf: parsedRows)
-            } catch {
-                guard !Task.isCancelled else { return nil }
-                failures[path] = error.localizedDescription
-                continue
-            }
-            guard !Task.isCancelled else { return nil }
-            // Monthly cycle anchor: the earliest-ever local Go usage (unbounded, so it survives the
-            // day-window cutoff). Best-effort per path — anchor failures are edge-warned (not silent)
-            // so a persistently broken anchor query surfaces once, then falls back to calendar month.
-            //
-            // The anchor is memoized per database revision: it is a full-history MIN() scan that
-            // cannot change unless the database file changes (any write moves size/mtime, which the
-            // memo key catches, including a deleted oldest session), yet it re-ran on every refresh.
-            let memoKey = Self.goAnchorMemoKey(path: path, schema: schema)
-            if let memoKey, let anchor = Self.cachedGoAnchor(key: memoKey) {
-                anchorMs = Swift.min(anchorMs ?? anchor, anchor)
-            } else {
-                let anchorDiagnosticKey = "opencode.sqlite.anchor.\(JSONLScanCachePaths.stableFingerprint(path))"
-                do {
-                    guard !Task.isCancelled else { return nil }
-                    let text = try JSONLAccountingWorkPacer.shared.perform({
-                        try sqlite.queryValue(path: path, sql: OpenCodeDatabaseSQL.anchorSQL(schema: schema))
-                    })
-                    DiagnosticGate.clearFailure(anchorDiagnosticKey)
-                    if let text,
-                       let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                        guard !Task.isCancelled else { return nil }
-                        anchorMs = Swift.min(anchorMs ?? value, value)
-                        if let memoKey {
-                            Self.storeGoAnchor(key: memoKey, anchorMs: value)
-                        }
-                    }
-                } catch {
-                    guard !Task.isCancelled else { return nil }
-                    DiagnosticGate.logOnce(for: anchorDiagnosticKey) {
-                        AppLog.warn(LogTag.plugin("opencode"), "anchor query failed for \(path): \(error.localizedDescription) — monthly window falls back to calendar month")
-                    }
-                }
-            }
-        }
+        guard let backend = await databaseAccess.readMessageDatabases(
+            paths: paths, cutoffMs: cutoffMs, maximumTimestampMs: maximumTimestampMs
+        ) else { return nil }
+        rows = backend.rows
+        anchorMs = backend.anchorMs
+        checked = backend.checked
+        failures = backend.failures
         guard !Task.isCancelled else { return nil }
         // Per-path detail is logged only for newly failing paths (the reporter edge-triggers), so a
         // persistently locked database warns once, not on every 5-minute refresh.
@@ -839,12 +780,10 @@ struct OpenCodeUsageScanner: Sendable {
             }
             do {
                 guard !Task.isCancelled else { return nil }
-                guard let json = try JSONLAccountingWorkPacer.shared.perform({
-                    try sqlite.queryValue(
-                        path: hermesPath,
-                        sql: Self.hermesGatewaySQL(cutoffSeconds: Double(cutoffMs) / 1000)
-                    )
-                }) else {
+                guard let json = try databaseAccess.queryValue(
+                    path: hermesPath,
+                    sql: Self.hermesGatewaySQL(cutoffSeconds: Double(cutoffMs) / 1000)
+                ) else {
                     throw Self.incompleteSource("Hermes query")
                 }
                 guard !Task.isCancelled else { return nil }
@@ -971,12 +910,7 @@ struct OpenCodeUsageScanner: Sendable {
         }
         for path in paths {
             do {
-                // The probe runs against the layout this database actually holds.
-                let schema = try OpenCodeDatabaseSchemaProbe.detect(sqlite: sqlite, path: path)
-                if let value = try sqlite.queryValue(
-                    path: path,
-                    sql: OpenCodeDatabaseSQL.probeSQL(schema: schema)
-                ), !value.isEmpty {
+                if let value = try databaseAccess.hostedUsageValue(path: path), !value.isEmpty {
                     return true
                 }
             } catch {
@@ -1561,7 +1495,7 @@ struct OpenCodeUsageScanner: Sendable {
 
     // MARK: - Parsing
 
-    private struct Row {
+    struct Row {
         var ms: Double
         var cost: Double?
         var tokens: Int
@@ -1570,11 +1504,98 @@ struct OpenCodeUsageScanner: Sendable {
         var providerID: String
     }
 
+    /// The `/usr/bin/sqlite3` read of every database, kept as the parity oracle and as the fallback
+    /// when the backend declines. Nil means the scan was cancelled.
+    ///
+    /// Every query runs through `JSONLAccountingWorkPacer` so a background pass stays inside its
+    /// CPU budget. The backend owns the only schema/anchor memo; this path re-reads the catalog
+    /// directly so a v1→v2 migration cannot leave two caches disagreeing.
+    static func readDatabasesViaCLI(
+        paths: [String],
+        cutoffMs: Int,
+        maximumTimestampMs: Double,
+        sqlite: SQLiteAccessing
+    ) async -> (rows: [Row], anchorMs: Double?, checked: Set<String>, failures: [String: String])? {
+        var rows: [Row] = []
+        var anchorMs: Double?
+        var checked: Set<String> = []
+        var failures: [String: String] = [:]
+
+        for path in paths {
+            // sqlite3 is a synchronous subprocess (bounded to five seconds). A disable cannot stop the
+            // query already running, but this prevents later database/anchor queries from starting.
+            guard !Task.isCancelled else { return nil }
+            checked.insert(path)
+            let schema: OpenCodeDatabaseSchema
+            do {
+                // Which message tables this database holds (OpenCode 1's `message`, OpenCode 2's
+                // `session_message`, or both while the v1→v2 migration runs). The oracle reads the
+                // catalog directly; the backend owns the only memo.
+                schema = try JSONLAccountingWorkPacer.shared.perform({
+                    try OpenCodeDatabaseSchemaProbe.detect(sqlite: sqlite, path: path)
+                })
+                if schema.readsV2 {
+                    let layout = schema == .v2 ? "session_message" : "session_message + message"
+                    DiagnosticGate.logOnce(for: "opencode.sqlite.schema.\(JSONLScanCachePaths.stableFingerprint(path))") {
+                        AppLog.info(.refresh, "opencode database \(path) uses the \(layout) layout")
+                    }
+                }
+                guard let json = try JSONLAccountingWorkPacer.shared.perform({
+                    try sqlite.queryValue(
+                        path: path,
+                        sql: OpenCodeDatabaseSQL.dataSQL(cutoffMs: cutoffMs, schema: schema)
+                    )
+                }) else {
+                    failures[path] = "usage query returned no result"
+                    continue
+                }
+                guard !Task.isCancelled else { return nil }
+                guard let parsedRows = JSONLAccountingWorkPacer.shared.perform({
+                    Self.parseRows(json, maximumTimestampMs: maximumTimestampMs)
+                }) else {
+                    failures[path] = "usage rows contain malformed accounting values"
+                    continue
+                }
+                rows.append(contentsOf: parsedRows)
+            } catch {
+                guard !Task.isCancelled else { return nil }
+                failures[path] = error.localizedDescription
+                continue
+            }
+            guard !Task.isCancelled else { return nil }
+            // Monthly cycle anchor: the earliest-ever local Go usage (unbounded, so it survives the
+            // day-window cutoff). Best-effort per path — anchor failures are edge-warned (not silent)
+            // so a persistently broken anchor query surfaces once, then falls back to calendar month.
+            //
+            // The CLI engine is the oracle/fallback, so it reads the anchor directly. The
+            // backend's per-revision memo is the only owner of memoized schema/anchor state.
+            let anchorDiagnosticKey = "opencode.sqlite.anchor.\(JSONLScanCachePaths.stableFingerprint(path))"
+            do {
+                guard !Task.isCancelled else { return nil }
+                let text = try JSONLAccountingWorkPacer.shared.perform({
+                    try sqlite.queryValue(path: path, sql: OpenCodeDatabaseSQL.anchorSQL(schema: schema))
+                })
+                DiagnosticGate.clearFailure(anchorDiagnosticKey)
+                if let text,
+                   let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                    guard !Task.isCancelled else { return nil }
+                    anchorMs = Swift.min(anchorMs ?? value, value)
+                }
+            } catch {
+                guard !Task.isCancelled else { return nil }
+                DiagnosticGate.logOnce(for: anchorDiagnosticKey) {
+                    AppLog.warn(LogTag.plugin("opencode"), "anchor query failed for \(path): \(error.localizedDescription) — monthly window falls back to calendar month")
+                }
+            }
+        }
+        return (rows, anchorMs, checked, failures)
+    }
+
     /// Parse the `json_group_array(json_array(...))` payload: an array of
     /// `[time_created, cost, tokensTotal, modelID, providerID]`. Invalid token/time/identity fields
     /// invalidate the query so last-good history stays intact; a missing source cost keeps measured
     /// tokens while marking dollar coverage incomplete.
-    private static func parseRows(_ json: String, maximumTimestampMs: Double) -> [Row]? {
+    static func parseRows(_ json: String, maximumTimestampMs: Double) -> [Row]? {
         guard let data = json.data(using: .utf8),
               let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [Any]
         else { return nil }
@@ -1626,28 +1647,4 @@ struct OpenCodeUsageScanner: Sendable {
 
     // MARK: - SQL
 
-    // MARK: Go anchor memo
-
-    /// Process-wide memo of the monthly-cycle anchor per database revision (path + main-db stat +
-    /// WAL stat). The anchor is a full-history `MIN()` scan that ran on every refresh, but it can
-    /// only change when the database changes. The key stats both the main file and its `-wal`
-    /// companion: in WAL mode a commit touches the companion without moving the main db, so any
-    /// write — including a deleted oldest session — re-queries. Idle databases (the common
-    /// panel-open case) then skip the scan entirely.
-    private static let goAnchorMemo = OSAllocatedUnfairLock<[String: Double]>(initialState: [:])
-
-    private static func goAnchorMemoKey(path: String, schema: OpenCodeDatabaseSchema) -> String? {
-        guard let revision = OpenCodeDatabaseSchemaProbe.revisionStamp(path: path) else { return nil }
-        // The layout is part of the key: the anchor query differs per layout, so a store that
-        // migrates under the same file stamp cannot reuse the other layout's answer.
-        return "\(path)|\(schema)|\(revision)"
-    }
-
-    private static func cachedGoAnchor(key: String) -> Double? {
-        goAnchorMemo.withLock { $0[key] }
-    }
-
-    private static func storeGoAnchor(key: String, anchorMs: Double) {
-        goAnchorMemo.withLock { $0[key] = anchorMs }
-    }
 }

@@ -50,5 +50,6 @@ counters, and billing metadata in. Read-only: QuotaBar never writes to it, and n
 ## Under the hood
 
 QuotaBar queries the `sessions` table (period totals, daily series) and `session_model_usage` (the
-per-model breakdown) with the same read-only sqlite access every other local provider uses. Days are
-grouped in your Mac's local time zone, so they line up with your own calendar.
+per-model breakdown) over one read-only SQLite connection in the Rust backend (see
+[Rust backend port](../rust-backend.md)). Days are grouped in your Mac's local time zone, so they line
+up with your own calendar.

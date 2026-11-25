@@ -126,7 +126,7 @@ actor FreebuffDesktopUsageScanner {
     private var cachedSessionChats: [String: SessionChatInfo] = [:]
 
     init(
-        sqlite: any SQLiteAccessing = SQLiteCLIAccessor(),
+        sqlite: any SQLiteAccessing = FreebuffDesktopDatabaseAccess(engine: .rust),
         databasePaths: @escaping @Sendable () throws -> [String] = FreebuffDesktopUsageScanner.defaultDatabasePaths,
         sessionEndsPath: @escaping @Sendable () -> String? = FreebuffDesktopUsageScanner.defaultSessionEndsPath,
         parseMetrics: @escaping @Sendable (String) -> [String: Any]? = { ProviderParse.jsonObject(Data($0.utf8)) },
@@ -245,11 +245,18 @@ actor FreebuffDesktopUsageScanner {
                 // Every selected expression is COALESCEd: SQLite's `||` yields NULL when one side is
                 // NULL, and a single NULL element used to fail the whole array cast — taking the
                 // entire history with it. An empty value now marks one unreadable row instead.
+                //
+                // The read is paced per statement inside `readRows` (a legacy-schema retry issues
+                // a second statement), and the decode is its own slice. Cancellation is observed
+                // between the stages.
                 let text = try FreebuffDesktopUsageSQL.readRows(sqlite: sqlite, path: path)
                 guard let text,
                       let data = text.data(using: .utf8)
                 else { throw FreebuffUsageError.localHistoryUnreadable }
-                let derived = try Self.deriveTurns(from: data, parseMetrics: parseMetrics)
+                try Task.checkCancellation()
+                let derived = try JSONLAccountingWorkPacer.shared.perform {
+                    try Self.deriveTurns(from: data, parseMetrics: parseMetrics)
+                }
                 turnsByDatabase.append(derived.turns)
                 unreadableRows += derived.unreadable
                 // One query is a consistent SQLite snapshot. If another turn commits while it is
@@ -498,13 +505,18 @@ actor FreebuffDesktopUsageScanner {
         remainingInstanceIDs: inout Set<String>,
         remainingThreadIDs: inout Set<String>
     ) {
+        guard !Task.isCancelled else { return }
+        // The statement is paced inside the SQL helper, including its legacy-schema fallback; the
+        // decode is its own slice.
         guard let jsonString = try? FreebuffDesktopUsageSQL.readActiveSessionChats(
             sqlite: sqlite, path: path,
             instanceIDs: Array(remainingInstanceIDs),
             threadIDs: Array(remainingThreadIDs)
         ),
-        let data = jsonString.data(using: .utf8),
-        let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return }
+        let rows = JSONLAccountingWorkPacer.shared.perform({ () -> [[String: Any]]? in
+            guard let data = jsonString.data(using: .utf8) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+        }) else { return }
 
         let stamp = sourceStamp(path)
         var best: [String: (preferred: Bool, info: SessionChatInfo)] = [:]

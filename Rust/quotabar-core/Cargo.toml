@@ -3,14 +3,23 @@ name = "quotabar-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Performance-critical QuotaBar primitives compiled to a static library and called from Swift over a small C ABI (Claude and Codex usage-line parsers)."
+description = "QuotaBar backend: performance-critical primitives and provider data-plane operations compiled to a static library and called from Swift over a small C ABI."
 
 [lib]
 name = "quotabar_core"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-serde_json = "1"
+# Derive half of the serde stack `serde_json` already pulls in; the backend folds deserialize
+# their pricing tables and payload headers with it rather than hand-writing field maps.
+serde = { version = "1", features = ["derive"] }
+# `float_roundtrip` is required, not optional: the default parser is lossy on some decimal shapes
+# (`9.600000000000001` parsed as `9.6`), which would price scans one ULP off the Swift oracle.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# SQLite access for local-usage providers (Hermes today; OpenCode, Antigravity, Freebuff, and
+# ZCode next). `bundled` compiles a pinned SQLite so behavior does not depend on the host's
+# /usr/bin/sqlite3 build, and it replaces one subprocess per query with one in-process connection.
+rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
 
 [profile.release]
 lto = true

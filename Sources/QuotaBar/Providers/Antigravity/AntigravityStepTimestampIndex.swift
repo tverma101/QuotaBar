@@ -79,6 +79,7 @@ struct AntigravityStepTimestampIndex: Equatable, Sendable {
             summary = nil
             supportsDigest = false
         } else {
+            let phaseDigestStart = DispatchTime.now().uptimeNanoseconds
             do {
                 summary = try digest(path: path, through: previous?.lastIndex ?? -1, sqlite: sqlite)
                 supportsDigest = summary == nil ? nil : true
@@ -87,7 +88,9 @@ struct AntigravityStepTimestampIndex: Equatable, Sendable {
                 summary = nil
                 supportsDigest = false
             }
+            AntigravityDbUsageScanner.phase("stepDigest", phaseDigestStart)
         }
+        let phaseLoadStart = DispatchTime.now().uptimeNanoseconds
         var index = Self()
         if let previous, previous.timeZoneIdentifier == index.timeZoneIdentifier,
            let summary, summary.prefix == previous.tableFingerprint {
@@ -118,7 +121,10 @@ struct AntigravityStepTimestampIndex: Equatable, Sendable {
                 try sqlite.queryValue(path: path, sql: sql)
             }) else { throw SQLiteError.queryFailed("Antigravity step timestamp query returned no result") }
             let rows = try JSONDecoder().decode([Row].self, from: Data(payload.utf8))
-            if rows.isEmpty { return index }
+            if rows.isEmpty {
+                AntigravityDbUsageScanner.phase("stepIndex", phaseLoadStart)
+                return index
+            }
             try JSONLAccountingWorkPacer.shared.perform {
                 for row in rows {
                     guard row.index > cursor else {

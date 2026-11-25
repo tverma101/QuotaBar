@@ -84,7 +84,9 @@ final class OpenCodeV2SchemaTests: XCTestCase {
     }
 
     private func scanner(path: String) -> OpenCodeUsageScanner {
-        OpenCodeUsageScanner(sqlite: SQLiteCLIAccessor(), databasePaths: { [path] })
+        OpenCodeUsageScanner(sqlite: SQLiteCLIAccessor(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [path] })
     }
 
     /// A scan with every gateway source switched off: these tests are about the database layer, so

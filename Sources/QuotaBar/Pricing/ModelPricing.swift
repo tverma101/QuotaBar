@@ -44,6 +44,23 @@ final class ModelPricing: Sendable {
     private let canonicalNameMemo = OSAllocatedUnfairLock<[String: CanonicalNameLookup]>(initialState: [:])
     private let cursorCanonicalNameMemo = OSAllocatedUnfairLock<[String: CanonicalNameLookup]>(initialState: [:])
 
+    /// The Rust pricing snapshot built for these catalogues. Loading is lazy and happens once per
+    /// `ModelPricing`; a declined load is remembered so a broken backend cannot make every refresh
+    /// pay the catalogue encode again. The Swift resolver above stays the parity oracle and the
+    /// fallback whenever this is nil.
+    private enum BackendState: Sendable {
+        case idle
+        case loaded(UInt64)
+        case unavailable
+    }
+    private let backendState = OSAllocatedUnfairLock<BackendState>(initialState: .idle)
+    #if DEBUG
+    /// Test-only evidence that a fold actually used the Rust pricing snapshot rather than the
+    /// inline fallback. Never read by shipping code.
+    private static let backendLoads = OSAllocatedUnfairLock(initialState: 0)
+    static var backendLoadsForTesting: Int { backendLoads.withLock { $0 } }
+    #endif
+
     init(
         supplement: PricingSupplement,
         primary: PricingCatalog,
@@ -423,5 +440,92 @@ final class ModelPricing: Sendable {
         primary.clearFuzzyIndex()
         secondary.clearFuzzyIndex()
         openRouter.clearFuzzyIndex()
+        if let handle = loadedBackendHandle() {
+            _ = try? RustBackend.call(op: "pricing.clear", params: ["handle": handle])
+        }
+    }
+
+    deinit {
+        guard let handle = loadedBackendHandle() else { return }
+        _ = try? RustBackend.call(op: "pricing.release", params: ["handle": handle])
+    }
+
+    // MARK: - Rust pricing snapshot
+
+    /// The backend snapshot for these catalogues, built on first use. Nil means the backend
+    /// declined; callers pass the inline per-model rate table instead. Alias rules are still
+    /// evaluated here (ICU `NSRegularExpression` is the authority for a fetched ruleset), and the
+    /// caller supplies one memoized canonical name per distinct slug to the fold.
+    func backendPricingHandle() -> UInt64? {
+        backendState.withLock { state in
+            switch state {
+            case .loaded(let handle):
+                return handle
+            case .unavailable:
+                return nil
+            case .idle:
+                if let handle = Self.loadBackendPricing(
+                    supplementPricing: supplement.pricing,
+                    fastMultipliers: supplement.fastMultipliers,
+                    primary: primary.entries,
+                    secondary: secondary.entries,
+                    openRouter: openRouter.entries
+                ) {
+                    state = .loaded(handle)
+                    return handle
+                }
+                state = .unavailable
+                return nil
+            }
+        }
+    }
+
+    /// The handle only if a fold already built it; never loads the catalogues just to clear them.
+    private func loadedBackendHandle() -> UInt64? {
+        backendState.withLock { state in
+            if case .loaded(let handle) = state { return handle }
+            return nil
+        }
+    }
+
+    /// Forward the discovery candidates a backend fold reported. Rust marks each name once per
+    /// snapshot, matching the memo `resolve` keeps, so the hook fires at most once per name.
+    func reportBackendRecheckModels(_ models: [String]) {
+        guard let onOpenRouterRecheckModel else { return }
+        for model in models { onOpenRouterRecheckModel(model) }
+    }
+
+    private static func loadBackendPricing(
+        supplementPricing: [String: ModelRates],
+        fastMultipliers: [String: Double],
+        primary: [String: ModelRates],
+        secondary: [String: ModelRates],
+        openRouter: [String: ModelRates]
+    ) -> UInt64? {
+        do {
+            // Assembled directly so no catalogue is decoded back into Foundation objects, and every
+            // rate keeps its exact bit pattern (`JSONEncoder` rounds to 15 significant digits).
+            guard let request = PricingSnapshotWire.request(
+                supplementPricing: supplementPricing,
+                fastMultipliers: fastMultipliers,
+                primary: primary,
+                secondary: secondary,
+                openRouter: openRouter
+            ) else {
+                throw RustBackend.BridgeError.invalidRequest("pricing snapshot contains a non-finite rate")
+            }
+            let result = try RustBackend.callRaw(request)
+            guard let object = try JSONSerialization.jsonObject(with: result) as? [String: Any],
+                  let handle = (object["handle"] as? NSNumber)?.uint64Value else {
+                throw RustBackend.BridgeError.malformedResponse("missing pricing handle")
+            }
+            #if DEBUG
+            Self.backendLoads.withLock { $0 += 1 }
+            #endif
+            return handle
+        } catch {
+            AppLog.warn(.cache, "rust pricing snapshot unavailable (\(error)); resolving rates inline")
+            return nil
+        }
     }
 }

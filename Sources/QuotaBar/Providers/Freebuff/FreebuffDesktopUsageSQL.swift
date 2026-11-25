@@ -66,15 +66,29 @@ enum FreebuffDesktopUsageSQL {
         return message.localizedCaseInsensitiveContains("no such table: auto_run_decision_receipts")
     }
 
+    /// One statement, one paced slice. A legacy-schema retry issues a second statement, so pacing
+    /// lives at the statement boundary here rather than around the whole read: each statement
+    /// accounts for itself exactly like the separate `sqlite3` process it replaced.
+    private static func pacedQuery(
+        sqlite: any SQLiteAccessing,
+        path: String,
+        sql: String
+    ) throws -> String? {
+        try JSONLAccountingWorkPacer.shared.perform {
+            try sqlite.queryValue(path: path, sql: sql)
+        }
+    }
+
     /// Older stores may predate either column/table. Retry only a proven missing-schema error;
     /// invalid databases and other query failures still reach the provider's visible history error.
     static func readRows(sqlite: any SQLiteAccessing, path: String) throws -> String? {
         var includeManagers = true
         var includeSnapshot = true
         while true {
+            try Task.checkCancellation()
             var sql = includeManagers ? messagesAndMissionManagers : assistantMessages
             if !includeSnapshot { sql = sql.replacingOccurrences(of: selectedModel, with: "COALESCE(t.model, '')") }
-            do { return try sqlite.queryValue(path: path, sql: sql) }
+            do { return try pacedQuery(sqlite: sqlite, path: path, sql: sql) }
             catch let error as SQLiteError {
                 if includeManagers && isMissingMissionReceiptTable(error) { includeManagers = false }
                 else if includeSnapshot, case .queryFailed(let message) = error,
@@ -116,7 +130,7 @@ enum FreebuffDesktopUsageSQL {
         guard !instanceIDs.isEmpty || !threadIDs.isEmpty else { return "[]" }
         let sql = activeSessionChatsQuery(instanceIDs: instanceIDs, threadIDs: threadIDs)
         do {
-            return try sqlite.queryValue(path: path, sql: sql)
+            return try pacedQuery(sqlite: sqlite, path: path, sql: sql)
         } catch let error as SQLiteError {
             if case .queryFailed(let message) = error,
                message.localizedCaseInsensitiveContains("no such column: freebuff_instance_id"),
@@ -131,7 +145,8 @@ enum FreebuffDesktopUsageSQL {
                 )), '[]') FROM threads
                 WHERE id IN (\(escapedThreads))
                 """
-                return try sqlite.queryValue(path: path, sql: fallbackSQL)
+                try Task.checkCancellation()
+                return try pacedQuery(sqlite: sqlite, path: path, sql: fallbackSQL)
             }
             throw error
         }

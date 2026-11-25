@@ -157,6 +157,7 @@ final class OpenCodeProvider: ProviderRuntime {
     init(
         authStore: OpenCodeAuthStore = OpenCodeAuthStore(),
         usageScanner: OpenCodeUsageScanner = OpenCodeUsageScanner(
+            databaseEngine: .rust,
             claudeRoots: { OpenCodeUsageScanner.discoverClaudeRoots() },
             codexHomes: { CodexLogUsageScanner.discoverCodexHomes() },
             hermesStateDBPath: {

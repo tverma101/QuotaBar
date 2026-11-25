@@ -165,6 +165,30 @@ const uint8_t *qb_pricing_compact_catalog_strings(const void *result, uint32_t *
 uint8_t qb_pricing_compact_catalog_retired_present(const void *result);
 void qb_pricing_compact_catalog_destroy(void *result);
 
+// ---------------------------------------------------------------------------
+// Provider backend envelope (JSON request → JSON response)
+// ---------------------------------------------------------------------------
+//
+// Swift sends {"op":"...","params":{...}} as UTF-8 and receives {"ok":true,"result":...} or
+// {"ok":false,"error":{"kind":"...","message":"..."}}. Operations are additive; the ABI
+// version bumps when the envelope contract changes. No operation returns a null result except for
+// a null pointer with a nonzero length: failures are reported inside the JSON envelope.
+
+typedef struct QbBackendResult QbBackendResult;
+
+/// ABI version of the backend envelope contract.
+uint32_t qb_backend_abi_version(void);
+/// Handle one backend request. Free with qb_backend_result_destroy.
+QbBackendResult *qb_backend_call(const uint8_t *request, size_t request_len);
+/// Handle one backend request plus a fixed-stride binary payload (the fold entry records).
+/// The JSON envelope still carries the operation, calendar boundaries, and pricing table.
+QbBackendResult *qb_backend_call_with_payload(
+    const uint8_t *request, size_t request_len,
+    const uint8_t *payload, size_t payload_len);
+/// Pointer to the UTF-8 JSON response bytes, plus its length, valid until destroy.
+const uint8_t *qb_backend_result_data(const QbBackendResult *result, size_t *length);
+void qb_backend_result_destroy(QbBackendResult *result);
+
 
 #ifdef __cplusplus
 }

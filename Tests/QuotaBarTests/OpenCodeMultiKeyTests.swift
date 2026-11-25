@@ -73,6 +73,7 @@ final class OpenCodeMultiKeyTests: XCTestCase {
             authStore: authStore(files: FakeFiles(["/oc/auth.json": authJSON])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: db.map { [dbPath: $0] } ?? [:]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { db == nil ? [] : [dbPath] }
             ),
             usageClient: OpenCodeGoUsageClient(http: http),
@@ -203,7 +204,9 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         let http = SequenceHTTPClient([])
         let runtime = OpenCodeProvider(
             authStore: auth,
-            usageScanner: OpenCodeUsageScanner(sqlite: sqlite, databasePaths: { ["/oc/opencode.db"] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: sqlite,
+                databaseEngine: .sqliteCLI,
+                databasePaths: { ["/oc/opencode.db"] }),
             usageClient: OpenCodeGoUsageClient(http: http),
             now: { now },
             goKeyStore: savedStore,
@@ -265,6 +268,7 @@ final class OpenCodeMultiKeyTests: XCTestCase {
             authStore: authStore(files: UnreadableFiles(present: ["/oc/auth.json"])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(failingPaths: ["/oc/opencode.db"]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: OpenCodeGoUsageClient(http: SequenceHTTPClient([])),
@@ -325,7 +329,9 @@ final class OpenCodeMultiKeyTests: XCTestCase {
         let http = SequenceHTTPClient([])
         let runtime = OpenCodeProvider(
             authStore: auth,
-            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(), databasePaths: { [] }),
+            usageScanner: OpenCodeUsageScanner(sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
+                databasePaths: { [] }),
             usageClient: OpenCodeGoUsageClient(http: http),
             goKeyStore: keyStore,
             onGoKeysChanged: { requestedReload = true },
@@ -572,6 +578,7 @@ final class OpenCodeMultiKeyTests: XCTestCase {
             authStore: authStore(files: authFiles),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { [] }
             ),
             usageClient: OpenCodeGoUsageClient(http: http),
@@ -613,6 +620,7 @@ final class OpenCodeMultiKeyTests: XCTestCase {
             authStore: authStore(files: UnreadableFiles(present: ["/oc/auth.json"])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(data: ["/oc/opencode.db": localUsage]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: OpenCodeGoUsageClient(http: http),
@@ -664,6 +672,7 @@ final class OpenCodeMultiKeyTests: XCTestCase {
             authStore: authStore(files: UnreadableFiles(present: ["/oc/auth.json"])),
             usageScanner: OpenCodeUsageScanner(
                 sqlite: StubSQLite(failingPaths: ["/oc/opencode.db"]),
+                databaseEngine: .sqliteCLI,
                 databasePaths: { ["/oc/opencode.db"] }
             ),
             usageClient: OpenCodeGoUsageClient(http: http),

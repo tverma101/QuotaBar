@@ -279,3 +279,16 @@ cached-input, output, reasoning, and total fields in one structural walk; OpenCo
 provider-stamped, successful rows it owns. Lines for other providers cost almost nothing because they are
 rejected before token accounting. A line the writer had not finished is carried to the next read rather
 than parsed, and a truncated line is skipped rather than turned into a short row.
+
+Every local SQLite read in a healthy refresh (the `opencode*.db` schema probe, usage query, and
+monthly-cycle anchor, the Hermes gateway ledger query, and the `hasHostedUsage` probe) runs over
+in-process read-only connections in the Rust backend, so that path spawns no `/usr/bin/sqlite3`
+subprocess. The intentional fallbacks (an internal backend failure, or the `.sqliteCLI` oracle)
+still use the subprocess path. The one memo for a database's layout and anchor is owned by Rust and
+keyed by the file revision, with the revision captured before the schema query so a mid-probe
+migration cannot cache the old layout under the new stamp. The engine is chosen explicitly (`.rust`
+in production, `.sqliteCLI` as the oracle and fallback). The Rust read is paced one statement at a
+time (schema, data, anchor), checks cancellation between stages and databases, bounds each
+statement at the CLI path's five seconds, retries a read-only failure with write access, and reads
+the usage payload out of the bridge envelope in one pass rather than re-encoding it.
+See [Rust backend port](../rust-backend.md).

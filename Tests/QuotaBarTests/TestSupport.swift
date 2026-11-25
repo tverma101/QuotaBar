@@ -21,6 +21,55 @@ enum TestPricing {
     }()
 }
 
+/// Compares the bridge's old result round-trip (decode the envelope, re-encode the result object,
+/// typed-decode it) with the current single-pass field read on one payload the backend produced.
+/// Test builds are unoptimized, so absolute times are inflated; the before/after ratio is the signal.
+enum BridgeDecodeBenchmark {
+    struct Timings {
+        let payloadBytes: Int
+        let oldMs: Double
+        let newMs: Double
+    }
+
+    enum MeasurementError: Error { case payloadMismatch }
+
+    static func measure(payload: String, iterations: Int = 5) throws -> Timings {
+        struct OldResult: Decodable { let value: String?; let error: String? }
+        let envelope = try JSONSerialization.data(
+            withJSONObject: ["ok": true, "result": ["value": payload]]
+        )
+        func oldDecode() throws -> String? {
+            let object = try JSONSerialization.jsonObject(with: envelope) as! [String: Any]
+            let result = try JSONSerialization.data(withJSONObject: object["result"]!)
+            return try JSONDecoder().decode(OldResult.self, from: result).value
+        }
+        func newDecode() throws -> String? {
+            let object = try JSONSerialization.jsonObject(with: envelope) as! [String: Any]
+            return (object["result"] as? [String: Any])?["value"] as? String
+        }
+        guard try oldDecode() == payload, try newDecode() == payload else {
+            throw MeasurementError.payloadMismatch
+        }
+
+        func timed(_ body: () throws -> Void) -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try? body()
+            return Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        }
+        var old: [Double] = []
+        var new: [Double] = []
+        for _ in 0..<max(1, iterations) {
+            old.append(timed { _ = try? oldDecode() })
+            new.append(timed { _ = try? newDecode() })
+        }
+        return Timings(
+            payloadBytes: payload.utf8.count,
+            oldMs: old.sorted()[old.count / 2],
+            newMs: new.sorted()[new.count / 2]
+        )
+    }
+}
+
 /// Builds throwaway Claude config dirs (`<tmp>/…/projects/<file>.jsonl`) and canned usage lines for
 /// `ClaudeLogUsageScanner` tests, plus a scanner wired to read only the fixture (never the real
 /// `~/.claude` of the machine running the tests).

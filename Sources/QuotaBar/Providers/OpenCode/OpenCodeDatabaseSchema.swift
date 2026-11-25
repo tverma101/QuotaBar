@@ -1,6 +1,4 @@
 import Foundation
-import Darwin
-import os
 
 /// The message tables an OpenCode database holds.
 ///
@@ -63,51 +61,12 @@ enum OpenCodeDatabaseSchemaProbe {
         }
     }
 
-    /// Detect the layout of one database, memoized per database revision.
-    ///
-    /// The layout only changes when the file changes (the migration adds the v2 tables), so the
-    /// answer is cached against the file's size/mtime — including the `-wal` companion, because in
-    /// WAL mode a commit, and any schema change, lands there first. An inconclusive probe is not
-    /// cached: it must not pin a database to a layout that a later read could contradict.
+    /// Detect the layout of one database. The Rust backend owns the only memo (schema and anchor
+    /// share one revision key), so this oracle/fallback path reads the catalog directly instead of
+    /// keeping a second cache that could disagree after a v1→v2 migration.
     static func detect(sqlite: SQLiteAccessing, path: String) throws -> OpenCodeDatabaseSchema {
-        let stamp = revisionStamp(path: path)
-        if let stamp, let cached = memo.withLock({ $0[path] }), cached.stamp == stamp {
-            return cached.schema
-        }
-        let output = try sqlite.queryValue(path: path, sql: detectionSQL)
-        let schema = schema(fromProbeOutput: output)
-        guard schema != .unknown, let stamp else { return schema }
-        memo.withLock { $0[path] = (stamp: stamp, schema: schema) }
-        return schema
+        schema(fromProbeOutput: try sqlite.queryValue(path: path, sql: detectionSQL))
     }
-
-    /// Forget every memoized layout (tests).
-    static func resetMemoForTesting() {
-        memo.withLock { $0.removeAll() }
-    }
-
-    /// The database revision the memo keys on: the main file's size/mtime plus its `-wal`
-    /// companion's. A write in WAL mode moves the companion, so the layout is re-probed as soon as
-    /// the database changes.
-    static func revisionStamp(path: String) -> String? {
-        func stamp(_ path: String, missingAllowed: Bool) -> String? {
-            var value = stat()
-            guard Darwin.lstat(path, &value) == 0 else {
-                return missingAllowed && errno == ENOENT ? "missing" : nil
-            }
-            return "\(value.st_dev):\(value.st_ino):\(value.st_size):"
-                + "\(value.st_mtimespec.tv_sec):\(value.st_mtimespec.tv_nsec):"
-                + "\(value.st_ctimespec.tv_sec):\(value.st_ctimespec.tv_nsec)"
-        }
-        guard let main = stamp(path, missingAllowed: false), let wal = stamp(path + "-wal", missingAllowed: true)
-        else { return nil }
-        return "\(main)|\(wal)"
-    }
-
-    /// One entry per database path: the revision it was probed at and the layout it reported.
-    private static let memo = OSAllocatedUnfairLock<[String: (stamp: String, schema: OpenCodeDatabaseSchema)]>(
-        initialState: [:]
-    )
 }
 
 /// The queries that read a database's hosted assistant usage, one variant per layout.

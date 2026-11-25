@@ -80,16 +80,23 @@ opening the panel or Usage History recomputes carried or stale history.
 
 Unchanged stores reuse cached totals. Changed stores verify old generation and step metadata with
 compact SQLite digests, then decode appended rows. Older SQLite builds use bounded verification
-batches. Historical edits, changed date matches, and time-zone changes rebuild the affected totals.
+batches; the in-process Rust query engine also lacks the CLI's optional `sha3` extension, so it uses
+that same bounded verifier path without changing results. Historical edits, changed date matches, and
+time-zone changes rebuild the affected totals.
 Step-date indexes share a 64 MB in-memory budget; an index that exceeds the remaining budget evicts
 its whole database cache, and macOS memory pressure clears those database caches together so usage
 rows and their dates are rebuilt as one unit. QuotaBar also keeps private, per-database accounting
 checkpoints on this Mac so a missing source's last measured tokens survive memory pressure and restarts.
 The checkpoints contain model names, token counts, and timestamps, not conversation content.
 
-The transcript logs don't include token accounting, so they aren't used. QuotaBar opens Antigravity
-databases in SQLite read-only mode and never retries with read-write access; SQLite may still use WAL
-sidecars while reading. Each bounded batch accounts for both generation data and step metadata before
+The transcript logs don't include token accounting, so they aren't used. QuotaBar runs each Antigravity
+SQLite statement through the in-process Rust query engine, read-only, with the CLI path's five-second
+bound; the healthy path spawns no `/usr/bin/sqlite3`. The explicit CLI engine remains the parity oracle;
+an internal backend failure falls back to it for that statement only, and the next statement tries
+the in-process engine again, so one bad response cannot disable the fast path for the session. That
+fallback does spawn `/usr/bin/sqlite3`. A SQL or database error is rethrown unchanged rather than
+retried on the other engine. Antigravity never retries with read-write access; SQLite may still use WAL sidecars while
+reading. Each bounded batch accounts for both generation data and step metadata before
 hex expansion. When a client root or database disappears from discovery, its last-good rows remain in the aggregate while
 readable stores continue updating. A completed scan of a readable database with no in-window usage
 clears old history; an empty directory listing alone does not, because it can race database rotation.

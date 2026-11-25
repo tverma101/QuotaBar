@@ -109,6 +109,7 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
         let db = "[[\(ms),2.0,500,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             codexHomes: { [codexHome] }
         )
@@ -135,6 +136,7 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
         ])
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": "[]"]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             codexHomes: { [codexHome] }
         )
@@ -150,6 +152,7 @@ final class OpenCodeCodexGatewayTests: XCTestCase {
         let db = "[[\(ms),2.0,500,\"glm-5.2\",\"opencode-go\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: StubSQLite(data: ["/oc/opencode.db": db]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/oc/opencode.db"] },
             codexHomes: { [] }
         )

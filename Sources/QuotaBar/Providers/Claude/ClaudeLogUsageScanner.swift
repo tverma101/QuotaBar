@@ -332,9 +332,19 @@ actor ClaudeLogUsageScanner {
             return .incomplete
         }
         DiagnosticGate.clearFailure(Self.futureTimestampDiagnosticGateKey(for: futureIdentity))
-        let deduped = Self.dedup(bucket.items)
-        guard !Task.isCancelled else { return .incomplete }
-        let result = Self.aggregate(entries: deduped, since: since, pricing: pricing)
+        // Rust performs the replay dedupe and the priced per-day roll-up in one pass. The Swift
+        // dedupe/aggregate below remain the reference oracle and the fallback if the backend
+        // declines, so the two engines can never publish different numbers.
+        let result: LogUsageScan
+        if let rustScan = ClaudeRustFold.fold(
+            entries: bucket.items, since: since, pricing: pricing, now: now
+        ) {
+            result = rustScan
+        } else {
+            let deduped = Self.dedup(bucket.items)
+            guard !Task.isCancelled else { return .incomplete }
+            result = Self.aggregate(entries: deduped, since: since, pricing: pricing)
+        }
         guard !Task.isCancelled else { return .incomplete }
         aggregateCache = ClaudeUsageFoldCache(key: aggregateKey, observedAt: now, value: result)
         return .complete(result)

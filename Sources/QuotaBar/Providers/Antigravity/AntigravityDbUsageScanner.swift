@@ -39,7 +39,7 @@ actor AntigravityDbUsageScanner {
     }
 
     init(
-        sqlite: SQLiteAccessing = SQLiteCLIAccessor(allowsReadWriteFallback: false),
+        sqlite: SQLiteAccessing = AntigravityDatabaseAccess(engine: .rust),
         conversationsDirectory: (@Sendable () -> String)? = nil,
         conversationsDirectories: (@Sendable () throws -> [String])? = nil,
         conversationDiscovery: (@Sendable () throws -> ConversationDirectoryDiscovery)? = nil,
@@ -573,6 +573,7 @@ actor AntigravityDbUsageScanner {
             )
         }
 
+        let phasePriceStart = DispatchTime.now().uptimeNanoseconds
         var accumulator = DailyUsageAccumulator()
         var recomputeAfter: Date?
         var latestAcceptedTimestamp: Int64?
@@ -597,6 +598,7 @@ actor AntigravityDbUsageScanner {
             recomputeAfter = min(recomputeAfter ?? transition, transition)
         }
         guard !Task.isCancelled else { return nil }
+        Self.phase("priceEvents=\(cached.events.count)", phasePriceStart)
         let scan = accumulator.build()
         guard !Task.isCancelled else { return nil }
         if var current = scanCache[path], current.fingerprint == cached.fingerprint {
@@ -833,6 +835,7 @@ actor AntigravityDbUsageScanner {
         if let existing = cached, existing.fingerprint != fingerprint {
             guard !Task.isCancelled else { return nil }
             if !contentFingerprintUnavailable {
+                let phaseFingerprintStart = DispatchTime.now().uptimeNanoseconds
                 do {
                     cachedContentFingerprint = try Self.contentFingerprint(
                         path: path,
@@ -841,9 +844,11 @@ actor AntigravityDbUsageScanner {
                         includeStepMetadata: existing.hasStepMetadata == true
                     )
                     if cachedContentFingerprint != nil { sqliteSupportsSHA3Aggregate = true }
+                    Self.phase("contentFingerprint \(cachedContentFingerprint == nil ? "nil" : "ok")", phaseFingerprintStart)
                 } catch {
                     contentFingerprintUnavailable = Self.isSHA3Unavailable(error)
                     if contentFingerprintUnavailable { sqliteSupportsSHA3Aggregate = false }
+                    Self.phase("contentFingerprint error=\(error.localizedDescription.prefix(60))", phaseFingerprintStart)
                 }
             }
             guard !Task.isCancelled else { return nil }
@@ -879,6 +884,8 @@ actor AntigravityDbUsageScanner {
             0,
             Self.maximumRetainedStepIndexBytes - retainedStepTimestampIndexBytes(excluding: path)
         )
+        Self.phase("preRead retained=\(cached != nil) lastIndex=\(refreshed.lastIndex) events=\(refreshed.events.count) verified=\(prefixVerifiedBeforeRead) digest=\(cachedContentFingerprint != nil)", DispatchTime.now().uptimeNanoseconds)
+        let phaseReadStart = DispatchTime.now().uptimeNanoseconds
         do {
             try readDatabase(
                 path: path,
@@ -899,6 +906,7 @@ actor AntigravityDbUsageScanner {
             throw AntigravityStepTimestampIndex.LoadError.memoryLimitExceeded
         }
         guard !Task.isCancelled else { return nil }
+        Self.phase("readDatabase lastIndex=\(refreshed.lastIndex) events=\(refreshed.events.count)", phaseReadStart)
 
         let comparablePrefix = retainedPrefix.flatMap {
             $0.hasStepMetadata == refreshed.hasStepMetadata ? $0 : nil
@@ -1064,7 +1072,9 @@ actor AntigravityDbUsageScanner {
         let hasStepMetadata: Bool
         let stepMetadataDiagnosticKey = "provider.antigravity.step-metadata-probe.\(JSONLScanCachePaths.stableFingerprint(path))"
         do {
-            hasStepMetadata = try sqlite.queryValue(path: path, sql: Self.stepMetadataProbeSQL) == "1"
+            hasStepMetadata = try JSONLAccountingWorkPacer.shared.perform {
+                try sqlite.queryValue(path: path, sql: Self.stepMetadataProbeSQL)
+            } == "1"
             DiagnosticGate.clearFailure(stepMetadataDiagnosticKey)
         } catch {
             if Self.isRetryableSQLiteFailure(error.localizedDescription) {
@@ -1187,7 +1197,9 @@ actor AntigravityDbUsageScanner {
 
     private static func maximumIndex(path: String, sqlite: SQLiteAccessing) throws -> Int {
         let sql = "SELECT COALESCE(MAX(idx), -1) FROM gen_metadata WHERE data IS NOT NULL"
-        guard let value = try sqlite.queryValue(path: path, sql: sql), let index = Int(value) else {
+        guard let value = try JSONLAccountingWorkPacer.shared.perform({
+            try sqlite.queryValue(path: path, sql: sql)
+        }), let index = Int(value) else {
             throw SQLiteError.queryFailed("Antigravity generation index query returned no value")
         }
         return index
@@ -1257,6 +1269,12 @@ actor AntigravityDbUsageScanner {
             )), '')
         FROM rows
         """
+    }
+
+    static func phase(_ label: String, _ start: UInt64) {
+        guard ProcessInfo.processInfo.environment["QUOTABAR_ANTIGRAVITY_PHASE"] != nil else { return }
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        print("ANTIGRAVITY_PHASE \(label) \(String(format: "%.1f", ms))ms")
     }
 
     private static func isSHA3Unavailable(_ error: Error) -> Bool {

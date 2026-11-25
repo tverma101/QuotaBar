@@ -78,10 +78,15 @@ fn int_keys(json: &Map<String, Value>, keys: &[&str]) -> (Option<i64>, bool, boo
 impl RawUsage {
     fn from_json(json: &Map<String, Value>) -> RawUsage {
         let parsed_input = int_keys(json, &["input_tokens", "prompt_tokens", "input"]);
-        let parsed_cached =
-            int_keys(json, &["cached_input_tokens", "cache_read_input_tokens", "cached_tokens"]);
-        let parsed_output =
-            int_keys(json, &["output_tokens", "completion_tokens", "output"]);
+        let parsed_cached = int_keys(
+            json,
+            &[
+                "cached_input_tokens",
+                "cache_read_input_tokens",
+                "cached_tokens",
+            ],
+        );
+        let parsed_output = int_keys(json, &["output_tokens", "completion_tokens", "output"]);
         let parsed_reasoning = int_keys(json, &["reasoning_output_tokens", "reasoning_tokens"]);
         let parsed_total = int_keys(json, &["total_tokens"]);
 
@@ -94,9 +99,12 @@ impl RawUsage {
         let reported = parsed_total.0.unwrap_or(0);
         let recomputed = saturating_add(input, output);
         let has_reported_total = reported > 0;
-        let total = if has_reported_total { reported } else { recomputed };
-        let has_authoritative_total = has_reported_total
-            || (parsed_input.1 && parsed_output.1);
+        let total = if has_reported_total {
+            reported
+        } else {
+            recomputed
+        };
+        let has_authoritative_total = has_reported_total || (parsed_input.1 && parsed_output.1);
         let is_valid = parsed_input.2
             && parsed_cached.2
             && parsed_output.2
@@ -203,11 +211,7 @@ impl ReplayGate {
     /// `line_timestamp` is the raw (trimmed) timestamp string of the task_started line, if any.
     /// `Ok(None)` means "timestamp present but not canonical"; the caller must fall back for the
     /// file because Swift's Foundation-backed parser could still understand it.
-    fn is_cleared(
-        &self,
-        started_at: f64,
-        line_timestamp: Option<&str>,
-    ) -> Result<bool, ()> {
+    fn is_cleared(&self, started_at: f64, line_timestamp: Option<&str>) -> Result<bool, ()> {
         match self {
             ReplayGate::UntilStartedAt(gate) => Ok(started_at >= *gate as f64),
             ReplayGate::UntilSelfTimed => {
@@ -215,9 +219,7 @@ impl ReplayGate {
                     return Ok(false);
                 };
                 match parse_canonical_utc(raw.as_bytes()) {
-                    CanonicalTimestamp::Ok(seconds) => {
-                        Ok(started_at >= seconds.floor())
-                    }
+                    CanonicalTimestamp::Ok(seconds) => Ok(started_at >= seconds.floor()),
                     CanonicalTimestamp::Invalid => Ok(false),
                     CanonicalTimestamp::NotCanonical => Err(()),
                 }
@@ -274,7 +276,14 @@ fn parsed_service_tier(raw: &Value) -> ServiceTierUpdate {
     };
     let tier = text.trim().to_lowercase();
     const KNOWN: &[&str] = &[
-        "auto", "default", "standard", "priority", "fast", "flex", "batch", "ultrafast",
+        "auto",
+        "default",
+        "standard",
+        "priority",
+        "fast",
+        "flex",
+        "batch",
+        "ultrafast",
     ];
     if tier.is_empty() || !KNOWN.contains(&tier.as_str()) {
         return ServiceTierUpdate {
@@ -438,10 +447,16 @@ impl CodexParser {
     fn consume(&mut self, line: &[u8]) -> Result<(), ()> {
         let is_turn_context = contains_marker(line, TURN_CONTEXT_MARKER);
         let is_session_meta = !self.saw_session_meta && contains_marker(line, SESSION_META_MARKER);
-        let is_task_started = self.replay_gate.is_some() && contains_marker(line, TASK_STARTED_MARKER);
+        let is_task_started =
+            self.replay_gate.is_some() && contains_marker(line, TASK_STARTED_MARKER);
         let is_thread_settings = contains_marker(line, THREAD_SETTINGS_MARKER);
         let is_token_count = contains_marker(line, TOKEN_COUNT_MARKER);
-        if !is_turn_context && !is_session_meta && !is_task_started && !is_thread_settings && !is_token_count {
+        if !is_turn_context
+            && !is_session_meta
+            && !is_task_started
+            && !is_thread_settings
+            && !is_token_count
+        {
             return Ok(());
         }
 
@@ -487,10 +502,8 @@ impl CodexParser {
             self.saw_session_meta = true;
             if let Some(payload) = payload {
                 if is_child_session_meta(payload) {
-                    let timestamp_raw = object
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .map(trim_ws);
+                    let timestamp_raw =
+                        object.get("timestamp").and_then(Value::as_str).map(trim_ws);
                     match timestamp_raw {
                         Some(raw) => match parse_canonical_utc(raw.as_bytes()) {
                             CanonicalTimestamp::Ok(seconds) => {
@@ -520,8 +533,7 @@ impl CodexParser {
             if let Some(payload) = payload {
                 if let Some(update) = service_tier_update(payload) {
                     self.current_service_tier_is_valid = update.is_valid;
-                    self.current_service_tier =
-                        if update.is_valid { update.tier } else { None };
+                    self.current_service_tier = if update.is_valid { update.tier } else { None };
                     self.current_tier_is_fast = update.is_valid
                         && matches!(
                             self.current_service_tier.as_deref(),
@@ -543,10 +555,8 @@ impl CodexParser {
         if payload.get("type").and_then(Value::as_str) == Some("task_started") {
             if let Some(gate) = self.replay_gate {
                 if let Some(started_at) = payload.get("started_at").and_then(Value::as_f64) {
-                    let line_timestamp = object
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .map(trim_ws);
+                    let line_timestamp =
+                        object.get("timestamp").and_then(Value::as_str).map(trim_ws);
                     match gate.is_cleared(started_at, line_timestamp) {
                         Ok(true) => self.replay_gate = None,
                         Ok(false) => {}
@@ -648,28 +658,26 @@ impl CodexParser {
         }
 
         let usage: RawUsage = match info.get("last_token_usage") {
-            Some(raw_last) if !raw_last.is_null() => {
-                match raw_last.as_object() {
-                    Some(last_object) => {
-                        let last = RawUsage::from_json(last_object);
-                        if !last.is_valid {
-                            self.has_malformed_usage = true;
-                            return Ok(());
-                        }
-                        if totals.is_none() {
-                            self.previous_totals = Some(match self.previous_totals {
-                                Some(previous) => previous.adding_as_baseline(&last),
-                                None => last.as_baseline(),
-                            });
-                        }
-                        last
-                    }
-                    None => {
+            Some(raw_last) if !raw_last.is_null() => match raw_last.as_object() {
+                Some(last_object) => {
+                    let last = RawUsage::from_json(last_object);
+                    if !last.is_valid {
                         self.has_malformed_usage = true;
                         return Ok(());
                     }
+                    if totals.is_none() {
+                        self.previous_totals = Some(match self.previous_totals {
+                            Some(previous) => previous.adding_as_baseline(&last),
+                            None => last.as_baseline(),
+                        });
+                    }
+                    last
                 }
-            }
+                None => {
+                    self.has_malformed_usage = true;
+                    return Ok(());
+                }
+            },
             _ => match totals {
                 Some(totals) => totals.subtracting(self.previous_totals.as_ref()),
                 None => {
@@ -800,7 +808,10 @@ fn push_optional(blob: &mut Vec<u8>, value: &Option<String>) -> Option<(u32, u32
 /// Create a parser for one file. `has_emit_since`/`emit_since_seconds` mirror Swift's `Date?`;
 /// when `has_emit_since == 0` every parsed event is emitted.
 #[no_mangle]
-pub extern "C" fn qb_codex_parser_create(has_emit_since: u8, emit_since_seconds: f64) -> *mut CodexParser {
+pub extern "C" fn qb_codex_parser_create(
+    has_emit_since: u8,
+    emit_since_seconds: f64,
+) -> *mut CodexParser {
     let emit_since = (has_emit_since != 0).then_some(emit_since_seconds);
     Box::into_raw(Box::new(CodexParser::new(emit_since)))
 }
@@ -854,7 +865,9 @@ pub unsafe extern "C" fn qb_codex_parser_malformed(parser: *const CodexParser) -
 /// # Safety
 /// `parser` must be a live pointer from [`qb_codex_parser_create`].
 #[no_mangle]
-pub unsafe extern "C" fn qb_codex_parser_take_events(parser: *mut CodexParser) -> *mut CodexEventResult {
+pub unsafe extern "C" fn qb_codex_parser_take_events(
+    parser: *mut CodexParser,
+) -> *mut CodexEventResult {
     if parser.is_null() {
         return ptr::null_mut();
     }
@@ -950,7 +963,9 @@ pub unsafe extern "C" fn qb_codex_take_events_destroy(result: *mut CodexEventRes
 /// # Safety
 /// `parser` must be a live pointer from [`qb_codex_parser_create`].
 #[no_mangle]
-pub unsafe extern "C" fn qb_codex_parser_checkpoint(parser: *const CodexParser) -> *mut CodexCheckpointResult {
+pub unsafe extern "C" fn qb_codex_parser_checkpoint(
+    parser: *const CodexParser,
+) -> *mut CodexCheckpointResult {
     if parser.is_null() {
         return ptr::null_mut();
     }
@@ -970,22 +985,30 @@ pub unsafe extern "C" fn qb_codex_parser_checkpoint(parser: *const CodexParser) 
         },
         None => (NIL_STRING, 0),
     };
-    let (has_previous_totals, previous_input, previous_cached, previous_output, previous_reasoning, previous_total,
-         previous_has_reported_total, previous_is_valid, previous_has_complete_cost_breakdown) =
-        match parser.previous_totals {
-            Some(u) => (
-                1u8,
-                u.input,
-                u.cached,
-                u.output,
-                u.reasoning,
-                u.total,
-                u8::from(u.has_reported_total),
-                u8::from(u.is_valid),
-                u8::from(u.has_complete_cost_breakdown),
-            ),
-            None => (0u8, 0, 0, 0, 0, 0, 0, 0, 0),
-        };
+    let (
+        has_previous_totals,
+        previous_input,
+        previous_cached,
+        previous_output,
+        previous_reasoning,
+        previous_total,
+        previous_has_reported_total,
+        previous_is_valid,
+        previous_has_complete_cost_breakdown,
+    ) = match parser.previous_totals {
+        Some(u) => (
+            1u8,
+            u.input,
+            u.cached,
+            u.output,
+            u.reasoning,
+            u.total,
+            u8::from(u.has_reported_total),
+            u8::from(u.is_valid),
+            u8::from(u.has_complete_cost_breakdown),
+        ),
+        None => (0u8, 0, 0, 0, 0, 0, 0, 0, 0),
+    };
     let (replay_gate_kind, replay_gate_started_at) = match parser.replay_gate {
         Some(ReplayGate::UntilStartedAt(t)) => (1u8, t as f64),
         Some(ReplayGate::UntilSelfTimed) => (2u8, 0.0),
@@ -1015,7 +1038,9 @@ pub unsafe extern "C" fn qb_codex_parser_checkpoint(parser: *const CodexParser) 
 }
 
 #[no_mangle]
-pub extern "C" fn qb_codex_checkpoint_has_previous_totals(result: *const CodexCheckpointResult) -> u8 {
+pub extern "C" fn qb_codex_checkpoint_has_previous_totals(
+    result: *const CodexCheckpointResult,
+) -> u8 {
     unsafe { result.as_ref().map(|r| r.has_previous_totals).unwrap_or(0) }
 }
 
@@ -1035,12 +1060,21 @@ codex_checkpoint_i64!(qb_codex_checkpoint_previous_reasoning, previous_reasoning
 codex_checkpoint_i64!(qb_codex_checkpoint_previous_total, previous_total);
 
 #[no_mangle]
-pub extern "C" fn qb_codex_checkpoint_previous_has_reported_total(result: *const CodexCheckpointResult) -> u8 {
-    unsafe { result.as_ref().map(|r| r.previous_has_reported_total).unwrap_or(0) }
+pub extern "C" fn qb_codex_checkpoint_previous_has_reported_total(
+    result: *const CodexCheckpointResult,
+) -> u8 {
+    unsafe {
+        result
+            .as_ref()
+            .map(|r| r.previous_has_reported_total)
+            .unwrap_or(0)
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn qb_codex_checkpoint_previous_is_valid(result: *const CodexCheckpointResult) -> u8 {
+pub extern "C" fn qb_codex_checkpoint_previous_is_valid(
+    result: *const CodexCheckpointResult,
+) -> u8 {
     unsafe { result.as_ref().map(|r| r.previous_is_valid).unwrap_or(0) }
 }
 
@@ -1048,7 +1082,12 @@ pub extern "C" fn qb_codex_checkpoint_previous_is_valid(result: *const CodexChec
 pub extern "C" fn qb_codex_checkpoint_previous_has_complete_cost_breakdown(
     result: *const CodexCheckpointResult,
 ) -> u8 {
-    unsafe { result.as_ref().map(|r| r.previous_has_complete_cost_breakdown).unwrap_or(0) }
+    unsafe {
+        result
+            .as_ref()
+            .map(|r| r.previous_has_complete_cost_breakdown)
+            .unwrap_or(0)
+    }
 }
 
 #[no_mangle]
@@ -1057,7 +1096,9 @@ pub extern "C" fn qb_codex_checkpoint_saw_session_meta(result: *const CodexCheck
 }
 
 #[no_mangle]
-pub extern "C" fn qb_codex_checkpoint_current_tier_is_fast(result: *const CodexCheckpointResult) -> u8 {
+pub extern "C" fn qb_codex_checkpoint_current_tier_is_fast(
+    result: *const CodexCheckpointResult,
+) -> u8 {
     unsafe { result.as_ref().map(|r| r.current_tier_is_fast).unwrap_or(0) }
 }
 
@@ -1065,7 +1106,12 @@ pub extern "C" fn qb_codex_checkpoint_current_tier_is_fast(result: *const CodexC
 pub extern "C" fn qb_codex_checkpoint_current_service_tier_is_valid(
     result: *const CodexCheckpointResult,
 ) -> u8 {
-    unsafe { result.as_ref().map(|r| r.current_service_tier_is_valid).unwrap_or(0) }
+    unsafe {
+        result
+            .as_ref()
+            .map(|r| r.current_service_tier_is_valid)
+            .unwrap_or(0)
+    }
 }
 
 /// 0 none, 1 until_started_at, 2 until_self_timed.
@@ -1075,27 +1121,52 @@ pub extern "C" fn qb_codex_checkpoint_replay_gate_kind(result: *const CodexCheck
 }
 
 #[no_mangle]
-pub extern "C" fn qb_codex_checkpoint_replay_gate_started_at(result: *const CodexCheckpointResult) -> f64 {
-    unsafe { result.as_ref().map(|r| r.replay_gate_started_at).unwrap_or(0.0) }
+pub extern "C" fn qb_codex_checkpoint_replay_gate_started_at(
+    result: *const CodexCheckpointResult,
+) -> f64 {
+    unsafe {
+        result
+            .as_ref()
+            .map(|r| r.replay_gate_started_at)
+            .unwrap_or(0.0)
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn qb_codex_checkpoint_current_model_offset(result: *const CodexCheckpointResult) -> u32 {
-    unsafe { result.as_ref().map(|r| r.current_model_offset).unwrap_or(NIL_STRING) }
+pub extern "C" fn qb_codex_checkpoint_current_model_offset(
+    result: *const CodexCheckpointResult,
+) -> u32 {
+    unsafe {
+        result
+            .as_ref()
+            .map(|r| r.current_model_offset)
+            .unwrap_or(NIL_STRING)
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn qb_codex_checkpoint_current_model_length(result: *const CodexCheckpointResult) -> u32 {
+pub extern "C" fn qb_codex_checkpoint_current_model_length(
+    result: *const CodexCheckpointResult,
+) -> u32 {
     unsafe { result.as_ref().map(|r| r.current_model_length).unwrap_or(0) }
 }
 
 #[no_mangle]
-pub extern "C" fn qb_codex_checkpoint_service_tier_offset(result: *const CodexCheckpointResult) -> u32 {
-    unsafe { result.as_ref().map(|r| r.service_tier_offset).unwrap_or(NIL_STRING) }
+pub extern "C" fn qb_codex_checkpoint_service_tier_offset(
+    result: *const CodexCheckpointResult,
+) -> u32 {
+    unsafe {
+        result
+            .as_ref()
+            .map(|r| r.service_tier_offset)
+            .unwrap_or(NIL_STRING)
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn qb_codex_checkpoint_service_tier_length(result: *const CodexCheckpointResult) -> u32 {
+pub extern "C" fn qb_codex_checkpoint_service_tier_length(
+    result: *const CodexCheckpointResult,
+) -> u32 {
     unsafe { result.as_ref().map(|r| r.service_tier_length).unwrap_or(0) }
 }
 

@@ -16,8 +16,11 @@ The code is grouped by role:
 - `Services/` — shared infrastructure (HTTP, the local API, process running).
 - `Support/` — small shared helpers (formatting, parsing, animations).
 - `Views/` — the SwiftUI screens (dashboard, customize, settings, menu-bar strip).
-- `CQuotabarCore/` — C ABI for the [Rust core](rust-core.md): a static library of hot primitives
-  (today, the Claude usage-line parser) that Swift calls over FFI.
+- `CQuotabarCore/` — C ABI for the [Rust core](rust-core.md): a static library of hot parsers and
+  provider data-plane operations (Hermes, OpenCode, Antigravity, and Freebuff Desktop database
+  reads, Claude and Codex accounting folds, pricing-catalogue resolution) that Swift calls over
+  FFI. See the [Rust backend port](rust-backend.md) for the
+  remaining inventory.
 
 ## Composition root
 

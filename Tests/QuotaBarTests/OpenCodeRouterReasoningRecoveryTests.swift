@@ -14,6 +14,7 @@ final class OpenCodeRouterReasoningRecoveryTests: XCTestCase {
         let native = "[[\(now.timeIntervalSince1970 * 1000),1.0,50,\"native-model\",\"opencode\"]]"
         let scanner = OpenCodeUsageScanner(
             sqlite: OpenCodeFakeSQLite(data: ["/native.db": native]),
+            databaseEngine: .sqliteCLI,
             databasePaths: { ["/native.db"] }, routerLedgerPaths: { [ledger.path] }
         )
         let result = try await scanner.scan(now: now, gatewaySources: [.codex])
