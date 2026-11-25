@@ -51,7 +51,22 @@ bun run test
 bun run tauri:build --bundles nsis --config $config -- --locked
 ```
 
-Sign the setup executable with the release publisher's Windows code-signing identity if available. Verify the installer on a Windows 11 x64 user profile. Check the default location, Start menu, first launch, Settings, tray dismiss and reopen, provider refresh, and the [local HTTP API](../windows/docs/local-http-api.md) while the panel is closed. Verify an upgrade preserves settings and provider selection.
+Use the default MSVC Rust toolchain for releases. On a GNU Rust development VM, select the GNU
+target explicitly with `--target x86_64-pc-windows-gnu` to build a local QA installer.
+If using the shell artifact collector after a GNU build with a tag-based version override, set
+`QUOTABAR_INSTALLER_VERSION` to the same version without the leading `v`.
+
+The CI installer is a QA artifact. Before publishing, Authenticode-sign the installer and both bundled
+executables with the release publisher's Windows code-signing identity. Sign the app and CLI before
+packing the installer. Use `Get-AuthenticodeSignature` on the installer and both installed executables;
+each must report `Valid` and the expected signer. QuotaBar does not use an updater or upstream feed.
+
+Run `./scripts/smoke-installer.ps1 -Installer <setup.exe>` in a disposable user profile to verify the
+per-user install, bundled providers, CLI and uninstall. For release, repeat on Windows 11 x64 both with
+WebView2 installed and with a clean runtime state. Check first launch, Settings, tray dismiss and reopen,
+provider refresh, and the [local HTTP API](local-http-api.md) while the panel is closed. Verify that
+Start on Login and Start Hidden work, an upgrade preserves settings and provider selection, and
+uninstall removes the executables and Start menu shortcut.
 
 ## GitHub
 
