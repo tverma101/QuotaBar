@@ -1636,8 +1636,11 @@ mod tests {
                     base_provider_id: "codex".to_owned(),
                     label: label.to_owned(),
                     credential: None,
+                    codex_home: None,
                     store_path: None,
                 },
+                false,
+                None,
             );
         };
         enqueue(&mut coord, "codex:work", "first");
