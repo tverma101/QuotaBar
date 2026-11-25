@@ -8,7 +8,7 @@ use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EVENT_SYSTEM_FOREGROUND, GA_ROOT, GW_OWNER, GetAncestor, GetMessageW,
-    GetWindow, MSG, OBJID_WINDOW, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    GetWindow, MSG, OBJID_WINDOW, SetForegroundWindow, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
     PBT_APMRESUMEAUTOMATIC, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_NCDESTROY,
     WM_POWERBROADCAST,
 };
@@ -61,6 +61,9 @@ pub fn show_panel(app_handle: &AppHandle) {
         }
         popover_platform::move_main_near_tray(app_handle);
         let _ = window.set_focus();
+        if let Ok(hwnd) = window.hwnd() {
+            unsafe { SetForegroundWindow(hwnd.0 as HWND) };
+        }
     }
 }
 

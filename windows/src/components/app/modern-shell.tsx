@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { useShallow } from "zustand/react/shallow"
 import { LiquidGlassFilter } from "@/components/liquid-glass-filter"
@@ -67,6 +67,7 @@ export function ModernShell({
 }: ModernShellProps) {
   const { t } = useTranslation()
   const [screen, setScreen] = useState<ModernScreen>("dashboard")
+  const scrollRef = useRef<HTMLDivElement>(null)
   const appVersion = useAppVersion()
 
   const { themeMode, displayMode, resetTimerDisplayMode, modernDensity, displayCurrency, exchangeRatesRevision, showTotalSpend, reduceAnimations } =
@@ -124,6 +125,10 @@ export function ModernShell({
   }, [probeStamp, scheduleRollupReload, scheduleHistoryInsightsReload])
 
   const setActiveView = useAppUiStore((s) => s.setActiveView)
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 })
+  }, [screen])
 
   useEffect(() => {
     if (!pluginSettings || !layout.hydrated) return
