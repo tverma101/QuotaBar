@@ -2058,32 +2058,13 @@ fn inject_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquick
                     opts.markers
                 );
 
-                // Windows: no ps command; plugins fall back to SQLite/Cloud API
-                #[cfg(windows)]
-                return Ok("null".to_string());
-
-                #[cfg(not(windows))]
-                {
-                // Use ps -e on Linux (GNU ps); -ax on macOS/BSD
-                let (ps_path, ps_args): (&str, &[&str]) = if std::env::consts::OS == "linux" {
-                    ("ps", &["-e", "-o", "pid=,args="][..])
-                } else {
-                    ("/bin/ps", &["-ax", "-o", "pid=,command="][..])
-                };
-                let ps_output = match std::process::Command::new(ps_path).args(ps_args).output() {
-                    Ok(o) => o,
+                let ps_stdout = match ls_list_processes(&opts.process_name) {
+                    Ok(out) => out,
                     Err(e) => {
-                        log::warn!("[plugin:{}] ps failed: {}", pid, e);
+                        log::warn!("[plugin:{}] process list failed: {}", pid, e);
                         return Ok("null".to_string());
                     }
                 };
-
-                if !ps_output.status.success() {
-                    log::warn!("[plugin:{}] ps returned non-zero", pid);
-                    return Ok("null".to_string());
-                }
-
-                let ps_stdout = String::from_utf8_lossy(&ps_output.stdout);
                 let process_name_lower = opts.process_name.to_lowercase();
                 let markers_lower: Vec<String> =
                     opts.markers.iter().map(|m| m.to_lowercase()).collect();
@@ -2132,6 +2113,7 @@ fn inject_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquick
                         }
                         // Fallback: path substring
                         command_lower.contains(&format!("/{}/", m))
+                            || command_lower.contains(&format!("{0}{1}{0}", char::from(92u8), m))
                     });
                     if !has_marker {
                         continue;
@@ -2177,39 +2159,12 @@ fn inject_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquick
                     }
                 }
 
-                // Find lsof binary
-                let lsof_path = ["/usr/sbin/lsof", "/usr/bin/lsof"]
-                    .iter()
-                    .find(|p| std::path::Path::new(p).exists())
-                    .copied();
-
-                let ports = if let Some(lsof) = lsof_path {
-                    match std::process::Command::new(lsof)
-                        .args([
-                            "-nP",
-                            "-iTCP",
-                            "-sTCP:LISTEN",
-                            "-a",
-                            "-p",
-                            &process_pid.to_string(),
-                        ])
-                        .output()
-                    {
-                        Ok(o) if o.status.success() => {
-                            ls_parse_listening_ports(&String::from_utf8_lossy(&o.stdout))
-                        }
-                        Ok(_) => {
-                            log::warn!("[plugin:{}] lsof returned non-zero", pid);
-                            Vec::new()
-                        }
-                        Err(e) => {
-                            log::warn!("[plugin:{}] lsof failed: {}", pid, e);
-                            Vec::new()
-                        }
+                let ports = match ls_listening_ports(process_pid) {
+                    Ok(ports) => ports,
+                    Err(e) => {
+                        log::warn!("[plugin:{}] port lookup failed: {}", pid, e);
+                        Vec::new()
                     }
-                } else {
-                    log::warn!("[plugin:{}] lsof not found", pid);
-                    Vec::new()
                 };
 
                 if ports.is_empty() && extension_port.is_none() {
@@ -2239,7 +2194,6 @@ fn inject_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquick
                 serde_json::to_string(&result).map_err(|e| {
                     Exception::throw_message(&ctx_inner, &format!("serialize failed: {}", e))
                 })
-                }
             },
         )?,
     )?;
@@ -2283,6 +2237,98 @@ fn ls_extract_flag(command: &str, flag: &str) -> Option<String> {
     None
 }
 
+#[cfg(not(windows))]
+fn ls_list_processes(_process_name: &str) -> Result<String, String> {
+    // Use ps -e on Linux (GNU ps); -ax on macOS/BSD
+    let (ps_path, ps_args): (&str, &[&str]) = if std::env::consts::OS == "linux" {
+        ("ps", &["-e", "-o", "pid=,args="][..])
+    } else {
+        ("/bin/ps", &["-ax", "-o", "pid=,command="][..])
+    };
+    let out = std::process::Command::new(ps_path)
+        .args(ps_args)
+        .output()
+        .map_err(|e| format!("ps failed: {e}"))?;
+    if !out.status.success() {
+        return Err("ps returned non-zero".to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Lists `pid command-line` lines for processes whose image name contains
+/// `process_name`, matching the `ps` output shape used on macOS.
+#[cfg(windows)]
+fn ls_list_processes(process_name: &str) -> Result<String, String> {
+    let name = ls_wql_safe_name(process_name);
+    if name.is_empty() {
+        return Err("empty process name".to_string());
+    }
+    let script = format!(
+        r#"Get-CimInstance Win32_Process -Filter "Name LIKE '%{name}%'" | Where-Object {{ $_.CommandLine }} | ForEach-Object {{ [string]$_.ProcessId + ' ' + $_.CommandLine }}"#
+    );
+    ls_run_powershell(&script)
+}
+
+#[cfg(not(windows))]
+fn ls_listening_ports(process_pid: i32) -> Result<Vec<i32>, String> {
+    let lsof = ["/usr/sbin/lsof", "/usr/bin/lsof"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .copied()
+        .ok_or_else(|| "lsof not found".to_string())?;
+    let out = std::process::Command::new(lsof)
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", &process_pid.to_string()])
+        .output()
+        .map_err(|e| format!("lsof failed: {e}"))?;
+    if !out.status.success() {
+        return Err("lsof returned non-zero".to_string());
+    }
+    Ok(ls_parse_listening_ports(&String::from_utf8_lossy(&out.stdout)))
+}
+
+#[cfg(windows)]
+fn ls_listening_ports(process_pid: i32) -> Result<Vec<i32>, String> {
+    let script = format!(
+        "Get-NetTCPConnection -State Listen -OwningProcess {process_pid} -ErrorAction SilentlyContinue | ForEach-Object {{ $_.LocalPort }}"
+    );
+    Ok(ls_parse_port_lines(&ls_run_powershell(&script)?))
+}
+
+#[cfg(windows)]
+fn ls_run_powershell(script: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("powershell failed: {e}"))?;
+    if !out.status.success() {
+        return Err("powershell returned non-zero".to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Keeps only characters that cannot break out of a WQL `LIKE` string.
+#[cfg(any(windows, test))]
+fn ls_wql_safe_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect()
+}
+
+/// Parses one port number per line (PowerShell `LocalPort` output).
+#[cfg(any(windows, test))]
+fn ls_parse_port_lines(output: &str) -> Vec<i32> {
+    let ports: std::collections::BTreeSet<i32> = output
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .filter(|p| *p > 0 && *p < 65536)
+        .collect();
+    ports.into_iter().collect()
+}
+
+#[cfg(not(windows))]
 /// Parse listening port numbers from `lsof -nP -iTCP -sTCP:LISTEN` output.
 fn ls_parse_listening_ports(output: &str) -> Vec<i32> {
     let mut ports = std::collections::BTreeSet::new();
@@ -3542,6 +3588,22 @@ fn expand_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ls_parse_port_lines_dedupes_and_filters() {
+        let output = "53123
+0
+53124
+53123
+abc
+70000
+";
+        assert_eq!(ls_parse_port_lines(output), vec![53123, 53124]);
+    }
+
+    #[test]
+    fn ls_wql_safe_name_strips_quotes_and_wildcards() {
+        assert_eq!(ls_wql_safe_name("language_server' OR '1%"), "language_serverOR1");
+    }
     use super::*;
     use rquickjs::{Context, Function, Object, Runtime};
 
