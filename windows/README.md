@@ -1,6 +1,6 @@
 # QuotaBar for Windows
 
-QuotaBar shows AI coding subscription limits, reset times, credits, and spend in the Windows notification area. See [GitHub Releases](https://github.com/tverma101/QuotaBar/releases) for the Windows 11 x64 setup executable.
+QuotaBar for Windows is the Windows half of the cross-platform QuotaBar desktop app. It shows AI coding subscription limits, reset times, credits, and spend in the Windows notification area, complementing the native macOS menu-bar app in the repository root. See [GitHub Releases](https://github.com/tverma101/QuotaBar/releases) for the Windows 11 x64 setup executable.
 
 ## Install and Set Up
 
@@ -33,4 +33,4 @@ bun run tauri:build --bundles nsis -- --locked
 
 The `-setup.exe` is under `target/release/bundle/nsis/`. For a public build, follow the [release instructions](../docs/releasing.md).
 
-The desktop port uses Tauri and a local QuickJS provider runtime. See [provenance](PROVENANCE.md) for attribution and upstream synchronization details.
+The desktop port uses Tauri, a React interface, a Rust backend/core, and a local QuickJS provider runtime. See [provenance](PROVENANCE.md) for attribution and upstream synchronization details.

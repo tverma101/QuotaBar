@@ -2,7 +2,7 @@
 
 Track your AI coding subscriptions from the macOS menu bar or Windows system tray.
 
-QuotaBar shows how much of your AI coding plans you've used: session and weekly limits, credits, and spend, all in one popover. Pin your most important metrics straight into the menu bar.
+QuotaBar is a cross-platform desktop app for macOS and Windows. It shows how much of your AI coding plans you've used — session and weekly limits, credits, and spend — all in one popover. On macOS, pin your most important metrics straight into the menu bar; on Windows, the dashboard lives in the system tray.
 
 > **This is an independent fork, not the official OpenUsage.**
 > QuotaBar is derived from [OpenUsage](https://github.com/robinebers/openusage) by Robin Ebers, which is
@@ -10,6 +10,15 @@ QuotaBar shows how much of your AI coding plans you've used: session and weekly 
 > OpenUsage, and the OpenUsage name and logo are not used here — see [TRADEMARK.md](TRADEMARK.md).
 > Report QuotaBar issues in this repository; report OpenUsage issues
 > [upstream](https://github.com/robinebers/openusage/issues).
+
+## Platforms
+
+QuotaBar ships as two native desktop implementations:
+
+- **macOS** — a Swift/SwiftUI menu-bar app backed by the shared Swift provider pipeline and Rust parsing core.
+- **Windows** — a Tauri system-tray app with a React interface, Rust backend, and QuickJS provider runtime. See [QuotaBar for Windows](windows/README.md).
+
+Both platforms track the same core usage concepts, but provider support and platform-specific shell features can differ.
 
 ## Download and Set Up
 
@@ -36,7 +45,7 @@ The development build runs from `dist/`. Use an Apple Development signing identi
 
 On Windows, follow the [Windows build and setup guide](windows/README.md).
 
-## macOS Providers
+## Providers
 
 - **[Antigravity](docs/providers/antigravity.md)** — shared Gemini and Claude pool quotas, 5-hour and weekly windows
 - **[Claude](docs/providers/claude.md)** — session, weekly, model-specific limits, extra usage, local daily spend
@@ -53,13 +62,15 @@ On Windows, follow the [Windows build and setup guide](windows/README.md).
 
 Most providers read the credentials already on your machine (keychain, auth files, app state) — no extra login. OpenRouter and Z.ai are the exceptions: they have no local credential to reuse, so you supply an API key (see [OpenRouter setup](docs/providers/openrouter.md) or [Z.ai setup](docs/providers/zai.md)). Credentials are used only for the corresponding provider requests. QuotaBar's separate anonymous summaries and public pricing downloads are documented under [Privacy & usage data](docs/privacy.md).
 
-## macOS Features
+## Features
 
-- **Menu bar pins.** Pin metrics to the menu bar (up to 2 per provider); render as compact text or mini bars. The strip hides metrics with no data instead of showing placeholders.
+These are the core product features. Some shell behavior is platform-specific; the Windows README documents Windows behavior.
+
+- **Menu bar pins (macOS).** Pin metrics to the menu bar (up to 2 per provider); render as compact text or mini bars. The strip hides metrics with no data instead of showing placeholders.
 - **Dashboard popover.** Provider-grouped meters with live reset countdowns and pace indicators. Click usage or reset values to flip their display everywhere; right-click a row to hide or star it, refresh its provider, or open Customize.
 - **Global shortcut.** Toggle the popover from anywhere — record any combo in Settings.
 - **Customize.** Turn providers and metrics on or off, choose which rows stay Always Visible or On Demand, and drag-reorder both.
-- **Local setup discovery.** QuotaBar checks supported provider setup sources on this Mac and marks matches in Customize. You choose which providers to enable; discovery stays local and never activates providers automatically.
+- **Local setup discovery.** QuotaBar checks supported provider setup sources on the device and marks matches in Customize. You choose which providers to enable; discovery stays local and never activates providers automatically.
 - **Stale-while-revalidate.** Cached values display instantly at launch; live quota meters refresh every minute (every two minutes on battery or in Low Power Mode), while full history refreshes every five minutes.
 - **[One-shot CLI](docs/cli.md).** Agents can read stable limit JSON through the same five-minute cache with `quotabar`, or bypass freshness with `quotabar --force`; the menu-bar app does not need to be running.
 - **[Local HTTP API](docs/local-http-api.md).** Other apps can read machine-friendly limits from `127.0.0.1:6736/v1/limits`; the legacy `/v1/usage` UI contract remains supported. It is loopback-only and never serves credentials; note that browser pages can read it too — see the [privacy note](docs/local-http-api.md#cors-and-privacy).
@@ -76,7 +87,7 @@ For working on the code, see the developer docs: [architecture](docs/architectur
 
 ## Architecture
 
-SwiftPM package, SwiftUI content hosted in an AppKit-owned `NSStatusItem` + custom key-capable `NSPanel`, Swift 6 strict concurrency. The app and CLI share one module: providers implement a small `ProviderRuntime` protocol (auth store → usage client → mapper → `ProviderSnapshot`), and both surfaces read the same normalized data — see the [architecture overview](docs/architecture.md) for how the pieces fit together and [AGENTS.md](AGENTS.md) for engineering conventions.
+The macOS app is a SwiftPM package with SwiftUI content hosted in an AppKit-owned `NSStatusItem` + custom key-capable `NSPanel`, using Swift 6 strict concurrency. The macOS app and CLI share one module: providers implement a small `ProviderRuntime` protocol (auth store → usage client → mapper → `ProviderSnapshot`), and both surfaces read the same normalized data. The Windows app uses Tauri, React, a Rust backend/core, and bundled JavaScript provider plugins under `windows/`. See the [architecture overview](docs/architecture.md), [Windows README](windows/README.md), and [AGENTS.md](AGENTS.md) for engineering conventions.
 
 ## Releasing
 
