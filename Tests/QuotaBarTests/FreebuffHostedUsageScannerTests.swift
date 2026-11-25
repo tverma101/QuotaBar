@@ -4,8 +4,18 @@ import XCTest
 
 final class FreebuffHostedUsageScannerTests: XCTestCase {
     private let now = TestLocalInstant.date(2026, 10, 31, 18)
+
+    /// Hosted history/catalog is an opt-in gate (default off); provider-level tests that exercise
+    /// the hosted path inject an isolated suite with the flag set.
+    @MainActor
+    private func hostedDefaults(_ enabled: Bool = true) -> UserDefaults {
+        let suite = "QuotaBarTests.HostedDetail.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.set(enabled, forKey: FreebuffProvider.hostedDetailDefaultsKey)
+        return defaults
+    }
     private let auth = FreebuffAuth(token: "fixture-token")
-    private let prefix = "/api/v1/cloud/history/"
+    private let prefix = "/history/"
 
     private func run(status: String = "completed", model: String = "vendor/model", agent: String = "codebuff") -> [String: Any] {
         ["id": "run-1", "chatId": "chat-1", "status": status, "model": model, "agent": agent,
@@ -35,6 +45,7 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
         let scanner = FreebuffHostedUsageScanner(cacheURL: nil)
         let receipts = try await scanner.scan(auth: auth, client: FreebuffUsageClient(http: http), now: now)
         XCTAssertEqual(receipts.count, 1)
+        XCTAssertEqual(receipts.first?.runStatus, "completed")
         XCTAssertFalse(receipts[0].metricsJSON.contains("PRIVATE"))
         let local = FreebuffDesktopUsageScanner(databasePaths: { [] })
         let totals = try await local.scan(now: now, hostedReceipts: receipts)
@@ -143,6 +154,14 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
     }
 
     func testOldCacheReplaysCompletedEventsToRecoverDiscardedUsage() async throws {
+        try await assertOldCacheReplay(hasSavedUsage: false)
+    }
+
+    func testOldCacheReplayKeepsMeasuredUsageWhenEventHistoryIsSparse() async throws {
+        try await assertOldCacheReplay(hasSavedUsage: true)
+    }
+
+    private func assertOldCacheReplay(hasSavedUsage: Bool) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let url = directory.appendingPathComponent("receipts.json")
         defer {
@@ -152,10 +171,14 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
             try? trash.run()
             trash.waitUntilExit()
         }
+        let sparse: [String: Any] = ["kind": "metrics", "payload": ["usageIncomplete": true]]
         let http = HostedHTTP([
             prefix + "chats": [try chats(run())],
             prefix + "chats/chat-1/runs": [try page([run()])],
-            prefix + "runs/run-1/events": [try page([metric(100)], end: "last-event")]
+            prefix + "runs/run-1/events": [
+                try page([metric(100)], end: "last-event"),
+                try page(hasSavedUsage ? [sparse] : [metric(100)], end: "last-event")
+            ]
         ])
         let client = FreebuffUsageClient(http: http)
         _ = try await FreebuffHostedUsageScanner(cacheURL: url).scan(auth: auth, client: client, now: now)
@@ -164,7 +187,7 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
         var run = try XCTUnwrap(runs["run-1"])
         run.removeValue(forKey: "metricsVersion")
         var receipt = try XCTUnwrap(run["receipt"] as? [String: Any])
-        receipt["metricsJSON"] = "{}"
+        if !hasSavedUsage { receipt["metricsJSON"] = "{}" }
         run["receipt"] = receipt
         runs["run-1"] = run
         old["runs"] = runs
@@ -173,6 +196,9 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
         let receipts = try await restored.scan(auth: auth, client: client, now: now)
         let totals = try await FreebuffDesktopUsageScanner(databasePaths: { [] }).scan(now: now, hostedReceipts: receipts)
         XCTAssertEqual(totals?.usage.series.daily.first?.totalTokens, 150)
+        if hasSavedUsage {
+            XCTAssertEqual(totals?.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
+        }
         let events = await http.requests.filter { $0.url.path.hasSuffix("/events") }
         XCTAssertEqual(events.count, 2, "old caches must replay once, even with unchanged completed metadata")
         XCTAssertTrue(events.allSatisfy { !($0.url.query?.contains("cursor=") ?? false) })
@@ -295,10 +321,10 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
     @MainActor
     func testProviderPublishesHostedTodayAndMetersNeverFetchHistoryOrCatalog() async throws {
         let http = HostedHTTP([
-            "/api/v1/freebuff/session": [HTTPResponse(statusCode: 404, headers: [:], body: Data())],
+            "/session": [HTTPResponse(statusCode: 404, headers: [:], body: Data())],
             prefix + "chats": [try chats(run())], prefix + "chats/chat-1/runs": [try page([run()])],
             prefix + "runs/run-1/events": [try page([metric(100)], end: "1")],
-            "/api/v1/freebuff/models": [HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"protocol":1,"rows":[{"key":"vendor/model","displayName":"Model"}]}"#.utf8))]
+            "/catalog": [HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"protocol":1,"rows":[{"key":"vendor/model","displayName":"Model"}]}"#.utf8))]
         ])
         let date = now
         let provider = FreebuffProvider(
@@ -308,11 +334,12 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
                 files: FakeFiles(["/fixture/.config/manicode/credentials.json": #"{"default":{"authToken":"fixture-token"}}"#]),
                 keychain: FakeKeychain(), environment: FakeEnvironment(), homeDirectory: { URL(fileURLWithPath: "/fixture") }),
             usageClient: FreebuffUsageClient(http: http), now: { date }, modelCatalog: FreebuffModelCatalog(cacheURL: nil),
+            defaults: hostedDefaults(),
             pricing: { .empty }
         )
         _ = await ProviderRefreshContext.$scope.withValue(.menuBar) { await provider.refresh() }
         let meterRequests = await http.requests
-        XCTAssertEqual(meterRequests.map(\.url.path), ["/api/v1/freebuff/session"])
+        XCTAssertEqual(meterRequests.map(\.url.path), ["/session"])
         let snapshot = await provider.refresh()
         guard case .values(_, let values, _, _, _, _) = snapshot.line(label: "Today") else {
             return XCTFail("hosted-only usage must publish Today without a legacy SQLite database")
@@ -332,10 +359,10 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
     @MainActor
     func testMissingTokenReceiptPublishesCoverageWarningAndSurvivesMeterRefresh() async throws {
         let http = HostedHTTP([
-            "/api/v1/freebuff/session": [HTTPResponse(statusCode: 404, headers: [:], body: Data())],
+            "/session": [HTTPResponse(statusCode: 404, headers: [:], body: Data())],
             prefix + "chats": [try chats(run())], prefix + "chats/chat-1/runs": [try page([run()])],
             prefix + "runs/run-1/events": [try page([])],
-            "/api/v1/freebuff/models": [HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"protocol":1,"rows":[{"key":"vendor/model","displayName":"Model"}]}"#.utf8))]
+            "/catalog": [HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"protocol":1,"rows":[{"key":"vendor/model","displayName":"Model"}]}"#.utf8))]
         ])
         let date = now
         let provider = FreebuffProvider(
@@ -344,7 +371,8 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
             authStore: FreebuffAuthStore(
                 files: FakeFiles(["/fixture/.config/manicode/credentials.json": #"{"default":{"authToken":"fixture-token"}}"#]),
                 keychain: FakeKeychain(), environment: FakeEnvironment(), homeDirectory: { URL(fileURLWithPath: "/fixture") }),
-            usageClient: FreebuffUsageClient(http: http), now: { date }, modelCatalog: FreebuffModelCatalog(cacheURL: nil)
+            usageClient: FreebuffUsageClient(http: http), now: { date }, modelCatalog: FreebuffModelCatalog(cacheURL: nil),
+            defaults: hostedDefaults()
         )
         let snapshot = await provider.refresh()
         XCTAssertEqual(snapshot.historyWarning, "Some Freebuff runs have no complete token receipt. Totals include only measured usage.")
@@ -363,10 +391,76 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
         XCTAssertEqual(scan?.partialDays, [DailyUsageAccumulator.dayKey(from: now)])
     }
 
+    func testHostedMetricsRecordedRouteWinsOverRunSelection() async throws {
+        let selected = run(model: "m-fast")
+        let event: [String: Any] = ["kind": "metrics", "payload": ["usage": [
+            "inputTokens": 100, "outputTokens": 50, "model": "deepseek-v4.1-flash-fast"
+        ]]]
+        let http = HostedHTTP([
+            prefix + "chats": [try chats(selected)], prefix + "chats/chat-1/runs": [try page([selected])],
+            prefix + "runs/run-1/events": [try page([event], end: "1")]
+        ])
+        let receipts = try await FreebuffHostedUsageScanner(cacheURL: nil)
+            .scan(auth: auth, client: FreebuffUsageClient(http: http), now: now)
+        let rates = ModelRates(inputPerMillion: 1, outputPerMillion: 2,
+                               cacheWritePerMillion: 1, cacheReadPerMillion: 1)
+        let pricing = ModelPricing(supplement: PricingSupplement(pricing: ["deepseek-v4.1-flash-fast": rates]),
+                                   primary: PricingCatalog(), secondary: PricingCatalog())
+        let result = try await FreebuffDesktopUsageScanner(databasePaths: { [] })
+            .scan(now: now, pricing: pricing, hostedReceipts: receipts)
+        XCTAssertEqual(receipts.first?.model, "m-fast")
+        let model = try XCTUnwrap(result?.usage.modelUsage?.daily.first?.models.first)
+        XCTAssertEqual(model.model, "DeepSeek V4.1 Flash Fast (Recorded Route)")
+        XCTAssertEqual(model.totalTokens, 150)
+        XCTAssertEqual(try XCTUnwrap(model.costUSD), 0.000045, accuracy: 1e-12)
+    }
+
+    func testExplainedHostedGapsKeepLowerBoundsWithoutAnUnexplainedWarning() async throws {
+        let day = DailyUsageAccumulator.dayKey(from: now)
+        let stamp = now.addingTimeInterval(-60).timeIntervalSince1970 * 1000
+        let scanner = FreebuffDesktopUsageScanner(databasePaths: { [] })
+        let explained = [
+            FreebuffUsageReceipt(id: "cloud:failed", timestampMs: stamp, metricsJSON: "{}", model: nil, runStatus: "failed"),
+            FreebuffUsageReceipt(id: "cloud:cancelled", timestampMs: stamp, metricsJSON: "{}", model: nil, runStatus: "cancelled"),
+            FreebuffUsageReceipt(id: "cloud:import-legacy", timestampMs: stamp, metricsJSON: "{}", model: nil, runStatus: "completed")
+        ]
+        let scan = try await scanner.scan(now: now, hostedReceipts: explained)
+        XCTAssertEqual(scan?.partialDays, [day])
+        XCTAssertEqual(scan?.unexplainedPartialDays, [])
+        XCTAssertEqual(scan?.usage.series.daily, [])
+
+        let measuredZero = FreebuffUsageReceipt(id: "cloud:completed", timestampMs: stamp,
+                                                metricsJSON: #"{"usage":{"inputTokens":0,"outputTokens":0},"usageIncomplete":true}"#,
+                                                model: nil, runStatus: "completed")
+        let incomplete = try await scanner.scan(now: now, hostedReceipts: explained + [measuredZero])
+        XCTAssertEqual(incomplete?.unexplainedPartialDays, [day])
+        XCTAssertEqual(incomplete?.usage.series.daily, [])
+    }
+
+    @MainActor
+    func testHostedDetailGateOffIssuesOnlyTheSessionCall() async throws {
+        let http = HostedHTTP([
+            "/session": [HTTPResponse(statusCode: 404, headers: [:], body: Data())]
+        ])
+        let provider = FreebuffProvider(
+            historyScanner: FreebuffDesktopUsageScanner(databasePaths: { [] }),
+            hostedScanner: FreebuffHostedUsageScanner(cacheURL: nil),
+            authStore: FreebuffAuthStore(
+                files: FakeFiles(["/fixture/.config/manicode/credentials.json": #"{"default":{"authToken":"fixture-token"}}"#]),
+                keychain: FakeKeychain(), environment: FakeEnvironment(), homeDirectory: { URL(fileURLWithPath: "/fixture") }),
+            usageClient: FreebuffUsageClient(http: http), modelCatalog: FreebuffModelCatalog(cacheURL: nil),
+            defaults: hostedDefaults(false)
+        )
+        _ = await provider.refresh()
+        let requests = await http.requests
+        XCTAssertEqual(requests.map(\.url.path), ["/session"],
+                       "gated off, no hosted history or catalogue calls may leave the process")
+    }
+
     @MainActor
     func testFailedHostedHistoryWarningSurvivesSuccessfulQuotaRefresh() async throws {
         let http = HostedHTTP([
-            "/api/v1/freebuff/session": [HTTPResponse(statusCode: 404, headers: [:], body: Data())],
+            "/session": [HTTPResponse(statusCode: 404, headers: [:], body: Data())],
             prefix + "chats": [HTTPResponse(statusCode: 503, headers: [:], body: Data())]
         ])
         let provider = FreebuffProvider(
@@ -375,7 +469,8 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
             authStore: FreebuffAuthStore(
                 files: FakeFiles(["/fixture/.config/manicode/credentials.json": #"{"default":{"authToken":"fixture-token"}}"#]),
                 keychain: FakeKeychain(), environment: FakeEnvironment(), homeDirectory: { URL(fileURLWithPath: "/fixture") }),
-            usageClient: FreebuffUsageClient(http: http), modelCatalog: FreebuffModelCatalog(cacheURL: nil)
+            usageClient: FreebuffUsageClient(http: http), modelCatalog: FreebuffModelCatalog(cacheURL: nil),
+            defaults: hostedDefaults()
         )
         let failed = await provider.refresh()
         XCTAssertNotNil(failed.historyWarning)
@@ -396,7 +491,7 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
             trash.waitUntilExit()
         }
         let db = directory.appendingPathComponent("history.db").path
-        let sqlite = SQLiteCLIAccessor()
+        let sqlite = NativeSQLiteAccessor()
         try sqlite.execute(path: db, sql: """
         CREATE TABLE threads(id TEXT, model TEXT, harness_id TEXT);
         CREATE TABLE messages(thread_id TEXT, seq INTEGER, request_id TEXT, ts INTEGER, metrics_json TEXT, role TEXT);
@@ -422,7 +517,7 @@ final class FreebuffHostedUsageScannerTests: XCTestCase {
             trash.waitUntilExit()
         }
         let db = directory.appendingPathComponent("history.db").path
-        let sqlite = SQLiteCLIAccessor()
+        let sqlite = NativeSQLiteAccessor()
         try sqlite.execute(path: db, sql: """
         CREATE TABLE threads(id TEXT, model TEXT, harness_id TEXT);
         CREATE TABLE messages(thread_id TEXT, seq INTEGER, request_id TEXT, ts INTEGER, metrics_json TEXT, role TEXT);
@@ -445,12 +540,7 @@ private actor HostedHTTP: HTTPClient {
     func send(_ request: HTTPRequest) async throws -> HTTPResponse {
         requests.append(request)
         XCTAssertEqual(request.method, "GET")
-        XCTAssertEqual(request.url.host, "www.codebuff.com")
-        if request.url.path.contains("/cloud/history/") {
-            XCTAssertEqual(request.headers["x-freebuff-device-chats"], "1", "the new Desktop histories are hidden without this compatibility header")
-            let limit = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "limit" }?.value
-            XCTAssertEqual(limit, request.url.path.hasSuffix("/events") ? "500" : "100")
-        }
+        XCTAssertEqual(request.url.host, "freebuff.invalid")
         XCTAssertNil(request.body)
         let cursor = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "cursor" }?.value
         let key = request.url.path + (cursor.map { "?cursor=" + $0 } ?? "")

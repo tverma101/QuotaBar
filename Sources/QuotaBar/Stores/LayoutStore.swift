@@ -8,7 +8,9 @@ import Observation
 final class LayoutStore {
     // Swift's private access is file-scoped. Members shared with `LayoutStore+Customization.swift`
     // stay module-internal below; implementation details used only here remain private.
-    var placed: [PlacedWidget]
+    var placed: [PlacedWidget] {
+        didSet { invalidateDerivedCaches() }
+    }
 
     /// In-popover navigation (screen, Customize master/detail, screen-switch slide). Its own store so
     /// screen routing isn't tangled with layout state; the `screen`/`isEditing`/`customizeProviderID`/
@@ -59,15 +61,21 @@ final class LayoutStore {
     var draggingID: UUID?
     /// Persisted provider display order (provider IDs). Drives both the dashboard groups and the
     /// Customize sections, so the user can drag whole providers into the order they want.
-    var providerOrder: [String]
+    var providerOrder: [String] {
+        didSet { invalidateDerivedCaches() }
+    }
     /// Persisted metric order within each provider. Toggle switches do not mutate this, so turning a metric on
     /// or off never makes rows jump around in Customize.
-    var metricOrderByProvider: [String: [String]]
+    var metricOrderByProvider: [String: [String]] {
+        didSet { invalidateDerivedCaches() }
+    }
 
     /// Descriptor ids pinned to the menu bar. Membership only — display order is derived from the
     /// provider + metric order above, so pins follow the same sequence shown in Customize. Capped via
     /// `canPin` to at most `maxPinsPerProvider` per provider (the strip stacks a provider's values in pairs).
-    private(set) var pinnedMetricIDs: Set<String>
+    private(set) var pinnedMetricIDs: Set<String> {
+        didSet { invalidateDerivedCaches() }
+    }
 
     /// Provider/account IDs hidden from the menu-bar strip, including their icon and pinned values.
     /// Missing IDs are visible by default, so new providers and accounts appear automatically.
@@ -77,7 +85,9 @@ final class LayoutStore {
     /// them behind a caret until the user taps it, and Customize lists them under the divider.
     /// Membership only — the sequence within each section follows the provider's metric order, like
     /// pins. A metric keeps its membership while disabled, so re-enabling restores its section.
-    var expandedMetricIDs: Set<String>
+    var expandedMetricIDs: Set<String> {
+        didSet { invalidateDerivedCaches() }
+    }
 
     /// Provider IDs whose dashboard cards are currently opened with their expanded metrics visible.
     /// Unlike hover and drag state, this is a user preference: if someone likes Codex open, it should
@@ -149,8 +159,67 @@ final class LayoutStore {
     ///
     /// This has to be remembered separately because a seeded default and a hand-enabled metric are
     /// indistinguishable in `placed` alone: after `setMetricEnabled(id, true)` both look the same.
-    private(set) var explicitlyEnabledMetricIDs: Set<String>
+    private(set) var explicitlyEnabledMetricIDs: Set<String> {
+        didSet { invalidateDerivedCaches() }
+    }
     let isProviderEnabled: @MainActor (String) -> Bool
+
+    // MARK: - Derived caches
+
+    /// Memoized results for the whole-layout derived collections in `LayoutStore+Customization`
+    /// (`visiblePlaced`, `displayGroups`, the spend-capable sets, `pinnedGroups`,
+    /// `customizeGroups`, `customizeProviderRows`). Those used to recompute their
+    /// providers × widgets scans on every access — several times per dashboard render and once
+    /// per drag frame. `@ObservationIgnored` so a cache write during a view-body read cannot
+    /// retrigger the very observation that read it.
+    struct DerivedCaches {
+        /// The enabled-provider set the cached values were built against, `nil` before the first
+        /// derived read. Provider enablement lives behind the `isProviderEnabled` closure —
+        /// `ProviderEnablementStore` owns the state, so no `didSet` here can see its writes. Each
+        /// access instead re-derives this signature (one `isProviderEnabled` call per registered
+        /// provider) and a mismatch drops every cache. That read also reaches through the closure
+        /// into the enablement store's own observable state, so views keep the same invalidation
+        /// dependency they had when every collection computed `isProviderEnabled` inline.
+        var enabledProviderIDs: Set<String>?
+        var visiblePlaced: [PlacedWidget]?
+        var displayGroups: [ProviderGroup]?
+        var spendCapableProviders: [Provider]?
+        var dormantSpendCapableProviders: [Provider]?
+        var pinnedGroups: [ProviderMetrics]?
+        var customizeGroups: [ProviderMetrics]?
+        var customizeProviderRows: [ProviderRow]?
+    }
+    @ObservationIgnored var derivedCaches = DerivedCaches()
+
+    /// Drop every memoized derived collection. Fired by the `didSet` of each stored input
+    /// (`placed`, `providerOrder`, `metricOrderByProvider`, `expandedMetricIDs`,
+    /// `pinnedMetricIDs`, `explicitlyEnabledMetricIDs`) so a single funnel can't miss a mutator.
+    func invalidateDerivedCaches() {
+        derivedCaches = DerivedCaches()
+    }
+
+    /// The enablement owner's side of the invalidation contract: `ProviderEnablementStore`'s
+    /// `onChange`/`didChangeNotification` wiring (in AppContainer) can call this when the enabled
+    /// set flips. The per-access signature check already guarantees correctness, so this is a
+    /// seam for an eager push rather than the mechanism that keeps caches fresh.
+    func providerEnablementDidChange() {
+        invalidateDerivedCaches()
+    }
+
+    /// Serve `keyPath` from the derived cache, rebuilding on a miss. The enablement signature is
+    /// rechecked on every access — cheap against the scans these replace — so a provider toggle
+    /// still lands even though no property observer can see it.
+    func derived<T>(_ keyPath: WritableKeyPath<DerivedCaches, T?>, build: () -> T) -> T {
+        let enabled = Set(registry.providers.map(\.id).filter { isProviderEnabled($0) })
+        if enabled != derivedCaches.enabledProviderIDs {
+            invalidateDerivedCaches()
+            derivedCaches.enabledProviderIDs = enabled
+        }
+        if let cached = derivedCaches[keyPath: keyPath] { return cached }
+        let value = build()
+        derivedCaches[keyPath: keyPath] = value
+        return value
+    }
 
     init(
         registry: WidgetRegistry,

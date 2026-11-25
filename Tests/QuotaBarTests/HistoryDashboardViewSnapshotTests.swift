@@ -3,14 +3,11 @@ import SwiftUI
 import XCTest
 @testable import QuotaBar
 
-/// Headless render of the real `HistoryDashboardView` against fixture data — the screen's live proof
-/// without needing to click the menu bar. Renders through `NSHostingView.cacheDisplay` (AppKit's
-/// production renderer, no window, no GUI automation — `ImageRenderer` blanks out when the view
-/// reads `@Observable` objects from the environment in this xctest process), saves a PNG, and
-/// asserts the report the view shows.
+/// Prepares the report through the production async path, then renders its SwiftUI content through
+/// AppKit without opening a window.
 @MainActor
 final class HistoryDashboardViewSnapshotTests: XCTestCase {
-    func testRendersHistoryScreenWithFixtureData() throws {
+    func testRendersHistoryScreenWithFixtureData() async throws {
         let suiteName = "HistoryDashboardViewSnapshotTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -61,16 +58,16 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
         // The report the view must show: three period cards, the estimate line, and Codex's dashed
         // codename row. Assert the model first — a silently-empty render would prove nothing.
         // Build it through the view's own plumbing: the estimatedCost flags come from the
-        // registry's history descriptors via `dataStore.historyDescriptorsByProvider`, exactly as
-        // `HistoryDashboardView.report` does.
+        // registry's history descriptors via `dataStore.historyDescriptorsByProvider`.
         let estimatedCosts = dataStore.historyDescriptorsByProvider.mapValues(\.estimatedCost)
-        let report = HistoryDashboardAggregator.report(.init(
+        let prepared = await HistoryDashboardAggregator.prepareReport(.init(
             enabledProviderIDs: layout.orderedProviderIDs().filter { layout.isProviderEnabled($0) },
             displayNameByProviderID: [:],
             historyByProviderID: ["claude": dataStore.snapshots["claude"]!.usageHistory!,
                                   "codex": dataStore.snapshots["codex"]!.usageHistory!],
             estimatedCostByProviderID: estimatedCosts
-        ), now: TestLocalInstant.date(2026, 10, 5, 12))
+        ), now: TestLocalInstant.date(2026, 10, 5, 12), calendar: .current)
+        let report = try XCTUnwrap(prepared)
         XCTAssertFalse(report.isEmpty, "fixture must produce sections")
         XCTAssertNotNil(report.apiEstimateTotal)
         XCTAssertTrue(report.lifetimeCostIsEstimated,
@@ -85,9 +82,7 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
             section.rows.contains { $0.slug == "space bunny" && $0.cost == nil && $0.tokens > 0 }
         }, "the stealth codename row must show tokens with a dashed cost")
 
-        let view = HistoryDashboardView(now: { TestLocalInstant.date(2026, 10, 5, 12) })
-            .environment(layout)
-            .environment(dataStore)
+        let view = PopoverScrollView { HistoryDashboardContent(report: report) }
             .environment(\.colorScheme, .dark)
             .background(Color(red: 0.09, green: 0.09, blue: 0.11))
             .frame(width: 320)
@@ -100,9 +95,6 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
         )
         hosting.cacheDisplay(in: hosting.bounds, to: rep)
         let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("quotabar_history_render-\(UUID().uuidString).png")
-        try png.write(to: url)
-        print("history render saved to: \(url.path), size: \(hosting.bounds.size), bytes: \(png.count)")
         XCTAssertGreaterThan(png.count, 20_000, "a real history screen renders far more than a blank bitmap")
     }
 
@@ -111,7 +103,7 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
     /// contributing provider's fold cost is the public-rate estimate, the card must disappear
     /// and only the hero's "Est." mark remains.
     @MainActor
-    func testEstimateCardHiddenWhenFoldCostIsTheEstimate() throws {
+    func testEstimateCardHiddenWhenFoldCostIsTheEstimate() async throws {
         let suiteName = "HistoryDashboardViewSnapshotTests-EstimateSuppressed.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -138,19 +130,18 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
         ]
 
         let estimatedCosts = dataStore.historyDescriptorsByProvider.mapValues(\.estimatedCost)
-        let report = HistoryDashboardAggregator.report(.init(
+        let prepared = await HistoryDashboardAggregator.prepareReport(.init(
             enabledProviderIDs: layout.orderedProviderIDs().filter { layout.isProviderEnabled($0) },
             displayNameByProviderID: [:],
             historyByProviderID: ["claude": dataStore.snapshots["claude"]!.usageHistory!],
             estimatedCostByProviderID: estimatedCosts
-        ), now: TestLocalInstant.date(2026, 10, 5, 12))
+        ), now: TestLocalInstant.date(2026, 10, 5, 12), calendar: .current)
+        let report = try XCTUnwrap(prepared)
         XCTAssertTrue(report.lifetimeCostIsEstimated)
         XCTAssertFalse(report.showsAPIEstimateCard,
                        "estimate equals the hero total — the duplicate card must be suppressed")
 
-        let view = HistoryDashboardView(now: { TestLocalInstant.date(2026, 10, 5, 12) })
-            .environment(layout)
-            .environment(dataStore)
+        let view = PopoverScrollView { HistoryDashboardContent(report: report) }
             .environment(\.colorScheme, .dark)
             .background(Color(red: 0.09, green: 0.09, blue: 0.11))
             .frame(width: 320)
@@ -160,10 +151,20 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
         let rep = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
         hosting.cacheDisplay(in: hosting.bounds, to: rep)
         let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("quotabar_history_render_no_estimate_card-\(UUID().uuidString).png")
-        try png.write(to: url)
-        print("suppressed render saved to: \(url.path), bytes: \(png.count)")
+        XCTAssertGreaterThan(png.count, 10_000)
+    }
+
+    func testCancelledHistoryPreparationReturnsNoReport() async {
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await HistoryDashboardAggregator.prepareReport(
+                .init(enabledProviderIDs: [], displayNameByProviderID: [:], historyByProviderID: [:]),
+                now: Date(),
+                calendar: .current
+            )
+        }
+        let result = await task.value
+        XCTAssertNil(result)
     }
 
     private static func history(

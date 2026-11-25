@@ -3,7 +3,7 @@
   "id": "devin",
   "name": "Devin",
   "version": "0.0.1",
-  "entry": "plugin.js",
+  "entry": "native:devin",
   "icon": "icon.svg",
   "brandColor": "#000000",
   "links": [

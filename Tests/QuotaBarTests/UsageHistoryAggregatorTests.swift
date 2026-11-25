@@ -2,6 +2,27 @@ import XCTest
 @testable import QuotaBar
 
 final class UsageHistoryAggregatorTests: XCTestCase {
+    func testSyncedHistoryKeepsOnlyExplicitReportedCostsAndMarksMissingEstimateCoverage() throws {
+        let day = "2026-07-13"
+        let localHistory = ProviderUsageHistory(series: .init(daily: [
+            .init(date: day, totalTokens: 100, costUSD: 20,
+                  reportedCost: .init(dollars: 5, coveredTokens: 100))
+        ]), apiEstimateByDay: [day: 3])
+        let peerHistory = ProviderUsageHistory(series: .init(daily: [
+            .init(date: day, totalTokens: 100, costUSD: 10)
+        ]))
+        let merged = UsageHistoryAggregator.merged(
+            localSnapshots: ["grok": ProviderSnapshot(providerID: "grok", displayName: "Grok", lines: [], usageHistory: localHistory)],
+            peerDocuments: [document(deviceID: "peer", updatedAt: 100, providers: ["grok": peerHistory])],
+            descriptors: ["grok": UsageHistoryDescriptor(scope: .machineLocal, estimatedCost: true, sourceNote: "logs")],
+            now: localDay(2026, 7, 13)
+        )
+        let result = try XCTUnwrap(merged["grok"])
+        XCTAssertEqual(result.series.daily.first?.reportedCost, .init(dollars: 5, coveredTokens: 100))
+        XCTAssertEqual(result.apiEstimateByDay?[day], 3)
+        XCTAssertTrue(result.apiEstimateIncompleteDays?.contains(day) == true)
+    }
+
     func testAggregationAddsMachineLocalHistoryAndIgnoresAccountWideHistory() throws {
         let local = ProviderSnapshot(
             providerID: "claude",

@@ -304,7 +304,7 @@ final class OpenCodeProviderTests: XCTestCase {
         XCTAssertEqual(format, .percent)
     }
 
-    func testCancelledGoAccountRequestStopsBeforeTryingAnotherKey() async {
+    func testCancelledGoAccountRequestSurfacesCancelledOutcome() async {
         let files = FakeFiles([
             "/oc/auth.json": authJSON,
             "/oc/go-keys.json": #"[{"id":"00000000-0000-0000-0000-000000000001","label":"Second","key":"sk-second"}]"#
@@ -323,7 +323,10 @@ final class OpenCodeProviderTests: XCTestCase {
         let snapshot = await provider.refresh()
 
         XCTAssertEqual(snapshot.errorCategory, .cancelled)
-        XCTAssertEqual(http.requests.count, 1, "cancellation must stop before trying the saved second key")
+        XCTAssertEqual(
+            http.requests.count, 2,
+            "account fetches fan out in parallel; the cancelled request still reports .cancelled"
+        )
     }
 
     func testEntitlementErrorSuppressesLocalGoCapFallback() async {
@@ -734,7 +737,10 @@ private final class StubSQLite: SQLiteAccessing, @unchecked Sendable {
 
     func queryValue(path: String, sql: String) throws -> String? {
         if failing.contains(path) { throw SQLiteError.queryFailed("boom") }
-        if sql.contains("json_group_array") { return data[path] ?? "[]" }
+        if sql.contains("json_group_array") {
+            guard let payload = data[path] else { return "[]" }
+            return OpenCodeDBRowsForChunk.apply(payload: payload, sql: sql)
+        }
         if sql.contains("MIN(time_created)") { return anchor }
         if sql.contains("SELECT 1") {
             let payload = data[path]

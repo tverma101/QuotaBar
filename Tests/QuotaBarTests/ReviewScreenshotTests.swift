@@ -76,6 +76,7 @@ final class ReviewScreenshotTests: XCTestCase {
     }
 }
 
+@MainActor
 extension ReviewScreenshotTests {
     func testAccountNameBlurRendersForReview() throws {
         func card(_ suite: String, blurred: Bool) throws -> NSImage {

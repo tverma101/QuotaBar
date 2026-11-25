@@ -75,8 +75,9 @@ final class AntigravityAggregatePersistenceTests: XCTestCase {
     }
 
     /// The disk record round-trips the full derived state: stamps, events, aggregate, and the
-    /// incomplete-day bookkeeping arrays survive encode/decode, and the step timestamp index is
-    /// deliberately absent from the record.
+    /// incomplete-day bookkeeping arrays survive encode/decode. Records written before the step
+    /// timestamp index was persisted decode cleanly with a nil index; the next changed scan then
+    /// rebuilds it once and re-persists.
     func testRoundTripsDerivedCacheRecord() throws {
         let fixture = try makeDatabaseDirectory()
         let cache = AntigravityDbUsageScanner.CachedDatabase(
@@ -137,7 +138,7 @@ final class AntigravityAggregatePersistenceTests: XCTestCase {
         XCTAssertNil(AntigravityAggregatePersistence.read(path: fixture.path))
     }
 
-    /// A fresh scanner — the scan-worker child, or this app after a memory-pressure unload —
+    /// A fresh scanner — a cold process, or this app after a memory-pressure unload —
     /// must rebuild its view from the disk record without re-reading the conversation database.
     func testFreshScannerServesDiskRecordWithoutSQLiteQueries() async throws {
         let fixture = try makeDatabaseDirectory()

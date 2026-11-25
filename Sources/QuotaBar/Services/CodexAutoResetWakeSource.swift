@@ -15,10 +15,11 @@ final class CodexAutoResetWakeSource {
         self.center = center
         self.workspaceCenter = NSWorkspace.shared.notificationCenter
         self.monitor = NWPathMonitor()
+        let wakeNotification = CodexAutoResetCoordinator.wakeNotification
         for (source, name) in [(workspaceCenter, NSWorkspace.didWakeNotification),
                                (NotificationCenter.default, .NSSystemClockDidChange)] {
             let token = source.addObserver(forName: name, object: nil, queue: nil) { [center] _ in
-                center.post(name: CodexAutoResetCoordinator.wakeNotification, object: nil)
+                center.post(name: wakeNotification, object: nil)
             }
             observers.append((source, token))
         }

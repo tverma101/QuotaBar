@@ -3,7 +3,7 @@ name = "quotabar-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Performance-critical QuotaBar primitives compiled to a static library and called from Swift over a small C ABI (Claude and Codex usage-line parsers)."
+description = "The macOS static library: the C ABI over quotabar-engine (the cross-platform backend) plus the Claude/Codex usage-line parsers and pricing codec Swift still calls directly."
 
 [lib]
 name = "quotabar_core"
@@ -11,6 +11,10 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 serde_json = "1"
+quotabar-engine = { path = "../quotabar-engine" }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = true

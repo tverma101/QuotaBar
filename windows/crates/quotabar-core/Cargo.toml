@@ -9,6 +9,7 @@ name = "quotabar_core"
 path = "src/lib.rs"
 
 [dependencies]
+quotabar-engine = { path = "../../../Rust/quotabar-engine" }
 aes = "0.8.4"
 aes-gcm = "0.10.3"
 cbc = { version = "0.1.2", features = ["alloc"] }

@@ -315,7 +315,7 @@ final class ClaudeAccountIsolationTests: XCTestCase {
     }
 
     private struct Fixture {
-        var provider: ClaudeProvider
+        var provider: ClaudeSwiftReferenceProvider
         var files: FakeFiles
         var http: RoutingHTTPClient
     }
@@ -341,7 +341,7 @@ final class ClaudeAccountIsolationTests: XCTestCase {
         let http = RoutingHTTPClient(handler: handler)
         let now = Date(timeIntervalSince1970: 1_771_603_200)
         return Fixture(
-            provider: ClaudeProvider(
+            provider: ClaudeSwiftReferenceProvider(
                 authStore: ClaudeAuthStore(
                     environment: FakeEnvironment(["CLAUDE_CONFIG_DIR": "/tmp/claude"]),
                     files: files,

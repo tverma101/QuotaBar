@@ -13,10 +13,13 @@ The project script owns the build/run loop. From the repo root:
 ./script/build_and_run.sh verify   # launch and confirm the process is running
 ```
 
-The script builds a signed app bundle under `dist/` and launches it in place — nothing is installed to
-`/Applications`. The dev build uses its own bundle id (`com.tverma101.quotabar.dev`), so it keeps its
-own settings and keychain and never disturbs a released QuotaBar. It ships no update feed, so it never
-checks for updates — test updates with a real signed, notarized release build.
+By default, `verify` launches a separate development bundle from `dist/` and never replaces anything
+in `/Applications`. The dev bundle uses `com.tverma101.quotabar.dev`, so it keeps its own settings
+and Keychain entries.
+
+Use `./script/build_and_run.sh install` to replace and relaunch `/Applications/QuotaBar.app` with the
+production identity (`com.tverma101.quotabar`). This is a manual local install: it doesn't require a
+release tag or enable automatic updates.
 
 ## Stream logs
 

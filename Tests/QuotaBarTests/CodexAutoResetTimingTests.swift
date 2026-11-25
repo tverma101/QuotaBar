@@ -153,7 +153,7 @@ final class CodexAutoResetTimingTests: XCTestCase {
             state.withLock { $0.writes += 1; $0.now = expiry.addingTimeInterval(1) }
             return HTTPResponse(statusCode: 401, headers: [:], body: Data())
         }
-        let service = CodexResetClaimService(usageClient: .init(http: http),
+        let service = CodexResetClaimReferenceService(usageClient: .init(http: http),
             credentialCandidates: { [("stale", "same-account"), ("fresh", "same-account")] },
             now: { state.withLock { $0.now } })
         let outcome = await service.claimAuto(credit: .init(id: "target", expiresAt: expiry),
@@ -162,7 +162,7 @@ final class CodexAutoResetTimingTests: XCTestCase {
         XCTAssertEqual(state.withLock { $0.writes }, 1, "a late auth rejection must not start another consume after expiry")
     }
 
-    private func service(expiry: Date) -> (CodexResetClaimService, RoutingHTTPClient) {
+    private func service(expiry: Date) -> (CodexResetClaimReferenceService, RoutingHTTPClient) {
         let body = Data("""
         {"credits":[{"id":"target","status":"available","reset_type":"codex_rate_limits",
         "expires_at":"\(OpenUsageISO8601.string(from: expiry))"}]}
@@ -173,7 +173,7 @@ final class CodexAutoResetTimingTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 200, headers: [:], body: Data("{\"code\":\"reset\"}".utf8))
         }
-        return (CodexResetClaimService(usageClient: .init(http: http),
+        return (CodexResetClaimReferenceService(usageClient: .init(http: http),
             credentialCandidates: { [("fixture-token", "fixture-account")] }), http)
     }
 }

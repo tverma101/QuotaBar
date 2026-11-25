@@ -9,6 +9,32 @@ import XCTest
 /// The mirror exists for exactly that. These tests count the whole-blob reads, decodes and writes a
 /// cache performs so a regression (a write path that bypasses the mirror) fails loudly.
 final class ProviderSnapshotCachePersistenceTests: XCTestCase {
+    /// A blob written before the native-source switch (or by a build without the marker) still
+    /// holds foreign-source Antigravity rows; decoding drops only that provider's data.
+    func testPreNativeSourcePayloadDropsAntigravityRows() throws {
+        let (defaults, suite) = makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
+        cache.store(snapshot("antigravity", used: 10, now: now))
+        cache.store(snapshot("codex", used: 20, now: now))
+
+        let data = try XCTUnwrap(defaults.data(forKey: "k"))
+        var object = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object.removeValue(forKey: "antigravityUsesNativeSources")
+        defaults.set(try JSONSerialization.data(withJSONObject: object), forKey: "k")
+
+        let reloaded = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
+        let survivors = reloaded.loadSnapshots(providerIDs: ["antigravity", "codex"])
+        XCTAssertNil(survivors["antigravity"], "foreign-source antigravity rows must not load")
+        XCTAssertNotNil(survivors["codex"], "other providers are untouched")
+
+        // A native store writes the marker back and does not resurrect the dropped row.
+        reloaded.store(snapshot("antigravity", used: 30, now: now))
+        let again = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
+        XCTAssertEqual(again.loadSnapshots(providerIDs: ["antigravity"]).count, 1)
+    }
+
     private func makeDefaults() -> (UserDefaults, String) {
         let suite = "providerSnapshotCache.persistence.\(UUID().uuidString)"
         return (UserDefaults(suiteName: suite)!, suite)
@@ -160,6 +186,90 @@ final class ProviderSnapshotCachePersistenceTests: XCTestCase {
         // A later reader — another process, or the next launch — must see it.
         let reader = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
         XCTAssertNotNil(reader.loadSnapshots(providerIDs: ["alpha"])["alpha"])
+    }
+
+    /// An Antigravity fold is history-only and machine-local: it can never prove which Google
+    /// account owns the cached quota. A fold committed by a process whose launch identity differs
+    /// from the stamped account must still merge its history under the ORIGINAL stamp — while its
+    /// own returned view shows no quota at all, so the other account's meters never paint.
+    func testAntigravityFoldPreservesStampedQuotaFromMismatchedCaller() throws {
+        let (defaults, suite) = makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let quotaStamp = Date(timeIntervalSince1970: 1_800_000_000)
+        let foldStamp = Date(timeIntervalSince1970: 1_900_000_000)
+        let now = Date(timeIntervalSince1970: 1_950_000_000)
+        let writer = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
+        // A second cache instance stands in for the other process sharing the blob.
+        let reader = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 9_999, now: { now })
+
+        var quotaSnapshot = snapshot("antigravity", used: 30, now: quotaStamp)
+        quotaSnapshot.plan = "Pro"
+        quotaSnapshot.quotaRefreshedAt = quotaStamp
+        writer.store(quotaSnapshot, producedByIdentityKey: "google-acct-A")
+
+        let historyDescriptor = UsageHistoryDescriptor(
+            scope: .machineLocal, estimatedCost: true, sourceNote: "test"
+        )
+        let fold = ProviderSnapshot(
+            providerID: "antigravity",
+            displayName: "Antigravity",
+            lines: [],
+            refreshedAt: foldStamp,
+            usageHistory: ProviderUsageHistory(series: DailyUsageSeries(daily: [
+                DailyUsageEntry(date: "2026-10-14", totalTokens: 500, costUSD: 5)
+            ]))
+        )
+        let order = try XCTUnwrap(reader.beginRefreshOrder(providerID: "antigravity"))
+        let result = reader.store(
+            fold,
+            producedByIdentityKey: "google-acct-B",
+            refreshOrder: order,
+            scope: .localAccounting,
+            historyDescriptor: historyDescriptor,
+            now: foldStamp
+        )
+
+        guard case .stored(let stored) = result, let stored else {
+            return XCTFail("the history fold must still commit its history")
+        }
+        // The mismatched caller is handed local history only — never the other account's meters.
+        XCTAssertNil(stored.plan)
+        XCTAssertNil(stored.line(label: "Session"))
+        XCTAssertEqual(stored.quotaRefreshedAt, .distantPast)
+        XCTAssertEqual(stored.usageHistory?.series.daily.first?.totalTokens, 500)
+
+        // The persisted blob keeps the original account's quota, stamp and freshness.
+        let persisted = reader.loadSnapshots(providerIDs: ["antigravity"])["antigravity"]
+        XCTAssertEqual(persisted?.plan, "Pro")
+        XCTAssertEqual(
+            persisted?.line(label: "Session"),
+            .progress(label: "Session", used: 30, limit: 100, format: .percent)
+        )
+        XCTAssertEqual(persisted?.quotaRefreshedAt, quotaStamp)
+        XCTAssertEqual(reader.producedByIdentityKey(providerID: "antigravity"), "google-acct-A")
+        XCTAssertEqual(persisted?.usageHistory?.series.daily.first?.totalTokens, 500)
+
+        // A fold that produced no history is `.unchanged`; the mismatched caller still sees no quota.
+        let emptyOrder = try XCTUnwrap(reader.beginRefreshOrder(providerID: "antigravity"))
+        let noHistory = reader.store(
+            ProviderSnapshot(
+                providerID: "antigravity",
+                displayName: "Antigravity",
+                lines: [],
+                refreshedAt: foldStamp
+            ),
+            producedByIdentityKey: "google-acct-B",
+            refreshOrder: emptyOrder,
+            scope: .localAccounting,
+            historyDescriptor: historyDescriptor,
+            now: foldStamp
+        )
+        guard case .unchanged(let unchanged) = noHistory, let unchanged else {
+            return XCTFail("a fold without history must leave the persisted entry unchanged")
+        }
+        XCTAssertNil(unchanged.plan)
+        XCTAssertNil(unchanged.line(label: "Session"))
+        XCTAssertEqual(reader.producedByIdentityKey(providerID: "antigravity"), "google-acct-A")
     }
 
     /// The refresh order fences a late result against a newer one, so it has to keep growing across

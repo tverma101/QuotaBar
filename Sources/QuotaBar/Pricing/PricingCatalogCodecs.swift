@@ -83,8 +83,6 @@ enum PricingCatalogCodecs {
                     promptRateTiers: promptTiers,
                     utcPriceOverrides: utcOverrides.isEmpty ? nil : utcOverrides,
                     cacheReadIsExplicit: cacheRead != nil
-                        || promptTiers.contains { $0.cacheReadPerMillion != nil }
-                        || utcOverrides.contains { $0.cacheReadPerMillion != nil }
                 )
 
                 let components = key.split(separator: "/", omittingEmptySubsequences: false)
@@ -131,7 +129,6 @@ enum PricingCatalogCodecs {
                     cacheWritePerMillion: cacheWrite ?? input,
                     cacheReadPerMillion: cacheRead ?? input,
                     cacheReadIsExplicit: cacheRead != nil
-                        || promptRateTiers.contains { $0.cacheReadPerMillion != nil }
                 )
                 rates.promptRateTiers = promptRateTiers
                 rates.inputAbove200kPerMillion = perMillionFromPerToken(entry["input_cost_per_token_above_200k_tokens"])
@@ -184,7 +181,6 @@ enum PricingCatalogCodecs {
                         cacheReadPerMillion: cacheRead ?? input,
                         promptRateTiers: tiers.sorted { $0.thresholdPromptTokens < $1.thresholdPromptTokens },
                         cacheReadIsExplicit: cacheRead != nil
-                            || tiers.contains { $0.cacheReadPerMillion != nil }
                     ))
                 }
             }
@@ -448,7 +444,7 @@ enum PricingCatalogCodecs {
                     outputAbove200kPerMillion: model.oa,
                     cacheWriteAbove200kPerMillion: model.cwa,
                     cacheReadAbove200kPerMillion: model.cra,
-                    cacheReadIsExplicit: model.cre ?? true,
+                    cacheReadIsExplicit: model.crb ?? model.cre ?? true,
                     fastMultiplier: model.fast ?? 1
                 )
             }
@@ -472,6 +468,9 @@ enum PricingCatalogCodecs {
         var models: [String: CompactCatalog.Model] = [:]
         models.reserveCapacity(catalog.entries.count)
         for (key, rates) in catalog.entries {
+            let hasCacheReadOverride = rates.cacheReadAbove200kPerMillion != nil
+                || rates.promptRateTiers.contains { $0.cacheReadPerMillion != nil }
+                || rates.utcPriceOverrides?.contains { $0.cacheReadPerMillion != nil } == true
             models[key] = CompactCatalog.Model(
                 i: rates.inputPerMillion,
                 o: rates.outputPerMillion,
@@ -484,7 +483,8 @@ enum PricingCatalogCodecs {
                 oa: rates.outputAbove200kPerMillion,
                 cwa: rates.cacheWriteAbove200kPerMillion,
                 cra: rates.cacheReadAbove200kPerMillion,
-                cre: rates.cacheReadIsExplicit ? nil : false,
+                cre: rates.cacheReadIsExplicit || hasCacheReadOverride ? nil : false,
+                crb: !rates.cacheReadIsExplicit && hasCacheReadOverride ? false : nil,
                 fast: rates.fastMultiplier == 1 ? nil : rates.fastMultiplier
             )
         }
@@ -509,9 +509,11 @@ enum PricingCatalogCodecs {
             var i: Double, o: Double, cw: Double, cr: Double
             var cw1: Double?, tiers: [PromptRateTier]?, utc: [UTCPriceRateOverride]?
             var ia: Double?, oa: Double?, cwa: Double?, cra: Double?
-            /// Omitted means explicit for backward compatibility with snapshots written before the
-            /// provenance bit existed. Newly compacted synthesized rates write `false`.
-            var cre: Bool?, fast: Double?
+            /// Legacy flag: an explicit cache-read rate exists in any lane; omitted means true.
+            var cre: Bool?
+            /// Base-only provenance when it differs from the legacy flag.
+            var crb: Bool?
+            var fast: Double?
         }
 
         enum CodingKeys: String, CodingKey {

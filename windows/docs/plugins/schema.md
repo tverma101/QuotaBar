@@ -76,6 +76,10 @@ Validation rules:
 - `icon` must be relative and point to an SVG file (use `fill="currentColor"` for theme compatibility)
 - `links[].url` (if provided) must be an `http://` or `https://` URL
 
+The bundled Devin plugin is the one exception to the `entry` rules: its `entry` is
+`native:devin`, which runs the shared Rust quota engine instead of a JS entry script. Every
+other plugin's `entry` remains a relative path into its plugin directory.
+
 ### Links Array (Optional)
 
 | Field   | Type   | Required | Description |

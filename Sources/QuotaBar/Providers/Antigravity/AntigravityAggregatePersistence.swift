@@ -2,14 +2,18 @@ import Darwin
 import Foundation
 
 /// Disk mirror of one Antigravity conversation database's derived scan state — parsed generation
-/// events plus the priced daily aggregate — validated against the database's file stamps before
-/// use. A fresh process (the scan-worker child, or this app after a memory-pressure unload)
-/// reloads the record instead of re-reading SQLite and re-decoding protobufs. Records carry the
-/// raw events so a changed database can verify its prefix and fold only appended rows, exactly
-/// like the in-memory cache path. The step timestamp index is the only excluded state; a scan
-/// rebuilds it from SQLite the first time it needs to resolve undated rows.
+/// events, the priced daily aggregate, and the step timestamp index — validated against the
+/// database's file stamps before use. A fresh process (a cold process, or this app after a
+/// memory-pressure unload) reloads the record instead of re-reading SQLite and re-decoding
+/// protobufs. Records carry the raw events so a changed database can verify its prefix and fold
+/// only appended rows, exactly like the in-memory cache path; the persisted step index is verified
+/// the same way (its table fingerprint against the live prefix digest) so reuse never skips the
+/// correctness check — it only skips the per-page table scan.
 enum AntigravityAggregatePersistence {
-    static let schema = 1
+    // v2: the oversized-row projection reads in 512-byte chunks, so records produced under the old
+    // 4 KiB chunk reader's read-budget refusals are suspect. Keep schema-1 records that never hit a
+    // refused oversized row; the rest rescan for real instead of replaying a truncated history.
+    static let schema = 2
     /// Refuse to cache pathological histories that would dominate the log-scan-cache directory.
     static let maximumRecordBytes = 64 * 1_024 * 1_024
     private static let mutationLock = NSLock()
@@ -37,6 +41,7 @@ enum AntigravityAggregatePersistence {
             guard let data = try? Data(contentsOf: fileURL(path: path)),
                   let record = try? decoder.decode(Record.self, from: data),
                   record.schema == schema
+                      || (record.schema == 1 && record.cache.oversizedTimestamps.isEmpty)
             else { return nil }
             return record
         }
@@ -49,21 +54,35 @@ enum AntigravityAggregatePersistence {
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .secondsSince1970
                 let data = try encoder.encode(record)
-                guard data.count <= maximumRecordBytes else { return }
+                guard data.count <= maximumRecordBytes else {
+                    DiagnosticGate.logOnce(
+                        for: "provider.antigravity.derivation-record-oversized.\(JSONLScanCachePaths.stableFingerprint(path))"
+                    ) {
+                        AppLog.warn(
+                            LogTag.plugin("antigravity"),
+                            "antigravity derivation record for \(JSONLScanCachePaths.stableFingerprint(path)) is \(data.count / 1_048_576) MB; not persisting it"
+                        )
+                    }
+                    return
+                }
                 let directory = url.deletingLastPathComponent()
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                // The kernel lock orders app/scan-worker writers on the same file, mirroring the
+                // The kernel lock orders process writers on the same file, mirroring the
                 // other log-scan-cache records; the write itself is atomic so readers never see a
                 // half-written record.
                 let descriptor = Darwin.open(
                     directory.appendingPathComponent(".antigravity-db-derivations.lock").path,
                     O_CREAT | O_RDWR | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR)
                 )
-                guard descriptor >= 0 else { return }
+                guard descriptor >= 0 else {
+                    throw SQLiteError.queryFailed("antigravity derivation lock file could not be opened (errno \(errno))")
+                }
                 defer { Darwin.close(descriptor) }
-                guard flock(descriptor, LOCK_EX) == 0 else { return }
+                guard flock(descriptor, LOCK_EX) == 0 else {
+                    throw SQLiteError.queryFailed("antigravity derivation lock could not be acquired (errno \(errno))")
+                }
                 defer { flock(descriptor, LOCK_UN) }
-                try? data.write(to: url, options: .atomic)
+                try data.write(to: url, options: .atomic)
             } catch {
                 // The in-memory cache still holds (or re-derives) the state; a failed disk mirror
                 // only costs the next process a SQLite re-read. Log it so persistent failures are

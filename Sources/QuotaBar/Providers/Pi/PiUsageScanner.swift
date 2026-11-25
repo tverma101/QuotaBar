@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import os
 
 /// A missing Pi source is a complete empty result, but a failed directory walk is not. Callers that
 /// merge Pi with another history source must keep the prior combined history on `.incomplete`.
@@ -114,6 +115,9 @@ actor PiUsageScanner {
             return .incomplete
         }
         let bucket = FutureTimestampFoldBucket<Entry>()
+        // Dedup during the fold (first occurrence wins, same as `Self.dedup` afterwards): the
+        // second full-size entries array a post-fold dedup would build never materializes.
+        let dedupIDs = OSAllocatedUnfairLock<Set<String>>(initialState: [])
         let complete = await scanner.foldItems(
             from: files,
             since: since,
@@ -122,6 +126,10 @@ actor PiUsageScanner {
             visit: { entry in
                 guard entry.cardID == cardID else { return }
                 guard entry.reportedTotalTokens > 0 || (entry.carriedCost ?? 0) > 0 else { return }
+                if let id = entry.id,
+                   !dedupIDs.withLock({ $0.insert(id).inserted }) {
+                    return
+                }
                 bucket.append(entry, timestamp: entry.timestamp, maximumTimestamp: maximumTimestamp)
             },
             fileStarted: { bucket.begin($0) },
@@ -140,9 +148,8 @@ actor PiUsageScanner {
             return .incomplete
         }
         DiagnosticGate.clearFailure(futureDiagnosticKey)
-        let deduped = Self.dedup(bucket.items)
         guard !Task.isCancelled else { return .incomplete }
-        let result = Self.aggregate(entries: deduped, cardID: cardID, since: since, pricing: pricing)
+        let result = Self.aggregate(entries: bucket.items, cardID: cardID, since: since, pricing: pricing)
         guard !Task.isCancelled else { return .incomplete }
         return .complete(result)
     }
@@ -168,7 +175,7 @@ actor PiUsageScanner {
     static func parseFile(_ data: Data) -> [Entry] {
         var entries: [Entry] = []
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            if case .entry(let entry) = parseLineResult(Data(line)) { entries.append(entry) }
+            if case .entry(let entry) = parseLineResult(line) { entries.append(entry) }
         }
         return entries
     }
@@ -179,7 +186,7 @@ actor PiUsageScanner {
         var entries: [Entry] = []
         var malformed = false
         let readSucceeded = JSONLFileReader.forEachLine(at: url) { line in
-            switch parseLineResult(Data(line)) {
+            switch parseLineResult(line) {
             case .entry(let entry): entries.append(entry)
             case .irrelevant: break
             case .malformed: malformed = true
@@ -202,9 +209,12 @@ actor PiUsageScanner {
         return entry
     }
 
-    private static func parseLineResult(_ data: Data) -> LineResult {
-        guard data.range(of: usageMarker) != nil else { return .irrelevant }
-        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+    private static func parseLineResult(_ line: Data.SubSequence) -> LineResult {
+        // The marker pre-filter runs on the slice so the per-line Data copy only happens for
+        // lines that can actually carry usage (the same gate the Muse scanner applies).
+        guard line.range(of: usageMarker) != nil else { return .irrelevant }
+        let lineData = Data(line)
+        guard let object = (try? JSONSerialization.jsonObject(with: lineData)) as? [String: Any] else {
             return .malformed
         }
         guard object["type"] as? String == "message" else { return .irrelevant }

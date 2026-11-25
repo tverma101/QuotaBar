@@ -274,7 +274,7 @@ final class CodexAuthStoreTests: XCTestCase {
     @MainActor
     func testUnreadablePresentAuthFileKeepsCodexDetectedAndSurfacesCredentialAccess() async {
         let files = UnreadableCodexAuthFile(path: "/tmp/codex-home/auth.json")
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: files,
@@ -790,7 +790,7 @@ final class CodexProviderTests: XCTestCase {
                 )
             ].joined(separator: "\n")
         ])
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
@@ -841,7 +841,7 @@ final class CodexProviderTests: XCTestCase {
             XCTFail("unexpected Codex endpoint after cancellation: \(request.url)")
             return HTTPResponse(statusCode: 200, headers: [:], body: Data())
         }
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
@@ -881,7 +881,7 @@ final class CodexProviderTests: XCTestCase {
                 body: Data(#"{"access_token":"new-access","refresh_token":"new-refresh"}"#.utf8)
             )
         }
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: files,
@@ -925,7 +925,7 @@ final class CodexProviderTests: XCTestCase {
                 await gate.pause()
                 return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"late-access","refresh_token":"late-refresh"}"#.utf8))
             }
-            let provider = CodexProvider(
+            let provider = CodexSwiftReferenceProvider(
                 authStore: CodexAuthStore(
                     environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                     files: files,
@@ -996,7 +996,7 @@ final class CodexProviderTests: XCTestCase {
                 return HTTPResponse(statusCode: 500, headers: [:], body: Data())
             }
         }
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 files: files,
                 keychain: FakeKeychain(),
@@ -1042,7 +1042,7 @@ final class CodexProviderTests: XCTestCase {
                 )
             ].joined(separator: "\n")
         ])
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles([
@@ -1095,7 +1095,7 @@ final class CodexProviderTests: XCTestCase {
                 )
             ].joined(separator: "\n")
         ])
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
@@ -1147,7 +1147,7 @@ final class CodexProviderTests: XCTestCase {
         ])
         defer { try? FileManager.default.removeItem(at: home) }
 
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),
@@ -1224,7 +1224,7 @@ final class CodexProviderTests: XCTestCase {
             homeDirectory: { piHome },
             incrementalScanner: IncrementalJSONLScanner<PiUsageScanner.Entry>()
         )
-        let provider = CodexProvider(
+        let provider = CodexSwiftReferenceProvider(
             authStore: CodexAuthStore(
                 environment: FakeEnvironment(["CODEX_HOME": "/tmp/codex-home"]),
                 files: FakeFiles(["/tmp/codex-home/auth.json": #"{"tokens":{"access_token":"token"}}"#]),

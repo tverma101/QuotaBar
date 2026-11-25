@@ -20,11 +20,12 @@ QuotaBar shows the reported tier (such as "Pay as you go" or "Free tier") beside
 Unlike the other providers, OpenRouter has no companion app or CLI that leaves a credential on your
 machine, so you supply an API key. Create one at [openrouter.ai/keys](https://openrouter.ai/keys),
 then add it in **Settings → API Keys** (recommended): expand OpenRouter, paste the key, and Save.
-The key is stored at `~/.config/openusage/openrouter.json` and picked up on the next refresh.
+The key is stored at `~/.config/quotabar/openrouter.json` and picked up on the next refresh; keys
+saved by older builds at `~/.config/openusage/openrouter.json` keep working.
 
 You can also provide the key directly (checked in this order, first match wins):
 
-1. **Config file:** `~/.config/openusage/openrouter.json` — the file the Settings card writes:
+1. **Config file:** `~/.config/quotabar/openrouter.json` — the file the Settings card writes:
 
    ```json
    { "apiKey": "sk-or-v1-..." }

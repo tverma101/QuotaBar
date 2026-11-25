@@ -2,13 +2,13 @@ import Darwin
 import Foundation
 
 /// Disk mirror of the in-memory per-database derived turn cache, validated against the
-/// database's WAL revision before use. A fresh process — the scan-worker child, or this app
+/// database's WAL revision before use. A fresh process — a cold process, or this app
 /// after a memory-pressure unload — reloads derived turns from the record instead of
 /// re-running sqlite3 and re-parsing every receipt's metrics JSON. Hosted receipts change on
 /// every active-session pass, so the composed whole-scan result cannot be shared across
 /// processes; the per-database rows are the stable unit, and pricing applies at fold time.
 enum FreebuffDesktopTurnPersistence {
-    static let schema = 1
+    static let schema = 2
     /// Refuse to cache pathological histories that would dominate the log-scan-cache directory.
     static let maximumRecordBytes = 64 * 1_024 * 1_024
     private static let mutationLock = NSLock()
@@ -20,6 +20,10 @@ enum FreebuffDesktopTurnPersistence {
         var revision: [FreebuffDesktopUsageScanner.Revision]
         var rows: [FreebuffDesktopUsageScanner.DerivedTurn]
         var unreadableRows: Int
+        /// Aggregate over the source rows captured at derive time. A stamp-level revision bump
+        /// with an unchanged fingerprint proves WAL churn only — the rows still describe the
+        /// live projection exactly. Nil on records written before the gate existed.
+        var contentFingerprint: String?
     }
 
     static func fileURL(path: String) -> URL {
@@ -36,13 +40,23 @@ enum FreebuffDesktopTurnPersistence {
         revision: [FreebuffDesktopUsageScanner.Revision]
     ) -> Record? {
         guard !revision.isEmpty else { return nil }
-        return autoreleasepool {
+        return load(path: path).flatMap { $0.revision == revision ? $0 : nil }
+    }
+
+    /// Decode the record without a revision check. The fingerprint caller then decides whether
+    /// the stored rows still describe the live projection — a stale revision alone no longer
+    /// discards them.
+    static func readAnyRevision(path: String) -> Record? {
+        load(path: path)
+    }
+
+    private static func load(path: String) -> Record? {
+        autoreleasepool {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .secondsSince1970
             guard let data = try? Data(contentsOf: fileURL(path: path)),
                   let record = try? decoder.decode(Record.self, from: data),
-                  record.schema == schema,
-                  record.revision == revision
+                  record.schema == schema
             else { return nil }
             return record
         }

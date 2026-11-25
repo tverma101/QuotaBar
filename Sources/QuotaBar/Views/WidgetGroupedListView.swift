@@ -10,65 +10,89 @@ import SwiftUI
 /// obvious place to do the same plus toggle metrics on/off. Both surfaces use the same local gesture/geometry
 /// helper so they work inside the menu-bar popover without a system drag/drop session.
 struct WidgetGroupedListView: View {
-    @Environment(AppContainer.self) private var container
     @Environment(LayoutStore.self) private var layout
-    @Environment(WidgetDataStore.self) private var dataStore
-    @Environment(PopoverTransparencyStore.self) private var transparency: PopoverTransparencyStore?
-    @Environment(\.colorScheme) private var colorScheme
     let reorderSpaceName: String
     @Binding var reorderLift: ReorderLift?
 
     @State private var frameStore = ReorderFrameStore()
-    @State private var hoveredProviderID: String?
-    @State private var activeMetricID: String?
     @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
 
     var body: some View {
         // Provider-section spacing is noticeably wider than the in-card row rhythm (so groups
         // still read as groups); the exact step comes from the density setting.
         //
-        // `displayGroups` is a computed property that rebuilds dictionaries + filters per access;
-        // capture it once per body evaluation so the `.animation` identity doesn't recompute the
-        // whole thing a second time.
+        // `displayGroups` is memoized on the store (it used to rebuild dictionaries + filters
+        // per access); capture it once per body evaluation so the `.animation` identity reads the
+        // same array the ForEach does.
         let groups = layout.displayGroups
         return VStack(alignment: .leading, spacing: density.sectionSpacing) {
             ForEach(groups) { group in
-                section(group)
+                ProviderSectionView(
+                    group: group,
+                    reorderSpaceName: reorderSpaceName,
+                    reorderLift: $reorderLift,
+                    frameStore: frameStore
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onChange(of: transparency?.popoverShown) { _, shown in
-            if shown == false { hoveredProviderID = nil }
-        }
         .onPreferenceChange(ReorderFramePreferenceKey.self) { frameStore.frames = $0 }
         .animation(Motion.spring, value: groups.map(\.provider.id))
     }
+}
 
-    @ViewBuilder
-    private func section(_ group: ProviderGroup) -> some View {
+/// One provider's dashboard section: the icon + name header over the rounded metric card. Kept as
+/// its own view because it owns two pieces of fast-flipping pointer state — the section hover that
+/// reveals the header's copy button, and the id of the metric row being dragged. When that state
+/// lived on the whole list, every hover crossing re-evaluated every provider's rows; scoped here it
+/// invalidates only this one section.
+private struct ProviderSectionView: View {
+    @Environment(AppContainer.self) private var container
+    @Environment(LayoutStore.self) private var layout
+    @Environment(WidgetDataStore.self) private var dataStore
+    @Environment(PopoverTransparencyStore.self) private var transparency: PopoverTransparencyStore?
+    @Environment(\.colorScheme) private var colorScheme
+    let group: ProviderGroup
+    let reorderSpaceName: String
+    @Binding var reorderLift: ReorderLift?
+    let frameStore: ReorderFrameStore
+
+    @State private var isCardHovered = false
+    @State private var activeMetricID: String?
+    @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
+
+    var body: some View {
         // Resolve first, then decide. The old path asked `hasVisibleRow(keeping:)` and then resolved
         // the same rows again, so the first visible row could build `WidgetData` three times during
         // the panel's initial mount. One resolution now drives both the visibility decision and the
         // rendered card.
-        let resolved = resolveRows(for: group)
+        let resolved = resolveRows()
+        let headerInfo = dataStore.providerHeaderInfo[group.provider.id]
+            ?? dataStore.headerInfo(for: group.provider.id)
         let showSection = ProviderSectionVisibility.shouldRender(
             hasVisibleMetric: resolved.hasVisibleRow,
-            hasPlan: dataStore.plan(for: group.provider.id) != nil,
-            hasNotice: dataStore.headerNotice(for: group.provider.id) != nil,
+            hasPlan: headerInfo.plan != nil,
+            hasNotice: headerInfo.warningMessage != nil,
             isRefreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
-            hasStaleness: dataStore.stalenessHint(for: group.provider.id) != nil
+            hasStaleness: headerInfo.stalenessHint != nil
         )
-        if showSection {
-            sectionBody(group, resolved: resolved)
+        Group {
+            if showSection {
+                sectionBody(resolved)
+            }
+        }
+        // A section that hides mid-hover still owns the flag observer — otherwise a panel close
+        // while hidden leaves `isCardHovered` stuck true and the copy control appears unhovered.
+        .onChange(of: transparency?.popoverShown) { _, shown in
+            if shown == false { isCardHovered = false }
         }
     }
 
-    private func sectionBody(_ group: ProviderGroup, resolved: ResolvedCard) -> some View {
+    private func sectionBody(_ resolved: ResolvedCard) -> some View {
         VStack(alignment: .leading, spacing: density.headerToCardSpacing) {
-            header(group)
+            header
             if resolved.hasVisibleRow {
                 card(
-                    for: group,
                     cardRows: resolved.cardRows,
                     condensedIDs: resolved.condensedIDs,
                     providerID: group.provider.id,
@@ -77,24 +101,23 @@ struct WidgetGroupedListView: View {
             }
         }
         .contentShape(Rectangle())
-        .onHover { isHovered in
-            if isHovered { hoveredProviderID = group.provider.id }
-            else if hoveredProviderID == group.provider.id { hoveredProviderID = nil }
-        }
+        .onHover { isCardHovered = $0 }
         .background(DiagnosticProviderAnchor(providerID: group.provider.id))
         .reorderFrame(id: group.provider.id, in: .named(reorderSpaceName))
     }
 
-    private func header(_ group: ProviderGroup) -> some View {
-        ProviderSectionHeader(
+    private var header: some View {
+        let headerInfo = dataStore.providerHeaderInfo[group.provider.id]
+            ?? dataStore.headerInfo(for: group.provider.id)
+        return ProviderSectionHeader(
             provider: group.provider,
-            plan: dataStore.plan(for: group.provider.id),
-            warning: dataStore.headerNotice(for: group.provider.id),
+            plan: headerInfo.plan,
+            warning: headerInfo.warningMessage,
             refreshing: dataStore.refreshingProviderIDs.contains(group.provider.id),
-            staleness: dataStore.stalenessHint(for: group.provider.id),
-            cardIsHovered: hoveredProviderID == group.provider.id,
-            onCopyScreenshot: { shareCard(group) },
-            onRefresh: dataStore.errorMessage(for: group.provider.id) == nil
+            staleness: headerInfo.stalenessHint,
+            cardIsHovered: isCardHovered,
+            onCopyScreenshot: { shareCard() },
+            onRefresh: headerInfo.errorMessage == nil
                 ? nil
                 : { retryProvider(group.provider.id) }
         )
@@ -125,7 +148,7 @@ struct WidgetGroupedListView: View {
                 withAnimation(Motion.modeSwitch) { layout.showProviderReorder() }
             }
             Divider()
-            Button("Share Screenshot") { _ = shareCard(group) }
+            Button("Share Screenshot") { _ = shareCard() }
         }
     }
 
@@ -135,7 +158,7 @@ struct WidgetGroupedListView: View {
     /// the export matches the card on screen instead of guessing from `NSApp.effectiveAppearance`. The
     /// same render path backs the footer's "Share Screenshot" submenu, which reaches it without a
     /// right-click.
-    private func shareCard(_ group: ProviderGroup) -> Bool {
+    private func shareCard() -> Bool {
         ShareCardRenderer.share(
             group: group,
             dataStore: dataStore,
@@ -165,7 +188,10 @@ struct WidgetGroupedListView: View {
         var id: String {
             switch self {
             case .metric(let row):
-                "metric:\(row.descriptor.id)"
+                // The raw descriptor id is unique here — the sentinel ids below can't collide with
+                // real "provider.metric" ids — so no "metric:" prefix (or its per-render
+                // interpolation) is needed.
+                row.descriptor.id
             case .divider:
                 "expanded-divider"
             case .links:
@@ -190,7 +216,7 @@ struct WidgetGroupedListView: View {
         let hasVisibleRow: Bool
     }
 
-    private func resolveRows(for group: ProviderGroup) -> ResolvedCard {
+    private func resolveRows() -> ResolvedCard {
         // Resolve each row's descriptor + data exactly once per render, then reuse it for the
         // visibility decision, the neighbor-aware condensing rule, and the row itself.
         let isExpanded = layout.isProviderExpanded(group.provider.id)
@@ -217,7 +243,6 @@ struct WidgetGroupedListView: View {
 
     /// The card body, split out so `container` can decide whether to render one at all.
     private func card(
-        for group: ProviderGroup,
         cardRows: [DashboardMetricCardRow],
         condensedIDs: Set<String>,
         providerID: String,
@@ -251,7 +276,7 @@ struct WidgetGroupedListView: View {
     private func resolvedRows(_ widgets: [PlacedWidget]) -> [ResolvedRow] {
         widgets.compactMap { widget -> ResolvedRow? in
             guard let descriptor = layout.descriptor(for: widget) else { return nil }
-            let data = dataStore.data(for: descriptor)
+            let data = dataStore.widgetDataByDescriptorID[descriptor.id] ?? dataStore.data(for: descriptor)
             if !ProviderSectionVisibility.shouldRenderMetricRow(
                 providerID: descriptor.providerID,
                 descriptorID: descriptor.id,
@@ -473,7 +498,8 @@ struct WidgetGroupedListView: View {
     private func makeMetricLift(for descriptor: WidgetDescriptor, value: DragGesture.Value) -> ReorderLift? {
         ReorderLift.make(
             id: descriptor.id,
-            payload: .dashboardMetric(data: dataStore.data(for: descriptor)),
+            payload: .dashboardMetric(data: dataStore.widgetDataByDescriptorID[descriptor.id]
+                ?? dataStore.data(for: descriptor)),
             value: value,
             frames: frameStore.frames
         )

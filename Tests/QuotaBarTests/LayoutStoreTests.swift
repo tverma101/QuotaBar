@@ -684,7 +684,8 @@ final class LayoutStoreTests: XCTestCase {
             "claude.extra", "claude.today", "claude.yesterday", "claude.last30",
             "codex.session", "codex.weekly", "codex.spark", "codex.sparkWeekly", "codex.trend",
             "codex.credits", "codex.rateLimitResets", "codex.today", "codex.yesterday", "codex.last30",
-            "devin.daily", "devin.weekly", "devin.extra",
+            "devin.daily", "devin.weekly", "devin.extra", "devin.trend",
+            "devin.today", "devin.yesterday", "devin.last30",
             "grok.weekly", "grok.trend",
             "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30",
             // Cursor spend tiles + usage trend are enabled, joining its live meters in the default layout.
@@ -723,8 +724,10 @@ final class LayoutStoreTests: XCTestCase {
             "codex.spark", "codex.sparkWeekly",
             "codex.credits", "codex.rateLimitResets", "codex.today", "codex.yesterday", "codex.last30"
         ])
-        XCTAssertEqual(primaryByProvider["devin"], ["devin.daily", "devin.weekly"])
-        XCTAssertEqual(expandedByProvider["devin"], ["devin.extra"])
+        XCTAssertEqual(primaryByProvider["devin"], ["devin.daily", "devin.weekly", "devin.trend"])
+        XCTAssertEqual(expandedByProvider["devin"], [
+            "devin.extra", "devin.today", "devin.yesterday", "devin.last30"
+        ])
         XCTAssertEqual(primaryByProvider["grok"], ["grok.weekly", "grok.trend"])
         XCTAssertEqual(expandedByProvider["grok"], [
             "grok.payAsYouGo", "grok.today", "grok.yesterday", "grok.last30"
@@ -1760,5 +1763,149 @@ extension LayoutStoreTests {
 
         XCTAssertFalse(store.explicitlyEnabledMetricIDs.contains("claude.extra"))
         XCTAssertFalse(store.showsRow(conditional, hasData: false))
+    }
+}
+
+// MARK: - Derived-collection caches
+
+extension LayoutStoreTests {
+    /// The derived collections are memoized; these pin that every mutation path still refreshes
+    /// them — a stale cache would fail exactly one of these.
+    func testDisplayGroupsRefreshAfterMetricToggle() {
+        let store = makeStore("DerivedCacheToggle")
+        XCTAssertTrue(store.displayGroups.contains { $0.provider.id == "claude" })
+
+        store.setMetricEnabled("claude.session", false)
+        let claude = store.displayGroups.first { $0.provider.id == "claude" }
+        XCTAssertFalse(claude?.widgets.map(\.descriptorID).contains("claude.session") ?? true)
+
+        store.setMetricEnabled("claude.session", true)
+        XCTAssertTrue(
+            store.displayGroups.first { $0.provider.id == "claude" }?
+                .widgets.map(\.descriptorID).contains("claude.session") ?? false
+        )
+    }
+
+    func testDisplayGroupsRefreshAfterMetricReorder() {
+        let store = makeStore("DerivedCacheMetricReorder")
+        for id in ["claude.session", "claude.weekly", "claude.extra", "claude.today"] {
+            store.setMetricEnabled(id, true)
+        }
+        _ = store.displayGroups // warm the cache
+        XCTAssertTrue(store.reorderMetric(dragged: "claude.today", target: "claude.session", in: "claude"))
+        XCTAssertEqual(
+            store.displayGroups.first { $0.provider.id == "claude" }?.widgets.map(\.descriptorID),
+            store.metricOrder(for: "claude").filter { store.isMetricEnabled($0) }
+        )
+    }
+
+    func testDisplayGroupsRefreshAfterExpandMove() {
+        let store = makeStore("DerivedCacheExpandMove")
+        _ = store.displayGroups
+        XCTAssertTrue(moveMetric("claude.weekly", expanded: true, in: store))
+        let group = store.displayGroups.first { $0.provider.id == "claude" }
+        XCTAssertTrue(group?.expandedWidgets.map(\.descriptorID).contains("claude.weekly") ?? false)
+        XCTAssertFalse(group?.alwaysShownWidgets.map(\.descriptorID).contains("claude.weekly") ?? true)
+    }
+
+    func testDisplayGroupsRefreshAfterProviderReorder() {
+        let store = makeStore("DerivedCacheProviderReorder")
+        _ = store.displayGroups
+        XCTAssertTrue(store.reorderProvider(dragged: "cursor", target: "claude"))
+        XCTAssertEqual(
+            store.displayGroups.map(\.provider.id),
+            store.customizeGroups.map(\.provider.id).filter { id in
+                store.displayGroups.contains { $0.provider.id == id }
+            }
+        )
+        XCTAssertEqual(store.displayGroups.first?.provider.id, "cursor")
+    }
+
+    func testPinnedGroupsRefreshAfterPinAndEnablement() {
+        var enabled: Set<String> = ["claude", "codex", "cursor"]
+        let store = LayoutStore(
+            registry: .mock,
+            defaults: makeDefaults("DerivedCachePins"),
+            storageKey: "layout",
+            isProviderEnabled: { enabled.contains($0) }
+        )
+        _ = store.pinnedGroups
+        store.setPinned(false, for: "claude.session")
+        XCTAssertFalse(
+            store.pinnedGroups.flatMap { $0.metrics.map(\.id) }.contains("claude.session"),
+            "unpinning must refresh the pinned groups"
+        )
+
+        enabled.remove("claude")
+        XCTAssertFalse(
+            store.pinnedGroups.contains { $0.provider.id == "claude" },
+            "disabling a provider must refresh the pinned groups even though no layout property changed"
+        )
+        XCTAssertFalse(
+            store.customizeGroups.contains { $0.provider.id == "claude" },
+            "the enablement signature must refresh customizeGroups too"
+        )
+        XCTAssertTrue(
+            store.customizeProviderRows.first { $0.id == "claude" }?.isEnabled == false,
+            "the L1 row must still list the provider, marked disabled"
+        )
+        XCTAssertFalse(store.visiblePlaced.contains { $0.descriptorID.hasPrefix("claude.") })
+    }
+
+    func testDerivedCollectionsTrackProviderEnablementBothWays() {
+        var enabled: Set<String> = ["claude", "codex", "cursor"]
+        let store = LayoutStore(
+            registry: .mock,
+            defaults: makeDefaults("DerivedCacheEnablement"),
+            storageKey: "layout",
+            isProviderEnabled: { enabled.contains($0) }
+        )
+        XCTAssertTrue(store.displayGroups.contains { $0.provider.id == "codex" })
+
+        enabled.remove("codex")
+        XCTAssertFalse(store.displayGroups.contains { $0.provider.id == "codex" })
+
+        enabled.insert("codex")
+        XCTAssertTrue(store.displayGroups.contains { $0.provider.id == "codex" })
+    }
+
+    func testProviderEnablementDidChangeHookRefreshesCaches() {
+        var enabled: Set<String> = ["claude", "codex", "cursor"]
+        let store = LayoutStore(
+            registry: .mock,
+            defaults: makeDefaults("DerivedCacheHook"),
+            storageKey: "layout",
+            isProviderEnabled: { enabled.contains($0) }
+        )
+        _ = store.displayGroups
+        // Flip enablement *inside* the closure without changing the signature shape the per-access
+        // check sees — the explicit hook must still force a refresh on the next read.
+        enabled.remove("codex")
+        store.providerEnablementDidChange()
+        XCTAssertFalse(store.displayGroups.contains { $0.provider.id == "codex" })
+    }
+
+    func testSpendCapableProvidersRefreshAfterEnablement() throws {
+        var spendTile = try XCTUnwrap(MockData.descriptors.first { $0.id == "claude.today" })
+        spendTile.isSpendTile = true
+        let registry = WidgetRegistry(
+            providers: MockData.providers,
+            descriptors: MockData.descriptors.filter { $0.id != spendTile.id } + [spendTile]
+        )
+        var enabled: Set<String> = ["claude", "codex", "cursor"]
+        let store = LayoutStore(
+            registry: registry,
+            defaults: makeDefaults("DerivedCacheSpend"),
+            storageKey: "layout",
+            isProviderEnabled: { enabled.contains($0) }
+        )
+        XCTAssertEqual(store.spendCapableProviders.map(\.id), ["claude"])
+        XCTAssertTrue(store.hasSpendCapableProvider)
+        XCTAssertTrue(store.dormantSpendCapableProviders.isEmpty)
+
+        enabled.remove("claude")
+        XCTAssertTrue(store.spendCapableProviders.isEmpty)
+        XCTAssertFalse(store.hasSpendCapableProvider)
+        XCTAssertEqual(store.dormantSpendCapableProviders.map(\.id), ["claude"])
     }
 }

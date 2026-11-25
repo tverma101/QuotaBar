@@ -277,10 +277,13 @@ enum AntigravityUsageMapper {
 
     static func line(pool: String, fraction: Double, resetTime: Date?, periodMs: Int) -> MetricLine {
         let clamped = max(0, min(1, fraction))
+        // Raw percent, not rounded: the headline rounds at display time, and `isFreshSessionWindow`
+        // keys its "Not started" claim off `used == 0` exactly. Rounding here would call an untouched
+        // near-full window "Not started" (fraction 0.99965 reads as used 0) while a reset is live.
         let used = (1 - clamped) * 100
         return .progress(
             label: pool,
-            used: used.rounded(), // keep whole percents so a fresh window reads 0 and "Not started" works
+            used: used,
             limit: 100,
             format: .percent,
             resetsAt: resetTime,

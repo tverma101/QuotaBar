@@ -1,0 +1,53 @@
+[package]
+name = "quotabar-engine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Cross-platform QuotaBar backend: provider auth, HTTP clients, local usage scanners, pricing and caches. Linked into the macOS app over a C ABI (Rust/quotabar-core) and into the Windows app as a Rust crate."
+
+[lib]
+name = "quotabar_engine"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# `float_roundtrip`: correctly rounded float parsing, so feed and cache rates decode to the same
+# doubles Foundation produced (prices are compared field for field across snapshots).
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# Native, in-process SQLite. Replaces the `/usr/bin/sqlite3` subprocess per query the Swift backend
+# spawned (each with its own 5-30 s timeout); `bundled` pins one SQLite build on every platform.
+rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
+tempfile = "3"
+# Local calendar math (day keys follow the user's time zone exactly like Swift's Calendar.current).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Fast newline / marker search in JSONL scanners.
+memchr = "2"
+# Log redaction patterns; the same small engine the Windows app already ships.
+regex-lite = "0.1.9"
+# Pricing supplement alias rules are ICU-syntax patterns from a remotely updated feed and use
+# look-around (`(?=-)`), which `regex-lite` cannot compile.
+fancy-regex = "0.19"
+# Content fingerprints for persisted caches.
+sha2 = "0.10"
+# Claude Desktop's Electron Safe Storage cache: base64 + AES-128-CBC with a PBKDF2-SHA1 key.
+base64 = "0.22"
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = "0.12"
+sha1 = "0.10"
+# Codex compresses finished sessions to `.jsonl.zst`. A pure-Rust decoder replaces the Swift
+# backend's `zstd` subprocess (which needed a Homebrew install and silently skipped archives without
+# it) and works the same on Windows.
+ruzstd = "0.9.1"
+
+# macOS uses the system TLS stack (Security.framework) so the static library does not carry a second
+# certificate store; other platforms use rustls, matching the Windows app's existing reqwest build.
+[target.'cfg(target_os = "macos")'.dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls", "system-proxy", "socks"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "system-proxy", "socks"] }
+
+[features]
+# Exposes `http::mock` to downstream crates' tests (the Windows app, the C ABI).
+test-support = []

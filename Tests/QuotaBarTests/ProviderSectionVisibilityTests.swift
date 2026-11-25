@@ -53,7 +53,8 @@ final class ProviderSectionVisibilityTests: XCTestCase {
         )
         let noPlan = ProviderSnapshot.error(
             provider: provider.provider,
-            error: ZAIUsageError.noCodingPlan,
+            message: "No active GLM Coding Plan. Subscribe at z.ai/subscribe to see usage.",
+            category: .notAvailable,
             clearsPriorMenuBarQuotaState: true
         )
         let runtime = SequenceProviderRuntime(

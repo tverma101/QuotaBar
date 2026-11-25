@@ -116,11 +116,32 @@ enum OpenCodeDatabaseSchemaProbe {
 /// which OpenCode version wrote the database: a JSON array of
 /// `[time_created, cost, tokens, model, provider]` entries.
 enum OpenCodeDatabaseSQL {
+    /// One statement's worth of history. The whole-history query marshals ~10 years of rows, each
+    /// carrying ~15 `json_extract`s, into a single string — that outruns the sqlite3 subprocess's
+    /// per-statement cap on a large store and the scan would fail closed on every refresh. Slicing
+    /// the window into bounded ranges keeps each subprocess call small enough to finish.
+    private static let dataChunkSpanMs = 366 * 86_400_000
+
+    /// The data query as serial time-bounded chunks: each covers `[lower, lower+span)` except the
+    /// last, which stays open-ended so future-dated rows still reach the parser's rejection path.
+    /// Results concatenate — the row shape is identical to the single-statement query.
+    static func dataSQLChunks(cutoffMs: Int, nowMs: Int, schema: OpenCodeDatabaseSchema) -> [String] {
+        var statements: [String] = []
+        var lower = cutoffMs
+        while lower + dataChunkSpanMs <= nowMs {
+            statements.append(dataSQL(cutoffMs: lower, beforeMs: lower + dataChunkSpanMs, schema: schema))
+            lower += dataChunkSpanMs
+        }
+        statements.append(dataSQL(cutoffMs: lower, schema: schema))
+        return statements
+    }
+
     /// The hosted assistant rows inside the scan window.
-    static func dataSQL(cutoffMs: Int, schema: OpenCodeDatabaseSchema) -> String {
+    static func dataSQL(cutoffMs: Int, beforeMs: Int? = nil, schema: OpenCodeDatabaseSchema) -> String {
         let source = sourceSQL(
             schema: schema.effective,
             cutoffMs: cutoffMs,
+            beforeMs: beforeMs,
             providers: OpenCodeUsageScanner.hostedProviderIDs
         )
         return """
@@ -155,6 +176,30 @@ enum OpenCodeDatabaseSQL {
         \(branches)
         );
         """
+    }
+
+    /// One aggregate per source the data query reads: assistant `session_message` rows carry their
+    /// payload+timestamp bytes for v2, and the whole `message` table for the legacy layout — the
+    /// role filter lives inside `data` there, and an over-sensitive fingerprint only costs a
+    /// needless re-read, never stale rows. A matching fingerprint across a stamp change proves WAL
+    /// churn, so the persisted row chunks still describe the live projection.
+    static func fingerprintSQL(schema: OpenCodeDatabaseSchema) -> String {
+        var parts: [String] = []
+        if schema.effective.readsV2 {
+            parts.append("""
+            (SELECT 'v2:' || COUNT(*) || ':' || COALESCE(SUM(rowid),0) || ':' ||
+                    COALESCE(SUM(LENGTH(data)+LENGTH(time_created)),0)
+             FROM session_message WHERE type='assistant')
+            """)
+        }
+        if schema.effective.readsLegacy {
+            parts.append("""
+            (SELECT 'm:' || COUNT(*) || ':' || COALESCE(SUM(rowid),0) || ':' ||
+                    COALESCE(SUM(LENGTH(data)+LENGTH(time_created)),0)
+             FROM message)
+            """)
+        }
+        return "SELECT \(parts.joined(separator: " || '|' || \n"))"
     }
 
     /// A cheap "does this database hold any hosted usage" probe.
@@ -210,19 +255,25 @@ enum OpenCodeDatabaseSQL {
     private static func sourceSQL(
         schema: OpenCodeDatabaseSchema,
         cutoffMs: Int?,
+        beforeMs: Int? = nil,
         providers: [String]
     ) -> String {
         var branches: [String] = []
         if schema.readsV2 {
-            branches.append(v2Branch(cutoffMs: cutoffMs, providers: providers))
+            branches.append(v2Branch(cutoffMs: cutoffMs, beforeMs: beforeMs, providers: providers))
         }
         if schema.readsLegacy {
-            branches.append(legacyBranch(cutoffMs: cutoffMs, providers: providers, dedupe: schema == .mixed))
+            branches.append(legacyBranch(
+                cutoffMs: cutoffMs,
+                beforeMs: beforeMs,
+                providers: providers,
+                dedupe: schema == .mixed
+            ))
         }
         return branches.joined(separator: "\n    UNION ALL\n")
     }
 
-    private static func v2Branch(cutoffMs: Int?, providers: [String]) -> String {
+    private static func v2Branch(cutoffMs: Int?, beforeMs: Int? = nil, providers: [String]) -> String {
         """
         SELECT
                    time_created,
@@ -247,13 +298,18 @@ enum OpenCodeDatabaseSQL {
                    1 AS tokens_absent_is_zero
         FROM session_message
         WHERE type = 'assistant'
-          \(cutoffClause(cutoffMs))
+          \(cutoffClause(cutoffMs, beforeMs: beforeMs))
           AND json_valid(data)
           AND \(providerExpression(v2: true)) IN \(providerList(providers))
         """
     }
 
-    private static func legacyBranch(cutoffMs: Int?, providers: [String], dedupe: Bool) -> String {
+    private static func legacyBranch(
+        cutoffMs: Int?,
+        beforeMs: Int? = nil,
+        providers: [String],
+        dedupe: Bool
+    ) -> String {
         """
         SELECT
                    time_created,
@@ -278,7 +334,7 @@ enum OpenCodeDatabaseSQL {
                    0 AS tokens_absent_is_zero
         FROM message
         WHERE json_extract(data,'$.role') = 'assistant'
-          \(cutoffClause(cutoffMs))
+          \(cutoffClause(cutoffMs, beforeMs: beforeMs))
           AND json_valid(data)
           AND \(providerExpression(v2: false)) IN \(providerList(providers))
           \(dedupe ? dedupeClause : "")
@@ -356,10 +412,15 @@ enum OpenCodeDatabaseSQL {
             : "COALESCE(json_extract(data,'$.providerID'), json_extract(data,'$.model.providerID'))"
     }
 
-    /// The window bound, or nothing for an unbounded (full-history) read.
-    private static func cutoffClause(_ cutoffMs: Int?) -> String {
-        guard let cutoffMs else { return "" }
-        return "AND time_created >= \(cutoffMs)"
+    /// The window bounds, or nothing for an unbounded (full-history) read.
+    private static func cutoffClause(_ cutoffMs: Int?, beforeMs: Int? = nil) -> String {
+        var clause = ""
+        if let cutoffMs { clause += "AND time_created >= \(cutoffMs)" }
+        if let beforeMs {
+            if !clause.isEmpty { clause += "\n          " }
+            clause += "AND time_created < \(beforeMs)"
+        }
+        return clause
     }
 
     /// Drops a v1 row whose message id the v2 table already holds.

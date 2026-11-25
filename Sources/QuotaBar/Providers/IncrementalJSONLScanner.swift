@@ -12,6 +12,12 @@ enum JSONLScanning {
         var size: Int
         var mtime: Date
         var attributeMtime: Date? = nil
+        var gatewayAppendWitness: GatewayAppendWitness? = nil
+    }
+
+    struct GatewayAppendWitness: Equatable, Sendable {
+        let revision: AppendOnlyFileRevision
+        let prefix: Data
     }
 
     /// Start of the day `daysBack` days before `now` — the lower bound of the scan window.
@@ -29,19 +35,75 @@ enum JSONLScanning {
     /// Recheck after asynchronous ownership/cache work; a discovered revision can change while its
     /// caller is suspended. Keep this identical for full folds and compact-result cache hits.
     static func filesStillMatch(_ files: [DiscoveredFile]) -> Bool {
-        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey]
-        return files.allSatisfy { file in
-            guard !Task.isCancelled else { return false }
-            let url = URL(fileURLWithPath: file.path)
-            guard let revision = AppendOnlyFileProbe.revision(at: url),
-                  file.size >= 0, revision.size == UInt64(file.size),
-                  let values = try? url.resourceValues(forKeys: keys)
-            else { return false }
-            return values.fileSize == file.size
-                && values.contentModificationDate == file.mtime
-                && values.attributeModificationDate == file.attributeMtime
-                && AppendOnlyFileProbe.revision(at: url) == revision
+        files.allSatisfy { file in
+            autoreleasepool { fileStillMatches(file) }
         }
+    }
+
+    static func fileStillMatches(_ file: DiscoveredFile) -> Bool {
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .attributeModificationDateKey]
+        guard !Task.isCancelled else { return false }
+        let url = URL(fileURLWithPath: file.path)
+        guard let revision = AppendOnlyFileProbe.revision(at: url),
+              file.size >= 0, revision.size == UInt64(file.size),
+              let values = try? url.resourceValues(forKeys: keys)
+        else { return false }
+        return values.fileSize == file.size
+            && values.contentModificationDate == file.mtime
+            && values.attributeModificationDate == file.attributeMtime
+            && AppendOnlyFileProbe.revision(at: url) == revision
+    }
+
+    // Gateway logs can grow during a fold. Sample the discovered prefix using the same
+    // bounded probe as the append caches; compressed archives and old files stay strict.
+    static func gatewayAppendWitnesses(
+        for files: [DiscoveredFile], since: Date
+    ) -> [String: GatewayAppendWitness] {
+        var witnesses: [String: GatewayAppendWitness] = [:]
+        for file in files where file.mtime >= since && file.path.hasSuffix(".jsonl") {
+            guard !Task.isCancelled else { break }
+            // Discovery-time witnesses cover appends while the rest of a source tree is being enumerated.
+            witnesses[file.path] = file.gatewayAppendWitness ?? gatewayAppendWitness(for: file)
+        }
+        return witnesses
+    }
+
+    private static func gatewayAppendWitness(for file: DiscoveredFile) -> GatewayAppendWitness? {
+        let url = URL(fileURLWithPath: file.path)
+        guard let stamp = AppendOnlyFileProbe.stamp(at: url),
+              fileStillMatches(file),
+              let prefix = AppendOnlyFileProbe.anchor(at: url, endingAt: stamp.revision.size),
+              let after = AppendOnlyFileProbe.stamp(at: url),
+              after.revision.device == stamp.revision.device, after.revision.inode == stamp.revision.inode,
+              after.revision.size >= stamp.revision.size,
+              after.revision.size > stamp.revision.size || after.modificationTimes == stamp.modificationTimes
+        else { return nil }
+        return GatewayAppendWitness(revision: stamp.revision, prefix: prefix)
+    }
+
+    static func gatewayAppendedPaths(
+        in files: [DiscoveredFile], witnesses: [String: GatewayAppendWitness]
+    ) -> Set<String>? {
+        var appended: Set<String> = []
+        for file in files {
+            guard !Task.isCancelled else { return nil }
+            if fileStillMatches(file) { continue }
+            let url = URL(fileURLWithPath: file.path)
+            guard let witness = witnesses[file.path],
+                  let before = AppendOnlyFileProbe.stamp(at: url),
+                  before.revision.device == witness.revision.device,
+                  before.revision.inode == witness.revision.inode,
+                  before.revision.size > witness.revision.size,
+                  AppendOnlyFileProbe.anchor(at: url, endingAt: witness.revision.size) == witness.prefix,
+                  let after = AppendOnlyFileProbe.stamp(at: url),
+                  after.revision.device == before.revision.device,
+                  after.revision.inode == before.revision.inode,
+                  after.revision.size >= before.revision.size,
+                  after.revision.size > before.revision.size
+                    || after.modificationTimes == before.modificationTimes else { return nil }
+            appended.insert(file.path)
+        }
+        return appended
     }
 
     /// Every `*.jsonl` regular file under `dir` (recursively), path-sorted so a keep-first dedup is
@@ -50,7 +112,11 @@ enum JSONLScanning {
     /// `includeCompressedJSONL` additionally yields `*.jsonl.zst` archives (Codex compacts finished
     /// sessions this way); callers that opt in must route them through a decompressor — the file
     /// bytes are not JSONL until expanded.
-    static func jsonlFilesIfComplete(under dir: URL, includeCompressedJSONL: Bool = false) -> [DiscoveredFile]? {
+    static func jsonlFilesIfComplete(
+        under dir: URL,
+        includeCompressedJSONL: Bool = false,
+        gatewayAppendWitnessesSince: Date? = nil
+    ) -> [DiscoveredFile]? {
         guard !Task.isCancelled else { return nil }
         return JSONLAccountingWorkPacer.shared.perform {
             // `FileManager.enumerator` silently yields nothing when `dir` itself is a symlink.
@@ -80,16 +146,39 @@ enum JSONLScanning {
             var files: [DiscoveredFile] = []
             for case let url as URL in enumerator {
                 guard !Task.isCancelled else { return nil }
-                let compressed = url.lastPathComponent.hasSuffix(".jsonl.zst")
-                guard url.pathExtension == "jsonl" || (includeCompressedJSONL && compressed) else { continue }
-                guard let values = try? url.resourceValues(forKeys: keySet) else { return nil }
-                guard values.isRegularFile == true else { continue }
-                files.append(DiscoveredFile(
-                    path: url.path,
-                    size: values.fileSize ?? 0,
-                    mtime: values.contentModificationDate ?? .distantPast,
-                    attributeMtime: values.attributeModificationDate
-                ))
+                // Per-URL NSURL/URLResourceValues autoreleases pile into the caller's pool for
+                // the whole tree otherwise; drain them per file on big corpora.
+                var discovered: DiscoveredFile?
+                var readFailed = false
+                autoreleasepool {
+                    let compressed = url.lastPathComponent.hasSuffix(".jsonl.zst")
+                    guard url.pathExtension == "jsonl" || (includeCompressedJSONL && compressed) else { return }
+                    guard let values = try? url.resourceValues(forKeys: keySet) else {
+                        readFailed = true
+                        return
+                    }
+                    guard values.isRegularFile == true else { return }
+                    var file = DiscoveredFile(
+                        path: url.path,
+                        size: values.fileSize ?? 0,
+                        mtime: values.contentModificationDate ?? .distantPast,
+                        attributeMtime: values.attributeModificationDate
+                    )
+                    if let since = gatewayAppendWitnessesSince, !compressed, file.mtime >= since {
+                        // Resource values prefetched by the enumerator can predate this file's turn.
+                        let freshURL = URL(fileURLWithPath: file.path)
+                        if let fresh = try? freshURL.resourceValues(forKeys: keySet),
+                           let size = fresh.fileSize, let mtime = fresh.contentModificationDate {
+                            file.size = size
+                            file.mtime = mtime
+                            file.attributeMtime = fresh.attributeModificationDate
+                            file.gatewayAppendWitness = gatewayAppendWitness(for: file)
+                        }
+                    }
+                    discovered = file
+                }
+                if readFailed { return nil }
+                if let discovered { files.append(discovered) }
             }
             guard !enumerationFailed else { return nil }
             return files.sorted { $0.path < $1.path }
@@ -352,9 +441,13 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         visit: @Sendable (Item) -> Void,
         skipPrefixCounts: [String: Int] = [:],
         fileStarted: (@Sendable (String) -> Void)? = nil,
-        fileCompleted: (@Sendable (String, Int) -> Void)? = nil
+        fileCompleted: (@Sendable (String, Int) -> Void)? = nil,
+        toleratesGatewayAppends: Bool = false
     ) async -> Bool {
         precondition(!cacheIdentity.isEmpty)
+        let witnesses = toleratesGatewayAppends
+            ? JSONLScanning.gatewayAppendWitnesses(for: files, since: since)
+            : [:]
         guard await acquire(cacheIdentity) else { return false }
         defer { release(cacheIdentity) }
         guard !Task.isCancelled else { return false }
@@ -366,7 +459,8 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
             identity: cacheIdentity,
             files: files,
             since: since,
-            retainItems: retainItems
+            retainItems: retainItems,
+            deferHydration: true
         ) else { return false }
         let currentCache = plan.currentCache
         var nextCache = plan.nextCache
@@ -385,7 +479,9 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         // Do not publish a partial fold or replace stale cache records until every changed file has
         // been read and parsed. Callers treat false as an incomplete source and keep last-good data.
         guard parseResults.allSatisfy({ $0.items != nil }) else { return false }
-        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return false }
+        guard let appendedDuringRead = validatedAppendedPaths(
+            files, witnesses: witnesses, cacheIdentity: cacheIdentity
+        ) else { return false }
         var newlyCached: [(path: String, cached: CachedFile)] = []
         for result in parseResults {
             let (file, parsed) = (result.file, result.items)
@@ -398,7 +494,10 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
             )
             nextCache[file.path] = cached
             unloadedResidentPaths[cacheIdentity]?.remove(file.path)
-            newlyCached.append((file.path, cached))
+            // Parsing may see new turns, so only stable reads are cached.
+            if !appendedDuringRead.contains(file.path) {
+                newlyCached.append((file.path, cached))
+            }
         }
         for (path, cached) in currentCache where nextCache[path] == nil {
             unloadedResidentPaths[cacheIdentity]?.remove(path)
@@ -434,24 +533,94 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         // `ProviderRefreshDeadline`, and the loop re-checks `Task.isCancelled` once per file, so any
         // large corpus that runs long hit this. Unvisited items are simply re-hydrated on demand by
         // the next scan, so dropping them costs one re-read, not correctness.
+        // Visit files in `files` order. Persisted records hydrate just ahead of their visit in
+        // bounded chunks — one shared-lock pass per chunk — so a warm scan keeps a window of
+        // items live rather than decoding the whole window's items up front.
+        let pendingHydration = plan.pendingHydration
+        let pendingHydrationSet = Set(pendingHydration.lazy.map(\.path))
+        var nextHydrationIndex = 0
+        var consumedHydration: Set<String> = []
+        var hydrationMisses: Set<String> = []
+        /// Pending-hydration paths that produced real items — decoded successfully or reparsed
+        /// — so the exit path can tell a leftover stub from a legitimately empty record.
+        var resolvedHydration: Set<String> = []
         defer {
-            if !retainItems {
-                let unvisited = nextCache.keys.filter { nextCache[$0]?.items.isEmpty == false }
-                for path in unvisited {
-                    if var cached = nextCache[path] {
-                        cached.items = []
-                        nextCache[path] = cached
-                        if retainResidentItems {
-                            unloadedResidentPaths[cacheIdentity, default: []].insert(path)
+            if !retainItems || !appendedDuringRead.isEmpty {
+                for path in appendedDuringRead {
+                    nextCache.removeValue(forKey: path)
+                }
+                if !retainItems {
+                    let unvisited = nextCache.keys.filter { nextCache[$0]?.items.isEmpty == false }
+                    for path in unvisited {
+                        if var cached = nextCache[path] {
+                            cached.items = []
+                            nextCache[path] = cached
+                            if retainResidentItems {
+                                unloadedResidentPaths[cacheIdentity, default: []].insert(path)
+                            }
                         }
                     }
                 }
                 caches[cacheIdentity] = nextCache
             }
+            // Deferred-hydration stubs never resolved to real items — early return before
+            // their turn, or a failed hydration/reparse — must not masquerade as real empty
+            // parses on a later keep-resident scan. Mark them for rehydration like any other
+            // dropped items.
+            if retainResidentItems {
+                for request in pendingHydration
+                where !resolvedHydration.contains(request.path)
+                    && nextCache[request.path]?.items.isEmpty == true {
+                    unloadedResidentPaths[cacheIdentity, default: []].insert(request.path)
+                }
+            }
+            trimResidentItems(protecting: cacheIdentity)
         }
 
         for file in files {
             guard !Task.isCancelled else { return false }
+            if pendingHydrationSet.contains(file.path), !consumedHydration.contains(file.path) {
+                var chunk: [(path: String, expected: CachedFile)] = []
+                var chunkSourceBytes = 0
+                while nextHydrationIndex < pendingHydration.count {
+                    guard chunk.isEmpty
+                            || (chunk.count < Self.hydrationPrefetchFileLimit
+                                && chunkSourceBytes < Self.hydrationPrefetchSourceByteLimit)
+                    else { break }
+                    let request = pendingHydration[nextHydrationIndex]
+                    nextHydrationIndex += 1
+                    chunk.append(request)
+                    consumedHydration.insert(request.path)
+                    chunkSourceBytes += max(0, request.expected.size)
+                }
+                let decoded = await hydrateResidentItemsBatch(
+                    identity: cacheIdentity,
+                    requests: chunk
+                )
+                for request in chunk {
+                    if let hydrated = decoded[request.path] {
+                        nextCache[request.path] = hydrated
+                        resolvedHydration.insert(request.path)
+                        unloadedResidentPaths[cacheIdentity]?.remove(request.path)
+                    } else {
+                        hydrationMisses.insert(request.path)
+                    }
+                }
+            }
+            if hydrationMisses.contains(file.path) {
+                hydrationMisses.remove(file.path)
+                // A record that failed validation reparses from source, mirroring the upfront
+                // `toParse` path — synchronously, since visit order must be preserved.
+                guard let reparsed = await reparseAfterHydrationMiss(
+                    file: file,
+                    parseFile: parseFile
+                ) else { return false }
+                nextCache[file.path] = reparsed
+                resolvedHydration.insert(file.path)
+                unloadedResidentPaths[cacheIdentity]?.remove(file.path)
+                await snapshotPendingUpserts(identity: cacheIdentity, files: [(file.path, reparsed)])
+                scheduleWrite(identity: cacheIdentity)
+            }
             guard var cached = nextCache[file.path] else { continue }
             fileStarted?(file.path)
             let skipped = min(skipPrefixCounts[file.path, default: 0], cached.items.count)
@@ -459,11 +628,13 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
             while offset < cached.items.count {
                 let end = min(offset + 512, cached.items.count)
                 let batchCompleted = JSONLAccountingWorkPacer.shared.perform {
-                    for index in offset..<end {
-                        guard !Task.isCancelled else { return false }
-                        visit(cached.items[index])
+                    autoreleasepool { () -> Bool in
+                        for index in offset..<end {
+                            guard !Task.isCancelled else { return false }
+                            visit(cached.items[index])
+                        }
+                        return !Task.isCancelled
                     }
-                    return !Task.isCancelled
                 }
                 guard batchCompleted else { return false }
                 offset = end
@@ -476,27 +647,70 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
                     unloadedResidentPaths[cacheIdentity, default: []].insert(file.path)
                 }
             }
+            // The visit/accumulate phase churns its own allocations (accumulator dictionaries,
+            // dedup sets, priced rows). Threshold-gated: this costs one mach trap when quiet.
+            ProcessMemoryBudget.reliefCheckpointIfGrown()
         }
-        guard discoveredFilesStillMatch(files, cacheIdentity: cacheIdentity) else { return false }
-        caches[cacheIdentity] = nextCache
-        trimResidentItems(protecting: cacheIdentity)
+        guard validatedAppendedPaths(
+            files, witnesses: witnesses, cacheIdentity: cacheIdentity
+        ) != nil else { return false }
         return !Task.isCancelled
+    }
+
+    /// Bounds for `foldItems`'s lazy hydration window: how many persisted records may decode
+    /// ahead of the visit loop at once, by file count and by summed source bytes. The first
+    /// pending record always fits, so one oversized file can still hydrate.
+    private static var hydrationPrefetchFileLimit: Int { 8 }
+    private static var hydrationPrefetchSourceByteLimit: Int { 48 * 1024 * 1024 }
+
+    /// Synchronous fallback for a persisted record that failed validation inside `foldItems`'s
+    /// lazy hydration window. Mirrors the upfront `parseFiles` contract — parse permit,
+    /// autoreleasepool, read-failure reporter — but runs in visit order so one bad record costs
+    /// a reparse of its own file only.
+    private func reparseAfterHydrationMiss(
+        file: JSONLScanning.DiscoveredFile,
+        parseFile: @Sendable @escaping (URL) -> [Item]?
+    ) async -> CachedFile? {
+        guard !Task.isCancelled, await parsePermitPool.acquire() else { return nil }
+        let exists = FileManager.default.fileExists(atPath: file.path)
+        let parsed: [Item]? = (Task.isCancelled || !exists)
+            ? nil
+            : autoreleasepool { parseFile(URL(fileURLWithPath: file.path)) }
+        await parsePermitPool.release()
+        await readFailureReporter.update(
+            checkedPaths: [file.path],
+            failingPaths: exists && parsed == nil ? [file.path] : []
+        )
+        guard let parsed else { return nil }
+        return CachedFile(
+            size: file.size,
+            mtime: file.mtime,
+            attributeMtime: file.attributeMtime,
+            items: parsed
+        )
     }
 
     private func discoveredFilesStillMatch(
         _ files: [JSONLScanning.DiscoveredFile],
         cacheIdentity: String
     ) -> Bool {
-        let changed = !JSONLScanning.filesStillMatch(files)
+        validatedAppendedPaths(files, witnesses: [:], cacheIdentity: cacheIdentity) != nil
+    }
+
+    private func validatedAppendedPaths(
+        _ files: [JSONLScanning.DiscoveredFile],
+        witnesses: [String: JSONLScanning.GatewayAppendWitness],
+        cacheIdentity: String
+    ) -> Set<String>? {
         let diagnosticKey = "jsonl.scan.source-changed.\(JSONLScanCachePaths.stableFingerprint(logTag + "|" + cacheIdentity))"
-        guard changed else {
+        if let appended = JSONLScanning.gatewayAppendedPaths(in: files, witnesses: witnesses) {
             DiagnosticGate.clearFailure(diagnosticKey)
-            return true
+            return appended
         }
         DiagnosticGate.logOnce(for: diagnosticKey) {
             AppLog.warn(logTag, "session source changed during its scan; preserving last-good history")
         }
-        return false
+        return nil
     }
 
     /// Wait for the real debounced tasks rather than bypassing them. Tests configure a tiny debounce,
@@ -743,6 +957,11 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         var currentCache: [String: CachedFile]
         var nextCache: [String: CachedFile]
         var toParse: [JSONLScanning.DiscoveredFile]
+        /// `foldItems` only (`deferHydration`): files needing a persisted-record decode, in
+        /// `files` order. Their `nextCache` entries stay metadata stubs until the visit loop
+        /// decodes them in bounded chunks just ahead of each visit, so a warm scan keeps a
+        /// window of items live instead of the whole window's items at once.
+        var pendingHydration: [(path: String, expected: CachedFile)] = []
     }
 
     /// Revision-classify the discovered files against the resident cache and hydrate every metadata
@@ -753,12 +972,14 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         identity: String,
         files: [JSONLScanning.DiscoveredFile],
         since: Date,
-        retainItems: Bool
+        retainItems: Bool,
+        deferHydration: Bool = false
     ) async -> ScanCachePlan? {
         let currentCache = caches[identity] ?? [:]
         var nextCache = currentCache.filter { $0.value.mtime >= since }
         var toParse: [JSONLScanning.DiscoveredFile] = []
         var toHydrate: [(path: String, expected: CachedFile)] = []
+        var pendingHydration: [(path: String, expected: CachedFile)] = []
         var filesByPath: [String: JSONLScanning.DiscoveredFile] = [:]
         filesByPath.reserveCapacity(files.count)
 
@@ -784,36 +1005,61 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
         }
 
         if !toHydrate.isEmpty {
-            let hydrated = await hydrateResidentItemsBatch(identity: identity, requests: toHydrate)
-            guard !Task.isCancelled else { return nil }
-            for request in toHydrate {
-                if let cached = hydrated[request.path] {
-                    nextCache[request.path] = cached
-                    unloadedResidentPaths[identity]?.remove(request.path)
-                } else {
-                    nextCache[request.path] = nil
-                    unloadedResidentPaths[identity]?.remove(request.path)
-                    if let file = filesByPath[request.path] {
-                        toParse.append(file)
+            if deferHydration {
+                // Stubs stand in for each record until the fold's visit loop decodes it in a
+                // bounded chunk, so a warm scan never holds the whole window's items at once.
+                for request in toHydrate {
+                    nextCache[request.path] = request.expected
+                }
+                pendingHydration = toHydrate
+            } else {
+                let hydrated = await hydrateResidentItemsBatch(identity: identity, requests: toHydrate)
+                guard !Task.isCancelled else { return nil }
+                for request in toHydrate {
+                    if let cached = hydrated[request.path] {
+                        nextCache[request.path] = cached
+                        unloadedResidentPaths[identity]?.remove(request.path)
+                    } else {
+                        nextCache[request.path] = nil
+                        unloadedResidentPaths[identity]?.remove(request.path)
+                        if let file = filesByPath[request.path] {
+                            toParse.append(file)
+                        }
                     }
                 }
             }
         }
-        return ScanCachePlan(currentCache: currentCache, nextCache: nextCache, toParse: toParse)
+        return ScanCachePlan(
+            currentCache: currentCache,
+            nextCache: nextCache,
+            toParse: toParse,
+            pendingHydration: pendingHydration
+        )
     }
+
+    /// Encoded upsert payloads may pile up faster than the debounce drains them on a cold fold
+    /// (cache rebuild, schema bump, mass rotation). Past this cap the write persists immediately
+    /// instead of letting `Data` copies of every fresh parse array sit next to the fold's own.
+    private static var maxBufferedUpsertBytes: Int { 32 * 1024 * 1024 }
 
     private func scheduleWrite(identity: String) {
         guard let persistence else { return }
         let generation = writeGenerations[identity, default: 0] + 1
         writeGenerations[identity] = generation
         writeTasks[identity]?.cancel()
+        let bufferedBytes = (pendingUpserts[identity] ?? [:]).values.reduce(0) {
+            $0 + $1.recordData.count
+        }
+        let urgent = bufferedBytes >= Self.maxBufferedUpsertBytes
         writeTasks[identity] = Task { [weak self] in
             guard let self else { return }
-            do {
-                try await Task.sleep(for: persistence.writeDebounce)
-            } catch {
-                await self.finishWriteTask(identity: identity, generation: generation)
-                return
+            if !urgent {
+                do {
+                    try await Task.sleep(for: persistence.writeDebounce)
+                } catch {
+                    await self.finishWriteTask(identity: identity, generation: generation)
+                    return
+                }
             }
             guard !Task.isCancelled else { return }
             await self.persistCache(identity: identity, generation: generation)
@@ -905,29 +1151,33 @@ actor IncrementalJSONLScanner<Item: Codable & Sendable> {
                 encoder.outputFormat = .binary
                 return try Dictionary(uniqueKeysWithValues: files.map { input in
                     try Task.checkCancellation()
-                    let metadata = JSONLScanCacheFileMetadata(
-                        size: input.cached.size,
-                        mtime: input.cached.mtime,
-                        attributeMtime: input.cached.attributeMtime,
-                        recordFileName: JSONLScanCachePaths.recordFileName(path: input.path)
-                    )
-                    let record = JSONLScanCacheRecord(
-                        path: input.path,
-                        size: input.cached.size,
-                        mtime: input.cached.mtime,
-                        attributeMtime: input.cached.attributeMtime,
-                        items: input.cached.items
-                    )
-                    let recordData = try JSONLAccountingWorkPacer.shared.perform(enabled: paceAccountingWork) {
-                        try encoder.encode(record)
-                    }
-                    return (
-                        input.path,
-                        JSONLScanCacheUpsert(
-                            metadata: metadata,
-                            recordData: recordData
+                    // One record encode's plist debris drains per file rather than collecting
+                    // across the whole batch inside this detached task.
+                    return try autoreleasepool { () -> (String, JSONLScanCacheUpsert) in
+                        let metadata = JSONLScanCacheFileMetadata(
+                            size: input.cached.size,
+                            mtime: input.cached.mtime,
+                            attributeMtime: input.cached.attributeMtime,
+                            recordFileName: JSONLScanCachePaths.recordFileName(path: input.path)
                         )
-                    )
+                        let record = JSONLScanCacheRecord(
+                            path: input.path,
+                            size: input.cached.size,
+                            mtime: input.cached.mtime,
+                            attributeMtime: input.cached.attributeMtime,
+                            items: input.cached.items
+                        )
+                        let recordData = try JSONLAccountingWorkPacer.shared.perform(enabled: paceAccountingWork) {
+                            try encoder.encode(record)
+                        }
+                        return (
+                            input.path,
+                            JSONLScanCacheUpsert(
+                                metadata: metadata,
+                                recordData: recordData
+                            )
+                        )
+                    }
                 })
             }
             encoded = try await withTaskCancellationHandler {

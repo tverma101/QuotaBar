@@ -59,7 +59,7 @@ struct CursorAuthStore: Sendable {
     var now: @Sendable () -> Date
 
     init(
-        sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
+        sqlite: SQLiteAccessing = NativeSQLiteAccessor(),
         keychain: KeychainAccessing = SecurityKeychainAccessor(),
         now: @escaping @Sendable () -> Date = Date.init
     ) {

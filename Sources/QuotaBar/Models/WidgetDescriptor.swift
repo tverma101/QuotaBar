@@ -79,4 +79,12 @@ extension WidgetDescriptor {
         copy.sample.trayStyle = .resetCountdown
         return copy
     }
+
+    /// Marks a percent meter to show two decimals just inside either edge, where whole-percent
+    /// rounding would report a small real value as exactly 0% or 100%.
+    func showingFractionalPercentAtEdges() -> WidgetDescriptor {
+        var copy = self
+        copy.sample.showsFractionalPercentAtEdges = true
+        return copy
+    }
 }

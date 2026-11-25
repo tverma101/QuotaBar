@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+mod native_devin;
+
 const PROBE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +129,9 @@ fn run_probe_with_account_timeout(
     timeout: Duration,
     refresh_history: bool,
 ) -> PluginOutput {
+    if plugin.manifest.uses_native_devin() {
+        return native_devin::run(plugin, account.as_ref(), timeout);
+    }
     let plugin_id = account
         .as_ref()
         .map(|account| account.instance_id.clone())

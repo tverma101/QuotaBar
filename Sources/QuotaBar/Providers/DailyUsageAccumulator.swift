@@ -12,6 +12,7 @@ import Foundation
 struct DailyUsageAccumulator {
     private var tokensByDay: [String: Int] = [:]
     private var costByDay: [String: Double] = [:]
+    private var reportedCosts = ReportedUsageCostAccumulator()
     private var estimatedCostDays: Set<String> = []
     private var apiEstimateByDay: [String: Double] = [:]
     private var apiEstimateIncompleteDays: Set<String> = []
@@ -30,12 +31,35 @@ struct DailyUsageAccumulator {
         unmeasuredUsageDays.insert(day)
     }
 
+    /// Memo state for `dayKey`: rows arrive roughly time-ordered within a file, so remembering the
+    /// last day's interval answers the common case without `dateComponents` + `String(format:)`
+    /// per row. Guarded by `dayKeyCacheLock`; `nonisolated(unsafe)` only silences the check the
+    /// lock already covers.
+    private static let dayKeyCacheLock = NSLock()
+    private nonisolated(unsafe) static var dayKeyCache:
+        (calendar: Calendar, start: TimeInterval, end: TimeInterval, key: String)?
+
     /// Local calendar day as `yyyy-MM-dd`. The single day-key contract shared by the accumulator,
     /// `SpendTileMapper`, and the Cursor CSV aggregation. `calendar` is injectable for tests; production
     /// uses `.current`.
     static func dayKey(from date: Date, calendar: Calendar = .current) -> String {
+        let t = date.timeIntervalSinceReferenceDate
+        dayKeyCacheLock.lock()
+        if let cache = dayKeyCache, cache.calendar == calendar, t >= cache.start, t < cache.end {
+            dayKeyCacheLock.unlock()
+            return cache.key
+        }
+        dayKeyCacheLock.unlock()
         let components = calendar.dateComponents([.year, .month, .day], from: date)
-        return String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
+        let key = String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
+        // `+1 day` rather than +86400s keeps the interval correct across DST transitions.
+        let start = calendar.startOfDay(for: date)
+        if let end = calendar.date(byAdding: .day, value: 1, to: start) {
+            dayKeyCacheLock.lock()
+            dayKeyCache = (calendar, start.timeIntervalSinceReferenceDate, end.timeIntervalSinceReferenceDate, key)
+            dayKeyCacheLock.unlock()
+        }
+        return key
     }
 
     /// Add a row's tokens + cost, attributed to `model` on `day`.
@@ -62,7 +86,8 @@ struct DailyUsageAccumulator {
         model: String,
         canonical: String? = nil,
         costIsComplete: Bool = true,
-        tokenCountSaturated: Bool = false
+        tokenCountSaturated: Bool = false,
+        reportedCost: Double? = nil
     ) {
         let priorTokens = tokensByDay[day, default: 0]
         if tokens > 0 && priorTokens > Int.max - tokens {
@@ -70,6 +95,7 @@ struct DailyUsageAccumulator {
         }
         if tokenCountSaturated { tokenCountSaturatedDays.insert(day) }
         tokensByDay[day] = ProviderParse.addingSaturating(priorTokens, tokens)
+        reportedCosts.add(day: day, dollars: reportedCost, tokens: tokens)
         if let cost {
             if overflowedCostDays.contains(day) {
                 incompleteCostDays.insert(day)
@@ -217,6 +243,9 @@ struct DailyUsageAccumulator {
         }
         for day in scan.series.daily
         where minDayKey.map({ day.date >= $0 }) ?? true {
+            if let reported = day.reportedCost {
+                reportedCosts.add(day: day.date, dollars: reported.dollars, tokens: reported.coveredTokens)
+            }
             if !day.costIsComplete {
                 incompleteCostDays.insert(day.date)
             }
@@ -514,7 +543,8 @@ struct DailyUsageAccumulator {
                 costUSD: costByDay[day],
                 costIsComplete: !incompleteCostDays.contains(day),
                 hasUnexplainedIncompleteCost: hasUnexplainedIncompleteCost,
-                tokenCountSaturated: tokenCountSaturatedDays.contains(day)
+                tokenCountSaturated: tokenCountSaturatedDays.contains(day),
+                reportedCost: reportedCosts.byDay[day]
             )
         }
         let modelUsage = ModelUsageSeries(daily: modelsByDay.keys.sorted(by: >).map { day in

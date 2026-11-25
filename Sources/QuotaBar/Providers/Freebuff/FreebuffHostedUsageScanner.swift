@@ -60,6 +60,8 @@ actor FreebuffHostedUsageScanner {
     }
     private struct Metrics: Codable {
         struct Usage: Codable {
+            /// A route recorded with the counters, distinct from the run's selected model.
+            var model: String?
             var inputTokens: Int
             var outputTokens: Int
             var cachedInputTokens: Int?
@@ -100,7 +102,7 @@ actor FreebuffHostedUsageScanner {
         var task: Task<Cache, Error>
     }
 
-    private static let metricsVersion = 2
+    private static let metricsVersion = 3
     static let incompleteReceiptRetryInterval: TimeInterval = 300
     static let maximumRuns = 10_000
     static let maximumCacheBytes = 8 * 1_024 * 1_024
@@ -205,7 +207,7 @@ actor FreebuffHostedUsageScanner {
         // Memory pressure drops the decoded mirror, not the persisted accounting evidence.
         // An offline/local fold must restore it before publishing totals without hosted usage.
         reloadIfChangedOnDisk()
-        if cache == nil { cache = try Self.loadCache(cacheURL) }
+        if cache == nil { cache = try? Self.loadCache(cacheURL) }
         guard let cache, cache.accountKey == Self.accountKey(auth) else { return [] }
         return Self.receipts(cache)
     }
@@ -225,6 +227,7 @@ actor FreebuffHostedUsageScanner {
             cached.receipt.map { receipt in
                 var receipt = receipt
                 receipt.model = cached.run.model
+                receipt.runStatus = cached.run.status
                 return receipt
             }
         }.sorted { $0.id < $1.id }
@@ -276,8 +279,8 @@ actor FreebuffHostedUsageScanner {
         var result = previous ?? CachedRun(run: run)
         result.run = run
         if previous?.metricsVersion != metricsVersion {
+            // Replay events without dropping saved usage if the server only returns sparse updates.
             result.cursor = nil
-            result.receipt = nil
         }
         var cursor = result.cursor
         var seen: Set<String> = []

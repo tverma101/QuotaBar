@@ -402,7 +402,7 @@ pub struct CodexParser {
     current_service_tier_is_valid: bool,
     saw_session_meta: bool,
     replay_gate: Option<ReplayGate>,
-    has_malformed_usage: bool,
+    damaged_line_count: u64,
     events: Vec<CodexEventOut>,
 }
 
@@ -417,7 +417,7 @@ impl CodexParser {
             current_service_tier_is_valid: true,
             saw_session_meta: false,
             replay_gate: None,
-            has_malformed_usage: false,
+            damaged_line_count: 0,
             events: Vec::new(),
         }
     }
@@ -449,7 +449,7 @@ impl CodexParser {
             Ok(v) => v,
             Err(_) => {
                 if is_token_count {
-                    self.has_malformed_usage = true;
+                    self.damaged_line_count += 1;
                 }
                 return Ok(());
             }
@@ -458,7 +458,7 @@ impl CodexParser {
             Value::Object(o) => o,
             _ => {
                 if is_token_count {
-                    self.has_malformed_usage = true;
+                    self.damaged_line_count += 1;
                 }
                 return Ok(());
             }
@@ -468,7 +468,7 @@ impl CodexParser {
 
         if line_type == Some("turn_context") {
             let Some(payload) = payload else {
-                self.has_malformed_usage = true;
+                self.damaged_line_count += 1;
                 self.current_model = None;
                 return Ok(());
             };
@@ -476,7 +476,7 @@ impl CodexParser {
                 ModelNameUpdate::Absent => {}
                 ModelNameUpdate::Value(model) => self.current_model = Some(model),
                 ModelNameUpdate::Invalid => {
-                    self.has_malformed_usage = true;
+                    self.damaged_line_count += 1;
                     self.current_model = None;
                 }
             }
@@ -534,7 +534,7 @@ impl CodexParser {
 
         if line_type != Some("event_msg") || payload.is_none() {
             if is_token_count {
-                self.has_malformed_usage = true;
+                self.damaged_line_count += 1;
             }
             return Ok(());
         }
@@ -559,7 +559,7 @@ impl CodexParser {
 
         if payload.get("type").and_then(Value::as_str) != Some("token_count") {
             if is_token_count {
-                self.has_malformed_usage = true;
+                self.damaged_line_count += 1;
             }
             return Ok(());
         }
@@ -568,22 +568,21 @@ impl CodexParser {
         let timestamp_raw = match object.get("timestamp").and_then(Value::as_str).map(trim_ws) {
             Some(raw) => raw,
             None => {
-                self.has_malformed_usage = true;
+                self.damaged_line_count += 1;
                 return Ok(());
             }
         };
         let timestamp = match parse_canonical_utc(timestamp_raw.as_bytes()) {
             CanonicalTimestamp::Ok(seconds) => seconds,
             CanonicalTimestamp::Invalid => {
-                self.has_malformed_usage = true;
+                self.damaged_line_count += 1;
                 return Ok(());
             }
             CanonicalTimestamp::NotCanonical => return Err(()),
         };
 
         // A rate-limit-only ping: `info` is explicitly null (OpenAI emits these while a turn is in
-        // flight with no usage to report). Nothing to count — skipping it must not mark the
-        // source malformed.
+        // flight with no usage to report). Nothing to count — skipping it is not damage.
         if matches!(payload.get("info"), Some(Value::Null)) {
             return Ok(());
         }
@@ -591,7 +590,7 @@ impl CodexParser {
         let info = match payload.get("info").and_then(Value::as_object) {
             Some(info) => info,
             None => {
-                self.has_malformed_usage = true;
+                self.damaged_line_count += 1;
                 return Ok(());
             }
         };
@@ -601,13 +600,13 @@ impl CodexParser {
             Some(Value::Object(totals_object)) => {
                 let parsed = RawUsage::from_json(totals_object);
                 if !parsed.is_valid {
-                    self.has_malformed_usage = true;
+                    self.damaged_line_count += 1;
                     return Ok(());
                 }
                 Some(parsed)
             }
             Some(_) => {
-                self.has_malformed_usage = true;
+                self.damaged_line_count += 1;
                 return Ok(());
             }
         };
@@ -621,7 +620,7 @@ impl CodexParser {
                         Some(last_object) => {
                             let last = RawUsage::from_json(last_object);
                             if !last.is_valid {
-                                self.has_malformed_usage = true;
+                                self.damaged_line_count += 1;
                                 return Ok(());
                             }
                             self.previous_totals = Some(match self.previous_totals {
@@ -630,7 +629,7 @@ impl CodexParser {
                             });
                         }
                         None => {
-                            self.has_malformed_usage = true;
+                            self.damaged_line_count += 1;
                             return Ok(());
                         }
                     }
@@ -653,7 +652,7 @@ impl CodexParser {
                     Some(last_object) => {
                         let last = RawUsage::from_json(last_object);
                         if !last.is_valid {
-                            self.has_malformed_usage = true;
+                            self.damaged_line_count += 1;
                             return Ok(());
                         }
                         if totals.is_none() {
@@ -665,7 +664,7 @@ impl CodexParser {
                         last
                     }
                     None => {
-                        self.has_malformed_usage = true;
+                        self.damaged_line_count += 1;
                         return Ok(());
                     }
                 }
@@ -673,14 +672,14 @@ impl CodexParser {
             _ => match totals {
                 Some(totals) => totals.subtracting(self.previous_totals.as_ref()),
                 None => {
-                    self.has_malformed_usage = true;
+                    self.damaged_line_count += 1;
                     return Ok(());
                 }
             },
         };
 
         if !usage.is_valid {
-            self.has_malformed_usage = true;
+            self.damaged_line_count += 1;
             return Ok(());
         }
         if totals.is_some() {
@@ -698,13 +697,13 @@ impl CodexParser {
         let parsed_model = match model_name_update(payload) {
             ModelNameUpdate::Value(model) => Some(model),
             ModelNameUpdate::Invalid => {
-                self.has_malformed_usage = true;
+                self.damaged_line_count += 1;
                 return Ok(());
             }
             ModelNameUpdate::Absent => match model_name_update(info) {
                 ModelNameUpdate::Value(model) => Some(model),
                 ModelNameUpdate::Invalid => {
-                    self.has_malformed_usage = true;
+                    self.damaged_line_count += 1;
                     return Ok(());
                 }
                 ModelNameUpdate::Absent => None,
@@ -836,16 +835,16 @@ pub unsafe extern "C" fn qb_codex_parser_feed_line(
     }
 }
 
-/// Nonzero when any line failed Swift's `hasMalformedUsage` accounting.
+/// Number of lines the parser skipped as damaged (Swift's `damagedLineCount` accounting).
 ///
 /// # Safety
 /// `parser` must be a live pointer from [`qb_codex_parser_create`].
 #[no_mangle]
-pub unsafe extern "C" fn qb_codex_parser_malformed(parser: *const CodexParser) -> u32 {
+pub unsafe extern "C" fn qb_codex_parser_damaged_count(parser: *const CodexParser) -> u64 {
     if parser.is_null() {
         return 0;
     }
-    u32::from(unsafe { &*parser }.has_malformed_usage)
+    unsafe { &*parser }.damaged_line_count
 }
 
 /// Move out the events emitted so far (the parser keeps its file state). Call once at the end

@@ -38,15 +38,33 @@ enum TokenRefreshOutcome: Sendable {
 /// Google Cloud Code endpoints, and the Google OAuth token refresh.
 struct AntigravityUsageClient: Sendable {
     static let lsService = "exa.language_server_pb.LanguageServerService"
+    // Daily has the active counters for the quota pools; production can return untouched Gemini
+    // windows, so the summary tries daily first and falls back to production.
     static let cloudCodeURLs = [
         "https://daily-cloudcode-pa.googleapis.com",
         "https://cloudcode-pa.googleapis.com"
+    ]
+    /// Plan and project lookups prefer production; daily has the active counters for quota reads.
+    static let planProjectURLs = [
+        "https://cloudcode-pa.googleapis.com",
+        "https://daily-cloudcode-pa.googleapis.com"
     ]
     static let fetchModelsPath = "/v1internal:fetchAvailableModels"
     static let loadCodeAssistPath = "/v1internal:loadCodeAssist"
     static let retrieveQuotaPath = "/v1internal:retrieveUserQuota"
     static let quotaSummaryPath = "/v1internal:retrieveUserQuotaSummary"
     static let googleOAuthURL = "https://oauth2.googleapis.com/token"
+    /// The hub client identity exposes the separate Argon quota and the paid tier; the bare IDE
+    /// identity omits them, and Google marks other callers `UNSUPPORTED_CLIENT`. Ported from
+    /// upstream openusage#1676 (e1ffa571), which verified Argon reports with this shape.
+    static let clientUserAgent: String = {
+        #if arch(arm64)
+        let arch = "arm64"
+        #else
+        let arch = "amd64"
+        #endif
+        return "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=\(arch))"
+    }()
     // Google OAuth "installed application" client credentials, extracted verbatim from the Antigravity
     // app bundle — the same pair the shipped app and the legacy Tauri plugin use. For installed-app OAuth
     // clients Google does not treat the "secret" as confidential (it ships in every copy of the client),
@@ -100,8 +118,14 @@ struct AntigravityUsageClient: Sendable {
     /// authentication; a 403 is a permission denial and must not trigger OAuth refresh. Both
     /// short-circuit because the same request would fail on the other base. Other non-2xx / transport
     /// errors fall through to the next base and finally `.unavailable`.
-    func cloudCode(path: String, token: String, userAgent: String, body: [String: String]) async throws -> CloudCodeOutcome {
-        switch try await cloudCodeResponses(path: path, token: token, userAgent: userAgent, body: body, collectSummaries: false) {
+    func cloudCode(
+        path: String,
+        token: String,
+        userAgent: String,
+        body: [String: any Sendable],
+        bases: [String] = AntigravityUsageClient.cloudCodeURLs
+    ) async throws -> CloudCodeOutcome {
+        switch try await cloudCodeResponses(path: path, token: token, userAgent: userAgent, body: body, collectSummaries: false, bases: bases) {
         case .ok(let bodies, _): return .ok(bodies[0])
         case .authFailed: return .authFailed
         case .forbidden: return .forbidden
@@ -112,18 +136,29 @@ struct AntigravityUsageClient: Sendable {
 
     /// A host can omit an entire quota pool. Consult the other host only when the first usable body
     /// cannot supply all shared meters; a failed supplemental host never discards measured limits.
-    func cloudCodeSummaries(token: String) async throws -> CloudCodeBatchOutcome {
-        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: "antigravity", body: [:], collectSummaries: true)
+    /// A host that answered with a complete summary ends the read with `allHostsAnswered: true`
+    /// even if another host refused it — a refusal on a canary host says nothing about the quota
+    /// pool a complete body can prove. Failed hosts still withhold the freshness stamp when no
+    /// answer was complete.
+    func cloudCodeSummaries(token: String, project: String? = nil) async throws -> CloudCodeBatchOutcome {
+        try await cloudCodeResponses(path: Self.quotaSummaryPath, token: token, userAgent: Self.clientUserAgent, body: project.map { ["project": $0] } ?? [:], collectSummaries: true, bases: Self.cloudCodeURLs)
     }
 
     private func cloudCodeResponses(
-        path: String, token: String, userAgent: String, body: [String: String], collectSummaries: Bool
+        path: String,
+        token: String,
+        userAgent: String,
+        body: [String: any Sendable],
+        collectSummaries: Bool,
+        bases: [String] = AntigravityUsageClient.cloudCodeURLs
     ) async throws -> CloudCodeBatchOutcome {
         let payload = (try? JSONSerialization.data(withJSONObject: body)) ?? Data("{}".utf8)
         var sawNotFound = false
         var sawOtherFailure = false
+        var sawAuthFailure = false
+        var sawForbidden = false
         var bodies: [Data] = []
-        for base in Self.cloudCodeURLs {
+        for (index, base) in bases.enumerated() {
             try Task.checkCancellation()
             guard let url = URL(string: base + path) else { continue }
             let request = HTTPRequest(
@@ -152,11 +187,18 @@ struct AntigravityUsageClient: Sendable {
             try Task.checkCancellation()
             if response.statusCode == 401 || response.statusCode == 403 {
                 if !bodies.isEmpty { return .ok(bodies, allHostsAnswered: false) }
+                if collectSummaries {
+                    // A refusal on one host may not hold on the other (daily is a canary host that
+                    // can 401 a token production accepts), so the summary consults both before
+                    // classifying. Legacy paths short-circuit — the same token fails there too.
+                    if response.statusCode == 401 { sawAuthFailure = true } else { sawForbidden = true }
+                    continue
+                }
                 return response.statusCode == 401 ? .authFailed : .forbidden
             }
             if (200..<300).contains(response.statusCode) {
                 bodies.append(response.body)
-                if !collectSummaries || AntigravityUsageMapper.hasAllSharedQuotaMeters(response.body, sourceID: "cloud-code-\(bodies.count - 1)") {
+                if !collectSummaries || AntigravityUsageMapper.hasAllSharedQuotaMeters(response.body, sourceID: "cloud-code-\(index)") {
                     return .ok(bodies, allHostsAnswered: true)
                 }
                 continue
@@ -168,20 +210,28 @@ struct AntigravityUsageClient: Sendable {
             }
         }
         if !bodies.isEmpty {
-            return .ok(bodies, allHostsAnswered: !sawNotFound && !sawOtherFailure)
+            return .ok(bodies, allHostsAnswered: !sawNotFound && !sawOtherFailure && !sawAuthFailure && !sawForbidden)
         }
+        if sawAuthFailure { return .authFailed }
+        if sawForbidden { return .forbidden }
         return sawNotFound && !sawOtherFailure ? .notFound : .unavailable
     }
 
     /// Exchange a Google refresh token for a fresh access token. Distinguishes a rejected OAuth client
     /// (`invalid_client`) from a dead refresh token (`invalid_grant`) and transient failures so the
     /// caller does not report expired sign-in when QuotaBar's client configuration was rejected.
-    func refreshGoogleToken(_ refreshToken: String) async throws -> TokenRefreshOutcome {
+    /// T3 Code's file credentials carry their own client pair — a refresh token only refreshes with
+    /// the client it was issued to, so the caller supplies that pair instead of the bundled one.
+    func refreshGoogleToken(
+        _ refreshToken: String,
+        clientID: String = AntigravityUsageClient.googleClientID,
+        clientSecret: String = AntigravityUsageClient.googleClientSecret
+    ) async throws -> TokenRefreshOutcome {
         try Task.checkCancellation()
         guard let url = URL(string: Self.googleOAuthURL) else { return .unavailable }
         let form = [
-            "client_id=\(Self.googleClientID.urlFormEncoded)",
-            "client_secret=\(Self.googleClientSecret.urlFormEncoded)",
+            "client_id=\(clientID.urlFormEncoded)",
+            "client_secret=\(clientSecret.urlFormEncoded)",
             "refresh_token=\(refreshToken.urlFormEncoded)",
             "grant_type=refresh_token"
         ].joined(separator: "&")

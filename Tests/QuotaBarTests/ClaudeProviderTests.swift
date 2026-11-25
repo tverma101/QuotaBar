@@ -411,7 +411,7 @@ final class ClaudeProviderTests: XCTestCase {
                 timestamp: "2026-02-20T16:00:00.000Z", input: 100, output: 50, costUSD: 0.25
             )
         ])
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: configuredAuthStore(files: FakeFiles([
                 "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","subscriptionType":"pro","scopes":["user:profile"]}}"#
             ]), now: { now }),
@@ -437,7 +437,7 @@ final class ClaudeProviderTests: XCTestCase {
             #"{"timestamp":"2026-02-20T12:00:00Z","message":{"usage":{"input_tokens":-1,"output_tokens":2}}}"#
         ])
         defer { try? FileManager.default.trashItem(at: home, resultingItemURL: nil) }
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: configuredAuthStore(files: FakeFiles([
                 "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","scopes":["user:profile"]}}"#
             ]), now: { now }),
@@ -466,7 +466,7 @@ final class ClaudeProviderTests: XCTestCase {
             )
         ])
         let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data()))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: ClaudeAuthStore(
                 environment: FakeEnvironment(),
                 files: FakeFiles(),
@@ -508,7 +508,7 @@ final class ClaudeProviderTests: XCTestCase {
             homeDirectory: { home },
             incrementalScanner: IncrementalJSONLScanner<PiUsageScanner.Entry>()
         )
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: ClaudeAuthStore(
                 environment: FakeEnvironment(), files: FakeFiles(), keychain: FakeKeychain(), now: { now }
             ),
@@ -547,7 +547,7 @@ final class ClaudeProviderTests: XCTestCase {
                 return .readable(organizationID: "org-a", accountID: "user-a", isAmbiguous: false)
             }
         )
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: ClaudeAuthStore(
                 environment: FakeEnvironment(), files: FakeFiles(), keychain: FakeKeychain(), now: { now }
             ),
@@ -577,7 +577,7 @@ final class ClaudeProviderTests: XCTestCase {
                 timestamp: "2026-02-20T16:00:00.000Z", input: 0, output: 0, costUSD: 0
             )
         ])
-        let zeroProvider = ClaudeProvider(
+        let zeroProvider = ClaudeSwiftReferenceProvider(
             authStore: ClaudeAuthStore(
                 environment: FakeEnvironment(),
                 files: FakeFiles(),
@@ -599,7 +599,7 @@ final class ClaudeProviderTests: XCTestCase {
                 timestamp: "2025-12-20T16:00:00.000Z", input: 100, output: 50, costUSD: 0.25
             )
         ])
-        let decemberProvider = ClaudeProvider(
+        let decemberProvider = ClaudeSwiftReferenceProvider(
             authStore: ClaudeAuthStore(
                 environment: FakeEnvironment(),
                 files: FakeFiles(),
@@ -642,7 +642,7 @@ final class ClaudeProviderTests: XCTestCase {
                 timestamp: "2026-02-20T16:00:00.000Z", input: 100, output: 50, costUSD: 0.25
             )
         ])
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: configuredAuthStore(files: FakeFiles([
                 "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","subscriptionType":"max","rateLimitTier":"default_claude_max_5x","scopes":["user:inference"]}}"#
             ]), now: { now }),
@@ -677,7 +677,7 @@ final class ClaudeProviderTests: XCTestCase {
             headers: [:],
             body: Data("OAuth token does not meet scope requirement user:profile".utf8)
         ))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: configuredAuthStore(files: files, now: { Date() }),
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -702,7 +702,7 @@ final class ClaudeProviderTests: XCTestCase {
             headers: [:],
             body: Data("Forbidden".utf8)
         ))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: configuredAuthStore(files: files, now: { Date() }),
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -721,7 +721,7 @@ final class ClaudeProviderTests: XCTestCase {
         let authStore = configuredAuthStore(files: FakeFiles(), keychain: keychain, now: { Date() })
         resetKeychainPermissionState(for: authStore)
         defer { resetKeychainPermissionState(for: authStore) }
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
                 statusCode: 200, headers: [:], body: Data()
@@ -743,7 +743,7 @@ final class ClaudeProviderTests: XCTestCase {
         resetKeychainPermissionState(for: authStore)
         defer { resetKeychainPermissionState(for: authStore) }
         let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data()))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -764,7 +764,7 @@ final class ClaudeProviderTests: XCTestCase {
         resetKeychainPermissionState(for: authStore)
         defer { resetKeychainPermissionState(for: authStore) }
         let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 200, headers: [:], body: Data()))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -786,7 +786,7 @@ final class ClaudeProviderTests: XCTestCase {
         let authStore = configuredAuthStore(files: FakeFiles(), keychain: keychain, now: { Date() })
         resetKeychainPermissionState(for: authStore)
         defer { resetKeychainPermissionState(for: authStore) }
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
                 statusCode: 200, headers: [:], body: Data()
@@ -814,7 +814,7 @@ final class ClaudeProviderTests: XCTestCase {
             headers: [:],
             body: Data(#"{"five_hour":{"utilization":41,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
         ))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -841,7 +841,7 @@ final class ClaudeProviderTests: XCTestCase {
             headers: [:],
             body: Data(#"{"five_hour":{"utilization":27,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
         ))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -864,7 +864,7 @@ final class ClaudeProviderTests: XCTestCase {
         resetKeychainPermissionState(for: authStore)
         defer { resetKeychainPermissionState(for: authStore) }
         let httpClient = FakeHTTPClient(response: HTTPResponse(statusCode: 401, headers: [:], body: Data()))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -895,7 +895,7 @@ final class ClaudeProviderTests: XCTestCase {
             headers: [:],
             body: Data(#"{"five_hour":{"utilization":27,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
         ))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: store,
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -930,7 +930,7 @@ final class ClaudeProviderTests: XCTestCase {
             let files = FakeFiles(["/tmp/claude/.credentials.json": fileContents])
             let authStore = configuredAuthStore(files: files, keychain: FakeKeychain(), now: { Date() })
             resetKeychainPermissionState(for: authStore)
-            let provider = ClaudeProvider(
+            let provider = ClaudeSwiftReferenceProvider(
                 authStore: authStore,
                 usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
                     statusCode: 200, headers: [:], body: Data()
@@ -959,7 +959,7 @@ final class ClaudeProviderTests: XCTestCase {
             headers: [:],
             body: Data(#"{"five_hour":{"utilization":35,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
         ))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -978,7 +978,7 @@ final class ClaudeProviderTests: XCTestCase {
             files: ClaudeUnreadableCredentialFiles(),
             keychain: FakeKeychain()
         )
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
                 statusCode: 200, headers: [:], body: Data()
@@ -1013,7 +1013,7 @@ final class ClaudeProviderTests: XCTestCase {
             desktop: desktop,
             desktopOnly: true
         )
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: FakeHTTPClient(response: HTTPResponse(
                 statusCode: 200, headers: [:], body: Data()
@@ -1087,7 +1087,7 @@ final class ClaudeProviderTests: XCTestCase {
                 body: Data(#"{"access_token":"fresh-token","refresh_token":"refresh-2","expires_in":3600}"#.utf8)
             )
         }
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: configuredAuthStore(files: files, now: { now }),
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -1137,7 +1137,7 @@ final class ClaudeProviderTests: XCTestCase {
             // Refresh endpoint: only the stale candidate reaches here, and its refresh token is revoked.
             return HTTPResponse(statusCode: 400, headers: [:], body: Data(#"{"error":"invalid_grant"}"#.utf8))
         }
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -1184,7 +1184,7 @@ final class ClaudeProviderTests: XCTestCase {
                 body: Data(#"{"five_hour":{"utilization":42,"resets_at":"2099-01-01T00:00:00.000Z"}}"#.utf8)
             )
         }
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore, usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil), pricing: { TestPricing.bundled }
         )
@@ -1220,7 +1220,7 @@ final class ClaudeProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 400, headers: [:], body: Data(#"{"error":"invalid_grant"}"#.utf8))
         }
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: authStore,
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),
@@ -1234,8 +1234,8 @@ final class ClaudeProviderTests: XCTestCase {
     }
 
     func testNoCredentialsReportsNotLoggedIn() async {
-        func makeProvider(files: FakeFiles) -> ClaudeProvider {
-            ClaudeProvider(
+        func makeProvider(files: FakeFiles) -> ClaudeSwiftReferenceProvider {
+            ClaudeSwiftReferenceProvider(
                 authStore: ClaudeAuthStore(
                     environment: FakeEnvironment(),
                     files: files,
@@ -1258,7 +1258,7 @@ final class ClaudeProviderTests: XCTestCase {
             headers: ["retry-after": "600"],
             body: Data()
         ))
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: configuredAuthStore(files: FakeFiles([
                 "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","subscriptionType":"pro","scopes":["user:profile"]}}"#
             ]), now: { now }),
@@ -1300,7 +1300,7 @@ final class ClaudeProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 429, headers: ["retry-after": "600"], body: Data())
         }
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: configuredAuthStore(files: FakeFiles([
                 "/tmp/claude/.credentials.json": #"{"claudeAiOauth":{"accessToken":"token","subscriptionType":"pro","scopes":["user:profile"]}}"#
             ]), now: { clock.now }),
@@ -1346,7 +1346,7 @@ final class ClaudeProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 400, headers: [:], body: Data("<html>Bad Gateway</html>".utf8))
         }
-        let provider = ClaudeProvider(
+        let provider = ClaudeSwiftReferenceProvider(
             authStore: configuredAuthStore(files: files, now: { now }),
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),

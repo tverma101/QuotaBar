@@ -121,44 +121,6 @@ extension CursorUsageError: CategorizedError {
     }
 }
 
-extension GrokAuthError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .notLoggedIn: .notLoggedIn
-        case .invalidAuth: .authInvalid
-        case .expired: .authExpired
-        }
-    }
-}
-
-extension GrokUsageError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .connectionFailed: .network
-        case .invalidResponse: .decoding
-        case .requestFailed(let status): ErrorCategory.http(status)
-        }
-    }
-}
-
-extension DevinAuthError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .notLoggedIn: .notLoggedIn
-        case .credentialsUnreadable: .credentialAccess
-        }
-    }
-}
-
-extension DevinUsageError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .invalidResponse: .decoding
-        case .quotaUnavailable: .notAvailable
-        }
-    }
-}
-
 extension FreebuffAuthError: CategorizedError {
     var errorCategory: ErrorCategory {
         switch self {
@@ -178,30 +140,7 @@ extension FreebuffUsageError: CategorizedError {
         case .requestFailed(let status): ErrorCategory.http(status)
         case .quotaUnavailable: .notAvailable
         case .localHistoryUnreadable: .decoding
-        }
-    }
-}
-
-extension CopilotAuthError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .notLoggedIn: .notLoggedIn
-        case .credentialPermissionRequired: .credentialAccess
-        case .credentialsUnreadable: .credentialAccess
-        case .invalidCredentials: .authInvalid
-        case .tokenInvalid: .authExpired
-        case .accessDenied: .http4xx
-        }
-    }
-}
-
-extension CopilotUsageError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .connectionFailed: .network
-        case .invalidResponse: .decoding
-        case .requestFailed(let status): ErrorCategory.http(status)
-        case .quotaUnavailable: .notAvailable
+        case .liveAccessUnavailable: .notAvailable
         }
     }
 }
@@ -216,49 +155,6 @@ extension OpenCodeUsageError: CategorizedError {
         case .accountAPIInvalidResponse: .decoding
         case .accountAPIRequestFailed(let status): ErrorCategory.http(status)
         case .accountAPIUnavailable: .network
-        }
-    }
-}
-
-extension OpenRouterAuthError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .missingKey: .notLoggedIn
-        case .credentialsUnreadable: .credentialAccess
-        case .invalidKey: .authInvalid
-        case .saveFailed, .deleteFailed: .other
-        }
-    }
-}
-
-extension OpenRouterUsageError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .connectionFailed: .network
-        case .invalidResponse: .decoding
-        case .requestFailed(let status): ErrorCategory.http(status)
-        }
-    }
-}
-
-extension ZAIAuthError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .missingKey: .notLoggedIn
-        case .credentialsUnreadable: .credentialAccess
-        case .invalidKey: .authInvalid
-        case .saveFailed, .deleteFailed: .other
-        }
-    }
-}
-
-extension ZAIUsageError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .connectionFailed: .network
-        case .invalidResponse: .decoding
-        case .requestFailed(let status): ErrorCategory.http(status)
-        case .noCodingPlan: .notAvailable
         }
     }
 }
@@ -285,15 +181,6 @@ extension AntigravityError: CategorizedError {
         case .accessDenied: .http4xx
         case .quotaEndpointUnavailable: .notAvailable
         case .unavailable: .network
-        }
-    }
-}
-
-extension HermesUsageError: CategorizedError {
-    var errorCategory: ErrorCategory {
-        switch self {
-        case .notDetected: .notLoggedIn
-        case .databaseUnreadable: .credentialAccess
         }
     }
 }

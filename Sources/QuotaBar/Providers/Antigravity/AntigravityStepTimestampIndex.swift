@@ -2,7 +2,7 @@ import Foundation
 
 /// Generation indices and conversation-step indices are different sequences. Match their explicit
 /// UUID/bot identities once per changed database instead of attributing historical rows to today.
-struct AntigravityStepTimestampIndex: Equatable, Sendable {
+struct AntigravityStepTimestampIndex: Codable, Equatable, Sendable {
     enum LoadError: LocalizedError {
         case memoryLimitExceeded
 
@@ -11,13 +11,51 @@ struct AntigravityStepTimestampIndex: Equatable, Sendable {
         }
     }
 
-    let timeZoneIdentifier = Calendar.current.timeZone.identifier
+    let timeZoneIdentifier: String
     private var timestamps: [AntigravityProtoDecoder.StepIdentity: Int64] = [:]
     private var ambiguous: Set<AntigravityProtoDecoder.StepIdentity> = []
     private(set) var estimatedMemoryBytes = 0
-    private var lastIndex = -1
+    /// Highest step index the persisted digest covers; the merged probe re-digests only beyond it.
+    private(set) var lastIndex = -1
     private var tableFingerprint: String?
     private var supportsDigest: Bool?
+
+    init() {
+        timeZoneIdentifier = Calendar.current.timeZone.identifier
+    }
+
+    /// The derivation record stores the index so a cold process verifies (prefix digest) instead
+    /// of re-paging every `steps` row. A fingerprint mismatch simply rebuilds the index from the
+    /// table — persistence changes cost, not correctness. Required fields decode strictly so a
+    /// truncated record rejects the whole index instead of silently trusting partial identities.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        timeZoneIdentifier = try container.decode(String.self, forKey: .timeZoneIdentifier)
+        timestamps = try container.decode([AntigravityProtoDecoder.StepIdentity: Int64].self,
+                                          forKey: .timestamps)
+        ambiguous = try container.decode(Set<AntigravityProtoDecoder.StepIdentity>.self,
+                                         forKey: .ambiguous)
+        estimatedMemoryBytes = try container.decode(Int.self, forKey: .estimatedMemoryBytes)
+        lastIndex = try container.decode(Int.self, forKey: .lastIndex)
+        tableFingerprint = try container.decodeIfPresent(String.self, forKey: .tableFingerprint)
+        supportsDigest = try container.decodeIfPresent(Bool.self, forKey: .supportsDigest)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(timeZoneIdentifier, forKey: .timeZoneIdentifier)
+        try container.encode(timestamps, forKey: .timestamps)
+        try container.encode(ambiguous, forKey: .ambiguous)
+        try container.encode(estimatedMemoryBytes, forKey: .estimatedMemoryBytes)
+        try container.encode(lastIndex, forKey: .lastIndex)
+        try container.encodeIfPresent(tableFingerprint, forKey: .tableFingerprint)
+        try container.encodeIfPresent(supportsDigest, forKey: .supportsDigest)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case timeZoneIdentifier, timestamps, ambiguous, estimatedMemoryBytes
+        case lastIndex, tableFingerprint, supportsDigest
+    }
 
     mutating func insert(_ metadata: [UInt8], maximumEstimatedMemoryBytes: Int) throws {
         guard let (identity, timestamp) = AntigravityProtoDecoder.stepIdentityAndTimestamp(from: metadata),
@@ -66,26 +104,39 @@ struct AntigravityStepTimestampIndex: Equatable, Sendable {
             && previous.ambiguous.isSubset(of: ambiguous)
     }
 
+    /// `precomputedDigest` carries the step table's prefix/table digests and maximum index from the
+    /// merged changed-database probe (`AntigravityChangeProbe`), so a warm index verifies without a
+    /// second full-table digest query. When the persisted/in-memory index already covers the probed
+    /// maximum index, the bounded page reads are skipped entirely.
     static func load(
         path: String,
         sqlite: SQLiteAccessing,
         previous: Self? = nil,
-        maximumEstimatedMemoryBytes: Int = 64 * 1024 * 1024
+        maximumEstimatedMemoryBytes: Int = 64 * 1024 * 1024,
+        precomputedDigest: (prefix: String, table: String, maximumIndex: Int)? = nil
     ) throws -> Self {
         struct Row: Decodable { let index: Int; let hex: String? }
         let summary: (prefix: String, table: String)?
         let supportsDigest: Bool?
-        if previous?.supportsDigest == false {
-            summary = nil
-            supportsDigest = false
+        let probedMaximumIndex: Int
+        if let precomputedDigest {
+            summary = (prefix: precomputedDigest.prefix, table: precomputedDigest.table)
+            supportsDigest = true
+            probedMaximumIndex = precomputedDigest.maximumIndex
         } else {
-            do {
-                summary = try digest(path: path, through: previous?.lastIndex ?? -1, sqlite: sqlite)
-                supportsDigest = summary == nil ? nil : true
-            } catch {
-                guard error.localizedDescription.lowercased().contains("no such function: sha3") else { throw error }
+            probedMaximumIndex = .max
+            if previous?.supportsDigest == false {
                 summary = nil
                 supportsDigest = false
+            } else {
+                do {
+                    summary = try digest(path: path, through: previous?.lastIndex ?? -1, sqlite: sqlite)
+                    supportsDigest = summary == nil ? nil : true
+                } catch {
+                    guard error.localizedDescription.lowercased().contains("no such function: sha3") else { throw error }
+                    summary = nil
+                    supportsDigest = false
+                }
             }
         }
         var index = Self()
@@ -96,12 +147,16 @@ struct AntigravityStepTimestampIndex: Equatable, Sendable {
         index.supportsDigest = supportsDigest
         index.tableFingerprint = summary?.table
         var cursor = index.lastIndex
+        // A verified prefix that already reaches the probed maximum index has no appended steps to
+        // read; skip the bounded page queries entirely (one subprocess saved per unchanged store).
+        guard cursor < probedMaximumIndex else { return index }
         while true {
             try Task.checkCancellation()
             let sql = """
             WITH step_timestamp_candidates AS (
                 SELECT idx, metadata FROM steps
-                WHERE idx > \(cursor) AND metadata IS NOT NULL ORDER BY idx LIMIT 128
+                WHERE idx > \(cursor) AND metadata IS NOT NULL ORDER BY idx
+                    LIMIT \(AntigravityDbUsageScanner.batchSize)
             ), bounded AS (
                 SELECT idx, metadata,
                     SUM(CASE WHEN length(metadata) <= \(AntigravityDbUsageScanner.maximumBlobBytes)

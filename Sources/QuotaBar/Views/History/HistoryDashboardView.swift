@@ -1,54 +1,90 @@
 import SwiftUI
 
-/// The Usage History screen: a 30-day, cross-provider report built from the same per-provider
-/// `usageHistory` the dashboard's spend tiles render, so the two can never disagree. Header cards
-/// (Today / 7 Days / 30 Days: tokens + plan-priced cost), the "At Public API Rates" what-if total
-/// from fold-time estimates, a 30-bar daily token trend, and one section per enabled provider with
-/// per-model rows. A codename model (e.g. "space-bunny") shows tokens with a dashed cost until the
-/// automatic pricing discovery prices it — then the cost backfills with no user action.
 struct HistoryDashboardView: View {
-    var now: () -> Date = Date.init
     @Environment(LayoutStore.self) private var layout
     @Environment(WidgetDataStore.self) private var dataStore
+    @Environment(\.timeZone) private var timeZone
 
-    @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
     @State private var scrollPosition = ScrollPosition(edge: .top)
+    @State private var prepared: (request: Request, report: HistoryReport)?
 
     var body: some View {
-        PopoverScrollView {
-            content
+        TimelineView(.everyMinute) { context in
+            screen(now: context.date)
         }
-        .scrollPosition($scrollPosition)
         .onChange(of: layout.screen) { _, screen in
             if screen == .history { scrollPosition.scrollTo(edge: .top) }
         }
     }
 
-    // MARK: - Report
-
-    /// Folds the enabled providers' snapshots into the report — in memory, every render. The same
-    /// inputs the dashboard cards read, so no second source of truth exists to drift.
-    private var report: HistoryReport {
-        let enabledIDs = layout.orderedProviderIDs().filter { layout.isProviderEnabled($0) }
-        var names: [String: String] = [:]
-        var histories: [String: ProviderUsageHistory] = [:]
-        var estimatedCosts: [String: Bool] = [:]
-        for id in enabledIDs {
-            names[id] = layout.provider(id: id)?.displayName ?? id
-            histories[id] = dataStore.snapshots[id]?.usageHistory
-            estimatedCosts[id] = dataStore.historyDescriptorsByProvider[id]?.estimatedCost
+    private func screen(now: Date) -> some View {
+        var calendar = Calendar.current
+        calendar.timeZone = timeZone
+        let providers = layout.orderedProviderIDs().filter { layout.isProviderEnabled($0) }.map { id in
+            ProviderSelection(
+                id: id,
+                name: layout.provider(id: id)?.displayName ?? id,
+                identity: dataStore.historyAccountIdentity(for: id),
+                estimatedCost: dataStore.historyDescriptorsByProvider[id]?.estimatedCost ?? false
+            )
         }
-        return HistoryDashboardAggregator.report(.init(
-            enabledProviderIDs: enabledIDs,
-            displayNameByProviderID: names,
-            historyByProviderID: histories,
-            estimatedCostByProviderID: estimatedCosts
-        ), now: now())
+        let request = Request(
+            scope: .init(providers: providers, calendar: calendar, day: calendar.startOfDay(for: now)),
+            revision: dataStore.historyPresentationRevision
+        )
+        return PopoverScrollView {
+            if let prepared, prepared.request.scope == request.scope {
+                HistoryDashboardContent(report: prepared.report)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Loading Usage History")
+                    .frame(maxWidth: .infinity, minHeight: 120)
+            }
+        }
+        .scrollPosition($scrollPosition)
+        .task(id: request) {
+            guard !Task.isCancelled, prepared?.request != request else { return }
+            if prepared?.request.scope != request.scope { prepared = nil }
+            let input = HistoryDashboardAggregator.Input(
+                enabledProviderIDs: providers.map(\.id),
+                displayNameByProviderID: Dictionary(uniqueKeysWithValues: providers.map { ($0.id, $0.name) }),
+                historyByProviderID: Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
+                    dataStore.snapshots[provider.id]?.usageHistory.map { (provider.id, $0) }
+                }),
+                estimatedCostByProviderID: Dictionary(uniqueKeysWithValues: providers.map { ($0.id, $0.estimatedCost) })
+            )
+            guard let report = await HistoryDashboardAggregator.prepareReport(input, now: now, calendar: request.scope.calendar),
+                  !Task.isCancelled else { return }
+            prepared = (request, report)
+        }
     }
 
-    @ViewBuilder
-    private var content: some View {
-        let report = report
+    private struct ProviderSelection: Equatable {
+        let id: String
+        let name: String
+        let identity: String?
+        let estimatedCost: Bool
+    }
+
+    private struct Request: Equatable {
+        struct Scope: Equatable {
+            let providers: [ProviderSelection]
+            let calendar: Calendar
+            let day: Date
+        }
+
+        let scope: Scope
+        let revision: UInt64
+    }
+}
+
+/// Renders the prepared Usage History totals, trend, and model breakdowns.
+struct HistoryDashboardContent: View {
+    let report: HistoryReport
+    @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
+
+    var body: some View {
         VStack(alignment: .leading, spacing: density.sectionSpacing) {
             if report.isEmpty {
                 emptyState

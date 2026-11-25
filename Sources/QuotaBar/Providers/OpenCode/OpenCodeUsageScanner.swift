@@ -74,6 +74,14 @@ struct OpenCodeUsageScanner: Sendable {
     static let goProviderID = "opencode-go"
     private static let zenProviderID = "opencode"
 
+    /// Per-statement wall-clock budget for this scanner's SQLite queries. OpenCode databases
+    /// routinely hold hundreds of MB of message JSON — the whole-history data chunks and the
+    /// anchor's full-table `MIN()` legitimately outrun the accessor's five-second default on a cold
+    /// or contended machine, and every timeout fails the whole scan. Thirty seconds leaves an order
+    /// of magnitude of headroom over the measured worst case (~2.5s on a 650MB store) while the
+    /// 120s provider-refresh deadline still bounds the sqlite stage as a whole.
+    static let sqliteQueryTimeout: TimeInterval = 30
+
     var sqlite: SQLiteAccessing
     var databasePaths: @Sendable () throws -> [String]
     /// Roots whose `projects/**/*.jsonl` hold Claude Code sessions routed through the OpenCode
@@ -105,7 +113,7 @@ struct OpenCodeUsageScanner: Sendable {
     private let readFailureReporter: UsageLogReadFailureReporter
 
     init(
-        sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
+        sqlite: SQLiteAccessing = NativeSQLiteAccessor(queryTimeout: OpenCodeUsageScanner.sqliteQueryTimeout),
         databasePaths: @escaping @Sendable () throws -> [String] = OpenCodeUsageScanner.defaultDatabasePaths,
         claudeRoots: @escaping @Sendable () -> [URL] = { [] },
         claudeCacheIdentity: @escaping @Sendable () -> String = { ClaudeLogUsageScanner.parseSourceIdentity() },
@@ -257,8 +265,9 @@ struct OpenCodeUsageScanner: Sendable {
 
     /// Scan the last `daysBack` days. Returns `nil` only when there is no OpenCode database at all (→ the
     /// provider shows "No data"); a present-but-empty database yields an empty scan (idle tiles collapse
-    /// to "No data" via `SpendTileMapper`). Throws `databaseUnreadable` when databases exist but none
-    /// could be read — an all-failed refresh has no data source and must not render as zero usage.
+    /// to "No data" via `SpendTileMapper`). Throws `databaseUnreadable` when the data directory or ANY
+    /// discovered database could not be read — a partial scan must not replace last-good history with a
+    /// smaller total.
     /// Escaping fold visits mutate OpenCode accumulators through this box.
     private final class GatewayFoldState: @unchecked Sendable {
         let scanSince: Date
@@ -330,12 +339,7 @@ struct OpenCodeUsageScanner: Sendable {
                     pricing: pricing
                 )
                 nativeCoverage.insert(key)
-                return OpenCodeUsageScanner.shouldFoldNativeCodexRow(
-                    row,
-                    accountIdentityKey: accountIdentityKey,
-                    completeRouterCoverage: routerCoverage,
-                    pricing: pricing
-                )
+                return !routerCoverage.contains(key)
             }
             OpenCodeUsageScanner.foldGatewayRows(
                 rowsToFold,
@@ -530,7 +534,7 @@ struct OpenCodeUsageScanner: Sendable {
         var failures: [String: String] = [:]
 
         for path in paths {
-            // sqlite3 is a synchronous subprocess (bounded to five seconds). A disable cannot stop the
+            // sqlite3 is a synchronous subprocess (bounded per statement). A disable cannot stop the
             // query already running, but this prevents later database/anchor queries from starting.
             guard !Task.isCancelled else { return nil }
             checked.insert(path)
@@ -548,23 +552,51 @@ struct OpenCodeUsageScanner: Sendable {
                         AppLog.info(.refresh, "opencode database \(path) uses the \(layout) layout")
                     }
                 }
-                guard let json = try JSONLAccountingWorkPacer.shared.perform({
-                    try sqlite.queryValue(
-                        path: path,
-                        sql: OpenCodeDatabaseSQL.dataSQL(cutoffMs: cutoffMs, schema: schema)
-                    )
-                }) else {
-                    failures[path] = "usage query returned no result"
+                // The whole-history read is chunked into bounded time ranges: one marshaled
+                // `json_group_array` for ~10 years of rows outruns the sqlite3 subprocess's
+                // per-statement cap on a large store and fails closed on every fold.
+                let nowMs = Int(now.timeIntervalSince1970 * 1000)
+                var queryFailure: String?
+                let stamp = OpenCodeDatabaseSchemaProbe.revisionStamp(path: path)
+                // Persisted chunks first: an exact stamp match costs zero sqlite calls, and a
+                // stamp that only moved on WAL churn re-verifies by one aggregate fingerprint.
+                // Stored rows are a safe superset — their older cutoff keeps rows the live
+                // `date >= scanSince` filter then drops — so window drift needs no re-read.
+                if let cached = cachedRows(path: path, schema: schema, stamp: stamp,
+                                           maximumTimestampMs: maximumTimestampMs) {
+                    rows.append(contentsOf: cached)
+                } else {
+                    var chunks: [String] = []
+                    for sql in OpenCodeDatabaseSQL.dataSQLChunks(cutoffMs: cutoffMs, nowMs: nowMs, schema: schema) {
+                        guard !Task.isCancelled else { return nil }
+                        guard let json = try JSONLAccountingWorkPacer.shared.perform({
+                            try sqlite.queryValue(path: path, sql: sql)
+                        }) else {
+                            queryFailure = "usage query returned no result"
+                            break
+                        }
+                        chunks.append(json)
+                    }
+                    if queryFailure == nil {
+                        for json in chunks {
+                            guard !Task.isCancelled else { return nil }
+                            guard let parsedRows = JSONLAccountingWorkPacer.shared.perform({
+                                Self.parseRows(json, maximumTimestampMs: maximumTimestampMs)
+                            }) else {
+                                queryFailure = "usage rows contain malformed accounting values"
+                                break
+                            }
+                            rows.append(contentsOf: parsedRows)
+                        }
+                        if queryFailure == nil {
+                            persistChunks(chunks, path: path, stamp: stamp, schema: schema)
+                        }
+                    }
+                }
+                if let queryFailure {
+                    failures[path] = queryFailure
                     continue
                 }
-                guard !Task.isCancelled else { return nil }
-                guard let parsedRows = JSONLAccountingWorkPacer.shared.perform({
-                    Self.parseRows(json, maximumTimestampMs: maximumTimestampMs)
-                }) else {
-                    failures[path] = "usage rows contain malformed accounting values"
-                    continue
-                }
-                rows.append(contentsOf: parsedRows)
             } catch {
                 guard !Task.isCancelled else { return nil }
                 failures[path] = error.localizedDescription
@@ -626,10 +658,13 @@ struct OpenCodeUsageScanner: Sendable {
         JSONLAccountingWorkPacer.shared.forEach(rows) { row in
             let date = Date(timeIntervalSince1970: row.ms / 1000)
             guard date >= scanSince else { return }
+            let day = DailyUsageAccumulator.dayKey(from: date)
+            accumulator.recordApiEstimate(day: day, cost: nil, tokens: row.tokens)
             accumulator.add(
-                day: DailyUsageAccumulator.dayKey(from: date),
+                day: day,
                 tokens: row.tokens, cost: row.cost, model: row.model,
-                tokenCountSaturated: row.tokenCountSaturated
+                tokenCountSaturated: row.tokenCountSaturated,
+                reportedCost: row.cost
             )
         }
 
@@ -1416,31 +1451,21 @@ struct OpenCodeUsageScanner: Sendable {
         partialDays: inout Set<String>,
         skippingDayModels: Set<String> = []
     ) {
+        let sinceDay = DailyUsageAccumulator.dayKey(from: since)
         JSONLAccountingWorkPacer.shared.forEach(rows) { row in
-            guard row.date >= since, row.tokens > 0 else { return }
+            // Aggregated rows are whole local-day buckets materialized at noon: a non-midnight
+            // `since` later than noon must still keep its boundary-day bucket.
+            guard row.tokens > 0,
+                  row.isAggregated
+                    ? DailyUsageAccumulator.dayKey(from: row.date) >= sinceDay
+                    : row.date >= since
+            else { return }
             let day = DailyUsageAccumulator.dayKey(from: row.date)
             guard !skippingDayModels.contains(Self.dayModelKey(day: day, model: row.model)) else { return }
             if row.isInProgress {
                 // Still-running Hermes session: its ledger is not final (Hermes writes it in
                 // delayed bursts), so the day's total is partial until the session ends.
                 partialDays.insert(day)
-            }
-            let cost: Double?
-            let providerID = row.burnsGoQuota ? Self.goProviderID : Self.zenProviderID
-            if let rate = effectiveRates[EffectiveRateKey(model: row.model, providerID: providerID)] {
-                // The gateway's own recorded average for this model — all of the row's tokens blend
-                // at it (the same proportion the provider's recorded dollars represent).
-                cost = rate * Double(row.tokens)
-            } else if let estimated = pricing.estimatedCostDollars(
-                model: row.model,
-                tokens: TokenBreakdown(
-                    input: row.input, cacheWrite5m: row.cacheWrite, cacheRead: row.cacheRead, output: row.output
-                ),
-                applyLongContextRates: !row.isAggregated
-            ) {
-                cost = estimated
-            } else {
-                cost = nil
             }
             let apiEstimate = pricing.estimatedCostDollars(
                 model: row.model,
@@ -1449,6 +1474,15 @@ struct OpenCodeUsageScanner: Sendable {
                 ),
                 applyLongContextRates: !row.isAggregated
             )
+            let cost: Double?
+            let providerID = row.burnsGoQuota ? Self.goProviderID : Self.zenProviderID
+            if let rate = effectiveRates[EffectiveRateKey(model: row.model, providerID: providerID)] {
+                // The gateway's own recorded average for this model — all of the row's tokens blend
+                // at it (the same proportion the provider's recorded dollars represent).
+                cost = rate * Double(row.tokens)
+            } else {
+                cost = apiEstimate
+            }
             let hasEstimatedRouterInput = row.routerInputWasEstimated == true
             let hasIncompleteRouterBreakdown = row.routerCostBreakdownIsComplete == false
             let hasIncompleteRouterAccounting = hasEstimatedRouterInput
@@ -1561,6 +1595,62 @@ struct OpenCodeUsageScanner: Sendable {
 
     // MARK: - Parsing
 
+    /// Serve a database's persisted chunk JSON when it still describes the live store: an exact
+    /// revision-stamp match is a free hit, and a stamp that moved on WAL churn alone re-verifies
+    /// by one aggregate fingerprint query. `nil` is unproven — the caller takes the live read
+    /// path exactly as before, so a stale record can never leak into the fold.
+    private func cachedRows(path: String, schema: OpenCodeDatabaseSchema, stamp: String?,
+                            maximumTimestampMs: Double) -> [Row]? {
+        guard let stamp,
+              let record = OpenCodeDatabaseRowsCache.readAnyRevision(path: path)
+        else { return nil }
+        let proven = record.revisionStamp == stamp
+            || (record.contentFingerprint.map { fingerprint in
+                Self.isWellFormedFingerprint(fingerprint)
+                    && ((try? sqlite.queryValue(path: path, sql: OpenCodeDatabaseSQL.fingerprintSQL(schema: schema))) == fingerprint)
+            } ?? false)
+        guard proven else { return nil }
+        var out: [Row] = []
+        for json in record.chunks {
+            guard let parsed = JSONLAccountingWorkPacer.shared.perform({
+                Self.parseRows(json, maximumTimestampMs: maximumTimestampMs)
+            }) else { return nil }
+            out.append(contentsOf: parsed)
+        }
+        return out
+    }
+
+    /// Persist the just-read chunks keyed by the pre-read stamp, only when the file stayed
+    /// stable across the whole read — the same consistent-snapshot contract the anchor memo
+    /// relies on. The fingerprint query runs once per real read and lets later WAL churn
+    /// resolve without the chunked re-read.
+    private func persistChunks(_ chunks: [String], path: String, stamp: String?,
+                             schema: OpenCodeDatabaseSchema) {
+        guard let stamp,
+              OpenCodeDatabaseSchemaProbe.revisionStamp(path: path) == stamp else { return }
+        let fingerprint = (try? sqlite.queryValue(
+            path: path, sql: OpenCodeDatabaseSQL.fingerprintSQL(schema: schema)
+        )).flatMap { Self.isWellFormedFingerprint($0) ? $0 : nil }
+        OpenCodeDatabaseRowsCache.write(
+            OpenCodeDatabaseRowsCache.Record(
+                schema: OpenCodeDatabaseRowsCache.schema,
+                revisionStamp: stamp,
+                chunks: chunks,
+                contentFingerprint: fingerprint
+            ),
+            path: path
+        )
+    }
+
+    /// `v2:N:N:N|m:N:N:N` segments — anything else (a stubbed accessor's canned value, an empty
+    /// result) is unproven so test fakes and odd stores cannot false-positive into stale reuse.
+    private static func isWellFormedFingerprint(_ value: String) -> Bool {
+        value.range(
+            of: #"^([a-z0-9]+:\d+:\d+:\d+\|)*[a-z0-9]+:\d+:\d+:\d+$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
     private struct Row {
         var ms: Double
         var cost: Double?
@@ -1591,7 +1681,11 @@ struct OpenCodeUsageScanner: Sendable {
             else { return nil }
             let tokenCountSaturated = rawTokens > 1e15
             let tokens = Int(min(rawTokens, 1e15))
-            let cost = ProviderParse.number(entry[1]).flatMap { $0 >= 0 ? $0 : nil }
+            // `dataSQL` emits `-1` for malformed cost just like it does for malformed token counts;
+            // treat it the same way — a corrupt row invalidates the query instead of silently
+            // degrading to unpriced.
+            if let rawCost = ProviderParse.number(entry[1]), rawCost < 0 { return nil }
+            let cost = ProviderParse.number(entry[1])
             // Completed zero-token, zero-cost bookkeeping rows carry no usage and must not let a
             // skewed timestamp discard otherwise complete history. Keep cost-only rows meaningful.
             if tokens == 0, (cost ?? 0) == 0 { continue }
@@ -1634,6 +1728,12 @@ struct OpenCodeUsageScanner: Sendable {
     /// companion: in WAL mode a commit touches the companion without moving the main db, so any
     /// write — including a deleted oldest session — re-queries. Idle databases (the common
     /// panel-open case) then skip the scan entirely.
+    ///
+    /// A weaker key was considered — an "anchor floor" per path reused while the file only grew —
+    /// but file stats cannot distinguish an append from a delete that does not shrink the file
+    /// (SQLite frees pages in place, and a WAL-mode delete only grows `-wal`), nor from an insert
+    /// carrying an *earlier* `time_created`. Either leaves a stale floor with no recovery signal,
+    /// so correctness keeps the full-stamp key and pays the rescan on active databases.
     private static let goAnchorMemo = OSAllocatedUnfairLock<[String: Double]>(initialState: [:])
 
     private static func goAnchorMemoKey(path: String, schema: OpenCodeDatabaseSchema) -> String? {

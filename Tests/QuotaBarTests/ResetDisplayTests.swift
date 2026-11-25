@@ -82,6 +82,113 @@ final class ResetDisplayTests: XCTestCase {
         XCTAssertNil(data.paceTick(for: state, now: now))
     }
 
+    func testAntigravitySessionJustUnderFullKeepsItsCountdownBehindTheRoundedPercent() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let line = AntigravityUsageMapper.line(
+            pool: AntigravityMetric.sessionLabel, fraction: 0.99965,
+            resetTime: now.addingTimeInterval(2 * 3600), periodMs: MetricPeriod.sessionMs)
+        guard case .progress(_, let used, let limit, _, let resetsAt, let periodMs, _, _) = line else {
+            return XCTFail("expected a progress line")
+        }
+        XCTAssertEqual(used, 0.035, accuracy: 0.001)
+        XCTAssertGreaterThan(used, 0)
+
+        var data = WidgetData(title: "Gemini 5h", icon: .providerMark("antigravity"), kind: .percent, used: used, limit: limit,
+                              resetsAt: resetsAt, periodDurationMs: periodMs)
+        data.sessionStartSignal = .zeroUsage
+        data.displayMode = .remaining
+
+        XCTAssertEqual(data.valueText, "100%")
+        XCTAssertFalse(data.isFreshSessionWindow(now: now))
+        XCTAssertEqual(data.boundedTrailingText(now: now), "Resets in 2h")
+    }
+
+    func testAntigravityUntouchedAndExhaustedWindowsKeepTheirFreshAndCountdownReads() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func line(fraction: Double) -> WidgetData {
+            guard case .progress(_, let used, let limit, _, let resetsAt, let periodMs, _, _) =
+                    AntigravityUsageMapper.line(pool: AntigravityMetric.sessionLabel, fraction: fraction,
+                                                resetTime: now.addingTimeInterval(2 * 3600),
+                                                periodMs: MetricPeriod.sessionMs)
+            else { preconditionFailure("expected a progress line") }
+            var data = WidgetData(title: "Gemini 5h", icon: .providerMark("antigravity"), kind: .percent, used: used, limit: limit,
+                                  resetsAt: resetsAt, periodDurationMs: periodMs)
+            data.sessionStartSignal = .zeroUsage
+            data.displayMode = .remaining
+            return data
+        }
+
+        let untouched = line(fraction: 1)
+        XCTAssertTrue(untouched.isFreshSessionWindow(now: now))
+        XCTAssertEqual(untouched.boundedTrailingText(now: now), "Not started")
+
+        let exhausted = line(fraction: 0)
+        XCTAssertFalse(exhausted.isFreshSessionWindow(now: now))
+        XCTAssertEqual(exhausted.boundedTrailingText(now: now), "Resets in 2h")
+
+        for (fraction, expected) in [(1.5, 0.0), (-0.5, 100.0)] {
+            guard case .progress(_, let used, _, _, _, _, _, _) =
+                    AntigravityUsageMapper.line(pool: "x", fraction: fraction, resetTime: nil, periodMs: MetricPeriod.sessionMs)
+            else { return XCTFail("expected a progress line") }
+            XCTAssertEqual(used, expected, "fraction \(fraction) clamps into 0...1")
+        }
+    }
+
+    /// Antigravity's descriptors opt in to fractional edge reads: a real 0.025%-used window must
+    /// print 99.98%/0.02% instead of rounding to a false "100% left"/"0% used". Exact endpoints are
+    /// untouched — 0 is still "Not started"/"100% left", 100 is still spent/"0% left".
+    func testAntigravityFractionalPercentEdgesStayHonest() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func edge(used: Double, mode: WidgetDisplayMode, optedIn: Bool = true) -> WidgetData {
+            var data = WidgetData(title: "Gemini 5h", icon: .providerMark("antigravity"), kind: .percent,
+                                  used: used, limit: 100,
+                                  resetsAt: now.addingTimeInterval(2 * 3600),
+                                  periodDurationMs: MetricPeriod.sessionMs)
+            data.sessionStartSignal = .zeroUsage
+            data.showsFractionalPercentAtEdges = optedIn
+            data.displayMode = mode
+            return data
+        }
+
+        let barelyUsed = edge(used: 0.024945, mode: .remaining)
+        XCTAssertEqual(barelyUsed.boundedHeadline, "99.98% left")
+        XCTAssertEqual(barelyUsed.menuBarValue, "99.98%")
+        XCTAssertEqual(barelyUsed.boundedTrailingText(now: now), "Resets in 2h")
+        XCTAssertFalse(barelyUsed.isFreshSessionWindow(now: now))
+
+        let usedRead = edge(used: 0.024945, mode: .used)
+        XCTAssertEqual(usedRead.boundedHeadline, "0.02% used")
+
+        let untouched = edge(used: 0, mode: .remaining)
+        XCTAssertEqual(untouched.boundedHeadline, "100% left")
+        XCTAssertTrue(untouched.isFreshSessionWindow(now: now))
+
+        let exhausted = edge(used: 100, mode: .remaining)
+        XCTAssertEqual(exhausted.boundedHeadline, "0% left")
+        guard case .spent = exhausted.meterState(now: now) else {
+            return XCTFail("a full window must stay spent")
+        }
+
+        // The same tiny value without the descriptor opt-in keeps the whole-percent read.
+        let silent = edge(used: 0.024945, mode: .remaining, optedIn: false)
+        XCTAssertEqual(silent.boundedHeadline, "100% left")
+        XCTAssertEqual(silent.menuBarValue, "100%")
+    }
+
+    func testAntigravityWeeklyKeepsTheFractionsRawPercentForTheDisplayToRound() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        guard case .progress(_, let used, let limit, _, let resetsAt, let periodMs, _, _) =
+                AntigravityUsageMapper.line(pool: AntigravityMetric.weeklyLabel, fraction: 0.9742,
+                                            resetTime: now.addingTimeInterval(5 * 24 * 3600),
+                                            periodMs: MetricPeriod.weekMs)
+        else { return XCTFail("expected a progress line") }
+        var data = WidgetData(title: "Gemini", icon: .providerMark("antigravity"), kind: .percent, used: used, limit: limit,
+                              resetsAt: resetsAt, periodDurationMs: periodMs)
+        data.displayMode = .remaining
+
+        XCTAssertEqual(data.valueText, "97%")
+    }
+
     @MainActor
     func testSessionWindowSignalIsWiredOnExactlyTheShippingSessionDescriptors() {
         // The tests around this hand-set `sessionStartSignal`, so they pin the mechanism but not the

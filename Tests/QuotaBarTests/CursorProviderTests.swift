@@ -477,7 +477,7 @@ final class CursorProviderTests: XCTestCase {
             XCTFail("credential loading should stop before network access")
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReference(
             authStore: CursorAuthStore(sqlite: UnreadableCursorSQLite(), keychain: ServiceKeychain()),
             usageClient: CursorUsageClient(http: http)
         )
@@ -538,7 +538,7 @@ final class CursorProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReference(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]),
                 keychain: FakeKeychain()
@@ -567,7 +567,7 @@ final class CursorProviderTests: XCTestCase {
             XCTAssertEqual(request.url, CursorUsageClient.refreshURL)
             throw CancellationError()
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReference(
             authStore: CursorAuthStore(sqlite: KeyValueSQLite(values: [
                 CursorAuthStore.accessTokenKey: makeCursorJWT(sub: "google-oauth2|user", exp: 0),
                 CursorAuthStore.refreshTokenKey: "refresh-token"
@@ -597,7 +597,7 @@ final class CursorProviderTests: XCTestCase {
             await gate.pause()
             return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"rotated-access"}"#.utf8))
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReference(
             authStore: CursorAuthStore(sqlite: sqlite, keychain: ServiceKeychain(), now: { now }),
             usageClient: CursorUsageClient(http: http),
             now: { now }
@@ -637,7 +637,7 @@ final class CursorProviderTests: XCTestCase {
                 await gate.pause()
                 return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"late-access-token"}"#.utf8))
             }
-            let provider = CursorProvider(
+            let provider = CursorSwiftReference(
                 authStore: CursorAuthStore(sqlite: sqlite, keychain: FakeKeychain(), now: { now }),
                 usageClient: CursorUsageClient(http: http),
                 now: { now }
@@ -673,7 +673,7 @@ final class CursorProviderTests: XCTestCase {
             await gate.pause()
             return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"late-access-token"}"#.utf8))
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReference(
             authStore: CursorAuthStore(sqlite: sqlite, keychain: keychain, now: { now }),
             usageClient: CursorUsageClient(http: http),
             now: { now }
@@ -702,7 +702,7 @@ final class CursorProviderTests: XCTestCase {
             XCTFail("an expired access token must not be sent after refresh fails: \(request.url)")
             return HTTPResponse(statusCode: 200, headers: [:], body: Data())
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReference(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [
                     CursorAuthStore.accessTokenKey: makeCursorJWT(sub: "google-oauth2|user", exp: 0),
@@ -733,7 +733,7 @@ final class CursorProviderTests: XCTestCase {
             XCTFail("optional Cursor endpoint must not run after cancellation: \(request.url)")
             return HTTPResponse(statusCode: 200, headers: [:], body: Data())
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReference(
             authStore: CursorAuthStore(sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]), keychain: FakeKeychain()),
             usageClient: CursorUsageClient(http: http)
         )
@@ -752,7 +752,7 @@ final class CursorProviderTests: XCTestCase {
         }
         let taskBox = CursorRefreshTaskBox()
         let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
-        let provider = CursorProvider(
+        let provider = CursorSwiftReference(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: token]),
                 keychain: FakeKeychain()

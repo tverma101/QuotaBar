@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Tracks pool quota for Antigravity (Google's Codeium/Windsurf-derived AI IDE). Quotas are
@@ -8,6 +9,8 @@ import Foundation
 /// 1. Antigravity language server (running app) — richest, gives the authoritative plan.
 /// 2. `agy` language server (running CLI).
 /// 3. Keychain token → Google Cloud Code (works with the app closed); refreshes via Google OAuth.
+/// 4. T3 Code's private Antigravity instances keep file-based OAuth credentials (`acp_token.json`);
+///    when the Keychain is absent or its ACL blocks this build, those refresh without any grant.
 ///
 /// On each source, `RetrieveUserQuotaSummary` is tried first (the only endpoint reporting the merged
 /// pools and the weekly windows); builds without it fall back to the legacy per-model endpoints,
@@ -16,6 +19,16 @@ import Foundation
 final class AntigravityProvider: ProviderRuntime {
     let provider = Provider(id: "antigravity", displayName: "Antigravity", icon: .providerMark("antigravity"))
 
+    /// Which quota transport this provider may use. Production is `nativeApp` — quota comes only
+    /// from the running Antigravity app's own `language_server` process. `legacyTestFixture`
+    /// exists so the retained transport tests can still exercise the Cloud Code/T3 paths; no
+    /// production caller selects it.
+    enum QuotaSource {
+        case nativeApp
+        case legacyTestFixture
+    }
+
+    let quotaSource: QuotaSource
     let authStore: AntigravityAuthStore
     let usageClient: AntigravityUsageClient
     let discovery: LanguageServerDiscovery
@@ -40,9 +53,26 @@ final class AntigravityProvider: ProviderRuntime {
         portFlag: nil
     )
 
+    /// Discovery pinned to the native Antigravity app's shipped executable. No markers: the exact
+    /// bundle path is the only identity we accept — a T3/agy/IDE language server copy elsewhere on
+    /// disk must never be mistaken for the app.
+    private var nativeServerOptions: LanguageServerDiscovery.Options {
+        let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.antigravity")
+            ?? URL(fileURLWithPath: "/Applications/Antigravity.app")
+        return .init(
+            processName: "language_server",
+            markers: [],
+            csrfFlag: "--csrf_token",
+            portFlag: "--extension_server_port",
+            requiredExecutablePath: bundle
+                .appendingPathComponent("Contents/Resources/bin/language_server").path
+        )
+    }
+
     private static let usageSourceNote = "From your Antigravity conversations"
 
     init(
+        quotaSource: QuotaSource = .nativeApp,
         authStore: AntigravityAuthStore = AntigravityAuthStore(),
         usageClient: AntigravityUsageClient = AntigravityUsageClient(),
         discovery: LanguageServerDiscovery = LanguageServerDiscovery(),
@@ -50,6 +80,7 @@ final class AntigravityProvider: ProviderRuntime {
         now: @escaping @Sendable () -> Date = Date.init,
         pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() }
     ) {
+        self.quotaSource = quotaSource
         self.authStore = authStore
         self.usageClient = usageClient
         self.discovery = discovery
@@ -61,18 +92,23 @@ final class AntigravityProvider: ProviderRuntime {
     var widgetDescriptors: [WidgetDescriptor] {
         [
             .percent(id: AntigravityMetric.geminiID, provider: provider, title: AntigravityMetric.sessionLabel, sessionStartSignal: .zeroUsage)
-                .exportingLimit("geminiSession", unit: "percent"),
+                .exportingLimit("geminiSession", unit: "percent")
+                .showingFractionalPercentAtEdges(),
             .percent(id: AntigravityMetric.geminiWeeklyID, provider: provider, title: AntigravityMetric.weeklyLabel)
-                .exportingLimit("geminiWeekly", unit: "percent"),
+                .exportingLimit("geminiWeekly", unit: "percent")
+                .showingFractionalPercentAtEdges(),
             .percent(id: AntigravityMetric.argonWeeklyID, provider: provider, title: AntigravityMetric.argonWeeklyLabel)
                 .exportingLimit("argonWeekly", unit: "percent")
-                .hidingWhenEmpty(),
+                .hidingWhenEmpty()
+                .showingFractionalPercentAtEdges(),
             .percent(id: AntigravityMetric.claudeID, provider: provider, title: AntigravityMetric.claudeLabel, sessionStartSignal: .zeroUsage)
                 .exportingLimit("nonGeminiSession", unit: "percent")
-                .hidingWhenEmpty(),
+                .hidingWhenEmpty()
+                .showingFractionalPercentAtEdges(),
             .percent(id: AntigravityMetric.claudeWeeklyID, provider: provider, title: AntigravityMetric.claudeWeeklyLabel)
                 .exportingLimit("nonGeminiWeekly", unit: "percent")
-                .hidingWhenEmpty(),
+                .hidingWhenEmpty()
+                .showingFractionalPercentAtEdges(),
             .usageTrend(provider: provider)
                 .exportingHistory(
                     scope: .machineLocal,
@@ -83,6 +119,18 @@ final class AntigravityProvider: ProviderRuntime {
     }
 
     func hasLocalCredentials() async -> Bool {
+        // Native quota comes from the running app's own language server, or from the app's saved
+        // macOS sign-in while it stays closed — never from T3, agy, or another client's credentials.
+        // Both checks are silent: process table + non-interactive Keychain read only.
+        if quotaSource == .nativeApp {
+            let discovery = self.discovery
+            let options = nativeServerOptions
+            if await loadOffMainActor({ discovery.discover(options) != nil }) { return true }
+            let authStore = self.authStore
+            return await loadOffMainActor {
+                authStore.cacheIdentityKeyForLaunch() != AntigravityAuthStore.unresolvedCacheIdentityKey
+            }
+        }
         // A running local server is an independent quota source. Discovery only inspects the local
         // process table and its listening sockets; it never calls Google during first-run seeding.
         let discovery = self.discovery
@@ -95,14 +143,20 @@ final class AntigravityProvider: ProviderRuntime {
             return discovery.discover(Self.agyServerOptions, processSnapshot: processSnapshot) != nil
         }
 
-        // The Keychain login remains the source of truth for Cloud Code. The app-owned access-token
-        // cache is derivative and must never independently enable the provider after logout.
+        // The Keychain login remains the source of truth for Cloud Code when readable. The app-owned
+        // access-token cache is derivative and must never independently enable the provider after
+        // logout. T3 Code's file credentials are an independent login that needs no Keychain grant.
         do {
             let keychainToken = try await loadOffMainActor { [authStore] in
                 try authStore.loadKeychainToken()
             }
             guard !Task.isCancelled else { return hasLocalServer }
             guard keychainToken != nil else {
+                let hasFileCredential = await loadOffMainActor { [authStore] in
+                    !authStore.loadFileCredentials().isEmpty
+                }
+                guard !Task.isCancelled else { return hasLocalServer }
+                if hasFileCredential { return true }
                 await loadOffMainActor { [authStore] in authStore.discardCachedToken() }
                 return hasLocalServer
             }
@@ -118,14 +172,7 @@ final class AntigravityProvider: ProviderRuntime {
 
     func refresh() async -> ProviderSnapshot {
         // Fold-only passes run the conversation-database scan (SQLite reads, protobuf decode, and
-        // the priced fold) in the scan-worker child when available; the body below stays the
-        // in-process path for the fallback and for meter/full scopes.
-        if ProviderRefreshContext.scope.suppressesLiveQuota {
-            return await ScanWorkerClient.shared.foldOnlySnapshot(
-                provider: provider,
-                inProcessFallback: { await self.refreshInProcess() }
-            )
-        }
+        // the priced fold) in-process in this reference implementation. Production uses the Rust engine.
         return await refreshInProcess()
     }
 
@@ -188,7 +235,14 @@ final class AntigravityProvider: ProviderRuntime {
                 return cancelledRefreshSnapshot(provider: provider)
             } catch {
                 guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
-                var snapshot = ProviderSnapshot.error(provider: provider, error: error)
+                // A proven sign-out clears the prior menu-bar quota for the native source; an ACL
+                // denial or outage keeps the same-process held values with the explicit error.
+                var snapshot = ProviderSnapshot.error(
+                    provider: provider,
+                    error: error,
+                    clearsPriorMenuBarQuotaState: quotaSource == .nativeApp
+                        && (error as? AntigravityError) == .notSignedIn ? true : nil
+                )
                 let history = await historyTask?.value
                 guard !Task.isCancelled else { return cancelledRefreshSnapshot(provider: provider) }
                 if let history {
@@ -270,7 +324,8 @@ final class AntigravityProvider: ProviderRuntime {
         return LocalHistoryResult(history: history, lines: lines, warning: warning)
     }
 
-    private struct StrategyResult {
+    /// Shared with the Cloud Code probe in AntigravityCloudCode.swift.
+    struct StrategyResult {
         var plan: String?
         var lines: [MetricLine]
         var replacesPriorQuotaProgress = true
@@ -279,6 +334,23 @@ final class AntigravityProvider: ProviderRuntime {
 
     private func probe() async throws -> StrategyResult {
         try Task.checkCancellation()
+        if quotaSource == .nativeApp {
+            // Native quota has exactly two sources: the running app's own language server, then the
+            // app's saved macOS sign-in. A discovered server that answers — even with a warning or
+            // an empty summary — is authoritative; dropping it for a credential read would risk an
+            // unwanted Keychain prompt. Only transport-level no-result falls through.
+            let discovery = self.discovery
+            let options = nativeServerOptions
+            if let server = await loadOffMainActor({ discovery.discover(options) }),
+               let result = try await probeLS(discovered: server) {
+                AppLog.debug(LogTag.plugin("antigravity"), "quota source: native Antigravity app")
+                return result
+            }
+            try Task.checkCancellation()
+            let result = try await probeCloudCode(allowFileCredentials: false)
+            AppLog.debug(LogTag.plugin("antigravity"), "quota source: Antigravity saved sign-in")
+            return result
+        }
         let discovery = self.discovery
         let processSnapshot = await loadOffMainActor { discovery.processSnapshot() }
         try Task.checkCancellation()
@@ -297,7 +369,7 @@ final class AntigravityProvider: ProviderRuntime {
             }
         }
         try Task.checkCancellation()
-        return try await probeCloudCode()
+        return try await probeCloudCode(allowFileCredentials: true)
     }
 
     // MARK: - Language server
@@ -310,7 +382,10 @@ final class AntigravityProvider: ProviderRuntime {
         guard let discovered = await loadOffMainActor({
             discovery.discover(options, processSnapshot: processSnapshot)
         }) else { return nil }
+        return try await probeLS(discovered: discovered)
+    }
 
+    private func probeLS(discovered: LanguageServerDiscovery.Result) async throws -> StrategyResult? {
         // HTTPS first (the LS serves a self-signed cert), then HTTP, then the HTTP-only extension port.
         var endpoints: [(scheme: String, port: Int)] = []
         for port in discovered.ports {
@@ -401,261 +476,5 @@ final class AntigravityProvider: ProviderRuntime {
     private static func quotaSummaryDiagnosticPrefix(for endpoint: (scheme: String, port: Int)) -> String {
         let identity = JSONLScanCachePaths.stableFingerprint("\(endpoint.scheme):\(endpoint.port)")
         return "antigravity.quota-summary.\(identity)."
-    }
-
-    // MARK: - Cloud Code
-
-    private func probeCloudCode() async throws -> StrategyResult {
-        let authStore = self.authStore
-        let keychainToken = try await loadOffMainActor { try authStore.loadKeychainToken() }
-        try Task.checkCancellation()
-
-        guard let keychainToken else {
-            // Proven logout invalidates the derived cache. A Keychain read failure throws above and
-            // deliberately leaves the cache untouched for recovery.
-            await loadOffMainActor { authStore.discardCachedToken() }
-            throw AntigravityError.notSignedIn
-        }
-        if let identityKey = AntigravityAuthStore.cacheIdentityKey(for: keychainToken) {
-            ProviderRefreshContext.cacheIdentityResult?.set(identityKey)
-        }
-
-        struct AccessTokenAttempt {
-            let value: String
-            let isDerivedCache: Bool
-        }
-        var tokens: [AccessTokenAttempt] = []
-        var hasKnownExpiredAccessToken = false
-        if let access = keychainToken.accessToken {
-            if authStore.isUsable(expiry: keychainToken.expiry) {
-                tokens.append(AccessTokenAttempt(value: access, isDerivedCache: false))
-            } else {
-                hasKnownExpiredAccessToken = true
-            }
-        }
-        if let cached = await loadOffMainActor({ authStore.loadCachedToken(matching: keychainToken) }),
-           !tokens.contains(where: { $0.value == cached }) {
-            try Task.checkCancellation()
-            tokens.append(AccessTokenAttempt(value: cached, isDerivedCache: true))
-        }
-        try Task.checkCancellation()
-
-        // We have something to authenticate with if any token was tried or a refresh token exists. Used
-        // to tell a transient outage ("temporarily unavailable") apart from a genuine "not signed in".
-        let hasCredentials = !tokens.isEmpty || (keychainToken.refreshToken?.isEmpty == false)
-
-        var sawAuthFailure = false
-        var sawForbidden = false
-        var sawNoQuotaEndpoint = false
-        var sawTransientFailure = false
-        for attempt in tokens {
-            switch try await fetchCloudCode(token: attempt.value) {
-            case .success(let result): return result
-            case .authFailed:
-                sawAuthFailure = true
-                if attempt.isDerivedCache {
-                    await loadOffMainActor { authStore.discardCachedToken() }
-                }
-            case .forbidden: sawForbidden = true
-            case .notFound: sawNoQuotaEndpoint = true
-            case .unavailable: sawTransientFailure = true
-            }
-        }
-
-        // Only refresh on evidence of an auth failure (or no token to try) — a transient Cloud Code
-        // outage must not trigger a Google OAuth refresh every cycle.
-        if sawAuthFailure || tokens.isEmpty, let refreshToken = keychainToken.refreshToken {
-            switch try await usageClient.refreshGoogleToken(refreshToken) {
-            case .refreshed(let accessToken, let expiresIn):
-                try Task.checkCancellation()
-                let cached = try await loadOffMainActor {
-                    try authStore.cacheToken(
-                        accessToken,
-                        expiresIn: expiresIn,
-                        matching: keychainToken
-                    )
-                }
-                guard cached else { throw AntigravityError.authExpired }
-                try Task.checkCancellation()
-                switch try await fetchCloudCode(token: accessToken) {
-                case .success(let result): return result
-                case .authFailed: throw AntigravityError.authExpired
-                case .forbidden: throw AntigravityError.accessDenied
-                case .notFound: throw AntigravityError.quotaEndpointUnavailable
-                // The refreshed token is valid, so a non-2xx here is a transient outage, not bad auth.
-                case .unavailable: throw AntigravityError.unavailable
-                }
-            // The refresh token itself is dead (revoked / expired) — that's expired auth, not an outage.
-            case .authFailed: throw AntigravityError.authExpired
-            case .clientConfigurationInvalid: throw AntigravityError.oauthClientConfigurationInvalid
-            // Refresh was only transiently unavailable (throttled / 5xx / network). The refresh token may
-            // still be valid, so report a transient outage — even if a token 401'd, an expired access
-            // token is normal and isn't evidence the sign-in is dead.
-            case .unavailable: throw AntigravityError.unavailable
-            }
-        }
-
-        // Reached only when no refresh was attempted (no refresh token): a rejected token with no way to
-        // refresh is genuinely expired auth.
-        if sawAuthFailure || hasKnownExpiredAccessToken { throw AntigravityError.authExpired }
-        if sawForbidden { throw AntigravityError.accessDenied }
-        if sawNoQuotaEndpoint, !sawTransientFailure {
-            throw AntigravityError.quotaEndpointUnavailable
-        }
-        // Signed in but every endpoint was unreachable — report a transient failure, not "not signed in".
-        if hasCredentials { throw AntigravityError.unavailable }
-        throw AntigravityError.notSignedIn
-    }
-
-    private enum CloudCodeProbe {
-        case success(StrategyResult)
-        case authFailed
-        case forbidden
-        case notFound
-        case unavailable
-    }
-
-    private enum CodeAssistLookup {
-        case response(plan: String?, project: String?)
-        case authFailed
-        case forbidden
-        case notFound
-        case unavailable
-
-        var plan: String? {
-            guard case .response(let plan, _) = self else { return nil }
-            return plan
-        }
-    }
-
-    private func fetchCloudCode(token: String) async throws -> CloudCodeProbe {
-        // Authoritative first: the quota summary (merged pools + weekly windows). A parsed summary —
-        // even one with zero usable buckets — is the answer and must never fall into the legacy chain
-        // below, which fabricates "fully used" from missing quota info. A 404 falls through; if every
-        // quota endpoint is absent and no request has a transient failure, report that permanent state.
-        let codeAssistTask = Task { try await loadCodeAssist(token: token) }
-        return try await withTaskCancellationHandler {
-            defer { codeAssistTask.cancel() }
-            var sawNotFound = false
-            var sawTransientFailure = false
-            var sawUnusableSuccess = false
-            switch try await usageClient.cloudCodeSummaries(token: token) {
-            case .authFailed:
-                return .authFailed
-            case .forbidden:
-                return .forbidden
-            case .notFound:
-                sawNotFound = true
-                for index in AntigravityUsageClient.cloudCodeURLs.indices {
-                    AntigravityUsageMapper.clearQuotaSummaryDiagnostics(sourceID: "cloud-code-\(index)")
-                }
-                break
-            case .ok(let bodies, let allHostsAnswered):
-                if let summary = AntigravityUsageMapper.parseQuotaSummariesResult(bodies, allHostsAnswered: allHostsAnswered) {
-                    return .success(StrategyResult(
-                        plan: try await codeAssistTask.value.plan,
-                        lines: summary.lines,
-                        replacesPriorQuotaProgress: summary.isComplete,
-                        warning: summary.isComplete
-                            ? nil
-                            : "Some Antigravity quota limits could not be read. Missing limits may retain older values."
-                    ))
-                }
-                // The named RPC answered, but its schema is not usable. Do not query legacy endpoints:
-                // they turn missing quota into fabricated depleted meters.
-                return .success(StrategyResult(
-                    plan: try await codeAssistTask.value.plan,
-                    lines: [],
-                    replacesPriorQuotaProgress: false,
-                    warning: "Antigravity quota summary could not be read. Existing limits are retained."
-                ))
-            case .unavailable:
-                sawTransientFailure = true
-                break
-            }
-
-            // Legacy: fetchAvailableModels — the full Antigravity model set (Gemini + Claude + GPT-OSS).
-            switch try await usageClient.cloudCode(path: AntigravityUsageClient.fetchModelsPath, token: token, userAgent: "antigravity", body: [:]) {
-            case .authFailed:
-                return .authFailed
-            case .forbidden:
-                return .forbidden
-            case .notFound:
-                sawNotFound = true
-                break
-            case .ok(let data):
-                let lines = AntigravityUsageMapper.buildLines(AntigravityUsageMapper.parseCloudCodeModels(data))
-                if !lines.isEmpty {
-                    return .success(StrategyResult(plan: try await codeAssistTask.value.plan, lines: lines))
-                }
-                sawUnusableSuccess = true
-            case .unavailable:
-                sawTransientFailure = true
-                break
-            }
-
-            // Fallback: the shared loadCodeAssist result supplies both the plan and project.
-            // Its request already ran alongside the summary/models lookups.
-            var plan: String?
-            var project: String?
-            switch try await codeAssistTask.value {
-            case .authFailed: return .authFailed
-            case .forbidden: return .forbidden
-            case .response(let loadedPlan, let loadedProject):
-                plan = loadedPlan
-                project = loadedProject
-            case .notFound:
-                sawNotFound = true
-            case .unavailable: sawTransientFailure = true
-            }
-
-            var quota = try await usageClient.cloudCode(
-                path: AntigravityUsageClient.retrieveQuotaPath,
-                token: token,
-                userAgent: "agy",
-                body: project.map { ["project": $0] } ?? [:]
-            )
-            if project != nil, quota.isUnavailable {
-                quota = try await usageClient.cloudCode(path: AntigravityUsageClient.retrieveQuotaPath, token: token, userAgent: "agy", body: [:])
-            }
-            switch quota {
-            case .authFailed: return .authFailed
-            case .forbidden: return .forbidden
-            case .notFound:
-                sawNotFound = true
-            case .ok(let data):
-                let lines = AntigravityUsageMapper.buildLines(AntigravityUsageMapper.parseQuotaBuckets(data))
-                if !lines.isEmpty { return .success(StrategyResult(plan: plan, lines: lines)) }
-                sawUnusableSuccess = true
-            case .unavailable:
-                sawTransientFailure = true
-            }
-            return (sawNotFound || sawUnusableSuccess) && !sawTransientFailure ? .notFound : .unavailable
-        } onCancel: {
-            codeAssistTask.cancel()
-        }
-    }
-
-    private func loadCodeAssist(token: String) async throws -> CodeAssistLookup {
-        switch try await usageClient.cloudCode(
-            path: AntigravityUsageClient.loadCodeAssistPath,
-            token: token,
-            userAgent: "agy",
-            body: [:]
-        ) {
-        case .authFailed:
-            return .authFailed
-        case .forbidden:
-            return .forbidden
-        case .notFound:
-            return .notFound
-        case .ok(let data):
-            return .response(
-                plan: AntigravityUsageMapper.parseLoadCodeAssistPlan(data),
-                project: AntigravityUsageMapper.parseProject(data)
-            )
-        case .unavailable:
-            return .unavailable
-        }
     }
 }
