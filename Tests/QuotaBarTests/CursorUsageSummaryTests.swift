@@ -91,7 +91,7 @@ final class CursorUsageSummaryMapperTests: XCTestCase {
         XCTAssertNil(progress(mapped.lines, "Total usage"))
         XCTAssertEqual(progress(mapped.lines, "Cursor Models")?.used, 18)
         XCTAssertEqual(progress(mapped.lines, "Other Models")?.used, 7)
-        let descriptor = try XCTUnwrap(CursorProvider().widgetDescriptors.first { $0.id == "cursor.usage" })
+        let descriptor = try XCTUnwrap(CursorSwiftReferenceProvider().widgetDescriptors.first { $0.id == "cursor.usage" })
         XCTAssertTrue(descriptor.hidesWhenEmpty)
     }
 
@@ -244,7 +244,7 @@ final class CursorEnterpriseProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReferenceProvider(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]),
                 keychain: FakeKeychain()

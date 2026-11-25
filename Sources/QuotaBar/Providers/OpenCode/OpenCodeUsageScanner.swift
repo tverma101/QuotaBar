@@ -74,6 +74,10 @@ struct OpenCodeUsageScanner: Sendable {
     static let goProviderID = "opencode-go"
     private static let zenProviderID = "opencode"
 
+    /// OpenCode stores hold hundreds of MB of message JSON, so whole-history reads can outrun the
+    /// accessor's five-second default on a cold machine.
+    static let sqliteQueryTimeout: TimeInterval = 30
+
     var sqlite: SQLiteAccessing
     var databasePaths: @Sendable () throws -> [String]
     /// Roots whose `projects/**/*.jsonl` hold Claude Code sessions routed through the OpenCode
@@ -105,7 +109,7 @@ struct OpenCodeUsageScanner: Sendable {
     private let readFailureReporter: UsageLogReadFailureReporter
 
     init(
-        sqlite: SQLiteAccessing = SQLiteCLIAccessor(),
+        sqlite: SQLiteAccessing = NativeSQLiteAccessor(queryTimeout: OpenCodeUsageScanner.sqliteQueryTimeout),
         databasePaths: @escaping @Sendable () throws -> [String] = OpenCodeUsageScanner.defaultDatabasePaths,
         claudeRoots: @escaping @Sendable () -> [URL] = { [] },
         claudeCacheIdentity: @escaping @Sendable () -> String = { ClaudeLogUsageScanner.parseSourceIdentity() },

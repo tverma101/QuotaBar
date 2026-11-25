@@ -42,16 +42,21 @@ final class ScanWorkerClient {
     private let timeout: TimeInterval
     /// Test hook: overrides the bundle-derived worker executable (nil = derive from the bundle).
     private let executableURLOverride: URL?
+    /// Production folds go through the Rust engine's `refreshBatch`; the child-process path stays
+    /// as the test seam and as a benign fallback when the engine rejects a batch.
+    private let engineBatch: Bool
     private var lastSpawnFailureLogAt: Date?
 
     init(
         runner: any ProcessRunning = SystemProcessRunner(),
         timeout: TimeInterval = 110,
-        executableURLOverride: URL? = nil
+        executableURLOverride: URL? = nil,
+        engineBatch: Bool? = nil
     ) {
         self.runner = runner
         self.timeout = timeout
         self.executableURLOverride = executableURLOverride
+        self.engineBatch = engineBatch ?? (Bundle.main.bundleURL.pathExtension == "app")
     }
 
     /// The child runs only when this process is the installed app bundle: the worker entry point
@@ -177,10 +182,55 @@ final class ScanWorkerClient {
     /// (callers fold in-process); a batched timeout returns per-member timeout error snapshots.
     func fetchFoldSnapshots(
         providers: [String: Provider],
+        engineConfigs: [String: EngineProviderConfig] = [:],
         paced: Bool
     ) async -> FoldBatchResult {
         var result = FoldBatchResult()
-        guard let executableURL = workerExecutableURL, !Task.isCancelled, !providers.isEmpty else {
+        guard !Task.isCancelled, !providers.isEmpty else {
+            return result
+        }
+        if engineBatch {
+            let items = providers.keys.sorted().map { id in
+                RustEngine.BatchItem(
+                    providerID: id,
+                    config: engineConfigs[id]?.values,
+                    defaultIdentityKey: nil
+                )
+            }
+            do {
+                let response = try await RustEngine.refreshBatch(
+                    items: items,
+                    scope: ProviderRefreshContext.scope,
+                    isManual: ProviderRefreshContext.isManual,
+                    skipModelCatalogRefresh: true,
+                    perProviderTimeoutSeconds: Self.batchFoldTimeout,
+                    batchBudgetSeconds: Self.batchFoldTimeout,
+                    paced: paced
+                )
+                result.snapshots = response.snapshots
+                result.identityKeys = response.identityKeys
+                for (providerID, message) in response.errors {
+                    guard let provider = providers[providerID] else { continue }
+                    result.snapshots[providerID] = ProviderSnapshot.error(
+                        provider: provider,
+                        error: ScanWorkerFoldError(message: message),
+                        clearsPriorMenuBarQuotaState: false
+                    )
+                }
+                if !result.snapshots.isEmpty || !result.identityKeys.isEmpty {
+                    return result
+                }
+                AppLog.warn(.refresh, "engine batch returned no fold snapshots; using the child fallback")
+            } catch {
+                guard !Task.isCancelled else { return result }
+                AppLog.warn(.refresh, "engine batch failed; folding in-process: \(error.localizedDescription)")
+                return result
+            }
+            // The app bundle never spawns the Swift child: an empty engine response means the
+            // store folds in-process through the providers' Rust refresh path.
+            return result
+        }
+        guard let executableURL = workerExecutableURL else {
             return result
         }
         let scope = ProviderRefreshContext.scope

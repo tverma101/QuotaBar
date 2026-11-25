@@ -195,7 +195,7 @@ final class LocalLimitsAPITests: XCTestCase {
 
     @MainActor
     func testCopilotPremiumCreditsExportsPersonalCountAndPaidPercent() throws {
-        let credits = CopilotProvider().widgetDescriptors.first { $0.id == "copilot.premium" }!
+        let credits = CopilotSwiftReferenceProvider().widgetDescriptors.first { $0.id == "copilot.premium" }!
         let personal = ProviderSnapshot(
             providerID: "copilot",
             displayName: "Copilot",

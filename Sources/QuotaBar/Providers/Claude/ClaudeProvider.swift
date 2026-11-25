@@ -1,8 +1,11 @@
 import CryptoKit
 import Foundation
 
+/// Test-only oracle for the Swift Claude refresh path, kept so the Swift unit tests can compare the
+/// Rust engine's behavior against the implementation it replaced. Production constructs the
+/// Rust-backed `ClaudeProvider` wrapper instead.
 @MainActor
-final class ClaudeProvider: ProviderRuntime {
+final class ClaudeSwiftReferenceProvider: ProviderRuntime {
     static func makeProvider(id: String = "claude", displayName: String = "Claude") -> Provider {
         Provider(
             id: id,
@@ -36,7 +39,7 @@ final class ClaudeProvider: ProviderRuntime {
     private static let rateLimitCooldown: TimeInterval = 5 * 60
 
     init(
-        provider: Provider = ClaudeProvider.makeProvider(),
+        provider: Provider = ClaudeSwiftReferenceProvider.makeProvider(),
         authStore: ClaudeAuthStore = ClaudeAuthStore(),
         usageClient: ClaudeUsageClient = ClaudeUsageClient(),
         logUsageScanner: ClaudeLogUsageScanner = ClaudeLogUsageScanner(),

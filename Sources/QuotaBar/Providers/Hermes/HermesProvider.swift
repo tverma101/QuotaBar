@@ -1,9 +1,8 @@
 import Foundation
 
 /// Tracks Hermes Agent usage from Hermes' own local session database (`~/.hermes/state.db`, or
-/// `$HERMES_HOME/state.db`): the token buckets Hermes records per session (input, output, cache reads,
-/// cache writes, reasoning), its per-session estimated cost, and its per-model attribution rows.
-/// Read-only, cookie-free, and network-free — see `HermesUsageScanner`.
+/// `$HERMES_HOME/state.db`). All database scanning and metric mapping live in the Rust engine
+/// (`Rust/quotabar-engine/src/providers/hermes`).
 @MainActor
 final class HermesProvider: ProviderRuntime {
     let provider = Provider(
@@ -15,21 +14,7 @@ final class HermesProvider: ProviderRuntime {
         ]
     )
 
-    let authStore: HermesAuthStore
-    let usageScanner: HermesUsageScanner
-    let now: @Sendable () -> Date
-
     var panelMetersRefreshIncludesHistory: Bool { true }
-
-    init(
-        authStore: HermesAuthStore = HermesAuthStore(),
-        usageScanner: HermesUsageScanner = HermesUsageScanner(),
-        now: @escaping @Sendable () -> Date = Date.init
-    ) {
-        self.authStore = authStore
-        self.usageScanner = usageScanner
-        self.now = now
-    }
 
     var widgetDescriptors: [WidgetDescriptor] {
         // Today / This Week / This Month above the fold — the period token rows are the card's core —
@@ -42,56 +27,16 @@ final class HermesProvider: ProviderRuntime {
                 .exportingHistory(
                     scope: .machineLocal,
                     estimatedCost: true,
-                    sourceNote: HermesUsageMapper.sourceNote
+                    sourceNote: "From your Hermes state database"
                 )
         ]
     }
 
     func hasLocalCredentials() async -> Bool {
-        // Same source as `refresh()`: the Hermes state database on disk. Local-only, off the main actor.
-        await loadOffMainActor { [authStore] in authStore.hasDatabase() }
+        await RustEngine.hasLocalCredentials(providerID: provider.id)
     }
 
     func refresh() async -> ProviderSnapshot {
-        // History-skip note: Hermes has no remote quota API — Today/Week/Month tiles ARE the local
-        // DB scan. Leave always-full; unpinned Hermes is omitted from `.menuBar` passes by the filter.
-        let refreshedAt = now()
-
-        let scan: HermesUsageScan?
-        do {
-            // The scanner is a Sendable struct whose async scan hops off the main actor itself.
-            scan = try await usageScanner.scan(now: refreshedAt)
-        } catch {
-            return ProviderSnapshot.error(provider: provider, error: error)
-        }
-
-        guard let scan else {
-            return ProviderSnapshot.error(provider: provider, error: HermesUsageError.notDetected)
-        }
-
-        let lines = HermesUsageMapper.lines(scan: scan, now: refreshedAt)
-        return ProviderSnapshot.make(
-            provider: provider,
-            plan: nil,
-            lines: lines,
-            refreshedAt: refreshedAt,
-            usageHistory: Self.usageHistory(from: scan)
-        )
-    }
-
-    /// Hermes' daily rows have no serving-model detail to price at public API rates. Mark every
-    /// token-bearing day incomplete so Usage History does not present other providers' estimates as
-    /// a complete cross-provider total.
-    nonisolated static func usageHistory(from scan: HermesUsageScan) -> ProviderUsageHistory {
-        let incompleteEstimateDays = Set(
-            scan.daily.daily.lazy.filter { $0.totalTokens > 0 }.map(\.date)
-        )
-        return ProviderUsageHistory(
-            series: scan.daily,
-            modelUsage: nil,
-            unknownModelsByDay: [:],
-            apiEstimateIncompleteDays: incompleteEstimateDays,
-            partialDays: scan.partialDays
-        )
+        await RustEngine.refresh(provider: provider)
     }
 }

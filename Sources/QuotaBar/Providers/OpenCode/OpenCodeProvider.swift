@@ -337,7 +337,7 @@ final class OpenCodeProvider: ProviderRuntime {
         await discoverAccountInventory(authStore: authStore, goKeyStore: goKeyStore).identities
     }
 
-    private static func distinctAccountIdentities(
+    static func distinctAccountIdentities(
         apiKeys: [(name: String, key: String, id: String, source: OpenCodeGoKeySource)]
     ) -> [OpenCodeGoAccountIdentity] {
         var seenCredentials = Set<String>()

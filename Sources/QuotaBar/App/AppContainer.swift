@@ -226,9 +226,9 @@ final class AppContainer {
         })
         let codexClaimServices = Dictionary(uniqueKeysWithValues: codexProviders.map { codex in
             (codex.provider.id, CodexResetClaimService(
-                authStore: codex.authStore.scoped(to: codexIdentityByProviderID[codex.provider.id]),
-                usageClient: codex.usageClient,
-                allowsKeychainFallback: codex.allowsKeychainFallback,
+                providerID: codex.provider.id,
+                engineConfig: codex.rawConfig,
+                verifiedAccountIdentity: codexIdentityByProviderID[codex.provider.id],
                 refreshAfterClaim: { [weak dataStore] in
                     // The bound must outlast the provider's slowest refresh: usage fetch (10s timeout)
                     // + token refresh (15s) + usage retry (10s) + reset-credit fetch (10s) ≈ 45s. The

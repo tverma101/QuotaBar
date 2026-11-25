@@ -78,7 +78,7 @@ final class ZAIQuotaValidationMapperTests: XCTestCase {
 @MainActor
 final class ZAIQuotaValidationProviderTests: XCTestCase {
     func testMissingUsageReportsInvalidResponseInsteadOfZeroMeter() async {
-        let provider = ZAIProvider(
+        let provider = ZAISwiftReferenceProvider(
             zcodeScanner: ZCodeUsageScanner(path: "/nonexistent-quotabar-zcode-test/db.sqlite", leveldbPath: "/nonexistent-quotabar-zcode-test/leveldb"),
             authStore: ZAIAuthStore(
                 files: FakeFiles(),

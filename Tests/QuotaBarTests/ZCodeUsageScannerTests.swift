@@ -137,7 +137,7 @@ final class ZCodeProviderIntegrationTests: XCTestCase {
             CREATE TABLE model_usage (input_tokens INTEGER, output_tokens INTEGER, provider_id TEXT, started_at INTEGER);
             INSERT INTO model_usage VALUES (100, 20, 'account:zai-start-plan', \(nowMs));
             """)
-        let provider = ZAIProvider(
+        let provider = ZAISwiftReferenceProvider(
             zcodeScanner: ZCodeUsageScanner(path: path),
             authStore: ZAIAuthStore(files: FakeFiles(), environment: FakeEnvironment())
         )
@@ -161,7 +161,7 @@ final class ZCodeProviderIntegrationTests: XCTestCase {
             {"cachedAt":1794254217417,"snapshot":{"quota":{"level":"Start","limits":[{"planId":"zcode-v3-start-plan-1109","period":"one_time","unit":300000000,"usage":30023335,"remaining":269976665,"nextResetTime":1794272400000}]},"subscription":{"details":[{"productId":"zcode-v3-start-plan-1109","expireTime":"2026-11-10T01:00:00.000Z"}]}}}
             """
         )
-        let provider = ZAIProvider(
+        let provider = ZAISwiftReferenceProvider(
             zcodeScanner: ZCodeUsageScanner(path: sqlitePath, leveldbPath: levelDir.path),
             authStore: ZAIAuthStore(files: FakeFiles(), environment: FakeEnvironment()),
             now: { Date(timeIntervalSince1970: 1794300000) }
@@ -191,7 +191,7 @@ final class ZCodeProviderIntegrationTests: XCTestCase {
         """
         try Data(payload.utf8).write(to: levelDir.appendingPathComponent("000001.log"))
 
-        let provider = ZAIProvider(
+        let provider = ZAISwiftReferenceProvider(
             zcodeScanner: ZCodeUsageScanner(path: sqlitePath, leveldbPath: levelDir.path),
             authStore: ZAIAuthStore(files: FakeFiles(), environment: FakeEnvironment()),
             now: { Date(timeIntervalSince1970: 1794160000) }
@@ -233,7 +233,7 @@ final class ZCodeProviderIntegrationTests: XCTestCase {
         XCTAssertNil(usage?.weekendBuild?.resetsAt)
         XCTAssertEqual(usage?.weekendBuild?.expiresAt, Date(timeIntervalSince1970: 1794186000))
 
-        let provider = ZAIProvider(
+        let provider = ZAISwiftReferenceProvider(
             zcodeScanner: scanner,
             authStore: ZAIAuthStore(files: FakeFiles(), environment: FakeEnvironment()),
             now: { Date(timeIntervalSince1970: 1794160000) }
@@ -352,7 +352,7 @@ final class ZCodeProviderIntegrationTests: XCTestCase {
             INSERT INTO model_usage VALUES ('1', 1000000, 200000, 500000, 0, 'GLM-5.3-Flash', 'account:zai-start-plan', \(nowMs));
             """)
 
-        let provider = ZAIProvider(
+        let provider = ZAISwiftReferenceProvider(
             zcodeScanner: ZCodeUsageScanner(path: path),
             authStore: ZAIAuthStore(files: FakeFiles(), environment: FakeEnvironment()),
             pricing: { TestPricing.bundled },
@@ -404,7 +404,7 @@ final class ZCodeLayoutTests: XCTestCase {
     func testLayoutSeedsSpendTilesAndPrunesRedundantTokens() throws {
         let suite = "ZCodeLayoutTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        let provider = ZAIProvider(zcodeScanner: ZCodeUsageScanner(path: "/missing-zcode-test"))
+        let provider = ZAISwiftReferenceProvider(zcodeScanner: ZCodeUsageScanner(path: "/missing-zcode-test"))
         let registry = WidgetRegistry(providers: [provider.provider], descriptors: provider.widgetDescriptors)
         let persistence = LayoutPersistence(defaults: defaults, storageKey: "layout")
         persistence.savePlaced([PlacedWidget(descriptorID: "zai.session"), PlacedWidget(descriptorID: "zai.zcodeTokens")])
@@ -427,7 +427,7 @@ final class ZCodeLayoutTests: XCTestCase {
         let usage = try scanner.usage(now: expiredNow)
         XCTAssertNil(usage?.weekendBuild, "Expired allowance must auto-remove")
 
-        let provider = ZAIProvider(
+        let provider = ZAISwiftReferenceProvider(
             zcodeScanner: scanner,
             authStore: ZAIAuthStore(files: FakeFiles(), environment: FakeEnvironment()),
             now: { expiredNow }
@@ -454,7 +454,7 @@ final class ZCodeLayoutTests: XCTestCase {
         XCTAssertEqual(usage?.weekendBuild?.remaining, 500_000_000)
         XCTAssertEqual(usage?.weekendBuild?.effectiveAt, OpenUsageISO8601.date(from: "2026-11-10T15:00:00.000Z"))
 
-        let provider = ZAIProvider(
+        let provider = ZAISwiftReferenceProvider(
             zcodeScanner: scanner,
             authStore: ZAIAuthStore(files: FakeFiles(), environment: FakeEnvironment()),
             now: { currentNow }

@@ -615,6 +615,11 @@ final class WidgetDataStore {
                 }
                 let fetched = await self.scanWorker.fetchFoldSnapshots(
                     providers: staleProviders,
+                    engineConfigs: staleIDs.reduce(into: [:]) { configs, id in
+                        if let config = providersByID[id]?.engineConfig {
+                            configs[id] = config
+                        }
+                    },
                     paced: ProviderRefreshContext.accountingCPUThrottleEnabled
                 )
                 prefetchedFoldSnapshots = fetched.snapshots

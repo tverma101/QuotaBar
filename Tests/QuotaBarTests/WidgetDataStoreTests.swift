@@ -2417,7 +2417,7 @@ final class WidgetDataStoreTests: XCTestCase {
     }
 
     func testCursorSpendValueTooltipUsesUsageHistorySourceNote() async {
-        let cursor = CursorProvider()
+        let cursor = CursorSwiftReferenceProvider()
         let provider = cursor.provider
         let combined = cursor.widgetDescriptors.first { $0.id == "cursor.last30" }!
         let runtime = TestProviderRuntime(

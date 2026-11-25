@@ -19,7 +19,7 @@ final class CodexAutoResetClaimTests: XCTestCase {
     private func service(
         body: Data,
         consumeCode: String = "reset"
-    ) -> (CodexResetClaimService, RoutingHTTPClient) {
+    ) -> (CodexResetClaimReferenceService, RoutingHTTPClient) {
         let http = RoutingHTTPClient { request in
             switch request.url {
             case CodexUsageClient.resetCreditsURL:
@@ -32,7 +32,7 @@ final class CodexAutoResetClaimTests: XCTestCase {
             }
         }
         return (
-            CodexResetClaimService(
+            CodexResetClaimReferenceService(
                 usageClient: CodexUsageClient(http: http),
                 credentialCandidates: { [("token", "account-X")] }
             ), http
@@ -116,7 +116,7 @@ final class CodexAutoResetClaimTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 403, headers: [:], body: Data())
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("token-A", "acct-A"), ("token-B", "acct-B")] }
         )
@@ -168,7 +168,7 @@ final class CodexAutoResetClaimTests: XCTestCase {
             XCTFail("a retry does not require a fresh credit list")
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("token-A", "acct-A"), ("token-B", "acct-B")] }
         )
@@ -218,7 +218,7 @@ final class CodexAutoResetClaimTests: XCTestCase {
             }
             return try await gate.waitForConsumeResponse()
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("token", "account-X")] }
         )
@@ -251,7 +251,7 @@ final class CodexAutoResetClaimTests: XCTestCase {
             }
             return try await gate.waitForConsumeResponse()
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("token", "account-X")] }
         )

@@ -90,9 +90,9 @@ final class ResetDisplayTests: XCTestCase {
         // must fail here, not ship silently. Claude must stay on `.missingResetDate`: its whole-percent
         // utilization reads 0 for an in-flight window under 1%, so `.zeroUsage` would regress #1160.
         let providers: [ProviderRuntime] = [
-            ClaudeProvider(), CodexProvider(), CursorProvider(),
-            AntigravityProvider(), CopilotProvider(), DevinProvider(),
-            GrokProvider(), OpenRouterProvider(), ZAIProvider(), OpenCodeProvider()
+            ClaudeSwiftReferenceProvider(), CodexSwiftReferenceProvider(), CursorSwiftReferenceProvider(),
+            AntigravityProvider(), CopilotSwiftReferenceProvider(), DevinSwiftReferenceProvider(),
+            GrokSwiftReferenceProvider(), OpenRouterSwiftReferenceProvider(), ZAISwiftReferenceProvider(), OpenCodeProvider()
         ]
         let descriptors = providers.flatMap(\.widgetDescriptors)
         let signals = Dictionary(uniqueKeysWithValues: descriptors

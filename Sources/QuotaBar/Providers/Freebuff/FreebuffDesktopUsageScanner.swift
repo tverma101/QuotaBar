@@ -126,7 +126,8 @@ actor FreebuffDesktopUsageScanner {
     private var cachedSessionChats: [String: SessionChatInfo] = [:]
 
     init(
-        sqlite: any SQLiteAccessing = SQLiteCLIAccessor(),
+        // Large project stores (GB-scale turn history) need more than the five-second default.
+        sqlite: any SQLiteAccessing = NativeSQLiteAccessor(queryTimeout: 30),
         databasePaths: @escaping @Sendable () throws -> [String] = FreebuffDesktopUsageScanner.defaultDatabasePaths,
         sessionEndsPath: @escaping @Sendable () -> String? = FreebuffDesktopUsageScanner.defaultSessionEndsPath,
         parseMetrics: @escaping @Sendable (String) -> [String: Any]? = { ProviderParse.jsonObject(Data($0.utf8)) },

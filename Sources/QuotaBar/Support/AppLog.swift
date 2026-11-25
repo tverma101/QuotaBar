@@ -1,3 +1,4 @@
+import CQuotabarCore
 import Foundation
 import os
 
@@ -111,6 +112,21 @@ enum AppLog {
         levelLock.lock()
         cachedSeverity = severity
         levelLock.unlock()
+        // The Rust engine gates its own lines on the same floor, so it skips formatting what this
+        // log would drop anyway.
+        qb_engine_set_log_level(UInt32(max(0, severity)))
+    }
+
+    /// The current level floor (0 error ... 3 debug).
+    static var currentSeverity: Int {
+        levelLock.lock()
+        defer { levelLock.unlock() }
+        return cachedSeverity
+    }
+
+    /// Entry point for lines the Rust engine emits (already redacted there; redacted again here).
+    static func engine(severity: Int, tag: String, message: String) {
+        emit(Level(rawValue: severity) ?? .debug, tag, { message })
     }
 
     // MARK: - Public API

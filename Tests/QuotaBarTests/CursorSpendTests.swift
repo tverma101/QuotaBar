@@ -496,7 +496,7 @@ final class CursorSpendProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReferenceProvider(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]),
                 keychain: FakeKeychain()
@@ -557,7 +557,7 @@ final class CursorSpendProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReferenceProvider(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]),
                 keychain: FakeKeychain()
@@ -583,7 +583,7 @@ final class CursorSpendProviderTests: XCTestCase {
     }
 
     func testSpendTileRendersCombinedCostAndTokensWithValueTooltip() async {
-        let cursor = CursorProvider()
+        let cursor = CursorSwiftReferenceProvider()
         let descriptor = try! XCTUnwrap(cursor.widgetDescriptors.first { $0.id == "cursor.today" })
 
         // The combined tile joins the dollar and the labeled token count. The render shape for a zero

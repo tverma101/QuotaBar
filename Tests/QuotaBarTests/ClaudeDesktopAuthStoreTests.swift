@@ -232,13 +232,14 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
     }
 
     @MainActor
-    func testGenericClaudeFallbackReusesDiscoverySafeStorageKeyCache() throws {
+    func testGenericClaudeFallbackUsesTheRustRuntime() throws {
         let keyCache = SafeStorageKeyCache()
         let provider = try XCTUnwrap(
             ProviderCatalog.make(claudeDesktopKeyCache: keyCache).compactMap { $0 as? ClaudeProvider }.first
         )
 
-        XCTAssertTrue(provider.authStore.desktop.keyCache === keyCache)
+        XCTAssertEqual(provider.provider.id, "claude")
+        XCTAssertNil(provider.engineConfig)
     }
 
     @MainActor
@@ -284,16 +285,16 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
             claudeIdentityKeys: assembly.identityKeysByCard,
             claudeDesktopKeyCache: assembly.desktopKeyCache
         ).compactMap { $0 as? ClaudeProvider }
-        XCTAssertTrue(providers.allSatisfy { $0.authStore.desktop.keyCache === assembly.desktopKeyCache })
+        XCTAssertEqual(providers.map { $0.engineConfig?.values["desktopOrganization"] as? String }, [otherOrganization, organization])
         XCTAssertEqual(fixture.keyReader.calls.count, 1, "discovery performs one successful Safe Storage read")
         _ = try assembly.desktopKeyCache.getOrLoad {
             try fixture.keyReader.readPassword(allowInteraction: false).map { Data($0.utf8) }
         }
         XCTAssertEqual(fixture.keyReader.calls.count, 1, "the provider cache reuses the discovery key")
         XCTAssertEqual(providers.map { $0.provider.id }, [workID, "claude"])
-        XCTAssertEqual(providers.map { $0.authStore.desktopOnly }, [false, true])
-        XCTAssertEqual(providers.map { $0.authStore.preferOrganizationScopedDesktop }, [true, false])
-        XCTAssertFalse(providers.contains { $0.allowsUnattributedPiUsage })
+        XCTAssertEqual(providers.map { $0.engineConfig?.values["desktopOnly"] as? Bool ?? false }, [false, true])
+        XCTAssertEqual(providers.map { $0.engineConfig?.values["preferOrganizationScopedDesktop"] as? Bool ?? false }, [true, false])
+        XCTAssertFalse(providers.contains { $0.engineConfig?.values["allowsUnattributedPiUsage"] as? Bool ?? false })
 
         let withoutDesktop = ProviderAccountAssembly.make(
             observer: observer, accountsStore: ProviderAccountsStore(defaults: defaults), families: ["claude"],
@@ -1162,9 +1163,9 @@ final class ClaudeDesktopAuthStoreTests: XCTestCase {
         keychainJSON: String?,
         keychain: (any KeychainAccessing)? = nil,
         httpClient: any HTTPClient
-    ) -> ClaudeProvider {
+    ) -> ClaudeSwiftReferenceProvider {
         let now = now
-        return ClaudeProvider(
+        return ClaudeSwiftReferenceProvider(
             authStore: makeAuthStore(fixture, environment: environment, keychainJSON: keychainJSON, keychain: keychain),
             usageClient: ClaudeUsageClient(httpClient: httpClient),
             logUsageScanner: ClaudeLogFixture.scanner(home: nil),

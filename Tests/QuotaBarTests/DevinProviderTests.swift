@@ -180,7 +180,7 @@ final class DevinProviderTests: XCTestCase {
         let httpClient = QueueHTTPClient(responses: [
             HTTPResponse(statusCode: 200, headers: [:], body: try makeUserStatusBody())
         ])
-        let provider = DevinProvider(
+        let provider = DevinSwiftReferenceProvider(
             authStore: DevinAuthStore(
                 files: FakeFiles([
                     DevinAuthStore.credentialsPath: """
@@ -212,7 +212,7 @@ final class DevinProviderTests: XCTestCase {
             HTTPResponse(statusCode: 401, headers: [:], body: Data("{}".utf8)),
             HTTPResponse(statusCode: 200, headers: [:], body: try makeUserStatusBody(planName: "Teams"))
         ])
-        let provider = DevinProvider(
+        let provider = DevinSwiftReferenceProvider(
             authStore: DevinAuthStore(
                 files: FakeFiles([
                     DevinAuthStore.credentialsPath: """
@@ -236,7 +236,7 @@ final class DevinProviderTests: XCTestCase {
 
     func testCancellationOfFirstCredentialSourceStopsBeforeAppAuthFallback() async {
         let httpClient = RoutingHTTPClient { _ in throw CancellationError() }
-        let provider = DevinProvider(
+        let provider = DevinSwiftReferenceProvider(
             authStore: DevinAuthStore(
                 files: FakeFiles([
                     DevinAuthStore.credentialsPath: "windsurf_api_key = \"devin-session-token$cli\"\napi_server_url = \"https://server.codeium.test\""
@@ -254,7 +254,7 @@ final class DevinProviderTests: XCTestCase {
     }
 
     func testRefreshReturnsLoginHintWithoutAuth() async {
-        let provider = DevinProvider(
+        let provider = DevinSwiftReferenceProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite()),
             usageClient: DevinUsageClient(http: QueueHTTPClient())
         )
@@ -272,7 +272,7 @@ final class DevinProviderTests: XCTestCase {
 
     func testUnreadableCredentialsFileKeepsProviderVisibleAndReportsCredentialAccess() async {
         let http = QueueHTTPClient()
-        let provider = DevinProvider(
+        let provider = DevinSwiftReferenceProvider(
             authStore: DevinAuthStore(
                 files: UnreadableDevinFiles(path: DevinAuthStore.credentialsPath),
                 sqlite: FakeSQLite()
@@ -291,7 +291,7 @@ final class DevinProviderTests: XCTestCase {
 
     func testUnreadableAppDatabaseKeepsProviderVisibleAndReportsCredentialAccess() async {
         let http = QueueHTTPClient()
-        let provider = DevinProvider(
+        let provider = DevinSwiftReferenceProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: UnreadableDevinSQLite()),
             usageClient: DevinUsageClient(http: http)
         )
@@ -313,11 +313,11 @@ final class DevinProviderTests: XCTestCase {
     }
 
     func testServerErrorIsReportedWithItsStatusAndLogged() async throws {
-        DiagnosticGate.clearFailure(DevinProvider.httpFailureDiagnosticKeyPrefix + "503")
+        DiagnosticGate.clearFailure(DevinSwiftReferenceProvider.httpFailureDiagnosticKeyPrefix + "503")
         let http = QueueHTTPClient(responses: [
             HTTPResponse(statusCode: 503, headers: [:], body: Data("{}".utf8))
         ])
-        let provider = DevinProvider(
+        let provider = DevinSwiftReferenceProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)),
             usageClient: DevinUsageClient(http: http)
         )
@@ -330,11 +330,11 @@ final class DevinProviderTests: XCTestCase {
     }
 
     func testUnreadableResponseIsReportedAsADecodingProblemAndLogged() async throws {
-        DiagnosticGate.clearFailure(DevinProvider.invalidResponseDiagnosticKey)
+        DiagnosticGate.clearFailure(DevinSwiftReferenceProvider.invalidResponseDiagnosticKey)
         let http = QueueHTTPClient(responses: [
             HTTPResponse(statusCode: 200, headers: [:], body: Data("{\"unexpected\":true}".utf8))
         ])
-        let provider = DevinProvider(
+        let provider = DevinSwiftReferenceProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)),
             usageClient: DevinUsageClient(http: http)
         )
@@ -348,8 +348,8 @@ final class DevinProviderTests: XCTestCase {
     }
 
     func testTransportFailureIsReportedAsAConnectionProblemAndLogged() async throws {
-        DiagnosticGate.clearFailure(DevinProvider.transportFailureDiagnosticKey)
-        let provider = DevinProvider(
+        DiagnosticGate.clearFailure(DevinSwiftReferenceProvider.transportFailureDiagnosticKey)
+        let provider = DevinSwiftReferenceProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)),
             usageClient: DevinUsageClient(http: ThrowingDevinHTTPClient())
         )

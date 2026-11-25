@@ -461,7 +461,7 @@ final class CopilotOrgBillingMapperTests: XCTestCase {
 @MainActor
 final class CopilotProviderTests: XCTestCase {
     func testUnreadableEditorConfigStaysDetectedAndRefreshShowsRepairMessage() async {
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: CopilotAuthStore(
                 files: UnreadableFiles(present: [CopilotAuthStore.editorAppsPath]),
                 keychain: FakeKeychain()
@@ -481,7 +481,7 @@ final class CopilotProviderTests: XCTestCase {
     }
 
     func testMalformedEditorConfigStaysDetectedAndRefreshShowsInvalidCredentialError() async {
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: CopilotAuthStore(
                 files: FakeFiles([CopilotAuthStore.editorAppsPath: #"{ "github.com": { "oauth_token": 7 } }"#]),
                 keychain: FakeKeychain()
@@ -505,7 +505,7 @@ final class CopilotProviderTests: XCTestCase {
         KeychainPermissionGate.shared.reset(key)
         defer { KeychainPermissionGate.shared.reset(key) }
         let keychain = CountingCopilotKeychain("go-keyring-base64:" + Data("other_account".utf8).base64EncodedString())
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: CopilotAuthStore(
                 files: UnreadableFiles(present: [CopilotAuthStore.ghHostsPath]),
                 keychain: keychain
@@ -522,7 +522,7 @@ final class CopilotProviderTests: XCTestCase {
     }
 
     func testNotLoggedInWhenNoToken() async {
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: CopilotAuthStore(files: FakeFiles(), keychain: FakeKeychain()),
             usageClient: CopilotUsageClient(http: FakeHTTPClient(response: ok(makePaidBody())))
         )
@@ -533,7 +533,7 @@ final class CopilotProviderTests: XCTestCase {
     }
 
     func testTokenInvalidOn401() async {
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: FakeHTTPClient(response: HTTPResponse(statusCode: 401, headers: [:], body: Data())))
         )
@@ -544,7 +544,7 @@ final class CopilotProviderTests: XCTestCase {
     }
 
     func testForbiddenOn403DoesNotTellUserToReauthenticate() async {
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: FakeHTTPClient(response: HTTPResponse(statusCode: 403, headers: [:], body: Data())))
         )
@@ -557,7 +557,7 @@ final class CopilotProviderTests: XCTestCase {
 
     func testMapsLinesAndSendsTokenHeaderOnSuccess() async throws {
         let http = FakeHTTPClient(response: ok(makePaidBody()))
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: http),
             now: { Date(timeIntervalSince1970: 1_800_000_000) }
@@ -588,7 +588,7 @@ final class CopilotProviderTests: XCTestCase {
         XCTAssertNil(snapshot.errorCategory)
         XCTAssertEqual(snapshot.plan, "Business")
         XCTAssertTrue(snapshot.lines.isEmpty)
-        XCTAssertNil(defaults.string(forKey: CopilotProvider.billingOrgDefaultsKey))
+        XCTAssertNil(defaults.string(forKey: CopilotSwiftReferenceProvider.billingOrgDefaultsKey))
     }
 
     func testOrgManagedSeatWithPersonalCreditsShowsThemDespiteForbiddenOrgBilling() async {
@@ -608,7 +608,7 @@ final class CopilotProviderTests: XCTestCase {
         XCTAssertNil(snapshot.errorCategory)
         XCTAssertEqual(snapshot.plan, "Business")
         XCTAssertEqual(countValue(snapshot.lines, "Credits"), 2111)
-        XCTAssertNil(defaults.string(forKey: CopilotProvider.billingOrgDefaultsKey))
+        XCTAssertNil(defaults.string(forKey: CopilotSwiftReferenceProvider.billingOrgDefaultsKey))
     }
 
     func testOrgManagedSeatWithPersonalCreditsAlsoKeepsOrgBillingLinesForAdmins() async {
@@ -630,7 +630,7 @@ final class CopilotProviderTests: XCTestCase {
         XCTAssertEqual(orgCount(snapshot.lines, "Org Credits") ?? -1, 298.698546, accuracy: 0.0001)
         XCTAssertEqual(orgDollars(snapshot.lines, "Org Spend"), 0)
         XCTAssertNil(snapshot.lines.first(where: { $0.label == "Extra Usage" }))
-        XCTAssertEqual(defaults.string(forKey: CopilotProvider.billingOrgDefaultsKey), "acme")
+        XCTAssertEqual(defaults.string(forKey: CopilotSwiftReferenceProvider.billingOrgDefaultsKey), "acme")
     }
 
     func testUsesCachedOrgWithoutReprobing() async {
@@ -639,7 +639,7 @@ final class CopilotProviderTests: XCTestCase {
             ("/orgs/acme/settings/billing/usage/summary", ok(makeOrgSummaryBody()))
         ])
         let defaults = freshDefaults()
-        defaults.set("acme", forKey: CopilotProvider.billingOrgDefaultsKey)
+        defaults.set("acme", forKey: CopilotSwiftReferenceProvider.billingOrgDefaultsKey)
         let provider = makeOrgProvider(http: http, defaults: defaults)
 
         let snapshot = await provider.refresh()
@@ -658,13 +658,13 @@ final class CopilotProviderTests: XCTestCase {
             ("/orgs/acme/settings/billing/usage/summary", ok(makeOrgSummaryBody()))
         ])
         let defaults = freshDefaults()
-        defaults.set("oldorg", forKey: CopilotProvider.billingOrgDefaultsKey)
+        defaults.set("oldorg", forKey: CopilotSwiftReferenceProvider.billingOrgDefaultsKey)
         let provider = makeOrgProvider(http: http, defaults: defaults)
 
         let snapshot = await provider.refresh()
 
         XCTAssertNotNil(orgCount(snapshot.lines, "Org Credits"))
-        XCTAssertEqual(defaults.string(forKey: CopilotProvider.billingOrgDefaultsKey), "acme")
+        XCTAssertEqual(defaults.string(forKey: CopilotSwiftReferenceProvider.billingOrgDefaultsKey), "acme")
     }
 
     func testCachedOrgAlreadyInDiscoveryListIsQueriedOnlyOnce() async {
@@ -674,7 +674,7 @@ final class CopilotProviderTests: XCTestCase {
             ("/user/orgs", okJSON([["login": "acme"]]))
         ])
         let defaults = freshDefaults()
-        defaults.set("acme", forKey: CopilotProvider.billingOrgDefaultsKey)
+        defaults.set("acme", forKey: CopilotSwiftReferenceProvider.billingOrgDefaultsKey)
         let provider = makeOrgProvider(http: http, defaults: defaults)
 
         let snapshot = await provider.refresh()
@@ -702,7 +702,7 @@ final class CopilotProviderTests: XCTestCase {
         let snapshot = await provider.refresh()
 
         XCTAssertNotNil(orgCount(snapshot.lines, "Org Credits"))
-        XCTAssertEqual(defaults.string(forKey: CopilotProvider.billingOrgDefaultsKey), "acme")
+        XCTAssertEqual(defaults.string(forKey: CopilotSwiftReferenceProvider.billingOrgDefaultsKey), "acme")
     }
 
     func testOrgDiscoveryFollowsPaginationAndFindsBillingOrgAfterPageOne() async {
@@ -828,7 +828,7 @@ final class CopilotProviderTests: XCTestCase {
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
         }
         let defaults = freshDefaults()
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: http),
             orgBillingClient: CopilotOrgBillingClient(http: http),
@@ -838,7 +838,7 @@ final class CopilotProviderTests: XCTestCase {
 
         _ = await provider.refresh()
 
-        XCTAssertNil(defaults.object(forKey: CopilotProvider.billingOrgProbeRetryAfterKey),
+        XCTAssertNil(defaults.object(forKey: CopilotSwiftReferenceProvider.billingOrgProbeRetryAfterKey),
                      "an incomplete membership scan must not be cached as a complete no-result scan")
         _ = await provider.refresh()
         XCTAssertEqual(http.requests.filter { $0.url.path == "/user/orgs" }.count, 4,
@@ -861,7 +861,7 @@ final class CopilotProviderTests: XCTestCase {
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
         }
         let defaults = freshDefaults()
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: http),
             orgBillingClient: CopilotOrgBillingClient(http: http),
@@ -871,7 +871,7 @@ final class CopilotProviderTests: XCTestCase {
 
         _ = await provider.refresh()
         XCTAssertEqual(
-            defaults.object(forKey: CopilotProvider.billingOrgRateLimitRetryAfterKey) as? Date,
+            defaults.object(forKey: CopilotSwiftReferenceProvider.billingOrgRateLimitRetryAfterKey) as? Date,
             clock.addingTimeInterval(120)
         )
         _ = await provider.refresh()
@@ -891,7 +891,7 @@ final class CopilotProviderTests: XCTestCase {
             ("/user/orgs", okJSON([["login": "acme"]])),
             ("/orgs/acme/settings/billing/usage/summary", HTTPResponse(statusCode: 404, headers: [:], body: Data()))
         ])
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: http),
             orgBillingClient: CopilotOrgBillingClient(http: http),
@@ -931,7 +931,7 @@ final class CopilotProviderTests: XCTestCase {
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
         }
         let defaults = freshDefaults()
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: http),
             orgBillingClient: CopilotOrgBillingClient(http: http),
@@ -943,7 +943,7 @@ final class CopilotProviderTests: XCTestCase {
         XCTAssertEqual(http.requests.filter { $0.url.path == "/orgs/acme/settings/billing/usage/summary" }.count, 0,
                        "a rate-limit response stops the rest of this refresh")
         XCTAssertEqual(
-            defaults.object(forKey: CopilotProvider.billingOrgRateLimitRetryAfterKey) as? Date,
+            defaults.object(forKey: CopilotSwiftReferenceProvider.billingOrgRateLimitRetryAfterKey) as? Date,
             clock.addingTimeInterval(120),
             "the server's deadline is retained"
         )
@@ -975,7 +975,7 @@ final class CopilotProviderTests: XCTestCase {
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
         }
         let defaults = freshDefaults()
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: http),
             orgBillingClient: CopilotOrgBillingClient(http: http),
@@ -985,7 +985,7 @@ final class CopilotProviderTests: XCTestCase {
 
         _ = await provider.refresh()
         XCTAssertEqual(
-            defaults.object(forKey: CopilotProvider.billingOrgRateLimitRetryAfterKey) as? Date,
+            defaults.object(forKey: CopilotSwiftReferenceProvider.billingOrgRateLimitRetryAfterKey) as? Date,
             reset
         )
         XCTAssertEqual(http.requests.filter { $0.url.path == "/user/orgs" }.count, 1)
@@ -1018,7 +1018,7 @@ final class CopilotProviderTests: XCTestCase {
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
         }
         let defaults = freshDefaults()
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: http),
             orgBillingClient: CopilotOrgBillingClient(http: http),
@@ -1029,7 +1029,7 @@ final class CopilotProviderTests: XCTestCase {
         _ = await provider.refresh()
 
         XCTAssertEqual(
-            defaults.object(forKey: CopilotProvider.billingOrgRateLimitRetryAfterKey) as? Date,
+            defaults.object(forKey: CopilotSwiftReferenceProvider.billingOrgRateLimitRetryAfterKey) as? Date,
             reset
         )
         XCTAssertEqual(http.requests.filter { $0.url.path.contains("/settings/billing/usage/summary") }.count, 1)
@@ -1059,7 +1059,7 @@ final class CopilotProviderTests: XCTestCase {
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
         }
         let defaults = freshDefaults()
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: http),
             orgBillingClient: CopilotOrgBillingClient(http: http),
@@ -1070,7 +1070,7 @@ final class CopilotProviderTests: XCTestCase {
         let snapshot = await provider.refresh()
         XCTAssertNotNil(orgCount(snapshot.lines, "Org Credits"), "the successful summary remains usable")
         XCTAssertEqual(
-            defaults.object(forKey: CopilotProvider.billingOrgRateLimitRetryAfterKey) as? Date,
+            defaults.object(forKey: CopilotSwiftReferenceProvider.billingOrgRateLimitRetryAfterKey) as? Date,
             reset
         )
 
@@ -1100,7 +1100,7 @@ final class CopilotProviderTests: XCTestCase {
             return HTTPResponse(statusCode: 500, headers: [:], body: Data())
         }
         let defaults = freshDefaults()
-        let provider = CopilotProvider(
+        let provider = CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: http),
             orgBillingClient: CopilotOrgBillingClient(http: http),
@@ -1111,7 +1111,7 @@ final class CopilotProviderTests: XCTestCase {
         _ = await provider.refresh()
 
         XCTAssertEqual(
-            defaults.object(forKey: CopilotProvider.billingOrgRateLimitRetryAfterKey) as? Date,
+            defaults.object(forKey: CopilotSwiftReferenceProvider.billingOrgRateLimitRetryAfterKey) as? Date,
             clock.addingTimeInterval(300),
             "when GitHub gives no reset or Retry-After, pause conservatively"
         )
@@ -1152,14 +1152,14 @@ final class CopilotProviderTests: XCTestCase {
             ("/orgs/acme/settings/billing/usage/summary", HTTPResponse(statusCode: 503, headers: [:], body: Data()))
         ])
         let defaults = freshDefaults()
-        defaults.set("acme", forKey: CopilotProvider.billingOrgDefaultsKey)
+        defaults.set("acme", forKey: CopilotSwiftReferenceProvider.billingOrgDefaultsKey)
         let provider = makeOrgProvider(http: http, defaults: defaults)
 
         let snapshot = await provider.refresh()
 
         XCTAssertNil(snapshot.errorCategory)
         XCTAssertTrue(snapshot.lines.isEmpty)
-        XCTAssertEqual(defaults.string(forKey: CopilotProvider.billingOrgDefaultsKey), "acme")
+        XCTAssertEqual(defaults.string(forKey: CopilotSwiftReferenceProvider.billingOrgDefaultsKey), "acme")
         XCTAssertFalse(http.requests.contains { $0.url.absoluteString.contains("/user/orgs") })
     }
 
@@ -1175,8 +1175,8 @@ final class CopilotProviderTests: XCTestCase {
         XCTAssertEqual(http.requests.count, 1)
     }
 
-    private func makeOrgProvider(http: RoutingHTTPClient, defaults: UserDefaults) -> CopilotProvider {
-        CopilotProvider(
+    private func makeOrgProvider(http: RoutingHTTPClient, defaults: UserDefaults) -> CopilotSwiftReferenceProvider {
+        CopilotSwiftReferenceProvider(
             authStore: editorTokenStore(),
             usageClient: CopilotUsageClient(http: http),
             orgBillingClient: CopilotOrgBillingClient(http: http),

@@ -33,6 +33,12 @@ let package = Package(
             publicHeadersPath: "include",
             linkerSettings: [
                 .linkedLibrary("quotabar_core"),
+                // System libraries the Rust engine needs (`cargo rustc -- --print native-static-libs`):
+                // TLS and certificate trust, the system proxy settings, and iconv.
+                .linkedFramework("Security"),
+                .linkedFramework("SystemConfiguration"),
+                .linkedFramework("CoreFoundation"),
+                .linkedLibrary("iconv"),
                 // The Rust static library is produced by script/build_rust_core.sh (run
                 // automatically by build_and_run.sh, ci.yml and script/test_suites.sh).
                 .unsafeFlags(["-L", rustCoreReleaseLibrary])

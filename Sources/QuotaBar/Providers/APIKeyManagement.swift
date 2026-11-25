@@ -17,7 +17,7 @@ import Foundation
 ///
 /// The auth store's existing precedence (config file > env) is what makes a saved key an override
 /// for free; this type just reports which combination is present.
-enum APIKeyStatus: Sendable, Equatable {
+enum APIKeyStatus: String, Sendable, Equatable, Decodable {
     case notSet
     case fromEnvironment
     case saved

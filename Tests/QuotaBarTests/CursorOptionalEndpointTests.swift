@@ -296,8 +296,8 @@ final class CursorOptionalEndpointTests: XCTestCase {
     private func makeProvider(
         accessToken: String = makeCursorJWT(),
         handler: @escaping @Sendable (HTTPRequest) async throws -> HTTPResponse
-    ) -> CursorProvider {
-        CursorProvider(
+    ) -> CursorSwiftReferenceProvider {
+        CursorSwiftReferenceProvider(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]),
                 keychain: FakeKeychain()

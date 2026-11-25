@@ -268,7 +268,7 @@ final class OpenRouterUsageMapperTests: XCTestCase {
 final class OpenRouterProviderTests: XCTestCase {
     func testCreditsCancellationStopsBeforeKeyEndpoint() async {
         let http = RoutingHTTPClient { _ in throw CancellationError() }
-        let provider = OpenRouterProvider(
+        let provider = OpenRouterSwiftReferenceProvider(
             authStore: makeAuthStore(key: "sk-or-test"),
             usageClient: OpenRouterUsageClient(http: http)
         )
@@ -281,7 +281,7 @@ final class OpenRouterProviderTests: XCTestCase {
     }
 
     func testRefreshMapsBothEndpoints() async throws {
-        let provider = OpenRouterProvider(
+        let provider = OpenRouterSwiftReferenceProvider(
             authStore: makeAuthStore(key: "sk-or-test"),
             usageClient: OpenRouterUsageClient(http: RoutingHTTPClient { request in
                 if request.url.absoluteString == OpenRouterUsageClient.creditsURL {
@@ -303,7 +303,7 @@ final class OpenRouterProviderTests: XCTestCase {
     }
 
     func testRefreshSurvivesKeyEndpointFailure() async {
-        let provider = OpenRouterProvider(
+        let provider = OpenRouterSwiftReferenceProvider(
             authStore: makeAuthStore(key: "sk-or-test"),
             usageClient: OpenRouterUsageClient(http: RoutingHTTPClient { request in
                 if request.url.absoluteString == OpenRouterUsageClient.creditsURL {
@@ -321,7 +321,7 @@ final class OpenRouterProviderTests: XCTestCase {
 
     func testRefreshShowsKeyDataWhenCreditsForbidden() async {
         // If `/credits` is gated (403) but `/key` succeeds, still show the spend rows rather than erroring.
-        let provider = OpenRouterProvider(
+        let provider = OpenRouterSwiftReferenceProvider(
             authStore: makeAuthStore(key: "sk-or-test"),
             usageClient: OpenRouterUsageClient(http: RoutingHTTPClient { request in
                 if request.url.absoluteString == OpenRouterUsageClient.creditsURL {
@@ -340,7 +340,7 @@ final class OpenRouterProviderTests: XCTestCase {
     }
 
     func testRefreshWithoutKeyReportsNotLoggedIn() async {
-        let provider = OpenRouterProvider(
+        let provider = OpenRouterSwiftReferenceProvider(
             authStore: OpenRouterAuthStore(files: FakeFiles(), environment: FakeEnvironment()),
             usageClient: OpenRouterUsageClient(http: RoutingHTTPClient { _ in
                 XCTFail("should not hit the network without a key")
@@ -356,7 +356,7 @@ final class OpenRouterProviderTests: XCTestCase {
 
     func testUnreadableSavedKeyRemainsDetectedAndSurfacesCredentialAccess() async {
         let path = OpenRouterAuthStore.configPaths[0]
-        let provider = OpenRouterProvider(
+        let provider = OpenRouterSwiftReferenceProvider(
             authStore: OpenRouterAuthStore(
                 files: UnreadableFiles(present: [path]),
                 environment: FakeEnvironment()
@@ -376,7 +376,7 @@ final class OpenRouterProviderTests: XCTestCase {
 
     func testRefreshOnAuthFailureReportsInvalidKey() async {
         // Both endpoints reject the key — nothing usable comes back, so it's a hard auth failure.
-        let provider = OpenRouterProvider(
+        let provider = OpenRouterSwiftReferenceProvider(
             authStore: makeAuthStore(key: "sk-or-bad"),
             usageClient: OpenRouterUsageClient(http: RoutingHTTPClient { _ in
                 HTTPResponse(statusCode: 401, headers: [:], body: Data("{}".utf8))
@@ -391,7 +391,7 @@ final class OpenRouterProviderTests: XCTestCase {
     func testRefreshDoesNotReportInvalidKeyWhenOnlyCreditsForbidden() async {
         // `/credits` 403 (gated for this key type) but `/key` 200 — the key is valid, just gated for
         // credits. With no usable lines, the error must NOT be "invalid key" (it's not the key's fault).
-        let provider = OpenRouterProvider(
+        let provider = OpenRouterSwiftReferenceProvider(
             authStore: makeAuthStore(key: "sk-or-test"),
             usageClient: OpenRouterUsageClient(http: RoutingHTTPClient { request in
                 if request.url.absoluteString == OpenRouterUsageClient.creditsURL {
@@ -409,7 +409,7 @@ final class OpenRouterProviderTests: XCTestCase {
 
     func testProviderAPIKeyManagingDelegatesToAuthStore() throws {
         let files = FakeFiles()
-        let provider = OpenRouterProvider(
+        let provider = OpenRouterSwiftReferenceProvider(
             authStore: OpenRouterAuthStore(files: files, environment: FakeEnvironment(["OPENROUTER_API_KEY": "sk-or-env"])),
             usageClient: OpenRouterUsageClient(http: RoutingHTTPClient { _ in jsonResponse([:]) })
         )

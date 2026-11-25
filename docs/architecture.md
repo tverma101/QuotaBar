@@ -16,8 +16,8 @@ The code is grouped by role:
 - `Services/` — shared infrastructure (HTTP, the local API, process running).
 - `Support/` — small shared helpers (formatting, parsing, animations).
 - `Views/` — the SwiftUI screens (dashboard, customize, settings, menu-bar strip).
-- `CQuotabarCore/` — C ABI for the [Rust core](rust-core.md): a static library of hot primitives
-  (today, the Claude usage-line parser) that Swift calls over FFI.
+- `CQuotabarCore/` — C ABI for the [Rust backend](rust-core.md): the static engine library that
+  serves provider refreshes, local scans, pricing, and accounting to Swift.
 
 ## Composition root
 
@@ -34,7 +34,14 @@ It never launches the GUI or duplicates provider, auth, pricing, or mapping logi
 
 ## The provider pipeline
 
-Each provider is a small module that conforms to `ProviderRuntime`. A refresh flows through three parts:
+Swift talks to the backend through `ProviderRuntime`. Every provider is a thin wrapper around
+`RustEngine.refresh(provider:)`; the Rust engine owns its auth store, usage client, mappers, and local
+scanners. That covers Antigravity, Claude, Codex, Copilot, Cursor, Devin, Freebuff, Grok, Hermes,
+OpenCode, OpenRouter, and Z.ai. The former Swift provider implementations remain only as test oracles.
+Codex's reset-credit list and claim also run in the engine; Swift keeps only the popover's
+orchestration and the state it observes.
+
+A refresh flows through three parts, wherever it runs:
 
 1. **Auth store** — reads credentials that already exist on the machine (config files, keychain). QuotaBar
    never asks the user to paste tokens.
@@ -47,14 +54,13 @@ Because every provider produces the same normalized `MetricLine` shapes, the UI 
 way and doesn't need to know provider-specific details. To add one, see
 [Adding a provider](adding-a-provider.md).
 
-Claude, Codex, and pi share `IncrementalJSONLScanner` for local JSONL history. Its per-file parsed events
-are cached by path, size, content modification time, and attribute modification time in a versioned
-Application Support store, partitioned by provider/home identity. Provider instances reading the same
-home share one scanner actor, which avoids duplicate parsing across cards; the disk store provides the
-reuse across process launches. Claude also path-deduplicates overlapping config roots, and the OpenCode
-gateway fold shares Claude's source identity so a cold refresh does not parse the same terminal sessions
-under a second cache key. Scans drop source-file records as their modification dates leave the requested
-history window, while aggregation and pricing still run on every refresh from the cached events.
+Claude, Codex, and pi local JSONL history runs through the engine's incremental scanner. Its per-file
+parsed events are cached by path, size, content modification time, and attribute modification time in a
+versioned Application Support store, partitioned by provider/home identity. Provider instances reading
+the same home share one scanner, which avoids duplicate parsing across cards; the disk store provides the
+reuse across process launches. Claude also path-deduplicates overlapping config roots. Scans drop
+source-file records as their modification dates leave the requested history window, while aggregation
+and pricing still run on every refresh from the cached events.
 
 The launch refresh serializes provider starts once, then returns to concurrent refreshes for the normal
 cadence. This preserves stale-while-revalidate display while preventing a large multi-account local

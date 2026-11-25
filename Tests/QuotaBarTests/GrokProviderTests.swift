@@ -30,7 +30,7 @@ final class GrokProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
         }
-        let provider = GrokProvider(
+        let provider = GrokSwiftReferenceProvider(
             authStore: GrokAuthStore(files: files, now: { clock.value }),
             usageClient: GrokUsageClient(httpClient: httpClient),
             logUsageScanner: noLogScanner(),
@@ -47,7 +47,7 @@ final class GrokProviderTests: XCTestCase {
 
         // Once the label is due again, a failed request keeps the last good one.
         settings.failing = true
-        clock.value = clock.value.addingTimeInterval(GrokProvider.planCacheInterval + 60)
+        clock.value = clock.value.addingTimeInterval(GrokSwiftReferenceProvider.planCacheInterval + 60)
         let third = await provider.refresh()
         XCTAssertEqual(third.plan, "SuperGrok Heavy", "a failed plan request must not drop the label")
         XCTAssertEqual(settings.value, 2)
@@ -107,7 +107,7 @@ final class GrokProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
         }
-        let provider = GrokProvider(
+        let provider = GrokSwiftReferenceProvider(
             authStore: GrokAuthStore(files: files, now: { now }),
             usageClient: GrokUsageClient(httpClient: httpClient),
             logUsageScanner: noLogScanner(),
@@ -174,7 +174,7 @@ final class GrokProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
         }
-        let provider = GrokProvider(
+        let provider = GrokSwiftReferenceProvider(
             authStore: GrokAuthStore(files: files, now: { now }),
             usageClient: GrokUsageClient(httpClient: httpClient),
             logUsageScanner: noLogScanner(),
@@ -239,7 +239,7 @@ final class GrokProviderTests: XCTestCase {
             if request.url == GrokUsageClient.refreshURL { throw URLError(.cancelled) }
             return HTTPResponse(statusCode: 200, headers: [:], body: GrokCreditsFixtures.capturedResponseBody)
         }
-        let provider = GrokProvider(
+        let provider = GrokSwiftReferenceProvider(
             authStore: GrokAuthStore(files: files, now: { now }),
             usageClient: GrokUsageClient(httpClient: httpClient),
             logUsageScanner: noLogScanner(),
@@ -270,7 +270,7 @@ final class GrokProviderTests: XCTestCase {
                 }
                 return HTTPResponse(statusCode: 200, headers: [:], body: GrokCreditsFixtures.capturedResponseBody)
             }
-            let provider = GrokProvider(
+            let provider = GrokSwiftReferenceProvider(
                 authStore: GrokAuthStore(files: files, now: { now }),
                 usageClient: GrokUsageClient(httpClient: httpClient),
                 logUsageScanner: noLogScanner(),
@@ -302,7 +302,7 @@ final class GrokProviderTests: XCTestCase {
                 await gate.pause()
                 return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"late-access-token","refresh_token":"late-refresh-token","expires_in":3600}"#.utf8))
             }
-            let provider = GrokProvider(
+            let provider = GrokSwiftReferenceProvider(
                 authStore: GrokAuthStore(files: files, now: { now }),
                 usageClient: GrokUsageClient(httpClient: http),
                 logUsageScanner: noLogScanner(),
@@ -340,7 +340,7 @@ final class GrokProviderTests: XCTestCase {
             await gate.pause()
             return HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"access_token":"late-access","refresh_token":"late-refresh","expires_in":3600}"#.utf8))
         }
-        let provider = GrokProvider(
+        let provider = GrokSwiftReferenceProvider(
             authStore: GrokAuthStore(files: files, now: { now }),
             usageClient: GrokUsageClient(httpClient: http),
             logUsageScanner: noLogScanner(),
@@ -502,7 +502,7 @@ final class GrokProviderTests: XCTestCase {
     }
 
     func testUnreadableAuthFileStaysDetectedAndRefreshShowsRepairMessage() async {
-        let provider = GrokProvider(
+        let provider = GrokSwiftReferenceProvider(
             authStore: GrokAuthStore(files: UnreadableFiles(present: [GrokAuthStore.authPath])),
             usageClient: GrokUsageClient(httpClient: RecordingHTTPClient(handler: Self.defaultRoutes)),
             logUsageScanner: noLogScanner()
@@ -517,7 +517,7 @@ final class GrokProviderTests: XCTestCase {
     }
 
     func testMalformedAuthFileStaysDetectedAndRefreshReportsInvalidAuth() async {
-        let provider = GrokProvider(
+        let provider = GrokSwiftReferenceProvider(
             authStore: GrokAuthStore(files: FakeFiles([GrokAuthStore.authPath: "not json"])),
             usageClient: GrokUsageClient(httpClient: RecordingHTTPClient(handler: Self.defaultRoutes)),
             logUsageScanner: noLogScanner()
@@ -546,11 +546,11 @@ final class GrokProviderTests: XCTestCase {
         httpClient: RecordingHTTPClient,
         scanner: GrokLogUsageScanner? = nil,
         now: Date = TestLocalInstant.date(2026, 6, 18, 12)
-    ) -> GrokProvider {
+    ) -> GrokSwiftReferenceProvider {
         let files = FakeFiles([
             GrokAuthStore.authPath: #"{"https://auth.x.ai::client":{"key":"token","refresh_token":"refresh","expires_at":"2026-07-01T00:00:00.000Z"}}"#
         ])
-        return GrokProvider(
+        return GrokSwiftReferenceProvider(
             authStore: GrokAuthStore(files: files, now: { now }),
             usageClient: GrokUsageClient(httpClient: httpClient),
             logUsageScanner: scanner ?? noLogScanner(),

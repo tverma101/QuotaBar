@@ -6,17 +6,17 @@ final class OptionalMetricVisibilityTests: XCTestCase {
     func testEveryConditionalProviderRowHidesWithoutDataButHonorsExplicitEnablement() throws {
         let providers: [ProviderRuntime] = [
             AntigravityProvider(),
-            ClaudeProvider(),
-            CodexProvider(),
-            CopilotProvider(),
-            CursorProvider(),
-            DevinProvider(),
+            ClaudeSwiftReferenceProvider(),
+            CodexSwiftReferenceProvider(),
+            CopilotSwiftReferenceProvider(),
+            CursorSwiftReferenceProvider(),
+            DevinSwiftReferenceProvider(),
             FreebuffProvider(),
-            GrokProvider(),
-            HermesProvider(),
+            GrokSwiftReferenceProvider(),
+            HermesSwiftReferenceProvider(),
             isolatedOpenCodeProvider(),
-            OpenRouterProvider(),
-            ZAIProvider()
+            OpenRouterSwiftReferenceProvider(),
+            ZAISwiftReferenceProvider()
         ]
         let registry = WidgetRegistry.from(providers)
         let (defaults, suiteName) = makeDefaults()
@@ -112,7 +112,7 @@ final class OptionalMetricVisibilityTests: XCTestCase {
     }
 
     func testCodexCreditsKeepsMeasuredZeroAndHidesWhenTheBalanceIsOmitted() async throws {
-        let codex = CodexProvider()
+        let codex = CodexSwiftReferenceProvider()
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let measuredZero = try CodexUsageMapper.mapUsageResponse(
             HTTPResponse(statusCode: 200, headers: [:], body: Data(#"{"credits":{"has_credits":false}}"#.utf8)),

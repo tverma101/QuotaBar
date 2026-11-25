@@ -35,7 +35,7 @@ final class ProviderSectionVisibilityTests: XCTestCase {
     }
 
     func testZAIEmptyCoreRowsHideForNoPlanButRemainForActivePlanWithoutUsableLimits() async throws {
-        let provider = ZAIProvider()
+        let provider = ZAISwiftReferenceProvider()
         let activePlan = ProviderSnapshot.make(
             provider: provider.provider,
             plan: "GLM Coding Max",

@@ -34,5 +34,6 @@ appcast.xml
 .codex/
 .cursor/
 Rust/quotabar-core/target/
+Rust/quotabar-engine/target/
 __pycache__/
 .zcode/

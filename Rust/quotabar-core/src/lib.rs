@@ -15,6 +15,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 mod codex;
+#[cfg(test)]
+mod efficiency_measure_tests;
+mod engine_ffi;
 mod pricing;
 
 const MAX_ENTRIES_PER_LINE: usize = 64;
@@ -88,9 +91,7 @@ fn number(bytes: &[u8], range: std::ops::Range<usize>) -> u32 {
 pub(crate) fn parse_canonical_utc(s: &[u8]) -> CanonicalTimestamp {
     let (millis,) = match s.len() {
         20 if s[19] == b'Z' => (0,),
-        24 if s[19] == b'.' && s[23] == b'Z'
-            && s[20..23].iter().all(|&b| is_ascii_digit(b)) =>
-        {
+        24 if s[19] == b'.' && s[23] == b'Z' && s[20..23].iter().all(|&b| is_ascii_digit(b)) => {
             (number(s, 20..23),)
         }
         _ => return CanonicalTimestamp::NotCanonical,
@@ -120,8 +121,7 @@ pub(crate) fn parse_canonical_utc(s: &[u8]) -> CanonicalTimestamp {
         return CanonicalTimestamp::Invalid;
     }
 
-    let is_leap_year =
-        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let is_leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let maximum_day: i64 = match month {
         2 => {
             if is_leap_year {
@@ -143,8 +143,7 @@ pub(crate) fn parse_canonical_utc(s: &[u8]) -> CanonicalTimestamp {
     let year_of_era = adjusted_year - era * 400;
     let adjusted_month = month + if month > 2 { -3 } else { 9 };
     let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
-    let day_of_era =
-        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days_since_epoch = era * 146_097 + day_of_era - 719_468;
     let whole_seconds = days_since_epoch * 86_400 + hour * 3_600 + minute * 60 + second;
 
@@ -165,10 +164,9 @@ fn is_valid_semver_identifiers(value: &str, allow_numeric_leading_zero: bool) ->
         if bytes.is_empty() {
             return false;
         }
-        if !bytes
-            .iter()
-            .all(|&b| b.is_ascii_digit() || (65..=90).contains(&b) || (97..=122).contains(&b) || b == b'-')
-        {
+        if !bytes.iter().all(|&b| {
+            b.is_ascii_digit() || (65..=90).contains(&b) || (97..=122).contains(&b) || b == b'-'
+        }) {
             return false;
         }
         if !allow_numeric_leading_zero
@@ -386,7 +384,10 @@ struct EntryOut {
 }
 
 enum LineOutcome {
-    Parsed { malformed: bool, entries: Vec<EntryOut> },
+    Parsed {
+        malformed: bool,
+        entries: Vec<EntryOut>,
+    },
     /// Legal Swift input outside this module's supported shapes; caller re-runs the Swift path.
     Fallback,
 }
@@ -515,7 +516,10 @@ fn parse_line(line: &[u8]) -> LineOutcome {
         .get("model")
         .and_then(Value::as_str)
         .and_then(|m| (m != "<synthetic>").then(|| m.to_string()));
-    let parent_message_id = message.get("id").and_then(Value::as_str).map(str::to_string);
+    let parent_message_id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let request_id = object
         .get("requestId")
         .and_then(Value::as_str)
@@ -681,7 +685,7 @@ fn build_result(outcome: LineOutcome) -> *mut ClaudeParseResult {
 /// ABI version of this library. Bump when the entry layout changes.
 #[no_mangle]
 pub extern "C" fn qb_core_version() -> u32 {
-    2
+    4
 }
 
 /// Parse one Claude usage line.
@@ -881,7 +885,9 @@ mod tests {
             ("\"costUSD\":0", false),
             ("\"costUSD\":1234.5", false),
         ] {
-            let line = format!(r#"{{"timestamp":"2026-02-20T12:00:00.000Z",{raw},"message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#);
+            let line = format!(
+                r#"{{"timestamp":"2026-02-20T12:00:00.000Z",{raw},"message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#
+            );
             let (malformed, _) = parse(&line);
             assert_eq!(malformed, expected, "cost case: {raw}");
         }
@@ -916,8 +922,15 @@ mod tests {
 
     #[test]
     fn token_counts_reject_non_numbers_bools_and_fractional() {
-        for raw in ["\"input_tokens\":\"5\"", "\"input_tokens\":true", "\"input_tokens\":1.5", "\"input_tokens\":1000000000000001"] {
-            let line = format!(r#"{{"timestamp":"2026-02-20T12:00:00.000Z","message":{{"id":"m","usage":{{{raw},"output_tokens":2}}}}}}"#);
+        for raw in [
+            "\"input_tokens\":\"5\"",
+            "\"input_tokens\":true",
+            "\"input_tokens\":1.5",
+            "\"input_tokens\":1000000000000001",
+        ] {
+            let line = format!(
+                r#"{{"timestamp":"2026-02-20T12:00:00.000Z","message":{{"id":"m","usage":{{{raw},"output_tokens":2}}}}}}"#
+            );
             let (malformed, entries) = parse(&line);
             assert!(malformed, "token case: {raw}");
             assert!(entries.is_empty());
@@ -927,7 +940,9 @@ mod tests {
     #[test]
     fn non_assistant_rows_are_skipped_silently() {
         for t in [r#""type":"user""#, r#""type":7"#] {
-            let line = format!(r#"{{"timestamp":"2026-02-20T12:00:00.000Z",{t},"message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#);
+            let line = format!(
+                r#"{{"timestamp":"2026-02-20T12:00:00.000Z",{t},"message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#
+            );
             let (malformed, entries) = parse(&line);
             assert!(!malformed);
             assert!(entries.is_empty());
@@ -945,13 +960,17 @@ mod tests {
     #[test]
     fn timestamp_shapes() {
         // Canonical non-fractional UTC.
-        let (m, entries) = parse(r#"{"timestamp":"2026-02-20T12:00:00Z","message":{"id":"m","usage":{"input_tokens":1,"output_tokens":2}}}"#);
+        let (m, entries) = parse(
+            r#"{"timestamp":"2026-02-20T12:00:00Z","message":{"id":"m","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        );
         assert!(!m);
         assert_eq!(entries.len(), 1);
 
         // Canonical datetime with invalid month is malformed in Swift too (Foundation is never
         // consulted for canonical shapes).
-        let (m, entries) = parse(r#"{"timestamp":"2026-13-20T12:00:00Z","message":{"id":"m","usage":{"input_tokens":1,"output_tokens":2}}}"#);
+        let (m, entries) = parse(
+            r#"{"timestamp":"2026-13-20T12:00:00Z","message":{"id":"m","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        );
         assert!(m);
         assert!(entries.is_empty());
 
@@ -963,7 +982,9 @@ mod tests {
             "2026-02-20T12:00:00+00:00",
             "2026-02-20T12:00:00.123456Z",
         ] {
-            let line = format!(r#"{{"timestamp":"{ts}","message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#);
+            let line = format!(
+                r#"{{"timestamp":"{ts}","message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2}}}}}}"#
+            );
             assert!(
                 matches!(parse_line(line.as_bytes()), LineOutcome::Fallback),
                 "expected fallback for {ts}"
@@ -999,10 +1020,13 @@ mod tests {
     fn entry_cap_forces_fallback() {
         let mut advisor_iters = String::new();
         for _ in 0..100 {
-            advisor_iters.push_str(r#"{"type":"advisor_message","input_tokens":1,"output_tokens":1},"#);
+            advisor_iters
+                .push_str(r#"{"type":"advisor_message","input_tokens":1,"output_tokens":1},"#);
         }
         let advisor_iters = advisor_iters.trim_end_matches(',');
-        let line = format!(r#"{{"timestamp":"2026-02-20T12:00:00.000Z","message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2,"iterations":[{advisor_iters}]}}}}}}"#);
+        let line = format!(
+            r#"{{"timestamp":"2026-02-20T12:00:00.000Z","message":{{"id":"m","usage":{{"input_tokens":1,"output_tokens":2,"iterations":[{advisor_iters}]}}}}}}"#
+        );
         assert!(matches!(parse_line(line.as_bytes()), LineOutcome::Fallback));
     }
 }

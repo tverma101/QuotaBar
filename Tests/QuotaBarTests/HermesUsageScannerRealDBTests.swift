@@ -203,7 +203,7 @@ final class HermesUsageScannerRealDBTests: XCTestCase {
         XCTAssertTrue(values.allSatisfy { $0.isPartial == true })
         XCTAssertTrue(breakdown?.models.first?.hasIncompleteCost == true)
 
-        let history = HermesProvider.usageHistory(from: scan)
+        let history = HermesSwiftReferenceProvider.usageHistory(from: scan)
         XCTAssertEqual(history.partialDays, scan.partialDays)
         let report = HistoryDashboardAggregator.report(
             .init(
@@ -238,7 +238,7 @@ final class HermesUsageScannerRealDBTests: XCTestCase {
             modelUsageByPeriod: [:]
         )
 
-        let history = HermesProvider.usageHistory(from: scan)
+        let history = HermesSwiftReferenceProvider.usageHistory(from: scan)
 
         XCTAssertNil(history.apiEstimateByDay)
         XCTAssertEqual(history.apiEstimateIncompleteDays, [today])

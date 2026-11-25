@@ -40,7 +40,7 @@ final class WidgetUsagePeriodTests: XCTestCase {
     }
 
     func testCodexBalanceRowsAreNotUsagePeriods() {
-        let descriptors = CodexProvider().widgetDescriptors
+        let descriptors = CodexSwiftReferenceProvider().widgetDescriptors
         XCTAssertEqual(descriptors.first { $0.id == "codex.rateLimitResets" }?.sample.isUsagePeriod, false)
         XCTAssertEqual(descriptors.first { $0.id == "codex.credits" }?.sample.isUsagePeriod, false)
         // The spend tiles on the same provider do carry the flag.

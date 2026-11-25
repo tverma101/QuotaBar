@@ -16,7 +16,7 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.removePersistentDomain(forName: suiteName)
 
-        let providers: [any ProviderRuntime] = [ClaudeProvider(), CodexProvider(), GrokProvider()]
+        let providers: [any ProviderRuntime] = [ClaudeSwiftReferenceProvider(), CodexSwiftReferenceProvider(), GrokSwiftReferenceProvider()]
         let registry = WidgetRegistry.from(providers)
         let layout = LayoutStore(registry: registry, defaults: defaults, storageKey: "layout")
         let dataStore = WidgetDataStore(registry: registry, providers: providers, defaults: defaults)
@@ -117,7 +117,7 @@ final class HistoryDashboardViewSnapshotTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         defaults.removePersistentDomain(forName: suiteName)
 
-        let providers: [any ProviderRuntime] = [ClaudeProvider(), CodexProvider()]
+        let providers: [any ProviderRuntime] = [ClaudeSwiftReferenceProvider(), CodexSwiftReferenceProvider()]
         let registry = WidgetRegistry.from(providers)
         let layout = LayoutStore(registry: registry, defaults: defaults, storageKey: "layout")
         let dataStore = WidgetDataStore(registry: registry, providers: providers, defaults: defaults)

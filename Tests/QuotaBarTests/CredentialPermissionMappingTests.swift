@@ -111,9 +111,9 @@ final class CredentialPermissionMappingTests: XCTestCase {
     @MainActor
     func testUnreadableKeychainDoesNotHideKeychainOnlyProvidersDuringSeeding() async {
         let unreadableKeychain = UnreadableKeychain()
-        let codex = CodexProvider(authStore: CodexAuthStore(files: FakeFiles(), keychain: unreadableKeychain))
-        let copilot = CopilotProvider(authStore: CopilotAuthStore(files: FakeFiles(), keychain: unreadableKeychain))
-        let cursor = CursorProvider(authStore: CursorAuthStore(sqlite: MissingSQLite(), keychain: unreadableKeychain))
+        let codex = CodexSwiftReferenceProvider(authStore: CodexAuthStore(files: FakeFiles(), keychain: unreadableKeychain))
+        let copilot = CopilotSwiftReferenceProvider(authStore: CopilotAuthStore(files: FakeFiles(), keychain: unreadableKeychain))
+        let cursor = CursorSwiftReferenceProvider(authStore: CursorAuthStore(sqlite: MissingSQLite(), keychain: unreadableKeychain))
 
         let codexDetected = await codex.hasLocalCredentials()
         let copilotDetected = await copilot.hasLocalCredentials()

@@ -6,11 +6,11 @@ final class UsageHistoryClassificationTests: XCTestCase {
     func testEverySpendProviderHasOneExplicitHistoryClassification() {
         let descriptorSets = [
             AntigravityProvider().widgetDescriptors,
-            ClaudeProvider().widgetDescriptors,
-            CodexProvider().widgetDescriptors,
-            CursorProvider().widgetDescriptors,
+            ClaudeSwiftReferenceProvider().widgetDescriptors,
+            CodexSwiftReferenceProvider().widgetDescriptors,
+            CursorSwiftReferenceProvider().widgetDescriptors,
             FreebuffProvider().widgetDescriptors,
-            GrokProvider().widgetDescriptors,
+            GrokSwiftReferenceProvider().widgetDescriptors,
             OpenCodeProvider().widgetDescriptors
         ]
 

@@ -1,15 +1,9 @@
 import XCTest
 @testable import QuotaBar
 
-/// Guards the seam where a provider's default arguments are silently bypassed.
-///
-/// `ProviderCatalog` does not use `OpenCodeProvider.init`'s defaults — it constructs an
-/// `OpenCodeUsageScanner` itself and passes it in. Wiring a source only on the provider's default argument
-/// therefore compiles, passes every test that constructs the scanner directly, and reads **nothing** in the
-/// running app. That is exactly how Space Bunny's 2.2B tokens stayed uncounted while the unit tests were
-/// green.
-///
-/// These assert on the catalog-built object, i.e. the object the app really uses.
+/// Guards the production catalog seam: the app must construct the Rust-backed providers, and the
+/// discovery inputs those runtimes need must be passed in the engine configuration. Swift's own
+/// implementations remain available as test oracles, but they must never be the object the app uses.
 @MainActor
 final class ProviderCatalogWiringTests: XCTestCase {
     private func catalogOpenCode(
@@ -20,44 +14,43 @@ final class ProviderCatalogWiringTests: XCTestCase {
         openCodeClaudeRoots: @escaping @Sendable () -> [URL] = {
             OpenCodeUsageScanner.discoverClaudeRoots()
         }
-    ) throws -> OpenCodeProvider {
+    ) throws -> RustOpenCodeProvider {
         try XCTUnwrap(
             ProviderCatalog.make(
                 openUsageEnvironment: openUsageEnvironment,
                 codexLogHomes: codexLogHomes,
                 openCodeClaudeRoots: openCodeClaudeRoots
-            ).compactMap { $0 as? OpenCodeProvider }.first
+            ).compactMap { $0 as? RustOpenCodeProvider }.first
         )
     }
 
-    func testTheProductionScannerIsToldAboutTheRouterLedger() throws {
-        let paths = try catalogOpenCode().usageScanner.routerLedgerPaths()
+    func testTheProductionEngineIsToldAboutTheRouterLedger() throws {
+        let config = try XCTUnwrap(catalogOpenCode().engineConfig?.values)
         XCTAssertEqual(
-            paths,
+            config["routerLedgerPaths"] as? [String],
             ["/synthetic/router/usage-events.jsonl"],
-            "ProviderCatalog builds the scanner itself, so the router ledger must be wired there — " +
-            "relying on OpenCodeProvider.init's default leaves it reading nothing in the real app"
+            "the catalog-built engine config must carry the router ledger into Rust"
         )
     }
 
-    func testTheProductionScannerIsToldAboutTheOtherFoldsToo() throws {
+    func testTheProductionEngineIsToldAboutTheOtherFoldsToo() throws {
         let claudeRoot = URL(fileURLWithPath: "/synthetic/claude-root")
         let codexHome = URL(fileURLWithPath: "/synthetic/codex-home")
-        let scanner = try catalogOpenCode(
-            codexLogHomes: [codexHome.path],
-            openCodeClaudeRoots: { [claudeRoot] }
-        ).usageScanner
-        XCTAssertEqual(scanner.claudeRoots(), [claudeRoot], "Claude gateway fold source")
+        let config = try XCTUnwrap(
+            catalogOpenCode(
+                codexLogHomes: [codexHome.path],
+                openCodeClaudeRoots: { [claudeRoot] }
+            ).engineConfig?.values
+        )
+        XCTAssertEqual(config["claudeRoots"] as? [String], [claudeRoot.path], "Claude gateway fold source")
         XCTAssertTrue(
-            scanner.codexHomes().contains {
-                $0.resolvingSymlinksInPath().standardizedFileURL.path
+            (config["codexHomes"] as? [String] ?? []).contains {
+                URL(fileURLWithPath: $0).resolvingSymlinksInPath().standardizedFileURL.path
                     == codexHome.resolvingSymlinksInPath().standardizedFileURL.path
             },
             "Codex gateway fold source"
         )
-        // Hermes is optional — the closure is what must be wired, and nil is the correct answer on a
-        // machine without a Hermes database.
-        _ = try scanner.hermesStateDBPath()
+        XCTAssertEqual(config["gatewayHermes"] as? Bool, true)
     }
 
     func testMuseGatewayFoldFollowsOpenCodeEnablement() {
@@ -79,7 +72,7 @@ final class ProviderCatalogWiringTests: XCTestCase {
     func testFreebuffIsRegisteredAlphabeticallyWithOwnerConfirmedDefaults() throws {
         let providers = ProviderCatalog.make()
         let ids = providers.map { $0.provider.id }
-        let freebuff = try XCTUnwrap(providers.compactMap { $0 as? FreebuffProvider }.first)
+        let freebuff = try XCTUnwrap(providers.compactMap { $0 as? RustFreebuffProvider }.first)
         let metrics = Set(freebuff.widgetDescriptors.map(\.id))
 
         XCTAssertEqual(Array(ids.prefix(3)), ["claude", "codex", "cursor"])
@@ -104,11 +97,10 @@ final class ProviderCatalogWiringTests: XCTestCase {
 
     /// End-to-end: whatever the fold's sources resolve to must actually produce rows on this machine.
     /// The window is unbounded on purpose — this is a wiring test (is the reader pointed at a real
-    /// ledger?), not an activity test; requiring rows in the last 24h made it fail whenever the
-    /// router simply hadn't been used since yesterday.
+    /// ledger?), not an activity test.
     func testAtLeastOneConfiguredSourceYieldsRows() throws {
-        let scanner = try catalogOpenCode().usageScanner
-        let ledgerPaths = try scanner.routerLedgerPaths()
+        let config = try XCTUnwrap(catalogOpenCode().engineConfig?.values)
+        let ledgerPaths = config["routerLedgerPaths"] as? [String] ?? []
         guard let first = ledgerPaths.first(where: { FileManager.default.isReadableFile(atPath: $0) }) else {
             throw XCTSkip("no router ledger on this machine")
         }

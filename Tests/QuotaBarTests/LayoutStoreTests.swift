@@ -650,11 +650,11 @@ final class LayoutStoreTests: XCTestCase {
 
     func testFreshCustomizeOrderFollowsProviderDeclarations() {
         let providers: [ProviderRuntime] = [
-            ClaudeProvider(),
-            CodexProvider(),
-            DevinProvider(),
-            GrokProvider(),
-            CursorProvider()
+            ClaudeSwiftReferenceProvider(),
+            CodexSwiftReferenceProvider(),
+            DevinSwiftReferenceProvider(),
+            GrokSwiftReferenceProvider(),
+            CursorSwiftReferenceProvider()
         ]
         let store = LayoutStore(
             registry: WidgetRegistry.from(providers), defaults: makeDefaults("FreshCustomizeOrder"), storageKey: "layout"
@@ -671,11 +671,11 @@ final class LayoutStoreTests: XCTestCase {
 
     func testFreshDefaultLayoutMatchesRecommendedMetricSections() {
         let registry = WidgetRegistry.from([
-            ClaudeProvider(),
-            CodexProvider(),
-            DevinProvider(),
-            GrokProvider(),
-            CursorProvider()
+            ClaudeSwiftReferenceProvider(),
+            CodexSwiftReferenceProvider(),
+            DevinSwiftReferenceProvider(),
+            GrokSwiftReferenceProvider(),
+            CursorSwiftReferenceProvider()
         ])
         let store = LayoutStore(registry: registry, defaults: makeDefaults("RecommendedDefaults"), storageKey: "layout")
 

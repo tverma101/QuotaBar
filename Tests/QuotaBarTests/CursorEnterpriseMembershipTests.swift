@@ -235,7 +235,7 @@ final class CursorEnterpriseMembershipTests: XCTestCase {
                 return HTTPResponse(statusCode: 404, headers: [:], body: Data())
             }
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReferenceProvider(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [
                     CursorAuthStore.accessTokenKey: accessToken,
@@ -275,7 +275,7 @@ final class CursorEnterpriseMembershipTests: XCTestCase {
                 return HTTPResponse(statusCode: 404, headers: [:], body: Data())
             }
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReferenceProvider(
             authStore: CursorAuthStore(sqlite: KeyValueSQLite(values: [
                 CursorAuthStore.accessTokenKey: token, CursorAuthStore.membershipTypeKey: "enterprise"
             ]), keychain: FakeKeychain()),
@@ -319,7 +319,7 @@ final class CursorEnterpriseMembershipTests: XCTestCase {
                 return HTTPResponse(statusCode: 404, headers: [:], body: Data())
             }
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReferenceProvider(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [
                     CursorAuthStore.accessTokenKey: accessToken,
@@ -358,7 +358,7 @@ final class CursorEnterpriseMembershipTests: XCTestCase {
                 return HTTPResponse(statusCode: 404, headers: [:], body: Data())
             }
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReferenceProvider(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]),
                 keychain: FakeKeychain()

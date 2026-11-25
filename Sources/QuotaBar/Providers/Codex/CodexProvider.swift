@@ -1,7 +1,10 @@
 import Foundation
 
+/// Test-only oracle for the Swift Codex refresh path, kept so the Swift unit tests can compare the
+/// Rust engine's behavior against the implementation it replaced. Production constructs the
+/// Rust-backed `CodexProvider` wrapper instead.
 @MainActor
-final class CodexProvider: ProviderRuntime {
+final class CodexSwiftReferenceProvider: ProviderRuntime {
     static func makeProvider(id: String = "codex", displayName: String = "Codex") -> Provider {
         Provider(
             id: id,
@@ -37,7 +40,7 @@ final class CodexProvider: ProviderRuntime {
     let pricing: @Sendable () async -> ModelPricing
 
     init(
-        provider: Provider = CodexProvider.makeProvider(),
+        provider: Provider = CodexSwiftReferenceProvider.makeProvider(),
         authStore: CodexAuthStore = CodexAuthStore(),
         usageClient: CodexUsageClient = CodexUsageClient(),
         logUsageScanner: CodexLogUsageScanner = CodexLogUsageScanner(),

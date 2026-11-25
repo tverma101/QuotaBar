@@ -360,7 +360,7 @@ final class CodexMultiAccountTests: XCTestCase {
 
         XCTAssertEqual(runtimes.map(\.provider.id), ["codex", secondID])
         XCTAssertEqual(runtimes.map(\.provider.displayName), ["Codex — A", "Codex — B"])
-        XCTAssertEqual(runtimes.map { $0.authStore.codexHome() }, [
+        XCTAssertEqual(runtimes.map { ($0.rawConfig["candidateAuthHomes"] as? [String])?.first }, [
             "/Users/dev/codex-a", "/Users/dev/codex-b"
         ])
         XCTAssertEqual(runtimes.compactMap(\.expectedIdentityKey), ["account-a", "account-b"])
@@ -387,13 +387,12 @@ final class CodexMultiAccountTests: XCTestCase {
             ProviderCatalog.make(codexCards: [card]).compactMap { $0 as? CodexProvider }.first
         )
 
-        XCTAssertEqual(runtime.authStore.codexHome(), "/Users/dev/OpenUsage/Account-A")
-        XCTAssertFalse((runtime.authStore.codexHome() ?? "").contains(","))
-        let homes = await runtime.logUsageScanner.discoveredHomesForTesting().map(\.path)
-        XCTAssertEqual(Set(homes), Set([
+        XCTAssertEqual((runtime.rawConfig["candidateAuthHomes"] as? [String])?.first, "/Users/dev/OpenUsage/Account-A")
+        XCTAssertFalse(((runtime.rawConfig["candidateAuthHomes"] as? [String])?.first ?? "").contains(","))
+        XCTAssertEqual(runtime.rawConfig["logHomes"] as? [String], [
             "/Users/dev/OpenUsage/Account-A",
             "/Users/dev/Library/Application Support/orca/codex-accounts/acct/home",
-        ]))
+        ])
     }
 
     func testOpenCodeGatewayIncludesRegisteredCodexHomesWithoutAliases() throws {
@@ -420,9 +419,10 @@ final class CodexMultiAccountTests: XCTestCase {
             ProviderCatalog.make(
                 codexCards: cards,
                 codexLogHomes: ["/Users/dev/codex-a/", "/Users/dev/OpenUsage/Account-B"]
-            ).compactMap { $0 as? OpenCodeProvider }.first
+            ).compactMap { $0 as? RustOpenCodeProvider }.first
         )
-        let homes = openCode.usageScanner.codexHomes().map { $0.standardizedFileURL.path }
+        let homes = (openCode.engineConfig?.values["codexHomes"] as? [String] ?? [])
+            .map { URL(fileURLWithPath: $0).standardizedFileURL.path }
 
         XCTAssertTrue(homes.contains("/Users/dev/codex-a"))
         XCTAssertTrue(homes.contains("/Users/dev/OpenUsage/Account-B"))
@@ -441,12 +441,12 @@ final class CodexMultiAccountTests: XCTestCase {
             files: files,
             keychain: FakeKeychain(nil)
         )
-        let matching = CodexProvider(
+        let matching = CodexSwiftReferenceProvider(
             authStore: authStore,
             expectedIdentityKey: "account-a",
             allowsKeychainFallback: false
         )
-        let wrong = CodexProvider(
+        let wrong = CodexSwiftReferenceProvider(
             authStore: authStore,
             expectedIdentityKey: "account-b",
             allowsKeychainFallback: false
@@ -670,24 +670,21 @@ final class CodexMultiAccountTests: XCTestCase {
         XCTAssertEqual(runtimes.count, 2)
 
         // Auth stays single-home; log env is still the comma-joined logHomes list.
-        XCTAssertEqual(runtimes[0].authStore.codexHome(), defaultHome)
-        XCTAssertEqual(runtimes[1].authStore.codexHome(), "/Users/dev/orca/account-b")
-        let homesA = await runtimes[0].logUsageScanner.discoveredHomesForTesting().map(\.path)
-        let homesB = await runtimes[1].logUsageScanner.discoveredHomesForTesting().map(\.path)
-        XCTAssertEqual(homesA, [defaultHome])
-        XCTAssertEqual(Set(homesB), Set([
+        XCTAssertEqual((runtimes[0].rawConfig["candidateAuthHomes"] as? [String])?.first, defaultHome)
+        XCTAssertEqual((runtimes[1].rawConfig["candidateAuthHomes"] as? [String])?.first, "/Users/dev/orca/account-b")
+        XCTAssertEqual(runtimes[0].rawConfig["logHomes"] as? [String], [defaultHome])
+        XCTAssertEqual(runtimes[1].rawConfig["logHomes"] as? [String], [
             "/Users/dev/orca/account-b",
             "/Users/dev/OpenUsage/Account-B",
-        ]))
+        ])
 
-        let peersA = runtimes[0].peerHomes().map(\.path)
-        let peersB = runtimes[1].peerHomes().map(\.path)
+        let peersA = runtimes[0].rawConfig["peerHomes"] as? [String] ?? []
+        let peersB = runtimes[1].rawConfig["peerHomes"] as? [String] ?? []
         XCTAssertTrue(peersA.isEmpty, "the default home has first ownership priority")
         XCTAssertEqual(peersB, [defaultHome])
 
         enabledProviderIDs.remove(secondID)
-        XCTAssertTrue(runtimes[0].peerHomes().isEmpty)
-        XCTAssertEqual(runtimes[1].peerHomes().map(\.path), [defaultHome],
+        XCTAssertEqual(runtimes[1].rawConfig["peerHomes"] as? [String], [defaultHome],
                        "peer identity paths remain available when their owner card is disabled")
     }
 
@@ -705,8 +702,8 @@ final class CodexMultiAccountTests: XCTestCase {
         let runtimes = ProviderCatalog.make(codexCards: [cardB, cardA])
             .compactMap { $0 as? CodexProvider }
 
-        XCTAssertEqual(runtimes[0].peerHomes().map(\.path), ["/tmp/codex/account-a"])
-        XCTAssertTrue(runtimes[1].peerHomes().isEmpty)
+        XCTAssertEqual(runtimes[0].rawConfig["peerHomes"] as? [String], ["/tmp/codex/account-a"])
+        XCTAssertTrue((runtimes[1].rawConfig["peerHomes"] as? [String] ?? []).isEmpty)
     }
 
 
