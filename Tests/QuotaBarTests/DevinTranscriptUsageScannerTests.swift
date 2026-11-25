@@ -336,7 +336,7 @@ final class DevinTranscriptUsageScannerTests: XCTestCase {
         let day = try XCTUnwrap(scan.series.daily.first)
         XCTAssertEqual(try XCTUnwrap(scan.apiEstimateByDay?[day.date]), 18.15, accuracy: 0.000001)
         XCTAssertEqual(day.totalTokens, 3_000_000)
-        XCTAssertNil(day.reportedCost)
+        XCTAssertTrue(scan.estimatedCostDays?.contains(day.date) == true)
 
         let missingRoute = DevinTranscriptUsageScanner.aggregate(entries: [entry], since: .distantPast, pricing: .empty)
         XCTAssertNil(missingRoute.apiEstimateByDay)
