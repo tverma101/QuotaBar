@@ -652,6 +652,8 @@ mod tests {
         let roots = claude_roots_for(missing.to_str(), Some(&home), None, &desktop);
         assert_eq!(roots.len(), 6);
         assert!(!roots.contains(&home.join(".claude")));
+        let cowork_only = scan_roots(&roots, since, default_pricing()).unwrap();
+        assert_eq!(cowork_only[0].total_tokens, 39);
     }
 
     #[test]

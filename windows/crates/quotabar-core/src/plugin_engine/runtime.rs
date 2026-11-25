@@ -170,10 +170,12 @@ fn run_probe_with_account_timeout(
             let Some(account) = &account else { return true };
             let Some(path) = &account.store_path else { return true };
             provider_accounts::load_store_path(path).is_ok_and(|store| {
-                let current = store.accounts.get(&plugin_id)
+                let stored = store.accounts.get(&plugin_id);
+                let current = stored
                     .map(|entry| &entry.credential)
                     .filter(|credential| !credential.is_empty());
                 current == account.credential.as_ref()
+                    && stored.and_then(|entry| entry.codex_home.as_ref()) == account.codex_home.as_ref()
             })
         })
     } else {
@@ -408,6 +410,18 @@ pub fn run_plugin_action(
     args_json: &str,
     account: Option<ProviderAccountContext>,
 ) -> Result<String, String> {
+    run_guarded_plugin_action(plugin, app_data_dir, app_version, action, args_json, account, || true)
+}
+
+pub fn run_guarded_plugin_action(
+    plugin: &LoadedPlugin,
+    app_data_dir: &PathBuf,
+    app_version: &str,
+    action: &str,
+    args_json: &str,
+    account: Option<ProviderAccountContext>,
+    can_redeem: impl Fn() -> bool + 'static,
+) -> Result<String, String> {
     let timeout = Duration::from_secs(PROBE_TIMEOUT_SECS);
     let deadline_at = Instant::now()
         .checked_add(timeout)
@@ -469,9 +483,11 @@ pub fn run_plugin_action(
         let args_value: Value = globals
             .get("__openusage_action_args")
             .map_err(|_| "missing action args".to_string())?;
+        let consent = rquickjs::Function::new(ctx.clone(), can_redeem)
+            .map_err(|_| "action consent guard failed".to_string())?;
 
         let result_value: Value = action_fn
-            .call((probe_ctx, args_value))
+            .call((probe_ctx, args_value, consent))
             .map_err(|_| extract_error_string(&ctx))?;
 
         let as_outcome = |value: Value| -> Result<String, String> {
@@ -1167,6 +1183,7 @@ mod tests {
                 session_key: None,
                 expires_at: None,
             }),
+            codex_home: None,
             store_path: None,
         }
     }

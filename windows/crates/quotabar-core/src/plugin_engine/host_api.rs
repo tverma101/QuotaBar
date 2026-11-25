@@ -713,6 +713,12 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     account_obj.set("instanceId", instance_id)?;
     account_obj.set("baseProviderId", base_plugin_id)?;
     account_obj.set("label", account.map(|a| a.label.as_str()).unwrap_or(""))?;
+    if let Some(home) = account.and_then(|a| a.codex_home.as_ref()) {
+        let codex_home = Object::new(ctx.clone())?;
+        codex_home.set("path", home.plugin_path())?;
+        codex_home.set("accountId", home.account_id.as_str())?;
+        account_obj.set("codexHome", codex_home)?;
+    }
     probe_ctx.set("account", account_obj)?;
 
     let host = Object::new(ctx.clone())?;
