@@ -5,7 +5,6 @@ import { SettingsPage, type ProviderAccountCredentialInput } from "@/pages/setti
 import type { DisplayPluginState } from "@/hooks/app/use-app-plugin-views"
 import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
 import type { TraySettingsPreview } from "@/hooks/app/use-tray-icon"
-import { useAppPluginStore } from "@/stores/app-plugin-store"
 import { useAppPreferencesStore } from "@/stores/app-preferences-store"
 import { useAppUiStore } from "@/stores/app-ui-store"
 import type {
@@ -128,8 +127,6 @@ export function AppContent({
   )
   const resolvedView = viewOverride ?? activeView
 
-  const pluginSettings = useAppPluginStore((state) => state.pluginSettings)
-
   const {
     displayMode,
     resetTimerDisplayMode,
@@ -187,8 +184,6 @@ export function AppContent({
       <div key="home" className="motion-view">
       <OverviewPage
         plugins={displayPlugins}
-        pluginSettings={pluginSettings}
-        preferWeeklyLimit={preferMenubarWeeklyLimit}
         onRetryPlugin={onRetryPlugin}
         displayMode={displayMode}
         resetTimerDisplayMode={resetTimerDisplayMode}

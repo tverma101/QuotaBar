@@ -61,6 +61,9 @@ describe("cursor plugin", () => {
     const result = plugin.probe(ctx)
 
     expect(ctx.host.http.request).not.toHaveBeenCalled()
+    expect(ctx.host.cursorUsageExport.queryDaily).not.toHaveBeenCalled()
+    expect(ctx.host.cursorUsageExport.queryMtd).not.toHaveBeenCalled()
+    expect(ctx.host.log.warn).not.toHaveBeenCalledWith(expect.stringContaining("usage export"))
     expect(result.plan).toBe("Dev mock")
     expect(result.lines.some((line) => line.label === "Data source")).toBe(true)
     expect(result.lines.some((line) => line.label === "Total usage")).toBe(true)

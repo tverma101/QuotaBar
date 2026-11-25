@@ -11,16 +11,55 @@ use serde_json::{Map, Value as JsonValue};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::VecDeque;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MIN_BLOCKING_TIMEOUT: Duration = Duration::from_millis(1);
+
+pub(crate) type DeferredUsage = Rc<RefCell<Vec<String>>>;
+type CachedGoResponse = Arc<Mutex<Option<Result<String, String>>>>;
+
+#[derive(Default)]
+pub struct OpenCodeGoProbeBatch {
+    responses: Mutex<HashMap<[u8; 32], CachedGoResponse>>,
+}
+
+pub(crate) struct ProbeNetwork {
+    pub deadline: ProbeDeadline,
+    pub opencode_go_batch: Option<Arc<OpenCodeGoProbeBatch>>,
+    pub deferred_usage: Option<DeferredUsage>,
+}
+
+impl OpenCodeGoProbeBatch {
+    fn response_slot(&self, req: &HttpReqParams) -> Option<CachedGoResponse> {
+        if req.url != "https://opencode.ai/zen/go/v1/usage"
+            || req.method.as_deref().unwrap_or("GET") != "GET"
+            || req.body_text.is_some()
+            || req.dangerously_ignore_tls.unwrap_or(false)
+            || req.http1_only.unwrap_or(false)
+        {
+            return None;
+        }
+        let key = req.headers.as_ref()?.get("Authorization")?.strip_prefix("Bearer ")?;
+        if key.is_empty() {
+            return None;
+        }
+        Some(self.responses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(Sha256::digest(key.as_bytes()).into())
+            .or_default()
+            .clone())
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProbeDeadline {
@@ -63,8 +102,11 @@ fn log_probe_deadline_skip(plugin_id: &str, operation: &str) {
     );
 }
 
-const WHITELISTED_ENV_VARS: [&str; 27] = [
+const WHITELISTED_ENV_VARS: [&str; 30] = [
     "CODEX_HOME",
+    "HERMES_HOME",
+    "OPENCODE_DATA_DIR",
+    "XDG_DATA_HOME",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CROFAI_API_KEY",
@@ -667,7 +709,11 @@ pub fn inject_host_api<'js>(
         account,
         app_data_dir,
         app_version,
-        ProbeDeadline::none(),
+        ProbeNetwork {
+            deadline: ProbeDeadline::none(),
+            opencode_go_batch: None,
+            deferred_usage: None,
+        },
     )
 }
 
@@ -678,8 +724,9 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     account: Option<&ProviderAccountContext>,
     app_data_dir: &PathBuf,
     app_version: &str,
-    deadline: ProbeDeadline,
+    network: ProbeNetwork,
 ) -> rquickjs::Result<()> {
+    let ProbeNetwork { deadline, opencode_go_batch, deferred_usage } = network;
     let globals = ctx.globals();
     let probe_ctx = Object::new(ctx.clone())?;
 
@@ -707,6 +754,12 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     account_obj.set("instanceId", instance_id)?;
     account_obj.set("baseProviderId", base_plugin_id)?;
     account_obj.set("label", account.map(|a| a.label.as_str()).unwrap_or(""))?;
+    if let Some(home) = account.and_then(|a| a.codex_home.as_ref()) {
+        let codex_home = Object::new(ctx.clone())?;
+        codex_home.set("path", home.plugin_path())?;
+        codex_home.set("accountId", home.account_id.as_str())?;
+        account_obj.set("codexHome", codex_home)?;
+    }
     probe_ctx.set("account", account_obj)?;
 
     let host = Object::new(ctx.clone())?;
@@ -720,18 +773,64 @@ pub(crate) fn inject_host_api_with_deadline<'js>(
     inject_cursor_paths(ctx, &host, base_plugin_id)?;
     inject_crypto(ctx, &host)?;
     inject_env(ctx, &host, base_plugin_id)?;
-    inject_http(ctx, &host, instance_id, deadline)?;
+    inject_http(ctx, &host, instance_id, deadline, opencode_go_batch)?;
     inject_credentials(ctx, &host, account)?;
     inject_keychain(ctx, &host, instance_id)?;
     inject_sqlite(ctx, &host)?;
     inject_chromium_cookies(ctx, &host, instance_id)?;
     inject_ls(ctx, &host, base_plugin_id)?;
-    inject_usage_daily(ctx, &host, instance_id, app_data_dir)?;
+    inject_usage_daily(ctx, &host, instance_id, app_data_dir, deferred_usage)?;
     inject_cursor_logs(ctx, &host, base_plugin_id, deadline)?;
     inject_claude_logs(ctx, &host, deadline)?;
     inject_codex_logs(ctx, &host, deadline)?;
     inject_antigravity_logs(ctx, &host, deadline, plugin_data_dir.join("antigravity-history-v1.db"))?;
     inject_grok_logs(ctx, &host, deadline)?;
+    if base_plugin_id == "opencode-go" && instance_id == base_plugin_id {
+        let gateway = Object::new(ctx.clone())?;
+        let settings_path = app_data_dir.join("settings.json");
+        gateway.set("scan", Function::new(ctx.clone(), move || {
+            if deadline.has_elapsed() {
+                return "null".to_string();
+            }
+            let settings = std::fs::read_to_string(&settings_path).ok()
+                .and_then(|raw| serde_json::from_str::<JsonValue>(&raw).ok());
+            let hermes_enabled = settings.as_ref().is_some_and(|settings| {
+                let plugins = &settings["plugins"];
+                let has_hermes = |key: &str| plugins[key].as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id == "hermes"));
+                has_hermes("order") && !has_hermes("disabled")
+            });
+            let hermes = match crate::hermes_gateway::scan(hermes_enabled) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    log::warn!("Hermes gateway history could not be read: {error}");
+                    return "null".to_string();
+                }
+            };
+            match crate::muse_usage::scan(|| deadline.has_elapsed()) {
+                Ok(mut rows) => {
+                    rows.extend(hermes);
+                    serde_json::to_string(&rows).unwrap_or_else(|_| "null".to_string())
+                }
+                Err(error) => {
+                    log::warn!("Muse history could not be read: {error}");
+                    "null".to_string()
+                }
+            }
+        })?)?;
+        host.set("opencodeGateway", gateway)?;
+    }
+    if base_plugin_id == "zai" {
+        let zcode = Object::new(ctx.clone())?;
+        zcode.set("scan", Function::new(ctx.clone(), move || {
+            if deadline.has_elapsed() {
+                "{}".to_string()
+            } else {
+                crate::zcode_usage::scan().to_string()
+            }
+        })?)?;
+        host.set("zcode", zcode)?;
+    }
     inject_cursor_usage_export(ctx, &host, account, deadline)?;
     inject_fireworks(ctx, &host, base_plugin_id)?;
 
@@ -1224,15 +1323,12 @@ fn inject_crypto<'js>(ctx: &Ctx<'js>, host: &Object<'js>) -> rquickjs::Result<()
 }
 
 fn inject_env<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquickjs::Result<()> {
+    let plugin_id = plugin_id.to_string();
     let env_obj = Object::new(ctx.clone())?;
-    let freebuff = plugin_id == "freebuff";
     env_obj.set(
         "get",
         Function::new(ctx.clone(), move |name: String| -> Option<String> {
-            if !WHITELISTED_ENV_VARS.contains(&name.as_str())
-                && !(freebuff && matches!(name.as_str(),
-                    "APPDATA" | "CODEBUFF_API_KEY" | "FREEBUFF_CONFIG_DIR" | "NEXT_PUBLIC_CB_ENVIRONMENT"))
-            {
+            if !env_allowed_for_plugin(&plugin_id, &name) {
                 return None;
             }
 
@@ -1243,19 +1339,34 @@ fn inject_env<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquic
     Ok(())
 }
 
+fn env_allowed_for_plugin(plugin_id: &str, name: &str) -> bool {
+    WHITELISTED_ENV_VARS.contains(&name)
+        || matches!(
+            (plugin_id, name),
+            ("openrouter", "OPENROUTER_API_KEY" | "OPENROUTER_KEY")
+                | ("copilot", "GH_CONFIG_DIR" | "LOCALAPPDATA" | "APPDATA")
+                | ("devin", "LOCALAPPDATA")
+                | (
+                    "freebuff",
+                    "APPDATA" | "CODEBUFF_API_KEY" | "FREEBUFF_CONFIG_DIR" | "NEXT_PUBLIC_CB_ENVIRONMENT"
+                )
+        )
+}
+
 fn inject_credentials<'js>(
     ctx: &Ctx<'js>,
     host: &Object<'js>,
     account: Option<&ProviderAccountContext>,
 ) -> rquickjs::Result<()> {
     let credentials_obj = Object::new(ctx.clone())?;
-    let credential_json = account
-        .and_then(|account| account.credential.as_ref())
-        .and_then(|credential| serde_json::to_string(credential).ok());
+    let credential = std::rc::Rc::new(std::cell::RefCell::new(
+        account.and_then(|account| account.credential.clone()),
+    ));
+    let current = credential.clone();
     credentials_obj.set(
         "get",
         Function::new(ctx.clone(), move || -> Option<String> {
-            credential_json.clone()
+            current.borrow().as_ref().and_then(|value| serde_json::to_string(value).ok())
         })?,
     )?;
 
@@ -1278,7 +1389,11 @@ fn inject_credentials<'js>(
                         &format!("invalid credential update: {}", e),
                     )
                 })?;
-                let updated = provider_accounts::update_credential_at_path(path, id, update)
+                let mut current = credential.borrow_mut();
+                let Some(expected) = current.as_ref() else {
+                    return Ok(None);
+                };
+                let updated = provider_accounts::update_credential_at_path(path, id, expected, update)
                     .map_err(|e| {
                         Exception::throw_message(
                             &ctx_inner,
@@ -1286,9 +1401,12 @@ fn inject_credentials<'js>(
                         )
                     })?;
                 match updated {
-                    Some(credential) => serde_json::to_string(&credential)
-                        .map(Some)
-                        .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string())),
+                    Some(credential) => {
+                        let json = serde_json::to_string(&credential)
+                            .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))?;
+                        *current = Some(credential);
+                        Ok(Some(json))
+                    }
                     None => Ok(None),
                 }
             },
@@ -1308,6 +1426,7 @@ fn inject_http<'js>(
     host: &Object<'js>,
     plugin_id: &str,
     deadline: ProbeDeadline,
+    opencode_go_batch: Option<Arc<OpenCodeGoProbeBatch>>,
 ) -> rquickjs::Result<()> {
     let http_obj = Object::new(ctx.clone())?;
     let pid = plugin_id.to_string();
@@ -1325,6 +1444,23 @@ fn inject_http<'js>(
                     return Err(probe_timeout_error(&ctx_inner));
                 }
 
+                let slot = opencode_go_batch.as_ref().and_then(|batch| batch.response_slot(&req));
+                let mut slot = slot.as_ref().map(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()));
+                if deadline.has_elapsed() {
+                    return Err(probe_timeout_error(&ctx_inner));
+                }
+                if let Some(response) = slot.as_deref().and_then(Option::as_ref) {
+                    return match response {
+                        Ok(body) => Ok(body.clone()),
+                        Err(message) => Err(Exception::throw_message(&ctx_inner, message)),
+                    };
+                }
+                let mut finish = |result: Result<String, String>| {
+                    if let Some(slot) = slot.as_deref_mut() {
+                        *slot = Some(result.clone());
+                    }
+                    result.map_err(|message| Exception::throw_message(&ctx_inner, &message))
+                };
                 let method_str = req.method.as_deref().unwrap_or("GET");
                 let redacted_url = redact_url(&req.url);
                 log::info!("[plugin:{}] HTTP {} {}", pid, method_str, redacted_url);
@@ -1350,24 +1486,22 @@ fn inject_http<'js>(
                 }
 
                 #[cfg(test)]
-                {
-                    let lock = HTTP_MOCK_STATE.get_or_init(|| Mutex::new(None));
-                    let mut guard = lock.lock().unwrap();
-                    if let Some(state) = guard.as_mut() {
+                if let Some(resp) = HTTP_MOCK_STATE.with_borrow_mut(|state| {
+                    state.as_mut().map(|state| {
                         state.requests.push(CapturedHttpRequest {
                             url: req.url.clone(),
                             method: method_str.to_string(),
                             headers: req.headers.clone().unwrap_or_default(),
                             body_text: req.body_text.clone(),
                         });
-                        let resp = state.responses.pop_front().unwrap_or(HttpRespParams {
+                        state.responses.pop_front().unwrap_or(HttpRespParams {
                             status: 200,
                             headers: std::collections::HashMap::new(),
                             body_text: "{}".to_string(),
-                        });
-                        return serde_json::to_string(&resp)
-                            .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()));
-                    }
+                        })
+                    })
+                }) {
+                    return finish(serde_json::to_string(&resp).map_err(|e| e.to_string()));
                 }
 
                 let timeout_ms = req.timeout_ms.unwrap_or(10_000);
@@ -1408,9 +1542,10 @@ fn inject_http<'js>(
                     builder = builder.body(body);
                 }
 
-                let response = builder
-                    .send()
-                    .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))?;
+                let response = match builder.send() {
+                    Ok(response) => response,
+                    Err(e) => return finish(Err(e.to_string())),
+                };
 
                 let status = response.status().as_u16();
                 let mut resp_headers = std::collections::HashMap::new();
@@ -1423,9 +1558,10 @@ fn inject_http<'js>(
                     })?;
                     resp_headers.insert(key.to_string(), header_value.to_string());
                 }
-                let body = response
-                    .text()
-                    .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))?;
+                let body = match response.text() {
+                    Ok(body) => body,
+                    Err(e) => return finish(Err(e.to_string())),
+                };
 
                 // Redact BEFORE truncation to ensure sensitive values are caught while intact
                 let redacted_body = redact_body(&body);
@@ -1455,8 +1591,7 @@ fn inject_http<'js>(
                     body_text: body,
                 };
 
-                serde_json::to_string(&resp)
-                    .map_err(|e| Exception::throw_message(&ctx_inner, &e.to_string()))
+                finish(serde_json::to_string(&resp).map_err(|e| e.to_string()))
             },
         )?,
     )?;
@@ -1634,13 +1769,12 @@ pub fn inject_utils(ctx: &rquickjs::Ctx<'_>) -> rquickjs::Result<()> {
                         if (!ctx.host.credentials || typeof ctx.host.credentials.update !== "function") return false;
                         var current = ctx.util.readProviderCredential() || {};
                         var update = Object.assign({}, current, partial || {});
-                        ctx.host.credentials.update(JSON.stringify({
+                        return Boolean(ctx.host.credentials.update(JSON.stringify({
                             accessToken: update.accessToken || null,
                             refreshToken: update.refreshToken || null,
                             sessionKey: update.sessionKey || null,
                             expiresAt: update.expiresAt || null
-                        }));
-                        return true;
+                        })));
                     } catch (e) {
                         return false;
                     }
@@ -1873,7 +2007,9 @@ struct HttpMockState {
 }
 
 #[cfg(test)]
-static HTTP_MOCK_STATE: OnceLock<Mutex<Option<HttpMockState>>> = OnceLock::new();
+thread_local! {
+    static HTTP_MOCK_STATE: RefCell<Option<HttpMockState>> = const { RefCell::new(None) };
+}
 
 #[cfg(test)]
 pub(crate) fn install_http_mock(responses: Vec<(u16, &str)>) {
@@ -1888,16 +2024,12 @@ pub(crate) fn install_http_mock(responses: Vec<(u16, &str)>) {
             .collect(),
         requests: Vec::new(),
     };
-    let lock = HTTP_MOCK_STATE.get_or_init(|| Mutex::new(None));
-    *lock.lock().unwrap() = Some(state);
+    HTTP_MOCK_STATE.set(Some(state));
 }
 
 #[cfg(test)]
 pub(crate) fn take_http_mock_requests() -> Vec<CapturedHttpRequest> {
-    let lock = HTTP_MOCK_STATE.get_or_init(|| Mutex::new(None));
-    lock.lock()
-        .unwrap()
-        .take()
+    HTTP_MOCK_STATE.take()
         .map(|state| state.requests)
         .unwrap_or_default()
 }
@@ -1944,32 +2076,13 @@ fn inject_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquick
                     opts.markers
                 );
 
-                // Windows: no ps command; plugins fall back to SQLite/Cloud API
-                #[cfg(windows)]
-                return Ok("null".to_string());
-
-                #[cfg(not(windows))]
-                {
-                // Use ps -e on Linux (GNU ps); -ax on macOS/BSD
-                let (ps_path, ps_args): (&str, &[&str]) = if std::env::consts::OS == "linux" {
-                    ("ps", &["-e", "-o", "pid=,args="][..])
-                } else {
-                    ("/bin/ps", &["-ax", "-o", "pid=,command="][..])
-                };
-                let ps_output = match std::process::Command::new(ps_path).args(ps_args).output() {
-                    Ok(o) => o,
+                let ps_stdout = match ls_list_processes(&opts.process_name) {
+                    Ok(out) => out,
                     Err(e) => {
-                        log::warn!("[plugin:{}] ps failed: {}", pid, e);
+                        log::warn!("[plugin:{}] process list failed: {}", pid, e);
                         return Ok("null".to_string());
                     }
                 };
-
-                if !ps_output.status.success() {
-                    log::warn!("[plugin:{}] ps returned non-zero", pid);
-                    return Ok("null".to_string());
-                }
-
-                let ps_stdout = String::from_utf8_lossy(&ps_output.stdout);
                 let process_name_lower = opts.process_name.to_lowercase();
                 let markers_lower: Vec<String> =
                     opts.markers.iter().map(|m| m.to_lowercase()).collect();
@@ -2018,6 +2131,7 @@ fn inject_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquick
                         }
                         // Fallback: path substring
                         command_lower.contains(&format!("/{}/", m))
+                            || command_lower.contains(&format!("{0}{1}{0}", char::from(92u8), m))
                     });
                     if !has_marker {
                         continue;
@@ -2063,39 +2177,12 @@ fn inject_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquick
                     }
                 }
 
-                // Find lsof binary
-                let lsof_path = ["/usr/sbin/lsof", "/usr/bin/lsof"]
-                    .iter()
-                    .find(|p| std::path::Path::new(p).exists())
-                    .copied();
-
-                let ports = if let Some(lsof) = lsof_path {
-                    match std::process::Command::new(lsof)
-                        .args([
-                            "-nP",
-                            "-iTCP",
-                            "-sTCP:LISTEN",
-                            "-a",
-                            "-p",
-                            &process_pid.to_string(),
-                        ])
-                        .output()
-                    {
-                        Ok(o) if o.status.success() => {
-                            ls_parse_listening_ports(&String::from_utf8_lossy(&o.stdout))
-                        }
-                        Ok(_) => {
-                            log::warn!("[plugin:{}] lsof returned non-zero", pid);
-                            Vec::new()
-                        }
-                        Err(e) => {
-                            log::warn!("[plugin:{}] lsof failed: {}", pid, e);
-                            Vec::new()
-                        }
+                let ports = match ls_listening_ports(process_pid) {
+                    Ok(ports) => ports,
+                    Err(e) => {
+                        log::warn!("[plugin:{}] port lookup failed: {}", pid, e);
+                        Vec::new()
                     }
-                } else {
-                    log::warn!("[plugin:{}] lsof not found", pid);
-                    Vec::new()
                 };
 
                 if ports.is_empty() && extension_port.is_none() {
@@ -2125,7 +2212,6 @@ fn inject_ls<'js>(ctx: &Ctx<'js>, host: &Object<'js>, plugin_id: &str) -> rquick
                 serde_json::to_string(&result).map_err(|e| {
                     Exception::throw_message(&ctx_inner, &format!("serialize failed: {}", e))
                 })
-                }
             },
         )?,
     )?;
@@ -2169,6 +2255,98 @@ fn ls_extract_flag(command: &str, flag: &str) -> Option<String> {
     None
 }
 
+#[cfg(not(windows))]
+fn ls_list_processes(_process_name: &str) -> Result<String, String> {
+    // Use ps -e on Linux (GNU ps); -ax on macOS/BSD
+    let (ps_path, ps_args): (&str, &[&str]) = if std::env::consts::OS == "linux" {
+        ("ps", &["-e", "-o", "pid=,args="][..])
+    } else {
+        ("/bin/ps", &["-ax", "-o", "pid=,command="][..])
+    };
+    let out = std::process::Command::new(ps_path)
+        .args(ps_args)
+        .output()
+        .map_err(|e| format!("ps failed: {e}"))?;
+    if !out.status.success() {
+        return Err("ps returned non-zero".to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Lists `pid command-line` lines for processes whose image name contains
+/// `process_name`, matching the `ps` output shape used on macOS.
+#[cfg(windows)]
+fn ls_list_processes(process_name: &str) -> Result<String, String> {
+    let name = ls_wql_safe_name(process_name);
+    if name.is_empty() {
+        return Err("empty process name".to_string());
+    }
+    let script = format!(
+        r#"Get-CimInstance Win32_Process -Filter "Name LIKE '%{name}%'" | Where-Object {{ $_.CommandLine }} | ForEach-Object {{ [string]$_.ProcessId + ' ' + $_.CommandLine }}"#
+    );
+    ls_run_powershell(&script)
+}
+
+#[cfg(not(windows))]
+fn ls_listening_ports(process_pid: i32) -> Result<Vec<i32>, String> {
+    let lsof = ["/usr/sbin/lsof", "/usr/bin/lsof"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .copied()
+        .ok_or_else(|| "lsof not found".to_string())?;
+    let out = std::process::Command::new(lsof)
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", &process_pid.to_string()])
+        .output()
+        .map_err(|e| format!("lsof failed: {e}"))?;
+    if !out.status.success() {
+        return Err("lsof returned non-zero".to_string());
+    }
+    Ok(ls_parse_listening_ports(&String::from_utf8_lossy(&out.stdout)))
+}
+
+#[cfg(windows)]
+fn ls_listening_ports(process_pid: i32) -> Result<Vec<i32>, String> {
+    let script = format!(
+        "Get-NetTCPConnection -State Listen -OwningProcess {process_pid} -ErrorAction SilentlyContinue | ForEach-Object {{ $_.LocalPort }}"
+    );
+    Ok(ls_parse_port_lines(&ls_run_powershell(&script)?))
+}
+
+#[cfg(windows)]
+fn ls_run_powershell(script: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("powershell failed: {e}"))?;
+    if !out.status.success() {
+        return Err("powershell returned non-zero".to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Keeps only characters that cannot break out of a WQL `LIKE` string.
+#[cfg(any(windows, test))]
+fn ls_wql_safe_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .collect()
+}
+
+/// Parses one port number per line (PowerShell `LocalPort` output).
+#[cfg(any(windows, test))]
+fn ls_parse_port_lines(output: &str) -> Vec<i32> {
+    let ports: std::collections::BTreeSet<i32> = output
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .filter(|p| *p > 0 && *p < 65536)
+        .collect();
+    ports.into_iter().collect()
+}
+
+#[cfg(not(windows))]
 /// Parse listening port numbers from `lsof -nP -iTCP -sTCP:LISTEN` output.
 fn ls_parse_listening_ports(output: &str) -> Vec<i32> {
     let mut ports = std::collections::BTreeSet::new();
@@ -2198,6 +2376,7 @@ fn inject_usage_daily<'js>(
     host: &Object<'js>,
     instance_id: &str,
     app_data_dir: &PathBuf,
+    deferred_usage: Option<DeferredUsage>,
 ) -> rquickjs::Result<()> {
     let usage_daily_obj = Object::new(ctx.clone())?;
     let app_data = app_data_dir.clone();
@@ -2208,7 +2387,9 @@ fn inject_usage_daily<'js>(
         Function::new(
             ctx.clone(),
             move |_ctx_inner: Ctx<'_>, payload_json: String| -> rquickjs::Result<()> {
-                if let Err(e) = crate::usage_daily::ingest_json(&app_data, &iid, &payload_json) {
+                if let Some(usage) = &deferred_usage {
+                    usage.borrow_mut().push(payload_json);
+                } else if let Err(e) = crate::usage_daily::ingest_json(&app_data, &iid, &payload_json) {
                     log::warn!("[plugin:{}] usageDaily.ingest failed: {}", iid, e);
                 }
                 Ok(())
@@ -3425,6 +3606,22 @@ fn expand_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ls_parse_port_lines_dedupes_and_filters() {
+        let output = "53123
+0
+53124
+53123
+abc
+70000
+";
+        assert_eq!(ls_parse_port_lines(output), vec![53123, 53124]);
+    }
+
+    #[test]
+    fn ls_wql_safe_name_strips_quotes_and_wildcards() {
+        assert_eq!(ls_wql_safe_name("language_server' OR '1%"), "language_serverOR1");
+    }
     use super::*;
     use rquickjs::{Context, Function, Object, Runtime};
 
@@ -3870,6 +4067,23 @@ mod tests {
             assert!(status == "ok" || status == "no_data", "got {status}");
             assert!(v.get("data").and_then(|d| d.get("daily")).and_then(|d| d.as_array()).is_some());
         });
+    }
+
+    #[test]
+    fn provider_specific_environment_variables_are_scoped() {
+        for (plugin, name) in [
+            ("openrouter", "OPENROUTER_API_KEY"),
+            ("openrouter", "OPENROUTER_KEY"),
+            ("copilot", "GH_CONFIG_DIR"),
+            ("devin", "LOCALAPPDATA"),
+            ("freebuff", "APPDATA"),
+            ("freebuff", "CODEBUFF_API_KEY"),
+            ("freebuff", "FREEBUFF_CONFIG_DIR"),
+            ("freebuff", "NEXT_PUBLIC_CB_ENVIRONMENT"),
+        ] {
+            assert!(env_allowed_for_plugin(plugin, name));
+            assert!(!env_allowed_for_plugin("unrelated", name));
+        }
     }
 
     #[test]

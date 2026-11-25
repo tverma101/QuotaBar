@@ -129,8 +129,15 @@
       entry.expires_at = new Date(expiresAtMs).toISOString()
 
       try {
-        ctx.host.fs.writeText(AUTH_PATH, JSON.stringify(auth, null, 2))
-        ctx.host.log.info("Grok auth refresh succeeded, token persisted")
+        if (auth) {
+          ctx.host.fs.writeText(AUTH_PATH, JSON.stringify(auth, null, 2))
+        } else if (!ctx.util.writeProviderCredential || !ctx.util.writeProviderCredential({
+          accessToken,
+          refreshToken: readRefreshToken(entry),
+          expiresAt: expiresAtMs,
+        })) {
+          ctx.host.log.warn("Grok auth refresh succeeded but could not save the selected account credential")
+        }
       } catch (e) {
         ctx.host.log.warn("Grok auth refresh succeeded but failed to save auth: " + String(e))
       }
@@ -145,9 +152,21 @@
 
   function loadAuth(ctx) {
     const credential = ctx.util.readProviderCredential && ctx.util.readProviderCredential()
-    if (credential && credential.accessToken) {
+    if (credential && (credential.accessToken || credential.refreshToken)) {
       ctx.host.log.info("auth loaded from provider account")
-      return { auth: null, entryKey: "provider-account", entry: credential, token: credential.accessToken }
+      const entryKey = "provider-account"
+      const entry = {
+        refresh_token: credential.refreshToken,
+        expires_at: ctx.util.toIso(credential.expiresAt),
+      }
+      let token = credential.accessToken
+      const currentMs = nowMs(ctx)
+      if (!token || needsRefresh(ctx, entry, token, currentMs)) {
+        const refreshed = refreshAuth(ctx, null, entryKey, entry)
+        if (refreshed) token = refreshed
+        else if (!token || isExpired(ctx, entry, token, currentMs)) throw LOGIN_HINT
+      }
+      return { auth: null, entryKey, entry, token }
     }
     const auth = readJson(ctx, AUTH_PATH)
     if (!auth || typeof auth !== "object") {
@@ -182,9 +201,9 @@
     throw "Grok auth invalid. Run `grok login` again."
   }
 
-  function unitsValue(obj) {
-    if (!obj || typeof obj !== "object") return null
-    const n = Number(obj.val)
+  function finiteNumber(value) {
+    if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return null
+    const n = Number(value)
     return Number.isFinite(n) ? n : null
   }
 
@@ -258,26 +277,25 @@
     }
   }
 
-  function parseCreditsConfig(config) {
+  function parseCreditsConfig(ctx, config) {
     if (!config || typeof config !== "object") return null
     const period = config.currentPeriod
     if (!period || typeof period !== "object") return null
     const periodType = typeof period.type === "string" ? period.type.trim() : ""
     if (!periodType) return null
-    const start = typeof period.start === "string" ? period.start : null
-    const end = typeof period.end === "string" ? period.end : null
-    if (!start || !end) return null
-    let usedPercent = 0
-    if (config.creditUsagePercent != null) {
-      const n = Number(config.creditUsagePercent)
-      if (!Number.isFinite(n)) return null
-      usedPercent = n
-    }
-    const onDemandCapUnits = unitsValue(config.onDemandCap) || 0
+    const start = typeof period.start === "string" ? ctx.util.parseDateMs(period.start.trim()) : null
+    const end = typeof period.end === "string" ? ctx.util.parseDateMs(period.end.trim()) : null
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null
+    const usedPercent = config.creditUsagePercent === undefined ? 0 : finiteNumber(config.creditUsagePercent)
+    const cap = config.onDemandCap
+    if (cap !== undefined && (!cap || typeof cap !== "object" || Array.isArray(cap))) return null
+    const onDemandCapUnits = cap && cap.val !== undefined ? finiteNumber(cap.val) : 0
+    if (usedPercent === null || onDemandCapUnits === null) return null
     return {
       periodType,
       usedPercent,
       periodEnd: end,
+      periodDurationMs: end - start <= 366 * 86400000 ? end - start : 7 * 86400000,
       onDemandCapUnits,
     }
   }
@@ -600,7 +618,7 @@
       throw "Grok billing response changed."
     }
 
-    const credits = parseCreditsConfig(config)
+    const credits = parseCreditsConfig(ctx, config)
     if (!credits) {
       throw "Grok billing response changed."
     }
@@ -618,6 +636,7 @@
         limit: 100,
         format: { kind: "percent" },
         resetsAt,
+        periodDurationMs: credits.periodDurationMs,
       }))
     }
     lines.push(ctx.line.badge({

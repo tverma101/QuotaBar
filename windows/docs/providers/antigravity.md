@@ -36,6 +36,8 @@ POST https://127.0.0.1:<port>/.../GetUnleashData  → first 200 OK wins
 
 Port and CSRF token change on every app/IDE restart. The LS may use HTTPS with a self-signed cert.
 
+On Windows, step 1 reads process command lines with `Get-CimInstance Win32_Process` (filtered by process name, and also matching a backslash path containing the marker). Step 2 uses `Get-NetTCPConnection -State Listen -OwningProcess <pid>`. Discovery runs only when a refresh needs it, with no background polling, and the CSRF token is never logged.
+
 `agy` can also expose the same local service via an `agy` process. It has listening ports but no CSRF token or Antigravity marker flags, so discovery matches the `agy` executable directly.
 
 ## Headers (all local requests)

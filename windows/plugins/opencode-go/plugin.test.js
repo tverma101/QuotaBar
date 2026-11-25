@@ -1,4 +1,6 @@
+// @vitest-environment node
 import { readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeCtx } from "../test-helpers.js";
 
@@ -18,43 +20,23 @@ function setAuth(ctx, value = "go-key") {
   );
 }
 
-function setHistoryQuery(ctx, rows, options = {}) {
-  const list = Array.isArray(rows) ? rows : [];
-  ctx.host.sqlite.query.mockImplementation((dbPath, sql) => {
-    expect(dbPath).toBe("~/.local/share/opencode/opencode.db");
-
-    if (String(sql).includes("SELECT 1 AS present")) {
-      if (options.assertFilters !== false) {
-        expect(String(sql)).toContain(
-          "json_extract(data, '$.providerID') = 'opencode-go'",
-        );
-        expect(String(sql)).toContain(
-          "json_extract(data, '$.role') = 'assistant'",
-        );
-        expect(String(sql)).toContain(
-          "json_type(data, '$.cost') IN ('integer', 'real')",
-        );
-      }
-      return JSON.stringify(list.length > 0 ? [{ present: 1 }] : []);
-    }
-
-    if (options.assertFilters !== false) {
-      expect(String(sql)).toContain(
-        "json_extract(data, '$.providerID') = 'opencode-go'",
-      );
-      expect(String(sql)).toContain(
-        "json_extract(data, '$.role') = 'assistant'",
-      );
-      expect(String(sql)).toContain(
-        "json_type(data, '$.cost') IN ('integer', 'real')",
-      );
-      expect(String(sql)).toContain(
-        "COALESCE(json_extract(data, '$.time.created'), time_created)",
-      );
-    }
-
-    return JSON.stringify(list);
+function mockDatabase(ctx, path) {
+  const db = new DatabaseSync(":memory:");
+  ctx.host.fs.writeText(path, "");
+  ctx.host.sqlite.query.mockImplementation((actualPath, sql) => {
+    expect(actualPath).toBe(path);
+    return JSON.stringify(db.prepare(sql).all());
   });
+  db.exec("CREATE TABLE migration(id); CREATE TABLE credential(value, integration_id, active, time_updated, id);");
+  return db;
+}
+
+function setHistoryQuery(ctx, rows) {
+  const db = mockDatabase(ctx, "~/.local/share/opencode/opencode.db");
+  db.exec("CREATE TABLE message(id, time_created, data)");
+  const insert = db.prepare("INSERT INTO message VALUES (?, ?, ?)");
+  rows.forEach(({ createdMs, cost }, id) => insert.run(String(id), createdMs,
+    JSON.stringify({ role: "assistant", providerID: "opencode-go", cost })));
 }
 
 function setUsageApi(ctx, { status = 200, headers = {}, body } = {}) {
@@ -105,6 +87,10 @@ describe("opencode-go plugin", () => {
       { type: "progress", label: "Session", scope: "overview", primaryOrder: 1 },
       { type: "progress", label: "Weekly", scope: "overview" },
       { type: "progress", label: "Monthly", scope: "detail" },
+      { type: "text", label: "Today", scope: "detail" },
+      { type: "text", label: "Yesterday", scope: "detail" },
+      { type: "text", label: "Last 30 Days", scope: "detail" },
+      { type: "barChart", label: "Usage Trend", scope: "detail" },
     ]);
   });
 
@@ -335,5 +321,64 @@ describe("opencode-go plugin", () => {
     expect(() => plugin.probe(ctx)).toThrow(
       "OpenCode Go not detected. Log in with OpenCode Go or use it locally first.",
     );
+  });
+
+  it("reads a channel DB at the Windows override and counts migrated messages only once", async () => {
+    vi.useFakeTimers();
+    const now = new Date(2026, 2, 6, 12);
+    vi.setSystemTime(now);
+    const ctx = makeCtx();
+    ctx.host.env.get.mockImplementation(name => name === "OPENCODE_DATA_DIR" ? "C:\\OpenCode Data" : null);
+    const db = mockDatabase(ctx, "C:\\OpenCode Data/opencode-preview.db");
+    db.exec("CREATE TABLE message(id, time_created, data); CREATE TABLE session_message(id, time_created, type, data);");
+    const ts = now.getTime() - 3600000;
+    db.prepare("INSERT INTO message VALUES (?, ?, ?)").run("copy", ts,
+      JSON.stringify({ role: "assistant", providerID: "opencode-go", tokens: { total: 10 }, cost: 9 }));
+    const insert = db.prepare("INSERT INTO session_message VALUES (?, ?, 'assistant', ?)");
+    insert.run("copy", ts, JSON.stringify({ model: { providerID: "opencode-go" }, tokens: { total: 20 }, cost: 3 }));
+    insert.run("zen", ts, JSON.stringify({ model: { providerID: "opencode" }, tokens: { total: 30 } }));
+    const { lines } = (await loadPlugin()).probe(ctx);
+    expect(lines.find(line => line.label === "Session").used).toBe(25);
+    expect(lines.find(line => line.label === "Today").value).toBe("50 tokens");
+    expect(ctx.host.usageDaily.ingest.mock.calls[0][0].daily).toEqual([
+      { date: "2026-03-06", totalTokens: 50, totalCost: null },
+    ]);
+    db.close();
+  });
+
+  it("includes projected tokens without saving shared history again for an account instance", async () => {
+    vi.useFakeTimers();
+    const now = new Date(2026, 2, 6, 12);
+    vi.setSystemTime(now);
+    const ctx = makeCtx();
+    const scan = vi.fn(() => JSON.stringify([
+      { createdMs: now.getTime() - 60000, tokens: 123, cost: null, go: true },
+    ]));
+    ctx.host.opencodeGateway = { scan };
+    const { probe } = await loadPlugin();
+    expect(probe(ctx).lines.find(line => line.label === "Today").value).toBe("123 tokens");
+    ctx.account = { instanceId: "opencode-go:account" };
+    setUsageApi(ctx, { body: API_USAGE });
+    ctx.util.providerApiKey = () => "go-key";
+    expect(probe(ctx).lines.map(line => line.label)).toEqual(["Session", "Weekly", "Monthly"]);
+    expect(scan).toHaveBeenCalledTimes(1);
+    expect(ctx.host.usageDaily.ingest).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the schema's provider precedence for Go quota and total spend", async () => {
+    vi.useFakeTimers();
+    const now = new Date(2026, 2, 6, 12);
+    vi.setSystemTime(now);
+    const ctx = makeCtx();
+    const db = mockDatabase(ctx, "~/.local/share/opencode/opencode.db");
+    db.exec("CREATE TABLE message(id, time_created, data);");
+    db.prepare("INSERT INTO message VALUES (?, ?, ?)").run("zen", now.getTime(),
+      JSON.stringify({ role: "assistant", providerID: "opencode", model: { providerID: "opencode-go" },
+        tokens: { total: 15 }, cost: 3 }));
+    const result = (await loadPlugin()).probe(ctx);
+    expect(result.plan).toBe("Zen");
+    expect(result.lines.find(line => line.label === "Session")).toBeUndefined();
+    expect(result.lines.find(line => line.label === "Today").value).toBe("$3.00 · 15 tokens");
+    db.close();
   });
 });

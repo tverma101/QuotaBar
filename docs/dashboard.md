@@ -114,7 +114,7 @@ Drag a provider header to open a compact list, then drag names into the order yo
 
 ## Windows
 
-Windows opens the Modern dashboard when there’s no saved layout preference. It leads with Cost when enabled, followed by the provider cards. Open **Options** for **Customize**, **Usage History**, **Settings**, **About QuotaBar**, and **Quit QuotaBar**. Click the update countdown to refresh. **Esc** backs out one screen at a time, then closes the dashboard.
+Windows opens the Modern dashboard when there’s no saved layout preference. It leads with Cost when enabled, followed by the provider cards. Classic starts with the provider cards. Open **Options** in Modern for **Customize**, **Usage History**, **Settings**, **About QuotaBar**, and **Quit QuotaBar**. Click the update countdown to refresh. **Esc** backs out one screen at a time, then closes the dashboard.
 
 In **Customize**, switch a provider on or off, or open its detail to choose which metrics appear. Drag metrics between **Always Visible** and **On Demand**. On the dashboard, use the provider’s arrow to reveal its On Demand metrics. If all its available metrics are On Demand, they stay visible so the provider still has a dashboard entry.
 

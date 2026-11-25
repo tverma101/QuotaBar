@@ -92,6 +92,7 @@ pub fn post_probe_local_usage_daily(
     app_data_dir: &Path,
     plugin_id: &str,
     display_name: &str,
+    commit: impl FnOnce(&str) -> rusqlite::Result<()>,
 ) {
     if !crate::usage_history::persist_usage_history_enabled(app_data_dir) {
         return;
@@ -117,7 +118,7 @@ pub fn post_probe_local_usage_daily(
         "source": "local_logs",
         "daily": daily,
     });
-    if let Err(e) = crate::usage_daily::ingest_json(app_data_dir, plugin_id, &payload.to_string()) {
+    if let Err(e) = commit(&payload.to_string()) {
         log::debug!(
             "[plugin:{}] local usage post-probe ingest failed: {}",
             plugin_id,
@@ -397,7 +398,7 @@ fn aggregate_entries(
             .unwrap_or_else(|| entry.model.clone());
         let entry_cost = entry
             .carried_cost
-            .or_else(|| pricing.estimated_cost_dollars(&entry.model, &entry.tokens));
+            .or_else(|| pricing.estimated_cost_dollars_at(&entry.model, &entry.tokens, entry.timestamp));
 
         let day = by_day.entry(day_key).or_default();
         let cache_w = i64::from(entry.tokens.cache_write5m) + i64::from(entry.tokens.cache_write1h);

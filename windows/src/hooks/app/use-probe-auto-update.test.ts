@@ -1,18 +1,22 @@
 import { act, renderHook } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-const { getEnabledPluginIdsMock } = vi.hoisted(() => ({
+const { getEnabledPluginIdsMock, listenMock } = vi.hoisted(() => ({
   getEnabledPluginIdsMock: vi.fn(),
+  listenMock: vi.fn(),
 }))
 
 vi.mock("@/lib/settings", () => ({
   getEnabledPluginIds: getEnabledPluginIdsMock,
 }))
 
+vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }))
+
 import { useProbeAutoUpdate } from "@/hooks/app/use-probe-auto-update"
 
 describe("useProbeAutoUpdate", () => {
   beforeEach(() => {
+    listenMock.mockReset().mockResolvedValue(vi.fn())
     getEnabledPluginIdsMock.mockReset()
     getEnabledPluginIdsMock.mockImplementation((settings: { order: string[]; disabled: string[] }) =>
       settings.order.filter((id) => !settings.disabled.includes(id))
@@ -22,6 +26,85 @@ describe("useProbeAutoUpdate", () => {
   afterEach(() => {
     vi.useRealTimers()
     vi.restoreAllMocks()
+  })
+
+  it("handles native resume without waiting for focus and does not run twice", () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 10, 20, 12))
+    const startBatch = vi.fn().mockResolvedValue(undefined)
+    renderHook(() =>
+      useProbeAutoUpdate({
+        pluginSettings: { order: ["codex"], disabled: [] },
+        autoUpdateInterval: 15,
+        setLoadingForPlugins: vi.fn(),
+        setErrorForPlugins: vi.fn(),
+        isPluginLoading: vi.fn(() => false),
+        startBatch,
+      })
+    )
+
+    const [event, resume] = listenMock.mock.lastCall!
+    expect(event).toBe("refresh:power-resume")
+    act(() => {
+      vi.setSystemTime(new Date(2026, 10, 20, 12, 40))
+      resume()
+    })
+    expect(startBatch).toHaveBeenCalledExactlyOnceWith(["codex"])
+    act(() => window.dispatchEvent(new Event("focus")))
+    expect(startBatch).toHaveBeenCalledTimes(1)
+  })
+
+  it("catches up once when the wall clock moves past multiple deadlines during sleep", () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 10, 20, 12))
+    const startBatch = vi.fn().mockResolvedValue(undefined)
+    const { result } = renderHook(() =>
+      useProbeAutoUpdate({
+        pluginSettings: { order: ["codex", "disabled"], disabled: ["disabled"] },
+        autoUpdateInterval: 15,
+        setLoadingForPlugins: vi.fn(),
+        setErrorForPlugins: vi.fn(),
+        isPluginLoading: vi.fn(() => false),
+        startBatch,
+      })
+    )
+
+    const resumedAt = new Date(2026, 10, 22, 12).getTime()
+    act(() => {
+      vi.setSystemTime(resumedAt)
+      window.dispatchEvent(new Event("focus"))
+      document.dispatchEvent(new Event("visibilitychange"))
+    })
+
+    expect(startBatch).toHaveBeenCalledExactlyOnceWith(["codex"])
+    expect(result.current.autoUpdateNextAt).toBe(resumedAt + 15 * 60_000)
+  })
+
+  it("refreshes at local midnight without postponing the metering deadline", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 10, 20, 23, 58))
+    const startBatch = vi.fn().mockResolvedValue(undefined)
+    const { result } = renderHook(() =>
+      useProbeAutoUpdate({
+        pluginSettings: { order: ["codex"], disabled: [] },
+        autoUpdateInterval: 15,
+        setLoadingForPlugins: vi.fn(),
+        setErrorForPlugins: vi.fn(),
+        isPluginLoading: vi.fn(() => false),
+        startBatch,
+      })
+    )
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2 * 60_000)
+    })
+    expect(startBatch).toHaveBeenCalledExactlyOnceWith(["codex"])
+    expect(result.current.autoUpdateNextAt).toBe(new Date(2026, 10, 21, 0, 13).getTime())
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(13 * 60_000)
+    })
+    expect(startBatch).toHaveBeenCalledTimes(2)
   })
 
   it("keeps auto-update cleared when plugin settings are missing", () => {

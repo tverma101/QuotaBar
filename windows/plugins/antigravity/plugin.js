@@ -1007,20 +1007,24 @@
   // --- Probe ---
 
   function probe(ctx) {
-    return attachLocalSpend(ctx, probeQuota(ctx), "Antigravity")
+    var injected = ctx.util.readProviderCredential && ctx.util.readProviderCredential()
+    var account = ctx.account
+    var isolated = Boolean(injected || (account && account.instanceId !== account.baseProviderId))
+    var result = probeQuota(ctx, injected, isolated)
+    return isolated ? result : attachLocalSpend(ctx, result, "Antigravity")
   }
 
-  function probeQuota(ctx) {
-    var lsResult = probeLs(ctx)
-    if (lsResult) return lsResult
+  function probeQuota(ctx, injected, isolated) {
+    if (!isolated) {
+      var lsResult = probeLs(ctx)
+      if (lsResult) return lsResult
 
-    var agyLsResult = probeAgyLs(ctx)
-    if (agyLsResult) return agyLsResult
+      var agyLsResult = probeAgyLs(ctx)
+      if (agyLsResult) return agyLsResult
+    }
 
-    var dbTokenCandidates = loadOAuthTokenCandidates(ctx)
-
+    var dbTokenCandidates = isolated ? [] : loadOAuthTokenCandidates(ctx)
     var tokens = []
-    var injected = ctx.util.readProviderCredential && ctx.util.readProviderCredential()
     if (injected && injected.accessToken && tokens.indexOf(injected.accessToken) === -1) {
       tokens.push(injected.accessToken)
     }
@@ -1078,7 +1082,7 @@
       }
     }
 
-    if (!ccData || ccData._authFailed) {
+    if (!isolated && (!ccData || ccData._authFailed)) {
       var agyTokens = loadAgyKeychainTokens(ctx)
       if (agyTokens) {
         var agyResult = probeAgyCloudCode(ctx, agyTokens.accessToken)
