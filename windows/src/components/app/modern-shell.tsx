@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { useShallow } from "zustand/react/shallow"
 import { LiquidGlassFilter } from "@/components/liquid-glass-filter"
@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button"
 import type { DisplayPluginState } from "@/hooks/app/use-app-plugin-views"
 import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
 import { useAppVersion } from "@/hooks/app/use-app-version"
+import { usePanel } from "@/hooks/app/use-panel"
 import { useWeeklyRollup } from "@/hooks/use-weekly-rollup"
 import { useHistoryInsights } from "@/hooks/use-history-insights"
 import { usePersistUsageHistory } from "@/hooks/use-persist-usage-history"
@@ -67,7 +68,6 @@ export function ModernShell({
 }: ModernShellProps) {
   const { t } = useTranslation()
   const [screen, setScreen] = useState<ModernScreen>("dashboard")
-  const scrollRef = useRef<HTMLDivElement>(null)
   const appVersion = useAppVersion()
 
   const { themeMode, displayMode, resetTimerDisplayMode, modernDensity, displayCurrency, exchangeRatesRevision, showTotalSpend, reduceAnimations } =
@@ -84,12 +84,22 @@ export function ModernShell({
     })),
   )
 
-  const { showAbout, setShowAbout } = useAppUiStore(
+  const { activeView, setActiveView, showAbout, setShowAbout } = useAppUiStore(
     useShallow((s) => ({
+      activeView: s.activeView,
+      setActiveView: s.setActiveView,
       showAbout: s.showAbout,
       setShowAbout: s.setShowAbout,
     })),
   )
+
+  const { containerRef, scrollRef, maxPanelHeightPx } = usePanel({
+    activeView,
+    setActiveView,
+    showAbout,
+    setShowAbout,
+    displayPlugins,
+  })
 
   const { pluginsMeta, pluginSettings } = useAppPluginStore(
     useShallow((s) => ({
@@ -124,11 +134,12 @@ export function ModernShell({
     scheduleHistoryInsightsReload()
   }, [probeStamp, scheduleRollupReload, scheduleHistoryInsightsReload])
 
-  const setActiveView = useAppUiStore((s) => s.setActiveView)
-
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: 0 })
-  }, [screen])
+    const frame = requestAnimationFrame(() => {
+      scrollRef.current?.scrollTo({ top: 0 })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [screen, scrollRef])
 
   useEffect(() => {
     if (!pluginSettings || !layout.hydrated) return
@@ -254,6 +265,7 @@ export function ModernShell({
 
   return (
     <div
+      ref={containerRef}
       className="app-popover-shell w-full bg-transparent"
       data-density={modernDensity}
     >
@@ -262,6 +274,7 @@ export function ModernShell({
         ref={panelMotionRef}
         className="app-panel-surface relative w-full overflow-hidden rounded-[18px] select-none flex flex-col min-h-[320px]"
         data-ui-layout="modern"
+        style={maxPanelHeightPx ? { maxHeight: `${maxPanelHeightPx}px` } : undefined}
       >
         <nav
           className="flex gap-1 px-3 pt-2 pb-1 border-b border-border/50"
@@ -301,6 +314,7 @@ export function ModernShell({
           ) : null}
 
           <div
+            ref={scrollRef}
             data-panel-scroll
             className={cn(
               "min-h-0 flex-1 overflow-y-auto scrollbar-none",
