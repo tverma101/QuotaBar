@@ -1,6 +1,6 @@
-# HTTP(S) URLs used by QuotaBar / OpenUsage
+# HTTP(S) URLs Used by QuotaBar
 
-This document lists **remote** endpoints and related strings that appear in **plugins** and the **Rust CLI**, with **why** they exist (constant names / role). It is maintained for developers auditing integrations.
+This reference explains selected remote endpoints in the Windows plugins and Rust CLI. Run the inventory script from `windows/` for the current list of URL strings.
 
 **Regenerate a sorted unique URL list** (no network access):
 
@@ -10,9 +10,9 @@ This document lists **remote** endpoints and related strings that appear in **pl
 ./scripts/list-api-urls.sh --context    # same + 2 lines of context
 ```
 
-**Not listed as fixed `https://` strings:** local **Codeium / Antigravity language server** calls to `{http|https}://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/...` (port from running IDE). See [providers/antigravity.md](providers/antigravity.md) and [providers/windsurf.md](providers/windsurf.md).
+The Antigravity language server uses a loopback port assigned by the IDE. See [Antigravity](providers/antigravity.md) for setup and discovery.
 
-**Plugins with no remote HTTP API in `plugin.js`:** `jetbrains-ai-assistant`, `opencode-go`, `mock` (local files / SQLite only).
+The `jetbrains-ai-assistant` and `mock` plugins use local data.
 
 ---
 
@@ -96,15 +96,6 @@ Quick copy-paste list: `./scripts/print-cursor-endpoints.sh`
 | `WORKOS_AUTH_URL` | `plugins/factory/plugin.js` | `https://api.workos.com/user_management/authenticate` | WorkOS |
 | `USAGE_URL` | `plugins/factory/plugin.js` | `https://api.factory.ai/api/organization/subscription/usage` | Subscription usage |
 
-### gemini
-
-| Symbol / role | File | URL | Purpose |
-|---------------|------|-----|---------|
-| `LOAD_CODE_ASSIST_URL` | `plugins/gemini/plugin.js` | `https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` | Plan / tier |
-| `QUOTA_URL` | `plugins/gemini/plugin.js` | `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` | Quota |
-| `PROJECTS_URL` | `plugins/gemini/plugin.js` | `https://cloudresourcemanager.googleapis.com/v1/projects` | GCP projects |
-| `TOKEN_URL` | `plugins/gemini/plugin.js` | `https://oauth2.googleapis.com/token` | OAuth token |
-
 ### gemini-apps
 
 | Symbol / role | File | URL | Purpose |
@@ -139,13 +130,11 @@ Quick copy-paste list: `./scripts/print-cursor-endpoints.sh`
 | `REST_API_BASE` | `plugins/perplexity/plugin.js` | `https://www.perplexity.ai/rest/pplx-api/v2` | Groups / usage analytics |
 | `RATE_LIMIT_ENDPOINT` | `plugins/perplexity/plugin.js` | `https://www.perplexity.ai/rest/rate-limit/all` | Rate limits |
 
-### windsurf
+### opencode-go
 
 | Symbol / role | File | URL | Purpose |
 |---------------|------|-----|---------|
-| `CLOUD_URL` | `plugins/windsurf/plugin.js` | `https://server.codeium.com` | Cloud Connect-RPC base |
-| Cloud RPC | `plugins/windsurf/plugin.js` | `https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus` | Built as `CLOUD_URL + "/" + CLOUD_SERVICE + "/GetUserStatus"` |
-| Local LS | `plugins/windsurf/plugin.js` | `http(s)://127.0.0.1:<port>/...` | Same LS service name as Antigravity |
+| `USAGE_URL` | `plugins/opencode-go/plugin.js` | `https://opencode.ai/zen/go/v1/usage` | OpenCode Go quota |
 
 ### z.ai
 

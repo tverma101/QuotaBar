@@ -1,24 +1,23 @@
 # Security Policy
 
-> **Fork note:** this is QuotaBar, an independent fork. Report QuotaBar-specific issues to the
-> repository owner. Vulnerabilities in shared upstream code should still reach Robin Ebers at the
-> address below.
+> **Fork note:** QuotaBar is an independent fork of OpenUsage. This policy covers the fork's macOS
+> and Windows apps.
 
 ## Reporting a Vulnerability
 
-If you find a security vulnerability in OpenUsage, please report it responsibly. Do not open a public issue.
+Report vulnerabilities through a private channel. Please keep vulnerability details out of public issues.
 
 ### Preferred: GitHub Security Advisories
 
-1. Go to the [Security Advisories page](https://github.com/robinebers/openusage/security/advisories/new)
-2. Click "Report a vulnerability"
-3. Fill in the details
+Use [Report a vulnerability to QuotaBar](https://github.com/tverma101/QuotaBar/security/advisories/new)
+to send a private report to this repository's maintainers.
 
 This keeps the report private until a fix is released.
 
-### Alternative: Email
+### OpenUsage Upstream
 
-Send details to [rob@robinebers.com](mailto:rob@robinebers.com) with the subject line "OpenUsage Security Report".
+For vulnerabilities that also affect OpenUsage, use [upstream's security reporting page](https://github.com/robinebers/openusage/security/advisories/new)
+or email [rob@robinebers.com](mailto:rob@robinebers.com) with the subject line "OpenUsage Security Report".
 
 ## What to Include
 
@@ -37,7 +36,7 @@ Send details to [rob@robinebers.com](mailto:rob@robinebers.com) with the subject
 
 The following are in scope:
 
-- The OpenUsage desktop application
+- QuotaBar for macOS and Windows
 - The built-in providers (credential handling, API calls)
 - The local HTTP API
 - Build and release infrastructure
