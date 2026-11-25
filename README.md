@@ -22,22 +22,20 @@ Both platforms track the same core usage concepts, but provider support and plat
 
 ## Download and Set Up
 
-Open [GitHub Releases](https://github.com/tverma101/QuotaBar/releases) and choose an installer from **Assets**. If your installer is missing, use the source build instructions below.
+**Windows 11 x64.** Run the setup program, open **QuotaBar** from Start, then click the gauge in the taskbar notification area. Check the hidden icons if needed. The current beta installer is unsigned, so Windows may show a SmartScreen or publisher prompt. [Download v0.7.2-beta.2](https://github.com/tverma101/QuotaBar/releases/download/v0.7.2-beta.2/QuotaBar_0.7.2-beta.2_x64-setup.exe) · [Release notes and checksum](https://github.com/tverma101/QuotaBar/releases/tag/v0.7.2-beta.2)
 
-| Platform | Installer | First Launch |
-| --- | --- | --- |
-| macOS 15 or later, Apple Silicon or Intel | `.dmg` | Drag QuotaBar to Applications, open it, and click the gauge in the menu bar. |
-| Windows 11 x64 | `-setup.exe` | Run the setup program, then open **QuotaBar** from Start. Click the gauge in the taskbar notification area. Check the hidden icon overflow if needed. |
+**macOS 15 or later.** Build QuotaBar from the same release tag. After launching, click the gauge in the menu bar. [macOS source build instructions](#build-from-source)
 
 Claude, Codex, Cursor, and Freebuff are enabled on a fresh install. Sign in through the corresponding provider tool, then refresh QuotaBar. Open **Options → Customize** to manage additional providers in the macOS or Windows Modern dashboard. Provider and metric availability varies by platform.
 
-To update, open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and install the newer build. On macOS, replace the app in Applications. On Windows, run the newer installer for the same user.
+Updates are manual. On Windows, open **About QuotaBar → Downloads and Updates**, quit QuotaBar, and run the newer installer under the same Windows account. On macOS, check out the newer tag and rebuild. [All releases](https://github.com/tverma101/QuotaBar/releases)
 
 ## Build From Source
 
-On macOS, install Xcode 26 or later and stable Rust. Run from the repository root:
+On macOS, install Xcode 26 or later and stable Rust. To build the current beta, clone this repository and run from its root.
 
 ```sh
+git checkout v0.7.2-beta.2
 CODESIGN_IDENTITY=- ALLOW_ADHOC_SIGNING=1 ./script/build_and_run.sh verify
 ```
 
@@ -67,18 +65,15 @@ Most providers read the credentials already on your machine (keychain, auth file
 These are the core product features. Some shell behavior is platform-specific; the Windows README documents Windows behavior.
 
 - **Menu bar pins (macOS).** Pin metrics to the menu bar (up to 2 per provider); render as compact text or mini bars. The strip hides metrics with no data instead of showing placeholders.
-- **Dashboard popover.** Provider-grouped meters with live reset countdowns and pace indicators. Click usage or reset values to flip their display everywhere; right-click a row to hide or star it, refresh its provider, or open Customize.
+- **Dashboard popover.** Provider-grouped meters with live reset countdowns and pace indicators. On macOS, click usage or reset values to flip their display, or right-click a row for metric actions.
 - **Global shortcut.** Toggle the popover from anywhere — record any combo in Settings.
 - **Customize.** Turn providers and metrics on or off, choose which rows stay Always Visible or On Demand, and drag-reorder both.
-- **Local setup discovery.** QuotaBar checks supported provider setup sources on the device and marks matches in Customize. You choose which providers to enable; discovery stays local and never activates providers automatically.
-- **Stale-while-revalidate.** Cached values display instantly at launch; live quota meters refresh every minute (every two minutes on battery or in Low Power Mode), while full history refreshes every five minutes.
-- **[One-shot CLI](docs/cli.md).** Agents can read stable limit JSON through the same five-minute cache with `quotabar`, or bypass freshness with `quotabar --force`; the menu-bar app does not need to be running.
-- **[Local HTTP API](docs/local-http-api.md).** Other apps can read machine-friendly limits from `127.0.0.1:6736/v1/limits`; the legacy `/v1/usage` UI contract remains supported. It is loopback-only and never serves credentials; note that browser pages can read it too — see the [privacy note](docs/local-http-api.md#cors-and-privacy).
+- **Local setup discovery (macOS).** Customize marks supported setups already on the device. You choose which providers to enable.
+- **Background refresh.** macOS refreshes live quota every minute, or every two minutes on battery or in Low Power Mode. On Windows, the default refresh interval is 15 minutes.
+- **One-shot CLI.** Read limit JSON with `quotabar` on macOS or `quotabar-cli read` on Windows. Add `--force` to refresh. [CLI guide](docs/cli.md)
+- **Local HTTP API.** Local apps can read limits from `127.0.0.1:6736/v1/limits`. [macOS API](docs/local-http-api.md) · [Windows API](windows/docs/local-http-api.md)
 - **[Proxy support](docs/proxy.md).** Route provider requests through SOCKS5 or HTTP(S) via `~/.quotabar/config.json`.
 - **Native settings.** Launch at login, global shortcut, icon style, theme, density, 12/24-hour time — see [Settings](docs/settings.md).
-
-
-
 ## Documentation
 
 Behavior docs live in [docs/](docs/README.md): the [dashboard](docs/dashboard.md), [menu bar pins](docs/menu-bar.md), [settings](docs/settings.md), [refresh & caching](docs/refreshing.md), the [CLI](docs/cli.md), the [local HTTP API](docs/local-http-api.md), the [proxy](docs/proxy.md), and one page per provider.
