@@ -1520,4 +1520,197 @@ mod tests {
             Some("WorkosCursorSessionToken=test-session")
         );
     }
+
+    fn isolated_bundled_plugin(plugin: &LoadedPlugin) -> LoadedPlugin {
+        let mut isolated = plugin.clone();
+        isolated.entry_script = format!(
+            "{}\n;globalThis.__openusage_plugin = (() => {{
+                const plugin = globalThis.__openusage_plugin;
+                const probe = plugin.probe;
+                plugin.probe = function(ctx) {{
+                    if (ctx.host.env) ctx.host.env.get = () => null;
+                    if (ctx.host.fs) {{
+                        ctx.host.fs.homeDir = \"C:/quotabar-isolated-home\";
+                        ctx.host.fs.exists = () => false;
+                        ctx.host.fs.firstExisting = () => null;
+                        ctx.host.fs.firstExistingAppSupport = () => null;
+                        ctx.host.fs.readText = () => null;
+                        ctx.host.fs.writeText = () => false;
+                        ctx.host.fs.listDir = () => [];
+                    }}
+                    const emptyDaily = () => ({{ status: \"no_data\", data: {{ daily: [] }} }});
+                    for (const name of [\"claudeLogs\", \"codexLogs\", \"cursorLogs\", \"grokLogs\", \"antigravityLogs\"]) {{
+                        if (ctx.host[name]) ctx.host[name].queryDaily = emptyDaily;
+                    }}
+                    if (ctx.host.cursorPaths) ctx.host.cursorPaths.resolveStateDb = () => null;
+                    if (ctx.host.cursorUsageExport) {{
+                        ctx.host.cursorUsageExport.queryDaily = () => null;
+                        ctx.host.cursorUsageExport.queryMtd = () => null;
+                    }}
+                    if (ctx.host.sqlite) {{
+                        ctx.host.sqlite.query = () => \"[]\";
+                        ctx.host.sqlite.exec = () => undefined;
+                    }}
+                    if (ctx.host.keychain) {{
+                        for (const key of Object.keys(ctx.host.keychain)) {{
+                            if (key.startsWith(\"read\")) ctx.host.keychain[key] = () => null;
+                            else ctx.host.keychain[key] = () => true;
+                        }}
+                    }}
+                    if (ctx.host.chromiumCookies) ctx.host.chromiumCookies.read = () => [];
+                    if (ctx.host.ls) ctx.host.ls.discover = () => null;
+                    if (ctx.host.opencodeGateway) ctx.host.opencodeGateway.scan = () => null;
+                    if (ctx.host.zcode) ctx.host.zcode.scan = () => null;
+                    return probe(ctx);
+                }};
+                return plugin;
+            }})();",
+            plugin.entry_script
+        );
+        isolated
+    }
+
+    #[test]
+    fn bundled_provider_scripts_execute_fail_closed_in_quickjs_without_machine_state() {
+        let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        let plugins = crate::plugin_engine::manifest::load_plugins_from_dir(&plugin_dir);
+        assert!(plugins.len() >= 30, "expected bundled provider inventory, got {}", plugins.len());
+        host_api::install_http_mock(vec![(200, "{}"); 400]);
+        let dir = temp_app_dir("bundled-provider-smoke");
+        let mut failures = Vec::new();
+        for plugin in plugins {
+            let id = plugin.manifest.id.clone();
+            let output = run_probe(&isolated_bundled_plugin(&plugin), &dir, "test");
+            if output.provider_id != id {
+                failures.push(format!("{id}: provider id became {}", output.provider_id));
+            }
+            if output.lines.is_empty() {
+                failures.push(format!("{id}: no metric lines or error badge"));
+            }
+            if matches!(output.lines.first(), Some(MetricLine::Badge { text, .. }) if text == "runtime error") {
+                failures.push(format!("{id}: generic runtime error"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    fn bundled_plugin(plugin_dir: &std::path::Path, id: &str) -> LoadedPlugin {
+        crate::plugin_engine::manifest::load_plugins_from_dir(plugin_dir)
+            .into_iter()
+            .find(|plugin| plugin.manifest.id == id)
+            .unwrap_or_else(|| panic!("bundled {id} plugin"))
+    }
+
+    #[test]
+    fn real_remote_plugins_map_mocked_success_responses_in_quickjs() {
+        let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        let dir = temp_app_dir("remote-provider-mocks");
+
+        let openrouter = bundled_plugin(&plugin_dir, "openrouter");
+        host_api::install_http_mock(vec![
+            (200, r#"{"data":{"total_usage":4.5,"total_credits":10}}"#),
+            (200, r#"{"data":{"is_free_tier":false,"usage_daily":1.25,"usage_weekly":3.5,"usage_monthly":8,"limit":20,"limit_remaining":15}}"#),
+        ]);
+        let output = run_probe_with_account(
+            &isolated_bundled_plugin(&openrouter),
+            &dir,
+            "test",
+            Some(account("openrouter:work", "openrouter", "Work", "sk-or-test")),
+        );
+        assert_eq!(output.plan.as_deref(), Some("Pay as you go"));
+        for expected in ["Credits", "Balance", "Today", "Key Limit"] {
+            assert!(output.lines.iter().any(|line| match line {
+                MetricLine::Text { label, .. } | MetricLine::Progress { label, .. } | MetricLine::Badge { label, .. } => label == expected,
+                _ => false,
+            }), "missing OpenRouter line {expected}: {:?}", output.lines);
+        }
+        assert!(!output.lines.iter().any(|line| matches!(line, MetricLine::Badge { label, .. } if label == "Error")));
+        let requests = host_api::take_http_mock_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.headers.get("Authorization").is_some_and(|value| value == "Bearer sk-or-test")));
+
+        let crofai = bundled_plugin(&plugin_dir, "crofai");
+        host_api::install_http_mock(vec![(200, r#"{"credits":10,"usable_requests":100,"requests_plan":500}"#)]);
+        let output = run_probe_with_account(
+            &isolated_bundled_plugin(&crofai),
+            &dir,
+            "test",
+            Some(account("crofai:work", "crofai", "Work", "crof-test")),
+        );
+        assert!(!output.lines.is_empty());
+        assert!(!output.lines.iter().any(|line| matches!(line, MetricLine::Badge { label, .. } if label == "Error")), "unexpected CrofAI error: {:?}", output.lines);
+        let requests = host_api::take_http_mock_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].headers.get("Authorization").map(String::as_str), Some("Bearer crof-test"));
+    }
+
+    #[test]
+    fn real_cursor_plugin_dev_mock_accounts_probe_successfully_without_network() {
+        let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        let plugin = crate::plugin_engine::manifest::load_plugins_from_dir(&plugin_dir)
+            .into_iter()
+            .find(|plugin| plugin.manifest.id == "cursor")
+            .expect("bundled Cursor plugin");
+        let dir = temp_app_dir("cursor-dev-mock-accounts");
+        for (instance, label) in [("cursor:work", "Work"), ("cursor:personal", "Personal")] {
+            let output = run_probe_with_account(
+                &isolated_bundled_plugin(&plugin),
+                &dir,
+                "test",
+                Some(account(instance, "cursor", label, "quotabar-dev-mock-access-token")),
+            );
+            assert_eq!(output.provider_id, instance);
+            assert_eq!(output.plan.as_deref(), Some("Dev mock"));
+            assert!(output.lines.iter().any(|line| matches!(
+                line,
+                MetricLine::Text { label, value, .. } if label == "Data source" && value == "Mock (QuotaBar dev)"
+            )));
+            assert!(!output.lines.iter().any(|line| matches!(line, MetricLine::Badge { label, .. } if label == "Error")));
+        }
+    }
+
+    #[test]
+    fn concurrent_quickjs_probes_survive_repeated_parallel_stress() {
+        let script = r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    let total = 0;
+                    for (let i = 0; i < 2000; i += 1) total += i % 7;
+                    ctx.host.usageDaily.ingest({ daily: [{ date: "2030-01-01", totalTokens: total }] });
+                    return { lines: [{ type: "text", label: "State", value: "ok" }] };
+                }
+            };
+        "#;
+        let mut failures = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for worker in 0..8 {
+                handles.push(scope.spawn(move || {
+                    let plugin = test_plugin_with_id("stress", "Stress", script);
+                    let dir = temp_app_dir(&format!("parallel-probe-{worker}"));
+                    for iteration in 0..10 {
+                        let (output, payloads) = run_probe_with_deferred_usage(
+                            &plugin,
+                            &dir,
+                            "test",
+                            account("stress:worker", "stress", "Worker", "token"),
+                        );
+                        if output.provider_id != "stress:worker" || payloads.len() != 1 {
+                            return Err(format!("worker {worker} iteration {iteration} produced invalid output"));
+                        }
+                    }
+                    Ok::<(), String>(())
+                }));
+            }
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => failures.push(error),
+                    Err(_) => failures.push("worker panicked".to_string()),
+                }
+            }
+        });
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
 }

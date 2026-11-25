@@ -388,7 +388,7 @@
         ctx.line.progress({
           label: "Other Models",
           used: 7,
-          limit: 50,
+          limit: 100,
           format: { kind: "percent" },
         }),
         ctx.line.progress({
@@ -400,7 +400,7 @@
         ctx.line.progress({
           label: "On-demand",
           used: 1,
-          limit: 10,
+          limit: 100,
           format: { kind: "percent" },
         }),
       ],
