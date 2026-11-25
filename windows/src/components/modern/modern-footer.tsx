@@ -105,6 +105,7 @@ function OptionsMenu({
 }) {
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -117,6 +118,7 @@ function OptionsMenu({
       event.preventDefault()
       event.stopPropagation()
       setOpen(false)
+      triggerRef.current?.focus()
     }
     document.addEventListener("pointerdown", onPointer)
     document.addEventListener("keydown", onKey, true)
@@ -135,6 +137,7 @@ function OptionsMenu({
   return (
     <div ref={rootRef} className="relative">
       <button
+        ref={triggerRef}
         type="button"
         aria-haspopup="menu"
         aria-expanded={open}
@@ -160,12 +163,12 @@ function OptionsMenu({
             const next = event.key === "ArrowDown" ? (at + 1) % items.length : (at - 1 + items.length) % items.length
             items[next]?.focus()
           }}
-          className="absolute bottom-[calc(100%+8px)] right-0 z-50 w-[220px] origin-bottom-right animate-in fade-in-0 zoom-in-95 rounded-[12px] border border-hairline bg-popover p-[5px] shadow-[0_10px_30px_rgba(0,0,0,0.35)] duration-100"
+          className="absolute bottom-[calc(100%+6px)] right-0 z-50 w-[220px] origin-bottom-right animate-in fade-in-0 zoom-in-95 rounded-[12px] border border-hairline bg-popover p-1 shadow-[0_10px_30px_rgba(0,0,0,0.35)] duration-100"
         >
           <MenuItem icon={<SlidersHorizontal />} label="Customize" onSelect={choose(onOpenCustomize)} />
           <MenuItem icon={<History />} label="Usage History" onSelect={choose(onOpenHistory)} />
           <MenuItem icon={<Settings />} label="Settings" shortcut="Ctrl+," onSelect={choose(onOpenSettings)} />
-          <div className="mx-[10px] my-[5px] h-px bg-hairline" role="separator" />
+          <div className="mx-[10px] my-[3px] h-px bg-hairline" role="separator" />
           <MenuItem icon={<Info />} label="About QuotaBar" onSelect={choose(onShowAbout)} />
           <MenuItem icon={<Power />} label="Quit QuotaBar" shortcut="Ctrl+Q" onSelect={choose(onQuit)} />
         </div>
@@ -190,7 +193,7 @@ function MenuItem({
       type="button"
       role="menuitem"
       onClick={onSelect}
-      className="flex h-[30px] w-full items-center gap-[9px] rounded-[7px] px-[9px] text-left text-[13px] outline-none transition-colors hover:bg-switch-on hover:text-white focus-visible:bg-switch-on focus-visible:text-white [&_svg]:size-[15px] [&_svg]:shrink-0"
+      className="flex h-[26px] w-full items-center gap-[9px] rounded-[7px] px-[9px] text-left text-[13px] outline-none transition-colors hover:bg-switch-on hover:text-white focus-visible:bg-switch-on focus-visible:text-white [&_svg]:size-[15px] [&_svg]:shrink-0"
     >
       {icon}
       <span className="flex-1 truncate">{label}</span>

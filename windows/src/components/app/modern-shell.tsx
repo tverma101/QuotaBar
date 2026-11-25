@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useMemo, useRef, useState } from "react"
 import { invoke, isTauri } from "@tauri-apps/api/core"
 import { useShallow } from "zustand/react/shallow"
 import { LiquidGlassFilter } from "@/components/liquid-glass-filter"
@@ -9,21 +9,16 @@ import { TotalSpendCard } from "@/components/modern/total-spend-card"
 import { UsageHistoryView } from "@/components/modern/usage-history-view"
 import { WelcomeHint } from "@/components/modern/welcome-hint"
 import { WidgetGroupedList } from "@/components/modern/widget-grouped-list"
-import { UsageInsightsBanner } from "@/components/usage-insights-banner"
 import { AppContent, type AppContentActionProps } from "@/components/app/app-content"
 import type { DisplayPluginState } from "@/hooks/app/use-app-plugin-views"
 import type { SettingsPluginState } from "@/hooks/app/use-settings-plugin-list"
 import { useAppVersion } from "@/hooks/app/use-app-version"
 import { useModernDashboard } from "@/hooks/app/use-modern-dashboard"
 import { useModernPanel } from "@/hooks/app/use-modern-panel"
-import { useWeeklyRollup } from "@/hooks/use-weekly-rollup"
-import { useHistoryInsights } from "@/hooks/use-history-insights"
-import { usePersistUsageHistory } from "@/hooks/use-persist-usage-history"
 import { useNowTicker } from "@/hooks/use-now-ticker"
 import { metricId } from "@/lib/metric-id"
 import { isMetricOnDemand } from "@/lib/metric-display"
 import { getProviderInstanceMeta, type UILayout } from "@/lib/settings"
-import { buildUsageInsights } from "@/lib/usage-insights"
 import { cn } from "@/lib/utils"
 import { useAppPreferencesStore } from "@/stores/app-preferences-store"
 import { useAppUiStore } from "@/stores/app-ui-store"
@@ -45,9 +40,7 @@ type ModernShellProps = {
   autoUpdateNextAt: number | null
   appContentProps: AppContentActionProps
   showOnboardingWizard: boolean
-  onOnboardingComplete: (layout: UILayout) => void
-  onOnboardingSkip: () => void
-  preferWeeklyLimit: boolean
+  onOnboardingComplete: (layout: UILayout, openSettings?: boolean) => void
 }
 
 export function ModernShell({
@@ -58,9 +51,10 @@ export function ModernShell({
   appContentProps,
   showOnboardingWizard,
   onOnboardingComplete,
-  preferWeeklyLimit,
 }: ModernShellProps) {
-  const [stack, setStack] = useState<ModernScreen[]>([])
+  const [stack, setStack] = useState<ModernScreen[]>(() =>
+    useAppUiStore.getState().activeView === "settings" ? [{ id: "settings" }] : [],
+  )
   const screen = stack[stack.length - 1] ?? DASHBOARD
   const appVersion = useAppVersion()
   const panelRef = useRef<HTMLDivElement>(null)
@@ -90,20 +84,6 @@ export function ModernShell({
   const nowMs = useNowTicker()
   const dashboard = useModernDashboard(displayPlugins, nowMs)
   const { pluginSettings, pluginsMeta, descriptors, placedMetricIds } = dashboard
-  const persistEnabled = usePersistUsageHistory()
-  const { dailyRows, rollup, rollup30, scheduleReload: scheduleRollupReload } = useWeeklyRollup(persistEnabled)
-  const { summary: historyInsights, scheduleReload: scheduleHistoryInsightsReload } = useHistoryInsights(persistEnabled)
-
-  const probeStamp = displayPlugins.map((p) => p.lastUpdatedAt ?? 0).join(",")
-  useEffect(() => {
-    scheduleRollupReload()
-    scheduleHistoryInsightsReload()
-  }, [probeStamp, scheduleRollupReload, scheduleHistoryInsightsReload])
-
-  const insights = useMemo(
-    () => buildUsageInsights({ plugins: displayPlugins, pluginSettings, preferWeeklyLimit, nowMs }),
-    [displayPlugins, pluginSettings, preferWeeklyLimit, nowMs],
-  )
 
   const push = useCallback((next: ModernScreen) => setStack((s) => [...s, next]), [])
   const back = useCallback(() => {
@@ -178,24 +158,12 @@ export function ModernShell({
             <WelcomeHint
               enabledNames={enabledNames}
               onOpenCustomize={() => {
-                onOnboardingComplete("modern")
+                onOnboardingComplete("modern", false)
                 push({ id: "customize" })
               }}
-              onDismiss={() => onOnboardingComplete("modern")}
+              onDismiss={() => onOnboardingComplete("modern", false)}
             />
           ) : null}
-          <UsageInsightsBanner
-            sparklineVariant="mac"
-            insights={insights}
-            historyTightest={historyInsights?.tightest}
-            rollup={rollup}
-            rollup30={rollup30}
-            dailyRows={dailyRows}
-            persistEnabled={persistEnabled}
-            nowMs={nowMs}
-            showHistoryHint={false}
-            className="mb-0 rounded-[12px] border-0 bg-surface px-[14px] py-[10px] text-[12px]"
-          />
           {showTotalSpend ? (
             <TotalSpendCard providers={dashboard.spendProviders} outputs={dashboard.spendOutputs} compact={compact} />
           ) : null}
@@ -265,7 +233,7 @@ export function ModernShell({
     case "history":
       title = "Usage History"
       content = (
-        <UsageHistoryView rows={dailyRows} persistEnabled={persistEnabled} nowMs={nowMs} onOpenSettings={openSettings} />
+        <UsageHistoryView nowMs={nowMs} onOpenSettings={openSettings} />
       )
       break
   }

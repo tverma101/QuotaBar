@@ -368,7 +368,7 @@ function App() {
   const showOnboardingWizard = onboardingComplete === false && pluginSettings !== null
 
   const handleOnboardingComplete = useCallback(
-    (layout: UILayout) => {
+    (layout: UILayout, openSettings = true) => {
       void getVersion()
         .then((appVersion) =>
           Promise.all([saveUILayout(layout), saveDualUiOnboardingComplete(appVersion)])
@@ -376,7 +376,7 @@ function App() {
         .then(() => {
           setUILayout(layout)
           setOnboardingComplete(true)
-          setActiveView("settings")
+          if (openSettings) setActiveView("settings")
         })
         .catch((error) => {
           console.error("Failed to save onboarding completion:", error)
@@ -703,12 +703,7 @@ function App() {
   }
 
   if (uiLayout === "modern") {
-    return (
-      <ModernShell
-        {...shellProps}
-        preferWeeklyLimit={preferMenubarWeeklyLimit}
-      />
-    )
+    return <ModernShell {...shellProps} />
   }
 
   return (

@@ -1,16 +1,17 @@
 # OpenUsage 0.7 UI spec (Modern layout port)
 
-Source of truth: upstream [`swift`](https://github.com/robinebers/openusage/tree/swift) branch (not `main`). QuotaBar implements **Modern** as a `uiLayout` inside the existing Tauri window — not a fixed 320px macOS popover.
+QuotaBar’s [macOS reference captures](../../docs/windows-port/reference/macos/README.md) guide the **Modern** layout. Windows uses a 320-point tray popover that grows with its content up to the available work area limit.
 
 ## Screens (Modern shell)
 
 | Screen | Swift reference | QuotaBar |
 |--------|-----------------|------------|
 | Dashboard | `DashboardView` | `ModernShell` → grouped provider cards (`WidgetGroupedList`) |
-| Customize | `CustomizeView` | Metric enable/disable + tray pins (max 2/provider) |
-| Settings | In-popover sections on macOS | Full `SettingsPage` tab (fork sections: history, insights, local API) |
+| Customize | `CustomizeView` | Provider list and detail with Always Visible and On Demand placement |
+| Usage History | `UsageHistoryView` | Local retained totals, daily token chart, and account breakdown |
+| Settings | In-popover sections on macOS | Grouped Windows controls across General, Tray, Look, Providers, and Advanced |
 
-Classic (`uiLayout === "classic"`) keeps `AppShell` + `SideNav` unchanged.
+Modern is the Windows default when there is no saved layout. From the dashboard, **Options** opens Customize, Usage History, Settings, About, and Quit. **Esc** goes back one screen at a time, then hides the panel. **Ctrl+,** opens Settings.
 
 ## Metric identity
 
@@ -25,6 +26,7 @@ Classic (`uiLayout === "classic"`) keeps `AppShell` + `SideNav` unchanged.
 | `placedMetricIds` | Dashboard-visible metrics |
 | `providerOrder` | Legacy stored order; current card order comes from `plugins.order` |
 | `metricOrderByProvider` | Row order within card |
+| `onDemandOverrides` | Saved Always Visible and On Demand choices per metric |
 | `pinnedMetricIds` | Tray strip (Modern only); max **2 per provider** |
 | `initialized` | First-launch defaults applied |
 
@@ -51,11 +53,6 @@ Port of `WidgetRowView.swift`:
 
 - **Density** (`regular` | `compact`) — row padding/fonts via `data-density` on shell
 - **Reduce transparency** — use existing `themeMode` solid/glass paths
-
-## Fork differentiators in Modern
-
-- `UsageInsightsBanner` above dashboard (not in upstream 0.7 popover)
-- All bundled plugins remain available in both layouts ([#565](https://github.com/robinebers/openusage/issues/565))
 
 ## Release (1.1.1 at upstream GA)
 

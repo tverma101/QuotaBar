@@ -28,10 +28,6 @@ type UsageInsightsBannerProps = {
   nowMs: number
   onSelectProvider?: (instanceId: string) => void
   className?: string
-  /** Show the "enable usage history" hint when history is off (Classic only). */
-  showHistoryHint?: boolean
-  /** Sparkline look: Classic's accent bars, or the Modern (macOS) blue bars. */
-  sparklineVariant?: "default" | "mac"
 }
 
 function insightIcon(kind: UsageInsight["kind"]): string {
@@ -50,8 +46,6 @@ export function UsageInsightsBanner({
   nowMs,
   onSelectProvider,
   className,
-  showHistoryHint = true,
-  sparklineVariant = "default",
 }: UsageInsightsBannerProps) {
   const [, bump] = useState(0)
 
@@ -72,7 +66,7 @@ export function UsageInsightsBanner({
     rollup30 != null &&
     countDistinctDaysInWindow(dailyRows, rollup30.currentWindow) >= 7
 
-  const showRollupHint = showHistoryHint && !persistEnabled
+  const showRollupHint = !persistEnabled
   const hasInsights = visibleInsights.length > 0
   const hasHistoryTightest = persistEnabled && historyTightest.length > 0
   const hasRollup = rollup != null
@@ -173,8 +167,6 @@ export function UsageInsightsBanner({
         <UsageSparkline
           label="Last 7d (all accounts)"
           points={sparklinePoints}
-          variant={sparklineVariant}
-          compact={sparklineVariant === "mac"}
           note="Estimated from local logs (not billing)."
         />
       ) : null}

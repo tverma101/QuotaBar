@@ -1210,6 +1210,17 @@ fn list_usage_daily(
     .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn list_retained_usage_daily(
+    state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<Vec<quotabar_core::usage_daily::UsageDailyRow>, String> {
+    let dir = state.lock().map_err(|e| e.to_string())?.app_data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || quotabar_core::usage_daily::list_all(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 fn resolve_cursor_usage_stats_target(
     app_data_dir: &std::path::Path,
     plugin_id: Option<&str>,
@@ -1475,6 +1486,7 @@ pub fn run() {
             list_usage_history,
             get_usage_insights,
             list_usage_daily,
+            list_retained_usage_daily,
             query_cursor_usage_stats,
             clear_usage_history,
             get_platform,

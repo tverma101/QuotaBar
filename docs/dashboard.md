@@ -111,3 +111,11 @@ Closing the popover resets navigation state: scroll position returns to the top 
 ## Reorder Providers
 
 Drag a provider header to open a compact list, then drag names into the order you want. The list includes disabled providers, so you can set their position before turning them on. Choose **Done** to return to the dashboard.
+
+## Windows
+
+Windows opens the Modern dashboard when there’s no saved layout preference. It leads with Cost when enabled, followed by the provider cards. Open **Options** for **Customize**, **Usage History**, **Settings**, **About QuotaBar**, and **Quit QuotaBar**. Click the update countdown to refresh. **Esc** backs out one screen at a time, then closes the dashboard.
+
+In **Customize**, switch a provider on or off, or open its detail to choose which metrics appear. Drag metrics between **Always Visible** and **On Demand**. On the dashboard, use the provider’s arrow to reveal its On Demand metrics. If all its available metrics are On Demand, they stay visible so the provider still has a dashboard entry.
+
+**Usage History** shows estimated spend and token counts from the daily data retained on this PC. It includes today, the last 7 and 30 days, a daily token chart, and totals by provider account. Enable local history in **Settings → Advanced** to collect data.

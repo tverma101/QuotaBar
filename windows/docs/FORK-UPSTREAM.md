@@ -63,4 +63,4 @@ Lists plugins whose `plugin.js` differs between `HEAD` and `upstream/swift` (ove
 
 ## Dual UI (Classic + Modern)
 
-One binary ships both layouts via Settings → **UI layout** (`uiLayout`: `classic` | `modern`). Default: **Classic**. Modern ports OpenUsage 0.7 grouped cards, Customize pins, and tray pin strip. See [OPENUSAGE-0.7-UI-SPEC.md](./OPENUSAGE-0.7-UI-SPEC.md).
+Both layouts are available in **Settings → Look → UI layout**. Windows defaults to **Modern** and honors saved layout choices. Other platforms using this frontend default to **Classic**. See [the Modern layout spec](./OPENUSAGE-0.7-UI-SPEC.md).
