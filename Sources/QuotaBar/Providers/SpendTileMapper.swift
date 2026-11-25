@@ -108,7 +108,40 @@ enum SpendTileMapper {
         // sum must cover exactly the labeled window. Filter instead of trusting the input: scan
         // windows are day-granular and a source that sweeps one day extra (or a persisted series that
         // outlived a window change) would otherwise be summed under the 30-day label.
-        let windowKeys = UsageHistoryWindow.dayKeys(through: now)
+        if let window = windowUsageLine(
+            label: "Last 30 Days", usage: usage, windowKeys: UsageHistoryWindow.dayKeys(through: now),
+            estimated: estimated, unknownModelsByDay: unknownModelsByDay, modelUsage: modelUsage,
+            modelSourceNote: modelSourceNote, partialDays: partialDays, estimatedCostDays: estimatedCostDays
+        ) {
+            lines.append(window)
+        }
+
+        // The All-At-API-Rates figure is intentionally NOT a dashboard row — the owner rejected the
+        // estimate tile; the plan-versus-API comparison lives only on the Usage History screen's
+        // total line, computed from the same `apiEstimateByDay` input.
+    }
+
+    static func windowUsageLine(
+        label: String,
+        usage: DailyUsageSeries,
+        windowKeys: Set<String>,
+        estimated: Bool,
+        unknownModelsByDay: [String: Set<String>],
+        modelUsage: ModelUsageSeries?,
+        modelSourceNote: String?,
+        partialDays: Set<String>,
+        estimatedCostDays: Set<String>?
+    ) -> MetricLine? {
+        let unexplainedIncompleteDays = Set(usage.daily.compactMap { entry -> String? in
+            guard let day = dayKey(fromUsageDate: entry.date), windowKeys.contains(day) else { return nil }
+            if entry.hasUnexplainedIncompleteCost == true
+                || (!entry.costIsComplete && entry.hasUnexplainedIncompleteCost == nil
+                    && unknownModelsByDay[day]?.isEmpty != false && !partialDays.contains(day))
+            {
+                return day
+            }
+            return nil
+        })
         let windowed = usage.daily.filter { entry in
             dayKey(fromUsageDate: entry.date).map { windowKeys.contains($0) } == true
         }
@@ -165,7 +198,7 @@ enum SpendTileMapper {
             let windowEstimated = estimatedCostDays.map { estimatedDays in
                 windowed.contains { dayKey(fromUsageDate: $0.date).map(estimatedDays.contains) == true }
             } ?? estimated
-            lines.append(.values(label: "Last 30 Days",
+            return .values(label: label,
                                  values: spendValues(tokens: totalTokens, costUSD: totalCost, estimated: windowEstimated,
                                                      tokensEstimated: windowPartial,
                                                      costIsLowerBound: costIsLowerBound,
@@ -179,12 +212,9 @@ enum SpendTileMapper {
                                     totalCostUSD: totalCost,
                                     sourceNote: modelSourceNote,
                                     unexplainedIncompleteDays: unexplainedIncompleteDays
-                                 )))
+                                 ))
         }
-
-        // The All-At-API-Rates figure is intentionally NOT a dashboard row — the owner rejected the
-        // estimate tile; the plan-versus-API comparison lives only on the Usage History screen's
-        // total line, computed from the same `apiEstimateByDay` input.
+        return nil
     }
 
     /// A period with any real usage: tokens used, dollars priced, or both. A zero-token, zero-cost day

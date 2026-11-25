@@ -110,6 +110,12 @@ final class WidgetDataStore {
     /// Rendered snapshots consumed by every UI/API surface. Equal to `localSnapshots` when iCloud sync
     /// is off; machine-local history rows are rebuilt from the union while sync is on.
     var snapshots: [String: ProviderSnapshot] = [:]
+    private struct SpendWindowCacheEntry {
+        let history: ProviderUsageHistory
+        let days: Set<String>
+        let line: MetricLine?
+    }
+    @ObservationIgnored private var spendWindowCache: [String: SpendWindowCacheEntry] = [:]
     /// Each provider's history descriptor, keyed by provider ID — the classifying metadata the
     /// Usage History screen reuses (e.g. `estimatedCost`, which drives the lifetime hero's
     /// "(Est.)" mark).
@@ -266,6 +272,13 @@ final class WidgetDataStore {
         didSet { defaults.set(alwaysShowPacing, forKey: Self.alwaysShowPacingKey) }
     }
 
+    var spendPeriods: SpendPeriodSettings {
+        didSet {
+            spendWindowCache.removeAll(keepingCapacity: true)
+            defaults.set(try? JSONEncoder().encode(spendPeriods), forKey: SpendPeriodSettings.key)
+        }
+    }
+
     /// Restores the Usage Display preferences (meter style, reset-time format, always-show-pacing) to
     /// their defaults — the Settings "Reset All Settings" path. Cached usage snapshots are data, not
     /// settings, and stay untouched.
@@ -273,6 +286,7 @@ final class WidgetDataStore {
         meterStyle = .remaining
         resetDisplayMode = .relative
         alwaysShowPacing = false
+        spendPeriods = SpendPeriodSettings()
     }
 
     func unloadProviderCachesForMemoryPressure() async {
@@ -351,6 +365,9 @@ final class WidgetDataStore {
         self.meterStyle = defaults.enumValue(forKey: Self.meterStyleKey, default: .remaining)
         self.resetDisplayMode = defaults.enumValue(forKey: Self.resetDisplayModeKey, default: .relative)
         self.alwaysShowPacing = defaults.bool(forKey: Self.alwaysShowPacingKey)
+        self.spendPeriods = defaults.data(forKey: SpendPeriodSettings.key).flatMap {
+            try? JSONDecoder().decode(SpendPeriodSettings.self, from: $0)
+        } ?? SpendPeriodSettings()
         // Stale-while-revalidate: load whatever was cached (expired included) so the menu bar and
         // dashboard show last-known values immediately at launch instead of "—"; the refresh loop
         // replaces them as soon as fresh data lands.
@@ -2235,10 +2252,16 @@ final class WidgetDataStore {
     }
 
     func data(for descriptor: WidgetDescriptor) -> WidgetData {
+        let snapshot = snapshots[descriptor.providerID]
+        let selection = descriptor.isSpendTile ? spendPeriods.selection(for: descriptor) : nil
+        let line: MetricLine?
+        if let selection {
+            line = spendLine(for: descriptor, selection: selection, snapshot: snapshot)
+        } else {
+            line = snapshot?.line(label: descriptor.metricLabel)
+        }
         var result: WidgetData
-        if let snapshot = snapshots[descriptor.providerID],
-           let line = snapshot.line(label: descriptor.metricLabel),
-           let data = resolve(line, descriptor: descriptor) {
+        if let line, let data = resolve(line, descriptor: descriptor) {
             result = data
         } else {
             // No real metric line backs this placed tile, so the sample's numbers are placeholders.
@@ -2246,6 +2269,7 @@ final class WidgetDataStore {
             result = descriptor.sample
             result.hasData = false
         }
+        if let selection { result.title = selection.title }
 
         if case .sessionCountdowns(let metricLabel) = descriptor.sample.trayStyle {
             // Read only explicit session expiries. Cached daily spend is not session activity.
@@ -2266,6 +2290,36 @@ final class WidgetDataStore {
         result.resetDisplayMode = resetDisplayMode
         result.alwaysShowPacing = alwaysShowPacing
         return result
+    }
+
+    private func spendLine(
+        for descriptor: WidgetDescriptor,
+        selection: SpendPeriodSettings.Selection,
+        snapshot: ProviderSnapshot?
+    ) -> MetricLine? {
+        guard let snapshot else { return nil }
+        if let label = selection.legacyLineLabel { return snapshot.line(label: label) }
+        guard let history = snapshot.usageHistory else { return nil }
+        let days = selection.dayKeys(through: now())
+        if let cached = spendWindowCache[descriptor.id], cached.days == days, cached.history == history {
+            return cached.line
+        }
+        let metadata = historyDescriptorsByProvider[descriptor.providerID]
+        let sourceNote = snapshot.line(label: "Last 30 Days").flatMap { line -> String? in
+            guard case .values(_, _, _, _, _, let modelBreakdown) = line else { return nil }
+            return modelBreakdown?.sourceNote
+        } ?? metadata?.sourceNote
+        let line = SpendTileMapper.windowUsageLine(
+            label: selection.title, usage: history.series, windowKeys: days,
+            estimated: metadata?.estimatedCost ?? true,
+            unknownModelsByDay: history.unknownModelsByDay,
+            modelUsage: history.modelUsage,
+            modelSourceNote: sourceNote,
+            partialDays: history.partialDays ?? [],
+            estimatedCostDays: history.estimatedCostDays
+        )
+        spendWindowCache[descriptor.id] = SpendWindowCacheEntry(history: history, days: days, line: line)
+        return line
     }
 
     /// The retained local history of providers the user has turned off, keyed by provider ID — the

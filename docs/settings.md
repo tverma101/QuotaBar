@@ -44,6 +44,13 @@ time; it also reports unavailable iCloud, loading, write, and malformed-file sta
 | Auto-Use Expiring Codex Resets | Off | Redeem eligible Codex credits one minute before expiry for verified connected accounts. The Mac must be awake and QuotaBar running; see [auto-use behavior](codex-auto-reset.md). |
 | Always Show Pacing | Off / On | Off (default) shows pacing only when a metric is close to or over its limit. On surfaces it on every metric with a reset window: on-track rows gain their projection ("~33% left at reset") and an even-pace tick marking where steady use would put you right now. Metrics without a reset window have no pace to show. |
 
+## Spend Periods
+
+Choose the three periods shown on provider spend rows and the Total Spend switcher. The defaults are
+**Today**, **Last 7 Days**, and **Last 30 Days**. Each slot can use a preset, including **Yesterday**,
+or a custom length from 1 to 3,653 days. Multi-day periods include today and use the saved history
+available for each provider. Changes take effect immediately.
+
 ## Snooze Subscriptions
 
 | Setting | Options | What it does |

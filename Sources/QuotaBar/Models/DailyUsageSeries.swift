@@ -126,7 +126,7 @@ enum UsageHistoryWindow {
     private nonisolated(unsafe) static var dayKeysCache: [DayKeysCacheKey: Set<String>] = [:]
     private static let dayKeysCacheLock = NSLock()
 
-    private static func dayKeys(through now: Date, count: Int, calendar: Calendar) -> Set<String> {
+    static func dayKeys(through now: Date, count: Int, calendar: Calendar) -> Set<String> {
         let today = calendar.startOfDay(for: now)
         let key = DayKeysCacheKey(
             startOfDay: today,
