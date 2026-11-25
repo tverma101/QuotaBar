@@ -51,7 +51,7 @@ On Windows, follow the [Windows build and setup guide](windows/README.md).
 - **[Copilot](docs/providers/copilot.md)** — AI credits, extra usage, organization billing, chat and completions
 - **[Cursor](docs/providers/cursor.md)** — credits, total usage, Grok Bot, Cursor Models, Other Models, requests, on-demand, per-day spend
 - **[Devin](docs/providers/devin.md)** — weekly and daily quota, extra usage balance
-- **[Freebuff](docs/providers/freebuff.md)** — session quotas, Freebucks credits, reset times, and reported monthly spend
+- **[Freebuff](docs/providers/freebuff.md)** — Daily Hours, Hours Balance, active sessions, and measured token and spend history
 - **[Grok](docs/providers/grok.md)** — weekly shared pool, pay-as-you-go, local daily spend
 - **[Hermes](docs/providers/hermes.md)** — session and weekly quota, local daily spend
 - **[OpenCode](docs/providers/opencode.md)** — Go session/weekly/monthly caps, Zen spend, local daily spend
@@ -74,6 +74,7 @@ These are the core product features. Some shell behavior is platform-specific; t
 - **Local HTTP API.** Local apps can read limits from `127.0.0.1:6736/v1/limits`. [macOS API](docs/local-http-api.md) · [Windows API](windows/docs/local-http-api.md)
 - **[Proxy support](docs/proxy.md).** Route provider requests through SOCKS5 or HTTP(S) via `~/.quotabar/config.json`.
 - **Native settings.** Launch at login, global shortcut, icon style, theme, density, 12/24-hour time — see [Settings](docs/settings.md).
+
 ## Documentation
 
 Behavior docs live in [docs/](docs/README.md): the [dashboard](docs/dashboard.md), [menu bar pins](docs/menu-bar.md), [settings](docs/settings.md), [refresh & caching](docs/refreshing.md), the [CLI](docs/cli.md), the [local HTTP API](docs/local-http-api.md), the [proxy](docs/proxy.md), and one page per provider.

@@ -17,9 +17,9 @@ This page records how the Tauri port adapted features from upstream OpenUsage. Q
 | Retirement / “get new app” banners | **Skip** — QuotaBar *is* the continued desktop app on Linux/Windows |
 | macOS-only panel/keychain | Port only if Linux/Windows benefit |
 
-## PR tracking (0.7 prep)
+## Historical PR Tracking
 
-Update this table as work lands on `feat/port-openusage-0.7-prep`.
+The original Tauri port tracked these PRs on `feat/port-openusage-0.7-prep`.
 
 | PR | Title | Class | QuotaBar status |
 |----|-------|-------|-------------------|
@@ -35,14 +35,12 @@ Update this table as work lands on `feat/port-openusage-0.7-prep`.
 | [#615](https://github.com/robinebers/openusage/pull/615) | Debug logging → native app | swift-rewrite | **done** — Settings log level + log path/reveal; default Info; `[refresh]` tags |
 | beta.2 | Pre-pin common stats on first launch | swift-rewrite | **done** — `DefaultLayout` + tray migration in Modern |
 
-## Workflow
+## Sync Workflow
 
-1. `git fetch upstream --tags`
-2. Diff: `git log v0.6.27..upstream/swift --oneline` and `git diff v0.6.27..upstream/swift -- plugins/`
-3. Classify each change (table above).
-4. Port on **`feat/port-openusage-0.7-prep`** — **no version bump** until `v0.7.0` GA.
-5. At GA: `git diff feat/port-openusage-0.7-prep...v0.7.0` → gap-fill → bump **1.1.1** → release.
-6. Plugin-only follow-ups after GA: patch releases; document upstream tag in [CHANGELOG.md](../CHANGELOG.md).
+1. Find the imported revision in [Windows port provenance](../PROVENANCE.md) or the most recent port note.
+2. Compare the upstream changes against that baseline and classify each change by platform and feature.
+3. Adapt applicable changes on a branch based on QuotaBar's `main` and run the affected tests.
+4. Record shipped changes in the [QuotaBar changelog](../../CHANGELOG.md). Public installer versions follow the [approved QuotaBar release tag](VERSIONING.md).
 
 ## Plugin sync checklist
 
@@ -50,7 +48,7 @@ When copying a plugin from upstream:
 
 - [ ] `plugin.js`, `plugin.json`, `plugin.test.js`
 - [ ] `bun run test plugins/<id>/plugin.test.js`
-- [ ] Redaction audit vs [`host_api.rs`](../src-tauri/src/plugin_engine/host_api.rs) (see [AGENTS.md](../AGENTS.md))
+- [ ] Check log redaction against [`host_api.rs`](../crates/quotabar-core/src/plugin_engine/host_api.rs) and the [project guide](../../AGENTS.md)
 - [ ] `bun run bundle:plugins` if shipping
 
 ## Compare plugins quickly

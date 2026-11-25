@@ -2,7 +2,7 @@
 
 Upstream **v0.7.4** and **v0.7.5** are Swift-only (`upstream/swift` tags). Port by reading Swift providers / Modern dashboard code and rewriting to JS plugins + React/Tauri.
 
-**Version:** [**1.3.2**](../VERSIONING.md) — upstream bundle = **PATCH** only. Reserve **1.4.0** for new **QuotaBar-specific** features (fork MINOR).
+**Historical port version:** [**1.3.2**](VERSIONING.md) — upstream bundle = **PATCH** only. The port reserved **1.4.0** for new **QuotaBar-specific** features (fork MINOR).
 
 **Strategy:** One patch release bundling **all** applicable 0.7.4 + 0.7.5 behavior. Do not call it 1.4.0.
 
