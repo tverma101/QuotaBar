@@ -3,7 +3,9 @@ use crate::plugin_engine::manifest::LoadedPlugin;
 use crate::provider_accounts::{self, ProviderAccountContext};
 use rquickjs::{Array, Context, Ctx, Error, Object, Promise, Runtime, Value};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const PROBE_TIMEOUT_SECS: u64 = 30;
@@ -116,7 +118,38 @@ pub fn run_probe_with_history(
         account,
         Duration::from_secs(PROBE_TIMEOUT_SECS),
         refresh_history,
+        None,
     )
+}
+
+pub fn run_probe_with_deferred_usage(
+    plugin: &LoadedPlugin,
+    app_data_dir: &PathBuf,
+    app_version: &str,
+    account: ProviderAccountContext,
+) -> (PluginOutput, Vec<String>) {
+    run_probe_with_deferred_usage_and_history(plugin, app_data_dir, app_version, account, false)
+}
+
+pub fn run_probe_with_deferred_usage_and_history(
+    plugin: &LoadedPlugin,
+    app_data_dir: &PathBuf,
+    app_version: &str,
+    account: ProviderAccountContext,
+    refresh_history: bool,
+) -> (PluginOutput, Vec<String>) {
+    let usage = Rc::new(RefCell::new(Vec::new()));
+    let output = run_probe_with_account_timeout(
+        plugin,
+        app_data_dir,
+        app_version,
+        Some(account),
+        Duration::from_secs(PROBE_TIMEOUT_SECS),
+        refresh_history,
+        Some(Rc::clone(&usage)),
+    );
+    let payloads = usage.take();
+    (output, payloads)
 }
 
 fn run_probe_with_account_timeout(
@@ -126,6 +159,7 @@ fn run_probe_with_account_timeout(
     account: Option<ProviderAccountContext>,
     timeout: Duration,
     refresh_history: bool,
+    deferred_usage: Option<host_api::DeferredUsage>,
 ) -> PluginOutput {
     let plugin_id = account
         .as_ref()
@@ -185,6 +219,7 @@ fn run_probe_with_account_timeout(
             &app_data,
             app_version,
             deadline,
+            deferred_usage,
         )
         .is_err()
         {
@@ -405,6 +440,7 @@ pub fn run_plugin_action(
             &app_data,
             app_version,
             deadline,
+            None,
         )
         .map_err(|_| "host api injection failed".to_string())?;
         host_api::patch_http_wrapper(&ctx).map_err(|_| "http wrapper failed".to_string())?;
@@ -1148,6 +1184,36 @@ mod tests {
         );
         let output = run_probe(&plugin, &temp_app_dir("sync"), "0.0.0");
         assert_eq!(error_text(output), "boom");
+    }
+
+    #[test]
+    fn deferred_probe_collects_daily_rows_without_writing_history() {
+        let plugin = test_plugin(
+            r#"
+            globalThis.__openusage_plugin = {
+                probe(ctx) {
+                    ctx.host.usageDaily.ingest({daily: [{date: "2030-01-01", totalTokens: 42}]});
+                    return {lines: [{type: "text", label: "State", value: "OK"}]};
+                }
+            };
+            "#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let app_data = dir.path().to_path_buf();
+        std::fs::write(app_data.join("settings.json"), r#"{"persistUsageHistory":true}"#).unwrap();
+        let account = ProviderAccountContext {
+            instance_id: "test:work".into(),
+            base_provider_id: "test".into(),
+            label: "Work".into(),
+            credential: None,
+            store_path: None,
+        };
+        let (output, payloads) = run_probe_with_deferred_usage(&plugin, &app_data, "0.0.0", account);
+        assert_eq!(output.provider_id, "test:work");
+        assert_eq!(payloads.len(), 1);
+        let usage: JsonValue = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(usage["daily"][0]["totalTokens"], 42);
+        assert!(!crate::usage_history::usage_history_db_path(&app_data).exists());
     }
 
     #[test]
