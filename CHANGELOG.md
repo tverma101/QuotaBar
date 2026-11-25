@@ -1,14 +1,16 @@
 # Changelog
 
-## Unreleased
+## v0.7.2-beta.2
+
+This prerelease includes an unsigned Windows 11 x64 installer. The macOS app is available to build from the same tag. [Download and SHA-256 checksum](https://github.com/tverma101/QuotaBar/releases/tag/v0.7.2-beta.2)
 
 ### Windows
 
-- The Modern tray panel follows the macOS dashboard layout, with provider cards, expandable metrics, and a single Options menu. It opens by default for new profiles. Saved Classic choices carry forward.
-- Both layouts open without the insights banner. Modern has a separate Usage History screen with local spend estimates, token totals, and account breakdowns.
-- The tray panel sizes to its content, reopens the running instance, and offers a Hide From Screen Share setting.
-- Added Codex CLI account enrollment and opt-in automatic use of expiring Codex reset credits. Improved Windows provider discovery, pricing, and local usage accounting.
-- The per-user x64 installer bundles the QuotaBar CLI.
+- The Modern tray panel opens by default for new profiles, with provider cards, expandable metrics, and a single Options menu. Saved layout choices carry forward. [#65](https://github.com/tverma101/QuotaBar/pull/65)
+- Both layouts open without the insights banner. Modern has a separate Usage History screen with local spend estimates, token totals, and account breakdowns. [#65](https://github.com/tverma101/QuotaBar/pull/65)
+- The tray panel sizes to its content, reopens the running instance, and offers a Hide From Screen Share setting. [#56](https://github.com/tverma101/QuotaBar/pull/56)
+- Added Codex CLI account enrollment and opt-in automatic use of expiring Codex reset credits. Improved provider discovery, pricing, and local usage accounting. [#64](https://github.com/tverma101/QuotaBar/pull/64)
+- The per-user x64 installer bundles the CLI. Windows CI verifies clean installation, a cached CLI read, and uninstall. [#65](https://github.com/tverma101/QuotaBar/pull/65)
 
 ## v0.7.2-beta.1
 
