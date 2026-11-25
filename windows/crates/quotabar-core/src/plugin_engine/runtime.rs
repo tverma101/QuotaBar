@@ -1319,6 +1319,7 @@ mod tests {
             base_provider_id: "test".into(),
             label: "Work".into(),
             credential: None,
+            codex_home: None,
             store_path: None,
         };
         let (output, payloads) = run_probe_with_deferred_usage(&plugin, &app_data, "0.0.0", account);

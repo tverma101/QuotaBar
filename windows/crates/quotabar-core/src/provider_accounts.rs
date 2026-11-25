@@ -492,6 +492,7 @@ mod tests {
                     instance_id: id.into(),
                     base_provider_id: "grok".into(),
                     label: id.into(),
+                    codex_home: None,
                     credential: ProviderCredential::default(),
                 },
             )
