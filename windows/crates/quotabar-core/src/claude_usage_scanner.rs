@@ -546,13 +546,13 @@ fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPrici
             continue;
         }
         let day = local_day_key_from_offset(&entry.timestamp);
-        let model = entry
+        let model_name = entry
             .model
             .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty());
         let cost = entry.cost_usd.or_else(|| {
-            model.and_then(|m| pricing.estimated_cost_dollars(m, &entry.tokens))
+            model_name.and_then(|m| pricing.estimated_cost_dollars_at(m, &entry.tokens, entry.timestamp))
         });
 
         let row = by_day.entry(day).or_insert_with_key(|date| DailyUsageRow {
@@ -568,15 +568,14 @@ fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPrici
         });
         let tokens = &entry.tokens;
         let total = total_tokens(tokens);
+        let cache_creation = tokens.cache_write5m.saturating_add(tokens.cache_write1h);
         row.input_tokens = row.input_tokens.saturating_add(tokens.input);
         row.output_tokens = row.output_tokens.saturating_add(tokens.output);
-        row.cache_creation_tokens = row.cache_creation_tokens
-            .saturating_add(tokens.cache_write5m)
-            .saturating_add(tokens.cache_write1h);
+        row.cache_creation_tokens = row.cache_creation_tokens.saturating_add(cache_creation);
         row.cache_read_tokens = row.cache_read_tokens.saturating_add(tokens.cache_read);
         row.total_tokens = row.total_tokens.saturating_add(total);
 
-        let model = row.models.entry(model.unwrap_or("Unattributed").to_string()).or_insert(ModelDayUsage {
+        let model = row.models.entry(model_name.unwrap_or("Unattributed").to_string()).or_insert(ModelDayUsage {
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_tokens: 0,
@@ -584,8 +583,11 @@ fn aggregate(entries: &[ClaudeEntry], since: DateTime<Utc>, pricing: &ModelPrici
             total_tokens: 0,
             total_cost: None,
         });
+        model.input_tokens = model.input_tokens.saturating_add(tokens.input);
+        model.output_tokens = model.output_tokens.saturating_add(tokens.output);
+        model.cache_creation_tokens = model.cache_creation_tokens.saturating_add(cache_creation);
+        model.cache_read_tokens = model.cache_read_tokens.saturating_add(tokens.cache_read);
         model.total_tokens = model.total_tokens.saturating_add(total);
-        model.output_tokens = model.total_tokens;
         if let Some(cost) = cost {
             let daily_cost = row.total_cost.unwrap_or_default() + cost;
             row.total_cost = Some(daily_cost);

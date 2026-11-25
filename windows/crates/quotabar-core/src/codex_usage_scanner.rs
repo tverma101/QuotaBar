@@ -641,7 +641,7 @@ fn aggregate(events: &[CodexEvent], since: DateTime<Utc>, pricing: &ModelPricing
             0.0
         } else {
             let pricing_model = event.pricing_model.as_deref().unwrap_or(&event.model);
-            let Some(c) = codex_pricing::estimated_cost_dollars(
+            let Some(c) = codex_pricing::estimated_cost_dollars_at(
                 pricing,
                 &CodexCostInput {
                     model: pricing_model,
@@ -652,6 +652,7 @@ fn aggregate(events: &[CodexEvent], since: DateTime<Utc>, pricing: &ModelPricing
                     is_fast: event.is_fast,
                     is_ultrafast: event.is_ultrafast,
                 },
+                Some(event.timestamp.with_timezone(&Utc)),
             ) else {
                 continue;
             };

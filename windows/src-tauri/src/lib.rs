@@ -11,6 +11,10 @@ mod panel_windows;
 use quotabar_core::{plugin_engine, provider_accounts};
 #[cfg(target_os = "windows")]
 use panel_windows as panel;
+#[cfg(target_os = "windows")]
+mod notification_windows;
+#[cfg(any(target_os = "windows", test))]
+mod popover_geometry;
 mod local_http_api;
 mod log_path;
 mod os_diagnostics;
@@ -18,10 +22,6 @@ mod support_bundle;
 mod usage_alert_sound;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod popover_platform;
-#[cfg(target_os = "windows")]
-mod notification_windows;
-#[cfg(any(target_os = "windows", test))]
-mod popover_geometry;
 mod tray;
 #[cfg(target_os = "linux")]
 mod tray_linux;
@@ -31,7 +31,7 @@ mod webkit_config;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
@@ -76,86 +76,123 @@ fn load_start_hidden(app: &tauri::AppHandle) -> bool {
 }
 const MAX_CONCURRENT_PROBES: usize = 4;
 
-fn probe_worker_count(plugin_count: usize) -> usize {
-    plugin_count.min(MAX_CONCURRENT_PROBES)
-}
-
-/// Coalesces overlapping probe requests so an enablement wake mid-batch is not
-/// dropped (#856). If `instance_id` is already probing, the latest request is
-/// kept in `pending` and runs after the in-flight probe finishes.
 struct PendingProbe {
-    batch_id: String,
+    generation: u64,
+    batch_ids: Vec<String>,
     plugin: plugin_engine::manifest::LoadedPlugin,
     account: provider_accounts::ProviderAccountContext,
     refresh_history: bool,
 }
 
+#[derive(Default)]
 struct ProbeCoord {
-    in_flight: HashSet<String>,
-    pending: HashMap<String, PendingProbe>,
+    generation: u64,
+    running: HashMap<String, u64>,
+    queued: HashMap<String, PendingProbe>,
+    ready: VecDeque<String>,
     batch_remaining: HashMap<String, usize>,
     active_workers: usize,
 }
 
-fn probe_coord() -> &'static Mutex<ProbeCoord> {
-    static COORD: OnceLock<Mutex<ProbeCoord>> = OnceLock::new();
-    COORD.get_or_init(|| {
-        Mutex::new(ProbeCoord {
-            in_flight: HashSet::new(),
-            pending: HashMap::new(),
-            batch_remaining: HashMap::new(),
-            active_workers: 0,
-        })
-    })
-}
-
-fn note_probe_finished(app_handle: &tauri::AppHandle, batch_id: &str) {
-    let complete = {
-        let mut coord = probe_coord()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let remaining = coord.batch_remaining.entry(batch_id.to_string()).or_insert(0);
-        if *remaining > 0 {
-            *remaining -= 1;
+impl ProbeCoord {
+    fn enqueue(
+        &mut self,
+        batch_id: String,
+        plugin: plugin_engine::manifest::LoadedPlugin,
+        account: provider_accounts::ProviderAccountContext,
+        refresh_history: bool,
+    ) {
+        let id = account.instance_id.clone();
+        self.generation += 1;
+        if let Some(work) = self.queued.get_mut(&id) {
+            work.generation = self.generation;
+            work.batch_ids.push(batch_id);
+            work.plugin = plugin;
+            work.account = account;
+            work.refresh_history |= refresh_history;
+            return;
         }
-        if *remaining == 0 {
-            coord.batch_remaining.remove(batch_id);
-            true
-        } else {
-            false
+        if !self.running.contains_key(&id) {
+            self.ready.push_back(id.clone());
         }
-    };
-    if complete {
-        log::info!("[refresh] batch {} complete", batch_id);
-        let _ = app_handle.emit(
-            "probe:batch-complete",
-            ProbeBatchComplete {
-                batch_id: batch_id.to_string(),
+        self.queued.insert(
+            id,
+            PendingProbe {
+                generation: self.generation,
+                batch_ids: vec![batch_id],
+                plugin,
+                account,
+                refresh_history,
             },
         );
     }
-}
 
-fn take_follow_up(finished_id: Option<&str>) -> Option<PendingProbe> {
-    let mut coord = probe_coord()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(id) = finished_id {
-        coord.in_flight.remove(id);
-        if let Some(entry) = coord.pending.remove(id) {
-            coord.in_flight.insert(id.to_string());
-            return Some(entry);
+    fn reserve_workers(&mut self) -> usize {
+        let count = self
+            .ready
+            .len()
+            .min(MAX_CONCURRENT_PROBES - self.active_workers);
+        self.active_workers += count;
+        count
+    }
+
+    fn next_work(&mut self) -> Option<PendingProbe> {
+        let Some(id) = self.ready.pop_front() else {
+            self.active_workers -= 1;
+            return None;
+        };
+        let work = self.queued.remove(&id).expect("ready probe is queued");
+        self.running.insert(id, work.generation);
+        Some(work)
+    }
+
+    fn is_current(&self, id: &str, generation: u64) -> bool {
+        self.running.get(id) == Some(&generation) && !self.queued.contains_key(id)
+    }
+
+    fn finish_work(&mut self, id: String, mut waiting_batches: Vec<String>) -> Vec<String> {
+        self.running.remove(&id);
+        if let Some(next) = self.queued.get_mut(&id) {
+            waiting_batches.append(&mut next.batch_ids);
+            next.batch_ids = waiting_batches;
+            self.ready.push_back(id);
+            Vec::new()
+        } else {
+            waiting_batches
         }
     }
-    let free_id = coord
-        .pending
-        .keys()
-        .find(|id| !coord.in_flight.contains(*id))
-        .cloned();
-    free_id.and_then(|id| {
-        coord.in_flight.insert(id.clone());
-        coord.pending.remove(&id)
-    })
+}
+
+fn probe_coord() -> &'static Mutex<ProbeCoord> {
+    static COORD: OnceLock<Mutex<ProbeCoord>> = OnceLock::new();
+    COORD.get_or_init(|| Mutex::new(ProbeCoord::default()))
+}
+
+fn note_probe_finished(app_handle: &tauri::AppHandle, instance_id: String, batch_ids: Vec<String>) {
+    let completed: Vec<_> = {
+        let mut coord = probe_coord()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        coord
+            .finish_work(instance_id, batch_ids)
+            .into_iter()
+            .filter(|batch_id| {
+                let Some(remaining) = coord.batch_remaining.get_mut(batch_id) else {
+                    return false;
+                };
+                *remaining -= 1;
+                if *remaining == 0 {
+                    coord.batch_remaining.remove(batch_id);
+                    return true;
+                }
+                false
+            })
+            .collect()
+    };
+    for batch_id in completed {
+        log::info!("[refresh] batch {} complete", batch_id);
+        let _ = app_handle.emit("probe:batch-complete", ProbeBatchComplete { batch_id });
+    }
 }
 
 /// Create `~/.quotabar/config.json` on first launch if missing (proxy + optional Synthetic key).
@@ -631,6 +668,10 @@ async fn start_probe_batch(
         )
     };
 
+    let accounts_path = provider_accounts::store_path(&app_data_dir);
+    let accounts = provider_accounts::load_store_path(&accounts_path)
+        .map_err(|error| format!("Failed to open provider accounts: {error}"))?
+        .accounts;
     let selected_targets: Vec<ProbeTarget> = match probe_targets {
         Some(targets) => {
             let mut seen = HashSet::new();
@@ -658,11 +699,8 @@ async fn start_probe_batch(
                 .into_iter()
                 .map(|id| {
                     let instance_id = id.trim().to_string();
-                    let account = provider_accounts::get_account(&app_data_dir, &instance_id)
-                        .ok()
-                        .flatten();
+                    let account = accounts.get(&instance_id);
                     let base_provider_id = account
-                        .as_ref()
                         .map(|entry| entry.base_provider_id.clone())
                         .filter(|base| !base.is_empty())
                         .unwrap_or_else(|| {
@@ -672,7 +710,7 @@ async fn start_probe_batch(
                                 .unwrap_or_else(|| instance_id.clone())
                         });
                     let label = account
-                        .map(|entry| entry.label)
+                        .map(|entry| entry.label.clone())
                         .filter(|value| !value.trim().is_empty());
                     ProbeTarget {
                         instance_id,
@@ -701,10 +739,8 @@ async fn start_probe_batch(
             .into_iter()
             .filter_map(|target| {
                 by_id.get(&target.base_provider_id).cloned().map(|plugin| {
-                    let credential = provider_accounts::get_account(&app_data_dir, &target.instance_id)
-                        .ok()
-                        .flatten()
-                        .map(|account| account.credential)
+                    let credential = accounts.get(&target.instance_id)
+                        .map(|account| account.credential.clone())
                         .filter(|credential| !credential.is_empty());
                     let label = target
                         .label
@@ -715,7 +751,7 @@ async fn start_probe_batch(
                         base_provider_id: target.base_provider_id,
                         label,
                         credential,
-                        store_path: Some(provider_accounts::store_path(&app_data_dir)),
+                        store_path: Some(accounts_path.clone()),
                     };
                     (plugin, account_context)
                 })
@@ -747,126 +783,43 @@ async fn start_probe_batch(
         });
     }
 
-    // Partition: run now vs coalesce into pending follow-up (#856).
-    let (to_run, need_drain_worker) = {
+    let spawn_count = {
         let mut coord = probe_coord()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         coord
             .batch_remaining
             .insert(batch_id.clone(), selected_plugins.len());
-        let mut to_run = Vec::new();
-        let mut deferred = Vec::new();
         for (plugin, account) in selected_plugins {
-            let id = account.instance_id.clone();
-            if coord.in_flight.contains(&id) {
-                let refresh_history = refresh_history.unwrap_or(false)
-                    || coord.pending.get(&id).is_some_and(|pending| pending.refresh_history);
-                coord.pending.insert(
-                    id.clone(),
-                    PendingProbe {
-                        batch_id: batch_id.clone(),
-                        plugin,
-                        account,
-                        refresh_history,
-                    },
-                );
-                deferred.push(id);
-            } else {
-                coord.in_flight.insert(id);
-                to_run.push((plugin, account));
-            }
+            coord.enqueue(batch_id.clone(), plugin, account, refresh_history.unwrap_or(false));
         }
-        if !deferred.is_empty() {
-            log::info!(
-                "[refresh] batch {} deferred (already in-flight): {:?}",
-                batch_id,
-                deferred
-            );
-        }
-        let need_drain = to_run.is_empty() && !deferred.is_empty() && coord.active_workers == 0;
-        if need_drain {
-            // Stale in_flight with no workers — free deferred ids so the drain worker can run them.
-            for id in &deferred {
-                coord.in_flight.remove(id);
-            }
-        }
-        (to_run, need_drain)
+        coord.reserve_workers()
     };
-
-    let history_dir = app_data_dir.clone();
-    let spawn_count = if to_run.is_empty() {
-        if need_drain_worker {
-            1
-        } else {
-            0
-        }
-    } else {
-        probe_worker_count(to_run.len())
-    };
-
-    if spawn_count > 0 && !to_run.is_empty() && spawn_count < to_run.len() {
-        log::info!(
-            "[refresh] batch {} using {} workers for {} plugins",
-            batch_id,
-            spawn_count,
-            to_run.len()
-        );
-    }
-
-    let probe_queue = Arc::new(Mutex::new(to_run.into_iter().collect::<VecDeque<_>>()));
-
-    {
-        let mut coord = probe_coord()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        coord.active_workers += spawn_count;
-    }
 
     for _ in 0..spawn_count {
         let handle = app_handle.clone();
         let data_dir = app_data_dir.clone();
-        let history_dir_spawn = history_dir.clone();
         let version = app_version.clone();
-        let queue = Arc::clone(&probe_queue);
-        let queue_batch_id = batch_id.clone();
-
         tauri::async_runtime::spawn_blocking(move || {
             loop {
-                let item = {
-                    let mut queue = queue
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    queue.pop_front()
-                };
-
-                let (plugin, account_context, bid, history) = match item {
-                    Some((plugin, account_context)) => {
-                        (plugin, account_context, queue_batch_id.clone(), refresh_history.unwrap_or(false))
-                    }
-                    None => match take_follow_up(None) {
-                        Some(pending) => (pending.plugin, pending.account, pending.batch_id, pending.refresh_history),
-                        None => break,
-                    },
-                };
-
-                run_and_emit_probe(
-                    &handle,
-                    &data_dir,
-                    &history_dir_spawn,
-                    &version,
-                    &bid,
-                    plugin,
-                    account_context,
-                    history,
-                );
-            }
-
-            {
-                let mut coord = probe_coord()
+                let work = probe_coord()
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                coord.active_workers = coord.active_workers.saturating_sub(1);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .next_work();
+                let Some(work) = work else {
+                    break;
+                };
+                let instance_id = work.account.instance_id.clone();
+                let batch_id = work.batch_ids.last().expect("probe work has a batch");
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_and_emit_probe(
+                        &handle, &data_dir, &version, batch_id, work.generation, work.plugin, work.account, work.refresh_history,
+                    );
+                }));
+                if result.is_err() {
+                    log::error!("publishing probe {} panicked", instance_id);
+                }
+                note_probe_finished(&handle, instance_id, work.batch_ids);
             }
         });
     }
@@ -880,9 +833,9 @@ async fn start_probe_batch(
 fn run_and_emit_probe(
     handle: &tauri::AppHandle,
     data_dir: &PathBuf,
-    history_dir: &PathBuf,
     version: &str,
     batch_id: &str,
+    generation: u64,
     plugin: plugin_engine::manifest::LoadedPlugin,
     account_context: provider_accounts::ProviderAccountContext,
     refresh_history: bool,
@@ -898,81 +851,82 @@ fn run_and_emit_probe(
         )
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        plugin_engine::runtime::run_probe_with_history(
+        plugin_engine::runtime::run_probe_with_deferred_usage_and_history(
             &plugin,
             data_dir,
             version,
-            Some(account_context),
+            account_context,
             refresh_history,
         )
     }));
-
-    match result {
-        Ok(output) => {
-            let has_error = output.lines.iter().any(|line| {
-                matches!(line, plugin_engine::runtime::MetricLine::Badge { label, .. } if label == "Error")
-            });
-            if has_error {
-                log::warn!("probe {} completed with error", plugin_id);
-            } else {
-                log::info!(
-                    "probe {} completed ok ({} lines)",
-                    plugin_id,
-                    output.lines.len()
-                );
-                local_http_api::cache_successful_output(&output);
-                if persist_usage_history_enabled(handle) {
-                    if let Err(e) =
-                        quotabar_core::usage_history::append_probe_snapshot(history_dir, &output)
-                    {
-                        log::debug!("usage history append: {}", e);
-                    }
-                    quotabar_core::cli_usage_scanners::post_probe_local_usage_daily(
-                        history_dir,
-                        &plugin_id,
-                        &output.display_name,
-                    );
-                }
-            }
-            let _ = handle.emit(
-                "probe:result",
-                ProbeResult {
-                    batch_id: batch_id.to_string(),
-                    output,
-                },
-            );
-        }
-        Err(_) => {
-            log::error!("probe {} panicked", plugin_id);
-            let output = plugin_engine::runtime::probe_fault_output(
+    let (output, payloads) = result.unwrap_or_else(|_| {
+        log::error!("probe {} panicked", plugin_id);
+        (
+            plugin_engine::runtime::probe_fault_output(
                 &plugin,
                 &plugin_id,
                 &probe_display_name,
                 "The probe crashed. Try again or update the app.".to_string(),
-            );
-            let _ = handle.emit(
-                "probe:result",
-                ProbeResult {
-                    batch_id: batch_id.to_string(),
-                    output,
-                },
-            );
+            ),
+            Vec::new(),
+        )
+    });
+    let display_name = output.display_name.clone();
+    let scan_local_usage = {
+        let coord = probe_coord()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !coord.is_current(&plugin_id, generation) {
+            log::debug!("discarding superseded probe {}", plugin_id);
+            return;
         }
-    }
-
-    note_probe_finished(handle, batch_id);
-
-    // Run coalesced follow-up for this id (nested call continues the chain).
-    if let Some(pending) = take_follow_up(Some(&plugin_id)) {
-        run_and_emit_probe(
-            handle,
+        let has_error = output.lines.iter().any(|line| {
+            matches!(line, plugin_engine::runtime::MetricLine::Badge { label, .. } if label == "Error")
+        });
+        let persist = !has_error && persist_usage_history_enabled(handle);
+        if has_error {
+            log::warn!("probe {} completed with error", plugin_id);
+        } else {
+            log::info!(
+                "probe {} completed ok ({} lines)",
+                plugin_id,
+                output.lines.len()
+            );
+            local_http_api::cache_successful_output(&output);
+            if persist {
+                if let Err(e) = quotabar_core::usage_history::append_probe_snapshot(data_dir, &output) {
+                    log::debug!("usage history append: {}", e);
+                }
+                for payload in payloads {
+                    if let Err(e) = quotabar_core::usage_daily::ingest_json(data_dir, &plugin_id, &payload) {
+                        log::warn!("[plugin:{}] usageDaily.ingest failed: {}", plugin_id, e);
+                    }
+                }
+            }
+        }
+        let _ = handle.emit(
+            "probe:result",
+            ProbeResult {
+                batch_id: batch_id.to_string(),
+                output,
+            },
+        );
+        persist
+    };
+    if scan_local_usage {
+        quotabar_core::cli_usage_scanners::post_probe_local_usage_daily(
             data_dir,
-            history_dir,
-            version,
-            &pending.batch_id,
-            pending.plugin,
-            pending.account,
-            pending.refresh_history,
+            &plugin_id,
+            &display_name,
+            |payload| {
+                let coord = probe_coord()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if coord.is_current(&plugin_id, generation) {
+                    quotabar_core::usage_daily::ingest_json(data_dir, &plugin_id, payload)?;
+                }
+                Ok(())
+            },
         );
     }
 }
@@ -1511,6 +1465,8 @@ pub fn run() {
             ensure_quotabar_user_config_file();
 
             let app_data_dir = app.path().app_data_dir().expect("no app data dir");
+            #[cfg(target_os = "windows")]
+            quotabar_core::model_pricing::enable_live_pricing(&app_data_dir);
             // `tauri dev` often has no packaged `resource_dir()` (returns Err) — do not panic;
             // `initialize_plugins` falls back to repo `plugins/` via `find_dev_plugins_dir()` and/or
             // copies from bundled resources when a root exists (release / portable).
@@ -1611,6 +1567,59 @@ mod tests {
         resolve_cursor_usage_stats_target, should_show_main_window_on_launch, start_hidden_from_setting,
     };
     use quotabar_core::provider_accounts::{self, ProviderAccount, ProviderCredential};
+
+    #[test]
+    fn coalesced_follow_up_keeps_each_batch_and_uses_the_latest_account() {
+        let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+        let plugin = super::plugin_engine::manifest::load_plugins_from_dir(&plugin_dir)
+            .into_iter()
+            .find(|plugin| plugin.manifest.id == "codex")
+            .expect("bundled Codex manifest");
+        let mut coord = super::ProbeCoord::default();
+        let enqueue = |coord: &mut super::ProbeCoord, id: &str, label: &str| {
+            coord.enqueue(
+                label.to_owned(),
+                plugin.clone(),
+                provider_accounts::ProviderAccountContext {
+                    instance_id: id.to_owned(),
+                    base_provider_id: "codex".to_owned(),
+                    label: label.to_owned(),
+                    credential: None,
+                    store_path: None,
+                },
+            );
+        };
+        enqueue(&mut coord, "codex:work", "first");
+        enqueue(&mut coord, "codex:work", "second");
+        assert_eq!(coord.reserve_workers(), 1);
+        let work = coord.next_work().unwrap();
+        assert_eq!(work.batch_ids, ["first", "second"]);
+        assert!(coord.is_current("codex:work", work.generation));
+        let superseded_generation = work.generation;
+
+        enqueue(&mut coord, "codex:work", "follow-up");
+        enqueue(&mut coord, "codex:work", "latest");
+        assert!(!coord.is_current("codex:work", work.generation));
+        assert_eq!(coord.reserve_workers(), 0);
+        assert!(coord.finish_work("codex:work".to_owned(), work.batch_ids).is_empty());
+        let work = coord.next_work().unwrap();
+        assert_eq!(&work.batch_ids[2..], ["follow-up", "latest"]);
+        assert_eq!(&work.batch_ids[..2], ["first", "second"]);
+        assert_eq!(work.account.label, "latest");
+        assert!(coord.is_current("codex:work", work.generation));
+        assert!(!coord.is_current("codex:work", superseded_generation));
+
+        for index in 0..8 {
+            enqueue(&mut coord, &format!("codex:{index}"), "other batch");
+        }
+        assert_eq!(coord.reserve_workers(), super::MAX_CONCURRENT_PROBES - 1);
+        assert_eq!(coord.reserve_workers(), 0);
+        assert_eq!(coord.active_workers, super::MAX_CONCURRENT_PROBES);
+        assert_eq!(
+            coord.finish_work("codex:work".to_owned(), work.batch_ids),
+            ["first", "second", "follow-up", "latest"]
+        );
+    }
 
     #[test]
     fn missing_non_default_cursor_account_stays_isolated() {

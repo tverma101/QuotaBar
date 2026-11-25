@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
+import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import {
   getEnabledPluginIds,
   type AutoUpdateIntervalMinutes,
@@ -12,6 +13,12 @@ type UseProbeAutoUpdateArgs = {
   setErrorForPlugins: (ids: string[], error: string) => void
   isPluginLoading: (id: string) => boolean
   startBatch: (pluginIds?: string[]) => Promise<string[] | undefined>
+}
+
+function nextLocalMidnight(now: number) {
+  const next = new Date(now)
+  next.setHours(24, 0, 0, 0)
+  return next.getTime()
 }
 
 export function useProbeAutoUpdate({
@@ -38,25 +45,58 @@ export function useProbeAutoUpdate({
     }
 
     const intervalMs = autoUpdateInterval * 60_000
-    const scheduleNext = () => setAutoUpdateNextAt(Date.now() + intervalMs)
-    scheduleNext()
+    let nextQuota = Date.now() + intervalMs
+    let midnight = nextLocalMidnight(Date.now())
+    let timer: ReturnType<typeof setTimeout>
+    setAutoUpdateNextAt(nextQuota)
 
-    const interval = setInterval(() => {
-      const idleIds = enabledIds.filter((id) => !isPluginLoading(id))
-      if (idleIds.length === 0) {
-        scheduleNext()
-        return
+    const schedule = () => {
+      clearTimeout(timer)
+      timer = setTimeout(checkDeadlines, Math.max(0, Math.min(nextQuota, midnight) - Date.now()))
+    }
+
+    function checkDeadlines() {
+      const now = Date.now()
+      const quotaDue = now >= nextQuota
+      const midnightDue = now >= midnight
+      midnight = nextLocalMidnight(now)
+      if (quotaDue) {
+        nextQuota = now + intervalMs
+        setAutoUpdateNextAt(nextQuota)
       }
+      schedule()
+      if (!quotaDue && !midnightDue) return
+
+      const idleIds = enabledIds.filter((id) => !isPluginLoading(id))
+      if (idleIds.length === 0) return
 
       setLoadingForPlugins(idleIds)
       startBatch(idleIds).catch((error) => {
         console.error("Failed to start auto-update batch:", error)
         setErrorForPlugins(idleIds, "Failed to start probe")
       })
-      scheduleNext()
-    }, intervalMs)
+    }
 
-    return () => clearInterval(interval)
+    schedule()
+    window.addEventListener("focus", checkDeadlines)
+    document.addEventListener("visibilitychange", checkDeadlines)
+    let cancelled = false
+    let unlistenResume: UnlistenFn | undefined
+    void listen("refresh:power-resume", () => {
+      if (!cancelled) checkDeadlines()
+    })
+      .then((unlisten) => {
+        if (cancelled) unlisten()
+        else unlistenResume = unlisten
+      })
+      .catch((error) => console.error("Failed to listen for Windows power resume:", error))
+    return () => {
+      cancelled = true
+      unlistenResume?.()
+      clearTimeout(timer)
+      window.removeEventListener("focus", checkDeadlines)
+      document.removeEventListener("visibilitychange", checkDeadlines)
+    }
   }, [
     autoUpdateInterval,
     autoUpdateResetToken,
