@@ -103,7 +103,7 @@ enum ProcessMemoryBudget {
     /// How far above the footprint at the last soft-limit unload the next one triggers. A footprint
     /// that merely hovers over `softLimitBytes` cannot re-trigger an expensive provider-cache unload
     /// every cycle; the trigger only engages on real growth.
-    private static let softUnloadMarginBytes: UInt64 = 24 * 1024 * 1024
+    static let softUnloadMarginBytes: UInt64 = 24 * 1024 * 1024
     private static let softUnloadCeilingLock = NSLock()
     /// Guarded by `softUnloadCeilingLock`; `nonisolated(unsafe)` only silences the check the lock
     /// already covers. Starts at the plain soft limit so the first unload behaves as before.
@@ -124,25 +124,37 @@ enum ProcessMemoryBudget {
         return bytes >= softUnloadCeilingBytes
     }
 
-    /// Raise the soft-unload ceiling to a margin above the current footprint, clamped so it can
-    /// never exceed the hard limit — an unload already near the hard limit therefore re-arms almost
-    /// immediately, which is deliberate: at peak pressure every unload is max-aggressive. Call when
-    /// an expensive provider-cache unload actually runs.
+    /// Raise the soft-unload ceiling to a margin above the current footprint. Call when an
+    /// expensive provider-cache unload actually runs.
     static func noteSoftLimitUnload() {
         // A failed probe must not write a low fallback ceiling — the gate that just passed may have
         // read a footprint far above the soft limit, and collapsing the ceiling would unload early.
         guard let current = physicalFootprintBytes() else { return }
         softUnloadCeilingLock.lock()
-        softUnloadCeilingBytes = min(
-            max(softLimitBytes, current + softUnloadMarginBytes),
-            hardLimitBytes
-        )
+        softUnloadCeilingBytes = softUnloadCeiling(afterUnloadAt: current)
         softUnloadCeilingLock.unlock()
+    }
+
+    /// The next unload trigger after an unload at `footprint`: a margin above it, never below the
+    /// soft limit. It is deliberately not capped at the hard limit. With that cap, any footprint
+    /// above `hardLimitBytes - softUnloadMarginBytes` passed the gate again at once, so every
+    /// provider in every batch unloaded every cache and the next pass rebuilt them all from disk.
+    static func softUnloadCeiling(afterUnloadAt footprint: UInt64) -> UInt64 {
+        max(softLimitBytes, footprint + softUnloadMarginBytes)
     }
 
     static var isOverHardLimit: Bool {
         guard let bytes = physicalFootprintBytes() else { return false }
         return bytes >= hardLimitBytes
+    }
+
+    /// Provider concurrency for a meters-only pass (`nil` = unlimited). Meter requests are small
+    /// network calls that parse no local corpora, so only the hard limit serializes them. Keying
+    /// them off the soft limit serialized every panel-open pass, because the settled footprint sits
+    /// above it, and cards filled in one at a time.
+    static func meterPassMaxConcurrentProviders(footprintBytes: UInt64?) -> Int? {
+        guard let footprintBytes, footprintBytes >= hardLimitBytes else { return nil }
+        return 1
     }
 
     /// Human-readable footprint for logs (`nil` when unavailable).

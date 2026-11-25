@@ -65,7 +65,8 @@ impl DiscoveryState {
     }
 
     fn outside_floor(&self, now: f64) -> bool {
-        self.last_open_router_attempt.map_or(true, |last| now - last >= RETRY_INTERVAL)
+        self.last_open_router_attempt
+            .map_or(true, |last| now - last >= RETRY_INTERVAL)
     }
 
     /// Drop names an exact OpenRouter route now prices, and names that exhausted their misses.
@@ -93,7 +94,11 @@ impl DiscoveryState {
         self.pending
             .iter()
             .filter(|n| self.miss_streaks.get(*n).copied().unwrap_or(0) < MAX_MISS_STREAK)
-            .filter(|n| self.backoff.get(*n).map_or(true, |eligible| now >= *eligible))
+            .filter(|n| {
+                self.backoff
+                    .get(*n)
+                    .map_or(true, |eligible| now >= *eligible)
+            })
             .take(MAX_TRACKED)
             .cloned()
             .collect()
@@ -208,15 +213,24 @@ impl PricingStore {
     }
 
     fn discover(self: &Arc<Self>, names: BTreeSet<String>) {
-        let changed = self.config.source_urls.contains_key(&SourceId::OpenRouter) && self.fetch(SourceId::OpenRouter);
+        let changed = self.config.source_urls.contains_key(&SourceId::OpenRouter)
+            && self.fetch(SourceId::OpenRouter);
         let now = self.now();
         let mut guard = self.lock();
         let state = &mut *guard;
         if changed {
             self.rebuild_pricing(state);
-            let matched = names.iter().filter(|n| state.pricing.has_exact_open_router_rate(n)).count();
+            let matched = names
+                .iter()
+                .filter(|n| state.pricing.has_exact_open_router_rate(n))
+                .count();
             if matched > 0 {
-                qlog!(Info, "pricing", "OpenRouter catalogue matched {matched} of {} model name(s)", names.len());
+                qlog!(
+                    Info,
+                    "pricing",
+                    "OpenRouter catalogue matched {matched} of {} model name(s)",
+                    names.len()
+                );
             }
         }
         if self.config.source_urls.contains_key(&SourceId::OpenRouter) {

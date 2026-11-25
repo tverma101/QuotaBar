@@ -17,7 +17,11 @@ pub struct FoldCache<T> {
 
 impl<T: Clone> FoldCache<T> {
     pub fn new(key: FoldKey, observed_at: f64, value: T) -> Self {
-        FoldCache { key, observed_at, value }
+        FoldCache {
+            key,
+            observed_at,
+            value,
+        }
     }
 
     pub fn lookup(&self, key: &FoldKey, now: f64) -> Option<T> {

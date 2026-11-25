@@ -35,7 +35,7 @@ final class CodexResetClaimTests: XCTestCase {
         consumeStatus: Int = 200,
         consumeBody: Data = consumeBody(code: "reset"),
         refreshes: RefreshCounter = RefreshCounter()
-    ) -> (CodexResetClaimService, RoutingHTTPClient) {
+    ) -> (CodexResetClaimReferenceService, RoutingHTTPClient) {
         let http = RoutingHTTPClient { request in
             switch request.url {
             case CodexUsageClient.resetCreditsURL:
@@ -47,7 +47,7 @@ final class CodexResetClaimTests: XCTestCase {
                 return HTTPResponse(statusCode: 500, headers: [:], body: Data())
             }
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("token-123", "acct-456")] },
             refreshAfterClaim: { refreshes.count += 1 }
@@ -58,7 +58,7 @@ final class CodexResetClaimTests: XCTestCase {
     private func makeProductionService(
         authStore: CodexAuthStore,
         expectedAccessToken: String?
-    ) -> (CodexResetClaimService, RoutingHTTPClient) {
+    ) -> (CodexResetClaimReferenceService, RoutingHTTPClient) {
         let http = RoutingHTTPClient { request in
             if let expectedAccessToken {
                 XCTAssertEqual(request.headers["Authorization"], "Bearer \(expectedAccessToken)")
@@ -73,7 +73,7 @@ final class CodexResetClaimTests: XCTestCase {
                 return HTTPResponse(statusCode: 500, headers: [:], body: Data())
             }
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             authStore: authStore,
             usageClient: CodexUsageClient(http: http),
             refreshAfterClaim: {}
@@ -112,7 +112,7 @@ final class CodexResetClaimTests: XCTestCase {
 
     func testConsumeOutcomeDecodesAllProtocolCodes() {
         func outcome(_ code: String, status: Int = 200) -> ResetClaimOutcome {
-            CodexResetClaimService.outcome(fromConsume:
+            CodexResetClaimReferenceService.outcome(fromConsume:
                 HTTPResponse(statusCode: status, headers: [:], body: Self.consumeBody(code: code)))
         }
         XCTAssertEqual(outcome("reset"), .success)
@@ -123,7 +123,7 @@ final class CodexResetClaimTests: XCTestCase {
         XCTAssertEqual(outcome("something_new"), .failed)      // unknown code
         XCTAssertEqual(outcome("reset", status: 500), .failed) // non-2xx wins over a parseable body
         XCTAssertEqual(
-            CodexResetClaimService.outcome(fromConsume:
+            CodexResetClaimReferenceService.outcome(fromConsume:
                 HTTPResponse(statusCode: 200, headers: [:], body: Data("not json".utf8))),
             .failed
         )
@@ -134,27 +134,27 @@ final class CodexResetClaimTests: XCTestCase {
     func testCreditMatchingByExpiry() throws {
         let body = try XCTUnwrap(ProviderParse.jsonObject(Self.listBody()))
         XCTAssertEqual(
-            CodexResetClaimService.creditID(in: body, expiringAt: Self.expiry),
+            CodexResetClaimReferenceService.creditID(in: body, expiringAt: Self.expiry),
             "RateLimitResetCredit_target"
         )
         // Sub-second truncation is tolerated; a different credit's expiry is not.
         XCTAssertEqual(
-            CodexResetClaimService.creditID(in: body, expiringAt: Self.expiry.addingTimeInterval(0.5)),
+            CodexResetClaimReferenceService.creditID(in: body, expiringAt: Self.expiry.addingTimeInterval(0.5)),
             "RateLimitResetCredit_target"
         )
-        XCTAssertNil(CodexResetClaimService.creditID(in: body, expiringAt: Self.expiry.addingTimeInterval(3600)))
+        XCTAssertNil(CodexResetClaimReferenceService.creditID(in: body, expiringAt: Self.expiry.addingTimeInterval(3600)))
     }
 
     func testCreditMatchingSkipsNonAvailableStatusButKeepsMissingStatus() throws {
         let redeemed = try XCTUnwrap(ProviderParse.jsonObject(Self.listBody(status: "redeemed")))
-        XCTAssertNil(CodexResetClaimService.creditID(in: redeemed, expiringAt: Self.expiry))
+        XCTAssertNil(CodexResetClaimReferenceService.creditID(in: redeemed, expiringAt: Self.expiry))
 
         // No `status` field at all counts as available — mirrors the mapper's filter.
         let noStatus = try XCTUnwrap(ProviderParse.jsonObject(Data(
             #"{"credits": [{"id": "RateLimitResetCredit_bare", "expires_at": \#(Self.expiry.timeIntervalSince1970)}]}"#.utf8
         )))
         XCTAssertEqual(
-            CodexResetClaimService.creditID(in: noStatus, expiringAt: Self.expiry),
+            CodexResetClaimReferenceService.creditID(in: noStatus, expiringAt: Self.expiry),
             "RateLimitResetCredit_bare"
         )
     }
@@ -208,7 +208,7 @@ final class CodexResetClaimTests: XCTestCase {
                 return HTTPResponse(statusCode: 500, headers: [:], body: Data())
             }
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("token", "account")] },
             refreshAfterClaim: { refreshes.count += 1 }
@@ -243,7 +243,7 @@ final class CodexResetClaimTests: XCTestCase {
         XCTAssertEqual(consumeOutcome, .failed)
 
         // No credentials at all.
-        let noCredentials = CodexResetClaimService(
+        let noCredentials = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: RoutingHTTPClient { _ in
                 XCTFail("no request should be sent without credentials")
                 return HTTPResponse(statusCode: 500, headers: [:], body: Data())
@@ -374,7 +374,7 @@ final class CodexResetClaimTests: XCTestCase {
                 return HTTPResponse(statusCode: 500, headers: [:], body: Data())
             }
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("token-123", "acct-456")] }
         )
@@ -411,7 +411,7 @@ final class CodexResetClaimTests: XCTestCase {
                 return HTTPResponse(statusCode: 500, headers: [:], body: Data())
             }
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("stale-token", "acct-old"), ("live-token", "acct-456")] }
         )
@@ -439,7 +439,7 @@ final class CodexResetClaimTests: XCTestCase {
                 return HTTPResponse(statusCode: 500, headers: [:], body: Data())
             }
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("shared-token", "acct-A"), ("shared-token", "acct-B")] }
         )
@@ -460,7 +460,7 @@ final class CodexResetClaimTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 503, headers: [:], body: Data())
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("token", currentAccount)] }
         )
@@ -484,7 +484,7 @@ final class CodexResetClaimTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 200, headers: [:], body: Self.consumeBody(code: "reset"))
         }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("stale", "acct-A"), ("fresh", "acct-A"), ("other", "acct-B")] }
         )
@@ -498,7 +498,7 @@ final class CodexResetClaimTests: XCTestCase {
 
     func testClaimFailsWhenEveryCandidateIsRejected() async {
         let http = RoutingHTTPClient { _ in HTTPResponse(statusCode: 401, headers: [:], body: Data()) }
-        let service = CodexResetClaimService(
+        let service = CodexResetClaimReferenceService(
             usageClient: CodexUsageClient(http: http),
             credentialCandidates: { [("stale-1", nil), ("stale-2", nil)] }
         )

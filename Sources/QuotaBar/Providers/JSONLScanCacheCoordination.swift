@@ -328,6 +328,7 @@ enum PersistentJSONLScanCaches {
     /// Call after a heavy local-log provider (Codex / Claude / OpenCode / …) finishes: unload session
     /// caches only when the process crosses its unload ceiling. These append caches are capped,
     /// and keeping them warm avoids reparsing unchanged session history between provider cards.
+    @concurrent
     static func unloadAfterHeavyProvider(providerID: String) async {
         if ProcessMemoryBudget.isOverSoftUnloadCeiling {
             await flushPendingWrites()
@@ -351,6 +352,7 @@ enum PersistentJSONLScanCaches {
     }
 
     /// Memory-pressure / hard-limit path: flush and unload even mid-cycle (including the router tail).
+    @concurrent
     static func unloadForMemoryPressure() async {
         await flushPendingWrites()
         CodexLogUsageScanner.unloadSharedTailCacheItems()

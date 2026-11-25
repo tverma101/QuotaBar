@@ -1,7 +1,9 @@
 //! Copilot credential loading: editor JSON files, `gh` hosts.yml, and GitHub CLI Keychain.
 
 use crate::context::RefreshContext;
-use crate::host::{self, auth_tag, diagnostic_gate, SecureAccount, SecureReadOutcome, SecureReadRequest};
+use crate::host::{
+    self, auth_tag, diagnostic_gate, SecureAccount, SecureReadOutcome, SecureReadRequest,
+};
 use crate::parse;
 use crate::paths;
 use crate::qlog;
@@ -48,9 +50,8 @@ impl CopilotAuthError {
         use crate::model::ErrorCategory;
         match self {
             CopilotAuthError::NotLoggedIn => ErrorCategory::NotLoggedIn,
-            CopilotAuthError::CredentialPermissionRequired | CopilotAuthError::CredentialsUnreadable => {
-                ErrorCategory::CredentialAccess
-            }
+            CopilotAuthError::CredentialPermissionRequired
+            | CopilotAuthError::CredentialsUnreadable => ErrorCategory::CredentialAccess,
             CopilotAuthError::InvalidCredentials => ErrorCategory::AuthInvalid,
             CopilotAuthError::Cancelled => ErrorCategory::Cancelled,
         }
@@ -73,7 +74,10 @@ impl CopilotAuthStore {
         }
     }
 
-    pub fn load_token(&self, ctx: Option<&RefreshContext>) -> Result<Option<String>, CopilotAuthError> {
+    pub fn load_token(
+        &self,
+        ctx: Option<&RefreshContext>,
+    ) -> Result<Option<String>, CopilotAuthError> {
         let mut saw_unreadable = false;
         let mut saw_invalid = false;
 
@@ -109,7 +113,10 @@ impl CopilotAuthStore {
         Ok(None)
     }
 
-    fn load_gh_token(&self, ctx: Option<&RefreshContext>) -> Result<Option<String>, CopilotAuthError> {
+    fn load_gh_token(
+        &self,
+        ctx: Option<&RefreshContext>,
+    ) -> Result<Option<String>, CopilotAuthError> {
         let yaml = match read_optional_file(&self.gh_hosts_path) {
             FileState::Missing => None,
             FileState::Unreadable => {
@@ -123,7 +130,9 @@ impl CopilotAuthStore {
                 return Ok(Some(decode_gh_token(&tok)));
             }
         }
-        let account = yaml.as_deref().and_then(|t| yaml_value(t, "user", "github.com"));
+        let account = yaml
+            .as_deref()
+            .and_then(|t| yaml_value(t, "user", "github.com"));
         let req = match account {
             Some(user) => match ctx {
                 Some(ctx) => SecureReadRequest::for_refresh(
@@ -132,15 +141,14 @@ impl CopilotAuthStore {
                     ID,
                     ctx,
                 ),
-                None => SecureReadRequest::silent(GH_KEYCHAIN_SERVICE, SecureAccount::Named(user), ID),
+                None => {
+                    SecureReadRequest::silent(GH_KEYCHAIN_SERVICE, SecureAccount::Named(user), ID)
+                }
             },
             None => match ctx {
-                Some(ctx) => SecureReadRequest::for_refresh(
-                    GH_KEYCHAIN_SERVICE,
-                    SecureAccount::Any,
-                    ID,
-                    ctx,
-                ),
+                Some(ctx) => {
+                    SecureReadRequest::for_refresh(GH_KEYCHAIN_SERVICE, SecureAccount::Any, ID, ctx)
+                }
                 None => SecureReadRequest::silent(GH_KEYCHAIN_SERVICE, SecureAccount::Any, ID),
             },
         };
@@ -181,9 +189,12 @@ fn read_optional_file(path: &Path) -> FileState {
             FileState::Present(text)
         }
         Err(_) => {
-            diagnostic_gate::log_once(&format!("auth.copilot.read.{}", file_fingerprint(path)), || {
-                qlog!(Error, auth_tag(ID), "copilot credential file read failed");
-            });
+            diagnostic_gate::log_once(
+                &format!("auth.copilot.read.{}", file_fingerprint(path)),
+                || {
+                    qlog!(Error, auth_tag(ID), "copilot credential file read failed");
+                },
+            );
             FileState::Unreadable
         }
     }

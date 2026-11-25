@@ -2,8 +2,8 @@
 //! (Swift `DevinSessionUsageReader` + `DevinSessionUsageCache`).
 
 use super::sessions_cache::{
-    read_cache_record, revision_for, sorted_entries, write_cache_record, DbRevision, FoldState, StoredWinner,
-    CACHE_SCHEMA,
+    read_cache_record, revision_for, sorted_entries, write_cache_record, CacheRecordView,
+    DbRevision, FoldState, StoredWinner, CACHE_SCHEMA,
 };
 pub use super::sessions_cache::{CacheRecord, StoredStamp};
 use crate::model::ModelUsageEntry;
@@ -13,6 +13,7 @@ use crate::time;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const REVERIFY_ROW_SPAN: i64 = 4_096;
 const REVERIFY_ROW_LIMIT: usize = 2_048;
@@ -33,9 +34,8 @@ pub enum FoldKind {
 
 pub struct DevinSessionUsageReader {
     cache_dir_override: Option<PathBuf>,
-    cached: Option<(DbRevision, Vec<DevinSessionEntry>)>,
+    cached: Option<(DbRevision, Arc<Vec<DevinSessionEntry>>)>,
     state: Option<FoldState>,
-    persisted: Option<CacheRecord>,
     pub last_fold_kind: Option<FoldKind>,
     pub adopted_disk_record: bool,
 }
@@ -52,7 +52,6 @@ impl DevinSessionUsageReader {
             cache_dir_override,
             cached: None,
             state: None,
-            persisted: None,
             last_fold_kind: None,
             adopted_disk_record: false,
         }
@@ -61,16 +60,15 @@ impl DevinSessionUsageReader {
     pub fn clear(&mut self) {
         self.cached = None;
         self.state = None;
-        self.persisted = None;
         self.last_fold_kind = None;
         self.adopted_disk_record = false;
     }
 
-    pub fn entries(&mut self, db_path: &Path) -> Result<Vec<DevinSessionEntry>, String> {
+    pub fn entries(&mut self, db_path: &Path) -> Result<Arc<Vec<DevinSessionEntry>>, String> {
         self.adopted_disk_record = false;
         let Some(before) = revision_for(db_path) else {
             self.clear();
-            return Ok(Vec::new());
+            return Ok(Arc::new(Vec::new()));
         };
         if let Some((ref rev, ref entries)) = self.cached {
             if *rev == before {
@@ -81,10 +79,10 @@ impl DevinSessionUsageReader {
         if self.state.is_none() {
             if let Some(record) = read_cache_record(db_path, self.cache_dir_override.as_deref()) {
                 if record.revision.len() == 2
-                    && record.revision[0].as_ref().map(|s| s.inode) == before[0].as_ref().map(|s| s.inode)
+                    && record.revision[0].as_ref().map(|s| s.inode)
+                        == before[0].as_ref().map(|s| s.inode)
                 {
                     let rev = [record.revision[0].clone(), record.revision[1].clone()];
-                    self.persisted = Some(record.clone());
                     self.state = Some(FoldState {
                         watermark: record.watermark,
                         row_count: record.row_count,
@@ -99,19 +97,19 @@ impl DevinSessionUsageReader {
 
         if let Some(ref state) = self.state {
             if state.revision == before {
-                let entries = sorted_entries(&state.winners);
+                let entries = Arc::new(sorted_entries(&state.winners));
                 self.cached = Some((before, entries.clone()));
                 self.last_fold_kind = Some(FoldKind::Verified);
                 return Ok(entries);
             }
         }
 
-        let same_file_prior = self
-            .state
-            .as_ref()
-            .filter(|s| s.revision[0].as_ref().map(|x| x.inode) == before[0].as_ref().map(|x| x.inode));
+        let same_file_prior = self.state.as_ref().filter(|s| {
+            s.revision[0].as_ref().map(|x| x.inode) == before[0].as_ref().map(|x| x.inode)
+        });
 
         let (new_state, entries, kind) = scan_db(db_path, same_file_prior, &before)?;
+        let entries = Arc::new(entries);
         let Some(after) = revision_for(db_path) else {
             self.clear();
             return Ok(entries);
@@ -123,18 +121,17 @@ impl DevinSessionUsageReader {
             return Ok(entries);
         }
 
-        let record = CacheRecord {
+        // Reached only after the revision moved, so the record always differs from the saved one.
+        // It is serialized straight from the fold state: no second copy of the winners is kept.
+        let record = CacheRecordView {
             schema: CACHE_SCHEMA,
-            revision: vec![new_state.revision[0].clone(), new_state.revision[1].clone()],
+            revision: &new_state.revision,
             watermark: new_state.watermark,
             row_count: new_state.row_count,
             row_id_sum: new_state.row_id_sum,
-            winners: new_state.winners.clone(),
+            winners: &new_state.winners,
         };
-        if self.persisted.as_ref() != Some(&record) {
-            write_cache_record(&record, db_path, self.cache_dir_override.as_deref());
-            self.persisted = Some(record);
-        }
+        write_cache_record(&record, db_path, self.cache_dir_override.as_deref());
         self.state = Some(new_state);
         self.cached = Some((before, entries.clone()));
         self.last_fold_kind = Some(kind);
@@ -211,7 +208,9 @@ struct RowIdAgg {
 
 fn row_id_aggregate(conn: &Connection, watermark: i64) -> Result<RowIdAgg, String> {
     let idx = covering_index_name(conn);
-    let indexed = idx.map_or_else(String::new, |name| format!(" INDEXED BY \"{}\"", name.replace('"', "\"\"")));
+    let indexed = idx.map_or_else(String::new, |name| {
+        format!(" INDEXED BY \"{}\"", name.replace('"', "\"\""))
+    });
     let sql = format!(
         "SELECT COUNT(*), COALESCE(SUM(row_id), 0), COALESCE(SUM(CASE WHEN row_id <= ?1 THEN row_id ELSE 0 END), 0), COALESCE(SUM(CASE WHEN row_id <= ?1 THEN 1 ELSE 0 END), 0), COALESCE(MAX(row_id), 0) FROM message_nodes{indexed}"
     );
@@ -229,7 +228,9 @@ fn row_id_aggregate(conn: &Connection, watermark: i64) -> Result<RowIdAgg, Strin
 
 fn covering_index_name(conn: &Connection) -> Option<String> {
     let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'message_nodes'")
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'message_nodes'",
+        )
         .ok()?;
     let mut names = Vec::new();
     let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
@@ -294,8 +295,13 @@ fn fold_rows(conn: &Connection, winners: &mut HashMap<String, StoredWinner>) -> 
     let mut stmt = conn
         .prepare(full_fold_query())
         .map_err(|_| "Could not read Devin session usage".to_string())?;
-    let mut rows = stmt.query([]).map_err(|_| "Could not read Devin session usage".to_string())?;
-    while let Some(row) = rows.next().map_err(|_| "Could not read Devin session usage".to_string())? {
+    let mut rows = stmt
+        .query([])
+        .map_err(|_| "Could not read Devin session usage".to_string())?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|_| "Could not read Devin session usage".to_string())?
+    {
         let (key, winner) = read_candidate(row)?;
         winners.insert(key, winner);
     }
@@ -308,9 +314,16 @@ fn each_candidate(
     mut body: impl FnMut(String, StoredWinner) -> Result<(), String>,
 ) -> Result<(), String> {
     let sql = metered_rows_query(predicate);
-    let mut stmt = conn.prepare(&sql).map_err(|_| "Could not read Devin session usage".to_string())?;
-    let mut rows = stmt.query([]).map_err(|_| "Could not read Devin session usage".to_string())?;
-    while let Some(row) = rows.next().map_err(|_| "Could not read Devin session usage".to_string())? {
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|_| "Could not read Devin session usage".to_string())?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|_| "Could not read Devin session usage".to_string())?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|_| "Could not read Devin session usage".to_string())?
+    {
         let (key, winner) = read_candidate(row)?;
         body(key, winner)?;
     }
@@ -358,7 +371,11 @@ fn incremental_winners(
         }
     }
     let mut seen: HashSet<i64> = HashSet::with_capacity(band.len());
-    let in_list = band.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let in_list = band
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let pred = format!("row_id IN ({in_list})");
     let mut consistent = true;
     each_candidate(conn, &pred, |key, winner| {
@@ -379,20 +396,36 @@ fn incremental_winners(
 }
 
 fn read_candidate(row: &rusqlite::Row<'_>) -> Result<(String, StoredWinner), String> {
-    let row_id: i64 = row.get(0).map_err(|_| "Could not read Devin session usage".to_string())?;
+    let row_id: i64 = row
+        .get(0)
+        .map_err(|_| "Could not read Devin session usage".to_string())?;
     let key = partition_key(row, row_id);
     let created_at_secs: i64 = row.get(2).unwrap_or(0);
     let generated_at = strict_text(row, 3).and_then(|s| time::parse_iso8601(&s));
     let timestamp = generated_at.unwrap_or(created_at_secs as f64);
-    let raw_model = strict_text(row, 4).map(|s| s.trim().to_string()).unwrap_or_default();
-    let model = if raw_model.is_empty() { ModelUsageEntry::UNATTRIBUTED.to_string() } else { raw_model };
+    let raw_model = strict_text(row, 4)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let model = if raw_model.is_empty() {
+        ModelUsageEntry::UNATTRIBUTED.to_string()
+    } else {
+        raw_model
+    };
     let input = strict_count(row, 5)?;
     let output = strict_count(row, 6)?;
     let cache_read = strict_count(row, 7)?;
     let cache_write_5m = strict_count(row, 8)?;
     Ok((
         key,
-        StoredWinner { row_id, timestamp, model, input, cache_write_5m, cache_read, output },
+        StoredWinner {
+            row_id,
+            timestamp,
+            model,
+            input,
+            cache_write_5m,
+            cache_read,
+            output,
+        },
     ))
 }
 
@@ -400,7 +433,11 @@ fn partition_key(row: &rusqlite::Row<'_>, row_id: i64) -> String {
     match row.get_ref(1).ok() {
         Some(rusqlite::types::ValueRef::Text(bytes)) => {
             let s = String::from_utf8_lossy(bytes);
-            if s.is_empty() { format!("u:{row_id}") } else { format!("r:{s}") }
+            if s.is_empty() {
+                format!("u:{row_id}")
+            } else {
+                format!("r:{s}")
+            }
         }
         Some(rusqlite::types::ValueRef::Null) | None => format!("u:{row_id}"),
         Some(rusqlite::types::ValueRef::Integer(i)) => format!("n:1:{i}"),
@@ -411,7 +448,9 @@ fn partition_key(row: &rusqlite::Row<'_>, row_id: i64) -> String {
 
 fn strict_text(row: &rusqlite::Row<'_>, idx: usize) -> Option<String> {
     match row.get_ref(idx).ok()? {
-        rusqlite::types::ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok().map(ToString::to_string),
+        rusqlite::types::ValueRef::Text(bytes) => {
+            std::str::from_utf8(bytes).ok().map(ToString::to_string)
+        }
         _ => None,
     }
 }
@@ -426,7 +465,9 @@ fn strict_count(row: &rusqlite::Row<'_>, col: usize) -> Result<i64, String> {
     if ty != "integer" {
         return Err("Could not read Devin session usage".to_string());
     }
-    let val: i64 = row.get(col).map_err(|_| "Could not read Devin session usage".to_string())?;
+    let val: i64 = row
+        .get(col)
+        .map_err(|_| "Could not read Devin session usage".to_string())?;
     if !(0..=1_000_000_000_000_000).contains(&val) {
         return Err("Could not read Devin session usage".to_string());
     }

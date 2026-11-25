@@ -1,5 +1,8 @@
 import Foundation
 
+/// Z.ai GLM Coding Plan quota and ZCode's local token history. Credential loading, the quota and
+/// subscription APIs, the ZCode SQLite/leveldb scans, and mapping all live in the Rust engine
+/// (`Rust/quotabar-engine/src/providers/zai`).
 @MainActor
 final class ZAIProvider: ProviderRuntime {
     let provider = Provider(
@@ -12,32 +15,8 @@ final class ZAIProvider: ProviderRuntime {
         ]
     )
 
-    let authStore: ZAIAuthStore
-    let usageClient: ZAIUsageClient
-    let zcodeScanner: ZCodeUsageScanner
-    let pricing: @Sendable () async -> ModelPricing
-    let now: @Sendable () -> Date
-
-    /// The plan name changes about once a month, so re-reading it on every refresh doubled the
-    /// provider's request count for a near-constant value.
-    static let planCacheInterval: TimeInterval = 3600
-    private var cachedSubscription: Data?
-    private var cachedSubscriptionApiKey: String?
-    private var cachedSubscriptionAt: Date?
-
-    init(
-        zcodeScanner: ZCodeUsageScanner = ZCodeUsageScanner(),
-        authStore: ZAIAuthStore = ZAIAuthStore(),
-        usageClient: ZAIUsageClient = ZAIUsageClient(),
-        pricing: @escaping @Sendable () async -> ModelPricing = { ModelPricingStore.shared.current() },
-        now: @escaping @Sendable () -> Date = Date.init
-    ) {
-        self.authStore = authStore
-        self.usageClient = usageClient
-        self.zcodeScanner = zcodeScanner
-        self.pricing = pricing
-        self.now = now
-    }
+    /// ZCode's local database, also read by the Generation Speed dashboard.
+    nonisolated static let zcodeSqlitePath = "~/.zcode/cli/db/db.sqlite"
 
     var widgetDescriptors: [WidgetDescriptor] {
         [
@@ -52,7 +31,7 @@ final class ZAIProvider: ProviderRuntime {
                 .hidingWhenEmpty(),
             .boundedCount(id: "zai.webSearches", provider: provider, title: "Web Searches",
                           metricLabel: "Web Searches", limit: 1000, suffix: "searches",
-                          periodDurationMs: ZAIUsageMapper.monthlyPeriodMs)
+                          periodDurationMs: MetricPeriod.monthMs)
                 .exportingLimit("webSearches", unit: "searches")
                 .hidingWhenEmpty()
         ] + WidgetDescriptor.spendTiles(provider: provider).map { descriptor in
@@ -69,284 +48,17 @@ final class ZAIProvider: ProviderRuntime {
     }
 
     func hasLocalCredentials() async -> Bool {
-        // Same source as `refresh()`: a stored or environment-exported API key. A present but
-        // unreadable config still counts so refresh can surface its repair message.
-        await loadOffMainActor { [authStore, zcodeScanner] in
-            authStore.hasKeyOrUnreadableConfig() || zcodeScanner.hasHistory()
-        }
+        await RustEngine.hasLocalCredentials(providerID: provider.id)
     }
 
     func refresh() async -> ProviderSnapshot {
-        // Fold-only passes run the ZCode leveldb scan and priced fold in the scan-worker child
-        // when available; `refreshInProcess` stays the in-process path for the fallback and for
-        // meter/full scopes.
-        if ProviderRefreshContext.scope.suppressesLiveQuota {
-            return await ScanWorkerClient.shared.foldOnlySnapshot(
-                provider: provider,
-                inProcessFallback: { await self.refreshInProcess() }
-            )
-        }
-        return await refreshInProcess()
-    }
-
-    private func refreshInProcess() async -> ProviderSnapshot {
-        // Fold-only scopes (.localAccounting / .panelAccounting) recompute local ZCode history but
-        // must not touch the live Coding Plan quota API — the Keychain-gated meter path stays a
-        // menu-bar/panel concern, and the store merge carries the last quota snapshot forward.
-        let foldsHistoryOnly = ProviderRefreshContext.scope.suppressesLiveQuota
-        let quota: ProviderSnapshot
-        if foldsHistoryOnly {
-            quota = .make(provider: provider, plan: nil, lines: [], refreshedAt: now())
-        } else {
-            quota = await refreshQuota()
-        }
-        guard quota.errorCategory != .cancelled, !Task.isCancelled else { return quota }
-
-        // Menu-bar and panel-meter passes only need the live quota meters. Skip the local ZCode
-        // sqlite/LevelDB scan; the data store merges prior spend tiles, Weekend Build, and usage
-        // history onto this snapshot (the same scope split Grok and Devin apply).
-        if ProviderRefreshContext.scope.skipsLocalAccounting {
-            return quota
-        }
-
-        do {
-            let currentNow = now()
-            let modelPricing = await pricing()
-            let usage = try await loadOffMainActor { [zcodeScanner] in try zcodeScanner.usage(pricing: modelPricing, now: currentNow) }
-            guard let usage,
-                  (usage.totalTokens ?? 0) > 0 || usage.weekendBuild != nil || usage.dailySeries != nil
-                      || usage.damagedRows > 0 || usage.planName != nil
-            else { return quota }
-            var result = quota
-            var quotaFailed = false
-            if case .badge(_, let message, _, _) = result.lines.first(where: \.isError) {
-                quotaFailed = true
-                // Keep local usage usable even when the separate Coding Plan request fails.
-                // When no API key is configured at all, do not surface an amber error warning
-                // over legitimate local ZCode usage.
-                let keyStatus = await loadOffMainActor { [authStore] in authStore.keyStatus() }
-                let isPureLocalUser = keyStatus == .notSet && quota.errorCategory == .notLoggedIn
-                let warning = isPureLocalUser ? nil : message
-                if warning != nil {
-                    DiagnosticGate.logOnce(for: "auth.zai.quota-with-zcode.failure") {
-                        AppLog.warn(LogTag.auth("zai"), "quota refresh failed: \(message)")
-                    }
-                }
-                result = .make(
-                    provider: provider,
-                    plan: quota.plan ?? usage.planName,
-                    lines: [],
-                    refreshedAt: now(),
-                    warning: warning
-                )
-                result.quotaRefreshedAt = .distantPast
-                result.clearsPriorMenuBarQuotaState = quota.clearsPriorMenuBarQuotaState
-            } else if result.plan == nil, let localPlan = usage.planName {
-                result.plan = localPlan
-            }
-            if !foldsHistoryOnly, quota.lines.allSatisfy({ !$0.isError }) {
-                DiagnosticGate.clearFailure("auth.zai.quota-with-zcode.failure")
-            }
-
-            if !foldsHistoryOnly, let weekend = usage.weekendBuild {
-                // If it has expired relative to currentNow, do not display it (auto-remove).
-                if let expiresAt = weekend.expiresAt, expiresAt <= currentNow {
-                    // Expired: auto-remove, do not append to result.lines
-                } else {
-                    var detail: String? = nil
-                    let resetsAt: Date?
-                    if let effectiveAt = weekend.effectiveAt, effectiveAt > currentNow {
-                        detail = Formatters.deadlineLabel("Starts", at: effectiveAt, mode: .relative, now: currentNow)
-                        // Persist the grant's END, not its start: the deadline field is what the
-                        // store's expiry sweep reads to retire the row once the promo lapses.
-                        resetsAt = weekend.expiresAt ?? effectiveAt
-                    } else if let expiresAt = weekend.expiresAt {
-                        detail = Formatters.deadlineLabel("Expires", at: expiresAt, mode: .relative, now: currentNow)
-                        resetsAt = expiresAt
-                    } else {
-                        resetsAt = weekend.resetsAt
-                    }
-                    result.lines.append(.progress(
-                        label: weekend.label,
-                        used: weekend.used,
-                        limit: weekend.limit,
-                        format: .count(suffix: "tokens"),
-                        resetsAt: resetsAt,
-                        detail: detail
-                    ))
-                    // A local promo row does not vouch for the live quota API — keep the failure
-                    // stamp when the quota half of this refresh already failed.
-                    if !quotaFailed {
-                        result.quotaRefreshedAt = currentNow
-                    }
-                }
-            }
-
-            if let scan = usage.logScan {
-                SpendTileMapper.appendTokenUsage(
-                    scan.series,
-                    to: &result.lines,
-                    now: currentNow,
-                    unknownModelsByDay: scan.unknownModelsByDay,
-                    modelUsage: scan.modelUsage,
-                    modelSourceNote: "From your ZCode usage history",
-                    apiEstimateByDay: scan.apiEstimateByDay,
-                    estimatedCostDays: scan.estimatedCostDays
-                )
-                // Feed the Usage History screen (cross-provider stats) with the same scan the tiles
-                // render, so ZCode's recorded days are accounted everywhere, not just on the card.
-                result.usageHistory = ProviderUsageHistory(
-                    series: scan.series,
-                    modelUsage: scan.modelUsage,
-                    unknownModelsByDay: scan.unknownModelsByDay,
-                    apiEstimateByDay: scan.apiEstimateByDay,
-                    apiEstimateIncompleteDays: scan.apiEstimateIncompleteDays,
-                    estimatedCostDays: scan.estimatedCostDays
-                )
-                // The init stamps historyRefreshedAt only when history is passed at construction;
-                // the scan lands after, so stamp it here or the history reads as undated.
-                result.historyRefreshedAt = currentNow
-            }
-            if let failure = usage.sqliteReadFailure {
-                AppLog.warn(LogTag.auth("zai"), "ZCode token history read failed: \(failure)")
-                result.historyWarning = "Couldn't read ZCode token usage."
-            }
-            if usage.damagedRows > 0 {
-                // Corrupt rows were excluded from the history rather than blanking it — say so.
-                DiagnosticGate.logOnce(for: "zcode.damaged-usage-rows") {
-                    AppLog.warn(LogTag.auth("zai"), "ZCode history had \(usage.damagedRows) invalid rows; totals exclude them")
-                }
-                let damaged = "Skipped \(usage.damagedRows) invalid ZCode usage row\(usage.damagedRows == 1 ? "" : "s"); recent totals may be slightly low."
-                result.historyWarning = [result.historyWarning, damaged].compactMap { $0 }.joined(separator: " · ")
-            }
-            return result
-        } catch {
-            if ProviderCancellation.isCancellation(error) { return cancelledRefreshSnapshot(provider: provider) }
-            AppLog.warn(LogTag.auth("zai"), "ZCode token history read failed: \(error.localizedDescription)")
-            var result = quota
-            result.historyWarning = "Couldn't read ZCode token usage."
-            return result
-        }
-    }
-
-    func unloadLocalAccountingCachesForMemoryPressure() async {
-        zcodeScanner.unloadCachesForMemoryPressure()
-    }
-
-    private func refreshQuota() async -> ProviderSnapshot {
-        let auth: ZAIAuth?
-        do {
-            auth = try await loadOffMainActor { [authStore] in try authStore.loadAPIKeyForRefresh() }
-        } catch {
-            return ProviderSnapshot.error(provider: provider, error: error)
-        }
-        guard let auth else {
-            return ProviderSnapshot.error(provider: provider, error: ZAIAuthError.missingKey)
-        }
-
-        // The quota endpoint is required; the subscription endpoint is best-effort (plan name only),
-        // so a failure there must not blank out the meters. Both are fetched, and whatever the quota
-        // returns is mapped alongside the plan name if the subscription succeeded.
-        let quota: QuotaResult
-        let subscription: Data?
-        do {
-            quota = try await load { try await usageClient.fetchQuota(apiKey: auth.apiKey) }
-            subscription = try await subscriptionBody(apiKey: auth.apiKey)
-        } catch {
-            return ProviderSnapshot.error(provider: provider, error: error)
-        }
-
-        switch quota {
-        case .success(let body):
-            // A valid key whose account has no GLM Coding Plan gets a 2xx with `success:false`. Surface
-            // that as a clear provider warning (the header's amber notice) rather than three blank "No
-            // data" meters that don't explain why nothing's there.
-            if ZAIUsageMapper.isNoCodingPlan(body) {
-                return ProviderSnapshot.error(
-                    provider: provider,
-                    error: ZAIUsageError.noCodingPlan,
-                    clearsPriorMenuBarQuotaState: true
-                )
-            }
-            do {
-                let mapped = try ZAIUsageMapper.map(quotaBody: body, subscriptionBody: subscription, now: now())
-                return ProviderSnapshot.make(provider: provider, plan: mapped.plan, lines: mapped.lines, refreshedAt: now())
-            } catch {
-                return ProviderSnapshot.error(provider: provider, error: error)
-            }
-        case .authFailure:
-            return ProviderSnapshot.error(provider: provider, error: ZAIAuthError.invalidKey)
-        case .failed(let error):
-            return ProviderSnapshot.error(provider: provider, error: error)
-        }
-    }
-
-    /// Run the required quota call and classify the outcome: the body on 2xx, an auth failure on
-    /// 401/403, or a typed failure for any other non-2xx, transport error, or empty body.
-    private func load(_ call: () async throws -> HTTPResponse) async throws -> QuotaResult {
-        try Task.checkCancellation()
-        do {
-            let response = try await call()
-            try Task.checkCancellation()
-            if response.statusCode == 401 || response.statusCode == 403 { return .authFailure }
-            guard (200..<300).contains(response.statusCode) else {
-                return .failed(.requestFailed(response.statusCode))
-            }
-            return .success(response.body)
-        } catch {
-            try ProviderCancellation.rethrowIfCancellation(error)
-            return .failed(.connectionFailed)
-        }
-    }
-
-    /// The subscription body, which carries the plan name.
-    ///
-    /// It is kept for an hour (a manual refresh re-reads it right away), and the last good value
-    /// survives a failed request, so a transient blip no longer drops the plan from the card.
-    private func subscriptionBody(apiKey: String) async throws -> Data? {
-        if !ProviderRefreshContext.isManual,
-           let cachedSubscriptionAt,
-           cachedSubscriptionApiKey == apiKey,
-           now().timeIntervalSince(cachedSubscriptionAt) < Self.planCacheInterval {
-            return cachedSubscription
-        }
-        let body = try await loadOptional { try await usageClient.fetchSubscription(apiKey: apiKey) }
-        // The fallback must be scoped to the same API key. A key switched in Settings leaves the old
-        // account's cached subscription body behind, and returning it after a failed fetch showed the
-        // previous account's plan on the new card.
-        guard let body else { return cachedSubscriptionApiKey == apiKey ? cachedSubscription : nil }
-        cachedSubscription = body
-        cachedSubscriptionApiKey = apiKey
-        cachedSubscriptionAt = now()
-        return body
-    }
-
-    /// Run the optional subscription call — never throws into the snapshot: a transport error, a
-    /// non-2xx, or an auth failure all just mean "no plan name this refresh". Returns just the body
-    /// (the only thing the mapper consumes); the outcome is otherwise discarded.
-    private func loadOptional(_ call: () async throws -> HTTPResponse) async throws -> Data? {
-        try Task.checkCancellation()
-        do {
-            let response = try await call()
-            try Task.checkCancellation()
-            guard (200..<300).contains(response.statusCode) else { return nil }
-            return response.body
-        } catch {
-            try ProviderCancellation.rethrowIfCancellation(error)
-            return nil
-        }
+        await RustEngine.refresh(provider: provider)
     }
 }
 
 extension ZAIProvider: APIKeyManaging {
-    var apiKeyStatus: APIKeyStatus { authStore.keyStatus() }
-    func currentAPIKey() -> String? { authStore.currentAPIKey() }
-    func saveAPIKey(_ key: String) throws { try authStore.saveAPIKey(key) }
-    func deleteAPIKey() throws { try authStore.deleteAPIKey() }
-}
-
-private enum QuotaResult {
-    case success(Data)
-    case authFailure
-    case failed(ZAIUsageError)
+    var apiKeyStatus: APIKeyStatus { RustEngine.apiKeyStatus(providerID: provider.id) }
+    func currentAPIKey() -> String? { RustEngine.currentAPIKey(providerID: provider.id) }
+    func saveAPIKey(_ key: String) throws { try RustEngine.saveAPIKey(key, providerID: provider.id) }
+    func deleteAPIKey() throws { try RustEngine.deleteAPIKey(providerID: provider.id) }
 }

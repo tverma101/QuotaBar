@@ -1,12 +1,16 @@
 import XCTest
 @testable import QuotaBar
 
-/// Regression: the batched fold child pre-marks providers in `refreshingProviderIDs` while
-/// `runningProviderRefreshScopes` stays empty for the whole child lifetime. The deferred-refresh
-/// emitter used to treat "no running scopes" as ready, so every meter pass that deferred behind the
+/// Regression: the engine batch pre-marks providers in `refreshingProviderIDs` while
+/// `runningProviderRefreshScopes` stays empty for the whole batch lifetime. The deferred-refresh
+/// emitter used to treat "no running scopes" as ready, so every request that deferred behind the
 /// window was re-emitted by its own batch's unregisters, re-latched, and re-deferred — a millisecond
-/// spin of all-deferred batches that lasted as long as the fold (minutes on a deep corpus). Emission
+/// spin of all-deferred batches that lasted as long as the fold. Emission
 /// must mirror the admission gate: only emit a request a resumed pass would actually run.
+///
+/// Regression: the overlap rule also saw no active scope in that window, so every panel-open meter
+/// pass deferred until the whole fold (20–30 s on a cold launch) finished. Meters overlap the window,
+/// and finishing early must not clear the window's in-flight marker.
 @MainActor
 final class DeferredRefreshFoldWindowTests: XCTestCase {
     private final class RecordingRuntime: ProviderRuntime {
@@ -27,42 +31,37 @@ final class DeferredRefreshFoldWindowTests: XCTestCase {
         }
     }
 
-    /// Blocks inside `run` (which executes off the main actor) until the test opens the gate, so the
-    /// pre-mark window can be held open deterministically.
-    private final class BlockingBatchRunner: ProcessRunning, @unchecked Sendable {
-        private let lock = NSLock()
-        private var _entered = false
-        private let gate = DispatchSemaphore(value: 0)
-        private let stdout: String
+    /// Suspends the engine batch until the test opens the gate, so the pre-mark window can be
+    /// held open deterministically.
+    private final class BlockingEngineBatch: @unchecked Sendable {
+        private var continuation: CheckedContinuation<Void, Never>?
+        private let response: RustEngine.BatchResponse
+        private(set) var entered = false
 
-        init(stdout: String) {
-            self.stdout = stdout
+        init(response: RustEngine.BatchResponse) {
+            self.response = response
         }
 
-        var entered: Bool {
-            lock.lock(); defer { lock.unlock() }
-            return _entered
+        func execute(
+            items _: [RustEngine.BatchItem],
+            scope _: ProviderRefreshContext.Scope,
+            skipModelCatalogRefresh _: Bool,
+            paced _: Bool
+        ) async throws -> RustEngine.BatchResponse {
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+                self.entered = true
+            }
+            return response
         }
 
         func open() {
-            gate.signal()
-        }
-
-        func run(
-            executable: String,
-            arguments: [String],
-            environment: [String: String],
-            timeout: TimeInterval
-        ) throws -> ProcessResult {
-            lock.lock()
-            _entered = true
-            lock.unlock()
-            gate.wait()
-            return ProcessResult(exitCode: 0, stdout: stdout, stderr: "")
+            continuation?.resume()
+            continuation = nil
         }
     }
 
-    func testDeferredMetersDoNotReEmitWhileTheFoldChildPreMarksProviders() async throws {
+    func testFoldWindowLetsMetersOverlapAndKeepsDeferredFoldsQueued() async throws {
         let suiteName = "OpenUsageTests.FoldWindow.\(UUID().uuidString)"
         let suite = UserDefaults(suiteName: suiteName)!
         suite.removePersistentDomain(forName: suiteName)
@@ -79,24 +78,17 @@ final class DeferredRefreshFoldWindowTests: XCTestCase {
             isProviderEnabled: { _ in true }
         )
 
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        let response = ScanWorkerCommand.Response(
-            schema: ScanWorkerCommand.schemaName,
+        let response = RustEngine.BatchResponse(
             snapshots: Dictionary(uniqueKeysWithValues: runtimes.map { runtime in
                 (runtime.provider.id, ProviderSnapshot.make(
-                    provider: runtime.provider, plan: "child-\(runtime.provider.id)", lines: [], refreshedAt: Date()
+                    provider: runtime.provider, plan: "batch-\(runtime.provider.id)", lines: [], refreshedAt: Date()
                 ))
             }),
             errors: [:],
             identityKeys: ["a": "identity-a", "b": "identity-b"]
         )
-        let runner = BlockingBatchRunner(stdout: String(data: try encoder.encode(response), encoding: .utf8)!)
-        store.scanWorker = ScanWorkerClient(
-            runner: runner,
-            timeout: 110,
-            executableURLOverride: URL(fileURLWithPath: "/tmp/fake.app/Contents/MacOS/QuotaBar")
-        )
+        let batch = BlockingEngineBatch(response: response)
+        store.foldBatch = EngineFoldBatchClient(batchExecutor: batch.execute)
 
         var ready: [WidgetDataStore.DeferredRefreshRequest] = []
         store.onDeferredRefreshReady = { ready.append($0) }
@@ -107,32 +99,43 @@ final class DeferredRefreshFoldWindowTests: XCTestCase {
             }
         }
         await waitUntil(
-            { runner.entered && store.refreshingProviderIDs.contains("a") && store.refreshingProviderIDs.contains("b") },
-            "the fold child holds the pre-mark window open"
+            { batch.entered && store.refreshingProviderIDs.contains("a") && store.refreshingProviderIDs.contains("b") },
+            "the engine batch holds the pre-mark window open"
         )
 
-        // Non-forced meter passes during the window defer — and must NOT be re-emitted: the gate
-        // would instantly re-defer them, which is the spin.
+        // Meter passes skip local accounting, so they overlap the fold-only window instead of
+        // waiting behind it, and the window keeps its in-flight markers when they finish.
         let outcomeA = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
             await store.refresh(providerID: "a")
         }
         let outcomeB = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
             await store.refresh(providerID: "b")
         }
-        XCTAssertEqual(outcomeA, .inFlight)
-        XCTAssertEqual(outcomeB, .inFlight)
+        XCTAssertEqual(outcomeA, .refreshed)
+        XCTAssertEqual(outcomeB, .refreshed)
+        XCTAssertTrue(store.refreshingProviderIDs.isSuperset(of: ["a", "b"]))
+
+        // A second fold must still wait for the window — and must NOT be re-emitted while it is
+        // open: the gate would instantly re-defer it, which is the spin.
+        for id in ["a", "b"] {
+            let outcome = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
+                await store.refresh(providerID: id)
+            }
+            XCTAssertEqual(outcome, .inFlight)
+        }
         XCTAssertTrue(ready.isEmpty, "a request the gate would re-defer must stay queued, not spin the scheduler")
 
-        runner.open()
+        batch.open()
         await fold.value
 
         // The window closed: each queued request resumes exactly once, with its scope intact.
         XCTAssertEqual(Set(ready.map(\.providerID)), ["a", "b"])
         XCTAssertEqual(ready.count, 2)
-        XCTAssertTrue(ready.allSatisfy { $0.scope == .panelMeters })
+        XCTAssertTrue(ready.allSatisfy { $0.scope == .panelAccounting })
+        XCTAssertTrue(store.refreshingProviderIDs.isEmpty)
 
-        // No work was lost: a resumed meter pass now runs instead of deferring again.
-        let resumed = await ProviderRefreshContext.$scope.withValue(.panelMeters) {
+        // No work was lost: a resumed fold now runs instead of deferring again.
+        let resumed = await ProviderRefreshContext.$scope.withValue(.panelAccounting) {
             await store.refresh(providerID: "a", force: true)
         }
         XCTAssertEqual(resumed, .refreshed)

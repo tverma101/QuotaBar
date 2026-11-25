@@ -47,8 +47,9 @@ pub fn load_for_refresh(spec: &ApiKeySpec) -> Result<String, (&'static str, Erro
     match spec.load_key_for_refresh() {
         Ok(Some(key)) => Ok(key),
         Ok(None) => Err((MISSING_KEY_ERROR, ErrorCategory::NotLoggedIn)),
-        Err(ReadKeyError::ConfigUnreadable) => {
-            Err((CREDENTIALS_UNREADABLE_ERROR, ErrorCategory::CredentialAccess))
-        }
+        Err(ReadKeyError::ConfigUnreadable) => Err((
+            CREDENTIALS_UNREADABLE_ERROR,
+            ErrorCategory::CredentialAccess,
+        )),
     }
 }

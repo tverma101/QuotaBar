@@ -17,14 +17,24 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let destination = resolve_symlink_destination(path);
-    let dir = destination.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let dir = destination
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
-    let name = destination.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut tmp = tempfile::Builder::new().prefix(&format!(".{name}.")).suffix(".tmp").tempfile_in(&dir)?;
+    let name = destination
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".tmp")
+        .tempfile_in(&dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     tmp.write_all(bytes)?;
     tmp.flush()?;
@@ -38,11 +48,15 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub fn resolve_symlink_destination(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     for _ in 0..MAX_SYMLINK_HOPS {
-        let is_link = std::fs::symlink_metadata(&current).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+        let is_link = std::fs::symlink_metadata(&current)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
         if !is_link {
             return current;
         }
-        let Ok(target) = std::fs::read_link(&current) else { return current };
+        let Ok(target) = std::fs::read_link(&current) else {
+            return current;
+        };
         if target.as_os_str().is_empty() {
             return current;
         }
@@ -50,7 +64,10 @@ pub fn resolve_symlink_destination(path: &Path) -> PathBuf {
         let next = if target.is_absolute() {
             target
         } else {
-            current.parent().unwrap_or_else(|| Path::new(".")).join(target)
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
         };
         current = normalize(&next);
     }
@@ -92,10 +109,19 @@ mod tests {
 
         write_private_file(&link, b"new").unwrap();
 
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link must survive");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive"
+        );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let leftovers: Vec<_> = std::fs::read_dir(real.parent().unwrap()).unwrap().collect();
         assert_eq!(leftovers.len(), 1, "no temporary file may remain");
     }
@@ -106,7 +132,10 @@ mod tests {
         let link = dir.path().join("auth.json");
         std::os::unix::fs::symlink("missing/real.json", &link).unwrap();
         write_private_file(&link, b"x").unwrap();
-        assert_eq!(std::fs::read_to_string(dir.path().join("missing/real.json")).unwrap(), "x");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("missing/real.json")).unwrap(),
+            "x"
+        );
 
         let a = dir.path().join("a");
         let b = dir.path().join("b");

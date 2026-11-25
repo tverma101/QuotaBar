@@ -49,7 +49,10 @@ const REQUIRED_COLUMNS: [&str; 6] = [
 ];
 
 pub fn is_opaque_grok_bot_product_label(raw_model: &str) -> bool {
-    let slug = raw_model.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    let slug = raw_model
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', ' '], "-");
     slug == "grok-bot"
         || slug.starts_with("grok-bot-")
         || slug == "grokbot"
@@ -65,7 +68,12 @@ pub fn for_each_record(
     cancel: &CancelToken,
     mut on_record: impl FnMut(&[(&str, String)], &[String]),
 ) -> Result<CSVScanSummary, CursorUsageCSVError> {
-    for_each_record_with_header(csv, cancel, |_| Ok(()), |pairs, headers| on_record(pairs, headers))
+    for_each_record_with_header(
+        csv,
+        cancel,
+        |_| Ok(()),
+        |pairs, headers| on_record(pairs, headers),
+    )
 }
 
 fn for_each_record_with_header(
@@ -75,14 +83,26 @@ fn for_each_record_with_header(
     mut on_record: impl FnMut(&[(&str, String)], &[String]),
 ) -> Result<CSVScanSummary, CursorUsageCSVError> {
     if cancel.is_cancelled() {
-        return Ok(CSVScanSummary { is_structurally_complete: false, was_cancelled: true, rejected_record_count: 0 });
+        return Ok(CSVScanSummary {
+            is_structurally_complete: false,
+            was_cancelled: true,
+            rejected_record_count: 0,
+        });
     }
     let mut rows = parse_raw_rows(csv, cancel)?;
     if cancel.is_cancelled() {
-        return Ok(CSVScanSummary { is_structurally_complete: false, was_cancelled: true, rejected_record_count: 0 });
+        return Ok(CSVScanSummary {
+            is_structurally_complete: false,
+            was_cancelled: true,
+            rejected_record_count: 0,
+        });
     }
     if rows.is_empty() {
-        return Ok(CSVScanSummary { is_structurally_complete: true, was_cancelled: false, rejected_record_count: 0 });
+        return Ok(CSVScanSummary {
+            is_structurally_complete: true,
+            was_cancelled: false,
+            rejected_record_count: 0,
+        });
     }
 
     let mut headers = rows.remove(0);
@@ -104,7 +124,11 @@ fn for_each_record_with_header(
     let mut pairs: Vec<(&str, String)> = Vec::with_capacity(trimmed_headers.len());
     for (idx, row) in rows.into_iter().enumerate() {
         if idx.is_multiple_of(256) && cancel.is_cancelled() {
-            return Ok(CSVScanSummary { is_structurally_complete: false, was_cancelled: true, rejected_record_count });
+            return Ok(CSVScanSummary {
+                is_structurally_complete: false,
+                was_cancelled: true,
+                rejected_record_count,
+            });
         }
         if row.len() == 1 && row[0].is_empty() && trimmed_headers.len() > 1 {
             continue;
@@ -120,10 +144,17 @@ fn for_each_record_with_header(
         on_record(&pairs, &trimmed_headers);
     }
 
-    Ok(CSVScanSummary { is_structurally_complete: true, was_cancelled: false, rejected_record_count })
+    Ok(CSVScanSummary {
+        is_structurally_complete: true,
+        was_cancelled: false,
+        rejected_record_count,
+    })
 }
 
-fn parse_raw_rows(csv: &str, cancel: &CancelToken) -> Result<Vec<Vec<String>>, CursorUsageCSVError> {
+fn parse_raw_rows(
+    csv: &str,
+    cancel: &CancelToken,
+) -> Result<Vec<Vec<String>>, CursorUsageCSVError> {
     let bytes = csv.as_bytes();
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut current_row: Vec<String> = Vec::new();
@@ -173,7 +204,11 @@ fn parse_raw_rows(csv: &str, cancel: &CancelToken) -> Result<Vec<Vec<String>>, C
                     rows.push(std::mem::take(&mut current_row));
                     at_field_start = true;
                     just_closed_quote = false;
-                    idx += if idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' { 2 } else { 1 };
+                    idx += if idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' {
+                        2
+                    } else {
+                        1
+                    };
                     continue;
                 }
                 b'\n' => {
@@ -209,7 +244,11 @@ fn parse_raw_rows(csv: &str, cancel: &CancelToken) -> Result<Vec<Vec<String>>, C
                 field.clear();
                 rows.push(std::mem::take(&mut current_row));
                 at_field_start = true;
-                idx += if idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' { 2 } else { 1 };
+                idx += if idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' {
+                    2
+                } else {
+                    1
+                };
             }
             b'\n' => {
                 current_row.push(String::from_utf8_lossy(&field).into_owned());
@@ -262,84 +301,92 @@ pub fn parse_usage_csv(
             Ok(())
         },
         |pairs, _| {
+            let map: HashMap<&str, &str> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let Some(date_str) = map.get("Date").map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                rejected_row_count += 1;
+                return;
+            };
+            let Some(date) = parse_csv_date(date_str) else {
+                rejected_row_count += 1;
+                return;
+            };
+            let model = map.get("Model").map(|s| s.trim()).unwrap_or("").to_string();
+            if model.is_empty() {
+                rejected_row_count += 1;
+                return;
+            }
 
-        let map: HashMap<&str, &str> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let Some(date_str) = map.get("Date").map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-            rejected_row_count += 1;
-            return;
-        };
-        let Some(date) = parse_csv_date(date_str) else {
-            rejected_row_count += 1;
-            return;
-        };
-        let model = map.get("Model").map(|s| s.trim()).unwrap_or("").to_string();
-        if model.is_empty() {
-            rejected_row_count += 1;
-            return;
-        }
+            let Some(cache_write) =
+                parse_grouped_token_int(map.get("Input (w/ Cache Write)").copied().unwrap_or(""))
+            else {
+                rejected_row_count += 1;
+                return;
+            };
+            let Some(input) =
+                parse_grouped_token_int(map.get("Input (w/o Cache Write)").copied().unwrap_or(""))
+            else {
+                rejected_row_count += 1;
+                return;
+            };
+            let Some(cache_read) =
+                parse_grouped_token_int(map.get("Cache Read").copied().unwrap_or(""))
+            else {
+                rejected_row_count += 1;
+                return;
+            };
+            let Some(output) =
+                parse_grouped_token_int(map.get("Output Tokens").copied().unwrap_or(""))
+            else {
+                rejected_row_count += 1;
+                return;
+            };
 
-        let Some(cache_write) = parse_grouped_token_int(map.get("Input (w/ Cache Write)").copied().unwrap_or("")) else {
-            rejected_row_count += 1;
-            return;
-        };
-        let Some(input) = parse_grouped_token_int(map.get("Input (w/o Cache Write)").copied().unwrap_or("")) else {
-            rejected_row_count += 1;
-            return;
-        };
-        let Some(cache_read) = parse_grouped_token_int(map.get("Cache Read").copied().unwrap_or("")) else {
-            rejected_row_count += 1;
-            return;
-        };
-        let Some(output) = parse_grouped_token_int(map.get("Output Tokens").copied().unwrap_or("")) else {
-            rejected_row_count += 1;
-            return;
-        };
+            let Some(row_token_count) = cache_write
+                .checked_add(input)
+                .and_then(|v| v.checked_add(cache_read))
+                .and_then(|v| v.checked_add(output))
+            else {
+                rejected_row_count += 1;
+                return;
+            };
 
-        let Some(row_token_count) = cache_write
-            .checked_add(input)
-            .and_then(|v| v.checked_add(cache_read))
-            .and_then(|v| v.checked_add(output))
-        else {
-            rejected_row_count += 1;
-            return;
-        };
+            let reported_cost_dollars = map.get("Cost").copied().and_then(parse_cost_dollars);
+            if row_token_count == 0 && reported_cost_dollars.unwrap_or(0.0) <= 0.0 {
+                return;
+            }
+            if date > maximum_timestamp {
+                has_future_timestamp = true;
+                return;
+            }
 
-        let reported_cost_dollars = map.get("Cost").copied().and_then(parse_cost_dollars);
-        if row_token_count == 0 && reported_cost_dollars.unwrap_or(0.0) <= 0.0 {
-            return;
-        }
-        if date > maximum_timestamp {
-            has_future_timestamp = true;
-            return;
-        }
+            let tokens = TokenBreakdown {
+                input,
+                cache_write_5m: cache_write,
+                cache_write_1h: 0,
+                cache_read,
+                output,
+                is_fast: false,
+            };
+            let opaque = is_opaque_grok_bot_product_label(&model);
+            let imputed_cost_dollars = if opaque {
+                unpriced_grok_bot_row_count += 1;
+                None
+            } else if row_token_count == 0 {
+                None
+            } else {
+                pricing.estimated_cursor_cost_dollars(&model, &tokens, false)
+            };
 
-        let tokens = TokenBreakdown {
-            input,
-            cache_write_5m: cache_write,
-            cache_write_1h: 0,
-            cache_read,
-            output,
-            is_fast: false,
-        };
-        let opaque = is_opaque_grok_bot_product_label(&model);
-        let imputed_cost_dollars = if opaque {
-            unpriced_grok_bot_row_count += 1;
-            None
-        } else if row_token_count == 0 {
-            None
-        } else {
-            pricing.estimated_cursor_cost_dollars(&model, &tokens, false)
-        };
-
-        rows.push(CursorUsageCSVRow {
-            date,
-            model,
-            tokens,
-            imputed_cost_dollars,
-            reported_cost_dollars,
-            cost_is_opaque_grok_bot: opaque,
-        });
-    })?;
+            rows.push(CursorUsageCSVRow {
+                date,
+                model,
+                tokens,
+                imputed_cost_dollars,
+                reported_cost_dollars,
+                cost_is_opaque_grok_bot: opaque,
+            });
+        },
+    )?;
 
     if !summary.is_structurally_complete {
         return Err(CursorUsageCSVError::MalformedCSV);
@@ -389,7 +436,11 @@ fn parse_grouped_token_int(raw: &str) -> Option<i64> {
         if rest_count == 0 {
             return None;
         }
-        return trimmed.replace(',', "").parse::<i64>().ok().filter(|&v| v >= 0);
+        return trimmed
+            .replace(',', "")
+            .parse::<i64>()
+            .ok()
+            .filter(|&v| v >= 0);
     }
     if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
         return None;

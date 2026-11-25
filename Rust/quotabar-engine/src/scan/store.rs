@@ -58,11 +58,16 @@ impl ScanStore {
     /// The engine-wide store under the app data directory.
     pub fn shared() -> &'static ScanStore {
         static STORE: OnceLock<ScanStore> = OnceLock::new();
-        STORE.get_or_init(|| ScanStore::at(crate::paths::cache_dir("scan").join("scan-cache.sqlite3")))
+        STORE.get_or_init(|| {
+            ScanStore::at(crate::paths::cache_dir("scan").join("scan-cache.sqlite3"))
+        })
     }
 
     pub fn at(path: PathBuf) -> ScanStore {
-        ScanStore { path, conn: Mutex::new(None) }
+        ScanStore {
+            path,
+            conn: Mutex::new(None),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -97,7 +102,12 @@ impl ScanStore {
             match f(slot.as_mut().expect("connection opened above")) {
                 Ok(value) => return Some(value),
                 Err(e) => {
-                    qlog!(Warn, "scan-cache", "{what} failed (attempt {}): {e}", attempt + 1);
+                    qlog!(
+                        Warn,
+                        "scan-cache",
+                        "{what} failed (attempt {}): {e}",
+                        attempt + 1
+                    );
                     *slot = None;
                 }
             }
@@ -169,11 +179,15 @@ impl ScanStore {
                         file.fragment_items,
                     ])?;
                 }
-                let mut delete = tx.prepare_cached("DELETE FROM scan_files WHERE partition = ?1 AND path = ?2")?;
+                let mut delete =
+                    tx.prepare_cached("DELETE FROM scan_files WHERE partition = ?1 AND path = ?2")?;
                 for path in removed {
                     delete.execute(params![partition, path])?;
                 }
-                tx.execute("DELETE FROM scan_files WHERE partition = ?1 AND layout != ?2", params![partition, layout])?;
+                tx.execute(
+                    "DELETE FROM scan_files WHERE partition = ?1 AND layout != ?2",
+                    params![partition, layout],
+                )?;
             }
             tx.commit()
         });
@@ -209,7 +223,13 @@ mod tests {
     fn row(path: &str, size: u64) -> StoredFile {
         StoredFile {
             path: path.into(),
-            revision: Revision { size, mtime_ns: 7, ctime_ns: 8, dev: u64::MAX, ino: 3 },
+            revision: Revision {
+                size,
+                mtime_ns: 7,
+                ctime_ns: 8,
+                dev: u64::MAX,
+                ino: 3,
+            },
             committed_end: size,
             fragment_len: 0,
             anchor: Some([9; 16]),
@@ -238,7 +258,10 @@ mod tests {
         assert_eq!(store.load_partition("claude:b", 1).len(), 1);
 
         store.store_result("k", b"fp1", b"value");
-        assert_eq!(store.load_result("k", b"fp1").as_deref(), Some(&b"value"[..]));
+        assert_eq!(
+            store.load_result("k", b"fp1").as_deref(),
+            Some(&b"value"[..])
+        );
         assert_eq!(store.load_result("k", b"fp2"), None);
     }
 

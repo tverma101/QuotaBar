@@ -44,7 +44,10 @@ pub fn read_lines(
         let n = file.read(&mut chunk[..want])?;
         if n == 0 {
             // The file shrank under us; the caller's revision check rejects this read.
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "log file shrank while it was read"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "log file shrank while it was read",
+            ));
         }
         remaining -= n as u64;
         bytes_read += n as u64;
@@ -62,16 +65,27 @@ pub fn read_lines(
             line_start = newline + 1;
             committed_end = offset + line_start as u64;
             if !keep_going {
-                return Ok(ReadSummary { committed_end, fragment: Vec::new(), bytes_read });
+                return Ok(ReadSummary {
+                    committed_end,
+                    fragment: Vec::new(),
+                    bytes_read,
+                });
             }
         }
         if pending.len() + (n - line_start) > MAX_LINE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "log line exceeds the 64 MB limit"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "log line exceeds the 64 MB limit",
+            ));
         }
         pending.extend_from_slice(&data[line_start..]);
         offset += n as u64;
     }
-    Ok(ReadSummary { committed_end, fragment: pending, bytes_read })
+    Ok(ReadSummary {
+        committed_end,
+        fragment: pending,
+        bytes_read,
+    })
 }
 
 /// Deliver every line of a zstd-compressed JSONL archive, including a final unterminated line.
@@ -97,7 +111,10 @@ pub fn read_zstd_lines(path: &Path, mut on_line: impl FnMut(&[u8]) -> bool) -> i
             }
         }
         if pending.len() + (data.len() - line_start) > MAX_LINE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "log line exceeds the 64 MB limit"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "log line exceeds the 64 MB limit",
+            ));
         }
         pending.extend_from_slice(&data[line_start..]);
         Ok(true)
@@ -110,8 +127,14 @@ pub fn read_zstd_lines(path: &Path, mut on_line: impl FnMut(&[u8]) -> bool) -> i
 
 /// Stream all frames, preserving their byte boundaries only for checksum verification. The
 /// consumer can stop early for a prefix read or cancellation.
-pub fn read_zstd_chunks(path: &Path, mut consume: impl FnMut(&[u8]) -> io::Result<bool>) -> io::Result<bool> {
-    use ruzstd::decoding::{errors::{FrameDecoderError, ReadFrameHeaderError}, FrameDecoder, StreamingDecoder};
+pub fn read_zstd_chunks(
+    path: &Path,
+    mut consume: impl FnMut(&[u8]) -> io::Result<bool>,
+) -> io::Result<bool> {
+    use ruzstd::decoding::{
+        errors::{FrameDecoderError, ReadFrameHeaderError},
+        FrameDecoder, StreamingDecoder,
+    };
 
     let mut file = io::BufReader::new(File::open(path)?);
     let mut frame = FrameDecoder::new();
@@ -120,9 +143,17 @@ pub fn read_zstd_chunks(path: &Path, mut consume: impl FnMut(&[u8]) -> io::Resul
     while !file.fill_buf()?.is_empty() {
         let mut decoder = match StreamingDecoder::new_with_decoder(&mut file, &mut frame) {
             Ok(decoder) => decoder,
-            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame { length, .. })) => {
-                if io::copy(&mut file.by_ref().take(u64::from(length)), &mut io::sink())? != u64::from(length) {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated zstd skippable frame"));
+            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                length,
+                ..
+            })) => {
+                if io::copy(&mut file.by_ref().take(u64::from(length)), &mut io::sink())?
+                    != u64::from(length)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated zstd skippable frame",
+                    ));
                 }
                 saw_frame = true;
                 if !consume(&[])? {
@@ -145,11 +176,17 @@ pub fn read_zstd_chunks(path: &Path, mut consume: impl FnMut(&[u8]) -> io::Resul
         if frame.get_checksum_from_data().is_some()
             && frame.get_calculated_checksum() != frame.get_checksum_from_data()
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd frame checksum mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zstd frame checksum mismatch",
+            ));
         }
     }
     if !saw_frame {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty zstd archive"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty zstd archive",
+        ));
     }
     Ok(true)
 }
@@ -260,8 +297,8 @@ mod tests {
     fn zstd_archives_stream_every_line() {
         // `printf 'a\nbb\nccc' | zstd -19 | xxd -i` (no trailing newline: the last line still counts).
         let compressed: &[u8] = &[
-            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x68, 0x41, 0x00, 0x00, 0x61, 0x0a, 0x62, 0x62, 0x0a, 0x63,
-            0x63, 0x63, 0x89, 0xaf, 0x7a, 0x1b,
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x68, 0x41, 0x00, 0x00, 0x61, 0x0a, 0x62, 0x62, 0x0a,
+            0x63, 0x63, 0x63, 0x89, 0xaf, 0x7a, 0x1b,
         ];
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.jsonl.zst");

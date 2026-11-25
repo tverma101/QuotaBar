@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Parity check for the Rust engine port: runs one provider's local-only fold through a Swift
-# reference build (`QuotaBar --scan-worker --return-only`) and through the Rust engine example on
-# this machine's real data, then diffs the normalized snapshots. Local scopes only: neither side
-# calls live quota APIs or rotates credentials.
+# Historical parity check for the Rust engine port: runs one provider's local-only fold through a
+# preserved pre-port Swift reference build (`QuotaBar --scan-worker --return-only`) and through the
+# Rust engine example on this machine's real data, then diffs the normalized snapshots. The current
+# app no longer implements --scan-worker, so SWIFT_REFERENCE_BIN is required. Local scopes only:
+# neither side calls live quota APIs or rotates credentials.
 #
-#   SWIFT_REFERENCE_BIN=/path/to/QuotaBar script/diff_provider.sh claude [panel-accounting|local-accounting]
+#   SWIFT_REFERENCE_BIN=/path/to/pre-port/QuotaBar script/diff_provider.sh claude [panel-accounting|local-accounting]
 #
 # Output lands in $DIFF_OUT (default: a new temp dir): swift.json, rust.json, *.norm.json, diff.txt.
 set -euo pipefail
@@ -16,7 +17,7 @@ case "$scope" in
   local-accounting) rust_scope=localAccounting ;;
   *) echo "unknown scope: $scope" >&2; exit 2 ;;
 esac
-swift_bin="${SWIFT_REFERENCE_BIN:-.build/debug/QuotaBar}"
+swift_bin="${SWIFT_REFERENCE_BIN:?set SWIFT_REFERENCE_BIN to a preserved pre-port QuotaBar executable}"
 out="${DIFF_OUT:-$(mktemp -d -t quotabar-diff)}"
 mkdir -p "$out"
 

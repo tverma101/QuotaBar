@@ -46,7 +46,13 @@ pub fn fetch_with_retry<E>(
         return RetryOutcome::Response(response);
     }
 
-    qlog!(Debug, "auth", "{} -> refreshing token, retrying once ({})", response.status, provider_id);
+    qlog!(
+        Debug,
+        "auth",
+        "{} -> refreshing token, retrying once ({})",
+        response.status,
+        provider_id
+    );
     let refreshed = match refresh_access_token() {
         Ok(tok) => tok,
         Err(err) => return RetryOutcome::RefreshError(err),
@@ -64,7 +70,11 @@ pub fn fetch_with_retry<E>(
     }
     if is_auth_failure(&retried) {
         diagnostic_gate::log_once(&diag_key, || {
-            qlog!(Warn, "auth", "retry still unauthorized -> auth expired ({provider_id})");
+            qlog!(
+                Warn,
+                "auth",
+                "retry still unauthorized -> auth expired ({provider_id})"
+            );
         });
         return RetryOutcome::AuthExpired;
     }
@@ -75,6 +85,10 @@ pub fn fetch_with_retry<E>(
 }
 
 fn diagnostic_key(provider_id: &str, source_id: &str) -> String {
-    let fp: String = Sha256::digest(source_id.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let fp: String = Sha256::digest(source_id.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
     format!("auth.provider-retry.{provider_id}.{fp}")
 }

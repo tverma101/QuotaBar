@@ -19,7 +19,10 @@ impl Record for Row {
         w.varint(self.ordinal);
     }
     fn decode(r: &mut Reader<'_>) -> Option<Self> {
-        Some(Row { n: r.i64()?, ordinal: r.varint()? })
+        Some(Row {
+            n: r.i64()?,
+            ordinal: r.varint()?,
+        })
     }
 }
 
@@ -46,22 +49,39 @@ impl LineParser for CountingParser {
 
     fn parse(&self, state: &mut Count, line: &[u8], out: &mut Vec<Row>) -> Result<(), LineError> {
         let text = std::str::from_utf8(line).map_err(|_| LineError("utf8"))?;
-        let n = text.strip_prefix("n=").and_then(|v| v.parse().ok()).ok_or(LineError("not a row"))?;
+        let n = text
+            .strip_prefix("n=")
+            .and_then(|v| v.parse().ok())
+            .ok_or(LineError("not a row"))?;
         state.0 += 1;
-        out.push(Row { n, ordinal: state.0 });
+        out.push(Row {
+            n,
+            ordinal: state.0,
+        });
         Ok(())
     }
 }
 
 fn values(result: &[FileItems<Row>]) -> Vec<(i64, u64)> {
-    result.iter().flat_map(|f| f.iter().map(|r| (r.n, r.ordinal))).collect()
+    result
+        .iter()
+        .flat_map(|f| f.iter().map(|r| (r.n, r.ordinal)))
+        .collect()
 }
 
 fn append(path: &Path, text: &str) {
-    std::fs::OpenOptions::new().append(true).open(path).unwrap().write_all(text.as_bytes()).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
 }
 
-fn scan(scanner: &IncrementalScanner<CountingParser>, root: &Path) -> Result<Vec<FileItems<Row>>, ScanError> {
+fn scan(
+    scanner: &IncrementalScanner<CountingParser>,
+    root: &Path,
+) -> Result<Vec<FileItems<Row>>, ScanError> {
     let files = discover(root, Extensions::Jsonl).unwrap();
     scanner.scan(&files, None, &CancelToken::new())
 }
@@ -73,14 +93,29 @@ fn reuses_unchanged_files_and_resumes_appends_with_parser_state() {
     std::fs::write(&path, "n=1\nskip\nn=2\n").unwrap();
     let scanner = IncrementalScanner::new(CountingParser, "test", None);
 
-    assert_eq!(values(&scan(&scanner, dir.path()).unwrap()), [(1, 1), (2, 2)]);
+    assert_eq!(
+        values(&scan(&scanner, dir.path()).unwrap()),
+        [(1, 1), (2, 2)]
+    );
     assert_eq!(scanner.last_stats().full, 1);
 
-    assert_eq!(values(&scan(&scanner, dir.path()).unwrap()), [(1, 1), (2, 2)]);
-    assert_eq!(scanner.last_stats(), ScanStats { reused: 1, ..Default::default() });
+    assert_eq!(
+        values(&scan(&scanner, dir.path()).unwrap()),
+        [(1, 1), (2, 2)]
+    );
+    assert_eq!(
+        scanner.last_stats(),
+        ScanStats {
+            reused: 1,
+            ..Default::default()
+        }
+    );
 
     append(&path, "n=3\n");
-    assert_eq!(values(&scan(&scanner, dir.path()).unwrap()), [(1, 1), (2, 2), (3, 3)]);
+    assert_eq!(
+        values(&scan(&scanner, dir.path()).unwrap()),
+        [(1, 1), (2, 2), (3, 3)]
+    );
     let stats = scanner.last_stats();
     assert_eq!((stats.appended, stats.full, stats.bytes_read), (1, 0, 4));
 }
@@ -92,10 +127,16 @@ fn a_trailing_partial_line_is_provisional_and_counted_once() {
     std::fs::write(&path, "n=1\nn=2").unwrap();
     let scanner = IncrementalScanner::new(CountingParser, "test", None);
     // The unterminated row is visible now...
-    assert_eq!(values(&scan(&scanner, dir.path()).unwrap()), [(1, 1), (2, 2)]);
+    assert_eq!(
+        values(&scan(&scanner, dir.path()).unwrap()),
+        [(1, 1), (2, 2)]
+    );
     // ...and when its line completes it is re-read as a whole, not counted twice.
     append(&path, "5\nn=7\n");
-    assert_eq!(values(&scan(&scanner, dir.path()).unwrap()), [(1, 1), (25, 2), (7, 3)]);
+    assert_eq!(
+        values(&scan(&scanner, dir.path()).unwrap()),
+        [(1, 1), (25, 2), (7, 3)]
+    );
     assert_eq!(scanner.last_stats().appended, 1);
 }
 
@@ -107,7 +148,10 @@ fn an_unparseable_trailing_fragment_is_skipped_until_complete() {
     let scanner = IncrementalScanner::new(CountingParser, "test", None);
     assert_eq!(values(&scan(&scanner, dir.path()).unwrap()), [(1, 1)]);
     append(&path, "4\n");
-    assert_eq!(values(&scan(&scanner, dir.path()).unwrap()), [(1, 1), (4, 2)]);
+    assert_eq!(
+        values(&scan(&scanner, dir.path()).unwrap()),
+        [(1, 1), (4, 2)]
+    );
 }
 
 #[test]
@@ -120,7 +164,10 @@ fn rewrites_and_truncations_force_a_full_parse() {
 
     // Same length, different content: the prefix signature changes.
     std::fs::write(&path, "n=8\nn=9\nn=3\n").unwrap();
-    assert_eq!(values(&scan(&scanner, dir.path()).unwrap()), [(8, 1), (9, 2), (3, 3)]);
+    assert_eq!(
+        values(&scan(&scanner, dir.path()).unwrap()),
+        [(8, 1), (9, 2), (3, 3)]
+    );
     assert_eq!(scanner.last_stats().full, 1);
 
     std::fs::write(&path, "n=5\n").unwrap();
@@ -136,10 +183,19 @@ fn a_malformed_complete_line_fails_the_scan_and_keeps_the_last_good_cache() {
     let scanner = IncrementalScanner::new(CountingParser, "test", None);
     scan(&scanner, dir.path()).unwrap();
     append(&path, "bad\n");
-    assert!(matches!(scan(&scanner, dir.path()), Err(ScanError::Malformed { reason: "not a row", .. })));
+    assert!(matches!(
+        scan(&scanner, dir.path()),
+        Err(ScanError::Malformed {
+            reason: "not a row",
+            ..
+        })
+    ));
     // The failed scan published nothing; fixing the file recovers through a full parse.
     std::fs::write(&path, "n=1\nn=2\n").unwrap();
-    assert_eq!(values(&scan(&scanner, dir.path()).unwrap()), [(1, 1), (2, 2)]);
+    assert_eq!(
+        values(&scan(&scanner, dir.path()).unwrap()),
+        [(1, 1), (2, 2)]
+    );
 }
 
 #[test]
@@ -148,10 +204,16 @@ fn removed_and_out_of_window_files_leave_the_cache() {
     std::fs::write(dir.path().join("a.jsonl"), "n=1\n").unwrap();
     std::fs::write(dir.path().join("b.jsonl"), "n=2\n").unwrap();
     let scanner = IncrementalScanner::new(CountingParser, "test", None);
-    assert_eq!(values(&scan(&scanner, dir.path()).unwrap()), [(1, 1), (2, 1)]);
+    assert_eq!(
+        values(&scan(&scanner, dir.path()).unwrap()),
+        [(1, 1), (2, 1)]
+    );
     let files = discover(dir.path(), Extensions::Jsonl).unwrap();
     let future = files.iter().map(|f| f.revision.mtime()).fold(0.0, f64::max) + 1.0;
-    assert!(scanner.scan(&files, Some(future), &CancelToken::new()).unwrap().is_empty());
+    assert!(scanner
+        .scan(&files, Some(future), &CancelToken::new())
+        .unwrap()
+        .is_empty());
     assert!(scanner.state.lock().unwrap().files.is_empty());
 }
 
@@ -163,14 +225,18 @@ fn cancellation_fails_the_scan() {
     let cancel = CancelToken::new();
     cancel.cancel();
     let files = discover(dir.path(), Extensions::Jsonl).unwrap();
-    assert!(matches!(scanner.scan(&files, None, &cancel), Err(ScanError::Cancelled)));
+    assert!(matches!(
+        scanner.scan(&files, None, &cancel),
+        Err(ScanError::Cancelled)
+    ));
 }
 
 #[test]
 fn the_persistent_store_survives_a_restart_and_resumes_appends() {
     let logs = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let store: &'static ScanStore = Box::leak(Box::new(ScanStore::at(cache.path().join("scan.sqlite3"))));
+    let store: &'static ScanStore =
+        Box::leak(Box::new(ScanStore::at(cache.path().join("scan.sqlite3"))));
     let path = logs.path().join("a.jsonl");
     std::fs::write(&path, "n=1\nn=2\n").unwrap();
 
@@ -180,13 +246,64 @@ fn the_persistent_store_survives_a_restart_and_resumes_appends() {
 
     // A new process: the rows come from the store, not the log.
     let second = IncrementalScanner::new(CountingParser, "p", Some(store));
-    assert_eq!(values(&scan(&second, logs.path()).unwrap()), [(1, 1), (2, 2)]);
-    assert_eq!(second.last_stats(), ScanStats { reused: 1, ..Default::default() });
+    assert_eq!(
+        values(&scan(&second, logs.path()).unwrap()),
+        [(1, 1), (2, 2)]
+    );
+    assert_eq!(
+        second.last_stats(),
+        ScanStats {
+            reused: 1,
+            ..Default::default()
+        }
+    );
 
     append(&path, "n=3\n");
     let third = IncrementalScanner::new(CountingParser, "p", Some(store));
-    assert_eq!(values(&scan(&third, logs.path()).unwrap()), [(1, 1), (2, 2), (3, 3)]);
+    assert_eq!(
+        values(&scan(&third, logs.path()).unwrap()),
+        [(1, 1), (2, 2), (3, 3)]
+    );
     assert_eq!(third.last_stats().appended, 1);
+}
+
+#[test]
+fn clearing_memory_rehydrates_the_persistent_cache_and_resumes_appends() {
+    let logs = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let store: &'static ScanStore =
+        Box::leak(Box::new(ScanStore::at(cache.path().join("scan.sqlite3"))));
+    let path = logs.path().join("a.jsonl");
+    std::fs::write(&path, "n=1\nn=2\n").unwrap();
+    let scanner = IncrementalScanner::new(CountingParser, "clear-memory", Some(store));
+
+    assert_eq!(
+        values(&scan(&scanner, logs.path()).unwrap()),
+        [(1, 1), (2, 2)]
+    );
+    scanner.clear_memory_cache();
+    assert!(scanner.state.lock().unwrap().files.is_empty());
+
+    // The next scan is a cache hit again, but the rows come from the compact persistent store.
+    assert_eq!(
+        values(&scan(&scanner, logs.path()).unwrap()),
+        [(1, 1), (2, 2)]
+    );
+    assert_eq!(
+        scanner.last_stats(),
+        ScanStats {
+            reused: 1,
+            ..Default::default()
+        }
+    );
+
+    scanner.clear_memory_cache();
+    append(&path, "n=3\n");
+    assert_eq!(
+        values(&scan(&scanner, logs.path()).unwrap()),
+        [(1, 1), (2, 2), (3, 3)]
+    );
+    assert_eq!(scanner.last_stats().appended, 1);
 }
 
 #[test]
@@ -196,7 +313,10 @@ fn many_files_parse_in_parallel_and_keep_input_order() {
         std::fs::write(dir.path().join(format!("{i:03}.jsonl")), format!("n={i}\n")).unwrap();
     }
     let scanner = IncrementalScanner::new(CountingParser, "test", None);
-    let got: Vec<i64> = values(&scan(&scanner, dir.path()).unwrap()).into_iter().map(|(n, _)| n).collect();
+    let got: Vec<i64> = values(&scan(&scanner, dir.path()).unwrap())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     assert_eq!(got, (0..40).collect::<Vec<_>>());
 }
 

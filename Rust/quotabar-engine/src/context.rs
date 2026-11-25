@@ -41,7 +41,10 @@ impl Scope {
 
 /// Cooperative cancellation shared between the caller and long-running scans.
 #[derive(Clone, Default, Debug)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken {
+    cancelled: Arc<AtomicBool>,
+    pub(crate) serial_scan: bool,
+}
 
 impl CancelToken {
     pub fn new() -> Self {
@@ -49,11 +52,11 @@ impl CancelToken {
     }
 
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.cancelled.load(Ordering::Relaxed)
     }
 
     pub fn check(&self) -> Result<(), Cancelled> {
@@ -85,7 +88,7 @@ pub struct RefreshContext {
     pub cancel: CancelToken,
     /// Skip network pricing-catalog refreshes (the host already refreshed recently).
     pub skip_model_catalog_refresh: bool,
-    /// Background folds run paced to bound CPU/IO impact.
+    /// Background folds limit scan concurrency to reduce CPU and memory spikes.
     pub paced: bool,
     /// The host's id for this refresh; forwarded with host callbacks (Keychain prompt budgets).
     pub request_id: Option<u64>,
@@ -115,11 +118,17 @@ impl RefreshContext {
     }
 
     pub fn set_observed_identity_key(&self, key: impl Into<String>) {
-        *self.observed_identity_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(key.into());
+        *self
+            .observed_identity_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(key.into());
     }
 
     pub fn observed_identity_key(&self) -> Option<String> {
-        self.observed_identity_key.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.observed_identity_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 

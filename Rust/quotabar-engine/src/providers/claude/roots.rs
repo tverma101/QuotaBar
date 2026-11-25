@@ -12,12 +12,21 @@ use std::path::{Path, PathBuf};
 
 /// Foundation's `.whitespaces` (spaces and tabs, no line breaks).
 fn trim_horizontal(value: &str) -> &str {
-    value.trim_matches(|c: char| c == '\t' || (c.is_whitespace() && !matches!(c, '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}')))
+    value.trim_matches(|c: char| {
+        c == '\t'
+            || (c.is_whitespace()
+                && !matches!(
+                    c,
+                    '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+                ))
+    })
 }
 
 /// The comma-separated entries of a `CLAUDE_CONFIG_DIR` value, trimmed and non-empty.
 fn config_dir_parts(raw: &str) -> impl Iterator<Item = &str> {
-    raw.split(',').map(trim_horizontal).filter(|part| !part.is_empty())
+    raw.split(',')
+        .map(trim_horizontal)
+        .filter(|part| !part.is_empty())
 }
 
 /// The desktop app's data directory (Swift hard-codes the macOS layout; the Windows app keeps the
@@ -36,7 +45,10 @@ pub(super) fn cowork_base(home: &Path) -> PathBuf {
 /// intentionally excluded: they appear and disappear over time but still share this source cache.
 pub fn parse_source_identity(home: &Path, env: &dyn Fn(&str) -> Option<String>) -> String {
     let resolved_home = resolve_path(home).to_string_lossy().into_owned();
-    let configured: Vec<PathBuf> = match env("CLAUDE_CONFIG_DIR").map(|raw| raw.trim().to_string()).filter(|raw| !raw.is_empty()) {
+    let configured: Vec<PathBuf> = match env("CLAUDE_CONFIG_DIR")
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+    {
         Some(raw) => config_dir_parts(&raw)
             .map(|part| {
                 let mut path = expand_home(home, part);
@@ -54,7 +66,10 @@ pub fn parse_source_identity(home: &Path, env: &dyn Fn(&str) -> Option<String>) 
             vec![xdg.join("claude"), home.join(".claude")]
         }
     };
-    let roots = resolved_set(&configured).into_iter().collect::<Vec<_>>().join("\n");
+    let roots = resolved_set(&configured)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n");
     format!("home={resolved_home}\nroots={roots}")
 }
 
@@ -69,7 +84,10 @@ pub(super) fn roots_identity(roots: &[PathBuf]) -> String {
 }
 
 fn resolved_set(paths: &[PathBuf]) -> BTreeSet<String> {
-    paths.iter().map(|p| resolve_path(p).to_string_lossy().into_owned()).collect()
+    paths
+        .iter()
+        .map(|p| resolve_path(p).to_string_lossy().into_owned())
+        .collect()
 }
 
 impl ClaudeLogScanner {
@@ -86,7 +104,9 @@ impl ClaudeLogScanner {
         }
         const INVALID_PREFIX: &str = "claude.config-dir.invalid.";
         let mut roots: Vec<PathBuf> = Vec::new();
-        let configured = (self.env)("CLAUDE_CONFIG_DIR").map(|raw| raw.trim().to_string()).filter(|raw| !raw.is_empty());
+        let configured = (self.env)("CLAUDE_CONFIG_DIR")
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty());
         match &configured {
             Some(raw) => {
                 for part in config_dir_parts(raw) {
@@ -98,13 +118,16 @@ impl ClaudeLogScanner {
                     add_if_valid(&mut roots, dir);
                 }
                 if roots.is_empty() {
-                    diagnostic_gate::log_once(&format!("{INVALID_PREFIX}{}", stable_fingerprint(raw)), || {
-                        qlog!(
+                    diagnostic_gate::log_once(
+                        &format!("{INVALID_PREFIX}{}", stable_fingerprint(raw)),
+                        || {
+                            qlog!(
                             Warn,
                             host::plugin_tag("claude"),
                             "CLAUDE_CONFIG_DIR is set but contains no Claude data directory with projects/"
                         );
-                    });
+                        },
+                    );
                 } else {
                     diagnostic_gate::clear_prefix(INVALID_PREFIX);
                 }
@@ -119,7 +142,11 @@ impl ClaudeLogScanner {
                 add_if_valid(&mut roots, self.home.join(".claude"));
             }
         }
-        for sandbox in cowork_claude_dirs(&self.home, self.organization_id.as_deref(), self.account_id.as_deref()) {
+        for sandbox in cowork_claude_dirs(
+            &self.home,
+            self.organization_id.as_deref(),
+            self.account_id.as_deref(),
+        ) {
             add_if_valid(&mut roots, sandbox);
         }
         roots
@@ -128,15 +155,24 @@ impl ClaudeLogScanner {
     /// The source files in scope for this scanner: every `*.jsonl` under the roots, narrowed to the
     /// sessions the organization owns when scoped. `None` means the source is incomplete (a root could
     /// not be enumerated, an ownership read failed, a file changed under us, or cancellation).
-    pub(super) fn source_files(&self, roots: &[PathBuf], cancel: &CancelToken) -> Option<Vec<DiscoveredFile>> {
+    pub(super) fn source_files(
+        &self,
+        roots: &[PathBuf],
+        cancel: &CancelToken,
+    ) -> Option<Vec<DiscoveredFile>> {
         let mut files = usage_files_if_complete(roots, cancel)?;
         if let Some(organization_id) = &self.organization_id {
             files = self.owned_usage_files(&files, organization_id, cancel)?;
             // Ownership lookups take time; a session rewritten meanwhile must not be scanned under its
             // stale discovered revision.
-            let changed = files.iter().find(|f| Revision::read(&f.path).map_or(true, |now| now != f.revision));
+            let changed = files
+                .iter()
+                .find(|f| Revision::read(&f.path).map_or(true, |now| now != f.revision));
             if let Some(file) = changed {
-                let key = format!("claude.fold.source-changed.{}", stable_fingerprint(&file.path.to_string_lossy()));
+                let key = format!(
+                    "claude.fold.source-changed.{}",
+                    stable_fingerprint(&file.path.to_string_lossy())
+                );
                 diagnostic_gate::log_once(&key, || {
                     qlog!(
                         Warn,
@@ -157,11 +193,18 @@ impl ClaudeLogScanner {
 /// variant one level deeper). Each holds the same `projects/**/*.jsonl` session logs as `~/.claude`,
 /// so they scan as additional roots. The walk is bounded to those known levels: session dirs contain
 /// full sandbox homes we must not recurse into.
-fn cowork_claude_dirs(home: &Path, organization_id: Option<&str>, account_id: Option<&str>) -> Vec<PathBuf> {
+fn cowork_claude_dirs(
+    home: &Path,
+    organization_id: Option<&str>,
+    account_id: Option<&str>,
+) -> Vec<PathBuf> {
     let lowered = |dir: &Path| dir.file_name().map(|n| n.to_string_lossy().to_lowercase());
     let mut dirs = Vec::new();
     for group in subdirectories(&cowork_base(home)) {
-        if organization_id.is_some() && account_id.is_some() && lowered(&group).as_deref() != account_id {
+        if organization_id.is_some()
+            && account_id.is_some()
+            && lowered(&group).as_deref() != account_id
+        {
             continue;
         }
         for sub in subdirectories(&group) {
@@ -169,8 +212,11 @@ fn cowork_claude_dirs(home: &Path, organization_id: Option<&str>, account_id: Op
                 continue;
             }
             let mut sessions = subdirectories(&sub);
-            let holders: Vec<PathBuf> =
-                sessions.iter().filter(|d| d.file_name().is_some_and(|n| n == "agent")).cloned().collect();
+            let holders: Vec<PathBuf> = sessions
+                .iter()
+                .filter(|d| d.file_name().is_some_and(|n| n == "agent"))
+                .cloned()
+                .collect();
             for holder in holders {
                 sessions.extend(subdirectories(&holder));
             }
@@ -188,9 +234,19 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
-            diagnostic_gate::log_once(&format!("claude.cowork.unreadable.{}", stable_fingerprint(&dir.to_string_lossy())), || {
-                qlog!(Warn, host::plugin_tag("claude"), "could not list Cowork session directories: {e}");
-            });
+            diagnostic_gate::log_once(
+                &format!(
+                    "claude.cowork.unreadable.{}",
+                    stable_fingerprint(&dir.to_string_lossy())
+                ),
+                || {
+                    qlog!(
+                        Warn,
+                        host::plugin_tag("claude"),
+                        "could not list Cowork session directories: {e}"
+                    );
+                },
+            );
             return Vec::new();
         }
     };
@@ -204,7 +260,10 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
 
 /// Every `*.jsonl` under each root's `projects/`, path-sorted so the dedup pass (keep-first wins) is
 /// deterministic, the same order ccusage scans in. `None` when any root cannot be fully enumerated.
-pub fn usage_files_if_complete(roots: &[PathBuf], cancel: &CancelToken) -> Option<Vec<DiscoveredFile>> {
+pub fn usage_files_if_complete(
+    roots: &[PathBuf],
+    cancel: &CancelToken,
+) -> Option<Vec<DiscoveredFile>> {
     let mut files = Vec::new();
     for root in roots {
         if cancel.is_cancelled() {
@@ -213,7 +272,10 @@ pub fn usage_files_if_complete(roots: &[PathBuf], cancel: &CancelToken) -> Optio
         match discover(&root.join("projects"), Extensions::Jsonl) {
             Ok(found) => files.extend(found),
             Err(error) => {
-                let key = format!("claude.discovery.{}", stable_fingerprint(&root.to_string_lossy()));
+                let key = format!(
+                    "claude.discovery.{}",
+                    stable_fingerprint(&root.to_string_lossy())
+                );
                 diagnostic_gate::log_once(&key, || {
                     qlog!(
                         Warn,

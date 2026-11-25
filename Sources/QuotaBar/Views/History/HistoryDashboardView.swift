@@ -2,53 +2,114 @@ import SwiftUI
 
 /// The Usage History screen: measured tokens and provider-reported charges or a separate API-rate
 /// estimate view, built from the same per-provider histories the dashboard's spend tiles render.
+/// The report is prepared off the panel's executor, so a long history never stalls the panel.
 struct HistoryDashboardView: View {
-    var now: () -> Date = Date.init
     @Environment(LayoutStore.self) private var layout
     @Environment(WidgetDataStore.self) private var dataStore
+    @Environment(\.timeZone) private var timeZone
 
-    @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
     @State private var scrollPosition = ScrollPosition(edge: .top)
     @State private var costMode: HistoryCostMode = .reportedOnly
+    @State private var prepared: (request: Request, report: HistoryReport)?
 
     var body: some View {
-        PopoverScrollView {
-            content
+        TimelineView(.everyMinute) { context in
+            screen(now: context.date)
         }
-        .scrollPosition($scrollPosition)
         .onChange(of: layout.screen) { _, screen in
             if screen == .history { scrollPosition.scrollTo(edge: .top) }
         }
     }
 
-    // MARK: - Report
-
-    /// Projects the enabled providers' cached histories onto the selected cost source.
-    private var report: HistoryReport {
-        let enabledIDs = layout.orderedProviderIDs().filter { layout.isProviderEnabled($0) }
-        var names: [String: String] = [:]
-        var histories: [String: ProviderUsageHistory] = [:]
-        for id in enabledIDs {
-            names[id] = layout.provider(id: id)?.displayName ?? id
-            histories[id] = dataStore.snapshots[id]?.usageHistory
+    private func screen(now: Date) -> some View {
+        var calendar = Calendar.current
+        calendar.timeZone = timeZone
+        let providers = layout.orderedProviderIDs().filter { layout.isProviderEnabled($0) }.map { id in
+            ProviderSelection(
+                id: id,
+                name: layout.provider(id: id)?.displayName ?? id,
+                identity: dataStore.historyAccountIdentity(for: id)
+            )
         }
-        return HistoryDashboardAggregator.report(
-            .init(
-                enabledProviderIDs: enabledIDs,
-                displayNameByProviderID: names,
-                historyByProviderID: histories
-            ),
+        let request = Request(
+            scope: .init(providers: providers, calendar: calendar, day: calendar.startOfDay(for: now)),
             costMode: costMode,
-            now: now()
+            revision: dataStore.historyPresentationRevision
         )
+        return PopoverScrollView {
+            // A cost-source switch keeps the previous report on screen until the new one is ready.
+            if let prepared, prepared.request.scope == request.scope {
+                HistoryDashboardContent(
+                    report: prepared.report,
+                    costMode: prepared.request.costMode,
+                    selection: $costMode
+                )
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Loading Usage History")
+                    .frame(maxWidth: .infinity, minHeight: 120)
+            }
+        }
+        .scrollPosition($scrollPosition)
+        .task(id: request) {
+            guard !Task.isCancelled, prepared?.request != request else { return }
+            if prepared?.request.scope != request.scope { prepared = nil }
+            let input = HistoryDashboardAggregator.Input(
+                enabledProviderIDs: providers.map(\.id),
+                displayNameByProviderID: Dictionary(uniqueKeysWithValues: providers.map { ($0.id, $0.name) }),
+                historyByProviderID: Dictionary(uniqueKeysWithValues: providers.compactMap { provider in
+                    dataStore.snapshots[provider.id]?.usageHistory.map { (provider.id, $0) }
+                })
+            )
+            guard let report = await HistoryDashboardAggregator.prepareReport(
+                input, costMode: request.costMode, now: now, calendar: request.scope.calendar
+            ), !Task.isCancelled else { return }
+            prepared = (request, report)
+        }
     }
 
-    @ViewBuilder
-    private var content: some View {
-        let report = report
+    private struct ProviderSelection: Equatable {
+        let id: String
+        let name: String
+        let identity: String?
+    }
+
+    private struct Request: Equatable {
+        struct Scope: Equatable {
+            let providers: [ProviderSelection]
+            let calendar: Calendar
+            let day: Date
+        }
+
+        let scope: Scope
+        let costMode: HistoryCostMode
+        let revision: UInt64
+    }
+}
+
+/// Renders the prepared Usage History totals, trend, and model breakdowns.
+struct HistoryDashboardContent: View {
+    let report: HistoryReport
+    /// The cost source `report` was built with.
+    let costMode: HistoryCostMode
+    @Binding var selection: HistoryCostMode
+    @AppStorage(DensitySetting.key) private var density = DensitySetting.regular
+
+    init(
+        report: HistoryReport,
+        costMode: HistoryCostMode = .reportedOnly,
+        selection: Binding<HistoryCostMode> = .constant(.reportedOnly)
+    ) {
+        self.report = report
+        self.costMode = costMode
+        _selection = selection
+    }
+
+    var body: some View {
         VStack(alignment: .leading, spacing: density.sectionSpacing) {
             VStack(alignment: .leading, spacing: 6) {
-                Picker("Cost Source", selection: $costMode) {
+                Picker("Cost Source", selection: $selection) {
                     ForEach(HistoryCostMode.allCases, id: \.self) { mode in
                         Text(mode.rawValue).tag(mode)
                     }
@@ -56,7 +117,7 @@ struct HistoryDashboardView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .accessibilityLabel("Cost Source")
-                Text(costMode == .reportedOnly
+                Text(selection == .reportedOnly
                      ? "Only dollar amounts recorded by providers. Missing costs are not estimated."
                      : "What the measured tokens would cost at published API rates, not a bill.")
                     .font(.system(size: density.supportingPointSize - 1))

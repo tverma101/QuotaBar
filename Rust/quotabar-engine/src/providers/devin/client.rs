@@ -39,8 +39,12 @@ impl Failure {
             Failure::RequestFailed(status) => {
                 format!("Devin's service returned an error (HTTP {status}). Try again later.")
             }
-            Failure::InvalidResponse => "Devin returned quota data QuotaBar couldn't read. Try again later.".into(),
-            Failure::ConnectionFailed => "QuotaBar couldn't reach Devin. Check your connection and try again.".into(),
+            Failure::InvalidResponse => {
+                "Devin returned quota data QuotaBar couldn't read. Try again later.".into()
+            }
+            Failure::ConnectionFailed => {
+                "QuotaBar couldn't reach Devin. Check your connection and try again.".into()
+            }
             Failure::QuotaUnavailable => QUOTA_UNAVAILABLE.into(),
         }
     }
@@ -70,7 +74,11 @@ pub fn attempt(
     if timeout.is_zero() {
         return Attempt::Failed(Failure::ConnectionFailed);
     }
-    let url = format!("{}/{}/GetUserStatus", auth.effective_api_server_url(), CLOUD_SERVICE);
+    let url = format!(
+        "{}/{}/GetUserStatus",
+        auth.effective_api_server_url(),
+        CLOUD_SERVICE
+    );
     let body = json!({
         "metadata": {
             "apiKey": auth.api_key,
@@ -89,7 +97,11 @@ pub fn attempt(
         Err(HttpError::Cancelled) => return Attempt::Cancelled,
         Err(error) => {
             diagnostic_gate::log_once(TRANSPORT_FAILURE_KEY, || {
-                qlog!(Warn, plugin_tag(ID), "quota request failed (transport): {error}");
+                qlog!(
+                    Warn,
+                    plugin_tag(ID),
+                    "quota request failed (transport): {error}"
+                );
             });
             return Attempt::Failed(Failure::ConnectionFailed);
         }

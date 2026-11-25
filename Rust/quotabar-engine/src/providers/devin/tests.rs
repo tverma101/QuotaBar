@@ -38,18 +38,26 @@ fn plan_status_mut(status: &mut Value) -> &mut serde_json::Map<String, Value> {
 
 fn progress(lines: &[MetricLine], label: &str) -> Option<(f64, f64, Option<f64>, Option<i64>)> {
     lines.iter().find_map(|line| match line {
-        MetricLine::Progress { label: l, used, limit, resets_at, period_duration_ms, .. } if l == label => {
-            Some((*used, *limit, *resets_at, *period_duration_ms))
-        }
+        MetricLine::Progress {
+            label: l,
+            used,
+            limit,
+            resets_at,
+            period_duration_ms,
+            ..
+        } if l == label => Some((*used, *limit, *resets_at, *period_duration_ms)),
         _ => None,
     })
 }
 
 fn dollars(lines: &[MetricLine], label: &str) -> Option<f64> {
     lines.iter().find_map(|line| match line {
-        MetricLine::Values { label: l, values, .. } if l == label => {
-            values.iter().find(|v| v.kind == MetricKind::Dollars).map(|v| v.number)
-        }
+        MetricLine::Values {
+            label: l, values, ..
+        } if l == label => values
+            .iter()
+            .find(|v| v.kind == MetricKind::Dollars)
+            .map(|v| v.number),
         _ => None,
     })
 }
@@ -67,7 +75,9 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        Fixture { dir: tempfile::tempdir().unwrap() }
+        Fixture {
+            dir: tempfile::tempdir().unwrap(),
+        }
     }
 
     fn credentials(&self) -> PathBuf {
@@ -92,15 +102,29 @@ impl Fixture {
     }
 
     fn provider(&self, http: Arc<MockClient>) -> DevinProvider {
-        DevinProvider::new(self.store(), http)
+        let transcripts = self.dir.path().join("empty-transcripts");
+        let sessions = self.dir.path().join("empty-sessions.db");
+        let cache = self.dir.path().join("devin-cache");
+        DevinProvider::new(self.store(), http).with_local_scanner(DevinTranscriptUsageScanner::new(
+            transcripts,
+            Some(sessions),
+            Some(cache),
+        ))
     }
 }
 
 fn write_state_db(path: &Path, value: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)").unwrap();
-    conn.execute("INSERT INTO ItemTable VALUES ('windsurfAuthStatus', ?1)", [value]).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO ItemTable VALUES ('windsurfAuthStatus', ?1)",
+        [value],
+    )
+    .unwrap();
 }
 
 fn ctx(now: f64) -> RefreshContext {
@@ -117,7 +141,10 @@ fn parses_credentials_toml_and_accepts_only_https_server_url() {
     fixture.write_credentials("windsurf_api_key = \"devin-session-token$cli\"\napi_server_url = \"https://server.codeium.test/\"");
     let auth = fixture.store().load_credentials_file().unwrap().unwrap();
     assert_eq!(auth.api_key, "devin-session-token$cli");
-    assert_eq!(auth.api_server_url.as_deref(), Some("https://server.codeium.test"));
+    assert_eq!(
+        auth.api_server_url.as_deref(),
+        Some("https://server.codeium.test")
+    );
 
     fixture.write_credentials("windsurf_api_key = \"devin-session-token$cli\"\r\napi_server_url = \"http://server.codeium.test\"");
     let auth = fixture.store().load_credentials_file().unwrap().unwrap();
@@ -127,18 +154,35 @@ fn parses_credentials_toml_and_accepts_only_https_server_url() {
 
 #[test]
 fn toml_reader_matches_swift_semantics() {
-    assert_eq!(read_toml_string("k = bare # comment", "k").as_deref(), Some("bare"));
-    assert_eq!(read_toml_string("k = 'single'", "k").as_deref(), Some("single"));
+    assert_eq!(
+        read_toml_string("k = bare # comment", "k").as_deref(),
+        Some("bare")
+    );
+    assert_eq!(
+        read_toml_string("k = 'single'", "k").as_deref(),
+        Some("single")
+    );
     assert_eq!(read_toml_string("k = \"unterminated", "k"), None);
-    assert_eq!(read_toml_string("k =\nk = later", "k"), None, "an empty value stops the search");
-    assert_eq!(read_toml_string("other = 1\n k = \"a\\\"b\"", "k").as_deref(), Some("a\\\"b"));
+    assert_eq!(
+        read_toml_string("k =\nk = later", "k"),
+        None,
+        "an empty value stops the search"
+    );
+    assert_eq!(
+        read_toml_string("other = 1\n k = \"a\\\"b\"", "k").as_deref(),
+        Some("a\\\"b")
+    );
 }
 
 #[test]
 fn reads_app_auth_from_sqlite_state() {
     let fixture = Fixture::new();
     fixture.write_app_auth(r#"{"apiKey":" devin-session-token$app "}"#);
-    let auth = fixture.store().load_app_auth(&fixture.state_db()).unwrap().unwrap();
+    let auth = fixture
+        .store()
+        .load_app_auth(&fixture.state_db())
+        .unwrap()
+        .unwrap();
     assert_eq!(auth.api_key, "devin-session-token$app");
     assert_eq!(auth.api_server_url, None);
 }
@@ -149,7 +193,10 @@ fn unreadable_credentials_file_errors_but_missing_file_is_none() {
     assert_eq!(fixture.store().load_credentials_file(), Ok(None));
     // A directory where the file should be: present but unreadable.
     std::fs::create_dir_all(fixture.credentials()).unwrap();
-    assert_eq!(fixture.store().load_credentials_file(), Err(CredentialsUnreadable));
+    assert_eq!(
+        fixture.store().load_credentials_file(),
+        Err(CredentialsUnreadable)
+    );
 }
 
 #[test]
@@ -157,8 +204,15 @@ fn unreadable_app_database_errors_but_missing_row_is_none() {
     let fixture = Fixture::new();
     assert_eq!(fixture.store().load_app_auth(&fixture.state_db()), Ok(None));
     std::fs::create_dir_all(fixture.state_db().parent().unwrap()).unwrap();
-    std::fs::write(fixture.state_db(), "this is not a sqlite database at all, not even close").unwrap();
-    assert_eq!(fixture.store().load_app_auth(&fixture.state_db()), Err(CredentialsUnreadable));
+    std::fs::write(
+        fixture.state_db(),
+        "this is not a sqlite database at all, not even close",
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.store().load_app_auth(&fixture.state_db()),
+        Err(CredentialsUnreadable)
+    );
 
     let empty = Fixture::new();
     std::fs::create_dir_all(empty.state_db().parent().unwrap()).unwrap();
@@ -173,7 +227,10 @@ fn unreadable_app_database_errors_but_missing_row_is_none() {
 fn undecodable_app_auth_is_unreadable() {
     let fixture = Fixture::new();
     fixture.write_app_auth("not json");
-    assert_eq!(fixture.store().load_app_auth(&fixture.state_db()), Err(CredentialsUnreadable));
+    assert_eq!(
+        fixture.store().load_app_auth(&fixture.state_db()),
+        Err(CredentialsUnreadable)
+    );
 }
 
 #[test]
@@ -184,12 +241,34 @@ fn app_auth_is_read_once_until_the_state_database_changes() {
     let db = fixture.state_db();
     assert_eq!(store.load_app_auth(&db).unwrap().unwrap().api_key, "first");
     // Corrupt the cached entry's value directly: an unchanged revision must serve the cache.
-    store.app_auth_cache.lock().unwrap().get_mut(&fixture.state_db()).unwrap().1 =
-        Some(DevinAuth { api_key: "cached".into(), api_server_url: None });
-    assert_eq!(store.load_app_auth(&fixture.state_db()).unwrap().unwrap().api_key, "cached");
+    store
+        .app_auth_cache
+        .lock()
+        .unwrap()
+        .get_mut(&fixture.state_db())
+        .unwrap()
+        .1 = Some(DevinAuth {
+        api_key: "cached".into(),
+        api_server_url: None,
+    });
+    assert_eq!(
+        store
+            .load_app_auth(&fixture.state_db())
+            .unwrap()
+            .unwrap()
+            .api_key,
+        "cached"
+    );
     std::thread::sleep(std::time::Duration::from_millis(5));
     fixture.write_app_auth(r#"{"apiKey":"second"}"#);
-    assert_eq!(store.load_app_auth(&fixture.state_db()).unwrap().unwrap().api_key, "second");
+    assert_eq!(
+        store
+            .load_app_auth(&fixture.state_db())
+            .unwrap()
+            .unwrap()
+            .api_key,
+        "second"
+    );
 }
 
 // --- mapper -------------------------------------------------------------------------------
@@ -257,7 +336,11 @@ fn valid_weekly_reset_with_absent_percentage_means_exhausted_window() {
         plan_status.remove("weeklyQuotaRemainingPercent");
         let mapped = map_user_status(&status, NOW).unwrap();
         let weekly = progress(&mapped.lines, "Weekly quota").unwrap();
-        assert_eq!(weekly, (100.0, 100.0, Some(1_774_166_400.0), Some(parse::WEEK_MS)), "hide={hide}");
+        assert_eq!(
+            weekly,
+            (100.0, 100.0, Some(1_774_166_400.0), Some(parse::WEEK_MS)),
+            "hide={hide}"
+        );
         if hide {
             assert!(progress(&mapped.lines, "Daily quota").is_none());
         }
@@ -269,7 +352,11 @@ fn invalid_weekly_percentage_is_invalid_response() {
     for invalid in [json!("abc"), json!(true), Value::Null] {
         let mut status = user_status("Max");
         plan_status_mut(&mut status).insert("weeklyQuotaRemainingPercent".into(), invalid.clone());
-        assert_eq!(map_user_status(&status, NOW), Err(UsageError::InvalidResponse), "{invalid}");
+        assert_eq!(
+            map_user_status(&status, NOW),
+            Err(UsageError::InvalidResponse),
+            "{invalid}"
+        );
     }
 }
 
@@ -280,7 +367,10 @@ fn stale_weekly_reset_with_absent_percentage_uses_daily_fallback() {
     plan_status["planInfo"]["hideDailyQuota"] = json!(true);
     plan_status.insert("dailyQuotaRemainingPercent".into(), json!(30));
     plan_status.remove("weeklyQuotaRemainingPercent");
-    plan_status.insert("weeklyQuotaResetAtUnix".into(), json!(((NOW as i64) - 1).to_string()));
+    plan_status.insert(
+        "weeklyQuotaResetAtUnix".into(),
+        json!(((NOW as i64) - 1).to_string()),
+    );
     let mapped = map_user_status(&status, NOW).unwrap();
     let weekly = progress(&mapped.lines, "Weekly quota").unwrap();
     assert_eq!((weekly.0, weekly.2), (70.0, None));
@@ -289,8 +379,14 @@ fn stale_weekly_reset_with_absent_percentage_uses_daily_fallback() {
 #[test]
 fn no_displayable_fields_is_quota_unavailable() {
     let status = json!({ "planStatus": { "planInfo": { "planName": "Max" } } });
-    assert_eq!(map_user_status(&status, NOW), Err(UsageError::QuotaUnavailable));
-    assert_eq!(map_user_status_response(b"{\"unexpected\":true}", NOW), Err(UsageError::InvalidResponse));
+    assert_eq!(
+        map_user_status(&status, NOW),
+        Err(UsageError::QuotaUnavailable)
+    );
+    assert_eq!(
+        map_user_status_response(b"{\"unexpected\":true}", NOW),
+        Err(UsageError::InvalidResponse)
+    );
 }
 
 #[test]
@@ -321,7 +417,9 @@ fn refresh_uses_credentials_file_before_app_state() {
     fixture.write_credentials("windsurf_api_key = \"devin-session-token$cli\"\napi_server_url = \"https://server.codeium.test\"");
     fixture.write_app_auth(r#"{"apiKey":"devin-session-token$app"}"#);
     let http = MockClient::new(vec![MockClient::json(200, &body("Max"))]);
-    let snapshot = fixture.provider(http.clone()).refresh(&ctx(1_800_000_000.0));
+    let snapshot = fixture
+        .provider(http.clone())
+        .refresh(&ctx(1_800_000_000.0));
     assert_eq!(snapshot.plan.as_deref(), Some("Max"));
     assert_eq!(snapshot.lines.len(), 3);
     let requests = http.requests.lock().unwrap();
@@ -330,7 +428,9 @@ fn refresh_uses_credentials_file_before_app_state() {
         requests[0].url,
         "https://server.codeium.test/exa.seat_management_pb.SeatManagementService/GetUserStatus"
     );
-    assert!(requests[0].headers.contains(&("Connect-Protocol-Version".into(), "1".into())));
+    assert!(requests[0]
+        .headers
+        .contains(&("Connect-Protocol-Version".into(), "1".into())));
     let sent: Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
     assert_eq!(sent["metadata"]["apiKey"], "devin-session-token$cli");
     assert_eq!(sent["metadata"]["ideName"], "devin");
@@ -342,10 +442,19 @@ fn refresh_falls_back_to_app_state_after_expired_credentials() {
     let fixture = Fixture::new();
     fixture.write_credentials("windsurf_api_key = \"devin-session-token$cli\"\napi_server_url = \"https://server.codeium.test\"");
     fixture.write_app_auth(r#"{"apiKey":"devin-session-token$app"}"#);
-    let http = MockClient::new(vec![MockClient::json(401, "{}"), MockClient::json(200, &body("Teams"))]);
+    let http = MockClient::new(vec![
+        MockClient::json(401, "{}"),
+        MockClient::json(200, &body("Teams")),
+    ]);
     let snapshot = fixture.provider(http.clone()).refresh(&ctx(NOW));
     assert_eq!(snapshot.plan.as_deref(), Some("Teams"));
-    let urls: Vec<String> = http.requests.lock().unwrap().iter().map(|r| r.url.clone()).collect();
+    let urls: Vec<String> = http
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.url.clone())
+        .collect();
     assert_eq!(
         urls,
         vec![
@@ -396,8 +505,14 @@ fn unreadable_credentials_file_keeps_provider_visible() {
     let provider = fixture.provider(http.clone());
     assert!(provider.has_local_credentials());
     let snapshot = provider.refresh(&ctx(NOW));
-    assert_eq!(snapshot.error_category, Some(ErrorCategory::CredentialAccess));
-    assert_eq!(error_text(&snapshot).as_deref(), Some(CREDENTIALS_UNREADABLE));
+    assert_eq!(
+        snapshot.error_category,
+        Some(ErrorCategory::CredentialAccess)
+    );
+    assert_eq!(
+        error_text(&snapshot).as_deref(),
+        Some(CREDENTIALS_UNREADABLE)
+    );
     assert!(http.requests.lock().unwrap().is_empty());
 }
 
@@ -405,12 +520,19 @@ fn unreadable_credentials_file_keeps_provider_visible() {
 fn unreadable_app_database_keeps_provider_visible() {
     let fixture = Fixture::new();
     std::fs::create_dir_all(fixture.state_db().parent().unwrap()).unwrap();
-    std::fs::write(fixture.state_db(), "garbage that is definitely not sqlite, padded out a little").unwrap();
+    std::fs::write(
+        fixture.state_db(),
+        "garbage that is definitely not sqlite, padded out a little",
+    )
+    .unwrap();
     let http = MockClient::new(vec![]);
     let provider = fixture.provider(http.clone());
     assert!(provider.has_local_credentials());
     let snapshot = provider.refresh(&ctx(NOW));
-    assert_eq!(snapshot.error_category, Some(ErrorCategory::CredentialAccess));
+    assert_eq!(
+        snapshot.error_category,
+        Some(ErrorCategory::CredentialAccess)
+    );
     assert!(http.requests.lock().unwrap().is_empty());
 }
 
@@ -420,7 +542,9 @@ fn server_error_reports_status_and_logs() {
     diagnostic_gate::clear("devin.usage.http.503");
     let fixture = Fixture::new();
     fixture.write_app_auth(r#"{"apiKey":"devin-session-token$app"}"#);
-    let snapshot = fixture.provider(MockClient::new(vec![MockClient::json(503, "{}")])).refresh(&ctx(NOW));
+    let snapshot = fixture
+        .provider(MockClient::new(vec![MockClient::json(503, "{}")]))
+        .refresh(&ctx(NOW));
     assert_eq!(snapshot.error_category, Some(ErrorCategory::Http5xx));
     assert!(error_text(&snapshot).unwrap().contains("503"));
     assert!(captured_logs().iter().any(|l| l.contains("HTTP 503")));
@@ -436,7 +560,9 @@ fn unreadable_response_is_a_decoding_problem_and_logs() {
     let snapshot = fixture.provider(http).refresh(&ctx(NOW));
     assert_eq!(snapshot.error_category, Some(ErrorCategory::Decoding));
     assert_ne!(error_text(&snapshot).as_deref(), Some(QUOTA_UNAVAILABLE));
-    assert!(captured_logs().iter().any(|l| l.contains("could not be read")));
+    assert!(captured_logs()
+        .iter()
+        .any(|l| l.contains("could not be read")));
 }
 
 #[test]
@@ -445,7 +571,9 @@ fn transport_failure_is_a_connection_problem_and_logs() {
     diagnostic_gate::clear(TRANSPORT_FAILURE_KEY);
     let fixture = Fixture::new();
     fixture.write_app_auth(r#"{"apiKey":"devin-session-token$app"}"#);
-    let http = MockClient::new(vec![Err(HttpError::Transport("Could not connect to the server.".into()))]);
+    let http = MockClient::new(vec![Err(HttpError::Transport(
+        "Could not connect to the server.".into(),
+    ))]);
     let snapshot = fixture.provider(http).refresh(&ctx(NOW));
     assert_eq!(snapshot.error_category, Some(ErrorCategory::Network));
     assert!(error_text(&snapshot).unwrap().contains("reach Devin"));
@@ -455,13 +583,44 @@ fn transport_failure_is_a_connection_problem_and_logs() {
 #[test]
 fn legacy_windsurf_state_is_used_when_devin_app_is_absent() {
     let fixture = Fixture::new();
-    let windsurf = fixture.dir.path().join("Windsurf/User/globalStorage/state.vscdb");
+    let windsurf = fixture
+        .dir
+        .path()
+        .join("Windsurf/User/globalStorage/state.vscdb");
     write_state_db(&windsurf, r#"{"apiKey":"windsurf-key"}"#);
-    let store = DevinAuthStore::new(vec![fixture.credentials()], vec![fixture.state_db(), windsurf]);
+    let store = DevinAuthStore::new(
+        vec![fixture.credentials()],
+        vec![fixture.state_db(), windsurf],
+    );
     let http = MockClient::new(vec![MockClient::json(200, &body("Pro"))]);
     let provider = DevinProvider::new(store, http.clone());
     assert!(provider.has_local_credentials());
     assert_eq!(provider.refresh(&ctx(NOW)).plan.as_deref(), Some("Pro"));
-    let sent: Value = serde_json::from_slice(http.requests.lock().unwrap()[0].body.as_ref().unwrap()).unwrap();
+    let sent: Value =
+        serde_json::from_slice(http.requests.lock().unwrap()[0].body.as_ref().unwrap()).unwrap();
     assert_eq!(sent["metadata"]["apiKey"], "windsurf-key");
+}
+
+#[test]
+fn explicit_key_never_falls_back_to_machine_credentials() {
+    let fixture = Fixture::new();
+    fixture.write_credentials("windsurf_api_key = \"devin-session-token$cli\"");
+    fixture.write_app_auth(r#"{"apiKey":"devin-session-token$app"}"#);
+    let http = MockClient::new(vec![MockClient::json(401, "{}")]);
+    let provider = fixture.provider(http.clone());
+
+    let mut context = RefreshContext::new(Scope::PanelMeters);
+    context.now = NOW;
+    let snapshot = provider.refresh_with_api_key(&context, Some("explicit"), None);
+    assert_eq!(snapshot.error_category, Some(ErrorCategory::NotLoggedIn));
+    {
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent: Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(sent["metadata"]["apiKey"], "explicit");
+    }
+
+    let snapshot = provider.refresh_with_api_key(&context, Some("   "), None);
+    assert_eq!(snapshot.error_category, Some(ErrorCategory::NotLoggedIn));
+    assert_eq!(http.requests.lock().unwrap().len(), 1);
 }

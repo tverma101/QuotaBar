@@ -7,7 +7,9 @@ use std::path::{Component, Path, PathBuf};
 /// Start of the local-calendar day `days_back` days before `now` (Swift `JSONLScanning.sinceDate`):
 /// the lower bound of the scan window, in the machine's time zone.
 pub fn since_date(days_back: usize, now: f64) -> f64 {
-    let Some(utc) = DateTime::from_timestamp(now.floor() as i64, 0) else { return now };
+    let Some(utc) = DateTime::from_timestamp(now.floor() as i64, 0) else {
+        return now;
+    };
     let today = utc.with_timezone(&Local).date_naive();
     today
         .checked_sub_days(Days::new(days_back as u64))
@@ -31,8 +33,10 @@ fn start_of_local_day(date: NaiveDate) -> Option<f64> {
 /// a DST transition inside the window) never reuses day buckets cut in the old calendar.
 pub fn zone_signature(since: f64, now: f64) -> String {
     let offset = |t: f64| {
-        DateTime::from_timestamp(t.floor() as i64, 0)
-            .map_or_else(|| "?".to_string(), |utc| utc.with_timezone(&Local).offset().to_string())
+        DateTime::from_timestamp(t.floor() as i64, 0).map_or_else(
+            || "?".to_string(),
+            |utc| utc.with_timezone(&Local).offset().to_string(),
+        )
     };
     format!("{}/{}", offset(since), offset(now))
 }
@@ -40,7 +44,11 @@ pub fn zone_signature(since: f64, now: f64) -> String {
 /// Stable short fingerprint for diagnostic keys and partition names (Swift
 /// `JSONLScanCachePaths.stableFingerprint`), so a user's paths never appear in either.
 pub fn stable_fingerprint(value: &str) -> String {
-    Sha256::digest(value.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Swift `resolvingSymlinksInPath().standardizedFileURL`: symlinks resolved as far as the path exists

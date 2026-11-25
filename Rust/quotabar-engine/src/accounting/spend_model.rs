@@ -21,7 +21,10 @@ struct SpellingVote {
 impl SpellingVote {
     fn note(&mut self, spelling: &str, weight: i64) {
         // Zero-token entries (cost-only lines) still get a say.
-        let slot = self.tokens_by_spelling.entry(spelling.to_string()).or_insert(0);
+        let slot = self
+            .tokens_by_spelling
+            .entry(spelling.to_string())
+            .or_insert(0);
         *slot = adding_saturating(*slot, weight.max(1));
     }
 
@@ -143,7 +146,8 @@ impl ModelAccumulator {
             self.token_count_saturated = true;
         }
         self.tokens = adding_saturating(self.tokens, entry.total_tokens);
-        self.token_count_saturated = self.token_count_saturated || entry.token_count_saturated == Some(true);
+        self.token_count_saturated =
+            self.token_count_saturated || entry.token_count_saturated == Some(true);
         if let Some(cost) = entry.cost_usd {
             self.accumulate_cost(cost);
         }
@@ -231,11 +235,17 @@ fn order_by(lhs: (Option<f64>, i64, &str), rhs: (Option<f64>, i64, &str)) -> Ord
 }
 
 fn variant_order(lhs: &ModelUsageVariant, rhs: &ModelUsageVariant) -> Ordering {
-    order_by((lhs.cost_usd, lhs.total_tokens, &lhs.model), (rhs.cost_usd, rhs.total_tokens, &rhs.model))
+    order_by(
+        (lhs.cost_usd, lhs.total_tokens, &lhs.model),
+        (rhs.cost_usd, rhs.total_tokens, &rhs.model),
+    )
 }
 
 fn model_order(lhs: &ModelUsageEntry, rhs: &ModelUsageEntry) -> Ordering {
-    order_by((lhs.cost_usd, lhs.total_tokens, &lhs.model), (rhs.cost_usd, rhs.total_tokens, &rhs.model))
+    order_by(
+        (lhs.cost_usd, lhs.total_tokens, &lhs.model),
+        (rhs.cost_usd, rhs.total_tokens, &rhs.model),
+    )
 }
 
 /// Everything `modelBreakdown` needs besides the model usage itself.
@@ -249,7 +259,10 @@ pub(super) struct BreakdownRequest<'a> {
     pub zone: DayZone,
 }
 
-pub(super) fn model_breakdown(usage: Option<&ModelUsageSeries>, request: &BreakdownRequest<'_>) -> Option<ModelUsageBreakdown> {
+pub(super) fn model_breakdown(
+    usage: Option<&ModelUsageSeries>,
+    request: &BreakdownRequest<'_>,
+) -> Option<ModelUsageBreakdown> {
     let usage = usage?;
     if request.days.is_empty() {
         return None;
@@ -259,10 +272,16 @@ pub(super) fn model_breakdown(usage: Option<&ModelUsageSeries>, request: &Breakd
     // spelling vote decides which casing titles it.
     let mut by_model: BTreeMap<String, ModelAccumulator> = BTreeMap::new();
     for day in &usage.daily {
-        let Some(key) = day_key_from_usage_date(&day.date, request.zone).filter(|k| request.days.contains(k)) else {
+        let Some(key) =
+            day_key_from_usage_date(&day.date, request.zone).filter(|k| request.days.contains(k))
+        else {
             continue;
         };
-        for model in day.models.iter().filter(|m| m.total_tokens > 0 || m.cost_usd.unwrap_or(0.0) > 0.0) {
+        for model in day
+            .models
+            .iter()
+            .filter(|m| m.total_tokens > 0 || m.cost_usd.unwrap_or(0.0) > 0.0)
+        {
             let name = normalized_model_name(&model.model);
             let hidden;
             let adjusted = if request.unexplained_incomplete_days.contains(&key) {
@@ -271,14 +290,19 @@ pub(super) fn model_breakdown(usage: Option<&ModelUsageSeries>, request: &Breakd
             } else {
                 model
             };
-            by_model.entry(name.to_lowercase()).or_insert_with(ModelAccumulator::new).add(adjusted, &name);
+            by_model
+                .entry(name.to_lowercase())
+                .or_insert_with(ModelAccumulator::new)
+                .add(adjusted, &name);
         }
     }
 
     if by_model.is_empty() {
         return None;
     }
-    let modeled_tokens = by_model.values().fold(0i64, |acc, v| adding_saturating(acc, v.tokens));
+    let modeled_tokens = by_model
+        .values()
+        .fold(0i64, |acc, v| adding_saturating(acc, v.tokens));
     if request.total_tokens > modeled_tokens {
         let name = ModelUsageEntry::UNATTRIBUTED;
         let entry = ModelUsageEntry {
@@ -289,11 +313,16 @@ pub(super) fn model_breakdown(usage: Option<&ModelUsageSeries>, request: &Breakd
             cost_is_complete: None,
             token_count_saturated: None,
         };
-        by_model.entry(name.to_lowercase()).or_insert_with(ModelAccumulator::new).add(&entry, name);
+        by_model
+            .entry(name.to_lowercase())
+            .or_insert_with(ModelAccumulator::new)
+            .add(&entry, name);
     }
 
-    let mut sorted: Vec<ModelUsageEntry> =
-        by_model.iter().map(|(key, accumulator)| accumulator.entry(accumulator.display_name().unwrap_or(key))).collect();
+    let mut sorted: Vec<ModelUsageEntry> = by_model
+        .iter()
+        .map(|(key, accumulator)| accumulator.entry(accumulator.display_name().unwrap_or(key)))
+        .collect();
     sorted.sort_by(model_order);
     let folded = fold_model_list(&sorted);
     if folded.is_empty() {
@@ -323,7 +352,11 @@ fn hiding_cost(model: &ModelUsageEntry) -> ModelUsageEntry {
 
 fn normalized_model_name(raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.is_empty() { ModelUsageEntry::UNATTRIBUTED.to_string() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        ModelUsageEntry::UNATTRIBUTED.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn fold_model_list(entries: &[ModelUsageEntry]) -> Vec<ModelUsageEntry> {
@@ -332,8 +365,10 @@ fn fold_model_list(entries: &[ModelUsageEntry]) -> Vec<ModelUsageEntry> {
     let unpriced_token_floor = (entries.first().map_or(0, |e| e.total_tokens) / 10).max(10_000_000);
 
     for entry in entries {
-        let is_unattributed = entry.model.to_lowercase() == ModelUsageEntry::UNATTRIBUTED.to_lowercase();
-        let unpriced_heavyweight = entry.cost_usd.is_none() && entry.total_tokens >= unpriced_token_floor;
+        let is_unattributed =
+            entry.model.to_lowercase() == ModelUsageEntry::UNATTRIBUTED.to_lowercase();
+        let unpriced_heavyweight =
+            entry.cost_usd.is_none() && entry.total_tokens >= unpriced_token_floor;
         if is_unattributed || (visible.len() >= NAMED_MODEL_CAP && !unpriced_heavyweight) {
             other.fold(entry);
         } else {

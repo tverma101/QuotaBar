@@ -114,11 +114,11 @@ final class AppContainer {
         }
         let hasPreloadedOpenCodeAccountInventory = openCodeGoAccountInventory != nil
             || openCodeGoAccountIdentities != nil
+        RustEngineHost.useClaudeDesktopKeyCache(accountAssembly.desktopKeyCache)
         let providers = ProviderCatalog.make(
             claudeCards: accountAssembly.claudeCards,
             codexCards: accountAssembly.codexCards,
             claudeIdentityKeys: accountAssembly.identityKeysByCard,
-            claudeDesktopKeyCache: accountAssembly.desktopKeyCache,
             codexDefaultIdentityKey: accountAssembly.identityKeysByCard["codex"],
             codexDefaultHome: accountAssembly.defaultCodexHome,
             codexLogHomes: codexAccounts.registeredHomes,
@@ -226,9 +226,9 @@ final class AppContainer {
         })
         let codexClaimServices = Dictionary(uniqueKeysWithValues: codexProviders.map { codex in
             (codex.provider.id, CodexResetClaimService(
-                authStore: codex.authStore.scoped(to: codexIdentityByProviderID[codex.provider.id]),
-                usageClient: codex.usageClient,
-                allowsKeychainFallback: codex.allowsKeychainFallback,
+                providerID: codex.provider.id,
+                engineConfig: codex.rawConfig,
+                verifiedAccountIdentity: codexIdentityByProviderID[codex.provider.id],
                 refreshAfterClaim: { [weak dataStore] in
                     // The bound must outlast the provider's slowest refresh: usage fetch (10s timeout)
                     // + token refresh (15s) + usage retry (10s) + reset-credit fetch (10s) ≈ 45s. The
@@ -480,7 +480,6 @@ final class AppContainer {
             unload: { [weak dataStore] in
                 await PersistentJSONLScanCaches.unloadForMemoryPressure()
                 await dataStore?.unloadProviderCachesForMemoryPressure()
-                await ModelPricingStore.shared.clearCaches()
                 ProcessMemoryBudget.releaseAllocatorFreePages()
             },
             shouldDefer: { [weak dataStore] in
@@ -720,7 +719,9 @@ final class AppContainer {
                                         await dataStore.refreshAll(
                                             bypassSnapshotCache: coveredBypassSnapshotCache,
                                             bypassFailureBackoff: coveredBypassFailureBackoff,
-                                            maxConcurrentProviders: overSoftMemoryLimit ? 1 : nil
+                                            maxConcurrentProviders: ProcessMemoryBudget.meterPassMaxConcurrentProviders(
+                                                footprintBytes: ProcessMemoryBudget.physicalFootprintBytes()
+                                            )
                                         )
                                     }
                                 }
@@ -798,18 +799,15 @@ final class AppContainer {
                                     (scope, $0.providerIDs, $0.bypassSnapshotCache, $0.bypassFailureBackoff)
                                 }
                             }
-                        // Closed-panel accounting is background bookkeeping: pace the scan-worker
-                        // children (--paced caps each at a fraction of a core) and cap concurrency so
-                        // the periodic history sweep cannot stack one 100%-core child per provider.
-                        // Panel-open passes stay unpaced for responsiveness.
+                        // Closed-panel accounting limits provider and file-scan concurrency.
+                        // Panel-open passes can use parallel scans for responsiveness.
                         let panelClosed = !panelOpen
                         passRan = true
                         accountingTask = Task { @MainActor in
-                            if scheduledScope == .panelAccounting {
-                                // Fold workers use disk catalogs and may exit before a fetch can finish.
-                                // The long-lived app owns due revalidation for subsequent folds.
-                                _ = await ModelPricingStore.shared.current()
-                            }
+                            // Rust provider runtimes own pricing in-process, including due catalog
+                            // revalidation. Warming the legacy Swift oracle store here would decode a
+                            // second copy of every catalog and keep it resident without serving a
+                            // production provider.
                             if let scheduledScope {
                                 await ProviderRefreshContext.$scope.withValue(scheduledScope) {
                                     await ProviderRefreshContext.$skipModelCatalogRefresh.withValue(
@@ -859,20 +857,15 @@ final class AppContainer {
                             // decision keys off panel visibility alone.
                             let keepWarm = transparency.popoverShown
                             await PersistentJSONLScanCaches.unloadAfterRefreshCycle(keepRouterItemsResident: keepWarm)
-                            await dataStore.unloadFreebuffAccountingCacheForMemoryPressure()
-                            if !transparency.popoverShown, ProcessMemoryBudget.isOverSoftUnloadCeiling {
-                                ProcessMemoryBudget.noteSoftLimitUnload()
-                                await dataStore.unloadProviderCachesForMemoryPressure()
-                                await ModelPricingStore.shared.clearCaches()
-                            } else if ProcessMemoryBudget.isOverSoftUnloadCeiling {
+                            if ProcessMemoryBudget.isOverSoftUnloadCeiling {
                                 // Hysteresis gate: record the trigger footprint before unloading so
                                 // the ceiling is measured against the pre-unload peak.
                                 ProcessMemoryBudget.noteSoftLimitUnload()
                                 await dataStore.unloadProviderCachesForMemoryPressure()
-                                await ModelPricingStore.shared.clearCaches()
+                            } else {
+                                await dataStore.unloadFreebuffAccountingCacheForMemoryPressure()
                             }
-                            URLCache.shared.removeAllCachedResponses()
-                            ProcessMemoryBudget.releaseAllocatorFreePages()
+                            await Self.releaseRefreshMemory()
                             wakeSignal.signalWorkCompletion()
                         }
                     }
@@ -883,7 +876,10 @@ final class AppContainer {
                 // Codex session tail remains warm between cycles under its own row cap; memory pressure
                 // releases both, while the durable indexes remain available for the next scan.
                 let keepRouterIndexWarm = transparency.popoverShown
-                if accountingTask == nil {
+                if Self.shouldRunRefreshCycleMaintenance(
+                    passRan: passRan,
+                    accountingTaskInFlight: accountingTask != nil
+                ) {
                     await PersistentJSONLScanCaches.unloadAfterRefreshCycle(
                         keepRouterItemsResident: keepRouterIndexWarm
                     )
@@ -894,24 +890,17 @@ final class AppContainer {
                     // the live heap, the dominant settled-footprint fragmentation. Warm caches are the
                     // cheaper state; the hysteresis ceiling and OS pressure still release them when
                     // they are actually too big.
-                    if !transparency.popoverShown, ProcessMemoryBudget.isOverSoftUnloadCeiling {
-                        ProcessMemoryBudget.noteSoftLimitUnload()
-                        await dataStore.unloadProviderCachesForMemoryPressure()
-                        await ModelPricingStore.shared.clearCaches()
-                    } else if ProcessMemoryBudget.isOverSoftUnloadCeiling {
+                    if ProcessMemoryBudget.isOverSoftUnloadCeiling {
                         // Hysteresis gate: record the trigger footprint before unloading so the
                         // ceiling is measured against the pre-unload peak.
                         ProcessMemoryBudget.noteSoftLimitUnload()
                         await dataStore.unloadProviderCachesForMemoryPressure()
-                        await ModelPricingStore.shared.clearCaches()
                     } else {
-                        // Freebuff's scan re-derives its turn cache every history pass regardless of
-                        // retention (an active session rewrites its receipts continuously), so its
-                        // derived caches cost memory without saving work; release them each cycle.
+                        // Freebuff's hosted-receipt cache is refetched within minutes anyway, so it is
+                        // released each cycle. The engine keeps its small Desktop message index.
                         await dataStore.unloadFreebuffAccountingCacheForMemoryPressure()
                     }
-                    URLCache.shared.removeAllCachedResponses()
-                    ProcessMemoryBudget.releaseAllocatorFreePages()
+                    await Self.releaseRefreshMemory()
                 }
                 // Re-evaluate quota pace milestones every pass — after the refresh so it sees fresh
                 // data — and otherwise at a bounded cadence, so pace worsening from elapsed time
@@ -1040,10 +1029,25 @@ final class AppContainer {
             guard let self else { return }
             await PersistentJSONLScanCaches.unloadAfterRefreshCycle(keepRouterItemsResident: false)
             await dataStore.unloadProviderCachesForMemoryPressure()
-            await ModelPricingStore.shared.clearCaches()
-            URLCache.shared.removeAllCachedResponses()
-            ProcessMemoryBudget.releaseAllocatorFreePages()
+            await Self.releaseRefreshMemory()
         }
+    }
+
+    /// The allocator can walk every malloc zone. Keep that work off the panel's executor.
+    @concurrent
+    private nonisolated static func releaseRefreshMemory() async {
+        URLCache.shared.removeAllCachedResponses()
+        ProcessMemoryBudget.releaseAllocatorFreePages()
+    }
+
+    /// Post-pass cache maintenance is worthwhile only after a pass allocated or fetched something.
+    /// Running it on a no-work wake repeatedly evicts Freebuff's derived cache, clears URLCache, and
+    /// walks the allocator free list without any new memory to reclaim.
+    nonisolated static func shouldRunRefreshCycleMaintenance(
+        passRan: Bool,
+        accountingTaskInFlight: Bool
+    ) -> Bool {
+        passRan && !accountingTaskInFlight
     }
 
     nonisolated static func hasPriorityRefreshPass(

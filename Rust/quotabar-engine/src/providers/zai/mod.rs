@@ -9,6 +9,7 @@ pub mod zcode_leveldb;
 mod tests;
 
 use super::api_key::{ApiKeySpec, ApiKeyStatus};
+use super::error_text;
 use super::{cancelled_snapshot, ProviderRuntime};
 use crate::accounting::{append_token_usage, TokenUsageOptions};
 use crate::context::RefreshContext;
@@ -20,7 +21,8 @@ use crate::model::{
 use crate::pricing::ModelPricing;
 use crate::{qlog, time};
 use mapper::{
-    is_no_coding_plan, map, plan_name as parse_plan_name, INVALID_RESPONSE_ERROR, NO_CODING_PLAN_ERROR,
+    is_no_coding_plan, map, plan_name as parse_plan_name, INVALID_RESPONSE_ERROR,
+    NO_CODING_PLAN_ERROR,
 };
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -33,7 +35,7 @@ pub const QUOTA_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 pub const SUBSCRIPTION_URL: &str = "https://api.z.ai/api/biz/subscription/list";
 pub const PLAN_CACHE_INTERVAL_SECS: f64 = 3600.0;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCAL_SOURCE_NOTE: &str = "From your ZCode usage history";
 const ZCODE_FAILURE_GATE_KEY: &str = "auth.zai.quota-with-zcode.failure";
 
@@ -56,7 +58,10 @@ pub struct ZAIProvider {
 impl ZAIProvider {
     pub fn live() -> Self {
         ZAIProvider {
-            info: ProviderInfo { id: ID.into(), display_name: "Z.ai".into() },
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "Z.ai".into(),
+            },
             spec: None,
             http: http::shared(),
             scanner: ZCodeUsageScanner::live(),
@@ -67,7 +72,10 @@ impl ZAIProvider {
 
     pub fn new(spec: ApiKeySpec, http: Arc<dyn HttpClient>, scanner: ZCodeUsageScanner) -> Self {
         ZAIProvider {
-            info: ProviderInfo { id: ID.into(), display_name: "Z.ai".into() },
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "Z.ai".into(),
+            },
             spec: Some(spec),
             http,
             scanner,
@@ -85,29 +93,46 @@ impl ZAIProvider {
         self.spec.clone().unwrap_or_else(auth::live_spec)
     }
 
+    /// The meters-only result. A ZCode user with no API key has no live quota, and the full pass
+    /// already shows their local usage without an error. The meter pass used to report "No Z.ai
+    /// API key" every minute instead, putting the card into failure backoff between folds.
+    fn meter_snapshot(&self, quota: ProviderSnapshot, ctx: &RefreshContext) -> ProviderSnapshot {
+        let pure_local = quota.error_category == Some(ErrorCategory::NotLoggedIn)
+            && self.effective_spec().key_status() == ApiKeyStatus::NotSet
+            && self.scanner.has_history();
+        if !pure_local {
+            return quota;
+        }
+        let mut result = ProviderSnapshot::new(&self.info, quota.plan, Vec::new(), ctx.now);
+        result.quota_refreshed_at = Some(time::DISTANT_PAST);
+        result.clears_prior_menu_bar_quota_state = quota.clears_prior_menu_bar_quota_state;
+        result
+    }
+
     fn refresh_quota(&self, ctx: &RefreshContext) -> ProviderSnapshot {
         let spec = self.effective_spec();
         let api_key = match auth::load_for_refresh(&spec) {
             Ok(Some(key)) => key,
-            Ok(None) => return ProviderSnapshot::error(&self.info, auth::MISSING_KEY_ERROR, ErrorCategory::NotLoggedIn, ctx.now),
-            Err((message, category)) => return ProviderSnapshot::error(&self.info, message, category, ctx.now),
+            Ok(None) => {
+                return ProviderSnapshot::error(
+                    &self.info,
+                    auth::MISSING_KEY_ERROR,
+                    ErrorCategory::NotLoggedIn,
+                    ctx.now,
+                )
+            }
+            Err((message, category)) => {
+                return ProviderSnapshot::error(&self.info, message, category, ctx.now)
+            }
         };
 
         let quota_req = Request::get(QUOTA_URL)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Accept", "application/json")
             .timeout(REQUEST_TIMEOUT);
-        let quota_resp = match self.http.send(&quota_req, &ctx.cancel) {
-            Ok(resp) => resp,
+        let quota_result = match self.http.send(&quota_req, &ctx.cancel) {
             Err(HttpError::Cancelled) => return cancelled_snapshot(&self.info, ctx),
-            Err(_) => {
-                return ProviderSnapshot::error(
-                    &self.info,
-                    "Couldn't reach Z.ai. Check your connection.",
-                    ErrorCategory::Network,
-                    ctx.now,
-                )
-            }
+            result => result,
         };
         if ctx.is_cancelled() {
             return cancelled_snapshot(&self.info, ctx);
@@ -118,33 +143,65 @@ impl ZAIProvider {
             Err(()) => return cancelled_snapshot(&self.info, ctx),
         };
 
+        let quota_resp = match quota_result {
+            Ok(response) => response,
+            Err(_) => {
+                return ProviderSnapshot::error(
+                    &self.info,
+                    error_text::CONNECTION_FAILED,
+                    ErrorCategory::Network,
+                    ctx.now,
+                )
+            }
+        };
         if quota_resp.status == 401 || quota_resp.status == 403 {
-            return ProviderSnapshot::error(&self.info, auth::INVALID_KEY_ERROR, ErrorCategory::AuthInvalid, ctx.now);
+            return ProviderSnapshot::error(
+                &self.info,
+                auth::INVALID_KEY_ERROR,
+                ErrorCategory::AuthInvalid,
+                ctx.now,
+            );
         }
         if !quota_resp.is_success() {
             return ProviderSnapshot::error(
                 &self.info,
-                &format!("Z.ai request failed (HTTP {}).", quota_resp.status),
+                &error_text::request_failed(quota_resp.status),
                 ErrorCategory::http(quota_resp.status),
                 ctx.now,
             );
         }
         if is_no_coding_plan(&quota_resp.body) {
-            let mut snap = ProviderSnapshot::error(&self.info, NO_CODING_PLAN_ERROR, ErrorCategory::NotAvailable, ctx.now);
+            let mut snap = ProviderSnapshot::error(
+                &self.info,
+                NO_CODING_PLAN_ERROR,
+                ErrorCategory::NotAvailable,
+                ctx.now,
+            );
             snap.clears_prior_menu_bar_quota_state = Some(true);
             return snap;
         }
         match map(&quota_resp.body, sub_body.as_deref(), ctx.now) {
             Ok(mapped) => ProviderSnapshot::new(&self.info, mapped.plan, mapped.lines, ctx.now),
-            Err(_) => ProviderSnapshot::error(&self.info, INVALID_RESPONSE_ERROR, ErrorCategory::Decoding, ctx.now),
+            Err(_) => ProviderSnapshot::error(
+                &self.info,
+                INVALID_RESPONSE_ERROR,
+                ErrorCategory::Decoding,
+                ctx.now,
+            ),
         }
     }
 
-    fn subscription_body(&self, api_key: &str, ctx: &RefreshContext) -> Result<Option<Vec<u8>>, ()> {
+    fn subscription_body(
+        &self,
+        api_key: &str,
+        ctx: &RefreshContext,
+    ) -> Result<Option<Vec<u8>>, ()> {
         if !ctx.is_manual {
             let guard = self.sub_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = guard.as_ref() {
-                if cached.api_key == api_key && (ctx.now - cached.fetched_at) < PLAN_CACHE_INTERVAL_SECS {
+                if cached.api_key == api_key
+                    && (ctx.now - cached.fetched_at) < PLAN_CACHE_INTERVAL_SECS
+                {
                     return Ok(Some(cached.body.clone()));
                 }
             }
@@ -169,7 +226,10 @@ impl ZAIProvider {
         };
         let mut guard = self.sub_cache.lock().unwrap_or_else(|e| e.into_inner());
         let Some(body) = fetched else {
-            return Ok(guard.as_ref().filter(|c| c.api_key == api_key).map(|c| c.body.clone()));
+            return Ok(guard
+                .as_ref()
+                .filter(|c| c.api_key == api_key)
+                .map(|c| c.body.clone()));
         };
         *guard = Some(CachedSubscription {
             body: body.clone(),
@@ -205,10 +265,13 @@ impl ProviderRuntime for ZAIProvider {
             return quota;
         }
         if ctx.scope.skips_local_accounting() {
-            return quota;
+            return self.meter_snapshot(quota, ctx);
         }
 
-        let usage = match self.scanner.usage(Some(ctx.now), self.pricing_override.as_deref()) {
+        let usage = match self
+            .scanner
+            .usage(Some(ctx.now), self.pricing_override.as_deref())
+        {
             Ok(Some(usage)) => usage,
             Ok(None) => return quota,
             Err(err) => {
@@ -291,15 +354,27 @@ impl ProviderRuntime for ZAIProvider {
 
         let mut warnings = Vec::new();
         if let Some(failure) = &usage.sqlite_read_failure {
-            qlog!(Warn, auth_tag(ID), "ZCode token history read failed: {failure}");
+            qlog!(
+                Warn,
+                auth_tag(ID),
+                "ZCode token history read failed: {failure}"
+            );
             warnings.push(UNREADABLE_HISTORY_WARNING.to_string());
         }
         if usage.damaged_rows > 0 {
             diagnostic_gate::log_once("zcode.damaged-usage-rows", || {
-                qlog!(Warn, auth_tag(ID), "ZCode history had {} invalid rows; totals exclude them", usage.damaged_rows);
+                qlog!(
+                    Warn,
+                    auth_tag(ID),
+                    "ZCode history had {} invalid rows; totals exclude them",
+                    usage.damaged_rows
+                );
             });
             let plural = if usage.damaged_rows == 1 { "" } else { "s" };
-            warnings.push(format!("Skipped {} invalid ZCode usage row{plural}; recent totals may be slightly low.", usage.damaged_rows));
+            warnings.push(format!(
+                "Skipped {} invalid ZCode usage row{plural}; recent totals may be slightly low.",
+                usage.damaged_rows
+            ));
         }
         if !warnings.is_empty() {
             result.history_warning = Some(warnings.join(" · "));
@@ -311,7 +386,10 @@ impl ProviderRuntime for ZAIProvider {
 
 fn promo_line(promo: &ZCodeAllowance, now: f64) -> MetricLine {
     let (detail, resets_at) = if let Some(eff) = promo.effective_at.filter(|&e| e > now) {
-        (Some(deadline_label("Starts", eff, now)), promo.expires_at.or(Some(eff)))
+        (
+            Some(deadline_label("Starts", eff, now)),
+            promo.expires_at.or(Some(eff)),
+        )
     } else if let Some(exp) = promo.expires_at {
         (Some(deadline_label("Expires", exp, now)), Some(exp))
     } else {
@@ -341,9 +419,17 @@ pub fn deadline_label(verb: &str, date: f64, now: f64) -> String {
     let days = total_hours / 24;
     let hours = total_hours % 24;
     let span = if days > 0 {
-        if hours > 0 { format!("{days}d {hours}h") } else { format!("{days}d") }
+        if hours > 0 {
+            format!("{days}d {hours}h")
+        } else {
+            format!("{days}d")
+        }
     } else if total_hours > 0 {
-        if minutes > 0 { format!("{total_hours}h {minutes}m") } else { format!("{total_hours}h") }
+        if minutes > 0 {
+            format!("{total_hours}h {minutes}m")
+        } else {
+            format!("{total_hours}h")
+        }
     } else {
         format!("{total_minutes}m")
     };

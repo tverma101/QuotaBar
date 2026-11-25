@@ -29,7 +29,10 @@ pub struct CopilotProvider {
 impl CopilotProvider {
     pub fn live() -> Self {
         CopilotProvider {
-            info: ProviderInfo { id: ID.into(), display_name: "Copilot".into() },
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "Copilot".into(),
+            },
             auth: None,
             http: http::shared(),
             org_store: Arc::new(FileOrgStateStore::live()),
@@ -42,7 +45,10 @@ impl CopilotProvider {
         org_store: Arc<dyn OrgStateStore>,
     ) -> Self {
         CopilotProvider {
-            info: ProviderInfo { id: ID.into(), display_name: "Copilot".into() },
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "Copilot".into(),
+            },
             auth: Some(auth),
             http,
             org_store,
@@ -75,9 +81,18 @@ impl ProviderRuntime for CopilotProvider {
     fn refresh(&self, ctx: &RefreshContext) -> ProviderSnapshot {
         let token = match self.effective_auth().load_token(Some(ctx)) {
             Ok(Some(token)) => token,
-            Ok(None) => return ProviderSnapshot::error(&self.info, NOT_LOGGED_IN_MSG, ErrorCategory::NotLoggedIn, ctx.now),
+            Ok(None) => {
+                return ProviderSnapshot::error(
+                    &self.info,
+                    NOT_LOGGED_IN_MSG,
+                    ErrorCategory::NotLoggedIn,
+                    ctx.now,
+                )
+            }
             Err(CopilotAuthError::Cancelled) => return cancelled_snapshot(&self.info, ctx),
-            Err(err) => return ProviderSnapshot::error(&self.info, err.message(), err.category(), ctx.now),
+            Err(err) => {
+                return ProviderSnapshot::error(&self.info, err.message(), err.category(), ctx.now)
+            }
         };
         if ctx.is_cancelled() {
             return cancelled_snapshot(&self.info, ctx);
@@ -88,17 +103,32 @@ impl ProviderRuntime for CopilotProvider {
             Err(HttpError::Cancelled) => return cancelled_snapshot(&self.info, ctx),
             Err(_) => {
                 let err = CopilotUsageError::ConnectionFailed;
-                return ProviderSnapshot::error(&self.info, &err.message(), err.category(), ctx.now);
+                return ProviderSnapshot::error(
+                    &self.info,
+                    &err.message(),
+                    err.category(),
+                    ctx.now,
+                );
             }
         };
         if ctx.is_cancelled() {
             return cancelled_snapshot(&self.info, ctx);
         }
         if resp.status == 401 {
-            return ProviderSnapshot::error(&self.info, TOKEN_INVALID_MSG, ErrorCategory::AuthExpired, ctx.now);
+            return ProviderSnapshot::error(
+                &self.info,
+                TOKEN_INVALID_MSG,
+                ErrorCategory::AuthExpired,
+                ctx.now,
+            );
         }
         if resp.status == 403 {
-            return ProviderSnapshot::error(&self.info, ACCESS_DENIED_MSG, ErrorCategory::http(403), ctx.now);
+            return ProviderSnapshot::error(
+                &self.info,
+                ACCESS_DENIED_MSG,
+                ErrorCategory::http(403),
+                ctx.now,
+            );
         }
         if !resp.is_success() {
             let err = CopilotUsageError::RequestFailed(resp.status);
@@ -107,7 +137,9 @@ impl ProviderRuntime for CopilotProvider {
 
         let mut mapped = match mapper::map_user_response(&resp.body) {
             Ok(mapped) => mapped,
-            Err(err) => return ProviderSnapshot::error(&self.info, &err.message(), err.category(), ctx.now),
+            Err(err) => {
+                return ProviderSnapshot::error(&self.info, &err.message(), err.category(), ctx.now)
+            }
         };
         if mapped.is_org_managed_seat {
             match org::org_billing_lines(self.http.as_ref(), self.org_store.as_ref(), &token, ctx) {

@@ -5,19 +5,20 @@ A high-level map of how QuotaBar is put together, for people working on the code
 
 ## The shape of the app
 
-QuotaBar is a SwiftPM package with a shared module and two thin executables — there is no Xcode project.
+QuotaBar is a SwiftPM package with a shared module, two executables, and a statically linked Rust backend.
 The main executable is a menu-bar app: a SwiftUI interface hosted inside an AppKit status item and panel.
 The code is grouped by role:
 
 - `App/` — startup and the AppKit bridge (status item, panel, the app entry point).
 - `Models/` — the small value types the rest of the app speaks in (`MetricLine`, `WidgetData`, descriptors).
-- `Providers/` — one folder per provider (Claude, Codex, Cursor, Devin, Grok, OpenCode, …).
+- `Providers/` — Swift provider wrappers, widget descriptors, and platform account workflows.
 - `Stores/` — the mutable state the UI observes.
 - `Services/` — shared infrastructure (HTTP, the local API, process running).
 - `Support/` — small shared helpers (formatting, parsing, animations).
 - `Views/` — the SwiftUI screens (dashboard, customize, settings, menu-bar strip).
-- `CQuotabarCore/` — C ABI for the [Rust core](rust-core.md): a static library of hot primitives
-  (today, the Claude usage-line parser) that Swift calls over FFI.
+- `CQuotabarCore/` — the C ABI used by the Swift client in `Engine/`.
+- `Rust/quotabar-engine/` — provider runtimes, pricing, local scans, and usage accounting. See
+  [Rust Core](rust-core.md) for the bridge and build details.
 
 ## Composition root
 
@@ -26,7 +27,7 @@ providers, turns it into a `WidgetRegistry`, creates the stores, starts the peri
 starts the local HTTP API. Everything else receives what it needs from here rather than reaching for
 globals, which keeps the pieces testable in isolation.
 
-The `quotabar` executable imports the same module. A normal invocation reads `ProviderSnapshotCache`
+The `quotabar-cli` executable imports the same module. A normal invocation reads `ProviderSnapshotCache`
 and exits; `--force` constructs the canonical `ProviderCatalog` and calls `WidgetDataStore`'s forced
 refresh path before reading. Providers annotate the scalar resources they export through the stable
 limits contract; the CLI and `/v1/limits` share one serializer over those same normalized snapshots.
@@ -34,10 +35,10 @@ It never launches the GUI or duplicates provider, auth, pricing, or mapping logi
 
 ## The provider pipeline
 
-Each provider is a small module that conforms to `ProviderRuntime`. A refresh flows through three parts:
+Each provider implements Rust's `ProviderRuntime`. A refresh flows through three parts:
 
-1. **Auth store** — reads credentials that already exist on the machine (config files, keychain). QuotaBar
-   never asks the user to paste tokens.
+1. **Auth store** — reads credentials that already exist on the machine (config files or Keychain).
+   API-key-only providers can also use the API Keys settings.
 2. **Usage client** — makes the HTTP calls to the provider's API.
 3. **Mapper** — turns the provider's response into the app's own vocabulary: a `ProviderSnapshot`
    containing typed widget values (`.progress`, `.values`, `.badge`, `.chart`) plus `.text` notices that
@@ -47,14 +48,12 @@ Because every provider produces the same normalized `MetricLine` shapes, the UI 
 way and doesn't need to know provider-specific details. To add one, see
 [Adding a provider](adding-a-provider.md).
 
-Claude, Codex, and pi share `IncrementalJSONLScanner` for local JSONL history. Its per-file parsed events
-are cached by path, size, content modification time, and attribute modification time in a versioned
-Application Support store, partitioned by provider/home identity. Provider instances reading the same
-home share one scanner actor, which avoids duplicate parsing across cards; the disk store provides the
-reuse across process launches. Claude also path-deduplicates overlapping config roots, and the OpenCode
-gateway fold shares Claude's source identity so a cold refresh does not parse the same terminal sessions
-under a second cache key. Scans drop source-file records as their modification dates leave the requested
-history window, while aggregation and pricing still run on every refresh from the cached events.
+An extra account card such as `codex@…` or `claude@…` runs on its family's engine runtime. Its
+config names the account, so single refreshes and batch folds both reach the same provider code.
+
+The Rust engine caches parsed local history by source revision and account or home identity. Unchanged
+sources reuse saved data and append-only logs can resume reading from a checkpoint. The app calls the
+engine once for a batch of stale history snapshots, and quota refreshes keep their own cadence.
 
 The launch refresh serializes provider starts once, then returns to concurrent refreshes for the normal
 cadence. This preserves stale-while-revalidate display while preventing a large multi-account local

@@ -27,7 +27,10 @@ use crate::context::CancelToken;
 use crate::host::{self, diagnostic_gate};
 use crate::pricing::ModelPricing;
 use crate::qlog;
-use crate::scan::{fingerprint, first_future_dated, DiscoveredFile, FileItems, IncrementalScanner, ScanError, ScanStore};
+use crate::scan::{
+    fingerprint, first_future_dated, DiscoveredFile, FileItems, IncrementalScanner, ScanError,
+    ScanStore,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -106,7 +109,10 @@ struct Source {
 
 impl ClaudeLogScanner {
     pub fn new(config: ClaudeLogConfig) -> Self {
-        assert!(config.cache_identity_override.as_deref() != Some(""), "cache identity override must not be empty");
+        assert!(
+            config.cache_identity_override.as_deref() != Some(""),
+            "cache identity override must not be empty"
+        );
         ClaudeLogScanner {
             home: config.home,
             env: config.env,
@@ -124,7 +130,13 @@ impl ClaudeLogScanner {
     /// Scan the last `days_back` days of Claude logs. `None` when no Claude data directory or no log
     /// files exist (the spend tiles then render "No data") or the scan was incomplete; an empty series
     /// when logs exist but have no usage in the window.
-    pub fn scan(&self, days_back: usize, now: f64, pricing: &ModelPricing, cancel: &CancelToken) -> Option<LogUsageScan> {
+    pub fn scan(
+        &self,
+        days_back: usize,
+        now: f64,
+        pricing: &ModelPricing,
+        cancel: &CancelToken,
+    ) -> Option<LogUsageScan> {
         match self.scan_result(days_back, now, pricing, cancel) {
             ClaudeScanResult::Complete(scan) => scan,
             ClaudeScanResult::Incomplete => None,
@@ -133,12 +145,24 @@ impl ClaudeLogScanner {
 
     /// Completeness-aware form used by the Claude provider so an ownership/read failure cannot be
     /// mistaken for a clean scan that simply found no Claude rows.
-    pub fn scan_result(&self, days_back: usize, now: f64, pricing: &ModelPricing, cancel: &CancelToken) -> ClaudeScanResult {
+    pub fn scan_result(
+        &self,
+        days_back: usize,
+        now: f64,
+        pricing: &ModelPricing,
+        cancel: &CancelToken,
+    ) -> ClaudeScanResult {
         let since = since_date(days_back, now);
         let identity = self.parse_cache_identity();
         let roots = self.claude_roots();
-        let files = if roots.is_empty() { Some(Vec::new()) } else { self.source_files(&roots, cancel) };
-        let Some(files) = files else { return ClaudeScanResult::Incomplete };
+        let files = if roots.is_empty() {
+            Some(Vec::new())
+        } else {
+            self.source_files(&roots, cancel)
+        };
+        let Some(files) = files else {
+            return ClaudeScanResult::Incomplete;
+        };
         if cancel.is_cancelled() {
             return ClaudeScanResult::Incomplete;
         }
@@ -148,11 +172,21 @@ impl ClaudeLogScanner {
             diagnostic_gate::clear(&self.future_gate_key("sessions", &identity));
             return ClaudeScanResult::Complete(None);
         }
-        let Some(source) = self.scan_source("sessions", identity, &files, since, now, cancel) else {
+        let Some(source) = self.scan_source("sessions", identity, &files, since, now, cancel)
+        else {
             return ClaudeScanResult::Incomplete;
         };
-        let key = self.fold_key(&source, "aggregate", since, now, Some(pricing.aggregate_cache_token()));
-        if let Some(cached) = lock(&self.aggregate_cache).as_ref().and_then(|c| c.lookup(&key, now)) {
+        let key = self.fold_key(
+            &source,
+            "aggregate",
+            since,
+            now,
+            Some(pricing.aggregate_cache_token()),
+        );
+        if let Some(cached) = lock(&self.aggregate_cache)
+            .as_ref()
+            .and_then(|c| c.lookup(&key, now))
+        {
             return ClaudeScanResult::Complete(Some(cached));
         }
         *lock(&self.aggregate_cache) = None;
@@ -193,7 +227,10 @@ impl ClaudeLogScanner {
         let since = since_date(days_back, now);
         let (roots, identity) = match roots {
             Some(roots) => {
-                let identity = self.cache_identity_override.clone().unwrap_or_else(|| super::roots::roots_identity(&roots));
+                let identity = self
+                    .cache_identity_override
+                    .clone()
+                    .unwrap_or_else(|| super::roots::roots_identity(&roots));
                 (roots, identity)
             }
             None => (self.claude_roots(), self.parse_cache_identity()),
@@ -208,7 +245,10 @@ impl ClaudeLogScanner {
         let source = self.scan_source("gateway", identity, &files, since, now, cancel)?;
         let key = self.fold_key(&source, "gateway", since, now, None);
         if hosted_gateway_only {
-            if let Some(cached) = lock(&self.gateway_cache).as_ref().and_then(|c| c.lookup(&key, now)) {
+            if let Some(cached) = lock(&self.gateway_cache)
+                .as_ref()
+                .and_then(|c| c.lookup(&key, now))
+            {
                 return Some(cached);
             }
             *lock(&self.gateway_cache) = None;
@@ -218,7 +258,11 @@ impl ClaudeLogScanner {
             return None;
         }
         if hosted_gateway_only {
-            entries.retain(|e| e.model.as_deref().is_some_and(|m| is_hosted_gateway_model(m.trim())));
+            entries.retain(|e| {
+                e.model
+                    .as_deref()
+                    .is_some_and(|m| is_hosted_gateway_model(m.trim()))
+            });
             if entries.len() <= MAXIMUM_CACHED_GATEWAY_ENTRIES {
                 *lock(&self.gateway_cache) = Some(FoldCache::new(key, now, entries.clone()));
             }
@@ -238,11 +282,18 @@ impl ClaudeLogScanner {
         now: f64,
         cancel: &CancelToken,
     ) -> Option<Source> {
-        let scanned = match self.incremental_for(&identity).scan(files, Some(since), cancel) {
+        let scanned = match self
+            .incremental_for(&identity)
+            .scan(files, Some(since), cancel)
+        {
             Ok(scanned) => scanned,
             Err(ScanError::Cancelled) => return None,
             Err(error) => {
-                qlog!(Warn, host::plugin_tag("claude"), "session scan is incomplete, preserving last-good history: {error}");
+                qlog!(
+                    Warn,
+                    host::plugin_tag("claude"),
+                    "session scan is incomplete, preserving last-good history: {error}"
+                );
                 return None;
             }
         };
@@ -258,14 +309,24 @@ impl ClaudeLogScanner {
             return None;
         }
         diagnostic_gate::clear(&gate);
-        Some(Source { files: scanned, identity })
+        Some(Source {
+            files: scanned,
+            identity,
+        })
     }
 
     /// Drop this source's cached files when nothing is in scope any more (Swift scans an empty list).
     fn prune(&self, identity: &str, since: f64, cancel: &CancelToken) {
-        if let Err(error) = self.incremental_for(identity).scan(&[], Some(since), cancel) {
+        if let Err(error) = self
+            .incremental_for(identity)
+            .scan(&[], Some(since), cancel)
+        {
             if !matches!(error, ScanError::Cancelled) {
-                qlog!(Warn, host::plugin_tag("claude"), "could not prune the session cache: {error}");
+                qlog!(
+                    Warn,
+                    host::plugin_tag("claude"),
+                    "could not prune the session cache: {error}"
+                );
             }
         }
     }
@@ -275,18 +336,28 @@ impl ClaudeLogScanner {
         if let Some(scanner) = &self.incremental {
             return scanner.clone();
         }
-        static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<ClaudeIncrementalScanner>>>> = OnceLock::new();
         let partition = format!("claude:{}", stable_fingerprint(identity));
-        let mut registry = lock(REGISTRY.get_or_init(Default::default));
+        let mut registry = lock(shared_scanner_registry());
         registry
             .entry(partition.clone())
             .or_insert_with(|| {
-                Arc::new(IncrementalScanner::new(ClaudeLineParser::new(), partition, Some(ScanStore::shared())))
+                Arc::new(IncrementalScanner::new(
+                    ClaudeLineParser::new(),
+                    partition,
+                    Some(ScanStore::shared()),
+                ))
             })
             .clone()
     }
 
-    fn fold_key(&self, source: &Source, kind: &str, since: f64, now: f64, pricing_token: Option<&str>) -> [u8; 16] {
+    fn fold_key(
+        &self,
+        source: &Source,
+        kind: &str,
+        since: f64,
+        now: f64,
+        pricing_token: Option<&str>,
+    ) -> [u8; 16] {
         let since_text = since.to_string();
         let zone = zone_signature(since, now);
         fingerprint(
@@ -299,7 +370,11 @@ impl ClaudeLogScanner {
                 pricing_token.unwrap_or(""),
                 self.organization_id.as_deref().unwrap_or("no-organization"),
                 self.account_id.as_deref().unwrap_or("no-account"),
-                if self.allows_unattributed_sessions { "allows-unattributed" } else { "requires-owned-session" },
+                if self.allows_unattributed_sessions {
+                    "allows-unattributed"
+                } else {
+                    "requires-owned-session"
+                },
             ],
         )
     }
@@ -310,10 +385,17 @@ impl ClaudeLogScanner {
             identity,
             self.organization_id.as_deref().unwrap_or("no-organization"),
             self.account_id.as_deref().unwrap_or("no-account"),
-            if self.allows_unattributed_sessions { "allows-unattributed" } else { "requires-owned-session" },
+            if self.allows_unattributed_sessions {
+                "allows-unattributed"
+            } else {
+                "requires-owned-session"
+            },
         ]
         .join("\n");
-        format!("claude.sessions.future-timestamp.{}", stable_fingerprint(&scope))
+        format!(
+            "claude.sessions.future-timestamp.{}",
+            stable_fingerprint(&scope)
+        )
     }
 
     /// Stable source configuration identity rather than the discovered root list: Cowork adds session
@@ -336,6 +418,22 @@ fn dedup_source(source: &Source) -> Vec<ClaudeEntry> {
         }
     }
     deduplication.into_entries()
+}
+
+fn shared_scanner_registry() -> &'static Mutex<HashMap<String, Arc<ClaudeIncrementalScanner>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<ClaudeIncrementalScanner>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(Default::default)
+}
+
+/// Release parsed Claude rows retained by every shared incremental scanner. Compact checkpoints
+/// remain in the scan store, so the next pass rehydrates them instead of reparsing source logs.
+pub(super) fn unload_shared_caches() {
+    let mut registry = lock(shared_scanner_registry());
+    for scanner in registry.values() {
+        scanner.clear_memory_cache();
+    }
+    registry.clear();
 }
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

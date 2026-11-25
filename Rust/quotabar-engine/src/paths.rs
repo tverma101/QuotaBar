@@ -27,7 +27,10 @@ pub fn current() -> Paths {
         return paths;
     }
     let home = default_home();
-    Paths { app_data: default_app_data(&home), home }
+    Paths {
+        app_data: default_app_data(&home),
+        home,
+    }
 }
 
 pub fn home() -> PathBuf {
@@ -61,7 +64,9 @@ fn default_home() -> PathBuf {
             return PathBuf::from(profile);
         }
     }
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn default_app_data(home: &Path) -> PathBuf {
@@ -103,11 +108,15 @@ pub fn platform_app_support() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| home().join("AppData/Roaming"))
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home().join("AppData/Roaming"))
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".config"))
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home().join(".config"))
     }
 }
 

@@ -21,7 +21,9 @@ pub struct DevinAuth {
 
 impl DevinAuth {
     pub fn effective_api_server_url(&self) -> &str {
-        self.api_server_url.as_deref().unwrap_or(DEFAULT_API_SERVER_URL)
+        self.api_server_url
+            .as_deref()
+            .unwrap_or(DEFAULT_API_SERVER_URL)
     }
 }
 
@@ -42,11 +44,17 @@ impl DevinAuthStore {
     }
 
     pub fn live() -> Self {
-        DevinAuthStore { fixed: None, app_auth_cache: Mutex::new(HashMap::new()) }
+        DevinAuthStore {
+            fixed: None,
+            app_auth_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn unload_caches(&self) {
-        self.app_auth_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.app_auth_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     pub fn credentials_paths(&self) -> Vec<PathBuf> {
@@ -79,17 +87,24 @@ impl DevinAuthStore {
             }
         };
         diagnostic_gate::clear("auth.devin.credentials-file-read");
-        let Some(api_key) = read_toml_string(&text, "windsurf_api_key") else { return Ok(None) };
+        let Some(api_key) = read_toml_string(&text, "windsurf_api_key") else {
+            return Ok(None);
+        };
         Ok(Some(DevinAuth {
             api_key,
-            api_server_url: clean_api_server_url(read_toml_string(&text, "api_server_url").as_deref()),
+            api_server_url: clean_api_server_url(
+                read_toml_string(&text, "api_server_url").as_deref(),
+            ),
         }))
     }
 
     pub fn load_app_auth(&self, path: &Path) -> Result<Option<DevinAuth>, CredentialsUnreadable> {
         let signature = sqlite::source_signature(path);
-        if let Some((cached_signature, auth)) =
-            self.app_auth_cache.lock().unwrap_or_else(|e| e.into_inner()).get(path)
+        if let Some((cached_signature, auth)) = self
+            .app_auth_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
         {
             if *cached_signature == signature {
                 return Ok(auth.clone());
@@ -129,7 +144,11 @@ fn read_app_auth(path: &Path) -> Result<Option<DevinAuth>, CredentialsUnreadable
         Ok(value) => value,
         Err(_) => {
             diagnostic_gate::log_once("auth.devin.state-db-read", || {
-                qlog!(Error, auth_tag(ID), "app state database credential read failed");
+                qlog!(
+                    Error,
+                    auth_tag(ID),
+                    "app state database credential read failed"
+                );
             });
             return Err(CredentialsUnreadable);
         }
@@ -139,14 +158,26 @@ fn read_app_auth(path: &Path) -> Result<Option<DevinAuth>, CredentialsUnreadable
         diagnostic_gate::clear("auth.devin.state-db-decode");
         return Ok(None);
     };
-    let Some(object) = serde_json::from_str::<Value>(&value).ok().filter(Value::is_object) else {
+    let Some(object) = serde_json::from_str::<Value>(&value)
+        .ok()
+        .filter(Value::is_object)
+    else {
         diagnostic_gate::log_once("auth.devin.state-db-decode", || {
-            qlog!(Error, auth_tag(ID), "app state database credential data could not be decoded");
+            qlog!(
+                Error,
+                auth_tag(ID),
+                "app state database credential data could not be decoded"
+            );
         });
         return Err(CredentialsUnreadable);
     };
     diagnostic_gate::clear("auth.devin.state-db-decode");
-    Ok(parse::trimmed_string(object.get("apiKey")).map(|api_key| DevinAuth { api_key, api_server_url: None }))
+    Ok(
+        parse::trimmed_string(object.get("apiKey")).map(|api_key| DevinAuth {
+            api_key,
+            api_server_url: None,
+        }),
+    )
 }
 
 pub fn clean_api_server_url(value: Option<&str>) -> Option<String> {
@@ -160,7 +191,9 @@ pub fn clean_api_server_url(value: Option<&str>) -> Option<String> {
 
 pub fn read_toml_string(text: &str, key: &str) -> Option<String> {
     for line in text.split(['\n', '\r']).filter(|l| !l.is_empty()) {
-        let Some((name, value)) = line.split_once('=') else { continue };
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
         if name.trim() != key {
             continue;
         }

@@ -25,7 +25,8 @@ const SESSION_DB_KEY: &str = "devin.sessions.read";
 pub struct DevinTranscriptUsageScanner {
     fixed: Option<(PathBuf, Option<PathBuf>)>,
     session_reader: Mutex<DevinSessionUsageReader>,
-    transcript_cache: Mutex<HashMap<PathBuf, (Revision, Vec<DevinSessionEntry>)>>,
+    // Shared immutable row vectors: reuse costs one refcount, not a deep copy of a transcript.
+    transcript_cache: Mutex<HashMap<PathBuf, (Revision, Arc<Vec<DevinSessionEntry>>)>>,
 }
 
 impl DevinTranscriptUsageScanner {
@@ -50,8 +51,26 @@ impl DevinTranscriptUsageScanner {
     }
 
     pub fn unload_caches(&self) {
-        self.session_reader.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.transcript_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.session_reader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.transcript_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_rows_shared_for_test(
+        &self,
+        path: &Path,
+    ) -> Option<Arc<Vec<DevinSessionEntry>>> {
+        self.transcript_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+            .map(|(_, rows)| rows.clone())
     }
 
     fn locations(&self) -> (PathBuf, Option<PathBuf>) {
@@ -110,7 +129,10 @@ impl DevinTranscriptUsageScanner {
                     return Some(aggregate(&db_entries, since, &pricing));
                 }
             } else {
-                self.session_reader.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                self.session_reader
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
             }
         }
 
@@ -130,28 +152,40 @@ impl DevinTranscriptUsageScanner {
             return None;
         }
 
-        let mut all_entries = Vec::new();
-        let mut cache = self.transcript_cache.lock().unwrap_or_else(|e| e.into_inner());
-        for file in files {
-            if cancel.is_cancelled() {
-                return None;
-            }
-            let entries = if let Some((rev, cached)) = cache.get(&file.path) {
-                if *rev == file.revision {
-                    cached.clone()
-                } else {
-                    let parsed = parse_file(&file.path)?;
-                    cache.insert(file.path.clone(), (file.revision, parsed.clone()));
-                    parsed
+        // Keep only cheap shared references while aggregating. Copying every cached transcript
+        // into one flat vector duplicated the whole corpus on each fold and dominated allocation
+        // churn on large Devin histories.
+        let mut by_file = Vec::new();
+        {
+            let mut cache = self
+                .transcript_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for file in files {
+                if cancel.is_cancelled() {
+                    return None;
                 }
-            } else {
-                let parsed = parse_file(&file.path)?;
-                cache.insert(file.path.clone(), (file.revision, parsed.clone()));
-                parsed
-            };
-            all_entries.extend(entries);
+                let entries = if let Some((rev, cached)) = cache.get(&file.path) {
+                    if *rev == file.revision {
+                        cached.clone()
+                    } else {
+                        let shared = Arc::new(parse_file(&file.path)?);
+                        cache.insert(file.path.clone(), (file.revision, shared.clone()));
+                        shared
+                    }
+                } else {
+                    let shared = Arc::new(parse_file(&file.path)?);
+                    cache.insert(file.path.clone(), (file.revision, shared.clone()));
+                    shared
+                };
+                by_file.push(entries);
+            }
         }
-        if all_entries.iter().any(|e| e.timestamp > max_ts) {
+        if by_file
+            .iter()
+            .flat_map(|entries| entries.iter())
+            .any(|e| e.timestamp > max_ts)
+        {
             log_future_timestamp();
             return None;
         }
@@ -160,7 +194,11 @@ impl DevinTranscriptUsageScanner {
             return None;
         }
         let pricing = pricing_provider();
-        Some(aggregate(&all_entries, since, &pricing))
+        let mut accumulator = DailyUsageAccumulator::new();
+        for entries in &by_file {
+            accumulate(&mut accumulator, entries.iter(), since, &pricing);
+        }
+        Some(accumulator.build())
     }
 }
 
@@ -178,7 +216,10 @@ fn discover_transcripts(dir: &Path) -> std::io::Result<Vec<DiscoveredFile>> {
     match std::fs::metadata(dir) {
         Ok(meta) => {
             if !meta.is_dir() {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "transcripts path is not a directory"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "transcripts path is not a directory",
+                ));
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -229,7 +270,9 @@ pub fn parse_bytes(data: &[u8]) -> Option<Vec<DevinSessionEntry>> {
         let prompt = optional_count(metrics.get("prompt_tokens"))?;
         let completion = optional_count(metrics.get("completion_tokens"))?;
         let cached = optional_count(metrics.get("cached_tokens"))?;
-        let (Some(prompt_val), completion_val, cached_val) = (prompt, completion.unwrap_or(0), cached.unwrap_or(0)) else {
+        let (Some(prompt_val), completion_val, cached_val) =
+            (prompt, completion.unwrap_or(0), cached.unwrap_or(0))
+        else {
             if completion.is_none() && cached.is_none() {
                 continue;
             }
@@ -248,7 +291,11 @@ pub fn parse_bytes(data: &[u8]) -> Option<Vec<DevinSessionEntry>> {
                 is_fast: false,
             };
             if tokens.total_tokens() > 0 {
-                out.push(DevinSessionEntry { timestamp, model, tokens });
+                out.push(DevinSessionEntry {
+                    timestamp,
+                    model,
+                    tokens,
+                });
             }
             continue;
         };
@@ -266,7 +313,11 @@ pub fn parse_bytes(data: &[u8]) -> Option<Vec<DevinSessionEntry>> {
             is_fast: false,
         };
         if tokens.total_tokens() > 0 {
-            out.push(DevinSessionEntry { timestamp, model, tokens });
+            out.push(DevinSessionEntry {
+                timestamp,
+                model,
+                tokens,
+            });
         }
     }
     Some(out)
@@ -294,13 +345,34 @@ fn parse_step_timestamp(val: Option<&Value>) -> Option<f64> {
 }
 
 fn step_model_name(val: Option<&Value>, fallback: &str) -> String {
-    let raw = val.and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let raw = val
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let chosen = raw.unwrap_or(fallback).trim();
-    if chosen.is_empty() { ModelUsageEntry::UNATTRIBUTED.to_string() } else { chosen.to_string() }
+    if chosen.is_empty() {
+        ModelUsageEntry::UNATTRIBUTED.to_string()
+    } else {
+        chosen.to_string()
+    }
 }
 
-pub fn aggregate(entries: &[DevinSessionEntry], since: f64, pricing: &ModelPricing) -> LogUsageScan {
+pub fn aggregate(
+    entries: &[DevinSessionEntry],
+    since: f64,
+    pricing: &ModelPricing,
+) -> LogUsageScan {
     let mut accumulator = DailyUsageAccumulator::new();
+    accumulate(&mut accumulator, entries.iter(), since, pricing);
+    accumulator.build()
+}
+
+fn accumulate<'a>(
+    accumulator: &mut DailyUsageAccumulator,
+    entries: impl Iterator<Item = &'a DevinSessionEntry>,
+    since: f64,
+    pricing: &ModelPricing,
+) {
     for entry in entries {
         if entry.timestamp < since {
             continue;
@@ -315,7 +387,12 @@ pub fn aggregate(entries: &[DevinSessionEntry], since: f64, pricing: &ModelPrici
                 }
                 rates.map(|r| r.cost_dollars(&entry.tokens, Some(entry.timestamp), false))
             }
-            _ => pricing.estimated_cost_dollars(&entry.model, &entry.tokens, Some(entry.timestamp), false),
+            _ => pricing.estimated_cost_dollars(
+                &entry.model,
+                &entry.tokens,
+                Some(entry.timestamp),
+                false,
+            ),
         };
         if estimate.is_none() {
             if entry.model == ModelUsageEntry::UNATTRIBUTED {
@@ -332,12 +409,15 @@ pub fn aggregate(entries: &[DevinSessionEntry], since: f64, pricing: &ModelPrici
             entry.tokens.total_tokens(),
             estimate,
             &entry.model,
-            RowOptions { canonical: Some(&canonical), cost_is_complete: estimate.is_some(), token_count_saturated: false },
+            RowOptions {
+                canonical: Some(&canonical),
+                cost_is_complete: estimate.is_some(),
+                token_count_saturated: false,
+            },
         );
         accumulator.record_api_estimate(&day, estimate, entry.tokens.total_tokens());
         if estimate.is_some() {
             accumulator.mark_estimated_cost(&day);
         }
     }
-    accumulator.build()
 }

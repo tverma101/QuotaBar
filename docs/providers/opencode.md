@@ -188,6 +188,9 @@ its own row instead of being listed twice, once as Other and again under it.
 - **Everything shows "No data"** — QuotaBar needs OpenCode's local database at
   `~/.local/share/opencode/opencode*.db`. Run an OpenCode session, then refresh. (An active Go account
   confirmed by the account endpoint can show cap meters before your first local message.)
+- **"OpenCode not detected"** — there is no Go key and no local OpenCode database on this Mac. A
+  local-only user with a database never sees this, including on the quick meter checks between full
+  refreshes; those leave the spend tiles in place.
 - **No Session / Weekly / Monthly meters** — those are Go-plan caps and require a successful current
   account response. Network/server/rate-limit failures, rejected keys, incomplete responses, and
   unconfirmed entitlements hide the cap meters. Local Go history does not prove an active subscription;

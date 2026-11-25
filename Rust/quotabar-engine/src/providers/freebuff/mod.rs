@@ -1,0 +1,439 @@
+//! Freebuff usage (`Providers/Freebuff`): hosted session meter, hosted receipt history, and
+//! Freebuff Desktop's local measured token history.
+
+mod auth;
+mod catalog;
+mod client;
+mod desktop;
+mod flash;
+mod fold;
+mod identity;
+mod mapper;
+mod scanner;
+mod sessions;
+
+use self::auth::{AuthError, FreebuffAuth, FreebuffAuthStore};
+use self::catalog::ModelCatalog;
+use self::client::{ClientError, FreebuffClient};
+use self::mapper::MappedUsage;
+use self::scanner::{FreebuffScan, FreebuffScanner};
+use self::sessions::SessionTitles;
+use super::{cancelled_snapshot, ProviderRuntime};
+use crate::accounting::{append_token_usage, append_usage_trend, TokenUsageOptions};
+use crate::context::RefreshContext;
+use crate::model::{
+    ErrorCategory, MetricLine, ProviderInfo, ProviderSnapshot, ProviderUsageHistory,
+};
+use crate::pricing::{self, ModelPricing};
+use crate::qlog;
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+pub const ID: &str = "freebuff";
+const HISTORY_SOURCE_NOTE: &str =
+    "Measured Freebuff hosted runs and legacy Desktop tokens on this Mac.";
+const HOSTED_HISTORY_WARNING: &str =
+    "Freebuff's hosted token history couldn't be refreshed. Totals may be incomplete.";
+const CATALOG_WARNING: &str =
+    "Freebuff model names couldn't be refreshed. Saved model data is still available.";
+const HISTORY_UNREADABLE_WARNING: &str =
+    "QuotaBar couldn't read Freebuff Desktop's measured token history. Refresh again after the current turn finishes.";
+const MISSING_RECEIPT_WARNING: &str =
+    "Some Freebuff runs have no complete token receipt. Totals include only measured usage.";
+const LIVE_ACCESS_UNAVAILABLE: &str =
+    "Live Freebuff quotas and session timers are unavailable. QuotaBar shows saved measurements only.";
+
+pub struct FreebuffProvider {
+    info: ProviderInfo,
+    store: FreebuffAuthStore,
+    client: FreebuffClient,
+    scanner: FreebuffScanner,
+    /// Chat names for the live session timers. Kept across memory-pressure unloads: it holds a
+    /// few short strings, and dropping it would re-query every project database each cycle.
+    titles: SessionTitles,
+    /// Saved public model identities that name Freebuff's opaque model keys for pricing.
+    catalog: ModelCatalog,
+    pricing_override: Option<Arc<ModelPricing>>,
+}
+
+impl FreebuffProvider {
+    pub fn live() -> Self {
+        FreebuffProvider {
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "Freebuff".into(),
+            },
+            store: FreebuffAuthStore::live(),
+            client: FreebuffClient::live(),
+            scanner: FreebuffScanner::live(),
+            titles: SessionTitles::new(crate::paths::home()),
+            catalog: ModelCatalog::live(),
+            pricing_override: None,
+        }
+    }
+
+    pub fn with_parts(
+        store: FreebuffAuthStore,
+        client: FreebuffClient,
+        scanner: FreebuffScanner,
+    ) -> Self {
+        FreebuffProvider {
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "Freebuff".into(),
+            },
+            store,
+            client,
+            titles: SessionTitles::new(scanner.home().to_path_buf()),
+            catalog: ModelCatalog::under_home(scanner.home()),
+            scanner,
+            pricing_override: None,
+        }
+    }
+
+    pub fn with_pricing_override(mut self, pricing: Arc<ModelPricing>) -> Self {
+        self.pricing_override = Some(pricing);
+        self
+    }
+
+    fn pricing(&self, ctx: &RefreshContext) -> Arc<ModelPricing> {
+        self.pricing_override.clone().unwrap_or_else(|| {
+            pricing::shared()
+                .current(ctx.skip_model_catalog_refresh || ctx.scope.suppresses_live_quota())
+        })
+    }
+
+    /// `false` when the catalogue could not be refreshed; the saved identities still price.
+    fn refresh_catalog(&self, auth: &FreebuffAuth, ctx: &RefreshContext) -> bool {
+        const GATE: &str = "auth.freebuff.catalog.failure";
+        match self
+            .catalog
+            .refresh(auth, &self.client, ctx.now, &ctx.cancel)
+        {
+            Ok(()) => {
+                crate::host::diagnostic_gate::clear(GATE);
+                true
+            }
+            Err(catalog::CatalogError::Cancelled) => true,
+            Err(error) => {
+                crate::host::diagnostic_gate::log_once(GATE, || {
+                    qlog!(
+                        Warn,
+                        crate::host::auth_tag("freebuff"),
+                        "model catalogue refresh failed: {error:?}"
+                    );
+                });
+                false
+            }
+        }
+    }
+
+    fn refresh_quota(&self, auth: &FreebuffAuth, ctx: &RefreshContext) -> ProviderSnapshot {
+        let response = match self.client.fetch_session(auth, &ctx.cancel) {
+            Ok(response) => response,
+            Err(ClientError::ConnectionFailed) => {
+                return ProviderSnapshot::error(
+                    &self.info,
+                    client::map_error(ClientError::ConnectionFailed),
+                    ErrorCategory::Network,
+                    ctx.now,
+                )
+            }
+            Err(error) => {
+                return ProviderSnapshot::error(
+                    &self.info,
+                    client::map_error(error),
+                    ErrorCategory::Network,
+                    ctx.now,
+                )
+            }
+        };
+        if ctx.is_cancelled() {
+            return cancelled_snapshot(&self.info, ctx);
+        }
+        if response.status == 401 {
+            return ProviderSnapshot::error(
+                &self.info,
+                AuthError::TokenInvalid.message(),
+                ErrorCategory::AuthExpired,
+                ctx.now,
+            );
+        }
+        if !response.is_success() && response.status != 404 {
+            return ProviderSnapshot::error(
+                &self.info,
+                &format!("Freebuff usage request failed (HTTP {}).", response.status),
+                ErrorCategory::http(response.status),
+                ctx.now,
+            );
+        }
+        let mut mapped = match mapper::map(&response.body, response.status) {
+            Ok(mapped) => mapped,
+            Err(_) => {
+                return ProviderSnapshot::error(
+                    &self.info,
+                    "Freebuff returned unreadable usage data. Try again later.",
+                    ErrorCategory::Decoding,
+                    ctx.now,
+                )
+            }
+        };
+        self.titles.resolve(
+            &mut mapped.active_sessions,
+            || self.scanner.database_paths(),
+            ctx.now,
+            ctx.is_manual,
+        );
+        snapshot_from_mapped(&self.info, mapped, ctx.now)
+    }
+}
+
+fn snapshot_from_mapped(info: &ProviderInfo, mapped: MappedUsage, now: f64) -> ProviderSnapshot {
+    let mut snapshot = ProviderSnapshot::new(info, mapped.plan, mapped.lines, now);
+    snapshot.warning = mapped.warning;
+    snapshot.clears_prior_menu_bar_quota_state = Some(true);
+    snapshot.active_sessions =
+        (!mapped.active_sessions.is_empty()).then_some(mapped.active_sessions);
+    snapshot
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Access {
+    live_session: bool,
+    hosted_detail: bool,
+}
+
+impl Access {
+    /// Live network access is host-granted and fail-closed. QuotaBar's public artifact passes
+    /// neither capability; the owner's local build may grant the read-only session meter, but not
+    /// hosted history/model-catalog detail. Test transports can opt into hosted detail explicitly.
+    fn from_config(config: Option<&serde_json::Value>) -> Self {
+        fn enabled(config: Option<&serde_json::Value>, key: &str) -> bool {
+            config
+                .and_then(|config| config.get(key))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        }
+        Access {
+            live_session: enabled(config, "liveSessionEnabled"),
+            hosted_detail: enabled(config, "hostedDetailEnabled"),
+        }
+    }
+}
+
+fn offline_snapshot(info: &ProviderInfo, now: f64) -> ProviderSnapshot {
+    // Empty live-value rows replace cached wallet/session values during partial snapshot merges,
+    // exactly like the transport-less Swift provider did.
+    let mut snapshot = ProviderSnapshot::new(
+        info,
+        None,
+        vec![
+            MetricLine::values("Hours Balance", Vec::new()),
+            MetricLine::values("Monthly Spend", Vec::new()),
+            MetricLine::values("Active Sessions", Vec::new()),
+        ],
+        now,
+    );
+    snapshot.warning = Some(LIVE_ACCESS_UNAVAILABLE.into());
+    snapshot.clears_prior_menu_bar_quota_state = Some(true);
+    snapshot.active_sessions = Some(Vec::new());
+    snapshot
+}
+
+fn append_history(result: &mut ProviderSnapshot, scan: &FreebuffScan, now: f64) {
+    let usage = &scan.usage;
+    let options = TokenUsageOptions {
+        estimated: true,
+        unknown_models_by_day: usage.unknown_models_by_day.clone(),
+        model_usage: usage.model_usage.clone(),
+        model_source_note: Some(HISTORY_SOURCE_NOTE.into()),
+        partial_days: scan.partial_days.clone(),
+        api_estimate_by_day: usage.api_estimate_by_day.clone(),
+        estimated_cost_days: usage.estimated_cost_days.clone(),
+    };
+    append_token_usage(&usage.series, &mut result.lines, now, &options);
+    append_usage_trend(
+        &usage.series,
+        &mut result.lines,
+        now,
+        HISTORY_SOURCE_NOTE,
+        &scan.partial_days,
+        Some("incomplete Freebuff history is shown as a lower bound"),
+    );
+    result.usage_history = Some(ProviderUsageHistory {
+        series: usage.series.clone(),
+        model_usage: usage.model_usage.clone(),
+        unknown_models_by_day: usage.unknown_models_by_day.clone(),
+        api_estimate_by_day: usage.api_estimate_by_day.clone(),
+        api_estimate_incomplete_days: usage.api_estimate_incomplete_days.clone(),
+        partial_days: Some(scan.partial_days.clone()),
+        estimated_cost_days: usage.estimated_cost_days.clone(),
+    });
+    result.history_refreshed_at = Some(now);
+}
+
+impl ProviderRuntime for FreebuffProvider {
+    fn info(&self) -> &ProviderInfo {
+        &self.info
+    }
+
+    fn has_local_credentials(&self) -> bool {
+        self.store.has_local_credentials() || self.scanner.has_history()
+    }
+
+    fn unload_caches(&self) {
+        self.scanner.unload_caches();
+    }
+
+    fn refresh(&self, ctx: &RefreshContext) -> ProviderSnapshot {
+        if ctx.is_cancelled() {
+            return cancelled_snapshot(&self.info, ctx);
+        }
+        let scope = ctx.scope;
+        let access = Access::from_config(ctx.config.as_ref());
+        // A transport-less public meter pass is completely offline: it must not even read the
+        // credential. Accounting passes do read it because the account key selects which saved
+        // hosted receipts may be reused.
+        let should_load_auth = access.live_session || !scope.skips_local_accounting();
+        let mut auth = None;
+        let mut auth_error = None;
+        if should_load_auth {
+            match self.store.load_auth(ctx.is_manual, ctx.request_id) {
+                Ok(loaded) => auth = loaded,
+                Err(error) => auth_error = Some(error),
+            }
+        }
+        let mut snapshot = if !access.live_session {
+            offline_snapshot(&self.info, ctx.now)
+        } else if scope.suppresses_live_quota() {
+            ProviderSnapshot::new(&self.info, None, Vec::new(), ctx.now)
+        } else if let Some(auth) = &auth {
+            self.refresh_quota(auth, ctx)
+        } else {
+            let error = auth_error.clone().unwrap_or(AuthError::NotLoggedIn);
+            ProviderSnapshot::error(&self.info, error.message(), auth_category(&error), ctx.now)
+        };
+        if scope.skips_local_accounting() || ctx.is_cancelled() {
+            return snapshot;
+        }
+        let scan_now = ctx.now;
+        let mut incomplete_history = auth.is_none();
+        if auth.is_none() {
+            let message = auth_error
+                .as_ref()
+                .map(AuthError::message)
+                .unwrap_or_else(|| AuthError::NotLoggedIn.message());
+            snapshot.history_warning = Some(message.to_string());
+        }
+        let pricing = self.pricing(ctx);
+        let hosted = if let Some(auth) = &auth {
+            if scope == crate::context::Scope::LocalAccounting || !access.hosted_detail {
+                self.scanner.cached_receipts(auth)
+            } else {
+                match self.scanner.hosted_receipts(
+                    auth,
+                    &self.client,
+                    scan_now,
+                    ctx.is_manual,
+                    &ctx.cancel,
+                ) {
+                    Ok(receipts) => receipts,
+                    Err(ClientError::TokenInvalid) => {
+                        let mut result = snapshot;
+                        result.lines = vec![MetricLine::badge(
+                            MetricLine::ERROR_BADGE_LABEL,
+                            AuthError::TokenInvalid.message(),
+                            Some("#EF4444"),
+                        )];
+                        result.error_category = Some(ErrorCategory::AuthExpired);
+                        return result;
+                    }
+                    Err(error) => {
+                        scanner::warn(&error);
+                        incomplete_history = true;
+                        snapshot.history_warning = Some(HOSTED_HISTORY_WARNING.into());
+                        self.scanner.cached_receipts(auth)
+                    }
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let has_history = !hosted.is_empty()
+            || (scope != crate::context::Scope::LocalAccounting && self.scanner.has_history());
+        if let Some(auth) = &auth {
+            let may_refresh = access.hosted_detail
+                && scope != crate::context::Scope::LocalAccounting
+                && !ctx.skip_model_catalog_refresh;
+            if may_refresh && has_history && !self.refresh_catalog(auth, ctx) {
+                snapshot
+                    .history_warning
+                    .get_or_insert(CATALOG_WARNING.into());
+            }
+        }
+        let scan = if has_history {
+            let catalog = self.catalog.current();
+            self.scanner
+                .scan(scan_now, &pricing, &catalog, &hosted, &ctx.cancel)
+        } else {
+            None
+        };
+        if ctx.is_cancelled() {
+            return cancelled_snapshot(&self.info, ctx);
+        }
+        let Some(mut scan) = scan else {
+            if snapshot.error_category.is_none() && !has_history {
+                return snapshot;
+            }
+            if snapshot.history_warning.is_none() {
+                snapshot.history_warning = Some(HISTORY_UNREADABLE_WARNING.into());
+            }
+            return snapshot;
+        };
+        if incomplete_history {
+            let days = scan
+                .usage
+                .series
+                .daily
+                .iter()
+                .map(|entry| entry.date.clone())
+                .collect::<BTreeSet<_>>();
+            scan.partial_days.extend(days);
+            scan.usage = scan.usage.marking_unmeasured_usage(&scan.partial_days);
+        }
+        let now = scan_now;
+        let first_day = crate::accounting::DayZone::Local.day_key(now - 29.0 * 86_400.0);
+        let today = crate::accounting::DayZone::Local.day_key(now);
+        if scan
+            .partial_days
+            .iter()
+            .any(|day| *day >= first_day && *day <= today)
+        {
+            qlog!(
+                Warn,
+                crate::host::auth_tag(ID),
+                "token history contains incomplete or missing usage receipts"
+            );
+            if snapshot.history_warning.is_none() {
+                snapshot.history_warning = Some(MISSING_RECEIPT_WARNING.into());
+            }
+        }
+        append_history(&mut snapshot, &scan, now);
+        snapshot
+    }
+}
+
+fn auth_category(error: &AuthError) -> ErrorCategory {
+    match error {
+        AuthError::NotLoggedIn => ErrorCategory::NotLoggedIn,
+        AuthError::CredentialPermissionRequired => ErrorCategory::CredentialAccess,
+        AuthError::TokenInvalid => ErrorCategory::AuthExpired,
+        AuthError::CredentialsUnreadable => ErrorCategory::CredentialAccess,
+        AuthError::InvalidConfigDirectory
+        | AuthError::InvalidCredentials
+        | AuthError::MissingDefaultProfile => ErrorCategory::AuthInvalid,
+    }
+}
+
+#[cfg(test)]
+mod tests;

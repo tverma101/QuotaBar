@@ -1,6 +1,6 @@
 use super::auth::{
-    yaml_value, CopilotAuthError, CopilotAuthStore, CREDENTIALS_UNREADABLE_MSG, GH_KEYCHAIN_SERVICE,
-    INVALID_CREDENTIALS_MSG, NOT_LOGGED_IN_MSG, TOKEN_INVALID_MSG,
+    yaml_value, CopilotAuthError, CopilotAuthStore, CREDENTIALS_UNREADABLE_MSG,
+    GH_KEYCHAIN_SERVICE, INVALID_CREDENTIALS_MSG, NOT_LOGGED_IN_MSG, TOKEN_INVALID_MSG,
 };
 use super::org::{org_logins, OrgBillingState, OrgStateStore};
 use super::*;
@@ -22,7 +22,10 @@ struct TestKeychainHost {
 
 impl TestKeychainHost {
     fn new(f: impl Fn(&SecureReadRequest) -> SecureReadOutcome + Send + Sync + 'static) -> Self {
-        TestKeychainHost { response: Arc::new(f), reads: Mutex::new(0) }
+        TestKeychainHost {
+            response: Arc::new(f),
+            reads: Mutex::new(0),
+        }
     }
     fn read_count(&self) -> usize {
         *self.reads.lock().unwrap()
@@ -104,7 +107,11 @@ fn org_summary_body() -> Vec<u8> {
 }
 
 fn ok_resp(body: Vec<u8>) -> Result<Response, HttpError> {
-    Ok(Response { status: 200, headers: Vec::new(), body })
+    Ok(Response {
+        status: 200,
+        headers: Vec::new(),
+        body,
+    })
 }
 
 #[test]
@@ -115,8 +122,16 @@ fn editor_config_picks_github_dot_com_and_yaml_parses_user() {
     let gh = dir.path().join("hosts.yml");
 
     // Enterprise-only editor config returns None without failing.
-    std::fs::write(&apps, r#"{ "ghe.corp.example:Iv1.x": { "oauth_token": "gho_ent" } }"#).unwrap();
-    let store = CopilotAuthStore { editor_apps_path: apps.clone(), editor_hosts_path: hosts.clone(), gh_hosts_path: gh.clone() };
+    std::fs::write(
+        &apps,
+        r#"{ "ghe.corp.example:Iv1.x": { "oauth_token": "gho_ent" } }"#,
+    )
+    .unwrap();
+    let store = CopilotAuthStore {
+        editor_apps_path: apps.clone(),
+        editor_hosts_path: hosts.clone(),
+        gh_hosts_path: gh.clone(),
+    };
     let host_none = Arc::new(TestKeychainHost::new(|_| SecureReadOutcome::NotFound));
     host::with_test_host(host_none, || {
         assert_eq!(store.load_token(None).unwrap(), None);
@@ -124,14 +139,23 @@ fn editor_config_picks_github_dot_com_and_yaml_parses_user() {
 
     // Multi-host picks github.com.
     std::fs::write(&apps, r#"{ "ghe.corp.example:Iv1.x": { "oauth_token": "gho_ent" }, "github.com:Iv1.y": { "oauth_token": "gho_dotcom" } }"#).unwrap();
-    assert_eq!(store.load_token(None).unwrap().as_deref(), Some("gho_dotcom"));
+    assert_eq!(
+        store.load_token(None).unwrap().as_deref(),
+        Some("gho_dotcom")
+    );
 
     // Malformed editor file falls back if gh hosts.yml has token, else returns InvalidCredentials.
     std::fs::write(&apps, r#"{ "github.com": { "oauth_token": 7 } }"#).unwrap();
-    assert_eq!(store.load_token(None), Err(CopilotAuthError::InvalidCredentials));
+    assert_eq!(
+        store.load_token(None),
+        Err(CopilotAuthError::InvalidCredentials)
+    );
 
     std::fs::write(&gh, "ghe.corp.example:\n    oauth_token: gho_ent\ngithub.com:\n    users:\n        octocat:\n    user: octocat\n    oauth_token: gho_cli\n").unwrap();
-    assert_eq!(yaml_value(&std::fs::read_to_string(&gh).unwrap(), "user", "github.com").as_deref(), Some("octocat"));
+    assert_eq!(
+        yaml_value(&std::fs::read_to_string(&gh).unwrap(), "user", "github.com").as_deref(),
+        Some("octocat")
+    );
     assert_eq!(store.load_token(None).unwrap().as_deref(), Some("gho_cli"));
 }
 
@@ -148,7 +172,11 @@ fn keychain_permission_refusal_and_service_only_guards() {
         SecureReadOutcome::InteractionRequired
     }));
     host::with_test_host(h.clone(), || {
-        let p = CopilotProvider::new(store.clone(), Arc::new(MockClient::new(|_| unreachable!())), Arc::new(MemoryOrgStore::default()));
+        let p = CopilotProvider::new(
+            store.clone(),
+            Arc::new(MockClient::new(|_| unreachable!())),
+            Arc::new(MemoryOrgStore::default()),
+        );
         assert!(p.has_local_credentials());
         let snap = p.refresh(&RefreshContext::new(Scope::Full));
         assert_eq!(snap.error_category, Some(ErrorCategory::CredentialAccess));
@@ -161,15 +189,22 @@ fn keychain_permission_refusal_and_service_only_guards() {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(&store.gh_hosts_path, "github.com:\n  user: octo\n").unwrap();
-        std::fs::set_permissions(&store.gh_hosts_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let h2 = Arc::new(TestKeychainHost::new(|_| panic!("must not query service-only keychain when hosts.yml is unreadable")));
+        std::fs::set_permissions(&store.gh_hosts_path, std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let h2 = Arc::new(TestKeychainHost::new(|_| {
+            panic!("must not query service-only keychain when hosts.yml is unreadable")
+        }));
         host::with_test_host(h2, || {
             let err = store.load_token(None).unwrap_err();
             assert_eq!(err, CopilotAuthError::CredentialsUnreadable);
             assert_eq!(err.message(), CREDENTIALS_UNREADABLE_MSG);
-            assert_eq!(CopilotAuthError::InvalidCredentials.message(), INVALID_CREDENTIALS_MSG);
+            assert_eq!(
+                CopilotAuthError::InvalidCredentials.message(),
+                INVALID_CREDENTIALS_MSG
+            );
         });
-        std::fs::set_permissions(&store.gh_hosts_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&store.gh_hosts_path, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
     }
 }
 
@@ -177,20 +212,50 @@ fn keychain_permission_refusal_and_service_only_guards() {
 fn maps_paid_and_org_managed_seats_and_paginates_org_discovery() {
     let dir = tempfile::tempdir().unwrap();
     let apps = dir.path().join("apps.json");
-    std::fs::write(&apps, r#"{ "github.com": { "oauth_token": "gho_editor" } }"#).unwrap();
-    let store = CopilotAuthStore { editor_apps_path: apps, editor_hosts_path: dir.path().join("h.json"), gh_hosts_path: dir.path().join("gh.yml") };
+    std::fs::write(
+        &apps,
+        r#"{ "github.com": { "oauth_token": "gho_editor" } }"#,
+    )
+    .unwrap();
+    let store = CopilotAuthStore {
+        editor_apps_path: apps,
+        editor_hosts_path: dir.path().join("h.json"),
+        gh_hosts_path: dir.path().join("gh.yml"),
+    };
 
     // 401 -> authExpired, 403 -> http4xx
-    let p401 = CopilotProvider::new(store.clone(), Arc::new(MockClient::new(|_| Ok(Response { status: 401, headers: Vec::new(), body: Vec::new() }))), Arc::new(MemoryOrgStore::default()));
+    let p401 = CopilotProvider::new(
+        store.clone(),
+        Arc::new(MockClient::new(|_| {
+            Ok(Response {
+                status: 401,
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+        })),
+        Arc::new(MemoryOrgStore::default()),
+    );
     let s401 = p401.refresh(&RefreshContext::new(Scope::Full));
     assert_eq!(s401.error_category, Some(ErrorCategory::AuthExpired));
-    assert!(matches!(s401.lines.first(), Some(MetricLine::Badge { text, .. }) if text == TOKEN_INVALID_MSG));
+    assert!(
+        matches!(s401.lines.first(), Some(MetricLine::Badge { text, .. }) if text == TOKEN_INVALID_MSG)
+    );
 
     // Paid plan
-    let p_paid = CopilotProvider::new(store.clone(), Arc::new(MockClient::new(|req: &Request| {
-        assert_eq!(req.headers.iter().find(|(k, _)| k == "Authorization").map(|(_, v)| v.as_str()), Some("token gho_editor"));
-        ok_resp(paid_body())
-    })), Arc::new(MemoryOrgStore::default()));
+    let p_paid = CopilotProvider::new(
+        store.clone(),
+        Arc::new(MockClient::new(|req: &Request| {
+            assert_eq!(
+                req.headers
+                    .iter()
+                    .find(|(k, _)| k == "Authorization")
+                    .map(|(_, v)| v.as_str()),
+                Some("token gho_editor")
+            );
+            ok_resp(paid_body())
+        })),
+        Arc::new(MemoryOrgStore::default()),
+    );
     let s_paid = p_paid.refresh(&RefreshContext::new(Scope::Full));
     assert_eq!(s_paid.plan.as_deref(), Some("Pro"));
     assert_eq!(s_paid.lines.len(), 1);
@@ -206,13 +271,20 @@ fn maps_paid_and_org_managed_seats_and_paginates_org_discovery() {
         } else if req.url == client::USER_ORGS_URL {
             Ok(Response {
                 status: 200,
-                headers: vec![("Link".into(), r#"<https://api.github.com/user/orgs?per_page=100&page=2>; rel="next""#.into())],
+                headers: vec![(
+                    "Link".into(),
+                    r#"<https://api.github.com/user/orgs?per_page=100&page=2>; rel="next""#.into(),
+                )],
                 body: serde_json::to_vec(&json!([{"login": "member-0"}])).unwrap(),
             })
         } else if req.url.contains("page=2") {
             ok_resp(serde_json::to_vec(&json!([{"login": "acme"}])).unwrap())
         } else if req.url.contains("/orgs/member-0/") {
-            Ok(Response { status: 404, headers: Vec::new(), body: Vec::new() })
+            Ok(Response {
+                status: 404,
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
         } else {
             ok_resp(org_summary_body())
         }
@@ -230,7 +302,11 @@ fn maps_paid_and_org_managed_seats_and_paginates_org_discovery() {
     // Cached org skips /user/orgs
     requests.lock().unwrap().clear();
     let _ = p_org.refresh(&ctx);
-    assert!(!requests.lock().unwrap().iter().any(|u| u.contains("/user/orgs")));
+    assert!(!requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|u| u.contains("/user/orgs")));
 
     // Rate-limit header sets cooldown
     let rl_store = Arc::new(MemoryOrgStore::default());
@@ -238,11 +314,20 @@ fn maps_paid_and_org_managed_seats_and_paginates_org_discovery() {
         if req.url == client::USAGE_URL {
             ok_resp(org_managed_body(None))
         } else {
-            Ok(Response { status: 429, headers: vec![("Retry-After".into(), "120".into())], body: Vec::new() })
+            Ok(Response {
+                status: 429,
+                headers: vec![("Retry-After".into(), "120".into())],
+                body: Vec::new(),
+            })
         }
     }));
     let p_rl = CopilotProvider::new(store, rl_client, rl_store.clone());
     let _ = p_rl.refresh(&ctx);
     assert!(rl_store.load().rate_limit_retry_after.unwrap() >= ctx.now + 119.0);
-    let _ = (NOT_LOGGED_IN_MSG, HashMap::<String, String>::new(), MetricKind::Count, org_logins(b"[]"));
+    let _ = (
+        NOT_LOGGED_IN_MSG,
+        HashMap::<String, String>::new(),
+        MetricKind::Count,
+        org_logins(b"[]"),
+    );
 }

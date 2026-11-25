@@ -15,9 +15,13 @@ use std::io;
 const SHA3_SIZES: [usize; 4] = [224, 256, 384, 512];
 
 pub fn register(connection: &Connection) -> Result<()> {
-    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS | FunctionFlags::SQLITE_DETERMINISTIC;
+    let flags = FunctionFlags::SQLITE_UTF8
+        | FunctionFlags::SQLITE_INNOCUOUS
+        | FunctionFlags::SQLITE_DETERMINISTIC;
     connection.create_scalar_function("sha3", 1, flags, |ctx| scalar_sha3(ctx, 0, 256))?;
-    connection.create_scalar_function("sha3", 2, flags, |ctx| scalar_sha3(ctx, 0, context_integer(ctx, 1).unwrap_or(0)))?;
+    connection.create_scalar_function("sha3", 2, flags, |ctx| {
+        scalar_sha3(ctx, 0, context_integer(ctx, 1).unwrap_or(0))
+    })?;
     connection.create_aggregate_function("sha3_agg", 1, flags, Sha3Aggregate)?;
     connection.create_aggregate_function("sha3_agg", 2, flags, Sha3Aggregate)?;
     Ok(())
@@ -57,7 +61,10 @@ fn scalar_sha3(ctx: &Context<'_>, index: usize, size: i64) -> Result<Option<Vec<
 }
 
 fn user_error(message: &str) -> Error {
-    Error::UserFunctionError(Box::new(io::Error::new(io::ErrorKind::InvalidInput, message)))
+    Error::UserFunctionError(Box::new(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        message,
+    )))
 }
 
 struct Sha3Aggregate;
@@ -109,7 +116,12 @@ struct Sha3 {
 impl Sha3 {
     fn new(bits: usize) -> Self {
         let rate = (1600 - 2 * bits) / 8;
-        Self { state: [0; 25], rate, output: bits / 8, loaded: 0 }
+        Self {
+            state: [0; 25],
+            rate,
+            output: bits / 8,
+            loaded: 0,
+        }
     }
 
     fn update(&mut self, mut data: &[u8]) {
@@ -133,7 +145,9 @@ impl Sha3 {
         let last = self.rate - 1;
         self.state[last / 8] ^= 0x80u64 << (8 * (last % 8));
         keccak_f1600(&mut self.state);
-        (0..self.output).map(|index| (self.state[index / 8] >> (8 * (index % 8))) as u8).collect()
+        (0..self.output)
+            .map(|index| (self.state[index / 8] >> (8 * (index % 8))) as u8)
+            .collect()
     }
 }
 
@@ -145,15 +159,37 @@ fn sha3(data: &[u8], bits: usize) -> Vec<u8> {
 
 fn keccak_f1600(a: &mut [u64; 25]) {
     const ROUND_CONSTANTS: [u64; 24] = [
-        0x0000_0000_0000_0001, 0x0000_0000_0000_8082, 0x8000_0000_0000_808a, 0x8000_0000_8000_8000,
-        0x0000_0000_0000_808b, 0x0000_0000_8000_0001, 0x8000_0000_8000_8081, 0x8000_0000_0000_8009,
-        0x0000_0000_0000_008a, 0x0000_0000_0000_0088, 0x0000_0000_8000_8009, 0x0000_0000_8000_000a,
-        0x0000_0000_8000_808b, 0x8000_0000_0000_008b, 0x8000_0000_0000_8089, 0x8000_0000_0000_8003,
-        0x8000_0000_0000_8002, 0x8000_0000_0000_0080, 0x0000_0000_0000_800a, 0x8000_0000_8000_000a,
-        0x8000_0000_8000_8081, 0x8000_0000_0000_8080, 0x0000_0000_8000_0001, 0x8000_0000_8000_8008,
+        0x0000_0000_0000_0001,
+        0x0000_0000_0000_8082,
+        0x8000_0000_0000_808a,
+        0x8000_0000_8000_8000,
+        0x0000_0000_0000_808b,
+        0x0000_0000_8000_0001,
+        0x8000_0000_8000_8081,
+        0x8000_0000_0000_8009,
+        0x0000_0000_0000_008a,
+        0x0000_0000_0000_0088,
+        0x0000_0000_8000_8009,
+        0x0000_0000_8000_000a,
+        0x0000_0000_8000_808b,
+        0x8000_0000_0000_008b,
+        0x8000_0000_0000_8089,
+        0x8000_0000_0000_8003,
+        0x8000_0000_0000_8002,
+        0x8000_0000_0000_0080,
+        0x0000_0000_0000_800a,
+        0x8000_0000_8000_000a,
+        0x8000_0000_8000_8081,
+        0x8000_0000_0000_8080,
+        0x0000_0000_8000_0001,
+        0x8000_0000_8000_8008,
     ];
-    const ROTATIONS: [u32; 24] = [1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44];
-    const PI_LANES: [usize; 24] = [10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1];
+    const ROTATIONS: [u32; 24] = [
+        1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
+    ];
+    const PI_LANES: [usize; 24] = [
+        10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
+    ];
 
     for rc in ROUND_CONSTANTS {
         let mut columns = [0u64; 5];
@@ -174,7 +210,13 @@ fn keccak_f1600(a: &mut [u64; 25]) {
             carried = next;
         }
         for y in 0..5 {
-            let row = [a[5 * y], a[5 * y + 1], a[5 * y + 2], a[5 * y + 3], a[5 * y + 4]];
+            let row = [
+                a[5 * y],
+                a[5 * y + 1],
+                a[5 * y + 2],
+                a[5 * y + 3],
+                a[5 * y + 4],
+            ];
             for x in 0..5 {
                 a[5 * y + x] = row[x] ^ ((!row[(x + 1) % 5]) & row[(x + 2) % 5]);
             }
@@ -202,20 +244,47 @@ mod tests {
 
     #[test]
     fn known_sha3_vectors_match_fips_202() {
-        assert_eq!(hex(&sha3(b"", 256)), "A7FFC6F8BF1ED76651C14756A061D662F580FF4DE43B49FA82D80A4B80F8434A");
-        assert_eq!(hex(&sha3(b"abc", 256)), "3A985DA74FE225B2045C172D6BD390BD855F086E3E9D525B46BFE24511431532");
+        assert_eq!(
+            hex(&sha3(b"", 256)),
+            "A7FFC6F8BF1ED76651C14756A061D662F580FF4DE43B49FA82D80A4B80F8434A"
+        );
+        assert_eq!(
+            hex(&sha3(b"abc", 256)),
+            "3A985DA74FE225B2045C172D6BD390BD855F086E3E9D525B46BFE24511431532"
+        );
         assert_eq!(hex(&sha3(b"abc", 512)), "B751850B1A57168A5693CD924B6B096E08F621827444F70D884F5D0240D2712E10E116E9192AF3C91A7EC57647E3934057340B4CF408D5A56592F8274EEC53F0");
-        assert_eq!(hex(&sha3(b"abc", 224)), "E642824C3F8CF24AD09234EE7D3C766FC9A3A5168D0C94AD73B46FDF");
+        assert_eq!(
+            hex(&sha3(b"abc", 224)),
+            "E642824C3F8CF24AD09234EE7D3C766FC9A3A5168D0C94AD73B46FDF"
+        );
     }
 
     #[test]
     fn block_boundary_and_binary_inputs_hash_exact_bytes() {
-        assert_eq!(hex(&sha3(&vec![0xA3; 134], 256)), "DC08CF7A2561019DC6BEA3E6A8321FFB1D94618234EF605407246EE2D98503DD");
-        assert_eq!(hex(&sha3(&vec![0xA3; 135], 256)), "D51927265CA4BF0CC8B4453387700918C03F8894E395AD437D4573F3BE4D2C34");
-        assert_eq!(hex(&sha3(&vec![0xA3; 136], 256)), "0ADF6BFB359AE40019B67D8C49C361574B70242A6B752DE6F9E0D426CA177F7A");
-        assert_eq!(hex(&sha3(&vec![0xA3; 137], 256)), "E2FA06EAA22FE60106AF67D5F6EA093FE58F07D2DCFB06D51057953F114849A7");
-        assert_eq!(hex(&sha3("héllo — 漢字".as_bytes(), 256)), "DB8D1D2DB81381690D1CC6BC64E8290F88D2C572403573DCDD1F10A5A8C262BB");
-        assert_eq!(hex(&sha3(b"a\0b", 256)), "B476FD9CC202C304856E5B838839A737FBAAA96A2F44808F8C28C8CFF135DB22");
+        assert_eq!(
+            hex(&sha3(&vec![0xA3; 134], 256)),
+            "DC08CF7A2561019DC6BEA3E6A8321FFB1D94618234EF605407246EE2D98503DD"
+        );
+        assert_eq!(
+            hex(&sha3(&vec![0xA3; 135], 256)),
+            "D51927265CA4BF0CC8B4453387700918C03F8894E395AD437D4573F3BE4D2C34"
+        );
+        assert_eq!(
+            hex(&sha3(&vec![0xA3; 136], 256)),
+            "0ADF6BFB359AE40019B67D8C49C361574B70242A6B752DE6F9E0D426CA177F7A"
+        );
+        assert_eq!(
+            hex(&sha3(&vec![0xA3; 137], 256)),
+            "E2FA06EAA22FE60106AF67D5F6EA093FE58F07D2DCFB06D51057953F114849A7"
+        );
+        assert_eq!(
+            hex(&sha3("héllo — 漢字".as_bytes(), 256)),
+            "DB8D1D2DB81381690D1CC6BC64E8290F88D2C572403573DCDD1F10A5A8C262BB"
+        );
+        assert_eq!(
+            hex(&sha3(b"a\0b", 256)),
+            "B476FD9CC202C304856E5B838839A737FBAAA96A2F44808F8C28C8CFF135DB22"
+        );
     }
 
     #[test]
@@ -226,19 +295,42 @@ mod tests {
              CREATE TABLE mixed(v); INSERT INTO mixed VALUES('a' || char(233)), (NULL), (x''), ('');",
         );
         let q = |sql: &str| query_text(db.path(), sql, false).unwrap();
-        assert_eq!(q("SELECT hex(sha3_agg(v)) FROM text_values;").as_deref(), Some("F0EE07121659E51396268FFD44F6CF5A846D0F3AFCC8CAFD3DF355B5C39B7714"));
-        assert_eq!(q("SELECT hex(sha3_agg(v)) FROM blob_values;").as_deref(), Some("BFBB654D136BB56C5D89B6AC613976B305CCE3C742E2258ACCACBC02E2A66636"));
-        assert_eq!(q("SELECT hex(sha3_agg(v)) FROM mixed;").as_deref(), Some("DBE6E4CBCE7E950DDB8B81215EA1DFB23425FF4098C4C1C10E875C426746B310"));
-        assert_eq!(q("SELECT hex(sha3_agg(x)) FROM (SELECT 100.015625 AS x);").as_deref(), Some("68FD5A3E7E1937BCB6CBCA67982D56270F0DC302AAD76FF4CBF88654462486EB"));
-        assert_eq!(q("SELECT hex(sha3_agg(x)) FROM (SELECT NULL AS x);").as_deref(), Some("345BAAA13BBE3A40695DB7697FBE3F64206323B77CF3635902106F9F29667361"));
+        assert_eq!(
+            q("SELECT hex(sha3_agg(v)) FROM text_values;").as_deref(),
+            Some("F0EE07121659E51396268FFD44F6CF5A846D0F3AFCC8CAFD3DF355B5C39B7714")
+        );
+        assert_eq!(
+            q("SELECT hex(sha3_agg(v)) FROM blob_values;").as_deref(),
+            Some("BFBB654D136BB56C5D89B6AC613976B305CCE3C742E2258ACCACBC02E2A66636")
+        );
+        assert_eq!(
+            q("SELECT hex(sha3_agg(v)) FROM mixed;").as_deref(),
+            Some("DBE6E4CBCE7E950DDB8B81215EA1DFB23425FF4098C4C1C10E875C426746B310")
+        );
+        assert_eq!(
+            q("SELECT hex(sha3_agg(x)) FROM (SELECT 100.015625 AS x);").as_deref(),
+            Some("68FD5A3E7E1937BCB6CBCA67982D56270F0DC302AAD76FF4CBF88654462486EB")
+        );
+        assert_eq!(
+            q("SELECT hex(sha3_agg(x)) FROM (SELECT NULL AS x);").as_deref(),
+            Some("345BAAA13BBE3A40695DB7697FBE3F64206323B77CF3635902106F9F29667361")
+        );
         assert_eq!(q("SELECT hex(sha3_agg(v)) FROM text_values WHERE 0;"), None);
-        assert_eq!(q("SELECT hex(sha3('hello'));").as_deref(), Some("3338BE694F50C5F338814986CDF0686453A888B84F424D792AF4B9202398F392"));
-        assert_eq!(q("SELECT hex(sha3(1));").as_deref(), Some("67B176705B46206614219F47A05AEE7AE6A3EDBE850BBBE214C536B989AEA4D2"));
+        assert_eq!(
+            q("SELECT hex(sha3('hello'));").as_deref(),
+            Some("3338BE694F50C5F338814986CDF0686453A888B84F424D792AF4B9202398F392")
+        );
+        assert_eq!(
+            q("SELECT hex(sha3(1));").as_deref(),
+            Some("67B176705B46206614219F47A05AEE7AE6A3EDBE850BBBE214C536B989AEA4D2")
+        );
         assert_eq!(q("SELECT hex(sha3(NULL));"), None);
         assert!(query_text(db.path(), "SELECT hex(sha3('x', 200));", false).is_err());
 
         let conn = open_read_only(db.path()).unwrap().unwrap();
-        let digest: String = conn.query_row("SELECT hex(sha3('hello'))", [], |row| row.get(0)).unwrap();
+        let digest: String = conn
+            .query_row("SELECT hex(sha3('hello'))", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(digest.len(), 64);
     }
 }

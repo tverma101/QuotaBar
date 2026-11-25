@@ -8,9 +8,9 @@ mod sessions_cache;
 pub mod transcripts;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod local_tests;
+#[cfg(test)]
+mod tests;
 
 pub use auth::{
     clean_api_server_url, read_toml_string, CredentialsUnreadable, DevinAuth, DevinAuthStore,
@@ -27,7 +27,9 @@ use crate::accounting::{
 };
 use crate::context::RefreshContext;
 use crate::http::{self, HttpClient};
-use crate::model::{ErrorCategory, MetricLine, ProviderInfo, ProviderSnapshot, ProviderUsageHistory};
+use crate::model::{
+    ErrorCategory, MetricLine, ProviderInfo, ProviderSnapshot, ProviderUsageHistory,
+};
 use crate::pricing;
 use client::{attempt, Attempt, Failure};
 use std::sync::Arc;
@@ -48,7 +50,10 @@ pub struct DevinProvider {
 impl DevinProvider {
     pub fn new(auth: DevinAuthStore, http: Arc<dyn HttpClient>) -> Self {
         DevinProvider {
-            info: ProviderInfo { id: ID.into(), display_name: "Devin".into() },
+            info: ProviderInfo {
+                id: ID.into(),
+                display_name: "Devin".into(),
+            },
             auth,
             http,
             local_scanner: DevinTranscriptUsageScanner::live(),
@@ -64,6 +69,7 @@ impl DevinProvider {
         DevinProvider::new(DevinAuthStore::live(), http::shared())
     }
 
+    /// An explicit key belongs to the caller's account; never fall back to machine credentials.
     pub fn refresh_with_api_key(
         &self,
         ctx: &RefreshContext,
@@ -74,6 +80,26 @@ impl DevinProvider {
             return self.local_only_snapshot(ctx);
         }
 
+        let error = |message: &str, category| {
+            ProviderSnapshot::error(&self.info, message, category, ctx.now)
+        };
+        if let Some(api_key) = api_key {
+            let api_key = api_key.trim();
+            if api_key.is_empty() {
+                return error(NOT_LOGGED_IN, ErrorCategory::NotLoggedIn);
+            }
+            let auth = DevinAuth {
+                api_key: api_key.into(),
+                api_server_url: None,
+            };
+            return match attempt(self.http.as_ref(), &auth, ctx, deadline) {
+                Attempt::Success(mapped) => self.finish_snapshot(mapped, ctx),
+                Attempt::AuthFailure => error(NOT_LOGGED_IN, ErrorCategory::NotLoggedIn),
+                Attempt::Failed(failure) => error(&failure.message(), failure.category()),
+                Attempt::Cancelled => cancelled_snapshot(&self.info, ctx),
+            };
+        }
+
         let mut saw_api_key = false;
         let mut saw_auth_failure = false;
         let mut source_unreadable = false;
@@ -81,7 +107,10 @@ impl DevinProvider {
         let mut attempted: Vec<(String, String)> = Vec::new();
 
         let mut try_auth = |auth: DevinAuth, this: &Self| -> Option<ProviderSnapshot> {
-            let fingerprint = (auth.api_key.clone(), auth.effective_api_server_url().to_string());
+            let fingerprint = (
+                auth.api_key.clone(),
+                auth.effective_api_server_url().to_string(),
+            );
             if attempted.contains(&fingerprint) {
                 return None;
             }
@@ -101,11 +130,7 @@ impl DevinProvider {
             }
         };
 
-        let credential = match api_key.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(api_key) => Ok(Some(DevinAuth { api_key: api_key.into(), api_server_url: None })),
-            None => self.auth.load_credentials_file(),
-        };
-        match credential {
+        match self.auth.load_credentials_file() {
             Ok(Some(auth)) => {
                 if let Some(snapshot) = try_auth(auth, self) {
                     return snapshot;
@@ -129,7 +154,6 @@ impl DevinProvider {
             }
         }
 
-        let error = |message: &str, category| ProviderSnapshot::error(&self.info, message, category, ctx.now);
         if source_unreadable {
             return error(CREDENTIALS_UNREADABLE, ErrorCategory::CredentialAccess);
         }
@@ -152,7 +176,8 @@ impl DevinProvider {
         } else {
             None
         };
-        ProviderSnapshot::new(&self.info, Some(mapped.plan), lines, ctx.now).with_usage_history(history)
+        ProviderSnapshot::new(&self.info, Some(mapped.plan), lines, ctx.now)
+            .with_usage_history(history)
     }
 
     fn local_only_snapshot(&self, ctx: &RefreshContext) -> ProviderSnapshot {
@@ -162,14 +187,20 @@ impl DevinProvider {
         ProviderSnapshot::new(&self.info, None, lines, ctx.now).with_usage_history(history)
     }
 
-    fn append_local_usage(&self, lines: &mut Vec<MetricLine>, ctx: &RefreshContext) -> Option<ProviderUsageHistory> {
+    fn append_local_usage(
+        &self,
+        lines: &mut Vec<MetricLine>,
+        ctx: &RefreshContext,
+    ) -> Option<ProviderUsageHistory> {
         if ctx.is_cancelled() {
             return None;
         }
         let days_back = UsageHistoryWindow::lifetime_days(ctx.now, DayZone::Local);
         let skip = ctx.skip_model_catalog_refresh;
         let pricing_fn = || pricing::shared().current(skip);
-        let scan = self.local_scanner.scan(days_back, ctx.now, &pricing_fn, &ctx.cancel)?;
+        let scan = self
+            .local_scanner
+            .scan(days_back, ctx.now, &pricing_fn, &ctx.cancel)?;
         let opts = TokenUsageOptions {
             estimated: true,
             unknown_models_by_day: scan.unknown_models_by_day.clone(),
@@ -180,7 +211,14 @@ impl DevinProvider {
             estimated_cost_days: scan.estimated_cost_days.clone(),
         };
         append_token_usage(&scan.series, lines, ctx.now, &opts);
-        append_usage_trend(&scan.series, lines, ctx.now, LOCAL_SOURCE_NOTE, &Default::default(), None);
+        append_usage_trend(
+            &scan.series,
+            lines,
+            ctx.now,
+            LOCAL_SOURCE_NOTE,
+            &Default::default(),
+            None,
+        );
         Some(ProviderUsageHistory {
             series: scan.series,
             model_usage: scan.model_usage,
@@ -203,7 +241,10 @@ impl ProviderRuntime for DevinProvider {
             Ok(Some(_)) | Err(CredentialsUnreadable) => return true,
             Ok(None) => {}
         }
-        self.auth.state_db_paths().iter().any(|path| !matches!(self.auth.load_app_auth(path), Ok(None)))
+        self.auth
+            .state_db_paths()
+            .iter()
+            .any(|path| !matches!(self.auth.load_app_auth(path), Ok(None)))
     }
 
     fn refresh(&self, ctx: &RefreshContext) -> ProviderSnapshot {

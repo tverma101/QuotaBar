@@ -79,4 +79,42 @@ final class WidgetDataStoreObservationTests: XCTestCase {
             "a provider without an error must not republish the error map"
         )
     }
+
+    func testUsageHistoryObservationIgnoresMeterUpdatesAndTracksHistoryRemoval() {
+        let provider = Provider(id: "alpha", displayName: "Alpha", icon: .providerMark("codex"))
+        let descriptor = WidgetDescriptor.percent(id: "alpha.session", provider: provider, title: "Session")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = makeStore(
+            provider: provider,
+            descriptor: descriptor,
+            defaults: makeUserDefaults("history-observation"),
+            now: now
+        )
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: [
+            DailyUsageEntry(date: "2027-01-15", totalTokens: 125, costUSD: 0.01)
+        ]))
+        store.snapshots[provider.id] = ProviderSnapshot(
+            providerID: provider.id,
+            displayName: provider.displayName,
+            lines: [],
+            usageHistory: history
+        )
+        let revision = store.historyPresentationRevision
+        let historyChanged = ObservationFlag()
+        withObservationTracking {
+            _ = store.historyPresentationRevision
+        } onChange: {
+            historyChanged.set()
+        }
+
+        store.snapshots[provider.id]?.lines = [
+            .progress(label: "Session", used: 40, limit: 100, format: .percent)
+        ]
+        XCTAssertFalse(historyChanged.value)
+        XCTAssertEqual(store.historyPresentationRevision, revision)
+
+        store.snapshots.removeValue(forKey: provider.id)
+        XCTAssertTrue(historyChanged.value)
+        XCTAssertEqual(store.historyPresentationRevision, revision + 1)
+    }
 }

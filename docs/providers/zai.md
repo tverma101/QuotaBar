@@ -19,7 +19,9 @@ local ZCode entitlement snapshot instead.
 ## Where credentials come from
 
 QuotaBar uses an API key for Coding Plan quotas. Weekend Build and the local usage history read ZCode
-data on this Mac independently and do not need a key.
+data on this Mac independently and do not need a key. Without a key, a ZCode user's card shows that
+local usage with no error, and the quick menu-bar checks between full refreshes do not report a
+missing key either.
 QuotaBar reads it from the first place it finds one, in this order:
 
 1. `~/.config/quotabar/zai.json` — `{"apiKey":"…"}` (the file Settings writes to)
@@ -81,7 +83,8 @@ allowance, so that meter is hidden rather than drawn empty.
 
 ## Troubleshooting
 
-- **"No Z.ai API key"** — add a key in Settings → API Keys, or export `ZAI_API_KEY`.
+- **"No Z.ai API key"** — add a key in Settings → API Keys, or export `ZAI_API_KEY`. This appears only
+  when this Mac also has no ZCode data; with ZCode data the card shows local usage instead.
 - **"Couldn't read the saved Z.ai API key"** — a saved config file exists but QuotaBar can't read it. The API Keys card shows an orange repair state; a valid environment key remains active and is labeled as a fallback. Check file permissions, enter a replacement, or remove the saved file, then refresh.
 - **"Z.ai API key invalid"** — the key was rejected (401/403). Regenerate it in the
   [Z.ai console](https://z.ai/manage-apikey/apikey-list).

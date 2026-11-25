@@ -9,16 +9,19 @@ mod format;
 mod merge;
 pub mod presentation;
 pub mod scan;
-pub mod spend_tiles;
 mod spend_model;
+pub mod spend_tiles;
 
 pub use accumulator::{DailyUsageAccumulator, RowOptions};
 pub use collate::localized_standard_compare;
+pub use day::{day_key, day_key_from_usage_date, day_key_in, DayZone, UsageHistoryWindow};
 pub use format::format_count_row;
-pub use day::{day_key, day_key_in, day_key_from_usage_date, DayZone, UsageHistoryWindow};
 pub use merge::{codex_cross_source_model_identity, default_model_identity};
 pub use scan::LogUsageScan;
-pub use spend_tiles::{append_token_usage, append_token_usage_in, append_usage_trend, append_usage_trend_in, TokenUsageOptions};
+pub use spend_tiles::{
+    append_token_usage, append_token_usage_in, append_usage_trend, append_usage_trend_in,
+    TokenUsageOptions,
+};
 
 use crate::model::DailyUsageEntry;
 

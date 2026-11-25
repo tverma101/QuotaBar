@@ -7,6 +7,11 @@ enum RustEngineHost {
     private static let environment = ProcessEnvironmentReader()
     private static let keychain = SecurityKeychainAccessor()
     private static let refreshes = Mutex<[UInt64: Refresh]>([:])
+    private static let claudeDesktopKeyCache = Mutex<SafeStorageKeyCache?>(nil)
+
+    static func useClaudeDesktopKeyCache(_ cache: SafeStorageKeyCache) {
+        claudeDesktopKeyCache.withLock { $0 = cache }
+    }
 
     struct Refresh: Sendable {
         let context = ProviderRefreshContext.detachedValues
@@ -34,14 +39,18 @@ enum RustEngineHost {
         _ = refreshes.withLock { $0.removeValue(forKey: id) }
     }
 
-    static func handle(_ request: Data, keychain: any KeychainAccessing = keychain) -> String? {
+    static func handle(
+        _ request: Data,
+        keychain: any KeychainAccessing = keychain,
+        claudeKeyCache: SafeStorageKeyCache? = claudeDesktopKeyCache.withLock { $0 }
+    ) -> String? {
         do {
             let envelope = try JSONDecoder().decode(Request.self, from: request)
             switch envelope.method {
             case "env":
                 return try encode(envelope.params.name.flatMap { environment.value(for: $0) })
             case "secureRead":
-                return try encode(read(envelope.params, keychain: keychain))
+                return try encode(read(envelope.params, keychain: keychain, claudeKeyCache: claudeKeyCache))
             case "secureWrite":
                 return try encode(write(envelope.params, keychain: keychain))
             case "secureDelete":
@@ -60,7 +69,9 @@ enum RustEngineHost {
         }
     }
 
-    private static func read(_ params: Parameters, keychain: any KeychainAccessing) -> Response {
+    private static func read(
+        _ params: Parameters, keychain: any KeychainAccessing, claudeKeyCache: SafeStorageKeyCache?
+    ) -> Response {
         guard let service = params.service else {
             return Response(status: "failed", message: "Keychain service is missing.")
         }
@@ -70,17 +81,27 @@ enum RustEngineHost {
                 return Response(status: "cancelled")
             }
             return refresh.withValue {
-                read(params, service: service, account: account, keychain: keychain)
+                read(params, service: service, account: account, keychain: keychain, claudeKeyCache: claudeKeyCache)
             }
         }
         return ProviderRefreshContext.$isManual.withValue(false) {
-            read(params, service: service, account: account, keychain: keychain)
+            read(params, service: service, account: account, keychain: keychain, claudeKeyCache: claudeKeyCache)
         }
     }
 
     private static func read(
-        _ params: Parameters, service: String, account: String?, keychain: any KeychainAccessing
+        _ params: Parameters, service: String, account: String?, keychain: any KeychainAccessing,
+        claudeKeyCache: SafeStorageKeyCache?
     ) -> Response {
+        guard !ProviderRefreshContext.credentialReadIsCancelled else { return Response(status: "cancelled") }
+        // Account discovery may already hold a one-time Safe Storage grant. Reuse it through
+        // the host callback so the refresh does not require another prompt or put it in config.
+        if service == ClaudeDesktopSafeStorageKeyReader.service,
+           account == ClaudeDesktopSafeStorageKeyReader.account,
+           let data = claudeKeyCache?.value,
+           let password = String(data: data, encoding: .utf8), !password.isEmpty {
+            return Response(status: "found", value: password)
+        }
         do {
             let mayInteract = params.allowInteraction == true && ProviderRefreshContext.isManual
                 && ProviderRefreshContext.credentialInteractionGate != nil

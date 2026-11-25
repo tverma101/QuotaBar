@@ -39,7 +39,9 @@ pub enum GrokUsageError {
 impl GrokUsageError {
     pub fn message(self) -> String {
         match self {
-            GrokUsageError::ConnectionFailed => "Grok billing request failed. Check your connection.".into(),
+            GrokUsageError::ConnectionFailed => {
+                "Grok billing request failed. Check your connection.".into()
+            }
             GrokUsageError::InvalidResponse => "Grok billing response changed.".into(),
             GrokUsageError::RequestFailed(status) => {
                 format!("Grok billing request failed (HTTP {status}). Try again later.")
@@ -132,7 +134,11 @@ pub fn map_credits_config(body: &[u8]) -> Result<Vec<MetricLine>, GrokUsageError
     } else {
         "Disabled".to_string()
     };
-    let color = if config.on_demand_cap > 0.0 { "#22c55e" } else { "#a3a3a3" };
+    let color = if config.on_demand_cap > 0.0 {
+        "#22c55e"
+    } else {
+        "#a3a3a3"
+    };
     lines.push(MetricLine::badge("Pay as you go", &text, Some(color)));
     Ok(lines)
 }

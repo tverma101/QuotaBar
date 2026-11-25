@@ -20,7 +20,9 @@ impl std::fmt::Display for CodecError {
         f.write_str(match self {
             CodecError::NotAnObject => "Pricing feed is not a JSON object.",
             CodecError::NoUsableEntries => "Pricing feed contained no usable model entries.",
-            CodecError::IncompleteModelList => "OpenRouter returned a paginated or incomplete model list.",
+            CodecError::IncompleteModelList => {
+                "OpenRouter returned a paginated or incomplete model list."
+            }
         })
     }
 }
@@ -40,7 +42,9 @@ fn valid_per_million(value: Option<&Value>) -> Option<f64> {
 }
 
 fn per_million_from_per_token(value: Option<&Value>) -> Option<f64> {
-    number(value).filter(|r| r.is_finite() && *r >= 0.0 && *r <= MAX_PER_MILLION / 1_000_000.0).map(|r| r * 1_000_000.0)
+    number(value)
+        .filter(|r| r.is_finite() && *r >= 0.0 && *r <= MAX_PER_MILLION / 1_000_000.0)
+        .map(|r| r * 1_000_000.0)
 }
 
 /// OpenRouter writes per-token prices as decimal strings.
@@ -54,7 +58,9 @@ fn nonnegative_finite(value: Option<&Value>) -> Option<f64> {
 }
 
 fn open_router_rate(value: Option<&Value>) -> Option<f64> {
-    nonnegative_finite(value).filter(|r| *r <= f64::MAX / 1_000_000.0).map(|r| r * 1_000_000.0)
+    nonnegative_finite(value)
+        .filter(|r| *r <= f64::MAX / 1_000_000.0)
+        .map(|r| r * 1_000_000.0)
 }
 
 pub(crate) fn integer(value: Option<&Value>) -> Option<i64> {
@@ -77,9 +83,15 @@ pub struct OpenRouterPage {
 
 pub fn open_router_page(data: &[u8]) -> Result<OpenRouterPage, CodecError> {
     let root: Value = serde_json::from_slice(data).map_err(|_| CodecError::IncompleteModelList)?;
-    let models = root.get("data").and_then(Value::as_array).filter(|m| m.iter().all(Value::is_object));
+    let models = root
+        .get("data")
+        .and_then(Value::as_array)
+        .filter(|m| m.iter().all(Value::is_object));
     let total = integer(root.get("total_count"));
-    let next = root.get("links").and_then(Value::as_object).and_then(|l| l.get("next"));
+    let next = root
+        .get("links")
+        .and_then(Value::as_object)
+        .and_then(|l| l.get("next"));
     let (Some(models), Some(total_count), Some(next)) = (models, total, next) else {
         return Err(CodecError::IncompleteModelList);
     };
@@ -88,7 +100,11 @@ pub fn open_router_page(data: &[u8]) -> Result<OpenRouterPage, CodecError> {
         Value::String(url) => Some(offset_query(url).ok_or(CodecError::IncompleteModelList)?),
         _ => return Err(CodecError::IncompleteModelList),
     };
-    Ok(OpenRouterPage { models: models.clone(), total_count, next_offset })
+    Ok(OpenRouterPage {
+        models: models.clone(),
+        total_count,
+        next_offset,
+    })
 }
 
 fn offset_query(url: &str) -> Option<i64> {
@@ -112,7 +128,10 @@ pub fn catalog_from_open_router(data: &[u8]) -> Result<PricingCatalog, CodecErro
         .filter(|m| m.iter().all(Value::is_object))
         .ok_or(CodecError::NotAnObject)?;
     let complete = integer(root.get("total_count")) == Some(models.len() as i64)
-        && root.get("links").and_then(|l| l.get("next")).is_some_and(Value::is_null);
+        && root
+            .get("links")
+            .and_then(|l| l.get("next"))
+            .is_some_and(Value::is_null);
     if !complete {
         return Err(CodecError::IncompleteModelList);
     }
@@ -120,13 +139,20 @@ pub fn catalog_from_open_router(data: &[u8]) -> Result<PricingCatalog, CodecErro
     let mut routes: HashMap<String, ModelRates> = HashMap::with_capacity(models.len());
     let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
     for model in models {
-        let Some(key) = model.get("id").and_then(Value::as_str).map(str::trim) else { continue };
+        let Some(key) = model.get("id").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
         if key.is_empty() || routes.contains_key(key) {
             continue;
         }
-        let Some(pricing) = model.get("pricing").and_then(Value::as_object) else { continue };
+        let Some(pricing) = model.get("pricing").and_then(Value::as_object) else {
+            continue;
+        };
         let limit = f64::MAX / 1_000_000.0;
-        let (Some(prompt), Some(completion)) = (nonnegative_finite(pricing.get("prompt")), nonnegative_finite(pricing.get("completion"))) else {
+        let (Some(prompt), Some(completion)) = (
+            nonnegative_finite(pricing.get("prompt")),
+            nonnegative_finite(pricing.get("completion")),
+        ) else {
             continue;
         };
         if prompt > limit || completion > limit {
@@ -150,7 +176,10 @@ pub fn catalog_from_open_router(data: &[u8]) -> Result<PricingCatalog, CodecErro
 
         let parts: Vec<&str> = key.split('/').collect();
         if parts.len() == 2 && !parts[1].contains(':') && !parts[1].is_empty() {
-            aliases.entry(parts[1].to_lowercase()).or_default().push(key.to_string());
+            aliases
+                .entry(parts[1].to_lowercase())
+                .or_default()
+                .push(key.to_string());
         }
     }
     if routes.is_empty() {
@@ -169,8 +198,17 @@ pub fn catalog_from_open_router(data: &[u8]) -> Result<PricingCatalog, CodecErro
 
 /// Only `min_prompt_tokens` overrides are request-size tiers (time/day lanes are handled below).
 fn open_router_prompt_tiers(value: Option<&Value>, model_id: &str) -> Vec<PromptRateTier> {
-    let Some(overrides) = object_array(value) else { return Vec::new() };
-    let slug = model_id.split('/').last().unwrap_or("").split(':').next().unwrap_or("").to_lowercase();
+    let Some(overrides) = object_array(value) else {
+        return Vec::new();
+    };
+    let slug = model_id
+        .split('/')
+        .last()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
     let mut tiers: Vec<PromptRateTier> = overrides
         .into_iter()
         .filter_map(|o| {
@@ -197,8 +235,18 @@ fn open_router_prompt_tiers(value: Option<&Value>, model_id: &str) -> Vec<Prompt
 /// `utc_days` plus HHMM boundaries; an end of `0` after a positive start means midnight at the end
 /// of that UTC day (1000-0 is 10:00-24:00).
 fn open_router_utc_overrides(value: Option<&Value>) -> Vec<UtcPriceRateOverride> {
-    const DAYS: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
-    let Some(overrides) = object_array(value) else { return Vec::new() };
+    const DAYS: [&str; 7] = [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    ];
+    let Some(overrides) = object_array(value) else {
+        return Vec::new();
+    };
     overrides
         .into_iter()
         .filter_map(|o| {
@@ -208,7 +256,11 @@ fn open_router_utc_overrides(value: Option<&Value>) -> Vec<UtcPriceRateOverride>
             let present = |k: &str| o.get(k).filter(|v| !v.is_null());
             let days = match present("utc_days") {
                 Some(v) => {
-                    let raw: Vec<&str> = v.as_array()?.iter().map(Value::as_str).collect::<Option<_>>()?;
+                    let raw: Vec<&str> = v
+                        .as_array()?
+                        .iter()
+                        .map(Value::as_str)
+                        .collect::<Option<_>>()?;
                     if raw.is_empty() {
                         return None;
                     }
@@ -276,7 +328,9 @@ pub fn catalog_from_litellm(data: &[u8]) -> Result<PricingCatalog, CodecError> {
     let root = root.as_object().ok_or(CodecError::NotAnObject)?;
     let mut entries = HashMap::with_capacity(root.len());
     for (key, value) in root {
-        let Some(entry) = value.as_object() else { continue };
+        let Some(entry) = value.as_object() else {
+            continue;
+        };
         let (Some(input), Some(output)) = (
             per_million_from_per_token(entry.get("input_cost_per_token")),
             per_million_from_per_token(entry.get("output_cost_per_token")),
@@ -288,7 +342,9 @@ pub fn catalog_from_litellm(data: &[u8]) -> Result<PricingCatalog, CodecError> {
             .iter()
             .filter_map(|threshold| {
                 let suffix = format!("above_{}k_tokens", threshold / 1_000);
-                let field = |prefix: &str| per_million_from_per_token(entry.get(&format!("{prefix}_{suffix}")));
+                let field = |prefix: &str| {
+                    per_million_from_per_token(entry.get(&format!("{prefix}_{suffix}")))
+                };
                 let tier = PromptRateTier {
                     threshold_prompt_tokens: *threshold,
                     includes_threshold: false,
@@ -304,18 +360,25 @@ pub fn catalog_from_litellm(data: &[u8]) -> Result<PricingCatalog, CodecError> {
         let mut rates = ModelRates::new(
             input,
             output,
-            per_million_from_per_token(entry.get("cache_creation_input_token_cost")).unwrap_or(input),
+            per_million_from_per_token(entry.get("cache_creation_input_token_cost"))
+                .unwrap_or(input),
             cache_read.unwrap_or(input),
         );
         rates.cache_read_is_explicit = cache_read.is_some();
         rates.prompt_rate_tiers = tiers;
-        rates.input_above_200k_per_million = per_million_from_per_token(entry.get("input_cost_per_token_above_200k_tokens"));
-        rates.output_above_200k_per_million = per_million_from_per_token(entry.get("output_cost_per_token_above_200k_tokens"));
-        rates.cache_write_above_200k_per_million =
-            per_million_from_per_token(entry.get("cache_creation_input_token_cost_above_200k_tokens"));
+        rates.input_above_200k_per_million =
+            per_million_from_per_token(entry.get("input_cost_per_token_above_200k_tokens"));
+        rates.output_above_200k_per_million =
+            per_million_from_per_token(entry.get("output_cost_per_token_above_200k_tokens"));
+        rates.cache_write_above_200k_per_million = per_million_from_per_token(
+            entry.get("cache_creation_input_token_cost_above_200k_tokens"),
+        );
         rates.cache_read_above_200k_per_million =
             per_million_from_per_token(entry.get("cache_read_input_token_cost_above_200k_tokens"));
-        if let Some(fast) = entry.get("provider_specific_entry").and_then(|p| number(p.get("fast"))) {
+        if let Some(fast) = entry
+            .get("provider_specific_entry")
+            .and_then(|p| number(p.get("fast")))
+        {
             if fast.is_finite() && fast > 0.0 {
                 rates.fast_multiplier = fast;
             }
@@ -339,10 +402,17 @@ pub fn catalog_from_models_dev(data: &[u8]) -> Result<PricingCatalog, CodecError
     providers.sort();
     let mut candidates: HashMap<String, Vec<ModelRates>> = HashMap::new();
     for name in providers {
-        let Some(models) = root[name].get("models").and_then(Value::as_object) else { continue };
+        let Some(models) = root[name].get("models").and_then(Value::as_object) else {
+            continue;
+        };
         for (model_id, model) in models {
-            let Some(cost) = model.get("cost").and_then(Value::as_object) else { continue };
-            let (Some(input), Some(output)) = (valid_per_million(cost.get("input")), valid_per_million(cost.get("output"))) else {
+            let Some(cost) = model.get("cost").and_then(Value::as_object) else {
+                continue;
+            };
+            let (Some(input), Some(output)) = (
+                valid_per_million(cost.get("input")),
+                valid_per_million(cost.get("output")),
+            ) else {
                 continue;
             };
             let mut tiers: Vec<PromptRateTier> = object_array(cost.get("tiers"))
@@ -357,13 +427,22 @@ pub fn catalog_from_models_dev(data: &[u8]) -> Result<PricingCatalog, CodecError
                 })
                 .collect();
             if !tiers.iter().any(|t| t.threshold_prompt_tokens == 200_000) {
-                if let Some(tier) = cost.get("context_over_200k").and_then(Value::as_object).and_then(|c| models_dev_tier(c, 200_000)) {
+                if let Some(tier) = cost
+                    .get("context_over_200k")
+                    .and_then(Value::as_object)
+                    .and_then(|c| models_dev_tier(c, 200_000))
+                {
                     tiers.push(tier);
                 }
             }
             tiers.sort_by_key(|t| t.threshold_prompt_tokens);
             let cache_read = valid_per_million(cost.get("cache_read"));
-            let mut rates = ModelRates::new(input, output, valid_per_million(cost.get("cache_write")).unwrap_or(input), cache_read.unwrap_or(input));
+            let mut rates = ModelRates::new(
+                input,
+                output,
+                valid_per_million(cost.get("cache_write")).unwrap_or(input),
+                cache_read.unwrap_or(input),
+            );
             rates.cache_read_is_explicit = cache_read.is_some();
             rates.prompt_rate_tiers = tiers;
             candidates.entry(model_id.clone()).or_default().push(rates);
@@ -403,7 +482,11 @@ fn models_dev_tier(rates: &Map<String, Value>, threshold: i64) -> Option<PromptR
 /// optional prompt tiers and UTC lanes, `cre` (omitted = explicit) and `fast`.
 #[derive(Serialize, Deserialize)]
 struct CompactFile {
-    #[serde(rename = "retrieved_at", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "retrieved_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     retrieved_at: Option<String>,
     models: BTreeMap<String, CompactModel>,
     /// Presence marks a complete tombstone snapshot; older writers omit it.
@@ -459,7 +542,12 @@ pub fn catalog_from_compact(data: &[u8]) -> Result<PricingCatalog, String> {
         })
         .collect();
     let authoritative = file.retired.is_some();
-    Ok(PricingCatalog::new(entries, file.retrieved_at, file.retired.unwrap_or_default().into_iter().collect(), authoritative))
+    Ok(PricingCatalog::new(
+        entries,
+        file.retrieved_at,
+        file.retired.unwrap_or_default().into_iter().collect(),
+        authoritative,
+    ))
 }
 
 pub fn compact_data(catalog: &PricingCatalog) -> Vec<u8> {
@@ -468,8 +556,12 @@ pub fn compact_data(catalog: &PricingCatalog) -> Vec<u8> {
         .iter()
         .map(|(key, r)| {
             let has_cache_read_override = r.cache_read_above_200k_per_million.is_some()
-                || r.prompt_rate_tiers.iter().any(|t| t.cache_read_per_million.is_some())
-                || r.utc_price_overrides.as_ref().is_some_and(|o| o.iter().any(|u| u.cache_read_per_million.is_some()));
+                || r.prompt_rate_tiers
+                    .iter()
+                    .any(|t| t.cache_read_per_million.is_some())
+                || r.utc_price_overrides
+                    .as_ref()
+                    .is_some_and(|o| o.iter().any(|u| u.cache_read_per_million.is_some()));
             let model = CompactModel {
                 i: r.input_per_million,
                 o: r.output_per_million,
@@ -494,5 +586,10 @@ pub fn compact_data(catalog: &PricingCatalog) -> Vec<u8> {
         keys.sort();
         keys
     });
-    serde_json::to_vec(&CompactFile { retrieved_at: catalog.retrieved_at.clone(), models, retired }).expect("compact catalog serializes")
+    serde_json::to_vec(&CompactFile {
+        retrieved_at: catalog.retrieved_at.clone(),
+        models,
+        retired,
+    })
+    .expect("compact catalog serializes")
 }

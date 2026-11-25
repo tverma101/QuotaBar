@@ -67,7 +67,10 @@ start time and route recorded with the counters are used for its estimate. A mod
 record itself is a saved selection, not proof of the route. `outcome_json.usage` is excluded because it
 repeats the completed assistant response; older databases without the manager-receipt table still
 provide assistant-message history. Unchanged database and WAL files reuse the previous read and
-complete daily fold, so an unchanged history is not decoded or re-aggregated on every refresh. If
+complete daily fold, so an unchanged history is not decoded or re-aggregated on every refresh. When a
+database changes, only new messages and messages whose stored sizes changed are read again, so an
+active session does not force a re-read of every earlier chat. A read is one consistent database
+snapshot, so a turn that finishes mid-read no longer drops that pass's history. If
 pricing changes, cached measured rows are repriced without another SQLite read while their per-turn
 entries remain cached. Changed turns replace their latest measurement. A row that carries no
 identifier or timestamp is skipped — and logged — instead of making the whole history unreadable. The
@@ -84,6 +87,9 @@ exact OpenRouter route rates when available, without remapping them through a bu
 Curated prices are a fallback for routes the catalogue cannot price. Model rows carry the
 catalogue's display name whenever one is known. Legacy model IDs use the catalogue's published
 identity digests, so receipts recorded with an old route and a current catalogue key share one row.
+The catalogue is the copy saved on this Mac. Builds without hosted access never request a new
+copy. A model Freebuff adds later keeps its tokens but stays unpriced until the saved catalogue
+includes it. A saved copy that can't be read is logged, and its models stay unpriced.
 For ambiguous DeepSeek V4.1 Flash Fast selections, QuotaBar assumes standard Flash public API
 rates and names the row Standard Rate Assumed. This is not evidence of the serving tier; a
 receipt that records an exact route takes precedence. This does not verify which route served a

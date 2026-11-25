@@ -20,7 +20,11 @@ use std::sync::{Mutex, OnceLock};
 /// preamble makes an account-scoped scan incomplete.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnershipLookup {
-    Readable { organization_id: Option<String>, account_id: Option<String>, is_ambiguous: bool },
+    Readable {
+        organization_id: Option<String>,
+        account_id: Option<String>,
+        is_ambiguous: bool,
+    },
     Unreadable,
 }
 
@@ -43,7 +47,10 @@ fn index() -> &'static Mutex<HashMap<PathBuf, CachedIdentity>> {
 /// The process-wide, revision-keyed lookup. A file whose size, mtimes or inode changed is re-read;
 /// unchanged files are answered from memory.
 pub fn shared_identity(file: &DiscoveredFile, cancel: &CancelToken) -> OwnershipLookup {
-    let failure_prefix = format!("{READ_DIAGNOSTIC_BASE}{}.", stable_fingerprint(&file.path.to_string_lossy()));
+    let failure_prefix = format!(
+        "{READ_DIAGNOSTIC_BASE}{}.",
+        stable_fingerprint(&file.path.to_string_lossy())
+    );
     let cached = index()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -60,10 +67,13 @@ pub fn shared_identity(file: &DiscoveredFile, cancel: &CancelToken) -> Ownership
     match read_ownership_prefix(&file.path, cancel) {
         Some(identity) => {
             diagnostic_gate::clear_prefix(&failure_prefix);
-            index()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(file.path.clone(), CachedIdentity { revision: file.revision, identity: identity.clone() });
+            index().lock().unwrap_or_else(|e| e.into_inner()).insert(
+                file.path.clone(),
+                CachedIdentity {
+                    revision: file.revision,
+                    identity: identity.clone(),
+                },
+            );
             identity.into_lookup()
         }
         None => {
@@ -106,19 +116,37 @@ impl OwnershipPrefix {
         if self.is_ambiguous || memmem::find(line, OWNER_MARKER).is_none() {
             return;
         }
-        let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(line) else { return };
-        let Some(owner) = object.get("ownerOrganizationUuid").and_then(Value::as_str).filter(|v| !v.is_empty()) else {
+        let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(line) else {
+            return;
+        };
+        let Some(owner) = object
+            .get("ownerOrganizationUuid")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        else {
             return;
         };
         let candidate = owner.to_lowercase();
-        if self.organization_id.as_ref().is_some_and(|existing| *existing != candidate) {
+        if self
+            .organization_id
+            .as_ref()
+            .is_some_and(|existing| *existing != candidate)
+        {
             self.is_ambiguous = true;
             return;
         }
         self.organization_id = Some(candidate);
-        if let Some(account) = object.get("ownerAccountUuid").and_then(Value::as_str).filter(|v| !v.is_empty()) {
+        if let Some(account) = object
+            .get("ownerAccountUuid")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
             let normalized = account.to_lowercase();
-            if self.account_id.as_ref().is_some_and(|existing| *existing != normalized) {
+            if self
+                .account_id
+                .as_ref()
+                .is_some_and(|existing| *existing != normalized)
+            {
                 self.is_ambiguous = true;
                 return;
             }

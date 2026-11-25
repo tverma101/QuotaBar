@@ -109,7 +109,10 @@ pub struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Reader { buf, strings: Vec::new() }
+        Reader {
+            buf,
+            strings: Vec::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -242,28 +245,59 @@ mod tests {
             w.opt_f64(self.cost);
         }
         fn decode(r: &mut Reader<'_>) -> Option<Self> {
-            Some(Row { n: r.i64()?, x: r.f64()?, model: r.opt_str()?, cost: r.opt_f64()? })
+            Some(Row {
+                n: r.i64()?,
+                x: r.f64()?,
+                model: r.opt_str()?,
+                cost: r.opt_f64()?,
+            })
         }
     }
 
     #[test]
     fn round_trips_and_shares_repeated_strings() {
         let rows = vec![
-            Row { n: -5, x: 1.5, model: Some("claude-opus-4".into()), cost: None },
-            Row { n: i64::MAX, x: -0.0, model: Some("claude-opus-4".into()), cost: Some(0.25) },
-            Row { n: 0, x: f64::MAX, model: None, cost: Some(1e12) },
+            Row {
+                n: -5,
+                x: 1.5,
+                model: Some("claude-opus-4".into()),
+                cost: None,
+            },
+            Row {
+                n: i64::MAX,
+                x: -0.0,
+                model: Some("claude-opus-4".into()),
+                cost: Some(0.25),
+            },
+            Row {
+                n: 0,
+                x: f64::MAX,
+                model: None,
+                cost: Some(1e12),
+            },
         ];
         let blob = seq_to_bytes(&rows);
         let decoded: Vec<Row> = seq_from_bytes(&blob).unwrap();
         assert_eq!(decoded, rows);
-        assert!(Arc::ptr_eq(decoded[0].model.as_ref().unwrap(), decoded[1].model.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            decoded[0].model.as_ref().unwrap(),
+            decoded[1].model.as_ref().unwrap()
+        ));
         // The second occurrence is a one-byte back reference, not a second copy.
-        assert_eq!(blob.windows(13).filter(|w| *w == b"claude-opus-4").count(), 1);
+        assert_eq!(
+            blob.windows(13).filter(|w| *w == b"claude-opus-4").count(),
+            1
+        );
     }
 
     #[test]
     fn corrupt_blobs_decode_to_none() {
-        let blob = seq_to_bytes(&[Row { n: 1, x: 2.0, model: Some("m".into()), cost: None }]);
+        let blob = seq_to_bytes(&[Row {
+            n: 1,
+            x: 2.0,
+            model: Some("m".into()),
+            cost: None,
+        }]);
         assert!(seq_from_bytes::<Row>(&blob[..blob.len() - 1]).is_none());
         let mut trailing = blob.clone();
         trailing.push(0);

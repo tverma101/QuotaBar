@@ -1754,7 +1754,7 @@ actor AntigravityDbUsageScanner {
 
     /// The unit of derived state per conversation database: source stamps plus parsed events plus
     /// the priced daily aggregate plus the step timestamp index. Codable mirrors the whole value to
-    /// the disk record so a cold scan worker verifies (rather than re-pages) the step table.
+    /// the disk record so a cold process verifies (rather than re-pages) the step table.
     struct CachedDatabase {
         var fingerprint: DatabaseFingerprint
         var windowStart: Date

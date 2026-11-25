@@ -97,12 +97,11 @@ sidecars while reading. Each bounded batch accounts for both generation data and
 hex expansion. When a client root or database disappears from discovery, its last-good rows remain in the aggregate while
 readable stores continue updating. A completed scan of a readable database with no in-window usage
 clears old history; an empty directory listing alone does not, because it can race database rotation.
-Missing or unpriced models aren't assigned an invented price. Large generation records use SQLite's
-read-only incremental BLOB API to project accounting fields while skipping conversation payloads.
-Reads are capped at 512 KiB and the projected envelope at 64 KiB; ordinary batch limits stay the same.
-Unchanged projections reuse cached totals. Changed sources replay projected rows so same-size edits
-cannot retain stale accounting. Records that exceed these bounds or cannot be projected stay
-incomplete with a warning. When a row has a timestamp, QuotaBar marks its day as a lower bound; when its timestamp or contents cannot be
+Missing or unpriced models aren't assigned an invented price. Generation records up to 64 MiB are
+read in place for their accounting fields only; conversation text is skipped and never kept. A
+larger record is left out, and the history is shown as a lower bound with a warning.
+Unchanged databases reuse cached totals. Changed sources are read again so same-size edits
+cannot retain stale accounting. Records that cannot be decoded stay incomplete with a warning. When a row has a timestamp, QuotaBar marks its day as a lower bound; when its timestamp or contents cannot be
 trusted, measured rows remain visible as partial lower bounds and the provider shows a warning. If a
 scan finds no measured rows, QuotaBar keeps the last visible history and still surfaces the warning.
 Rows without a trustworthy timestamp are excluded from dated totals and keep an incomplete-history
@@ -133,7 +132,9 @@ Malformed or oversized records remain partial until corrected or until they age 
 
 ## Under the hood
 
-QuotaBar discovers only the `language_server` process inside the installed `/Applications/Antigravity.app` bundle and reads its CSRF token and listening ports — a same-named binary anywhere else is not the app. It asks the quota-summary endpoint first (`RetrieveUserQuotaSummary`) — the only endpoint that reports the merged pools and the weekly windows. Builds without it fall back to the legacy per-model endpoints (`GetUserStatus` / `GetCommandModelConfigs`), whose per-model quotas are merged into the two pools by keeping each pool's worst remaining fraction; those endpoints only know the 5-hour windows. The plan name prefers Antigravity's own `userTier` over the inherited Windsurf plan field. Spend history comes from the generation-accounting protobuf records in the native conversation database.
+QuotaBar discovers only the `language_server` process inside the installed `/Applications/Antigravity.app` bundle and reads its CSRF token and listening ports — a same-named binary anywhere else is not the app. It asks the quota-summary endpoint first (`RetrieveUserQuotaSummary`) — the only endpoint that reports the merged pools and the weekly windows. Builds without it fall back to the legacy per-model endpoints (`GetUserStatus` / `GetCommandModelConfigs`), whose per-model quotas are merged into the two pools by keeping each pool's worst remaining fraction; those endpoints only know the 5-hour windows. The plan name prefers Antigravity's own `userTier` over the inherited Windsurf plan field.
+
+With the app closed, QuotaBar asks Google's Cloud Code service for the same quota summary using the saved sign-in. It first looks up the account's plan and project, then requests the summary for that project; if Google refuses the project-scoped request, it asks once more without a project. Each request identifies itself as the Antigravity app, because Google rejects quota reads from other clients. This path never uses the per-model endpoints: an empty summary shows *did not provide a supported usage endpoint* instead of guessed meters. Spend history comes from the generation-accounting protobuf records in the native conversation database.
 
 Thanks to [FelixIsaac](https://github.com/FelixIsaac) for identifying the conversation-database source and contributing the original SQLite/protobuf implementation in [issue #1120](https://github.com/robinebers/openusage/issues/1120) and [pull request #1058](https://github.com/robinebers/openusage/pull/1058).
 

@@ -536,7 +536,7 @@ final class CursorSpendProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReference(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]),
                 keychain: FakeKeychain()
@@ -597,7 +597,7 @@ final class CursorSpendProviderTests: XCTestCase {
             }
             return HTTPResponse(statusCode: 404, headers: [:], body: Data())
         }
-        let provider = CursorProvider(
+        let provider = CursorSwiftReference(
             authStore: CursorAuthStore(
                 sqlite: KeyValueSQLite(values: [CursorAuthStore.accessTokenKey: accessToken]),
                 keychain: FakeKeychain()

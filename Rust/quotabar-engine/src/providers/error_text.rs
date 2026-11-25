@@ -20,8 +20,14 @@ mod tests {
 
     #[test]
     fn copy_matches_the_swift_provider_usage_error_text() {
-        assert_eq!(CONNECTION_FAILED, "Usage request failed. Check your connection.");
+        assert_eq!(
+            CONNECTION_FAILED,
+            "Usage request failed. Check your connection."
+        );
         assert_eq!(INVALID_RESPONSE, "Usage response invalid. Try again later.");
-        assert_eq!(request_failed(503), "Usage request failed (HTTP 503). Try again later.");
+        assert_eq!(
+            request_failed(503),
+            "Usage request failed (HTTP 503). Try again later."
+        );
     }
 }

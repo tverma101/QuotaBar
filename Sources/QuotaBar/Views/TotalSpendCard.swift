@@ -57,14 +57,11 @@ struct TotalSpendCard: View {
         )
     }
 
-    private var projection: TotalSpendProjection {
-        total.projection(for: metric)
-    }
-
     var body: some View {
+        let total = total
         VStack(alignment: .leading, spacing: density.headerToCardSpacing) {
-            header
-            card
+            header(total: total)
+            card(total: total, projection: total.projection(for: metric))
         }
     }
 
@@ -72,7 +69,7 @@ struct TotalSpendCard: View {
 
     /// Section header matching the provider headers' scale: title menu leading, the share control
     /// trailing where a provider header shows its mark.
-    private var header: some View {
+    private func header(total: TotalSpend) -> some View {
         HStack(spacing: 5) {
             metricMenu
             Image(systemName: "info.circle")
@@ -80,7 +77,7 @@ struct TotalSpendCard: View {
                 .foregroundStyle(.secondary)
                 .hoverTooltip { infoTooltip }
             Spacer(minLength: 8)
-            shareButton
+            shareButton(total: total)
         }
         .padding(.leading, 4)
         .padding(.trailing, 4)
@@ -144,7 +141,7 @@ struct TotalSpendCard: View {
         return "Only includes \(names.formatted(.list(type: .and))). \(coverageNote)"
     }
 
-    private var shareButton: some View {
+    private func shareButton(total: TotalSpend) -> some View {
         CopyFeedbackButton(accessibilityLabel: "Copy \(metric.title) Screenshot") {
             ShareCardRenderer.shareTotalSpend(
                 total: total,
@@ -157,11 +154,11 @@ struct TotalSpendCard: View {
 
     // MARK: - Card
 
-    private var card: some View {
+    private func card(total: TotalSpend, projection: TotalSpendProjection) -> some View {
         VStack(spacing: 12) {
             periodPicker
             if projection.isEmpty {
-                emptyState
+                emptyState(hasIncompleteCost: projection.hasIncompleteCost)
             } else {
                 TotalSpendRingContent(projection: projection)
             }
@@ -226,9 +223,9 @@ struct TotalSpendCard: View {
 
     /// A metric/period combination with nothing to show mirrors the spend tiles' "No data" rule —
     /// never a fabricated zero ring.
-    private var emptyState: some View {
+    private func emptyState(hasIncompleteCost: Bool) -> some View {
         let message: String
-        if projection.hasIncompleteCost {
+        if hasIncompleteCost {
             switch metric {
             case .cost: message = "No priced usage for this period"
             case .costPerMtok: message = "No complete cost-per-token data for this period"

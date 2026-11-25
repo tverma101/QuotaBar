@@ -11,7 +11,9 @@ pub const CLAUDE_GATEWAY_PREFIXES: [&str; 2] = ["anthropic/opencode_go/", "anthr
 /// gateway turn on both the native card and the OpenCode fold.
 pub fn is_hosted_gateway_model(model: &str) -> bool {
     let trimmed = model.trim();
-    CLAUDE_GATEWAY_PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix))
+    CLAUDE_GATEWAY_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
 }
 
 /// The Go slug identifies Go billing even when an older Router row carries the upstream vendor as its

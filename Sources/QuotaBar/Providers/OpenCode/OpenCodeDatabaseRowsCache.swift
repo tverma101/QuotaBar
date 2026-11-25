@@ -3,7 +3,7 @@ import Foundation
 
 /// Disk mirror of the sqlite stage's `json_group_array` chunks, validated like the other
 /// log-scan caches: an exact revision-stamp match reuses rows for free, and a content
-/// fingerprint rescues a stamp that only moved on WAL churn. A fresh process — the scan-worker
+/// fingerprint rescues a stamp that only moved on WAL churn. A fresh process — a cold CLI
 /// child, or this app after an unload — skips the chunked whole-history read entirely instead of
 /// re-running bounded `sqlite3` queries over ~10 years of billing rows.
 enum OpenCodeDatabaseRowsCache {

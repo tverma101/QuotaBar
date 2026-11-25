@@ -124,7 +124,7 @@ struct HistoryReport: Equatable, Sendable {
 /// deterministic: same snapshots + reveals in, same report out (no dictionary-order leakage).
 enum HistoryDashboardAggregator {
     /// Names for a report's inputs, so call sites can't mis-order the dictionaries.
-    struct Input {
+    struct Input: Sendable {
         var enabledProviderIDs: [String]
         var displayNameByProviderID: [String: String]
         var historyByProviderID: [String: ProviderUsageHistory]
@@ -134,12 +134,32 @@ enum HistoryDashboardAggregator {
         var estimatedCostByProviderID: [String: Bool] = [:]
     }
 
+    /// Builds the report off the panel's executor so a long history never stalls the UI.
+    @concurrent
+    static func prepareReport(_ input: Input, now: Date, calendar: Calendar) async -> HistoryReport? {
+        buildReport(input, now: now, calendar: calendar, shouldCancel: { Task.isCancelled })
+    }
+
+    /// `prepareReport` for one cost source: projects every history onto `costMode` first.
+    @concurrent
+    static func prepareReport(
+        _ input: Input, costMode: HistoryCostMode, now: Date, calendar: Calendar
+    ) async -> HistoryReport? {
+        buildReport(project(input, costMode: costMode), now: now, calendar: calendar,
+                    shouldCancel: { Task.isCancelled })
+    }
+
     static func report(
         _ input: Input,
         costMode: HistoryCostMode,
         now: Date = Date(),
         calendar: Calendar = .current
     ) -> HistoryReport {
+        report(project(input, costMode: costMode), now: now, calendar: calendar)
+    }
+
+    /// Replaces each day's cost with the selected source, so the report shows one kind of dollar.
+    private static func project(_ input: Input, costMode: HistoryCostMode) -> Input {
         var projected = input
         projected.estimatedCostByProviderID = [:]
         for (providerID, original) in input.historyByProviderID {
@@ -179,12 +199,19 @@ enum HistoryDashboardAggregator {
             history.estimatedCostDays = estimateDays
             projected.historyByProviderID[providerID] = history
         }
-        return report(projected, now: now, calendar: calendar)
+        return projected
     }
 
     /// Folds the window's histories. `now` anchors the 30-day window and the Today/7-day buckets;
     /// `calendar` decides local day keys, exactly like the scanners.
     static func report(_ input: Input, now: Date = Date(), calendar: Calendar = .current) -> HistoryReport {
+        buildReport(input, now: now, calendar: calendar, shouldCancel: { false })!
+    }
+
+    private static func buildReport(
+        _ input: Input, now: Date, calendar: Calendar, shouldCancel: () -> Bool
+    ) -> HistoryReport? {
+        guard !shouldCancel() else { return nil }
         let windowKeys = UsageHistoryWindow.dayKeys(through: now, calendar: calendar)
         let todayKey = DailyUsageAccumulator.dayKey(from: now, calendar: calendar)
         // The 7-day bucket is today back through today-6. `windowKeys` is a Set — unordered — so
@@ -228,6 +255,7 @@ enum HistoryDashboardAggregator {
         var earliestDayKey: String?
 
         for providerID in input.enabledProviderIDs {
+            guard !shouldCancel() else { return nil }
             guard let history = input.historyByProviderID[providerID] else { continue }
             // Pre-provenance OpenCode snapshots can contain gateway-priced dollars without a
             // per-day marker. Treat nil as unknown until a fresh scan writes an explicit empty set.
@@ -397,6 +425,7 @@ enum HistoryDashboardAggregator {
             }
 
             for day in history.modelUsage?.daily ?? [] where windowKeys.contains(day.date) {
+                guard !shouldCancel() else { return nil }
                 for model in day.models {
                     let key = model.model.lowercased()
                     var row = rowsBySlug[key] ?? (0, nil, false, model.model, false, false, false)
@@ -581,6 +610,7 @@ enum HistoryDashboardAggregator {
             }
         }
 
+        guard !shouldCancel() else { return nil }
         return HistoryReport(
             days: days,
             today: HistoryPeriodTotal(

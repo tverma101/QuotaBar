@@ -13,8 +13,8 @@ use crate::paths;
 use crate::pricing::{ModelPricing, TokenBreakdown};
 use crate::qlog;
 use crate::scan::{
-    discover, fingerprint, first_future_dated, Extensions, FileItems, IncrementalScanner, LineError, LineParser,
-    Reader, Record, ScanError, ScanStore, Writer,
+    discover, fingerprint, first_future_dated, Extensions, FileItems, IncrementalScanner,
+    LineError, LineParser, Reader, Record, ScanError, ScanStore, Writer,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -107,7 +107,12 @@ impl LineParser for PiLineParser {
         memchr::memmem::find(line, br#""usage""#).is_some()
     }
 
-    fn parse(&self, _state: &mut (), line: &[u8], out: &mut Vec<Self::Item>) -> Result<(), LineError> {
+    fn parse(
+        &self,
+        _state: &mut (),
+        line: &[u8],
+        out: &mut Vec<Self::Item>,
+    ) -> Result<(), LineError> {
         if line.iter().all(u8::is_ascii_whitespace) {
             return Ok(());
         }
@@ -165,11 +170,14 @@ pub fn parse_line(line: &[u8]) -> Result<Option<PiEntry>, LineError> {
 
     let input = strict_count(usage.get("input"), true).ok_or(LineError("invalid input"))?;
     let output = strict_count(usage.get("output"), true).ok_or(LineError("invalid output"))?;
-    let cache_read = strict_count(usage.get("cacheRead"), false).ok_or(LineError("invalid cacheRead"))?;
-    let cache_write = strict_count(usage.get("cacheWrite"), false).ok_or(LineError("invalid cacheWrite"))?;
+    let cache_read =
+        strict_count(usage.get("cacheRead"), false).ok_or(LineError("invalid cacheRead"))?;
+    let cache_write =
+        strict_count(usage.get("cacheWrite"), false).ok_or(LineError("invalid cacheWrite"))?;
     let cache_write_1h_raw =
         strict_count(usage.get("cacheWrite1h"), false).ok_or(LineError("invalid cacheWrite1h"))?;
-    let reported_total = strict_count(usage.get("totalTokens"), true).ok_or(LineError("invalid totalTokens"))?;
+    let reported_total =
+        strict_count(usage.get("totalTokens"), true).ok_or(LineError("invalid totalTokens"))?;
 
     let cache_write_1h = cache_write_1h_raw.min(cache_write);
     let cache_write_5m = cache_write - cache_write_1h;
@@ -245,7 +253,12 @@ pub fn dedup(entries: impl IntoIterator<Item = PiEntry>) -> Vec<PiEntry> {
     out
 }
 
-pub fn aggregate(entries: &[PiEntry], card_id: &str, since: f64, pricing: &ModelPricing) -> LogUsageScan {
+pub fn aggregate(
+    entries: &[PiEntry],
+    card_id: &str,
+    since: f64,
+    pricing: &ModelPricing,
+) -> LogUsageScan {
     let mut accumulator = DailyUsageAccumulator::new();
     for entry in entries {
         if entry.card_id.as_ref() != card_id || entry.timestamp < since {
@@ -254,7 +267,9 @@ pub fn aggregate(entries: &[PiEntry], card_id: &str, since: f64, pricing: &Model
         let day = day_key(entry.timestamp);
         let trimmed = (!entry.model.is_empty()).then_some(entry.model.as_ref());
         let model_name = trimmed.unwrap_or(ModelUsageEntry::UNATTRIBUTED);
-        let api_estimate = trimmed.and_then(|m| pricing.estimated_cost_dollars(m, &entry.tokens, Some(entry.timestamp), true));
+        let api_estimate = trimmed.and_then(|m| {
+            pricing.estimated_cost_dollars(m, &entry.tokens, Some(entry.timestamp), true)
+        });
         let cost = entry.carried_cost.filter(|c| *c > 0.0).or(api_estimate);
         if cost.is_none() && entry.reported_total_tokens > 0 {
             accumulator.add_unknown_model(&day, model_name);
@@ -291,10 +306,21 @@ impl PiUsageScanner {
         env: Arc<dyn Fn(&str) -> Option<String> + Send + Sync>,
         incremental: Option<Arc<IncrementalScanner<PiLineParser>>>,
     ) -> Self {
-        PiUsageScanner { home, env, incremental }
+        PiUsageScanner {
+            home,
+            env,
+            incremental,
+        }
     }
 
-    pub fn scan(&self, card_id: &str, days_back: usize, now: f64, pricing: &ModelPricing, cancel: &CancelToken) -> Option<LogUsageScan> {
+    pub fn scan(
+        &self,
+        card_id: &str,
+        days_back: usize,
+        now: f64,
+        pricing: &ModelPricing,
+        cancel: &CancelToken,
+    ) -> Option<LogUsageScan> {
         match self.scan_result(card_id, days_back, now, pricing, cancel) {
             PiScanResult::Complete(scan) => scan,
             PiScanResult::Incomplete => None,
@@ -318,7 +344,11 @@ impl PiUsageScanner {
         let files = match discover(&dir, Extensions::Jsonl) {
             Ok(files) => files,
             Err(err) => {
-                qlog!(Warn, host::plugin_tag("pi"), "session directory could not be completely enumerated: {err}");
+                qlog!(
+                    Warn,
+                    host::plugin_tag("pi"),
+                    "session directory could not be completely enumerated: {err}"
+                );
                 return PiScanResult::Incomplete;
             }
         };
@@ -334,11 +364,18 @@ impl PiUsageScanner {
             Ok(s) => s,
             Err(ScanError::Cancelled) => return PiScanResult::Incomplete,
             Err(err) => {
-                qlog!(Warn, host::plugin_tag("pi"), "pi session scan incomplete: {err}");
+                qlog!(
+                    Warn,
+                    host::plugin_tag("pi"),
+                    "pi session scan incomplete: {err}"
+                );
                 return PiScanResult::Incomplete;
             }
         };
-        let gate = format!("pi.sessions.future-timestamp.{}", stable_fingerprint(&identity));
+        let gate = format!(
+            "pi.sessions.future-timestamp.{}",
+            stable_fingerprint(&identity)
+        );
         if first_future_dated(&scanned, now).is_some() {
             diagnostic_gate::log_once(&gate, || {
                 qlog!(
@@ -374,18 +411,29 @@ impl PiUsageScanner {
         let partition = format!("pi:{}", stable_fingerprint(identity));
         let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         reg.entry(partition.clone())
-            .or_insert_with(|| Arc::new(IncrementalScanner::new(PiLineParser, partition, Some(ScanStore::shared()))))
+            .or_insert_with(|| {
+                Arc::new(IncrementalScanner::new(
+                    PiLineParser,
+                    partition,
+                    Some(ScanStore::shared()),
+                ))
+            })
             .clone()
     }
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<IncrementalScanner<PiLineParser>>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<IncrementalScanner<PiLineParser>>>>> = OnceLock::new();
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<IncrementalScanner<PiLineParser>>>>> =
+        OnceLock::new();
     REGISTRY.get_or_init(Default::default)
 }
 
 pub fn unload_caches() {
-    registry().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let mut registry = registry().lock().unwrap_or_else(|e| e.into_inner());
+    for scanner in registry.values() {
+        scanner.clear_memory_cache();
+    }
+    registry.clear();
 }
 
 #[cfg(test)]
@@ -393,8 +441,17 @@ mod tests {
     use super::*;
     use crate::pricing::{ModelRates, PricingCatalog, PricingSupplement};
 
-    fn sample_line(id: &str, provider: &str, model: &str, cost: Option<&str>, cw: i64, cw1h: i64) -> Vec<u8> {
-        let cost_json = cost.map(|c| format!(r#","cost":{{"total":{c}}}"#)).unwrap_or_default();
+    fn sample_line(
+        id: &str,
+        provider: &str,
+        model: &str,
+        cost: Option<&str>,
+        cw: i64,
+        cw1h: i64,
+    ) -> Vec<u8> {
+        let cost_json = cost
+            .map(|c| format!(r#","cost":{{"total":{c}}}"#))
+            .unwrap_or_default();
         format!(
             r#"{{"type":"message","id":"{id}","timestamp":"2026-07-12T10:00:00.000Z","message":{{"role":"assistant","provider":"{provider}","model":"{model}","usage":{{"input":100,"output":50,"cacheRead":0,"cacheWrite":{cw},"cacheWrite1h":{cw1h},"totalTokens":150{cost_json}}}}}}}"#
         )
@@ -403,17 +460,35 @@ mod tests {
 
     #[test]
     fn parses_maps_and_splits_cache_write_1h() {
-        let entry = parse_line(&sample_line("m1", "anthropic", "claude-opus-4-8", Some("0.5"), 1000, 400))
-            .unwrap()
-            .unwrap();
+        let entry = parse_line(&sample_line(
+            "m1",
+            "anthropic",
+            "claude-opus-4-8",
+            Some("0.5"),
+            1000,
+            400,
+        ))
+        .unwrap()
+        .unwrap();
         assert_eq!(entry.card_id.as_ref(), "claude");
         assert_eq!(entry.carried_cost, Some(0.5));
         assert_eq!(entry.tokens.cache_write_1h, 400);
         assert_eq!(entry.tokens.cache_write_5m, 600);
         assert_eq!(entry.reported_total_tokens, 150);
 
-        assert_eq!(parse_line(&sample_line("m2", "openai-codex", "gpt-5", None, 0, 0)).unwrap().unwrap().card_id.as_ref(), "codex");
-        assert!(parse_line(&sample_line("m3", "nvidia-nim", "x", None, 0, 0)).unwrap().is_none());
+        assert_eq!(
+            parse_line(&sample_line("m2", "openai-codex", "gpt-5", None, 0, 0))
+                .unwrap()
+                .unwrap()
+                .card_id
+                .as_ref(),
+            "codex"
+        );
+        assert!(
+            parse_line(&sample_line("m3", "nvidia-nim", "x", None, 0, 0))
+                .unwrap()
+                .is_none()
+        );
         let user = br#"{"type":"message","timestamp":"2026-07-12T10:00:00.000Z","message":{"role":"user","provider":"anthropic","usage":{}}}"#;
         assert!(parse_line(user).unwrap().is_none());
     }
@@ -431,7 +506,10 @@ mod tests {
     #[test]
     fn carried_zero_falls_through_and_dedup_works() {
         let mut entries_map = HashMap::new();
-        entries_map.insert("composer-2.5".to_string(), ModelRates::new(10.0, 20.0, 10.0, 1.0));
+        entries_map.insert(
+            "composer-2.5".to_string(),
+            ModelRates::new(10.0, 20.0, 10.0, 1.0),
+        );
         let pricing = ModelPricing::new(
             PricingSupplement::default(),
             PricingCatalog::from_entries(entries_map),
@@ -439,8 +517,26 @@ mod tests {
             PricingCatalog::default(),
             None,
         );
-        let e1 = parse_line(&sample_line("dup", "cursor", "composer-2.5", Some("0"), 0, 0)).unwrap().unwrap();
-        let e2 = parse_line(&sample_line("dup", "cursor", "composer-2.5", Some("0"), 0, 0)).unwrap().unwrap();
+        let e1 = parse_line(&sample_line(
+            "dup",
+            "cursor",
+            "composer-2.5",
+            Some("0"),
+            0,
+            0,
+        ))
+        .unwrap()
+        .unwrap();
+        let e2 = parse_line(&sample_line(
+            "dup",
+            "cursor",
+            "composer-2.5",
+            Some("0"),
+            0,
+            0,
+        ))
+        .unwrap()
+        .unwrap();
         let scan = aggregate(&dedup([e1, e2]), "cursor", 0.0, &pricing);
         assert_eq!(scan.series.daily.len(), 1);
         assert!((scan.series.daily[0].cost_usd.unwrap() - 0.002).abs() < 1e-6);
@@ -455,16 +551,42 @@ mod tests {
         let scanner_bad = PiUsageScanner::new(
             bad_home,
             Arc::new(|_| None),
-            Some(Arc::new(IncrementalScanner::new(PiLineParser, "test-pi-bad", None))),
+            Some(Arc::new(IncrementalScanner::new(
+                PiLineParser,
+                "test-pi-bad",
+                None,
+            ))),
         );
-        assert_eq!(scanner_bad.scan_result("claude", 30, 1_800_000_000.0, &ModelPricing::default(), &CancelToken::new()), PiScanResult::Incomplete);
+        assert_eq!(
+            scanner_bad.scan_result(
+                "claude",
+                30,
+                1_800_000_000.0,
+                &ModelPricing::default(),
+                &CancelToken::new()
+            ),
+            PiScanResult::Incomplete
+        );
 
         let empty_home = dir.path().join("empty");
         let scanner_empty = PiUsageScanner::new(
             empty_home,
             Arc::new(|_| None),
-            Some(Arc::new(IncrementalScanner::new(PiLineParser, "test-pi-empty", None))),
+            Some(Arc::new(IncrementalScanner::new(
+                PiLineParser,
+                "test-pi-empty",
+                None,
+            ))),
         );
-        assert_eq!(scanner_empty.scan_result("claude", 30, 1_800_000_000.0, &ModelPricing::default(), &CancelToken::new()), PiScanResult::Complete(None));
+        assert_eq!(
+            scanner_empty.scan_result(
+                "claude",
+                30,
+                1_800_000_000.0,
+                &ModelPricing::default(),
+                &CancelToken::new()
+            ),
+            PiScanResult::Complete(None)
+        );
     }
 }

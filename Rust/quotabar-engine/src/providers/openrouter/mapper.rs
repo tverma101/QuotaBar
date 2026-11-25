@@ -39,7 +39,10 @@ pub fn credits_lines(data: &Map<String, Value>) -> Vec<MetricLine> {
     }
     lines.push(MetricLine::values(
         "Balance",
-        vec![MetricValue::new((total_credits - used).max(0.0), MetricKind::Dollars)],
+        vec![MetricValue::new(
+            (total_credits - used).max(0.0),
+            MetricKind::Dollars,
+        )],
     ));
     lines
 }
@@ -75,9 +78,8 @@ pub fn key_metrics(data: &Map<String, Value>) -> (Option<String>, Vec<MetricLine
         }
     }
 
-    let plan = foundation_bool(data.get("is_free_tier")).map(|free| {
-        if free { "Free tier" } else { "Pay as you go" }.to_string()
-    });
+    let plan = foundation_bool(data.get("is_free_tier"))
+        .map(|free| if free { "Free tier" } else { "Pay as you go" }.to_string());
     (plan, lines)
 }
 
@@ -85,7 +87,10 @@ fn append_spend(value: Option<&Value>, label: &str, lines: &mut Vec<MetricLine>)
     let Some(amount) = parse::number(value) else {
         return;
     };
-    lines.push(MetricLine::values(label, vec![MetricValue::new(amount.max(0.0), MetricKind::Dollars)]));
+    lines.push(MetricLine::values(
+        label,
+        vec![MetricValue::new(amount.max(0.0), MetricKind::Dollars)],
+    ));
 }
 
 /// Swift's `value as? Bool` on a `JSONSerialization` value: a real boolean, or a number that is

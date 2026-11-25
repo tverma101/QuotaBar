@@ -23,15 +23,20 @@ pub fn aggregate(entries: &[ClaudeEntry], since: f64, pricing: &ModelPricing) ->
         let day = day_key(entry.timestamp);
         // One trimmed slug for pricing, the unknown-model warning and the breakdown key alike:
         // diverging spellings would let the warning triangle and the hover panel disagree.
-        let trimmed_model = entry.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+        let trimmed_model = entry
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty());
         let model_name = trimmed_model.unwrap_or(ModelUsageEntry::UNATTRIBUTED);
         // OpenCode Go/Zen gateway turns are folded into the OpenCode card; counting them here would
         // double-count the same dollars/tokens in Total Spend.
         if trimmed_model.is_some_and(is_hosted_gateway_model) {
             continue;
         }
-        let estimate = trimmed_model
-            .and_then(|model| pricing.estimated_cost_dollars(model, &entry.tokens, Some(entry.timestamp), true));
+        let estimate = trimmed_model.and_then(|model| {
+            pricing.estimated_cost_dollars(model, &entry.tokens, Some(entry.timestamp), true)
+        });
         let cost = entry.cost_usd.or(estimate);
         let tokens = entry.tokens.total_tokens();
         if cost.is_none() && tokens > 0 {

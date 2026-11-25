@@ -37,19 +37,36 @@ fn field(json: &Map<String, Value>, keys: &[&str]) -> Field {
     for key in keys {
         let Some(raw) = json.get(*key) else { continue };
         return match raw.as_f64() {
-            Some(v) if v.is_finite() && (0.0..=1e15).contains(&v) && v.fract() == 0.0 => {
-                Field { value: Some(v as i64), is_present: true, is_valid: true }
-            }
-            _ => Field { value: None, is_present: true, is_valid: false },
+            Some(v) if v.is_finite() && (0.0..=1e15).contains(&v) && v.fract() == 0.0 => Field {
+                value: Some(v as i64),
+                is_present: true,
+                is_valid: true,
+            },
+            _ => Field {
+                value: None,
+                is_present: true,
+                is_valid: false,
+            },
         };
     }
-    Field { value: None, is_present: false, is_valid: true }
+    Field {
+        value: None,
+        is_present: false,
+        is_valid: true,
+    }
 }
 
 impl RawUsage {
     pub fn from_json(json: &Map<String, Value>) -> RawUsage {
         let parsed_input = field(json, &["input_tokens", "prompt_tokens", "input"]);
-        let parsed_cached = field(json, &["cached_input_tokens", "cache_read_input_tokens", "cached_tokens"]);
+        let parsed_cached = field(
+            json,
+            &[
+                "cached_input_tokens",
+                "cache_read_input_tokens",
+                "cached_tokens",
+            ],
+        );
         let parsed_output = field(json, &["output_tokens", "completion_tokens", "output"]);
         let parsed_reasoning = field(json, &["reasoning_output_tokens", "reasoning_tokens"]);
         let parsed_total = field(json, &["total_tokens"]);
@@ -63,13 +80,18 @@ impl RawUsage {
         // Reasoning tokens are a subset of output on OpenAI/Codex usage; do not add them again.
         let recomputed = saturating_add(input, output);
         let has_reported_total = reported > 0;
-        let has_authoritative_total = has_reported_total || (parsed_input.is_present && parsed_output.is_present);
+        let has_authoritative_total =
+            has_reported_total || (parsed_input.is_present && parsed_output.is_present);
         RawUsage {
             input,
             cached,
             output,
             reasoning,
-            total: if has_reported_total { reported } else { recomputed },
+            total: if has_reported_total {
+                reported
+            } else {
+                recomputed
+            },
             has_reported_total,
             is_valid: parsed_input.is_valid
                 && parsed_cached.is_valid
@@ -90,7 +112,9 @@ impl RawUsage {
     /// Swift `subtracting`: the per-turn delta of a cumulative counter. Components reset
     /// independently, so a counter that went backwards counts as a fresh start.
     pub fn subtracting(&self, previous: Option<&RawUsage>) -> RawUsage {
-        let Some(previous) = previous else { return *self };
+        let Some(previous) = previous else {
+            return *self;
+        };
         let delta = |now: i64, before: i64| if now >= before { now - before } else { now };
         let input = delta(self.input, previous.input);
         let cached = delta(self.cached, previous.cached);
@@ -100,7 +124,11 @@ impl RawUsage {
         // A reported total stays authoritative against a prior reported total or a baseline
         // accumulated from last-only events; a mismatch with the component deltas only makes the
         // cost incomplete.
-        let total = if self.has_reported_total { delta(self.total, previous.total) } else { component_total };
+        let total = if self.has_reported_total {
+            delta(self.total, previous.total)
+        } else {
+            component_total
+        };
         RawUsage {
             input,
             cached,
@@ -127,18 +155,28 @@ impl RawUsage {
             total: saturating_add(self.total, delta.total),
             has_reported_total: false,
             is_valid: self.is_valid && delta.is_valid,
-            has_complete_cost_breakdown: self.has_complete_cost_breakdown && delta.has_complete_cost_breakdown,
+            has_complete_cost_breakdown: self.has_complete_cost_breakdown
+                && delta.has_complete_cost_breakdown,
         }
     }
 
     pub fn as_baseline(&self) -> RawUsage {
-        RawUsage { has_reported_total: false, ..*self }
+        RawUsage {
+            has_reported_total: false,
+            ..*self
+        }
     }
 }
 
 impl Record for RawUsage {
     fn encode(&self, w: &mut Writer) {
-        for value in [self.input, self.cached, self.output, self.reasoning, self.total] {
+        for value in [
+            self.input,
+            self.cached,
+            self.output,
+            self.reasoning,
+            self.total,
+        ] {
             w.i64(value);
         }
         w.bool(self.has_reported_total);

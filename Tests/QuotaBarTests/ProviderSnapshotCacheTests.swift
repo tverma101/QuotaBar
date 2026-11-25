@@ -172,6 +172,29 @@ final class ProviderSnapshotCacheTests: XCTestCase {
         XCTAssertEqual(stored.usageHistory, history)
     }
 
+    func testFoldOnlyFreshnessIgnoresRecoveredMeterStamp() {
+        let (defaults, suite) = makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_900_000_000)
+        let cache = ProviderSnapshotCache(userDefaults: defaults, storageKey: "k", ttl: 300, now: { now })
+        let history = ProviderUsageHistory(series: DailyUsageSeries(daily: []), unknownModelsByDay: [:])
+        var snapshot = ProviderSnapshot(
+            providerID: "codex",
+            displayName: "Codex",
+            lines: [],
+            refreshedAt: now,
+            usageHistory: history
+        )
+        snapshot.quotaRefreshedAt = now.addingTimeInterval(-3_000)
+        snapshot.historyRefreshedAt = now
+        cache.store(snapshot, now: now)
+
+        XCTAssertNil(cache.snapshot(providerID: "codex"),
+                     "whole-snapshot freshness still includes the recovered meter stamp")
+        XCTAssertNotNil(cache.snapshot(providerID: "codex", includeMeterFreshness: false),
+                        "a fold-only pass must not refold forever just because recovered meters are old")
+    }
+
     func testPanelMeterCacheMergeKeepsCarriedHistoryMarkedForPanelRefold() {
         let (defaults, suite) = makeDefaults()
         defer { defaults.removePersistentDomain(forName: suite) }

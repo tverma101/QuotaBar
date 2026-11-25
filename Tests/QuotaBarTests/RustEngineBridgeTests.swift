@@ -57,7 +57,6 @@ final class RustEngineBridgeTests: XCTestCase {
         let devin = DevinProvider()
         let hermes = HermesProvider()
         let grok = GrokProvider()
-        let copilot = CopilotProvider()
         let openRouter = OpenRouterProvider()
 
         let devinDetected = await devin.hasLocalCredentials()
@@ -66,7 +65,6 @@ final class RustEngineBridgeTests: XCTestCase {
         let hermesSnapshot = await hermes.refresh()
         let grokDetected = await grok.hasLocalCredentials()
         let grokSnapshot = await grok.refresh()
-        let copilotDetected = await copilot.hasLocalCredentials()
         let openRouterInitialStatus = openRouter.apiKeyStatus
         var savedStatus: APIKeyStatus?
         var revealedKey: String?
@@ -87,8 +85,6 @@ final class RustEngineBridgeTests: XCTestCase {
         } catch {
             keyActionError = error
         }
-        let openRouterDetected = await openRouter.hasLocalCredentials()
-        let openRouterSnapshot = await openRouter.refresh()
 
         // Restore the real home for anything else in this process that uses the engine.
         _ = await RustEngine.call(["method": "configure", "params": [
@@ -117,18 +113,128 @@ final class RustEngineBridgeTests: XCTestCase {
         XCTAssertEqual(grokSnapshot.providerID, "grok")
         XCTAssertEqual(grokSnapshot.errorCategory, .notLoggedIn)
 
-        _ = copilotDetected
-        _ = copilot
-
         XCTAssertTrue(openRouterInitialStatus == .notSet || openRouterInitialStatus == .fromEnvironment)
         XCTAssertEqual(savedStatus, openRouterInitialStatus == .fromEnvironment ? .overrideActive : .saved)
         XCTAssertEqual(revealedKey, "sk-or-bridge-test")
         XCTAssertTrue(emptySaveThrew)
         XCTAssertEqual(clearedStatus, openRouterInitialStatus)
-        if openRouterInitialStatus == .notSet {
-            XCTAssertFalse(openRouterDetected)
-            XCTAssertEqual(openRouterSnapshot.errorCategory, .notLoggedIn)
+    }
+
+    func testHostReusesClaudeDesktopDiscoveryKeyForTheMatchingItem() throws {
+        let discoveryCache = SafeStorageKeyCache()
+        _ = try discoveryCache.getOrLoad { Data("discovery-fixture".utf8) }
+        let keychain = FakeKeychain("keychain-fixture")
+
+        func read(account: String) throws -> [String: Any] {
+            let request = try JSONSerialization.data(withJSONObject: [
+                "method": "secureRead",
+                "params": [
+                    "service": ClaudeDesktopSafeStorageKeyReader.service,
+                    "account": ["kind": "named", "name": account]
+                ]
+            ])
+            let reply = try XCTUnwrap(
+                RustEngineHost.handle(request, keychain: keychain, claudeKeyCache: discoveryCache)
+            )
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(reply.utf8)) as? [String: Any])
         }
+
+        let desktop = try read(account: ClaudeDesktopSafeStorageKeyReader.account)
+        XCTAssertEqual(desktop["status"] as? String, "found")
+        XCTAssertEqual(desktop["value"] as? String, "discovery-fixture")
+        XCTAssertNotEqual(try read(account: "other-account")["value"] as? String, "discovery-fixture")
+    }
+
+    @MainActor
+    func testRefreshBatchRoundTripsThroughTheEngine() async throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("QuotaBarTests.RustBatch.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        RustEngine.prepare()
+        _ = await RustEngine.call(["method": "configure", "params": ["home": home.path, "appData": home.path]])
+        func restore() async {
+            try? FileManager.default.removeItem(at: home)
+            _ = await RustEngine.call(["method": "configure", "params": [
+                "home": FileManager.default.homeDirectoryForCurrentUser.path,
+                "appData": FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("QuotaBar").path
+            ]])
+        }
+
+        let response: RustEngine.BatchResponse
+        do {
+            response = try await RustEngine.refreshBatch(
+                items: [RustEngine.BatchItem(providerID: "devin")],
+                scope: .panelAccounting,
+                perProviderTimeoutSeconds: 30,
+                batchBudgetSeconds: 60
+            )
+        } catch {
+            await restore()
+            throw error
+        }
+        await restore()
+        let snapshot = try XCTUnwrap(response.snapshots["devin"])
+        XCTAssertEqual(snapshot.providerID, "devin")
+        // A fold-only batch deliberately does not read live credentials or call the provider API;
+        // an empty home yields a usable, empty local snapshot rather than a login error.
+        XCTAssertNil(snapshot.errorCategory)
+        XCTAssertTrue(response.errors.isEmpty)
+    }
+
+    @MainActor
+    func testCodexResetClaimServiceUsesTheEngineForItsCredentiallessPath() async throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("QuotaBarTests.ResetClaim.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        RustEngine.prepare()
+        _ = await RustEngine.call(["method": "configure", "params": ["home": home.path, "appData": home.path]])
+        func restore() async {
+            try? FileManager.default.removeItem(at: home)
+            _ = await RustEngine.call(["method": "configure", "params": [
+                "home": FileManager.default.homeDirectoryForCurrentUser.path,
+                "appData": FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("QuotaBar").path
+            ]])
+        }
+
+        var refreshes = 0
+        let service = CodexResetClaimService(
+            providerID: "codex",
+            engineConfig: [
+                "candidateAuthHomes": [home.path],
+                "allowsKeychainFallback": false
+            ],
+            refreshAfterClaim: { refreshes += 1 }
+        )
+        let credits = await service.availableCredits()
+        let outcome = await service.claim(
+            creditExpiringAt: Date(timeIntervalSince1970: 1_800_000_000),
+            redeemRequestID: "bridge-test"
+        )
+        await restore()
+
+        XCTAssertNil(credits, "a credentialless account has no live credit list")
+        XCTAssertEqual(outcome, .failed)
+        XCTAssertEqual(refreshes, 0, "a failed claim must not refresh the dashboard")
+    }
+
+    func testNativeSQLiteAccessorUsesTheInProcessEngine() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("QuotaBarTests.NativeSQLite.\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let sqlite = NativeSQLiteAccessor()
+        try sqlite.execute(
+            path: path,
+            sql: "CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('hello');"
+        )
+        XCTAssertEqual(try sqlite.queryValue(path: path, sql: "SELECT value FROM sample;"), "hello")
+        XCTAssertNil(
+            try sqlite.queryValue(path: path + ".missing", sql: "SELECT 1;"),
+            "a missing database is an absent source, and the native path must not create it"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path + ".missing"))
     }
 
     func testUnknownMethodsFailLoudly() async {

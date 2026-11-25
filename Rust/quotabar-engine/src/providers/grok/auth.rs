@@ -90,11 +90,15 @@ impl GrokAuthStore {
     }
 
     pub fn at(path: PathBuf) -> Self {
-        GrokAuthStore { fixed_path: Some(path) }
+        GrokAuthStore {
+            fixed_path: Some(path),
+        }
     }
 
     pub fn auth_path(&self) -> PathBuf {
-        self.fixed_path.clone().unwrap_or_else(|| paths::expand_home("~/.grok/auth.json"))
+        self.fixed_path
+            .clone()
+            .unwrap_or_else(|| paths::expand_home("~/.grok/auth.json"))
     }
 
     pub fn load_auth_candidates(&self) -> Result<Vec<GrokAuthState>, GrokAuthError> {
@@ -140,7 +144,11 @@ impl GrokAuthStore {
         Ok(candidates)
     }
 
-    pub fn save_replacing(&self, state: &GrokAuthState, original: &GrokAuthState) -> Result<(), GrokAuthError> {
+    pub fn save_replacing(
+        &self,
+        state: &GrokAuthState,
+        original: &GrokAuthState,
+    ) -> Result<(), GrokAuthError> {
         if state.entry_key != original.entry_key {
             return Err(GrokAuthError::AuthConflict);
         }
@@ -175,14 +183,22 @@ impl GrokAuthStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(_) => {
                 diagnostic_gate::log_once("auth.grok.auth-file-read", || {
-                    qlog!(Error, auth_tag(ID), "Grok auth file read failed while saving");
+                    qlog!(
+                        Error,
+                        auth_tag(ID),
+                        "Grok auth file read failed while saving"
+                    );
                 });
                 Err(GrokAuthError::CredentialsUnreadable)
             }
         }
     }
 
-    fn save_with_existing(&self, state: &GrokAuthState, existing_text: Option<&str>) -> Result<(), GrokAuthError> {
+    fn save_with_existing(
+        &self,
+        state: &GrokAuthState,
+        existing_text: Option<&str>,
+    ) -> Result<(), GrokAuthError> {
         let mut auth_object: Map<String, Value> = match existing_text {
             Some(text) => serde_json::from_str::<Value>(text)
                 .ok()
@@ -216,7 +232,8 @@ impl GrokAuthStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|_| GrokAuthError::InvalidAuth)?;
         }
-        let encoded = serde_json::to_vec_pretty(&Value::Object(auth_object)).map_err(|_| GrokAuthError::InvalidAuth)?;
+        let encoded = serde_json::to_vec_pretty(&Value::Object(auth_object))
+            .map_err(|_| GrokAuthError::InvalidAuth)?;
         write_atomic(&path, &encoded).map_err(|_| GrokAuthError::CredentialsUnreadable)
     }
 
@@ -288,7 +305,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600));
+        let _ = tmp
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600));
     }
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())

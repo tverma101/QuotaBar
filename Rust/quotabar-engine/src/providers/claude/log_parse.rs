@@ -28,7 +28,10 @@ impl LineParse {
     }
 
     fn rejected(reason: &'static str) -> Self {
-        LineParse { entries: Vec::new(), malformed: Some(reason) }
+        LineParse {
+            entries: Vec::new(),
+            malformed: Some(reason),
+        }
     }
 }
 
@@ -39,7 +42,9 @@ pub struct ClaudeLineParser {
 
 impl Default for ClaudeLineParser {
     fn default() -> Self {
-        ClaudeLineParser { usage_marker: memmem::Finder::new(b"\"usage\"").into_owned() }
+        ClaudeLineParser {
+            usage_marker: memmem::Finder::new(b"\"usage\"").into_owned(),
+        }
     }
 }
 
@@ -59,7 +64,12 @@ impl LineParser for ClaudeLineParser {
         self.usage_marker.find(line).is_some()
     }
 
-    fn parse(&self, _state: &mut (), line: &[u8], out: &mut Vec<ClaudeEntry>) -> Result<(), LineError> {
+    fn parse(
+        &self,
+        _state: &mut (),
+        line: &[u8],
+        out: &mut Vec<ClaudeEntry>,
+    ) -> Result<(), LineError> {
         let parsed = parse_line(line);
         match parsed.malformed {
             Some(reason) => Err(LineError(reason)),
@@ -89,17 +99,29 @@ pub fn parse_line(line: &[u8]) -> LineParse {
             return LineParse::skipped();
         }
     }
-    let message_usage = object.get("message").and_then(Value::as_object).and_then(|m| m.get("usage").map(|u| (m, u)));
+    let message_usage = object
+        .get("message")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get("usage").map(|u| (m, u)));
     let Some((message, raw_usage)) = message_usage else {
         // A claimed assistant accounting record in an unfamiliar shape must stay observable. Other
         // rows may legitimately carry a usage key inside unrelated payloads.
-        let claimed = object.get("type").and_then(Value::as_str) == Some("assistant") && object.contains_key("usage");
-        return if claimed { LineParse::rejected("assistant usage record in an unfamiliar shape") } else { LineParse::skipped() };
+        let claimed = object.get("type").and_then(Value::as_str) == Some("assistant")
+            && object.contains_key("usage");
+        return if claimed {
+            LineParse::rejected("assistant usage record in an unfamiliar shape")
+        } else {
+            LineParse::skipped()
+        };
     };
     let Value::Object(usage) = raw_usage else {
         return LineParse::rejected("usage is not an object");
     };
-    let Some(timestamp) = object.get("timestamp").and_then(Value::as_str).and_then(parse_iso8601) else {
+    let Some(timestamp) = object
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_iso8601)
+    else {
         return LineParse::rejected("missing or invalid timestamp");
     };
     if !is_valid_entry(&object, message) {
@@ -107,7 +129,10 @@ pub fn parse_line(line: &[u8]) -> LineParse {
     }
     let mut malformed: Option<&'static str> = None;
     let Some(parsed_usage) = token_breakdown(usage, &mut malformed) else {
-        return LineParse { entries: Vec::new(), malformed };
+        return LineParse {
+            entries: Vec::new(),
+            malformed,
+        };
     };
     let cost_usd = match object.get("costUSD") {
         None | Some(Value::Null) => None,
@@ -118,11 +143,20 @@ pub fn parse_line(line: &[u8]) -> LineParse {
         Some(_) => return LineParse::rejected("costUSD is not a number"),
     };
 
-    let model: Option<Arc<str>> =
-        message.get("model").and_then(Value::as_str).filter(|m| *m != "<synthetic>").map(Arc::from);
+    let model: Option<Arc<str>> = message
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| *m != "<synthetic>")
+        .map(Arc::from);
     let message_id: Option<Arc<str>> = message.get("id").and_then(Value::as_str).map(Arc::from);
-    let request_id: Option<Arc<str>> = object.get("requestId").and_then(Value::as_str).map(Arc::from);
-    let is_sidechain = object.get("isSidechain").and_then(Value::as_bool).unwrap_or(false);
+    let request_id: Option<Arc<str>> = object
+        .get("requestId")
+        .and_then(Value::as_str)
+        .map(Arc::from);
+    let is_sidechain = object
+        .get("isSidechain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let mut entries = vec![ClaudeEntry {
         timestamp,
@@ -151,7 +185,9 @@ pub fn parse_line(line: &[u8]) -> LineParse {
                 if iteration.get("type").and_then(Value::as_str) != Some("advisor_message") {
                     continue;
                 }
-                let Some((tokens, has_speed)) = token_breakdown(iteration, &mut malformed) else { continue };
+                let Some((tokens, has_speed)) = token_breakdown(iteration, &mut malformed) else {
+                    continue;
+                };
                 // Missing or malformed model attribution must not discard measured advisor tokens.
                 // Keep them under the shared Unattributed label so their cost remains visibly unknown.
                 let advisor_model = iteration
@@ -163,7 +199,9 @@ pub fn parse_line(line: &[u8]) -> LineParse {
                 entries.push(ClaudeEntry {
                     timestamp,
                     tokens,
-                    message_id: message_id.as_ref().map(|id| Arc::from(format!("{id}:advisor:{advisor_index}"))),
+                    message_id: message_id
+                        .as_ref()
+                        .map(|id| Arc::from(format!("{id}:advisor:{advisor_index}"))),
                     request_id: request_id.clone(),
                     is_sidechain,
                     has_speed,
@@ -183,7 +221,8 @@ pub fn parse_line(line: &[u8]) -> LineParse {
 /// Swift `nonnegativeTokenCount`: a JSON number (never a bool), finite, in [0, 1e15] and integral.
 fn nonnegative_token_count(raw: &Value) -> Option<i64> {
     let value = raw.as_f64()?;
-    (value.is_finite() && (0.0..=1e15).contains(&value) && value.fract() == 0.0).then_some(value as i64)
+    (value.is_finite() && (0.0..=1e15).contains(&value) && value.fract() == 0.0)
+        .then_some(value as i64)
 }
 
 /// Swift `optionalNonnegativeTokenCount`: absent or `null` means zero.
@@ -196,25 +235,35 @@ fn optional_token_count(raw: Option<&Value>) -> Option<i64> {
 
 /// Normalize one usage object (the parent's, or an advisor iteration's) into token buckets plus
 /// whether the log carried a `speed` field. `None` marks `malformed` and drops the object.
-fn token_breakdown(usage: &Map<String, Value>, malformed: &mut Option<&'static str>) -> Option<(TokenBreakdown, bool)> {
+fn token_breakdown(
+    usage: &Map<String, Value>,
+    malformed: &mut Option<&'static str>,
+) -> Option<(TokenBreakdown, bool)> {
     let mut fail = |reason: &'static str| {
         malformed.get_or_insert(reason);
         None
     };
-    let (Some(input_raw), Some(output_raw)) = (usage.get("input_tokens"), usage.get("output_tokens")) else {
+    let (Some(input_raw), Some(output_raw)) =
+        (usage.get("input_tokens"), usage.get("output_tokens"))
+    else {
         return fail("input_tokens or output_tokens is missing");
     };
-    let (Some(input), Some(output)) = (nonnegative_token_count(input_raw), nonnegative_token_count(output_raw)) else {
+    let (Some(input), Some(output)) = (
+        nonnegative_token_count(input_raw),
+        nonnegative_token_count(output_raw),
+    ) else {
         return fail("input_tokens or output_tokens is not a token count");
     };
 
     // Cache writes: the 5m/1h split when present (1h bills at 2x input), else the legacy aggregate
     // `cache_creation_input_tokens` treated as all-5m.
     let (cache_write_5m, cache_write_1h) = match usage.get("cache_creation") {
-        None | Some(Value::Null) => match optional_token_count(usage.get("cache_creation_input_tokens")) {
-            Some(aggregate) => (aggregate, 0),
-            None => return fail("cache_creation_input_tokens is not a token count"),
-        },
+        None | Some(Value::Null) => {
+            match optional_token_count(usage.get("cache_creation_input_tokens")) {
+                Some(aggregate) => (aggregate, 0),
+                None => return fail("cache_creation_input_tokens is not a token count"),
+            }
+        }
         Some(Value::Object(creation)) => match (
             optional_token_count(creation.get("ephemeral_5m_input_tokens")),
             optional_token_count(creation.get("ephemeral_1h_input_tokens")),
@@ -253,7 +302,14 @@ fn is_valid_entry(object: &Map<String, Value>, message: &Map<String, Value>) -> 
             return false;
         }
     }
-    for value in [object.get("sessionId"), object.get("requestId"), message.get("id")].into_iter().flatten() {
+    for value in [
+        object.get("sessionId"),
+        object.get("requestId"),
+        message.get("id"),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if !value.as_str().is_some_and(|text| !text.is_empty()) {
             return false;
         }
@@ -284,21 +340,31 @@ pub fn is_valid_semver(value: &str) -> bool {
     let core = release_parts.next().unwrap_or("");
     let core_parts: Vec<&str> = core.split('.').collect();
     let core_ok = core_parts.len() == 3
-        && core_parts
-            .iter()
-            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) && (*part == "0" || !part.starts_with('0')));
+        && core_parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|b| b.is_ascii_digit())
+                && (*part == "0" || !part.starts_with('0'))
+        });
     if !core_ok {
         return false;
     }
-    release_parts.next().is_none_or(|prerelease| is_valid_identifiers(prerelease, false))
+    release_parts
+        .next()
+        .is_none_or(|prerelease| is_valid_identifiers(prerelease, false))
 }
 
 fn is_valid_identifiers(value: &str, allow_numeric_leading_zero: bool) -> bool {
     value.split('.').all(|identifier| {
         let bytes = identifier.as_bytes();
-        if bytes.is_empty() || !bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
+        if bytes.is_empty()
+            || !bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
             return false;
         }
-        allow_numeric_leading_zero || bytes.len() == 1 || !(bytes.iter().all(u8::is_ascii_digit) && bytes[0] == b'0')
+        allow_numeric_leading_zero
+            || bytes.len() == 1
+            || !(bytes.iter().all(u8::is_ascii_digit) && bytes[0] == b'0')
     })
 }

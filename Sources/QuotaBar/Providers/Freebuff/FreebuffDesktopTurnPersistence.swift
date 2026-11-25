@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 /// Disk mirror of the in-memory per-database derived turn cache, validated against the
-/// database's WAL revision before use. A fresh process — the scan-worker child, or this app
+/// database's WAL revision before use. A fresh process — a cold process, or this app
 /// after a memory-pressure unload — reloads derived turns from the record instead of
 /// re-running sqlite3 and re-parsing every receipt's metrics JSON. Hosted receipts change on
 /// every active-session pass, so the composed whole-scan result cannot be shared across

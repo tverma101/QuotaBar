@@ -11,8 +11,8 @@ mod trend;
 use super::spend_tiles::{append_token_usage_in, TokenUsageOptions};
 use super::DayZone;
 use crate::model::{
-    DailyModelUsageEntry, DailyUsageEntry, DailyUsageSeries, MetricKind, MetricLine, MetricValue, ModelUsageBreakdown,
-    ModelUsageEntry, ModelUsageSeries, ModelUsageVariant, Timestamp,
+    DailyModelUsageEntry, DailyUsageEntry, DailyUsageSeries, MetricKind, MetricLine, MetricValue,
+    ModelUsageBreakdown, ModelUsageEntry, ModelUsageSeries, ModelUsageVariant, Timestamp,
 };
 use crate::time::days_from_civil;
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,7 +56,10 @@ pub(super) fn variant(name: &str, tokens: i64, cost: Option<f64>) -> ModelUsageV
 }
 
 pub(super) fn model_day(date: &str, models: Vec<ModelUsageEntry>) -> DailyModelUsageEntry {
-    DailyModelUsageEntry { date: date.to_string(), models }
+    DailyModelUsageEntry {
+        date: date.to_string(),
+        models,
+    }
 }
 
 pub(super) fn series(daily: Vec<DailyUsageEntry>) -> DailyUsageSeries {
@@ -64,7 +67,13 @@ pub(super) fn series(daily: Vec<DailyUsageEntry>) -> DailyUsageSeries {
 }
 
 /// Swift `MetricValue(number:kind:label:estimated:isLowerBound:)`.
-pub(super) fn value(number: f64, kind: MetricKind, label: Option<&str>, estimated: bool, lower_bound: bool) -> MetricValue {
+pub(super) fn value(
+    number: f64,
+    kind: MetricKind,
+    label: Option<&str>,
+    estimated: bool,
+    lower_bound: bool,
+) -> MetricValue {
     MetricValue {
         number,
         kind,
@@ -90,7 +99,10 @@ pub(super) fn set(items: &[&str]) -> BTreeSet<String> {
 }
 
 pub(super) fn unknown_by_day(items: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {
-    items.iter().map(|(day, models)| (day.to_string(), set(models))).collect()
+    items
+        .iter()
+        .map(|(day, models)| (day.to_string(), set(models)))
+        .collect()
 }
 
 /// Swift `mappedLines`: the tiles for `daily` / `models` at `now` (default 2026-06-26 midday UTC).
@@ -107,7 +119,13 @@ pub(super) fn mapped_lines(
         model_source_note: Some("From test logs".to_string()),
         ..TokenUsageOptions::default()
     };
-    append_token_usage_in(&series(daily), &mut lines, now.unwrap_or_else(|| day(2026, 6, 26)), &options, utc());
+    append_token_usage_in(
+        &series(daily),
+        &mut lines,
+        now.unwrap_or_else(|| day(2026, 6, 26)),
+        &options,
+        utc(),
+    );
     lines
 }
 
@@ -124,7 +142,9 @@ pub(super) fn values(lines: &[MetricLine], label: &str) -> Option<Vec<MetricValu
 
 pub(super) fn model_breakdown(lines: &[MetricLine], label: &str) -> Option<ModelUsageBreakdown> {
     match line(lines, label)? {
-        MetricLine::Values { model_breakdown, .. } => model_breakdown.clone(),
+        MetricLine::Values {
+            model_breakdown, ..
+        } => model_breakdown.clone(),
         _ => None,
     }
 }
@@ -133,6 +153,9 @@ pub(super) fn model_names(breakdown: &ModelUsageBreakdown) -> Vec<&str> {
     breakdown.models.iter().map(|m| m.model.as_str()).collect()
 }
 
-pub(super) fn find<'a>(breakdown: &'a ModelUsageBreakdown, name: &str) -> Option<&'a ModelUsageEntry> {
+pub(super) fn find<'a>(
+    breakdown: &'a ModelUsageBreakdown,
+    name: &str,
+) -> Option<&'a ModelUsageEntry> {
     breakdown.models.iter().find(|m| m.model == name)
 }

@@ -83,7 +83,12 @@ pub struct SecureReadRequest {
 
 impl SecureReadRequest {
     /// A read on behalf of `ctx`'s refresh: interactive only when the refresh is manual.
-    pub fn for_refresh(service: &str, account: SecureAccount, provider: &str, ctx: &crate::context::RefreshContext) -> Self {
+    pub fn for_refresh(
+        service: &str,
+        account: SecureAccount,
+        provider: &str,
+        ctx: &crate::context::RefreshContext,
+    ) -> Self {
         SecureReadRequest {
             service: service.to_string(),
             account,
@@ -112,7 +117,9 @@ impl SecureReadRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum SecureReadOutcome {
-    Found { value: String },
+    Found {
+        value: String,
+    },
     NotFound,
     /// The item exists but reading it needs a prompt the host was not allowed to show.
     InteractionRequired,
@@ -122,7 +129,9 @@ pub enum SecureReadOutcome {
     Deferred,
     /// The refresh this read belonged to was cancelled.
     Cancelled,
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
 }
 
 /// A request to store one secret (a rotated OAuth token, a cached access token).
@@ -168,11 +177,15 @@ pub trait Host: Send + Sync {
     fn secure_read(&self, request: &SecureReadRequest) -> SecureReadOutcome;
     fn secure_write(&self, request: &SecureWriteRequest) -> SecureWriteOutcome {
         let _ = request;
-        SecureWriteOutcome::Failed { message: "this host has no credential store".into() }
+        SecureWriteOutcome::Failed {
+            message: "this host has no credential store".into(),
+        }
     }
     fn secure_delete(&self, request: &SecureDeleteRequest) -> SecureDeleteOutcome {
         let _ = request;
-        SecureDeleteOutcome::Failed { message: "this host has no credential store".into() }
+        SecureDeleteOutcome::Failed {
+            message: "this host has no credential store".into(),
+        }
     }
     /// Whether an item exists, from its attributes only (never reads the secret or prompts).
     /// `None` when the store cannot tell.
@@ -215,7 +228,11 @@ impl Host for StderrHost {
 
 fn host_slot() -> &'static RwLock<Arc<dyn Host>> {
     static SLOT: OnceLock<RwLock<Arc<dyn Host>>> = OnceLock::new();
-    SLOT.get_or_init(|| RwLock::new(Arc::new(StderrHost { level: LogLevel::Warn })))
+    SLOT.get_or_init(|| {
+        RwLock::new(Arc::new(StderrHost {
+            level: LogLevel::Warn,
+        }))
+    })
 }
 
 pub fn set_host(host: Arc<dyn Host>) {
@@ -246,7 +263,10 @@ pub fn host() -> Arc<dyn Host> {
     if let Some(h) = TEST_HOST.with(|slot| slot.borrow().clone()) {
         return h;
     }
-    host_slot().read().unwrap_or_else(|e| e.into_inner()).clone()
+    host_slot()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 pub fn env_var(name: &str) -> Option<String> {
@@ -313,7 +333,10 @@ pub mod diagnostic_gate {
     }
 
     pub fn log_once(key: &str, emit: impl FnOnce()) {
-        let first = keys().lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string());
+        let first = keys()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string());
         if first {
             emit();
         }
@@ -324,7 +347,10 @@ pub mod diagnostic_gate {
     }
 
     pub fn clear_prefix(prefix: &str) {
-        keys().lock().unwrap_or_else(|e| e.into_inner()).retain(|k| !k.starts_with(prefix));
+        keys()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k| !k.starts_with(prefix));
     }
 }
 
@@ -334,7 +360,8 @@ mod tests {
 
     #[test]
     fn secure_requests_use_the_host_wire_format() {
-        let mut request = SecureReadRequest::silent("Claude Code-credentials", SecureAccount::Any, "claude");
+        let mut request =
+            SecureReadRequest::silent("Claude Code-credentials", SecureAccount::Any, "claude");
         assert_eq!(
             serde_json::to_value(&request).unwrap(),
             serde_json::json!({"service": "Claude Code-credentials", "provider": "claude", "allowInteraction": false})
@@ -343,9 +370,15 @@ mod tests {
         request.recheck_blocked_silently = true;
         request.request_id = Some(4);
         let value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value["account"], serde_json::json!({"kind": "named", "name": "antigravity"}));
+        assert_eq!(
+            value["account"],
+            serde_json::json!({"kind": "named", "name": "antigravity"})
+        );
         assert_eq!(value["recheckBlockedSilently"], true);
-        assert_eq!(serde_json::from_value::<SecureReadRequest>(value).unwrap(), request);
+        assert_eq!(
+            serde_json::from_value::<SecureReadRequest>(value).unwrap(),
+            request
+        );
 
         let write = SecureWriteRequest {
             service: "s".into(),
@@ -353,8 +386,12 @@ mod tests {
             provider: "cursor".into(),
             value: "v".into(),
         };
-        assert_eq!(serde_json::to_value(&write).unwrap()["account"], serde_json::json!({"kind": "currentUser"}));
-        let outcome: SecureReadOutcome = serde_json::from_str(r#"{"status":"found","value":"x"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_value(&write).unwrap()["account"],
+            serde_json::json!({"kind": "currentUser"})
+        );
+        let outcome: SecureReadOutcome =
+            serde_json::from_str(r#"{"status":"found","value":"x"}"#).unwrap();
         assert_eq!(outcome, SecureReadOutcome::Found { value: "x".into() });
         let outcome: SecureReadOutcome = serde_json::from_str(r#"{"status":"deferred"}"#).unwrap();
         assert_eq!(outcome, SecureReadOutcome::Deferred);
@@ -363,7 +400,10 @@ mod tests {
             account: SecureAccount::Named("acct".into()),
             provider: "openrouter".into(),
         };
-        assert_eq!(serde_json::to_value(&delete).unwrap()["account"], serde_json::json!({"kind": "named", "name": "acct"}));
+        assert_eq!(
+            serde_json::to_value(&delete).unwrap()["account"],
+            serde_json::json!({"kind": "named", "name": "acct"})
+        );
         let deleted: SecureDeleteOutcome = serde_json::from_str(r#"{"status":"deleted"}"#).unwrap();
         assert_eq!(deleted, SecureDeleteOutcome::Deleted);
     }

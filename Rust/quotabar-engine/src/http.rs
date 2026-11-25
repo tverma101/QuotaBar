@@ -23,11 +23,21 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
     pub timeout: Duration,
+    /// Trust a self-signed loopback certificate. Only ever set for `https://127.0.0.1` requests;
+    /// `send` rejects the flag for any other host so a provider cannot accidentally weaken TLS.
+    pub allow_insecure_loopback: bool,
 }
 
 impl Request {
     pub fn get(url: impl Into<String>) -> Self {
-        Request { method: "GET", url: url.into(), headers: Vec::new(), body: None, timeout: DEFAULT_TIMEOUT }
+        Request {
+            method: "GET",
+            url: url.into(),
+            headers: Vec::new(),
+            body: None,
+            timeout: DEFAULT_TIMEOUT,
+            allow_insecure_loopback: false,
+        }
     }
 
     pub fn post_json(url: impl Into<String>, body: &serde_json::Value) -> Self {
@@ -37,6 +47,7 @@ impl Request {
             headers: vec![("Content-Type".into(), "application/json".into())],
             body: Some(serde_json::to_vec(body).unwrap_or_default()),
             timeout: DEFAULT_TIMEOUT,
+            allow_insecure_loopback: false,
         }
     }
 
@@ -44,9 +55,13 @@ impl Request {
         Request {
             method: "POST",
             url: url.into(),
-            headers: vec![("Content-Type".into(), "application/x-www-form-urlencoded".into())],
+            headers: vec![(
+                "Content-Type".into(),
+                "application/x-www-form-urlencoded".into(),
+            )],
             body: Some(body.into().into_bytes()),
             timeout: DEFAULT_TIMEOUT,
+            allow_insecure_loopback: false,
         }
     }
 
@@ -57,6 +72,12 @@ impl Request {
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Trust the local language server's self-signed certificate. Valid only for loopback HTTPS.
+    pub fn insecure_loopback_tls(mut self) -> Self {
+        self.allow_insecure_loopback = true;
         self
     }
 }
@@ -88,7 +109,10 @@ impl Response {
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 
     pub fn json(&self) -> Option<serde_json::Value> {
@@ -123,6 +147,7 @@ pub trait HttpClient: Send + Sync {
 
 pub struct ReqwestClient {
     client: reqwest::blocking::Client,
+    insecure_loopback: Option<reqwest::blocking::Client>,
 }
 
 impl ReqwestClient {
@@ -134,11 +159,30 @@ impl ReqwestClient {
         if let Some(proxy) = app_proxy() {
             builder = builder.proxy(proxy);
         }
+        // `danger_accept_invalid_certs` applies to the local language server only; every
+        // non-loopback request still goes through the validating client above.
+        let mut insecure = reqwest::blocking::Client::builder()
+            .user_agent(concat!("QuotaBar/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .danger_accept_invalid_certs(true)
+            .no_proxy();
+        if let Some(proxy) = app_proxy() {
+            insecure = insecure.proxy(proxy);
+        }
+        let insecure_loopback = insecure.build().ok();
         let client = builder.build().unwrap_or_else(|error| {
-            qlog!(Error, "http", "HTTP client setup failed, using defaults: {error}");
+            qlog!(
+                Error,
+                "http",
+                "HTTP client setup failed, using defaults: {error}"
+            );
             reqwest::blocking::Client::new()
         });
-        ReqwestClient { client }
+        ReqwestClient {
+            client,
+            insecure_loopback,
+        }
     }
 }
 
@@ -147,9 +191,19 @@ impl HttpClient for ReqwestClient {
         if cancel.is_cancelled() {
             return Err(HttpError::Cancelled);
         }
-        let method = reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|_| HttpError::InvalidUrl)?;
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|_| HttpError::InvalidUrl)?;
         let url = reqwest::Url::parse(&request.url).map_err(|_| HttpError::InvalidUrl)?;
-        let mut builder = self.client.request(method, url).timeout(request.timeout);
+        let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+        if request.allow_insecure_loopback && !loopback {
+            return Err(HttpError::InvalidUrl);
+        }
+        let client = if request.allow_insecure_loopback {
+            self.insecure_loopback.as_ref().unwrap_or(&self.client)
+        } else {
+            &self.client
+        };
+        let mut builder = client.request(method, url).timeout(request.timeout);
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -158,16 +212,30 @@ impl HttpClient for ReqwestClient {
         }
         let redacted_url = redact::redact_url(&request.url);
         let response = builder.send().map_err(|error| {
-            qlog!(Debug, "http", "{} {} -> transport error: {}", request.method, redacted_url, transport_reason(&error));
+            qlog!(
+                Debug,
+                "http",
+                "{} {} -> transport error: {}",
+                request.method,
+                redacted_url,
+                transport_reason(&error)
+            );
             HttpError::Transport(transport_reason(&error))
         })?;
         let status = response.status().as_u16();
         let headers = response
             .headers()
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|v| (k.as_str().to_string(), v.to_string()))
+            })
             .collect();
-        let body = response.bytes().map_err(|error| HttpError::Transport(transport_reason(&error)))?.to_vec();
+        let body = response
+            .bytes()
+            .map_err(|error| HttpError::Transport(transport_reason(&error)))?
+            .to_vec();
         if status >= 400 {
             qlog!(
                 Debug,
@@ -179,12 +247,23 @@ impl HttpClient for ReqwestClient {
                 redact::body_preview(&String::from_utf8_lossy(&body), 500)
             );
         } else {
-            qlog!(Debug, "http", "{} {} -> {}", request.method, redacted_url, status);
+            qlog!(
+                Debug,
+                "http",
+                "{} {} -> {}",
+                request.method,
+                redacted_url,
+                status
+            );
         }
         if cancel.is_cancelled() {
             return Err(HttpError::Cancelled);
         }
-        Ok(Response { status, headers, body })
+        Ok(Response {
+            status,
+            headers,
+            body,
+        })
     }
 }
 
@@ -204,7 +283,9 @@ fn transport_reason(error: &reqwest::Error) -> String {
 /// The shared production client.
 pub fn shared() -> Arc<dyn HttpClient> {
     static CLIENT: OnceLock<Arc<ReqwestClient>> = OnceLock::new();
-    CLIENT.get_or_init(|| Arc::new(ReqwestClient::build())).clone()
+    CLIENT
+        .get_or_init(|| Arc::new(ReqwestClient::build()))
+        .clone()
 }
 
 /// `~/.quotabar/config.json` → `{"proxy": {"enabled": true, "url": "socks5://host:port"}}`.
@@ -215,7 +296,11 @@ fn app_proxy() -> Option<reqwest::Proxy> {
     let root: serde_json::Value = match serde_json::from_str(&text) {
         Ok(root) => root,
         Err(_) => {
-            qlog!(Warn, "config", "proxy config could not be parsed; ignoring it");
+            qlog!(
+                Warn,
+                "config",
+                "proxy config could not be parsed; ignoring it"
+            );
             return None;
         }
     };
@@ -225,14 +310,24 @@ fn app_proxy() -> Option<reqwest::Proxy> {
     }
     let url = proxy.get("url").and_then(|v| v.as_str())?;
     let lower = url.to_ascii_lowercase();
-    if !(lower.starts_with("socks5://") || lower.starts_with("http://") || lower.starts_with("https://")) {
+    if !(lower.starts_with("socks5://")
+        || lower.starts_with("http://")
+        || lower.starts_with("https://"))
+    {
         qlog!(Warn, "config", "proxy url scheme unsupported; ignoring it");
         return None;
     }
     match reqwest::Proxy::all(url) {
         Ok(proxy) => {
             let shown = reqwest::Url::parse(url)
-                .map(|u| format!("{}://{}:{}", u.scheme(), u.host_str().unwrap_or(""), u.port_or_known_default().unwrap_or(0)))
+                .map(|u| {
+                    format!(
+                        "{}://{}:{}",
+                        u.scheme(),
+                        u.host_str().unwrap_or(""),
+                        u.port_or_known_default().unwrap_or(0)
+                    )
+                })
                 .unwrap_or_default();
             qlog!(Info, "config", "proxy enabled {shown}");
             Some(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1")))
@@ -257,11 +352,18 @@ pub mod mock {
 
     impl MockClient {
         pub fn new(responses: Vec<Result<Response, HttpError>>) -> Arc<Self> {
-            Arc::new(MockClient { responses: Mutex::new(responses), requests: Mutex::new(Vec::new()) })
+            Arc::new(MockClient {
+                responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
+            })
         }
 
         pub fn json(status: u16, body: &str) -> Result<Response, HttpError> {
-            Ok(Response { status, headers: Vec::new(), body: body.as_bytes().to_vec() })
+            Ok(Response {
+                status,
+                headers: Vec::new(),
+                body: body.as_bytes().to_vec(),
+            })
         }
     }
 
@@ -288,7 +390,10 @@ pub mod mock {
         pub fn new(
             handler: impl Fn(&Request) -> Result<Response, HttpError> + Send + Sync + 'static,
         ) -> Self {
-            FnClient { handler: Box::new(handler), requests: Mutex::new(Vec::new()) }
+            FnClient {
+                handler: Box::new(handler),
+                requests: Mutex::new(Vec::new()),
+            }
         }
     }
 

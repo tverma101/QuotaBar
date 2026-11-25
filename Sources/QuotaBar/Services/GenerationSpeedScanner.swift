@@ -2,7 +2,7 @@ import Foundation
 
 struct GenerationSpeedScanner: Sendable {
     var sqlite: any SQLiteAccessing = SQLiteCLIAccessor(allowsReadWriteFallback: false)
-    var zcodePath: String = ZCodeUsageScanner.defaultSqlitePath
+    var zcodePath: String = ZAIProvider.zcodeSqlitePath
     var antigravityHome: URL = FileManager.default.homeDirectoryForCurrentUser
 
     func scan(now: Date = Date(), calendar: Calendar = .current) async throws -> GenerationSpeedReport {

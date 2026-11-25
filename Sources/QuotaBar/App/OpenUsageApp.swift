@@ -121,7 +121,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                 }
                 async let cursorHistoryIdentityKeyLoad = loadOffMainActor {
-                    CursorAuthStore().cacheIdentityKeyForLaunch()
+                    CursorProvider.cacheIdentityKeyForLaunch()
                 }
                 async let antigravityIdentityKeyLoad = loadOffMainActor {
                     AntigravityAuthStore().cacheIdentityKeyForLaunch()
@@ -264,7 +264,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { [weak self] in
                 async let openCodeGoAccountInventoryLoad = OpenCodeProvider.discoverAccountInventory()
                 async let cursorHistoryIdentityKeyLoad = loadOffMainActor {
-                    CursorAuthStore().cacheIdentityKeyForLaunch()
+                    CursorProvider.cacheIdentityKeyForLaunch()
                 }
                 async let antigravityIdentityKeyLoad = loadOffMainActor {
                     AntigravityAuthStore().cacheIdentityKeyForLaunch()

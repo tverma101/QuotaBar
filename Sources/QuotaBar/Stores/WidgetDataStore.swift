@@ -43,8 +43,8 @@ final class WidgetDataStore {
     /// `ProviderEnablementStore` without owning it; defaults to "all enabled" for tests and previews.
     private let isProviderEnabled: @MainActor (String) -> Bool
     /// Overridable for tests: the batched fold delegation point for accounting passes. Production
-    /// always uses `ScanWorkerClient.shared`.
-    var scanWorker: ScanWorkerClient
+    /// always uses `EngineFoldBatchClient.shared`.
+    var foldBatch: EngineFoldBatchClient
     /// The user's widget order (already enablement-filtered) that drives the menu-bar value. Injected
     /// so the store reads `LayoutStore.visiblePlaced` without owning it; defaults to registry order.
     private let orderedDescriptors: @MainActor () -> [WidgetDescriptor]
@@ -65,6 +65,8 @@ final class WidgetDataStore {
     /// See `defaultProviderRefreshTimeout`. Injected so tests can drive the deadline in milliseconds.
     private let providerRefreshTimeout: TimeInterval
     private let isOverSoftMemoryLimit: () -> Bool
+    /// Meters-only passes serialize only over the hard limit; see `meterPassMaxConcurrentProviders`.
+    private let isOverHardMemoryLimit: () -> Bool
     /// Quota-notification preferences (three independent triggers). Injected; `nil` disables
     /// notifications entirely (tests and previews that don't wire it).
     private let notificationSettings: (@MainActor () -> NotificationSettingsStore)?
@@ -131,7 +133,22 @@ final class WidgetDataStore {
 
     /// Rendered snapshots consumed by every UI/API surface. Equal to `localSnapshots` when iCloud sync
     /// is off; machine-local history rows are rebuilt from the union while sync is on.
-    var snapshots: [String: ProviderSnapshot] = [:]
+    var snapshots: [String: ProviderSnapshot] = [:] {
+        didSet {
+            let historyChanged = snapshots.contains { id, snapshot in
+                snapshot.usageHistory != oldValue[id]?.usageHistory
+            } || oldValue.contains { id, snapshot in
+                snapshot.usageHistory != nil && snapshots[id] == nil
+            }
+            if historyChanged { historyPresentationRevision &+= 1 }
+        }
+    }
+    /// Usage History observes this independently of meter and refresh-status updates.
+    private(set) var historyPresentationRevision: UInt64 = 0
+
+    func historyAccountIdentity(for providerID: String) -> String? {
+        providerIdentityKeys[providerID]
+    }
     /// Each provider's history descriptor, keyed by provider ID — the classifying metadata the
     /// Usage History screen reuses (e.g. `estimatedCost`, which drives the lifetime hero's
     /// "(Est.)" mark).
@@ -235,6 +252,10 @@ final class WidgetDataStore {
     /// past their deadline. Other combinations remain serialized, except an explicit forced panel-meter
     /// retry uses the same safe overlap rule to keep the visible Retry action responsive.
     @ObservationIgnored private var runningProviderRefreshScopes: [String: [UUID: ProviderRefreshContext.Scope]] = [:]
+    /// The fold-only scope of an open engine batch window, per provider it pre-marked in flight. That
+    /// window has no entry in `runningProviderRefreshScopes`, so without this the overlap rule saw no
+    /// active scope and deferred every panel-open meter pass until the whole fold finished.
+    @ObservationIgnored private var engineFoldScopes: [String: ProviderRefreshContext.Scope] = [:]
     /// Refresh requests skipped behind an incompatible in-flight scope. They are emitted to the
     /// scheduler as soon as the provider can accept them, so a consumed timer/ledger/panel intent is
     /// retried promptly without repeatedly polling the provider.
@@ -323,36 +344,21 @@ final class WidgetDataStore {
     }
 
     func unloadProviderCachesForMemoryPressure() async {
-        if let antigravity = providersByID["antigravity"] as? AntigravityProvider {
-            await antigravity.unloadLocalAccountingCachesForMemoryPressure()
-        }
-        if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
-            await freebuff.unloadLocalAccountingCachesForMemoryPressure()
-        }
-        if let zai = providersByID["zai"] as? ZAIProvider {
-            await zai.unloadLocalAccountingCachesForMemoryPressure()
-        }
-        for provider in providersByID.values {
-            if let codex = provider as? CodexProvider {
-                await codex.unloadLocalAccountingCachesForMemoryPressure()
-            }
-        }
+        // Providers served by the Rust engine keep their recomputable local-accounting caches there.
+        // Unload them as one engine pass so account-scoped Claude/Codex cards share the same pressure
+        // response without depending on which Swift wrapper the catalog constructed.
+        await RustEngine.unloadCaches()
         // Callers relieve the malloc zone at the end of the chain so one free-list walk covers
         // every unload in the cycle.
     }
 
-    /// Releases Freebuff's derived accounting caches on every refresh cycle, below the memory budget.
+    /// Releases Freebuff's hosted-receipt cache on every refresh cycle, below the memory budget.
     ///
-    /// An active session rewrites its database receipts continuously, so the desktop scan re-derives
-    /// its turn cache every history pass whether or not the cache was retained — measured at ~18 s
-    /// per cycle both warm and cold. Retaining the derived turns between cycles therefore pays their
-    /// memory (tens of MB) without saving any rescan work; releasing them each cycle returns those
-    /// pages while the cheap-to-rebuild provider caches (Antigravity's ~8 MB index and friends) stay
-    /// warm under the soft budget.
+    /// The engine keeps Freebuff's per-message Desktop index through this call: it holds only token
+    /// counts, and an active session's next pass then reads just its new or resized messages instead
+    /// of every transcript in the project database.
     func unloadFreebuffAccountingCacheForMemoryPressure() async {
-        if let freebuff = providersByID["freebuff"] as? FreebuffProvider {
-            await freebuff.unloadLocalAccountingCachesForMemoryPressure()
-        }
+        await RustEngine.unloadCaches(providerID: "freebuff")
     }
 
     init(
@@ -369,11 +375,12 @@ final class WidgetDataStore {
         slowProviderRefreshThreshold: TimeInterval = WidgetDataStore.defaultSlowProviderRefreshThreshold,
         providerRefreshTimeout: TimeInterval = WidgetDataStore.defaultProviderRefreshTimeout,
         isOverSoftMemoryLimit: @escaping () -> Bool = { ProcessMemoryBudget.isOverSoftLimit },
+        isOverHardMemoryLimit: @escaping () -> Bool = { ProcessMemoryBudget.isOverHardLimit },
         notificationSettings: (@MainActor () -> NotificationSettingsStore)? = nil,
         postNotification: (@MainActor (String, String, String, String) async -> Bool)? = nil,
         providerIdentityKeys: [String: String] = [:],
         vmBoxHistoryDirectory: URL? = nil,
-        scanWorker: ScanWorkerClient? = nil
+        foldBatch: EngineFoldBatchClient? = nil
     ) {
         precondition(slowProviderRefreshThreshold >= 0)
         precondition(providerRefreshTimeout > 0)
@@ -390,6 +397,7 @@ final class WidgetDataStore {
         self.slowProviderRefreshThreshold = slowProviderRefreshThreshold
         self.providerRefreshTimeout = providerRefreshTimeout
         self.isOverSoftMemoryLimit = isOverSoftMemoryLimit
+        self.isOverHardMemoryLimit = isOverHardMemoryLimit
         self.notificationSettings = notificationSettings
         self.postNotification = postNotification
             ?? { idPrefix, title, subtitle, body in
@@ -397,7 +405,7 @@ final class WidgetDataStore {
             }
         self.providerIdentityKeys = providerIdentityKeys
         self.vmBoxHistory = vmBoxHistoryDirectory.map(VMBoxUsageHistory.init(directory:))
-        self.scanWorker = scanWorker ?? .shared
+        self.foldBatch = foldBatch ?? .shared
         self.meterStyle = defaults.enumValue(forKey: Self.meterStyleKey, default: .remaining)
         self.resetDisplayMode = defaults.enumValue(forKey: Self.resetDisplayModeKey, default: .relative)
         self.alwaysShowPacing = defaults.bool(forKey: Self.alwaysShowPacingKey)
@@ -602,7 +610,7 @@ final class WidgetDataStore {
             hiddenMenuBarProviderIDs: hiddenMenuBarProviderIDs()
         )
         // The panel fold phase only needs providers whose snapshot carries local accounting (the
-        // history exporters). Pure-API providers (Z.ai, OpenRouter, Devin, …) have no local fold;
+        // history exporters). Pure-API providers (Z.ai, OpenRouter, …) have no local fold;
         // suppressing their quota fetch would just re-stamp an unchanged snapshot, and running
         // them here would double every panel-open API call (phase 1 already fetched their meters).
         if ProviderRefreshContext.scope == .panelAccounting {
@@ -629,10 +637,10 @@ final class WidgetDataStore {
         }
         let start = monotonicNow()
         AppLog.info(.refresh, "batch start (\(providerIDs.count) providers, force=\(force), scope=\(Self.batchScopeLabel(ProviderRefreshContext.scope)))")
-        // One batched scan-worker child folds the whole provider set: the per-process fixed costs
-        // (account discovery, login shell, Keychain metadata queries, Swift-runtime startup) are
-        // paid once per pass instead of once per provider. Providers the child can't cover fall
-        // back to the in-process fold inside performRefresh, exactly as if delegation never ran.
+        // One engine batch folds the whole provider set, so shared pricing/cache state and batch
+        // scheduling are paid once per pass instead of once per provider. Providers the batch
+        // can't cover fall back to their ordinary Rust-backed runtime inside performRefresh,
+        // exactly as if batching never ran.
         //
         // Members whose snapshot cache is TTL-fresh are left out of the child entirely — they hit
         // the cache inside performRefresh as usual, so a panel-open pass within the window pays
@@ -650,7 +658,11 @@ final class WidgetDataStore {
             var staleIDs = foldProviders.keys.filter { id in
                 force || bypassSnapshotCache
                     || cache.hasStaleAccountStamp(providerID: id, currentIdentityKey: providerIdentityKeys[id])
-                    || cache.snapshot(providerID: id, freshnessInterval: nil) == nil
+                    || cache.snapshot(
+                        providerID: id,
+                        freshnessInterval: nil,
+                        includeMeterFreshness: !ProviderRefreshContext.scope.suppressesLiveQuota
+                    ) == nil
             }
             staleIDs.sort()
             if !staleIDs.isEmpty {
@@ -668,24 +680,32 @@ final class WidgetDataStore {
                 // `runningProviderRefreshScopes` is deliberately untouched — meter passes may
                 // overlap a fold-only pass by design.
                 preMarkedInFlight = Set(staleIDs)
-                for id in preMarkedInFlight where !refreshingProviderIDs.contains(id) {
-                    refreshingProviderIDs.insert(id)
+                for id in preMarkedInFlight {
+                    engineFoldScopes[id] = ProviderRefreshContext.scope
+                    if !refreshingProviderIDs.contains(id) { refreshingProviderIDs.insert(id) }
                 }
-                let fetched = await self.scanWorker.fetchFoldSnapshots(
+                let engineConfigs = staleIDs.reduce(into: [String: EngineProviderConfig]()) { partial, id in
+                    if let config = providersByID[id]?.engineConfig { partial[id] = config }
+                }
+                let fetched = await self.foldBatch.fetchFoldSnapshots(
                     providers: staleProviders,
-                    paced: ProviderRefreshContext.accountingCPUThrottleEnabled
+                    engineConfigs: engineConfigs,
+                    paced: ProviderRefreshContext.accountingCPUThrottleEnabled || maxConcurrentProviders == 1
                 )
                 prefetchedFoldSnapshots = fetched.snapshots
                 prefetchedFoldIdentityKeys = fetched.identityKeys
                 AppLog.info(
                     .refresh,
-                    "batched scan worker folded \(fetched.snapshots.count)/\(staleIDs.count) stale providers (of \(foldProviders.count) enabled)"
+                    "engine batch folded \(fetched.snapshots.count)/\(staleIDs.count) stale providers (of \(foldProviders.count) enabled)"
                 )
                 // Clear before members run: performRefresh reads `refreshingProviderIDs` as its
                 // in-flight gate, so leaving our placeholder set would make every member defer
                 // against its own marker. The window is covered by these markers; members mark
                 // themselves for the (instant) consuming phase as usual.
-                for id in preMarkedInFlight { refreshingProviderIDs.remove(id) }
+                for id in preMarkedInFlight {
+                    engineFoldScopes[id] = nil
+                    refreshingProviderIDs.remove(id)
+                }
                 // Resume anything that deferred behind the fold child the instant the window closes,
                 // instead of waiting for a consumption-phase unregister (which a mid-loop cancellation
                 // could skip entirely for some providers).
@@ -708,8 +728,13 @@ final class WidgetDataStore {
             // Re-check the budget before every chunk, not just once per pass. The per-provider unload
             // runs *after* a provider finishes, so a chunk that started under the limit can leave the
             // next one stacking on top of a much larger footprint. Dropping to one at a time here
-            // caps the peak at a single provider's parse arrays instead of their sum.
-            if isOverSoftMemoryLimit() {
+            // caps the peak at a single provider's parse arrays instead of their sum. A meters-only
+            // pass parses no corpora, so it serializes only over the hard limit: the settled
+            // footprint sits above the soft one, which made every panel open fill cards one by one.
+            let overMemoryBudget = ProviderRefreshContext.scope.skipsLocalAccounting
+                ? isOverHardMemoryLimit()
+                : isOverSoftMemoryLimit()
+            if overMemoryBudget {
                 concurrency = 1
             }
             // Heavy local-log scans allocate their parse working set before the post-refresh unload.
@@ -1076,9 +1101,17 @@ final class WidgetDataStore {
         emitReadyDeferredRefreshes(for: providerID)
     }
 
+    /// Scopes the overlap rule weighs for `providerID`: its running refresh tasks plus an open engine
+    /// fold window.
+    private func activeRefreshScopes(for providerID: String) -> [ProviderRefreshContext.Scope] {
+        var scopes = Array(runningProviderRefreshScopes[providerID, default: [:]].values)
+        if let fold = engineFoldScopes[providerID] { scopes.append(fold) }
+        return scopes
+    }
+
     private func emitReadyDeferredRefreshes(for providerID: String) {
         guard let requests = deferredRefreshRequests[providerID], !requests.isEmpty else { return }
-        let activeScopes = Array(runningProviderRefreshScopes[providerID, default: [:]].values)
+        let activeScopes = activeRefreshScopes(for: providerID)
         // Mirror the admission gate exactly: a resumed non-forced pass runs iff the provider is not
         // marked in flight, or its meter scope may overlap the running scopes. The batched fold child
         // pre-marks providers while `runningProviderRefreshScopes` stays empty; emitting on "no running
@@ -1251,7 +1284,11 @@ final class WidgetDataStore {
             ? RefreshSetting.quotaCacheInterval
             : nil
         if !force, !bypassSnapshotCache, !staleAccountStamp,
-           let cachedSnapshot = cache.snapshot(providerID: providerID, freshnessInterval: freshnessInterval) {
+           let cachedSnapshot = cache.snapshot(
+            providerID: providerID,
+            freshnessInterval: freshnessInterval,
+            includeMeterFreshness: !ProviderRefreshContext.scope.suppressesLiveQuota
+        ) {
             var cached = cachedSnapshot
             if let history = cached.usageHistory {
                 let compacted = history.retainingHistory(through: now())
@@ -1326,7 +1363,7 @@ final class WidgetDataStore {
         // open time would leave the panel on quota-only merge data and the cache TTL could block the next
         // full pass.
         if refreshingProviderIDs.contains(providerID) {
-            let activeScopes = Array(runningProviderRefreshScopes[providerID, default: [:]].values)
+            let activeScopes = activeRefreshScopes(for: providerID)
             let requestedScope = ProviderRefreshContext.scope
             let canOverlapFold = Self.mayOverlapMeterRefresh(requestedScope, with: activeScopes)
             if canOverlapFold && (!force || requestedScope == .panelMeters) {
@@ -1398,7 +1435,8 @@ final class WidgetDataStore {
             runningProviderRefreshScopes[providerID]?[taskID] = nil
             if runningProviderRefreshScopes[providerID]?.isEmpty == true {
                 runningProviderRefreshScopes[providerID] = nil
-                if refreshingProviderIDs.contains(providerID) {
+                // A meter pass that overlapped an engine fold window leaves its marker to the window.
+                if engineFoldScopes[providerID] == nil, refreshingProviderIDs.contains(providerID) {
                     refreshingProviderIDs.remove(providerID)
                     providerHeaderInfo[providerID]?.isRefreshing = false
                 }
@@ -1406,7 +1444,7 @@ final class WidgetDataStore {
         }
         // App and CLI share persisted snapshots but have independent in-process request generations.
         // The cache order fences a slower result if a newer refresh starts in the other process.
-        // A prefetched fold allocated its order before the scan-worker child started, so the fence
+        // A prefetched fold allocated its order before the engine batch started, so the fence
         // can still reject it in favor of a newer commit; only in-process passes allocate here.
         let cacheRefreshOrder = prefetchedRefreshOrder ?? cache.beginRefreshOrder(providerID: providerID)
         let start = monotonicNow()
@@ -1415,7 +1453,7 @@ final class WidgetDataStore {
         let cacheIdentityResult = ProviderCacheIdentityResult()
         var fetchedSnapshot: ProviderSnapshot? = nil
         if let prefetchedFoldSnapshot {
-            // Batched scan-worker fold already produced this provider's snapshot; treat it as the
+            // Batched engine batch fold already produced this provider's snapshot; treat it as the
             // runtime result (including its identity key, reported through the batch response).
             if let prefetchedFoldIdentityKey { cacheIdentityResult.set(prefetchedFoldIdentityKey) }
             fetchedSnapshot = prefetchedFoldSnapshot
@@ -1442,7 +1480,7 @@ final class WidgetDataStore {
         }
         // Antigravity's history is machine-local, so a fold-scope result can never prove which
         // Google account owns the cached quota. Ignore any identity it reports — including a key
-        // forwarded by an older or misbehaving scan worker — and let only a live-quota scope move
+        // forwarded by an older or misbehaving engine batch — and let only a live-quota scope move
         // the account stamp.
         if let identityKey = cacheIdentityResult.value,
            providerID != "antigravity" || !scope.suppressesLiveQuota
@@ -1801,7 +1839,7 @@ final class WidgetDataStore {
     }
 
     /// Provider IDs / families whose refresh parses large on-disk JSONL corpora. Internal so the
-    /// scan-worker child can serialize them the same way the app serializes its own heavy providers.
+    /// engine batch can serialize them the same way the app serializes its own heavy providers.
     nonisolated static let heavyLocalLogProviders: Set<String> = [
         // Large on-disk corpora whose folds allocate real parse working sets: JSONL logs,
         // protobuf-over-SQLite receipt stores, multi-thousand-row usage CSVs.

@@ -25,8 +25,11 @@ enum ResetClaimOutcome: Equatable, Sendable {
 /// the meantime) simply fails to match → `.noCredit`, exactly the truth. A successful claim awaits a
 /// forced Codex refresh before returning, so by the time the popover shows its result banner the
 /// Session/Weekly meters and the credit count already tell the post-reset story.
+///
+/// **Reference oracle only.** Production uses `RustCodexResetClaimService`; this type keeps the
+/// previous Swift behavior for tests, including its injectable HTTP client and credentials.
 @MainActor
-final class CodexResetClaimService {
+final class CodexResetClaimReferenceService {
     typealias Credentials = (accessToken: String, accountID: String?)
 
     private struct CredentialCandidateLoad {

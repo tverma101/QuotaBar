@@ -15,6 +15,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 mod codex;
+#[cfg(test)]
+mod efficiency_measure_tests;
 mod engine_ffi;
 mod pricing;
 
