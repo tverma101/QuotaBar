@@ -100,3 +100,7 @@ The app version shows in the popover footer.
 Your settings normally carry across updates — layout, stars, preferences, and the menu-bar shortcut stay put. When an update changes how a setting is stored, the app upgrades it in place on launch, stepping through any in-between versions if you skipped a few. (Earlier betas wiped all settings on every update; that no longer happens.)
 
 Optional providers now require a manual toggle in Customize; updates never turn them on just because a local login exists. This release keeps recorded Customize choices and enabled provider cards that can be identified from saved account records, leaves currently enabled core defaults on, and turns off optional cards older versions enabled only through credential detection. Freebuff stays on when it was already enabled; a new default turns it on only when saved provider history shows it was unseen and not explicitly disabled. When older settings leave an optional provider's choice ambiguous, it stays off unless a Customize choice was recorded. New installs start with Claude, Codex, Cursor, and Freebuff on. See [Which Providers Are On](provider-enablement.md).
+
+## Windows
+
+Open Settings from **Options** or press **Ctrl+,** in the Modern dashboard. Settings groups controls into **General**, **Tray**, **Look**, **Providers**, and **Advanced**. Choose **Look → UI layout** to switch between Classic and Modern. New profiles start in Modern and saved layout choices carry forward. Local usage history is under **Advanced**.

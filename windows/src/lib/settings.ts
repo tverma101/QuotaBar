@@ -163,7 +163,10 @@ export const DEFAULT_SHOW_TRAY_ICON = true;
 export const DEFAULT_SHOW_TRAY_INSIGHT = true;
 export const DEFAULT_SHOW_TOTAL_SPEND = true;
 export const DEFAULT_TOTAL_SPEND_METRIC = "apiSpend";
-export const DEFAULT_UI_LAYOUT: UILayout = "classic";
+export const DEFAULT_UI_LAYOUT: UILayout =
+  typeof navigator !== "undefined" && /Windows NT/i.test(navigator.userAgent)
+    ? "modern"
+    : "classic";
 export const DEFAULT_MODERN_DENSITY: ModernDensity = "regular";
 export const DEFAULT_SHOW_ACCOUNT_IDENTITY = false;
 /** `0` = keep forever (row cap still applies in SQLite). */

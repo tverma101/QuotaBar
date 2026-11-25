@@ -1,8 +1,10 @@
-import { useMemo } from "react"
+import { useEffect, useMemo, useState } from "react"
+import { invoke } from "@tauri-apps/api/core"
 import { History } from "lucide-react"
 import { GroupCard } from "@/components/modern/mac-ui"
 import { formatMoney } from "@/lib/locale-format"
 import type { UsageDailyRow } from "@/lib/usage-daily"
+import { loadPersistUsageHistory } from "@/lib/settings"
 import { formatCompactTokens, summarizeUsageHistory, type UsagePeriodTotal } from "@/lib/usage-history-summary"
 import { cn } from "@/lib/utils"
 
@@ -59,19 +61,53 @@ function DailyTokensChart({ daily }: { daily: { dayKey: string; tokens: number }
 }
 
 export function UsageHistoryView({
-  rows,
-  persistEnabled,
   nowMs,
   onOpenSettings,
 }: {
-  rows: UsageDailyRow[]
-  persistEnabled: boolean
   nowMs: number
   onOpenSettings: () => void
 }) {
-  const summary = useMemo(() => summarizeUsageHistory(rows, new Date(nowMs)), [rows, nowMs])
+  const [rows, setRows] = useState<UsageDailyRow[] | null>(null)
+  const [status, setStatus] = useState<"loading" | "disabled" | "ready" | "error">("loading")
 
-  if (!persistEnabled || summary.lifetime.sinceDayKey == null) {
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const enabled = await loadPersistUsageHistory()
+        if (cancelled) return
+        if (!enabled) {
+          setStatus("disabled")
+          return
+        }
+        const retained = await invoke<UsageDailyRow[]>("list_retained_usage_daily")
+        if (cancelled) return
+        setRows(retained)
+        setStatus("ready")
+      } catch (error) {
+        console.error("Load retained usage history:", error)
+        if (!cancelled) setStatus("error")
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const day = new Date(nowMs).setHours(0, 0, 0, 0)
+  const summary = useMemo(() => rows && summarizeUsageHistory(rows, new Date(day)), [rows, day])
+  if (status === "loading" || status === "error") {
+    return (
+      <GroupCard className="px-6 py-8 text-center text-sm">
+        <p role={status === "error" ? "alert" : "status"}>
+          {status === "error" ? "Couldn’t load usage history. Go back and try again." : "Loading usage history…"}
+        </p>
+      </GroupCard>
+    )
+  }
+
+  if (!summary?.lifetime.sinceDayKey) {
+    const persistEnabled = status === "ready"
     return (
       <GroupCard className="flex flex-col items-center px-6 py-8 text-center">
         <History className="size-6 text-muted-foreground" strokeWidth={1.75} aria-hidden />
@@ -79,7 +115,7 @@ export function UsageHistoryView({
         <p className="mt-1 text-[12px] leading-[1.35] text-muted-foreground">
           {persistEnabled
             ? "Spend and token totals appear here once providers report daily usage."
-            : "Turn on usage history in Settings to keep daily spend and token totals on this PC."}
+            : "Turn on usage history in Settings under Advanced to keep daily totals on this PC."}
         </p>
         {!persistEnabled ? (
           <button

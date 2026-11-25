@@ -107,10 +107,14 @@ export function useModernPanel({
     if (!panel || !content) return
     let platform: string | null = null
     let frame = 0
+    let cancelled = false
 
     const resize = async () => {
-      platform ??= await invoke<string>("get_platform").catch(() => "")
-      if (platform !== "windows") return
+      platform ??= await invoke<string>("get_platform").catch((error) => {
+        console.error("Get panel platform:", error)
+        return ""
+      })
+      if (cancelled || platform !== "windows") return
       const scroll = content.parentElement
       const chrome = panel.offsetHeight - (scroll ? scroll.offsetHeight : 0)
       await invoke<number | null>("resize_panel", { height: chrome + content.offsetHeight + 2 }).catch(console.error)
@@ -124,6 +128,7 @@ export function useModernPanel({
     const observer = new ResizeObserver(schedule)
     observer.observe(content)
     return () => {
+      cancelled = true
       cancelAnimationFrame(frame)
       observer.disconnect()
     }
