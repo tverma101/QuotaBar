@@ -129,7 +129,7 @@ struct CustomizeProviderDetailView: View {
     private func metricRow(_ metric: WidgetDescriptor, in providerID: String) -> some View {
         let isActive = activeMetricID == metric.id
         return CustomizeMetricRow(
-            title: metric.title,
+            title: container.dataStore.spendPeriods.selection(for: metric)?.title ?? metric.title,
             // The grip is visual-only and publishes its frame (id "grip:<metric>") so the container
             // gesture can tell which row a drag started on. The drag gesture itself is on the section
             // stack, not the grip — see `metricDragGesture`.

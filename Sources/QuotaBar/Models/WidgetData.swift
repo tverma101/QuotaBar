@@ -12,7 +12,7 @@ struct WidgetData: Hashable {
     /// Subtitle shown on a placed tile with no real backing metric. Copy is intentionally exact.
     static let noDataSubtitle = "No data"
 
-    let title: String          // "Claude 5h", "Cursor credits"
+    var title: String          // "Claude 5h", "Cursor credits"
     let icon: IconSource
     let kind: MetricKind
     var currencyCode: String? = nil

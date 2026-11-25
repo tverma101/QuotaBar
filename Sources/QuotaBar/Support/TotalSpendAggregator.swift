@@ -271,9 +271,11 @@ enum TotalSpendAggregator {
         period: TotalSpendPeriod,
         history: ProviderUsageHistory,
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        selection: SpendPeriodSettings.Selection? = nil
     ) -> TotalSpendSlice? {
-        let days = windowDayKeys(for: period, now: now, calendar: calendar)
+        let days = selection?.dayKeys(through: now, calendar: calendar)
+            ?? windowDayKeys(for: period, now: now, calendar: calendar)
         guard !days.isEmpty else { return nil }
 
         var amount = 0.0
@@ -389,17 +391,25 @@ enum TotalSpendAggregator {
         snapshots: [String: ProviderSnapshot],
         dormantHistories: [String: ProviderUsageHistory] = [:],
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        selection: SpendPeriodSettings.Selection? = nil
     ) -> TotalSpend {
+        let lineLabel = selection?.legacyLineLabel ?? period.lineLabel
         let slices = providers.compactMap { provider -> TotalSpendSlice? in
             // Dormant providers are keyed in `dormantHistories` whether or not they have a retained
             // history — presence is what marks them as turned off, so their frozen spend tiles are
             // never trusted for a period. An empty history contributes nothing.
             if let history = dormantHistories[provider.id] {
-                return slice(for: provider, period: period, history: history, now: now, calendar: calendar)
+                return slice(for: provider, period: period, history: history, now: now,
+                             calendar: calendar, selection: selection)
+            }
+            if let selection, selection.legacyLineLabel == nil {
+                guard let history = snapshots[provider.id]?.usageHistory else { return nil }
+                return slice(for: provider, period: period, history: history, now: now,
+                             calendar: calendar, selection: selection)
             }
             guard let snapshot = snapshots[provider.id],
-                  let line = snapshot.line(label: period.lineLabel),
+                  let line = snapshot.line(label: lineLabel),
                   case .values(_, let values, _, _, let unknownModels, _) = line else { return nil }
 
             let dollars = values.filter { $0.kind == .dollars }
