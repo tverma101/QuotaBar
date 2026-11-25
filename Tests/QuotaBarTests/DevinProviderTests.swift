@@ -191,7 +191,9 @@ final class DevinProviderTests: XCTestCase {
                 sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)
             ),
             usageClient: DevinUsageClient(http: httpClient),
-            now: { Date(timeIntervalSince1970: 1_800_000_000) }
+            transcriptUsageScanner: devinIsolatedScanner(),
+            now: { Date(timeIntervalSince1970: 1_800_000_000) },
+            pricing: { TestPricing.bundled }
         )
 
         let snapshot = await provider.refresh()
@@ -222,7 +224,9 @@ final class DevinProviderTests: XCTestCase {
                 ]),
                 sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)
             ),
-            usageClient: DevinUsageClient(http: httpClient)
+            usageClient: DevinUsageClient(http: httpClient),
+            transcriptUsageScanner: devinIsolatedScanner(),
+            pricing: { TestPricing.bundled }
         )
 
         let snapshot = await provider.refresh()
@@ -243,7 +247,9 @@ final class DevinProviderTests: XCTestCase {
                 ]),
                 sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)
             ),
-            usageClient: DevinUsageClient(http: httpClient)
+            usageClient: DevinUsageClient(http: httpClient),
+            transcriptUsageScanner: devinIsolatedScanner(),
+            pricing: { TestPricing.bundled }
         )
 
         let snapshot = await provider.refresh()
@@ -256,7 +262,9 @@ final class DevinProviderTests: XCTestCase {
     func testRefreshReturnsLoginHintWithoutAuth() async {
         let provider = DevinProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite()),
-            usageClient: DevinUsageClient(http: QueueHTTPClient())
+            usageClient: DevinUsageClient(http: QueueHTTPClient()),
+            transcriptUsageScanner: devinIsolatedScanner(),
+            pricing: { TestPricing.bundled }
         )
 
         let detected = await provider.hasLocalCredentials()
@@ -277,7 +285,9 @@ final class DevinProviderTests: XCTestCase {
                 files: UnreadableDevinFiles(path: DevinAuthStore.credentialsPath),
                 sqlite: FakeSQLite()
             ),
-            usageClient: DevinUsageClient(http: http)
+            usageClient: DevinUsageClient(http: http),
+            transcriptUsageScanner: devinIsolatedScanner(),
+            pricing: { TestPricing.bundled }
         )
 
         let detected = await provider.hasLocalCredentials()
@@ -293,7 +303,9 @@ final class DevinProviderTests: XCTestCase {
         let http = QueueHTTPClient()
         let provider = DevinProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: UnreadableDevinSQLite()),
-            usageClient: DevinUsageClient(http: http)
+            usageClient: DevinUsageClient(http: http),
+            transcriptUsageScanner: devinIsolatedScanner(),
+            pricing: { TestPricing.bundled }
         )
 
         let detected = await provider.hasLocalCredentials()
@@ -319,7 +331,9 @@ final class DevinProviderTests: XCTestCase {
         ])
         let provider = DevinProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)),
-            usageClient: DevinUsageClient(http: http)
+            usageClient: DevinUsageClient(http: http),
+            transcriptUsageScanner: devinIsolatedScanner(),
+            pricing: { TestPricing.bundled }
         )
 
         let (snapshot, logs) = try await captureLogs { await provider.refresh() }
@@ -336,7 +350,9 @@ final class DevinProviderTests: XCTestCase {
         ])
         let provider = DevinProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)),
-            usageClient: DevinUsageClient(http: http)
+            usageClient: DevinUsageClient(http: http),
+            transcriptUsageScanner: devinIsolatedScanner(),
+            pricing: { TestPricing.bundled }
         )
 
         let (snapshot, logs) = try await captureLogs { await provider.refresh() }
@@ -351,7 +367,9 @@ final class DevinProviderTests: XCTestCase {
         DiagnosticGate.clearFailure(DevinProvider.transportFailureDiagnosticKey)
         let provider = DevinProvider(
             authStore: DevinAuthStore(files: FakeFiles(), sqlite: FakeSQLite(value: #"{"apiKey":"devin-session-token$app"}"#)),
-            usageClient: DevinUsageClient(http: ThrowingDevinHTTPClient())
+            usageClient: DevinUsageClient(http: ThrowingDevinHTTPClient()),
+            transcriptUsageScanner: devinIsolatedScanner(),
+            pricing: { TestPricing.bundled }
         )
 
         let (snapshot, logs) = try await captureLogs { await provider.refresh() }
@@ -359,6 +377,82 @@ final class DevinProviderTests: XCTestCase {
         XCTAssertEqual(snapshot.errorCategory, .network)
         XCTAssertTrue(errorText(snapshot.lines)?.contains("reach Devin") == true, errorText(snapshot.lines) ?? "no message")
         XCTAssertTrue(logs.contains("transport"), "a transport failure must leave a log line: \(logs)")
+    }
+
+    func testRefreshAppendsTranscriptSpendTilesAndTrendAlongsideQuotaMeters() async throws {
+        let now = TestLocalInstant.date(2026, 6, 18, 12)
+        let home = try DevinTranscriptFixture.makeTranscripts(files: [
+            "today.json": DevinTranscriptFixture.transcript(steps: [
+                .metered(timestamp: TestLocalInstant.iso(2026, 6, 18, 10), prompt: 2_000_000, completion: 50_000, cached: 1_000_000)
+            ]),
+            "yesterday.json": DevinTranscriptFixture.transcript(steps: [
+                .metered(timestamp: TestLocalInstant.iso(2026, 6, 17, 10), prompt: 1_000_000, completion: 25_000)
+            ])
+        ])
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let httpClient = QueueHTTPClient(responses: [
+            HTTPResponse(statusCode: 200, headers: [:], body: try makeUserStatusBody())
+        ])
+        let provider = DevinProvider(
+            authStore: DevinAuthStore(
+                files: FakeFiles([DevinAuthStore.credentialsPath: "windsurf_api_key = \"devin-session-token$cli\"\napi_server_url = \"https://server.codeium.test\""]),
+                sqlite: FakeSQLite()
+            ),
+            usageClient: DevinUsageClient(http: httpClient),
+            transcriptUsageScanner: DevinTranscriptUsageScanner(
+                transcriptsDirectory: home.appendingPathComponent("transcripts", isDirectory: true),
+                incrementalScanner: IncrementalJSONLScanner<DevinTranscriptUsageScanner.Entry>()
+            ),
+            now: { now },
+            pricing: { TestPricing.bundled }
+        )
+
+        let snapshot = await provider.refresh()
+
+        // Live quota meters stay; the transcript history adds the standard spend rows.
+        XCTAssertNotNil(snapshot.lines.first { $0.label == "Daily quota" })
+        XCTAssertNotNil(snapshot.lines.first { $0.label == "Weekly quota" })
+        XCTAssertNotNil(snapshot.usageHistory)
+
+        // These historical calls predate the documented rates and still carry measured tokens.
+        XCTAssertEqual(
+            values(snapshot.lines, "Today"),
+            [MetricValue(number: 2_050_000, kind: .count, label: "tokens")]
+        )
+        XCTAssertEqual(
+            values(snapshot.lines, "Yesterday"),
+            [MetricValue(number: 1_025_000, kind: .count, label: "tokens")]
+        )
+        XCTAssertEqual(
+            values(snapshot.lines, "Last 30 Days"),
+            [MetricValue(number: 3_075_000, kind: .count, label: "tokens")]
+        )
+
+        guard case .chart(_, let points, let note) = snapshot.lines.first(where: { $0.label == "Usage Trend" }) else {
+            return XCTFail("expected a Usage Trend chart line")
+        }
+        XCTAssertEqual(note, "From local Devin sessions; dollar amounts are estimates")
+        XCTAssertEqual(points.count, UsageHistoryWindow.totalDays)
+        XCTAssertEqual(points.last?.value, 2_050_000)
+    }
+
+    /// A scanner pointed at a directory that never exists — DevinProvider tests must not read the
+    /// real `~/.local/share/devin` transcripts of the machine running the suite.
+    private func devinIsolatedScanner() -> DevinTranscriptUsageScanner {
+        DevinTranscriptUsageScanner(
+            transcriptsDirectory: FileManager.default.temporaryDirectory
+                .appendingPathComponent("openusage-devin-none-\(UUID().uuidString)", isDirectory: true),
+            incrementalScanner: IncrementalJSONLScanner<DevinTranscriptUsageScanner.Entry>()
+        )
+    }
+
+    /// The first `.values` line's values for a label, for spend-tile assertions.
+    private func values(_ lines: [MetricLine], _ label: String) -> [MetricValue]? {
+        guard case .values(_, let values, _, _, _, _) = lines.first(where: { $0.label == label }) else {
+            return nil
+        }
+        return values
     }
 
     /// Run a refresh with the log sink pointed at a temporary file so the diagnostics it writes can

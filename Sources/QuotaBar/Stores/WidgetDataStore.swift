@@ -547,7 +547,7 @@ final class WidgetDataStore {
             hiddenMenuBarProviderIDs: hiddenMenuBarProviderIDs()
         )
         // The panel fold phase only needs providers whose snapshot carries local accounting (the
-        // history exporters). Pure-API providers (Z.ai, OpenRouter, Devin, …) have no local fold;
+        // history exporters). Pure-API providers such as OpenRouter have no local fold;
         // suppressing their quota fetch would just re-stamp an unchanged snapshot, and running
         // them here would double every panel-open API call (phase 1 already fetched their meters).
         if ProviderRefreshContext.scope == .panelAccounting {
@@ -1726,7 +1726,7 @@ final class WidgetDataStore {
         // Large on-disk corpora whose folds allocate real parse working sets: JSONL logs,
         // protobuf-over-SQLite receipt stores, multi-thousand-row usage CSVs.
         "claude", "codex", "opencode", "grok", "muse", "pi", "hermes", "freebuff",
-        "cursor", "antigravity",
+        "cursor", "antigravity", "devin",
     ]
 
     private static func heavyProvidersToSerialize(in scope: ProviderRefreshContext.Scope) -> Set<String> {
